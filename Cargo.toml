@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/haider-protocol",
+    "crates/haider-store",
+    "crates/haider-core",
+    "crates/haider-provider",
+    "crates/haider-tools",
+    "crates/haider-verify",
+    "crates/haider-accounts",
+    "crates/haider-rpc",
+    "crates/haider-tui",
+    "crates/haider-cli",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "LicenseRef-Proprietary-Undecided"
+repository = "https://github.com/Rizzist/haider-agent"
+rust-version = "1.95"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+
+[profile.release]
+lto = "thin"
+strip = "symbols"

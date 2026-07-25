@@ -1,0 +1,25 @@
+[package]
+name = "haider-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "haider"
+path = "src/main.rs"
+
+[dependencies]
+haider-protocol = { path = "../haider-protocol" }
+haider-store = { path = "../haider-store" }
+haider-core = { path = "../haider-core" }
+haider-provider = { path = "../haider-provider" }
+haider-tools = { path = "../haider-tools" }
+haider-verify = { path = "../haider-verify" }
+haider-accounts = { path = "../haider-accounts" }
+haider-rpc = { path = "../haider-rpc" }
+haider-tui = { path = "../haider-tui" }
+
+[lints]
+workspace = true
