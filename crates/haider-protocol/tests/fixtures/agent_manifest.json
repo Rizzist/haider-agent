@@ -1,0 +1,25 @@
+{
+  "agent": "a-child-1",
+  "role": "subagent",
+  "callsign": "Hasan",
+  "model_profile": "gpt-5.6",
+  "grant": {
+    "tools": [
+      "fs_read",
+      "fs_patch"
+    ],
+    "effect_ceiling": [
+      {
+        "class": "fs_write"
+      }
+    ]
+  },
+  "budget_tokens": 500000,
+  "placement": {
+    "placement": "local"
+  },
+  "lease": "l-1",
+  "fencing_epoch": 2,
+  "attempt": 1,
+  "parent": "a-head"
+}

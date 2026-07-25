@@ -1,0 +1,14 @@
+{
+  "node": "n-10",
+  "parent": "n-9",
+  "kind": {
+    "kind": "todos",
+    "items": [
+      {
+        "id": 1,
+        "text": "scope entrypoints",
+        "state": "completed"
+      }
+    ]
+  }
+}

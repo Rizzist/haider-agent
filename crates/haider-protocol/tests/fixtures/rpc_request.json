@@ -1,0 +1,8 @@
+{
+  "id": 7,
+  "method": "menu.answer",
+  "command_id": "cmd-1",
+  "params": {
+    "menu": "m-1"
+  }
+}

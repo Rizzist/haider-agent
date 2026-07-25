@@ -1,0 +1,8 @@
+{
+  "phase": "authorized",
+  "effect": "ef-1",
+  "verdict": {
+    "verdict": "ask",
+    "menu": "m-1"
+  }
+}

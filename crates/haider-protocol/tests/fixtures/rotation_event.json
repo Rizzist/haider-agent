@@ -1,0 +1,6 @@
+{
+  "provider": "openai",
+  "from": "work-chatgpt",
+  "to": "billing-key",
+  "cause": "rate_limit"
+}

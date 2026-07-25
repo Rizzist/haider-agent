@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "event_id": "ev-0001",
+  "seq": 42,
+  "session_id": "s-billing",
+  "branch_id": "b-main",
+  "run_id": "r-7",
+  "agent_id": "a-head",
+  "device_id": "d-mac",
+  "authority_epoch": 3,
+  "worker_generation": 5,
+  "committed_at_ms": 1753500000000,
+  "render": {
+    "ui": true,
+    "durable": true,
+    "prompt": "verbatim"
+  },
+  "payload": {
+    "type": "run_state",
+    "state": "thinking"
+  }
+}
