@@ -252,3 +252,56 @@ fn command_decode_error_is_visible_in_the_session_view() {
     let (text, _) = draw(&model, 90, 30);
     assert!(text.contains("⚠ some output could not be decoded"));
 }
+
+#[test]
+fn paste_behind_a_blocking_menu_is_dropped() {
+    use haider_tui::mock::demo_script;
+    let mut model = AppModel::new();
+    for payload in demo_script() {
+        if matches!(payload, EventPayload::MenuAnswered(_)) {
+            break;
+        }
+        model.handle(AppEvent::Envelope(Box::new(payload)));
+    }
+    assert!(model.projection.open_menu().is_some());
+    model.handle(AppEvent::Paste("sneaky text".to_owned()));
+    assert_eq!(
+        model.composer, "",
+        "paste has no target while the menu replaces the composer"
+    );
+}
+
+#[test]
+fn honesty_notices_survive_long_bottom_anchored_output() {
+    use base64::Engine as _;
+    use haider_protocol::ids::ItemId;
+    use haider_protocol::item::{ItemDelta, ItemEvent, OutputStream, ToolStatus, TurnItem};
+    let mut model = model_after_full_demo();
+    model.handle(AppEvent::Envelope(Box::new(EventPayload::Item(
+        ItemEvent::Started {
+            item_id: ItemId::new("cmd-long"),
+            item: TurnItem::CommandExecution {
+                call_id: "c".to_owned(),
+                command: "yes".to_owned(),
+                status: ToolStatus::InProgress,
+                exit_code: None,
+            },
+        },
+    ))));
+    // A multi-line tail far taller than the viewport, with the cap exceeded.
+    let long = "line\n".repeat(4000);
+    model.handle(AppEvent::Envelope(Box::new(EventPayload::Item(
+        ItemEvent::Delta {
+            item_id: ItemId::new("cmd-long"),
+            delta: ItemDelta::CommandOutput {
+                stream: OutputStream::Stdout,
+                chunk_b64: base64::engine::general_purpose::STANDARD.encode(long.as_bytes()),
+            },
+        },
+    ))));
+    let (text, _) = draw(&model, 90, 24);
+    assert!(
+        text.contains("earlier output truncated"),
+        "the truncation notice must be visible at the bottom-anchored viewport"
+    );
+}

@@ -106,6 +106,12 @@ impl AppModel {
             }
             AppEvent::Paste(text) => {
                 self.dirty = true;
+                // While a blocking menu replaces the composer, paste has no
+                // target — dropping it beats invisible composer text that
+                // surfaces after the menu closes (review r2 P2).
+                if self.projection.open_menu().is_some() && self.screen == Screen::Session {
+                    return;
+                }
                 // Paste is atomic text; pasted newlines become spaces so they
                 // can never trigger submit (rec 14; multi-line lands later).
                 let normalized = text.replace("\r\n", "\n").replace(['\r', '\n'], " ");

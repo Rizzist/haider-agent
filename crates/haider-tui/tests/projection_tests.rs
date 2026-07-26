@@ -626,3 +626,37 @@ fn finished_plan_redelivery_does_not_duplicate_history() {
     assert_eq!(projection.entries().len(), 1, "one history entry per plan");
     assert_eq!(projection.duplicate_items(), 1);
 }
+
+#[test]
+fn stale_plan_started_cannot_overwrite_a_progressed_plan() {
+    // Review r2 P2: active plans live in todos, not entries — Started
+    // idempotency must cover them.
+    let mut projection = SessionProjection::new();
+    projection.apply(&started(
+        60,
+        TurnItem::Plan {
+            items: vec![todo(0, "a", TodoState::Processing)],
+        },
+    ));
+    projection.apply(&completed(
+        60,
+        TurnItem::Plan {
+            items: vec![
+                todo(0, "a", TodoState::Completed),
+                todo(1, "b", TodoState::Processing),
+            ],
+        },
+    ));
+    // Stale re-delivered Started for the same plan id: ignored, counted.
+    projection.apply(&started(
+        60,
+        TurnItem::Plan {
+            items: vec![todo(0, "a", TodoState::Processing)],
+        },
+    ));
+    let todos_panel = projection.todos().expect("plan pinned");
+    assert!(todos_panel.pinned);
+    assert_eq!(todos_panel.done_count(), 1, "progressed state survives");
+    assert_eq!(todos_panel.items.len(), 2);
+    assert_eq!(projection.duplicate_items(), 1);
+}

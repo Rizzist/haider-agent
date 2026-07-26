@@ -317,11 +317,15 @@ fn item_lines<'a>(lines: &mut Vec<Line<'a>>, block: &'a ItemBlock, theme: &Theme
                 spans.push(Span::styled(format!(" · exit {code}"), theme.dim_style()));
             }
             lines.push(Line::from(spans));
-            // Honesty first (review r1 P2): bounded/undecodable output must
-            // never read as complete.
+            for line in block.output_text().lines() {
+                lines.push(Line::styled(format!("  {line}"), theme.faint_style()));
+            }
+            // Honesty notices go BELOW the tail: the transcript is
+            // bottom-anchored, so only the last lines are guaranteed visible —
+            // a long tail must never scroll the warnings away (review r2 P2).
             if block.output_truncated {
                 lines.push(Line::styled(
-                    "  ⋯ earlier output truncated",
+                    "  ⋯ output above is a bounded tail — earlier output truncated",
                     theme.dim_style(),
                 ));
             }
@@ -330,9 +334,6 @@ fn item_lines<'a>(lines: &mut Vec<Line<'a>>, block: &'a ItemBlock, theme: &Theme
                     "  ⚠ some output could not be decoded",
                     theme.warn_style(),
                 ));
-            }
-            for line in block.output_text().lines() {
-                lines.push(Line::styled(format!("  {line}"), theme.faint_style()));
             }
         }
         TurnItem::FileChange {

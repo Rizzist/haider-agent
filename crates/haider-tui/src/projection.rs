@@ -210,8 +210,17 @@ impl SessionProjection {
         match event {
             ItemEvent::Started { item_id, item } => {
                 // Idempotency: a closed id never restarts, an open id never
-                // doubles (replay/re-delivery under fresh seqs).
-                if self.finished_items.contains(item_id) || self.open_block_mut(item_id).is_some() {
+                // doubles (replay/re-delivery under fresh seqs). Active plans
+                // live in `todos`, not `entries` — a stale plan Started must
+                // not overwrite a progressed plan (review r2 P2).
+                let plan_active = self
+                    .todos
+                    .as_ref()
+                    .is_some_and(|panel| panel.pinned && panel.item_id == *item_id);
+                if self.finished_items.contains(item_id)
+                    || plan_active
+                    || self.open_block_mut(item_id).is_some()
+                {
                     self.duplicate_items += 1;
                     return;
                 }

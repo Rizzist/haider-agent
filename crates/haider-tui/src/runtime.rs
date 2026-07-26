@@ -27,15 +27,21 @@ use tokio::sync::mpsc;
 /// lives fails instead of stacking panic hooks and fighting over the screen.
 /// The panic hook stays installed after drop — `restore_terminal` is
 /// idempotent and harmless once the terminal is already restored.
-pub struct TerminalGuard;
+pub struct TerminalGuard {
+    /// Construction only via [`TerminalGuard::enter`] — an unentered guard
+    /// must be unrepresentable (its Drop restores state it never owned).
+    _private: (),
+}
 
 static GUARD_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static PANIC_HOOK: std::sync::Once = std::sync::Once::new();
 
 impl TerminalGuard {
     /// Enter raw mode + alt screen TRANSACTIONALLY (review r1 P1): if any
     /// later step fails, everything already entered is rolled back before
-    /// the error returns. Registers a chaining panic hook that restores the
-    /// terminal before the default report prints.
+    /// the error returns. The chaining panic hook is installed ONCE per
+    /// process (review r2 P3 — enter/drop cycles must not stack hooks) and
+    /// only restores while a guard is actually active.
     pub fn enter() -> std::io::Result<Self> {
         use std::sync::atomic::Ordering;
         if GUARD_ACTIVE.swap(true, Ordering::SeqCst) {
@@ -54,12 +60,16 @@ impl TerminalGuard {
             GUARD_ACTIVE.store(false, Ordering::SeqCst);
             return Err(error);
         }
-        let previous = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            restore_terminal();
-            previous(info);
-        }));
-        Ok(Self)
+        PANIC_HOOK.call_once(|| {
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                if GUARD_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
+                    restore_terminal();
+                }
+                previous(info);
+            }));
+        });
+        Ok(Self { _private: () })
     }
 }
 
@@ -160,8 +170,21 @@ pub async fn run_demo(mut model: AppModel) -> std::io::Result<()> {
                 model.dirty = false;
             }
         }
-        for answer in model.outbox.drain(..) {
-            let _ = answer_echo.try_send(EventPayload::MenuAnswered(answer));
+        // Reliable outbox drain (review r2 P2): a Full channel keeps the
+        // answer queued for the next loop turn — a full channel guarantees
+        // pending envelopes, so the loop WILL wake and retry. Awaiting the
+        // send here instead would deadlock: this loop is the only consumer.
+        while let Some(answer) = model.outbox.first().cloned() {
+            match answer_echo.try_send(EventPayload::MenuAnswered(answer)) {
+                Ok(()) => {
+                    model.outbox.remove(0);
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => break,
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    model.outbox.clear();
+                    break;
+                }
+            }
         }
     }
     Ok(())
