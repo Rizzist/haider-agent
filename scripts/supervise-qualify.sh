@@ -1,5 +1,6 @@
 #!/bin/bash
-# Qualification gate: fake Codex only, with a private journal.
+# Qualification gate for codex-supervised.sh: every case drives a fake codex
+# binary against a private journal. More cases: supervise-qualify-extra.sh.
 set -u
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 1
 WRAPPER="$SCRIPT_DIR/codex-supervised.sh"
@@ -43,18 +44,18 @@ if IFS= read -r unexpected_input; then
 fi
 
 spawn_stall_tree() {
-    printf '%s\n' "$$" >> "$FAKE_PID_FILE"
+    ps -o pid=,lstart= -p "$$" | awk '{$1=$1; print}' >> "$FAKE_PID_FILE"
     # Include both a child and grandchild in the supervised process group.
     sh -c '
-        printf "%s\n" "$$" >> "$1"
+        ps -o pid=,lstart= -p "$$" |
+            awk '"'"'{$1=$1; print}'"'"' >> "$1"
         sh -c '"'"'
-            printf "%s\n" "$$" >> "$1"
+            ps -o pid=,lstart= -p "$$" |
+                awk '"'"'"'"'"'"'"'"'{$1=$1; print}'"'"'"'"'"'"'"'"' >> "$1"
             while :; do sleep 60; done
         '"'"' grandchild "$1" &
-        printf "%s\n" "$!" >> "$1"
         while :; do sleep 60; done
     ' child "$FAKE_PID_FILE" &
-    printf '%s\n' "$!" >> "$FAKE_PID_FILE"
 }
 
 prompt=$6
@@ -85,13 +86,34 @@ case "${FAKE_MODE:-}" in
     leader_exits)
         printf 'fake leader exited\n'
         sh -c '
-            printf "%s\n" "$$" >> "$1"
+            ps -o pid=,lstart= -p "$$" |
+                awk '"'"'{$1=$1; print}'"'"' >> "$1"
             while :; do sleep 60; done
         ' orphan "$FAKE_PID_FILE" &
         exit 0
         ;;
+    detached_leader_exits)
+        printf 'fake detached leader exited\n'
+        if command -v setsid >/dev/null 2>&1; then
+            setsid sh -c '
+                ps -o pid=,lstart= -p "$$" |
+                    awk '"'"'{$1=$1; print}'"'"' >> "$1"
+                while :; do sleep 60; done
+            ' detached "$FAKE_PID_FILE" &
+        else
+            perl -MPOSIX=setsid -e '
+                setsid();
+                exec "sh", "-c",
+                    q{ps -o pid=,lstart= -p "$$" | awk '"'"'{$1=$1; print}'"'"' >> "$1"; while :; do sleep 60; done},
+                    "detached", $ARGV[0]
+            ' "$FAKE_PID_FILE" &
+        fi
+        sleep 0.2
+        exit 0
+        ;;
     interrupt)
-        printf '%s\n' "$$" >> "$FAKE_PID_FILE"
+        ps -o pid=,lstart= -p "$$" |
+            awk '{$1=$1; print}' >> "$FAKE_PID_FILE"
         printf 'fake codex requests interrupt\n'
         kill -TERM "$PPID"
         while :; do sleep 60; done
@@ -101,15 +123,12 @@ esac
 FAKE
 chmod +x "$FAKE_CODEX" || exit 1
 
-pass() {
-    echo "PASS: $1"
-}
+pass() { echo "PASS: $1"; }
 
-fail() {
-    echo "FAIL: $1${2:+ — $2}"
-    FAILURES=$((FAILURES + 1))
-}
+fail() { echo "FAIL: $1${2:+ — $2}"; FAILURES=$((FAILURES + 1)); }
 
+# Run a case command in its own process group, guarded by a 60s watchdog
+# that kills the group and leaves `marker` behind; returns 124 on timeout.
 run_with_watchdog() {
     local marker status
     marker=$1
@@ -158,11 +177,13 @@ event_line() {
 }
 
 pids_survive() {
-    local file pid
+    local file pid identity current
     file=$1
     [ -f "$file" ] || return 1
-    while IFS= read -r pid; do
-        [ -n "$pid" ] && pid_is_live "$pid" && return 0
+    while read -r pid identity; do
+        [ -n "$pid" ] && [ -n "$identity" ] || continue
+        current=$(process_identity "$pid") || current=
+        [ "$current" = "$identity" ] && pid_is_live "$pid" && return 0
     done < "$file"
     return 1
 }
@@ -256,27 +277,6 @@ run_orphan_reap() {
     fi
 }
 
-run_dirty_git_safety() {
-    local brief output repo before after status marker
-    brief="$TMP_ROOT/dirty.brief"; output="$TMP_ROOT/dirty.out"
-    repo="$TMP_ROOT/dirty-repo"; marker="$TMP_ROOT/dirty.timeout"
-    printf 'Make no repository changes.' > "$brief"
-    git init -q "$repo" || { fail "dirty-git safety" "git init failed"; return; }
-    printf 'staged\n' > "$repo/tracked.txt"
-    git -C "$repo" add tracked.txt || { fail "dirty-git safety" "git add failed"; return; }
-    printf 'dirty\n' >> "$repo/tracked.txt"
-    before=$(git -C "$repo" status --porcelain=v1 --untracked-files=all)
-    run_with_watchdog "$marker" env FAKE_MODE=no_changes CODEX_BIN="$FAKE_CODEX" \
-        HAIDER_RUN_JOURNAL="$JOURNAL" bash -c \
-        'cd "$1" && exec bash "$2" "$3" "$4" --max-stall-secs 3 --max-retries 0' \
-        case "$repo" "$WRAPPER" "$brief" "$output"
-    status=$?; after=$(git -C "$repo" status --porcelain=v1 --untracked-files=all)
-    if [ "$status" -eq 0 ] && [ -n "$before" ] && [ "$before" = "$after" ]; then
-        pass "dirty-git safety"
-    else
-        fail "dirty-git safety" "status=$status or git status changed"
-    fi
-}
 # shellcheck source=scripts/supervise-qualify-extra.sh
 . "$SCRIPT_DIR/supervise-qualify-extra.sh"
 if [ ! -x "$WRAPPER" ]; then
