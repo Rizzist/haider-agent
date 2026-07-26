@@ -52,6 +52,7 @@ fn demo_script_produces_the_expected_transcript() {
         .iter()
         .map(|entry| match entry {
             TranscriptEntry::User { .. } => "user",
+            TranscriptEntry::Note { .. } => "note",
             TranscriptEntry::Item(block) => match block.item {
                 TurnItem::AgentMessage { .. } => "agent",
                 TurnItem::ToolCall { .. } => "tool",
@@ -66,7 +67,7 @@ fn demo_script_produces_the_expected_transcript() {
     // Everything settled: nothing left streaming, plan unpinned, tokens live.
     assert!(entries.iter().all(|entry| match entry {
         TranscriptEntry::Item(block) => !block.streaming,
-        TranscriptEntry::User { .. } => true,
+        TranscriptEntry::User { .. } | TranscriptEntry::Note { .. } => true,
     }));
     let todos = projection.todos().expect("plan ran");
     assert!(!todos.pinned);

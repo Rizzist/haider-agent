@@ -70,7 +70,8 @@ fn main() {
         model.handle(AppEvent::Envelope(Box::new(payload.clone())));
     }
     dump(&model, "session (end of demo)");
-    // Session palette (session-only commands included).
+    // Session palette (session-only commands included) — the ghost
+    // completion trails the cursor.
     for c in "/t".chars() {
         model.handle(AppEvent::Key(KeyEvent::new(
             KeyCode::Char(c),
@@ -78,4 +79,12 @@ fn main() {
         )));
     }
     dump(&model, "session + palette");
+    // /theme argument slot (G12 slice).
+    for c in "heme ".chars() {
+        model.handle(AppEvent::Key(KeyEvent::new(
+            KeyCode::Char(c),
+            KeyModifiers::NONE,
+        )));
+    }
+    dump(&model, "session + theme args");
 }

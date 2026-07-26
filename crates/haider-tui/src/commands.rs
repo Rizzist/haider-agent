@@ -106,22 +106,102 @@ const fn session_cmd(
     }
 }
 
-/// Filter the registry for a palette query (the composer text after `/`).
+/// One palette row: a command, or an argument candidate for the current
+/// slot (sim `getSuggestions`, tui.js:234-262). Only `/theme` carries an
+/// executable slot today — the full arg-slot table lands with the daemon's
+/// real command arguments.
+#[derive(Debug, Clone, Copy)]
+pub enum PaletteItem {
+    Cmd(&'static CommandSpec),
+    Arg {
+        cmd: &'static str,
+        value: &'static str,
+        desc: &'static str,
+    },
+}
+
+impl PaletteItem {
+    /// The fixed-width name-column text (sim `.cname`).
+    #[must_use]
+    pub fn label(&self) -> String {
+        match self {
+            Self::Cmd(spec) => format!("/{}", spec.name),
+            Self::Arg { value, .. } => (*value).to_owned(),
+        }
+    }
+
+    /// The dim description column (sim `.cdesc`).
+    #[must_use]
+    pub const fn desc(&self) -> &'static str {
+        match self {
+            Self::Cmd(spec) => spec.desc,
+            Self::Arg { desc, .. } => desc,
+        }
+    }
+}
+
+/// Palette rows shown at once (the sim scrolls beyond its max-height; we
+/// cap and clamp the selection instead — ledgered).
+pub const PALETTE_MAX_ROWS: usize = 8;
+
+/// Commands whose argument slot the palette can complete today.
 #[must_use]
-pub fn palette_matches(query: &str, in_session: bool) -> Vec<&'static CommandSpec> {
-    let needle = query
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    COMMANDS
+pub fn has_arg_slots(name: &str) -> bool {
+    name == "theme"
+}
+
+/// `/theme`'s argument candidates, derived from the theme registry (sim
+/// `argSlots("theme")`, tui.js:227 — value = key, desc = label).
+fn theme_args(fragment: &str) -> Vec<PaletteItem> {
+    crate::theme::ThemeKey::ALL
         .iter()
-        .filter(|spec| in_session || !spec.session_only)
-        .filter(|spec| spec.name.starts_with(&needle))
+        .filter(|key| key.name().starts_with(fragment))
+        .map(|key| PaletteItem::Arg {
+            cmd: "theme",
+            value: key.name(),
+            desc: key.theme().label,
+        })
         .collect()
 }
 
-/// The `/help` panel body (sim `HELP_TEXT` parity).
+/// Palette rows for a composer query (the text after `/`). A single
+/// unfinished token filters command names; once `/theme ` is complete the
+/// palette switches to its argument slot (sim `getSuggestions` shape).
+#[must_use]
+pub fn palette_items(query: &str, in_session: bool) -> Vec<PaletteItem> {
+    let ends_space = query.ends_with(char::is_whitespace);
+    let mut tokens = query.split_whitespace();
+    let first = tokens.next().unwrap_or("").to_ascii_lowercase();
+    let rest: Vec<&str> = tokens.collect();
+    if !ends_space && rest.is_empty() {
+        return COMMANDS
+            .iter()
+            .filter(|spec| in_session || !spec.session_only)
+            .filter(|spec| spec.name.starts_with(&first))
+            .map(PaletteItem::Cmd)
+            .collect();
+    }
+    // Argument position. /theme has one slot; further args offer nothing.
+    if first == "theme" {
+        let done_args = if ends_space {
+            rest.len()
+        } else {
+            rest.len().saturating_sub(1)
+        };
+        if done_args == 0 {
+            let fragment = if ends_space {
+                String::new()
+            } else {
+                rest.last().copied().unwrap_or("").to_ascii_lowercase()
+            };
+            return theme_args(&fragment);
+        }
+    }
+    Vec::new()
+}
+
+/// The `/help` panel body — the sim's `HELP_TEXT` verbatim (tui.js:587-614),
+/// including the `menus —` and `keys —` explainers.
 pub const HELP_TEXT: &[&str] = &[
     "commands",
     "  /model [name]      switch model — fable-5 · gpt-5.6 · gemini-3 · qwen3",
@@ -130,16 +210,23 @@ pub const HELP_TEXT: &[&str] = &[
     "  /tree              session tree — main-line view, ⏎ opens forks, f forks at a node",
     "  /fork              fork the session at the current point",
     "  /sessions          list + switch sessions",
-    "  /aura              Aura Mode — a voice/orchestrator session",
-    "  /peers             reachability ladder — peers · sponsored nodes · shell targets",
-    "  /accounts          provider credentials — pick the active",
-    "  /login <prov> <oauth|api>  add a provider account",
-    "  /clear · /back     back to the main screen",
+    "  /aura              Aura Mode — a voice/orchestrator session (spawns sessions, never codes)",
+    "  /peers             reachability ladder — enrolled peers · sponsored SSH nodes · shell targets",
+    "  /accounts          provider credentials — OAuth / API / HuggingFace / custom, pick the active",
+    "  /account <alias>   switch the active account for its provider (tab-completes aliases)",
+    "  /login <prov> <oauth|api>  add a provider account (OAuth loopback, API key, or custom URL)",
+    "  /clear · /back     back to the main screen; typing there starts a fresh session",
     "  /compact           compact context now",
     "  /tokens            token panel — context by model (also ⌃G)",
-    "  /voice · /say      voice providers · speak a turn",
-    "  /queue <steer|turn> mid-turn input mode",
+    "  /hooks             trust third-party hooks — FULL-SCREEN startup gate (not a session card)",
+    "  /voice             enable voice · pick STT / TTS providers (menu card)",
+    "  /say <words>       speak a turn once voice is on (simulated STT)",
+    "  /tools             core + custom tools · register with a dispatch mode (menu card)",
+    "  /queue <steer|turn> mid-turn input mode — steer at safe boundary, or hold until turn end",
+    "  /update            check for updates — FULL-SCREEN startup gate (harness-level)",
+    "  /rename <name>     rename this session",
     "  /reset             reset the demo to the seed sessions",
-    "",
-    "keys — ⏎ send · esc back/close · ⌃T theme · ⌃C quit · 1-3 attach a session",
+    "menus — every card (permission · hook trust · update · recovery · voice · tools) is a typed menu:",
+    "  answer by typing [n] ⏎, clicking, by id over RPC (menu.answer), or from Diff Forge web",
+    "keys — ⏎ send · ⇧⏎ newline · esc interrupt / back · type / for the palette (↑↓ pick · tab complete · ⏎ run)",
 ];

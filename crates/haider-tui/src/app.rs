@@ -2,15 +2,45 @@
 //! event stream (research rec 3/6). Rendering reads this model; nothing else
 //! mutates it. The reducer is pure enough to test headlessly.
 
-use crate::commands::{CommandSpec, palette_matches};
+use crate::commands::{PALETTE_MAX_ROWS, PaletteItem, has_arg_slots, palette_items};
 use crate::mock::{SampleSession, sample_sessions};
 use crate::projection::SessionProjection;
 use crate::sanctum::SanctumTier;
 use crate::theme::ThemeKey;
 use haider_protocol::EventPayload;
 use haider_protocol::menu::{AnswerVia, MenuAnswer};
-use haider_protocol::state::HarnessStatus;
+use haider_protocol::state::{HarnessStatus, RunState};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+/// Sim `autoBlurb` (tui.js:401-406): strip a leading slash-command token,
+/// keep the first seven words, cap at 46 chars, capitalize the first letter.
+#[must_use]
+pub fn auto_blurb(text: &str) -> String {
+    let body: String = if text.starts_with('/') {
+        text.split_whitespace()
+            .skip(1)
+            .collect::<Vec<_>>()
+            .join(" ")
+    } else {
+        text.to_owned()
+    };
+    let joined = body
+        .split_whitespace()
+        .take(7)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let truncated = if joined.chars().count() > 46 {
+        let cut: String = joined.chars().take(46).collect();
+        format!("{}…", cut.trim_end())
+    } else {
+        joined
+    };
+    let mut chars = truncated.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => "New session".to_owned(),
+    }
+}
 
 /// Which screen is showing (sim: boot | main | session).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -30,6 +60,9 @@ pub enum AppRequest {
     AttachSample(usize),
     /// Stop any playing script (fresh session / reset).
     StopScripts,
+    /// Esc mid-turn: stop the playing script; the reducer already settled
+    /// the projection into idle(i) (sim interrupt, tui.js:1551-1567).
+    Interrupt,
     /// Quit the app.
     Quit,
 }
@@ -46,6 +79,9 @@ pub enum Hit {
     BackChip,
     TalkChip,
     HelpHint,
+    /// The sticky origin line pinned atop a scrolled-back transcript —
+    /// click returns to the live tail (zeroes the scroll-back).
+    StickyJump,
 }
 
 /// Everything the reducer consumes.
@@ -131,6 +167,14 @@ pub struct AppModel {
     /// Wheel scroll-back offset in the session transcript (0 = follow
     /// bottom; wheel up increases, wheel down decreases).
     pub scroll_back: u16,
+    /// Max scroll-back of the LAST rendered frame — set by the renderer
+    /// (interior mutability: render reads `&AppModel`), consumed by
+    /// [`Self::handle_wheel`] to clamp wheel-up (G16). Starts unclamped;
+    /// the first drawn frame tightens it.
+    pub scroll_max: std::cell::Cell<u16>,
+    /// A freshly auto-titled session owes the transcript its
+    /// `· session titled` note once the first user message lands.
+    pub title_note_pending: bool,
     pub should_quit: bool,
     /// Set by every state change; cleared when a frame is drawn (rec 6).
     pub dirty: bool,
@@ -158,6 +202,8 @@ impl Default for AppModel {
             turn_active: false,
             auto_play_spent: false,
             scroll_back: 0,
+            scroll_max: std::cell::Cell::new(u16::MAX),
+            title_note_pending: false,
             should_quit: false,
             dirty: true,
         }
@@ -203,13 +249,45 @@ impl AppModel {
         !(self.screen == Screen::Session && self.projection.open_menu().is_some())
     }
 
-    /// Current palette matches for rendering and completion.
+    /// Current palette rows (commands, or `/theme`'s argument slot) for
+    /// rendering and completion.
     #[must_use]
-    pub fn palette_items(&self) -> Vec<&'static CommandSpec> {
-        palette_matches(
+    pub fn palette_items(&self) -> Vec<PaletteItem> {
+        palette_items(
             self.composer.trim_start_matches('/'),
             self.screen == Screen::Session,
         )
+    }
+
+    /// The inline ghost completion (sim `ghostFor`, tui.js:265-276): the
+    /// remainder of the highlighted palette row beyond the typed fragment,
+    /// drawn dim after the cursor with a faint `⇥ tab` tag.
+    #[must_use]
+    pub fn ghost(&self) -> Option<String> {
+        if !self.palette_open() {
+            return None;
+        }
+        let items = self.palette_items();
+        let item = items
+            .get(self.palette_selection.min(items.len().saturating_sub(1)))
+            .copied()?;
+        let body = self.composer.strip_prefix('/')?;
+        match item {
+            // Command rows exist only while the body is one unfinished
+            // token, so the whole body is the fragment.
+            PaletteItem::Cmd(spec) => {
+                let rest = spec.name.strip_prefix(body)?;
+                (!rest.is_empty()).then(|| rest.to_owned())
+            }
+            PaletteItem::Arg { value, .. } => {
+                if body.ends_with(char::is_whitespace) {
+                    return Some((*value).to_owned());
+                }
+                let fragment = body.split_whitespace().last().unwrap_or("");
+                let rest = value.strip_prefix(fragment)?;
+                (!rest.is_empty()).then(|| rest.to_owned())
+            }
+        }
     }
 
     /// Reduce one event into the model. Returns nothing; render reads state,
@@ -233,8 +311,17 @@ impl AppModel {
                 }
                 // Paste is atomic text; pasted newlines become spaces so they
                 // can never trigger submit (rec 14; multi-line lands later).
-                let normalized = text.replace("\r\n", "\n").replace(['\r', '\n'], " ");
-                self.composer.push_str(&normalized);
+                // Big pastes become a pill token (sim, tui.js:2298-2317) —
+                // the raw bytes travel as real attachments in a later wave.
+                let normalized = text.replace("\r\n", "\n");
+                let line_count = normalized.split('\n').count();
+                if line_count > 3 || normalized.chars().count() > 300 {
+                    self.composer
+                        .push_str(&format!("[Pasted {line_count} lines] "));
+                } else {
+                    self.composer
+                        .push_str(&normalized.replace(['\r', '\n'], " "));
+                }
                 // Any composer edit re-opens a dismissed palette (sim
                 // `setMenuDismissed(false)` on change).
                 self.palette_dismissed = false;
@@ -260,6 +347,11 @@ impl AppModel {
                 KeyCode::Char('c') => self.should_quit = true,
                 // Ctrl+T cycles the theme (demo stand-in for /theme).
                 KeyCode::Char('t') => self.cycle_theme(),
+                // ⌃G = the token panel (sim binding) — same honest stub.
+                KeyCode::Char('g') => {
+                    self.flash =
+                        Some("· /tokens — UI ready; lands with the daemon wave (W3)".to_owned());
+                }
                 _ => {}
             }
             return;
@@ -284,21 +376,44 @@ impl AppModel {
         if self.palette_open() {
             match key.code {
                 KeyCode::Up => {
-                    self.palette_selection = self.palette_selection.saturating_sub(1);
+                    // Selection wraps around (sim, tui.js:2763-2772).
+                    let count = self.palette_items().len().min(PALETTE_MAX_ROWS);
+                    if count > 0 {
+                        self.palette_selection =
+                            (self.palette_selection.min(count - 1) + count - 1) % count;
+                    }
                     return;
                 }
                 KeyCode::Down => {
                     // Only 8 rows render; selection stays visible (r1 P2).
-                    let count = self.palette_items().len().min(8);
+                    let count = self.palette_items().len().min(PALETTE_MAX_ROWS);
                     if count > 0 {
-                        self.palette_selection = (self.palette_selection + 1).min(count - 1);
+                        self.palette_selection = (self.palette_selection + 1) % count;
                     }
                     return;
                 }
                 KeyCode::Tab => {
-                    if let Some(spec) = self.palette_items().get(self.palette_selection) {
-                        self.composer = format!("/{} ", spec.name);
+                    // Sim acceptSuggestion(tab): arg commands open their
+                    // slot; arg-less commands complete in place; an arg row
+                    // completes the full command for ⏎ to run.
+                    let items = self.palette_items();
+                    match items
+                        .get(self.palette_selection.min(items.len().saturating_sub(1)))
+                        .copied()
+                    {
+                        Some(PaletteItem::Cmd(spec)) => {
+                            self.composer = if has_arg_slots(spec.name) {
+                                format!("/{} ", spec.name)
+                            } else {
+                                format!("/{}", spec.name)
+                            };
+                        }
+                        Some(PaletteItem::Arg { cmd, value, .. }) => {
+                            self.composer = format!("/{cmd} {value}");
+                        }
+                        None => {}
                     }
+                    self.palette_selection = 0;
                     return;
                 }
                 KeyCode::Esc => {
@@ -319,7 +434,20 @@ impl AppModel {
         }
         match key.code {
             KeyCode::Esc if self.screen == Screen::Session => {
-                self.screen = Screen::Launcher;
+                if self.turn_active {
+                    // Esc mid-turn INTERRUPTS (sim, tui.js:2533-2539 +
+                    // 1551-1567): the script stops, run → cancelled, badge
+                    // ⏸ IDLE (i), a transcript note lands — and the session
+                    // stays on screen. Only an idle esc walks back.
+                    self.turn_active = false;
+                    self.requests.push(AppRequest::Interrupt);
+                    self.projection
+                        .apply(&EventPayload::RunState(RunState::Cancelled));
+                    self.projection
+                        .push_note("· interrupted — run → cancelled · idle (i)".to_owned());
+                } else {
+                    self.screen = Screen::Launcher;
+                }
             }
             KeyCode::Enter => self.submit_composer(),
             KeyCode::Backspace => {
@@ -337,6 +465,10 @@ impl AppModel {
                 self.composer.push(c);
                 self.palette_selection = 0;
                 self.palette_dismissed = false;
+                // Typing decays interrupted-idle → idle (sim, tui.js:3020).
+                if self.projection.interrupted() {
+                    self.projection.apply(&EventPayload::IdleDecayed);
+                }
             }
             _ => {}
         }
@@ -361,6 +493,11 @@ impl AppModel {
         if self.turn_active {
             self.flash =
                 Some("· a turn is already running — steer lands with the daemon".to_owned());
+            // The text must not be lost (G51): echo it as a transcript note
+            // until real steer/queue delivery exists.
+            self.projection.push_note(format!(
+                "⧗ mid-turn input — “{text}” · steer/queue delivery lands with the daemon (W3)"
+            ));
             return;
         }
         // Typing on the LAUNCHER starts a FRESH session (sim promise);
@@ -368,12 +505,8 @@ impl AppModel {
         if self.screen == Screen::Launcher {
             self.fresh_session();
         }
-        if self.session_title.is_none() {
-            let mut title: String = text.chars().take(38).collect();
-            if text.chars().count() > 38 {
-                title.push('…');
-            }
-            self.session_title = Some(title);
+        if self.maybe_title(&text) {
+            self.title_note_pending = true;
         }
         self.screen = Screen::Session;
         self.turn_active = true;
@@ -383,23 +516,45 @@ impl AppModel {
 
     /// Run the highlighted palette row with any typed args — the ⏎ and
     /// mouse-click paths share this law (a click must run the CLICKED row,
-    /// never the raw query).
+    /// never the raw query). An argument row completes the command and runs
+    /// it (sim acceptSuggestion with execute).
     fn run_palette_selection(&mut self) {
-        if let Some(spec) = self.palette_items().get(self.palette_selection) {
-            let args: String = self
-                .composer
-                .trim_start_matches('/')
-                .split_whitespace()
-                .skip(1)
-                .collect::<Vec<_>>()
-                .join(" ");
-            self.composer = if args.is_empty() {
-                format!("/{}", spec.name)
-            } else {
-                format!("/{} {args}", spec.name)
-            };
+        let items = self.palette_items();
+        match items
+            .get(self.palette_selection.min(items.len().saturating_sub(1)))
+            .copied()
+        {
+            Some(PaletteItem::Cmd(spec)) => {
+                let args: String = self
+                    .composer
+                    .trim_start_matches('/')
+                    .split_whitespace()
+                    .skip(1)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                self.composer = if args.is_empty() {
+                    format!("/{}", spec.name)
+                } else {
+                    format!("/{} {args}", spec.name)
+                };
+            }
+            Some(PaletteItem::Arg { cmd, value, .. }) => {
+                self.composer = format!("/{cmd} {value}");
+            }
+            None => {}
         }
         self.execute_slash();
+    }
+
+    /// Title an untitled session from its first message (sim auto-title
+    /// micro-call). True when a title was newly set — the caller owes the
+    /// transcript its `· session titled` note once the message lands.
+    fn maybe_title(&mut self, text: &str) -> bool {
+        if self.session_title.is_some() {
+            return false;
+        }
+        self.session_title = Some(auto_blurb(text));
+        true
     }
 
     fn execute_slash(&mut self) {
@@ -423,7 +578,16 @@ impl AppModel {
                             Some(format!("· unknown theme “{name}” — dawn · ivory · dark"));
                     }
                 },
-                None => self.cycle_theme(),
+                None => {
+                    // Documented divergence: the sim only LISTS the themes
+                    // on a bare /theme (tui.js:1729-1733); in a TUI cycling
+                    // is the better default — cycle, name the result, and
+                    // still list the choices.
+                    self.cycle_theme();
+                    if let Some(flash) = &mut self.flash {
+                        flash.push_str(" · themes — dawn · ivory · dark");
+                    }
+                }
             },
             "clear" | "back" => {
                 // /clear promises a fresh start (review r1 P2).
@@ -468,11 +632,13 @@ impl AppModel {
         };
         let option_count = menu.options.len();
         match code {
-            KeyCode::Up => {
-                self.menu_selection = self.menu_selection.saturating_sub(1);
+            // Selection wraps around (sim, tui.js:2441-2449).
+            KeyCode::Up if option_count > 0 => {
+                self.menu_selection =
+                    (self.menu_selection.min(option_count - 1) + option_count - 1) % option_count;
             }
             KeyCode::Down if option_count > 0 => {
-                self.menu_selection = (self.menu_selection + 1).min(option_count - 1);
+                self.menu_selection = (self.menu_selection + 1) % option_count;
             }
             KeyCode::Char(c @ '1'..='9') => {
                 let index = (c as usize) - ('1' as usize);
@@ -515,12 +681,8 @@ impl AppModel {
         if let EventPayload::UserMessage { text, .. } = payload {
             self.screen = Screen::Session;
             self.turn_active = true;
-            if self.session_title.is_none() {
-                let mut title: String = text.chars().take(38).collect();
-                if text.chars().count() > 38 {
-                    title.push('…');
-                }
-                self.session_title = Some(title);
+            if self.maybe_title(text) {
+                self.title_note_pending = true;
             }
         }
         if let EventPayload::RunState(state) = payload
@@ -532,6 +694,15 @@ impl AppModel {
             self.menu_selection = 0;
         }
         self.projection.apply(payload);
+        // The auto-title note lands right AFTER the first user row (sim
+        // `· session titled — "…"`).
+        if matches!(payload, EventPayload::UserMessage { .. }) && self.title_note_pending {
+            self.title_note_pending = false;
+            if let Some(title) = &self.session_title {
+                self.projection
+                    .push_note(format!("· session titled — “{title}”"));
+            }
+        }
     }
 
     /// Start-fresh semantics (review r1 P2): a new session begins from an
@@ -539,6 +710,7 @@ impl AppModel {
     fn fresh_session(&mut self) {
         self.projection = SessionProjection::new();
         self.session_title = None;
+        self.title_note_pending = false;
         self.turn_active = false;
         self.scroll_back = 0;
     }
@@ -599,17 +771,23 @@ impl AppModel {
                     Some("· ◉ talk — voice lands post-v0.1; the chip is the promise".to_owned());
             }
             Hit::HelpHint => self.help_open = true,
+            Hit::StickyJump => self.scroll_back = 0,
         }
     }
 
     /// Wheel scroll in the session transcript (⇧-drag selects text natively).
     pub fn handle_wheel(&mut self, up: bool) {
-        if self.screen != Screen::Session {
+        if self.screen != Screen::Session || self.help_open {
             return;
         }
         self.dirty = true;
         if up {
-            self.scroll_back = self.scroll_back.saturating_add(3);
+            // Clamped to the last rendered frame's max scroll (G16):
+            // wheel-up never winds unpayable debt past the top.
+            self.scroll_back = self
+                .scroll_back
+                .saturating_add(3)
+                .min(self.scroll_max.get());
         } else {
             self.scroll_back = self.scroll_back.saturating_sub(3);
         }

@@ -318,7 +318,9 @@ pub async fn run_demo(mut model: AppModel) -> std::io::Result<()> {
                     let generation = script_gen.load(std::sync::atomic::Ordering::SeqCst);
                     play(crate::mock::turn_script(turn_counter), generation);
                 }
-                AppRequest::StopScripts => {
+                AppRequest::StopScripts | AppRequest::Interrupt => {
+                    // Interrupt = stop the playing script; the reducer
+                    // already settled the projection into idle(i).
                     script_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
                 AppRequest::Quit => model.should_quit = true,

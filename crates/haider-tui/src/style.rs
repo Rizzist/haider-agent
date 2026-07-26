@@ -54,12 +54,14 @@ impl Theme {
         Style::default().fg(self.frame.into())
     }
 
-    /// The state badge, per visual class (sim vocabulary: restful states
-    /// outlined in gold; active work filled gold; tool machinery maroon;
-    /// needs-you warn; failure err).
+    /// The state badge, per visual class — the sim's badge vocabulary
+    /// (tui.js:5531-5564): outlined states carry only their ink (the `[ ]`
+    /// chip form stands in for the border); fills carry badge_fg on the
+    /// state ground.
     #[must_use]
     pub fn badge_style(&self, tone: crate::projection::BadgeTone) -> Style {
         use crate::projection::BadgeTone;
+        let outline = |ink: Rgb| Style::default().fg(ink.into());
         let filled = |ground: Rgb| {
             Style::default()
                 .fg(self.badge_fg.into())
@@ -67,12 +69,13 @@ impl Theme {
                 .add_modifier(Modifier::BOLD)
         };
         match tone {
-            BadgeTone::Muted => Style::default()
-                .fg(self.gold.into())
-                .add_modifier(Modifier::BOLD),
+            BadgeTone::Idle => outline(self.dim),
+            BadgeTone::Restful => outline(self.gold),
+            BadgeTone::Attention => outline(self.warn),
+            BadgeTone::EffectUnknown => outline(self.err),
             BadgeTone::Active => filled(self.gold),
             BadgeTone::Tool => filled(self.maroon),
-            BadgeTone::Attention => filled(self.warn),
+            BadgeTone::Compacting => filled(self.warn),
             BadgeTone::Error => filled(self.err),
         }
     }
@@ -92,6 +95,12 @@ impl Theme {
         Style::default()
             .fg(self.text.into())
             .bg(self.gold_soft.into())
+    }
+
+    /// The agent-body left rail (sim AgentRow `border-left: goldSoft`).
+    #[must_use]
+    pub fn rail_style(&self) -> Style {
+        Style::default().fg(self.gold_soft.into())
     }
 
     /// The selected row/option.

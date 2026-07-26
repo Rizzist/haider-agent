@@ -35,6 +35,10 @@ pub fn render_plain(projection: &SessionProjection, window: u64) -> String {
                 out.push('\n');
             }
             TranscriptEntry::Item(block) => render_item(&mut out, block),
+            TranscriptEntry::Note { text } => {
+                out.push_str(text);
+                out.push('\n');
+            }
         }
     }
     if let Some(todos) = projection.todos().filter(|t| t.pinned) {

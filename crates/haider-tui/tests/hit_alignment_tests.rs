@@ -170,8 +170,8 @@ fn palette_row_hits_align_and_click_runs_that_row() {
         model.handle(key(KeyCode::Char(c)));
     }
     // Session matches for /t, sim registry order: theme · tree · tokens · tools.
-    let names: Vec<&str> = model.palette_items().iter().map(|s| s.name).collect();
-    assert_eq!(names, ["theme", "tree", "tokens", "tools"]);
+    let names: Vec<String> = model.palette_items().iter().map(|s| s.label()).collect();
+    assert_eq!(names, ["/theme", "/tree", "/tokens", "/tools"]);
     let (rows, hits, _) = draw(&model, 118, 34);
     for (index, label) in ["/theme", "/tree", "/tokens", "/tools"]
         .into_iter()

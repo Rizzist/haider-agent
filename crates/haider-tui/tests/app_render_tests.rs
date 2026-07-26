@@ -123,7 +123,8 @@ fn session_screen_shows_transcript_and_meter() {
     let (text, _) = draw(&model, 100, 30);
     assert!(text.contains("❯ fix the failing boundary test"));
     assert!(text.contains("✓ fs_read"), "tool row: status glyph + name");
-    assert!(text.contains("± crates/haider-store/src/event_store.rs"));
+    // File changes render as the sim's fs_patch tool-row shape (G30).
+    assert!(text.contains("✓ fs_patch crates/haider-store/src/event_store.rs +4 −1"));
     assert!(text.contains("IDLE"));
     assert!(text.contains("17% of 200k"));
     assert!(text.contains("fable-5 · anthropic"));
@@ -162,6 +163,11 @@ fn reducer_handles_quit_composer_and_navigation() {
     assert_eq!(model.composer, "");
 
     assert_eq!(model.screen, Screen::Session);
+    // Esc mid-turn INTERRUPTS and stays (G40, sim parity); the next esc,
+    // now idle, walks back to the launcher.
+    model.handle(key(KeyCode::Esc));
+    assert_eq!(model.screen, Screen::Session, "mid-turn esc interrupts");
+    assert!(model.projection.interrupted(), "idle (i) marker set");
     model.handle(key(KeyCode::Esc));
     assert_eq!(model.screen, Screen::Launcher);
     model.handle(key(KeyCode::Enter));
@@ -358,7 +364,7 @@ fn slash_palette_filters_completes_and_runs() {
     assert!(model.palette_open());
     let items = model.palette_items();
     assert_eq!(items.len(), 1);
-    assert_eq!(items[0].name, "theme");
+    assert_eq!(items[0].label(), "/theme");
     let (text, _) = draw(&model, 100, 34);
     assert!(text.contains("/theme"), "palette row visible");
     // Sim CmdMenu: the key hint sits at the BOTTOM of the palette.
@@ -416,10 +422,11 @@ fn typed_text_starts_a_session_and_requests_a_turn() {
         model.requests,
         vec![AppRequest::SubmitText("refactor the parser".to_owned())]
     );
-    assert_eq!(model.session_title.as_deref(), Some("refactor the parser"));
+    // Sim autoBlurb (G47): first seven words, first letter capitalized.
+    assert_eq!(model.session_title.as_deref(), Some("Refactor the parser"));
     assert_eq!(
         model.window_title(),
-        "haider — refactor the parser · this-mac"
+        "haider — Refactor the parser · this-mac"
     );
 }
 

@@ -6,16 +6,17 @@
 
 use crate::app::{AppModel, Hit, Screen};
 use crate::boot::{boot_subline, check_rows, launcher_subline};
-use crate::commands::HELP_TEXT;
+use crate::commands::{HELP_TEXT, PALETTE_MAX_ROWS};
 use crate::format::{METER_CELLS_DEFAULT, fmt_tok, meter_cells};
 use crate::plain::status_glyph;
 use crate::projection::{ItemBlock, TranscriptEntry};
 use crate::sanctum::SanctumLine;
 use crate::theme::Theme;
-use haider_protocol::history::TodoState;
+use haider_protocol::history::{TodoItem, TodoState};
 use haider_protocol::item::TurnItem;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
+use ratatui::style::Modifier;
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Paragraph, Wrap};
 
@@ -53,8 +54,6 @@ const PLACEHOLDER_SESSION: &str =
 const PALETTE_HINT: &str = "↑↓ options · tab complete · ⏎ run · esc dismiss";
 /// Fixed command-name column (sim `.cname` flex-basis), in cells.
 const PALETTE_NAME_COL: usize = 14;
-/// Palette rows shown at once (the sim scrolls beyond its max-height).
-const PALETTE_MAX_ROWS: usize = 8;
 /// Left/right composer padding in cells (sim InputBar `padding: … 16px`).
 const COMPOSER_PAD: usize = 2;
 
@@ -132,22 +131,29 @@ fn render_boot(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rec
     let mut lines = vec![
         Line::styled(
             sanctum.mark(),
-            theme
-                .maroon_style()
-                .add_modifier(ratatui::style::Modifier::BOLD),
+            theme.maroon_style().add_modifier(Modifier::BOLD),
         ),
         Line::styled(spaced_wordmark(), theme.bright_style()),
-        Line::styled(boot_subline(VERSION), theme.dim_style()),
+        // Sim `.sub` on the boot screen is GOLD (tui.js:5102-5107).
+        Line::styled(boot_subline(VERSION), theme.gold_style()),
         Line::default(),
     ];
     if let Some(checks) = model.projection.boot_checks() {
-        for row in check_rows(checks) {
+        // Sim `.checks`: a LEFT-ALIGNED column inside the centered block —
+        // pad every row to the widest so the marker glyphs align.
+        let rows = check_rows(checks);
+        let widest = rows
+            .iter()
+            .map(|row| row.line().chars().count())
+            .max()
+            .unwrap_or(0);
+        for row in rows {
             let style = match row.marker {
                 crate::boot::CheckMarker::Done => theme.ok_style(),
                 crate::boot::CheckMarker::Current => theme.gold_style(),
                 crate::boot::CheckMarker::Pending => theme.faint_style(),
             };
-            lines.push(Line::styled(row.line(), style));
+            lines.push(Line::styled(format!("{:<widest$}", row.line()), style));
         }
     }
     let _ = centered(frame, area, lines);
@@ -226,11 +232,20 @@ fn render_launcher(
     ]));
     lines.push(Line::default());
 
-    // Recent sessions — sim seed rows (`.rhead` + rows, tui.js:3239).
-    lines.push(Line::from(vec![Span::styled(
+    // Recent sessions — sim seed rows (`.rhead` + rows, tui.js:3239),
+    // with the gold `· N running` live count (`.livehd`).
+    let running = model.samples.iter().filter(|s| s.running).count();
+    let mut rhead = vec![Span::styled(
         "recent sessions — click or 1-3 attach · /sessions for all",
         theme.dim_style(),
-    )]));
+    )];
+    if running > 0 {
+        rhead.push(Span::styled(
+            format!(" · {running} running"),
+            theme.gold_style(),
+        ));
+    }
+    lines.push(Line::from(rhead));
     let mut sample_rows: Vec<(usize, usize)> = Vec::new();
     let mut extra_rows: Vec<usize> = Vec::new();
     for (index, sample) in model.samples.iter().enumerate() {
@@ -444,38 +459,96 @@ fn render_session(
 
     // Transcript: bottom-anchored; wheel scroll-back offsets follow-bottom.
     let mut lines: Vec<Line<'_>> = Vec::new();
+    // Remember where each user prompt row lands (sticky origin line).
+    let mut user_rows: Vec<(usize, &str)> = Vec::new();
     for entry in model.projection.entries() {
-        transcript_lines(&mut lines, entry, theme);
+        if let TranscriptEntry::User { text, .. } = entry {
+            // transcript_lines pushes a spacer, then the prompt row.
+            user_rows.push((lines.len() + 1, text.as_str()));
+        }
+        transcript_lines(&mut lines, entry, theme, transcript_area.width);
     }
     // Sim `.thinking` (tui.js:4458): a transient gold tail while thinking.
     if model.projection.is_thinking() {
-        lines.push(Line::styled("● thinking…", theme.gold_style()));
+        lines.push(Line::from(vec![
+            Span::raw(" "),
+            Span::styled("● thinking…", theme.gold_style()),
+        ]));
     }
+    // Wrapped-row prefix sums — the sticky line and the wheel clamp need
+    // real row math, not logical line counts.
+    let mut row_of_line: Vec<u16> = Vec::with_capacity(lines.len());
+    let mut total: u16 = 0;
+    for line in &lines {
+        row_of_line.push(total);
+        let height = Paragraph::new(line.clone())
+            .wrap(Wrap { trim: false })
+            .line_count(transcript_area.width);
+        total = total.saturating_add(u16::try_from(height).unwrap_or(1));
+    }
+    let max_scroll = total.saturating_sub(transcript_area.height);
+    // Render feedback for wheel clamping (G16) — interior mutability by
+    // design: render reads `&AppModel`.
+    model.scroll_max.set(max_scroll);
+    let scroll_back = model.scroll_back.min(max_scroll);
+    let scroll = max_scroll - scroll_back;
     let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
-    let total = u16::try_from(paragraph.line_count(transcript_area.width)).unwrap_or(u16::MAX);
-    let scroll = total
-        .saturating_sub(transcript_area.height)
-        .saturating_sub(model.scroll_back);
     frame.render_widget(paragraph.scroll((scroll, 0)), transcript_area);
+    // Sticky origin line (sim StickyLine, tui.js:3345-3349): while scrolled
+    // into history, pin the user prompt that produced the top-visible
+    // content; click returns to the live tail.
+    if scroll_back > 0 && scroll > 0 && transcript_area.height > 0 {
+        let sticky = user_rows.iter().rev().find(|(line_index, _)| {
+            row_of_line
+                .get(*line_index)
+                .is_some_and(|row| *row < scroll)
+        });
+        if let Some((_, text)) = sticky {
+            let sticky_rect = Rect {
+                x: transcript_area.x,
+                y: transcript_area.y,
+                width: transcript_area.width,
+                height: 1,
+            };
+            let budget = (transcript_area.width as usize).saturating_sub(5);
+            let mut spans = vec![
+                Span::raw(" "),
+                Span::styled(
+                    "❯ ",
+                    theme
+                        .maroon_style()
+                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                ),
+                Span::styled(
+                    ellipsize(text, budget),
+                    theme.bright_style().add_modifier(Modifier::UNDERLINED),
+                ),
+            ];
+            let pad =
+                (transcript_area.width as usize).saturating_sub(Line::from(spans.clone()).width());
+            if pad > 0 {
+                spans.push(Span::raw(" ".repeat(pad)));
+            }
+            frame.render_widget(
+                Paragraph::new(Line::from(spans)).style(theme.text_style().bg(theme.bar_bg.into())),
+                sticky_rect,
+            );
+            hits.push((sticky_rect, Hit::StickyJump));
+        }
+    }
 
     if let Some(todos) = model.projection.todos().filter(|t| t.pinned) {
+        // Sim TodoPanel (tui.js:2863-2888, 4667-4709): dim header with a
+        // GOLD count; rows styled by state.
         let mut todo_lines = vec![Line::from(vec![
-            Span::styled("▾ todos", theme.gold_style()),
+            Span::styled("▾ todos", theme.dim_style()),
             Span::styled(
                 format!(" — {}/{} done", todos.done_count(), todos.items.len()),
-                theme.dim_style(),
+                theme.gold_style(),
             ),
         ])];
         for item in &todos.items {
-            let (mark, style) = match item.state {
-                TodoState::Completed => ("✓", theme.ok_style()),
-                TodoState::Processing => ("■", theme.gold_style()),
-                TodoState::Listed => ("☐", theme.dim_style()),
-            };
-            todo_lines.push(Line::from(vec![
-                Span::styled(format!("  {mark} "), style),
-                Span::styled(item.text.clone(), theme.text_style()),
-            ]));
+            todo_lines.push(todo_row(item, &todos.items, theme));
         }
         frame.render_widget(Paragraph::new(Text::from(todo_lines)), todos_area);
     }
@@ -505,7 +578,7 @@ fn render_session(
         for (index, option) in menu.options.iter().enumerate() {
             let selected = index == model.menu_selection;
             let cursor = if selected { "❯" } else { " " };
-            let line = Line::from(vec![
+            let mut spans = vec![
                 Span::styled(format!(" {cursor} "), theme.gold_style()),
                 Span::styled(
                     format!("{}. {}", index + 1, option.label),
@@ -515,11 +588,17 @@ fn render_session(
                         theme.menu_style()
                     },
                 ),
-            ]);
+            ];
             menu_lines.push(if selected {
-                line.style(theme.selection_style())
+                // Selection ground spans the full row (sim `.imo.sel`).
+                let pad = (composer_area.width as usize)
+                    .saturating_sub(Line::from(spans.clone()).width());
+                if pad > 0 {
+                    spans.push(Span::raw(" ".repeat(pad)));
+                }
+                Line::from(spans).style(theme.selection_style())
             } else {
-                line
+                Line::from(spans)
             });
         }
         menu_lines.push(Line::from(vec![Span::styled(
@@ -627,6 +706,12 @@ fn composer_line<'a>(
     } else {
         spans.push(Span::styled(model.composer.as_str(), theme.bright_style()));
         spans.push(Span::styled("▮", theme.gold_style()));
+        // Inline ghost completion (sim `.ghostline`, tui.js:3028-3034):
+        // the highlighted row's remainder dim, plus a faint ⇥ tab tag.
+        if let Some(ghost) = model.ghost() {
+            spans.push(Span::styled(ghost, theme.dim_style()));
+            spans.push(Span::styled(" ⇥ tab", theme.faint_style()));
+        }
     }
     // Display-cell widths (unicode-aware — review r1 P3: CJK/emoji composers
     // must not drift the chip).
@@ -660,20 +745,20 @@ fn palette_block(model: &AppModel, theme: &Theme, width: u16) -> Vec<Line<'stati
     }
     let width = width as usize;
     let mut lines = vec![Line::styled("─".repeat(width), theme.frame_style())];
-    for (index, spec) in items.iter().take(PALETTE_MAX_ROWS).enumerate() {
+    for (index, item) in items.iter().take(PALETTE_MAX_ROWS).enumerate() {
         let selected = index == model.palette_selection;
         let name_style = if selected {
             theme.gold_style()
         } else {
             theme.maroon_style()
         };
-        let name = format!("{:<PALETTE_NAME_COL$}", format!("/{}", spec.name));
+        let name = format!("{:<PALETTE_NAME_COL$}", item.label());
         let desc_budget = width.saturating_sub(2 + PALETTE_NAME_COL + 2);
         let mut spans = vec![
             Span::raw("  "),
             Span::styled(name, name_style),
             Span::raw("  "),
-            Span::styled(ellipsize(spec.desc, desc_budget), theme.dim_style()),
+            Span::styled(ellipsize(item.desc(), desc_budget), theme.dim_style()),
         ];
         if selected {
             // Fill the row so the selection ground spans the full width.
@@ -816,14 +901,23 @@ fn render_status_bar(
     }
 }
 
-fn transcript_lines<'a>(lines: &mut Vec<Line<'a>>, entry: &'a TranscriptEntry, theme: &Theme) {
+fn transcript_lines<'a>(
+    lines: &mut Vec<Line<'a>>,
+    entry: &'a TranscriptEntry,
+    theme: &Theme,
+    width: u16,
+) {
     match entry {
         TranscriptEntry::User { text, attachments } => {
             lines.push(Line::default());
+            // Sim UserRow (tui.js:4465-4492): MAROON bold sigil (gold ❯
+            // belongs to the composer/sticky only), bright text, gold pill
+            // paste tokens.
             let mut spans = vec![
-                Span::styled("❯ ", theme.gold_style()),
-                Span::styled(text.as_str(), theme.bright_style()),
+                Span::raw(" "),
+                Span::styled("❯ ", theme.maroon_style().add_modifier(Modifier::BOLD)),
             ];
+            spans.extend(user_text_spans(text, theme));
             if *attachments > 0 {
                 spans.push(Span::styled(
                     format!(" [+{attachments} attachment(s)]"),
@@ -832,44 +926,193 @@ fn transcript_lines<'a>(lines: &mut Vec<Line<'a>>, entry: &'a TranscriptEntry, t
             }
             lines.push(Line::from(spans));
         }
-        TranscriptEntry::Item(block) => item_lines(lines, block, theme),
+        TranscriptEntry::Item(block) => item_lines(lines, block, theme, width),
+        TranscriptEntry::Note { text } => {
+            // Sim NoteRow (tui.js:4572-4577): dim, indented off the margin.
+            lines.push(Line::from(vec![
+                Span::raw("   "),
+                Span::styled(text.as_str(), theme.dim_style()),
+            ]));
+        }
     }
 }
 
-fn item_lines<'a>(lines: &mut Vec<Line<'a>>, block: &'a ItemBlock, theme: &Theme) {
+/// User text split into spans, styling sim paste/image tokens gold on the
+/// gold-soft ground (`.ptoken`, tui.js:4480-4486).
+fn user_text_spans<'a>(text: &'a str, theme: &Theme) -> Vec<Span<'a>> {
+    let token_style = theme.gold_style().bg(theme.gold_soft.into());
+    let mut spans = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find('[') {
+        let candidate = &rest[start..];
+        if let Some(len) = paste_token_len(candidate) {
+            if start > 0 {
+                spans.push(Span::styled(&rest[..start], theme.bright_style()));
+            }
+            spans.push(Span::styled(&candidate[..len], token_style));
+            rest = &candidate[len..];
+        } else {
+            // Not a token: emit through the bracket and keep scanning.
+            spans.push(Span::styled(&rest[..=start], theme.bright_style()));
+            rest = &candidate[1..];
+        }
+    }
+    if !rest.is_empty() {
+        spans.push(Span::styled(rest, theme.bright_style()));
+    }
+    spans
+}
+
+/// Length of a sim paste token (`[Pasted N lines]` / `[Image #N]`) at the
+/// start of `text`, if present.
+fn paste_token_len(text: &str) -> Option<usize> {
+    for (prefix, suffix) in [("[Pasted ", " lines]"), ("[Image #", "]")] {
+        if let Some(body) = text.strip_prefix(prefix) {
+            let digits = body.chars().take_while(char::is_ascii_digit).count();
+            if digits > 0 && body[digits..].starts_with(suffix) {
+                return Some(prefix.len() + digits + suffix.len());
+            }
+        }
+    }
+    None
+}
+
+/// Greedy word wrap by display cells — the agent body wraps manually so
+/// EVERY visual row carries the gold-soft rail (sim border-left).
+fn wrap_words(text: &str, budget: usize) -> Vec<String> {
+    let mut rows = Vec::new();
+    let mut row = String::new();
+    let mut row_width = 0usize;
+    for word in text.split_whitespace() {
+        let word_width = word.chars().count();
+        let sep = usize::from(!row.is_empty());
+        if row_width + sep + word_width > budget && !row.is_empty() {
+            rows.push(std::mem::take(&mut row));
+            row_width = 0;
+        }
+        if !row.is_empty() {
+            row.push(' ');
+            row_width += 1;
+        }
+        row.push_str(word);
+        row_width += word_width;
+    }
+    if !row.is_empty() || rows.is_empty() {
+        rows.push(row);
+    }
+    rows
+}
+
+/// One pinned-todo row, styled by state (sim `.trow` classes: completed
+/// struck faint, processing gold+bright, listed dim, dep-blocked faint with
+/// its `· after #n` tag).
+fn todo_row<'a>(item: &'a TodoItem, all: &[TodoItem], theme: &Theme) -> Line<'a> {
+    let blocked = item.state == TodoState::Listed
+        && item.dep.is_some_and(|dep| {
+            all.get(dep as usize)
+                .is_some_and(|d| d.state != TodoState::Completed)
+        });
+    let (mark, mark_style, text_style) = match item.state {
+        TodoState::Completed => (
+            "✓",
+            theme.ok_style(),
+            theme.faint_style().add_modifier(Modifier::CROSSED_OUT),
+        ),
+        TodoState::Processing => ("■", theme.gold_style(), theme.bright_style()),
+        TodoState::Listed if blocked => ("☐", theme.faint_style(), theme.faint_style()),
+        TodoState::Listed => ("☐", theme.dim_style(), theme.dim_style()),
+    };
+    let mut spans = vec![
+        Span::styled(format!("  {mark} "), mark_style),
+        Span::styled(item.text.as_str(), text_style),
+    ];
+    if let Some(dep) = item.dep
+        && item.state == TodoState::Listed
+    {
+        spans.push(Span::styled(
+            format!(" · after #{}", dep + 1),
+            theme.faint_style(),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// Dim tool description derived from the call args (sim ToolRow `.desc` —
+/// the demo script carries path/query/glob keys).
+fn tool_desc(args: &serde_json::Value) -> String {
+    if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
+        return path.to_owned();
+    }
+    if let Some(query) = args.get("query").and_then(|v| v.as_str()) {
+        return match args.get("glob").and_then(|v| v.as_str()) {
+            Some(glob) => format!("\"{query}\" {glob}"),
+            None => format!("\"{query}\""),
+        };
+    }
+    String::new()
+}
+
+fn item_lines<'a>(lines: &mut Vec<Line<'a>>, block: &'a ItemBlock, theme: &Theme, width: u16) {
     match &block.item {
         TurnItem::AgentMessage { text } => {
-            // Sim parity: agent blocks carry a "■ haider" name header.
+            // Sim AgentRow (tui.js:4494-4513): the ■ haider header is GOLD;
+            // the body indents behind a gold-soft left rail on every
+            // wrapped line (manual wrap keeps the rail on continuations).
             lines.push(Line::default());
             lines.push(Line::from(vec![
-                Span::styled("■ ", theme.maroon_style()),
-                Span::styled("haider", theme.dim_style()),
+                Span::raw(" "),
+                Span::styled("■ haider", theme.gold_style()),
             ]));
-            let mut spans = vec![Span::styled(text.as_str(), theme.text_style())];
-            if block.streaming {
-                spans.push(Span::styled("▮", theme.gold_style()));
+            let budget = (width as usize).saturating_sub(3).max(8);
+            let body = wrap_words(text, budget);
+            let last = body.len().saturating_sub(1);
+            for (index, row) in body.into_iter().enumerate() {
+                let mut spans = vec![
+                    Span::raw(" "),
+                    Span::styled("▏ ", theme.rail_style()),
+                    Span::styled(row, theme.text_style()),
+                ];
+                if block.streaming && index == last {
+                    spans.push(Span::styled("▮", theme.gold_style()));
+                }
+                lines.push(Line::from(spans));
             }
-            lines.push(Line::from(spans));
         }
         TurnItem::Reasoning { summary } => {
             lines.push(Line::from(vec![
-                Span::styled("· ", theme.faint_style()),
+                Span::styled(" · ", theme.faint_style()),
                 Span::styled(summary.as_str(), theme.dim_style()),
             ]));
         }
-        TurnItem::ToolCall { name, status, .. } => {
-            lines.push(Line::from(vec![
-                Span::styled("  ", theme.text_style()),
+        TurnItem::ToolCall {
+            name, status, args, ..
+        } => {
+            // Sim ToolRow (tui.js:3901-3908): glyph (ok / warn-running /
+            // err) · MAROON name · dim ellipsized desc from the args.
+            let mut spans = vec![
+                Span::raw("  "),
                 Span::styled(
                     format!("{} ", status_glyph(*status)),
                     match status {
                         haider_protocol::item::ToolStatus::Failed => theme.err_style(),
                         haider_protocol::item::ToolStatus::Cancelled => theme.dim_style(),
-                        _ => theme.ok_style(),
+                        haider_protocol::item::ToolStatus::Pending
+                        | haider_protocol::item::ToolStatus::InProgress => theme.warn_style(),
+                        haider_protocol::item::ToolStatus::Completed => theme.ok_style(),
                     },
                 ),
-                Span::styled(name.as_str(), theme.bright_style()),
-            ]));
+                Span::styled(name.as_str(), theme.maroon_style()),
+            ];
+            let desc = tool_desc(args);
+            if !desc.is_empty() {
+                let used = Line::from(spans.clone()).width();
+                let budget = (width as usize).saturating_sub(used + 1);
+                spans.push(Span::styled(
+                    format!(" {}", ellipsize(&desc, budget)),
+                    theme.dim_style(),
+                ));
+            }
+            lines.push(Line::from(spans));
         }
         TurnItem::CommandExecution {
             command,
@@ -908,11 +1151,14 @@ fn item_lines<'a>(lines: &mut Vec<Line<'a>>, block: &'a ItemBlock, theme: &Theme
             added,
             removed,
         } => {
+            // Sim shape (seed rows, tui.js:480): a completed fs_patch tool
+            // row — ✓ glyph · maroon name · dim path · dim +a −r meta.
             lines.push(Line::from(vec![
-                Span::styled("  ± ", theme.gold_style()),
-                Span::styled(path.as_str(), theme.text_style()),
-                Span::styled(format!(" +{added}"), theme.ok_style()),
-                Span::styled(format!(" -{removed}"), theme.err_style()),
+                Span::raw("  "),
+                Span::styled("✓ ", theme.ok_style()),
+                Span::styled("fs_patch", theme.maroon_style()),
+                Span::styled(format!(" {path}"), theme.dim_style()),
+                Span::styled(format!(" +{added} −{removed}"), theme.dim_style()),
             ]));
         }
         TurnItem::ChildSpawn { agent } => {
@@ -932,16 +1178,47 @@ fn item_lines<'a>(lines: &mut Vec<Line<'a>>, block: &'a ItemBlock, theme: &Theme
                 .iter()
                 .filter(|i| i.state == TodoState::Completed)
                 .count();
-            lines.push(Line::from(vec![
-                Span::styled("  ✓ ", theme.ok_style()),
-                Span::styled(
-                    format!("plan — {done}/{} done", items.len()),
-                    theme.dim_style(),
-                ),
-            ]));
+            if !items.is_empty() && done == items.len() {
+                // Sim TodosDone card (tui.js:3925-3935): ok header + one
+                // struck faint row per item.
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(
+                        format!("☑ plan completed — {} todos", items.len()),
+                        theme.ok_style(),
+                    ),
+                ]));
+                for item in items {
+                    lines.push(Line::from(vec![
+                        Span::raw("    "),
+                        Span::styled("✓ ", theme.ok_style()),
+                        Span::styled(
+                            item.text.as_str(),
+                            theme.faint_style().add_modifier(Modifier::CROSSED_OUT),
+                        ),
+                    ]));
+                }
+            } else {
+                lines.push(Line::from(vec![
+                    Span::styled("  ✓ ", theme.ok_style()),
+                    Span::styled(
+                        format!("plan — {done}/{} done", items.len()),
+                        theme.dim_style(),
+                    ),
+                ]));
+            }
         }
         TurnItem::ContextCompaction { .. } => {
-            lines.push(Line::styled("  ⊟ context compacted", theme.dim_style()));
+            // Sim CompactRow (tui.js:3919-3924) is a gold card. The
+            // protocol item carries only the summary artifact — there are
+            // no before/after token counts to show honestly.
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    "⊟ context compacted — summary retained · originals stay in /tree",
+                    theme.gold_style(),
+                ),
+            ]));
         }
         TurnItem::Extension { kind, .. } => {
             lines.push(Line::styled(format!("  ⋯ {kind}"), theme.faint_style()));
