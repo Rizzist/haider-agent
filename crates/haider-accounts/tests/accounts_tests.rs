@@ -1,0 +1,392 @@
+#![allow(clippy::unwrap_used)] // Test failures should stop at the asserted boundary.
+
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use haider_accounts::{
+    AccountStore, AccountsResult, AuthMethod, CredentialAlias, CredentialDescriptor,
+    CredentialStatus, ErrorCode, JsonFileStore, KeychainVault, MemoryVault, Resolver,
+    RotationCallback, RotationDecision, StoreLike, Vault, import_env,
+};
+
+fn descriptor(
+    alias: &str,
+    provider: &str,
+    status: CredentialStatus,
+    active: bool,
+) -> CredentialDescriptor {
+    CredentialDescriptor {
+        alias: CredentialAlias::new(alias),
+        provider: provider.to_owned(),
+        auth_method: AuthMethod::ApiKey,
+        identity: format!("{alias}@example.test"),
+        status,
+        active,
+    }
+}
+
+#[test]
+fn memory_vault_alias_round_trip_and_delete_are_stable() {
+    let vault = MemoryVault::new();
+    let beta = CredentialAlias::new("beta");
+    let alpha = CredentialAlias::new("alpha");
+
+    vault.put(&beta, b"beta-secret").unwrap();
+    vault.put(&alpha, b"alpha-secret").unwrap();
+
+    assert_eq!(
+        vault.list().unwrap(),
+        vec![CredentialAlias::new("alpha"), CredentialAlias::new("beta")]
+    );
+    assert_eq!(
+        vault.resolve(&alpha).unwrap().expose_secret(),
+        b"alpha-secret"
+    );
+
+    vault.delete(&alpha).unwrap();
+    vault.delete(&alpha).unwrap();
+    let error = vault.resolve(&alpha).unwrap_err();
+    assert_eq!(error.code, ErrorCode::CredentialMissing);
+}
+
+#[test]
+fn secret_handle_debug_and_display_are_redacted() {
+    let vault = MemoryVault::new();
+    let alias = CredentialAlias::new("redaction");
+    let secret = "never-print-this-token";
+    vault.put(&alias, secret.as_bytes()).unwrap();
+
+    let handle = vault.resolve(&alias).unwrap();
+    let debug = format!("{handle:?}");
+    let display = format!("{handle}");
+
+    assert_eq!(debug, "SecretHandle([REDACTED])");
+    assert_eq!(display, "[REDACTED]");
+    assert!(!debug.contains(secret));
+    assert!(!display.contains(secret));
+}
+
+#[test]
+fn account_store_enforces_one_active_account_per_provider() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = JsonFileStore::new(directory.path());
+    let mut accounts = AccountStore::new(store.clone()).unwrap();
+
+    accounts
+        .add(descriptor("first", "openai", CredentialStatus::Ok, false))
+        .unwrap();
+    accounts
+        .add(descriptor("second", "openai", CredentialStatus::Ok, false))
+        .unwrap();
+    assert_active(&accounts, "openai", "first");
+
+    accounts
+        .add(descriptor("third", "openai", CredentialStatus::Ok, true))
+        .unwrap();
+    assert_active(&accounts, "openai", "third");
+    assert_eq!(
+        accounts
+            .list()
+            .iter()
+            .filter(|account| account.provider == "openai" && account.active)
+            .count(),
+        1
+    );
+
+    accounts.select(&CredentialAlias::new("second")).unwrap();
+    assert_active(&accounts, "openai", "second");
+    accounts.remove(&CredentialAlias::new("second")).unwrap();
+    assert_active(&accounts, "openai", "first");
+
+    let reloaded = AccountStore::new(store).unwrap();
+    assert_active(&reloaded, "openai", "first");
+    assert_eq!(reloaded.list().len(), 2);
+}
+
+#[test]
+fn account_store_rejects_corrupt_active_invariant_on_load() {
+    let store = SnapshotStore::with_descriptors(vec![
+        descriptor("one", "anthropic", CredentialStatus::Ok, true),
+        descriptor("two", "anthropic", CredentialStatus::Ok, true),
+    ]);
+
+    let error = AccountStore::new(store).err().unwrap();
+    assert_eq!(error.code, ErrorCode::StoreCorrupt);
+}
+
+#[test]
+fn failed_persistence_does_not_mutate_account_view() {
+    let store = FailingSaveStore;
+    let mut accounts = AccountStore::new(store).unwrap();
+
+    let error = accounts
+        .add(descriptor("one", "openai", CredentialStatus::Ok, true))
+        .unwrap_err();
+
+    assert_eq!(error.code, ErrorCode::StoreLocked);
+    assert!(accounts.list().is_empty());
+}
+
+#[test]
+fn resolver_picks_the_active_account() {
+    let mut accounts = AccountStore::new(SnapshotStore::default()).unwrap();
+    accounts
+        .add(descriptor(
+            "inactive",
+            "openai",
+            CredentialStatus::Ok,
+            false,
+        ))
+        .unwrap();
+    accounts
+        .add(descriptor("active", "openai", CredentialStatus::Ok, true))
+        .unwrap();
+    let vault = MemoryVault::new();
+    vault
+        .put(&CredentialAlias::new("inactive"), b"inactive-secret")
+        .unwrap();
+    vault
+        .put(&CredentialAlias::new("active"), b"active-secret")
+        .unwrap();
+    let callback = FixedRotation::new(RotationDecision::Stop);
+    let resolver = Resolver::new(&accounts, &vault, &callback);
+
+    let (selected, secret) = resolver.resolve_for_provider("openai").unwrap();
+
+    assert_eq!(selected.alias, CredentialAlias::new("active"));
+    assert_eq!(secret.expose_secret(), b"active-secret");
+    assert_eq!(callback.calls(), 0);
+}
+
+#[test]
+fn expired_limit_is_skipped_without_invoking_rotation_callback() {
+    let mut accounts = AccountStore::new(SnapshotStore::default()).unwrap();
+    accounts
+        .add(descriptor(
+            "stale-limit",
+            "openai",
+            CredentialStatus::Limited { until_ms: 0 },
+            true,
+        ))
+        .unwrap();
+    let vault = MemoryVault::new();
+    vault
+        .put(&CredentialAlias::new("stale-limit"), b"usable-again")
+        .unwrap();
+    let callback = FixedRotation::new(RotationDecision::Stop);
+    let resolver = Resolver::new(&accounts, &vault, &callback);
+
+    let (selected, secret) = resolver.resolve_for_provider("openai").unwrap();
+
+    assert_eq!(selected.alias, CredentialAlias::new("stale-limit"));
+    assert_eq!(secret.expose_secret(), b"usable-again");
+    assert_eq!(callback.calls(), 0);
+}
+
+#[test]
+fn current_limit_delegates_rotation_decision_to_callback() {
+    let mut accounts = AccountStore::new(SnapshotStore::default()).unwrap();
+    accounts
+        .add(descriptor(
+            "limited",
+            "openai",
+            CredentialStatus::Limited { until_ms: u64::MAX },
+            true,
+        ))
+        .unwrap();
+    accounts
+        .add(descriptor(
+            "alternate",
+            "openai",
+            CredentialStatus::Ok,
+            false,
+        ))
+        .unwrap();
+    let vault = MemoryVault::new();
+    vault
+        .put(&CredentialAlias::new("alternate"), b"alternate-secret")
+        .unwrap();
+    let callback = FixedRotation::new(RotationDecision::RotateTo(CredentialAlias::new(
+        "alternate",
+    )));
+    let resolver = Resolver::new(&accounts, &vault, &callback);
+
+    let (selected, secret) = resolver.resolve_for_provider("openai").unwrap();
+
+    assert_eq!(selected.alias, CredentialAlias::new("alternate"));
+    assert_eq!(secret.expose_secret(), b"alternate-secret");
+    assert_eq!(callback.calls(), 1);
+}
+
+#[test]
+fn wait_and_stop_decisions_preserve_retryability() {
+    for (decision, expected_retryable) in [
+        (RotationDecision::Wait, true),
+        (RotationDecision::Stop, false),
+    ] {
+        let mut accounts = AccountStore::new(SnapshotStore::default()).unwrap();
+        accounts
+            .add(descriptor(
+                "limited",
+                "openai",
+                CredentialStatus::Limited { until_ms: u64::MAX },
+                true,
+            ))
+            .unwrap();
+        let vault = MemoryVault::new();
+        let callback = FixedRotation::new(decision);
+        let resolver = Resolver::new(&accounts, &vault, &callback);
+
+        let error = resolver.resolve_for_provider("openai").unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::CredentialLimited);
+        assert_eq!(error.retryable, expected_retryable);
+    }
+}
+
+#[test]
+fn env_import_reads_and_vaults_a_single_environment_value() {
+    let vault = MemoryVault::new();
+    let expected = std::env::var("PATH").unwrap();
+
+    let alias = import_env(&vault, "migration-test", "PATH").unwrap();
+
+    assert_eq!(alias, CredentialAlias::new("migration-test-env"));
+    assert_eq!(
+        vault.resolve(&alias).unwrap().expose_secret(),
+        expected.as_bytes()
+    );
+}
+
+#[test]
+fn env_import_of_unset_variable_reports_credential_missing() {
+    let vault = MemoryVault::new();
+
+    let error = import_env(&vault, "migration-test", "HAIDER_ACCOUNTS_TEST_UNSET_VAR").unwrap_err();
+
+    assert_eq!(error.code, ErrorCode::CredentialMissing);
+    assert!(error.message.contains("HAIDER_ACCOUNTS_TEST_UNSET_VAR"));
+}
+
+#[test]
+fn json_file_store_uses_profile_relative_accounts_file() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = JsonFileStore::new(directory.path());
+    let mut accounts = AccountStore::new(store.clone()).unwrap();
+
+    accounts
+        .add(descriptor(
+            "persisted",
+            "openai",
+            CredentialStatus::Ok,
+            true,
+        ))
+        .unwrap();
+
+    assert_eq!(store.path(), directory.path().join("accounts.json"));
+    let json = std::fs::read_to_string(store.path()).unwrap();
+    assert!(json.contains("\"alias\": \"persisted\""));
+    assert!(!json.contains("secret"));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires an interactive macOS Keychain; headless CI has no Keychain UI"]
+fn keychain_round_trip() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let alias = CredentialAlias::new(format!(
+        "haider-accounts-test-{}-{unique}",
+        std::process::id()
+    ));
+    let vault = KeychainVault::new();
+    let secret = b"non-production-keychain-test-secret";
+
+    vault.put(&alias, secret).unwrap();
+    assert_eq!(vault.resolve(&alias).unwrap().expose_secret(), secret);
+    assert!(vault.list().unwrap().contains(&alias));
+    vault.delete(&alias).unwrap();
+    assert_eq!(
+        vault.resolve(&alias).unwrap_err().code,
+        ErrorCode::CredentialMissing
+    );
+}
+
+fn assert_active<S: StoreLike>(accounts: &AccountStore<S>, provider: &str, alias: &str) {
+    assert_eq!(
+        accounts
+            .active_for_provider(provider)
+            .map(|account| account.alias.as_str()),
+        Some(alias)
+    );
+}
+
+#[derive(Default)]
+struct SnapshotStore {
+    descriptors: Mutex<Vec<CredentialDescriptor>>,
+}
+
+impl SnapshotStore {
+    fn with_descriptors(descriptors: Vec<CredentialDescriptor>) -> Self {
+        Self {
+            descriptors: Mutex::new(descriptors),
+        }
+    }
+}
+
+impl StoreLike for SnapshotStore {
+    fn load(&self) -> AccountsResult<Vec<CredentialDescriptor>> {
+        Ok(self.descriptors.lock().unwrap().clone())
+    }
+
+    fn save(&self, descriptors: &[CredentialDescriptor]) -> AccountsResult<()> {
+        *self.descriptors.lock().unwrap() = descriptors.to_vec();
+        Ok(())
+    }
+}
+
+/// Store double whose `save` always fails, for no-mutation-on-error tests.
+struct FailingSaveStore;
+
+impl StoreLike for FailingSaveStore {
+    fn load(&self) -> AccountsResult<Vec<CredentialDescriptor>> {
+        Ok(Vec::new())
+    }
+
+    fn save(&self, _descriptors: &[CredentialDescriptor]) -> AccountsResult<()> {
+        Err(haider_accounts::HaiderError::new(
+            ErrorCode::StoreLocked,
+            "test double rejected save",
+            true,
+        ))
+    }
+}
+
+struct FixedRotation {
+    decision: RotationDecision,
+    calls: AtomicUsize,
+}
+
+impl FixedRotation {
+    fn new(decision: RotationDecision) -> Self {
+        Self {
+            decision,
+            calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+impl RotationCallback for FixedRotation {
+    fn on_limited(&self, _alias: &CredentialAlias, _until_ms: u64) -> RotationDecision {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.decision.clone()
+    }
+}
