@@ -11,11 +11,12 @@
 //!   [`crate::ChangeLedger`],
 //!   attributed to the caller's `(session, turn)`, for the verify gate. The
 //!   atomic rename, ledger append, and terminal outcome decision are one
-//!   indivisible blocking critical section. A detached finalizer always
+//!   indivisible blocking critical section. A broker-owned finalizer always
 //!   consumes that decision and journals its outcome, even if the calling task
 //!   is cancelled: once the rename lands, the outcome is journaled as `Ok` or
-//!   as `Failed` carrying the ledger error. No cancellation path can silently
-//!   drop a successful write.
+//!   as `Failed` carrying the ledger error. [`EffectBroker::close`] drains all
+//!   such finalizers, so no live-runtime shutdown path silently drops a
+//!   successful write.
 //! - Every caller-supplied path is resolved to a canonical path under the
 //!   broker's canonical workspace root before it is digested or dispatched.
 //!   Execution then converts that path back to a checked relative path and
@@ -372,22 +373,62 @@ where
                 summary,
             )
         });
-        let finish = self.detached_finish(&intent);
-        // This task is the cancellation shield: dropping the caller's await
-        // only detaches this join handle. The finalizer itself still consumes
-        // the blocking result and journals the terminal outcome.
-        let finalizer = tokio::spawn(async move {
+        // Tokio can abort a queued blocking task, but not one that has begun.
+        // Caller cancellation therefore prevents an unstarted apply; once the
+        // worker starts, the broker-owned finalizer must consume its decision.
+        let worker_abort = worker.abort_handle();
+        let mut worker_cancel = WorkerCancelGuard::new(worker_abort);
+        let finish = self.effect_finish(&intent);
+        let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
+        let finalizer_id = self.register_finalizer(async move {
             let result = match worker.await {
                 Ok(outcome) => outcome.into_result(),
+                Err(error) if error.is_cancelled() => return None,
                 Err(error) => Err(ToolError::Runtime {
                     message: format!("blocking filesystem worker failed: {error}"),
                 }),
             };
-            finish.finish(result).await
+            let result = finish.finish(result).await;
+            let error = result.as_ref().err().cloned();
+            let _ = result_sender.send(result);
+            error
         });
-        finalizer.await.map_err(|error| ToolError::Runtime {
-            message: format!("filesystem outcome finalizer failed: {error}"),
-        })?
+        match result_receiver.await {
+            Ok(result) => {
+                worker_cancel.disarm();
+                self.observe_finalizer(finalizer_id);
+                result
+            }
+            Err(error) => Err(ToolError::Runtime {
+                message: format!("filesystem outcome finalizer failed: {error}"),
+            }),
+        }
+    }
+}
+
+struct WorkerCancelGuard {
+    worker: tokio::task::AbortHandle,
+    armed: bool,
+}
+
+impl WorkerCancelGuard {
+    fn new(worker: tokio::task::AbortHandle) -> Self {
+        Self {
+            worker,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for WorkerCancelGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.worker.abort();
+        }
     }
 }
 

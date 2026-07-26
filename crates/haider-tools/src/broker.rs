@@ -1,12 +1,17 @@
 //! Effect normalization, permission evaluation, and lifecycle journaling.
 //!
 //! Owned invariants:
-//! - **Four-phase effect law.** Every effect journals `Intent` → `Authorized`
-//!   → `Dispatched` → `Outcome`, in that order; each phase is appended through
-//!   the [`JournalSink`] before the next step runs, and a failed append halts
-//!   the effect. The crash window between dispatch and result is
-//!   representable as [`EffectOutcome::Unknown`] (see
-//!   [`EffectBroker::journal_unknown`]).
+//! - **Four-phase effect law.** Every completed effect journals `Intent` →
+//!   `Authorized` → `Dispatched` → `Outcome`, in that order; each phase is
+//!   appended through the [`JournalSink`] before the next step runs, and a
+//!   failed append halts the effect. A single atomic terminal claim makes
+//!   competing writers no-ops, so at most one `Outcome` can land per effect.
+//! - **Owned terminalization.** Filesystem apply finalizers are registered with
+//!   the broker. Orderly shutdown calls [`EffectBroker::close`], which never
+//!   drops a finalizer: it drains all registered work and surfaces unobserved
+//!   errors. Process death is the W3 crash-recovery seam: durable `Dispatched`
+//!   phases without a terminal phase are reconciled at startup by journaling
+//!   [`EffectOutcome::Unknown`] (see [`EffectBroker::journal_unknown`]).
 //! - **Digest-bound approvals.** `args_digest` is BLAKE3 over canonical
 //!   (recursively key-sorted) argument JSON — never a tool name. A persistent
 //!   "always allow" stores class + exact digest, so a mutated operation gets
@@ -31,8 +36,9 @@ use haider_protocol::menu::{DecisionKind, Menu, MenuAnswer, MenuKind, MenuOption
 use rustix::fd::OwnedFd;
 use rustix::fs::{Mode, OFlags};
 use serde_json::{Map, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -198,6 +204,7 @@ enum LifecycleState {
     AuthorizedAllow,
     AuthorizedBlocked,
     Dispatched,
+    Terminalizing,
     Outcome,
 }
 
@@ -222,15 +229,16 @@ struct OneShotRule {
 }
 
 struct BrokerJournalState {
-    /// Terminal states are retained, never evicted: a duplicate transition on
-    /// a finished effect must fail loudly instead of re-journaling a phase.
+    /// Terminal states are retained, never evicted. `Terminalizing` is the
+    /// atomic ownership claim: all later terminal writers become no-ops.
     lifecycles: HashMap<EffectId, LifecycleRecord>,
     journaled_phases: Vec<EffectPhase>,
+    terminal_errors: Vec<ToolError>,
 }
 
-/// Shared ownership lets a detached finalizer durably close a dispatched
-/// effect after its caller has been cancelled, while preserving the broker's
-/// lifecycle checks and read-only phase snapshot.
+/// Shared ownership lets a broker-owned finalizer durably close a dispatched
+/// effect after its caller has been cancelled, while preserving one lifecycle
+/// lock and a read-only phase snapshot.
 struct BrokerJournal<J> {
     sink: Arc<tokio::sync::Mutex<J>>,
     state: Arc<Mutex<BrokerJournalState>>,
@@ -246,6 +254,7 @@ where
             state: Arc::new(Mutex::new(BrokerJournalState {
                 lifecycles: HashMap::new(),
                 journaled_phases: Vec::new(),
+                terminal_errors: Vec::new(),
             })),
         }
     }
@@ -338,38 +347,103 @@ where
         Ok(())
     }
 
+    /// Atomically transfers terminalization ownership exactly once.
+    ///
+    /// `Terminalizing` and `Outcome` are successful no-op states for competing
+    /// writers. Earlier lifecycle states remain errors because they have not
+    /// crossed the durable dispatch boundary.
+    fn claim_terminal(&self, intent: &EffectIntent) -> ToolResult<Option<TerminalClaim<J>>> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(record) = state.lifecycles.get_mut(&intent.effect) else {
+            return Err(ToolError::Lifecycle {
+                message: format!("effect {} has no journaled intent", intent.effect),
+            });
+        };
+        if record.intent != *intent {
+            return Err(ToolError::Lifecycle {
+                message: format!(
+                    "effect {} does not match its journaled intent (expected digest {}, received {})",
+                    intent.effect, record.intent.args_digest, intent.args_digest
+                ),
+            });
+        }
+        match record.state {
+            LifecycleState::Dispatched => {
+                record.state = LifecycleState::Terminalizing;
+                Ok(Some(TerminalClaim {
+                    journal: self.clone(),
+                    effect: intent.effect.clone(),
+                }))
+            }
+            LifecycleState::Terminalizing | LifecycleState::Outcome => Ok(None),
+            state => Err(ToolError::Lifecycle {
+                message: format!(
+                    "effect {} is {state:?}, expected {:?}",
+                    intent.effect,
+                    LifecycleState::Dispatched
+                ),
+            }),
+        }
+    }
+
+    fn mark_outcome(&self, effect: &EffectId) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(record) = state.lifecycles.get_mut(effect) {
+            debug_assert_eq!(record.state, LifecycleState::Terminalizing);
+            record.state = LifecycleState::Outcome;
+        } else {
+            debug_assert!(false, "terminal claim retains its lifecycle record");
+        }
+    }
+
+    fn record_terminal_error(&self, error: ToolError) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .terminal_errors
+            .push(error);
+    }
+
+    fn take_terminal_errors(&self) -> Vec<ToolError> {
+        std::mem::take(
+            &mut self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .terminal_errors,
+        )
+    }
+
     async fn journal_outcome(
         &self,
         intent: &EffectIntent,
         outcome: EffectOutcome,
     ) -> ToolResult<()> {
-        self.require_recorded_intent(intent)?;
-        self.require_state(&intent.effect, LifecycleState::Dispatched)?;
-        self.append_phase(EffectPhase::Outcome {
-            effect: intent.effect.clone(),
-            outcome,
-        })
-        .await?;
-        self.set_state(&intent.effect, LifecycleState::Outcome)?;
-        Ok(())
+        let Some(claim) = self.claim_terminal(intent)? else {
+            return Ok(());
+        };
+        claim.append(outcome).await
     }
 
     async fn finish<T>(&self, intent: &EffectIntent, result: ToolResult<T>) -> ToolResult<T> {
-        match result {
-            Ok(value) => {
-                self.journal_outcome(intent, EffectOutcome::Ok).await?;
-                Ok(value)
-            }
-            Err(error) => {
-                self.journal_outcome(
-                    intent,
-                    EffectOutcome::Failed {
-                        error: error.to_string(),
-                    },
-                )
-                .await?;
-                Err(error)
-            }
+        let outcome = match &result {
+            Ok(_) => EffectOutcome::Ok,
+            Err(error) => EffectOutcome::Failed {
+                error: error.to_string(),
+            },
+        };
+        let Some(claim) = self.claim_terminal(intent)? else {
+            return result;
+        };
+        match claim.append(outcome).await {
+            Ok(()) => result,
+            Err(error) => Err(error),
         }
     }
 }
@@ -383,12 +457,52 @@ impl<J> Clone for BrokerJournal<J> {
     }
 }
 
-pub(crate) struct DetachedEffectFinish<J> {
+/// Unique, non-cloneable authority to append one terminal phase.
+struct TerminalClaim<J> {
+    journal: BrokerJournal<J>,
+    effect: EffectId,
+}
+
+impl<J> TerminalClaim<J>
+where
+    J: JournalSink,
+{
+    async fn append(self, outcome: EffectOutcome) -> ToolResult<()> {
+        let phase = EffectPhase::Outcome {
+            effect: self.effect.clone(),
+            outcome,
+        };
+        match self.journal.append_phase(phase).await {
+            Ok(()) => {
+                self.journal.mark_outcome(&self.effect);
+                Ok(())
+            }
+            Err(error) => {
+                // Retain the original append failure even when the one allowed
+                // Unknown escalation succeeds, so close() can surface it.
+                self.journal.record_terminal_error(error.clone());
+                let escalation = EffectPhase::Outcome {
+                    effect: self.effect.clone(),
+                    outcome: EffectOutcome::Unknown,
+                };
+                match self.journal.append_phase(escalation).await {
+                    Ok(()) => self.journal.mark_outcome(&self.effect),
+                    Err(escalation_error) => {
+                        self.journal.record_terminal_error(escalation_error);
+                    }
+                }
+                Err(error)
+            }
+        }
+    }
+}
+
+pub(crate) struct EffectFinish<J> {
     journal: BrokerJournal<J>,
     intent: EffectIntent,
 }
 
-impl<J> DetachedEffectFinish<J>
+impl<J> EffectFinish<J>
 where
     J: JournalSink,
 {
@@ -409,6 +523,9 @@ pub struct EffectBroker<J> {
     next_menu: u64,
     pending_permissions: HashMap<MenuId, PendingPermission>,
     one_shot_rules: Vec<OneShotRule>,
+    next_finalizer: u64,
+    finalizers: tokio::task::JoinSet<(u64, Option<ToolError>)>,
+    observed_finalizers: HashSet<u64>,
 }
 
 impl<J> EffectBroker<J>
@@ -470,6 +587,9 @@ where
             next_menu: 0,
             pending_permissions: HashMap::new(),
             one_shot_rules: Vec::new(),
+            next_finalizer: 0,
+            finalizers: tokio::task::JoinSet::new(),
+            observed_finalizers: HashSet::new(),
         })
     }
 
@@ -487,6 +607,29 @@ where
     /// The sink itself is intentionally neither borrowed nor recoverable.
     pub fn journal_snapshot(&self) -> Vec<EffectPhase> {
         self.journal.journal_snapshot()
+    }
+
+    /// Drains every broker-owned apply finalizer before orderly shutdown.
+    ///
+    /// Operation errors already returned by `fs_patch` are considered
+    /// observed. Errors from a cancelled caller, task failure, or terminal
+    /// append are returned here. Process death is instead recovered by the W3
+    /// dispatched-without-terminal startup reconciliation seam.
+    pub async fn close(mut self) -> ToolResult<()> {
+        let mut errors = Vec::new();
+        while let Some(finalizer) = self.finalizers.join_next().await {
+            match finalizer {
+                Ok((id, Some(error))) if !self.observed_finalizers.contains(&id) => {
+                    errors.push(error);
+                }
+                Ok(_) => {}
+                Err(error) => errors.push(ToolError::Runtime {
+                    message: format!("effect finalizer task failed: {error}"),
+                }),
+            }
+        }
+        errors.extend(self.journal.take_terminal_errors());
+        surface_close_errors(errors)
     }
 
     /// Produces and journals an intent whose digest is the BLAKE3 hash of
@@ -677,11 +820,28 @@ where
         self.journal.finish(intent, result).await
     }
 
-    pub(crate) fn detached_finish(&self, intent: &EffectIntent) -> DetachedEffectFinish<J> {
-        DetachedEffectFinish {
+    pub(crate) fn effect_finish(&self, intent: &EffectIntent) -> EffectFinish<J> {
+        EffectFinish {
             journal: self.journal.clone(),
             intent: intent.clone(),
         }
+    }
+
+    pub(crate) fn register_finalizer<F>(&mut self, finalizer: F) -> u64
+    where
+        F: Future<Output = Option<ToolError>> + Send + 'static,
+    {
+        self.next_finalizer += 1;
+        let id = self.next_finalizer;
+        self.finalizers.spawn(async move {
+            let error = finalizer.await;
+            (id, error)
+        });
+        id
+    }
+
+    pub(crate) fn observe_finalizer(&mut self, id: u64) {
+        self.observed_finalizers.insert(id);
     }
 
     async fn append_phase(&self, phase: EffectPhase) -> ToolResult<()> {
@@ -748,6 +908,34 @@ where
             rule.class == intent.class && rule.args_digest == intent.args_digest
         })?;
         Some(self.one_shot_rules.remove(index).decision)
+    }
+}
+
+fn surface_close_errors(errors: Vec<ToolError>) -> ToolResult<()> {
+    let mut unique = Vec::new();
+    for error in errors {
+        if !unique
+            .iter()
+            .any(|existing: &ToolError| existing.to_string() == error.to_string())
+        {
+            unique.push(error);
+        }
+    }
+    if unique.is_empty() {
+        Ok(())
+    } else if unique.len() == 1 {
+        Err(unique.remove(0))
+    } else {
+        Err(ToolError::Runtime {
+            message: format!(
+                "effect broker close observed multiple errors: {}",
+                unique
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+        })
     }
 }
 
