@@ -108,9 +108,19 @@ impl Write for LimitedWriter {
             self.exceeded = true;
             return Err(std::io::Error::other("wire frame limit exceeded"));
         }
-        if self.bytes.try_reserve_exact(buffer.len()).is_err() {
-            self.allocation_failed = Some(next_len);
-            return Err(std::io::Error::other("wire frame allocation failed"));
+        if next_len > self.bytes.capacity() {
+            // Geometric growth capped at the frame limit: `try_reserve_exact`
+            // per serde write re-copies the accumulated JSON on nearly every
+            // small write (worst-case O(n²)). The exact length check above is
+            // unchanged; only the growth policy differs.
+            let target = next_len
+                .max(self.bytes.capacity().saturating_mul(2))
+                .min(self.frame_limit);
+            let additional = target - self.bytes.len();
+            if self.bytes.try_reserve(additional).is_err() {
+                self.allocation_failed = Some(next_len);
+                return Err(std::io::Error::other("wire frame allocation failed"));
+            }
         }
         self.bytes.extend_from_slice(buffer);
         Ok(buffer.len())

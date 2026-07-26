@@ -41,3 +41,22 @@ Deliberate gaps against the `/tui` sim, each with its landing wave:
 |---|---|---|
 | crates/haider-store | Persistent connection + cached prepared statements (highest ROI per rider) | adopted — W1/M1 |
 | crates/haider-tui/runtime.rs | Loss-free theme detection: parse the OSC-11 reply inside the sole input reader instead of termbg's owning probe (TUI1 review P2 — an 80ms pre-UI window can consume one keystroke) | Needs the unified input stack; termbg window shrunk + documented meanwhile | planned → daemon-era input stack |
+
+## haider-rpc efficiency rider (W3a, gpt-5.6, 2026-07-26)
+
+Adopted now: encoder growth policy — `try_reserve_exact` per serde write re-copied the
+accumulated JSON worst-case O(n²); replaced with geometric growth capped at frame_limit
+(exact length check unchanged, no wire-byte change).
+
+Ledgered pending real daemon profiles (rider items 2-9, full text in ~/haider-run/w3a-efficiency.log):
+
+| Where | Idea | Why deferred |
+|---|---|---|
+| uds_codec encode | Serialize into a prefix-placeholder buffer (kills the second body copy) | prefix accounting risk; needs golden transport parity proof |
+| codec/ws_codec | Optional `encode_into` caller-scratch APIs | scratch lifetime vs async sends; wait for daemon call patterns |
+| uds_codec decode | Decode complete bodies from the input slice; stage only fragments | state/poison/coalesce transitions get subtle |
+| uds_codec | Reusable fragmented-body scratch w/ retention ceiling | can pin ~frame_limit per connection; needs daemon shape |
+| transport seam | BytesMut adapter + borrowed frame view (only if daemon uses BytesMut) | added dep, lifetimes across await, duplicate types |
+| codec decode | Drop explicit UTF-8 pass, let serde_json validate | changes InvalidUtf8→Json error semantics; benchmark first |
+| frame.rs serde | Manual order-independent visitor to avoid flatten/content buffering | DO-NOT-DO casually: tag layout/field order = wire bytes |
+| Event payloads | Typed fast-path decode beside RawEnvelope | DO-NOT-DO: closed enum would break unknown-event tolerance |
