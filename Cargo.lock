@@ -193,6 +193,7 @@ dependencies = [
  "haider-protocol",
  "haider-provider",
  "haider-store",
+ "haider-tools",
  "serde_json",
  "tempfile",
  "tokio",
@@ -235,6 +236,15 @@ dependencies = [
 [[package]]
 name = "haider-tools"
 version = "0.0.5"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "haider-protocol",
+ "rustix",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
 
 [[package]]
 name = "haider-tui"

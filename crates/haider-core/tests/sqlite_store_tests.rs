@@ -13,6 +13,7 @@ use haider_protocol::ids::{DeviceId, SessionId};
 use haider_protocol::provider::FinishReason;
 use haider_protocol::state::RunState;
 use haider_provider::{FakeProvider, FakeStep};
+use haider_tools::CasSink;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -314,6 +315,31 @@ async fn real_store_profile_lock_is_exclusive_across_handles() {
         .await
         .expect("profile lock is released with its handle");
     reopened.close().await.expect("reopened handle closes");
+}
+
+#[tokio::test]
+async fn real_store_is_a_durable_tool_result_cas_sink() {
+    let root = tempfile::tempdir().expect("temporary profile");
+    let mut store = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("real store opens");
+    let bytes = b"complete bounded tool result";
+
+    let artifact = CasSink::put(&mut store, bytes)
+        .await
+        .expect("tool CAS bridge stores result");
+    assert_eq!(
+        store.get(&artifact).await.expect("stored result reads"),
+        bytes
+    );
+    assert!(
+        store
+            .verify(&artifact)
+            .await
+            .expect("stored result verifies")
+    );
+
+    store.close().await.expect("store closes");
 }
 
 struct GatedStore {
