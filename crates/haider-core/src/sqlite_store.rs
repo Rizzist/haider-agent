@@ -10,6 +10,7 @@ use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::{ArtifactRef, SessionId};
 use haider_store::{Cas, EventStore, Store};
+use haider_tools::{CasSink, ToolResult};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -117,6 +118,17 @@ impl StoreHandle for SqliteStoreHandle {
         let owner = Arc::clone(&self.owner);
         let session_id = session_id.clone();
         run_blocking(move || owner.with_store(|store| store.latest_seq(&session_id))).await
+    }
+}
+
+/// The durable profile CAS is the production overflow sink for bounded tool
+/// results. This bridge keeps `haider-tools` independent of the runtime crate.
+#[async_trait]
+impl CasSink for SqliteStoreHandle {
+    async fn put(&mut self, bytes: &[u8]) -> ToolResult<ArtifactRef> {
+        SqliteStoreHandle::put(self, bytes.to_vec())
+            .await
+            .map_err(|error| haider_tools::ToolError::cas(error.message))
     }
 }
 

@@ -13,6 +13,9 @@
 //!   success — durable-before-visible.
 //! - `event_id` uniqueness is minted by the runtime (see
 //!   `HarnessActor::next_event_id`), not the store.
+//! - [`SqliteStoreHandle`] also adapts the durable profile CAS to
+//!   `haider_tools::CasSink`; bounded tool-result overflow therefore uses the
+//!   same verified content-addressed store without coupling tools back to core.
 
 mod actor;
 mod fake_store;
