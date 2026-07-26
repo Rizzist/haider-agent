@@ -25,3 +25,4 @@ Rider adoptions 2026-07-26 (TUI0): #3 release args_fragments at completion · #4
 | Where | Idea | Patch |
 |---|---|---|
 | crates/haider-store | Persistent connection + cached prepared statements (highest ROI per rider) | adopted — W1/M1 |
+| crates/haider-tui/runtime.rs | Loss-free theme detection: parse the OSC-11 reply inside the sole input reader instead of termbg's owning probe (TUI1 review P2 — an 80ms pre-UI window can consume one keystroke) | Needs the unified input stack; termbg window shrunk + documented meanwhile | planned → daemon-era input stack |

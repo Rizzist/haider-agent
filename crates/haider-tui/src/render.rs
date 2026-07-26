@@ -147,6 +147,7 @@ fn render_session(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: 
         Paragraph::new(Text::from(vec![
             Line::from(vec![
                 Span::styled(format!(" {} ", sanctum.mark()), theme.gold_style()),
+                Span::styled("· ", theme.faint_style()),
                 Span::styled("haider", theme.bright_style()),
                 Span::styled(format!(" v{VERSION} · {}", identity.dir), theme.dim_style()),
             ]),

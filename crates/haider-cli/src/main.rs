@@ -124,11 +124,14 @@ async fn tui_command(rest: &[String]) -> ExitCode {
     }
     if let Ok(cwd) = std::env::current_dir() {
         let home = std::env::var("HOME").unwrap_or_default();
-        let shown = cwd.display().to_string();
-        model.identity.dir = if !home.is_empty() && shown.starts_with(&home) {
-            format!("~{}", &shown[home.len()..])
-        } else {
-            shown
+        // Component-aware: /Users/alice2 must not abbreviate under ~alice.
+        model.identity.dir = match (!home.is_empty())
+            .then(|| cwd.strip_prefix(&home).ok())
+            .flatten()
+        {
+            Some(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
+            Some(rest) => format!("~/{}", rest.display()),
+            None => cwd.display().to_string(),
         };
     }
     if !interactive {

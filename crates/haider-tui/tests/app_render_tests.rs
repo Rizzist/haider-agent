@@ -313,7 +313,7 @@ fn session_screen_has_header_and_composer_gap() {
     let (text, _) = draw(&model, 100, 30);
     // Header: mark + product line + session line (owner ask: sim-parity header).
     assert!(text.contains("حيدر"));
-    assert!(text.contains("haider v"));
+    assert!(text.contains("· haider v"), "mark · product separator");
     assert!(text.contains("~/dev/enterprise-suite"));
     assert!(text.contains("← esc"));
     assert!(

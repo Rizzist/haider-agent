@@ -47,9 +47,15 @@ fn sync_terminal_bg(theme: ThemeKey) {
 /// Detect the system/terminal appearance (OSC 11 background luminance) and
 /// map it to a theme: dark ground → Dark, light ground (or undetectable) →
 /// Desert Dawn. Call BEFORE entering raw mode/alt screen.
+///
+/// Known residual (review TUI1 P2): the probe owns the tty for its bounded
+/// window, so a keystroke typed in that pre-UI instant is consumed, not
+/// forwarded. The window is kept tiny (80ms) and runs before any UI invites
+/// input. The loss-free design — parsing the OSC reply inside the sole input
+/// reader — lands with the daemon-era input stack (see OPTIMIZATIONS.md).
 #[must_use]
 pub fn detect_system_theme() -> ThemeKey {
-    match termbg::theme(Duration::from_millis(150)) {
+    match termbg::theme(Duration::from_millis(80)) {
         Ok(termbg::Theme::Dark) => ThemeKey::Dark,
         Ok(termbg::Theme::Light) | Err(_) => ThemeKey::Dawn,
     }
