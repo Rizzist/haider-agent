@@ -1,19 +1,31 @@
 use haider_rpc::DEFAULT_FRAME_LIMIT;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// Complete, explicit configuration for one profile daemon.
+///
+/// All fields are plain data; validation happens once at daemon start and
+/// violations surface as `DaemonError::InvalidConfig`.
 #[derive(Debug, Clone)]
 pub struct DaemonConfig {
+    /// Profile identity; the singleton scope. One daemon per profile.
     pub profile_id: String,
+    /// Root of the profile store — the lifetime lock and SQLite journal.
     pub store_dir: PathBuf,
+    /// Per-user runtime directory (forced to `0700`) holding the socket (R2).
     pub runtime_dir: PathBuf,
+    /// Maximum inbound frame size; also advertised in `Welcome.frame_limit`,
+    /// so it must fit `u32`.
     pub frame_limit: usize,
+    /// Depth of each connection's bounded outbound queue (R12 mechanism);
+    /// an unwritable full queue is a connection-fatal error, never a stall.
     pub outbound_queue_capacity: usize,
+    /// Bounded completion window for the drain barrier (R17).
     pub drain_timeout: Duration,
 }
 
 impl DaemonConfig {
+    /// Builds a config with production defaults for the tuning knobs.
     pub fn new(
         profile_id: impl Into<String>,
         store_dir: impl Into<PathBuf>,
@@ -29,7 +41,11 @@ impl DaemonConfig {
         }
     }
 
-    /// Fixed-length, profile-derived rendezvous path.
+    /// Fixed-length, profile-derived rendezvous path (R2).
+    ///
+    /// Hashing the profile id keeps the socket name a constant 32 hex chars
+    /// regardless of profile-id length or charset, which protects the tight
+    /// OS limit on Unix socket path length (`sun_path`, ~104 bytes on macOS).
     pub fn endpoint_path(&self) -> PathBuf {
         let digest = blake3::hash(self.profile_id.as_bytes()).to_hex();
         self.runtime_dir
@@ -53,9 +69,5 @@ impl DaemonConfig {
             return Err("outbound queue capacity must be greater than zero".into());
         }
         Ok(())
-    }
-
-    pub fn store_dir(&self) -> &Path {
-        &self.store_dir
     }
 }

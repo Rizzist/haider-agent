@@ -1,3 +1,26 @@
+//! W3b1 acceptance matrix (brief deliverable 7; d1 report R19/R22 named
+//! cases). Traceability, matrix case -> test:
+//!
+//! - simultaneous-start            -> `simultaneous_start_n_processes_has_one_winner_and_clean_losers`
+//! - loser diagnostics (R1)        -> `already_running_error_carries_incumbent_diagnostics`
+//! - stale-PID-reuse               -> `stale_pid_reuse_is_diagnostic_only_and_does_not_block_start`
+//! - cold-start socket-missing     -> `cold_start_socket_missing_serves_handshake_ping_and_stub_with_private_modes`
+//! - successor-socket-deletion     -> `successor_socket_deletion_guard_preserves_replacement_identity`
+//! - failed-listener-startup       -> `failed_listener_startup_publishes_failed_and_releases_profile_lock`
+//! - abrupt-death (kill -9)        -> `abrupt_death_kill_9_leaves_recoverable_socket_and_next_start_serves`
+//! - version-mismatch rejection    -> `handshake_version_mismatch_returns_fatal_rejection`
+//! - oversize frame                -> `oversize_frame_is_rejected_at_connection_layer_before_body_allocation`
+//! - client frame-limit honored    -> `client_max_receive_frame_is_enforced_on_welcome`
+//! - drain-notifies-connections    -> `drain_notifies_every_open_connection_before_close`
+//! - second-signal termination     -> `second_signal_request_selects_immediate_forced_termination_path`
+//! - second OS signal, end to end  -> `second_os_signal_terminates_the_daemon_through_the_forced_exit_path`
+//! - shutdown before startup       -> `first_signal_before_startup_drains_without_advertising_ready`
+//! - forced shutdown before startup -> `second_signal_before_startup_prevents_ready_and_forces_termination`
+//! - reconcile-before-ready (R16)  -> `reconcile_before_ready_marks_unknown_exactly_once_and_never_retries_effect`
+//!
+//! All cases use a real UDS in a tempdir runtime dir and poll readiness
+//! states — no sleeps as synchronization.
+
 #![allow(clippy::expect_used)] // integration failures should name the exact lifecycle boundary
 
 use haider_daemon::{DaemonConfig, DaemonError, DaemonState, ShutdownOutcome, spawn};

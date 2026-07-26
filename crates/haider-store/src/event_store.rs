@@ -77,11 +77,14 @@ pub trait EventStore: Send + Sync {
     fn latest_seq(&self, session: &SessionId) -> StoreResult<u64>;
 }
 
-/// Opaque ownership of the profile's kernel-held lifetime lock.
+/// Opaque ownership of the profile's OS-held lifetime lock.
 ///
-/// Daemon startup acquires this before opening SQLite or examining an endpoint,
-/// then transfers it into [`Store::open_locked`]. Dropping an unconsumed lease
-/// releases the lock.
+/// W3b1 seam (additive): daemon startup acquires this before opening SQLite
+/// or examining an endpoint — the lock is the singleton authority (d1 report
+/// R1), so it must be held before any stale-socket cleanup. The lease is then
+/// transferred into [`Store::open_locked`]; [`Store::open`] remains the
+/// one-step path for everyone else. Dropping an unconsumed lease releases the
+/// lock. The lease deliberately exposes no store access.
 pub struct ProfileLease {
     root: PathBuf,
     lock: ProfileLock,
@@ -162,13 +165,19 @@ impl Store {
 
     /// Durably advances the daemon-process generation for one guarded start.
     ///
-    /// This identity is intentionally distinct from `worker_generation`.
+    /// W3b1 seam (additive): intentionally distinct from `worker_generation`,
+    /// which is consumed by *every* store open (including read-only tooling).
+    /// The daemon generation counts daemon starts only and is what the daemon
+    /// advertises in `Welcome`/`ServerDraining` for client-side fencing.
     pub fn advance_daemon_generation(&self) -> StoreResult<u64> {
         let mut connection = self.connection()?;
         next_profile_counter(&mut connection, "daemon_generation", "daemon generation")
     }
 
     /// Lists every durable session in stable byte order.
+    ///
+    /// W3b1 seam (additive): startup recovery must visit every session; the
+    /// stable order keeps interrupted recovery passes deterministic.
     pub fn session_ids(&self) -> StoreResult<Vec<SessionId>> {
         let connection = self.connection()?;
         let mut statement = connection
@@ -183,6 +192,10 @@ impl Store {
     }
 
     /// Checkpoints committed WAL pages before orderly profile close.
+    ///
+    /// W3b1 seam (additive), used by the daemon drain barrier. Committed data
+    /// is durable without this; checkpointing shrinks the WAL a successor
+    /// must replay. A busy checkpoint surfaces as retryable `StoreLocked`.
     pub fn flush(&self) -> StoreResult<()> {
         let connection = self.connection()?;
         let (busy, _, _): (u32, u32, u32) = connection
@@ -248,6 +261,10 @@ fn next_worker_generation(connection: &mut Connection) -> StoreResult<u64> {
     next_profile_counter(connection, "worker_generation", "worker generation")
 }
 
+/// Compare-and-set increment of one `profile_meta` singleton counter, in an
+/// immediate transaction. `column` is a compile-time-constant identifier
+/// (`worker_generation` / `daemon_generation`) — the `format!` SQL never
+/// carries external input.
 fn next_profile_counter(
     connection: &mut Connection,
     column: &str,

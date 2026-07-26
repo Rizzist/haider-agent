@@ -1,4 +1,21 @@
 //! Per-connection handshake, ping, bounded writer, and drain notification.
+//!
+//! Laws at this layer:
+//!
+//! - peer-UID gate before any byte is read (R2);
+//! - `Hello` must be the first frame; anything else is a fatal
+//!   `handshake_required`;
+//! - outbound frames respect `min(server frame_limit, client
+//!   max_receive_frame)` — the daemon never sends what the client said it
+//!   cannot receive;
+//! - the outbound queue is bounded and never blocks the daemon on a slow
+//!   client (R12's mechanism): a full queue is a connection error, and the
+//!   store — not the socket — is the lag buffer in later lanes;
+//! - one `ServerDraining` is the last frame of a draining connection (R17).
+//!
+//! W3b2 seams: `Request` bodies and `MenuAnswer` are answered with typed
+//! `draining` / `not_found` stubs (see [`handle_frame`] / [`enqueue_stub`]);
+//! session hub, attach/replay, and menu arbitration replace them in W3b2.
 
 use crate::DaemonError;
 use haider_rpc::{
@@ -11,6 +28,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::{mpsc, watch};
 
+/// Owns the socket write half; aborted on drop so a peer that never reads
+/// cannot leak a writer task past its connection.
 struct WriterTask(Option<tokio::task::JoinHandle<std::io::Result<()>>>);
 
 impl WriterTask {
@@ -30,6 +49,8 @@ impl Drop for WriterTask {
     }
 }
 
+/// Payload of the one-shot drain broadcast; becomes the `ServerDraining`
+/// frame verbatim (R17).
 #[derive(Debug, Clone)]
 pub(crate) struct DrainNotice {
     pub(crate) reason: String,
@@ -38,6 +59,7 @@ pub(crate) struct DrainNotice {
     pub(crate) deadline_unix_ms: u64,
 }
 
+/// Immutable per-daemon facts shared by every connection task.
 #[derive(Debug, Clone)]
 pub(crate) struct ConnectionContext {
     pub(crate) profile_id: String,
@@ -45,10 +67,16 @@ pub(crate) struct ConnectionContext {
     pub(crate) daemon_generation: u64,
     pub(crate) frame_limit: usize,
     pub(crate) outbound_queue_capacity: usize,
+    /// UID that owns the endpoint; every peer must match it (R2).
     pub(crate) owner_uid: u32,
+    /// For error context only; the stream is already accepted.
     pub(crate) endpoint_path: PathBuf,
 }
 
+/// Runs one client connection to completion: UID gate, framed read loop,
+/// bounded write queue, and a final `ServerDraining` + close when the drain
+/// broadcast fires. Errors returned here end only this connection — the
+/// accept loop in `runtime.rs` deliberately ignores them.
 pub(crate) async fn serve(
     stream: UnixStream,
     context: ConnectionContext,
@@ -147,6 +175,8 @@ pub(crate) async fn serve(
         .map_err(|error| DaemonError::io("write Unix connection", &context.endpoint_path, error))
 }
 
+/// Dispatches one decoded frame. Returns `Ok(true)` when the connection must
+/// close (fatal protocol error or rejected handshake).
 fn handle_frame(
     frame: WireFrame,
     context: &ConnectionContext,
@@ -165,6 +195,8 @@ fn handle_frame(
             )?;
             return Ok(true);
         };
+        // From here on the client's max_receive_frame caps everything we
+        // send, including the Welcome itself and any rejection.
         *outbound_limit = context.frame_limit.min(hello.max_receive_frame as usize);
         return negotiate_hello(hello, context, drain, outbound, handshaken, *outbound_limit);
     }
@@ -174,10 +206,14 @@ fn handle_frame(
             enqueue(outbound, &WireFrame::Pong { nonce }, *outbound_limit)?;
             Ok(false)
         }
+        // W3b2 seam: the session hub will route Request bodies; until then
+        // every request gets the typed draining/not_found stub.
         WireFrame::Request { request_id, .. } => {
             enqueue_stub(request_id, drain, outbound, *outbound_limit)?;
             Ok(false)
         }
+        // W3b2 seam: menu arbitration (durable compare-and-set answers)
+        // replaces this stub.
         WireFrame::MenuAnswer { .. } => {
             let (code, message) = if drain.borrow().is_some() {
                 (ERROR_CODE_DRAINING, "daemon is draining")
@@ -222,6 +258,10 @@ fn handle_frame(
     }
 }
 
+/// Version/capability negotiation via haider-rpc, answered with a `Welcome`
+/// carrying instance id, daemon generation, frame limit, and the honest
+/// lifecycle phase (`Draining` once the drain broadcast fired, else `Ready` —
+/// connections are only accepted between those two states).
 fn negotiate_hello(
     hello: Hello,
     context: &ConnectionContext,
@@ -269,6 +309,9 @@ fn negotiate_hello(
     Ok(false)
 }
 
+/// W3b2 seam: typed `Response::Error` stub for every session RPC.
+/// `draining` (retryable — try the next generation) once shutdown started,
+/// `not_found` (not retryable) otherwise.
 fn enqueue_stub(
     request_id: RequestId,
     drain: &watch::Receiver<Option<DrainNotice>>,
@@ -316,6 +359,9 @@ fn enqueue_fatal(
     )
 }
 
+/// Non-blocking enqueue (R12): a full queue means the client is not reading
+/// its own replies, and the connection errors out instead of stalling the
+/// daemon.
 fn enqueue(
     outbound: &mpsc::Sender<Vec<u8>>,
     frame: &WireFrame,
@@ -332,6 +378,9 @@ fn enqueue(
         })
 }
 
+/// Awaiting enqueue, used only for the final `ServerDraining` frame: the
+/// drain notice must not be dropped for queue pressure, and waiting is safe
+/// because it is the last frame before this connection closes.
 async fn enqueue_wait(
     outbound: &mpsc::Sender<Vec<u8>>,
     frame: &WireFrame,

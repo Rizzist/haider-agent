@@ -6,6 +6,11 @@
 //! no later `Outcome` receives one durable `Unknown` outcome. Re-running the
 //! scan is idempotent because the appended outcome becomes part of that same
 //! reduction.
+//!
+//! W3b1 seam (additive, d1 report R16): `haider-daemon` runs this inside its
+//! reconcile-before-ready gate — after the profile lock and generation bump,
+//! before any listener binds. Ambiguous effects are never retried here; they
+//! are only marked `Unknown` so a human or later policy can decide.
 
 use crate::{SqliteStoreHandle, StoreHandle};
 use haider_protocol::EventPayload;
@@ -26,6 +31,12 @@ pub struct RecoveryReport {
 }
 
 /// Reconciles every prior dispatched-without-outcome effect before readiness.
+///
+/// Appends `EffectOutcome::Unknown` exactly once per orphaned dispatch:
+/// the deterministic `recovery-*` event id makes reruns of the same
+/// generation collide harmlessly, and a completed rerun finds the appended
+/// outcome terminal. Effects are processed in stable (sorted) order so two
+/// interrupted passes cannot interleave differently.
 pub async fn reconcile_dispatched_effects(
     store: &SqliteStoreHandle,
     device_id: &DeviceId,
@@ -136,6 +147,11 @@ fn reduce_page(
     Ok(())
 }
 
+/// Deterministic id for one (session, generation, effect) recovery outcome.
+///
+/// Hashing each part separately (fixed-width digests) removes concatenation
+/// ambiguity: `("a", "b-2-c")` and `("a-2-b", "c")` cannot collide even
+/// though the ids are opaque strings.
 fn recovery_event_id(session_id: &str, worker_generation: u64, effect_id: &str) -> EventId {
     let mut hasher = blake3::Hasher::new();
     hash_part(&mut hasher, session_id.as_bytes());

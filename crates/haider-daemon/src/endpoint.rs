@@ -1,4 +1,9 @@
-//! Conservative filesystem UDS rendezvous ownership.
+//! Conservative filesystem UDS rendezvous ownership (d1 report R2/R3).
+//!
+//! Callers may only reach a bound endpoint through [`bind`], which runs the
+//! full probe → verified-unlink → bind → record-identity sequence. This is
+//! rendezvous plumbing only; the singleton authority is the profile lock,
+//! which `runtime.rs` acquires before this module ever touches the socket.
 
 use crate::{DaemonConfig, DaemonError};
 use std::fs;
@@ -6,15 +11,24 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use tokio::net::{UnixListener, UnixStream};
 
+/// The one identity cleanup trusts: the `lstat` device+inode pair recorded
+/// immediately after bind (R3). Path equality is never sufficient — a
+/// successor daemon may have re-bound the same path with a new inode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SocketIdentity {
     device: u64,
     inode: u64,
 }
 
+/// A bound, permission-verified listener plus the cleanup guard for exactly
+/// the socket inode it created.
 pub(crate) struct BoundEndpoint {
+    /// `None` after [`BoundEndpoint::close_listener`]: drain has begun and no
+    /// further connections are accepted.
     listener: Option<UnixListener>,
     cleanup: SocketCleanup,
+    /// Effective UID owning the runtime dir and socket; connections from any
+    /// other peer UID are refused (R2).
     pub(crate) owner_uid: u32,
 }
 
@@ -23,6 +37,7 @@ impl BoundEndpoint {
         &self.cleanup.path
     }
 
+    /// Removes the owned socket now (drain step); Drop remains as a backstop.
     pub(crate) fn cleanup(&mut self) -> Result<(), DaemonError> {
         self.cleanup.remove_owned()
     }
@@ -32,6 +47,8 @@ impl BoundEndpoint {
     ) -> std::io::Result<(UnixStream, tokio::net::unix::SocketAddr)> {
         match &self.listener {
             Some(listener) => listener.accept().await,
+            // Defensive: the accept loop exits before the listener closes,
+            // so this arm only fires on a future misordering.
             None => Err(std::io::Error::new(
                 std::io::ErrorKind::NotConnected,
                 "daemon listener is closed",
@@ -44,6 +61,7 @@ impl BoundEndpoint {
     }
 }
 
+/// Idempotent remove-exactly-what-we-bound guard (R3).
 struct SocketCleanup {
     path: PathBuf,
     identity: SocketIdentity,
@@ -51,6 +69,10 @@ struct SocketCleanup {
 }
 
 impl SocketCleanup {
+    /// Unlinks the socket only if the node at `path` still has the recorded
+    /// device+inode. A replaced or already-removed node is left untouched —
+    /// this is what keeps an old daemon from deleting its successor's socket
+    /// (R22 named case: successor-socket-deletion).
     fn remove_owned(&mut self) -> Result<(), DaemonError> {
         if !self.active {
             return Ok(());
@@ -79,6 +101,15 @@ impl Drop for SocketCleanup {
     }
 }
 
+/// Owns the profile rendezvous socket, in this fixed order:
+///
+/// 1. create/verify the `0700` same-user runtime directory (R2);
+/// 2. probe the endpoint, unlinking only a verified-stale socket (R3);
+/// 3. bind, then immediately record the new node's device+inode identity;
+/// 4. chmod the socket to `0600` and re-verify type + owner.
+///
+/// Precondition: the caller already holds the profile lifetime lock, so a
+/// *live* endpoint here is an inconsistency worth failing on, not a race.
 pub(crate) async fn bind(config: &DaemonConfig) -> Result<BoundEndpoint, DaemonError> {
     let runtime_dir = config.runtime_dir.clone();
     let owner_uid = tokio::task::spawn_blocking(move || prepare_runtime_dir(&runtime_dir))
@@ -121,6 +152,9 @@ pub(crate) async fn bind(config: &DaemonConfig) -> Result<BoundEndpoint, DaemonE
     })
 }
 
+/// Creates the runtime directory if needed and enforces R2: a real (non-
+/// symlink) directory owned by the current user, permissions forced to
+/// `0700`. Returns the owner UID used for all later peer checks.
 fn prepare_runtime_dir(runtime_dir: &Path) -> Result<u32, DaemonError> {
     fs::create_dir_all(runtime_dir)
         .map_err(|error| DaemonError::io("create runtime directory", runtime_dir, error))?;
@@ -150,6 +184,11 @@ fn prepare_runtime_dir(runtime_dir: &Path) -> Result<u32, DaemonError> {
     Ok(expected_uid)
 }
 
+/// Probe-then-verified-unlink (R3): connect first; only `ECONNREFUSED`
+/// (a socket node with no listener) may lead to an unlink, and even then
+/// only after [`remove_verified_stale`] proves ownership. `NotFound` is the
+/// clean cold-start path; any live listener is an error because the caller
+/// holds the profile lock.
 async fn preflight(
     socket_path: &Path,
     runtime_dir: &Path,
@@ -170,6 +209,10 @@ async fn preflight(
     }
 }
 
+/// The conservative half of R3: unlink only an `lstat`-verified socket node
+/// owned by the expected user, directly inside the expected (same-owner,
+/// non-symlink) runtime directory. Anything else is refused rather than
+/// removed — a wrong unlink here could take down a healthy daemon's endpoint.
 fn remove_verified_stale(
     socket_path: &Path,
     runtime_dir: &Path,

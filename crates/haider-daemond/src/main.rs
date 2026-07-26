@@ -1,4 +1,8 @@
 //! Thin `haiderd` entry point; lifecycle ownership lives in `haider-daemon`.
+//!
+//! Exit codes: 0 graceful drain, 130 forced termination (128 + SIGINT
+//! convention), otherwise `DaemonError::exit_code` (sysexits; 75 = a daemon
+//! for this profile is already running).
 
 use haider_daemon::{DaemonConfig, ShutdownOutcome, run_with_signals};
 use std::path::PathBuf;
@@ -23,6 +27,8 @@ async fn main() -> ExitCode {
     }
 }
 
+/// `haiderd --profile <id> --store-dir <path> --runtime-dir <path>`; every
+/// other knob keeps its `DaemonConfig` default.
 fn parse_args(args: impl Iterator<Item = String>) -> Result<DaemonConfig, String> {
     let mut profile = None;
     let mut store_dir = None;

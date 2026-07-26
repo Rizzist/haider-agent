@@ -3,38 +3,43 @@ use std::path::PathBuf;
 
 /// Best-effort facts about the incumbent lock holder.
 ///
-/// These values are diagnostic only; the kernel-held profile lock remains the
-/// sole authority.
+/// These values are diagnostic only; the OS-held profile lock remains the
+/// sole singleton authority (R1) — PID/socket contents are never trusted to
+/// decide liveness.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IncumbentDiagnostics {
     pub profile_id: String,
+    /// Where the incumbent's endpoint would live; not probed, not verified.
     pub endpoint_path: PathBuf,
+    /// Truncated contents of the store's lock file, if readable.
     pub lock_contents: Option<String>,
 }
 
+/// Typed failure surface of the daemon lifecycle.
 #[derive(Debug)]
 pub enum DaemonError {
-    AlreadyRunning {
-        diagnostics: IncumbentDiagnostics,
-    },
-    InvalidConfig {
-        message: String,
-    },
+    /// Another process holds the profile's lifetime lock. This is the loser's
+    /// clean exit in the R1/R4 singleton race, not a fault.
+    AlreadyRunning { diagnostics: IncumbentDiagnostics },
+    /// [`crate::DaemonConfig`] failed validation before any resource was touched.
+    InvalidConfig { message: String },
+    /// The profile store refused an operation (open, generation bump, append,
+    /// flush, close); carries the store's own typed error.
     Store(HaiderError),
+    /// A named filesystem/socket syscall failed at a named path.
     Io {
         operation: &'static str,
         path: PathBuf,
         source: std::io::Error,
     },
-    Endpoint {
-        message: String,
-    },
-    Protocol {
-        message: String,
-    },
-    Task {
-        message: String,
-    },
+    /// The rendezvous endpoint could not be owned safely (unverified stale
+    /// socket, wrong directory owner, live socket under a held lock, ...).
+    Endpoint { message: String },
+    /// A connection violated the wire contract or its bounded queue.
+    Protocol { message: String },
+    /// A daemon-owned task or process-level facility failed (spawn, join,
+    /// signal handler, randomness).
+    Task { message: String },
 }
 
 impl DaemonError {
@@ -50,6 +55,9 @@ impl DaemonError {
         }
     }
 
+    /// Process exit code for `haiderd`, following BSD `sysexits.h`:
+    /// 75 `EX_TEMPFAIL` (already running — retry/attach is reasonable),
+    /// 64 `EX_USAGE`, 74 `EX_IOERR`, 70 `EX_SOFTWARE`.
     pub fn exit_code(&self) -> u8 {
         match self {
             Self::AlreadyRunning { .. } => 75,
@@ -82,7 +90,11 @@ impl std::fmt::Display for DaemonError {
             Self::InvalidConfig { message } => {
                 write!(formatter, "invalid daemon config: {message}")
             }
-            Self::Store(error) => write!(formatter, "daemon store error: {error:?}"),
+            Self::Store(error) => write!(
+                formatter,
+                "daemon store error ({:?}): {}",
+                error.code, error.message
+            ),
             Self::Io {
                 operation,
                 path,

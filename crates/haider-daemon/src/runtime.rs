@@ -1,4 +1,25 @@
 //! Top-level lifecycle ordering and task ownership.
+//!
+//! [`run_inner`] is the one place that sequences the daemon's life. Its
+//! ordering is load-bearing (d1 report R1/R16/R17) and must not be reordered:
+//!
+//! 1. validate config — nothing touched yet;
+//! 2. acquire the profile lifetime lock (R1) — BEFORE socket cleanup or
+//!    store open; losing this race is the typed `AlreadyRunning` exit;
+//! 3. open the store under the lock, durably bump the daemon generation,
+//!    and run C4a reconciliation for every dispatched-without-terminal
+//!    effect (R16) — no listener exists yet, so nothing can observe
+//!    half-recovered state;
+//! 4. bind the endpoint, then publish `Ready` (unless shutdown already
+//!    intervened) and serve the accept loop;
+//! 5. drain (R17): close the listener, publish `Draining`, broadcast
+//!    `ServerDraining`, wait bounded for connections, flush the store,
+//!    remove the exact owned socket, and close the store LAST — closing
+//!    the store is what releases the profile lock.
+//!
+//! Shutdown may arrive at any point; the early-exit helpers
+//! ([`shutdown_without_store`], [`shutdown_before_listener`]) run the same
+//! tail ordering with whatever resources exist so far.
 
 use crate::connection::{ConnectionContext, DrainNotice, serve};
 use crate::endpoint;
@@ -18,6 +39,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::watch;
 use tokio::task::{JoinHandle, JoinSet};
 
+/// Handle to one spawned daemon: observe its phases, request shutdown, and
+/// join for the typed outcome.
 pub struct DaemonTask {
     readiness: Readiness,
     shutdown: ShutdownHandle,
@@ -25,14 +48,18 @@ pub struct DaemonTask {
 }
 
 impl DaemonTask {
+    /// Phase observer — poll this instead of sleeping (R4 daemon half).
     pub fn readiness(&self) -> Readiness {
         self.readiness.clone()
     }
 
+    /// Shutdown control: first request drains, later requests force (R17).
     pub fn shutdown_handle(&self) -> ShutdownHandle {
         self.shutdown.clone()
     }
 
+    /// Waits for the daemon to finish. `Err` values are the daemon's typed
+    /// failures (including the loser-side `AlreadyRunning`).
     pub async fn join(self) -> Result<ShutdownOutcome, DaemonError> {
         self.task.await.map_err(|error| DaemonError::Task {
             message: format!("daemon owner task failed: {error}"),
@@ -120,7 +147,10 @@ async fn run_inner(
         return shutdown_without_store(config, states, request);
     }
     let endpoint_path = config.endpoint_path();
-    let lease = match SqliteStoreHandle::acquire_profile(config.store_dir()).await {
+    // R1: the profile lifetime lock is acquired before any socket cleanup or
+    // store open, and it is the only singleton authority. A held lock means
+    // an incumbent daemon exists — exit typed, with diagnostics only.
+    let lease = match SqliteStoreHandle::acquire_profile(&config.store_dir).await {
         Ok(lease) => lease,
         Err(error) if error.code == ErrorCode::StoreLocked => {
             return Err(DaemonError::AlreadyRunning {
@@ -135,6 +165,9 @@ async fn run_inner(
         return shutdown_without_store(config, states, request);
     }
 
+    // R16 ready gate: open store under the lock -> durable generation bump ->
+    // reconcile every dispatched-without-terminal effect. Only after all of
+    // this may a listener bind or Ready be advertised.
     states.publish(DaemonState::Recovering);
     let store = SqliteStoreHandle::open_locked(lease).await?;
     let instance_id = random_instance_id()?;
@@ -146,6 +179,8 @@ async fn run_inner(
         }
     };
     let device_id = DeviceId::new(format!("daemon-{instance_id}"));
+    // Recovery is shutdown-interruptible: a request during the scan abandons
+    // the pass (the next generation redoes it idempotently) and drains.
     let mut recovery = Box::pin(reconcile_dispatched_effects(&store, &device_id));
     let recovery_result = loop {
         if !matches!(*shutdown.borrow(), ShutdownRequest::None) {
@@ -195,6 +230,9 @@ async fn run_inner(
         owner_uid: endpoint.owner_uid,
         endpoint_path: endpoint.path().to_path_buf(),
     };
+    // Ready is published under the shutdown transition mutex, so a first
+    // signal that races this point either wins (no Ready, drain from
+    // Recovering) or loses (Ready, then a normal drain).
     shutdown_observer.publish_ready_if_idle(states);
 
     let mut connections = JoinSet::new();
@@ -241,10 +279,15 @@ async fn run_inner(
         }
     };
 
+    // R17 drain barrier, in order: stop accepting, publish Draining,
+    // broadcast ServerDraining to every connection, bounded completion,
+    // flush, remove the exact owned socket, close the store (lock release)
+    // LAST.
     endpoint.close_listener();
     let (reason, mut forced) = match request {
         ShutdownRequest::Graceful { reason } => (reason, false),
         ShutdownRequest::Forced { reason } => (reason, true),
+        // Unreachable: the loop above only breaks with a real request.
         ShutdownRequest::None => ("internal shutdown".into(), true),
     };
     let deadline_unix_ms = unix_time_ms().saturating_add(duration_ms(config.drain_timeout));
@@ -293,6 +336,10 @@ async fn run_inner(
     }
     while connections.join_next().await.is_some() {}
 
+    // Flush is attempted on both paths; only the graceful path treats its
+    // failure as a daemon error (the forced path is already lossy by
+    // contract). The store close below releases the profile lock — it must
+    // stay the last resource released.
     let flush_result = store.flush().await.err().map(DaemonError::from);
     let flush_error = if forced { None } else { flush_result };
     let cleanup_error = endpoint.cleanup().err();
@@ -313,6 +360,9 @@ async fn run_inner(
     })
 }
 
+/// Drain tail for shutdown observed after store open but before the listener
+/// bound: no socket or connections exist yet, so the barrier reduces to
+/// publish Draining -> flush -> close (lock release last).
 async fn shutdown_before_listener(
     config: &DaemonConfig,
     states: &StatePublisher,
@@ -322,6 +372,8 @@ async fn shutdown_before_listener(
     let (reason, forced) = match request {
         ShutdownRequest::Graceful { reason } => (reason, false),
         ShutdownRequest::Forced { reason } => (reason, true),
+        // `None` means the ShutdownHandle was dropped without a request
+        // (watch channel closed mid-recovery); treat as forced.
         ShutdownRequest::None => ("startup shutdown controller dropped".into(), true),
     };
     states.publish(DaemonState::Draining {
@@ -341,6 +393,9 @@ async fn shutdown_before_listener(
     })
 }
 
+/// Drain tail for shutdown observed before the profile lock or store exist:
+/// nothing was acquired, so only the phase transitions are published. This
+/// path must not consume a worker/daemon generation.
 fn shutdown_without_store(
     config: &DaemonConfig,
     states: &StatePublisher,
@@ -363,6 +418,9 @@ fn shutdown_without_store(
     })
 }
 
+/// Best-effort description of whoever holds the profile lock. Read-only and
+/// advisory (R1): nothing here is probed for liveness or trusted for
+/// decisions — the lock itself already decided.
 fn incumbent_diagnostics(config: &DaemonConfig, endpoint_path: &Path) -> IncumbentDiagnostics {
     let lock_path = config.store_dir.join("lock");
     let lock_contents = fs::read_to_string(lock_path)
