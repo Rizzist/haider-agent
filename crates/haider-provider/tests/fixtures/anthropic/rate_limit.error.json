@@ -1,0 +1,6 @@
+{
+  "kind": "rate_limited",
+  "message": "Anthropic HTTP 429 returned a rate-limit error",
+  "retryable": true,
+  "retry_after_ms": 3000
+}

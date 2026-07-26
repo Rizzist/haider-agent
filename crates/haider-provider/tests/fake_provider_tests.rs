@@ -15,6 +15,9 @@ fn request() -> TurnRequest {
         }],
         model: "fixture-model".into(),
         max_tokens: 128,
+        system_prompt: None,
+        tools: Vec::new(),
+        attachments: Vec::new(),
     }
 }
 

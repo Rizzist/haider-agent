@@ -1,0 +1,29 @@
+[
+  {
+    "result": "ok",
+    "value": {"event": "reasoning_delta", "text": "Compare the evidence. "}
+  },
+  {
+    "result": "ok",
+    "value": {"event": "reasoning_delta", "text": "Then answer."}
+  },
+  {
+    "result": "ok",
+    "value": {"event": "text_delta", "text": "Done."}
+  },
+  {
+    "result": "ok",
+    "value": {
+      "event": "usage_update",
+      "input": 1500,
+      "output": 501,
+      "reasoning": 0,
+      "cached": 900,
+      "source": "provider_reported"
+    }
+  },
+  {
+    "result": "ok",
+    "value": {"event": "finish", "reason": "end_turn"}
+  }
+]

@@ -1,0 +1,10 @@
+[
+  {
+    "result": "err",
+    "value": {
+      "kind": "overloaded",
+      "message": "Anthropic API returned an overloaded error",
+      "retryable": true
+    }
+  }
+]

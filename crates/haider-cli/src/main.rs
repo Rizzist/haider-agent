@@ -1,5 +1,9 @@
 //! `haider` — the Haider Code harness binary.
 
+use haider_accounts::{
+    AccountStore, AuthMethod, CredentialAlias, CredentialDescriptor, CredentialStatus,
+    JsonFileStore, KeychainVault, Resolver, RotationCallback, RotationDecision, import_env,
+};
 use haider_core::{
     HarnessActor, HarnessConfig, MemoryStore, SqliteStoreHandle, StoreHandle, SubmitTurn,
     TurnOutcome,
@@ -9,7 +13,9 @@ use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::{DeviceId, SessionId};
 use haider_protocol::provider::{FinishReason, Usage, UsageSource};
 use haider_protocol::state::RunState;
-use haider_provider::{FakeProvider, FakeStep, Provider};
+use haider_provider::{
+    ANTHROPIC_PROVIDER_NAME, AnthropicProvider, FakeProvider, FakeStep, Provider, ProviderError,
+};
 use haider_tui::app::AppModel;
 use haider_tui::runtime::{run_demo, run_demo_plain};
 use haider_tui::sanctum::SanctumTier;
@@ -28,6 +34,7 @@ const EX_IOERR: u8 = 74;
 const EX_CANCELLED: u8 = 130;
 const FAKE_SCRIPT_ENV: &str = "HAIDER_FAKE_SCRIPT_JSON";
 const PROFILE_DIR_ENV: &str = "HAIDER_PROFILE_DIR";
+const ANTHROPIC_KEY_ENV: &str = "HAIDER_ANTHROPIC_API_KEY";
 const READ_PAGE_SIZE: usize = 256;
 
 /// Every workspace crate, asserted linkable by the self-test.
@@ -52,14 +59,13 @@ async fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         [command] if command == "self-test" => self_test().await,
-        [command, framing, prompt] if command == "run" && framing == "--jsonl" => {
-            run_jsonl(prompt).await
-        }
+        [command, rest @ ..] if command == "run" => run_command(rest).await,
         [command, rest @ ..] if command == "tui" => tui_command(rest).await,
         [other, ..] => {
             eprintln!(
                 "haider: unknown or incomplete command `{other}` \
                  (supports: --version, self-test, run --jsonl <prompt>, \
+                 run --jsonl --provider anthropic --model <id> <prompt>, \
                  tui --demo [--plain] [--theme dawn|ivory|dark])"
             );
             ExitCode::from(2)
@@ -134,22 +140,33 @@ async fn tui_command(rest: &[String]) -> ExitCode {
     }
 }
 
-/// Runs one fake-provider turn, streaming every committed envelope to stdout
-/// as LF-framed JSONL. Exit codes: Done → 0, provider-errored turn or bad
-/// fixture → 65, harness/stdout faults → 70/74, cancellation → 130.
-async fn run_jsonl(prompt: &str) -> ExitCode {
-    let provider = match provider_for_cli(prompt) {
-        Ok(provider) => Arc::new(provider),
-        Err(error) => {
-            eprintln!("haider: invalid fake-provider fixture: {error}");
-            return ExitCode::from(EX_DATAERR);
+async fn run_command(rest: &[String]) -> ExitCode {
+    let options = match parse_run_options(rest) {
+        Ok(options) => options,
+        Err(message) => {
+            eprintln!("haider run: {message}");
+            return ExitCode::from(2);
         }
     };
+    run_jsonl(options).await
+}
+
+/// Runs one provider turn, streaming every committed envelope to stdout as
+/// LF-framed JSONL. Exit codes: Done → 0, provider/setup errors → 65,
+/// harness/stdout faults → 70/74, cancellation → 130.
+async fn run_jsonl(options: RunOptions) -> ExitCode {
     let profile_dir = match cli_profile_dir() {
         Ok(profile_dir) => profile_dir,
         Err(error) => {
             eprintln!("haider: {}", error.message);
             return ExitCode::from(EX_SOFTWARE);
+        }
+    };
+    let provider = match provider_for_cli(&options, &profile_dir) {
+        Ok(provider) => provider,
+        Err(error) => {
+            eprintln!("haider: {error}");
+            return ExitCode::from(EX_DATAERR);
         }
     };
     let store = match SqliteStoreHandle::open(profile_dir).await {
@@ -159,11 +176,12 @@ async fn run_jsonl(prompt: &str) -> ExitCode {
             return ExitCode::from(EX_SOFTWARE);
         }
     };
-    let config = cli_config(store.worker_generation());
+    let config = cli_config(store.worker_generation(), &options.model);
     let actor_store: Arc<dyn StoreHandle> = Arc::new(store.clone());
     let stdout = io::stdout();
     let mut output = io::BufWriter::new(stdout.lock());
-    let run_result = stream_jsonl_turn(prompt, config, provider, actor_store, &mut output).await;
+    let run_result =
+        stream_jsonl_turn(&options.prompt, config, provider, actor_store, &mut output).await;
     let close_result = store.close().await;
     let outcome = match run_result {
         Ok(outcome) => outcome,
@@ -353,9 +371,109 @@ fn write_jsonl(output: &mut (impl Write + ?Sized), envelope: &RawEnvelope) -> io
     output.flush()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderSelection {
+    Fake,
+    Anthropic,
+}
+
+#[derive(Debug)]
+struct RunOptions {
+    prompt: String,
+    provider: ProviderSelection,
+    model: String,
+}
+
+fn parse_run_options(rest: &[String]) -> Result<RunOptions, String> {
+    let mut jsonl = false;
+    let mut provider = ProviderSelection::Fake;
+    let mut model = None;
+    let mut prompt = None;
+    let mut index = 0;
+    while index < rest.len() {
+        match rest[index].as_str() {
+            "--jsonl" if !jsonl => jsonl = true,
+            "--jsonl" => return Err("duplicate --jsonl flag".into()),
+            "--provider" => {
+                index += 1;
+                let value = rest
+                    .get(index)
+                    .ok_or_else(|| "--provider requires fake|anthropic".to_owned())?;
+                provider = match value.as_str() {
+                    "fake" => ProviderSelection::Fake,
+                    ANTHROPIC_PROVIDER_NAME => ProviderSelection::Anthropic,
+                    _ => return Err(format!("unknown provider `{value}`; use fake|anthropic")),
+                };
+            }
+            "--model" => {
+                index += 1;
+                let value = rest
+                    .get(index)
+                    .ok_or_else(|| "--model requires a model id".to_owned())?;
+                if value.is_empty() {
+                    return Err("--model requires a non-empty model id".into());
+                }
+                model = Some(value.clone());
+            }
+            flag if flag.starts_with("--") => return Err(format!("unknown flag `{flag}`")),
+            value if prompt.is_none() => prompt = Some(value.to_owned()),
+            _ => return Err("exactly one prompt argument is required".into()),
+        }
+        index += 1;
+    }
+    if !jsonl {
+        return Err("--jsonl is required".into());
+    }
+    let prompt = prompt.ok_or_else(|| "a prompt argument is required".to_owned())?;
+    let model = match (provider, model) {
+        (ProviderSelection::Fake, model) => model.unwrap_or_else(|| "fake-model".into()),
+        (ProviderSelection::Anthropic, Some(model)) => model,
+        (ProviderSelection::Anthropic, None) => {
+            return Err("--provider anthropic requires --model <id>".into());
+        }
+    };
+    Ok(RunOptions {
+        prompt,
+        provider,
+        model,
+    })
+}
+
+#[derive(Debug)]
+enum CliProviderError {
+    FakeFixture(serde_json::Error),
+    Accounts(HaiderError),
+    Adapter(ProviderError),
+}
+
+impl fmt::Display for CliProviderError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::FakeFixture(error) => write!(formatter, "invalid fake-provider fixture: {error}"),
+            Self::Accounts(error) => formatter.write_str(&error.message),
+            Self::Adapter(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for CliProviderError {}
+
+fn provider_for_cli(
+    options: &RunOptions,
+    profile_dir: &std::path::Path,
+) -> Result<Arc<dyn Provider>, CliProviderError> {
+    match options.provider {
+        ProviderSelection::Fake => fake_provider_for_cli(&options.prompt)
+            .map(|provider| Arc::new(provider) as Arc<dyn Provider>)
+            .map_err(CliProviderError::FakeFixture),
+        ProviderSelection::Anthropic => anthropic_provider_for_cli(profile_dir, &options.model)
+            .map(|provider| Arc::new(provider) as Arc<dyn Provider>),
+    }
+}
+
 /// Fixture comes from `HAIDER_FAKE_SCRIPT_JSON` when set (the test hook);
 /// otherwise a canned happy-path turn that echoes the prompt.
-fn provider_for_cli(prompt: &str) -> Result<FakeProvider, serde_json::Error> {
+fn fake_provider_for_cli(prompt: &str) -> Result<FakeProvider, serde_json::Error> {
     match std::env::var(FAKE_SCRIPT_ENV) {
         Ok(script) => FakeProvider::from_json(&script),
         Err(_) => Ok(FakeProvider::new(vec![
@@ -379,13 +497,57 @@ fn provider_for_cli(prompt: &str) -> Result<FakeProvider, serde_json::Error> {
     }
 }
 
-fn cli_config(worker_generation: u64) -> HarnessConfig {
-    HarnessConfig::for_session(
+fn anthropic_provider_for_cli(
+    profile_dir: &std::path::Path,
+    model: &str,
+) -> Result<AnthropicProvider, CliProviderError> {
+    let mut accounts =
+        AccountStore::new(JsonFileStore::new(profile_dir)).map_err(CliProviderError::Accounts)?;
+    let vault = KeychainVault::new();
+    if accounts
+        .active_for_provider(ANTHROPIC_PROVIDER_NAME)
+        .is_none()
+    {
+        let alias = import_env(&vault, ANTHROPIC_PROVIDER_NAME, ANTHROPIC_KEY_ENV)
+            .map_err(CliProviderError::Accounts)?;
+        accounts
+            .add(CredentialDescriptor {
+                alias,
+                provider: ANTHROPIC_PROVIDER_NAME.into(),
+                auth_method: AuthMethod::ApiKey,
+                identity: format!("{ANTHROPIC_KEY_ENV} import"),
+                status: CredentialStatus::Ok,
+                active: true,
+            })
+            .map_err(CliProviderError::Accounts)?;
+    }
+    let rotation = StopRotation;
+    let resolver = Resolver::new(&accounts, &vault, &rotation);
+    let (descriptor, credential) = resolver
+        .resolve_for_provider(ANTHROPIC_PROVIDER_NAME)
+        .map_err(CliProviderError::Accounts)?;
+    AnthropicProvider::new(credential, model)
+        .map(|provider| provider.with_account(descriptor.alias))
+        .map_err(CliProviderError::Adapter)
+}
+
+struct StopRotation;
+
+impl RotationCallback for StopRotation {
+    fn on_limited(&self, _alias: &CredentialAlias, _until_ms: u64) -> RotationDecision {
+        RotationDecision::Stop
+    }
+}
+
+fn cli_config(worker_generation: u64, model: &str) -> HarnessConfig {
+    let mut config = HarnessConfig::for_session(
         SessionId::new("cli-session"),
         DeviceId::new("cli-device"),
         1,
         worker_generation,
-    )
+    );
+    config.model = model.into();
+    config
 }
 
 fn cli_profile_dir() -> Result<PathBuf, HaiderError> {
@@ -435,7 +597,7 @@ async fn fake_turn_self_test() -> bool {
         },
     ]));
     let store = Arc::new(MemoryStore::new());
-    let handle = HarnessActor::spawn(cli_config(1), provider, store.clone());
+    let handle = HarnessActor::spawn(cli_config(1, "fake-model"), provider, store.clone());
     let Ok(turn) = handle.submit_turn(SubmitTurn::new("self-test")).await else {
         return false;
     };

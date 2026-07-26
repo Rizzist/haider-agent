@@ -323,6 +323,9 @@ impl HarnessActor {
             messages: vec![Message::user_text(submit.text)],
             model: self.config.model.clone(),
             max_tokens: self.config.max_tokens,
+            system_prompt: None,
+            tools: Vec::new(),
+            attachments: Vec::new(),
         };
         let mut stream = tokio::select! {
             biased;
@@ -1030,9 +1033,14 @@ fn provider_protocol_error(message: impl Into<String>) -> ProviderError {
 }
 
 fn provider_error_to_haider(provider_error: ProviderError) -> HaiderError {
-    let mut error = HaiderError::new(ErrorCode::ProviderError, provider_error.to_string(), false);
+    let mut error = HaiderError::new(
+        ErrorCode::ProviderError,
+        provider_error.to_string(),
+        provider_error.retryable,
+    );
     error.details = Some(serde_json::json!({
         "provider_error_kind": format!("{:?}", provider_error.kind),
+        "retry_after_ms": provider_error.retry_after_ms,
     }));
     error
 }
