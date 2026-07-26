@@ -11,7 +11,7 @@ use haider_protocol::provider::{FinishReason, Usage, UsageSource};
 use haider_protocol::state::RunState;
 use haider_provider::{FakeProvider, FakeStep, Provider};
 use haider_tui::app::AppModel;
-use haider_tui::runtime::{run_demo, run_demo_plain};
+use haider_tui::runtime::{detect_system_theme, run_demo, run_demo_plain};
 use haider_tui::sanctum::SanctumTier;
 use haider_tui::theme::ThemeKey;
 use std::fmt;
@@ -83,14 +83,14 @@ async fn tui_command(rest: &[String]) -> ExitCode {
     use std::io::IsTerminal;
     let mut demo = false;
     let mut plain = false;
-    let mut theme = ThemeKey::Dawn;
+    let mut theme: Option<ThemeKey> = None;
     let mut iter = rest.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--demo" => demo = true,
             "--plain" => plain = true,
             "--theme" => match iter.next().and_then(|name| ThemeKey::parse(name)) {
-                Some(key) => theme = key,
+                Some(key) => theme = Some(key),
                 None => {
                     eprintln!("haider tui: --theme takes dawn|ivory|dark");
                     return ExitCode::from(2);
@@ -106,14 +106,32 @@ async fn tui_command(rest: &[String]) -> ExitCode {
         eprintln!("haider tui: only `haider tui --demo` is available until the daemon lands");
         return ExitCode::from(2);
     }
+    let interactive = !plain && io::stdout().is_terminal();
     let mut model = AppModel::new();
-    model.theme = theme;
-    // Translit is the terminal default (no bidi/shaping in ratatui);
-    // HAIDER_SHAHADA=arabic opts shaping-capable terminals into Arabic.
-    if matches!(std::env::var("HAIDER_SHAHADA").as_deref(), Ok("arabic")) {
-        model.sanctum_tier = SanctumTier::Arabic;
+    // Explicit --theme wins; otherwise follow the system/terminal appearance
+    // (OSC 11 background luminance): dark ground -> Dark, light -> Dawn.
+    model.theme = theme.unwrap_or_else(|| {
+        if interactive {
+            detect_system_theme()
+        } else {
+            ThemeKey::Dawn
+        }
+    });
+    // Arabic is the default sanctum tier (owner decision, sim parity);
+    // HAIDER_SHAHADA=translit serves emulators that cannot shape Arabic.
+    if matches!(std::env::var("HAIDER_SHAHADA").as_deref(), Ok("translit")) {
+        model.sanctum_tier = SanctumTier::Translit;
     }
-    if plain || !io::stdout().is_terminal() {
+    if let Ok(cwd) = std::env::current_dir() {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let shown = cwd.display().to_string();
+        model.identity.dir = if !home.is_empty() && shown.starts_with(&home) {
+            format!("~{}", &shown[home.len()..])
+        } else {
+            shown
+        };
+    }
+    if !interactive {
         // Fallible write: `print!` panics on BrokenPipe (review r1 P2).
         // A closed pipe is a normal consumer choice → success; other write
         // failures are real I/O errors.

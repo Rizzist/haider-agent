@@ -119,13 +119,54 @@ fn render_session(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: 
     // A blocking menu REPLACES the composer (sim §3 law) and takes its rows.
     let menu = model.projection.open_menu();
     let input_height = menu.map_or(1, |m| u16::try_from(m.options.len() + 1).unwrap_or(6));
-    let [transcript_area, todos_area, rule_area, composer_area] = Layout::vertical([
+    // Header (sim parity): mark · "haider vX · dir" / session line, then a
+    // frame rule; one spacer row keeps the composer OFF the status bar.
+    let [
+        header_area,
+        header_rule,
+        transcript_area,
+        todos_area,
+        rule_area,
+        composer_area,
+        _gap,
+    ] = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Length(1),
         Constraint::Min(1),
         Constraint::Length(todos_height),
         Constraint::Length(1),
         Constraint::Length(input_height),
+        Constraint::Length(1),
     ])
     .areas(area);
+
+    let sanctum = SanctumLine::new(model.sanctum_tier);
+    let identity = &model.identity;
+    let title = model.session_title.as_deref().unwrap_or("session");
+    frame.render_widget(
+        Paragraph::new(Text::from(vec![
+            Line::from(vec![
+                Span::styled(format!(" {} ", sanctum.mark()), theme.gold_style()),
+                Span::styled("haider", theme.bright_style()),
+                Span::styled(format!(" v{VERSION} · {}", identity.dir), theme.dim_style()),
+            ]),
+            Line::from(vec![
+                Span::styled(" ← esc ", theme.faint_style()),
+                Span::styled("· ", theme.faint_style()),
+                Span::styled(title, theme.maroon_style()),
+                Span::styled(format!(" · {}", identity.device), theme.dim_style()),
+            ]),
+        ]))
+        .style(theme.text_style().bg(theme.bar_bg.into())),
+        header_area,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "─".repeat(header_rule.width as usize),
+            theme.frame_style(),
+        )),
+        header_rule,
+    );
 
     // Transcript: bottom-anchored, follow-bottom (scroll state is a later
     // slice — rec 10).
@@ -283,6 +324,12 @@ fn transcript_lines<'a>(lines: &mut Vec<Line<'a>>, entry: &'a TranscriptEntry, t
 fn item_lines<'a>(lines: &mut Vec<Line<'a>>, block: &'a ItemBlock, theme: &Theme) {
     match &block.item {
         TurnItem::AgentMessage { text } => {
+            // Sim parity: agent blocks carry a "■ haider" name header.
+            lines.push(Line::default());
+            lines.push(Line::from(vec![
+                Span::styled("■ ", theme.maroon_style()),
+                Span::styled("haider", theme.dim_style()),
+            ]));
             let mut spans = vec![Span::styled(text.as_str(), theme.text_style())];
             if block.streaming {
                 spans.push(Span::styled("▮", theme.gold_style()));

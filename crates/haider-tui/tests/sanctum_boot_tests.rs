@@ -22,8 +22,8 @@ fn sanctum_tiers_expose_their_texts() {
     );
     assert_eq!(
         SanctumTier::default(),
-        SanctumTier::Translit,
-        "terminal default is the shaping-safe tier"
+        SanctumTier::Arabic,
+        "Arabic default — owner decision, sim parity"
     );
     assert_eq!(SanctumLine::new(SanctumTier::Arabic).mark(), "حيدر");
     assert_eq!(SanctumLine::new(SanctumTier::Translit).mark(), "ḤAYDAR");

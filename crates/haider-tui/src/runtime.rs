@@ -6,11 +6,15 @@
 use crate::app::{AppEvent, AppModel};
 use crate::mock::demo_script;
 use crate::render::render;
+use crate::theme::{Rgb, ThemeKey};
 use haider_protocol::EventPayload;
 use haider_protocol::state::HarnessStatus;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::crossterm::event::{DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind};
+use ratatui::crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    KeyEventKind,
+};
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
@@ -18,6 +22,38 @@ use ratatui::crossterm::{event, execute};
 use std::io::{Stdout, Write, stdout};
 use std::time::Duration;
 use tokio::sync::mpsc;
+
+/// OSC 11 sequence setting the terminal's own background — the emulator's
+/// window padding around the cell grid then matches the theme ground, so the
+/// app reaches the window edge. Restored by [`osc_reset_background`].
+#[must_use]
+pub fn osc_set_background(rgb: Rgb) -> String {
+    format!("\u{1b}]11;#{:02x}{:02x}{:02x}\u{7}", rgb.r, rgb.g, rgb.b)
+}
+
+/// OSC 111: reset the terminal background to the user's default.
+#[must_use]
+pub const fn osc_reset_background() -> &'static str {
+    "\u{1b}]111\u{7}"
+}
+
+/// Best-effort terminal-background sync to the active theme.
+fn sync_terminal_bg(theme: ThemeKey) {
+    let mut out = stdout();
+    let _ = out.write_all(osc_set_background(theme.theme().bg).as_bytes());
+    let _ = out.flush();
+}
+
+/// Detect the system/terminal appearance (OSC 11 background luminance) and
+/// map it to a theme: dark ground → Dark, light ground (or undetectable) →
+/// Desert Dawn. Call BEFORE entering raw mode/alt screen.
+#[must_use]
+pub fn detect_system_theme() -> ThemeKey {
+    match termbg::theme(Duration::from_millis(150)) {
+        Ok(termbg::Theme::Dark) => ThemeKey::Dark,
+        Ok(termbg::Theme::Light) | Err(_) => ThemeKey::Dawn,
+    }
+}
 
 /// RAII terminal state: raw mode + alternate screen + bracketed paste on
 /// construction, restored on drop AND on panic (the panic hook restores
@@ -51,7 +87,12 @@ impl TerminalGuard {
             GUARD_ACTIVE.store(false, Ordering::SeqCst);
             return Err(error);
         }
-        if let Err(error) = execute!(stdout(), EnterAlternateScreen, EnableBracketedPaste) {
+        if let Err(error) = execute!(
+            stdout(),
+            EnterAlternateScreen,
+            EnableBracketedPaste,
+            EnableMouseCapture
+        ) {
             // Roll back the partial setup: raw mode is on, and the alternate
             // screen may or may not have been entered before the failure —
             // restore_terminal unwinds both (leaving a screen we never
@@ -82,7 +123,13 @@ impl Drop for TerminalGuard {
 
 fn restore_terminal() {
     let _ = disable_raw_mode();
-    let _ = execute!(stdout(), DisableBracketedPaste, LeaveAlternateScreen);
+    let _ = execute!(
+        stdout(),
+        DisableMouseCapture,
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    );
+    let _ = stdout().write_all(osc_reset_background().as_bytes());
     let _ = stdout().flush();
 }
 
@@ -105,6 +152,12 @@ pub fn demo_pace(payload: &EventPayload) -> Duration {
 pub async fn run_demo(mut model: AppModel) -> std::io::Result<()> {
     let _guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
+    // Sync the emulator's own background (window padding) to the theme
+    // ground. (No Terminal::clear() here: ratatui's clear paths can issue a
+    // cursor-position query that hangs non-answering PTYs; the first full
+    // draw repaints every cell anyway.)
+    sync_terminal_bg(model.theme);
+    let mut active_theme = model.theme;
 
     // Input pump: crossterm's blocking read on a dedicated thread, forwarded
     // into the async loop (no event-stream feature needed).
@@ -169,6 +222,11 @@ pub async fn run_demo(mut model: AppModel) -> std::io::Result<()> {
                 draw(&mut terminal, &model)?;
                 model.dirty = false;
             }
+        }
+        // Theme cycled (Ctrl+T): re-sync the emulator background.
+        if model.theme != active_theme {
+            active_theme = model.theme;
+            sync_terminal_bg(active_theme);
         }
         // Reliable outbox drain (review r2 P2): a Full channel keeps the
         // answer queued for the next loop turn — a full channel guarantees
