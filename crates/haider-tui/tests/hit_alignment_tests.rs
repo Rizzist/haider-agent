@@ -170,18 +170,19 @@ fn palette_row_hits_align_and_click_runs_that_row() {
         model.handle(key(KeyCode::Char(c)));
     }
     // Session matches for /t, sim registry order: theme · tree · tokens · tools.
-    let names: Vec<String> = model.palette_items().iter().map(|s| s.label()).collect();
+    let items = model.palette_items();
+    let names: Vec<String> = items.iter().map(|s| s.label()).collect();
     assert_eq!(names, ["/theme", "/tree", "/tokens", "/tools"]);
     let (rows, hits, _) = draw(&model, 118, 34);
-    for (index, label) in ["/theme", "/tree", "/tokens", "/tools"]
-        .into_iter()
-        .enumerate()
-    {
-        let rect = rect_for(&hits, Hit::PaletteRow(index));
+    for (item, label) in items.iter().zip(["/theme", "/tree", "/tokens", "/tools"]) {
+        let rect = rect_for(&hits, Hit::PaletteRow(*item));
         assert_eq!(rect.y, row_of(&rows, label), "palette row {label} aligned");
     }
-    assert!(
-        !hits.iter().any(|(_, h)| *h == Hit::PaletteRow(4)),
+    assert_eq!(
+        hits.iter()
+            .filter(|(_, h)| matches!(h, Hit::PaletteRow(_)))
+            .count(),
+        4,
         "no hit region beyond the rendered rows"
     );
     // The bottom hint line is not clickable.
@@ -192,26 +193,45 @@ fn palette_row_hits_align_and_click_runs_that_row() {
             .any(|(rect, h)| matches!(h, Hit::PaletteRow(_)) && rect.y == hint_y),
         "hint row carries no palette hit"
     );
-    // Clicking the second row runs /tree (honest wave flash).
-    model.handle_hit(Hit::PaletteRow(1));
+    // Clicking the /tree row runs /tree (honest wave flash) — the hit
+    // carries the VALUE it was rendered with.
+    model.handle_hit(Hit::PaletteRow(items[1]));
     assert!(model.flash.as_deref().unwrap_or("").contains("/tree"));
 }
 
 #[test]
 fn menu_option_hits_align_with_their_rows() {
+    use haider_protocol::ids::MenuId;
     let model = menu_model();
     let (rows, hits, _) = draw(&model, 90, 26);
-    let allow = rect_for(&hits, Hit::MenuOption(0));
+    // Hits are bound to the menu they were rendered for (P2-2).
+    let menu_id = MenuId::new("t0-menu-1");
+    let allow = rect_for(
+        &hits,
+        Hit::MenuOption {
+            menu: menu_id.clone(),
+            index: 0,
+        },
+    );
     assert_eq!(allow.y, row_of(&rows, "1. Allow once"));
-    let deny = rect_for(&hits, Hit::MenuOption(1));
+    let deny = rect_for(
+        &hits,
+        Hit::MenuOption {
+            menu: menu_id,
+            index: 1,
+        },
+    );
     assert_eq!(deny.y, row_of(&rows, "2. Deny"));
+    // Body context lines render dim between title and options (P2-8).
+    let body_y = row_of(&rows, "fs_patch wants to modify");
+    assert!(body_y < allow.y, "body sits above the options");
     // The bottom hint names the menu id and the RPC answer contract.
     let hint_y = row_of(&rows, "menu.answer");
     assert!(rows[hint_y as usize].contains("menu t0-menu-1"));
     assert!(
         !hits
             .iter()
-            .any(|(rect, h)| matches!(h, Hit::MenuOption(_)) && rect.y == hint_y),
+            .any(|(rect, h)| matches!(h, Hit::MenuOption { .. }) && rect.y == hint_y),
         "hint row carries no option hit"
     );
 }

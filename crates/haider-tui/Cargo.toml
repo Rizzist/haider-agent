@@ -13,6 +13,7 @@ ratatui.workspace = true
 termbg.workspace = true
 tokio.workspace = true
 serde_json.workspace = true
+unicode-width.workspace = true
 
 [lints]
 workspace = true

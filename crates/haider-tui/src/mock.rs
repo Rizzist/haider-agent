@@ -166,7 +166,10 @@ pub fn turn_script(turn: u64) -> Vec<EventPayload> {
             effect_summary: "patch crates/haider-store/src/event_store.rs".to_owned(),
         },
         title: "Allow fs_patch — event_store.rs?".to_owned(),
-        body: vec![],
+        body: vec![
+            "fs_patch wants to modify crates/haider-store/src/event_store.rs".to_owned(),
+            "effect class: workspace write · reversible via /tree".to_owned(),
+        ],
         options: vec![
             MenuOption {
                 key: "allow".to_owned(),

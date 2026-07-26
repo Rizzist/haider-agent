@@ -56,6 +56,9 @@ const PALETTE_HINT: &str = "↑↓ options · tab complete · ⏎ run · esc dis
 const PALETTE_NAME_COL: usize = 14;
 /// Left/right composer padding in cells (sim InputBar `padding: … 16px`).
 const COMPOSER_PAD: usize = 2;
+/// Max composer rows before it scrolls internally (sim textarea autoGrow
+/// cap `max-height: 128px`, tui.js:2799-2803 + 5431).
+const COMPOSER_MAX_ROWS: usize = 5;
 
 /// A full-width one-row hit region.
 fn row_rect(area: Rect, top: u16, offset: usize) -> Rect {
@@ -177,7 +180,8 @@ fn render_launcher(
     let mut palette_height = u16::try_from(palette.len()).unwrap_or(0);
     // Input sacred: the palette yields entirely before the composer loses a
     // row (review r1 P2 rule, same as the session layout).
-    let fixed = 1 + 1 + 1 + 1; // content min + rule + composer + gap
+    let composer_rows = composer_height(model);
+    let fixed = 1 + 1 + composer_rows + 1; // content min + rule + composer + gap
     if palette_height > area.height.saturating_sub(fixed) {
         palette_height = 0;
     }
@@ -185,7 +189,7 @@ fn render_launcher(
         Constraint::Min(1),
         Constraint::Length(palette_height),
         Constraint::Length(1),
-        Constraint::Length(1),
+        Constraint::Length(composer_rows),
         Constraint::Length(1),
     ])
     .areas(area);
@@ -351,9 +355,12 @@ fn render_session(
     hits: &mut Vec<(Rect, Hit)>,
 ) {
     // A blocking menu REPLACES the composer (sim §3 law) and takes its rows:
-    // title + options + the bottom hint line.
+    // title + body context lines + options + the bottom hint line.
     let menu = model.projection.open_menu();
-    let input_height = menu.map_or(1, |m| u16::try_from(m.options.len() + 2).unwrap_or(6));
+    let input_height = menu.map_or_else(
+        || composer_height(model),
+        |m| u16::try_from(1 + m.body.len() + m.options.len() + 1).unwrap_or(8),
+    );
     // Short windows: the INPUT is sacred — todos, then the palette, yield
     // entirely before the composer/menu loses a row (review r1 P2).
     let fixed = 2 + 1 + 1 + input_height + 1; // header + rule + rule + input + gap
@@ -494,16 +501,22 @@ fn render_session(
     let scroll = max_scroll - scroll_back;
     let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
     frame.render_widget(paragraph.scroll((scroll, 0)), transcript_area);
-    // Sticky origin line (sim StickyLine, tui.js:3345-3349): while scrolled
-    // into history, pin the user prompt that produced the top-visible
-    // content; click returns to the live tail.
+    // Sticky origin line (sim StickyLine, tui.js:3345-3349 / 4597-4623):
+    // while scrolled into history, pin the user prompt that produced the
+    // top-visible content. Chrome per sim: near-opaque THEME ground (no bar
+    // tint), bright nowrap-ellipsized text, maroon bold sigil — no
+    // underline. Click keeps the reader AT the prompt (jumpToSticky,
+    // tui.js:2637-2645): the hit carries the scroll-back that puts the
+    // prompt's first row at the viewport top.
     if scroll_back > 0 && scroll > 0 && transcript_area.height > 0 {
         let sticky = user_rows.iter().rev().find(|(line_index, _)| {
             row_of_line
                 .get(*line_index)
                 .is_some_and(|row| *row < scroll)
         });
-        if let Some((_, text)) = sticky {
+        if let Some((line_index, text)) = sticky {
+            let jump = max_scroll
+                .saturating_sub(row_of_line.get(*line_index).copied().unwrap_or(max_scroll));
             let sticky_rect = Rect {
                 x: transcript_area.x,
                 y: transcript_area.y,
@@ -513,15 +526,10 @@ fn render_session(
             let budget = (transcript_area.width as usize).saturating_sub(5);
             let mut spans = vec![
                 Span::raw(" "),
+                Span::styled("❯ ", theme.maroon_style().add_modifier(Modifier::BOLD)),
                 Span::styled(
-                    "❯ ",
-                    theme
-                        .maroon_style()
-                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-                ),
-                Span::styled(
-                    ellipsize(text, budget),
-                    theme.bright_style().add_modifier(Modifier::UNDERLINED),
+                    ellipsize(&text.replace('\n', " "), budget),
+                    theme.bright_style(),
                 ),
             ];
             let pad =
@@ -530,10 +538,10 @@ fn render_session(
                 spans.push(Span::raw(" ".repeat(pad)));
             }
             frame.render_widget(
-                Paragraph::new(Line::from(spans)).style(theme.text_style().bg(theme.bar_bg.into())),
+                Paragraph::new(Line::from(spans)).style(theme.text_style()),
                 sticky_rect,
             );
-            hits.push((sticky_rect, Hit::StickyJump));
+            hits.push((sticky_rect, Hit::StickyJump(jump)));
         }
     }
 
@@ -575,6 +583,14 @@ fn render_session(
             format!(" {glyph} {}", menu.title),
             theme.warn_style(),
         )])];
+        // Dim context body lines between title and options (sim `.iml`,
+        // tui.js:3063-3067 — permission cards must show what they gate).
+        for body_line in &menu.body {
+            menu_lines.push(Line::from(vec![
+                Span::raw(" "),
+                Span::styled(body_line.as_str(), theme.dim_style()),
+            ]));
+        }
         for (index, option) in menu.options.iter().enumerate() {
             let selected = index == model.menu_selection;
             let cursor = if selected { "❯" } else { " " };
@@ -614,9 +630,11 @@ fn render_session(
             Paragraph::new(Text::from(menu_lines)).style(theme.menu_style()),
             composer_area,
         );
-        // Option rows sit between the title (offset 0) and the hint (last).
+        // Option rows sit after the title + body lines, before the hint.
+        // Hits carry the menu id (review r2 P2-2): only THIS menu answers.
+        let option_top = 1 + menu.body.len();
         for offset in 0..menu.options.len() {
-            let y = composer_area.y + 1 + u16::try_from(offset).unwrap_or(u16::MAX);
+            let y = composer_area.y + u16::try_from(option_top + offset).unwrap_or(u16::MAX);
             if y < composer_area.y + composer_area.height {
                 hits.push((
                     Rect {
@@ -625,7 +643,10 @@ fn render_session(
                         width: composer_area.width,
                         height: 1,
                     },
-                    Hit::MenuOption(offset),
+                    Hit::MenuOption {
+                        menu: menu.id.clone(),
+                        index: offset,
+                    },
                 ));
             }
         }
@@ -644,7 +665,45 @@ const fn menu_glyph(kind: &haider_protocol::menu::MenuKind) -> &'static str {
     }
 }
 
-/// The gold rule + composer row on the input ground (sim InputBar,
+/// Composer rows currently needed: one per line, capped at
+/// [`COMPOSER_MAX_ROWS`] (sim textarea autoGrow, tui.js:2799-2803); beyond
+/// the cap the composer scrolls to its tail.
+fn composer_height(model: &AppModel) -> u16 {
+    let rows = model
+        .composer
+        .split('\n')
+        .count()
+        .clamp(1, COMPOSER_MAX_ROWS);
+    u16::try_from(rows).unwrap_or(1)
+}
+
+/// Keep the editable TAIL of an overlong composer line visible (sim: the
+/// textarea scrolls its caret into view): a leading … plus the last cells
+/// that fit.
+fn tail_window(text: &str, budget: usize) -> String {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    if budget == 0 {
+        return String::new();
+    }
+    if UnicodeWidthStr::width(text) <= budget {
+        return text.to_owned();
+    }
+    let keep = budget.saturating_sub(1);
+    let mut cells = 0usize;
+    let mut reversed: Vec<char> = Vec::new();
+    for ch in text.chars().rev() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if cells + ch_width > keep {
+            break;
+        }
+        cells += ch_width;
+        reversed.push(ch);
+    }
+    let tail: String = reversed.into_iter().rev().collect();
+    format!("…{tail}")
+}
+
+/// The gold rule + composer rows on the input ground (sim InputBar,
 /// tui.js:5395: `border-top: gold`, `background: inputBg`). Pushes the
 /// talk-chip hit region so the click lands exactly on the chip.
 fn render_composer(
@@ -663,8 +722,11 @@ fn render_composer(
         .style(theme.text_style()),
         rule_area,
     );
-    let (line, chip_at) = composer_line(model, theme, row_area.width);
-    frame.render_widget(Paragraph::new(line).style(theme.input_style()), row_area);
+    let (lines, chip_at) = composer_lines(model, theme, row_area.width);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).style(theme.input_style()),
+        row_area,
+    );
     if let Some((offset, width)) = chip_at {
         hits.push((
             Rect {
@@ -678,59 +740,99 @@ fn render_composer(
     }
 }
 
-/// The composer row (sim InputBar): padded off the frame edge, bold gold ❯
-/// sigil, typed text (bright + gold block cursor) or the dim placeholder,
-/// and the right-aligned `[ ◉ talk ]` chip. Returns the line plus the chip's
-/// column offset + width for the hit map.
-fn composer_line<'a>(
+/// The composer rows (sim InputBar textarea): padded off the frame edge,
+/// bold gold ❯ sigil, REAL newlines on their own rows (tail-visible past
+/// [`COMPOSER_MAX_ROWS`], with a faint ⋮ gutter marker), a horizontal
+/// tail-window on any overlong line so the editable end stays visible,
+/// typed text bright with a gold block cursor (or the dim placeholder +
+/// ghost completion), and the right-aligned `[ ◉ talk ]` chip on the first
+/// row. Returns the rows plus the chip's column offset + width.
+fn composer_lines<'a>(
     model: &'a AppModel,
     theme: &Theme,
     width: u16,
-) -> (Line<'a>, Option<(u16, u16)>) {
-    let placeholder = match model.screen {
-        Screen::Launcher => PLACEHOLDER_LAUNCHER,
-        _ => PLACEHOLDER_SESSION,
-    };
-    let mut spans = vec![
-        Span::raw(" ".repeat(COMPOSER_PAD)),
-        Span::styled(
-            "❯ ",
-            theme
-                .gold_style()
-                .add_modifier(ratatui::style::Modifier::BOLD),
-        ),
-    ];
-    if model.composer.is_empty() {
-        spans.push(Span::styled("▮", theme.gold_style()));
-        spans.push(Span::styled(format!(" {placeholder}"), theme.dim_style()));
-    } else {
-        spans.push(Span::styled(model.composer.as_str(), theme.bright_style()));
-        spans.push(Span::styled("▮", theme.gold_style()));
-        // Inline ghost completion (sim `.ghostline`, tui.js:3028-3034):
-        // the highlighted row's remainder dim, plus a faint ⇥ tab tag.
-        if let Some(ghost) = model.ghost() {
-            spans.push(Span::styled(ghost, theme.dim_style()));
-            spans.push(Span::styled(" ⇥ tab", theme.faint_style()));
-        }
-    }
-    // Display-cell widths (unicode-aware — review r1 P3: CJK/emoji composers
-    // must not drift the chip).
-    let typed_width = Line::from(spans.clone()).width();
+) -> (Vec<Line<'a>>, Option<(u16, u16)>) {
+    let sigil = Span::styled(
+        "❯ ",
+        theme
+            .gold_style()
+            .add_modifier(ratatui::style::Modifier::BOLD),
+    );
     let chip_spans = chip("◉ talk".to_owned(), theme.gold_style());
     let chip_width = Line::from(chip_spans.clone()).width();
-    // Right-aligned talk chip when there's room, padded off the right edge.
-    let total = typed_width + chip_width + COMPOSER_PAD;
-    let mut chip_at = None;
-    if (width as usize) > total {
-        let filler = width as usize - total;
-        spans.push(Span::raw(" ".repeat(filler)));
-        spans.extend(chip_spans);
-        chip_at = Some((
-            u16::try_from(typed_width + filler).unwrap_or(0),
-            u16::try_from(chip_width).unwrap_or(0),
-        ));
+    // Right-aligned talk chip when the row leaves room (2-col right pad).
+    let chip_fit = |spans: &mut Vec<Span<'a>>| -> Option<(u16, u16)> {
+        let used = Line::from(spans.clone()).width();
+        let total = used + chip_width + COMPOSER_PAD;
+        if (width as usize) > total {
+            let filler = width as usize - total;
+            spans.push(Span::raw(" ".repeat(filler)));
+            spans.extend(chip_spans.clone());
+            Some((
+                u16::try_from(used + filler).unwrap_or(0),
+                u16::try_from(chip_width).unwrap_or(0),
+            ))
+        } else {
+            None
+        }
+    };
+
+    if model.composer.is_empty() {
+        let placeholder = match model.screen {
+            Screen::Launcher => PLACEHOLDER_LAUNCHER,
+            _ => PLACEHOLDER_SESSION,
+        };
+        let mut spans = vec![
+            Span::raw(" ".repeat(COMPOSER_PAD)),
+            sigil,
+            Span::styled("▮", theme.gold_style()),
+            Span::styled(format!(" {placeholder}"), theme.dim_style()),
+        ];
+        let chip_at = chip_fit(&mut spans);
+        return (vec![Line::from(spans)], chip_at);
     }
-    (Line::from(spans), chip_at)
+
+    let all: Vec<&str> = model.composer.split('\n').collect();
+    let skip = all.len().saturating_sub(COMPOSER_MAX_ROWS);
+    let visible = &all[skip..];
+    let last = visible.len().saturating_sub(1);
+    let mut rows = Vec::new();
+    let mut chip_at = None;
+    for (index, segment) in visible.iter().enumerate() {
+        let first_row = index == 0;
+        let last_row = index == last;
+        let mut spans = vec![Span::raw(" ".repeat(COMPOSER_PAD))];
+        if first_row && skip == 0 {
+            spans.push(sigil.clone());
+        } else if first_row {
+            // Earlier lines are scrolled out above (vertical tail window).
+            spans.push(Span::styled("⋮ ", theme.faint_style()));
+        } else {
+            spans.push(Span::raw("  "));
+        }
+        // Horizontal tail-window: the cursor/editable end must stay
+        // visible on the cursor row; long earlier rows tail-window too.
+        let reserve = COMPOSER_PAD + 2 + usize::from(last_row);
+        let budget = (width as usize).saturating_sub(reserve);
+        spans.push(Span::styled(
+            tail_window(segment, budget),
+            theme.bright_style(),
+        ));
+        if last_row {
+            spans.push(Span::styled("▮", theme.gold_style()));
+            // Inline ghost completion (sim `.ghostline`, tui.js:3028-3034)
+            // — palette queries are single-line, so this is also row 0.
+            if let Some(ghost) = model.ghost() {
+                spans.push(Span::styled(ghost, theme.dim_style()));
+                spans.push(Span::styled(" ⇥ tab", theme.faint_style()));
+            }
+        }
+        if first_row {
+            chip_at = chip_fit(&mut spans);
+        }
+        rows.push(Line::from(spans));
+    }
+    (rows, chip_at)
 }
 
 /// The slash palette (sim CmdMenu, tui.js:5345): a frame rule on top, then
@@ -743,10 +845,13 @@ fn palette_block(model: &AppModel, theme: &Theme, width: u16) -> Vec<Line<'stati
     if items.is_empty() {
         return Vec::new();
     }
+    // A scroll WINDOW over the full match list (sim internal scroll,
+    // tui.js:2710-2718) — the reducer keeps the selection inside it.
+    let start = model.palette_scroll.min(items.len().saturating_sub(1));
     let width = width as usize;
     let mut lines = vec![Line::styled("─".repeat(width), theme.frame_style())];
-    for (index, item) in items.iter().take(PALETTE_MAX_ROWS).enumerate() {
-        let selected = index == model.palette_selection;
+    for (offset, item) in items.iter().skip(start).take(PALETTE_MAX_ROWS).enumerate() {
+        let selected = start + offset == model.palette_selection;
         let name_style = if selected {
             theme.gold_style()
         } else {
@@ -778,11 +883,16 @@ fn palette_block(model: &AppModel, theme: &Theme, width: u16) -> Vec<Line<'stati
     lines
 }
 
-/// Hit regions for the palette's option rows — offsets skip the top frame
-/// rule and never cover the bottom hint line.
+/// Hit regions for the palette's visible rows — offsets skip the top frame
+/// rule and never cover the bottom hint line. Each hit carries the row's
+/// VALUE (review r2 P2-2): stale maps activate what was drawn or nothing.
 fn palette_row_hits(model: &AppModel, area: Rect, hits: &mut Vec<(Rect, Hit)>) {
-    let rows = model.palette_items().len().min(PALETTE_MAX_ROWS);
-    for offset in 0..rows {
+    let items = model.palette_items();
+    if items.is_empty() {
+        return;
+    }
+    let start = model.palette_scroll.min(items.len().saturating_sub(1));
+    for (offset, item) in items.iter().skip(start).take(PALETTE_MAX_ROWS).enumerate() {
         let y = area.y + 1 + u16::try_from(offset).unwrap_or(u16::MAX);
         if y < area.y + area.height {
             hits.push((
@@ -792,7 +902,7 @@ fn palette_row_hits(model: &AppModel, area: Rect, hits: &mut Vec<(Rect, Hit)>) {
                     width: area.width,
                     height: 1,
                 },
-                Hit::PaletteRow(offset),
+                Hit::PaletteRow(*item),
             ));
         }
     }
@@ -911,20 +1021,28 @@ fn transcript_lines<'a>(
         TranscriptEntry::User { text, attachments } => {
             lines.push(Line::default());
             // Sim UserRow (tui.js:4465-4492): MAROON bold sigil (gold ❯
-            // belongs to the composer/sticky only), bright text, gold pill
-            // paste tokens.
-            let mut spans = vec![
-                Span::raw(" "),
-                Span::styled("❯ ", theme.maroon_style().add_modifier(Modifier::BOLD)),
-            ];
-            spans.extend(user_text_spans(text, theme));
-            if *attachments > 0 {
-                spans.push(Span::styled(
-                    format!(" [+{attachments} attachment(s)]"),
-                    theme.dim_style(),
-                ));
+            // belongs to the composer/sticky only), bright pre-wrap text
+            // (multi-line submits keep their newlines), gold pill paste
+            // tokens.
+            let last_segment = text.split('\n').count().saturating_sub(1);
+            for (index, segment) in text.split('\n').enumerate() {
+                let mut spans = if index == 0 {
+                    vec![
+                        Span::raw(" "),
+                        Span::styled("❯ ", theme.maroon_style().add_modifier(Modifier::BOLD)),
+                    ]
+                } else {
+                    vec![Span::raw("   ")]
+                };
+                spans.extend(user_text_spans(segment, theme));
+                if index == last_segment && *attachments > 0 {
+                    spans.push(Span::styled(
+                        format!(" [+{attachments} attachment(s)]"),
+                        theme.dim_style(),
+                    ));
+                }
+                lines.push(Line::from(spans));
             }
-            lines.push(Line::from(spans));
         }
         TranscriptEntry::Item(block) => item_lines(lines, block, theme, width),
         TranscriptEntry::Note { text } => {
@@ -977,27 +1095,59 @@ fn paste_token_len(text: &str) -> Option<usize> {
     None
 }
 
-/// Greedy word wrap by display cells — the agent body wraps manually so
-/// EVERY visual row carries the gold-soft rail (sim border-left).
-fn wrap_words(text: &str, budget: usize) -> Vec<String> {
+/// Pre-wrap word wrap by DISPLAY CELLS (sim AgentRow `white-space:
+/// pre-wrap`, tui.js:4508-4513): explicit newlines and leading indentation
+/// survive; words wrap greedily by unicode width; an unbreakable word
+/// longer than the budget hard-splits at the cell boundary — every visual
+/// row stays within budget, so the gold-soft rail never drops off a
+/// continuation (review r2 P2-10: CJK, emoji, long URLs).
+fn wrap_body(text: &str, budget: usize) -> Vec<String> {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    let budget = budget.max(1);
     let mut rows = Vec::new();
-    let mut row = String::new();
-    let mut row_width = 0usize;
-    for word in text.split_whitespace() {
-        let word_width = word.chars().count();
-        let sep = usize::from(!row.is_empty());
-        if row_width + sep + word_width > budget && !row.is_empty() {
-            rows.push(std::mem::take(&mut row));
-            row_width = 0;
+    for source in text.split('\n') {
+        let trimmed = source.trim_start_matches(' ');
+        let indent = &source[..source.len() - trimmed.len()];
+        let mut row = indent.to_owned();
+        let mut row_width = UnicodeWidthStr::width(indent);
+        let mut row_has_word = false;
+        for word in trimmed.split_whitespace() {
+            let word_width = UnicodeWidthStr::width(word);
+            let sep = usize::from(row_has_word);
+            if row_width + sep + word_width > budget {
+                if row_width > 0 {
+                    rows.push(std::mem::take(&mut row));
+                    row_width = 0;
+                    row_has_word = false;
+                }
+                if word_width > budget {
+                    // Hard-split the unbreakable word at cell boundaries.
+                    let mut piece = String::new();
+                    let mut piece_width = 0usize;
+                    for ch in word.chars() {
+                        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+                        if piece_width + ch_width > budget && !piece.is_empty() {
+                            rows.push(std::mem::take(&mut piece));
+                            piece_width = 0;
+                        }
+                        piece.push(ch);
+                        piece_width += ch_width;
+                    }
+                    row = piece;
+                    row_width = piece_width;
+                    row_has_word = true;
+                    continue;
+                }
+            }
+            if row_has_word {
+                row.push(' ');
+                row_width += 1;
+            }
+            row.push_str(word);
+            row_width += word_width;
+            row_has_word = true;
         }
-        if !row.is_empty() {
-            row.push(' ');
-            row_width += 1;
-        }
-        row.push_str(word);
-        row_width += word_width;
-    }
-    if !row.is_empty() || rows.is_empty() {
+        // Blank source lines survive as blank rail rows (pre-wrap).
         rows.push(row);
     }
     rows
@@ -1064,7 +1214,7 @@ fn item_lines<'a>(lines: &mut Vec<Line<'a>>, block: &'a ItemBlock, theme: &Theme
                 Span::styled("■ haider", theme.gold_style()),
             ]));
             let budget = (width as usize).saturating_sub(3).max(8);
-            let body = wrap_words(text, budget);
+            let body = wrap_body(text, budget);
             let last = body.len().saturating_sub(1);
             for (index, row) in body.into_iter().enumerate() {
                 let mut spans = vec![

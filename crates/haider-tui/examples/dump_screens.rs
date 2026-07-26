@@ -87,4 +87,33 @@ fn main() {
         )));
     }
     dump(&model, "session + theme args");
+    // Multi-line composer (⇧⏎/⌥⏎ newlines, review r2 P2-4).
+    for _ in 0..7 {
+        model.handle(AppEvent::Key(KeyEvent::new(
+            KeyCode::Backspace,
+            KeyModifiers::NONE,
+        )));
+    }
+    for (index, line) in [
+        "draft the migration plan",
+        "then apply it to staging",
+        "and verify",
+    ]
+    .iter()
+    .enumerate()
+    {
+        if index > 0 {
+            model.handle(AppEvent::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::ALT,
+            )));
+        }
+        for c in line.chars() {
+            model.handle(AppEvent::Key(KeyEvent::new(
+                KeyCode::Char(c),
+                KeyModifiers::NONE,
+            )));
+        }
+    }
+    dump(&model, "session + multi-line composer");
 }

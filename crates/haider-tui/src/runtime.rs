@@ -215,21 +215,29 @@ pub async fn run_demo(mut model: AppModel) -> std::io::Result<()> {
     // (typed submits or sample attaches). `answer_echo` is the demo's client
     // seam — user menu answers loop back as MenuAnswered envelopes, exactly
     // the shape the daemon will publish later.
-    let (envelope_tx, mut envelope_rx) = mpsc::channel::<EventPayload>(64);
+    //
+    // Every envelope travels GENERATION-TAGGED and is re-checked at
+    // consumption (review r2 P1-1): an Esc that bumps the generation must
+    // also invalidate envelopes already BUFFERED in the channel, or a stale
+    // UserMessage re-arms `turn_active` on a dead script.
+    let (envelope_tx, mut envelope_rx) = mpsc::channel::<(u64, EventPayload)>(64);
+    // Script generation: bumping it silences any in-flight script (fresh
+    // session / reset / interrupt) at BOTH ends of the channel.
+    let script_gen = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let answer_echo = envelope_tx.clone();
     let script_tx = envelope_tx.clone();
+    let boot_gen = std::sync::Arc::clone(&script_gen);
     tokio::spawn(async move {
         for payload in crate::mock::boot_script() {
             tokio::time::sleep(demo_pace(&payload)).await;
-            if envelope_tx.send(payload).await.is_err() {
+            // Boot beats tag with the CURRENT generation at send: they
+            // belong to the harness, not any turn, and survive bumps.
+            let generation = boot_gen.load(std::sync::atomic::Ordering::SeqCst);
+            if envelope_tx.send((generation, payload)).await.is_err() {
                 return;
             }
         }
     });
-    // Script generation: bumping it silences any in-flight script (fresh
-    // session / reset), so two scripts can never interleave into one
-    // projection (review r1 P1).
-    let script_gen = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let play = |payloads: Vec<EventPayload>, generation: u64| {
         let tx = script_tx.clone();
         let gen_ref = std::sync::Arc::clone(&script_gen);
@@ -239,7 +247,7 @@ pub async fn run_demo(mut model: AppModel) -> std::io::Result<()> {
                 if gen_ref.load(std::sync::atomic::Ordering::SeqCst) != generation {
                     return;
                 }
-                if tx.send(payload).await.is_err() {
+                if tx.send((generation, payload)).await.is_err() {
                     return;
                 }
             }
@@ -265,7 +273,7 @@ pub async fn run_demo(mut model: AppModel) -> std::io::Result<()> {
                     model.handle(AppEvent::Key(key));
                 }
                 Some(Event::Paste(text)) => model.handle(AppEvent::Paste(text)),
-                Some(Event::Resize(..)) => model.dirty = true,
+                Some(Event::Resize(..)) => model.handle_resize(),
                 Some(Event::Mouse(mouse)) => match mouse.kind {
                     MouseEventKind::Down(MouseButton::Left) => {
                         let hit = hit_map.iter().find(|(rect, _)| {
@@ -275,7 +283,7 @@ pub async fn run_demo(mut model: AppModel) -> std::io::Result<()> {
                                 && mouse.row < rect.y + rect.height
                         });
                         if let Some((_, action)) = hit {
-                            model.handle_hit(*action);
+                            model.handle_hit(action.clone());
                         }
                     }
                     MouseEventKind::ScrollUp => model.handle_wheel(true),
@@ -288,8 +296,11 @@ pub async fn run_demo(mut model: AppModel) -> std::io::Result<()> {
             () = &mut autoplay, if !model.auto_play_spent => {
                 model.handle(AppEvent::AutoPlay);
             }
-            payload = envelope_rx.recv(), if stream_open => match payload {
-                Some(payload) => model.handle(AppEvent::Envelope(Box::new(payload))),
+            tagged = envelope_rx.recv(), if stream_open => match tagged {
+                Some((generation, payload)) => {
+                    let current = script_gen.load(std::sync::atomic::Ordering::SeqCst);
+                    consume_scripted(&mut model, generation, current, payload);
+                }
                 None => {
                     stream_open = false;
                     model.handle(AppEvent::StreamEnded);
@@ -318,10 +329,22 @@ pub async fn run_demo(mut model: AppModel) -> std::io::Result<()> {
                     let generation = script_gen.load(std::sync::atomic::Ordering::SeqCst);
                     play(crate::mock::turn_script(turn_counter), generation);
                 }
-                AppRequest::StopScripts | AppRequest::Interrupt => {
-                    // Interrupt = stop the playing script; the reducer
-                    // already settled the projection into idle(i).
+                AppRequest::StopScripts => {
                     script_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                AppRequest::Interrupt => {
+                    // Stop the playing script (the reducer already settled
+                    // the projection into idle(i)), then schedule the sim's
+                    // 30s idle(i) → idle decay (tui.js:1561-1564). The
+                    // decay is generation-guarded: a newer interrupt/reset
+                    // makes this one stale; typing-decay makes it a no-op.
+                    let decay_gen =
+                        script_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    let tx = script_tx.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(IDLE_DECAY).await;
+                        let _ = tx.send((decay_gen, EventPayload::IdleDecayed)).await;
+                    });
                 }
                 AppRequest::Quit => model.should_quit = true,
             }
@@ -342,7 +365,8 @@ pub async fn run_demo(mut model: AppModel) -> std::io::Result<()> {
         // pending envelopes, so the loop WILL wake and retry. Awaiting the
         // send here instead would deadlock: this loop is the only consumer.
         while let Some(answer) = model.outbox.first().cloned() {
-            match answer_echo.try_send(EventPayload::MenuAnswered(answer)) {
+            let generation = script_gen.load(std::sync::atomic::Ordering::SeqCst);
+            match answer_echo.try_send((generation, EventPayload::MenuAnswered(answer))) {
                 Ok(()) => {
                     model.outbox.remove(0);
                 }
@@ -355,6 +379,23 @@ pub async fn run_demo(mut model: AppModel) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// The sim's idle(i) decay window (tui.js:1562: 30s of nothing).
+pub const IDLE_DECAY: Duration = Duration::from_secs(30);
+
+/// Consume one generation-tagged script envelope. Stale generations are
+/// dropped whole — the P1-1 law: an interrupt's bump invalidates envelopes
+/// already buffered in the channel, not only future sends.
+pub fn consume_scripted(
+    model: &mut AppModel,
+    generation: u64,
+    current: u64,
+    payload: EventPayload,
+) {
+    if generation == current {
+        model.handle(AppEvent::Envelope(Box::new(payload)));
+    }
 }
 
 fn draw(

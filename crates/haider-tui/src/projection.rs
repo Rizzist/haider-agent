@@ -398,25 +398,19 @@ impl SessionProjection {
     }
 
     /// Visual class of the badge — the sim's `BADGE_OUTLINE`/`badgeTone`
-    /// vocabulary (tui.js:5531-5564): plain idle is a QUIET dim outline;
-    /// notable-restful states outline gold; needs-you states outline warn
-    /// (never filled); effect-unknown outlines err; fills are reserved for
-    /// live machinery (gold work · maroon tool · warn compaction · err
-    /// failure).
+    /// vocabulary (tui.js:5531-5547): idle AND interrupted-idle both fall
+    /// through to the QUIET dim outline — the `⏸ IDLE (i)` label carries
+    /// the distinction (review r2 P2-11); waiting/starting outline gold;
+    /// needs-you states outline warn (never filled); effect-unknown
+    /// outlines err; fills are reserved for live machinery (gold work ·
+    /// maroon tool · warn compaction · err failure).
     #[must_use]
     pub fn badge_tone(&self) -> BadgeTone {
         if matches!(self.harness, Some(HarnessStatus::Starting { .. })) {
             return BadgeTone::Restful;
         }
-        let idle = || {
-            if self.interrupted {
-                BadgeTone::Restful
-            } else {
-                BadgeTone::Idle
-            }
-        };
         match &self.run {
-            None => idle(),
+            None | Some(RunState::Done | RunState::Cancelled) => BadgeTone::Idle,
             Some(RunState::Queued | RunState::Waiting { .. }) => BadgeTone::Restful,
             Some(
                 RunState::Thinking
@@ -431,7 +425,6 @@ impl SessionProjection {
             }
             Some(RunState::EffectOutcomeUnknown) => BadgeTone::EffectUnknown,
             Some(RunState::Errored) => BadgeTone::Error,
-            Some(RunState::Done | RunState::Cancelled) => idle(),
         }
     }
 

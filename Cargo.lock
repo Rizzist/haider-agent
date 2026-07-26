@@ -685,6 +685,7 @@ dependencies = [
  "serde_json",
  "termbg",
  "tokio",
+ "unicode-width",
 ]
 
 [[package]]

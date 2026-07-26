@@ -3,7 +3,7 @@
 //! waves execute as an honest flash note naming the wave.
 
 /// One palette entry.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommandSpec {
     pub name: &'static str,
     pub desc: &'static str,
@@ -109,8 +109,9 @@ const fn session_cmd(
 /// One palette row: a command, or an argument candidate for the current
 /// slot (sim `getSuggestions`, tui.js:234-262). Only `/theme` carries an
 /// executable slot today — the full arg-slot table lands with the daemon's
-/// real command arguments.
-#[derive(Debug, Clone, Copy)]
+/// real command arguments. `Eq` matters: mouse hits carry the VALUE so a
+/// stale hit map can never activate a different row (review r2 P2-2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaletteItem {
     Cmd(&'static CommandSpec),
     Arg {
@@ -140,8 +141,9 @@ impl PaletteItem {
     }
 }
 
-/// Palette rows shown at once (the sim scrolls beyond its max-height; we
-/// cap and clamp the selection instead — ledgered).
+/// Palette rows visible at once — a scroll WINDOW over the full match list
+/// (sim max-height + internal scroll, tui.js:5353, 2710-2718), never a
+/// truncation: selection wraps over every match and the window follows.
 pub const PALETTE_MAX_ROWS: usize = 8;
 
 /// Commands whose argument slot the palette can complete today.
@@ -165,8 +167,10 @@ fn theme_args(fragment: &str) -> Vec<PaletteItem> {
 }
 
 /// Palette rows for a composer query (the text after `/`). A single
-/// unfinished token filters command names; once `/theme ` is complete the
-/// palette switches to its argument slot (sim `getSuggestions` shape).
+/// unfinished token filters command names — but a FULLY-typed arg command
+/// (exact single match with slots) jumps straight to its argument rows (sim
+/// `getSuggestions` "lead" case, tui.js:243-247). After the space the
+/// palette stays on the argument slot.
 #[must_use]
 pub fn palette_items(query: &str, in_session: bool) -> Vec<PaletteItem> {
     let ends_space = query.ends_with(char::is_whitespace);
@@ -174,12 +178,20 @@ pub fn palette_items(query: &str, in_session: bool) -> Vec<PaletteItem> {
     let first = tokens.next().unwrap_or("").to_ascii_lowercase();
     let rest: Vec<&str> = tokens.collect();
     if !ends_space && rest.is_empty() {
-        return COMMANDS
+        let matches: Vec<PaletteItem> = COMMANDS
             .iter()
             .filter(|spec| in_session || !spec.session_only)
             .filter(|spec| spec.name.starts_with(&first))
             .map(PaletteItem::Cmd)
             .collect();
+        // Exact arg-command fully typed → its slot candidates, unfiltered.
+        if matches.len() == 1
+            && has_arg_slots(&first)
+            && matches!(matches[0], PaletteItem::Cmd(spec) if spec.name == first)
+        {
+            return theme_args("");
+        }
+        return matches;
     }
     // Argument position. /theme has one slot; further args offer nothing.
     if first == "theme" {

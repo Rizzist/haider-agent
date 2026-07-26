@@ -27,12 +27,11 @@ Deliberate gaps against the `/tui` sim, each with its landing wave:
 | Where | Gap | Why deferred | Status |
 |---|---|---|---|
 | crates/haider-tui | In-app mouse drag-select in the transcript | Mouse capture is ON (kills scrollback bleed); native ⇧-drag selection already works in every emulator — reimplementing OS selection in-app buys nothing at demo scale | left to native ⇧-drag |
-| crates/haider-tui | Arg-slot table beyond `/theme` (sim `argSlots`: /model, /provider, /login, /account, /queue) | TUI2.3 shipped the inline ghost completion + `/theme`'s slot (the one executable today); the rest take real args only once the daemon wires them | planned → daemon wave (W3) |
+| crates/haider-tui | Arg-slot table beyond `/theme` (sim `argSlots`: /model, /provider, /login, /account, /queue) | TUI2.3/2.4 shipped the inline ghost + `/theme`'s full slot semantics (lead rows at exact `/theme`, ⏎/click/tab slot entry — the one command executable today); the rest take real args only once the daemon wires them | planned → daemon wave (W3) |
 | crates/haider-tui | Compaction before/after token counts in the transcript card | The protocol's `ContextCompaction` carries only `summary_artifact` — no counts to show honestly; the gold card renders without numbers | planned → protocol usage-delta field |
 | crates/haider-tui | Todos collapse toggle + queued-messages panel; multi-menu queue (`· N more queued`) | Demo opens one card and pins one plan; collapse needs persistent UI prefs | planned → daemon wave (W3) |
 | crates/haider-tui | Hover-select/hover-highlight (sim `onMouseEnter`) | Left-click + wheel only — mouse-move reporting floods the input channel for cosmetic gain | open |
-| crates/haider-tui | Multi-line composer (⇧⏎ newline — the sim placeholder's promise) | Legacy terminal input can't tell ⇧⏎ from ⏎ (needs the kitty keyboard protocol + a multi-row composer); pasted newlines are already normalized honestly | planned → daemon-era input stack |
-| crates/haider-tui | Palette scrolling past 8 rows (sim scrolls inside max-height 260px) | List is capped at 8 with clamped selection; only the bare `/` query exceeds it | open |
+| crates/haider-tui | Mid-composer cursor movement (←→/click editing; the cursor is end-of-text) | TUI2.4 shipped real multi-line entry (⇧⏎ where reported + ⌥⏎ universally, growth to 5 rows, vertical+horizontal tail windows, newline-preserving small pastes); a movable cursor + selection is an editor feature | planned → daemon-era input stack |
 
 ## Adopted
 

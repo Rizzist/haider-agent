@@ -139,7 +139,7 @@ fn wheel_clamps_to_the_rendered_scroll_range() {
 }
 
 #[test]
-fn sticky_origin_line_pins_the_producing_prompt_and_click_returns() {
+fn sticky_origin_line_pins_the_prompt_and_click_stays_at_it() {
     let mut model = session_model();
     let (_, _, _) = draw(&model, 90, 14);
     model.handle_wheel(true);
@@ -151,23 +151,40 @@ fn sticky_origin_line_pins_the_producing_prompt_and_click_returns() {
         "sticky pins the producing prompt: {:?}",
         rows[sticky_y as usize]
     );
+    // Chrome per sim StickyLine (tui.js:4597-4623): near-opaque THEME
+    // ground (no bar tint), maroon bold sigil, bright text, no underline.
     let theme = model.theme.theme();
     let buffer = terminal.backend().buffer();
-    assert_eq!(
-        buffer[(0, sticky_y)].bg,
-        Color::from(theme.bar_bg),
-        "sticky band ground"
-    );
-    let (rect, _) = hits
+    assert_eq!(buffer[(0, sticky_y)].bg, Color::from(theme.bg));
+    let sig_x = col_of(&rows[sticky_y as usize], "❯");
+    let sig = &buffer[(sig_x, sticky_y)];
+    assert_eq!(sig.fg, Color::from(theme.maroon));
+    assert!(sig.modifier.contains(Modifier::BOLD));
+    assert!(!sig.modifier.contains(Modifier::UNDERLINED));
+    // Click keeps the reader AT the prompt (sim jumpToSticky): the carried
+    // scroll-back puts the prompt's first row at the viewport top.
+    let (rect, hit) = hits
         .iter()
-        .find(|(_, h)| *h == Hit::StickyJump)
+        .find(|(_, h)| matches!(h, Hit::StickyJump(_)))
         .expect("sticky hit region");
     assert_eq!(rect.y, sticky_y);
-    model.handle_hit(Hit::StickyJump);
-    assert_eq!(model.scroll_back, 0, "click returns to the live tail");
-    // Back at the bottom, no sticky (and no hit) renders.
+    model.handle_hit(hit.clone());
+    assert!(
+        model.scroll_back > 0,
+        "click does NOT yank to the live tail"
+    );
+    let (rows, _, _) = draw(&model, 90, 14);
+    assert!(
+        rows[sticky_y as usize].contains("❯ fix the failing boundary test in haider-store"),
+        "the prompt row now sits at the transcript top: {:?}",
+        rows[sticky_y as usize]
+    );
+    // Wheel back to the bottom: no sticky (and no hit) renders.
+    for _ in 0..50 {
+        model.handle_wheel(false);
+    }
     let (_, hits, _) = draw(&model, 90, 14);
-    assert!(!hits.iter().any(|(_, h)| *h == Hit::StickyJump));
+    assert!(!hits.iter().any(|(_, h)| matches!(h, Hit::StickyJump(_))));
 }
 
 #[test]
@@ -218,12 +235,19 @@ fn theme_arg_slot_offers_completes_and_runs() {
     model.handle(key(KeyCode::Down));
     model.handle(key(KeyCode::Enter));
     assert_eq!(model.theme, ThemeKey::Ivory, "/theme ivory executed");
-    // Click path: the third arg row runs /theme dark.
+    // Click path: the "dark" arg row runs /theme dark — the hit carries
+    // the VALUE it was rendered with.
     for c in "/theme ".chars() {
         model.handle(key(KeyCode::Char(c)));
     }
-    assert!(hits.iter().any(|(_, h)| *h == Hit::PaletteRow(2)));
-    model.handle_hit(Hit::PaletteRow(2));
+    let dark_hit = hits
+        .iter()
+        .find_map(|(_, h)| match h {
+            Hit::PaletteRow(item) if item.label() == "dark" => Some(h.clone()),
+            _ => None,
+        })
+        .expect("dark arg row hit");
+    model.handle_hit(dark_hit);
     assert_eq!(model.theme, ThemeKey::Dark, "clicked arg row executed");
     // Fragment filtering: /theme i → ivory only; tab completes in place.
     for c in "/theme i".chars() {
@@ -262,10 +286,10 @@ fn big_pastes_become_pill_tokens_and_render_gold() {
     assert_eq!(cell.fg, Color::from(theme.gold));
     assert_eq!(cell.bg, Color::from(theme.gold_soft));
 
-    // Small pastes stay literal text.
+    // Small pastes stay literal — and KEEP their newlines (r2 P2-4d).
     let mut model = launcher_model();
     model.handle(AppEvent::Paste("a\nb".to_owned()));
-    assert_eq!(model.composer, "a b");
+    assert_eq!(model.composer, "a\nb");
 }
 
 // ---- G51 + G47: mid-turn echo + auto-title note ----
@@ -562,15 +586,56 @@ fn palette_and_menu_selection_wrap_around() {
 }
 
 #[test]
-fn bare_theme_cycles_and_lists_the_choices() {
+fn exact_theme_leads_to_its_slot_and_dismissed_bare_theme_cycles() {
+    // Sim getSuggestions lead case (tui.js:243-247): the EXACT `/theme`
+    // (no space) already shows the argument rows — ⏎ runs the highlighted
+    // arg, and the ghost offers ` dawn`.
     let mut model = launcher_model();
     assert_eq!(model.theme, ThemeKey::Dawn);
     for c in "/theme".chars() {
         model.handle(key(KeyCode::Char(c)));
     }
+    let labels: Vec<String> = model.palette_items().iter().map(|i| i.label()).collect();
+    assert_eq!(labels, ["dawn", "ivory", "dark"], "lead arg rows");
+    assert_eq!(model.ghost().as_deref(), Some(" dawn"), "lead ghost");
     model.handle(key(KeyCode::Enter));
-    assert_eq!(model.theme, ThemeKey::Ivory, "bare /theme still cycles");
+    assert_eq!(model.theme, ThemeKey::Dawn, "⏎ ran the highlighted arg");
+    assert!(
+        model
+            .flash
+            .as_deref()
+            .unwrap_or("")
+            .contains("theme → Desert Dawn")
+    );
+
+    // The blessed divergence survives only with the palette DISMISSED:
+    // bare /theme + esc + ⏎ cycles and lists (documented).
+    for c in "/theme".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Esc));
+    assert!(!model.palette_open(), "esc dismissed the palette");
+    model.handle(key(KeyCode::Enter));
+    assert_eq!(model.theme, ThemeKey::Ivory, "dismissed bare /theme cycles");
     let flash = model.flash.as_deref().unwrap_or("");
     assert!(flash.contains("theme → Ivory Light"));
     assert!(flash.contains("themes — dawn · ivory · dark"));
+}
+
+// ---- r3 (review round 2 fixes): partial-fragment slot entry ----
+
+#[test]
+fn enter_on_a_partial_arg_command_enters_its_slot() {
+    // Sim acceptSuggestion: ⏎ on a command row that takes args ENTERS the
+    // slot instead of executing (tui.js:2722-2734).
+    let mut model = launcher_model();
+    let before = model.theme;
+    for c in "/th".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Enter));
+    assert_eq!(model.composer, "/theme ", "slot entered, nothing ran");
+    assert_eq!(model.theme, before, "no theme change");
+    let labels: Vec<String> = model.palette_items().iter().map(|i| i.label()).collect();
+    assert_eq!(labels, ["dawn", "ivory", "dark"], "slot rows now offered");
 }

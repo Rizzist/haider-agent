@@ -8,6 +8,7 @@ use crate::projection::SessionProjection;
 use crate::sanctum::SanctumTier;
 use crate::theme::ThemeKey;
 use haider_protocol::EventPayload;
+use haider_protocol::ids::MenuId;
 use haider_protocol::menu::{AnswerVia, MenuAnswer};
 use haider_protocol::state::{HarnessStatus, RunState};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -69,19 +70,29 @@ pub enum AppRequest {
 
 /// A clickable region's action (hit-testing: render reports regions, the
 /// runtime maps clicks back through [`AppModel::handle_hit`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Hits carry VALUES, not row indices (review r2 P2-2): a click resolved
+/// through the previous frame's map must activate exactly what was on
+/// screen — or be dropped — never a different row the model drifted to.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Hit {
     AttachSample(usize),
     /// Aura / Accounts / Peers launcher rows (UI stubs).
     ExtraRow(u8),
-    PaletteRow(usize),
-    MenuOption(usize),
+    /// The palette row's actual content at render time.
+    PaletteRow(PaletteItem),
+    /// A menu option, bound to the menu it was rendered for.
+    MenuOption {
+        menu: MenuId,
+        index: usize,
+    },
     BackChip,
     TalkChip,
     HelpHint,
-    /// The sticky origin line pinned atop a scrolled-back transcript —
-    /// click returns to the live tail (zeroes the scroll-back).
-    StickyJump,
+    /// The sticky origin line — carries the scroll-back that puts the
+    /// producing prompt's first row at the viewport top (sim jumpToSticky:
+    /// stay AT the prompt, tui.js:2637-2645).
+    StickyJump(u16),
 }
 
 /// Everything the reducer consumes.
@@ -146,7 +157,11 @@ pub struct AppModel {
     /// Selected option index while a blocking menu replaces the composer.
     pub menu_selection: usize,
     /// Selected row in the slash palette (open while composer starts with /).
+    /// Ranges over the FULL match list; the render window follows.
     pub palette_selection: usize,
+    /// First visible palette row — the scroll window that keeps the
+    /// selection visible (sim CmdMenu internal scroll, tui.js:2710-2718).
+    pub palette_scroll: usize,
     /// Esc dismissed the palette without clearing the composer (sim
     /// `menuDismissed`); any composer edit re-opens it.
     pub palette_dismissed: bool,
@@ -169,8 +184,9 @@ pub struct AppModel {
     pub scroll_back: u16,
     /// Max scroll-back of the LAST rendered frame — set by the renderer
     /// (interior mutability: render reads `&AppModel`), consumed by
-    /// [`Self::handle_wheel`] to clamp wheel-up (G16). Starts unclamped;
-    /// the first drawn frame tightens it.
+    /// [`Self::handle_wheel`]/[`Self::handle_resize`] to clamp scrolling.
+    /// Starts at 0 (review r2 P2-6): wheel before the first session frame
+    /// must not bank invisible debt.
     pub scroll_max: std::cell::Cell<u16>,
     /// A freshly auto-titled session owes the transcript its
     /// `· session titled` note once the first user message lands.
@@ -194,6 +210,7 @@ impl Default for AppModel {
             samples: sample_sessions(),
             menu_selection: 0,
             palette_selection: 0,
+            palette_scroll: 0,
             palette_dismissed: false,
             help_open: false,
             flash: None,
@@ -202,7 +219,7 @@ impl Default for AppModel {
             turn_active: false,
             auto_play_spent: false,
             scroll_back: 0,
-            scroll_max: std::cell::Cell::new(u16::MAX),
+            scroll_max: std::cell::Cell::new(0),
             title_note_pending: false,
             should_quit: false,
             dirty: true,
@@ -237,12 +254,17 @@ impl AppModel {
         }
     }
 
-    /// The palette is open while the composer is a slash query, esc has not
-    /// dismissed it (sim `menuDismissed`), and no blocking menu owns the
-    /// input.
+    /// The palette is open while the composer is a single-line slash query,
+    /// esc has not dismissed it (sim `menuDismissed`), and no blocking menu
+    /// owns the input. A newline closes it (sim getSuggestions bails on
+    /// `\n`, tui.js:235).
     #[must_use]
     pub fn palette_open(&self) -> bool {
-        if !self.composer.starts_with('/') || self.palette_dismissed || self.help_open {
+        if !self.composer.starts_with('/')
+            || self.composer.contains('\n')
+            || self.palette_dismissed
+            || self.help_open
+        {
             return false;
         }
         // A blocking menu REPLACES the composer, palette included.
@@ -279,9 +301,14 @@ impl AppModel {
                 let rest = spec.name.strip_prefix(body)?;
                 (!rest.is_empty()).then(|| rest.to_owned())
             }
-            PaletteItem::Arg { value, .. } => {
+            PaletteItem::Arg { cmd, value, .. } => {
                 if body.ends_with(char::is_whitespace) {
                     return Some((*value).to_owned());
+                }
+                // Lead case (sim `sugg.lead`): the command is fully typed
+                // with no space yet — ghost the space + argument.
+                if body.eq_ignore_ascii_case(cmd) {
+                    return Some(format!(" {value}"));
                 }
                 let fragment = body.split_whitespace().last().unwrap_or("");
                 let rest = value.strip_prefix(fragment)?;
@@ -309,18 +336,17 @@ impl AppModel {
                 if self.projection.open_menu().is_some() && self.screen == Screen::Session {
                     return;
                 }
-                // Paste is atomic text; pasted newlines become spaces so they
-                // can never trigger submit (rec 14; multi-line lands later).
-                // Big pastes become a pill token (sim, tui.js:2298-2317) —
-                // the raw bytes travel as real attachments in a later wave.
-                let normalized = text.replace("\r\n", "\n");
-                let line_count = normalized.split('\n').count();
-                if line_count > 3 || normalized.chars().count() > 300 {
+                // Sim thresholds measure the RAW clipboard — UTF-16 code
+                // units and raw newline count, BEFORE any normalization
+                // (tui.js:2298-2317). Big pastes become a pill token; small
+                // pastes keep their newlines (multi-line composer).
+                let raw_lines = text.split('\n').count();
+                if raw_lines > 3 || text.encode_utf16().count() > 300 {
                     self.composer
-                        .push_str(&format!("[Pasted {line_count} lines] "));
+                        .push_str(&format!("[Pasted {raw_lines} lines] "));
                 } else {
                     self.composer
-                        .push_str(&normalized.replace(['\r', '\n'], " "));
+                        .push_str(&text.replace("\r\n", "\n").replace('\r', "\n"));
                 }
                 // Any composer edit re-opens a dismissed palette (sim
                 // `setMenuDismissed(false)` on change).
@@ -373,22 +399,36 @@ impl AppModel {
             self.handle_menu_key(key.code);
             return;
         }
+        // ⇧⏎ (kitty-protocol terminals report SHIFT) / ⌥⏎ (the universal
+        // path) insert a newline (sim Shift+Enter, tui.js:2792-2796). Must
+        // precede the palette branch — a newline also closes the palette.
+        if key.code == KeyCode::Enter
+            && key
+                .modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
+        {
+            self.composer.push('\n');
+            self.palette_dismissed = false;
+            return;
+        }
         if self.palette_open() {
             match key.code {
                 KeyCode::Up => {
-                    // Selection wraps around (sim, tui.js:2763-2772).
-                    let count = self.palette_items().len().min(PALETTE_MAX_ROWS);
+                    // Selection wraps over the FULL match list; the window
+                    // follows (sim, tui.js:2763-2772 + 2710-2718).
+                    let count = self.palette_items().len();
                     if count > 0 {
                         self.palette_selection =
                             (self.palette_selection.min(count - 1) + count - 1) % count;
+                        self.scroll_palette_into_view(count);
                     }
                     return;
                 }
                 KeyCode::Down => {
-                    // Only 8 rows render; selection stays visible (r1 P2).
-                    let count = self.palette_items().len().min(PALETTE_MAX_ROWS);
+                    let count = self.palette_items().len();
                     if count > 0 {
                         self.palette_selection = (self.palette_selection + 1) % count;
+                        self.scroll_palette_into_view(count);
                     }
                     return;
                 }
@@ -414,6 +454,7 @@ impl AppModel {
                         None => {}
                     }
                     self.palette_selection = 0;
+                    self.palette_scroll = 0;
                     return;
                 }
                 KeyCode::Esc => {
@@ -421,12 +462,21 @@ impl AppModel {
                     // text; the next composer edit re-opens it.
                     self.palette_dismissed = true;
                     self.palette_selection = 0;
+                    self.palette_scroll = 0;
                     return;
                 }
                 KeyCode::Enter => {
-                    // Enter runs the HIGHLIGHTED command with any typed args
-                    // (r1 P2: /t + Down + Enter must run the selection).
-                    self.run_palette_selection();
+                    // Enter activates the HIGHLIGHTED row (sim
+                    // acceptSuggestion): arg commands enter their slot,
+                    // everything else runs.
+                    let items = self.palette_items();
+                    match items
+                        .get(self.palette_selection.min(items.len().saturating_sub(1)))
+                        .copied()
+                    {
+                        Some(item) => self.activate_palette_item(item),
+                        None => self.execute_slash(),
+                    }
                     return;
                 }
                 _ => {}
@@ -453,6 +503,7 @@ impl AppModel {
             KeyCode::Backspace => {
                 self.composer.pop();
                 self.palette_selection = 0;
+                self.palette_scroll = 0;
                 self.palette_dismissed = false;
             }
             KeyCode::Char(c @ '1'..='3')
@@ -464,6 +515,7 @@ impl AppModel {
             KeyCode::Char(c) => {
                 self.composer.push(c);
                 self.palette_selection = 0;
+                self.palette_scroll = 0;
                 self.palette_dismissed = false;
                 // Typing decays interrupted-idle → idle (sim, tui.js:3020).
                 if self.projection.interrupted() {
@@ -478,6 +530,7 @@ impl AppModel {
         let text = self.composer.trim().to_owned();
         self.composer.clear();
         self.palette_selection = 0;
+        self.palette_scroll = 0;
         self.palette_dismissed = false;
         if text.is_empty() {
             if self.screen == Screen::Launcher && !self.projection.entries().is_empty() {
@@ -514,17 +567,33 @@ impl AppModel {
         self.requests.push(AppRequest::SubmitText(text));
     }
 
-    /// Run the highlighted palette row with any typed args — the ⏎ and
-    /// mouse-click paths share this law (a click must run the CLICKED row,
-    /// never the raw query). An argument row completes the command and runs
-    /// it (sim acceptSuggestion with execute).
-    fn run_palette_selection(&mut self) {
-        let items = self.palette_items();
-        match items
-            .get(self.palette_selection.min(items.len().saturating_sub(1)))
-            .copied()
-        {
-            Some(PaletteItem::Cmd(spec)) => {
+    /// Keep the palette selection inside the visible window (sim CmdMenu
+    /// scroll keep-visible, tui.js:2710-2718).
+    fn scroll_palette_into_view(&mut self, count: usize) {
+        self.palette_scroll = self
+            .palette_scroll
+            .min(count.saturating_sub(PALETTE_MAX_ROWS));
+        if self.palette_selection < self.palette_scroll {
+            self.palette_scroll = self.palette_selection;
+        } else if self.palette_selection >= self.palette_scroll + PALETTE_MAX_ROWS {
+            self.palette_scroll = self.palette_selection + 1 - PALETTE_MAX_ROWS;
+        }
+    }
+
+    /// Activate one palette row — ⏎ and mouse click share this law (the
+    /// click carries the VALUE, so a stale map can never run a different
+    /// row). Sim acceptSuggestion (tui.js:2720-2753): a command with
+    /// argument slots ENTERS its slot instead of executing; arg-less
+    /// commands and argument rows execute.
+    fn activate_palette_item(&mut self, item: PaletteItem) {
+        match item {
+            PaletteItem::Cmd(spec) if has_arg_slots(spec.name) => {
+                self.composer = format!("/{} ", spec.name);
+                self.palette_selection = 0;
+                self.palette_scroll = 0;
+                self.palette_dismissed = false;
+            }
+            PaletteItem::Cmd(spec) => {
                 let args: String = self
                     .composer
                     .trim_start_matches('/')
@@ -537,13 +606,13 @@ impl AppModel {
                 } else {
                     format!("/{} {args}", spec.name)
                 };
+                self.execute_slash();
             }
-            Some(PaletteItem::Arg { cmd, value, .. }) => {
+            PaletteItem::Arg { cmd, value, .. } => {
                 self.composer = format!("/{cmd} {value}");
+                self.execute_slash();
             }
-            None => {}
         }
-        self.execute_slash();
     }
 
     /// Title an untitled session from its first message (sim auto-title
@@ -561,6 +630,7 @@ impl AppModel {
         let raw = self.composer.trim_start_matches('/').trim().to_owned();
         self.composer.clear();
         self.palette_selection = 0;
+        self.palette_scroll = 0;
         self.palette_dismissed = false;
         let mut words = raw.split_whitespace();
         let name = words.next().unwrap_or("").to_ascii_lowercase();
@@ -733,11 +803,19 @@ impl AppModel {
         }
     }
 
-    /// A left-click resolved through the frame's hit map.
+    /// A left-click resolved through the frame's hit map. The map may be
+    /// one frame stale (review r2 P2-2): hits carry values and every
+    /// context-sensitive hit re-checks its context — activate exactly what
+    /// was clicked, or drop the click.
     pub fn handle_hit(&mut self, hit: Hit) {
         self.dirty = true;
         self.flash = None;
         self.auto_play_spent = true;
+        // A visible overlay owns the screen; hits from the covered frame
+        // must not act through it.
+        if self.help_open {
+            return;
+        }
         match hit {
             Hit::AttachSample(index) => self.attach_sample(index),
             Hit::ExtraRow(which) => {
@@ -748,15 +826,19 @@ impl AppModel {
                 };
                 self.flash = Some(format!("· /{name} — UI ready; lands with {wave}"));
             }
-            Hit::PaletteRow(index) => {
-                if index < self.palette_items().len() {
-                    self.palette_selection = index;
-                    self.run_palette_selection();
+            Hit::PaletteRow(item) => {
+                // Dismissed/replaced palettes drop the click.
+                if self.palette_open() {
+                    self.activate_palette_item(item);
                 }
             }
-            Hit::MenuOption(index) => {
-                let count = self.projection.open_menu().map_or(0, |m| m.options.len());
-                if index < count {
+            Hit::MenuOption { menu, index } => {
+                // Only the SAME menu the row was rendered for may answer.
+                let valid = self
+                    .projection
+                    .open_menu()
+                    .is_some_and(|m| m.id == menu && index < m.options.len());
+                if valid {
                     self.menu_selection = index;
                     self.submit_menu_answer();
                 }
@@ -771,7 +853,10 @@ impl AppModel {
                     Some("· ◉ talk — voice lands post-v0.1; the chip is the promise".to_owned());
             }
             Hit::HelpHint => self.help_open = true,
-            Hit::StickyJump => self.scroll_back = 0,
+            Hit::StickyJump(scroll_back) => {
+                // Stay AT the producing prompt (sim jumpToSticky).
+                self.scroll_back = scroll_back.min(self.scroll_max.get());
+            }
         }
     }
 
@@ -791,6 +876,14 @@ impl AppModel {
         } else {
             self.scroll_back = self.scroll_back.saturating_sub(3);
         }
+    }
+
+    /// Terminal resize: re-clamp the scroll debt against the last known
+    /// range and force a redraw (review r2 P2-6 — the next frame rewrites
+    /// the true max).
+    pub fn handle_resize(&mut self) {
+        self.dirty = true;
+        self.scroll_back = self.scroll_back.min(self.scroll_max.get());
     }
 
     fn cycle_theme(&mut self) {

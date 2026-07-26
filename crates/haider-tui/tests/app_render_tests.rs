@@ -157,8 +157,10 @@ fn reducer_handles_quit_composer_and_navigation() {
     assert_eq!(model.composer, "hi");
     model.handle(key(KeyCode::Backspace));
     assert_eq!(model.composer, "h");
+    // Small pastes KEEP their newlines (review r2 P2-4d: real multi-line
+    // composer) — and still never submit.
     model.handle(AppEvent::Paste("a\nb\r\nc".to_owned()));
-    assert_eq!(model.composer, "ha b c", "pasted newlines never submit");
+    assert_eq!(model.composer, "ha\nb\nc", "pasted newlines never submit");
     model.handle(key(KeyCode::Enter));
     assert_eq!(model.composer, "");
 
@@ -676,9 +678,15 @@ fn clicks_attach_sessions_and_wheel_scrolls() {
     })));
     assert_eq!(model.screen, Screen::Session);
 
-    // Wheel scroll-back only in session; back chip returns to launcher.
+    // Wheel scroll-back only in session — and CLAMPED to the rendered
+    // range (review r2 P2-6): before any session frame the max is 0, and a
+    // short transcript never scrolls, so wheel-up banks no invisible debt.
     model.handle_wheel(true);
-    assert_eq!(model.scroll_back, 3);
+    assert_eq!(model.scroll_back, 0, "no debt before/without overflow");
+    let (_, _) = draw_with_hits(&model, 118, 34);
+    assert_eq!(model.scroll_max.get(), 0, "everything visible → max 0");
+    model.handle_wheel(true);
+    assert_eq!(model.scroll_back, 0);
     model.handle_wheel(false);
     assert_eq!(model.scroll_back, 0);
     model.handle_hit(Hit::BackChip);
