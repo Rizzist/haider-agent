@@ -257,7 +257,10 @@ struct ExistingManifestEntry {
 
 fn prepare_fixture(shape: CaptureShape, response: AnthropicCapture) -> PreparedFixture {
     let CaptureShape {
-        name, semantics, ..
+        name,
+        semantics,
+        request,
+        ..
     } = shape;
     let AnthropicCapture {
         status,
@@ -286,7 +289,7 @@ fn prepare_fixture(shape: CaptureShape, response: AnthropicCapture) -> PreparedF
     } else {
         assert_eq!(status, 200, "SSE capture `{name}` must use HTTP 200");
         let items = replay_anthropic_sse(&body);
-        assert_capture_semantics(name, semantics, &body, &items);
+        assert_capture_semantics(name, semantics, &request, &body, &items);
         let wire_name = format!("{name}.sse");
         let golden_name = format!("{name}.events.json");
         PreparedFixture {
@@ -307,12 +310,21 @@ fn prepare_fixture(shape: CaptureShape, response: AnthropicCapture) -> PreparedF
 fn assert_capture_semantics(
     name: &str,
     semantics: CaptureSemantics,
+    request: &TurnRequest,
     body: &[u8],
     items: &[ProviderStreamItem],
 ) {
     assert!(!items.is_empty(), "shape `{name}` produced no replay items");
     match semantics {
         CaptureSemantics::Text | CaptureSemantics::ImageText => {
+            if matches!(semantics, CaptureSemantics::ImageText) {
+                // r2 gate: a text-only capture must NOT be promotable as
+                // image_in — the REQUEST must have carried an image.
+                assert!(
+                    !request.attachments.is_empty(),
+                    "shape `{name}` request must carry an image attachment"
+                );
+            }
             assert_successful_end_turn(name, items);
             assert!(
                 items.iter().any(|item| matches!(
@@ -323,7 +335,7 @@ fn assert_capture_semantics(
             );
         }
         CaptureSemantics::ToolCall => assert_tool_call_capture(name, items),
-        CaptureSemantics::UsageHeavy => assert_usage_capture(name, body, items),
+        CaptureSemantics::UsageHeavy => assert_usage_capture(name, request, body, items),
         CaptureSemantics::OverloadedStream => {
             let message_start = sse_event_offset(body, "message_start")
                 .expect("overload capture must contain message_start");
@@ -439,7 +451,29 @@ fn assert_tool_call_capture(name: &str, items: &[ProviderStreamItem]) {
     );
 }
 
-fn assert_usage_capture(name: &str, body: &[u8], items: &[ProviderStreamItem]) {
+fn assert_usage_capture(
+    name: &str,
+    request: &TurnRequest,
+    body: &[u8],
+    items: &[ProviderStreamItem],
+) {
+    // r2 gate: "usage-heavy" must mean a genuinely large prompt — a trivial
+    // text capture must not satisfy this shape.
+    let request_chars: usize = request
+        .messages
+        .iter()
+        .flat_map(|message| &message.blocks)
+        .map(|block| match block {
+            Block::Text { text } => text.len(),
+            Block::Reasoning { summary } => summary.len(),
+            Block::ToolResult { preview, .. } => preview.len(),
+            _ => 0,
+        })
+        .sum();
+    assert!(
+        request_chars >= 4096,
+        "shape `{name}` request carries only {request_chars} chars — not usage-heavy"
+    );
     assert_successful_end_turn(name, items);
     let wire = std::str::from_utf8(body).expect("usage capture must be UTF-8 SSE");
     assert!(
@@ -453,7 +487,11 @@ fn assert_usage_capture(name: &str, body: &[u8], items: &[ProviderStreamItem]) {
             _ => None,
         })
         .expect("usage-heavy capture must emit UsageUpdate");
-    assert!(usage.input > 0, "usage input tokens must be populated");
+    assert!(
+        usage.input >= 1000,
+        "usage-heavy capture must report >=1000 input tokens (got {})",
+        usage.input
+    );
     assert!(usage.output > 0, "usage output tokens must be populated");
     assert_eq!(usage.reasoning, 0);
     assert_eq!(usage.source, UsageSource::ProviderReported);
@@ -720,4 +758,61 @@ fn json_bytes(value: &impl Serialize) -> Vec<u8> {
     let mut bytes = serde_json::to_vec_pretty(value).expect("serializes promoted fixture");
     bytes.push(b'\n');
     bytes
+}
+
+// ---- negative promotion-gate tests (offline; review r2) ----
+// A well-formed TEXT capture must NOT be promotable under the image_in or
+// usage_heavy shapes: wrong-shape captures may never replace named fixtures.
+
+fn text_capture_for_gate_tests() -> (TurnRequest, Vec<u8>, Vec<ProviderStreamItem>) {
+    let body = fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/anthropic/text_only.sse"),
+    )
+    .expect("committed text fixture");
+    let items = replay_anthropic_sse(&body);
+    let request = TurnRequest {
+        messages: vec![Message::user_text("small prompt")],
+        model: "claude-fable-5".to_owned(),
+        max_tokens: 512,
+        system_prompt: None,
+        tools: Vec::new(),
+        attachments: Vec::new(),
+    };
+    (request, body, items)
+}
+
+#[test]
+fn text_capture_cannot_pass_the_image_gate() {
+    let (request, body, items) = text_capture_for_gate_tests();
+    let outcome = std::panic::catch_unwind(|| {
+        assert_capture_semantics(
+            "image_in",
+            CaptureSemantics::ImageText,
+            &request,
+            &body,
+            &items,
+        );
+    });
+    assert!(
+        outcome.is_err(),
+        "a text capture without an image attachment must fail the image_in gate"
+    );
+}
+
+#[test]
+fn small_capture_cannot_pass_the_usage_heavy_gate() {
+    let (request, body, items) = text_capture_for_gate_tests();
+    let outcome = std::panic::catch_unwind(|| {
+        assert_capture_semantics(
+            "usage_heavy",
+            CaptureSemantics::UsageHeavy,
+            &request,
+            &body,
+            &items,
+        );
+    });
+    assert!(
+        outcome.is_err(),
+        "a small-prompt capture must fail the usage_heavy gate"
+    );
 }
