@@ -32,17 +32,20 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
     frame.render_widget(Block::default().style(theme.text_style()), area);
 
     let mut hits: Vec<(Rect, Hit)> = Vec::new();
-    // The status row is the FIRST chrome to yield when a blocking menu
-    // cannot otherwise fit its options (review r5 P2-1: options outrank
-    // everything). Minimal in-session need with the full 4-row chrome is
-    // status(1) + chrome(4) + options.
-    let status_height: u16 = if model.screen == Screen::Session
-        && model
+    // The status row is the FIRST chrome to yield when a session's sacred
+    // input — a blocking menu's options OR the composer's cursor row
+    // (review r5 P2-1 + r6 P2-1) — cannot otherwise fit. Minimal need
+    // with the full 4-row chrome is status(1) + chrome(4) + floor.
+    let status_height: u16 = if model.screen == Screen::Session {
+        let input_floor = model
             .projection
             .open_menu()
-            .is_some_and(|menu| (area.height as usize) < 1 + 4 + menu.options.len())
-    {
-        0
+            .map_or(1, |menu| menu.options.len());
+        if (area.height as usize) < 1 + 4 + input_floor {
+            0
+        } else {
+            1
+        }
     } else {
         1
     };
@@ -60,6 +63,15 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
     if status_height > 0 {
         render_status_bar(model, theme, frame, status, &mut hits);
     }
+    // Hit-map seam guard (review r6 P2-1b): a hit must be a real, visible
+    // region — non-empty and fully inside the frame. Shed or starved
+    // regions can never leak phantom click targets, at ANY size.
+    hits.retain(|(rect, _)| {
+        rect.width > 0
+            && rect.height > 0
+            && rect.x.saturating_add(rect.width) <= area.x.saturating_add(area.width)
+            && rect.y.saturating_add(rect.height) <= area.y.saturating_add(area.height)
+    });
     hits
 }
 
@@ -195,26 +207,37 @@ fn render_launcher(
         Vec::new()
     };
     let mut palette_height = u16::try_from(palette.len()).unwrap_or(0);
-    // Sacred-input ledger (review r3 P2-1a, launcher form): the composer
-    // grows up to its need but tail-windows to whatever the height allows —
-    // the cursor row is never hidden. The spacer gap yields first, then the
-    // palette, before the composer loses a row.
+    // Sacred-input ledger (review r3 P2-1a, launcher form; r6 P2-1: same
+    // shed ladder as the session): the composer grows up to its need but
+    // tail-windows to whatever the height allows — the cursor row is never
+    // hidden. Under pressure the gap yields, then the content's sacred
+    // row, then the rule, before the composer loses its row.
     let needed = composer_height(model);
     let mut gap: u16 = 1;
-    let mut input_avail = area.height.saturating_sub(1 + 1 + gap); // content + rule
+    let mut content_min: u16 = 1;
+    let mut rule_h: u16 = 1;
+    let mut input_avail = area.height.saturating_sub(content_min + rule_h + gap);
     if input_avail < 1 {
         gap = 0;
-        input_avail = area.height.saturating_sub(2);
+        input_avail = area.height.saturating_sub(content_min + rule_h);
     }
-    let composer_rows = needed.min(input_avail).max(1);
-    let fixed = 1 + 1 + composer_rows + gap; // content min + rule + composer + gap
+    if input_avail < 1 {
+        content_min = 0;
+        input_avail = area.height.saturating_sub(rule_h);
+    }
+    if input_avail < 1 {
+        rule_h = 0;
+        input_avail = area.height;
+    }
+    let composer_rows = needed.min(input_avail).clamp(1, area.height.max(1));
+    let fixed = content_min + rule_h + composer_rows + gap;
     if palette_height > area.height.saturating_sub(fixed) {
         palette_height = 0;
     }
     let [content_area, palette_area, rule_area, composer_area, _gap] = Layout::vertical([
-        Constraint::Min(1),
+        Constraint::Min(content_min),
         Constraint::Length(palette_height),
-        Constraint::Length(1),
+        Constraint::Length(rule_h),
         Constraint::Length(composer_rows),
         Constraint::Length(gap),
     ])
@@ -419,45 +442,45 @@ fn render_session(
             .height
             .saturating_sub(header_h + header_rule_h + input_rule_h + transcript_min);
     }
-    if menu.is_some() {
-        // Menu options outrank even the transcript's sacred row (r4 P2-1)
-        // and then the chrome itself, piece by piece (r5 P2-1): session
-        // line → header rule → input rule → product line.
-        if input_avail < floor_input {
-            transcript_min = 0;
-        }
-        if area
-            .height
-            .saturating_sub(header_h + header_rule_h + input_rule_h)
-            < floor_input
-        {
-            header_h = 1;
-        }
-        if area
-            .height
-            .saturating_sub(header_h + header_rule_h + input_rule_h)
-            < floor_input
-        {
-            header_rule_h = 0;
-        }
-        if area
-            .height
-            .saturating_sub(header_h + header_rule_h + input_rule_h)
-            < floor_input
-        {
-            input_rule_h = 0;
-        }
-        if area
-            .height
-            .saturating_sub(header_h + header_rule_h + input_rule_h)
-            < floor_input
-        {
-            header_h = 0;
-        }
-        input_avail = area
-            .height
-            .saturating_sub(header_h + header_rule_h + input_rule_h + gap + transcript_min);
+    // The sacred input — a menu's options OR the composer's cursor row —
+    // outranks the transcript's sacred row (r4 P2-1) and then the chrome
+    // itself, piece by piece (r5 P2-1, extended to the composer path by
+    // r6 P2-1: the menu-close transition must never starve the composer):
+    // session line → header rule → input rule → product line.
+    if input_avail < floor_input {
+        transcript_min = 0;
     }
+    if area
+        .height
+        .saturating_sub(header_h + header_rule_h + input_rule_h)
+        < floor_input
+    {
+        header_h = 1;
+    }
+    if area
+        .height
+        .saturating_sub(header_h + header_rule_h + input_rule_h)
+        < floor_input
+    {
+        header_rule_h = 0;
+    }
+    if area
+        .height
+        .saturating_sub(header_h + header_rule_h + input_rule_h)
+        < floor_input
+    {
+        input_rule_h = 0;
+    }
+    if area
+        .height
+        .saturating_sub(header_h + header_rule_h + input_rule_h)
+        < floor_input
+    {
+        header_h = 0;
+    }
+    input_avail = area
+        .height
+        .saturating_sub(header_h + header_rule_h + input_rule_h + gap + transcript_min);
     let chrome = header_h + header_rule_h + input_rule_h;
     let input_height = needed_input
         .min(input_avail)
@@ -892,6 +915,11 @@ fn render_composer(
     row_area: Rect,
     hits: &mut Vec<(Rect, Hit)>,
 ) {
+    // Source-region guard (mirrors menu_block): an empty area renders
+    // nothing and emits NO hits — never a phantom chip over another row.
+    if row_area.height == 0 {
+        return;
+    }
     frame.render_widget(
         Paragraph::new(Line::styled(
             "─".repeat(rule_area.width as usize),

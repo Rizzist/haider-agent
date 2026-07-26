@@ -33,6 +33,7 @@ Deliberate gaps against the `/tui` sim, each with its landing wave:
 | crates/haider-tui | Hover-select/hover-highlight (sim `onMouseEnter`) | Left-click + wheel only — mouse-move reporting floods the input channel for cosmetic gain | open |
 | crates/haider-tui | Mid-composer cursor movement (←→/click editing; the cursor is end-of-text) | TUI2.4 shipped real multi-line entry (⇧⏎ where reported + ⌥⏎ universally, growth to 5 rows, vertical+horizontal tail windows, newline-preserving small pastes); a movable cursor + selection is an editor feature | planned → daemon-era input stack |
 | crates/haider-tui | `\t` in pre-wrap agent bodies expands to a fixed 4 cells | Terminal buffer cells cannot render a tab; a fixed expansion is the one deliberate divergence from CSS pre-wrap (review r3 P2-5, documented at `wrap_body`) | deliberate |
+| crates/haider-tui | Live-geometry scroll parity: a wheel-up between a resize and the next frame clamps to the ≤1-frame-stale range (holds the last-known top) instead of the not-yet-measured new range | The sim reads DOM geometry synchronously (tui.js:2648); we reconcile at 33ms frames — reconcile-then-apply (r5 P2-2) trades one frame of optimism for burst-debt safety; accepted r6 P3-2, pinned in `review4_fix_tests` | deliberate |
 
 ## Adopted
 

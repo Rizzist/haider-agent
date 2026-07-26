@@ -75,6 +75,19 @@ fn main() {
     // Chrome yields to the blocking card below 90×7 (review r5 P2-1):
     // status row + session line shed, both options intact.
     dump_at(&menu_model, "session + blocking menu @ 90×5", 90, 5);
+    // The menu-close transition (review r6 P2-1): the composer inherits
+    // the ladder — the answered card gives way to an EDITABLE composer.
+    let mut answered_model = menu_model;
+    answered_model.handle(AppEvent::Envelope(Box::new(
+        haider_protocol::EventPayload::MenuAnswered(haider_protocol::menu::MenuAnswer {
+            menu: haider_protocol::ids::MenuId::new("t0-menu-1"),
+            option_key: Some("allow".to_owned()),
+            option_index: 0,
+            value: None,
+            via: haider_protocol::menu::AnswerVia::Tui,
+        }),
+    )));
+    dump_at(&answered_model, "session @ 90×5 · menu answered", 90, 5);
     // Full session.
     for payload in script.iter().skip(6) {
         model.handle(AppEvent::Envelope(Box::new(payload.clone())));

@@ -181,13 +181,14 @@ pub struct AppModel {
     pub auto_play_spent: bool,
     /// Wheel scroll-back offset in the session transcript (0 = follow
     /// bottom; wheel up increases, wheel down decreases). A `Cell` because
-    /// RENDER is the single scroll authority (review r3 P2-2): every frame
-    /// reconciles this against the true max, so no path can bank invisible
-    /// debt — the wheel only expresses intent.
+    /// RENDER is the single scroll authority (review r3 P2-2). The wheel
+    /// applies reconcile-then-apply (review r5 P2-2): fold to the
+    /// ≤1-frame-stale [`Self::scroll_max`], then apply the notch clamped
+    /// to it — bursts bank no debt; the frame's reconcile is the backstop.
     pub scroll_back: std::cell::Cell<u16>,
     /// Max scroll-back of the LAST rendered frame — written by the
-    /// renderer; sticky jumps clamp against it. The wheel does NOT (review
-    /// r4 P3-3: raw intent, frame-reconciled). Starts at 0 (review r2
+    /// renderer; wheel notches and sticky jumps clamp against it
+    /// (reconcile-then-apply, review r5 P2-2). Starts at 0 (review r2
     /// P2-6).
     pub scroll_max: std::cell::Cell<u16>,
     /// The sticky origin line is suppressed after a sticky jump until the
