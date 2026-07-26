@@ -877,11 +877,12 @@ impl AppModel {
     }
 
     /// Wheel scroll in the session transcript (⇧-drag selects text
-    /// natively). The wheel records RAW intent — never clamped against a
-    /// possibly-stale `scroll_max` (review r4 P3-3: a notch between resize
-    /// and redraw must not be lost). The frame reconciles against the true
-    /// range before painting, so overshoot is invisible by construction
-    /// (sim reads live DOM geometry, tui.js:2648).
+    /// natively). Reconcile-then-apply (review r5 P2-2): the offset first
+    /// folds to the last frame's truth (`scroll_max` is at most one frame
+    /// stale), THEN the notch applies clamped to it — queued bursts can
+    /// never bank unbounded debt, and a reversal mid-burst always moves
+    /// the view. The frame's own reconcile stays as the backstop (sim
+    /// reads live DOM geometry, tui.js:2648).
     pub fn handle_wheel(&mut self, up: bool) {
         if self.screen != Screen::Session || self.help_open {
             return;
@@ -890,13 +891,14 @@ impl AppModel {
         // A real scroll lifts the post-jump sticky suppression (sim
         // onTranscriptScroll → computeSticky).
         self.sticky_suppressed = false;
-        if up {
-            self.scroll_back
-                .set(self.scroll_back.get().saturating_add(3));
+        let max = self.scroll_max.get();
+        let current = self.scroll_back.get().min(max);
+        let next = if up {
+            current.saturating_add(3).min(max)
         } else {
-            self.scroll_back
-                .set(self.scroll_back.get().saturating_sub(3));
-        }
+            current.saturating_sub(3)
+        };
+        self.scroll_back.set(next);
     }
 
     /// Terminal resize: force a redraw. The frame itself reconciles the

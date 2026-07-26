@@ -72,6 +72,9 @@ fn main() {
     // Sacred options at short heights (review r3 P2-1b): hint + body shed,
     // options never.
     dump_at(&menu_model, "session + blocking menu @ 90×10", 90, 10);
+    // Chrome yields to the blocking card below 90×7 (review r5 P2-1):
+    // status row + session line shed, both options intact.
+    dump_at(&menu_model, "session + blocking menu @ 90×5", 90, 5);
     // Full session.
     for payload in script.iter().skip(6) {
         model.handle(AppEvent::Envelope(Box::new(payload.clone())));

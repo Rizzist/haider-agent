@@ -161,32 +161,42 @@ fn streaming_cursor_never_leaves_the_rail() {
     assert!(rows[inline_y as usize].contains('▏'));
 }
 
-// ---- P3-3: a wheel notch between resize and redraw is honored ----
+// ---- P3-3 (r5 semantics): wheel between resize and redraw ----
 
 #[test]
 fn wheel_notch_between_resize_and_redraw_is_honored() {
+    // Under reconcile-then-apply (review r5 P2-2) a notch always applies
+    // against the LAST KNOWN truth — never more than one frame stale, and
+    // never banking debt. A post-shrink pre-redraw up-notch holds the
+    // last-known top; the next notch after the frame advances into the
+    // newly-grown range. Nothing is ever lost relative to what the frame
+    // knew.
     let mut model = session_model();
     // At 90×16 the transcript overflows a little; ride to the top.
     let (_, _, _) = draw(&model, 90, 16);
     for _ in 0..50 {
         model.handle_wheel(true);
     }
-    let (_, _, _) = draw(&model, 90, 16);
     let old_max = model.scroll_max.get();
     assert!(old_max > 0, "overflow at 90×16");
     assert_eq!(model.scroll_back.get(), old_max, "at the old top");
     // SHRINK (range grows), then one wheel-up notch BEFORE any redraw:
-    // raw intent is recorded, not clamped against the stale max.
+    // the notch clamps to the last-known top — no debt, no loss.
     dispatch_input(&mut model, &[], Event::Resize(90, 12));
     model.handle_wheel(true);
-    // The next frame reconciles against the TRUE (larger) range — the
-    // notch is honored, not lost.
+    assert_eq!(model.scroll_back.get(), old_max, "held at last-known top");
     let (_, _, _) = draw(&model, 90, 12);
     let new_max = model.scroll_max.get();
     assert!(new_max >= old_max + 3, "shrinking grew the range");
+    assert_eq!(model.scroll_back.get(), old_max, "frame confirms it");
+    // The next notch, now against fresh truth, advances the view.
+    model.handle_wheel(true);
     assert_eq!(
         model.scroll_back.get(),
-        old_max + 3,
-        "the pre-redraw notch moved the view"
+        (old_max + 3).min(new_max),
+        "post-frame notch advances into the grown range"
     );
+    // And a reversal ALWAYS moves the view (the r5 law).
+    model.handle_wheel(false);
+    assert_eq!(model.scroll_back.get(), old_max, "reversal moves back");
 }

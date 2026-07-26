@@ -32,7 +32,22 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
     frame.render_widget(Block::default().style(theme.text_style()), area);
 
     let mut hits: Vec<(Rect, Hit)> = Vec::new();
-    let [body, status] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
+    // The status row is the FIRST chrome to yield when a blocking menu
+    // cannot otherwise fit its options (review r5 P2-1: options outrank
+    // everything). Minimal in-session need with the full 4-row chrome is
+    // status(1) + chrome(4) + options.
+    let status_height: u16 = if model.screen == Screen::Session
+        && model
+            .projection
+            .open_menu()
+            .is_some_and(|menu| (area.height as usize) < 1 + 4 + menu.options.len())
+    {
+        0
+    } else {
+        1
+    };
+    let [body, status] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(status_height)]).areas(area);
     match model.screen {
         Screen::Boot => render_boot(model, theme, frame, body),
         Screen::Launcher => render_launcher(model, theme, frame, body, &mut hits),
@@ -42,7 +57,9 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
         render_help(theme, frame, body);
         hits.clear();
     }
-    render_status_bar(model, theme, frame, status, &mut hits);
+    if status_height > 0 {
+        render_status_bar(model, theme, frame, status, &mut hits);
+    }
     hits
 }
 
@@ -365,16 +382,19 @@ fn render_session(
 ) {
     // A blocking menu REPLACES the composer (sim §3 law) and takes its rows.
     //
-    // Sacred-input height ledger (review r3 P2-1 + r4 P2-1) — invariants
-    // at ANY size:
+    // Sacred-input height ledger (review r3 P2-1 + r4 P2-1 + r5 P2-1) —
+    // invariants at ANY size:
     // (a) the composer's CURSOR row is visible: growth steals from the
     //     transcript first (up to 5 rows, sim autoGrow); when even that
     //     cannot fit, the composer tail-windows to its allocation instead
     //     of hiding the cursor;
-    // (b) a menu's OPTIONS are always visible — they outrank EVERYTHING.
-    //     Full shed order under pressure: gap → hint → body-from-top →
-    //     title → the transcript's sacred row (the sim's flex transcript
-    //     collapses entirely, tui.js:4444) → options never.
+    // (b) a menu's OPTIONS are always visible — they outrank EVERYTHING,
+    //     chrome included. Full shed order under pressure: gap → hint →
+    //     body-from-top → title-later → the transcript's sacred row (the
+    //     sim's flex transcript collapses, tui.js:4444) → status row
+    //     (handled in `render`) → header line 2 → header rule → input rule
+    //     → header line 1 → options never (below option count the menu
+    //     WINDOWS them around the selection with ⋮ markers).
     let menu = model.projection.open_menu();
     let menu_wrapped_body_rows = menu.map_or(0, |m| wrapped_menu_body(m, area.width).len());
     let needed_input = menu.map_or_else(
@@ -385,24 +405,64 @@ fn render_session(
     // rule(1) + input rule(1) + gap(1) + one sacred transcript row.
     let mut gap: u16 = 1;
     let mut transcript_min: u16 = 1;
-    let chrome: u16 = 2 + 1 + 1;
+    let mut header_h: u16 = 2;
+    let mut header_rule_h: u16 = 1;
+    let mut input_rule_h: u16 = 1;
     let floor_input = menu.map_or(1, |m| u16::try_from(m.options.len().max(1)).unwrap_or(1));
-    let mut input_avail = area.height.saturating_sub(chrome + gap + transcript_min);
+    let mut input_avail = area
+        .height
+        .saturating_sub(header_h + header_rule_h + input_rule_h + gap + transcript_min);
     if input_avail < floor_input {
         // The spacer gap yields before any sacred row does.
         gap = 0;
-        input_avail = area.height.saturating_sub(chrome + transcript_min);
+        input_avail = area
+            .height
+            .saturating_sub(header_h + header_rule_h + input_rule_h + transcript_min);
     }
-    if input_avail < floor_input && menu.is_some() {
-        // Menu options outrank even the transcript's sacred row (review
-        // r4 P2-1): a hidden blocking control is worse than a collapsed
-        // transcript.
-        transcript_min = 0;
-        input_avail = area.height.saturating_sub(chrome);
+    if menu.is_some() {
+        // Menu options outrank even the transcript's sacred row (r4 P2-1)
+        // and then the chrome itself, piece by piece (r5 P2-1): session
+        // line → header rule → input rule → product line.
+        if input_avail < floor_input {
+            transcript_min = 0;
+        }
+        if area
+            .height
+            .saturating_sub(header_h + header_rule_h + input_rule_h)
+            < floor_input
+        {
+            header_h = 1;
+        }
+        if area
+            .height
+            .saturating_sub(header_h + header_rule_h + input_rule_h)
+            < floor_input
+        {
+            header_rule_h = 0;
+        }
+        if area
+            .height
+            .saturating_sub(header_h + header_rule_h + input_rule_h)
+            < floor_input
+        {
+            input_rule_h = 0;
+        }
+        if area
+            .height
+            .saturating_sub(header_h + header_rule_h + input_rule_h)
+            < floor_input
+        {
+            header_h = 0;
+        }
+        input_avail = area
+            .height
+            .saturating_sub(header_h + header_rule_h + input_rule_h + gap + transcript_min);
     }
-    let input_height = needed_input.min(input_avail).max(floor_input.min(
-        area.height.saturating_sub(chrome), // absolute best-effort floor
-    ));
+    let chrome = header_h + header_rule_h + input_rule_h;
+    let input_height = needed_input
+        .min(input_avail)
+        .max(floor_input.min(area.height.saturating_sub(chrome)))
+        .clamp(1, area.height.max(1));
     // Short windows: todos, then the palette, yield entirely before the
     // composer/menu loses a row (review r1 P2).
     let fixed = chrome + input_height + gap;
@@ -436,12 +496,12 @@ fn render_session(
         composer_area,
         _gap,
     ] = Layout::vertical([
-        Constraint::Length(2),
-        Constraint::Length(1),
+        Constraint::Length(header_h),
+        Constraint::Length(header_rule_h),
         Constraint::Min(transcript_min),
         Constraint::Length(todos_height),
         Constraint::Length(palette_height),
-        Constraint::Length(1),
+        Constraint::Length(input_rule_h),
         Constraint::Length(input_height),
         Constraint::Length(gap),
     ])
@@ -481,6 +541,8 @@ fn render_session(
             theme.dim_style(),
         ),
     ];
+    // Shed chrome renders nothing: a 1-row header keeps only the product
+    // line (the area clips line 2), a 0-row header/rule disappears whole.
     frame.render_widget(
         Paragraph::new(Text::from(vec![
             Line::from(header_top),
@@ -496,15 +558,17 @@ fn render_session(
         )),
         header_rule,
     );
-    hits.push((
-        Rect {
-            x: header_area.x,
-            y: header_area.y,
-            width: 10.min(header_area.width),
-            height: 1,
-        },
-        Hit::BackChip,
-    ));
+    if header_area.height > 0 {
+        hits.push((
+            Rect {
+                x: header_area.x,
+                y: header_area.y,
+                width: 10.min(header_area.width),
+                height: 1,
+            },
+            Hit::BackChip,
+        ));
+    }
 
     // Transcript: bottom-anchored; wheel scroll-back offsets follow-bottom.
     let mut lines: Vec<Line<'_>> = Vec::new();
@@ -678,11 +742,15 @@ fn menu_block(
     area: Rect,
 ) -> (Vec<Line<'static>>, Vec<(u16, usize)>) {
     let allocated = area.height as usize;
+    if allocated == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    let selection = selection.min(menu.options.len().saturating_sub(1));
     let mut body_rows = wrapped_menu_body(menu, area.width);
     let needed = 1 + body_rows.len() + menu.options.len() + 1;
     let mut show_title = true;
     let mut show_hint = true;
-    let mut over = needed.saturating_sub(allocated.max(menu.options.len()));
+    let mut over = needed.saturating_sub(allocated);
     if over > 0 {
         show_hint = false;
         over -= 1;
@@ -693,6 +761,17 @@ fn menu_block(
     if over > 0 {
         show_title = false;
     }
+    // Floor case (review r5 P2-1): fewer rows than options even with all
+    // chrome shed — WINDOW the options around the selection (the palette
+    // viewport pattern); ⋮ marks hidden neighbors. Every option stays
+    // reachable by ↑↓ (the window follows) and answerable by digit.
+    let option_slots = allocated
+        .saturating_sub(usize::from(show_title) + body_rows.len() + usize::from(show_hint))
+        .max(1);
+    let window_len = menu.options.len().min(option_slots);
+    let start = selection.min(menu.options.len().saturating_sub(window_len));
+    let hidden_above = start > 0;
+    let hidden_below = start + window_len < menu.options.len();
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut option_rows: Vec<(u16, usize)> = Vec::new();
@@ -709,11 +788,16 @@ fn menu_block(
             Span::styled(body_row, theme.dim_style()),
         ]));
     }
-    for (index, option) in menu.options.iter().enumerate() {
+    for (offset, option) in menu.options.iter().skip(start).take(window_len).enumerate() {
+        let index = start + offset;
         let selected = index == selection;
         let cursor = if selected { "❯" } else { " " };
+        // The gutter's first cell carries the ⋮ viewport marker on edge
+        // rows adjacent to hidden options — none may vanish silently.
+        let edge = (offset == 0 && hidden_above) || (offset + 1 == window_len && hidden_below);
         let mut spans = vec![
-            Span::styled(format!(" {cursor} "), theme.gold_style()),
+            Span::styled(if edge { "⋮" } else { " " }, theme.faint_style()),
+            Span::styled(format!("{cursor} "), theme.gold_style()),
             Span::styled(
                 format!("{}. {}", index + 1, option.label),
                 if selected {
