@@ -15,6 +15,8 @@
 
 mod env_bridge;
 mod keychain;
+#[cfg(test)]
+mod keychain_tests;
 mod resolver;
 mod store;
 mod vault;

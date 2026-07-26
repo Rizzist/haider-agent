@@ -1,5 +1,11 @@
 #![allow(clippy::unwrap_used)] // Test failures should stop at the asserted boundary.
 
+#[cfg(unix)]
+use std::ffi::OsString;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStringExt;
+#[cfg(unix)]
+use std::process::Command;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -8,6 +14,13 @@ use haider_accounts::{
     CredentialStatus, ErrorCode, JsonFileStore, KeychainVault, MemoryVault, Resolver,
     RotationCallback, RotationDecision, StoreLike, Vault, import_env,
 };
+
+#[cfg(unix)]
+const NOT_UNICODE_HELPER_FLAG: &str = "HAIDER_ACCOUNTS_NOT_UNICODE_HELPER";
+#[cfg(unix)]
+const NOT_UNICODE_ENV_VAR: &str = "HAIDER_ACCOUNTS_NOT_UNICODE_VALUE";
+#[cfg(unix)]
+const NOT_UNICODE_SECRET: &[u8] = &[0x66, 0x6f, 0xff];
 
 fn descriptor(
     alias: &str,
@@ -219,6 +232,39 @@ fn current_limit_delegates_rotation_decision_to_callback() {
 }
 
 #[test]
+fn rotation_target_that_is_also_limited_stops_after_one_callback() {
+    let mut accounts = AccountStore::new(SnapshotStore::default()).unwrap();
+    accounts
+        .add(descriptor(
+            "limited-active",
+            "openai",
+            CredentialStatus::Limited { until_ms: u64::MAX },
+            true,
+        ))
+        .unwrap();
+    accounts
+        .add(descriptor(
+            "limited-target",
+            "openai",
+            CredentialStatus::Limited { until_ms: u64::MAX },
+            false,
+        ))
+        .unwrap();
+    let vault = MemoryVault::new();
+    let callback = FixedRotation::new(RotationDecision::RotateTo(CredentialAlias::new(
+        "limited-target",
+    )));
+    let resolver = Resolver::new(&accounts, &vault, &callback);
+
+    let error = resolver.resolve_for_provider("openai").unwrap_err();
+
+    assert_eq!(error.code, ErrorCode::CredentialLimited);
+    assert!(error.retryable);
+    assert!(error.message.contains("limited-target"));
+    assert_eq!(callback.calls(), 1);
+}
+
+#[test]
 fn wait_and_stop_decisions_preserve_retryability() {
     for (decision, expected_retryable) in [
         (RotationDecision::Wait, true),
@@ -268,11 +314,63 @@ fn env_import_of_unset_variable_reports_credential_missing() {
     assert!(error.message.contains("HAIDER_ACCOUNTS_TEST_UNSET_VAR"));
 }
 
+#[cfg(unix)]
+#[test]
+fn env_import_of_not_unicode_value_never_exposes_secret() {
+    if std::env::var_os(NOT_UNICODE_HELPER_FLAG).is_some() {
+        run_not_unicode_import_helper();
+        return;
+    }
+
+    let output = Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("env_import_of_not_unicode_value_never_exposes_secret")
+        .arg("--nocapture")
+        .env(NOT_UNICODE_HELPER_FLAG, "1")
+        .env(
+            NOT_UNICODE_ENV_VAR,
+            OsString::from_vec(NOT_UNICODE_SECRET.to_vec()),
+        )
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert_not_unicode_secret_absent(&output.stdout);
+    assert_not_unicode_secret_absent(&output.stderr);
+}
+
+#[cfg(unix)]
+fn run_not_unicode_import_helper() {
+    let vault = MemoryVault::new();
+    let error = import_env(&vault, "not-unicode-test", NOT_UNICODE_ENV_VAR).unwrap_err();
+    let debug = format!("{error:?}");
+    let serialized = serde_json::to_vec(&error).unwrap();
+
+    assert_eq!(error.code, ErrorCode::CredentialMissing);
+    assert!(!error.retryable);
+    assert_not_unicode_secret_absent(error.message.as_bytes());
+    assert_not_unicode_secret_absent(debug.as_bytes());
+    assert_not_unicode_secret_absent(&serialized);
+
+    println!("message={}", error.message);
+    println!("debug={debug}");
+    println!("serialized={}", String::from_utf8(serialized).unwrap());
+}
+
 #[test]
 fn json_file_store_uses_profile_relative_accounts_file() {
     let directory = tempfile::tempdir().unwrap();
     let store = JsonFileStore::new(directory.path());
     let mut accounts = AccountStore::new(store.clone()).unwrap();
+    let vault = MemoryVault::new();
+    let alias = CredentialAlias::new("persisted");
+    let vaulted_secret = b"vaulted-json-sentinel-7f4b3e9102";
+
+    vault.put(&alias, vaulted_secret).unwrap();
+    assert_eq!(
+        vault.resolve(&alias).unwrap().expose_secret(),
+        vaulted_secret
+    );
 
     accounts
         .add(descriptor(
@@ -284,9 +382,9 @@ fn json_file_store_uses_profile_relative_accounts_file() {
         .unwrap();
 
     assert_eq!(store.path(), directory.path().join("accounts.json"));
-    let json = std::fs::read_to_string(store.path()).unwrap();
-    assert!(json.contains("\"alias\": \"persisted\""));
-    assert!(!json.contains("secret"));
+    let json = std::fs::read(store.path()).unwrap();
+    assert!(contains_bytes(&json, b"\"alias\": \"persisted\""));
+    assert_bytes_absent(&json, vaulted_secret);
 }
 
 #[cfg(target_os = "macos")]
@@ -323,6 +421,31 @@ fn assert_active<S: StoreLike>(accounts: &AccountStore<S>, provider: &str, alias
             .map(|account| account.alias.as_str()),
         Some(alias)
     );
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+fn assert_bytes_absent(haystack: &[u8], needle: &[u8]) {
+    assert!(!contains_bytes(haystack, needle));
+}
+
+#[cfg(unix)]
+fn assert_not_unicode_secret_absent(bytes: &[u8]) {
+    // Cover raw propagation, OsString's escaped Debug/Display form, and lossy
+    // UTF-8 conversion. A regression must not become invisible merely because
+    // Rust renders the invalid byte instead of writing it verbatim.
+    for representation in [
+        NOT_UNICODE_SECRET,
+        b"fo\\xFF",
+        b"fo\\xff",
+        b"fo\xef\xbf\xbd",
+    ] {
+        assert_bytes_absent(bytes, representation);
+    }
 }
 
 #[derive(Default)]
