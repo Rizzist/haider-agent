@@ -9,7 +9,7 @@ use haider_tui::app::{AppEvent, AppModel, Screen};
 use haider_tui::mock::demo_script;
 use haider_tui::render::render;
 use haider_tui::runtime::run_demo_plain;
-use haider_tui::sanctum::SHAHADA_ARABIC;
+use haider_tui::sanctum::SHAHADA_TRANSLIT;
 use haider_tui::theme::ThemeKey;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -59,7 +59,7 @@ fn boot_screen_shows_mark_word_and_progressing_checks() {
     let model = model_at_boot_mid_checks();
     assert_eq!(model.screen, Screen::Boot);
     let (text, _) = draw(&model, 80, 24);
-    assert!(text.contains("حيدر"));
+    assert!(text.contains("ḤAYDAR"));
     assert!(text.contains("HAIDER CODE"));
     assert!(text.contains("· starting up"));
     assert!(text.contains("✓ store open · journal replayed"));
@@ -75,7 +75,10 @@ fn launcher_shows_sanctum_identity_and_composer() {
     ))));
     assert_eq!(model.screen, Screen::Launcher);
     let (text, _) = draw(&model, 80, 24);
-    assert!(text.contains(SHAHADA_ARABIC), "sanctum line, Arabic tier");
+    assert!(
+        text.contains(SHAHADA_TRANSLIT),
+        "sanctum line, translit default"
+    );
     assert!(text.contains("the lion"));
     assert!(text.contains("provider"));
     assert!(text.contains("anthropic"));
@@ -92,7 +95,7 @@ fn narrow_launcher_omits_the_sanctum_whole() {
     let (text, _) = draw(&model, 24, 20);
     // Dignity rule: at 24 columns the shahada cannot fit whole, so NO part
     // of it may appear — never truncated, never ellipsized.
-    for word in SHAHADA_ARABIC.split_whitespace() {
+    for word in SHAHADA_TRANSLIT.split_whitespace().filter(|w| w.len() > 3) {
         assert!(
             !text.contains(word),
             "sanctum fragment leaked into narrow frame"

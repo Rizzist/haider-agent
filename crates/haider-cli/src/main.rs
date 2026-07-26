@@ -108,8 +108,10 @@ async fn tui_command(rest: &[String]) -> ExitCode {
     }
     let mut model = AppModel::new();
     model.theme = theme;
-    if matches!(std::env::var("HAIDER_SHAHADA").as_deref(), Ok("translit")) {
-        model.sanctum_tier = SanctumTier::Translit;
+    // Translit is the terminal default (no bidi/shaping in ratatui);
+    // HAIDER_SHAHADA=arabic opts shaping-capable terminals into Arabic.
+    if matches!(std::env::var("HAIDER_SHAHADA").as_deref(), Ok("arabic")) {
+        model.sanctum_tier = SanctumTier::Arabic;
     }
     if plain || !io::stdout().is_terminal() {
         print!("{}", run_demo_plain(model));

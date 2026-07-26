@@ -8,12 +8,15 @@
 //! 3. It never appears in logs, error strings, metrics, or addresses — it is
 //!    display-only ceremony.
 //!
-//! Terminal reality: Arabic needs RTL layout and glyph shaping, which many
-//! terminal emulators render broken (disconnected letterforms). Rendering the
-//! shahada broken violates rule 2's spirit, so the transliteration tier
-//! exists as a first-class rendering, not a degradation. v0.1 defaults to the
-//! Arabic tier for sim parity; `HAIDER_SHAHADA=translit` (read by the app
-//! layer) or `--plain` selects the transliteration.
+//! Terminal reality: ratatui writes cells left-to-right with NO bidi
+//! reordering and no Arabic glyph shaping, and most terminal emulators do
+//! not shape either — Arabic would render disconnected and reversed. That is
+//! exactly what rule 2's spirit forbids: better absent (or transliterated)
+//! than broken. So v0.1 DEFAULTS to the transliteration tier — a first-class
+//! rendering, not a degradation — and `HAIDER_SHAHADA=arabic` (read by the
+//! app layer) opts terminals with real bidi+shaping into the Arabic tier.
+//! The web/GUI surfaces, which shape correctly, default to Arabic (sim
+//! parity lives there).
 
 /// The shahada, Arabic tier (matches the sim's `SHAHADA`).
 pub const SHAHADA_ARABIC: &str = "لا إله إلا الله محمد رسول الله";
@@ -25,14 +28,15 @@ pub const SHAHADA_TRANSLIT: &str = "lā ilāha illā llāh · muḥammadun rasū
 /// The boot-mark word above the sanctum (the sim's `mark`).
 pub const MARK_ARABIC: &str = "حيدر";
 
-/// Latin fallback for the mark.
-pub const MARK_TRANSLIT: &str = "HAIDER";
+/// The mark in the transliteration tier — the name itself, the lion.
+pub const MARK_TRANSLIT: &str = "ḤAYDAR";
 
-/// Which rendering tier is active.
+/// Which rendering tier is active. Translit is the terminal default (see
+/// module docs); Arabic is the opt-in for shaping-capable terminals.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum SanctumTier {
-    #[default]
     Arabic,
+    #[default]
     Translit,
 }
 

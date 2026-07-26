@@ -20,9 +20,13 @@ fn sanctum_tiers_expose_their_texts() {
         SanctumLine::new(SanctumTier::Translit).text(),
         SHAHADA_TRANSLIT
     );
-    assert_eq!(SanctumTier::default(), SanctumTier::Arabic);
+    assert_eq!(
+        SanctumTier::default(),
+        SanctumTier::Translit,
+        "terminal default is the shaping-safe tier"
+    );
     assert_eq!(SanctumLine::new(SanctumTier::Arabic).mark(), "حيدر");
-    assert_eq!(SanctumLine::new(SanctumTier::Translit).mark(), "HAIDER");
+    assert_eq!(SanctumLine::new(SanctumTier::Translit).mark(), "ḤAYDAR");
 }
 
 #[test]
