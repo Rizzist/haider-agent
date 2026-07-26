@@ -1,0 +1,228 @@
+[
+  {
+    "v": 1,
+    "kind": "hello",
+    "protocol_min": 1,
+    "protocol_max": 2,
+    "client_kind": "gui",
+    "capabilities_requested": [
+      "view",
+      "control"
+    ]
+  },
+  {
+    "v": 1,
+    "kind": "welcome",
+    "protocol": 1,
+    "instance_id": "instance-1",
+    "daemon_generation": 4,
+    "frame_limit": 1048576,
+    "lifecycle_phase": "ready",
+    "capabilities_granted": [
+      "view"
+    ]
+  },
+  {
+    "v": 1,
+    "kind": "request",
+    "request_id": "request-list",
+    "body": {
+      "method": "session.list",
+      "page": 2,
+      "page_size": 50
+    }
+  },
+  {
+    "v": 1,
+    "kind": "request",
+    "request_id": "request-read",
+    "body": {
+      "method": "session.read",
+      "session_id": "session-1",
+      "range": {
+        "start_seq": 5,
+        "end_seq": 9
+      }
+    }
+  },
+  {
+    "v": 1,
+    "kind": "request",
+    "request_id": "request-attach",
+    "body": {
+      "method": "session.attach",
+      "session_id": "session-1",
+      "after_seq": 4,
+      "mode": "view"
+    }
+  },
+  {
+    "v": 1,
+    "kind": "request",
+    "request_id": "request-detach",
+    "body": {
+      "method": "session.detach",
+      "attachment_id": "attachment-1"
+    }
+  },
+  {
+    "v": 1,
+    "kind": "request",
+    "request_id": "request-ping",
+    "body": {
+      "method": "ping",
+      "nonce": 99
+    }
+  },
+  {
+    "v": 1,
+    "kind": "response",
+    "request_id": "request-list",
+    "body": {
+      "method": "session.list",
+      "page": 2,
+      "page_size": 50,
+      "sessions": [
+        {
+          "session_id": "session-1",
+          "head_seq": 9,
+          "worker_generation": 7
+        }
+      ],
+      "next_page": 3
+    }
+  },
+  {
+    "v": 1,
+    "kind": "response",
+    "request_id": "request-read",
+    "body": {
+      "method": "session.read",
+      "result": {
+        "session_id": "session-1",
+        "range": {
+          "start_seq": 5,
+          "end_seq": 9
+        },
+        "head_seq": 9,
+        "envelopes": [
+          {
+            "schema_version": 1,
+            "event_id": "ev-9",
+            "seq": 9,
+            "session_id": "session-1",
+            "device_id": "device-1",
+            "authority_epoch": 3,
+            "worker_generation": 7,
+            "committed_at_ms": 1753500000009,
+            "render": {
+              "ui": true,
+              "durable": true,
+              "prompt": "verbatim"
+            },
+            "payload": {
+              "detail": "kept raw",
+              "type": "future_event"
+            }
+          }
+        ]
+      }
+    }
+  },
+  {
+    "v": 1,
+    "kind": "response",
+    "request_id": "request-attach",
+    "body": {
+      "method": "session.attach",
+      "attachment_id": "attachment-1",
+      "attach_state": {
+        "session_id": "session-1",
+        "requested_after_seq": 4,
+        "replay_through_seq": 9,
+        "worker_generation": 7,
+        "authority_epoch": 3
+      }
+    }
+  },
+  {
+    "v": 1,
+    "kind": "response",
+    "request_id": "request-detach",
+    "body": {
+      "method": "session.detach",
+      "attachment_id": "attachment-1"
+    }
+  },
+  {
+    "v": 1,
+    "kind": "response",
+    "request_id": "request-ping",
+    "body": {
+      "method": "pong",
+      "nonce": 99
+    }
+  },
+  {
+    "v": 1,
+    "kind": "event",
+    "session_id": "session-1",
+    "envelope": {
+      "schema_version": 1,
+      "event_id": "ev-10",
+      "seq": 10,
+      "session_id": "session-1",
+      "device_id": "device-1",
+      "authority_epoch": 3,
+      "worker_generation": 7,
+      "committed_at_ms": 1753500000010,
+      "render": {
+        "ui": true,
+        "durable": true,
+        "prompt": "verbatim"
+      },
+      "payload": {
+        "detail": "kept raw",
+        "type": "future_event"
+      }
+    }
+  },
+  {
+    "v": 1,
+    "kind": "attach_caught_up",
+    "attachment_id": "attachment-1",
+    "high_water_seq": 10
+  },
+  {
+    "v": 1,
+    "kind": "menu_answer",
+    "command_id": "command-1",
+    "session_id": "session-1",
+    "menu_id": "menu-1",
+    "request_seq": 8,
+    "worker_generation": 7,
+    "option": "allow"
+  },
+  {
+    "v": 1,
+    "kind": "lagged",
+    "attachment_id": "attachment-1",
+    "resume_after_seq": 10
+  },
+  {
+    "v": 1,
+    "kind": "server_draining",
+    "deadline_ms": 1753500030000
+  },
+  {
+    "v": 1,
+    "kind": "protocol_error",
+    "code": "capability_denied",
+    "message": "control capability required",
+    "fatal": false
+  },
+  {
+    "v": 1,
+    "kind": "unknown"
+  }
+]

@@ -798,6 +798,11 @@ dependencies = [
 [[package]]
 name = "haider-rpc"
 version = "0.0.8"
+dependencies = [
+ "haider-protocol",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "haider-store"
