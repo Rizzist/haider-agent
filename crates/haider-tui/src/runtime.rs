@@ -13,7 +13,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-    KeyEventKind,
+    KeyEventKind, MouseButton, MouseEventKind,
 };
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -44,17 +44,22 @@ pub fn osc_set_title(title: &str) -> String {
     format!("\u{1b}]2;{title}\u{7}")
 }
 
-/// Best effort title restore: OSC 22/23 pop where supported, else clear.
+/// Best effort title restore: a single XTWINOPS pop matching the single
+/// push (terminals without the stack simply ignore it).
 #[must_use]
 pub const fn osc_reset_title() -> &'static str {
-    "\u{1b}[23;2t\u{1b}]2;\u{7}"
+    "\u{1b}[23;2t"
 }
+
+static TITLE_PUSHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn sync_window_title(title: &str) {
     let mut out = stdout();
-    // Push the current title (XTWINOPS 22) once per set is harmless; the
-    // matching pop runs in restore_terminal.
-    let _ = out.write_all(b"\x1b[22;2t");
+    // Push the user's title exactly ONCE; later syncs only set. The single
+    // matching pop runs in restore_terminal (review r1 P2: balanced stack).
+    if !TITLE_PUSHED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        let _ = out.write_all(b"\x1b[22;2t");
+    }
     let _ = out.write_all(osc_set_title(title).as_bytes());
     let _ = out.flush();
 }
@@ -221,17 +226,26 @@ pub async fn run_demo(mut model: AppModel) -> std::io::Result<()> {
             }
         }
     });
-    let play = |payloads: Vec<EventPayload>| {
+    // Script generation: bumping it silences any in-flight script (fresh
+    // session / reset), so two scripts can never interleave into one
+    // projection (review r1 P1).
+    let script_gen = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let play = |payloads: Vec<EventPayload>, generation: u64| {
         let tx = script_tx.clone();
+        let gen_ref = std::sync::Arc::clone(&script_gen);
         tokio::spawn(async move {
             for payload in payloads {
                 tokio::time::sleep(demo_pace(&payload)).await;
+                if gen_ref.load(std::sync::atomic::Ordering::SeqCst) != generation {
+                    return;
+                }
                 if tx.send(payload).await.is_err() {
                     return;
                 }
             }
         });
     };
+    let mut turn_counter: u64 = 0;
     // Launcher auto-play: if untouched, the classic demo plays once.
     let autoplay = tokio::time::sleep(Duration::from_secs(6));
     tokio::pin!(autoplay);
@@ -241,6 +255,8 @@ pub async fn run_demo(mut model: AppModel) -> std::io::Result<()> {
     // Fused: after the stream closes this branch is disabled — a closed
     // receiver must never spin the loop (review r1 P1).
     let mut stream_open = true;
+    // The last frame's clickable regions (render reports, mouse consumes).
+    let mut hit_map: Vec<(ratatui::layout::Rect, crate::app::Hit)> = Vec::new();
 
     while !model.should_quit {
         tokio::select! {
@@ -250,6 +266,22 @@ pub async fn run_demo(mut model: AppModel) -> std::io::Result<()> {
                 }
                 Some(Event::Paste(text)) => model.handle(AppEvent::Paste(text)),
                 Some(Event::Resize(..)) => model.dirty = true,
+                Some(Event::Mouse(mouse)) => match mouse.kind {
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        let hit = hit_map.iter().find(|(rect, _)| {
+                            mouse.column >= rect.x
+                                && mouse.column < rect.x + rect.width
+                                && mouse.row >= rect.y
+                                && mouse.row < rect.y + rect.height
+                        });
+                        if let Some((_, action)) = hit {
+                            model.handle_hit(*action);
+                        }
+                    }
+                    MouseEventKind::ScrollUp => model.handle_wheel(true),
+                    MouseEventKind::ScrollDown => model.handle_wheel(false),
+                    _ => {}
+                },
                 Some(_) => {}
                 None => break,
             },
@@ -269,15 +301,26 @@ pub async fn run_demo(mut model: AppModel) -> std::io::Result<()> {
             // it and the overdue tick fires immediately, keeping the 30fps
             // coalescing behavior.
             _ = frame_tick.tick(), if model.dirty => {
-                draw(&mut terminal, &model)?;
+                hit_map = draw(&mut terminal, &model)?;
                 model.dirty = false;
             }
         }
         // Reducer-requested side effects.
         for request in model.requests.drain(..) {
             match request {
-                AppRequest::SubmitText(text) => play(response_script(&text)),
-                AppRequest::AttachSample(_) => play(crate::mock::turn_script()),
+                AppRequest::SubmitText(text) => {
+                    turn_counter += 1;
+                    let generation = script_gen.load(std::sync::atomic::Ordering::SeqCst);
+                    play(response_script(&text, turn_counter), generation);
+                }
+                AppRequest::AttachSample(_) => {
+                    turn_counter += 1;
+                    let generation = script_gen.load(std::sync::atomic::Ordering::SeqCst);
+                    play(crate::mock::turn_script(turn_counter), generation);
+                }
+                AppRequest::StopScripts => {
+                    script_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
                 AppRequest::Quit => model.should_quit = true,
             }
         }
@@ -315,9 +358,10 @@ pub async fn run_demo(mut model: AppModel) -> std::io::Result<()> {
 fn draw(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     model: &AppModel,
-) -> std::io::Result<()> {
-    terminal.draw(|frame| render(model, frame))?;
-    Ok(())
+) -> std::io::Result<Vec<(ratatui::layout::Rect, crate::app::Hit)>> {
+    let mut hits = Vec::new();
+    terminal.draw(|frame| hits = render(model, frame))?;
+    Ok(hits)
 }
 
 /// Run the demo headlessly: play the whole script through the model and

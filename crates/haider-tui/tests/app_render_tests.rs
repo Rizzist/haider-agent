@@ -18,7 +18,11 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 fn draw(model: &AppModel, width: u16, height: u16) -> (String, Terminal<TestBackend>) {
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("test terminal");
-    terminal.draw(|frame| render(model, frame)).expect("draw");
+    terminal
+        .draw(|frame| {
+            render(model, frame);
+        })
+        .expect("draw");
     let buffer = terminal.backend().buffer().clone();
     let mut text = String::new();
     for y in 0..buffer.area.height {
@@ -449,4 +453,226 @@ fn status_bar_has_boxed_chips_and_hint() {
     assert!(text.contains("fable-5 · anthropic"));
     assert!(text.contains("[ ◉ voice · whisper→openai ]"), "voice chip");
     assert!(text.contains("/help · theme desert dawn"), "launcher hint");
+}
+
+// ---- TUI2 review r1 + mouse regressions ----
+
+fn draw_with_hits(
+    model: &AppModel,
+    width: u16,
+    height: u16,
+) -> (String, Vec<(ratatui::layout::Rect, haider_tui::app::Hit)>) {
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("test terminal");
+    let mut hits = Vec::new();
+    terminal
+        .draw(|frame| hits = render(model, frame))
+        .expect("draw");
+    let buffer = terminal.backend().buffer().clone();
+    let mut text = String::new();
+    for y in 0..buffer.area.height {
+        for x in 0..buffer.area.width {
+            text.push_str(buffer[(x, y)].symbol());
+        }
+        text.push('\n');
+    }
+    (text, hits)
+}
+
+#[test]
+fn one_turn_at_a_time_across_digits_and_submits() {
+    use haider_tui::app::AppRequest;
+    let mut model = AppModel::new();
+    model.handle(AppEvent::Envelope(Box::new(EventPayload::HarnessStatus(
+        HarnessStatus::Ready,
+    ))));
+    model.handle(key(KeyCode::Char('1')));
+    assert_eq!(model.requests.len(), 1);
+    assert!(
+        model.turn_active,
+        "attach marks the turn active immediately"
+    );
+    // A second digit while active is refused.
+    model.handle(key(KeyCode::Char('2')));
+    assert_eq!(model.requests.len(), 1, "no concurrent scripts");
+    assert!(
+        model
+            .flash
+            .as_deref()
+            .unwrap_or("")
+            .contains("already running")
+    );
+    // AutoPlay can never double-fire either.
+    model.handle(AppEvent::AutoPlay);
+    assert_eq!(model.requests.len(), 1);
+    let _ = AppRequest::Quit;
+}
+
+#[test]
+fn same_length_prompts_produce_distinct_turn_items() {
+    use haider_tui::mock::response_script;
+    let mut projection = haider_tui::projection::SessionProjection::new();
+    for payload in response_script("aaa", 1) {
+        projection.apply(&payload);
+    }
+    for payload in response_script("bbb", 2) {
+        projection.apply(&payload);
+    }
+    assert_eq!(projection.duplicate_items(), 0, "per-turn id namespace");
+    assert_eq!(projection.orphan_deltas(), 0);
+    let users = projection
+        .entries()
+        .iter()
+        .filter(|entry| matches!(entry, haider_tui::projection::TranscriptEntry::User { .. }))
+        .count();
+    assert_eq!(users, 2, "both turns landed");
+}
+
+#[test]
+fn window_title_strips_control_characters() {
+    let mut model = AppModel::new();
+    model.handle(AppEvent::Envelope(Box::new(EventPayload::UserMessage {
+        text: "evil\u{1b}]2;pwned\u{7}title".to_owned(),
+        attachments: vec![],
+        mode: haider_protocol::DeliveryMode::Steer,
+    })));
+    let title = model.window_title();
+    assert!(!title.contains('\u{1b}'), "no ESC in OSC titles");
+    assert!(!title.contains('\u{7}'), "no BEL in OSC titles");
+    assert!(
+        title.contains("pwned") || title.contains("evil"),
+        "text kept"
+    );
+}
+
+#[test]
+fn clear_starts_fresh_and_launcher_typing_never_leaks_old_turns() {
+    let mut model = model_after_full_demo();
+    assert!(!model.projection.entries().is_empty());
+    for c in "/clear".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Enter));
+    assert_eq!(model.screen, Screen::Launcher);
+    assert!(model.projection.entries().is_empty(), "fresh projection");
+    assert!(model.session_title.is_none());
+}
+
+#[test]
+fn palette_enter_runs_the_highlighted_command() {
+    let mut model = AppModel::new();
+    model.handle(AppEvent::Envelope(Box::new(EventPayload::HarnessStatus(
+        HarnessStatus::Ready,
+    ))));
+    // Enter a session so session-only commands are offered.
+    for c in "hello".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Enter));
+    for c in "/t".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    // matches: theme, tree, tokens, tools — Down selects the second.
+    model.handle(key(KeyCode::Down));
+    model.handle(key(KeyCode::Enter));
+    assert!(
+        model.flash.as_deref().unwrap_or("").contains("/tree"),
+        "highlighted command ran, not the raw query: {:?}",
+        model.flash
+    );
+}
+
+#[test]
+fn invalid_theme_and_unknown_commands_are_told_apart() {
+    let mut model = AppModel::new();
+    model.handle(AppEvent::Envelope(Box::new(EventPayload::HarnessStatus(
+        HarnessStatus::Ready,
+    ))));
+    let before = model.theme;
+    for c in "/theme sepia".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Enter));
+    assert_eq!(model.theme, before, "invalid theme never cycles");
+    assert!(
+        model
+            .flash
+            .as_deref()
+            .unwrap_or("")
+            .contains("unknown theme")
+    );
+
+    for c in "/frobnicate".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Enter));
+    assert!(
+        model
+            .flash
+            .as_deref()
+            .unwrap_or("")
+            .contains("unknown command"),
+        "typos are not presented as planned features"
+    );
+}
+
+#[test]
+fn boot_swallows_ordinary_input() {
+    let mut model = AppModel::new();
+    assert_eq!(model.screen, Screen::Boot);
+    for c in "sneaky".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Enter));
+    assert_eq!(model.composer, "");
+    assert!(model.requests.is_empty(), "boot cannot start turns");
+}
+
+#[test]
+fn short_launcher_keeps_the_composer_visible() {
+    let mut model = AppModel::new();
+    model.handle(AppEvent::Envelope(Box::new(EventPayload::HarnessStatus(
+        HarnessStatus::Ready,
+    ))));
+    let (text, _) = draw(&model, 90, 10);
+    assert!(
+        text.contains("start a session"),
+        "tail-visible centering keeps the input on screen"
+    );
+}
+
+#[test]
+fn clicks_attach_sessions_and_wheel_scrolls() {
+    use haider_tui::app::Hit;
+    let mut model = AppModel::new();
+    model.handle(AppEvent::Envelope(Box::new(EventPayload::HarnessStatus(
+        HarnessStatus::Ready,
+    ))));
+    let (_, hits) = draw_with_hits(&model, 118, 34);
+    assert!(
+        hits.iter().any(|(_, h)| *h == Hit::AttachSample(0)),
+        "sample rows are clickable"
+    );
+    assert!(hits.iter().any(|(_, h)| *h == Hit::TalkChip));
+    assert!(hits.iter().any(|(_, h)| *h == Hit::HelpHint));
+
+    model.handle_hit(Hit::AttachSample(2));
+    assert!(model.turn_active);
+    assert_eq!(model.session_head, ("Ali", "(a)"));
+
+    // The script's UserMessage envelope flips to the session view.
+    model.handle(AppEvent::Envelope(Box::new(EventPayload::UserMessage {
+        text: "L1 remote-projects contract read".to_owned(),
+        attachments: vec![],
+        mode: haider_protocol::DeliveryMode::Steer,
+    })));
+    assert_eq!(model.screen, Screen::Session);
+
+    // Wheel scroll-back only in session; back chip returns to launcher.
+    model.handle_wheel(true);
+    assert_eq!(model.scroll_back, 3);
+    model.handle_wheel(false);
+    assert_eq!(model.scroll_back, 0);
+    model.handle_hit(Hit::BackChip);
+    assert_eq!(model.screen, Screen::Launcher);
 }

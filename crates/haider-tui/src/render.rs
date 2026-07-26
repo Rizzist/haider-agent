@@ -4,7 +4,7 @@
 //! Visual authority: the `/tui` sim — typography, chips, and row shapes are
 //! copied from it deliberately.
 
-use crate::app::{AppModel, Screen};
+use crate::app::{AppModel, Hit, Screen};
 use crate::boot::{boot_subline, check_rows, launcher_subline};
 use crate::commands::HELP_TEXT;
 use crate::format::{METER_CELLS_DEFAULT, fmt_tok, meter_cells};
@@ -22,23 +22,61 @@ use ratatui::widgets::{Block, Paragraph, Wrap};
 /// Workspace version shown on boot/launcher (single source: the crate).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Render the whole frame for the current screen.
-pub fn render(model: &AppModel, frame: &mut Frame<'_>) {
+/// Render the whole frame for the current screen. Returns the frame's
+/// clickable regions (hit map) for the runtime's mouse dispatch.
+pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
     let theme = model.theme.theme();
     let area = frame.area();
     // Ground the whole frame in the theme bg.
     frame.render_widget(Block::default().style(theme.text_style()), area);
 
+    let mut hits: Vec<(Rect, Hit)> = Vec::new();
     let [body, status] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
     match model.screen {
         Screen::Boot => render_boot(model, theme, frame, body),
-        Screen::Launcher => render_launcher(model, theme, frame, body),
-        Screen::Session => render_session(model, theme, frame, body),
+        Screen::Launcher => render_launcher(model, theme, frame, body, &mut hits),
+        Screen::Session => render_session(model, theme, frame, body, &mut hits),
     }
     if model.help_open {
         render_help(theme, frame, body);
+        hits.clear();
     }
     render_status_bar(model, theme, frame, status);
+    if model.screen == Screen::Launcher && !model.help_open {
+        // The /help · theme hint on the right of the status bar is clickable.
+        let hint_width = 28.min(status.width);
+        hits.push((
+            Rect {
+                x: status.x + status.width - hint_width,
+                y: status.y,
+                width: hint_width,
+                height: 1,
+            },
+            Hit::HelpHint,
+        ));
+    }
+    hits
+}
+
+/// A full-width one-row hit region.
+fn row_rect(area: Rect, top: u16, offset: usize) -> Rect {
+    Rect {
+        x: area.x,
+        y: top + u16::try_from(offset).unwrap_or(u16::MAX),
+        width: area.width,
+        height: 1,
+    }
+}
+
+/// The right-aligned talk-chip region of a composer row.
+fn talk_chip_rect(row: Rect) -> Rect {
+    let width = 12.min(row.width);
+    Rect {
+        x: row.x + row.width - width,
+        y: row.y,
+        width,
+        height: 1,
+    }
 }
 
 /// An outlined chip: `[ label ]` in the given style (the sim's bordered
@@ -51,7 +89,16 @@ fn chip<'a>(label: String, style: ratatui::style::Style) -> Vec<Span<'a>> {
     ]
 }
 
-fn centered(frame: &mut Frame<'_>, area: Rect, lines: Vec<Line<'_>>) {
+/// Center a block of lines; when the block is taller than the area, keep the
+/// TAIL visible (the composer lives at the bottom — review r1 P2: short
+/// windows must never hide the input). Returns the drawn rect and how many
+/// leading lines were dropped (hit maps shift by that amount).
+fn centered(frame: &mut Frame<'_>, area: Rect, mut lines: Vec<Line<'_>>) -> (Rect, usize) {
+    let mut dropped = 0usize;
+    if lines.len() > area.height as usize {
+        dropped = lines.len() - area.height as usize;
+        lines.drain(..dropped);
+    }
     let height = u16::try_from(lines.len()).unwrap_or(u16::MAX);
     let top = area.height.saturating_sub(height) / 2;
     let [_, middle, _] = Layout::vertical([
@@ -64,6 +111,7 @@ fn centered(frame: &mut Frame<'_>, area: Rect, lines: Vec<Line<'_>>) {
         Paragraph::new(Text::from(lines)).alignment(Alignment::Center),
         middle,
     );
+    (middle, dropped)
 }
 
 /// The sim's letter-spaced wordmark.
@@ -99,10 +147,16 @@ fn render_boot(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rec
             lines.push(Line::styled(row.line(), style));
         }
     }
-    centered(frame, area, lines);
+    let _ = centered(frame, area, lines);
 }
 
-fn render_launcher(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rect) {
+fn render_launcher(
+    model: &AppModel,
+    theme: &Theme,
+    frame: &mut Frame<'_>,
+    area: Rect,
+    hits: &mut Vec<(Rect, Hit)>,
+) {
     let sanctum = SanctumLine::new(model.sanctum_tier);
     let identity = &model.identity;
     // Sim typography: big maroon mark · gold shahada · gold rule ·
@@ -143,6 +197,8 @@ fn render_launcher(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area:
         "recent sessions — 1-3 attach · type below to start fresh",
         theme.faint_style(),
     )]));
+    let mut sample_rows: Vec<(usize, usize)> = Vec::new();
+    let mut extra_rows: Vec<usize> = Vec::new();
     for (index, sample) in model.samples.iter().enumerate() {
         let (dot, dot_style) = if sample.running {
             ("◉", theme.gold_style())
@@ -175,6 +231,7 @@ fn render_launcher(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area:
             ),
             theme.dim_style(),
         ));
+        sample_rows.push((lines.len(), index));
         lines.push(Line::from(spans));
     }
     for (glyph, name, blurb) in [
@@ -194,6 +251,7 @@ fn render_launcher(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area:
             "reachability ladder — peers · sponsored nodes · shells",
         ),
     ] {
+        extra_rows.push(lines.len());
         lines.push(Line::from(vec![
             Span::styled(format!("  {glyph} "), theme.gold_style()),
             Span::styled(name, theme.dim_style()),
@@ -201,30 +259,75 @@ fn render_launcher(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area:
         ]));
     }
     lines.push(Line::default());
+    let composer_row = lines.len();
     lines.push(composer_line(model, theme, area.width));
+    let mut palette_rows: Vec<(usize, usize)> = Vec::new();
     if model.palette_open() {
         lines.push(Line::default());
-        for palette_row in palette_lines(model, theme) {
+        for (offset, palette_row) in palette_lines(model, theme).into_iter().enumerate() {
+            if offset > 0 {
+                palette_rows.push((lines.len(), offset - 1));
+            }
             lines.push(palette_row);
         }
     }
-    centered(frame, area, lines);
+    let (middle, dropped) = centered(frame, area, lines);
+    let visible = |row: usize| row.checked_sub(dropped);
+    for (row, index) in sample_rows {
+        if let Some(row) = visible(row) {
+            hits.push((row_rect(area, middle.y, row), Hit::AttachSample(index)));
+        }
+    }
+    for (order, row) in extra_rows.into_iter().enumerate() {
+        if let Some(row) = visible(row) {
+            hits.push((
+                row_rect(area, middle.y, row),
+                Hit::ExtraRow(u8::try_from(order).unwrap_or(2)),
+            ));
+        }
+    }
+    if let Some(row) = visible(composer_row) {
+        hits.push((talk_chip_rect(row_rect(area, middle.y, row)), Hit::TalkChip));
+    }
+    for (row, index) in palette_rows {
+        if let Some(row) = visible(row) {
+            hits.push((row_rect(area, middle.y, row), Hit::PaletteRow(index)));
+        }
+    }
 }
 
-fn render_session(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rect) {
-    let todos_height = model
+fn render_session(
+    model: &AppModel,
+    theme: &Theme,
+    frame: &mut Frame<'_>,
+    area: Rect,
+    hits: &mut Vec<(Rect, Hit)>,
+) {
+    // A blocking menu REPLACES the composer (sim §3 law) and takes its rows.
+    let menu = model.projection.open_menu();
+    let input_height = menu.map_or(1, |m| u16::try_from(m.options.len() + 1).unwrap_or(6));
+    // Short windows: the INPUT is sacred — todos, then the palette, yield
+    // entirely before the composer/menu loses a row (review r1 P2).
+    let fixed = 2 + 1 + 1 + input_height + 1; // header + rule + rule + input + gap
+    let mut todos_height = model
         .projection
         .todos()
         .filter(|t| t.pinned)
         .map_or(0, |t| u16::try_from(t.items.len() + 1).unwrap_or(4));
-    // A blocking menu REPLACES the composer (sim §3 law) and takes its rows.
-    let menu = model.projection.open_menu();
-    let palette_height = if model.palette_open() {
+    let mut palette_height = if model.palette_open() {
         u16::try_from(model.palette_items().len().min(8) + 1).unwrap_or(9)
     } else {
         0
     };
-    let input_height = menu.map_or(1, |m| u16::try_from(m.options.len() + 1).unwrap_or(6));
+    let mut budget = area.height.saturating_sub(fixed + 1); // ≥1 transcript row
+    if palette_height > budget {
+        palette_height = 0;
+    } else {
+        budget -= palette_height;
+    }
+    if todos_height > budget {
+        todos_height = 0;
+    }
     let [
         header_area,
         header_rule,
@@ -295,16 +398,26 @@ fn render_session(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: 
         )),
         header_rule,
     );
+    hits.push((
+        Rect {
+            x: header_area.x,
+            y: header_area.y,
+            width: 10.min(header_area.width),
+            height: 1,
+        },
+        Hit::BackChip,
+    ));
 
-    // Transcript: bottom-anchored, follow-bottom (scroll state is a later
-    // slice — rec 10).
+    // Transcript: bottom-anchored; wheel scroll-back offsets follow-bottom.
     let mut lines: Vec<Line<'_>> = Vec::new();
     for entry in model.projection.entries() {
         transcript_lines(&mut lines, entry, theme);
     }
     let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
     let total = u16::try_from(paragraph.line_count(transcript_area.width)).unwrap_or(u16::MAX);
-    let scroll = total.saturating_sub(transcript_area.height);
+    let scroll = total
+        .saturating_sub(transcript_area.height)
+        .saturating_sub(model.scroll_back);
     frame.render_widget(paragraph.scroll((scroll, 0)), transcript_area);
 
     if let Some(todos) = model.projection.todos().filter(|t| t.pinned) {
@@ -334,6 +447,17 @@ fn render_session(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: 
             Paragraph::new(Text::from(palette_lines(model, theme))),
             palette_area,
         );
+        for offset in 1..palette_area.height {
+            hits.push((
+                Rect {
+                    x: palette_area.x,
+                    y: palette_area.y + offset,
+                    width: palette_area.width,
+                    height: 1,
+                },
+                Hit::PaletteRow((offset - 1) as usize),
+            ));
+        }
     }
 
     frame.render_widget(
@@ -370,12 +494,24 @@ fn render_session(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: 
             });
         }
         frame.render_widget(Paragraph::new(Text::from(menu_lines)), composer_area);
+        for offset in 1..composer_area.height {
+            hits.push((
+                Rect {
+                    x: composer_area.x,
+                    y: composer_area.y + offset,
+                    width: composer_area.width,
+                    height: 1,
+                },
+                Hit::MenuOption((offset - 1) as usize),
+            ));
+        }
     } else {
         frame.render_widget(
             Paragraph::new(composer_line(model, theme, composer_area.width))
                 .style(theme.input_style()),
             composer_area,
         );
+        hits.push((talk_chip_rect(composer_area), Hit::TalkChip));
     }
 }
 
@@ -387,15 +523,16 @@ fn composer_line<'a>(model: &'a AppModel, theme: &Theme, width: u16) -> Line<'a>
         _ => "message haider — ⏎ send · / commands · paste images/text",
     };
     let mut spans = vec![Span::styled("❯ ", theme.gold_style())];
-    let typed_width = if model.composer.is_empty() {
+    if model.composer.is_empty() {
         spans.push(Span::styled("▮", theme.gold_style()));
         spans.push(Span::styled(format!(" {placeholder}"), theme.faint_style()));
-        3 + placeholder.chars().count()
     } else {
         spans.push(Span::styled(model.composer.as_str(), theme.bright_style()));
         spans.push(Span::styled("▮", theme.gold_style()));
-        3 + model.composer.chars().count()
-    };
+    }
+    // Display-cell width (unicode-aware — review r1 P3: CJK/emoji composers
+    // must not drift the chip).
+    let typed_width = Line::from(spans.clone()).width();
     // Right-aligned talk chip when there's room.
     let talk = "[ ◉ talk ]";
     let total = typed_width + talk.chars().count() + 2;

@@ -28,8 +28,24 @@ pub enum AppRequest {
     SubmitText(String),
     /// Attach a sample session: replay the classic scripted demo turn.
     AttachSample(usize),
+    /// Stop any playing script (fresh session / reset).
+    StopScripts,
     /// Quit the app.
     Quit,
+}
+
+/// A clickable region's action (hit-testing: render reports regions, the
+/// runtime maps clicks back through [`AppModel::handle_hit`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hit {
+    AttachSample(usize),
+    /// Aura / Accounts / Peers launcher rows (UI stubs).
+    ExtraRow(u8),
+    PaletteRow(usize),
+    MenuOption(usize),
+    BackChip,
+    TalkChip,
+    HelpHint,
 }
 
 /// Everything the reducer consumes.
@@ -109,6 +125,9 @@ pub struct AppModel {
     pub turn_active: bool,
     /// The launcher auto-play fired or was cancelled by interaction.
     pub auto_play_spent: bool,
+    /// Wheel scroll-back offset in the session transcript (0 = follow
+    /// bottom; wheel up increases, wheel down decreases).
+    pub scroll_back: u16,
     pub should_quit: bool,
     /// Set by every state change; cleared when a frame is drawn (rec 6).
     pub dirty: bool,
@@ -134,6 +153,7 @@ impl Default for AppModel {
             requests: Vec::new(),
             turn_active: false,
             auto_play_spent: false,
+            scroll_back: 0,
             should_quit: false,
             dirty: true,
         }
@@ -153,7 +173,15 @@ impl AppModel {
             Screen::Boot => "haider — starting".to_owned(),
             Screen::Launcher => "haider — launcher".to_owned(),
             Screen::Session => {
-                let title = self.session_title.as_deref().unwrap_or("session");
+                // Strip control characters: user text must never smuggle
+                // escape sequences into OSC 2 (review r1 P1).
+                let title: String = self
+                    .session_title
+                    .as_deref()
+                    .unwrap_or("session")
+                    .chars()
+                    .filter(|c| !c.is_control())
+                    .collect();
                 format!("haider — {title} · {}", self.identity.device)
             }
         }
@@ -209,7 +237,7 @@ impl AppModel {
                 if !self.auto_play_spent && self.screen == Screen::Launcher && !self.turn_active {
                     self.auto_play_spent = true;
                     self.dirty = true;
-                    self.requests.push(AppRequest::AttachSample(0));
+                    self.attach_sample(0);
                 }
             }
             AppEvent::StreamEnded => {}
@@ -224,6 +252,11 @@ impl AppModel {
                 KeyCode::Char('t') => self.cycle_theme(),
                 _ => {}
             }
+            return;
+        }
+        // Boot renders no composer — hidden input must not accumulate or
+        // start turns (review r1 P2).
+        if self.screen == Screen::Boot {
             return;
         }
         if self.help_open {
@@ -245,7 +278,8 @@ impl AppModel {
                     return;
                 }
                 KeyCode::Down => {
-                    let count = self.palette_items().len();
+                    // Only 8 rows render; selection stays visible (r1 P2).
+                    let count = self.palette_items().len().min(8);
                     if count > 0 {
                         self.palette_selection = (self.palette_selection + 1).min(count - 1);
                     }
@@ -263,6 +297,22 @@ impl AppModel {
                     return;
                 }
                 KeyCode::Enter => {
+                    // Enter runs the HIGHLIGHTED command with any typed args
+                    // (r1 P2: /t + Down + Enter must run the selection).
+                    if let Some(spec) = self.palette_items().get(self.palette_selection) {
+                        let args: String = self
+                            .composer
+                            .trim_start_matches('/')
+                            .split_whitespace()
+                            .skip(1)
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        self.composer = if args.is_empty() {
+                            format!("/{}", spec.name)
+                        } else {
+                            format!("/{} {args}", spec.name)
+                        };
+                    }
                     self.execute_slash();
                     return;
                 }
@@ -282,13 +332,7 @@ impl AppModel {
                 if self.screen == Screen::Launcher && self.composer.is_empty() =>
             {
                 let index = (c as usize) - ('1' as usize);
-                if index < self.samples.len() {
-                    let sample = &self.samples[index];
-                    self.session_title = Some(sample.blurb.to_owned());
-                    self.session_head = (sample.head, sample.honorific);
-                    self.flash = Some(format!("· attached {} — demo replay", sample.name));
-                    self.requests.push(AppRequest::AttachSample(index));
-                }
+                self.attach_sample(index);
             }
             KeyCode::Char(c) => {
                 self.composer.push(c);
@@ -318,7 +362,11 @@ impl AppModel {
                 Some("· a turn is already running — steer lands with the daemon".to_owned());
             return;
         }
-        // Starting a session from typed text (sim: first message starts one).
+        // Typing on the LAUNCHER starts a FRESH session (sim promise);
+        // typing inside a session continues it.
+        if self.screen == Screen::Launcher {
+            self.fresh_session();
+        }
         if self.session_title.is_none() {
             let mut title: String = text.chars().take(38).collect();
             if text.chars().count() > 38 {
@@ -328,6 +376,7 @@ impl AppModel {
         }
         self.screen = Screen::Session;
         self.turn_active = true;
+        self.scroll_back = 0;
         self.requests.push(AppRequest::SubmitText(text));
     }
 
@@ -340,41 +389,52 @@ impl AppModel {
         let arg = words.next().map(str::to_ascii_lowercase);
         match name.as_str() {
             "help" => self.help_open = true,
-            "theme" => match arg.as_deref().and_then(ThemeKey::parse) {
-                Some(key) => {
-                    self.theme = key;
-                    self.flash = Some(format!("· theme → {}", key.theme().label));
-                }
+            "theme" => match arg.as_deref() {
+                Some(name) => match ThemeKey::parse(name) {
+                    Some(key) => {
+                        self.theme = key;
+                        self.flash = Some(format!("· theme → {}", key.theme().label));
+                    }
+                    None => {
+                        self.flash =
+                            Some(format!("· unknown theme “{name}” — dawn · ivory · dark"));
+                    }
+                },
                 None => self.cycle_theme(),
             },
             "clear" | "back" => {
+                // /clear promises a fresh start (review r1 P2).
+                self.fresh_session();
                 self.screen = Screen::Launcher;
+                self.requests.push(AppRequest::StopScripts);
             }
             "reset" => {
-                self.projection = SessionProjection::new();
-                self.session_title = None;
-                self.turn_active = false;
+                self.fresh_session();
                 self.samples = sample_sessions();
                 self.screen = Screen::Launcher;
                 self.flash = Some("· demo reset".to_owned());
+                self.requests.push(AppRequest::StopScripts);
             }
             "quit" | "exit" => self.requests.push(AppRequest::Quit),
             "" => {}
             other => {
-                // Honest stubs: the UI is present; the machinery names its wave.
+                // Known stubs name their wave; typos say so (review r1 P2).
                 let wave = match other {
                     "model" | "provider" | "login" | "account" | "accounts" => {
-                        "the account switchboard (W3)"
+                        Some("the account switchboard (W3)")
                     }
                     "sessions" | "tree" | "fork" | "rename" | "compact" | "tokens" | "queue" => {
-                        "the daemon wave (W3)"
+                        Some("the daemon wave (W3)")
                     }
-                    "voice" | "say" | "aura" => "the voice wave (post-v0.1)",
-                    "peers" => "the mesh wave (post-v0.1)",
-                    "hooks" | "update" | "tools" => "the gates wave (W4)",
-                    _ => "a later wave",
+                    "voice" | "say" | "aura" => Some("the voice wave (post-v0.1)"),
+                    "peers" => Some("the mesh wave (post-v0.1)"),
+                    "hooks" | "update" | "tools" => Some("the gates wave (W4)"),
+                    _ => None,
                 };
-                self.flash = Some(format!("· /{other} — UI ready; lands with {wave}"));
+                self.flash = Some(match wave {
+                    Some(wave) => format!("· /{other} — UI ready; lands with {wave}"),
+                    None => format!("· unknown command /{other} — /help lists commands"),
+                });
             }
         }
     }
@@ -449,6 +509,87 @@ impl AppModel {
             self.menu_selection = 0;
         }
         self.projection.apply(payload);
+    }
+
+    /// Start-fresh semantics (review r1 P2): a new session begins from an
+    /// empty projection; the previous demo transcript does not leak in.
+    fn fresh_session(&mut self) {
+        self.projection = SessionProjection::new();
+        self.session_title = None;
+        self.turn_active = false;
+        self.scroll_back = 0;
+    }
+
+    /// Attach a sample session (digit or click) — one turn at a time.
+    fn attach_sample(&mut self, index: usize) {
+        if self.turn_active {
+            self.flash = Some("· a turn is already running".to_owned());
+            return;
+        }
+        if let Some(sample) = self.samples.get(index) {
+            let (blurb, head, honorific, name) =
+                (sample.blurb, sample.head, sample.honorific, sample.name);
+            self.fresh_session();
+            self.session_title = Some(blurb.to_owned());
+            self.session_head = (head, honorific);
+            self.flash = Some(format!("· attached {name} — demo replay"));
+            self.turn_active = true;
+            self.requests.push(AppRequest::AttachSample(index));
+        }
+    }
+
+    /// A left-click resolved through the frame's hit map.
+    pub fn handle_hit(&mut self, hit: Hit) {
+        self.dirty = true;
+        self.flash = None;
+        self.auto_play_spent = true;
+        match hit {
+            Hit::AttachSample(index) => self.attach_sample(index),
+            Hit::ExtraRow(which) => {
+                let (name, wave) = match which {
+                    0 => ("aura", "the voice wave (post-v0.1)"),
+                    1 => ("accounts", "the account switchboard (W3)"),
+                    _ => ("peers", "the mesh wave (post-v0.1)"),
+                };
+                self.flash = Some(format!("· /{name} — UI ready; lands with {wave}"));
+            }
+            Hit::PaletteRow(index) => {
+                if index < self.palette_items().len() {
+                    self.palette_selection = index;
+                    self.execute_slash();
+                }
+            }
+            Hit::MenuOption(index) => {
+                let count = self.projection.open_menu().map_or(0, |m| m.options.len());
+                if index < count {
+                    self.menu_selection = index;
+                    self.submit_menu_answer();
+                }
+            }
+            Hit::BackChip => {
+                if self.screen == Screen::Session {
+                    self.screen = Screen::Launcher;
+                }
+            }
+            Hit::TalkChip => {
+                self.flash =
+                    Some("· ◉ talk — voice lands post-v0.1; the chip is the promise".to_owned());
+            }
+            Hit::HelpHint => self.help_open = true,
+        }
+    }
+
+    /// Wheel scroll in the session transcript (⇧-drag selects text natively).
+    pub fn handle_wheel(&mut self, up: bool) {
+        if self.screen != Screen::Session {
+            return;
+        }
+        self.dirty = true;
+        if up {
+            self.scroll_back = self.scroll_back.saturating_add(3);
+        } else {
+            self.scroll_back = self.scroll_back.saturating_sub(3);
+        }
     }
 
     fn cycle_theme(&mut self) {

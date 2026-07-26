@@ -13,7 +13,11 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 fn dump(model: &AppModel, label: &str) {
     let backend = TestBackend::new(118, 34);
     let mut terminal = Terminal::new(backend).expect("terminal");
-    terminal.draw(|frame| render(model, frame)).expect("draw");
+    terminal
+        .draw(|frame| {
+            render(model, frame);
+        })
+        .expect("draw");
     let buffer = terminal.backend().buffer().clone();
     println!("──── {label} ────");
     for y in 0..buffer.area.height {

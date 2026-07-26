@@ -41,8 +41,8 @@ fn starting(done: usize) -> EventPayload {
     })
 }
 
-fn item(n: u32) -> ItemId {
-    ItemId::new(format!("demo-item-{n}"))
+fn turn_item(turn: u64, n: u32) -> ItemId {
+    ItemId::new(format!("t{turn}-item-{n}"))
 }
 
 fn todos(states: [TodoState; 3]) -> Vec<TodoItem> {
@@ -79,13 +79,13 @@ pub fn boot_script() -> Vec<EventPayload> {
 #[must_use]
 pub fn demo_script() -> Vec<EventPayload> {
     let mut script = boot_script();
-    script.extend(turn_script());
+    script.extend(turn_script(0));
     script
 }
 
 /// The classic scripted session turn (attach/auto-play path).
 #[must_use]
-pub fn turn_script() -> Vec<EventPayload> {
+pub fn turn_script(turn: u64) -> Vec<EventPayload> {
     use TodoState::{Completed, Listed, Processing};
     // The demo turn.
     let mut script = vec![
@@ -100,7 +100,7 @@ pub fn turn_script() -> Vec<EventPayload> {
 
     // A pinned plan appears.
     script.push(EventPayload::Item(ItemEvent::Started {
-        item_id: item(1),
+        item_id: turn_item(turn, 1),
         item: TurnItem::Plan {
             items: todos([Processing, Listed, Listed]),
         },
@@ -109,7 +109,7 @@ pub fn turn_script() -> Vec<EventPayload> {
     // Streaming agent text.
     script.push(EventPayload::RunState(RunState::Streaming));
     script.push(EventPayload::Item(ItemEvent::Started {
-        item_id: item(2),
+        item_id: turn_item(turn, 2),
         item: TurnItem::AgentMessage {
             text: String::new(),
         },
@@ -120,14 +120,14 @@ pub fn turn_script() -> Vec<EventPayload> {
         "but the fixture starts at 0.",
     ] {
         script.push(EventPayload::Item(ItemEvent::Delta {
-            item_id: item(2),
+            item_id: turn_item(turn, 2),
             delta: ItemDelta::Text {
                 text: chunk.to_owned(),
             },
         }));
     }
     script.push(EventPayload::Item(ItemEvent::Completed {
-        item_id: item(2),
+        item_id: turn_item(turn, 2),
         item: TurnItem::AgentMessage {
             text: "Reading the failing test first — the boundary check rejects seq 0 \
                    but the fixture starts at 0."
@@ -138,7 +138,7 @@ pub fn turn_script() -> Vec<EventPayload> {
     // A tool call runs.
     script.push(EventPayload::RunState(RunState::RunningTool));
     script.push(EventPayload::Item(ItemEvent::Started {
-        item_id: item(3),
+        item_id: turn_item(turn, 3),
         item: TurnItem::ToolCall {
             call_id: "demo-call-1".to_owned(),
             name: "fs_read".to_owned(),
@@ -147,7 +147,7 @@ pub fn turn_script() -> Vec<EventPayload> {
         },
     }));
     script.push(EventPayload::Item(ItemEvent::Completed {
-        item_id: item(3),
+        item_id: turn_item(turn, 3),
         item: TurnItem::ToolCall {
             call_id: "demo-call-1".to_owned(),
             name: "fs_read".to_owned(),
@@ -159,7 +159,7 @@ pub fn turn_script() -> Vec<EventPayload> {
     // A permission menu replaces the composer (blocking), then the script
     // self-answers so non-interactive runs stay deterministic — an
     // interactive answer beats it and the later duplicate is ignored.
-    let menu_id = MenuId::new("demo-menu-1");
+    let menu_id = MenuId::new(format!("t{turn}-menu-1"));
     script.push(EventPayload::MenuOpened(Menu {
         id: menu_id.clone(),
         kind: MenuKind::Permission {
@@ -201,13 +201,13 @@ pub fn turn_script() -> Vec<EventPayload> {
 
     // Plan progresses; the patch lands as a file change.
     script.push(EventPayload::Item(ItemEvent::Completed {
-        item_id: item(1),
+        item_id: turn_item(turn, 1),
         item: TurnItem::Plan {
             items: todos([Completed, Processing, Listed]),
         },
     }));
     script.push(EventPayload::Item(ItemEvent::Completed {
-        item_id: item(4),
+        item_id: turn_item(turn, 4),
         item: TurnItem::FileChange {
             path: "crates/haider-store/src/event_store.rs".to_owned(),
             added: 4,
@@ -217,7 +217,7 @@ pub fn turn_script() -> Vec<EventPayload> {
 
     // The plan finishes (unpins into the transcript), usage arrives, done.
     script.push(EventPayload::Item(ItemEvent::Completed {
-        item_id: item(1),
+        item_id: turn_item(turn, 1),
         item: TurnItem::Plan {
             items: todos([Completed, Completed, Completed]),
         },
@@ -300,7 +300,7 @@ pub fn sample_sessions() -> Vec<SampleSession> {
 /// A canned response turn for user-typed demo input: the same envelope shapes
 /// the real harness emits, themed around the typed text.
 #[must_use]
-pub fn response_script(user_text: &str) -> Vec<EventPayload> {
+pub fn response_script(user_text: &str, turn: u64) -> Vec<EventPayload> {
     let mut script = vec![
         EventPayload::UserMessage {
             text: user_text.to_owned(),
@@ -311,7 +311,7 @@ pub fn response_script(user_text: &str) -> Vec<EventPayload> {
         EventPayload::RunState(RunState::Thinking),
         EventPayload::RunState(RunState::Streaming),
     ];
-    let reply_id = ItemId::new(format!("reply-{}", user_text.len()));
+    let reply_id = ItemId::new(format!("t{turn}-reply"));
     script.push(EventPayload::Item(ItemEvent::Started {
         item_id: reply_id.clone(),
         item: TurnItem::AgentMessage {
@@ -339,7 +339,7 @@ pub fn response_script(user_text: &str) -> Vec<EventPayload> {
         },
     }));
     script.push(EventPayload::RunState(RunState::RunningTool));
-    let search_id = ItemId::new(format!("search-{}", user_text.len()));
+    let search_id = ItemId::new(format!("t{turn}-search"));
     script.push(EventPayload::Item(ItemEvent::Started {
         item_id: search_id.clone(),
         item: TurnItem::ToolCall {
@@ -359,7 +359,7 @@ pub fn response_script(user_text: &str) -> Vec<EventPayload> {
         },
     }));
     script.push(EventPayload::RunState(RunState::Streaming));
-    let close_id = ItemId::new(format!("close-{}", user_text.len()));
+    let close_id = ItemId::new(format!("t{turn}-close"));
     script.push(EventPayload::Item(ItemEvent::Started {
         item_id: close_id.clone(),
         item: TurnItem::AgentMessage {
