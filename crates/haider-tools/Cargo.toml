@@ -8,9 +8,11 @@ rust-version.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+base64.workspace = true
 blake3.workspace = true
 haider-protocol = { path = "../haider-protocol" }
 rustix.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 tokio.workspace = true

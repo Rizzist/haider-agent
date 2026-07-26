@@ -1,0 +1,8 @@
+{
+  "phase": "outcome",
+  "effect": "ef-shell-leaked",
+  "outcome": {
+    "outcome": "cancelled_escalated",
+    "note": "SIGKILL escalation failed"
+  }
+}

@@ -15,9 +15,13 @@ use crate::{Cas, StoreResult, store_error};
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::ArtifactRef;
 use std::fs::{self, File, OpenOptions};
-use std::io::{ErrorKind, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+#[cfg(test)]
+#[path = "cas_tests.rs"]
+mod cas_tests;
 
 /// Process-wide counter making temp-file names unique across threads.
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -51,10 +55,93 @@ impl FileCas {
     /// Returns whether the object at `path` exists with bytes matching
     /// `artifact`; missing is `Ok(false)`, unreadable is an error.
     fn verify_existing(&self, artifact: &ArtifactRef, path: &Path) -> StoreResult<bool> {
-        match fs::read(path) {
-            Ok(bytes) => Ok(artifact_for(&bytes) == *artifact),
+        match File::open(path) {
+            Ok(file) => Ok(artifact_for_reader(file, path)? == *artifact),
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
             Err(error) => Err(io_error("read CAS object", path, error)),
+        }
+    }
+
+    /// Copies and hashes one reader in the same pass. The temporary lives in
+    /// the CAS root because its digest (and therefore its shard) is not known
+    /// until every byte that will be published has been written.
+    fn put_reader(&self, mut source: impl Read, source_path: &Path) -> StoreResult<ArtifactRef> {
+        let (mut temporary_path, mut temporary) = create_temporary(&self.root)?;
+        let mut hasher = blake3::Hasher::new();
+        let mut buffer = [0_u8; 16 * 1024];
+        let copy_result = (|| {
+            loop {
+                let read = source
+                    .read(&mut buffer)
+                    .map_err(|error| io_error("read CAS source", source_path, error))?;
+                if read == 0 {
+                    break;
+                }
+                temporary.write_all(&buffer[..read]).map_err(|error| {
+                    io_error("persist temporary CAS object", temporary_path.path(), error)
+                })?;
+                // Update only after write_all succeeds: the address covers
+                // exactly the complete bytes eligible for publication.
+                hasher.update(&buffer[..read]);
+            }
+            temporary.sync_all().map_err(|error| {
+                io_error("persist temporary CAS object", temporary_path.path(), error)
+            })?;
+            Ok(ArtifactRef::new(format!(
+                "blake3:{}",
+                hasher.finalize().to_hex()
+            )))
+        })();
+        let artifact = match copy_result {
+            Ok(artifact) => artifact,
+            Err(error) => {
+                drop(temporary);
+                cleanup_temporary(&mut temporary_path, &self.root)?;
+                return Err(error);
+            }
+        };
+        drop(temporary);
+
+        let path = self.path_for(&artifact)?;
+        if self.verify_existing(&artifact, &path)? {
+            cleanup_temporary(&mut temporary_path, &self.root)?;
+            return Ok(artifact);
+        }
+        let parent = path.parent().ok_or_else(|| {
+            store_error(
+                ErrorCode::Internal,
+                format!("CAS object has no parent directory: {}", path.display()),
+                false,
+            )
+        })?;
+        let shard_created = !parent.exists();
+        fs::create_dir_all(parent).map_err(|error| io_error("create CAS shard", parent, error))?;
+        if shard_created {
+            sync_directory(&self.root)?;
+        }
+
+        match fs::hard_link(temporary_path.path(), &path) {
+            Ok(()) => {
+                // Both directory mutations are durability boundaries: unlink
+                // the root staging name and persist the shard publication.
+                cleanup_temporary(&mut temporary_path, &self.root)?;
+                sync_directory(parent)?;
+                Ok(artifact)
+            }
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                let winner_is_valid = self.verify_existing(&artifact, &path);
+                cleanup_temporary(&mut temporary_path, &self.root)?;
+                if winner_is_valid? {
+                    Ok(artifact)
+                } else {
+                    Err(corrupt_object(&path))
+                }
+            }
+            Err(error) => {
+                let publish_error = io_error("publish CAS object", &path, error);
+                cleanup_temporary(&mut temporary_path, &self.root)?;
+                Err(publish_error)
+            }
         }
     }
 }
@@ -118,6 +205,12 @@ impl Cas for FileCas {
         }
     }
 
+    fn put_file(&self, source_path: &Path) -> StoreResult<ArtifactRef> {
+        let source = File::open(source_path)
+            .map_err(|error| io_error("open CAS source", source_path, error))?;
+        self.put_reader(source, source_path)
+    }
+
     fn get(&self, artifact: &ArtifactRef) -> StoreResult<Vec<u8>> {
         let path = self.path_for(artifact)?;
         let bytes = fs::read(&path).map_err(|error| {
@@ -149,6 +242,24 @@ impl Cas for FileCas {
 /// Computes the canonical address for a byte string.
 fn artifact_for(bytes: &[u8]) -> ArtifactRef {
     ArtifactRef::new(format!("blake3:{}", blake3::hash(bytes).to_hex()))
+}
+
+fn artifact_for_reader(mut reader: impl Read, path: &Path) -> StoreResult<ArtifactRef> {
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|error| io_error("hash CAS object", path, error))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(ArtifactRef::new(format!(
+        "blake3:{}",
+        hasher.finalize().to_hex()
+    )))
 }
 
 /// Extracts the hex digest from a `blake3:<hex>` reference, requiring exactly

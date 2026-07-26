@@ -294,6 +294,12 @@ impl CasSink for RecordingCas {
             blake3::hash(bytes).to_hex()
         )))
     }
+
+    async fn put_file(&mut self, path: &Path) -> ToolResult<ArtifactRef> {
+        let bytes = std::fs::read(path)
+            .map_err(|error| ToolError::cas(format!("read recording CAS source: {error}")))?;
+        self.put(&bytes).await
+    }
 }
 
 fn allow(class: EffectClass) -> PermissionPolicy {

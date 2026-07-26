@@ -40,6 +40,11 @@ pub struct EffectIntent {
 #[serde(tag = "verdict", rename_all = "snake_case")]
 pub enum AuthorizationVerdict {
     Allow,
+    /// The user directly initiated this effect (for example with `!cmd`).
+    /// It is durably distinguished from a model effect allowed by policy.
+    PreAuthorized {
+        source: AuthorizationSource,
+    },
     /// Blocked on a permission menu.
     Ask {
         menu: MenuId,
@@ -47,6 +52,12 @@ pub enum AuthorizationVerdict {
     Deny {
         reason: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthorizationSource {
+    UserTyped,
 }
 
 /// Effect lifecycle events as journaled.
@@ -71,6 +82,15 @@ pub enum EffectPhase {
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum EffectOutcome {
     Ok,
+    /// The effect crossed the dispatch boundary and was deliberately stopped.
+    /// Cancellation is a terminal outcome, never a failure.
+    Cancelled,
+    /// Cancellation won, but userspace could not prove process-group death.
+    /// The note is durable and orderly broker close separately reports the
+    /// leaked registry entry.
+    CancelledEscalated {
+        note: String,
+    },
     Failed {
         error: String,
     },

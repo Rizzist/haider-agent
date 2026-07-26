@@ -14,8 +14,10 @@
 //!   `RunState::Cancelled` as its final envelope and emits nothing after it,
 //!   even when cancellation wins a race with a buffered provider event.
 //!
-//! Tool calls are surfaced (completed as `ToolStatus::Pending`) but not
-//! executed yet — execution lands in a later wave.
+//! General tool calls are surfaced (completed as `ToolStatus::Pending`) for a
+//! later dispatcher. `request_input` is the intentional exception: the actor
+//! owns its blocking menu round trip because only the actor may journal the
+//! session's `MenuOpened`/`MenuAnswered` and run-state envelopes.
 
 use crate::{StoreHandle, unix_time_ms};
 use haider_protocol::DeliveryMode;
@@ -24,13 +26,22 @@ use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
 };
 use haider_protocol::error::{ErrorCode, HaiderError};
-use haider_protocol::ids::{AgentId, BranchId, DeviceId, EventId, ItemId, RunId, SessionId};
+use haider_protocol::ids::{
+    AgentId, BranchId, DeviceId, EventId, ItemId, MenuId, RunId, SessionId,
+};
 use haider_protocol::item::{ItemDelta, ItemEvent, ToolStatus, TurnItem};
-use haider_protocol::provider::{FinishReason, StreamEvent};
+use haider_protocol::menu::{MenuAnswer, MenuCloseReason};
+use haider_protocol::provider::{Block, FinishReason, StreamEvent};
 use haider_protocol::state::RunState;
+use haider_protocol::tool::BoundedResult;
 use haider_provider::{Message, Provider, ProviderError, ProviderErrorKind, TurnRequest};
+use haider_tools::RequestInput;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
+
+const DEFAULT_MAX_PROVIDER_REQUESTS_PER_TURN: usize = 32;
+const DEFAULT_DEFERRED_COMMAND_CAPACITY: usize = 64;
 
 /// Immutable identity and fencing parameters for one session actor.
 #[derive(Debug, Clone)]
@@ -45,6 +56,10 @@ pub struct HarnessConfig {
     pub max_tokens: u64,
     pub command_capacity: usize,
     pub broadcast_capacity: usize,
+    /// Hard ceiling on provider requests made by one logical turn.
+    pub max_provider_requests_per_turn: usize,
+    /// Maximum number of submissions parked behind the active turn.
+    pub deferred_command_capacity: usize,
     started_at_ms: Option<u64>,
 }
 
@@ -67,6 +82,8 @@ impl HarnessConfig {
             max_tokens: 4096,
             command_capacity: 8,
             broadcast_capacity: 128,
+            max_provider_requests_per_turn: DEFAULT_MAX_PROVIDER_REQUESTS_PER_TURN,
+            deferred_command_capacity: DEFAULT_DEFERRED_COMMAND_CAPACITY,
             started_at_ms: None,
         }
     }
@@ -188,7 +205,26 @@ impl HarnessHandle {
                 "session actor stopped before accepting the turn",
                 true,
             )
-        })
+        })?
+    }
+
+    /// Answers the currently open input menu. Invalid or stale answers fail
+    /// without closing the menu, so another surface may still answer it.
+    pub async fn answer_menu(&self, answer: MenuAnswer) -> Result<(), HaiderError> {
+        let (completed, response) = oneshot::channel();
+        self.commands
+            .send(ActorCommand::AnswerMenu { answer, completed })
+            .await
+            .map_err(|_| {
+                HaiderError::new(ErrorCode::Internal, "session actor is not running", true)
+            })?;
+        response.await.map_err(|_| {
+            HaiderError::new(
+                ErrorCode::Internal,
+                "session actor stopped before resolving the menu answer",
+                true,
+            )
+        })?
     }
 
     /// Live feed of committed envelopes (from subscription time onward).
@@ -208,7 +244,11 @@ impl HarnessHandle {
 enum ActorCommand {
     Submit {
         request: SubmitTurn,
-        accepted: oneshot::Sender<TurnHandle>,
+        accepted: oneshot::Sender<Result<TurnHandle, HaiderError>>,
+    },
+    AnswerMenu {
+        answer: MenuAnswer,
+        completed: oneshot::Sender<Result<(), HaiderError>>,
     },
 }
 
@@ -225,6 +265,8 @@ pub struct HarnessActor {
     /// Actor start instant (ms) — embedded in event ids for global uniqueness.
     started_at_ms: u64,
     next_item: u64,
+    next_menu: u64,
+    deferred_commands: VecDeque<ActorCommand>,
 }
 
 impl HarnessActor {
@@ -254,6 +296,8 @@ impl HarnessActor {
                 next_event: 0,
                 started_at_ms,
                 next_item: 0,
+                next_menu: 0,
+                deferred_commands: VecDeque::new(),
             },
             handle,
         )
@@ -273,7 +317,7 @@ impl HarnessActor {
 
     /// Processes submissions strictly in order until every handle is dropped.
     pub async fn run(mut self) {
-        while let Some(command) = self.commands.recv().await {
+        while let Some(command) = self.next_command().await {
             match command {
                 ActorCommand::Submit { request, accepted } => {
                     let cancel = CancelToken::new();
@@ -282,13 +326,20 @@ impl HarnessActor {
                         cancel: cancel.clone(),
                         outcome,
                     };
-                    if accepted.send(turn).is_err() {
+                    if accepted.send(Ok(turn)).is_err() {
                         // Submitter vanished before receiving the handle;
                         // drop the turn un-run rather than run it unowned.
                         continue;
                     }
                     let outcome = self.drive_turn(request, cancel).await;
                     let _ = outcome_sender.send(outcome);
+                }
+                ActorCommand::AnswerMenu { completed, .. } => {
+                    let _ = completed.send(Err(HaiderError::new(
+                        ErrorCode::MenuNotFound,
+                        "there is no open input menu",
+                        false,
+                    )));
                 }
             }
         }
@@ -319,45 +370,72 @@ impl HarnessActor {
             return self.errored_state_outcome(&run_id, error).await;
         }
 
-        let provider_request = TurnRequest {
-            messages: vec![Message::user_text(submit.text)],
-            model: self.config.model.clone(),
-            max_tokens: self.config.max_tokens,
-            system_prompt: None,
-            tools: Vec::new(),
-            attachments: Vec::new(),
-        };
-        let mut stream = tokio::select! {
-            biased;
-            () = cancel.cancelled() => {
-                return self.cancelled_outcome(&run_id).await;
-            }
-            stream = self.provider.stream_turn(provider_request) => {
-                if cancel.is_cancelled() {
-                    return self.cancelled_outcome(&run_id).await;
-                }
-                match stream {
-                    Ok(stream) => stream,
-                    Err(error) => {
-                        return self.provider_failure_outcome(&run_id, error).await;
-                    }
-                }
-            }
-        };
-        if let Err(error) = self.commit_state(&run_id, RunState::Streaming).await {
-            return self.errored_state_outcome(&run_id, error).await;
-        }
-
+        let mut messages = vec![Message::user_text(submit.text)];
         let mut message: Option<TextAccumulator> = None;
         let mut reasoning: Option<TextAccumulator> = None;
         let mut tools: Vec<ToolAccumulator> = Vec::new();
+        let mut provider_request_count = 0usize;
 
-        loop {
-            let next = tokio::select! {
-                // biased: when cancellation and a buffered provider event are
-                // both ready, cancellation must win (cancellation-as-outcome).
-                biased;
-                () = cancel.cancelled() => {
+        'requests: loop {
+            provider_request_count = provider_request_count.saturating_add(1);
+            if provider_request_count > self.config.max_provider_requests_per_turn {
+                return self
+                    .errored_outcome_with_items(
+                        &run_id,
+                        &mut message,
+                        &mut reasoning,
+                        &mut tools,
+                        loop_limit_error(
+                            provider_request_count,
+                            self.config.max_provider_requests_per_turn,
+                        ),
+                    )
+                    .await;
+            }
+            let provider_request = TurnRequest {
+                messages: messages.clone(),
+                model: self.config.model.clone(),
+                max_tokens: self.config.max_tokens,
+                system_prompt: None,
+                tools: Vec::new(),
+                attachments: Vec::new(),
+            };
+            let provider = Arc::clone(&self.provider);
+            let mut opening = Box::pin(provider.stream_turn(provider_request));
+            let mut stream = loop {
+                let opened = tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => {
+                        return self
+                            .cancelled_outcome_with_items(
+                                &run_id,
+                                &mut message,
+                                &mut reasoning,
+                                &mut tools,
+                            )
+                            .await;
+                    }
+                    opened = &mut opening => opened,
+                    command = self.commands.recv() => {
+                        let Some(command) = command else {
+                            let error = provider_protocol_error(
+                                "session actor command channel closed while opening provider stream",
+                            );
+                            return self
+                                .provider_failure_outcome_with_items(
+                                    &run_id,
+                                    &mut message,
+                                    &mut reasoning,
+                                    &mut tools,
+                                    error,
+                                )
+                                .await;
+                        };
+                        self.service_command_without_menu(command);
+                        continue;
+                    }
+                };
+                if cancel.is_cancelled() {
                     return self
                         .cancelled_outcome_with_items(
                             &run_id,
@@ -367,32 +445,77 @@ impl HarnessActor {
                         )
                         .await;
                 }
-                item = stream.recv() => item,
+                match opened {
+                    Ok(stream) => break stream,
+                    Err(error) => {
+                        return self
+                            .provider_failure_outcome_with_items(
+                                &run_id,
+                                &mut message,
+                                &mut reasoning,
+                                &mut tools,
+                                error,
+                            )
+                            .await;
+                    }
+                }
             };
-
-            // The provider result may already have been selected when another
-            // task cancelled the turn. Cancellation is sticky, so recheck
-            // before applying any buffered event, closure, or stream error.
-            if cancel.is_cancelled() {
-                return self
-                    .cancelled_outcome_with_items(&run_id, &mut message, &mut reasoning, &mut tools)
-                    .await;
+            if let Err(error) = self.commit_state(&run_id, RunState::Streaming).await {
+                return self.errored_state_outcome(&run_id, error).await;
             }
-            let Some(next) = next else {
-                let error = provider_protocol_error("provider stream closed before a finish event");
-                return self
-                    .provider_failure_outcome_with_items(
-                        &run_id,
-                        &mut message,
-                        &mut reasoning,
-                        &mut tools,
-                        error,
-                    )
-                    .await;
-            };
-            let event = match next {
-                Ok(event) => event,
-                Err(error) => {
+
+            let mut assistant_blocks = Vec::new();
+            let mut tool_results = Vec::new();
+            loop {
+                let next = tokio::select! {
+                    // Cancellation owns ties. Provider progress is polled
+                    // before command service on every round so an unbounded
+                    // command arrival rate cannot starve the active stream.
+                    biased;
+                    () = cancel.cancelled() => {
+                        return self
+                            .cancelled_outcome_with_items(
+                                &run_id,
+                                &mut message,
+                                &mut reasoning,
+                                &mut tools,
+                            )
+                            .await;
+                    }
+                    item = stream.recv() => item,
+                    command = self.commands.recv() => {
+                        let Some(command) = command else {
+                            let error = provider_protocol_error(
+                                "session actor command channel closed during provider stream",
+                            );
+                            return self
+                                .provider_failure_outcome_with_items(
+                                    &run_id,
+                                    &mut message,
+                                    &mut reasoning,
+                                    &mut tools,
+                                    error,
+                                )
+                                .await;
+                        };
+                        self.service_command_without_menu(command);
+                        continue;
+                    }
+                };
+
+                if cancel.is_cancelled() {
+                    return self
+                        .cancelled_outcome_with_items(
+                            &run_id,
+                            &mut message,
+                            &mut reasoning,
+                            &mut tools,
+                        )
+                        .await;
+                }
+                let Some(next) = next else {
+                    let error =
+                        provider_protocol_error("provider stream closed before a finish event");
                     return self
                         .provider_failure_outcome_with_items(
                             &run_id,
@@ -402,43 +525,162 @@ impl HarnessActor {
                             error,
                         )
                         .await;
-                }
-            };
-
-            let event_result = match event {
-                StreamEvent::TextDelta { text } => {
-                    self.apply_text_delta(&run_id, &mut message, text, false)
-                        .await
-                }
-                StreamEvent::ReasoningDelta { text } => {
-                    self.apply_text_delta(&run_id, &mut reasoning, text, true)
-                        .await
-                }
-                StreamEvent::ToolCallStart { call_id, name } => {
-                    async {
-                        self.complete_text(&run_id, &mut message, false).await?;
-                        self.complete_text(&run_id, &mut reasoning, true).await?;
-                        self.start_tool(&run_id, &mut tools, call_id, name).await
+                };
+                let event = match next {
+                    Ok(event) => event,
+                    Err(error) => {
+                        return self
+                            .provider_failure_outcome_with_items(
+                                &run_id,
+                                &mut message,
+                                &mut reasoning,
+                                &mut tools,
+                                error,
+                            )
+                            .await;
                     }
-                    .await
-                }
-                StreamEvent::ToolCallArgsDelta {
-                    call_id,
-                    args_fragment,
-                } => {
-                    self.apply_tool_delta(&run_id, &mut tools, &call_id, args_fragment)
+                };
+
+                let event_result: Result<Option<Message>, DriveError> = match event {
+                    StreamEvent::TextDelta { text } => {
+                        assistant_blocks.push(Block::Text { text: text.clone() });
+                        self.apply_text_delta(&run_id, &mut message, text, false)
+                            .await
+                            .map(|()| None)
+                    }
+                    StreamEvent::ReasoningDelta { text } => {
+                        assistant_blocks.push(Block::Reasoning {
+                            summary: text.clone(),
+                        });
+                        self.apply_text_delta(&run_id, &mut reasoning, text, true)
+                            .await
+                            .map(|()| None)
+                    }
+                    StreamEvent::ToolCallStart { call_id, name } => {
+                        async {
+                            self.complete_text(&run_id, &mut message, false).await?;
+                            self.complete_text(&run_id, &mut reasoning, true).await?;
+                            self.start_tool(&run_id, &mut tools, call_id, name).await?;
+                            Ok(None)
+                        }
                         .await
-                }
-                StreamEvent::ToolCallEnd { call_id } => {
-                    self.complete_tool(&run_id, &mut tools, &call_id).await
-                }
-                StreamEvent::UsageUpdate(usage) => self
-                    .commit_payload(&run_id, EventPayload::Usage(usage), prompt_omit_render())
-                    .await
-                    .map(|_| ())
-                    .map_err(DriveError::Store),
-                StreamEvent::Finish { reason } => {
-                    if reason == FinishReason::Cancelled {
+                    }
+                    StreamEvent::ToolCallArgsDelta {
+                        call_id,
+                        args_fragment,
+                    } => self
+                        .apply_tool_delta(&run_id, &mut tools, &call_id, args_fragment)
+                        .await
+                        .map(|()| None),
+                    StreamEvent::ToolCallEnd { call_id } => {
+                        match provider_tool_block(&tools, &call_id) {
+                            Ok(block) => {
+                                assistant_blocks.push(block);
+                                self.complete_tool(&run_id, &mut tools, &call_id, &cancel)
+                                    .await
+                            }
+                            Err(error) => Err(error),
+                        }
+                    }
+                    StreamEvent::UsageUpdate(usage) => self
+                        .commit_payload(&run_id, EventPayload::Usage(usage), prompt_omit_render())
+                        .await
+                        .map(|_| None)
+                        .map_err(DriveError::Store),
+                    StreamEvent::Finish { reason } => {
+                        if reason == FinishReason::Cancelled {
+                            return self
+                                .cancelled_outcome_with_items(
+                                    &run_id,
+                                    &mut message,
+                                    &mut reasoning,
+                                    &mut tools,
+                                )
+                                .await;
+                        }
+                        if reason == FinishReason::Error {
+                            let error = HaiderError::new(
+                                ErrorCode::ProviderError,
+                                "provider finished the turn with an error",
+                                false,
+                            );
+                            return self
+                                .errored_outcome_with_items(
+                                    &run_id,
+                                    &mut message,
+                                    &mut reasoning,
+                                    &mut tools,
+                                    error,
+                                )
+                                .await;
+                        }
+                        if let Err(error) = self.complete_text(&run_id, &mut message, false).await {
+                            return self
+                                .drive_error_outcome_with_items(
+                                    &run_id,
+                                    &mut message,
+                                    &mut reasoning,
+                                    &mut tools,
+                                    error,
+                                )
+                                .await;
+                        }
+                        if let Err(error) = self.complete_text(&run_id, &mut reasoning, true).await
+                        {
+                            return self
+                                .drive_error_outcome_with_items(
+                                    &run_id,
+                                    &mut message,
+                                    &mut reasoning,
+                                    &mut tools,
+                                    error,
+                                )
+                                .await;
+                        }
+                        if let Err(error) = self
+                            .complete_all_tools(&run_id, &mut tools, ToolStatus::Pending)
+                            .await
+                        {
+                            return self
+                                .drive_error_outcome_with_items(
+                                    &run_id,
+                                    &mut message,
+                                    &mut reasoning,
+                                    &mut tools,
+                                    error,
+                                )
+                                .await;
+                        }
+                        if cancel.is_cancelled() {
+                            return self
+                                .cancelled_outcome_with_items(
+                                    &run_id,
+                                    &mut message,
+                                    &mut reasoning,
+                                    &mut tools,
+                                )
+                                .await;
+                        }
+                        if !assistant_blocks.is_empty() {
+                            messages
+                                .push(Message::assistant(std::mem::take(&mut assistant_blocks)));
+                        }
+                        if !tool_results.is_empty() {
+                            messages.append(&mut tool_results);
+                            if let Err(error) = self.commit_state(&run_id, RunState::Thinking).await
+                            {
+                                return self.errored_state_outcome(&run_id, error).await;
+                            }
+                            continue 'requests;
+                        }
+                        return self.finish_outcome(&run_id, reason).await;
+                    }
+                };
+
+                match event_result {
+                    Ok(Some(result)) => tool_results.push(result),
+                    Ok(None) => {}
+                    Err(DriveError::Cancelled) => {
                         return self
                             .cancelled_outcome_with_items(
                                 &run_id,
@@ -448,23 +690,7 @@ impl HarnessActor {
                             )
                             .await;
                     }
-                    if reason == FinishReason::Error {
-                        let error = HaiderError::new(
-                            ErrorCode::ProviderError,
-                            "provider finished the turn with an error",
-                            false,
-                        );
-                        return self
-                            .errored_outcome_with_items(
-                                &run_id,
-                                &mut message,
-                                &mut reasoning,
-                                &mut tools,
-                                error,
-                            )
-                            .await;
-                    }
-                    if let Err(error) = self.complete_text(&run_id, &mut message, false).await {
+                    Err(error) => {
                         return self
                             .drive_error_outcome_with_items(
                                 &run_id,
@@ -475,62 +701,17 @@ impl HarnessActor {
                             )
                             .await;
                     }
-                    if let Err(error) = self.complete_text(&run_id, &mut reasoning, true).await {
-                        return self
-                            .drive_error_outcome_with_items(
-                                &run_id,
-                                &mut message,
-                                &mut reasoning,
-                                &mut tools,
-                                error,
-                            )
-                            .await;
-                    }
-                    if let Err(error) = self
-                        .complete_all_tools(&run_id, &mut tools, ToolStatus::Pending)
-                        .await
-                    {
-                        return self
-                            .drive_error_outcome_with_items(
-                                &run_id,
-                                &mut message,
-                                &mut reasoning,
-                                &mut tools,
-                                error,
-                            )
-                            .await;
-                    }
-                    // Closing items performs store awaits. Give cancellation a
-                    // final linearization point before committing `Done`.
-                    if cancel.is_cancelled() {
-                        return self
-                            .cancelled_outcome_with_items(
-                                &run_id,
-                                &mut message,
-                                &mut reasoning,
-                                &mut tools,
-                            )
-                            .await;
-                    }
-                    return self.finish_outcome(&run_id, reason).await;
                 }
-            };
-
-            if let Err(error) = event_result {
-                return self
-                    .drive_error_outcome_with_items(
-                        &run_id,
-                        &mut message,
-                        &mut reasoning,
-                        &mut tools,
-                        error,
-                    )
-                    .await;
-            }
-            if cancel.is_cancelled() {
-                return self
-                    .cancelled_outcome_with_items(&run_id, &mut message, &mut reasoning, &mut tools)
-                    .await;
+                if cancel.is_cancelled() {
+                    return self
+                        .cancelled_outcome_with_items(
+                            &run_id,
+                            &mut message,
+                            &mut reasoning,
+                            &mut tools,
+                        )
+                        .await;
+                }
             }
         }
     }
@@ -692,16 +873,158 @@ impl HarnessActor {
         run_id: &RunId,
         tools: &mut Vec<ToolAccumulator>,
         call_id: &str,
-    ) -> Result<(), DriveError> {
+        cancel: &CancelToken,
+    ) -> Result<Option<Message>, DriveError> {
         let Some(index) = tools.iter().position(|tool| tool.call_id == call_id) else {
             return Err(DriveError::Provider(provider_protocol_error(format!(
                 "provider ended unknown tool call `{call_id}`",
             ))));
         };
+        if tools[index].name == "request_input" {
+            return self
+                .complete_request_input(run_id, tools, index, cancel)
+                .await
+                .map(Some);
+        }
         self.commit_tool_completed(run_id, &tools[index], ToolStatus::Pending)
             .await?;
         tools.remove(index);
-        Ok(())
+        Ok(None)
+    }
+
+    async fn complete_request_input(
+        &mut self,
+        run_id: &RunId,
+        tools: &mut Vec<ToolAccumulator>,
+        index: usize,
+        cancel: &CancelToken,
+    ) -> Result<Message, DriveError> {
+        let args = parse_tool_args(&tools[index])?;
+        let request = RequestInput::from_tool_args(args).map_err(tool_error_to_drive)?;
+        let menu = request.menu(self.next_menu_id());
+        self.commit_payload(
+            run_id,
+            EventPayload::MenuOpened(menu.clone()),
+            prompt_omit_render(),
+        )
+        .await
+        .map_err(DriveError::Store)?;
+        self.commit_state(
+            run_id,
+            RunState::InputRequired {
+                menu: menu.id.clone(),
+            },
+        )
+        .await
+        .map_err(DriveError::Store)?;
+
+        loop {
+            let command = tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    self.commit_payload(
+                        run_id,
+                        EventPayload::MenuClosed {
+                            menu: menu.id.clone(),
+                            reason: MenuCloseReason::Cancelled,
+                        },
+                        prompt_omit_render(),
+                    )
+                    .await
+                    .map_err(DriveError::Store)?;
+                    return Err(DriveError::Cancelled);
+                },
+                command = self.commands.recv() => command,
+            };
+            let Some(command) = command else {
+                self.commit_payload(
+                    run_id,
+                    EventPayload::MenuClosed {
+                        menu: menu.id.clone(),
+                        reason: MenuCloseReason::Dismissed,
+                    },
+                    prompt_omit_render(),
+                )
+                .await
+                .map_err(DriveError::Store)?;
+                return Err(DriveError::Provider(provider_protocol_error(
+                    "session actor command channel closed with request_input unanswered",
+                )));
+            };
+            match command {
+                command @ ActorCommand::Submit { .. } => {
+                    self.defer_submit_or_reject(command);
+                }
+                ActorCommand::AnswerMenu { answer, completed } => {
+                    if answer.menu != menu.id {
+                        let _ = completed.send(Err(HaiderError::new(
+                            ErrorCode::MenuNotFound,
+                            format!(
+                                "menu {} is not open; request_input is waiting on {}",
+                                answer.menu, menu.id
+                            ),
+                            false,
+                        )));
+                        continue;
+                    }
+                    let resolved = match request.resolve(&menu, &answer) {
+                        Ok(resolved) => resolved,
+                        Err(error) => {
+                            let _ = completed.send(Err(HaiderError::new(
+                                ErrorCode::InvalidArgument,
+                                error.to_string(),
+                                false,
+                            )));
+                            continue;
+                        }
+                    };
+                    if let Err(error) = self
+                        .commit_payload(
+                            run_id,
+                            EventPayload::MenuAnswered(answer),
+                            prompt_omit_render(),
+                        )
+                        .await
+                    {
+                        let _ = completed.send(Err(error.clone()));
+                        return Err(DriveError::Store(error));
+                    }
+                    let result = serde_json::json!({
+                        "value": resolved.value,
+                        "option_key": resolved.option_key,
+                    })
+                    .to_string();
+                    let call_id = tools[index].call_id.clone();
+                    if let Err(error) = self
+                        .commit_payload(
+                            run_id,
+                            EventPayload::ToolResult {
+                                call_id: call_id.clone(),
+                                result: BoundedResult {
+                                    preview: result.clone(),
+                                    truncated: false,
+                                    artifact: None,
+                                    cursor: None,
+                                },
+                            },
+                            prompt_verbatim_render(),
+                        )
+                        .await
+                    {
+                        let _ = completed.send(Err(error.clone()));
+                        return Err(DriveError::Store(error));
+                    }
+                    self.commit_tool_completed(run_id, &tools[index], ToolStatus::Completed)
+                        .await?;
+                    tools.remove(index);
+                    self.commit_state(run_id, RunState::Streaming)
+                        .await
+                        .map_err(DriveError::Store)?;
+                    let _ = completed.send(Ok(()));
+                    return Ok(Message::tool_result(call_id, result, false));
+                }
+            }
+        }
     }
 
     /// Closes every tool still open, in start order.
@@ -791,16 +1114,6 @@ impl HarnessActor {
             return errored_outcome(drive_error_to_haider(error));
         }
         self.cancelled_outcome(run_id).await
-    }
-
-    /// Wraps a provider failure as a typed `HaiderError`, then commits `Errored`.
-    async fn provider_failure_outcome(
-        &mut self,
-        run_id: &RunId,
-        provider_error: ProviderError,
-    ) -> TurnOutcome {
-        self.errored_state_outcome(run_id, provider_error_to_haider(provider_error))
-            .await
     }
 
     async fn provider_failure_outcome_with_items(
@@ -983,6 +1296,50 @@ impl HarnessActor {
             self.next_item
         ))
     }
+
+    fn next_menu_id(&mut self) -> MenuId {
+        self.next_menu += 1;
+        MenuId::new(format!(
+            "input-{}-{}-{}-{}",
+            self.config.session_id.as_str(),
+            self.config.worker_generation,
+            self.started_at_ms,
+            self.next_menu
+        ))
+    }
+
+    async fn next_command(&mut self) -> Option<ActorCommand> {
+        match self.deferred_commands.pop_front() {
+            Some(command) => Some(command),
+            None => self.commands.recv().await,
+        }
+    }
+
+    fn service_command_without_menu(&mut self, command: ActorCommand) {
+        match command {
+            command @ ActorCommand::Submit { .. } => self.defer_submit_or_reject(command),
+            ActorCommand::AnswerMenu { completed, .. } => {
+                let _ = completed.send(Err(HaiderError::new(
+                    ErrorCode::MenuNotFound,
+                    "there is no open input menu",
+                    false,
+                )));
+            }
+        }
+    }
+
+    fn defer_submit_or_reject(&mut self, command: ActorCommand) {
+        if self.deferred_commands.len() >= self.config.deferred_command_capacity {
+            let ActorCommand::Submit { accepted, .. } = command else {
+                unreachable!("only Submit commands may be deferred");
+            };
+            let _ = accepted.send(Err(submit_busy_error(
+                self.config.deferred_command_capacity,
+            )));
+        } else {
+            self.deferred_commands.push_back(command);
+        }
+    }
 }
 
 /// Turn-loop failure, tagged by which port failed (drives the error surface).
@@ -990,6 +1347,7 @@ impl HarnessActor {
 enum DriveError {
     Provider(ProviderError),
     Store(HaiderError),
+    Cancelled,
 }
 
 /// One in-flight text or reasoning item (started, not yet completed).
@@ -1020,6 +1378,19 @@ fn parse_tool_args(tool: &ToolAccumulator) -> Result<serde_json::Value, DriveErr
     })
 }
 
+fn provider_tool_block(tools: &[ToolAccumulator], call_id: &str) -> Result<Block, DriveError> {
+    let Some(tool) = tools.iter().find(|tool| tool.call_id == call_id) else {
+        return Err(DriveError::Provider(provider_protocol_error(format!(
+            "provider ended unknown tool call `{call_id}`",
+        ))));
+    };
+    Ok(Block::ToolCall {
+        call_id: tool.call_id.clone(),
+        name: tool.name.clone(),
+        args: parse_tool_args(tool)?,
+    })
+}
+
 fn tool_args_or_raw(tool: &ToolAccumulator) -> serde_json::Value {
     if tool.args.is_empty() {
         return serde_json::json!({});
@@ -1030,6 +1401,31 @@ fn tool_args_or_raw(tool: &ToolAccumulator) -> serde_json::Value {
 
 fn provider_protocol_error(message: impl Into<String>) -> ProviderError {
     ProviderError::new(ProviderErrorKind::MalformedFrame, message)
+}
+
+fn loop_limit_error(count: usize, limit: usize) -> HaiderError {
+    let mut error = HaiderError::new(
+        ErrorCode::LoopLimit,
+        format!("provider request loop limit exceeded at request {count} (limit {limit})"),
+        false,
+    );
+    error.details = Some(serde_json::json!({
+        "provider_request_count": count,
+        "provider_request_limit": limit,
+    }));
+    error
+}
+
+fn submit_busy_error(capacity: usize) -> HaiderError {
+    let mut error = HaiderError::new(
+        ErrorCode::Busy,
+        format!("session deferred submission queue is full (capacity {capacity})"),
+        true,
+    );
+    error.details = Some(serde_json::json!({
+        "deferred_command_capacity": capacity,
+    }));
+    error
 }
 
 fn provider_error_to_haider(provider_error: ProviderError) -> HaiderError {
@@ -1049,7 +1445,16 @@ fn drive_error_to_haider(error: DriveError) -> HaiderError {
     match error {
         DriveError::Provider(error) => provider_error_to_haider(error),
         DriveError::Store(error) => error,
+        DriveError::Cancelled => HaiderError::new(
+            ErrorCode::Internal,
+            "cancelled drive error escaped its turn outcome boundary",
+            false,
+        ),
     }
+}
+
+fn tool_error_to_drive(error: haider_tools::ToolError) -> DriveError {
+    DriveError::Provider(provider_protocol_error(error.to_string()))
 }
 
 /// Terminal outcome for faults where even the `Errored` commit failed.

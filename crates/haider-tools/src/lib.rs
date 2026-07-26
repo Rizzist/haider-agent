@@ -9,6 +9,9 @@ mod broker;
 mod error;
 mod filesystem;
 mod ledger;
+mod process;
+mod request_input;
+mod shell;
 
 pub use broker::{
     AlwaysAllowRule, EffectBroker, EffectBrokerCloseError, EffectBrokerCloseReport,
@@ -17,6 +20,16 @@ pub use broker::{
 pub use error::{FsPatchConflict, ToolError, ToolResult};
 pub use filesystem::{CasSink, FsList, FsPatch, FsRead, FsSearch, ResultBounds, TurnAttribution};
 pub use ledger::{ChangeLedger, ChangeLedgerSink, FsWriteRecord, TurnChanges};
+pub use process::{
+    CommandOutputSink, NoopCommandOutputSink, PROCESS_OUTPUT_CHUNK_BYTES, ProcessBounds,
+    ProcessControl, ProcessControlAction, ProcessControlResult, ProcessExec, ProcessExecution,
+    ProcessLifecycleEvent, ProcessOutputChunk, ProcessResult, ProcessSignal,
+};
+pub use request_input::{RequestInput, RequestInputAnswer, RequestInputKind, RequestInputOption};
+pub use shell::{
+    BuiltinResult, ComposerSubmission, EnvViewEntry, REDACTED_ENV_VALUE, ShellSession,
+    UserProcessExec,
+};
 
 /// Crate marker used by the workspace self-test.
 pub const CRATE_NAME: &str = "haider-tools";

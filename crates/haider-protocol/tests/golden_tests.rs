@@ -9,7 +9,9 @@
 use haider_protocol::EventPayload;
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets};
 use haider_protocol::ids::*;
-use haider_protocol::menu::{AnswerVia, Menu, MenuAnswer, MenuKind, MenuOption, MenuScope};
+use haider_protocol::menu::{
+    AnswerVia, Menu, MenuAnswer, MenuCloseReason, MenuKind, MenuOption, MenuScope,
+};
 use haider_protocol::state::{RunState, SessionState, VerifyStep, WaitReason};
 use haider_protocol::verify::{Diagnostic, GateReport, Severity, VerifyVerdict};
 use serde::{Serialize, de::DeserializeOwned};
@@ -131,6 +133,13 @@ fn golden_menu_permission() {
             option_index: 0,
             value: None,
             via: AnswerVia::Rpc,
+        },
+    );
+    golden(
+        "menu_closed",
+        &EventPayload::MenuClosed {
+            menu: MenuId::new("m-perm-1"),
+            reason: MenuCloseReason::Cancelled,
         },
     );
 }
@@ -289,6 +298,31 @@ fn golden_effect_phases() {
             effect: EffectId::new("ef-1"),
             verdict: AuthorizationVerdict::Ask {
                 menu: MenuId::new("m-1"),
+            },
+        },
+    );
+    golden(
+        "effect_authorized_user_typed",
+        &EffectPhase::Authorized {
+            effect: EffectId::new("ef-shell"),
+            verdict: AuthorizationVerdict::PreAuthorized {
+                source: AuthorizationSource::UserTyped,
+            },
+        },
+    );
+    golden(
+        "effect_outcome_cancelled",
+        &EffectPhase::Outcome {
+            effect: EffectId::new("ef-shell"),
+            outcome: EffectOutcome::Cancelled,
+        },
+    );
+    golden(
+        "effect_outcome_cancelled_escalated",
+        &EffectPhase::Outcome {
+            effect: EffectId::new("ef-shell-leaked"),
+            outcome: EffectOutcome::CancelledEscalated {
+                note: "SIGKILL escalation failed".into(),
             },
         },
     );

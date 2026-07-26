@@ -51,6 +51,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[async_trait]
 pub trait CasSink: Send {
     async fn put(&mut self, bytes: &[u8]) -> ToolResult<ArtifactRef>;
+    /// Streams a staged file into CAS without rebuilding it as one buffer.
+    async fn put_file(&mut self, path: &Path) -> ToolResult<ArtifactRef>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

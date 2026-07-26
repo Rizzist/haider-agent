@@ -17,9 +17,9 @@ use haider_provider::{
 };
 use std::collections::HashSet;
 use std::future::pending;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::sync::Notify;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use tokio::sync::{Notify, mpsc};
 use tokio::time::{Duration, sleep, timeout};
 
 const SESSION: &str = "session-test";
@@ -537,6 +537,87 @@ async fn hanging_provider_can_always_be_cancelled() {
 }
 
 #[tokio::test]
+async fn submit_flood_is_bounded_and_cannot_starve_provider_progress() {
+    let provider = Arc::new(FairnessProvider::new());
+    let store = Arc::new(MemoryStore::new());
+    let mut actor_config = config();
+    actor_config.command_capacity = 64;
+    actor_config.deferred_command_capacity = 4;
+    let handle = HarnessActor::spawn(actor_config, provider.clone(), store);
+    let first = handle
+        .submit_turn(SubmitTurn::new("active stream"))
+        .await
+        .expect("first turn accepted");
+    timeout(Duration::from_secs(1), provider.first_started.notified())
+        .await
+        .expect("provider stream starts");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let busy_count = Arc::new(AtomicUsize::new(0));
+    let first_busy = Arc::new(Mutex::new(None));
+    let mut flooders = Vec::new();
+    for worker in 0..12 {
+        let handle = handle.clone();
+        let stop = Arc::clone(&stop);
+        let busy_count = Arc::clone(&busy_count);
+        let first_busy = Arc::clone(&first_busy);
+        flooders.push(tokio::spawn(async move {
+            let mut submission = 0usize;
+            while !stop.load(Ordering::Acquire) {
+                submission = submission.saturating_add(1);
+                match handle
+                    .submit_turn(SubmitTurn::new(format!("flood-{worker}-{submission}")))
+                    .await
+                {
+                    Ok(turn) => {
+                        let _ = turn.wait().await;
+                    }
+                    Err(error) if error.code == ErrorCode::Busy => {
+                        busy_count.fetch_add(1, Ordering::Relaxed);
+                        let mut observed = first_busy.lock().unwrap_or_else(|e| e.into_inner());
+                        if observed.is_none() {
+                            *observed = Some(error);
+                        }
+                    }
+                    Err(_) => return,
+                }
+            }
+        }));
+    }
+
+    timeout(Duration::from_secs(1), async {
+        while busy_count.load(Ordering::Relaxed) < 100 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("bounded queue surfaces busy rejections under flood");
+    let busy = first_busy
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .expect("typed busy error");
+    assert_eq!(busy.code, ErrorCode::Busy);
+    assert_eq!(
+        busy.details.expect("busy details")["deferred_command_capacity"],
+        4
+    );
+
+    provider.release.notify_one();
+    let outcome = timeout(Duration::from_secs(1), first.wait())
+        .await
+        .expect("provider progress is not starved by command flood")
+        .expect("first outcome");
+    assert_eq!(outcome.state, RunState::Done);
+
+    stop.store(true, Ordering::Release);
+    for flooder in flooders {
+        flooder.abort();
+        let _ = flooder.await;
+    }
+}
+
+#[tokio::test]
 async fn actor_restarts_do_not_reuse_run_or_item_ids() {
     let store = Arc::new(MemoryStore::new());
     let script = || {
@@ -721,6 +802,22 @@ impl Provider for ImmediateErrorProvider {
     }
 }
 
+struct FairnessProvider {
+    first_started: Arc<Notify>,
+    release: Arc<Notify>,
+    requests: AtomicUsize,
+}
+
+impl FairnessProvider {
+    fn new() -> Self {
+        Self {
+            first_started: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+            requests: AtomicUsize::new(0),
+        }
+    }
+}
+
 #[async_trait]
 impl Provider for HangingStartProvider {
     async fn capabilities(&self) -> CapabilityDoc {
@@ -730,5 +827,44 @@ impl Provider for HangingStartProvider {
     async fn stream_turn(&self, _request: TurnRequest) -> Result<ProviderStream, ProviderError> {
         self.entered.notify_one();
         pending().await
+    }
+}
+
+#[async_trait]
+impl Provider for FairnessProvider {
+    async fn capabilities(&self) -> CapabilityDoc {
+        FakeProvider::new(Vec::new()).capabilities().await
+    }
+
+    async fn stream_turn(&self, _request: TurnRequest) -> Result<ProviderStream, ProviderError> {
+        let request = self.requests.fetch_add(1, Ordering::Relaxed);
+        let (sender, receiver) = mpsc::channel(4);
+        if request == 0 {
+            let started = Arc::clone(&self.first_started);
+            let release = Arc::clone(&self.release);
+            tokio::spawn(async move {
+                started.notify_one();
+                let _ = sender
+                    .send(Ok(haider_protocol::provider::StreamEvent::TextDelta {
+                        text: "started".into(),
+                    }))
+                    .await;
+                release.notified().await;
+                let _ = sender
+                    .send(Ok(haider_protocol::provider::StreamEvent::Finish {
+                        reason: FinishReason::EndTurn,
+                    }))
+                    .await;
+            });
+        } else {
+            tokio::spawn(async move {
+                let _ = sender
+                    .send(Ok(haider_protocol::provider::StreamEvent::Finish {
+                        reason: FinishReason::EndTurn,
+                    }))
+                    .await;
+            });
+        }
+        Ok(receiver)
     }
 }

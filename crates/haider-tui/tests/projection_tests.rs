@@ -8,7 +8,9 @@ use haider_protocol::envelope::{EventEnvelope, PromptRender, RawEnvelope, Render
 use haider_protocol::history::{TodoItem, TodoState};
 use haider_protocol::ids::{DeviceId, EventId, ItemId, SessionId};
 use haider_protocol::item::{ItemDelta, ItemEvent, OutputStream, ToolStatus, TurnItem};
-use haider_protocol::menu::{AnswerVia, Menu, MenuAnswer, MenuKind, MenuOption, MenuScope};
+use haider_protocol::menu::{
+    AnswerVia, Menu, MenuAnswer, MenuCloseReason, MenuKind, MenuOption, MenuScope,
+};
 use haider_protocol::provider::{Usage, UsageSource};
 use haider_protocol::state::{HarnessStatus, ReadinessCheck, RunState, VerifyStep, WaitReason};
 use haider_tui::projection::{OUTPUT_TAIL_MAX, SessionProjection, TranscriptEntry};
@@ -416,6 +418,18 @@ fn user_messages_and_menus_project() {
         value: None,
         via: AnswerVia::Tui,
     }));
+    assert!(projection.open_menu().is_none());
+
+    projection.apply(&EventPayload::MenuOpened(menu));
+    projection.apply(&EventPayload::MenuClosed {
+        menu: haider_protocol::ids::MenuId::new("menu-0"),
+        reason: MenuCloseReason::Cancelled,
+    });
+    assert!(projection.open_menu().is_some());
+    projection.apply(&EventPayload::MenuClosed {
+        menu: haider_protocol::ids::MenuId::new("menu-1"),
+        reason: MenuCloseReason::Cancelled,
+    });
     assert!(projection.open_menu().is_none());
 }
 

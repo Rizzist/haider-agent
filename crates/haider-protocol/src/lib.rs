@@ -42,6 +42,10 @@ pub enum EventPayload {
     // interaction
     MenuOpened(menu::Menu),
     MenuAnswered(menu::MenuAnswer),
+    MenuClosed {
+        menu: ids::MenuId,
+        reason: menu::MenuCloseReason,
+    },
     UserMessage {
         text: String,
         attachments: Vec<tool::AttachmentBlock>,

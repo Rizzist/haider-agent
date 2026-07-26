@@ -67,6 +67,12 @@ impl SqliteStoreHandle {
         run_blocking(move || owner.with_store(|store| store.put(&bytes))).await
     }
 
+    /// Durably streams an artifact file on the blocking pool.
+    pub async fn put_file(&self, path: std::path::PathBuf) -> Result<ArtifactRef, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.put_file(&path))).await
+    }
+
     /// Reads and verifies an artifact on the blocking pool.
     pub async fn get(&self, artifact: &ArtifactRef) -> Result<Vec<u8>, HaiderError> {
         let owner = Arc::clone(&self.owner);
@@ -127,6 +133,12 @@ impl StoreHandle for SqliteStoreHandle {
 impl CasSink for SqliteStoreHandle {
     async fn put(&mut self, bytes: &[u8]) -> ToolResult<ArtifactRef> {
         SqliteStoreHandle::put(self, bytes.to_vec())
+            .await
+            .map_err(|error| haider_tools::ToolError::cas(error.message))
+    }
+
+    async fn put_file(&mut self, path: &std::path::Path) -> ToolResult<ArtifactRef> {
+        SqliteStoreHandle::put_file(self, path.to_path_buf())
             .await
             .map_err(|error| haider_tools::ToolError::cas(error.message))
     }

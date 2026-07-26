@@ -55,6 +55,10 @@ impl haider_tools::CasSink for UnusedCas {
     async fn put(&mut self, _bytes: &[u8]) -> ToolResult<haider_protocol::ids::ArtifactRef> {
         panic!("small result should not reach CAS")
     }
+
+    async fn put_file(&mut self, _path: &Path) -> ToolResult<haider_protocol::ids::ArtifactRef> {
+        panic!("small result should not reach CAS")
+    }
 }
 
 fn broker_at<J>(journal: J, workspace_root: &Path, generation: u64) -> EffectBroker

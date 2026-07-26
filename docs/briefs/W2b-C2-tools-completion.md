@@ -34,3 +34,13 @@ Laws
 
 Gate: cargo test --workspace, clippy -D warnings (all targets), fmt --check,
 xtask test-count --update, git diff --check. Leave uncommitted.
+
+## Launch addenda (2026-07-26, lane open)
+- The C4a terminalization machinery (claim_terminal, broker-owned finalizers, close()
+  drain/sweep) is NOW IN MAIN — process_exec/process_control MUST journal through it;
+  do not invent a parallel path. Read crates/haider-tools/src/broker.rs contract headers
+  first.
+- Actor wiring for InputRequired lives in haider-core: keep core edits minimal and
+  surgical (RunState::InputRequired already exists in the protocol; the actor needs the
+  menu round-trip seam + FakeStep support).
+- Kill-grace timing behind a test clock: tokio::time::pause-style tests, no wall sleeps.

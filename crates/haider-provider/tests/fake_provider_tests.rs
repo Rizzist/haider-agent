@@ -122,3 +122,44 @@ async fn fake_capabilities_are_explicit() {
     assert_eq!(capabilities.provider, "fake");
     assert_eq!(capabilities.context_limit, 1_000_000);
 }
+
+#[tokio::test]
+async fn script_segments_are_consumed_one_request_at_a_time() {
+    let provider = FakeProvider::new(vec![
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "call-1".into(),
+        },
+        FakeStep::EmitText {
+            text: "continued".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]);
+    let mut first = provider
+        .stream_turn(request())
+        .await
+        .expect("first request starts");
+    assert_eq!(
+        first.recv().await.expect("finish").expect("valid event"),
+        StreamEvent::Finish {
+            reason: FinishReason::ToolUse
+        }
+    );
+    let mut next = request();
+    next.messages
+        .push(Message::tool_result("call-1", r#"{"ok":true}"#, false));
+    let mut second = provider
+        .stream_turn(next)
+        .await
+        .expect("second request observes result");
+    assert_eq!(
+        second.recv().await.expect("text").expect("valid event"),
+        StreamEvent::TextDelta {
+            text: "continued".into()
+        }
+    );
+}
