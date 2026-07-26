@@ -549,7 +549,7 @@ dependencies = [
 
 [[package]]
 name = "haider-accounts"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "haider-protocol",
  "security-framework",
@@ -560,7 +560,7 @@ dependencies = [
 
 [[package]]
 name = "haider-cli"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "async-trait",
  "haider-accounts",
@@ -579,7 +579,7 @@ dependencies = [
 
 [[package]]
 name = "haider-core"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "async-trait",
  "haider-protocol",
@@ -593,7 +593,7 @@ dependencies = [
 
 [[package]]
 name = "haider-protocol"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "serde",
  "serde_json",
@@ -601,7 +601,7 @@ dependencies = [
 
 [[package]]
 name = "haider-provider"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "async-trait",
  "haider-protocol",
@@ -612,11 +612,11 @@ dependencies = [
 
 [[package]]
 name = "haider-rpc"
-version = "0.0.5"
+version = "0.0.6"
 
 [[package]]
 name = "haider-store"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "blake3",
  "haider-protocol",
@@ -627,7 +627,7 @@ dependencies = [
 
 [[package]]
 name = "haider-tools"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "async-trait",
  "blake3",
@@ -640,7 +640,7 @@ dependencies = [
 
 [[package]]
 name = "haider-tui"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "base64",
  "haider-protocol",
@@ -651,7 +651,7 @@ dependencies = [
 
 [[package]]
 name = "haider-verify"
-version = "0.0.5"
+version = "0.0.6"
 
 [[package]]
 name = "hashbrown"
@@ -2026,7 +2026,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "xtask"
-version = "0.0.5"
+version = "0.0.6"
 
 [[package]]
 name = "zmij"

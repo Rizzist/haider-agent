@@ -65,13 +65,13 @@ pub fn check_rows(checks: &[ReadinessCheck]) -> Vec<CheckRow<'_>> {
         .collect()
 }
 
-/// The boot sub-line under the wordmark: `v0.0.5 · starting up`.
+/// The boot sub-line under the wordmark: `v{version} · starting up`.
 #[must_use]
 pub fn boot_subline(version: &str) -> String {
     format!("v{version} · starting up")
 }
 
-/// The launcher sub-line: `v0.0.5 · the lion`.
+/// The launcher sub-line: `v{version} · the lion`.
 #[must_use]
 pub fn launcher_subline(version: &str) -> String {
     format!("v{version} · the lion")
