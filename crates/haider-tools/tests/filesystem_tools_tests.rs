@@ -10,9 +10,32 @@ use haider_tools::{
 };
 use std::fs;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::time::Duration;
+
+// Every JournalSink double in this module is constructed as one value and
+// moved exactly once into one broker. Arc fields expose read-only observation
+// or synchronization state; they are implementation details of that sole sink
+// value and are never used to box a second sink over the same journal.
+
+#[derive(Debug, Default)]
+struct SharedJournalStorage {
+    payloads: Mutex<Vec<EventPayload>>,
+    sink_taken: AtomicBool,
+}
+
+impl SharedJournalStorage {
+    fn claim_sole_sink(&self, claimed: &mut bool) {
+        if !*claimed {
+            debug_assert!(
+                !self.sink_taken.swap(true, Ordering::SeqCst),
+                "test journal storage was boxed behind more than one sink value"
+            );
+            *claimed = true;
+        }
+    }
+}
 
 #[derive(Debug, Default)]
 struct RecordingJournal {
@@ -29,17 +52,19 @@ impl JournalSink for RecordingJournal {
 
 #[derive(Debug, Default)]
 struct SharedRecordingJournal {
-    payloads: Arc<Mutex<Vec<EventPayload>>>,
+    storage: Arc<SharedJournalStorage>,
+    claimed: bool,
 }
 
 #[derive(Debug, Clone)]
 struct JournalObserver {
-    payloads: Arc<Mutex<Vec<EventPayload>>>,
+    storage: Arc<SharedJournalStorage>,
 }
 
 impl JournalObserver {
     fn effect_phases(&self) -> Vec<EffectPhase> {
-        self.payloads
+        self.storage
+            .payloads
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
@@ -54,7 +79,7 @@ impl JournalObserver {
 impl SharedRecordingJournal {
     fn observer(&self) -> JournalObserver {
         JournalObserver {
-            payloads: Arc::clone(&self.payloads),
+            storage: Arc::clone(&self.storage),
         }
     }
 }
@@ -62,7 +87,9 @@ impl SharedRecordingJournal {
 #[async_trait::async_trait]
 impl JournalSink for SharedRecordingJournal {
     async fn append(&mut self, payload: EventPayload) -> ToolResult<()> {
-        self.payloads
+        self.storage.claim_sole_sink(&mut self.claimed);
+        self.storage
+            .payloads
             .lock()
             .map_err(|_| ToolError::journal("shared recording journal lock is poisoned"))?
             .push(payload);
@@ -72,7 +99,8 @@ impl JournalSink for SharedRecordingJournal {
 
 #[derive(Debug, Default)]
 struct TerminalGateJournal {
-    payloads: Arc<Mutex<Vec<EventPayload>>>,
+    storage: Arc<SharedJournalStorage>,
+    claimed: bool,
     reached: Arc<tokio::sync::Notify>,
     release: Arc<tokio::sync::Notify>,
     terminal_attempts: Arc<AtomicUsize>,
@@ -82,7 +110,7 @@ struct TerminalGateJournal {
 impl TerminalGateJournal {
     fn observer(&self) -> JournalObserver {
         JournalObserver {
-            payloads: Arc::clone(&self.payloads),
+            storage: Arc::clone(&self.storage),
         }
     }
 }
@@ -90,12 +118,16 @@ impl TerminalGateJournal {
 #[async_trait::async_trait]
 impl JournalSink for TerminalGateJournal {
     async fn append(&mut self, payload: EventPayload) -> ToolResult<()> {
+        self.storage.claim_sole_sink(&mut self.claimed);
         let is_terminal = matches!(payload, EventPayload::Effect(EffectPhase::Outcome { .. }));
         if is_terminal && self.terminal_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+            // The legal cancellation gate is before the append records
+            // anything; this double never commits and then yields.
             self.reached.notify_one();
             self.release.notified().await;
         }
-        self.payloads
+        self.storage
+            .payloads
             .lock()
             .map_err(|_| ToolError::journal("terminal gate journal lock is poisoned"))?
             .push(payload);
@@ -108,14 +140,15 @@ impl JournalSink for TerminalGateJournal {
 
 #[derive(Debug, Default)]
 struct FailFirstTerminalJournal {
-    payloads: Arc<Mutex<Vec<EventPayload>>>,
+    storage: Arc<SharedJournalStorage>,
+    claimed: bool,
     terminal_attempts: Arc<AtomicUsize>,
 }
 
 impl FailFirstTerminalJournal {
     fn observer(&self) -> JournalObserver {
         JournalObserver {
-            payloads: Arc::clone(&self.payloads),
+            storage: Arc::clone(&self.storage),
         }
     }
 }
@@ -123,6 +156,7 @@ impl FailFirstTerminalJournal {
 #[async_trait::async_trait]
 impl JournalSink for FailFirstTerminalJournal {
     async fn append(&mut self, payload: EventPayload) -> ToolResult<()> {
+        self.storage.claim_sole_sink(&mut self.claimed);
         if matches!(payload, EventPayload::Effect(EffectPhase::Outcome { .. }))
             && self.terminal_attempts.fetch_add(1, Ordering::SeqCst) == 0
         {
@@ -131,7 +165,8 @@ impl JournalSink for FailFirstTerminalJournal {
                 "injected first terminal outcome append failure",
             ));
         }
-        self.payloads
+        self.storage
+            .payloads
             .lock()
             .map_err(|_| ToolError::journal("terminal recording journal lock is poisoned"))?
             .push(payload);
@@ -164,6 +199,7 @@ impl JournalSink for DispatchBarrierJournal {
             payload,
             EventPayload::Effect(EffectPhase::Dispatched { .. })
         ) {
+            // This synchronization point precedes the conceptual commit.
             self.barrier.wait().await;
         }
         Ok(())
@@ -183,6 +219,7 @@ impl JournalSink for DispatchGateJournal {
             payload,
             EventPayload::Effect(EffectPhase::Dispatched { .. })
         ) {
+            // This synchronization point precedes the conceptual commit.
             self.reached.notify_one();
             self.release.notified().await;
         }
@@ -641,7 +678,7 @@ async fn cancelling_apply_during_ledger_failure_still_journals_failed_outcome() 
 }
 
 #[tokio::test]
-async fn cancelled_terminal_claim_rearms_for_the_apply_finalizer() {
+async fn caller_cancellation_cannot_sever_a_dispatched_terminal_append() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let path = directory.path().join("cancel-terminal-claim.txt");
     fs::write(&path, "before").expect("seed file");
@@ -655,6 +692,7 @@ async fn cancelled_terminal_claim_rearms_for_the_apply_finalizer() {
     let journal = TerminalGateJournal::default();
     let observed_journal = journal.observer();
     let terminal_reached = Arc::clone(&journal.reached);
+    let terminal_release = Arc::clone(&journal.release);
     let terminal_attempts = Arc::clone(&journal.terminal_attempts);
     let terminal_completions = Arc::clone(&journal.terminal_completions);
     let attribution = TurnAttribution::new(SessionId::new("session"), RunId::new("turn"));
@@ -688,11 +726,15 @@ async fn cancelled_terminal_claim_rearms_for_the_apply_finalizer() {
     tokio::task::spawn_blocking(move || ledger_release.wait())
         .await
         .expect("release successful ledger append");
-    let report = broker.close().await.expect("finalizer reclaims and drains");
+    terminal_release.notify_one();
+    let report = broker
+        .close()
+        .await
+        .expect("owned append and finalizer drain");
 
     assert_eq!(fs::read_to_string(&path).expect("read file"), "after");
     assert!(report.reconciled_effects.is_empty());
-    assert_eq!(terminal_attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(terminal_attempts.load(Ordering::SeqCst), 1);
     assert_eq!(terminal_completions.load(Ordering::SeqCst), 1);
     let phases = observed_journal.effect_phases();
     let outcomes = terminal_phases(&phases);
@@ -700,20 +742,21 @@ async fn cancelled_terminal_claim_rearms_for_the_apply_finalizer() {
     assert!(matches!(
         outcomes.as_slice(),
         [EffectPhase::Outcome {
-            outcome: EffectOutcome::Ok,
+            outcome: EffectOutcome::Unknown,
             ..
         }]
     ));
 }
 
 #[tokio::test]
-async fn abandoned_terminal_claim_is_swept_to_unknown_on_close() {
+async fn cancelled_terminal_caller_leaves_owned_append_for_close_to_drain() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let path = directory.path().join("swept-read.txt");
     fs::write(&path, "contents").expect("seed file");
     let journal = TerminalGateJournal::default();
     let observed_journal = journal.observer();
     let terminal_reached = Arc::clone(&journal.reached);
+    let terminal_release = Arc::clone(&journal.release);
     let terminal_attempts = Arc::clone(&journal.terminal_attempts);
     let terminal_completions = Arc::clone(&journal.terminal_completions);
     let mut broker = broker_at(journal, directory.path());
@@ -739,11 +782,12 @@ async fn abandoned_terminal_claim_is_swept_to_unknown_on_close() {
     assert_eq!(terminal_attempts.load(Ordering::SeqCst), 1);
     assert_eq!(terminal_completions.load(Ordering::SeqCst), 0);
     drop(abandoned);
+    terminal_release.notify_one();
 
-    let report = broker.close().await.expect("close sweep succeeds");
+    let report = broker.close().await.expect("close drains owned append");
 
-    assert_eq!(report.reconciled_effects, vec![intent.effect]);
-    assert_eq!(terminal_attempts.load(Ordering::SeqCst), 2);
+    assert!(report.reconciled_effects.is_empty());
+    assert_eq!(terminal_attempts.load(Ordering::SeqCst), 1);
     assert_eq!(terminal_completions.load(Ordering::SeqCst), 1);
     let phases = observed_journal.effect_phases();
     let outcomes = terminal_phases(&phases);
@@ -875,6 +919,81 @@ async fn close_waits_for_a_cancelled_callers_failing_finalizer() {
             ..
         }] if error.contains("injected gated ledger append failure")
     ));
+}
+
+#[tokio::test]
+async fn mixed_close_error_keeps_successful_reconciliations_visible() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let read_path = directory.path().join("pending-read.txt");
+    let write_path = directory.path().join("failing-write.txt");
+    fs::write(&read_path, "contents").expect("seed read file");
+    fs::write(&write_path, "before").expect("seed write file");
+    let journal = SharedRecordingJournal::default();
+    let observed_journal = journal.observer();
+    let mut broker = broker_at(journal, directory.path());
+
+    let read_intent = broker
+        .normalize(&FsRead::new(&read_path))
+        .await
+        .expect("normalize pending read");
+    broker
+        .authorize(&read_intent, &allow(EffectClass::FsRead))
+        .await
+        .expect("authorize pending read");
+    broker
+        .journal_dispatched(&read_intent)
+        .await
+        .expect("dispatch pending read");
+
+    let reached = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let ledger = GatedRejectLedger {
+        reached: Arc::clone(&reached),
+        release: Arc::clone(&release),
+    };
+    let attribution = TurnAttribution::new(SessionId::new("session"), RunId::new("turn"));
+    let write_patch = FsPatch::new(&write_path, "before", "after");
+    let write_policy = allow(EffectClass::FsWrite);
+    let mut apply = Box::pin(broker.fs_patch(&write_patch, &write_policy, &attribution, &ledger));
+    let worker_reached = tokio::task::spawn_blocking(move || reached.wait());
+
+    tokio::select! {
+        result = &mut apply => panic!("apply completed before ledger failure gate: {result:?}"),
+        result = worker_reached => {
+            result.expect("wait for ledger failure gate");
+        }
+    }
+    drop(apply);
+    tokio::task::spawn_blocking(move || release.wait())
+        .await
+        .expect("release failing ledger");
+
+    let close_error = broker
+        .close()
+        .await
+        .expect_err("mixed close retains its error");
+    assert_eq!(
+        close_error.report.reconciled_effects,
+        vec![read_intent.effect.clone()]
+    );
+    assert!(close_error.errors.iter().any(|error| {
+        error
+            .to_string()
+            .contains("injected gated ledger append failure")
+    }));
+
+    let phases = observed_journal.effect_phases();
+    let outcomes = terminal_phases(&phases);
+    assert_eq!(outcomes.len(), 2);
+    assert!(outcomes.iter().any(|phase| {
+        matches!(
+            phase,
+            EffectPhase::Outcome {
+                effect,
+                outcome: EffectOutcome::Unknown,
+            } if effect == &read_intent.effect
+        )
+    }));
 }
 
 #[tokio::test]

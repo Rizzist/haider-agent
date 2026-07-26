@@ -10,6 +10,9 @@ use haider_tools::{
 use std::fs;
 use std::path::Path;
 
+// Each JournalSink double here is a distinct value moved exactly once into one
+// broker. None shares an underlying journal with another boxed sink value.
+
 #[derive(Debug, Default)]
 struct RecordingJournal {
     payloads: Vec<EventPayload>,
