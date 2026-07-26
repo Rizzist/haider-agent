@@ -8,6 +8,7 @@
 pub mod boot;
 pub mod format;
 pub mod mock;
+pub mod plain;
 pub mod projection;
 pub mod sanctum;
 pub mod theme;
