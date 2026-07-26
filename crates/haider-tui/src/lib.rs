@@ -11,6 +11,7 @@ pub mod mock;
 pub mod plain;
 pub mod projection;
 pub mod sanctum;
+pub mod style;
 pub mod theme;
 
 /// Crate marker used by the workspace self-test.
