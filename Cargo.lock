@@ -630,9 +630,11 @@ name = "haider-tools"
 version = "0.0.6"
 dependencies = [
  "async-trait",
+ "base64",
  "blake3",
  "haider-protocol",
  "rustix",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

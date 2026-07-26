@@ -14,8 +14,10 @@
 //!   `RunState::Cancelled` as its final envelope and emits nothing after it,
 //!   even when cancellation wins a race with a buffered provider event.
 //!
-//! Tool calls are surfaced (completed as `ToolStatus::Pending`) but not
-//! executed yet — execution lands in a later wave.
+//! General tool calls are surfaced (completed as `ToolStatus::Pending`) for a
+//! later dispatcher. `request_input` is the intentional exception: the actor
+//! owns its blocking menu round trip because only the actor may journal the
+//! session's `MenuOpened`/`MenuAnswered` and run-state envelopes.
 
 use crate::{StoreHandle, unix_time_ms};
 use haider_protocol::DeliveryMode;
@@ -24,11 +26,17 @@ use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
 };
 use haider_protocol::error::{ErrorCode, HaiderError};
-use haider_protocol::ids::{AgentId, BranchId, DeviceId, EventId, ItemId, RunId, SessionId};
+use haider_protocol::ids::{
+    AgentId, BranchId, DeviceId, EventId, ItemId, MenuId, RunId, SessionId,
+};
 use haider_protocol::item::{ItemDelta, ItemEvent, ToolStatus, TurnItem};
+use haider_protocol::menu::MenuAnswer;
 use haider_protocol::provider::{FinishReason, StreamEvent};
 use haider_protocol::state::RunState;
+use haider_protocol::tool::BoundedResult;
 use haider_provider::{Message, Provider, ProviderError, ProviderErrorKind, TurnRequest};
+use haider_tools::RequestInput;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
@@ -191,6 +199,25 @@ impl HarnessHandle {
         })
     }
 
+    /// Answers the currently open input menu. Invalid or stale answers fail
+    /// without closing the menu, so another surface may still answer it.
+    pub async fn answer_menu(&self, answer: MenuAnswer) -> Result<(), HaiderError> {
+        let (completed, response) = oneshot::channel();
+        self.commands
+            .send(ActorCommand::AnswerMenu { answer, completed })
+            .await
+            .map_err(|_| {
+                HaiderError::new(ErrorCode::Internal, "session actor is not running", true)
+            })?;
+        response.await.map_err(|_| {
+            HaiderError::new(
+                ErrorCode::Internal,
+                "session actor stopped before resolving the menu answer",
+                true,
+            )
+        })?
+    }
+
     /// Live feed of committed envelopes (from subscription time onward).
     pub fn subscribe(&self) -> broadcast::Receiver<RawEnvelope> {
         self.events.subscribe()
@@ -210,6 +237,10 @@ enum ActorCommand {
         request: SubmitTurn,
         accepted: oneshot::Sender<TurnHandle>,
     },
+    AnswerMenu {
+        answer: MenuAnswer,
+        completed: oneshot::Sender<Result<(), HaiderError>>,
+    },
 }
 
 /// Single-session, single-writer run loop.
@@ -225,6 +256,8 @@ pub struct HarnessActor {
     /// Actor start instant (ms) — embedded in event ids for global uniqueness.
     started_at_ms: u64,
     next_item: u64,
+    next_menu: u64,
+    deferred_commands: VecDeque<ActorCommand>,
 }
 
 impl HarnessActor {
@@ -254,6 +287,8 @@ impl HarnessActor {
                 next_event: 0,
                 started_at_ms,
                 next_item: 0,
+                next_menu: 0,
+                deferred_commands: VecDeque::new(),
             },
             handle,
         )
@@ -273,7 +308,7 @@ impl HarnessActor {
 
     /// Processes submissions strictly in order until every handle is dropped.
     pub async fn run(mut self) {
-        while let Some(command) = self.commands.recv().await {
+        while let Some(command) = self.next_command().await {
             match command {
                 ActorCommand::Submit { request, accepted } => {
                     let cancel = CancelToken::new();
@@ -289,6 +324,13 @@ impl HarnessActor {
                     }
                     let outcome = self.drive_turn(request, cancel).await;
                     let _ = outcome_sender.send(outcome);
+                }
+                ActorCommand::AnswerMenu { completed, .. } => {
+                    let _ = completed.send(Err(HaiderError::new(
+                        ErrorCode::MenuNotFound,
+                        "there is no open input menu",
+                        false,
+                    )));
                 }
             }
         }
@@ -427,7 +469,8 @@ impl HarnessActor {
                         .await
                 }
                 StreamEvent::ToolCallEnd { call_id } => {
-                    self.complete_tool(&run_id, &mut tools, &call_id).await
+                    self.complete_tool(&run_id, &mut tools, &call_id, &cancel)
+                        .await
                 }
                 StreamEvent::UsageUpdate(usage) => self
                     .commit_payload(&run_id, EventPayload::Usage(usage), prompt_omit_render())
@@ -513,6 +556,11 @@ impl HarnessActor {
                 }
             };
 
+            if matches!(event_result, Err(DriveError::Cancelled)) {
+                return self
+                    .cancelled_outcome_with_items(&run_id, &mut message, &mut reasoning, &mut tools)
+                    .await;
+            }
             if let Err(error) = event_result {
                 return self
                     .drive_error_outcome_with_items(
@@ -689,16 +737,134 @@ impl HarnessActor {
         run_id: &RunId,
         tools: &mut Vec<ToolAccumulator>,
         call_id: &str,
+        cancel: &CancelToken,
     ) -> Result<(), DriveError> {
         let Some(index) = tools.iter().position(|tool| tool.call_id == call_id) else {
             return Err(DriveError::Provider(provider_protocol_error(format!(
                 "provider ended unknown tool call `{call_id}`",
             ))));
         };
+        if tools[index].name == "request_input" {
+            self.complete_request_input(run_id, tools, index, cancel)
+                .await?;
+            return Ok(());
+        }
         self.commit_tool_completed(run_id, &tools[index], ToolStatus::Pending)
             .await?;
         tools.remove(index);
         Ok(())
+    }
+
+    async fn complete_request_input(
+        &mut self,
+        run_id: &RunId,
+        tools: &mut Vec<ToolAccumulator>,
+        index: usize,
+        cancel: &CancelToken,
+    ) -> Result<(), DriveError> {
+        let args = parse_tool_args(&tools[index])?;
+        let request = RequestInput::from_tool_args(args).map_err(tool_error_to_drive)?;
+        let menu = request.menu(self.next_menu_id());
+        self.commit_payload(
+            run_id,
+            EventPayload::MenuOpened(menu.clone()),
+            prompt_omit_render(),
+        )
+        .await
+        .map_err(DriveError::Store)?;
+        self.commit_state(
+            run_id,
+            RunState::InputRequired {
+                menu: menu.id.clone(),
+            },
+        )
+        .await
+        .map_err(DriveError::Store)?;
+
+        loop {
+            let command = tokio::select! {
+                biased;
+                () = cancel.cancelled() => return Err(DriveError::Cancelled),
+                command = self.commands.recv() => command,
+            };
+            let Some(command) = command else {
+                return Err(DriveError::Provider(provider_protocol_error(
+                    "session actor command channel closed with request_input unanswered",
+                )));
+            };
+            match command {
+                command @ ActorCommand::Submit { .. } => {
+                    self.deferred_commands.push_back(command);
+                }
+                ActorCommand::AnswerMenu { answer, completed } => {
+                    if answer.menu != menu.id {
+                        let _ = completed.send(Err(HaiderError::new(
+                            ErrorCode::MenuNotFound,
+                            format!(
+                                "menu {} is not open; request_input is waiting on {}",
+                                answer.menu, menu.id
+                            ),
+                            false,
+                        )));
+                        continue;
+                    }
+                    let resolved = match request.resolve(&menu, &answer) {
+                        Ok(resolved) => resolved,
+                        Err(error) => {
+                            let _ = completed.send(Err(HaiderError::new(
+                                ErrorCode::InvalidArgument,
+                                error.to_string(),
+                                false,
+                            )));
+                            continue;
+                        }
+                    };
+                    if let Err(error) = self
+                        .commit_payload(
+                            run_id,
+                            EventPayload::MenuAnswered(answer),
+                            prompt_omit_render(),
+                        )
+                        .await
+                    {
+                        let _ = completed.send(Err(error.clone()));
+                        return Err(DriveError::Store(error));
+                    }
+                    let result = serde_json::json!({
+                        "value": resolved.value,
+                        "option_key": resolved.option_key,
+                    })
+                    .to_string();
+                    if let Err(error) = self
+                        .commit_payload(
+                            run_id,
+                            EventPayload::ToolResult {
+                                call_id: tools[index].call_id.clone(),
+                                result: BoundedResult {
+                                    preview: result,
+                                    truncated: false,
+                                    artifact: None,
+                                    cursor: None,
+                                },
+                            },
+                            prompt_verbatim_render(),
+                        )
+                        .await
+                    {
+                        let _ = completed.send(Err(error.clone()));
+                        return Err(DriveError::Store(error));
+                    }
+                    self.commit_tool_completed(run_id, &tools[index], ToolStatus::Completed)
+                        .await?;
+                    tools.remove(index);
+                    self.commit_state(run_id, RunState::Streaming)
+                        .await
+                        .map_err(DriveError::Store)?;
+                    let _ = completed.send(Ok(()));
+                    return Ok(());
+                }
+            }
+        }
     }
 
     /// Closes every tool still open, in start order.
@@ -980,6 +1146,24 @@ impl HarnessActor {
             self.next_item
         ))
     }
+
+    fn next_menu_id(&mut self) -> MenuId {
+        self.next_menu += 1;
+        MenuId::new(format!(
+            "input-{}-{}-{}-{}",
+            self.config.session_id.as_str(),
+            self.config.worker_generation,
+            self.started_at_ms,
+            self.next_menu
+        ))
+    }
+
+    async fn next_command(&mut self) -> Option<ActorCommand> {
+        match self.deferred_commands.pop_front() {
+            Some(command) => Some(command),
+            None => self.commands.recv().await,
+        }
+    }
 }
 
 /// Turn-loop failure, tagged by which port failed (drives the error surface).
@@ -987,6 +1171,7 @@ impl HarnessActor {
 enum DriveError {
     Provider(ProviderError),
     Store(HaiderError),
+    Cancelled,
 }
 
 /// One in-flight text or reasoning item (started, not yet completed).
@@ -1041,7 +1226,16 @@ fn drive_error_to_haider(error: DriveError) -> HaiderError {
     match error {
         DriveError::Provider(error) => provider_error_to_haider(error),
         DriveError::Store(error) => error,
+        DriveError::Cancelled => HaiderError::new(
+            ErrorCode::Internal,
+            "cancelled drive error escaped its turn outcome boundary",
+            false,
+        ),
     }
+}
+
+fn tool_error_to_drive(error: haider_tools::ToolError) -> DriveError {
+    DriveError::Provider(provider_protocol_error(error.to_string()))
 }
 
 /// Terminal outcome for faults where even the `Errored` commit failed.

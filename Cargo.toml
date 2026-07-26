@@ -27,11 +27,11 @@ base64 = "0.22"
 blake3 = "1"
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 rusqlite = { version = "0.38", features = ["bundled"] }
-rustix = { version = "1", features = ["fs"] }
+rustix = { version = "1", features = ["fs", "process"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "test-util"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

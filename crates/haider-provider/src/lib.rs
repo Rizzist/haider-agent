@@ -119,6 +119,17 @@ pub enum FakeStep {
         call_id: String,
         fragment: String,
     },
+    /// Emits the canonical `request_input` tool call. The actor, rather than
+    /// the fake provider, allocates and journals the protocol menu.
+    EmitRequestInput {
+        call_id: String,
+        kind: FakeInputKind,
+        title: String,
+        #[serde(default)]
+        body: Vec<String>,
+        #[serde(default)]
+        options: Vec<FakeInputOption>,
+    },
     /// Splits the first multibyte scalar after its first byte, then incrementally
     /// decodes both raw chunks. Invalid partial strings never cross the trait.
     SplitUtf8 {
@@ -137,6 +148,21 @@ pub enum FakeStep {
     },
     /// Produces no more data until the consumer drops the stream.
     Hang,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FakeInputKind {
+    Question,
+    Choice,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FakeInputOption {
+    pub key: String,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 /// Fixture-driven provider used by runtime and CLI tests.
@@ -232,6 +258,26 @@ async fn play_script(script: Arc<Vec<FakeStep>>, sender: mpsc::Sender<ProviderSt
                 )
                 .await
                 {
+                    return;
+                }
+            }
+            FakeStep::EmitRequestInput {
+                call_id,
+                kind,
+                title,
+                body,
+                options,
+            } => {
+                let args = serde_json::json!({
+                    "kind": match kind {
+                        FakeInputKind::Question => "question",
+                        FakeInputKind::Choice => "choice",
+                    },
+                    "title": title,
+                    "body": body,
+                    "options": options,
+                });
+                if !emit_tool_call(&sender, call_id, "request_input".into(), args).await {
                     return;
                 }
             }

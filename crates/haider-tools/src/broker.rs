@@ -37,11 +37,13 @@
 //!   read-only snapshot of successfully appended phases instead of recovering
 //!   or mutating the sink.
 
+use crate::process::ProcessRegistry;
 use crate::{ToolError, ToolResult};
 use async_trait::async_trait;
 use haider_protocol::EventPayload;
 use haider_protocol::effect::{
-    AuthorizationVerdict, EffectClass, EffectIntent, EffectOutcome, EffectPhase,
+    AuthorizationSource, AuthorizationVerdict, EffectClass, EffectIntent, EffectOutcome,
+    EffectPhase,
 };
 use haider_protocol::ids::{EffectId, MenuId, SessionId, WorkspaceRevision};
 use haider_protocol::menu::{DecisionKind, Menu, MenuAnswer, MenuKind, MenuOption, MenuScope};
@@ -599,9 +601,30 @@ pub(crate) struct EffectFinish {
     intent: EffectIntent,
 }
 
+pub(crate) struct FinalizerObserver {
+    id: u64,
+    observed: Arc<Mutex<HashSet<u64>>>,
+}
+
+impl FinalizerObserver {
+    pub(crate) fn observe(self) {
+        self.observed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(self.id);
+    }
+}
+
 impl EffectFinish {
     pub(crate) async fn finish<T>(self, result: ToolResult<T>) -> ToolResult<T> {
         self.journal.finish_in_finalizer(&self.intent, result).await
+    }
+
+    pub(crate) async fn finish_outcome(self, outcome: EffectOutcome) -> ToolResult<()> {
+        let Some(claim) = self.journal.claim_terminal(&self.intent)? else {
+            return Ok(());
+        };
+        claim.append(outcome).await
     }
 }
 
@@ -619,7 +642,8 @@ pub struct EffectBroker {
     one_shot_rules: Vec<OneShotRule>,
     next_finalizer: u64,
     finalizers: tokio::task::JoinSet<(u64, Option<ToolError>)>,
-    observed_finalizers: HashSet<u64>,
+    observed_finalizers: Arc<Mutex<HashSet<u64>>>,
+    pub(crate) processes: ProcessRegistry,
 }
 
 impl EffectBroker {
@@ -686,7 +710,8 @@ impl EffectBroker {
             one_shot_rules: Vec::new(),
             next_finalizer: 0,
             finalizers: tokio::task::JoinSet::new(),
-            observed_finalizers: HashSet::new(),
+            observed_finalizers: Arc::new(Mutex::new(HashSet::new())),
+            processes: ProcessRegistry::default(),
         })
     }
 
@@ -717,6 +742,7 @@ impl EffectBroker {
     /// Process death is instead recovered by the W3 dispatched-without-terminal
     /// startup reconciliation seam.
     pub async fn close(mut self) -> Result<EffectBrokerCloseReport, EffectBrokerCloseError> {
+        self.processes.cancel_all().await;
         let mut errors = Vec::new();
         self.drain_finalizers(&mut errors).await;
 
@@ -832,7 +858,10 @@ impl EffectBroker {
         if let Some((menu_id, pending)) = pending_permission {
             self.pending_permissions.insert(menu_id, pending);
         }
-        let state = if verdict == AuthorizationVerdict::Allow {
+        let state = if matches!(
+            verdict,
+            AuthorizationVerdict::Allow | AuthorizationVerdict::PreAuthorized { .. }
+        ) {
             LifecycleState::AuthorizedAllow
         } else {
             LifecycleState::AuthorizedBlocked
@@ -905,6 +934,26 @@ impl EffectBroker {
         Ok(())
     }
 
+    /// Journals a user-initiated authorization and dispatches without applying
+    /// model-effect permission policy. This is reserved for direct composer
+    /// actions such as `!cmd`.
+    pub(crate) async fn begin_user_typed<O>(&mut self, operation: &O) -> ToolResult<EffectIntent>
+    where
+        O: EffectOperation,
+    {
+        let intent = self.normalize(operation).await?;
+        self.append_phase(EffectPhase::Authorized {
+            effect: intent.effect.clone(),
+            verdict: AuthorizationVerdict::PreAuthorized {
+                source: AuthorizationSource::UserTyped,
+            },
+        })
+        .await?;
+        self.set_state(&intent.effect, LifecycleState::AuthorizedAllow)?;
+        self.journal_dispatched(&intent).await?;
+        Ok(intent)
+    }
+
     pub async fn journal_outcome(
         &mut self,
         intent: &EffectIntent,
@@ -934,7 +983,7 @@ impl EffectBroker {
     {
         let intent = self.normalize(operation).await?;
         match self.authorize(&intent, policy).await? {
-            AuthorizationVerdict::Allow => {
+            AuthorizationVerdict::Allow | AuthorizationVerdict::PreAuthorized { .. } => {
                 self.journal_dispatched(&intent).await?;
                 Ok(intent)
             }
@@ -983,7 +1032,17 @@ impl EffectBroker {
     }
 
     pub(crate) fn observe_finalizer(&mut self, id: u64) {
-        self.observed_finalizers.insert(id);
+        self.observed_finalizers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id);
+    }
+
+    pub(crate) fn finalizer_observer(&self, id: u64) -> FinalizerObserver {
+        FinalizerObserver {
+            id,
+            observed: Arc::clone(&self.observed_finalizers),
+        }
     }
 
     fn register_terminal_append(
@@ -1024,7 +1083,13 @@ impl EffectBroker {
     async fn drain_finalizers(&mut self, errors: &mut Vec<ToolError>) {
         while let Some(finalizer) = self.finalizers.join_next().await {
             match finalizer {
-                Ok((id, Some(error))) if !self.observed_finalizers.contains(&id) => {
+                Ok((id, Some(error)))
+                    if !self
+                        .observed_finalizers
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .contains(&id) =>
+                {
                     errors.push(error);
                 }
                 Ok(_) => {}

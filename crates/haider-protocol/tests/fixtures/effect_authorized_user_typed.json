@@ -1,0 +1,8 @@
+{
+  "phase": "authorized",
+  "effect": "ef-shell",
+  "verdict": {
+    "verdict": "pre_authorized",
+    "source": "user_typed"
+  }
+}

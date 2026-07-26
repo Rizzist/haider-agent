@@ -121,10 +121,7 @@ impl std::fmt::Display for ToolError {
                 )
             }
             Self::InvalidMenuAnswer { menu, message } => {
-                write!(
-                    formatter,
-                    "invalid answer for permission menu {menu}: {message}"
-                )
+                write!(formatter, "invalid answer for menu {menu}: {message}")
             }
             Self::WorkspaceBoundary {
                 workspace_root,

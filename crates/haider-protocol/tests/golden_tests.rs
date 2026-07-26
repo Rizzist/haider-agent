@@ -293,6 +293,22 @@ fn golden_effect_phases() {
         },
     );
     golden(
+        "effect_authorized_user_typed",
+        &EffectPhase::Authorized {
+            effect: EffectId::new("ef-shell"),
+            verdict: AuthorizationVerdict::PreAuthorized {
+                source: AuthorizationSource::UserTyped,
+            },
+        },
+    );
+    golden(
+        "effect_outcome_cancelled",
+        &EffectPhase::Outcome {
+            effect: EffectId::new("ef-shell"),
+            outcome: EffectOutcome::Cancelled,
+        },
+    );
+    golden(
         "effect_outcome_unknown",
         &EffectPhase::Outcome {
             effect: EffectId::new("ef-1"),
