@@ -185,6 +185,11 @@ impl SessionProjection {
                     self.menu = None;
                 }
             }
+            EventPayload::MenuClosed { menu, .. } => {
+                if self.menu.as_ref().is_some_and(|open| open.id == *menu) {
+                    self.menu = None;
+                }
+            }
             EventPayload::UserMessage {
                 text, attachments, ..
             } => self.entries.push(TranscriptEntry::User {

@@ -358,6 +358,10 @@ impl Cas for Store {
         self.cas.put(bytes)
     }
 
+    fn put_file(&self, path: &Path) -> StoreResult<ArtifactRef> {
+        self.cas.put_file(path)
+    }
+
     fn get(&self, artifact: &ArtifactRef) -> StoreResult<Vec<u8>> {
         self.cas.get(artifact)
     }

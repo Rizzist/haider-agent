@@ -37,6 +37,9 @@ pub trait Cas: Send + Sync {
     /// Durably writes bytes and returns their BLAKE3 content address.
     fn put(&self, bytes: &[u8]) -> StoreResult<ArtifactRef>;
 
+    /// Durably streams a file into the CAS without loading it as one buffer.
+    fn put_file(&self, path: &std::path::Path) -> StoreResult<ArtifactRef>;
+
     /// Reads and verifies bytes. Hash mismatch is reported as store corruption.
     fn get(&self, artifact: &ArtifactRef) -> StoreResult<Vec<u8>>;
 

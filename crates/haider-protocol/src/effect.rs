@@ -85,6 +85,12 @@ pub enum EffectOutcome {
     /// The effect crossed the dispatch boundary and was deliberately stopped.
     /// Cancellation is a terminal outcome, never a failure.
     Cancelled,
+    /// Cancellation won, but userspace could not prove process-group death.
+    /// The note is durable and orderly broker close separately reports the
+    /// leaked registry entry.
+    CancelledEscalated {
+        note: String,
+    },
     Failed {
         error: String,
     },

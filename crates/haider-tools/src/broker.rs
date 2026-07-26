@@ -85,6 +85,7 @@ pub trait JournalSink: Send {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EffectBrokerCloseReport {
     pub reconciled_effects: Vec<EffectId>,
+    pub leaked_processes: Vec<String>,
 }
 
 /// An orderly close that observed errors after retaining its successful work.
@@ -781,8 +782,17 @@ impl EffectBroker {
                 .iter()
                 .any(|(_, terminal_error)| terminal_error == error)
         });
+        let leaked_processes = self.processes.leaked_call_ids().await;
+        errors.extend(leaked_processes.iter().map(|call_id| ToolError::Runtime {
+            message: format!(
+                "process `{call_id}` leaked after process-group termination escalation"
+            ),
+        }));
         finish_close(
-            EffectBrokerCloseReport { reconciled_effects },
+            EffectBrokerCloseReport {
+                reconciled_effects,
+                leaked_processes,
+            },
             errors,
             terminal_errors,
         )

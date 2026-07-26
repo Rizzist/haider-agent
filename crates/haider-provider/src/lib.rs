@@ -37,6 +37,42 @@ impl Message {
             blocks: vec![Block::Text { text: text.into() }],
         }
     }
+
+    pub fn assistant(blocks: Vec<Block>) -> Self {
+        Self {
+            role: MessageRole::Assistant,
+            blocks,
+        }
+    }
+
+    pub fn tool_result(
+        call_id: impl Into<String>,
+        preview: impl Into<String>,
+        truncated: bool,
+    ) -> Self {
+        let call_id = call_id.into();
+        Self {
+            role: MessageRole::Tool,
+            blocks: vec![Block::ToolResult {
+                call_id,
+                preview: preview.into(),
+                truncated,
+            }],
+        }
+    }
+
+    pub fn tool_result_for(&self, expected_call_id: &str) -> Option<&Block> {
+        (self.role == MessageRole::Tool)
+            .then_some(())
+            .and_then(|()| {
+                self.blocks.iter().find(|block| {
+                    matches!(
+                        block,
+                        Block::ToolResult { call_id, .. } if call_id == expected_call_id
+                    )
+                })
+            })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,6 +136,12 @@ pub trait Provider: Send + Sync {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "step", rename_all = "snake_case")]
 pub enum FakeStep {
+    /// Asserts that this request contains the named result from a preceding
+    /// request. A `Finish` ends one request segment; the following steps are
+    /// consumed only by the next `stream_turn` call.
+    ExpectToolResult {
+        call_id: String,
+    },
     EmitText {
         text: String,
     },
@@ -169,6 +211,7 @@ pub struct FakeInputOption {
 #[derive(Debug, Clone)]
 pub struct FakeProvider {
     script: Arc<Vec<FakeStep>>,
+    next_step: Arc<Mutex<usize>>,
     requests: Arc<Mutex<Vec<TurnRequest>>>,
 }
 
@@ -176,6 +219,7 @@ impl FakeProvider {
     pub fn new(script: Vec<FakeStep>) -> Self {
         Self {
             script: Arc::new(script),
+            next_step: Arc::new(Mutex::new(0)),
             requests: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -215,10 +259,46 @@ impl Provider for FakeProvider {
     }
 
     async fn stream_turn(&self, request: TurnRequest) -> Result<ProviderStream, ProviderError> {
-        self.record_request(request);
+        self.record_request(request.clone());
+        let segment = self.next_segment();
+        for step in segment.iter() {
+            if let FakeStep::ExpectToolResult { call_id } = step
+                && !request
+                    .messages
+                    .iter()
+                    .any(|message| message.tool_result_for(call_id.as_str()).is_some())
+            {
+                return Err(ProviderError::new(
+                    ProviderErrorKind::Internal,
+                    format!("expected tool result `{call_id}` in this request"),
+                ));
+            }
+        }
         let (sender, receiver) = mpsc::channel(32);
-        tokio::spawn(play_script(Arc::clone(&self.script), sender));
+        tokio::spawn(play_script(segment, sender));
         Ok(receiver)
+    }
+}
+
+impl FakeProvider {
+    fn next_segment(&self) -> Arc<Vec<FakeStep>> {
+        let mut next = self
+            .next_step
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let start = *next;
+        let mut end = start;
+        while end < self.script.len() {
+            end += 1;
+            if matches!(
+                self.script[end - 1],
+                FakeStep::Finish { .. } | FakeStep::Hang | FakeStep::MalformedFrame
+            ) {
+                break;
+            }
+        }
+        *next = end;
+        Arc::new(self.script[start..end].to_vec())
     }
 }
 
@@ -229,6 +309,7 @@ async fn play_script(script: Arc<Vec<FakeStep>>, sender: mpsc::Sender<ProviderSt
     let mut utf8 = Utf8Assembler::default();
     for step in script.iter().cloned() {
         match step {
+            FakeStep::ExpectToolResult { .. } => {}
             FakeStep::EmitText { text } => {
                 if !emit_bytes(&sender, &mut utf8, text.as_bytes()).await {
                     return;

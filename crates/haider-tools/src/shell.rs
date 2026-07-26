@@ -5,15 +5,56 @@
 //! [`EffectBroker::process_exec_user`](crate::EffectBroker::process_exec_user),
 //! preserving the distinct user-typed authorization source.
 
-use crate::{ProcessExec, ToolError, ToolResult};
+use crate::process::ProcessExec;
+use crate::{ToolError, ToolResult};
 use std::env;
 use std::path::{Path, PathBuf};
+
+pub const REDACTED_ENV_VALUE: &str = "•redacted";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ComposerSubmission {
     Message(String),
     Builtin(BuiltinResult),
-    UserProcess(ProcessExec),
+    UserProcess(UserProcessExec),
+}
+
+/// A process command carrying unforgeable direct-composer provenance.
+///
+/// Public callers may receive this value from [`ShellSession::submit`], but
+/// cannot construct one or turn a model-created [`ProcessExec`] into one.
+///
+/// ```compile_fail
+/// use haider_tools::{ProcessExec, UserProcessExec};
+///
+/// let forged = UserProcessExec {
+///     operation: ProcessExec::new("model-call", "echo forged"),
+/// };
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserProcessExec {
+    operation: ProcessExec,
+    provenance: UserTypedProvenance,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UserTypedProvenance(());
+
+impl UserProcessExec {
+    fn new(operation: ProcessExec) -> Self {
+        Self {
+            operation,
+            provenance: UserTypedProvenance(()),
+        }
+    }
+
+    pub(crate) fn operation(&self) -> &ProcessExec {
+        &self.operation
+    }
+
+    pub(crate) fn provenance(&self) -> UserTypedProvenance {
+        self.provenance
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,18 +132,18 @@ impl ShellSession {
                     .iter()
                     .map(|name| EnvViewEntry {
                         name: name.clone(),
-                        value: env::var(name).ok(),
+                        value: display_env_value(name, env::var(name).ok()),
                     })
                     .collect(),
             }));
         }
 
         self.next_call += 1;
-        Ok(ComposerSubmission::UserProcess(
+        Ok(ComposerSubmission::UserProcess(UserProcessExec::new(
             ProcessExec::new(format!("shell-{}", self.next_call), command)
                 .with_cwd(self.cwd.clone())
                 .with_env_allowlist(self.env_allowlist.clone()),
-        ))
+        )))
     }
 
     fn change_directory(&mut self, path: &str) -> ToolResult<ComposerSubmission> {
@@ -140,4 +181,32 @@ impl ShellSession {
             BuiltinResult::ChangedDirectory { cwd: resolved },
         ))
     }
+}
+
+fn is_secret_env_name(name: &str) -> bool {
+    const SECRET_WORDS: &[&str] = &[
+        "KEY",
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "PASSWD",
+        "CREDENTIAL",
+        "CREDENTIALS",
+        "BEARER",
+    ];
+    name.split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|word| {
+            let word = word.to_ascii_uppercase();
+            SECRET_WORDS.contains(&word.as_str())
+        })
+}
+
+fn display_env_value(name: &str, value: Option<String>) -> Option<String> {
+    value.map(|value| {
+        if is_secret_env_name(name) {
+            REDACTED_ENV_VALUE.to_owned()
+        } else {
+            value
+        }
+    })
 }

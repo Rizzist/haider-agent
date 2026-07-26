@@ -26,7 +26,10 @@ pub use process::{
     ProcessSignal,
 };
 pub use request_input::{RequestInput, RequestInputAnswer, RequestInputKind, RequestInputOption};
-pub use shell::{BuiltinResult, ComposerSubmission, EnvViewEntry, ShellSession};
+pub use shell::{
+    BuiltinResult, ComposerSubmission, EnvViewEntry, REDACTED_ENV_VALUE, ShellSession,
+    UserProcessExec,
+};
 
 /// Crate marker used by the workspace self-test.
 pub const CRATE_NAME: &str = "haider-tools";

@@ -11,16 +11,50 @@ use haider_protocol::ids::{ArtifactRef, SessionId};
 use haider_protocol::item::{ItemDelta, ToolStatus};
 use haider_tools::{
     BuiltinResult, CasSink, CommandOutputSink, ComposerSubmission, EffectBroker, JournalSink,
-    PermissionPolicy, ProcessBounds, ProcessControl, ProcessExec, ProcessOutputChunk, ShellSession,
-    ToolError, ToolResult,
+    PermissionPolicy, ProcessBounds, ProcessControl, ProcessExec, ProcessOutputChunk,
+    REDACTED_ENV_VALUE, ShellSession, ToolError, ToolResult,
 };
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::sync::Notify;
 
 #[derive(Debug, Default)]
 struct SharedJournal {
     payloads: Arc<Mutex<Vec<EventPayload>>>,
+}
+
+struct SwapCwdJournal {
+    target: std::path::PathBuf,
+    anchored: std::path::PathBuf,
+    replacement: std::path::PathBuf,
+    swapped: bool,
+}
+
+#[async_trait]
+impl JournalSink for SwapCwdJournal {
+    async fn append(&mut self, payload: EventPayload) -> ToolResult<()> {
+        if !self.swapped
+            && matches!(
+                payload,
+                EventPayload::Effect(EffectPhase::Authorized {
+                    verdict: AuthorizationVerdict::Allow,
+                    ..
+                })
+            )
+        {
+            std::fs::rename(&self.target, &self.anchored).map_err(|error| ToolError::Runtime {
+                message: format!("move authorized cwd: {error}"),
+            })?;
+            std::os::unix::fs::symlink(&self.replacement, &self.target).map_err(|error| {
+                ToolError::Runtime {
+                    message: format!("replace authorized cwd: {error}"),
+                }
+            })?;
+            self.swapped = true;
+        }
+        Ok(())
+    }
 }
 
 impl SharedJournal {
@@ -60,6 +94,26 @@ impl CasSink for RecordingCas {
             .push(bytes.to_vec());
         Ok(ArtifactRef::new(format!("blake3:{}", blake3::hash(bytes))))
     }
+
+    async fn put_file(&mut self, path: &Path) -> ToolResult<ArtifactRef> {
+        let bytes = std::fs::read(path)
+            .map_err(|error| ToolError::cas(format!("read recording CAS source: {error}")))?;
+        self.put(&bytes).await
+    }
+}
+
+#[derive(Debug, Default)]
+struct FailingCas;
+
+#[async_trait]
+impl CasSink for FailingCas {
+    async fn put(&mut self, _bytes: &[u8]) -> ToolResult<ArtifactRef> {
+        Err(ToolError::cas("injected CAS failure"))
+    }
+
+    async fn put_file(&mut self, _path: &Path) -> ToolResult<ArtifactRef> {
+        Err(ToolError::cas("injected CAS file failure"))
+    }
 }
 
 #[derive(Debug, Default)]
@@ -83,6 +137,21 @@ impl CommandOutputSink for RecordingOutput {
             })?
             .push(delta);
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct FailingOutput {
+    attempted: Arc<Notify>,
+}
+
+#[async_trait]
+impl CommandOutputSink for FailingOutput {
+    async fn emit(&self, _call_id: &str, _delta: ItemDelta) -> ToolResult<()> {
+        self.attempted.notify_one();
+        Err(ToolError::Runtime {
+            message: "injected output sink failure".into(),
+        })
     }
 }
 
@@ -196,6 +265,125 @@ async fn process_exec_streams_exact_bytes_freezes_overflow_and_journals_four_pha
     broker.close().await.expect("broker closes");
 }
 
+#[tokio::test(start_paused = true)]
+async fn output_flood_spills_while_streaming_and_completes_under_paused_time() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let (mut broker, _journal) = broker(workspace.path());
+    let cas = RecordingCas::default();
+    let cas_observer = cas.observer();
+    let result = broker
+        .process_exec(
+            &ProcessExec::new("flood", "/usr/bin/head -c 1048576 /dev/zero"),
+            &process_policy(),
+            cas,
+            RecordingOutput::default(),
+            ProcessBounds {
+                max_inline_bytes: 1024,
+                kill_grace: Duration::from_secs(1),
+            },
+        )
+        .await
+        .expect("flood starts")
+        .wait()
+        .await
+        .expect("flood completes");
+    assert_eq!(result.status, ToolStatus::Completed);
+    assert_eq!(result.output_bytes, 1_048_576);
+    assert!(result.inline_output.is_empty());
+    assert!(result.artifact.is_some());
+    {
+        let artifacts = cas_observer.lock().expect("CAS observer");
+        assert_eq!(artifacts.len(), 1);
+        let transcript: Vec<ProcessOutputChunk> =
+            serde_json::from_slice(&artifacts[0]).expect("streamed transcript");
+        assert_eq!(
+            transcript
+                .iter()
+                .map(|chunk| BASE64.decode(&chunk.chunk_b64).expect("base64").len())
+                .sum::<usize>(),
+            1_048_576
+        );
+    }
+    broker.close().await.expect("broker closes");
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancellation_wins_over_output_sink_and_cas_failures() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let (mut broker, journal) = broker(workspace.path());
+    let output = FailingOutput::default();
+    let attempted = Arc::clone(&output.attempted);
+    let grace = Duration::from_secs(2);
+    let execution = broker
+        .process_exec(
+            &ProcessExec::new(
+                "cancel-errors",
+                "trap '' TERM; /usr/bin/head -c 16384 /dev/zero; while :; do :; done",
+            ),
+            &process_policy(),
+            FailingCas,
+            output,
+            ProcessBounds {
+                max_inline_bytes: 1024,
+                kill_grace: grace,
+            },
+        )
+        .await
+        .expect("process starts");
+    attempted.notified().await;
+    execution.cancel();
+    tokio::time::advance(grace).await;
+    let result = execution
+        .wait()
+        .await
+        .expect("cancellation context masks supervisor errors");
+    assert_eq!(result.status, ToolStatus::Cancelled);
+    assert!(
+        result
+            .escalation_note
+            .as_deref()
+            .is_some_and(|note| note.contains("supervisor error after cancellation"))
+    );
+    assert!(phases(&journal).iter().any(|phase| matches!(
+        phase,
+        EffectPhase::Outcome {
+            outcome: EffectOutcome::CancelledEscalated { note },
+            ..
+        } if note.contains("injected")
+    )));
+    broker
+        .close()
+        .await
+        .expect("non-leaked cancellation closes");
+}
+
+#[tokio::test]
+async fn shell_exit_sweeps_background_members_of_its_process_group() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let (mut broker, _journal) = broker(workspace.path());
+    let result = broker
+        .process_exec(
+            &ProcessExec::new(
+                "background",
+                "/usr/bin/perl -e '$pid = fork; exit 0 if $pid; sleep 30'",
+            ),
+            &process_policy(),
+            RecordingCas::default(),
+            RecordingOutput::default(),
+            ProcessBounds {
+                max_inline_bytes: 1024,
+                kill_grace: Duration::from_secs(1),
+            },
+        )
+        .await
+        .expect("process starts")
+        .wait()
+        .await
+        .expect("group sweep completes");
+    assert_eq!(result.status, ToolStatus::Completed);
+    broker.close().await.expect("broker closes");
+}
+
 #[tokio::test]
 async fn process_digest_is_exactly_command_canonical_cwd_and_sorted_env_allowlist() {
     let workspace = tempfile::tempdir().expect("tempdir");
@@ -228,6 +416,43 @@ async fn process_digest_is_exactly_command_canonical_cwd_and_sorted_env_allowlis
         another.args_digest, intent.args_digest,
         "call_id is correlation identity, not an execution argument"
     );
+    broker.close().await.expect("broker closes");
+}
+
+#[tokio::test]
+async fn cwd_identity_change_after_authorization_is_refused_before_spawn() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let outside = tempfile::tempdir().expect("outside");
+    let target = workspace.path().join("target");
+    let anchored = workspace.path().join("authorized-original");
+    std::fs::create_dir(&target).expect("target cwd");
+    let journal = SwapCwdJournal {
+        target: target.clone(),
+        anchored: anchored.clone(),
+        replacement: outside.path().to_path_buf(),
+        swapped: false,
+    };
+    let mut broker = EffectBroker::new_at(
+        Box::new(journal),
+        workspace.path(),
+        SessionId::new("cwd-race"),
+        1,
+        1_700_000_000_000,
+    )
+    .expect("broker");
+    let error = broker
+        .process_exec(
+            &ProcessExec::new("cwd-race", "printf spawned > marker").with_cwd("target"),
+            &process_policy(),
+            RecordingCas::default(),
+            RecordingOutput::default(),
+            ProcessBounds::default(),
+        )
+        .await
+        .expect_err("changed cwd identity is rejected");
+    assert!(error.to_string().contains("changed before spawn"));
+    assert!(!anchored.join("marker").exists());
+    assert!(!outside.path().join("marker").exists());
     broker.close().await.expect("broker closes");
 }
 
@@ -461,4 +686,45 @@ async fn shell_builtins_do_not_spawn_and_escaped_commands_are_user_preauthorized
         }
     ));
     broker.close().await.expect("broker closes");
+}
+
+#[test]
+fn env_view_redacts_secret_names_and_preserves_non_secret_values() {
+    const CHILD: &str = "HAIDER_ENV_VIEW_TEST_CHILD";
+    const SECRET: &str = "HAIDER_SHELL_TEST_API_TOKEN";
+    const VISIBLE: &str = "HAIDER_SHELL_TEST_REGION";
+    if std::env::var(CHILD).as_deref() != Ok("1") {
+        let status = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "env_view_redacts_secret_names_and_preserves_non_secret_values",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env(SECRET, "do-not-display")
+            .env(VISIBLE, "eu-test-1")
+            .status()
+            .expect("spawn isolated env-view test");
+        assert!(status.success());
+        return;
+    }
+
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let mut shell =
+        ShellSession::new(workspace.path(), vec![SECRET.into(), VISIBLE.into()]).expect("shell");
+    let ComposerSubmission::Builtin(BuiltinResult::Environment { entries }) =
+        shell.submit("!env-view").expect("env-view")
+    else {
+        panic!("env-view is a builtin");
+    };
+    let secret = entries
+        .iter()
+        .find(|entry| entry.name == SECRET)
+        .expect("secret entry");
+    let visible = entries
+        .iter()
+        .find(|entry| entry.name == VISIBLE)
+        .expect("visible entry");
+    assert_eq!(secret.value.as_deref(), Some(REDACTED_ENV_VALUE));
+    assert_eq!(visible.value.as_deref(), Some("eu-test-1"));
 }

@@ -107,6 +107,14 @@ pub struct MenuAnswer {
     pub via: AnswerVia,
 }
 
+/// Why an unanswered menu ceased to be answerable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MenuCloseReason {
+    Cancelled,
+    Dismissed,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AnswerVia {
