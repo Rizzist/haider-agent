@@ -462,3 +462,86 @@ fn raw_stream_tracks_gaps_duplicates_and_unknown_payloads() {
     assert!(projection.gap_seen());
     assert_eq!(projection.badge(), "▮ STREAMING");
 }
+
+#[test]
+fn command_tail_capacity_stays_bounded_after_huge_chunks() {
+    // Rider #4: append-then-drain retained a chunk-sized capacity high-water
+    // mark. The tail must bound BEFORE appending.
+    let mut projection = SessionProjection::new();
+    projection.apply(&started(
+        30,
+        TurnItem::CommandExecution {
+            call_id: "cap".to_owned(),
+            command: "yes".to_owned(),
+            status: ToolStatus::InProgress,
+            exit_code: None,
+        },
+    ));
+    let huge = vec![b'z'; OUTPUT_TAIL_MAX * 8];
+    projection.apply(&delta(
+        30,
+        ItemDelta::CommandOutput {
+            stream: OutputStream::Stdout,
+            chunk_b64: base64::engine::general_purpose::STANDARD.encode(&huge),
+        },
+    ));
+    let TranscriptEntry::Item(block) = &projection.entries()[0] else {
+        panic!("command block");
+    };
+    assert_eq!(block.output_tail.len(), OUTPUT_TAIL_MAX);
+    assert!(block.output_truncated);
+    assert!(
+        block.output_tail.capacity() < OUTPUT_TAIL_MAX * 4,
+        "capacity {} retains the huge chunk",
+        block.output_tail.capacity()
+    );
+}
+
+#[test]
+fn completed_tool_call_releases_the_fragment_accumulation() {
+    // Rider #3: the completed item carries authoritative args; the raw
+    // fragment duplicate must be released.
+    let mut projection = SessionProjection::new();
+    projection.apply(&started(
+        31,
+        TurnItem::ToolCall {
+            call_id: "frag".to_owned(),
+            name: "fs_patch".to_owned(),
+            args: serde_json::Value::Null,
+            status: ToolStatus::InProgress,
+        },
+    ));
+    projection.apply(&delta(
+        31,
+        ItemDelta::ToolArgs {
+            fragment: "{\"big\":\"payload\"}".to_owned(),
+        },
+    ));
+    projection.apply(&completed(
+        31,
+        TurnItem::ToolCall {
+            call_id: "frag".to_owned(),
+            name: "fs_patch".to_owned(),
+            args: serde_json::json!({"big": "payload"}),
+            status: ToolStatus::Completed,
+        },
+    ));
+    let TranscriptEntry::Item(block) = &projection.entries()[0] else {
+        panic!("tool block");
+    };
+    assert!(block.args_fragments.is_empty());
+}
+
+#[test]
+fn context_tokens_saturate_on_adversarial_usage() {
+    let mut projection = SessionProjection::new();
+    projection.apply(&EventPayload::Usage(Usage {
+        input: u64::MAX,
+        output: 10,
+        reasoning: 10,
+        cached: 10,
+        source: UsageSource::ProviderReported,
+        account: None,
+    }));
+    assert_eq!(projection.context_tokens(), u64::MAX);
+}

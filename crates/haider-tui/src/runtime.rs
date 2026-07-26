@@ -116,11 +116,14 @@ pub async fn run_demo(mut model: AppModel) -> std::io::Result<()> {
                 Some(payload) => model.handle(AppEvent::Envelope(Box::new(payload))),
                 None => model.handle(AppEvent::StreamEnded),
             },
-            _ = frame_tick.tick() => {
-                if model.dirty {
-                    draw(&mut terminal, &model)?;
-                    model.dirty = false;
-                }
+            // Guarded tick: while the model is clean this branch is disabled,
+            // so the idle loop takes NO periodic wakeups (efficiency rider
+            // #10 — ~109k/hour otherwise). The first dirtying event re-arms
+            // it and the overdue tick fires immediately, keeping the 30fps
+            // coalescing behavior.
+            _ = frame_tick.tick(), if model.dirty => {
+                draw(&mut terminal, &model)?;
+                model.dirty = false;
             }
         }
     }

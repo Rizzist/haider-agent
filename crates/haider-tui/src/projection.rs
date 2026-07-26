@@ -73,10 +73,11 @@ impl ItemBlock {
     }
 
     /// The bounded output tail as text (command output is bytes by law;
-    /// display is lossy UTF-8).
+    /// display is lossy UTF-8). Zero-copy when the tail is valid UTF-8
+    /// (efficiency rider #6 — this runs per command block per dirty frame).
     #[must_use]
-    pub fn output_text(&self) -> String {
-        String::from_utf8_lossy(&self.output_tail).into_owned()
+    pub fn output_text(&self) -> std::borrow::Cow<'_, str> {
+        String::from_utf8_lossy(&self.output_tail)
     }
 }
 
@@ -233,6 +234,10 @@ impl SessionProjection {
                     // Replace semantics: the final item is authoritative.
                     block.item = item.clone();
                     block.streaming = false;
+                    // The completed item carries the parsed args; the raw
+                    // fragment accumulation is a duplicate — release it
+                    // (efficiency rider #3).
+                    block.args_fragments = String::new();
                 } else {
                     // Attach-mid-stream tolerance: a Completed we never saw
                     // start still lands as a finished block.
@@ -266,12 +271,21 @@ impl SessionProjection {
             ItemDelta::CommandOutput { chunk_b64, .. } => {
                 match base64::engine::general_purpose::STANDARD.decode(chunk_b64) {
                     Ok(bytes) => {
-                        block.output_tail.extend_from_slice(&bytes);
-                        if block.output_tail.len() > OUTPUT_TAIL_MAX {
-                            let excess = block.output_tail.len() - OUTPUT_TAIL_MAX;
-                            block.output_tail.drain(..excess);
+                        // Bound BEFORE appending so the tail's capacity never
+                        // grows past the cap (efficiency rider #4: append-
+                        // then-drain retained chunk-sized high-water marks).
+                        let keep = bytes.len().min(OUTPUT_TAIL_MAX);
+                        let incoming = &bytes[bytes.len() - keep..];
+                        if bytes.len() > keep {
                             block.output_truncated = true;
                         }
+                        let overflow = (block.output_tail.len() + incoming.len())
+                            .saturating_sub(OUTPUT_TAIL_MAX);
+                        if overflow > 0 {
+                            block.output_tail.drain(..overflow);
+                            block.output_truncated = true;
+                        }
+                        block.output_tail.extend_from_slice(incoming);
                     }
                     Err(_) => block.output_decode_error = true,
                 }
@@ -339,11 +353,15 @@ impl SessionProjection {
     /// Context-meter tokens: the latest usage frame's total footprint
     /// (input + cached + output + reasoning). v0 upper-bound approximation —
     /// exact per-provider window accounting lands with the real adapters.
+    /// Saturating: adversarial usage frames must not panic the meter.
     #[must_use]
     pub fn context_tokens(&self) -> u64 {
-        self.usage
-            .as_ref()
-            .map_or(0, |u| u.input + u.cached + u.output + u.reasoning)
+        self.usage.as_ref().map_or(0, |u| {
+            u.input
+                .saturating_add(u.cached)
+                .saturating_add(u.output)
+                .saturating_add(u.reasoning)
+        })
     }
 
     #[must_use]

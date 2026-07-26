@@ -53,3 +53,11 @@ fn default_meter_width_matches_the_sim() {
     assert_eq!(METER_CELLS_DEFAULT, 10);
     assert_eq!(meter_cells(0.62, METER_CELLS_DEFAULT).chars().count(), 10);
 }
+
+#[test]
+fn fmt_tok_survives_the_extremes_without_overflow() {
+    // Rider #9: `n + 50_000` overflowed near u64::MAX; remainder-compare
+    // rounding must not.
+    assert_eq!(fmt_tok(u64::MAX), "18446744073709.6M");
+    assert_eq!(fmt_tok(u64::MAX - 50_000), "18446744073709.5M");
+}

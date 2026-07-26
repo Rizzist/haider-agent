@@ -11,7 +11,9 @@
 pub fn fmt_tok(n: u64) -> String {
     if n >= 1_000_000 {
         // One decimal in units of M, trailing .0 stripped (sim: 2M, 1.5M).
-        let tenths = (n + 50_000) / 100_000;
+        // Round-half-up via remainder compare — `n + 50_000` would overflow
+        // near u64::MAX (efficiency rider #9).
+        let tenths = n / 100_000 + u64::from(n % 100_000 >= 50_000);
         if tenths.is_multiple_of(10) {
             format!("{}M", tenths / 10)
         } else {
