@@ -338,6 +338,13 @@ impl SessionProjection {
         })
     }
 
+    /// True while the run is in its THINKING beat — the sim shows a
+    /// transient `● thinking…` line at the transcript tail.
+    #[must_use]
+    pub const fn is_thinking(&self) -> bool {
+        matches!(self.run, Some(RunState::Thinking))
+    }
+
     /// The status-bar badge, sim `BADGE_LABEL` goldens.
     #[must_use]
     pub fn badge(&self) -> String {

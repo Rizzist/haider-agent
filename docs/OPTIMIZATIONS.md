@@ -20,6 +20,17 @@ The clean-code reviewer moves entries in/out; adopted entries get the patch tag 
 
 Rider adoptions 2026-07-26 (TUI0): #3 release args_fragments at completion · #4 capacity-bounded command tails (bound before append) · #6 Cow output_text (zero-copy valid-UTF-8 path) · #9 overflow-free fmt_tok M-tier + saturating context_tokens · #10 guarded frame tick (no idle wakeups). SUFFICIENT confirmed: String::push_str streaming accumulation, no ring buffer at 8KiB cap, compile-time blends.
 
+## Sim-parity deferrals (TUI2.2 composer/mouse pass)
+
+Deliberate gaps against the `/tui` sim, each with its landing wave:
+
+| Where | Gap | Why deferred | Status |
+|---|---|---|---|
+| crates/haider-tui | In-app mouse drag-select in the transcript | Mouse capture is ON (kills scrollback bleed); native ⇧-drag selection already works in every emulator — reimplementing OS selection in-app buys nothing at demo scale | left to native ⇧-drag |
+| crates/haider-tui | Palette arg-slot suggestions + inline ghost completion (sim `getSuggestions` arg rows / `ghostFor`) | Commands take no real args until the daemon wires them; the palette shows command rows only, `/theme x` etc. parse typed args directly | planned → daemon wave (W3) |
+| crates/haider-tui | Multi-line composer (⇧⏎ newline — the sim placeholder's promise) | Legacy terminal input can't tell ⇧⏎ from ⏎ (needs the kitty keyboard protocol + a multi-row composer); pasted newlines are already normalized honestly | planned → daemon-era input stack |
+| crates/haider-tui | Palette scrolling past 8 rows (sim scrolls inside max-height 260px) | List is capped at 8 with clamped selection; only the bare `/` query exceeds it | open |
+
 ## Adopted
 
 | Where | Idea | Patch |

@@ -85,6 +85,15 @@ impl Theme {
             .bg(self.input_bg.into())
     }
 
+    /// The blocking input-replacement menu's ground (sim `InputMenu`:
+    /// warn border on a gold-soft field).
+    #[must_use]
+    pub fn menu_style(&self) -> Style {
+        Style::default()
+            .fg(self.text.into())
+            .bg(self.gold_soft.into())
+    }
+
     /// The selected row/option.
     #[must_use]
     pub fn selection_style(&self) -> Style {

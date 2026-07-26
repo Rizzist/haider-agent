@@ -111,6 +111,9 @@ pub struct AppModel {
     pub menu_selection: usize,
     /// Selected row in the slash palette (open while composer starts with /).
     pub palette_selection: usize,
+    /// Esc dismissed the palette without clearing the composer (sim
+    /// `menuDismissed`); any composer edit re-opens it.
+    pub palette_dismissed: bool,
     /// The /help overlay (esc closes).
     pub help_open: bool,
     /// One-line transient notice shown in the status bar until the next
@@ -147,6 +150,7 @@ impl Default for AppModel {
             samples: sample_sessions(),
             menu_selection: 0,
             palette_selection: 0,
+            palette_dismissed: false,
             help_open: false,
             flash: None,
             outbox: Vec::new(),
@@ -187,13 +191,16 @@ impl AppModel {
         }
     }
 
-    /// The palette is open while the composer is a slash query and no
-    /// blocking menu owns the input.
+    /// The palette is open while the composer is a slash query, esc has not
+    /// dismissed it (sim `menuDismissed`), and no blocking menu owns the
+    /// input.
     #[must_use]
     pub fn palette_open(&self) -> bool {
-        self.composer.starts_with('/')
-            && !self.help_open
-            && !(self.screen == Screen::Session && self.projection.open_menu().is_some())
+        if !self.composer.starts_with('/') || self.palette_dismissed || self.help_open {
+            return false;
+        }
+        // A blocking menu REPLACES the composer, palette included.
+        !(self.screen == Screen::Session && self.projection.open_menu().is_some())
     }
 
     /// Current palette matches for rendering and completion.
@@ -228,6 +235,9 @@ impl AppModel {
                 // can never trigger submit (rec 14; multi-line lands later).
                 let normalized = text.replace("\r\n", "\n").replace(['\r', '\n'], " ");
                 self.composer.push_str(&normalized);
+                // Any composer edit re-opens a dismissed palette (sim
+                // `setMenuDismissed(false)` on change).
+                self.palette_dismissed = false;
             }
             AppEvent::Envelope(payload) => {
                 self.dirty = true;
@@ -292,28 +302,16 @@ impl AppModel {
                     return;
                 }
                 KeyCode::Esc => {
-                    self.composer.clear();
+                    // Sim: esc DISMISSES the palette but keeps the typed
+                    // text; the next composer edit re-opens it.
+                    self.palette_dismissed = true;
                     self.palette_selection = 0;
                     return;
                 }
                 KeyCode::Enter => {
                     // Enter runs the HIGHLIGHTED command with any typed args
                     // (r1 P2: /t + Down + Enter must run the selection).
-                    if let Some(spec) = self.palette_items().get(self.palette_selection) {
-                        let args: String = self
-                            .composer
-                            .trim_start_matches('/')
-                            .split_whitespace()
-                            .skip(1)
-                            .collect::<Vec<_>>()
-                            .join(" ");
-                        self.composer = if args.is_empty() {
-                            format!("/{}", spec.name)
-                        } else {
-                            format!("/{} {args}", spec.name)
-                        };
-                    }
-                    self.execute_slash();
+                    self.run_palette_selection();
                     return;
                 }
                 _ => {}
@@ -327,6 +325,7 @@ impl AppModel {
             KeyCode::Backspace => {
                 self.composer.pop();
                 self.palette_selection = 0;
+                self.palette_dismissed = false;
             }
             KeyCode::Char(c @ '1'..='3')
                 if self.screen == Screen::Launcher && self.composer.is_empty() =>
@@ -337,6 +336,7 @@ impl AppModel {
             KeyCode::Char(c) => {
                 self.composer.push(c);
                 self.palette_selection = 0;
+                self.palette_dismissed = false;
             }
             _ => {}
         }
@@ -346,6 +346,7 @@ impl AppModel {
         let text = self.composer.trim().to_owned();
         self.composer.clear();
         self.palette_selection = 0;
+        self.palette_dismissed = false;
         if text.is_empty() {
             if self.screen == Screen::Launcher && !self.projection.entries().is_empty() {
                 self.screen = Screen::Session;
@@ -380,10 +381,32 @@ impl AppModel {
         self.requests.push(AppRequest::SubmitText(text));
     }
 
+    /// Run the highlighted palette row with any typed args — the ⏎ and
+    /// mouse-click paths share this law (a click must run the CLICKED row,
+    /// never the raw query).
+    fn run_palette_selection(&mut self) {
+        if let Some(spec) = self.palette_items().get(self.palette_selection) {
+            let args: String = self
+                .composer
+                .trim_start_matches('/')
+                .split_whitespace()
+                .skip(1)
+                .collect::<Vec<_>>()
+                .join(" ");
+            self.composer = if args.is_empty() {
+                format!("/{}", spec.name)
+            } else {
+                format!("/{} {args}", spec.name)
+            };
+        }
+        self.execute_slash();
+    }
+
     fn execute_slash(&mut self) {
         let raw = self.composer.trim_start_matches('/').trim().to_owned();
         self.composer.clear();
         self.palette_selection = 0;
+        self.palette_dismissed = false;
         let mut words = raw.split_whitespace();
         let name = words.next().unwrap_or("").to_ascii_lowercase();
         let arg = words.next().map(str::to_ascii_lowercase);
@@ -556,7 +579,7 @@ impl AppModel {
             Hit::PaletteRow(index) => {
                 if index < self.palette_items().len() {
                     self.palette_selection = index;
-                    self.execute_slash();
+                    self.run_palette_selection();
                 }
             }
             Hit::MenuOption(index) => {

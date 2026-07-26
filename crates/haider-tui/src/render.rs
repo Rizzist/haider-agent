@@ -41,22 +41,22 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
         render_help(theme, frame, body);
         hits.clear();
     }
-    render_status_bar(model, theme, frame, status);
-    if model.screen == Screen::Launcher && !model.help_open {
-        // The /help · theme hint on the right of the status bar is clickable.
-        let hint_width = 28.min(status.width);
-        hits.push((
-            Rect {
-                x: status.x + status.width - hint_width,
-                y: status.y,
-                width: hint_width,
-                height: 1,
-            },
-            Hit::HelpHint,
-        ));
-    }
+    render_status_bar(model, theme, frame, status, &mut hits);
     hits
 }
+
+/// Sim placeholder copy (`InputBar` textarea, tui.js:3008).
+const PLACEHOLDER_LAUNCHER: &str = "start a session — describe the task, or / for commands";
+const PLACEHOLDER_SESSION: &str =
+    "message haider — ⏎ send · ⇧⏎ newline · / commands · paste images/text";
+/// Sim palette hint (`CmdMenu .chint`), pinned at the palette's BOTTOM.
+const PALETTE_HINT: &str = "↑↓ options · tab complete · ⏎ run · esc dismiss";
+/// Fixed command-name column (sim `.cname` flex-basis), in cells.
+const PALETTE_NAME_COL: usize = 14;
+/// Palette rows shown at once (the sim scrolls beyond its max-height).
+const PALETTE_MAX_ROWS: usize = 8;
+/// Left/right composer padding in cells (sim InputBar `padding: … 16px`).
+const COMPOSER_PAD: usize = 2;
 
 /// A full-width one-row hit region.
 fn row_rect(area: Rect, top: u16, offset: usize) -> Rect {
@@ -68,14 +68,17 @@ fn row_rect(area: Rect, top: u16, offset: usize) -> Rect {
     }
 }
 
-/// The right-aligned talk-chip region of a composer row.
-fn talk_chip_rect(row: Rect) -> Rect {
-    let width = 12.min(row.width);
-    Rect {
-        x: row.x + row.width - width,
-        y: row.y,
-        width,
-        height: 1,
+/// Char-truncate with a trailing ellipsis (sim `text-overflow: ellipsis`).
+fn ellipsize(text: &str, budget: usize) -> String {
+    if budget == 0 {
+        return String::new();
+    }
+    if text.chars().count() <= budget {
+        text.to_owned()
+    } else {
+        let mut out: String = text.chars().take(budget.saturating_sub(1)).collect();
+        out.push('…');
+        out
     }
 }
 
@@ -157,6 +160,30 @@ fn render_launcher(
     area: Rect,
     hits: &mut Vec<(Rect, Hit)>,
 ) {
+    // Sim layout (Launcher, tui.js:4237 / JSX 3219): the centered content
+    // column on top, then the palette (CmdMenu) directly ABOVE the composer,
+    // then the gold-ruled composer at the bottom.
+    let palette = if model.palette_open() {
+        palette_block(model, theme, area.width)
+    } else {
+        Vec::new()
+    };
+    let mut palette_height = u16::try_from(palette.len()).unwrap_or(0);
+    // Input sacred: the palette yields entirely before the composer loses a
+    // row (review r1 P2 rule, same as the session layout).
+    let fixed = 1 + 1 + 1 + 1; // content min + rule + composer + gap
+    if palette_height > area.height.saturating_sub(fixed) {
+        palette_height = 0;
+    }
+    let [content_area, palette_area, rule_area, composer_area, _gap] = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(palette_height),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(area);
+
     let sanctum = SanctumLine::new(model.sanctum_tier);
     let identity = &model.identity;
     // Sim typography: big maroon mark · gold shahada · gold rule ·
@@ -190,45 +217,62 @@ fn render_launcher(
         Span::styled(" · device ", theme.faint_style()),
         Span::styled(identity.device.clone(), theme.dim_style()),
     ]));
+    // Sim `.dirline`: dir {dir} · mesh off.
+    lines.push(Line::from(vec![
+        Span::styled("dir ", theme.faint_style()),
+        Span::styled(identity.dir.clone(), theme.dim_style()),
+        Span::styled(" · mesh ", theme.faint_style()),
+        Span::styled("off", theme.dim_style()),
+    ]));
     lines.push(Line::default());
 
-    // Recent sessions — sim seed rows: dot · name ▸ head hon · blurb · meta.
+    // Recent sessions — sim seed rows (`.rhead` + rows, tui.js:3239).
     lines.push(Line::from(vec![Span::styled(
-        "recent sessions — 1-3 attach · type below to start fresh",
-        theme.faint_style(),
+        "recent sessions — click or 1-3 attach · /sessions for all",
+        theme.dim_style(),
     )]));
     let mut sample_rows: Vec<(usize, usize)> = Vec::new();
     let mut extra_rows: Vec<usize> = Vec::new();
     for (index, sample) in model.samples.iter().enumerate() {
+        // Sim `.dotc`: ok-green idle dot, gold pulsing when running.
         let (dot, dot_style) = if sample.running {
             ("◉", theme.gold_style())
         } else {
-            ("●", theme.faint_style())
+            ("●", theme.ok_style())
         };
         let mut spans = vec![
             Span::styled(format!("{} ", index + 1), theme.faint_style()),
             Span::styled(format!("{dot} "), dot_style),
             Span::styled(sample.name, theme.bright_style()),
-            Span::styled(" ▸ ", theme.faint_style()),
-            Span::styled(sample.head, theme.maroon_style()),
-            Span::styled(format!(" {}", sample.honorific), theme.gold_style()),
+            // Sim `.hd`: the head callsign + honorific, dim.
+            Span::styled(
+                format!(" ▸ {} {}", sample.head, sample.honorific),
+                theme.dim_style(),
+            ),
         ];
         if sample.running {
             spans.push(Span::styled("  running… ·", theme.gold_style()));
         }
+        let meta = format!(
+            " “{}” · {} · {} {} · {} tok · {} · {} · {}",
+            sample.blurb,
+            if sample.branches > 1 {
+                format!("{} branches", sample.branches)
+            } else {
+                "1 branch".to_owned()
+            },
+            sample.turns,
+            if sample.turns == 1 { "turn" } else { "turns" },
+            fmt_tok(sample.tokens),
+            sample.model,
+            sample.device,
+            sample.ago
+        );
+        // Sim `.meta`: ellipsized into the remaining width, never clipped
+        // mid-frame by the centered layout.
+        let meta_budget = (area.width as usize).saturating_sub(Line::from(spans.clone()).width());
         spans.push(Span::styled(
-            format!(
-                " “{}” · {} · {} tok · {} · {}",
-                sample.blurb,
-                if sample.branches > 1 {
-                    format!("{} branches", sample.branches)
-                } else {
-                    "1 branch".to_owned()
-                },
-                fmt_tok(sample.tokens),
-                sample.device,
-                sample.ago
-            ),
+            ellipsize(&meta, meta_budget),
             theme.dim_style(),
         ));
         sample_rows.push((lines.len(), index));
@@ -252,48 +296,36 @@ fn render_launcher(
         ),
     ] {
         extra_rows.push(lines.len());
+        // Sim `.aurarow`: gold glyph + gold name, dim meta.
         lines.push(Line::from(vec![
             Span::styled(format!("  {glyph} "), theme.gold_style()),
-            Span::styled(name, theme.dim_style()),
-            Span::styled(format!("  {blurb}"), theme.faint_style()),
+            Span::styled(name, theme.gold_style()),
+            Span::styled(format!("  {blurb}"), theme.dim_style()),
         ]));
     }
-    lines.push(Line::default());
-    let composer_row = lines.len();
-    lines.push(composer_line(model, theme, area.width));
-    let mut palette_rows: Vec<(usize, usize)> = Vec::new();
-    if model.palette_open() {
-        lines.push(Line::default());
-        for (offset, palette_row) in palette_lines(model, theme).into_iter().enumerate() {
-            if offset > 0 {
-                palette_rows.push((lines.len(), offset - 1));
-            }
-            lines.push(palette_row);
-        }
-    }
-    let (middle, dropped) = centered(frame, area, lines);
+    let (middle, dropped) = centered(frame, content_area, lines);
     let visible = |row: usize| row.checked_sub(dropped);
     for (row, index) in sample_rows {
         if let Some(row) = visible(row) {
-            hits.push((row_rect(area, middle.y, row), Hit::AttachSample(index)));
+            hits.push((
+                row_rect(content_area, middle.y, row),
+                Hit::AttachSample(index),
+            ));
         }
     }
     for (order, row) in extra_rows.into_iter().enumerate() {
         if let Some(row) = visible(row) {
             hits.push((
-                row_rect(area, middle.y, row),
+                row_rect(content_area, middle.y, row),
                 Hit::ExtraRow(u8::try_from(order).unwrap_or(2)),
             ));
         }
     }
-    if let Some(row) = visible(composer_row) {
-        hits.push((talk_chip_rect(row_rect(area, middle.y, row)), Hit::TalkChip));
+    if palette_height > 0 {
+        frame.render_widget(Paragraph::new(Text::from(palette)), palette_area);
+        palette_row_hits(model, palette_area, hits);
     }
-    for (row, index) in palette_rows {
-        if let Some(row) = visible(row) {
-            hits.push((row_rect(area, middle.y, row), Hit::PaletteRow(index)));
-        }
-    }
+    render_composer(model, theme, frame, rule_area, composer_area, hits);
 }
 
 fn render_session(
@@ -303,9 +335,10 @@ fn render_session(
     area: Rect,
     hits: &mut Vec<(Rect, Hit)>,
 ) {
-    // A blocking menu REPLACES the composer (sim §3 law) and takes its rows.
+    // A blocking menu REPLACES the composer (sim §3 law) and takes its rows:
+    // title + options + the bottom hint line.
     let menu = model.projection.open_menu();
-    let input_height = menu.map_or(1, |m| u16::try_from(m.options.len() + 1).unwrap_or(6));
+    let input_height = menu.map_or(1, |m| u16::try_from(m.options.len() + 2).unwrap_or(6));
     // Short windows: the INPUT is sacred — todos, then the palette, yield
     // entirely before the composer/menu loses a row (review r1 P2).
     let fixed = 2 + 1 + 1 + input_height + 1; // header + rule + rule + input + gap
@@ -314,11 +347,12 @@ fn render_session(
         .todos()
         .filter(|t| t.pinned)
         .map_or(0, |t| u16::try_from(t.items.len() + 1).unwrap_or(4));
-    let mut palette_height = if model.palette_open() {
-        u16::try_from(model.palette_items().len().min(8) + 1).unwrap_or(9)
+    let palette = if model.palette_open() {
+        palette_block(model, theme, area.width)
     } else {
-        0
+        Vec::new()
     };
+    let mut palette_height = u16::try_from(palette.len()).unwrap_or(0);
     let mut budget = area.height.saturating_sub(fixed + 1); // ≥1 transcript row
     if palette_height > budget {
         palette_height = 0;
@@ -349,8 +383,9 @@ fn render_session(
     ])
     .areas(area);
 
-    // Header (sim parity, image #30): [← main] chip · mark · bold product ·
-    // version · dir / session ▸ head hon · branch · device.
+    // Header (sim SessHead, tui.js:5183): [← main] chip · mark · bold GOLD
+    // product · dim version · dir / dim session line with a GOLD head
+    // callsign (`.headcs`).
     let sanctum = SanctumLine::new(model.sanctum_tier);
     let identity = &model.identity;
     let title = model.session_title.as_deref().unwrap_or("session");
@@ -365,19 +400,18 @@ fn render_session(
     header_top.push(Span::styled(
         "haider",
         theme
-            .maroon_style()
+            .gold_style()
             .add_modifier(ratatui::style::Modifier::BOLD),
     ));
+    header_top.push(Span::styled(format!(" v{VERSION}"), theme.dim_style()));
     header_top.push(Span::styled(
-        format!(" v{VERSION} · {}", identity.dir),
-        theme.dim_style(),
+        format!(" · {}", identity.dir),
+        theme.bright_style(),
     ));
     let header_bottom = vec![
         Span::styled("         ", theme.dim_style()),
-        Span::styled(title, theme.gold_style()),
-        Span::styled(" ▸ ", theme.faint_style()),
-        Span::styled(head, theme.maroon_style()),
-        Span::styled(format!(" {honorific}"), theme.gold_style()),
+        Span::styled(title, theme.dim_style()),
+        Span::styled(format!(" ▸ {head} {honorific}"), theme.gold_style()),
         Span::styled(
             format!(" · branch main · {}", identity.device),
             theme.dim_style(),
@@ -388,7 +422,7 @@ fn render_session(
             Line::from(header_top),
             Line::from(header_bottom),
         ]))
-        .style(theme.text_style().bg(theme.bar_bg.into())),
+        .style(theme.text_style()),
         header_area,
     );
     frame.render_widget(
@@ -412,6 +446,10 @@ fn render_session(
     let mut lines: Vec<Line<'_>> = Vec::new();
     for entry in model.projection.entries() {
         transcript_lines(&mut lines, entry, theme);
+    }
+    // Sim `.thinking` (tui.js:4458): a transient gold tail while thinking.
+    if model.projection.is_thinking() {
+        lines.push(Line::styled("● thinking…", theme.gold_style()));
     }
     let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
     let total = u16::try_from(paragraph.line_count(transcript_area.width)).unwrap_or(u16::MAX);
@@ -443,36 +481,27 @@ fn render_session(
     }
 
     if palette_height > 0 {
-        frame.render_widget(
-            Paragraph::new(Text::from(palette_lines(model, theme))),
-            palette_area,
-        );
-        for offset in 1..palette_area.height {
-            hits.push((
-                Rect {
-                    x: palette_area.x,
-                    y: palette_area.y + offset,
-                    width: palette_area.width,
-                    height: 1,
-                },
-                Hit::PaletteRow((offset - 1) as usize),
-            ));
-        }
+        frame.render_widget(Paragraph::new(Text::from(palette)), palette_area);
+        palette_row_hits(model, palette_area, hits);
     }
 
-    frame.render_widget(
-        Paragraph::new(Line::styled(
-            "─".repeat(rule_area.width as usize),
-            theme.faint_style(),
-        )),
-        rule_area,
-    );
     if let Some(menu) = menu {
-        let mut menu_lines = vec![Line::from(vec![
-            Span::styled("? ", theme.warn_style()),
-            Span::styled(menu.title.as_str(), theme.bright_style()),
-            Span::styled("  ↑↓ select · ⏎ confirm · 1-9 quick", theme.faint_style()),
-        ])];
+        // Sim InputMenu (tui.js:4932): warn top border, gold-soft ground,
+        // warn title with the kind glyph, ❯-cursor options, faint bottom
+        // hint carrying the answer-by-id contract.
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                "─".repeat(rule_area.width as usize),
+                theme.warn_style(),
+            ))
+            .style(theme.text_style()),
+            rule_area,
+        );
+        let glyph = menu_glyph(&menu.kind);
+        let mut menu_lines = vec![Line::from(vec![Span::styled(
+            format!(" {glyph} {}", menu.title),
+            theme.warn_style(),
+        )])];
         for (index, option) in menu.options.iter().enumerate() {
             let selected = index == model.menu_selection;
             let cursor = if selected { "❯" } else { " " };
@@ -483,7 +512,7 @@ fn render_session(
                     if selected {
                         theme.bright_style()
                     } else {
-                        theme.dim_style()
+                        theme.menu_style()
                     },
                 ),
             ]);
@@ -493,96 +522,195 @@ fn render_session(
                 line
             });
         }
-        frame.render_widget(Paragraph::new(Text::from(menu_lines)), composer_area);
-        for offset in 1..composer_area.height {
-            hits.push((
-                Rect {
-                    x: composer_area.x,
-                    y: composer_area.y + offset,
-                    width: composer_area.width,
-                    height: 1,
-                },
-                Hit::MenuOption((offset - 1) as usize),
-            ));
-        }
-    } else {
+        menu_lines.push(Line::from(vec![Span::styled(
+            format!(
+                " ↑↓ select · ⏎ confirm · 1-{} quick · menu {} · menu.answer(\"{}\", n) over RPC",
+                menu.options.len(),
+                menu.id,
+                menu.id
+            ),
+            theme.faint_style(),
+        )]));
         frame.render_widget(
-            Paragraph::new(composer_line(model, theme, composer_area.width))
-                .style(theme.input_style()),
+            Paragraph::new(Text::from(menu_lines)).style(theme.menu_style()),
             composer_area,
         );
-        hits.push((talk_chip_rect(composer_area), Hit::TalkChip));
+        // Option rows sit between the title (offset 0) and the hint (last).
+        for offset in 0..menu.options.len() {
+            let y = composer_area.y + 1 + u16::try_from(offset).unwrap_or(u16::MAX);
+            if y < composer_area.y + composer_area.height {
+                hits.push((
+                    Rect {
+                        x: composer_area.x,
+                        y,
+                        width: composer_area.width,
+                        height: 1,
+                    },
+                    Hit::MenuOption(offset),
+                ));
+            }
+        }
+    } else {
+        render_composer(model, theme, frame, rule_area, composer_area, hits);
     }
 }
 
-/// The composer row: gold ❯, text or dim placeholder, cursor, and the
-/// right-aligned ◉ talk chip (sim parity).
-fn composer_line<'a>(model: &'a AppModel, theme: &Theme, width: u16) -> Line<'a> {
+/// Sim `MENU_GLYPH` (tui.js:3057) mapped onto the protocol's menu kinds.
+const fn menu_glyph(kind: &haider_protocol::menu::MenuKind) -> &'static str {
+    use haider_protocol::menu::MenuKind;
+    match kind {
+        MenuKind::Recovery { .. } => "⌁",
+        MenuKind::Exhausted => "⟳",
+        _ => "?",
+    }
+}
+
+/// The gold rule + composer row on the input ground (sim InputBar,
+/// tui.js:5395: `border-top: gold`, `background: inputBg`). Pushes the
+/// talk-chip hit region so the click lands exactly on the chip.
+fn render_composer(
+    model: &AppModel,
+    theme: &Theme,
+    frame: &mut Frame<'_>,
+    rule_area: Rect,
+    row_area: Rect,
+    hits: &mut Vec<(Rect, Hit)>,
+) {
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "─".repeat(rule_area.width as usize),
+            theme.gold_style(),
+        ))
+        .style(theme.text_style()),
+        rule_area,
+    );
+    let (line, chip_at) = composer_line(model, theme, row_area.width);
+    frame.render_widget(Paragraph::new(line).style(theme.input_style()), row_area);
+    if let Some((offset, width)) = chip_at {
+        hits.push((
+            Rect {
+                x: row_area.x + offset,
+                y: row_area.y,
+                width,
+                height: 1,
+            },
+            Hit::TalkChip,
+        ));
+    }
+}
+
+/// The composer row (sim InputBar): padded off the frame edge, bold gold ❯
+/// sigil, typed text (bright + gold block cursor) or the dim placeholder,
+/// and the right-aligned `[ ◉ talk ]` chip. Returns the line plus the chip's
+/// column offset + width for the hit map.
+fn composer_line<'a>(
+    model: &'a AppModel,
+    theme: &Theme,
+    width: u16,
+) -> (Line<'a>, Option<(u16, u16)>) {
     let placeholder = match model.screen {
-        Screen::Launcher => "start a session — describe the task, or / for commands",
-        _ => "message haider — ⏎ send · / commands · paste images/text",
+        Screen::Launcher => PLACEHOLDER_LAUNCHER,
+        _ => PLACEHOLDER_SESSION,
     };
-    let mut spans = vec![Span::styled("❯ ", theme.gold_style())];
+    let mut spans = vec![
+        Span::raw(" ".repeat(COMPOSER_PAD)),
+        Span::styled(
+            "❯ ",
+            theme
+                .gold_style()
+                .add_modifier(ratatui::style::Modifier::BOLD),
+        ),
+    ];
     if model.composer.is_empty() {
         spans.push(Span::styled("▮", theme.gold_style()));
-        spans.push(Span::styled(format!(" {placeholder}"), theme.faint_style()));
+        spans.push(Span::styled(format!(" {placeholder}"), theme.dim_style()));
     } else {
         spans.push(Span::styled(model.composer.as_str(), theme.bright_style()));
         spans.push(Span::styled("▮", theme.gold_style()));
     }
-    // Display-cell width (unicode-aware — review r1 P3: CJK/emoji composers
+    // Display-cell widths (unicode-aware — review r1 P3: CJK/emoji composers
     // must not drift the chip).
     let typed_width = Line::from(spans.clone()).width();
-    // Right-aligned talk chip when there's room.
-    let talk = "[ ◉ talk ]";
-    let total = typed_width + talk.chars().count() + 2;
+    let chip_spans = chip("◉ talk".to_owned(), theme.gold_style());
+    let chip_width = Line::from(chip_spans.clone()).width();
+    // Right-aligned talk chip when there's room, padded off the right edge.
+    let total = typed_width + chip_width + COMPOSER_PAD;
+    let mut chip_at = None;
     if (width as usize) > total {
-        spans.push(Span::styled(
-            " ".repeat(width as usize - total),
-            theme.text_style(),
+        let filler = width as usize - total;
+        spans.push(Span::raw(" ".repeat(filler)));
+        spans.extend(chip_spans);
+        chip_at = Some((
+            u16::try_from(typed_width + filler).unwrap_or(0),
+            u16::try_from(chip_width).unwrap_or(0),
         ));
-        spans.extend(chip("◉ talk".to_owned(), theme.gold_style()));
     }
-    Line::from(spans)
+    (Line::from(spans), chip_at)
 }
 
-/// The slash palette rows (filtered commands, ❯ selection, tab hint).
-fn palette_lines<'a>(model: &AppModel, theme: &Theme) -> Vec<Line<'a>> {
+/// The slash palette (sim CmdMenu, tui.js:5345): a frame rule on top, then
+/// fixed-width command names (maroon; GOLD when selected) beside dim
+/// ellipsized descriptions — the selected row on the selection ground — and
+/// the key hint pinned at the BOTTOM. Empty matches render nothing (the sim
+/// hides the menu entirely).
+fn palette_block(model: &AppModel, theme: &Theme, width: u16) -> Vec<Line<'static>> {
     let items = model.palette_items();
-    let mut lines = vec![Line::from(vec![Span::styled(
-        "slash commands — ↑↓ select · ⇥ complete · ⏎ run · esc close",
-        theme.faint_style(),
-    )])];
-    for (index, spec) in items.iter().take(8).enumerate() {
+    if items.is_empty() {
+        return Vec::new();
+    }
+    let width = width as usize;
+    let mut lines = vec![Line::styled("─".repeat(width), theme.frame_style())];
+    for (index, spec) in items.iter().take(PALETTE_MAX_ROWS).enumerate() {
         let selected = index == model.palette_selection;
-        let cursor = if selected { "❯" } else { " " };
         let name_style = if selected {
             theme.gold_style()
         } else {
-            theme.bright_style()
+            theme.maroon_style()
         };
+        let name = format!("{:<PALETTE_NAME_COL$}", format!("/{}", spec.name));
+        let desc_budget = width.saturating_sub(2 + PALETTE_NAME_COL + 2);
         let mut spans = vec![
-            Span::styled(format!(" {cursor} ",), theme.gold_style()),
-            Span::styled(format!("/{}", spec.name), name_style),
+            Span::raw("  "),
+            Span::styled(name, name_style),
+            Span::raw("  "),
+            Span::styled(ellipsize(spec.desc, desc_budget), theme.dim_style()),
         ];
-        if !spec.arg_hint.is_empty() {
-            spans.push(Span::styled(
-                format!(" {}", spec.arg_hint),
-                theme.faint_style(),
+        if selected {
+            // Fill the row so the selection ground spans the full width.
+            let pad = width.saturating_sub(Line::from(spans.clone()).width());
+            if pad > 0 {
+                spans.push(Span::raw(" ".repeat(pad)));
+            }
+            lines.push(Line::from(spans).style(theme.selection_style()));
+        } else {
+            lines.push(Line::from(spans));
+        }
+    }
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(PALETTE_HINT, theme.faint_style()),
+    ]));
+    lines
+}
+
+/// Hit regions for the palette's option rows — offsets skip the top frame
+/// rule and never cover the bottom hint line.
+fn palette_row_hits(model: &AppModel, area: Rect, hits: &mut Vec<(Rect, Hit)>) {
+    let rows = model.palette_items().len().min(PALETTE_MAX_ROWS);
+    for offset in 0..rows {
+        let y = area.y + 1 + u16::try_from(offset).unwrap_or(u16::MAX);
+        if y < area.y + area.height {
+            hits.push((
+                Rect {
+                    x: area.x,
+                    y,
+                    width: area.width,
+                    height: 1,
+                },
+                Hit::PaletteRow(offset),
             ));
         }
-        spans.push(Span::styled(format!("  {}", spec.desc), theme.dim_style()));
-        let line = Line::from(spans);
-        lines.push(if selected {
-            line.style(theme.selection_style())
-        } else {
-            line
-        });
     }
-    if items.is_empty() {
-        lines.push(Line::styled("  no matching command", theme.faint_style()));
-    }
-    lines
 }
 
 /// The /help overlay: sim HELP_TEXT panel over the body.
@@ -606,9 +734,16 @@ fn render_help(theme: &Theme, frame: &mut Frame<'_>, area: Rect) {
     );
 }
 
-/// The status bar (sim image #28): boxed state chip · model · provider ·
-/// meter · voice chip · right hint (launcher)/flash.
-fn render_status_bar(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rect) {
+/// The status bar (sim StatusBar, tui.js:5492): boxed state chip · model ·
+/// provider [· branch] · meter · voice chip · right hint (launcher)/flash.
+/// Pushes the /help·theme hint's hit region when the hint is displayed.
+fn render_status_bar(
+    model: &AppModel,
+    theme: &Theme,
+    frame: &mut Frame<'_>,
+    area: Rect,
+    hits: &mut Vec<(Rect, Hit)>,
+) {
     let badge = model.projection.badge();
     let identity = &model.identity;
     let tokens = model.projection.context_tokens();
@@ -631,8 +766,14 @@ fn render_status_bar(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, are
         badge,
         theme.badge_style(model.projection.badge_tone()),
     ));
+    // Sim `.mid`: model · provider, plus the branch name inside a session.
+    let branch = if model.screen == Screen::Session {
+        " · main"
+    } else {
+        ""
+    };
     left.push(Span::styled(
-        format!("  {} · {}", identity.model_short, identity.provider),
+        format!("  {} · {}{branch}", identity.model_short, identity.provider),
         theme.text_style(),
     ));
     left.push(Span::styled(format!("  {meter}  "), theme.dim_style()));
@@ -641,9 +782,10 @@ fn render_status_bar(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, are
         theme.gold_style(),
     ));
 
+    let hint_shown = model.flash.is_none() && model.screen == Screen::Launcher && !model.help_open;
     let right = if let Some(flash) = &model.flash {
         flash.clone()
-    } else if model.screen == Screen::Launcher {
+    } else if hint_shown {
         format!(
             "/help · theme {} ",
             model.theme.theme().label.to_lowercase()
@@ -654,6 +796,8 @@ fn render_status_bar(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, are
     let right_width = u16::try_from(right.chars().count()).unwrap_or(0);
     let [left_area, right_area] =
         Layout::horizontal([Constraint::Min(1), Constraint::Length(right_width)]).areas(area);
+    // The sim separates the bar with a frame border-top; a terminal row is
+    // too dear for a rule here, so the bar_bg tint carries the separation.
     frame.render_widget(
         Paragraph::new(Line::from(left)).style(theme.text_style().bg(theme.bar_bg.into())),
         left_area,
@@ -665,6 +809,10 @@ fn render_status_bar(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, are
                 .style(theme.text_style().bg(theme.bar_bg.into())),
             right_area,
         );
+        if hint_shown {
+            // The hint's hit region is exactly the right-aligned text.
+            hits.push((right_area, Hit::HelpHint));
+        }
     }
 }
 

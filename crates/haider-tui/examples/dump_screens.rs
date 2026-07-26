@@ -49,13 +49,33 @@ fn main() {
         KeyModifiers::NONE,
     )));
     dump(&model, "launcher + palette");
-    model.handle(AppEvent::Key(KeyEvent::new(
-        KeyCode::Esc,
-        KeyModifiers::NONE,
-    )));
+    for _ in 0..2 {
+        model.handle(AppEvent::Key(KeyEvent::new(
+            KeyCode::Backspace,
+            KeyModifiers::NONE,
+        )));
+    }
+    // Blocking menu (a separate model: the demo turn up to, not including,
+    // its self-answer — the main model must not see events twice).
+    let mut menu_model = AppModel::new();
+    for payload in &script {
+        if matches!(payload, haider_protocol::EventPayload::MenuAnswered(_)) {
+            break;
+        }
+        menu_model.handle(AppEvent::Envelope(Box::new(payload.clone())));
+    }
+    dump(&menu_model, "session + blocking menu");
     // Full session.
     for payload in script.iter().skip(6) {
         model.handle(AppEvent::Envelope(Box::new(payload.clone())));
     }
     dump(&model, "session (end of demo)");
+    // Session palette (session-only commands included).
+    for c in "/t".chars() {
+        model.handle(AppEvent::Key(KeyEvent::new(
+            KeyCode::Char(c),
+            KeyModifiers::NONE,
+        )));
+    }
+    dump(&model, "session + palette");
 }

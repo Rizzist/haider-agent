@@ -361,7 +361,8 @@ fn slash_palette_filters_completes_and_runs() {
     assert_eq!(items[0].name, "theme");
     let (text, _) = draw(&model, 100, 34);
     assert!(text.contains("/theme"), "palette row visible");
-    assert!(text.contains("slash commands"));
+    // Sim CmdMenu: the key hint sits at the BOTTOM of the palette.
+    assert!(text.contains("↑↓ options · tab complete · ⏎ run · esc dismiss"));
 
     model.handle(key(KeyCode::Tab));
     assert_eq!(model.composer, "/theme ");
