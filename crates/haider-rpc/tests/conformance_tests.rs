@@ -183,6 +183,28 @@ fn uds_accepts_a_frame_exactly_at_the_limit() {
 }
 
 #[test]
+fn uds_valid_utf8_but_invalid_json_body_poisons_decoder() {
+    let body = b"{\"v\":1,";
+    let length_prefix = u32::try_from(body.len())
+        .expect("prefix fits")
+        .to_be_bytes();
+    let mut framed = length_prefix.to_vec();
+    framed.extend_from_slice(body);
+    let mut decoder = uds_codec::Decoder::new(TEST_FRAME_LIMIT);
+
+    assert!(matches!(decoder.push(&framed), Err(CodecError::Json(_))));
+    assert!(decoder.is_poisoned());
+}
+
+#[test]
+fn ws_empty_message_is_rejected_as_an_empty_frame() {
+    assert!(matches!(
+        ws_codec::decode("", TEST_FRAME_LIMIT),
+        Err(CodecError::EmptyFrame)
+    ));
+}
+
+#[test]
 fn uds_invalid_utf8_body_poisons_decoder() {
     let bytes = [0, 0, 0, 1, 0xff];
     let mut decoder = uds_codec::Decoder::new(TEST_FRAME_LIMIT);

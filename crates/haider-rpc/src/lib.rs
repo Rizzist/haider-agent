@@ -28,11 +28,11 @@ pub mod ws_codec;
 pub use codec::CodecError;
 pub use frame::{
     AttachMode, AttachState, AttachmentId, Capability, CapabilitySet, ClientKind, CommandId,
-    DEFAULT_FRAME_LIMIT, Hello, LifecyclePhase, Negotiated, ProtocolError, RequestBody, RequestId,
-    ResponseBody, SeqRange, ServerRange, SessionReadResult, SessionSummary, WIRE_PROTOCOL_VERSION,
-    Welcome, WireFrame,
+    DEFAULT_FRAME_LIMIT, Hello, LifecyclePhase, ProtocolError, RequestBody, RequestId,
+    ResponseBody, SeqRange, SessionReadResult, SessionSummary, WIRE_PROTOCOL_VERSION, Welcome,
+    WireFrame,
 };
-pub use negotiation::negotiate;
+pub use negotiation::{Negotiated, ServerRange, negotiate};
 
 /// Crate marker used by the workspace self-test.
 pub const CRATE_NAME: &str = "haider-rpc";

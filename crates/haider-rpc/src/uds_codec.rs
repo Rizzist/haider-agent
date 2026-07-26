@@ -10,7 +10,11 @@ use crate::{CodecError, WireFrame};
 
 const PREFIX_LEN: usize = 4;
 
-/// Serializes one UDS frame.
+/// Serializes one UDS frame: a four-byte big-endian prefix holding the exact
+/// JSON body length, followed by the body bytes.
+///
+/// The frame limit is enforced while serializing, so an oversized frame is
+/// rejected before a full-frame buffer ever exists.
 pub fn encode(frame: &WireFrame, frame_limit: usize) -> Result<Vec<u8>, CodecError> {
     let body = encode_json(frame, frame_limit)?;
     let body_len = u32::try_from(body.len()).map_err(|_| CodecError::LengthPrefixOverflow {
@@ -71,6 +75,10 @@ impl Decoder {
     }
 
     /// Accepts an arbitrary byte chunk and returns every completed frame.
+    ///
+    /// Any framing or body violation returns its typed error and permanently
+    /// poisons the decoder (poisoned, not recoverable, is the documented
+    /// choice); the caller must discard the decoder with its connection.
     pub fn push(&mut self, mut chunk: &[u8]) -> Result<Vec<WireFrame>, CodecError> {
         if self.is_poisoned() {
             return Err(CodecError::DecoderPoisoned);

@@ -8,6 +8,11 @@ use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// The logical wire protocol encoded by this crate.
+///
+/// Decoding is deliberately strict about the top-level `"v"` field: any other
+/// value is rejected, unlike unknown frame kinds, methods, and object fields,
+/// which are tolerated. A version bump is a contract change; silent
+/// cross-version decoding is not.
 pub const WIRE_PROTOCOL_VERSION: u32 = 1;
 
 /// Default v0.1 JSON body limit: 8 MiB.
@@ -69,12 +74,19 @@ pub enum ClientKind {
 }
 
 /// Connection capability requested or granted during negotiation.
+///
+/// The wire crate only models the `view | control` set; enforcing what a
+/// capability permits is daemon (W3b) authorization policy, never codec logic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Capability {
+    /// Receive session events.
     View,
+    /// Additionally submit control commands such as [`WireFrame::MenuAnswer`].
     Control,
+    /// Decode artifact for a capability this crate does not know. It is never
+    /// granted by [`crate::negotiate`].
     #[serde(other)]
     Unknown,
 }
@@ -85,14 +97,21 @@ pub type CapabilitySet = BTreeSet<Capability>;
 /// Client handshake parameters.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hello {
+    /// Lowest wire protocol version the client implements (inclusive).
     pub protocol_min: u32,
+    /// Highest wire protocol version the client implements (inclusive).
     pub protocol_max: u32,
     pub client_kind: ClientKind,
+    /// Ceiling for the grant: negotiation returns a subset of this set and
+    /// never invents a capability the client did not ask for.
     #[serde(default)]
     pub capabilities_requested: CapabilitySet,
 }
 
 /// Daemon lifecycle state advertised in [`Welcome`].
+///
+/// The wire crate only names the phases; their transitions and guarantees are
+/// owned by W3b's recovery/drain machinery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -111,13 +130,17 @@ pub enum LifecyclePhase {
 /// Server handshake response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Welcome {
+    /// The single wire protocol version selected by negotiation.
     pub protocol: u32,
     /// Random process-instance identity. W3b supplies its generation semantics.
     pub instance_id: String,
     /// Durable per-profile daemon generation. This is not a worker generation.
     pub daemon_generation: u64,
+    /// Maximum JSON body bytes per frame on either transport. Both peers must
+    /// enforce this limit before allocating a body buffer.
     pub frame_limit: u32,
     pub lifecycle_phase: LifecyclePhase,
+    /// Granted capability set: a subset of [`Hello::capabilities_requested`].
     #[serde(default)]
     pub capabilities_granted: CapabilitySet,
 }
@@ -125,11 +148,16 @@ pub struct Welcome {
 /// Inclusive sequence range for a non-subscribing session read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SeqRange {
+    /// Inclusive lower bound.
     pub start_seq: u64,
+    /// Inclusive upper bound.
     pub end_seq: u64,
 }
 
-/// Requested attachment authority.
+/// Requested attachment authority; mirrors [`Capability`] per attachment.
+///
+/// Whether the daemon honors the requested mode is authorization policy owned
+/// by W3b, not by this crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -144,7 +172,11 @@ pub enum AttachMode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttachState {
     pub session_id: SessionId,
+    /// Echo of the `after_seq` the client attached with: the greatest sequence
+    /// it reported as fully applied (zero for complete history).
     pub requested_after_seq: u64,
+    /// Committed head captured at attach time. Replay covers
+    /// `(requested_after_seq, replay_through_seq]`; higher sequences are live.
     pub replay_through_seq: u64,
     /// Session/execution-scoped generation, distinct from daemon generation.
     pub worker_generation: u64,
@@ -156,6 +188,7 @@ pub struct AttachState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSummary {
     pub session_id: SessionId,
+    /// Greatest committed envelope sequence for the session.
     pub head_seq: u64,
     pub worker_generation: u64,
 }
@@ -179,23 +212,35 @@ pub struct SessionReadResult {
 #[serde(tag = "method")]
 #[non_exhaustive]
 pub enum RequestBody {
+    /// Paginated, non-subscribing session listing. The ordering key that makes
+    /// `page` stable is W3b's contract, not the wire's.
     #[serde(rename = "session.list")]
     SessionList { page: u64, page_size: u32 },
+    /// Non-subscribing read of committed envelopes in an inclusive range.
     #[serde(rename = "session.read")]
     SessionRead {
         session_id: SessionId,
         range: SeqRange,
     },
+    /// The only operation that begins event delivery. `after_seq` is the
+    /// greatest sequence the client has fully applied (zero for complete
+    /// history); the daemon replays strictly after it.
     #[serde(rename = "session.attach")]
     SessionAttach {
         session_id: SessionId,
         after_seq: u64,
         mode: AttachMode,
     },
+    /// Ends event delivery for one attachment; never affects session
+    /// authority or worker ownership.
     #[serde(rename = "session.detach")]
     SessionDetach { attachment_id: AttachmentId },
+    /// Liveness probe. The nonce is opaque and echoed verbatim by
+    /// [`ResponseBody::Pong`].
     #[serde(rename = "ping")]
     Ping { nonce: u64 },
+    /// Decode artifact for a method this crate does not know (tolerance
+    /// discipline). W3b answers it with a protocol error, not a panic.
     #[serde(other)]
     Unknown,
 }
@@ -205,6 +250,8 @@ pub enum RequestBody {
 #[serde(tag = "method")]
 #[non_exhaustive]
 pub enum ResponseBody {
+    /// One page of session summaries. `next_page` is the `page` value to
+    /// request next; it is omitted from the wire on the last page.
     #[serde(rename = "session.list")]
     SessionList {
         page: u64,
@@ -223,8 +270,11 @@ pub enum ResponseBody {
     },
     #[serde(rename = "session.detach")]
     SessionDetach { attachment_id: AttachmentId },
+    /// Echoes the nonce of the [`RequestBody::Ping`] it answers.
     #[serde(rename = "pong")]
     Pong { nonce: u64 },
+    /// Decode artifact for a method this crate does not know (tolerance
+    /// discipline).
     #[serde(other)]
     Unknown,
 }
@@ -232,8 +282,12 @@ pub enum ResponseBody {
 /// Protocol-error wire shape, also returned by failed negotiation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProtocolError {
+    /// Stable, machine-readable `snake_case` token. Codes are strings on the
+    /// wire so an old client can carry a code it does not recognize.
     pub code: String,
+    /// Human-readable detail; never load-bearing for client behavior.
     pub message: String,
+    /// When `true`, the sender will close the connection after this frame.
     pub fatal: bool,
 }
 
@@ -245,48 +299,57 @@ impl std::fmt::Display for ProtocolError {
 
 impl std::error::Error for ProtocolError {}
 
-/// Server protocol range and capabilities used by [`crate::negotiate`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ServerRange {
-    pub protocol_min: u32,
-    pub protocol_max: u32,
-    pub capabilities: CapabilitySet,
-}
-
-/// Successful handshake selection.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Negotiated {
-    pub protocol: u32,
-    pub capabilities_granted: CapabilitySet,
-}
-
 /// One versioned logical frame shared by WebSocket and UDS transports.
 ///
+/// # Serde tagging rationale
+///
 /// The JSON representation is internally tagged with a stable `kind` and a
-/// top-level `"v": 1`. Internal tagging keeps common fields and variant fields
-/// in one inspectable object. Unknown object fields are intentionally ignored
-/// by Serde; an unknown `kind` decodes to [`WireFrame::Unknown`].
+/// top-level `"v": 1`. Internal tagging was chosen over adjacent tagging
+/// because it keeps every frame one flat, inspectable object — the version,
+/// the discriminant, and the fields sit side by side, which keeps golden
+/// fixtures readable and lets tooling grep a transcript by `"kind"`. Adjacent
+/// tagging would bury variant fields under a content key for no wire benefit.
+/// Unknown object fields are intentionally ignored by Serde; an unknown
+/// `kind` decodes to [`WireFrame::Unknown`] (tolerance discipline), while a
+/// wrong `"v"` is rejected outright (see [`WIRE_PROTOCOL_VERSION`]).
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum WireFrame {
+    /// First application frame, client to daemon. Authentication happens
+    /// before this frame (WS) or via endpoint access (UDS), never inside it.
     Hello(Hello),
+    /// Daemon reply to [`WireFrame::Hello`]; carries the negotiation outcome.
     Welcome(Welcome),
+    /// Correlated operation. `request_id` is connection-scoped: the matching
+    /// [`WireFrame::Response`] echoes it. It is not an idempotency key —
+    /// retrying across connections requires a durable [`CommandId`].
     Request {
         request_id: RequestId,
         body: RequestBody,
     },
+    /// Answer to the [`WireFrame::Request`] whose `request_id` it echoes.
     Response {
         request_id: RequestId,
         body: ResponseBody,
     },
+    /// One committed envelope. `envelope.seq` is the ONLY replay cursor:
+    /// there is deliberately no frame-level event ID, counter, or snapshot
+    /// generation to compete with it. Delivery is at-least-once; clients drop
+    /// `seq <= last_applied` and treat a gap as a signal to reattach.
     Event {
         session_id: SessionId,
         envelope: RawEnvelope,
     },
+    /// Replay for the attachment is complete through `high_water_seq`; every
+    /// later [`WireFrame::Event`] on this attachment is live.
     AttachCaughtUp {
         attachment_id: AttachmentId,
         high_water_seq: u64,
     },
+    /// Wire shape of the durable compare-and-set menu command: first
+    /// committed answer wins, and `request_seq` plus `worker_generation`
+    /// fence stale answers. Only the shape lives here — validation,
+    /// arbitration, and the append are daemon (W3b) work.
     MenuAnswer {
         command_id: CommandId,
         session_id: SessionId,
@@ -295,14 +358,21 @@ pub enum WireFrame {
         worker_generation: u64,
         option: String,
     },
+    /// The daemon dropped this attachment under backpressure. The client
+    /// recovers by reattaching with `after_seq = resume_after_seq`; W3b
+    /// defines how that cursor is computed.
     Lagged {
         attachment_id: AttachmentId,
         resume_after_seq: u64,
     },
-    ServerDraining {
-        deadline_ms: u64,
-    },
+    /// The daemon entered its drain window and will stop accepting work.
+    /// Reserved: W3b pins whether `deadline_ms` is a duration or an absolute
+    /// epoch timestamp when it implements drain.
+    ServerDraining { deadline_ms: u64 },
+    /// See [`ProtocolError`]; `fatal` decides whether the connection closes.
     ProtocolError(ProtocolError),
+    /// Decode artifact for a frame kind this crate does not know (tolerance
+    /// discipline). Never constructed for sending.
     Unknown,
 }
 

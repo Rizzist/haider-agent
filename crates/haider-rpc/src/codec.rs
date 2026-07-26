@@ -9,11 +9,17 @@ use crate::WireFrame;
 #[non_exhaustive]
 pub enum CodecError {
     /// The encoded or announced body exceeds the configured limit.
+    ///
+    /// `announced_len` is `Some` when the offending length was known up front
+    /// (a decode input or a UDS length prefix) and `None` when streaming
+    /// serialization crossed the limit mid-encode, before the full length
+    /// existed anywhere.
     FrameLimitExceeded {
         frame_limit: usize,
         announced_len: Option<usize>,
     },
-    /// UDS length prefixes are strict: a zero-length JSON body is invalid.
+    /// A zero-length JSON body is invalid on both transports: an empty WS
+    /// text message, or a UDS length prefix announcing zero bytes.
     EmptyFrame,
     /// A complete UDS body was not UTF-8.
     InvalidUtf8(std::str::Utf8Error),

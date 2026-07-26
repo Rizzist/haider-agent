@@ -82,10 +82,30 @@ fn negotiation_rejects_disjoint_protocol_ranges() {
             capabilities: capabilities([]),
         },
     )
-    .expect_err("ranges must be disjoint");
+    .expect_err("disjoint ranges must fail");
 
     assert_eq!(error.code, "protocol_version_mismatch");
     assert!(error.fatal);
+}
+
+#[test]
+fn negotiation_never_grants_the_unknown_capability_even_when_both_sides_list_it() {
+    // hello() requests Unknown alongside View and Control; Unknown exists
+    // only as a decode artifact and must never become a grant.
+    let negotiated = negotiate(
+        &hello(1, 1),
+        &ServerRange {
+            protocol_min: 1,
+            protocol_max: 1,
+            capabilities: capabilities([Capability::View, Capability::Unknown]),
+        },
+    )
+    .expect("negotiate");
+
+    assert_eq!(
+        negotiated.capabilities_granted,
+        capabilities([Capability::View])
+    );
 }
 
 #[test]
