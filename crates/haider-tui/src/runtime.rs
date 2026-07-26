@@ -3,8 +3,8 @@
 //! (research rec 3/6). Alternate screen for v0.1 (rec 1); native-scrollback
 //! insertion is explicitly deferred (rec 19).
 
-use crate::app::{AppEvent, AppModel};
-use crate::mock::demo_script;
+use crate::app::{AppEvent, AppModel, AppRequest};
+use crate::mock::{demo_script, response_script};
 use crate::render::render;
 use crate::theme::{Rgb, ThemeKey};
 use haider_protocol::EventPayload;
@@ -35,6 +35,28 @@ pub fn osc_set_background(rgb: Rgb) -> String {
 #[must_use]
 pub const fn osc_reset_background() -> &'static str {
     "\u{1b}]111\u{7}"
+}
+
+/// OSC 2: set the terminal window title (owner ask — the window should say
+/// what haider is doing). Restored via [`osc_reset_title`] on exit.
+#[must_use]
+pub fn osc_set_title(title: &str) -> String {
+    format!("\u{1b}]2;{title}\u{7}")
+}
+
+/// Best effort title restore: OSC 22/23 pop where supported, else clear.
+#[must_use]
+pub const fn osc_reset_title() -> &'static str {
+    "\u{1b}[23;2t\u{1b}]2;\u{7}"
+}
+
+fn sync_window_title(title: &str) {
+    let mut out = stdout();
+    // Push the current title (XTWINOPS 22) once per set is harmless; the
+    // matching pop runs in restore_terminal.
+    let _ = out.write_all(b"\x1b[22;2t");
+    let _ = out.write_all(osc_set_title(title).as_bytes());
+    let _ = out.flush();
 }
 
 /// Best-effort terminal-background sync to the active theme.
@@ -136,6 +158,7 @@ fn restore_terminal() {
         LeaveAlternateScreen
     );
     let _ = stdout().write_all(osc_reset_background().as_bytes());
+    let _ = stdout().write_all(osc_reset_title().as_bytes());
     let _ = stdout().flush();
 }
 
@@ -163,7 +186,9 @@ pub async fn run_demo(mut model: AppModel) -> std::io::Result<()> {
     // cursor-position query that hangs non-answering PTYs; the first full
     // draw repaints every cell anyway.)
     sync_terminal_bg(model.theme);
+    sync_window_title(&model.window_title());
     let mut active_theme = model.theme;
+    let mut active_title = model.window_title();
 
     // Input pump: crossterm's blocking read on a dedicated thread, forwarded
     // into the async loop (no event-stream feature needed).
@@ -181,19 +206,35 @@ pub async fn run_demo(mut model: AppModel) -> std::io::Result<()> {
         }
     });
 
-    // Demo driver: the script plays on its own clock. `answer_echo` is the
-    // demo's client seam — user menu answers loop back as MenuAnswered
-    // envelopes, exactly the shape the daemon will publish later.
+    // Demo drivers: the boot beats play immediately; turns play on demand
+    // (typed submits or sample attaches). `answer_echo` is the demo's client
+    // seam — user menu answers loop back as MenuAnswered envelopes, exactly
+    // the shape the daemon will publish later.
     let (envelope_tx, mut envelope_rx) = mpsc::channel::<EventPayload>(64);
     let answer_echo = envelope_tx.clone();
+    let script_tx = envelope_tx.clone();
     tokio::spawn(async move {
-        for payload in demo_script() {
+        for payload in crate::mock::boot_script() {
             tokio::time::sleep(demo_pace(&payload)).await;
             if envelope_tx.send(payload).await.is_err() {
                 return;
             }
         }
     });
+    let play = |payloads: Vec<EventPayload>| {
+        let tx = script_tx.clone();
+        tokio::spawn(async move {
+            for payload in payloads {
+                tokio::time::sleep(demo_pace(&payload)).await;
+                if tx.send(payload).await.is_err() {
+                    return;
+                }
+            }
+        });
+    };
+    // Launcher auto-play: if untouched, the classic demo plays once.
+    let autoplay = tokio::time::sleep(Duration::from_secs(6));
+    tokio::pin!(autoplay);
 
     let mut frame_tick = tokio::time::interval(Duration::from_millis(33));
     frame_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -212,6 +253,9 @@ pub async fn run_demo(mut model: AppModel) -> std::io::Result<()> {
                 Some(_) => {}
                 None => break,
             },
+            () = &mut autoplay, if !model.auto_play_spent => {
+                model.handle(AppEvent::AutoPlay);
+            }
             payload = envelope_rx.recv(), if stream_open => match payload {
                 Some(payload) => model.handle(AppEvent::Envelope(Box::new(payload))),
                 None => {
@@ -229,10 +273,24 @@ pub async fn run_demo(mut model: AppModel) -> std::io::Result<()> {
                 model.dirty = false;
             }
         }
-        // Theme cycled (Ctrl+T): re-sync the emulator background.
+        // Reducer-requested side effects.
+        for request in model.requests.drain(..) {
+            match request {
+                AppRequest::SubmitText(text) => play(response_script(&text)),
+                AppRequest::AttachSample(_) => play(crate::mock::turn_script()),
+                AppRequest::Quit => model.should_quit = true,
+            }
+        }
+        // Theme cycled: re-sync the emulator background.
         if model.theme != active_theme {
             active_theme = model.theme;
             sync_terminal_bg(active_theme);
+        }
+        // Screen/session changed: re-sync the window title (owner ask).
+        let title = model.window_title();
+        if title != active_title {
+            active_title = title;
+            sync_window_title(&active_title);
         }
         // Reliable outbox drain (review r2 P2): a Full channel keeps the
         // answer queued for the next loop turn — a full channel guarantees

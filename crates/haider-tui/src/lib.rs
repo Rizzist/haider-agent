@@ -7,6 +7,7 @@
 
 pub mod app;
 pub mod boot;
+pub mod commands;
 pub mod format;
 pub mod mock;
 pub mod plain;

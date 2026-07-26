@@ -60,7 +60,7 @@ fn boot_screen_shows_mark_word_and_progressing_checks() {
     assert_eq!(model.screen, Screen::Boot);
     let (text, _) = draw(&model, 80, 24);
     assert!(text.contains("حيدر"));
-    assert!(text.contains("HAIDER CODE"));
+    assert!(text.contains("H A I D E R"));
     assert!(text.contains("· starting up"));
     assert!(text.contains("✓ store open · journal replayed"));
     assert!(text.contains("◌"), "current check marker");
@@ -82,7 +82,15 @@ fn launcher_shows_sanctum_identity_and_composer() {
     assert!(text.contains("the lion"));
     assert!(text.contains("provider"));
     assert!(text.contains("anthropic"));
-    assert!(text.contains("no sessions yet"));
+    assert!(text.contains("recent sessions"));
+    assert!(text.contains("billing-service"), "sim seed rows present");
+    assert!(text.contains("Stripe webhooks + invoice backfill"));
+    assert!(text.contains("cellular-pool-fix"));
+    assert!(
+        text.contains("start a session — describe the task"),
+        "composer placeholder"
+    );
+    assert!(text.contains("◉ talk"), "talk chip");
     assert!(text.contains("❯"));
 }
 
@@ -101,7 +109,7 @@ fn narrow_launcher_omits_the_sanctum_whole() {
             "sanctum fragment leaked into narrow frame"
         );
     }
-    assert!(text.contains("HAIDER CODE"), "the rest still renders");
+    assert!(text.contains("H A I D E R"), "the rest still renders");
 }
 
 #[test]
@@ -110,11 +118,11 @@ fn session_screen_shows_transcript_and_meter() {
     assert_eq!(model.screen, Screen::Session);
     let (text, _) = draw(&model, 100, 30);
     assert!(text.contains("❯ fix the failing boundary test"));
-    assert!(text.contains("⚒ fs_read"));
+    assert!(text.contains("✓ fs_read"), "tool row: status glyph + name");
     assert!(text.contains("± crates/haider-store/src/event_store.rs"));
     assert!(text.contains("IDLE"));
     assert!(text.contains("17% of 200k"));
-    assert!(text.contains("claude-fable-5 · anthropic"));
+    assert!(text.contains("fable-5 · anthropic"));
 }
 
 #[test]
@@ -313,9 +321,9 @@ fn session_screen_has_header_and_composer_gap() {
     let (text, _) = draw(&model, 100, 30);
     // Header: mark + product line + session line (owner ask: sim-parity header).
     assert!(text.contains("حيدر"));
-    assert!(text.contains("· haider v"), "mark · product separator");
+    assert!(text.contains("← main"), "back chip present");
     assert!(text.contains("~/dev/enterprise-suite"));
-    assert!(text.contains("← esc"));
+    assert!(text.contains("← main"));
     assert!(
         text.contains("fix the failing boundary test in haid"),
         "session title from first message"
@@ -332,4 +340,113 @@ fn session_screen_has_header_and_composer_gap() {
         "spacer row between composer and status bar"
     );
     assert!(lines[lines.len() - 1].contains("IDLE"));
+}
+
+#[test]
+fn slash_palette_filters_completes_and_runs() {
+    let mut model = AppModel::new();
+    model.handle(AppEvent::Envelope(Box::new(EventPayload::HarnessStatus(
+        HarnessStatus::Ready,
+    ))));
+    for c in "/th".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    assert!(model.palette_open());
+    let items = model.palette_items();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].name, "theme");
+    let (text, _) = draw(&model, 100, 34);
+    assert!(text.contains("/theme"), "palette row visible");
+    assert!(text.contains("slash commands"));
+
+    model.handle(key(KeyCode::Tab));
+    assert_eq!(model.composer, "/theme ");
+    for c in "dark".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Enter));
+    assert_eq!(model.theme, ThemeKey::Dark, "/theme dark executed");
+    assert!(model.composer.is_empty());
+}
+
+#[test]
+fn stub_commands_flash_honestly_and_help_opens() {
+    let mut model = AppModel::new();
+    model.handle(AppEvent::Envelope(Box::new(EventPayload::HarnessStatus(
+        HarnessStatus::Ready,
+    ))));
+    for c in "/tree".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Enter));
+    assert!(
+        model.flash.as_deref().unwrap_or("").contains("lands with"),
+        "stubs name their wave"
+    );
+
+    for c in "/help".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Enter));
+    assert!(model.help_open);
+    let (text, _) = draw(&model, 100, 34);
+    assert!(text.contains("/queue <steer|turn>"), "help panel body");
+    model.handle(key(KeyCode::Esc));
+    assert!(!model.help_open);
+}
+
+#[test]
+fn typed_text_starts_a_session_and_requests_a_turn() {
+    use haider_tui::app::AppRequest;
+    let mut model = AppModel::new();
+    model.handle(AppEvent::Envelope(Box::new(EventPayload::HarnessStatus(
+        HarnessStatus::Ready,
+    ))));
+    for c in "refactor the parser".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Enter));
+    assert_eq!(model.screen, Screen::Session);
+    assert_eq!(
+        model.requests,
+        vec![AppRequest::SubmitText("refactor the parser".to_owned())]
+    );
+    assert_eq!(model.session_title.as_deref(), Some("refactor the parser"));
+    assert_eq!(
+        model.window_title(),
+        "haider — refactor the parser · this-mac"
+    );
+}
+
+#[test]
+fn digit_attaches_a_sample_and_autoplay_is_one_shot() {
+    use haider_tui::app::AppRequest;
+    let mut model = AppModel::new();
+    model.handle(AppEvent::Envelope(Box::new(EventPayload::HarnessStatus(
+        HarnessStatus::Ready,
+    ))));
+    model.handle(key(KeyCode::Char('2')));
+    assert_eq!(model.requests, vec![AppRequest::AttachSample(1)]);
+    assert_eq!(model.session_head, ("Fatima", "(a)"));
+
+    // Interaction spends the auto-play.
+    model.requests.clear();
+    model.handle(AppEvent::AutoPlay);
+    assert!(
+        model.requests.is_empty(),
+        "auto-play never fires after keys"
+    );
+}
+
+#[test]
+fn status_bar_has_boxed_chips_and_hint() {
+    let mut model = AppModel::new();
+    model.handle(AppEvent::Envelope(Box::new(EventPayload::HarnessStatus(
+        HarnessStatus::Ready,
+    ))));
+    let (text, _) = draw(&model, 118, 34);
+    assert!(text.contains("[ IDLE ]"), "boxed state chip");
+    assert!(text.contains("fable-5 · anthropic"));
+    assert!(text.contains("[ ◉ voice · whisper→openai ]"), "voice chip");
+    assert!(text.contains("/help · theme desert dawn"), "launcher hint");
 }

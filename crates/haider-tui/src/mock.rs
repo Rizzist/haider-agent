@@ -64,26 +64,39 @@ fn todos(states: [TodoState; 3]) -> Vec<TodoItem> {
         .collect()
 }
 
-/// The full demo payload sequence, in commit order.
+/// Boot beats only: readiness checks then Ready (drives boot → launcher).
 #[must_use]
-pub fn demo_script() -> Vec<EventPayload> {
-    use TodoState::{Completed, Listed, Processing};
+pub fn boot_script() -> Vec<EventPayload> {
     let mut script = Vec::new();
-
-    // Boot: the readiness checklist completes one check at a time.
     for done in 0..=DEMO_CHECKS.len() {
         script.push(starting(done));
     }
     script.push(EventPayload::HarnessStatus(HarnessStatus::Ready));
+    script
+}
 
+/// The full demo payload sequence, in commit order (plain/CI path).
+#[must_use]
+pub fn demo_script() -> Vec<EventPayload> {
+    let mut script = boot_script();
+    script.extend(turn_script());
+    script
+}
+
+/// The classic scripted session turn (attach/auto-play path).
+#[must_use]
+pub fn turn_script() -> Vec<EventPayload> {
+    use TodoState::{Completed, Listed, Processing};
     // The demo turn.
-    script.push(EventPayload::UserMessage {
-        text: "fix the failing boundary test in haider-store".to_owned(),
-        attachments: vec![],
-        mode: haider_protocol::DeliveryMode::Steer,
-    });
-    script.push(EventPayload::RunState(RunState::Queued));
-    script.push(EventPayload::RunState(RunState::Thinking));
+    let mut script = vec![
+        EventPayload::UserMessage {
+            text: "fix the failing boundary test in haider-store".to_owned(),
+            attachments: vec![],
+            mode: haider_protocol::DeliveryMode::Steer,
+        },
+        EventPayload::RunState(RunState::Queued),
+        EventPayload::RunState(RunState::Thinking),
+    ];
 
     // A pinned plan appears.
     script.push(EventPayload::Item(ItemEvent::Started {
@@ -214,6 +227,164 @@ pub fn demo_script() -> Vec<EventPayload> {
         output: 2_100,
         reasoning: 900,
         cached: 12_000,
+        source: UsageSource::ProviderReported,
+        account: None,
+    }));
+    script.push(EventPayload::RunState(RunState::Done));
+    script
+}
+
+/// A launcher sample session row (sim seed parity — display data only until
+/// real sessions arrive with the daemon).
+#[derive(Debug, Clone)]
+pub struct SampleSession {
+    pub name: &'static str,
+    pub head: &'static str,
+    pub honorific: &'static str,
+    pub blurb: &'static str,
+    pub branches: u32,
+    pub turns: u32,
+    pub tokens: u64,
+    pub model: &'static str,
+    pub device: &'static str,
+    pub ago: &'static str,
+    pub running: bool,
+}
+
+/// The sim's seed sessions, verbatim identity (owner default roster).
+#[must_use]
+pub fn sample_sessions() -> Vec<SampleSession> {
+    vec![
+        SampleSession {
+            name: "billing-service",
+            head: "Muhammad",
+            honorific: "ﷺ",
+            blurb: "Stripe webhooks + invoice backfill",
+            branches: 2,
+            turns: 2,
+            tokens: 118_000,
+            model: "fable-5",
+            device: "this-mac",
+            ago: "12m",
+            running: false,
+        },
+        SampleSession {
+            name: "cellular-pool-fix",
+            head: "Fatima",
+            honorific: "(a)",
+            blurb: "Deploy-drain pool orphan hunt",
+            branches: 1,
+            turns: 4,
+            tokens: 41_000,
+            model: "gpt-5.6",
+            device: "hetzner-1",
+            ago: "2h",
+            running: true,
+        },
+        SampleSession {
+            name: "l1-remote-projects",
+            head: "Ali",
+            honorific: "(a)",
+            blurb: "L1 remote-projects contract read",
+            branches: 1,
+            turns: 6,
+            tokens: 22_000,
+            model: "gemini-3",
+            device: "mac-studio",
+            ago: "1d",
+            running: false,
+        },
+    ]
+}
+
+/// A canned response turn for user-typed demo input: the same envelope shapes
+/// the real harness emits, themed around the typed text.
+#[must_use]
+pub fn response_script(user_text: &str) -> Vec<EventPayload> {
+    let mut script = vec![
+        EventPayload::UserMessage {
+            text: user_text.to_owned(),
+            attachments: vec![],
+            mode: haider_protocol::DeliveryMode::Steer,
+        },
+        EventPayload::RunState(RunState::Queued),
+        EventPayload::RunState(RunState::Thinking),
+        EventPayload::RunState(RunState::Streaming),
+    ];
+    let reply_id = ItemId::new(format!("reply-{}", user_text.len()));
+    script.push(EventPayload::Item(ItemEvent::Started {
+        item_id: reply_id.clone(),
+        item: TurnItem::AgentMessage {
+            text: String::new(),
+        },
+    }));
+    let head: String = user_text.chars().take(42).collect();
+    for chunk in [
+        "On it — reading the relevant code before ".to_owned(),
+        "changing anything. Task noted: ".to_owned(),
+        format!("“{head}”."),
+    ] {
+        script.push(EventPayload::Item(ItemEvent::Delta {
+            item_id: reply_id.clone(),
+            delta: ItemDelta::Text { text: chunk },
+        }));
+    }
+    script.push(EventPayload::Item(ItemEvent::Completed {
+        item_id: reply_id.clone(),
+        item: TurnItem::AgentMessage {
+            text: format!(
+                "On it — reading the relevant code before changing anything. \
+                 Task noted: “{head}”."
+            ),
+        },
+    }));
+    script.push(EventPayload::RunState(RunState::RunningTool));
+    let search_id = ItemId::new(format!("search-{}", user_text.len()));
+    script.push(EventPayload::Item(ItemEvent::Started {
+        item_id: search_id.clone(),
+        item: TurnItem::ToolCall {
+            call_id: "demo-search".to_owned(),
+            name: "fs_search".to_owned(),
+            args: serde_json::json!({"query": head, "glob": "src/**"}),
+            status: ToolStatus::InProgress,
+        },
+    }));
+    script.push(EventPayload::Item(ItemEvent::Completed {
+        item_id: search_id,
+        item: TurnItem::ToolCall {
+            call_id: "demo-search".to_owned(),
+            name: "fs_search".to_owned(),
+            args: serde_json::json!({"query": head, "glob": "src/**"}),
+            status: ToolStatus::Completed,
+        },
+    }));
+    script.push(EventPayload::RunState(RunState::Streaming));
+    let close_id = ItemId::new(format!("close-{}", user_text.len()));
+    script.push(EventPayload::Item(ItemEvent::Started {
+        item_id: close_id.clone(),
+        item: TurnItem::AgentMessage {
+            text: String::new(),
+        },
+    }));
+    script.push(EventPayload::Item(ItemEvent::Delta {
+        item_id: close_id.clone(),
+        delta: ItemDelta::Text {
+            text: "That's the demo loop — the real turn engine ships with the daemon wave."
+                .to_owned(),
+        },
+    }));
+    script.push(EventPayload::Item(ItemEvent::Completed {
+        item_id: close_id,
+        item: TurnItem::AgentMessage {
+            text: "That's the demo loop — the real turn engine ships with the daemon wave."
+                .to_owned(),
+        },
+    }));
+    script.push(EventPayload::Usage(Usage {
+        input: 6_200,
+        output: 480,
+        reasoning: 120,
+        cached: 2_400,
         source: UsageSource::ProviderReported,
         account: None,
     }));
