@@ -10,6 +10,10 @@ use haider_protocol::ids::{DeviceId, SessionId};
 use haider_protocol::provider::{FinishReason, Usage, UsageSource};
 use haider_protocol::state::RunState;
 use haider_provider::{FakeProvider, FakeStep, Provider};
+use haider_tui::app::AppModel;
+use haider_tui::runtime::{run_demo, run_demo_plain};
+use haider_tui::sanctum::SanctumTier;
+use haider_tui::theme::ThemeKey;
 use std::fmt;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -51,19 +55,81 @@ async fn main() -> ExitCode {
         [command, framing, prompt] if command == "run" && framing == "--jsonl" => {
             run_jsonl(prompt).await
         }
+        [command, rest @ ..] if command == "tui" => tui_command(rest).await,
         [other, ..] => {
             eprintln!(
                 "haider: unknown or incomplete command `{other}` \
-                 (supports: --version, self-test, run --jsonl <prompt>)"
+                 (supports: --version, self-test, run --jsonl <prompt>, \
+                 tui --demo [--plain] [--theme dawn|ivory|dark])"
             );
             ExitCode::from(2)
         }
         [] => {
             println!(
-                "haider {VERSION} — run `haider self-test` or \
-                 `haider run --jsonl \"<prompt>\"`"
+                "haider {VERSION} — run `haider self-test`, \
+                 `haider run --jsonl \"<prompt>\"`, or `haider tui --demo`"
             );
             ExitCode::SUCCESS
+        }
+    }
+}
+
+/// `haider tui --demo [--plain] [--theme dawn|ivory|dark]` — the scripted
+/// demo drives every surface until the daemon lands (W3). `--plain` (or a
+/// non-TTY stdout, research rec 2) renders the final state as plain text
+/// instead of taking the terminal. `HAIDER_SHAHADA=translit` selects the
+/// transliteration sanctum tier.
+async fn tui_command(rest: &[String]) -> ExitCode {
+    use std::io::IsTerminal;
+    let mut demo = false;
+    let mut plain = false;
+    let mut theme = ThemeKey::Dawn;
+    let mut iter = rest.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--demo" => demo = true,
+            "--plain" => plain = true,
+            "--theme" => match iter.next().and_then(|name| ThemeKey::parse(name)) {
+                Some(key) => theme = key,
+                None => {
+                    eprintln!("haider tui: --theme takes dawn|ivory|dark");
+                    return ExitCode::from(2);
+                }
+            },
+            other => {
+                eprintln!("haider tui: unknown flag `{other}`");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    if !demo {
+        eprintln!("haider tui: only `haider tui --demo` is available until the daemon lands");
+        return ExitCode::from(2);
+    }
+    let mut model = AppModel::new();
+    model.theme = theme;
+    // Translit is the terminal default (no bidi/shaping in ratatui);
+    // HAIDER_SHAHADA=arabic opts shaping-capable terminals into Arabic.
+    if matches!(std::env::var("HAIDER_SHAHADA").as_deref(), Ok("arabic")) {
+        model.sanctum_tier = SanctumTier::Arabic;
+    }
+    if plain || !io::stdout().is_terminal() {
+        // Fallible write: `print!` panics on BrokenPipe (review r1 P2).
+        // A closed pipe is a normal consumer choice → success; other write
+        // failures are real I/O errors.
+        let text = run_demo_plain(model);
+        let mut out = io::stdout();
+        return match out.write_all(text.as_bytes()).and_then(|()| out.flush()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) if error.kind() == io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
+            Err(_) => ExitCode::from(EX_IOERR),
+        };
+    }
+    match run_demo(model).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("haider tui: terminal error: {error}");
+            ExitCode::from(EX_IOERR)
         }
     }
 }

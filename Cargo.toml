@@ -23,7 +23,9 @@ rust-version = "1.95"
 
 [workspace.dependencies]
 async-trait = "0.1"
+base64 = "0.22"
 blake3 = "1"
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 rusqlite = { version = "0.38", features = ["bundled"] }
 rustix = { version = "1", features = ["fs"] }
 serde = { version = "1", features = ["derive"] }

@@ -363,3 +363,50 @@ impl StoreHandle for FailOnceStore {
         self.inner.latest_seq(session_id).await
     }
 }
+
+#[test]
+fn tui_demo_with_piped_stdout_renders_plain() {
+    let out = haider()
+        .args(["tui", "--demo"])
+        .output()
+        .expect("binary runs");
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).expect("utf8");
+    assert!(text.contains("❯ fix the failing boundary test in haider-store"));
+    assert!(text.contains("✓ plan — 3/3 done"));
+    assert!(
+        text.lines()
+            .last()
+            .expect("status line")
+            .starts_with("IDLE")
+    );
+}
+
+#[test]
+fn tui_demo_plain_flag_matches_piped_output() {
+    let piped = haider()
+        .args(["tui", "--demo"])
+        .output()
+        .expect("binary runs");
+    let flagged = haider()
+        .args(["tui", "--demo", "--plain", "--theme", "dark"])
+        .output()
+        .expect("binary runs");
+    assert!(flagged.status.success());
+    assert_eq!(piped.stdout, flagged.stdout, "plain output is theme-free");
+}
+
+#[test]
+fn tui_without_demo_exits_2() {
+    let out = haider().arg("tui").output().expect("binary runs");
+    assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn tui_rejects_bad_theme() {
+    let out = haider()
+        .args(["tui", "--demo", "--theme", "sepia"])
+        .output()
+        .expect("binary runs");
+    assert_eq!(out.status.code(), Some(2));
+}
