@@ -38,6 +38,9 @@ pub enum TranscriptEntry {
     User { text: String, attachments: usize },
     /// A turn item and its streaming accumulation state.
     Item(ItemBlock),
+    /// A display-only UI note (sim `NoteRow`): auto-title, interrupt, and
+    /// mid-turn echoes. The ONLY non-envelope entry source.
+    Note { text: String },
 }
 
 /// A turn item block plus the delta state that `TurnItem` itself cannot hold
@@ -343,6 +346,25 @@ impl SessionProjection {
         })
     }
 
+    /// True while the run is in its THINKING beat — the sim shows a
+    /// transient `● thinking…` line at the transcript tail.
+    #[must_use]
+    pub const fn is_thinking(&self) -> bool {
+        matches!(self.run, Some(RunState::Thinking))
+    }
+
+    /// True while the idle(i) marker is set (esc interrupted the last turn).
+    #[must_use]
+    pub const fn interrupted(&self) -> bool {
+        self.interrupted
+    }
+
+    /// Append a display-only note row (sim `NoteRow`): auto-title,
+    /// interrupt, mid-turn input echoes. Never sourced from envelopes.
+    pub fn push_note(&mut self, text: String) {
+        self.entries.push(TranscriptEntry::Note { text });
+    }
+
     /// The status-bar badge, sim `BADGE_LABEL` goldens.
     #[must_use]
     pub fn badge(&self) -> String {
@@ -380,32 +402,34 @@ impl SessionProjection {
         }
     }
 
-    /// Visual class of the badge (sim vocabulary: outlined for restful
-    /// states, filled gold for active work, maroon for tool/machinery,
-    /// warn for needs-you states, err for failures).
+    /// Visual class of the badge — the sim's `BADGE_OUTLINE`/`badgeTone`
+    /// vocabulary (tui.js:5531-5547): idle AND interrupted-idle both fall
+    /// through to the QUIET dim outline — the `⏸ IDLE (i)` label carries
+    /// the distinction (review r2 P2-11); waiting/starting outline gold;
+    /// needs-you states outline warn (never filled); effect-unknown
+    /// outlines err; fills are reserved for live machinery (gold work ·
+    /// maroon tool · warn compaction · err failure).
     #[must_use]
     pub fn badge_tone(&self) -> BadgeTone {
         if matches!(self.harness, Some(HarnessStatus::Starting { .. })) {
-            return BadgeTone::Muted;
+            return BadgeTone::Restful;
         }
         match &self.run {
-            None | Some(RunState::Queued | RunState::Waiting { .. }) => BadgeTone::Muted,
+            None | Some(RunState::Done | RunState::Cancelled) => BadgeTone::Idle,
+            Some(RunState::Queued | RunState::Waiting { .. }) => BadgeTone::Restful,
             Some(
                 RunState::Thinking
                 | RunState::Streaming
                 | RunState::Concluding
                 | RunState::Verifying { .. },
             ) => BadgeTone::Active,
-            Some(RunState::RunningTool | RunState::Compacting | RunState::Cancelling) => {
-                BadgeTone::Tool
+            Some(RunState::RunningTool | RunState::Cancelling) => BadgeTone::Tool,
+            Some(RunState::Compacting) => BadgeTone::Compacting,
+            Some(RunState::InputRequired { .. } | RunState::PermissionRequired { .. }) => {
+                BadgeTone::Attention
             }
-            Some(
-                RunState::InputRequired { .. }
-                | RunState::PermissionRequired { .. }
-                | RunState::EffectOutcomeUnknown,
-            ) => BadgeTone::Attention,
+            Some(RunState::EffectOutcomeUnknown) => BadgeTone::EffectUnknown,
             Some(RunState::Errored) => BadgeTone::Error,
-            Some(RunState::Done | RunState::Cancelled) => BadgeTone::Muted,
         }
     }
 
@@ -476,10 +500,22 @@ impl SessionProjection {
 /// Badge visual class — see [`SessionProjection::badge_tone`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BadgeTone {
-    Muted,
+    /// Plain IDLE — quiet dim outline (sim: dim ink, frame border).
+    Idle,
+    /// Notable-but-restful outline states — interrupted idle, waiting,
+    /// starting, queued: gold outline.
+    Restful,
+    /// Active thinking/streaming work: gold fill.
     Active,
+    /// Tool machinery: maroon fill.
     Tool,
+    /// Context compaction: warn fill.
+    Compacting,
+    /// Needs-you (permission / input required): warn OUTLINE, never filled.
     Attention,
+    /// Effect outcome unknown: err outline.
+    EffectUnknown,
+    /// Failure: err fill.
     Error,
 }
 

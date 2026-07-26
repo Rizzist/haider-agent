@@ -13,6 +13,10 @@ ratatui.workspace = true
 termbg.workspace = true
 tokio.workspace = true
 serde_json.workspace = true
+unicode-width.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

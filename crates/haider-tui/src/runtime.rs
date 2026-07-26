@@ -3,8 +3,8 @@
 //! (research rec 3/6). Alternate screen for v0.1 (rec 1); native-scrollback
 //! insertion is explicitly deferred (rec 19).
 
-use crate::app::{AppEvent, AppModel};
-use crate::mock::demo_script;
+use crate::app::{AppEvent, AppModel, AppRequest};
+use crate::mock::{demo_script, response_script};
 use crate::render::render;
 use crate::theme::{Rgb, ThemeKey};
 use haider_protocol::EventPayload;
@@ -13,7 +13,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-    KeyEventKind,
+    KeyEventKind, MouseButton, MouseEventKind,
 };
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -35,6 +35,33 @@ pub fn osc_set_background(rgb: Rgb) -> String {
 #[must_use]
 pub const fn osc_reset_background() -> &'static str {
     "\u{1b}]111\u{7}"
+}
+
+/// OSC 2: set the terminal window title (owner ask — the window should say
+/// what haider is doing). Restored via [`osc_reset_title`] on exit.
+#[must_use]
+pub fn osc_set_title(title: &str) -> String {
+    format!("\u{1b}]2;{title}\u{7}")
+}
+
+/// Best effort title restore: a single XTWINOPS pop matching the single
+/// push (terminals without the stack simply ignore it).
+#[must_use]
+pub const fn osc_reset_title() -> &'static str {
+    "\u{1b}[23;2t"
+}
+
+static TITLE_PUSHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn sync_window_title(title: &str) {
+    let mut out = stdout();
+    // Push the user's title exactly ONCE; later syncs only set. The single
+    // matching pop runs in restore_terminal (review r1 P2: balanced stack).
+    if !TITLE_PUSHED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        let _ = out.write_all(b"\x1b[22;2t");
+    }
+    let _ = out.write_all(osc_set_title(title).as_bytes());
+    let _ = out.flush();
 }
 
 /// Best-effort terminal-background sync to the active theme.
@@ -136,6 +163,7 @@ fn restore_terminal() {
         LeaveAlternateScreen
     );
     let _ = stdout().write_all(osc_reset_background().as_bytes());
+    let _ = stdout().write_all(osc_reset_title().as_bytes());
     let _ = stdout().flush();
 }
 
@@ -163,7 +191,9 @@ pub async fn run_demo(mut model: AppModel) -> std::io::Result<()> {
     // cursor-position query that hangs non-answering PTYs; the first full
     // draw repaints every cell anyway.)
     sync_terminal_bg(model.theme);
+    sync_window_title(&model.window_title());
     let mut active_theme = model.theme;
+    let mut active_title = model.window_title();
 
     // Input pump: crossterm's blocking read on a dedicated thread, forwarded
     // into the async loop (no event-stream feature needed).
@@ -181,39 +211,37 @@ pub async fn run_demo(mut model: AppModel) -> std::io::Result<()> {
         }
     });
 
-    // Demo driver: the script plays on its own clock. `answer_echo` is the
-    // demo's client seam — user menu answers loop back as MenuAnswered
-    // envelopes, exactly the shape the daemon will publish later.
-    let (envelope_tx, mut envelope_rx) = mpsc::channel::<EventPayload>(64);
-    let answer_echo = envelope_tx.clone();
-    tokio::spawn(async move {
-        for payload in demo_script() {
-            tokio::time::sleep(demo_pace(&payload)).await;
-            if envelope_tx.send(payload).await.is_err() {
-                return;
-            }
-        }
-    });
+    // The demo driver owns the generation-tagged envelope channel and the
+    // script/decay timers — the SAME production seams the tests drive
+    // (review r3 P3-7).
+    let (mut driver, mut envelope_rx) = DemoDriver::new(64);
+    driver.spawn_boot();
+    let answer_echo = driver.sender();
+    // Launcher auto-play: if untouched, the classic demo plays once.
+    let autoplay = tokio::time::sleep(Duration::from_secs(6));
+    tokio::pin!(autoplay);
 
     let mut frame_tick = tokio::time::interval(Duration::from_millis(33));
     frame_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Fused: after the stream closes this branch is disabled — a closed
     // receiver must never spin the loop (review r1 P1).
     let mut stream_open = true;
+    // The last frame's clickable regions (render reports, mouse consumes).
+    let mut hit_map: Vec<(ratatui::layout::Rect, crate::app::Hit)> = Vec::new();
 
     while !model.should_quit {
         tokio::select! {
             input = input_rx.recv() => match input {
-                Some(Event::Key(key)) if key.kind != KeyEventKind::Release => {
-                    model.handle(AppEvent::Key(key));
-                }
-                Some(Event::Paste(text)) => model.handle(AppEvent::Paste(text)),
-                Some(Event::Resize(..)) => model.dirty = true,
-                Some(_) => {}
+                Some(event) => dispatch_input(&mut model, &hit_map, event),
                 None => break,
             },
-            payload = envelope_rx.recv(), if stream_open => match payload {
-                Some(payload) => model.handle(AppEvent::Envelope(Box::new(payload))),
+            () = &mut autoplay, if !model.auto_play_spent => {
+                model.handle(AppEvent::AutoPlay);
+            }
+            tagged = envelope_rx.recv(), if stream_open => match tagged {
+                Some((generation, payload)) => {
+                    driver.consume(&mut model, generation, payload);
+                }
                 None => {
                     stream_open = false;
                     model.handle(AppEvent::StreamEnded);
@@ -225,21 +253,33 @@ pub async fn run_demo(mut model: AppModel) -> std::io::Result<()> {
             // it and the overdue tick fires immediately, keeping the 30fps
             // coalescing behavior.
             _ = frame_tick.tick(), if model.dirty => {
-                draw(&mut terminal, &model)?;
+                hit_map = draw(&mut terminal, &model)?;
                 model.dirty = false;
             }
         }
-        // Theme cycled (Ctrl+T): re-sync the emulator background.
+        // Reducer-requested side effects.
+        let requests: Vec<AppRequest> = model.requests.drain(..).collect();
+        for request in requests {
+            driver.handle_request(&mut model, request);
+        }
+        // Theme cycled: re-sync the emulator background.
         if model.theme != active_theme {
             active_theme = model.theme;
             sync_terminal_bg(active_theme);
+        }
+        // Screen/session changed: re-sync the window title (owner ask).
+        let title = model.window_title();
+        if title != active_title {
+            active_title = title;
+            sync_window_title(&active_title);
         }
         // Reliable outbox drain (review r2 P2): a Full channel keeps the
         // answer queued for the next loop turn — a full channel guarantees
         // pending envelopes, so the loop WILL wake and retry. Awaiting the
         // send here instead would deadlock: this loop is the only consumer.
         while let Some(answer) = model.outbox.first().cloned() {
-            match answer_echo.try_send(EventPayload::MenuAnswered(answer)) {
+            let generation = driver.generation();
+            match answer_echo.try_send((generation, EventPayload::MenuAnswered(answer))) {
                 Ok(()) => {
                     model.outbox.remove(0);
                 }
@@ -254,12 +294,181 @@ pub async fn run_demo(mut model: AppModel) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The sim's idle(i) decay window (tui.js:1562: 30s of nothing).
+pub const IDLE_DECAY: Duration = Duration::from_secs(30);
+
+/// One terminal input event through the production dispatch — key/paste
+/// into the reducer, resize into [`AppModel::handle_resize`], mouse through
+/// the last frame's hit map. Extracted from the event loop so tests drive
+/// the SAME wiring (review r3 P3-7).
+pub fn dispatch_input(
+    model: &mut AppModel,
+    hit_map: &[(ratatui::layout::Rect, crate::app::Hit)],
+    event: Event,
+) {
+    match event {
+        Event::Key(key) if key.kind != KeyEventKind::Release => {
+            model.handle(AppEvent::Key(key));
+        }
+        Event::Paste(text) => model.handle(AppEvent::Paste(text)),
+        Event::Resize(..) => model.handle_resize(),
+        Event::Mouse(mouse) => match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let hit = hit_map.iter().find(|(rect, _)| {
+                    mouse.column >= rect.x
+                        && mouse.column < rect.x + rect.width
+                        && mouse.row >= rect.y
+                        && mouse.row < rect.y + rect.height
+                });
+                if let Some((_, action)) = hit {
+                    model.handle_hit(action.clone());
+                }
+            }
+            MouseEventKind::ScrollUp => model.handle_wheel(true),
+            MouseEventKind::ScrollDown => model.handle_wheel(false),
+            _ => {}
+        },
+        _ => {}
+    }
+}
+
+/// The demo's script engine — the production seams of [`run_demo`]'s event
+/// loop, extracted whole so tests drive the SAME wiring (review r3 P3-7):
+/// the same generation-tagged channel, the same spawn/bump/decay behavior,
+/// the same consumption guard.
+pub struct DemoDriver {
+    tx: mpsc::Sender<(u64, EventPayload)>,
+    script_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    turn_counter: u64,
+}
+
+impl DemoDriver {
+    /// A driver plus the receiving end of its envelope channel.
+    #[must_use]
+    pub fn new(capacity: usize) -> (Self, mpsc::Receiver<(u64, EventPayload)>) {
+        let (tx, rx) = mpsc::channel(capacity);
+        (
+            Self {
+                tx,
+                script_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                turn_counter: 0,
+            },
+            rx,
+        )
+    }
+
+    /// The current script generation.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.script_gen.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// A clone of the tagged-envelope sender (the menu-answer echo seam).
+    #[must_use]
+    pub fn sender(&self) -> mpsc::Sender<(u64, EventPayload)> {
+        self.tx.clone()
+    }
+
+    /// Spawn the boot beats. They tag with the CURRENT generation at each
+    /// send: they belong to the harness, not any turn, and survive bumps.
+    pub fn spawn_boot(&self) {
+        let tx = self.tx.clone();
+        let gen_ref = std::sync::Arc::clone(&self.script_gen);
+        tokio::spawn(async move {
+            for payload in crate::mock::boot_script() {
+                tokio::time::sleep(demo_pace(&payload)).await;
+                let generation = gen_ref.load(std::sync::atomic::Ordering::SeqCst);
+                if tx.send((generation, payload)).await.is_err() {
+                    return;
+                }
+            }
+        });
+    }
+
+    /// Play one script, generation-captured: bumps at EITHER end of the
+    /// channel silence it (send-side check + consumption guard).
+    fn play(&self, payloads: Vec<EventPayload>, generation: u64) {
+        let tx = self.tx.clone();
+        let gen_ref = std::sync::Arc::clone(&self.script_gen);
+        tokio::spawn(async move {
+            for payload in payloads {
+                tokio::time::sleep(demo_pace(&payload)).await;
+                if gen_ref.load(std::sync::atomic::Ordering::SeqCst) != generation {
+                    return;
+                }
+                if tx.send((generation, payload)).await.is_err() {
+                    return;
+                }
+            }
+        });
+    }
+
+    /// Drain one reducer request — scripts play generation-captured,
+    /// stop/interrupt bump the generation (so buffered envelopes AND
+    /// pending timers of the old context drop at consumption — review r2
+    /// P1-1, r3 P3-6), and an interrupt schedules the sim's 30s idle(i)
+    /// decay (tui.js:1561-1564).
+    pub fn handle_request(&mut self, model: &mut AppModel, request: AppRequest) {
+        match request {
+            AppRequest::SubmitText(text) => {
+                self.turn_counter += 1;
+                self.play(response_script(&text, self.turn_counter), self.generation());
+            }
+            AppRequest::AttachSample(_) => {
+                self.turn_counter += 1;
+                self.play(
+                    crate::mock::turn_script(self.turn_counter),
+                    self.generation(),
+                );
+            }
+            AppRequest::StopScripts => {
+                self.script_gen
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            AppRequest::Interrupt => {
+                let decay_gen = self
+                    .script_gen
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    + 1;
+                let tx = self.tx.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(IDLE_DECAY).await;
+                    let _ = tx.send((decay_gen, EventPayload::IdleDecayed)).await;
+                });
+            }
+            AppRequest::Quit => model.should_quit = true,
+        }
+    }
+
+    /// Consume one generation-tagged envelope. Stale generations are
+    /// dropped whole — the P1-1 law: a bump invalidates envelopes already
+    /// buffered in the channel, not only future sends.
+    pub fn consume(&self, model: &mut AppModel, generation: u64, payload: EventPayload) {
+        consume_scripted(model, generation, self.generation(), payload);
+    }
+}
+
+/// Consume one generation-tagged script envelope against `current`. Kept
+/// public as the driver's inner law (tests may exercise it directly, but
+/// the production path is [`DemoDriver::consume`]).
+pub fn consume_scripted(
+    model: &mut AppModel,
+    generation: u64,
+    current: u64,
+    payload: EventPayload,
+) {
+    if generation == current {
+        model.handle(AppEvent::Envelope(Box::new(payload)));
+    }
+}
+
 fn draw(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     model: &AppModel,
-) -> std::io::Result<()> {
-    terminal.draw(|frame| render(model, frame))?;
-    Ok(())
+) -> std::io::Result<Vec<(ratatui::layout::Rect, crate::app::Hit)>> {
+    let mut hits = Vec::new();
+    terminal.draw(|frame| hits = render(model, frame))?;
+    Ok(hits)
 }
 
 /// Run the demo headlessly: play the whole script through the model and

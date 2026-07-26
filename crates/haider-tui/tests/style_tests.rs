@@ -16,26 +16,37 @@ fn rgb_converts_to_ratatui_truecolor() {
 }
 
 #[test]
-fn badge_styles_follow_the_state_vocabulary() {
+fn badge_styles_follow_the_sim_state_vocabulary() {
     use haider_tui::projection::BadgeTone;
     for key in ThemeKey::ALL {
         let theme = key.theme();
-        // Active work: gold fill with theme-bg ink.
+        // Sim BADGE_OUTLINE (tui.js:5531-5564): plain IDLE is a QUIET dim
+        // outline; notable-restful gold; needs-you warn OUTLINE (never a
+        // fill); effect-unknown err outline.
+        let idle = theme.badge_style(BadgeTone::Idle);
+        assert_eq!(idle.fg, Some(theme.dim.into()));
+        assert_eq!(idle.bg, None);
+        let restful = theme.badge_style(BadgeTone::Restful);
+        assert_eq!(restful.fg, Some(theme.gold.into()));
+        assert_eq!(restful.bg, None);
+        let attention = theme.badge_style(BadgeTone::Attention);
+        assert_eq!(attention.fg, Some(theme.warn.into()));
+        assert_eq!(attention.bg, None, "needs-you states outline, not fill");
+        let unknown = theme.badge_style(BadgeTone::EffectUnknown);
+        assert_eq!(unknown.fg, Some(theme.err.into()));
+        assert_eq!(unknown.bg, None);
+        // Fills are reserved for live machinery: gold work · maroon tool ·
+        // warn compaction · err failure — badge_fg ink on the state ground.
         let active = theme.badge_style(BadgeTone::Active);
         assert_eq!(active.fg, Some(theme.badge_fg.into()));
         assert_eq!(active.bg, Some(theme.gold.into()));
         assert!(active.add_modifier.contains(Modifier::BOLD));
-        // Restful states: outlined gold, no fill.
-        let muted = theme.badge_style(BadgeTone::Muted);
-        assert_eq!(muted.fg, Some(theme.gold.into()));
-        assert_eq!(muted.bg, None);
-        // Machinery / attention / failure fills.
         assert_eq!(
             theme.badge_style(BadgeTone::Tool).bg,
             Some(theme.maroon.into())
         );
         assert_eq!(
-            theme.badge_style(BadgeTone::Attention).bg,
+            theme.badge_style(BadgeTone::Compacting).bg,
             Some(theme.warn.into())
         );
         assert_eq!(
