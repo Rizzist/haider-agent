@@ -4,12 +4,14 @@ use haider_protocol::EventPayload;
 use haider_protocol::effect::{EffectClass, EffectOutcome, EffectPhase};
 use haider_protocol::ids::{ArtifactRef, RunId, SessionId};
 use haider_tools::{
-    CasSink, ChangeLedger, EffectBroker, FsList, FsPatch, FsRead, FsSearch, JournalSink,
-    PermissionPolicy, ResultBounds, ToolError, ToolResult, TurnAttribution,
+    CasSink, ChangeLedger, ChangeLedgerSink, EffectBroker, FsList, FsPatch, FsRead, FsSearch,
+    FsWriteRecord, JournalSink, PermissionPolicy, ResultBounds, ToolError, ToolResult,
+    TurnAttribution,
 };
 use std::fs;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
+use std::time::Duration;
 
 #[derive(Debug, Default)]
 struct RecordingJournal {
@@ -52,6 +54,60 @@ impl JournalSink for DispatchBarrierJournal {
             self.barrier.wait().await;
         }
         Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct DispatchGateJournal {
+    reached: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl JournalSink for DispatchGateJournal {
+    async fn append(&mut self, payload: EventPayload) -> ToolResult<()> {
+        if matches!(
+            payload,
+            EventPayload::Effect(EffectPhase::Dispatched { .. })
+        ) {
+            self.reached.notify_one();
+            self.release.notified().await;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct GatedLedger {
+    inner: ChangeLedger,
+    reached: Arc<Barrier>,
+    release: Arc<Barrier>,
+}
+
+impl ChangeLedgerSink for GatedLedger {
+    fn record_fs_write(
+        &self,
+        session: SessionId,
+        turn: RunId,
+        record: FsWriteRecord,
+    ) -> ToolResult<()> {
+        self.reached.wait();
+        self.release.wait();
+        self.inner.record_fs_write(session, turn, record)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RejectLedger;
+
+impl ChangeLedgerSink for RejectLedger {
+    fn record_fs_write(
+        &self,
+        _session: SessionId,
+        _turn: RunId,
+        _record: FsWriteRecord,
+    ) -> ToolResult<()> {
+        Err(ToolError::ledger("injected change ledger append failure"))
     }
 }
 
@@ -105,14 +161,14 @@ async fn preimage_mismatch_returns_typed_conflict_and_failed_outcome() {
     fs::write(&path, "current").expect("seed file");
     let mut broker = broker_at(RecordingJournal::default(), directory.path());
     let attribution = TurnAttribution::new(SessionId::new("session"), RunId::new("turn"));
-    let mut ledger = ChangeLedger::new();
+    let ledger = ChangeLedger::new();
 
     let error = broker
         .fs_patch(
             &FsPatch::new(&path, "stale", "replacement"),
             &allow(EffectClass::FsWrite),
             &attribution,
-            &mut ledger,
+            &ledger,
         )
         .await
         .expect_err("preimage mismatch");
@@ -148,14 +204,14 @@ async fn ledger_attributes_successful_writes_to_the_exact_turn() {
     let second_turn = TurnAttribution::new(session.clone(), RunId::new("turn-2"));
     let policy = allow(EffectClass::FsWrite);
     let mut broker = broker_at(RecordingJournal::default(), directory.path());
-    let mut ledger = ChangeLedger::new();
+    let ledger = ChangeLedger::new();
 
     broker
         .fs_patch(
             &FsPatch::new(&first_path, "a", "b"),
             &policy,
             &first_turn,
-            &mut ledger,
+            &ledger,
         )
         .await
         .expect("first patch");
@@ -164,7 +220,7 @@ async fn ledger_attributes_successful_writes_to_the_exact_turn() {
             &FsPatch::new(&second_path, "x", "y"),
             &policy,
             &second_turn,
-            &mut ledger,
+            &ledger,
         )
         .await
         .expect("second patch");
@@ -210,19 +266,14 @@ async fn concurrent_patches_cannot_both_apply_the_same_stale_preimage() {
     let policy = allow(EffectClass::FsWrite);
     let first_attribution = TurnAttribution::new(SessionId::new("session"), RunId::new("turn-1"));
     let second_attribution = TurnAttribution::new(SessionId::new("session"), RunId::new("turn-2"));
-    let mut first_ledger = ChangeLedger::new();
-    let mut second_ledger = ChangeLedger::new();
+    let first_ledger = ChangeLedger::new();
+    let second_ledger = ChangeLedger::new();
     let first_patch = FsPatch::new(&path, "before", "first");
     let second_patch = FsPatch::new(&path, "before", "second");
 
     let (first, second) = tokio::join!(
-        first_broker.fs_patch(&first_patch, &policy, &first_attribution, &mut first_ledger,),
-        second_broker.fs_patch(
-            &second_patch,
-            &policy,
-            &second_attribution,
-            &mut second_ledger,
-        )
+        first_broker.fs_patch(&first_patch, &policy, &first_attribution, &first_ledger,),
+        second_broker.fs_patch(&second_patch, &policy, &second_attribution, &second_ledger,)
     );
 
     assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
@@ -249,14 +300,14 @@ async fn applied_write_is_ledgered_before_a_failed_outcome_append() {
     fs::write(&path, "before").expect("seed file");
     let attribution = TurnAttribution::new(SessionId::new("session"), RunId::new("turn"));
     let mut broker = broker_at(RejectOutcomeJournal, directory.path());
-    let mut ledger = ChangeLedger::new();
+    let ledger = ChangeLedger::new();
 
     let error = broker
         .fs_patch(
             &FsPatch::new(&path, "before", "after"),
             &allow(EffectClass::FsWrite),
             &attribution,
-            &mut ledger,
+            &ledger,
         )
         .await
         .expect_err("outcome append fails after apply");
@@ -276,6 +327,94 @@ async fn applied_write_is_ledgered_before_a_failed_outcome_append() {
     assert!(matches!(
         broker.journal_snapshot().last(),
         Some(EffectPhase::Dispatched { .. })
+    ));
+}
+
+#[tokio::test]
+async fn cancelling_apply_cannot_leave_a_write_without_ledger_evidence() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("cancelled.txt");
+    fs::write(&path, "before").expect("seed file");
+    let reached = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let observed_ledger = ChangeLedger::new();
+    let ledger = GatedLedger {
+        inner: observed_ledger.clone(),
+        reached: Arc::clone(&reached),
+        release: Arc::clone(&release),
+    };
+    let attribution = TurnAttribution::new(SessionId::new("session"), RunId::new("turn"));
+    let observed_attribution = attribution.clone();
+    let mut broker = broker_at(RecordingJournal::default(), directory.path());
+    let task = tokio::spawn(async move {
+        broker
+            .fs_patch(
+                &FsPatch::new(path, "before", "after"),
+                &allow(EffectClass::FsWrite),
+                &attribution,
+                &ledger,
+            )
+            .await
+    });
+
+    tokio::task::spawn_blocking(move || reached.wait())
+        .await
+        .expect("wait for post-rename ledger gate");
+    assert_eq!(
+        fs::read_to_string(directory.path().join("cancelled.txt")).expect("read renamed target"),
+        "after"
+    );
+    assert!(
+        !observed_ledger.has_fs_writes(&observed_attribution.session, &observed_attribution.turn)
+    );
+
+    task.abort();
+    tokio::task::spawn_blocking(move || release.wait())
+        .await
+        .expect("release ledger append");
+    let error = task.await.expect_err("outer patch task is cancelled");
+    assert!(error.is_cancelled());
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !observed_ledger
+            .has_fs_writes(&observed_attribution.session, &observed_attribution.turn)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("blocking critical section completes ledger append");
+}
+
+#[tokio::test]
+async fn ledger_append_failure_becomes_a_failed_effect_outcome() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("ledger-failure.txt");
+    fs::write(&path, "before").expect("seed file");
+    let attribution = TurnAttribution::new(SessionId::new("session"), RunId::new("turn"));
+    let mut broker = broker_at(RecordingJournal::default(), directory.path());
+
+    let error = broker
+        .fs_patch(
+            &FsPatch::new(&path, "before", "after"),
+            &allow(EffectClass::FsWrite),
+            &attribution,
+            &RejectLedger,
+        )
+        .await
+        .expect_err("ledger failure is returned");
+
+    assert!(matches!(error, ToolError::Ledger { .. }));
+    assert_eq!(
+        fs::read_to_string(&path).expect("read applied file"),
+        "after"
+    );
+    assert!(matches!(
+        broker.journal_snapshot().last(),
+        Some(EffectPhase::Outcome {
+            outcome: EffectOutcome::Failed { error, },
+            ..
+        }) if error.contains("change ledger failed")
     ));
 }
 
@@ -329,6 +468,67 @@ async fn workspace_symlink_escape_is_rejected_before_authorization_or_read() {
 
     assert!(matches!(error, ToolError::WorkspaceBoundary { .. }));
     assert!(broker.journal_snapshot().is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn component_swapped_to_outside_symlink_after_authorization_is_refused() {
+    use std::os::unix::fs::symlink;
+
+    let parent = tempfile::tempdir().expect("temporary parent");
+    let workspace = parent.path().join("workspace");
+    let component = workspace.join("component");
+    let parked = workspace.join("parked");
+    let outside = parent.path().join("outside");
+    fs::create_dir_all(&component).expect("create workspace component");
+    fs::create_dir(&outside).expect("create outside directory");
+    fs::write(component.join("target.txt"), "before").expect("seed workspace target");
+    fs::write(outside.join("target.txt"), "before").expect("seed outside target");
+
+    let reached = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let mut broker = broker_at(
+        DispatchGateJournal {
+            reached: Arc::clone(&reached),
+            release: Arc::clone(&release),
+        },
+        &workspace,
+    );
+    let attribution = TurnAttribution::new(SessionId::new("session"), RunId::new("turn"));
+    let ledger = ChangeLedger::new();
+    let observed_ledger = ledger.clone();
+    let patch = FsPatch::new(component.join("target.txt"), "before", "after");
+    let policy = allow(EffectClass::FsWrite);
+    let task = tokio::spawn(async move {
+        let result = broker
+            .fs_patch(&patch, &policy, &attribution, &ledger)
+            .await;
+        (result, broker)
+    });
+
+    reached.notified().await;
+    fs::rename(&component, &parked).expect("park authorized component");
+    symlink(&outside, &component).expect("swap component to outside symlink");
+    release.notify_one();
+
+    let (result, broker) = task.await.expect("patch task joins");
+    assert!(matches!(result, Err(ToolError::PathChanged { .. })));
+    assert_eq!(
+        fs::read_to_string(parked.join("target.txt")).expect("read parked target"),
+        "before"
+    );
+    assert_eq!(
+        fs::read_to_string(outside.join("target.txt")).expect("read outside target"),
+        "before"
+    );
+    assert!(!observed_ledger.has_fs_writes(&SessionId::new("session"), &RunId::new("turn")));
+    assert!(matches!(
+        broker.journal_snapshot().last(),
+        Some(EffectPhase::Outcome {
+            outcome: EffectOutcome::Failed { .. },
+            ..
+        })
+    ));
 }
 
 #[tokio::test]

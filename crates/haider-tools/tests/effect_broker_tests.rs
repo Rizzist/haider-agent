@@ -475,7 +475,7 @@ async fn deny_is_journaled_and_blocks_filesystem_apply() {
     let mut policy = PermissionPolicy::default();
     policy.deny(EffectClass::FsWrite, "workspace is read-only");
     let mut broker = broker_at(RecordingJournal::default(), directory.path(), 1);
-    let mut ledger = haider_tools::ChangeLedger::new();
+    let ledger = haider_tools::ChangeLedger::new();
     let attribution = haider_tools::TurnAttribution::new(
         haider_protocol::ids::SessionId::new("session"),
         haider_protocol::ids::RunId::new("turn"),
@@ -486,7 +486,7 @@ async fn deny_is_journaled_and_blocks_filesystem_apply() {
             &FsPatch::new(&path, "before", "after"),
             &policy,
             &attribution,
-            &mut ledger,
+            &ledger,
         )
         .await
         .expect_err("deny must block patch");
@@ -517,7 +517,7 @@ async fn failed_dispatched_append_blocks_filesystem_apply() {
     let mut policy = PermissionPolicy::default();
     policy.allow(EffectClass::FsWrite);
     let mut broker = broker_at(RejectDispatchJournal::default(), directory.path(), 1);
-    let mut ledger = haider_tools::ChangeLedger::new();
+    let ledger = haider_tools::ChangeLedger::new();
     let attribution = haider_tools::TurnAttribution::new(
         haider_protocol::ids::SessionId::new("session"),
         haider_protocol::ids::RunId::new("turn"),
@@ -528,7 +528,7 @@ async fn failed_dispatched_append_blocks_filesystem_apply() {
             &FsPatch::new(&path, "before", "after"),
             &policy,
             &attribution,
-            &mut ledger,
+            &ledger,
         )
         .await
         .expect_err("dispatch append must gate apply");

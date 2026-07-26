@@ -28,6 +28,8 @@ use haider_protocol::effect::{
 };
 use haider_protocol::ids::{EffectId, MenuId, SessionId, WorkspaceRevision};
 use haider_protocol::menu::{DecisionKind, Menu, MenuAnswer, MenuKind, MenuOption, MenuScope};
+use rustix::fd::OwnedFd;
+use rustix::fs::{Mode, OFlags};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::fs;
@@ -222,6 +224,7 @@ struct OneShotRule {
 pub struct EffectBroker<J> {
     journal: J,
     workspace_root: PathBuf,
+    workspace_dir: OwnedFd,
     session_id: SessionId,
     worker_generation: u64,
     started_at_ms: u64,
@@ -276,9 +279,17 @@ where
                 workspace_root.display()
             )));
         }
+        let workspace_dir = rustix::fs::openat(
+            rustix::fs::CWD,
+            &workspace_root,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| ToolError::io("open workspace root", &workspace_root, error))?;
         Ok(Self {
             journal,
             workspace_root,
+            workspace_dir,
             session_id,
             worker_generation,
             started_at_ms,
@@ -293,6 +304,11 @@ where
 
     pub fn workspace_root(&self) -> &Path {
         &self.workspace_root
+    }
+
+    pub(crate) fn duplicate_workspace_dir(&self) -> ToolResult<OwnedFd> {
+        rustix::io::dup(&self.workspace_dir)
+            .map_err(|error| ToolError::io("duplicate workspace root", &self.workspace_root, error))
     }
 
     /// Read-only copy of every effect phase whose durable append succeeded.

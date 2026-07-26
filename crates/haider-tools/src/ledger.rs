@@ -9,10 +9,15 @@
 //!   so an applied write must never be missing here.
 //! - `paths` and `summaries` deduplicate in first-touch order for cheap
 //!   queries; `writes` keeps every record, preserving per-effect evidence.
+//! - [`ChangeLedgerSink`] is synchronous and shareable so the filesystem
+//!   worker can append evidence in the same cancellation-shielded critical
+//!   section as the rename.
 
+use crate::{ToolError, ToolResult};
 use haider_protocol::ids::{EffectId, RunId, SessionId};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FsWriteRecord {
@@ -36,9 +41,29 @@ impl TurnChanges {
     }
 }
 
+/// Synchronous port for the post-apply evidence append.
+///
+/// Implementations must return only after the record is retained or a typed
+/// failure is known; this method runs immediately after rename with no
+/// cancellation-aware await between the two operations. Clones must address
+/// the same logical sink because the blocking worker owns a clone.
+pub trait ChangeLedgerSink: Clone + Send + Sync + 'static {
+    fn record_fs_write(
+        &self,
+        session: SessionId,
+        turn: RunId,
+        record: FsWriteRecord,
+    ) -> ToolResult<()>;
+}
+
+#[derive(Debug, Default)]
+struct LedgerState {
+    turns: HashMap<(SessionId, RunId), TurnChanges>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ChangeLedger {
-    turns: HashMap<(SessionId, RunId), TurnChanges>,
+    state: Arc<Mutex<LedgerState>>,
 }
 
 impl ChangeLedger {
@@ -46,8 +71,17 @@ impl ChangeLedger {
         Self::default()
     }
 
-    pub fn record_fs_write(&mut self, session: SessionId, turn: RunId, record: FsWriteRecord) {
-        let changes = self.turns.entry((session, turn)).or_default();
+    pub fn record_fs_write(
+        &self,
+        session: SessionId,
+        turn: RunId,
+        record: FsWriteRecord,
+    ) -> ToolResult<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ToolError::ledger("change ledger lock is poisoned"))?;
+        let changes = state.turns.entry((session, turn)).or_default();
         for path in &record.paths {
             if !changes.paths.iter().any(|existing| existing == path) {
                 changes.paths.push(path.clone());
@@ -61,19 +95,40 @@ impl ChangeLedger {
             changes.summaries.push(record.summary.clone());
         }
         changes.writes.push(record);
+        Ok(())
     }
 
-    pub fn changes_for(&self, session: &SessionId, turn: &RunId) -> Option<&TurnChanges> {
-        self.turns.get(&(session.clone(), turn.clone()))
+    pub fn changes_for(&self, session: &SessionId, turn: &RunId) -> Option<TurnChanges> {
+        self.read_state()
+            .turns
+            .get(&(session.clone(), turn.clone()))
+            .cloned()
     }
 
     pub fn has_fs_writes(&self, session: &SessionId, turn: &RunId) -> bool {
         self.changes_for(session, turn)
-            .is_some_and(TurnChanges::has_fs_writes)
+            .is_some_and(|changes| changes.has_fs_writes())
     }
 
     pub fn path_touched(&self, session: &SessionId, turn: &RunId, path: &Path) -> bool {
         self.changes_for(session, turn)
             .is_some_and(|changes| changes.paths.iter().any(|touched| touched == path))
+    }
+
+    fn read_state(&self) -> std::sync::MutexGuard<'_, LedgerState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl ChangeLedgerSink for ChangeLedger {
+    fn record_fs_write(
+        &self,
+        session: SessionId,
+        turn: RunId,
+        record: FsWriteRecord,
+    ) -> ToolResult<()> {
+        Self::record_fs_write(self, session, turn, record)
     }
 }

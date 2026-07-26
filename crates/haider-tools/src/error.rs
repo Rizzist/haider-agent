@@ -4,8 +4,10 @@
 //! [`ToolError::AuthorizationRequired`] names the menu to answer before
 //! retrying as a fresh effect, [`ToolError::InvalidMenuAnswer`] keeps malformed
 //! answers closed and retryable, [`ToolError::WorkspaceBoundary`] reports path
-//! escapes, and [`ToolError::Conflict`] carries the exact pre-image evidence a
-//! caller needs to rebase a stale patch.
+//! escapes, [`ToolError::PathChanged`] refuses post-authorization namespace
+//! changes, [`ToolError::Conflict`] carries the exact pre-image evidence a
+//! caller needs to rebase a stale patch, and [`ToolError::Ledger`] makes a
+//! post-apply evidence failure explicit.
 
 use haider_protocol::ids::MenuId;
 use std::path::PathBuf;
@@ -40,6 +42,10 @@ pub enum ToolError {
         requested_path: PathBuf,
         resolved_path: Option<PathBuf>,
     },
+    PathChanged {
+        path: PathBuf,
+        message: String,
+    },
     Conflict(FsPatchConflict),
     Io {
         operation: &'static str,
@@ -50,6 +56,9 @@ pub enum ToolError {
         message: String,
     },
     Cas {
+        message: String,
+    },
+    Ledger {
         message: String,
     },
     Runtime {
@@ -75,6 +84,12 @@ impl ToolError {
 
     pub fn cas(message: impl Into<String>) -> Self {
         Self::Cas {
+            message: message.into(),
+        }
+    }
+
+    pub fn ledger(message: impl Into<String>) -> Self {
+        Self::Ledger {
             message: message.into(),
         }
     }
@@ -127,6 +142,11 @@ impl std::fmt::Display for ToolError {
                 }
                 Ok(())
             }
+            Self::PathChanged { path, message } => write!(
+                formatter,
+                "authorized path {} changed before access: {message}",
+                path.display()
+            ),
             Self::Conflict(conflict) => write!(
                 formatter,
                 "patch conflict for {}: expected pre-image was not present",
@@ -139,6 +159,7 @@ impl std::fmt::Display for ToolError {
             } => write!(formatter, "{operation} {}: {message}", path.display()),
             Self::Journal { message } => write!(formatter, "effect journal failed: {message}"),
             Self::Cas { message } => write!(formatter, "artifact storage failed: {message}"),
+            Self::Ledger { message } => write!(formatter, "change ledger failed: {message}"),
             Self::Runtime { message } => write!(formatter, "tool runtime failed: {message}"),
             Self::Lifecycle { message } => write!(formatter, "invalid effect lifecycle: {message}"),
         }

@@ -2,31 +2,46 @@
 //!
 //! Owned invariants:
 //! - Every tool runs inside the broker's begin/finish envelope, so the
-//!   four-phase effect law covers reads and writes alike and nothing here
-//!   touches the filesystem before a journaled `Allow` + `Dispatched`.
+//!   four-phase effect law covers reads and writes alike and no requested read
+//!   or write runs before a journaled `Allow` + `Dispatched`.
 //! - Read-class results are bounded: an oversized result keeps a UTF-8-safe
 //!   preview and freezes the complete payload in the CAS via [`CasSink`].
 //! - `fs_patch` proves its pre-image before writing (mismatch is a typed
-//!   [`FsPatchConflict`]) and records applied writes in the [`ChangeLedger`],
-//!   attributed to the caller's `(session, turn)`, for the verify gate. The
-//!   read/verify/replace sequence holds exclusive file locks, writes a
-//!   same-directory temporary file, and atomically renames it over the target.
+//!   [`FsPatchConflict`]) and records applied writes in the
+//!   [`crate::ChangeLedger`],
+//!   attributed to the caller's `(session, turn)`, for the verify gate. Apply
+//!   and ledger append are one cancellation-shielded blocking critical section:
+//!   after an atomic rename succeeds there is no cancellation-aware await
+//!   before the fallible ledger append.
 //! - Every caller-supplied path is resolved to a canonical path under the
 //!   broker's canonical workspace root before it is digested or dispatched.
+//!   Execution then converts that path back to a checked relative path and
+//!   walks it component-by-component from the broker's retained root dirfd.
+//!   Every open uses `O_NOFOLLOW`, so a post-authorization symlink swap is a
+//!   typed refusal rather than an access outside the workspace.
+//! - Patch pre-image bytes are read from the one locked target fd used for
+//!   identity verification. The derived bytes go to a same-directory temp
+//!   opened through the parent dirfd and land through `renameat`. This
+//!   serializes broker-mediated writes to a target; under Haider's workspace
+//!   doctrine every AI write is broker-mediated. Concurrent non-broker writers
+//!   are outside this guarantee and belong to §9.2 external-edit detection.
 
 use crate::broker::{EffectBroker, EffectOperation, JournalSink, PermissionPolicy};
-use crate::ledger::{ChangeLedger, FsWriteRecord};
+use crate::ledger::{ChangeLedgerSink, FsWriteRecord};
 use crate::{FsPatchConflict, ToolError, ToolResult};
 use async_trait::async_trait;
 use haider_protocol::effect::EffectClass;
 use haider_protocol::ids::{ArtifactRef, RunId, SessionId};
 use haider_protocol::tool::BoundedResult;
-use same_file::Handle;
+use rustix::fd::OwnedFd;
+use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use serde_json::{Value, json};
-use std::fs::{self, OpenOptions};
+use std::ffi::{CStr, OsStr, OsString};
+use std::fs;
 use std::io::{Read, Write};
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
-use tempfile::NamedTempFile;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Port for storing the complete result when its prompt preview is truncated.
 #[async_trait]
@@ -227,9 +242,13 @@ where
             &operation.path,
             PathResolution::Existing,
         )?);
-        let path = operation.path.clone();
-        self.bounded_read(&operation, policy, cas, bounds, move || read_utf8(&path))
-            .await
+        let relative = anchored_relative_path(self.workspace_root(), &operation.path)?;
+        let display_path = operation.path.clone();
+        let workspace_dir = self.duplicate_workspace_dir()?;
+        self.bounded_read(&operation, policy, cas, bounds, move || {
+            read_utf8_at(workspace_dir, &relative, &display_path)
+        })
+        .await
     }
 
     pub async fn fs_list<C>(
@@ -247,9 +266,11 @@ where
             &operation.path,
             PathResolution::Existing,
         )?);
-        let path = operation.path.clone();
+        let relative = anchored_relative_path(self.workspace_root(), &operation.path)?;
+        let display_path = operation.path.clone();
+        let workspace_dir = self.duplicate_workspace_dir()?;
         self.bounded_read(&operation, policy, cas, bounds, move || {
-            list_directory(&path)
+            list_directory_at(workspace_dir, &relative, &display_path)
         })
         .await
     }
@@ -273,9 +294,10 @@ where
             operation.query.clone(),
         );
         let owned = operation.clone();
-        let workspace_root = self.workspace_root().to_path_buf();
+        let relative = anchored_relative_path(self.workspace_root(), &operation.root)?;
+        let workspace_dir = self.duplicate_workspace_dir()?;
         self.bounded_read(&operation, policy, cas, bounds, move || {
-            search_files(&owned, &workspace_root)
+            search_files_at(workspace_dir, &relative, &owned)
         })
         .await
     }
@@ -304,13 +326,16 @@ where
         self.finish(&intent, result).await
     }
 
-    pub async fn fs_patch(
+    pub async fn fs_patch<L>(
         &mut self,
         operation: &FsPatch,
         policy: &PermissionPolicy,
         attribution: &TurnAttribution,
-        ledger: &mut ChangeLedger,
-    ) -> ToolResult<BoundedResult> {
+        ledger: &L,
+    ) -> ToolResult<BoundedResult>
+    where
+        L: ChangeLedgerSink,
+    {
         let operation = FsPatch::new(
             resolve_workspace_path(
                 self.workspace_root(),
@@ -321,46 +346,80 @@ where
             operation.replacement.clone(),
         );
         let intent = self.begin(&operation, policy).await?;
+        let relative = anchored_relative_path(self.workspace_root(), &operation.path);
+        let workspace_dir = self.duplicate_workspace_dir();
         let owned_operation = operation.clone();
-        let workspace_root = self.workspace_root().to_path_buf();
-        let result = run_blocking(move || apply_patch(&owned_operation, &workspace_root)).await;
-        let result = result.map(|applied| {
-            // The atomic rename is real on disk at this point. Record evidence
-            // made from the exact byte buffer written before attempting the
-            // outcome append, which may still fail independently.
-            ledger.record_fs_write(
-                attribution.session.clone(),
-                attribution.turn.clone(),
-                FsWriteRecord {
-                    effect: intent.effect.clone(),
-                    paths: vec![applied.path],
-                    summary: intent.summary.clone(),
-                    bytes_hash: applied.bytes_hash,
-                },
-            );
-            applied.result
-        });
+        let critical_ledger = ledger.clone();
+        let attribution = attribution.clone();
+        let effect = intent.effect.clone();
+        let summary = intent.summary.clone();
+        let result = match (relative, workspace_dir) {
+            (Ok(relative), Ok(workspace_dir)) => {
+                run_blocking(move || {
+                    let applied = apply_patch_at(workspace_dir, &relative, &owned_operation)?;
+                    // The rename and this fallible append are one blocking
+                    // critical section. Dropping the awaiting future does not
+                    // cancel a running `spawn_blocking` worker.
+                    critical_ledger.record_fs_write(
+                        attribution.session,
+                        attribution.turn,
+                        FsWriteRecord {
+                            effect,
+                            paths: vec![applied.path],
+                            summary,
+                            bytes_hash: applied.bytes_hash,
+                        },
+                    )?;
+                    Ok(applied.result)
+                })
+                .await
+            }
+            (Err(error), _) | (_, Err(error)) => Err(error),
+        };
         self.finish(&intent, result).await
     }
 }
 
-fn read_utf8(path: &Path) -> ToolResult<String> {
-    let bytes = fs::read(path).map_err(|error| ToolError::io("read", path, error))?;
+fn read_utf8_at(
+    workspace_dir: OwnedFd,
+    relative: &Path,
+    display_path: &Path,
+) -> ToolResult<String> {
+    let target = open_target_at(
+        workspace_dir,
+        relative,
+        OFlags::RDONLY,
+        "open for read",
+        display_path,
+    )?;
+    read_utf8_file(fs::File::from(target), display_path)
+}
+
+fn read_utf8_file(mut file: fs::File, display_path: &Path) -> ToolResult<String> {
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|error| ToolError::io("read", display_path, error))?;
     String::from_utf8(bytes).map_err(|error| ToolError::InvalidArgument {
-        message: format!("{} is not UTF-8 text: {error}", path.display()),
+        message: format!("{} is not UTF-8 text: {error}", display_path.display()),
     })
 }
 
-fn list_directory(path: &Path) -> ToolResult<String> {
-    let entries = fs::read_dir(path).map_err(|error| ToolError::io("list", path, error))?;
+fn list_directory_at(
+    workspace_dir: OwnedFd,
+    relative: &Path,
+    display_path: &Path,
+) -> ToolResult<String> {
+    let directory = open_directory_at(workspace_dir, relative, "open for list", display_path)?;
+    let mut entries = rustix::fs::Dir::new(directory)
+        .map_err(|error| ToolError::io("list", display_path, error))?;
     let mut listed = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|error| ToolError::io("list", path, error))?;
-        let file_type = entry
-            .file_type()
-            .map_err(|error| ToolError::io("inspect", entry.path(), error))?;
+    while let Some(entry) = entries.read() {
+        let entry = entry.map_err(|error| ToolError::io("list", display_path, error))?;
+        if is_dot_entry(entry.file_name()) {
+            continue;
+        }
         let mut name = entry.file_name().to_string_lossy().into_owned();
-        if file_type.is_dir() {
+        if entry.file_type() == FileType::Directory {
             name.push('/');
         }
         listed.push(name);
@@ -369,65 +428,103 @@ fn list_directory(path: &Path) -> ToolResult<String> {
     Ok(join_lines(listed))
 }
 
-fn search_files(operation: &FsSearch, workspace_root: &Path) -> ToolResult<String> {
+fn search_files_at(
+    workspace_dir: OwnedFd,
+    relative: &Path,
+    operation: &FsSearch,
+) -> ToolResult<String> {
     if operation.query.is_empty() {
         return Err(ToolError::invalid_argument(
             "fs_search query cannot be empty",
         ));
     }
-    let mut files = Vec::new();
-    collect_files(&operation.root, workspace_root, &operation.root, &mut files)?;
-    files.sort();
-
+    let directory = open_directory_at(workspace_dir, relative, "open for search", &operation.root)?;
     let mut matches = Vec::new();
-    for path in files {
-        let bytes = fs::read(&path).map_err(|error| ToolError::io("read", &path, error))?;
-        let Ok(contents) = std::str::from_utf8(&bytes) else {
-            continue;
-        };
-        let display_path = path
-            .strip_prefix(&operation.root)
-            .ok()
-            .filter(|relative| !relative.as_os_str().is_empty())
-            .unwrap_or(&path);
-        for (index, line) in contents.lines().enumerate() {
-            if line.contains(&operation.query) {
-                matches.push(format!("{}:{}:{}", display_path.display(), index + 1, line));
-            }
-        }
-    }
+    collect_search_matches_at(
+        directory,
+        Path::new(""),
+        &operation.root,
+        &operation.query,
+        &mut matches,
+    )?;
     Ok(join_lines(matches))
 }
 
-fn collect_files(
-    path: &Path,
-    workspace_root: &Path,
-    search_root: &Path,
-    files: &mut Vec<PathBuf>,
+fn collect_search_matches_at(
+    directory: OwnedFd,
+    relative: &Path,
+    display_root: &Path,
+    query: &str,
+    matches: &mut Vec<String>,
 ) -> ToolResult<()> {
-    let metadata =
-        fs::symlink_metadata(path).map_err(|error| ToolError::io("inspect", path, error))?;
-    // Symlinks are skipped entirely: following them risks cycles and reads
-    // outside the search root.
-    if metadata.file_type().is_symlink() {
-        return Ok(());
+    let mut entries = rustix::fs::Dir::read_from(&directory)
+        .map_err(|error| ToolError::io("list", display_root.join(relative), error))?;
+    let mut names = Vec::new();
+    while let Some(entry) = entries.read() {
+        let entry =
+            entry.map_err(|error| ToolError::io("list", display_root.join(relative), error))?;
+        let name = entry.file_name();
+        if !is_dot_entry(name) {
+            names.push(OsString::from_vec(name.to_bytes().to_vec()));
+        }
     }
-    let canonical =
-        fs::canonicalize(path).map_err(|error| ToolError::io("canonicalize", path, error))?;
-    require_under_root(workspace_root, path, &canonical)?;
-    require_under_root(search_root, path, &canonical)?;
-    if metadata.is_file() {
-        files.push(canonical);
-        return Ok(());
-    }
-    if !metadata.is_dir() {
-        return Ok(());
-    }
+    names.sort();
 
-    let entries = fs::read_dir(path).map_err(|error| ToolError::io("list", path, error))?;
-    for entry in entries {
-        let entry = entry.map_err(|error| ToolError::io("list", path, error))?;
-        collect_files(&entry.path(), workspace_root, search_root, files)?;
+    for name in names {
+        let display_path = relative.join(&name);
+        let entry_path = display_root.join(&display_path);
+        let metadata = rustix::fs::statat(&directory, &name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|error| anchored_io_error("inspect", &entry_path, error))?;
+        match FileType::from_raw_mode(metadata.st_mode) {
+            FileType::Symlink => {}
+            FileType::Directory => {
+                let child = openat_nofollow(
+                    &directory,
+                    &name,
+                    OFlags::RDONLY | OFlags::DIRECTORY,
+                    "open search directory",
+                    &entry_path,
+                )?;
+                collect_search_matches_at(child, &display_path, display_root, query, matches)?;
+            }
+            FileType::RegularFile => {
+                let file = openat_nofollow(
+                    &directory,
+                    &name,
+                    OFlags::RDONLY | OFlags::NONBLOCK,
+                    "open search file",
+                    &entry_path,
+                )?;
+                let opened = rustix::fs::fstat(&file)
+                    .map_err(|error| ToolError::io("inspect", &entry_path, error))?;
+                if FileType::from_raw_mode(opened.st_mode) == FileType::RegularFile {
+                    collect_file_matches(file, &display_path, &entry_path, query, matches)?;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn collect_file_matches(
+    file: OwnedFd,
+    display_path: &Path,
+    entry_path: &Path,
+    query: &str,
+    matches: &mut Vec<String>,
+) -> ToolResult<()> {
+    let mut bytes = Vec::new();
+    fs::File::from(file)
+        .read_to_end(&mut bytes)
+        .map_err(|error| ToolError::io("read", entry_path, error))?;
+    let Ok(contents) = std::str::from_utf8(&bytes) else {
+        return Ok(());
+    };
+    for (index, line) in contents.lines().enumerate() {
+        if line.contains(query) {
+            matches.push(format!("{}:{}:{}", display_path.display(), index + 1, line));
+        }
     }
     Ok(())
 }
@@ -443,28 +540,18 @@ struct AppliedPatch {
     bytes_hash: String,
 }
 
-fn apply_patch(operation: &FsPatch, workspace_root: &Path) -> ToolResult<AppliedPatch> {
+fn apply_patch_at(
+    workspace_dir: OwnedFd,
+    relative: &Path,
+    operation: &FsPatch,
+) -> ToolResult<AppliedPatch> {
     if operation.preimage.is_empty() {
         return Err(ToolError::invalid_argument(
             "fs_patch preimage cannot be empty",
         ));
     }
-    let mut source = open_locked_current(&operation.path)?;
-    let resolved = fs::canonicalize(&operation.path)
-        .map_err(|error| ToolError::io("canonicalize locked patch", &operation.path, error))?;
-    require_under_root(workspace_root, &operation.path, &resolved)?;
-    if resolved != operation.path {
-        return Err(ToolError::Lifecycle {
-            message: format!(
-                "authorized patch path {} now resolves to {}; re-authorization required",
-                operation.path.display(),
-                resolved.display()
-            ),
-        });
-    }
-    let source_metadata = source
-        .metadata()
-        .map_err(|error| ToolError::io("inspect", &operation.path, error))?;
+    let (parent, leaf) = open_parent_at(workspace_dir, relative, &operation.path)?;
+    let (mut source, source_metadata) = open_locked_current_at(&parent, &leaf, &operation.path)?;
     let mut bytes = Vec::new();
     source
         .read_to_end(&mut bytes)
@@ -482,32 +569,18 @@ fn apply_patch(operation: &FsPatch, workspace_root: &Path) -> ToolResult<Applied
         .replacen(&operation.preimage, &operation.replacement, 1)
         .into_bytes();
     let bytes_hash = format!("blake3:{}", blake3::hash(&patched).to_hex());
-    let parent = operation
-        .path
-        .parent()
-        .ok_or_else(|| ToolError::invalid_argument("fs_patch path has no parent directory"))?;
-    let mut temporary = NamedTempFile::new_in(parent)
-        .map_err(|error| ToolError::io("create patch temporary", parent, error))?;
-    temporary
-        .as_file()
-        .set_permissions(source_metadata.permissions())
-        .map_err(|error| ToolError::io("set patch permissions", temporary.path(), error))?;
-    temporary
-        .write_all(&patched)
-        .map_err(|error| ToolError::io("write patch temporary", temporary.path(), error))?;
-    temporary
-        .as_file()
-        .sync_all()
-        .map_err(|error| ToolError::io("sync patch temporary", temporary.path(), error))?;
-    temporary
-        .as_file()
-        .lock()
-        .map_err(|error| ToolError::io("lock patch temporary", temporary.path(), error))?;
-    let _persisted = temporary
-        .persist(&operation.path)
-        .map_err(|error| ToolError::io("replace patched file", &operation.path, error.error))?;
-
-    Ok(AppliedPatch {
+    let (temporary_name, temporary_fd) = create_patch_temporary(&parent, &operation.path)?;
+    let write_result = write_patch_temporary(
+        temporary_fd,
+        source_metadata.st_mode,
+        &patched,
+        &operation.path,
+    );
+    if let Err(error) = write_result {
+        remove_temporary(&parent, &temporary_name);
+        return Err(error);
+    }
+    let applied = AppliedPatch {
         result: BoundedResult {
             preview: format!("patched {}", operation.path.display()),
             truncated: false,
@@ -516,43 +589,241 @@ fn apply_patch(operation: &FsPatch, workspace_root: &Path) -> ToolResult<Applied
         },
         path: operation.path.clone(),
         bytes_hash,
-    })
+    };
+    if let Err(error) = rustix::fs::renameat(&parent, &temporary_name, &parent, &leaf) {
+        remove_temporary(&parent, &temporary_name);
+        return Err(anchored_io_error(
+            "replace patched file",
+            &operation.path,
+            error,
+        ));
+    }
+    Ok(applied)
 }
 
-/// Opens and exclusively locks the inode currently named by `path`.
+/// Opens and exclusively locks the inode currently named by `leaf`.
 ///
 /// A writer may have opened the old inode before another writer atomically
-/// replaced the path. Comparing handles after the lock detects that stale-open
-/// race and retries against the replacement inode before reading any bytes.
-fn open_locked_current(path: &Path) -> ToolResult<std::fs::File> {
+/// replaced the path. Comparing the locked fd's identity with an anchored
+/// `statat` detects that stale-open race and retries before reading any bytes.
+fn open_locked_current_at(
+    parent: &OwnedFd,
+    leaf: &OsStr,
+    display_path: &Path,
+) -> ToolResult<(fs::File, rustix::fs::Stat)> {
     const MAX_STALE_OPEN_RETRIES: usize = 16;
     for _ in 0..MAX_STALE_OPEN_RETRIES {
-        let source = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
-            .map_err(|error| ToolError::io("open for patch", path, error))?;
+        let source_fd =
+            openat_nofollow(parent, leaf, OFlags::RDONLY, "open for patch", display_path)?;
+        let source = fs::File::from(source_fd);
         source
             .lock()
-            .map_err(|error| ToolError::io("lock for patch", path, error))?;
-        let locked = Handle::from_file(
-            source
-                .try_clone()
-                .map_err(|error| ToolError::io("clone locked patch", path, error))?,
-        )
-        .map_err(|error| ToolError::io("inspect locked patch", path, error))?;
-        let current = Handle::from_path(path)
-            .map_err(|error| ToolError::io("inspect current patch", path, error))?;
-        if locked == current {
-            return Ok(source);
+            .map_err(|error| ToolError::io("lock for patch", display_path, error))?;
+        let locked = rustix::fs::fstat(&source)
+            .map_err(|error| ToolError::io("inspect locked patch", display_path, error))?;
+        let current = rustix::fs::statat(parent, leaf, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|error| anchored_io_error("inspect current patch", display_path, error))?;
+        if locked.st_dev == current.st_dev && locked.st_ino == current.st_ino {
+            return Ok((source, locked));
         }
     }
     Err(ToolError::Runtime {
         message: format!(
             "patch target {} changed during {MAX_STALE_OPEN_RETRIES} lock attempts",
-            path.display()
+            display_path.display()
         ),
     })
+}
+
+fn create_patch_temporary(
+    parent: &OwnedFd,
+    display_path: &Path,
+) -> ToolResult<(OsString, OwnedFd)> {
+    static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
+    const MAX_NAME_RETRIES: usize = 16;
+    for _ in 0..MAX_NAME_RETRIES {
+        let sequence = NEXT_TEMPORARY.fetch_add(1, Ordering::Relaxed);
+        let name = OsString::from(format!(
+            ".haider-patch-{}-{sequence}.tmp",
+            std::process::id()
+        ));
+        match rustix::fs::openat(
+            parent,
+            &name,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o600),
+        ) {
+            Ok(file) => return Ok((name, file)),
+            Err(rustix::io::Errno::EXIST) => {}
+            Err(error) => {
+                return Err(ToolError::io("create patch temporary", display_path, error));
+            }
+        }
+    }
+    Err(ToolError::Runtime {
+        message: format!(
+            "could not allocate a unique patch temporary for {}",
+            display_path.display()
+        ),
+    })
+}
+
+fn write_patch_temporary(
+    temporary: OwnedFd,
+    source_mode: rustix::fs::RawMode,
+    patched: &[u8],
+    display_path: &Path,
+) -> ToolResult<()> {
+    rustix::fs::fchmod(&temporary, Mode::from_raw_mode(source_mode))
+        .map_err(|error| ToolError::io("set patch permissions", display_path, error))?;
+    let mut temporary = fs::File::from(temporary);
+    temporary
+        .write_all(patched)
+        .map_err(|error| ToolError::io("write patch temporary", display_path, error))?;
+    temporary
+        .sync_all()
+        .map_err(|error| ToolError::io("sync patch temporary", display_path, error))
+}
+
+fn remove_temporary(parent: &OwnedFd, name: &OsStr) {
+    let _ = rustix::fs::unlinkat(parent, name, AtFlags::empty());
+}
+
+fn anchored_relative_path(workspace_root: &Path, canonical_path: &Path) -> ToolResult<PathBuf> {
+    let relative =
+        canonical_path
+            .strip_prefix(workspace_root)
+            .map_err(|_| ToolError::WorkspaceBoundary {
+                workspace_root: workspace_root.to_path_buf(),
+                requested_path: canonical_path.to_path_buf(),
+                resolved_path: Some(canonical_path.to_path_buf()),
+            })?;
+    let mut checked = PathBuf::new();
+    for component in relative.components() {
+        match component {
+            std::path::Component::Normal(component) => checked.push(component),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => {
+                return Err(ToolError::WorkspaceBoundary {
+                    workspace_root: workspace_root.to_path_buf(),
+                    requested_path: relative.to_path_buf(),
+                    resolved_path: Some(canonical_path.to_path_buf()),
+                });
+            }
+        }
+    }
+    Ok(checked)
+}
+
+fn open_target_at(
+    workspace_dir: OwnedFd,
+    relative: &Path,
+    flags: OFlags,
+    operation: &'static str,
+    display_path: &Path,
+) -> ToolResult<OwnedFd> {
+    let mut components = normal_components(relative);
+    let Some(leaf) = components.pop() else {
+        return Ok(workspace_dir);
+    };
+    let parent = walk_directories(workspace_dir, &components, operation, display_path)?;
+    openat_nofollow(&parent, &leaf, flags, operation, display_path)
+}
+
+fn open_directory_at(
+    workspace_dir: OwnedFd,
+    relative: &Path,
+    operation: &'static str,
+    display_path: &Path,
+) -> ToolResult<OwnedFd> {
+    let components = normal_components(relative);
+    walk_directories(workspace_dir, &components, operation, display_path)
+}
+
+fn open_parent_at(
+    workspace_dir: OwnedFd,
+    relative: &Path,
+    display_path: &Path,
+) -> ToolResult<(OwnedFd, OsString)> {
+    let mut components = normal_components(relative);
+    let leaf = components
+        .pop()
+        .ok_or_else(|| ToolError::invalid_argument("fs_patch path has no file name"))?;
+    let parent = walk_directories(
+        workspace_dir,
+        &components,
+        "open patch parent",
+        display_path,
+    )?;
+    Ok((parent, leaf))
+}
+
+fn normal_components(relative: &Path) -> Vec<OsString> {
+    relative
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(component) => Some(component.to_os_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn walk_directories(
+    mut directory: OwnedFd,
+    components: &[OsString],
+    operation: &'static str,
+    display_path: &Path,
+) -> ToolResult<OwnedFd> {
+    for component in components {
+        directory = openat_nofollow(
+            &directory,
+            component,
+            OFlags::RDONLY | OFlags::DIRECTORY,
+            operation,
+            display_path,
+        )?;
+    }
+    Ok(directory)
+}
+
+fn openat_nofollow(
+    directory: &OwnedFd,
+    path: impl rustix::path::Arg,
+    flags: OFlags,
+    operation: &'static str,
+    display_path: &Path,
+) -> ToolResult<OwnedFd> {
+    rustix::fs::openat(
+        directory,
+        path,
+        flags | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| anchored_io_error(operation, display_path, error))
+}
+
+fn anchored_io_error(
+    operation: &'static str,
+    display_path: &Path,
+    error: rustix::io::Errno,
+) -> ToolError {
+    if matches!(
+        error,
+        rustix::io::Errno::LOOP | rustix::io::Errno::NOENT | rustix::io::Errno::NOTDIR
+    ) {
+        ToolError::PathChanged {
+            path: display_path.to_path_buf(),
+            message: error.to_string(),
+        }
+    } else {
+        ToolError::io(operation, display_path, error)
+    }
+}
+
+fn is_dot_entry(name: &CStr) -> bool {
+    matches!(name.to_bytes(), b"." | b"..")
 }
 
 /// Applies the result bound: a small result passes through untruncated; an

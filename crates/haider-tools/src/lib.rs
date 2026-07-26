@@ -15,7 +15,7 @@ pub use broker::{
 };
 pub use error::{FsPatchConflict, ToolError, ToolResult};
 pub use filesystem::{CasSink, FsList, FsPatch, FsRead, FsSearch, ResultBounds, TurnAttribution};
-pub use ledger::{ChangeLedger, FsWriteRecord, TurnChanges};
+pub use ledger::{ChangeLedger, ChangeLedgerSink, FsWriteRecord, TurnChanges};
 
 /// Crate marker used by the workspace self-test.
 pub const CRATE_NAME: &str = "haider-tools";
