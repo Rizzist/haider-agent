@@ -25,6 +25,10 @@ jobs:
         with:
           toolchain: 1.95.0
           targets: ${{ matrix.target }}
+      - name: tag matches workspace version (pre-build check)
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          grep -q "^version = \"$TAG\"" Cargo.toml || { echo "tag v$TAG != workspace version"; exit 1; }
       - name: build
         run: cargo build --release --locked -p haider-cli --target ${{ matrix.target }}
       - name: smoke (artifact must match tag + pass self-test)
