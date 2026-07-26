@@ -4,11 +4,16 @@
 //! insertion is explicitly deferred (rec 19).
 
 use crate::app::{AppEvent, AppModel, AppRequest};
-use crate::mock::{demo_script, response_script};
+use crate::mock::demo_script;
 use crate::render::render;
+use crate::script::{
+    AUTO_TITLE_MS, Beat, DemoEvent, TALK_HOLD_MS, compaction_beats, from_legacy, respond_beats,
+    title_note,
+};
 use crate::theme::{Rgb, ThemeKey};
 use haider_protocol::EventPayload;
-use haider_protocol::state::HarnessStatus;
+use haider_protocol::provider::{Usage, UsageSource};
+use haider_protocol::state::{HarnessStatus, RunState};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
@@ -239,8 +244,8 @@ pub async fn run_demo(mut model: AppModel) -> std::io::Result<()> {
                 model.handle(AppEvent::AutoPlay);
             }
             tagged = envelope_rx.recv(), if stream_open => match tagged {
-                Some((generation, payload)) => {
-                    driver.consume(&mut model, generation, payload);
+                Some((generation, event)) => {
+                    driver.consume(&mut model, generation, event);
                 }
                 None => {
                     stream_open = false;
@@ -289,7 +294,10 @@ pub async fn run_demo(mut model: AppModel) -> std::io::Result<()> {
         // send here instead would deadlock: this loop is the only consumer.
         while let Some(answer) = model.outbox.first().cloned() {
             let generation = driver.generation();
-            match answer_echo.try_send((generation, EventPayload::MenuAnswered(answer))) {
+            match answer_echo.try_send((
+                generation,
+                DemoEvent::Envelope(EventPayload::MenuAnswered(answer)),
+            )) {
                 Ok(()) => {
                     model.outbox.remove(0);
                 }
@@ -357,23 +365,48 @@ pub fn dispatch_input(
 /// The demo's script engine — the production seams of [`run_demo`]'s event
 /// loop, extracted whole so tests drive the SAME wiring (review r3 P3-7):
 /// the same generation-tagged channel, the same spawn/bump/decay behavior,
-/// the same consumption guard.
+/// the same consumption guard. TUI3b: plays [`Beat`] scripts (the sim's
+/// respond() port), owns the token meter (cumulative `Usage` frames), the
+/// GENERIC/roster rotation counters, parked `AwaitMenu` arms, and the
+/// turn-end law (`finish_turn`).
 pub struct DemoDriver {
-    tx: mpsc::Sender<(u64, EventPayload)>,
+    tx: mpsc::Sender<(u64, DemoEvent)>,
     script_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
     turn_counter: u64,
+    /// Sim `genRef` (tui.js:1488): generic-branch post-increment rotation.
+    generic_counter: u64,
+    /// Sim `rosterRef` (tui.js:681): starts at 3 (seed heads claim 0-2).
+    roster_counter: u64,
+    /// Demo token meter, input bucket (user text 9/char + tools 2400).
+    tokens_input: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Demo token meter, output bucket (streamed words 9/char).
+    tokens_output: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Menus a script parked on: menu id → (generation, continuation arms).
+    /// `MenuAnswered` at consume selects `arms[option_index]` (clamped) and
+    /// plays it under the SAME generation; a bump while parked cancels the
+    /// continuation (sim `alive()` guard killing a turn parked on askMenu).
+    #[allow(clippy::type_complexity)]
+    pending_arms:
+        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, (u64, Vec<Vec<Beat>>)>>>,
 }
 
 impl DemoDriver {
-    /// A driver plus the receiving end of its envelope channel.
+    /// A driver plus the receiving end of its demo-event channel.
     #[must_use]
-    pub fn new(capacity: usize) -> (Self, mpsc::Receiver<(u64, EventPayload)>) {
+    pub fn new(capacity: usize) -> (Self, mpsc::Receiver<(u64, DemoEvent)>) {
         let (tx, rx) = mpsc::channel(capacity);
         (
             Self {
                 tx,
                 script_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 turn_counter: 0,
+                generic_counter: 0,
+                roster_counter: crate::script::ROSTER_FIRST_CLAIM,
+                tokens_input: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                tokens_output: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                pending_arms: std::sync::Arc::new(std::sync::Mutex::new(
+                    std::collections::HashMap::new(),
+                )),
             },
             rx,
         )
@@ -385,9 +418,17 @@ impl DemoDriver {
         self.script_gen.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// A clone of the tagged-envelope sender (the menu-answer echo seam).
+    /// The demo token meter's current total (both buckets).
     #[must_use]
-    pub fn sender(&self) -> mpsc::Sender<(u64, EventPayload)> {
+    pub fn tokens_total(&self) -> u64 {
+        self.tokens_input
+            .load(std::sync::atomic::Ordering::SeqCst)
+            .saturating_add(self.tokens_output.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// A clone of the tagged-event sender (the menu-answer echo seam).
+    #[must_use]
+    pub fn sender(&self) -> mpsc::Sender<(u64, DemoEvent)> {
         self.tx.clone()
     }
 
@@ -400,25 +441,79 @@ impl DemoDriver {
             for payload in crate::mock::boot_script() {
                 tokio::time::sleep(demo_pace(&payload)).await;
                 let generation = gen_ref.load(std::sync::atomic::Ordering::SeqCst);
-                if tx.send((generation, payload)).await.is_err() {
+                if tx
+                    .send((generation, DemoEvent::Envelope(payload)))
+                    .await
+                    .is_err()
+                {
                     return;
                 }
             }
         });
     }
 
-    /// Play one script, generation-captured: bumps at EITHER end of the
-    /// channel silence it (send-side check + consumption guard).
-    fn play(&self, payloads: Vec<EventPayload>, generation: u64) {
+    /// Play one beat script, generation-captured: bumps at EITHER end of
+    /// the channel silence it (send-side check + consumption guard).
+    /// `AwaitMenu` parks the script (arms registered, task ends);
+    /// `Tokens`/`TokensReset` mutate the meter and emit a cumulative
+    /// protocol-honest `Usage` frame.
+    pub fn play_beats(&self, beats: Vec<Beat>, generation: u64) {
         let tx = self.tx.clone();
         let gen_ref = std::sync::Arc::clone(&self.script_gen);
+        let arms_ref = std::sync::Arc::clone(&self.pending_arms);
+        let input_ref = std::sync::Arc::clone(&self.tokens_input);
+        let output_ref = std::sync::Arc::clone(&self.tokens_output);
         tokio::spawn(async move {
-            for payload in payloads {
-                tokio::time::sleep(demo_pace(&payload)).await;
-                if gen_ref.load(std::sync::atomic::Ordering::SeqCst) != generation {
+            use std::sync::atomic::Ordering::SeqCst;
+            let usage_event =
+                |input: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+                 output: &std::sync::Arc<std::sync::atomic::AtomicU64>| {
+                    DemoEvent::Envelope(EventPayload::Usage(Usage {
+                        input: input.load(SeqCst),
+                        output: output.load(SeqCst),
+                        reasoning: 0,
+                        cached: 0,
+                        source: UsageSource::Estimated,
+                        account: None,
+                    }))
+                };
+            for beat in beats {
+                if gen_ref.load(SeqCst) != generation {
                     return;
                 }
-                if tx.send((generation, payload)).await.is_err() {
+                let event = match beat {
+                    Beat::Sleep(ms) => {
+                        tokio::time::sleep(Duration::from_millis(ms)).await;
+                        continue;
+                    }
+                    Beat::Emit(payload) => DemoEvent::Envelope(payload),
+                    Beat::Note(text) => DemoEvent::Note(text),
+                    Beat::Voice(on) => DemoEvent::Voice(on),
+                    Beat::Tokens { n, output } => {
+                        if output {
+                            output_ref.fetch_add(n, SeqCst);
+                        } else {
+                            input_ref.fetch_add(n, SeqCst);
+                        }
+                        usage_event(&input_ref, &output_ref)
+                    }
+                    Beat::TokensReset(n) => {
+                        input_ref.store(n, SeqCst);
+                        output_ref.store(0, SeqCst);
+                        usage_event(&input_ref, &output_ref)
+                    }
+                    Beat::AwaitMenu { menu, arms } => {
+                        if let Ok(mut pending) = arms_ref.lock() {
+                            pending.insert(menu.as_str().to_owned(), (generation, arms));
+                        }
+                        return;
+                    }
+                    Beat::TurnEnd => DemoEvent::TurnEnd,
+                };
+                if gen_ref.load(SeqCst) != generation {
+                    return;
+                }
+                if tx.send((generation, event)).await.is_err() {
                     return;
                 }
             }
@@ -432,41 +527,169 @@ impl DemoDriver {
     /// decay (tui.js:1561-1564).
     pub fn handle_request(&mut self, model: &mut AppModel, request: AppRequest) {
         match request {
-            AppRequest::SubmitText(text) => {
+            AppRequest::SubmitText { text, voice, title } => {
                 self.turn_counter += 1;
-                self.play(response_script(&text, self.turn_counter), self.generation());
+                let generation = self.generation();
+                let beats = respond_beats(
+                    &text,
+                    voice,
+                    haider_protocol::DeliveryMode::Steer,
+                    self.turn_counter,
+                    &mut self.generic_counter,
+                    &mut self.roster_counter,
+                );
+                self.play_beats(beats, generation);
+                // Auto-title (sim tui.js:1221-1227): scheduled at turn
+                // start, the note lands 1.5 s later wherever the transcript
+                // is; an interrupt inside the window drops it (gen guard).
+                if let Some(blurb) = title {
+                    self.play_beats(
+                        vec![Beat::Sleep(AUTO_TITLE_MS), Beat::Note(title_note(&blurb))],
+                        generation,
+                    );
+                }
             }
             AppRequest::AttachSample(_) => {
                 self.turn_counter += 1;
-                self.play(
-                    crate::mock::turn_script(self.turn_counter),
+                self.play_beats(
+                    from_legacy(crate::mock::turn_script(self.turn_counter)),
                     self.generation(),
                 );
             }
             AppRequest::StopScripts => {
                 self.script_gen
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // A fresh session starts from a zero meter and no parked
+                // continuations (stale arms are also gen-guarded; clearing
+                // is hygiene, not correctness).
+                self.tokens_input
+                    .store(0, std::sync::atomic::Ordering::SeqCst);
+                self.tokens_output
+                    .store(0, std::sync::atomic::Ordering::SeqCst);
+                if let Ok(mut pending) = self.pending_arms.lock() {
+                    pending.clear();
+                }
             }
             AppRequest::Interrupt => {
                 let decay_gen = self
                     .script_gen
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
                     + 1;
+                if let Ok(mut pending) = self.pending_arms.lock() {
+                    pending.clear();
+                }
                 let tx = self.tx.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(IDLE_DECAY).await;
-                    let _ = tx.send((decay_gen, EventPayload::IdleDecayed)).await;
+                    let _ = tx
+                        .send((decay_gen, DemoEvent::Envelope(EventPayload::IdleDecayed)))
+                        .await;
+                });
+            }
+            AppRequest::Compact => {
+                // Manual /compact (sim tui.js:1791-1806): before = current
+                // meter, after = 6% of the window — 1200 ms, then IDLE.
+                let before = self.tokens_total();
+                let after = model.identity.context_window * 6 / 100;
+                self.play_beats(compaction_beats(before, after, true), self.generation());
+            }
+            AppRequest::Talk => {
+                // ◉ talk hold (sim tui.js:2044-2054): 1300 ms of
+                // `◉ listening…`, then the canned phrase fires through the
+                // voice path. Generation-captured like every timer.
+                let generation = self.generation();
+                let tx = self.tx.clone();
+                let gen_ref = std::sync::Arc::clone(&self.script_gen);
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(TALK_HOLD_MS)).await;
+                    if gen_ref.load(std::sync::atomic::Ordering::SeqCst) != generation {
+                        return;
+                    }
+                    let _ = tx.send((generation, DemoEvent::TalkFire)).await;
                 });
             }
             AppRequest::Quit => model.should_quit = true,
         }
     }
 
-    /// Consume one generation-tagged envelope. Stale generations are
-    /// dropped whole — the P1-1 law: a bump invalidates envelopes already
+    /// Consume one generation-tagged demo event. Stale generations are
+    /// dropped whole — the P1-1 law: a bump invalidates events already
     /// buffered in the channel, not only future sends.
-    pub fn consume(&self, model: &mut AppModel, generation: u64, payload: EventPayload) {
-        consume_scripted(model, generation, self.generation(), payload);
+    pub fn consume(&mut self, model: &mut AppModel, generation: u64, event: DemoEvent) {
+        let current = self.generation();
+        if generation != current {
+            return;
+        }
+        match event {
+            DemoEvent::Envelope(payload) => {
+                // A parked script's menu was answered: the option index
+                // selects the continuation arm (clamped to the last arm),
+                // played under the SAME generation.
+                if let EventPayload::MenuAnswered(answer) = &payload {
+                    let parked = self
+                        .pending_arms
+                        .lock()
+                        .ok()
+                        .and_then(|mut pending| pending.remove(answer.menu.as_str()));
+                    if let Some((arm_gen, mut arms)) = parked
+                        && arm_gen == current
+                        && !arms.is_empty()
+                    {
+                        let index = (answer.option_index as usize).min(arms.len() - 1);
+                        let beats = arms.swap_remove(index);
+                        self.play_beats(beats, current);
+                    }
+                }
+                consume_scripted(model, generation, current, payload);
+            }
+            DemoEvent::Note(text) => {
+                model.projection.push_note(text);
+                model.dirty = true;
+            }
+            DemoEvent::Voice(on) => {
+                model.projection.set_voice_live(on);
+                model.dirty = true;
+            }
+            DemoEvent::TurnEnd => self.finish_turn(model),
+            DemoEvent::TalkFire => model.talk_fire(),
+        }
+    }
+
+    /// The sim's `finishTurn` + auto-compaction law (tui.js:1507-1543):
+    /// queued input consumes directly — the session never passes through
+    /// idle; else the 85% auto-compaction check (checked BEFORE emitting
+    /// Done — the sim's 30 ms transient-IDLE flicker is a known sim wart
+    /// the spec says not to port); else IDLE.
+    pub fn finish_turn(&mut self, model: &mut AppModel) {
+        let generation = self.generation();
+        if !model.msg_queue.is_empty() {
+            let text = model.msg_queue.remove(0);
+            model.dirty = true;
+            self.turn_counter += 1;
+            let mut beats = vec![Beat::Note(
+                "· turn ended with queued input — consuming it directly, no idle".to_owned(),
+            )];
+            beats.extend(respond_beats(
+                &text,
+                false,
+                haider_protocol::DeliveryMode::Queue,
+                self.turn_counter,
+                &mut self.generic_counter,
+                &mut self.roster_counter,
+            ));
+            self.play_beats(beats, generation);
+            return;
+        }
+        let window = model.identity.context_window;
+        let total = self.tokens_total();
+        if window > 0 && total.saturating_mul(100) >= window.saturating_mul(85) {
+            self.play_beats(compaction_beats(total, window * 6 / 100, false), generation);
+            return;
+        }
+        self.play_beats(
+            vec![Beat::Emit(EventPayload::RunState(RunState::Done))],
+            generation,
+        );
     }
 }
 

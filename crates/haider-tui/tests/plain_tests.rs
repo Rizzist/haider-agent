@@ -85,7 +85,8 @@ fn command_blocks_render_output_tail_and_truncation_notice() {
 #[test]
 fn status_glyphs_cover_every_tool_status() {
     assert_eq!(status_glyph(ToolStatus::Pending), "…");
-    assert_eq!(status_glyph(ToolStatus::InProgress), "◌");
+    // Sim ToolRow running glyph (tui.js:3901-3909) — TUI3b parity fix.
+    assert_eq!(status_glyph(ToolStatus::InProgress), "◐");
     assert_eq!(status_glyph(ToolStatus::Completed), "✓");
     assert_eq!(status_glyph(ToolStatus::Failed), "✗");
     assert_eq!(status_glyph(ToolStatus::Cancelled), "⊘");

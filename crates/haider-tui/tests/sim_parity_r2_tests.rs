@@ -303,10 +303,13 @@ fn big_pastes_become_pill_tokens_and_render_gold() {
     assert_eq!(model.composer, "a\nb");
 }
 
-// ---- G51 + G47: mid-turn echo + auto-title note ----
+// ---- G51 + G47 (superseded by TUI3b §4): steer delivery + auto-title ----
 
 #[test]
 fn mid_turn_submit_flashes_and_echoes_a_note() {
+    // TUI3b §4 step 9 replaces the old G51 echo stub: default STEER pushes
+    // the user row immediately plus the sim's steer note — typed text is
+    // still never lost, now with the sim's real delivery semantics.
     let mut model = launcher_model();
     model.handle(key(KeyCode::Char('1')));
     assert!(model.turn_active);
@@ -320,23 +323,26 @@ fn mid_turn_submit_flashes_and_echoes_a_note() {
         model.handle(key(KeyCode::Char(c)));
     }
     model.handle(key(KeyCode::Enter));
-    assert!(
-        model
-            .flash
-            .as_deref()
-            .unwrap_or("")
-            .contains("already running")
-    );
     let (rows, _, _) = draw(&model, 140, 34);
     assert!(
         rows.iter()
-            .any(|row| row.contains("⧗ mid-turn input — “also update the docs”")),
-        "typed text is not lost"
+            .any(|row| row.contains("❯ also update the docs")),
+        "typed text is not lost — the steered row lands"
     );
+    assert!(
+        rows.iter().any(|row| row
+            .contains("· steered — delivered at the next safe boundary of the current turn")),
+        "sim steer note (tui.js:2035)"
+    );
+    assert!(model.turn_active, "the running turn is not disturbed");
 }
 
 #[test]
 fn auto_title_uses_auto_blurb_and_notes_the_transcript() {
+    // TUI3b §1.0: the blurb is computed at submit and rides the request;
+    // the driver lands the sim's FULL note 1.5 s later (driver-timed path
+    // covered in turn_engine_tests). The header shows the slug, never the
+    // blurb.
     let mut model = launcher_model();
     for c in "please fix the flaky boundary test suite before the release".chars() {
         model.handle(key(KeyCode::Char(c)));
@@ -347,19 +353,20 @@ fn auto_title_uses_auto_blurb_and_notes_the_transcript() {
         model.session_title.as_deref(),
         Some("Please fix the flaky boundary test suite")
     );
-    // The note lands right after the echoed user row.
-    model.handle(AppEvent::Envelope(Box::new(EventPayload::UserMessage {
-        text: "please fix the flaky boundary test suite before the release".to_owned(),
-        attachments: vec![],
-        mode: haider_protocol::DeliveryMode::Steer,
-    })));
-    let (rows, _, _) = draw(&model, 140, 34);
-    let user_y = row_of(&rows, "❯ please fix the flaky");
-    let note_y = row_of(
-        &rows,
-        "· session titled — “Please fix the flaky boundary test suite”",
+    assert_eq!(model.session_name.as_deref(), Some("please-fix-the"));
+    assert!(
+        model.requests.iter().any(|request| matches!(
+            request,
+            haider_tui::app::AppRequest::SubmitText { title: Some(blurb), .. }
+                if blurb == "Please fix the flaky boundary test suite"
+        )),
+        "the fresh blurb rides the request for the driver's 1.5 s note"
     );
-    assert_eq!(note_y, user_y + 1, "note directly under the prompt");
+    let (rows, _, _) = draw(&model, 140, 34);
+    assert!(
+        !rows.iter().any(|row| row.contains("· session titled")),
+        "no immediate note — it lands via the driver at 1500 ms"
+    );
 }
 
 // ---- G27/G28/G29/G31/G32: transcript typography ----
@@ -410,6 +417,8 @@ fn compaction_row_is_gold_and_honest() {
             item_id: ItemId::new("compact-1"),
             item: TurnItem::ContextCompaction {
                 summary_artifact: ArtifactRef::new("blake3:abc"),
+                tokens_before: None,
+                tokens_after: None,
             },
         },
     ))));

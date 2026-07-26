@@ -299,10 +299,11 @@ fn render_launcher(
         Span::styled(" · device ", theme.dim_style()),
         Span::styled(identity.device.clone(), theme.bright_style()),
     ]));
-    // Sim `.dirline`: dir {dir} · mesh off.
+    // Sim `.dirline`: dir {dir} · mesh off — `cd` on the launcher
+    // retargets this dir (shell builtins, §4).
     lines.push(Line::from(vec![
         Span::styled("dir ", theme.dim_style()),
-        Span::styled(identity.dir.clone(), theme.bright_style()),
+        Span::styled(model.launcher_dir.clone(), theme.bright_style()),
         Span::styled(" · mesh ", theme.dim_style()),
         Span::styled("off", theme.bright_style()),
     ]));
@@ -438,6 +439,24 @@ fn render_launcher(
         }
         lines.push(line);
     }
+    // The `.shellout` block (sim tui.js:3302-3308): the last shell
+    // builtin's `$ cmd` + output, under the recent list, same column.
+    if let Some((cmd, out)) = &model.launcher_shellout {
+        lines.push(Line::default());
+        lines.push(Line::from(pad_spans_to(
+            vec![
+                Span::styled("$ ", theme.gold_style()),
+                Span::styled(cmd.clone(), theme.bright_style()),
+            ],
+            column,
+        )));
+        for row in out.split('\n') {
+            lines.push(Line::from(pad_spans_to(
+                vec![Span::styled(row.to_owned(), theme.dim_style())],
+                column,
+            )));
+        }
+    }
     let (middle, dropped) = centered(frame, content_area, lines);
     let visible = |row: usize| row.checked_sub(dropped);
     for (row, index) in sample_rows {
@@ -553,14 +572,22 @@ fn render_session(
         .min(input_avail)
         .max(floor_input.min(area.height.saturating_sub(chrome)))
         .clamp(1, area.height.max(1));
-    // Short windows: todos, then the palette, yield entirely before the
-    // composer/menu loses a row (review r1 P2).
+    // Short windows: todos first, then the ⧗ queue panel, then the
+    // palette, yield entirely before the composer/menu loses a row
+    // (review r1 P2; TUI3b: the queue panel joins the ledger BETWEEN the
+    // todos and the composer — it sheds after the todos, before the
+    // composer ever gives up a row).
     let fixed = chrome + input_height + gap;
     let mut todos_height = model
         .projection
         .todos()
         .filter(|t| t.pinned)
         .map_or(0, |t| u16::try_from(t.items.len() + 1).unwrap_or(4));
+    let mut queue_height = if model.msg_queue.is_empty() {
+        0
+    } else {
+        u16::try_from(model.msg_queue.len() + 1).unwrap_or(4)
+    };
     let palette = if model.palette_open() {
         palette_block(model, theme, area.width)
     } else {
@@ -573,6 +600,11 @@ fn render_session(
     } else {
         budget -= palette_height;
     }
+    if queue_height > budget {
+        queue_height = 0;
+    } else {
+        budget -= queue_height;
+    }
     if todos_height > budget {
         todos_height = 0;
     }
@@ -581,6 +613,7 @@ fn render_session(
         header_rule,
         transcript_area,
         todos_area,
+        queue_area,
         palette_area,
         rule_area,
         composer_area,
@@ -590,6 +623,7 @@ fn render_session(
         Constraint::Length(header_rule_h),
         Constraint::Min(transcript_min),
         Constraint::Length(todos_height),
+        Constraint::Length(queue_height),
         Constraint::Length(palette_height),
         Constraint::Length(input_rule_h),
         Constraint::Length(input_height),
@@ -602,7 +636,9 @@ fn render_session(
     // callsign (`.headcs`).
     let sanctum = SanctumLine::new(model.sanctum_tier);
     let identity = &model.identity;
-    let title = model.session_title.as_deref().unwrap_or("session");
+    // The header shows the session's slug NAME (sim `session.name`); the
+    // auto-title blurb lives in the `· session titled` note only.
+    let title = model.display_name();
     let (head, honorific) = model.session_head;
     // Sim `.backbtn` (tui.js:5190-5205): FRAME border, dim label; hover
     // turns text and border gold.
@@ -625,8 +661,10 @@ fn render_session(
             .add_modifier(ratatui::style::Modifier::BOLD),
     ));
     header_top.push(Span::styled(format!(" v{VERSION}"), theme.dim_style()));
+    // The session's working dir — `cd` retargets it (sim: "the agent
+    // works elsewhere while the session stays global").
     header_top.push(Span::styled(
-        format!(" · {}", identity.dir),
+        format!(" · {}", model.session_dir),
         theme.bright_style(),
     ));
     let header_bottom = vec![
@@ -770,6 +808,32 @@ fn render_session(
         frame.render_widget(Paragraph::new(Text::from(todo_lines)), todos_area);
     }
 
+    if queue_height > 0 {
+        // The ⧗ queued panel (sim tui.js:2891-2906): header + numbered
+        // rows, text truncated at 72 chars.
+        let count = model.msg_queue.len();
+        let plural = if count == 1 { "" } else { "s" };
+        let mut queue_lines = vec![Line::from(vec![
+            Span::styled("⧗ queued", theme.gold_style()),
+            Span::styled(
+                format!(" — {count} message{plural} · consumed at turn end, no idle between"),
+                theme.dim_style(),
+            ),
+        ])];
+        for (index, text) in model.msg_queue.iter().enumerate() {
+            let shown: String = if text.chars().count() > 72 {
+                format!("{}…", text.chars().take(72).collect::<String>())
+            } else {
+                text.clone()
+            };
+            queue_lines.push(Line::from(vec![
+                Span::styled(format!("  {}. ", index + 1), theme.faint_style()),
+                Span::styled(shown, theme.dim_style()),
+            ]));
+        }
+        frame.render_widget(Paragraph::new(Text::from(queue_lines)), queue_area);
+    }
+
     if palette_height > 0 {
         frame.render_widget(Paragraph::new(Text::from(palette)), palette_area);
         palette_row_hits(model, palette_area, hits);
@@ -873,7 +937,7 @@ fn menu_block(
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut option_rows: Vec<(u16, usize)> = Vec::new();
     if show_title {
-        let glyph = menu_glyph(&menu.kind);
+        let glyph = menu_glyph(menu);
         lines.push(Line::from(vec![Span::styled(
             format!(" {glyph} {}", menu.title),
             theme.warn_style(),
@@ -931,11 +995,15 @@ fn menu_block(
 }
 
 /// Sim `MENU_GLYPH` (tui.js:3057) mapped onto the protocol's menu kinds.
-const fn menu_glyph(kind: &haider_protocol::menu::MenuKind) -> &'static str {
+/// The command cards (`voice` ◉ / `tools` ⚒) are `Choice` menus — their
+/// free-form `origin` tag carries the sim kind (MenuKind is frozen).
+fn menu_glyph(menu: &haider_protocol::menu::Menu) -> &'static str {
     use haider_protocol::menu::MenuKind;
-    match kind {
+    match &menu.kind {
         MenuKind::Recovery { .. } => "⌁",
         MenuKind::Exhausted => "⟳",
+        MenuKind::Choice if menu.origin == "voice" => "◉",
+        MenuKind::Choice if menu.origin == "tools" => "⚒",
         _ => "?",
     }
 }
@@ -1045,13 +1113,18 @@ fn composer_lines<'a>(
             .add_modifier(ratatui::style::Modifier::BOLD),
     );
     // Sim `.mic` (tui.js:5467-5489): FRAME chrome, gold label; hover
-    // turns the border gold.
+    // turns the border gold; a live hold shows `◉ listening…`.
     let talk_chrome = if model.hovered == Some(Hit::TalkChip) {
         theme.gold_style()
     } else {
         theme.frame_style()
     };
-    let chip_spans = chip_two_tone("◉ talk".to_owned(), talk_chrome, theme.gold_style());
+    let talk_label = if model.listening {
+        "◉ listening…"
+    } else {
+        "◉ talk"
+    };
+    let chip_spans = chip_two_tone(talk_label.to_owned(), talk_chrome, theme.gold_style());
     let chip_width = Line::from(chip_spans.clone()).width();
     // Right-aligned talk chip when the row leaves room (2-col right pad).
     let chip_fit = |spans: &mut Vec<Span<'a>>| -> Option<(u16, u16)> {
@@ -1261,23 +1334,42 @@ fn render_status_bar(
         theme.badge_style(tone)
     };
     left.extend(chip_two_tone(badge, badge_chrome, theme.badge_style(tone)));
-    // Sim `.mid`: model · provider, plus the branch name inside a session.
+    // Sim `.mid`: model · provider, plus the branch name inside a session,
+    // plus ` · q:turn` while queue mode holds (tui.js:2840-2842).
     let branch = if model.screen == Screen::Session {
         " · main"
     } else {
         ""
     };
+    let queue_tag = if model.queue_mode && model.screen == Screen::Session {
+        " · q:turn"
+    } else {
+        ""
+    };
     left.push(Span::styled(
-        format!("  {} · {}{branch}", identity.model_short, identity.provider),
+        format!(
+            "  {} · {}{branch}{queue_tag}",
+            identity.model_short, identity.provider
+        ),
         theme.text_style(),
     ));
     left.push(Span::styled(format!("  {meter}  "), theme.dim_style()));
-    // Sim `.voice` (tui.js:5511-5520): FRAME border, gold label.
-    left.extend(chip_two_tone(
-        format!("◉ voice · {}", identity.voice),
-        theme.frame_style(),
-        theme.gold_style(),
-    ));
+    // Sim `.voice` (tui.js:5511-5520): FRAME border, gold label —
+    // `◉ listening…` during a talk hold, the pipeline label otherwise
+    // (tui.js:2846-2850); hidden entirely while voice is off.
+    if model.listening {
+        left.extend(chip_two_tone(
+            "◉ listening…".to_owned(),
+            theme.frame_style(),
+            theme.gold_style(),
+        ));
+    } else if model.voice.enabled {
+        left.extend(chip_two_tone(
+            format!("◉ voice · {}", model.voice.bar_label()),
+            theme.frame_style(),
+            theme.gold_style(),
+        ));
+    }
 
     let hint_shown = model.flash.is_none() && model.screen == Screen::Launcher && !model.help_open;
     let right = if let Some(flash) = &model.flash {
@@ -1322,28 +1414,39 @@ fn transcript_lines<'a>(
     width: u16,
 ) {
     match entry {
-        TranscriptEntry::User { text, attachments } => {
+        TranscriptEntry::User {
+            text,
+            attachments,
+            voice,
+        } => {
             lines.push(Line::default());
             // Sim UserRow (tui.js:4465-4492): MAROON bold sigil (gold ❯
             // belongs to the composer/sticky only), bright pre-wrap text
             // (multi-line submits keep their newlines), gold pill paste
-            // tokens.
+            // tokens. Voice rows swap the sigil for ◉ and tag ` · spoken`
+            // (tui.js:3884-3890).
+            let sigil = if *voice { "◉ " } else { "❯ " };
             let last_segment = text.split('\n').count().saturating_sub(1);
             for (index, segment) in text.split('\n').enumerate() {
                 let mut spans = if index == 0 {
                     vec![
                         Span::raw(" "),
-                        Span::styled("❯ ", theme.maroon_style().add_modifier(Modifier::BOLD)),
+                        Span::styled(sigil, theme.maroon_style().add_modifier(Modifier::BOLD)),
                     ]
                 } else {
                     vec![Span::raw("   ")]
                 };
                 spans.extend(user_text_spans(segment, theme));
-                if index == last_segment && *attachments > 0 {
-                    spans.push(Span::styled(
-                        format!(" [+{attachments} attachment(s)]"),
-                        theme.dim_style(),
-                    ));
+                if index == last_segment {
+                    if *attachments > 0 {
+                        spans.push(Span::styled(
+                            format!(" [+{attachments} attachment(s)]"),
+                            theme.dim_style(),
+                        ));
+                    }
+                    if *voice {
+                        spans.push(Span::styled(" · spoken", theme.faint_style()));
+                    }
                 }
                 lines.push(Line::from(spans));
             }
@@ -1355,6 +1458,21 @@ fn transcript_lines<'a>(
                 Span::raw("   "),
                 Span::styled(text.as_str(), theme.dim_style()),
             ]));
+        }
+        TranscriptEntry::Shell { cmd, out } => {
+            // Sim ShellRow (tui.js:3910-3918): `$ {cmd}` + output line.
+            lines.push(Line::default());
+            lines.push(Line::from(vec![
+                Span::raw(" "),
+                Span::styled("$ ", theme.gold_style()),
+                Span::styled(cmd.as_str(), theme.bright_style()),
+            ]));
+            for row in out.split('\n') {
+                lines.push(Line::from(vec![
+                    Span::raw("   "),
+                    Span::styled(row, theme.dim_style()),
+                ]));
+            }
         }
     }
 }
@@ -1534,9 +1652,13 @@ fn todo_row<'a>(item: &'a TodoItem, all: &[TodoItem], theme: &Theme) -> Line<'a>
     Line::from(spans)
 }
 
-/// Dim tool description derived from the call args (sim ToolRow `.desc` —
-/// the demo script carries path/query/glob keys).
+/// Dim tool description derived from the call args (sim ToolRow `.desc`).
+/// The turn engine carries the sim's desc/meta via the args convention
+/// (`{"desc": …, "meta": …}` — §6); legacy scripts carry path/query/glob.
 fn tool_desc(args: &serde_json::Value) -> String {
+    if let Some(desc) = args.get("desc").and_then(|v| v.as_str()) {
+        return desc.to_owned();
+    }
     if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
         return path.to_owned();
     }
@@ -1549,17 +1671,31 @@ fn tool_desc(args: &serde_json::Value) -> String {
     String::new()
 }
 
+/// The tool row's meta text (sim `.meta`): `running…` while in progress,
+/// else the completed args' meta (tui.js:3901-3909).
+fn tool_meta(args: &serde_json::Value, status: haider_protocol::item::ToolStatus) -> String {
+    if status == haider_protocol::item::ToolStatus::InProgress {
+        return "running…".to_owned();
+    }
+    args.get("meta")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_owned()
+}
+
 fn item_lines<'a>(lines: &mut Vec<Line<'a>>, block: &'a ItemBlock, theme: &Theme, width: u16) {
     match &block.item {
         TurnItem::AgentMessage { text } => {
             // Sim AgentRow (tui.js:4494-4513): the ■ haider header is GOLD;
             // the body indents behind a gold-soft left rail on every
             // wrapped line (manual wrap keeps the rail on continuations).
+            // Voice turns tag the header ` · ♪ speaking` (tui.js:3895-3897).
             lines.push(Line::default());
-            lines.push(Line::from(vec![
-                Span::raw(" "),
-                Span::styled("■ haider", theme.gold_style()),
-            ]));
+            let mut head = vec![Span::raw(" "), Span::styled("■ haider", theme.gold_style())];
+            if block.spoken {
+                head.push(Span::styled(" · ♪ speaking", theme.faint_style()));
+            }
+            lines.push(Line::from(head));
             // Content width = area minus margin+rail; never wider — every
             // produced row fits the frame, so ratatui never implicitly
             // wraps and the rail survives ANY width (review r3 P2-5). At
@@ -1623,13 +1759,22 @@ fn item_lines<'a>(lines: &mut Vec<Line<'a>>, block: &'a ItemBlock, theme: &Theme
                 Span::styled(name.as_str(), theme.maroon_style()),
             ];
             let desc = tool_desc(args);
+            let meta = tool_meta(args, *status);
             if !desc.is_empty() {
                 let used = Line::from(spans.clone()).width();
-                let budget = (width as usize).saturating_sub(used + 1);
+                let reserve = if meta.is_empty() {
+                    1
+                } else {
+                    meta.chars().count() + 3
+                };
+                let budget = (width as usize).saturating_sub(used + reserve);
                 spans.push(Span::styled(
                     format!(" {}", ellipsize(&desc, budget)),
                     theme.dim_style(),
                 ));
+            }
+            if !meta.is_empty() {
+                spans.push(Span::styled(format!("  {meta}"), theme.faint_style()));
             }
             lines.push(Line::from(spans));
         }
@@ -1727,16 +1872,25 @@ fn item_lines<'a>(lines: &mut Vec<Line<'a>>, block: &'a ItemBlock, theme: &Theme
                 ]));
             }
         }
-        TurnItem::ContextCompaction { .. } => {
-            // Sim CompactRow (tui.js:3919-3924) is a gold card. The
-            // protocol item carries only the summary artifact — there are
-            // no before/after token counts to show honestly.
+        TurnItem::ContextCompaction {
+            tokens_before,
+            tokens_after,
+            ..
+        } => {
+            // Sim CompactRow (tui.js:3919-3924), gold: the additive
+            // optional token counts render the sim string exactly; items
+            // without numbers keep the honest count-free row.
+            let text = match (tokens_before, tokens_after) {
+                (Some(before), Some(after)) => format!(
+                    "⊟ compacted {} → {} · summary retained · originals stay in /tree",
+                    fmt_tok(*before),
+                    fmt_tok(*after)
+                ),
+                _ => "⊟ context compacted — summary retained · originals stay in /tree".to_owned(),
+            };
             lines.push(Line::from(vec![
                 Span::raw("  "),
-                Span::styled(
-                    "⊟ context compacted — summary retained · originals stay in /tree",
-                    theme.gold_style(),
-                ),
+                Span::styled(text, theme.gold_style()),
             ]));
         }
         TurnItem::Extension { kind, .. } => {

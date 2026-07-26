@@ -51,6 +51,15 @@ pub enum TurnItem {
     },
     ContextCompaction {
         summary_artifact: ArtifactRef,
+        /// Context footprint before compaction, in tokens. ADDITIVE +
+        /// OPTIONAL (TUI3b): the numbers are already protocol-blessed on
+        /// `NodeKind::Compaction`; carrying them on the item lets clients
+        /// render `⊟ compacted 118k → 12k` without tree access.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tokens_before: Option<u64>,
+        /// Context footprint after compaction, in tokens (see above).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tokens_after: Option<u64>,
     },
     Extension {
         kind: String,

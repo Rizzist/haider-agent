@@ -129,10 +129,21 @@ fn talk_chip_hit_covers_exactly_the_rendered_chip() {
     let chip_col = col_of(&rows[composer_y as usize], "[ ◉ talk ]");
     assert_eq!(rect.x, chip_col, "hit starts at the chip's [");
     assert_eq!(rect.width, 10, "hit spans exactly [ ◉ talk ]");
-    // Clicking it flashes the honest voice promise.
+    // Clicking it starts the 1300 ms listening hold (TUI3b §4.1 — voice
+    // ships ON): the chip flips to `◉ listening…`; the driver owns the
+    // timer.
     let mut model = model;
     model.handle_hit(Hit::TalkChip);
-    assert!(model.flash.as_deref().unwrap_or("").contains("◉ talk"));
+    assert!(model.listening, "hold started");
+    assert!(
+        model.requests.contains(&haider_tui::app::AppRequest::Talk),
+        "driver timer requested"
+    );
+    let (rows, _, _) = draw(&model, 118, 34);
+    assert!(
+        rows.iter().any(|row| row.contains("[ ◉ listening… ]")),
+        "chip shows the live hold"
+    );
 }
 
 #[test]
@@ -355,8 +366,12 @@ fn launcher_composer_is_bottom_anchored_with_the_gold_rule() {
     assert_eq!(composer_y, height - 3, "composer anchored above the bar");
     assert_eq!(buffer[(0, composer_y - 1)].fg, Color::from(theme.gold));
     assert_eq!(buffer[(0, composer_y)].bg, Color::from(theme.input_bg));
-    // The launcher shows dir + mesh (sim .dirline).
-    assert!(rows.iter().any(|row| row.contains("dir ~ · mesh off")));
+    // The launcher shows dir + mesh (sim .dirline) — the dir is the
+    // launcher's shell working dir (TUI3b §4: `cd` retargets it).
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("dir ~/dev/enterprise-suite · mesh off"))
+    );
     // Sample metadata carries turns (sim row meta); the tail ellipsizes
     // into the width instead of clipping mid-frame.
     assert!(rows.iter().any(|row| row.contains("2 turns")));

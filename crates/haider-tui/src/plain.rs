@@ -7,12 +7,13 @@ use crate::format::{METER_CELLS_DEFAULT, fmt_tok, meter_cells};
 use crate::projection::{ItemBlock, SessionProjection, TranscriptEntry};
 use haider_protocol::item::{ToolStatus, TurnItem};
 
-/// Status glyphs shared by tool and command rows (sim chip vocabulary).
+/// Status glyphs shared by tool and command rows (sim ToolRow vocabulary,
+/// tui.js:3901-3909: running `◐` · ok `✓` · err `✗`).
 #[must_use]
 pub const fn status_glyph(status: ToolStatus) -> &'static str {
     match status {
         ToolStatus::Pending => "…",
-        ToolStatus::InProgress => "◌",
+        ToolStatus::InProgress => "◐",
         ToolStatus::Completed => "✓",
         ToolStatus::Failed => "✗",
         ToolStatus::Cancelled => "⊘",
@@ -26,11 +27,18 @@ pub fn render_plain(projection: &SessionProjection, window: u64) -> String {
     let mut out = String::new();
     for entry in projection.entries() {
         match entry {
-            TranscriptEntry::User { text, attachments } => {
-                out.push_str("❯ ");
+            TranscriptEntry::User {
+                text,
+                attachments,
+                voice,
+            } => {
+                out.push_str(if *voice { "◉ " } else { "❯ " });
                 out.push_str(text);
                 if *attachments > 0 {
                     out.push_str(&format!(" [+{attachments} attachment(s)]"));
+                }
+                if *voice {
+                    out.push_str(" · spoken");
                 }
                 out.push('\n');
             }
@@ -38,6 +46,17 @@ pub fn render_plain(projection: &SessionProjection, window: u64) -> String {
             TranscriptEntry::Note { text } => {
                 out.push_str(text);
                 out.push('\n');
+            }
+            TranscriptEntry::Shell {
+                cmd,
+                out: shell_out,
+            } => {
+                out.push_str(&format!("$ {cmd}\n"));
+                for line in shell_out.split('\n') {
+                    out.push_str("  ");
+                    out.push_str(line);
+                    out.push('\n');
+                }
             }
         }
     }
@@ -151,7 +170,18 @@ fn render_item(out: &mut String, block: &ItemBlock) {
                 .count();
             out.push_str(&format!("✓ plan — {done}/{} done\n", items.len()));
         }
-        TurnItem::ContextCompaction { .. } => out.push_str("⊟ context compacted\n"),
+        TurnItem::ContextCompaction {
+            tokens_before,
+            tokens_after,
+            ..
+        } => match (tokens_before, tokens_after) {
+            (Some(before), Some(after)) => out.push_str(&format!(
+                "⊟ compacted {} → {}\n",
+                fmt_tok(*before),
+                fmt_tok(*after)
+            )),
+            _ => out.push_str("⊟ context compacted\n"),
+        },
         TurnItem::Extension { kind, .. } => out.push_str(&format!("⋯ {kind}\n")),
     }
 }
