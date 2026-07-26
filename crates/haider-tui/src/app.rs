@@ -6,7 +6,7 @@ use crate::commands::{PALETTE_MAX_ROWS, PaletteItem, has_arg_slots, palette_item
 use crate::mock::{SampleSession, sample_sessions};
 use crate::projection::SessionProjection;
 use crate::sanctum::SanctumTier;
-use crate::script::TALK_PHRASE;
+use crate::script::{AuraState, ChipDisplayState, ChipPrefill, ChipSeed, TALK_PHRASE};
 use crate::theme::ThemeKey;
 use haider_protocol::ids::MenuId;
 use haider_protocol::menu::{
@@ -190,12 +190,359 @@ pub fn run_shell(
     }
 }
 
-/// Which screen is showing (sim: boot | main | session).
+/// Which screen is showing (sim: boot | main | session | sub | aura).
+/// The subagent view's target chip lives in [`AppModel::view_path`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Screen {
     Boot,
     Launcher,
     Session,
+    Subagent,
+    Aura,
+}
+
+/// A chip's pending question (the amber `?` / recovery `⌁`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChipQuestion {
+    pub recovery: bool,
+    pub text: String,
+    pub options: Vec<String>,
+    pub resolved: bool,
+}
+
+/// One subagent chip — the sim's recursive tree node (§2). Each chip owns
+/// its own [`SessionProjection`]: "a child is the same object".
+#[derive(Debug)]
+pub struct ChipModel {
+    pub agent: String,
+    pub callsign: String,
+    pub hon: &'static str,
+    pub full: String,
+    pub name: String,
+    pub model: String,
+    pub device: String,
+    pub state: ChipDisplayState,
+    pub tokens: u64,
+    pub question: Option<ChipQuestion>,
+    pub closed: bool,
+    pub removing: bool,
+    pub children: Vec<ChipModel>,
+    pub transcript: SessionProjection,
+}
+
+impl ChipModel {
+    #[must_use]
+    pub fn from_seed(seed: ChipSeed) -> Self {
+        let mut transcript = SessionProjection::new();
+        for prefill in &seed.prefill {
+            match prefill {
+                ChipPrefill::Note(text) => transcript.push_note(text.clone()),
+                ChipPrefill::Agent(text) => {
+                    transcript.apply(&EventPayload::Item(
+                        haider_protocol::item::ItemEvent::Completed {
+                            item_id: haider_protocol::ids::ItemId::new(format!(
+                                "{}-seed-a",
+                                seed.agent
+                            )),
+                            item: haider_protocol::item::TurnItem::AgentMessage {
+                                text: text.clone(),
+                            },
+                        },
+                    ));
+                }
+                ChipPrefill::ToolOk { name, desc, meta } => {
+                    transcript.apply(&EventPayload::Item(
+                        haider_protocol::item::ItemEvent::Completed {
+                            item_id: haider_protocol::ids::ItemId::new(format!(
+                                "{}-seed-t",
+                                seed.agent
+                            )),
+                            item: haider_protocol::item::TurnItem::ToolCall {
+                                call_id: format!("{}-seed-t", seed.agent),
+                                name: name.clone(),
+                                args: serde_json::json!({ "desc": desc, "meta": meta }),
+                                status: haider_protocol::item::ToolStatus::Completed,
+                            },
+                        },
+                    ));
+                }
+            }
+        }
+        Self {
+            agent: seed.agent,
+            callsign: seed.callsign,
+            hon: seed.hon,
+            full: seed.full,
+            name: seed.name,
+            model: seed.model,
+            device: seed.device,
+            state: seed.state,
+            tokens: seed.tokens,
+            question: None,
+            closed: false,
+            removing: false,
+            children: Vec::new(),
+            transcript,
+        }
+    }
+
+    /// The chip's question card, per the sim's `chipMenu` gate
+    /// (tui.js:2360-2364): open only while the chip is `input_required`/
+    /// `error` AND holds an UNRESOLVED question. A closed chip has its
+    /// question force-resolved, so its view shows the composer again even
+    /// though the protocol Menu in its projection is still open.
+    #[must_use]
+    pub fn question_menu(&self) -> Option<&Menu> {
+        if self.closed
+            || !matches!(
+                self.state,
+                ChipDisplayState::InputRequired | ChipDisplayState::Error
+            )
+            || self.question.as_ref().is_none_or(|q| q.resolved)
+        {
+            return None;
+        }
+        self.transcript.open_menu()
+    }
+
+    /// `chipIsLive` (tui.js:286): not closed, state ∉ {done, error}.
+    #[must_use]
+    pub fn is_live(&self) -> bool {
+        !self.closed && !matches!(self.state, ChipDisplayState::Done | ChipDisplayState::Error)
+    }
+
+    /// `chipDisplayState` (tui.js:2810-2811): a live chip that is NOT
+    /// input_required with a live descendant displays `waiting`.
+    #[must_use]
+    pub fn display_state(&self) -> ChipDisplayState {
+        if self.is_live()
+            && self.state != ChipDisplayState::InputRequired
+            && tree_live_count(&self.children) > 0
+        {
+            ChipDisplayState::Waiting
+        } else {
+            self.state
+        }
+    }
+
+    /// `chipActivity` (tui.js:2825-2833), truncated at 52 chars + `…`.
+    #[must_use]
+    pub fn activity(&self) -> String {
+        if self.closed {
+            return "closing · leaves in 5s".to_owned();
+        }
+        if self.state == ChipDisplayState::InputRequired
+            && let Some(question) = &self.question
+            && !question.resolved
+        {
+            return truncate_activity(&question.text);
+        }
+        let live_children = tree_live_count(&self.children);
+        if self.display_state() == ChipDisplayState::Waiting && live_children > 0 {
+            let plural = if live_children > 1 {
+                "children"
+            } else {
+                "child"
+            };
+            return format!("waiting on {live_children} {plural}");
+        }
+        if self.state == ChipDisplayState::Done {
+            return "report ready".to_owned();
+        }
+        if self.state == ChipDisplayState::Thinking {
+            return "thinking…".to_owned();
+        }
+        // Sim: NO entries → `starting…`; an entry with empty text → `…`
+        // (tui.js:2377-2380).
+        let last = self.transcript.entries().last().map(|entry| match entry {
+            crate::projection::TranscriptEntry::Item(block) => match &block.item {
+                haider_protocol::item::TurnItem::ToolCall { name, args, .. } => {
+                    let desc = args
+                        .get("desc")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+                    format!("{name} {desc}")
+                }
+                haider_protocol::item::TurnItem::AgentMessage { text } => text.clone(),
+                _ => String::new(),
+            },
+            crate::projection::TranscriptEntry::User { text, .. } => text.clone(),
+            crate::projection::TranscriptEntry::Note { text } => text.clone(),
+            crate::projection::TranscriptEntry::Shell { cmd, .. } => format!("$ {cmd}"),
+        });
+        match last {
+            Some(text) if text.is_empty() => "…".to_owned(),
+            Some(text) => truncate_activity(&text),
+            None => "starting…".to_owned(),
+        }
+    }
+}
+
+fn truncate_activity(text: &str) -> String {
+    if text.chars().count() > 52 {
+        format!("{}…", text.chars().take(52).collect::<String>())
+    } else {
+        text.to_owned()
+    }
+}
+
+/// `treeLiveCount` (tui.js:286-329): live chips, recursively.
+#[must_use]
+pub fn tree_live_count(chips: &[ChipModel]) -> usize {
+    chips
+        .iter()
+        .map(|chip| usize::from(chip.is_live()) + tree_live_count(&chip.children))
+        .sum()
+}
+
+/// Find a chip anywhere in the tree.
+#[must_use]
+pub fn find_chip<'t>(chips: &'t [ChipModel], agent: &str) -> Option<&'t ChipModel> {
+    for chip in chips {
+        if chip.agent == agent {
+            return Some(chip);
+        }
+        if let Some(found) = find_chip(&chip.children, agent) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+pub fn find_chip_mut<'t>(chips: &'t mut [ChipModel], agent: &str) -> Option<&'t mut ChipModel> {
+    for chip in chips {
+        if chip.agent == agent {
+            return Some(chip);
+        }
+        if let Some(found) = find_chip_mut(&mut chip.children, agent) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// The root→chip path (breadcrumb + view addressing).
+#[must_use]
+pub fn path_to_chip(chips: &[ChipModel], agent: &str) -> Option<Vec<String>> {
+    for chip in chips {
+        if chip.agent == agent {
+            return Some(vec![chip.agent.clone()]);
+        }
+        if let Some(mut path) = path_to_chip(&chip.children, agent) {
+            path.insert(0, chip.agent.clone());
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// Remove a chip (and its subtree) wherever it sits.
+pub fn remove_chip(chips: &mut Vec<ChipModel>, agent: &str) -> bool {
+    if let Some(index) = chips.iter().position(|chip| chip.agent == agent) {
+        chips.remove(index);
+        return true;
+    }
+    chips
+        .iter_mut()
+        .any(|chip| remove_chip(&mut chip.children, agent))
+}
+
+/// Depth-first flatten with depth (the SubTree rows).
+#[must_use]
+pub fn flatten_chips(chips: &[ChipModel]) -> Vec<(usize, &ChipModel)> {
+    let mut rows = Vec::new();
+    fn walk<'t>(chips: &'t [ChipModel], depth: usize, rows: &mut Vec<(usize, &'t ChipModel)>) {
+        for chip in chips {
+            rows.push((depth, chip));
+            walk(&chip.children, depth + 1, rows);
+        }
+    }
+    walk(chips, 0, &mut rows);
+    rows
+}
+
+/// One controlled-session row on the aura stage.
+#[derive(Debug, Clone)]
+pub struct AuraAgentRow {
+    pub name: String,
+    pub device: String,
+    pub state: ChipDisplayState,
+    pub activity: String,
+}
+
+/// The aura orchestrator surface (§3 — demo-local; sim seedVoiceSession,
+/// tui.js:121-138). Exiting the screen does NOT reset this state.
+#[derive(Debug)]
+pub struct AuraModel {
+    /// true = gpt-realtime (native duplex); false = composed STT·LLM·TTS.
+    pub realtime: bool,
+    pub muted: bool,
+    pub state: AuraState,
+    pub roster: Vec<AuraAgentRow>,
+    pub log: Vec<String>,
+    pub transcript: SessionProjection,
+    /// Per-run counter for unique stream item ids.
+    pub runs: u64,
+}
+
+impl AuraModel {
+    #[must_use]
+    pub fn seed() -> Self {
+        let mut transcript = SessionProjection::new();
+        transcript.set_voice_live(true);
+        transcript.apply(&EventPayload::Item(
+            haider_protocol::item::ItemEvent::Completed {
+                item_id: haider_protocol::ids::ItemId::new("aura-seed"),
+                item: haider_protocol::item::TurnItem::AgentMessage {
+                    text: "Aura online. I orchestrate sessions across your devices — I don't write code myself. Say or type what to spin up.".to_owned(),
+                },
+            },
+        ));
+        transcript.set_voice_live(false);
+        Self {
+            realtime: true,
+            muted: false,
+            state: AuraState::Idle,
+            roster: vec![AuraAgentRow {
+                name: "billing-service".to_owned(),
+                device: "workstation".to_owned(),
+                state: ChipDisplayState::Done,
+                activity: "webhook tests green".to_owned(),
+            }],
+            log: vec![
+                "spawned billing-service on workstation".to_owned(),
+                "ran cargo test -p billing — 216 passed".to_owned(),
+            ],
+            transcript,
+            runs: 0,
+        }
+    }
+
+    /// `VOICE_ENGINES[engine].label` (tui.js:121-138).
+    #[must_use]
+    pub const fn engine_label(&self) -> &'static str {
+        if self.realtime {
+            "gpt-realtime-2"
+        } else {
+            "whisper → gpt-5.6 → openai"
+        }
+    }
+
+    /// `VOICE_ENGINES[engine].kind`.
+    #[must_use]
+    pub const fn engine_kind(&self) -> &'static str {
+        if self.realtime {
+            "native duplex"
+        } else {
+            "STT·LLM·TTS"
+        }
+    }
+}
+
+impl Default for AuraModel {
+    fn default() -> Self {
+        Self::seed()
+    }
 }
 
 /// Side effects the reducer requests from the runtime (the reducer itself
@@ -221,6 +568,18 @@ pub enum AppRequest {
     Compact,
     /// The ◉ talk hold started — fire the canned phrase after 1300 ms.
     Talk,
+    /// Steer/message a subagent (respondChip, §2.4) — a full turn on the
+    /// CHIP's state machine.
+    ChipSubmit { agent: String, text: String },
+    /// Close a chip (✕ / the docs-recovery close arm): lifecycle flags are
+    /// the reducer's; the driver owns the 5 s removal + resume timers.
+    ChipClose { agent: String },
+    /// Run an aura orchestrate turn (§3.4).
+    AuraSubmit { text: String, voice: bool },
+    /// The aura hold-to-talk: 1100 ms listening, then the canned phrase.
+    AuraTalk,
+    /// `/reset` reseeded the aura — bump its script guard.
+    ResetAura,
     /// Quit the app.
     Quit,
 }
@@ -280,6 +639,21 @@ pub enum Hit {
     BackChip,
     TalkChip,
     HelpHint,
+    /// A SubTree row — opens the chip's own view.
+    ChipRow(String),
+    /// The SubTree header (collapse toggle).
+    SubTreeToggle,
+    /// `⌂ {session} — back to the main transcript` (subagent screen).
+    SessionHome,
+    /// The chip view's `✕ close`.
+    ChipCloseBtn(String),
+    /// A breadcrumb hop in the chip view (session root = empty path).
+    ChipCrumb(Vec<String>),
+    /// Aura stage chrome.
+    AuraEngine,
+    AuraMute,
+    AuraExit,
+    AuraTalkBtn,
     /// The sticky origin line — carries the scroll-back that puts the
     /// producing prompt's first row at the viewport top (sim jumpToSticky:
     /// stay AT the prompt, tui.js:2637-2645).
@@ -356,6 +730,16 @@ pub struct AppModel {
     pub vfs: BTreeMap<String, Vec<String>>,
     /// The launcher's `.shellout` block: last builtin (cmd, output).
     pub launcher_shellout: Option<(String, String)>,
+    /// The session's subagent chip tree (§2 — demo-local).
+    pub chips: Vec<ChipModel>,
+    /// The chip path the subagent screen is viewing (breadcrumb).
+    pub view_path: Vec<String>,
+    /// The SubTree header collapse toggle (`▾`/`▸ subagents`).
+    pub subtree_collapsed: bool,
+    /// An auto-resume turn is in flight (§2.7 guard).
+    pub auto_resuming: bool,
+    /// The aura orchestrator surface (persists across screen exits).
+    pub aura: AuraModel,
     /// Launcher sample rows (sim seeds; display-only until the daemon).
     pub samples: Vec<SampleSession>,
     /// Selected option index while a blocking menu replaces the composer.
@@ -430,6 +814,11 @@ impl Default for AppModel {
             session_dir: "~/dev/enterprise-suite".to_owned(),
             vfs: vfs_seed(),
             launcher_shellout: None,
+            chips: Vec::new(),
+            view_path: Vec::new(),
+            subtree_collapsed: false,
+            auto_resuming: false,
+            aura: AuraModel::seed(),
             samples: sample_sessions(),
             menu_selection: 0,
             palette_selection: 0,
@@ -470,7 +859,7 @@ impl AppModel {
         match self.screen {
             Screen::Boot => "haider — starting".to_owned(),
             Screen::Launcher => "haider — launcher".to_owned(),
-            Screen::Session => {
+            Screen::Session | Screen::Subagent | Screen::Aura => {
                 // Strip control characters: user text must never smuggle
                 // escape sequences into OSC 2 (review r1 P1).
                 let title: String = self
@@ -478,9 +867,42 @@ impl AppModel {
                     .chars()
                     .filter(|c| !c.is_control())
                     .collect();
-                format!("haider — {title} · {}", self.identity.device)
+                let suffix = if self.screen == Screen::Aura {
+                    " · aura"
+                } else {
+                    ""
+                };
+                format!("haider — {title} · {}{suffix}", self.identity.device)
             }
         }
+    }
+
+    /// The chip the subagent screen is viewing.
+    #[must_use]
+    pub fn viewed_chip(&self) -> Option<&ChipModel> {
+        self.view_path
+            .last()
+            .and_then(|agent| find_chip(&self.chips, agent))
+    }
+
+    /// The status-bar badge with the DERIVED `◔ WAITING · N subagent(s)`
+    /// overlay (§2.6): an idle session with live chips waits — display
+    /// only, never a synthesized envelope. Interrupted idle (`⏸ IDLE (i)`)
+    /// is respected, not overwritten.
+    #[must_use]
+    pub fn status_badge(&self) -> (String, crate::projection::BadgeTone) {
+        let badge = self.projection.badge();
+        if badge == "IDLE" {
+            let live = tree_live_count(&self.chips);
+            if live > 0 {
+                let plural = if live > 1 { "s" } else { "" };
+                return (
+                    format!("◔ WAITING · {live} subagent{plural}"),
+                    crate::projection::BadgeTone::Restful,
+                );
+            }
+        }
+        (badge, self.projection.badge_tone())
     }
 
     /// The palette is open while the composer is a single-line slash query,
@@ -496,8 +918,15 @@ impl AppModel {
         {
             return false;
         }
-        // A blocking menu REPLACES the composer, palette included.
-        !(self.screen == Screen::Session && self.projection.open_menu().is_some())
+        // A menu REPLACES the composer, palette included — the session's
+        // card on the session screen, the chip's question in its view.
+        if self.screen == Screen::Session && self.projection.open_menu().is_some() {
+            return false;
+        }
+        !(self.screen == Screen::Subagent
+            && self
+                .viewed_chip()
+                .is_some_and(|chip| chip.question_menu().is_some()))
     }
 
     /// Current palette rows (commands, or `/theme`'s argument slot) for
@@ -506,7 +935,10 @@ impl AppModel {
     pub fn palette_items(&self) -> Vec<PaletteItem> {
         palette_items(
             self.composer.trim_start_matches('/'),
-            self.screen == Screen::Session,
+            matches!(
+                self.screen,
+                Screen::Session | Screen::Subagent | Screen::Aura
+            ),
         )
     }
 
@@ -621,6 +1053,28 @@ impl AppModel {
             if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
                 self.help_open = false;
             }
+            return;
+        }
+        // Subagent view (§2.10): esc ALWAYS walks back to the session (the
+        // parent is not blocked); the chip's question menu replaces the
+        // chip view's composer.
+        if self.screen == Screen::Subagent {
+            if key.code == KeyCode::Esc {
+                self.screen = Screen::Session;
+                return;
+            }
+            if self
+                .viewed_chip()
+                .is_some_and(|chip| chip.question_menu().is_some())
+            {
+                self.handle_chip_menu_key(key.code);
+                return;
+            }
+        }
+        // Aura (§3.1): esc exits to the session if one is attached, else
+        // the launcher; exiting never resets aura state.
+        if self.screen == Screen::Aura && key.code == KeyCode::Esc {
+            self.exit_aura();
             return;
         }
         // A blocking menu REPLACES the composer (sim §3 law).
@@ -778,11 +1232,29 @@ impl AppModel {
             self.execute_slash();
             return;
         }
+        // §4 step 3: on the aura screen non-slash text drives orchestrate
+        // ONLY while the aura is idle (otherwise silently dropped).
+        if self.screen == Screen::Aura {
+            if self.aura.state == AuraState::Idle {
+                self.aura_submit(text, false);
+            }
+            return;
+        }
         // Shell builtins run against the VFS — local, instant, NO model
-        // turn (sim tui.js:1993-2008) — and never start a session.
+        // turn (sim tui.js:1993-2008) — never on the subagent screen, and
+        // they never start a session.
         let first_word = text.split_whitespace().next().unwrap_or("");
-        if SHELL_CMDS.contains(&first_word.to_ascii_lowercase().as_str()) {
+        if self.screen != Screen::Subagent
+            && SHELL_CMDS.contains(&first_word.to_ascii_lowercase().as_str())
+        {
             self.run_shell_line(&text);
+            return;
+        }
+        // §4 step 6: the subagent screen steers ITS chip (respondChip).
+        if self.screen == Screen::Subagent {
+            if let Some(agent) = self.view_path.last().cloned() {
+                self.requests.push(AppRequest::ChipSubmit { agent, text });
+            }
             return;
         }
         // Mid-turn input (sim tui.js:2027-2038): queue mode holds it for
@@ -885,6 +1357,112 @@ impl AppModel {
             return;
         }
         self.submit_voice(TALK_PHRASE.to_owned());
+    }
+
+    /// An aura orchestrate turn: user row + driver request (§3.4).
+    fn aura_submit(&mut self, text: String, voice: bool) {
+        if voice {
+            self.aura.transcript.push_user_voice(text.clone());
+        } else {
+            self.aura.transcript.apply(&EventPayload::UserMessage {
+                text: text.clone(),
+                attachments: vec![],
+                mode: DeliveryMode::Steer,
+            });
+        }
+        self.aura.runs += 1;
+        self.requests.push(AppRequest::AuraSubmit { text, voice });
+    }
+
+    /// The aura talk hold finished (driver timer, tui.js:2128-2132).
+    pub fn aura_talk_fire(&mut self) {
+        self.dirty = true;
+        self.aura_submit(crate::script::AURA_TALK_PHRASE.to_owned(), true);
+    }
+
+    /// Esc from the aura stage: back to the session if one is attached,
+    /// else the launcher — aura state persists either way.
+    fn exit_aura(&mut self) {
+        self.screen = if self.projection.entries().is_empty() && self.session_name.is_none() {
+            Screen::Launcher
+        } else {
+            Screen::Session
+        };
+    }
+
+    /// Chip close lifecycle flags (§2.5) — the DRIVER owns the 5 s removal
+    /// timer and the resume check; returns whether the chip WAS live
+    /// (closing the last live child discharges the wait).
+    pub fn close_chip_state(&mut self, agent: &str) -> Option<bool> {
+        let chip = find_chip_mut(&mut self.chips, agent)?;
+        if chip.closed {
+            return None;
+        }
+        let was_live = chip.is_live();
+        chip.closed = true;
+        chip.removing = true;
+        if let Some(question) = &mut chip.question {
+            question.resolved = true;
+        }
+        let note = format!(
+            "· subagent {} {} closed — leaving the tree in 5s",
+            chip.callsign, chip.hon
+        );
+        self.projection.push_note(note);
+        // Sim closeChip (tui.js:1176-1178): the screen ALWAYS returns to the
+        // session, but the remembered view path only clears when the CLOSED
+        // chip is the one being viewed (`viewChipId === chipId ? null : v`).
+        self.screen = Screen::Session;
+        if self.view_path.last().is_some_and(|last| last == agent) {
+            self.view_path.clear();
+        }
+        self.dirty = true;
+        Some(was_live)
+    }
+
+    /// Keys while the viewed chip's question menu replaces its composer
+    /// (§2.10): digits/arrows/enter answer; the parent is never blocked.
+    fn handle_chip_menu_key(&mut self, code: KeyCode) {
+        let Some(menu) = self
+            .viewed_chip()
+            .and_then(ChipModel::question_menu)
+            .cloned()
+        else {
+            return;
+        };
+        let option_count = menu.options.len();
+        match code {
+            KeyCode::Up if option_count > 0 => {
+                self.menu_selection =
+                    (self.menu_selection.min(option_count - 1) + option_count - 1) % option_count;
+            }
+            KeyCode::Down if option_count > 0 => {
+                self.menu_selection = (self.menu_selection + 1) % option_count;
+            }
+            KeyCode::Char(c @ '1'..='9') => {
+                let index = (c as usize) - ('1' as usize);
+                if index < option_count {
+                    self.menu_selection = index;
+                    self.answer_chip_menu(&menu);
+                }
+            }
+            KeyCode::Enter => self.answer_chip_menu(&menu),
+            _ => {}
+        }
+    }
+
+    fn answer_chip_menu(&mut self, menu: &Menu) {
+        let Some(option) = menu.options.get(self.menu_selection) else {
+            return;
+        };
+        self.outbox.push(MenuAnswer {
+            menu: menu.id.clone(),
+            option_key: Some(option.key.clone()),
+            option_index: u32::try_from(self.menu_selection).unwrap_or(u32::MAX),
+            value: None,
+            via: AnswerVia::Tui,
+        });
+        self.menu_selection = 0;
     }
 
     /// Keep the palette selection inside the visible window (sim CmdMenu
@@ -992,10 +1570,13 @@ impl AppModel {
             "reset" => {
                 self.fresh_session();
                 self.samples = sample_sessions();
+                self.aura = AuraModel::seed();
+                self.requests.push(AppRequest::ResetAura);
                 self.screen = Screen::Launcher;
                 self.flash = Some("· demo reset".to_owned());
             }
             "quit" | "exit" => self.requests.push(AppRequest::Quit),
+            "aura" => self.screen = Screen::Aura,
             "compact" => {
                 // Manual compaction (sim tui.js:1791-1806). Adapted gate:
                 // the sim's single-threaded state writes tolerate /compact
@@ -1088,7 +1669,6 @@ impl AppModel {
                     "sessions" | "tree" | "fork" | "rename" | "tokens" => {
                         Some("the daemon wave (W3)")
                     }
-                    "aura" => Some("the aura wave (TUI3b commit 2)"),
                     "peers" => Some("the mesh wave (post-v0.1)"),
                     "hooks" | "update" => Some("the gates wave (W4)"),
                     _ => None,
@@ -1176,11 +1756,23 @@ impl AppModel {
             && state.is_terminal()
         {
             self.turn_active = false;
+            self.auto_resuming = false;
         }
         if matches!(payload, EventPayload::MenuOpened(_)) {
             self.menu_selection = 0;
         }
         self.projection.apply(payload);
+        // Chip questions are Subagent-scoped menus living in the CHIP's
+        // projection — an answer closes the matching chip card too.
+        if matches!(payload, EventPayload::MenuAnswered(_)) {
+            fn route(chips: &mut [ChipModel], payload: &EventPayload) {
+                for chip in chips {
+                    chip.transcript.apply(payload);
+                    route(&mut chip.children, payload);
+                }
+            }
+            route(&mut self.chips, payload);
+        }
         // Command-card consequences (sim /voice + /tools, tui.js:1824-1906)
         // apply AFTER the answer closed the card.
         if let EventPayload::MenuAnswered(answer) = payload {
@@ -1261,6 +1853,10 @@ impl AppModel {
         self.voice = VoiceState::default();
         self.listening = false;
         self.session_dir = self.launcher_dir.clone();
+        self.chips.clear();
+        self.view_path.clear();
+        self.subtree_collapsed = false;
+        self.auto_resuming = false;
         self.scroll_back.set(0);
         self.scroll_max.set(0);
         self.sticky_suppressed = false;
@@ -1301,14 +1897,20 @@ impl AppModel {
         }
         match hit {
             Hit::AttachSample(index) => self.attach_sample(index),
-            Hit::ExtraRow(which) => {
-                let (name, wave) = match which {
-                    0 => ("aura", "the voice wave (post-v0.1)"),
-                    1 => ("accounts", "the account switchboard (W3)"),
-                    _ => ("peers", "the mesh wave (post-v0.1)"),
-                };
-                self.flash = Some(format!("· /{name} — UI ready; lands with {wave}"));
-            }
+            Hit::ExtraRow(which) => match which {
+                0 => self.screen = Screen::Aura,
+                1 => {
+                    self.flash = Some(
+                        "· /accounts — UI ready; lands with the account switchboard (W3)"
+                            .to_owned(),
+                    );
+                }
+                _ => {
+                    self.flash = Some(
+                        "· /peers — UI ready; lands with the mesh wave (post-v0.1)".to_owned(),
+                    );
+                }
+            },
             Hit::PaletteRow(item) => {
                 // Dismissed/replaced palettes drop the click.
                 if self.palette_open() {
@@ -1342,6 +1944,58 @@ impl AppModel {
                 }
             }
             Hit::HelpHint => self.help_open = true,
+            Hit::ChipRow(agent) => {
+                if let Some(path) = path_to_chip(&self.chips, &agent) {
+                    self.view_path = path;
+                    self.screen = Screen::Subagent;
+                    self.menu_selection = 0;
+                    self.scroll_back.set(0);
+                }
+            }
+            Hit::SubTreeToggle => self.subtree_collapsed = !self.subtree_collapsed,
+            Hit::SessionHome => {
+                self.screen = Screen::Session;
+                self.scroll_back.set(0);
+            }
+            Hit::ChipCloseBtn(agent) => {
+                self.requests.push(AppRequest::ChipClose { agent });
+            }
+            Hit::ChipCrumb(path) => {
+                if path.is_empty() {
+                    self.screen = Screen::Session;
+                } else if path
+                    .last()
+                    .is_some_and(|agent| find_chip(&self.chips, agent).is_some())
+                {
+                    self.view_path = path;
+                    self.screen = Screen::Subagent;
+                }
+            }
+            Hit::AuraEngine => {
+                self.aura.realtime = !self.aura.realtime;
+                let label = self.aura.engine_label();
+                self.aura
+                    .transcript
+                    .push_note(format!("· engine hot-swapped → {label} · dialogue kept"));
+            }
+            Hit::AuraMute => {
+                self.aura.muted = !self.aura.muted;
+                self.aura.transcript.push_note(
+                    if self.aura.muted {
+                        "· audio output muted — orchestrating silently, activity still shown"
+                    } else {
+                        "· audio output on"
+                    }
+                    .to_owned(),
+                );
+            }
+            Hit::AuraExit => self.exit_aura(),
+            Hit::AuraTalkBtn => {
+                if self.aura.state == AuraState::Idle {
+                    self.aura.state = AuraState::Listening;
+                    self.requests.push(AppRequest::AuraTalk);
+                }
+            }
             Hit::StickyJump(scroll_back) => {
                 // Stay AT the producing prompt, and suppress the sticky
                 // until the next REAL wheel (sim jumpToSticky: "the bar is
@@ -1361,7 +2015,7 @@ impl AppModel {
     /// the view. The frame's own reconcile stays as the backstop (sim
     /// reads live DOM geometry, tui.js:2648).
     pub fn handle_wheel(&mut self, up: bool) {
-        if self.screen != Screen::Session || self.help_open {
+        if !matches!(self.screen, Screen::Session | Screen::Subagent) || self.help_open {
             return;
         }
         self.dirty = true;

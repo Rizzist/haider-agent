@@ -33,10 +33,69 @@ pub enum DemoEvent {
     TurnEnd,
     /// The ◉ talk hold finished — submit the canned voice phrase.
     TalkFire,
+    // ---- Chip events (§2), tagged with the CHIP guard's generation ----
+    ChipAdd(Box<ChipSeed>),
+    ChipState {
+        agent: String,
+        state: ChipDisplayState,
+    },
+    ChipEmit {
+        agent: String,
+        payload: EventPayload,
+    },
+    ChipNote {
+        agent: String,
+        text: String,
+    },
+    ChipTokens {
+        agent: String,
+        n: u64,
+    },
+    ChipQuestion {
+        agent: String,
+        recovery: bool,
+        text: String,
+        options: Vec<String>,
+    },
+    ChipResolve {
+        agent: String,
+        state: ChipDisplayState,
+    },
+    ChipQuestionClear {
+        agent: String,
+        state: ChipDisplayState,
+    },
+    /// Run the close lifecycle (script arm / ✕ both land here).
+    ChipCloseReq {
+        agent: String,
+    },
+    /// The 5 s removal timer fired.
+    ChipRemove {
+        agent: String,
+    },
+    /// The 120 ms autoResumeParent defer fired — check the §2.7 guards.
+    AutoResume,
+    // ---- Aura events (§3), tagged with the AURA guard's generation ----
+    AuraState(AuraState),
+    AuraEmit(EventPayload),
+    AuraNote(String),
+    AuraVoice(bool),
+    AuraRosterPush {
+        name: String,
+        device: String,
+    },
+    AuraRosterPatch {
+        name: String,
+        state: Option<ChipDisplayState>,
+        activity: String,
+    },
+    AuraLog(String),
+    /// The aura hold-to-talk fired the canned phrase.
+    AuraTalkFire,
 }
 
 /// One script beat (sim beats: state writes, sleeps, streams, tools,
-/// notes, menu parks).
+/// notes, menu parks, chip and aura operations).
 ///
 /// `large_enum_variant` allowed deliberately: `Emit` dominates every
 /// script (one per delta token), so boxing the payload would pessimize
@@ -62,11 +121,221 @@ pub enum Beat {
         arms: Vec<Vec<Beat>>,
     },
     TurnEnd,
+    // ---- Subagent chips (§2 — demo-local tree; keys are opaque ids) ----
+    /// Add a chip to the tree (under `seed.parent` when nested).
+    ChipAdd(Box<ChipSeed>),
+    /// Set a chip's display state (sim 9-state vocabulary).
+    ChipState {
+        agent: String,
+        state: ChipDisplayState,
+    },
+    /// Route an ordinary envelope into the CHIP's own projection —
+    /// "a child is the same object" (chip streams/tools/user rows/menus).
+    ChipEmit {
+        agent: String,
+        payload: EventPayload,
+    },
+    /// A note row inside the chip's transcript.
+    ChipNote {
+        agent: String,
+        text: String,
+    },
+    /// Chip token accrual (+8/char at stream END, +1800/tool — chipOps).
+    ChipTokens {
+        agent: String,
+        n: u64,
+    },
+    /// Set the chip's pending question (the amber `?` / recovery `⌁`) AND
+    /// its state in ONE patch — the sim writes both in a single `mutChip`
+    /// (tui.js:925-933 tests, 948-956 docs), and `respondChip`'s
+    /// steer-queue gate reads exactly that pair (tui.js:1105): an observer
+    /// must never catch `input_required` without its question. `recovery`
+    /// selects the state the sim pairs with each card: `error` for the `⌁`
+    /// recovery card, `input_required` for the amber `?`.
+    ChipQuestion {
+        agent: String,
+        recovery: bool,
+        text: String,
+        options: Vec<String>,
+    },
+    /// Resolve the chip's question AND set its state in one patch (sim
+    /// `answerChip`'s single `mutChip`, tui.js:1043-1064).
+    ChipResolve {
+        agent: String,
+        state: ChipDisplayState,
+    },
+    /// Clear the chip's question AND set its state in one patch (sim
+    /// respondChip step 3: `{ state: "thinking", question: null }`,
+    /// tui.js:1108).
+    ChipQuestionClear {
+        agent: String,
+        state: ChipDisplayState,
+    },
+    /// Run the close lifecycle on a chip (flags + 5 s removal + resume).
+    ChipClose {
+        agent: String,
+    },
+    /// Play a concurrent child script (childRunTests/Docs, nested child) —
+    /// the parent beat stream continues immediately.
+    ChipScript(Vec<Beat>),
+    /// Sim `autoResumeParent` (§2.7): a 120 ms deferred, guard-checked
+    /// resume of the parked parent turn.
+    AutoResume,
+    // ---- Aura (§3 — demo-local orchestrator surface) ----
+    AuraState(AuraState),
+    /// Route an envelope into the aura transcript (16 ms streams).
+    AuraEmit(EventPayload),
+    AuraNote(String),
+    /// Spoken tag for aura agent rows (`■ aura · ♪`).
+    AuraVoice(bool),
+    AuraRosterPush {
+        name: String,
+        device: String,
+    },
+    AuraRosterPatch {
+        name: String,
+        state: Option<ChipDisplayState>,
+        activity: String,
+    },
+    AuraLog(String),
+}
+
+/// Sim chip display states (tui.js:332-342) — the protocol `ChipState`
+/// lacks `Running`, so the demo keeps the sim's 9-state vocabulary
+/// display-local (spec §2.8 recommendation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChipDisplayState {
+    Idle,
+    Thinking,
+    Streaming,
+    Running,
+    Tool,
+    InputRequired,
+    Waiting,
+    Done,
+    Error,
+}
+
+impl ChipDisplayState {
+    /// `CHIP_GLYPH` (tui.js:332-342); closed chips render `⊘` everywhere.
+    #[must_use]
+    pub const fn glyph(self) -> &'static str {
+        match self {
+            Self::Idle => "○",
+            Self::Thinking => "●",
+            Self::Streaming => "▮",
+            Self::Running => "◐",
+            Self::Tool => "⚒",
+            Self::InputRequired => "?",
+            Self::Waiting => "◔",
+            Self::Done => "✓",
+            Self::Error => "✗",
+        }
+    }
+
+    /// Uppercase label for the chip-view state badge.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Idle => "IDLE",
+            Self::Thinking => "THINKING",
+            Self::Streaming => "STREAMING",
+            Self::Running => "RUNNING",
+            Self::Tool => "TOOL",
+            Self::InputRequired => "INPUT_REQUIRED",
+            Self::Waiting => "WAITING",
+            Self::Done => "DONE",
+            Self::Error => "ERROR",
+        }
+    }
+}
+
+/// A chip's seed data (sim chip literal): identity + display fields +
+/// pre-filled transcript rows (§1.4's pre-seeded auth chip).
+#[derive(Debug, Clone)]
+pub struct ChipSeed {
+    pub agent: String,
+    pub parent: Option<String>,
+    pub callsign: String,
+    pub hon: &'static str,
+    pub full: String,
+    pub name: String,
+    pub model: String,
+    pub device: String,
+    pub state: ChipDisplayState,
+    pub tokens: u64,
+    pub prefill: Vec<ChipPrefill>,
+}
+
+/// One pre-filled chip transcript row.
+#[derive(Debug, Clone)]
+pub enum ChipPrefill {
+    Note(String),
+    Agent(String),
+    ToolOk {
+        name: String,
+        desc: String,
+        meta: String,
+    },
+}
+
+/// Sim aura orb states (tui.js:121-138).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuraState {
+    Idle,
+    Listening,
+    Thinking,
+    Orchestrating,
+    Speaking,
+}
+
+impl AuraState {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Idle => "IDLE",
+            Self::Listening => "LISTENING",
+            Self::Thinking => "THINKING",
+            Self::Orchestrating => "ORCHESTRATING",
+            Self::Speaking => "SPEAKING",
+        }
+    }
+
+    /// Orb stand-in glyph (a terminal cell cannot animate the sim's CSS
+    /// orb — approximated per state, documented divergence).
+    #[must_use]
+    pub const fn orb(self) -> &'static str {
+        match self {
+            Self::Idle => "◌",
+            Self::Listening => "◉",
+            Self::Thinking => "●",
+            Self::Orchestrating => "◎",
+            Self::Speaking => "◍",
+        }
+    }
 }
 
 /// Sim timing constants (tui.js — see the per-beat tables in the spec).
 pub const THINK_MS: u64 = 750;
 pub const STREAM_MS: u64 = 22;
+/// Chip streams pace at 18 ms/word (chipOps, tui.js:898-915).
+pub const CHIP_STREAM_MS: u64 = 18;
+/// Aura streams pace at 16 ms/word (tui.js:2058).
+pub const AURA_STREAM_MS: u64 = 16;
+/// The auto-resume stream paces at 20 ms/word (tui.js:960-1013).
+pub const RESUME_STREAM_MS: u64 = 20;
+/// respondChip's thinking beat (tui.js:1097-1161).
+pub const CHIP_THINK_MS: u64 = 650;
+/// Closed chips leave the tree after 5 s (tui.js:1168-1185).
+pub const CHIP_REMOVE_MS: u64 = 5000;
+/// autoResumeParent defers 120 ms before its guards (tui.js:960-1013).
+pub const AUTO_RESUME_DEFER_MS: u64 = 120;
+/// The aura talk hold (tui.js:2128-2132).
+pub const AURA_TALK_MS: u64 = 1100;
+/// The aura talk canned phrase (tui.js:2131).
+pub const AURA_TALK_PHRASE: &str = "spin up the auth service on hetzner-1 and run its tests";
+/// Sim DEVICES (tui.js:139).
+pub const AURA_DEVICES: [&str; 4] = ["workstation", "hetzner-1", "this-mac", "phone"];
 pub const AUTO_TITLE_MS: u64 = 1500;
 pub const ERRORED_HOLD_MS: u64 = 1800;
 pub const DEFERRED_CALLBACK_MS: u64 = 2600;
@@ -160,8 +429,12 @@ pub fn roster_at(index: u64) -> RosterName {
     #[allow(clippy::cast_possible_truncation)]
     let (name, hon, full) = ROSTER[(index % 38) as usize];
     #[allow(clippy::cast_possible_truncation)]
-    let generation = ((index / 38) as usize).min(ROMAN.len() - 1);
-    let suffix = ROMAN[generation];
+    let generation = (index / 38) as usize;
+    // Sim `ROMAN[gen] || gen + 1` (tui.js:399): past VIII the suffix falls
+    // back to the plain generation NUMBER rather than clamping.
+    let suffix = ROMAN
+        .get(generation)
+        .map_or_else(|| (generation + 1).to_string(), |roman| (*roman).to_owned());
     if suffix.is_empty() {
         RosterName {
             callsign: name.to_owned(),
@@ -303,6 +576,11 @@ impl B {
     /// stream(text) — sim tui.js:1229-1242: per word-token (words AND
     /// whitespace runs) append + 9 tok/char + 22 ms.
     fn stream(&mut self, text: &str) {
+        self.stream_at(text, STREAM_MS);
+    }
+
+    /// stream at an explicit pace (auto-resume streams at 20 ms).
+    fn stream_at(&mut self, text: &str, pace_ms: u64) {
         let item_id = self.id("msg");
         self.emit(EventPayload::Item(ItemEvent::Started {
             item_id: item_id.clone(),
@@ -320,7 +598,7 @@ impl B {
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let n = ((token.chars().count() as f64) * 9.0).round() as u64;
             self.beats.push(Beat::Tokens { n, output: true });
-            self.sleep(STREAM_MS);
+            self.sleep(pace_ms);
         }
         self.emit(EventPayload::Item(ItemEvent::Completed {
             item_id,
@@ -487,27 +765,55 @@ pub fn respond_beats(
     b.beats
 }
 
-/// §1.1 `/subagent/` — commit 1 slice: the parent-side beats verbatim
-/// (names claimed from the roster exactly as the sim does). The live chips
-/// themselves land with the subagent system (commit 2); until then a
-/// closing note says so honestly.
+/// §1.1 `/subagent/` (tui.js:1262-1290): the parent turn spawns LIVE
+/// chips; `childRunTests`/`childRunDocs` play CONCURRENTLY while the
+/// parent keeps going — the turn ends with children still running, so the
+/// derived `◔ WAITING · N subagent(s)` badge takes over (§2.6).
 fn branch_subagent(b: &mut B, low: &str, roster_counter: &mut u64) {
     let plural = word_match(low, "subagents");
     let tests_name = claim_name(roster_counter);
-    if plural {
-        let docs_name = claim_name(roster_counter);
+    let tests_agent = format!("t{}-tests", b.turn);
+    let docs_name = if plural {
+        Some(claim_name(roster_counter))
+    } else {
+        None
+    };
+    if let Some(docs_name) = &docs_name {
         b.stream(&format!(
             "Spinning up two subagents — {} on the tests, {} on the docs. They run concurrently; click a chip under the input to watch one live.",
             tests_name.cs(),
             docs_name.cs(),
         ));
-        b.tool(
-            "agent_spawn",
-            &format!("{} · tests → local · gpt-5.6", tests_name.callsign),
-            800,
-            "spawned · lease ok",
-            true,
-        );
+    } else {
+        b.stream(&format!(
+            "Spinning up a subagent — {} takes the test suite. It runs concurrently; click its chip under the input to watch it live.",
+            tests_name.cs(),
+        ));
+    }
+    b.tool(
+        "agent_spawn",
+        &format!("{} · tests → local · gpt-5.6", tests_name.callsign),
+        800,
+        "spawned · lease ok",
+        true,
+    );
+    b.beats.push(Beat::ChipAdd(Box::new(ChipSeed {
+        agent: tests_agent.clone(),
+        parent: None,
+        callsign: tests_name.callsign.clone(),
+        hon: tests_name.hon,
+        full: tests_name.full.clone(),
+        name: "tests".to_owned(),
+        model: "gpt-5.6".to_owned(),
+        device: "local".to_owned(),
+        state: ChipDisplayState::Idle,
+        tokens: 1200,
+        prefill: vec![],
+    })));
+    b.beats
+        .push(Beat::ChipScript(child_run_tests(&tests_agent, b.turn)));
+    if let Some(docs_name) = &docs_name {
+        let docs_agent = format!("t{}-docs", b.turn);
         b.tool(
             "agent_spawn",
             &format!("{} · docs → local · gemini-3", docs_name.callsign),
@@ -515,18 +821,21 @@ fn branch_subagent(b: &mut B, low: &str, roster_counter: &mut u64) {
             "spawned · lease ok",
             true,
         );
-    } else {
-        b.stream(&format!(
-            "Spinning up a subagent — {} takes the test suite. It runs concurrently; click its chip under the input to watch it live.",
-            tests_name.cs(),
-        ));
-        b.tool(
-            "agent_spawn",
-            &format!("{} · tests → local · gpt-5.6", tests_name.callsign),
-            800,
-            "spawned · lease ok",
-            true,
-        );
+        b.beats.push(Beat::ChipAdd(Box::new(ChipSeed {
+            agent: docs_agent.clone(),
+            parent: None,
+            callsign: docs_name.callsign.clone(),
+            hon: docs_name.hon,
+            full: docs_name.full.clone(),
+            name: "docs".to_owned(),
+            model: "gemini-3".to_owned(),
+            device: "local".to_owned(),
+            state: ChipDisplayState::Idle,
+            tokens: 900,
+            prefill: vec![],
+        })));
+        b.beats
+            .push(Beat::ChipScript(child_run_docs(&docs_agent, b.turn)));
     }
     b.streaming();
     b.stream(
@@ -537,7 +846,6 @@ fn branch_subagent(b: &mut B, low: &str, roster_counter: &mut u64) {
     b.stream(
         "My side is done. Chip glyphs: ○ idle · ◐ running · ⚒ tool · ? input required · ✓ done.",
     );
-    b.note("· live subagent chips land with the next wave — the parent turn above is the sim's exact script");
 }
 
 /// §1.2 `/crash|unstable|unreliable|corrupt/` (tui.js:1291-1318).
@@ -682,14 +990,40 @@ fn branch_prod(b: &mut B) {
     });
 }
 
-/// §1.4 `/auth|deleg|split|machin|device/` — commit 1 slice: parent beats
-/// verbatim; the hetzner-1 chip itself lands with the subagent system.
+/// §1.4 `/auth|deleg|split|machin|device/` (tui.js:1345-1378): the
+/// hetzner-1 chip is PRE-SEEDED (added before the spawn tool, transcript
+/// pre-filled) and stepped tool → done between the parent's beats.
 fn branch_auth(b: &mut B, roster_counter: &mut u64) {
     let auth_name = claim_name(roster_counter);
+    let auth_agent = format!("t{}-auth", b.turn);
     b.stream(&format!(
         "Splitting this: {} {} takes the service core on hetzner-1 while I wire the local side here.",
         auth_name.callsign, auth_name.hon,
     ));
+    b.beats.push(Beat::ChipAdd(Box::new(ChipSeed {
+        agent: auth_agent.clone(),
+        parent: None,
+        callsign: auth_name.callsign.clone(),
+        hon: auth_name.hon,
+        full: auth_name.full.clone(),
+        name: "auth-svc".to_owned(),
+        model: "gpt-5.6".to_owned(),
+        device: "hetzner-1".to_owned(),
+        state: ChipDisplayState::Running,
+        tokens: 2400,
+        prefill: vec![
+            ChipPrefill::Note("· delegated over the mesh — lease accepted, epoch 3".to_owned()),
+            ChipPrefill::Agent(
+                "Patching the service core on hetzner-1; result returns as a fenced patch."
+                    .to_owned(),
+            ),
+            ChipPrefill::ToolOk {
+                name: "fs_patch".to_owned(),
+                desc: "svc/src/auth/core.rs".to_owned(),
+                meta: "+88 −17".to_owned(),
+            },
+        ],
+    })));
     b.tool(
         "agent_spawn",
         &format!("{} · auth-svc → hetzner-1 · gpt-5.6", auth_name.callsign),
@@ -697,6 +1031,10 @@ fn branch_auth(b: &mut B, roster_counter: &mut u64) {
         "lease accepted · epoch 3",
         true,
     );
+    b.beats.push(Beat::ChipState {
+        agent: auth_agent.clone(),
+        state: ChipDisplayState::Tool,
+    });
     b.tool("fs_patch", "web/src/lib/session.ts", 800, "+41 −7", true);
     b.tool(
         "process_exec",
@@ -710,6 +1048,10 @@ fn branch_auth(b: &mut B, roster_counter: &mut u64) {
         "Local wiring is done and verified. The delegated agent is patching the service core; its result lands as a fenced patch you accept from the chip below.",
     );
     b.sleep(900);
+    b.beats.push(Beat::ChipState {
+        agent: auth_agent,
+        state: ChipDisplayState::Done,
+    });
     b.tool(
         "agent_control",
         "collect auth-svc result",
@@ -1063,5 +1405,685 @@ pub fn from_legacy(payloads: Vec<EventPayload>) -> Vec<Beat> {
         beats.push(Beat::Sleep(u64::try_from(pace).unwrap_or(300)));
         beats.push(Beat::Emit(payload));
     }
+    beats
+}
+
+// ---- §2 chip scripts (chipOps, tui.js:898-1074) ----
+
+/// cStream: 18 ms/word, chip tokens `round(len*8)` ONCE at stream end.
+fn chip_stream(beats: &mut Vec<Beat>, agent: &str, id: &str, text: &str) {
+    let item_id = ItemId::new(format!("{agent}-{id}"));
+    beats.push(Beat::ChipEmit {
+        agent: agent.to_owned(),
+        payload: EventPayload::Item(ItemEvent::Started {
+            item_id: item_id.clone(),
+            item: TurnItem::AgentMessage {
+                text: String::new(),
+            },
+        }),
+    });
+    for token in split_word_tokens(text) {
+        beats.push(Beat::ChipEmit {
+            agent: agent.to_owned(),
+            payload: EventPayload::Item(ItemEvent::Delta {
+                item_id: item_id.clone(),
+                delta: ItemDelta::Text { text: token },
+            }),
+        });
+        beats.push(Beat::Sleep(CHIP_STREAM_MS));
+    }
+    beats.push(Beat::ChipEmit {
+        agent: agent.to_owned(),
+        payload: EventPayload::Item(ItemEvent::Completed {
+            item_id,
+            item: TurnItem::AgentMessage {
+                text: text.to_owned(),
+            },
+        }),
+    });
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let n = ((text.chars().count() as f64) * 8.0).round() as u64;
+    beats.push(Beat::ChipTokens {
+        agent: agent.to_owned(),
+        n,
+    });
+}
+
+/// cTool: running row → sleep dur → patched row, chip tokens +1800.
+#[allow(clippy::too_many_arguments)]
+fn chip_tool(
+    beats: &mut Vec<Beat>,
+    agent: &str,
+    id: &str,
+    name: &str,
+    desc: &str,
+    dur: u64,
+    meta: &str,
+    ok: bool,
+) {
+    let item_id = ItemId::new(format!("{agent}-{id}"));
+    beats.push(Beat::ChipEmit {
+        agent: agent.to_owned(),
+        payload: EventPayload::Item(ItemEvent::Started {
+            item_id: item_id.clone(),
+            item: TurnItem::ToolCall {
+                call_id: item_id.as_str().to_owned(),
+                name: name.to_owned(),
+                args: serde_json::json!({ "desc": desc }),
+                status: ToolStatus::InProgress,
+            },
+        }),
+    });
+    beats.push(Beat::Sleep(dur));
+    beats.push(Beat::ChipEmit {
+        agent: agent.to_owned(),
+        payload: EventPayload::Item(ItemEvent::Completed {
+            item_id: item_id.clone(),
+            item: TurnItem::ToolCall {
+                call_id: item_id.as_str().to_owned(),
+                name: name.to_owned(),
+                args: serde_json::json!({ "desc": desc, "meta": meta }),
+                status: if ok {
+                    ToolStatus::Completed
+                } else {
+                    ToolStatus::Failed
+                },
+            },
+        }),
+    });
+    beats.push(Beat::ChipTokens {
+        agent: agent.to_owned(),
+        n: 1800,
+    });
+}
+
+fn chip_state(beats: &mut Vec<Beat>, agent: &str, state: ChipDisplayState) {
+    beats.push(Beat::ChipState {
+        agent: agent.to_owned(),
+        state,
+    });
+}
+
+/// A parent-transcript tool row pushed already-complete (the collect rows).
+fn parent_tool_done(beats: &mut Vec<Beat>, id: &str, name: &str, desc: &str, meta: &str) {
+    let item_id = ItemId::new(id.to_owned());
+    beats.push(Beat::Emit(EventPayload::Item(ItemEvent::Completed {
+        item_id: item_id.clone(),
+        item: TurnItem::ToolCall {
+            call_id: item_id.as_str().to_owned(),
+            name: name.to_owned(),
+            args: serde_json::json!({ "desc": desc, "meta": meta }),
+            status: ToolStatus::Completed,
+        },
+    })));
+}
+
+/// The chip question card routed into the CHIP's transcript — protocol
+/// Menu with `MenuScope::Subagent` (the scope exists precisely for this).
+/// The `ChipQuestion` beat carries the state too (see its doc comment):
+/// callers must NOT emit a separate `ChipState` before it.
+fn chip_question_menu(
+    beats: &mut Vec<Beat>,
+    agent: &str,
+    recovery: bool,
+    text: &str,
+    options: &[&str],
+) -> MenuId {
+    beats.push(Beat::ChipQuestion {
+        agent: agent.to_owned(),
+        recovery,
+        text: text.to_owned(),
+        options: options.iter().map(|o| (*o).to_owned()).collect(),
+    });
+    let menu_id = MenuId::new(format!("{agent}-q"));
+    let kind = if recovery {
+        MenuKind::Recovery {
+            effect: EffectId::new(format!("e-{agent}")),
+        }
+    } else {
+        MenuKind::Question
+    };
+    beats.push(Beat::ChipEmit {
+        agent: agent.to_owned(),
+        payload: EventPayload::MenuOpened(Menu {
+            id: menu_id.clone(),
+            kind,
+            title: text.to_owned(),
+            body: vec![],
+            options: options
+                .iter()
+                .enumerate()
+                .map(|(index, label)| option(&format!("o{index}"), label))
+                .collect(),
+            blocking: false,
+            scope: MenuScope::Subagent {
+                agent: haider_protocol::ids::AgentId::new(agent),
+            },
+            origin: "subagent".to_owned(),
+            ttl_ms: None,
+            timeout_option: None,
+        }),
+    });
+    menu_id
+}
+
+/// childRunTests (tui.js:921-937): scoping → patch → the amber `?`
+/// question; the answer arm finishes the suite and resumes the parent.
+#[must_use]
+pub fn child_run_tests(agent: &str, turn: u64) -> Vec<Beat> {
+    let mut beats = Vec::new();
+    chip_state(&mut beats, agent, ChipDisplayState::Running);
+    chip_stream(
+        &mut beats,
+        agent,
+        "s1",
+        "Picking up the lease — scoping the billing test surface before writing anything.",
+    );
+    chip_tool(
+        &mut beats,
+        agent,
+        "t1",
+        "fs_read",
+        "cloud/tests/billing/mod.rs",
+        700,
+        "212 lines",
+        true,
+    );
+    chip_state(&mut beats, agent, ChipDisplayState::Tool);
+    chip_tool(
+        &mut beats,
+        agent,
+        "t2",
+        "fs_patch",
+        "cloud/tests/billing/webhooks.rs",
+        900,
+        "+96 −4",
+        true,
+    );
+    let options = [
+        "testcontainers — real db, slower",
+        "mocks — fast, less coverage",
+    ];
+    let menu_id = chip_question_menu(
+        &mut beats,
+        agent,
+        false,
+        "Run the suite against testcontainers or mocks?",
+        &options,
+    );
+    beats.push(Beat::Note(
+        "· subagent tests needs input — its chip is holding an amber ? — click it to answer"
+            .to_owned(),
+    ));
+    let arm = |choice: usize| -> Vec<Beat> {
+        // Sim answerChip: state → running AND the question resolved in ONE
+        // patch, then the chosen option + note rows (tui.js:1057-1063).
+        let mut arm_beats = vec![Beat::ChipResolve {
+            agent: agent.to_owned(),
+            state: ChipDisplayState::Running,
+        }];
+        arm_beats.push(Beat::ChipEmit {
+            agent: agent.to_owned(),
+            payload: EventPayload::UserMessage {
+                text: options[choice].to_owned(),
+                attachments: vec![],
+                mode: haider_protocol::DeliveryMode::Steer,
+            },
+        });
+        arm_beats.push(Beat::ChipNote {
+            agent: agent.to_owned(),
+            text: "· input resolved — continuing".to_owned(),
+        });
+        arm_beats.push(Beat::Sleep(600));
+        let cmd = if choice == 0 {
+            "cargo test -p billing --tests -- --ignored"
+        } else {
+            "cargo test -p billing --tests"
+        };
+        chip_tool(
+            &mut arm_beats,
+            agent,
+            "t3",
+            "process_exec",
+            cmd,
+            1400,
+            "41 passed",
+            true,
+        );
+        chip_state(&mut arm_beats, agent, ChipDisplayState::Done);
+        parent_tool_done(
+            &mut arm_beats,
+            &format!("t{turn}-collect-tests"),
+            "agent_control",
+            "collect tests → report accepted",
+            "✓",
+        );
+        arm_beats.push(Beat::Note(
+            "· subagent tests finished — report merged".to_owned(),
+        ));
+        arm_beats.push(Beat::AutoResume);
+        arm_beats
+    };
+    beats.push(Beat::AwaitMenu {
+        menu: menu_id,
+        arms: vec![arm(0), arm(1)],
+    });
+    beats
+}
+
+/// childRunDocs (tui.js:940-958): a deliberate failure + `⌁` recovery.
+#[must_use]
+pub fn child_run_docs(agent: &str, turn: u64) -> Vec<Beat> {
+    let mut beats = Vec::new();
+    chip_state(&mut beats, agent, ChipDisplayState::Running);
+    chip_stream(
+        &mut beats,
+        agent,
+        "s1",
+        "Drafting API docs for the new webhook endpoint from the patched source.",
+    );
+    chip_tool(
+        &mut beats,
+        agent,
+        "t1",
+        "fs_read",
+        "cloud/src/billing/webhooks.rs",
+        800,
+        "381 lines",
+        true,
+    );
+    chip_state(&mut beats, agent, ChipDisplayState::Tool);
+    chip_tool(
+        &mut beats,
+        agent,
+        "t2",
+        "fs_patch",
+        "docs/api/billing-webhooks.md",
+        1100,
+        "+140 −0",
+        true,
+    );
+    chip_tool(
+        &mut beats,
+        agent,
+        "t3",
+        "process_exec",
+        "cargo doc --no-deps",
+        900,
+        "exit 101 · docs feature flag missing",
+        false,
+    );
+    let options = [
+        "retry with --features docs",
+        "close this subagent — keep the patch",
+    ];
+    let menu_id = chip_question_menu(
+        &mut beats,
+        agent,
+        true,
+        "cargo doc failed (exit 101 — the docs feature flag is missing). How should I recover?",
+        &options,
+    );
+    beats.push(Beat::Note(
+        "· subagent docs failed (✗) — open its row to pick a recovery".to_owned(),
+    ));
+    let mut retry = vec![Beat::ChipResolve {
+        agent: agent.to_owned(),
+        state: ChipDisplayState::Running,
+    }];
+    retry.push(Beat::ChipEmit {
+        agent: agent.to_owned(),
+        payload: EventPayload::UserMessage {
+            text: options[0].to_owned(),
+            attachments: vec![],
+            mode: haider_protocol::DeliveryMode::Steer,
+        },
+    });
+    retry.push(Beat::ChipNote {
+        agent: agent.to_owned(),
+        text: "· retrying with the fix".to_owned(),
+    });
+    retry.push(Beat::Sleep(700));
+    chip_tool(
+        &mut retry,
+        agent,
+        "t4",
+        "process_exec",
+        "cargo doc --no-deps --features docs",
+        1300,
+        "docs built ✓",
+        true,
+    );
+    chip_state(&mut retry, agent, ChipDisplayState::Done);
+    parent_tool_done(
+        &mut retry,
+        &format!("t{turn}-collect-docs"),
+        "agent_control",
+        "collect docs → report accepted",
+        "✓",
+    );
+    retry.push(Beat::AutoResume);
+    // idx 1: close the chip — the close lifecycle owns the note, the 5 s
+    // removal and the resume check.
+    let close = vec![Beat::ChipClose {
+        agent: agent.to_owned(),
+    }];
+    beats.push(Beat::AwaitMenu {
+        menu: menu_id,
+        arms: vec![retry, close],
+    });
+    beats
+}
+
+/// respondChip (tui.js:1097-1161): a full turn on the CHIP's state
+/// machine. The nested-delegation path ports the INTENDED flow — the
+/// shipped sim early-returns at tui.js:1137 (`if (!(await ops.cTool(...)))`
+/// where cTool returns undefined), leaving parent `streaming` and child
+/// `running` forever; that dead-code path is a documented sim bug the
+/// spec says NOT to port as-is.
+#[must_use]
+pub fn respond_chip_beats(
+    agent: &str,
+    chip_callsign: &str,
+    chip_model: &str,
+    chip_device: &str,
+    text: &str,
+    turn: u64,
+    roster_counter: &mut u64,
+) -> Vec<Beat> {
+    let low = text.to_lowercase();
+    let mut beats = Vec::new();
+    beats.push(Beat::ChipEmit {
+        agent: agent.to_owned(),
+        payload: EventPayload::UserMessage {
+            text: text.to_owned(),
+            attachments: vec![],
+            mode: haider_protocol::DeliveryMode::Steer,
+        },
+    });
+    // Sim: `{ state: "thinking", question: null }` — one patch, so the
+    // pending card can never survive the steer that cleared it.
+    beats.push(Beat::ChipQuestionClear {
+        agent: agent.to_owned(),
+        state: ChipDisplayState::Thinking,
+    });
+    beats.push(Beat::Sleep(CHIP_THINK_MS));
+    let nested = [
+        "subagent", "delegate", "split", "spawn", "fan out", "parallel",
+    ]
+    .iter()
+    .any(|k| low.contains(k));
+    if nested {
+        chip_state(&mut beats, agent, ChipDisplayState::Streaming);
+        chip_stream(
+            &mut beats,
+            agent,
+            "n1",
+            "Good call — I'll delegate part of this to a child agent and wait on its result.",
+        );
+        let child_name = claim_name(roster_counter);
+        let child_agent = format!("{agent}-sub{turn}");
+        beats.push(Beat::ChipAdd(Box::new(ChipSeed {
+            agent: child_agent.clone(),
+            parent: Some(agent.to_owned()),
+            callsign: child_name.callsign.clone(),
+            hon: child_name.hon,
+            full: child_name.full.clone(),
+            name: "subtask".to_owned(),
+            model: chip_model.to_owned(),
+            device: chip_device.to_owned(),
+            state: ChipDisplayState::Running,
+            tokens: 400,
+            prefill: vec![ChipPrefill::Note(format!(
+                "· spawned by {chip_callsign} — nested delegation"
+            ))],
+        })));
+        chip_tool(
+            &mut beats,
+            agent,
+            "n2",
+            "agent_spawn",
+            &format!("{} → {chip_device} · nested", child_name.callsign),
+            700,
+            "lease ok",
+            true,
+        );
+        // INTENDED flow (see the sim-bug note above): the parent chip
+        // waits on its child — the session waits too.
+        chip_state(&mut beats, agent, ChipDisplayState::Waiting);
+        chip_state(&mut beats, &child_agent, ChipDisplayState::Thinking);
+        beats.push(Beat::Sleep(500));
+        chip_state(&mut beats, &child_agent, ChipDisplayState::Streaming);
+        chip_stream(
+            &mut beats,
+            &child_agent,
+            "s1",
+            "On it — scoped the subtask, patching now.",
+        );
+        chip_state(&mut beats, &child_agent, ChipDisplayState::Tool);
+        chip_tool(
+            &mut beats,
+            &child_agent,
+            "t1",
+            "fs_patch",
+            "src/subtask.rs",
+            1100,
+            "+40 −6",
+            true,
+        );
+        chip_state(&mut beats, &child_agent, ChipDisplayState::Done);
+        chip_state(&mut beats, agent, ChipDisplayState::Streaming);
+        chip_stream(
+            &mut beats,
+            agent,
+            "n3",
+            &format!(
+                "{} {} finished — folded its patch into my work. Done.",
+                child_name.callsign, child_name.hon
+            ),
+        );
+        chip_state(&mut beats, agent, ChipDisplayState::Done);
+        beats.push(Beat::AutoResume);
+    } else {
+        chip_state(&mut beats, agent, ChipDisplayState::Streaming);
+        chip_stream(
+            &mut beats,
+            agent,
+            "g1",
+            "Acknowledged — folding that into the current step.",
+        );
+        chip_state(&mut beats, agent, ChipDisplayState::Tool);
+        chip_tool(
+            &mut beats,
+            agent,
+            "g2",
+            "fs_read",
+            "src/target.rs",
+            700,
+            "read ok",
+            true,
+        );
+        chip_state(&mut beats, agent, ChipDisplayState::Done);
+        beats.push(Beat::AutoResume);
+    }
+    beats
+}
+
+/// autoResumeParent's script (§2.7, guards already checked): note →
+/// THINKING 750 → STREAMING → 20 ms stream → the turn-end law.
+#[must_use]
+pub fn auto_resume_beats(reports: usize, turn: u64) -> Vec<Beat> {
+    let mut b = B::new(turn);
+    b.seq = 70;
+    b.note("· all subagents reported — resuming the parked turn (waiting → thinking, never idle)");
+    b.state(RunState::Thinking);
+    b.sleep(THINK_MS);
+    b.streaming();
+    let what = if reports > 1 {
+        format!("the {reports} subagent reports")
+    } else {
+        "the subagent report".to_owned()
+    };
+    b.stream_at(
+        &format!(
+            "Folding {what} into the main line — results merged, and the turn can now commit."
+        ),
+        RESUME_STREAM_MS,
+    );
+    b.beats.push(Beat::TurnEnd);
+    b.beats
+}
+
+// ---- §3 aura scripts (tui.js:2058-2156) ----
+
+/// The status-branch matcher:
+/// `/status|what.*(doing|going|happen)|where|report|roster/`.
+#[must_use]
+pub fn aura_is_status(low: &str) -> bool {
+    if ["status", "where", "report", "roster"]
+        .iter()
+        .any(|k| low.contains(k))
+    {
+        return true;
+    }
+    low.find("what").is_some_and(|at| {
+        let rest = &low[at..];
+        ["doing", "going", "happen"]
+            .iter()
+            .any(|k| rest.contains(k))
+    })
+}
+
+/// The spawn-branch targets: first DEVICE found in the text (else
+/// `workstation`), first `\b(billing|auth|cellular|payments|web|api|docs|search|infra)\w*`
+/// word (else `service`).
+#[must_use]
+pub fn aura_target(low: &str) -> (String, String) {
+    let device = AURA_DEVICES
+        .iter()
+        .find(|device| low.contains(*device))
+        .copied()
+        .unwrap_or("workstation")
+        .to_owned();
+    const STEMS: [&str; 9] = [
+        "billing", "auth", "cellular", "payments", "web", "api", "docs", "search", "infra",
+    ];
+    let mut name = "service".to_owned();
+    let mut best: Option<usize> = None;
+    for stem in STEMS {
+        let mut start = 0;
+        while let Some(pos) = low[start..].find(stem) {
+            let at = start + pos;
+            let boundary = at == 0
+                || !low[..at]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+            if boundary && best.is_none_or(|b| at < b) {
+                // Extend through the word (`\w*`).
+                let tail = low[at + stem.len()..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect::<String>();
+                name = format!("{stem}{tail}");
+                best = Some(at);
+            }
+            start = at + stem.len();
+        }
+    }
+    (name, device)
+}
+
+/// Aura stream: 16 ms/word into the aura transcript (no token meter).
+fn aura_stream(beats: &mut Vec<Beat>, id: &str, text: &str) {
+    let item_id = ItemId::new(format!("aura-{id}"));
+    beats.push(Beat::AuraEmit(EventPayload::Item(ItemEvent::Started {
+        item_id: item_id.clone(),
+        item: TurnItem::AgentMessage {
+            text: String::new(),
+        },
+    })));
+    for token in split_word_tokens(text) {
+        beats.push(Beat::AuraEmit(EventPayload::Item(ItemEvent::Delta {
+            item_id: item_id.clone(),
+            delta: ItemDelta::Text { text: token },
+        })));
+        beats.push(Beat::Sleep(AURA_STREAM_MS));
+    }
+    beats.push(Beat::AuraEmit(EventPayload::Item(ItemEvent::Completed {
+        item_id,
+        item: TurnItem::AgentMessage {
+            text: text.to_owned(),
+        },
+    })));
+}
+
+/// The status branch (tui.js:2078-2084). `summary` is built by the driver
+/// from the live roster at submit time.
+#[must_use]
+pub fn aura_status_beats(spoken: bool, summary: &str, run: u64) -> Vec<Beat> {
+    let mut beats = vec![
+        Beat::AuraVoice(spoken),
+        Beat::AuraState(AuraState::Thinking),
+        Beat::Sleep(450),
+        Beat::AuraState(AuraState::Speaking),
+    ];
+    aura_stream(
+        &mut beats,
+        &format!("r{run}-status"),
+        &format!("Current roster: {summary}. Say the word to spin up more."),
+    );
+    beats.push(Beat::AuraState(AuraState::Idle));
+    beats.push(Beat::AuraVoice(false));
+    beats
+}
+
+/// The spawn branch (tui.js:2086-2124), verbatim strings and timings.
+#[must_use]
+pub fn aura_spawn_beats(spoken: bool, name: &str, device: &str, run: u64) -> Vec<Beat> {
+    let mut beats = vec![
+        Beat::AuraVoice(spoken),
+        Beat::AuraState(AuraState::Thinking),
+        Beat::Sleep(500),
+    ];
+    aura_stream(
+        &mut beats,
+        &format!("r{run}-plan"),
+        &format!(
+            "On it — I'll place a {name} session on {device}, start the work, and report back. I don't touch the code myself."
+        ),
+    );
+    beats.push(Beat::AuraState(AuraState::Orchestrating));
+    beats.push(Beat::AuraRosterPush {
+        name: name.to_owned(),
+        device: device.to_owned(),
+    });
+    beats.push(Beat::AuraLog(format!(
+        "agent_spawn — {name} → {device} · lease ok"
+    )));
+    beats.push(Beat::Sleep(1100));
+    beats.push(Beat::AuraRosterPatch {
+        name: name.to_owned(),
+        state: None,
+        activity: "running the suite".to_owned(),
+    });
+    beats.push(Beat::AuraLog(format!("agent_control — {name}: run tests")));
+    beats.push(Beat::Sleep(1300));
+    beats.push(Beat::AuraRosterPatch {
+        name: name.to_owned(),
+        state: Some(ChipDisplayState::Done),
+        activity: "tests green".to_owned(),
+    });
+    beats.push(Beat::AuraLog(format!("{name} on {device}: tests green ✓")));
+    beats.push(Beat::AuraState(AuraState::Speaking));
+    aura_stream(
+        &mut beats,
+        &format!("r{run}-done"),
+        &format!(
+            "Done — {name} is live on {device} and its tests are green. Open it, or spin up another?"
+        ),
+    );
+    beats.push(Beat::AuraState(AuraState::Idle));
+    beats.push(Beat::AuraVoice(false));
     beats
 }

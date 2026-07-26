@@ -3,9 +3,10 @@
 //! dump_screens`.
 #![allow(clippy::expect_used)]
 
-use haider_tui::app::{AppEvent, AppModel};
+use haider_tui::app::{AppEvent, AppModel, AuraAgentRow, ChipModel, ChipQuestion, Hit, Screen};
 use haider_tui::mock::demo_script;
 use haider_tui::render::render;
+use haider_tui::script::{ChipDisplayState, ChipPrefill, ChipSeed};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -256,7 +257,227 @@ fn main() {
 
     // The launcher .shellout block under the recent list.
     let mut shell_launcher = AppModel::new();
-    shell_launcher.handle(AppEvent::Envelope(Box::new(ready)));
+    shell_launcher.handle(AppEvent::Envelope(Box::new(ready.clone())));
     submit(&mut shell_launcher, "ls");
     dump(&shell_launcher, "launcher + shellout");
+
+    // ---- TUI3b commit 2: subagent chips (§2) + aura mode (§3) ----
+    let mut sub_model = AppModel::new();
+    sub_model.handle(AppEvent::Envelope(Box::new(ready)));
+    submit(&mut sub_model, "use two subagents to split this work");
+    sub_model.requests.clear();
+    // Replay the parent turn's own envelopes so the transcript above the
+    // panel is the real §1.1 branch (the chips below are hand-seeded).
+    let (mut sub_generic, mut sub_roster) = (0, 3);
+    for beat in &haider_tui::script::respond_beats(
+        "use two subagents to split this work",
+        false,
+        haider_protocol::DeliveryMode::Steer,
+        1,
+        &mut sub_generic,
+        &mut sub_roster,
+    ) {
+        if let haider_tui::script::Beat::Emit(payload) = beat {
+            sub_model.handle(AppEvent::Envelope(Box::new(payload.clone())));
+        }
+    }
+    sub_model.turn_active = false;
+    sub_model.handle(AppEvent::Envelope(Box::new(
+        haider_protocol::EventPayload::RunState(haider_protocol::state::RunState::Done),
+    )));
+    // A three-node tree: a chip WAITING on its nested child, a failed chip
+    // holding the ⌁ recovery card, and a closed chip on its way out.
+    let mut tests = chip(
+        "t1-tests",
+        "Hasan",
+        "(a)",
+        "Imam Hasan al-Mujtaba",
+        "tests",
+        "gpt-5.6",
+        "local",
+        ChipDisplayState::Tool,
+        4800,
+        &[
+            ChipPrefill::Agent(
+                "Picking up the lease — scoping the billing test surface before writing anything."
+                    .to_owned(),
+            ),
+            ChipPrefill::ToolOk {
+                name: "fs_patch".to_owned(),
+                desc: "cloud/tests/billing/webhooks.rs".to_owned(),
+                meta: "+96 −4".to_owned(),
+            },
+        ],
+    );
+    tests.children.push(chip(
+        "t1-tests-sub",
+        "Husayn",
+        "(a)",
+        "Imam Husayn",
+        "subtask",
+        "gpt-5.6",
+        "local",
+        ChipDisplayState::Running,
+        400,
+        &[ChipPrefill::Note(
+            "· spawned by Hasan — nested delegation".to_owned(),
+        )],
+    ));
+    let mut docs = chip(
+        "t1-docs",
+        "Salman",
+        "(r)",
+        "Salman al-Farsi",
+        "docs",
+        "gemini-3",
+        "local",
+        ChipDisplayState::Error,
+        3900,
+        &[
+            ChipPrefill::Agent(
+                "Drafting API docs for the new webhook endpoint from the patched source."
+                    .to_owned(),
+            ),
+            ChipPrefill::ToolOk {
+                name: "fs_patch".to_owned(),
+                desc: "docs/api/billing-webhooks.md".to_owned(),
+                meta: "+140 −0".to_owned(),
+            },
+        ],
+    );
+    let recovery_text =
+        "cargo doc failed (exit 101 — the docs feature flag is missing). How should I recover?";
+    let recovery_options = [
+        "retry with --features docs",
+        "close this subagent — keep the patch",
+    ];
+    docs.question = Some(ChipQuestion {
+        recovery: true,
+        text: recovery_text.to_owned(),
+        options: recovery_options.iter().map(|o| (*o).to_owned()).collect(),
+        resolved: false,
+    });
+    docs.transcript
+        .apply(&haider_protocol::EventPayload::MenuOpened(
+            haider_protocol::menu::Menu {
+                id: haider_protocol::ids::MenuId::new("t1-docs-q"),
+                kind: haider_protocol::menu::MenuKind::Recovery {
+                    effect: haider_protocol::ids::EffectId::new("e-t1-docs"),
+                },
+                title: recovery_text.to_owned(),
+                body: vec![],
+                options: recovery_options
+                    .iter()
+                    .enumerate()
+                    .map(|(index, label)| haider_protocol::menu::MenuOption {
+                        key: format!("o{index}"),
+                        label: (*label).to_owned(),
+                        detail: None,
+                        decision: None,
+                    })
+                    .collect(),
+                blocking: false,
+                scope: haider_protocol::menu::MenuScope::Subagent {
+                    agent: haider_protocol::ids::AgentId::new("t1-docs"),
+                },
+                origin: "subagent".to_owned(),
+                ttl_ms: None,
+                timeout_option: None,
+            },
+        ));
+    let mut lint = chip(
+        "t1-lint",
+        "Miqdad",
+        "(r)",
+        "Miqdad ibn al-Aswad",
+        "lint",
+        "fable-5",
+        "hetzner-1",
+        ChipDisplayState::Done,
+        1500,
+        &[],
+    );
+    lint.closed = true;
+    lint.removing = true;
+    sub_model.chips = vec![tests, docs, lint];
+    dump(&sub_model, "session + SubTree panel (live chips)");
+
+    // The subagent view: breadcrumb head, the chip's own transcript, and the
+    // question card replacing ITS composer (the parent is never blocked).
+    sub_model.screen = Screen::Subagent;
+    sub_model.view_path = vec!["t1-docs".to_owned()];
+    dump(&sub_model, "subagent view + ⌁ recovery card");
+    // A chip WAITING on its nested child: ◔ badge, waiting tail line, and
+    // the nested row's ` │  ` indent in the shared map.
+    sub_model.view_path = vec!["t1-tests".to_owned()];
+    dump(&sub_model, "subagent view — ◔ waiting on a nested child");
+
+    // The aura stage: orb block, both columns, the spoken transcript.
+    let mut aura_model = AppModel::new();
+    aura_model.screen = Screen::Aura;
+    aura_model.aura.roster.push(AuraAgentRow {
+        name: "auth".to_owned(),
+        device: "hetzner-1".to_owned(),
+        state: ChipDisplayState::Done,
+        activity: "tests green".to_owned(),
+    });
+    for line in [
+        "agent_spawn — auth → hetzner-1 · lease ok",
+        "agent_control — auth: run tests",
+        "auth on hetzner-1: tests green ✓",
+    ] {
+        aura_model.aura.log.push(line.to_owned());
+    }
+    aura_model
+        .aura
+        .transcript
+        .push_user_voice("spin up the auth service on hetzner-1 and run its tests".to_owned());
+    aura_model.aura.transcript.set_voice_live(true);
+    aura_model
+        .aura
+        .transcript
+        .apply(&haider_protocol::EventPayload::Item(
+            haider_protocol::item::ItemEvent::Completed {
+                item_id: haider_protocol::ids::ItemId::new("aura-r1-done"),
+                item: haider_protocol::item::TurnItem::AgentMessage {
+                    text: "Done — auth is live on hetzner-1 and its tests are green. Open it, or spin up another?".to_owned(),
+                },
+            },
+        ));
+    aura_model.aura.transcript.set_voice_live(false);
+    dump(&aura_model, "aura stage (◉ AURA · orb · columns)");
+    aura_model.handle_hit(Hit::AuraEngine);
+    aura_model.handle_hit(Hit::AuraMute);
+    dump(&aura_model, "aura stage — engine swapped · audio muted");
+}
+
+/// Build one chip straight from a seed (the driver's `ChipAdd` path). The
+/// argument list mirrors `ChipSeed`'s display fields one-for-one — a dump
+/// helper, not an API.
+#[allow(clippy::too_many_arguments)]
+fn chip(
+    agent: &str,
+    callsign: &str,
+    hon: &'static str,
+    full: &str,
+    name: &str,
+    model: &str,
+    device: &str,
+    state: ChipDisplayState,
+    tokens: u64,
+    prefill: &[ChipPrefill],
+) -> ChipModel {
+    ChipModel::from_seed(ChipSeed {
+        agent: agent.to_owned(),
+        parent: None,
+        callsign: callsign.to_owned(),
+        hon,
+        full: full.to_owned(),
+        name: name.to_owned(),
+        model: model.to_owned(),
+        device: device.to_owned(),
+        state,
+        tokens,
+        prefill: prefill.to_vec(),
+    })
 }

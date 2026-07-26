@@ -36,11 +36,18 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
     // input — a blocking menu's options OR the composer's cursor row
     // (review r5 P2-1 + r6 P2-1) — cannot otherwise fit. Minimal need
     // with the full 4-row chrome is status(1) + chrome(4) + floor.
-    let status_height: u16 = if model.screen == Screen::Session {
-        let input_floor = model
-            .projection
-            .open_menu()
-            .map_or(1, |menu| menu.options.len());
+    let status_height: u16 = if matches!(model.screen, Screen::Session | Screen::Subagent) {
+        let input_floor = if model.screen == Screen::Session {
+            model
+                .projection
+                .open_menu()
+                .map_or(1, |menu| menu.options.len())
+        } else {
+            model
+                .viewed_chip()
+                .and_then(crate::app::ChipModel::question_menu)
+                .map_or(1, |menu| menu.options.len())
+        };
         if (area.height as usize) < 1 + 4 + input_floor {
             0
         } else {
@@ -55,6 +62,8 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
         Screen::Boot => render_boot(model, theme, frame, body),
         Screen::Launcher => render_launcher(model, theme, frame, body, &mut hits),
         Screen::Session => render_session(model, theme, frame, body, &mut hits),
+        Screen::Subagent => render_subagent(model, theme, frame, body, &mut hits),
+        Screen::Aura => render_aura(model, theme, frame, body, &mut hits),
     }
     if model.help_open {
         render_help(theme, frame, body);
@@ -572,11 +581,19 @@ fn render_session(
         .min(input_avail)
         .max(floor_input.min(area.height.saturating_sub(chrome)))
         .clamp(1, area.height.max(1));
-    // Short windows: todos first, then the ⧗ queue panel, then the
-    // palette, yield entirely before the composer/menu loses a row
-    // (review r1 P2; TUI3b: the queue panel joins the ledger BETWEEN the
-    // todos and the composer — it sheds after the todos, before the
-    // composer ever gives up a row).
+    // The optional-panel ledger (review r1 P2; TUI3b adds the SubTree slot).
+    // Each panel claims from `budget` in PRIORITY order below, so the LAST
+    // claimant is the FIRST to vanish. Priority, survives-longest first:
+    //
+    //   palette  →  ⧗ queue  →  SubTree  →  todos
+    //
+    // Rationale for the SubTree's slot: it is a MAP of live work, so it
+    // outranks the todos (whose plan the transcript re-prints when it
+    // unpins) but yields to the ⧗ queue — which holds UNSENT user input,
+    // the only rows here that would otherwise be silently lost — and to the
+    // palette, a live interaction under the cursor. All four shed ENTIRELY
+    // before the composer's cursor row or a blocking menu's options give up
+    // a single row; those stay sacred at any size.
     let fixed = chrome + input_height + gap;
     let mut todos_height = model
         .projection
@@ -588,6 +605,7 @@ fn render_session(
     } else {
         u16::try_from(model.msg_queue.len() + 1).unwrap_or(4)
     };
+    let mut subtree_height = subtree_needed(model, false);
     let palette = if model.palette_open() {
         palette_block(model, theme, area.width)
     } else {
@@ -605,6 +623,11 @@ fn render_session(
     } else {
         budget -= queue_height;
     }
+    if subtree_height > budget {
+        subtree_height = 0;
+    } else {
+        budget -= subtree_height;
+    }
     if todos_height > budget {
         todos_height = 0;
     }
@@ -617,6 +640,7 @@ fn render_session(
         palette_area,
         rule_area,
         composer_area,
+        subtree_area,
         _gap,
     ] = Layout::vertical([
         Constraint::Length(header_h),
@@ -627,6 +651,7 @@ fn render_session(
         Constraint::Length(palette_height),
         Constraint::Length(input_rule_h),
         Constraint::Length(input_height),
+        Constraint::Length(subtree_height),
         Constraint::Length(gap),
     ])
     .areas(area);
@@ -849,8 +874,14 @@ fn render_session(
             .style(theme.text_style()),
             rule_area,
         );
+        let footer = format!(
+            " ↑↓ select · ⏎ confirm · 1-{} quick · menu {} · menu.answer(\"{}\", n) over RPC",
+            menu.options.len(),
+            menu.id,
+            menu.id
+        );
         let (menu_lines, option_rows) =
-            menu_block(menu, model.menu_selection, theme, composer_area);
+            menu_block(menu, model.menu_selection, theme, composer_area, &footer);
         frame.render_widget(
             Paragraph::new(Text::from(menu_lines)).style(theme.menu_style()),
             composer_area,
@@ -877,6 +908,727 @@ fn render_session(
     } else {
         render_composer(model, theme, frame, rule_area, composer_area, hits);
     }
+    if subtree_height > 0 {
+        render_subtree(model, theme, frame, subtree_area, false, hits);
+    }
+}
+
+/// The SubTree panel's needed height (0 when there are no chips):
+/// header + one row per (uncollapsed) tree node, plus the `⌂` home row on
+/// the subagent screen.
+fn subtree_needed(model: &AppModel, on_subagent: bool) -> u16 {
+    if model.chips.is_empty() {
+        return 0;
+    }
+    if model.subtree_collapsed {
+        return 1;
+    }
+    let rows = crate::app::flatten_chips(&model.chips).len() + usize::from(on_subagent);
+    u16::try_from(rows + 1).unwrap_or(u16::MAX)
+}
+
+/// `subCounts` (tui.js:2908-2944): non-zero categories joined ` · `.
+fn subtree_counts(model: &AppModel) -> String {
+    let rows = crate::app::flatten_chips(&model.chips);
+    let mut needs_input = 0;
+    let mut waiting = 0;
+    let mut working = 0;
+    let mut done = 0;
+    let mut failed = 0;
+    let mut idle = 0;
+    let mut closing = 0;
+    for (_, chip) in &rows {
+        if chip.closed {
+            closing += 1;
+            continue;
+        }
+        use crate::script::ChipDisplayState as S;
+        match chip.display_state() {
+            S::InputRequired => needs_input += 1,
+            S::Waiting => waiting += 1,
+            S::Running | S::Tool | S::Thinking | S::Streaming => working += 1,
+            S::Done => done += 1,
+            S::Error => failed += 1,
+            S::Idle => idle += 1,
+        }
+    }
+    let mut parts = Vec::new();
+    for (count, label) in [
+        (needs_input, "? {} needs input"),
+        (waiting, "◔ {} waiting"),
+        (working, "◐ {} working"),
+        (done, "✓ {} done"),
+        (failed, "✗ {} failed"),
+        (idle, "○ {} idle"),
+        (closing, "⊘ {} closing"),
+    ] {
+        if count > 0 {
+            parts.push(label.replace("{}", &count.to_string()));
+        }
+    }
+    parts.join(" · ")
+}
+
+/// The SubTree panel (§2.9): header toggle + depth-first rows with
+/// connectors; every row opens its chip's view. Shared by the session and
+/// subagent screens (the map is one surface).
+fn render_subtree(
+    model: &AppModel,
+    theme: &Theme,
+    frame: &mut Frame<'_>,
+    area: Rect,
+    on_subagent: bool,
+    hits: &mut Vec<(Rect, Hit)>,
+) {
+    if area.height == 0 {
+        return;
+    }
+    let arrow = if model.subtree_collapsed {
+        "▸"
+    } else {
+        "▾"
+    };
+    let mut lines = vec![Line::from(vec![
+        Span::styled(format!("{arrow} subagents"), theme.gold_style()),
+        Span::styled(format!(" — {}", subtree_counts(model)), theme.dim_style()),
+    ])];
+    let mut row_hits: Vec<(usize, Hit)> = vec![(0, Hit::SubTreeToggle)];
+    if !model.subtree_collapsed {
+        if on_subagent {
+            row_hits.push((lines.len(), Hit::SessionHome));
+            lines.push(Line::from(vec![
+                Span::styled(" ⌂ ", theme.gold_style()),
+                Span::styled(
+                    format!("{} — back to the main transcript", model.display_name()),
+                    theme.dim_style(),
+                ),
+            ]));
+        }
+        let rows = crate::app::flatten_chips(&model.chips);
+        let total = rows.len();
+        for (index, (depth, chip)) in rows.iter().enumerate() {
+            let connector = if chip.closed {
+                "⊘"
+            } else if index + 1 == total {
+                "└─"
+            } else {
+                "├─"
+            };
+            let indent = if *depth > 0 {
+                " │  ".repeat(*depth)
+            } else {
+                String::new()
+            };
+            let display = chip.display_state();
+            let glyph = if chip.closed { "⊘" } else { display.glyph() };
+            // Sim: `viewing` needs the subagent SCREEN too (tui.js:2925) —
+            // a remembered view path must not mark a row on the session.
+            let viewing = on_subagent && model.view_path.last() == Some(&chip.agent);
+            let activity = if viewing {
+                "viewing ←".to_owned()
+            } else {
+                chip.activity()
+            };
+            let ink = if chip.closed {
+                theme.faint_style()
+            } else {
+                theme.dim_style()
+            };
+            let mut spans = vec![
+                Span::styled(format!(" {indent}{connector} "), theme.faint_style()),
+                Span::styled(format!("{glyph} "), theme.gold_style()),
+                Span::styled(
+                    format!("{} {}", chip.callsign, chip.hon),
+                    if chip.closed {
+                        theme.faint_style()
+                    } else {
+                        theme.bright_style()
+                    },
+                ),
+                Span::styled(format!(" · {} · {}", chip.name, chip.model), ink),
+            ];
+            if *depth == 0 {
+                spans.push(Span::styled(format!(" · {}", chip.device), ink));
+            }
+            spans.push(Span::styled(format!(" — {activity}"), ink));
+            let mut line = Line::from(spans);
+            if model.hovered == Some(Hit::ChipRow(chip.agent.clone())) {
+                let pad = (area.width as usize).saturating_sub(line.width());
+                if pad > 0 {
+                    line.push_span(Span::raw(" ".repeat(pad)));
+                }
+                line = line.style(theme.hover_style());
+            }
+            row_hits.push((lines.len(), Hit::ChipRow(chip.agent.clone())));
+            lines.push(line);
+        }
+    }
+    frame.render_widget(Paragraph::new(Text::from(lines)), area);
+    for (offset, hit) in row_hits {
+        let y = area.y + u16::try_from(offset).unwrap_or(u16::MAX);
+        if y < area.y + area.height {
+            hits.push((
+                Rect {
+                    x: area.x,
+                    y,
+                    width: area.width,
+                    height: 1,
+                },
+                hit,
+            ));
+        }
+    }
+}
+
+/// The subagent view (§2.10): breadcrumb head, the chip's OWN transcript,
+/// the shared SubTree map, and a composer that steers THIS chip — its
+/// question card replaces the composer, but the parent is never blocked
+/// (esc always walks back).
+fn render_subagent(
+    model: &AppModel,
+    theme: &Theme,
+    frame: &mut Frame<'_>,
+    area: Rect,
+    hits: &mut Vec<(Rect, Hit)>,
+) {
+    let Some(chip) = model.viewed_chip() else {
+        // The viewed chip left the tree (5 s removal) — the session view
+        // is the honest fallback.
+        render_session(model, theme, frame, area, hits);
+        return;
+    };
+    let menu = chip.question_menu();
+    let needed_input = menu.map_or_else(
+        || composer_height(model),
+        |m| {
+            u16::try_from(1 + wrapped_menu_body(m, area.width).len() + m.options.len() + 1)
+                .unwrap_or(u16::MAX)
+        },
+    );
+    let floor_input = menu.map_or(1, |m| u16::try_from(m.options.len().max(1)).unwrap_or(1));
+    // Compact ledger (the session screen's shed order, condensed): gap →
+    // subtree → transcript row → header line 2 → rules → header line 1;
+    // the input floor never yields.
+    let mut gap: u16 = 1;
+    let mut transcript_min: u16 = 1;
+    let mut header_h: u16 = 2;
+    let mut header_rule_h: u16 = 1;
+    let mut input_rule_h: u16 = 1;
+    let mut subtree_height = subtree_needed(model, true);
+    let over = |header_h: u16, rules: u16, extras: u16, area: Rect| {
+        area.height.saturating_sub(header_h + rules + extras) < floor_input
+    };
+    if over(
+        header_h,
+        header_rule_h + input_rule_h,
+        gap + transcript_min + subtree_height,
+        area,
+    ) {
+        subtree_height = 0;
+    }
+    if over(
+        header_h,
+        header_rule_h + input_rule_h,
+        gap + transcript_min,
+        area,
+    ) {
+        gap = 0;
+    }
+    if over(header_h, header_rule_h + input_rule_h, transcript_min, area) {
+        transcript_min = 0;
+    }
+    if over(header_h, header_rule_h + input_rule_h, 0, area) {
+        header_h = 1;
+    }
+    if over(header_h, header_rule_h + input_rule_h, 0, area) {
+        header_rule_h = 0;
+        input_rule_h = 0;
+    }
+    if over(header_h, 0, 0, area) {
+        header_h = 0;
+    }
+    let chrome = header_h + header_rule_h + input_rule_h;
+    let input_avail = area
+        .height
+        .saturating_sub(chrome + gap + transcript_min + subtree_height);
+    let input_height = needed_input
+        .min(input_avail)
+        .max(floor_input.min(area.height.saturating_sub(chrome)))
+        .clamp(1, area.height.max(1));
+    let [
+        header_area,
+        header_rule,
+        transcript_area,
+        rule_area,
+        composer_area,
+        subtree_area,
+        _gap,
+    ] = Layout::vertical([
+        Constraint::Length(header_h),
+        Constraint::Length(header_rule_h),
+        Constraint::Min(transcript_min),
+        Constraint::Length(input_rule_h),
+        Constraint::Length(input_height),
+        Constraint::Length(subtree_height),
+        Constraint::Length(gap),
+    ])
+    .areas(area);
+
+    // ---- SubHead breadcrumb (tui.js:3430-3483) ----
+    let mut crumb_spans: Vec<Span<'_>> = vec![Span::raw(" ")];
+    let mut crumb_hits: Vec<(usize, usize, Hit)> = Vec::new(); // (x, width, hit)
+    let mut x = 1usize;
+    let session_name = model.display_name().to_owned();
+    crumb_hits.push((x, session_name.chars().count(), Hit::ChipCrumb(Vec::new())));
+    crumb_spans.push(Span::styled(session_name.clone(), theme.dim_style()));
+    x += session_name.chars().count();
+    for (index, agent) in model.view_path.iter().enumerate() {
+        crumb_spans.push(Span::styled(" ▸ ", theme.faint_style()));
+        x += 3;
+        let Some(hop) = crate::app::find_chip(&model.chips, agent) else {
+            continue;
+        };
+        let last = index + 1 == model.view_path.len();
+        if last {
+            let label = format!("{} {}", hop.callsign, hop.hon);
+            crumb_spans.push(Span::styled(
+                label.clone(),
+                theme.bright_style().add_modifier(Modifier::BOLD),
+            ));
+            x += label.chars().count();
+        } else {
+            let path: Vec<String> = model.view_path[..=index].to_vec();
+            crumb_hits.push((x, hop.callsign.chars().count(), Hit::ChipCrumb(path)));
+            crumb_spans.push(Span::styled(hop.callsign.clone(), theme.dim_style()));
+            x += hop.callsign.chars().count();
+        }
+    }
+    if !chip.closed {
+        let close_label = "✕ close";
+        crumb_spans.push(Span::raw("  "));
+        x += 2;
+        crumb_hits.push((
+            x,
+            close_label.chars().count(),
+            Hit::ChipCloseBtn(chip.agent.clone()),
+        ));
+        let close_hovered = model.hovered == Some(Hit::ChipCloseBtn(chip.agent.clone()));
+        crumb_spans.push(Span::styled(
+            close_label,
+            if close_hovered {
+                theme.err_style()
+            } else {
+                theme.dim_style()
+            },
+        ));
+    }
+    // Header line 2: meta + state badge.
+    let display = chip.display_state();
+    let live_children = crate::app::tree_live_count(&chip.children);
+    let badge_label = if chip.closed {
+        "⊘ CLOSED".to_owned()
+    } else if display == crate::script::ChipDisplayState::Waiting && live_children > 0 {
+        format!("◔ WAITING · {live_children} child")
+    } else {
+        format!("{} {}", display.glyph(), display.label())
+    };
+    let mut header_bottom = vec![Span::styled(
+        format!(
+            " {} · {} · {} · {}  ",
+            chip.full, chip.name, chip.model, chip.device
+        ),
+        theme.dim_style(),
+    )];
+    header_bottom.extend(chip_two_tone(
+        badge_label,
+        theme.frame_style(),
+        theme.gold_style(),
+    ));
+    frame.render_widget(
+        Paragraph::new(Text::from(vec![
+            Line::from(crumb_spans),
+            Line::from(header_bottom),
+        ]))
+        .style(theme.text_style()),
+        header_area,
+    );
+    if header_area.height > 0 {
+        for (col, width, hit) in crumb_hits {
+            hits.push((
+                Rect {
+                    x: header_area.x + u16::try_from(col).unwrap_or(u16::MAX),
+                    y: header_area.y,
+                    width: u16::try_from(width).unwrap_or(1),
+                    height: 1,
+                },
+                hit,
+            ));
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "─".repeat(header_rule.width as usize),
+            theme.frame_style(),
+        )),
+        header_rule,
+    );
+
+    // ---- The chip's transcript (same Entry renderer) + tail lines ----
+    let mut lines: Vec<Line<'_>> = Vec::new();
+    for entry in chip.transcript.entries() {
+        transcript_lines(&mut lines, entry, theme, transcript_area.width);
+    }
+    if chip.state == crate::script::ChipDisplayState::Thinking {
+        lines.push(Line::from(vec![
+            Span::raw(" "),
+            Span::styled("● thinking…", theme.gold_style()),
+        ]));
+    }
+    if display == crate::script::ChipDisplayState::Waiting && live_children > 0 {
+        lines.push(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                format!("◔ waiting on {live_children} child subagent — this session waits too"),
+                theme.dim_style(),
+            ),
+        ]));
+    }
+    let mut total: u16 = 0;
+    for line in &lines {
+        let height = Paragraph::new(line.clone())
+            .wrap(Wrap { trim: false })
+            .line_count(transcript_area.width);
+        total = total.saturating_add(u16::try_from(height).unwrap_or(1));
+    }
+    let max_scroll = total.saturating_sub(transcript_area.height);
+    model.scroll_max.set(max_scroll);
+    model
+        .scroll_back
+        .set(model.scroll_back.get().min(max_scroll));
+    let scroll = max_scroll - model.scroll_back.get();
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
+        transcript_area,
+    );
+
+    // ---- Composer / question card ----
+    if let Some(menu) = menu {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                "─".repeat(rule_area.width as usize),
+                theme.warn_style(),
+            ))
+            .style(theme.text_style()),
+            rule_area,
+        );
+        let footer = format!(
+            " ↑↓ select · ⏎ confirm · 1-{} quick · the parent turn is not blocked · esc back to session",
+            menu.options.len()
+        );
+        let (menu_lines, option_rows) =
+            menu_block(menu, model.menu_selection, theme, composer_area, &footer);
+        frame.render_widget(
+            Paragraph::new(Text::from(menu_lines)).style(theme.menu_style()),
+            composer_area,
+        );
+        for (row_offset, option_index) in option_rows {
+            let y = composer_area.y + row_offset;
+            if y < composer_area.y + composer_area.height {
+                hits.push((
+                    Rect {
+                        x: composer_area.x,
+                        y,
+                        width: composer_area.width,
+                        height: 1,
+                    },
+                    Hit::MenuOption {
+                        menu: menu.id.clone(),
+                        index: option_index,
+                    },
+                ));
+            }
+        }
+    } else {
+        render_composer(model, theme, frame, rule_area, composer_area, hits);
+    }
+    if subtree_height > 0 {
+        render_subtree(model, theme, frame, subtree_area, true, hits);
+    }
+}
+
+/// The aura stage (§3.3): top bar chips, the orb block (a terminal cell
+/// cannot animate the sim's CSS orb — a per-state glyph stands in,
+/// documented divergence), the two columns, the tail-following transcript
+/// and the aura composer.
+fn render_aura(
+    model: &AppModel,
+    theme: &Theme,
+    frame: &mut Frame<'_>,
+    area: Rect,
+    hits: &mut Vec<(Rect, Hit)>,
+) {
+    let aura = &model.aura;
+    let left_rows = 1 + aura.roster.len().max(1);
+    let right_rows = 1 + aura.log.len().min(7);
+    let mut columns_h = u16::try_from(left_rows.max(right_rows)).unwrap_or(8).min(8);
+    let mut orb_h: u16 = 4;
+    // Small windows: columns shed first, then the orb — the composer and
+    // transcript row survive.
+    if area.height < orb_h + columns_h + 7 {
+        columns_h = 0;
+    }
+    if area.height < orb_h + 7 {
+        orb_h = 0;
+    }
+    let [
+        bar_area,
+        bar_rule,
+        orb_area,
+        columns_area,
+        transcript_area,
+        rule_area,
+        composer_area,
+        _gap,
+    ] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(orb_h),
+        Constraint::Length(columns_h),
+        Constraint::Min(1),
+        Constraint::Length(1),
+        Constraint::Length(composer_height(model)),
+        Constraint::Length(1),
+    ])
+    .areas(area);
+
+    // ---- Top bar: ◉ AURA + chips (engine ⇄ · audio · exit ⤶) ----
+    let mut bar = vec![
+        Span::raw(" "),
+        Span::styled("◉ AURA", theme.gold_style().add_modifier(Modifier::BOLD)),
+        Span::styled("  voice session · orchestrator  ", theme.dim_style()),
+    ];
+    let mut bar_x = Line::from(bar.clone()).width();
+    let chip_hit = |bar: &mut Vec<Span<'static>>,
+                    bar_x: &mut usize,
+                    label: String,
+                    hit: Hit,
+                    hits: &mut Vec<(Rect, Hit)>,
+                    hovered: bool| {
+        let chrome = if hovered {
+            theme.gold_style()
+        } else {
+            theme.frame_style()
+        };
+        let spans = chip_two_tone(label, chrome, theme.gold_style());
+        let width = Line::from(spans.clone()).width();
+        if bar_area.height > 0 {
+            hits.push((
+                Rect {
+                    x: bar_area.x + u16::try_from(*bar_x).unwrap_or(u16::MAX),
+                    y: bar_area.y,
+                    width: u16::try_from(width).unwrap_or(1),
+                    height: 1,
+                },
+                hit,
+            ));
+        }
+        bar.extend(spans);
+        bar.push(Span::raw(" "));
+        *bar_x += width + 1;
+    };
+    chip_hit(
+        &mut bar,
+        &mut bar_x,
+        format!("engine · {} ⇄", aura.engine_label()),
+        Hit::AuraEngine,
+        hits,
+        model.hovered == Some(Hit::AuraEngine),
+    );
+    chip_hit(
+        &mut bar,
+        &mut bar_x,
+        if aura.muted {
+            "⨂ audio muted".to_owned()
+        } else {
+            "♪ audio on".to_owned()
+        },
+        Hit::AuraMute,
+        hits,
+        model.hovered == Some(Hit::AuraMute),
+    );
+    chip_hit(
+        &mut bar,
+        &mut bar_x,
+        "exit ⤶".to_owned(),
+        Hit::AuraExit,
+        hits,
+        model.hovered == Some(Hit::AuraExit),
+    );
+    frame.render_widget(Paragraph::new(Line::from(bar)), bar_area);
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "─".repeat(bar_rule.width as usize),
+            theme.frame_style(),
+        )),
+        bar_rule,
+    );
+
+    // ---- Orb block ----
+    if orb_h > 0 {
+        let talk_label = if aura.state == crate::script::AuraState::Listening {
+            "◉ listening…"
+        } else {
+            "◉ hold to talk"
+        };
+        let talk_chrome = if model.hovered == Some(Hit::AuraTalkBtn) {
+            theme.gold_style()
+        } else {
+            theme.frame_style()
+        };
+        let talk_spans = chip_two_tone(talk_label.to_owned(), talk_chrome, theme.gold_style());
+        let talk_width = Line::from(talk_spans.clone()).width();
+        let orb_lines = vec![
+            Line::from(Span::styled(
+                format!("{} {}", aura.state.orb(), aura.state.label()),
+                theme.gold_style().add_modifier(Modifier::BOLD),
+            ))
+            .alignment(Alignment::Center),
+            Line::from(Span::styled(
+                format!(
+                    "{} · never writes code — it spawns and steers sessions on your devices",
+                    aura.engine_kind()
+                ),
+                theme.dim_style(),
+            ))
+            .alignment(Alignment::Center),
+            Line::default(),
+            Line::from(talk_spans).alignment(Alignment::Center),
+        ];
+        frame.render_widget(Paragraph::new(Text::from(orb_lines)), orb_area);
+        // The centered chip's hit rect (row 4 of the orb block).
+        if orb_area.height >= 4 {
+            let left_pad = (orb_area.width as usize).saturating_sub(talk_width) / 2;
+            hits.push((
+                Rect {
+                    x: orb_area.x + u16::try_from(left_pad).unwrap_or(0),
+                    y: orb_area.y + 3,
+                    width: u16::try_from(talk_width).unwrap_or(1),
+                    height: 1,
+                },
+                Hit::AuraTalkBtn,
+            ));
+        }
+    }
+
+    // ---- Two columns: controlled sessions / activity ----
+    if columns_h > 0 {
+        let [left_area, right_area] =
+            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .areas(columns_area);
+        let mut left = vec![Line::from(Span::styled(
+            " controlled sessions",
+            theme.dim_style(),
+        ))];
+        if aura.roster.is_empty() {
+            left.push(Line::from(Span::styled(
+                "  — none yet —",
+                theme.faint_style(),
+            )));
+        }
+        for row in &aura.roster {
+            left.push(Line::from(vec![
+                Span::styled(format!("  {} ", row.state.glyph()), theme.gold_style()),
+                Span::styled(
+                    format!("{} · {}", row.name, row.device),
+                    theme.bright_style(),
+                ),
+                Span::styled(format!(" — {}", row.activity), theme.dim_style()),
+            ]));
+        }
+        let mut right = vec![Line::from(Span::styled(
+            " activity — doing / done",
+            theme.dim_style(),
+        ))];
+        for text in aura.log.iter().rev().take(7).rev() {
+            right.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(format!("· {text}"), theme.dim_style()),
+            ]));
+        }
+        frame.render_widget(Paragraph::new(Text::from(left)), left_area);
+        frame.render_widget(Paragraph::new(Text::from(right)), right_area);
+    }
+
+    // ---- Transcript: last 40 entries, tail-following ----
+    let entries = aura.transcript.entries();
+    let start = entries.len().saturating_sub(40);
+    let mut lines: Vec<Line<'_>> = Vec::new();
+    for entry in &entries[start..] {
+        match entry {
+            TranscriptEntry::User { text, voice, .. } => {
+                lines.push(Line::default());
+                lines.push(Line::from(vec![
+                    Span::raw(" "),
+                    Span::styled(
+                        if *voice { "◉ " } else { "❯ " },
+                        theme.maroon_style().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(text.as_str(), theme.bright_style()),
+                ]));
+            }
+            TranscriptEntry::Note { text } => {
+                lines.push(Line::from(vec![
+                    Span::raw("   "),
+                    Span::styled(text.as_str(), theme.dim_style()),
+                ]));
+            }
+            TranscriptEntry::Item(block) => {
+                if let TurnItem::AgentMessage { text } = &block.item {
+                    lines.push(Line::default());
+                    lines.push(Line::from(vec![
+                        Span::raw(" "),
+                        Span::styled("■ aura", theme.gold_style()),
+                        Span::styled(
+                            if block.spoken { " · ♪" } else { " · muted" },
+                            theme.faint_style(),
+                        ),
+                    ]));
+                    let budget = (transcript_area.width as usize).saturating_sub(3);
+                    let body = if block.streaming {
+                        wrap_body(&format!("{text}▮"), budget.max(1))
+                    } else {
+                        wrap_body(text, budget.max(1))
+                    };
+                    for row in body {
+                        lines.push(Line::from(vec![
+                            Span::raw(" "),
+                            Span::styled("▏ ", theme.rail_style()),
+                            Span::styled(row, theme.text_style()),
+                        ]));
+                    }
+                }
+            }
+            TranscriptEntry::Shell { .. } => {}
+        }
+    }
+    let mut total: u16 = 0;
+    for line in &lines {
+        let height = Paragraph::new(line.clone())
+            .wrap(Wrap { trim: false })
+            .line_count(transcript_area.width);
+        total = total.saturating_add(u16::try_from(height).unwrap_or(1));
+    }
+    let scroll = total.saturating_sub(transcript_area.height);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
+        transcript_area,
+    );
+
+    render_composer(model, theme, frame, rule_area, composer_area, hits);
 }
 
 /// The menu's body lines pre-wrapped by display cells into the menu's
@@ -901,6 +1653,7 @@ fn menu_block(
     selection: usize,
     theme: &Theme,
     area: Rect,
+    footer: &str,
 ) -> (Vec<Line<'static>>, Vec<(u16, usize)>) {
     let allocated = area.height as usize;
     if allocated == 0 {
@@ -982,12 +1735,7 @@ fn menu_block(
     }
     if show_hint {
         lines.push(Line::from(vec![Span::styled(
-            format!(
-                " ↑↓ select · ⏎ confirm · 1-{} quick · menu {} · menu.answer(\"{}\", n) over RPC",
-                menu.options.len(),
-                menu.id,
-                menu.id
-            ),
+            footer.to_owned(),
             theme.faint_style(),
         )]));
     }
@@ -1127,7 +1875,13 @@ fn composer_lines<'a>(
     let chip_spans = chip_two_tone(talk_label.to_owned(), talk_chrome, theme.gold_style());
     let chip_width = Line::from(chip_spans.clone()).width();
     // Right-aligned talk chip when the row leaves room (2-col right pad).
+    // Hidden on the subagent and aura screens (sim §4.1 — aura has its own
+    // hold-to-talk button).
+    let talk_here = matches!(model.screen, Screen::Session | Screen::Launcher);
     let chip_fit = |spans: &mut Vec<Span<'a>>| -> Option<(u16, u16)> {
+        if !talk_here {
+            return None;
+        }
         let used = Line::from(spans.clone()).width();
         let total = used + chip_width + COMPOSER_PAD;
         if (width as usize) > total {
@@ -1145,8 +1899,18 @@ fn composer_lines<'a>(
 
     if model.composer.is_empty() {
         let placeholder = match model.screen {
-            Screen::Launcher => PLACEHOLDER_LAUNCHER,
-            _ => PLACEHOLDER_SESSION,
+            Screen::Launcher => PLACEHOLDER_LAUNCHER.to_owned(),
+            // Sim SubComposer placeholder (tui.js:3430-3483).
+            Screen::Subagent => model.viewed_chip().map_or_else(
+                || PLACEHOLDER_SESSION.to_owned(),
+                |chip| format!("message {} — steer this subagent · ⏎ send", chip.callsign),
+            ),
+            // Sim aura composer placeholder (tui.js:3508-3586), verbatim.
+            Screen::Aura => {
+                "speak or type — e.g. “spin up billing-service on workstation and run its tests”"
+                    .to_owned()
+            }
+            _ => PLACEHOLDER_SESSION.to_owned(),
         };
         let mut spans = vec![
             Span::raw(" ".repeat(COMPOSER_PAD)),
@@ -1306,7 +2070,8 @@ fn render_status_bar(
     area: Rect,
     hits: &mut Vec<(Rect, Hit)>,
 ) {
-    let badge = model.projection.badge();
+    // The derived WAITING-on-subagents badge overlays plain IDLE (§2.6).
+    let (badge, tone) = model.status_badge();
     let identity = &model.identity;
     let tokens = model.projection.context_tokens();
     #[allow(clippy::cast_precision_loss)]
@@ -1327,7 +2092,6 @@ fn render_status_bar(
     // Sim Badge (tui.js:5541-5547): IDLE wears a FRAME border with dim
     // ink; other outlined states border in their own tone; fills carry the
     // fill on chrome and label alike.
-    let tone = model.projection.badge_tone();
     let badge_chrome = if matches!(tone, crate::projection::BadgeTone::Idle) {
         theme.frame_style()
     } else {
