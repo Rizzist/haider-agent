@@ -10,7 +10,13 @@
 //! - [`FakeProvider`] is fixture-driven and deterministic — the same script
 //!   yields the same event sequence (`Delay` only adds wall time).
 
+mod anthropic;
+#[cfg(test)]
+mod anthropic_tests;
+mod wire;
+
 use async_trait::async_trait;
+use haider_protocol::ids::ArtifactRef;
 use haider_protocol::provider::{
     Block, CapabilityDoc, FeatureResolve, FinishReason, StreamEvent, Usage,
 };
@@ -19,6 +25,12 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, sleep};
+
+pub use anthropic::{
+    ANTHROPIC_API_URL, ANTHROPIC_PROVIDER_NAME, AnthropicCapture, AnthropicProvider,
+    AnthropicRetryPolicy, AnthropicTransportConfig, replay_anthropic_http_error,
+    replay_anthropic_sse,
+};
 
 /// Crate marker used by the workspace self-test.
 pub const CRATE_NAME: &str = "haider-provider";
@@ -47,26 +59,61 @@ pub enum MessageRole {
     Tool,
 }
 
-/// Minimal normalized request accepted by every provider adapter.
+/// Provider-local tool definition. The protocol tool manifest has execution
+/// and permission fields that do not belong on a model-provider request.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolDefinition {
+    pub name: String,
+    pub description: String,
+    pub input_schema: serde_json::Value,
+}
+
+/// Resolved bytes for one A2 attachment reference.
+///
+/// The message tree keeps only content-addressed refs. The prompt compiler
+/// resolves those refs before crossing the provider boundary.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResolvedAttachment {
+    pub artifact: ArtifactRef,
+    pub data_base64: String,
+}
+
+/// Normalized request accepted by every provider adapter.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TurnRequest {
     pub messages: Vec<Message>,
     pub model: String,
     pub max_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<ToolDefinition>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<ResolvedAttachment>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ProviderErrorKind {
+    Authentication,
+    PermissionDenied,
+    RateLimited,
+    Overloaded,
+    InvalidRequest,
+    Transport,
     MalformedFrame,
     InvalidUtf8,
     Internal,
 }
 
 /// Typed failure yielded by a provider stream.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderError {
     pub kind: ProviderErrorKind,
     pub message: String,
+    pub retryable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_ms: Option<u64>,
 }
 
 impl ProviderError {
@@ -74,7 +121,21 @@ impl ProviderError {
         Self {
             kind,
             message: message.into(),
+            retryable: kind.default_retryable(),
+            retry_after_ms: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_retry_after_ms(mut self, retry_after_ms: Option<u64>) -> Self {
+        self.retry_after_ms = retry_after_ms;
+        self
+    }
+}
+
+impl ProviderErrorKind {
+    const fn default_retryable(self) -> bool {
+        matches!(self, Self::RateLimited | Self::Overloaded | Self::Transport)
     }
 }
 
@@ -367,14 +428,14 @@ fn split_inside_multibyte(text: &str) -> Option<usize> {
 /// Incremental UTF-8 decoder: buffers a trailing partial scalar between
 /// pushes so only complete, valid text ever leaves the fake provider.
 #[derive(Debug, Default)]
-struct Utf8Assembler {
+pub(crate) struct Utf8Assembler {
     pending: Vec<u8>,
 }
 
 impl Utf8Assembler {
     /// Returns the complete text now decodable, buffering any trailing
     /// partial scalar; an invalid (not merely incomplete) sequence is an error.
-    fn push(&mut self, bytes: &[u8]) -> Result<Vec<String>, ProviderError> {
+    pub(crate) fn push(&mut self, bytes: &[u8]) -> Result<Vec<String>, ProviderError> {
         self.pending.extend_from_slice(bytes);
         let mut decoded = Vec::new();
 
@@ -416,7 +477,7 @@ impl Utf8Assembler {
         }
     }
 
-    fn has_pending(&self) -> bool {
+    pub(crate) fn has_pending(&self) -> bool {
         !self.pending.is_empty()
     }
 }

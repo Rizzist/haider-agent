@@ -1,0 +1,45 @@
+[
+  {
+    "result": "ok",
+    "value": {
+      "event": "tool_call_start",
+      "call_id": "toolu_sanitized",
+      "name": "get_weather"
+    }
+  },
+  {
+    "result": "ok",
+    "value": {
+      "event": "tool_call_args_delta",
+      "call_id": "toolu_sanitized",
+      "args_fragment": "{\"location\":"
+    }
+  },
+  {
+    "result": "ok",
+    "value": {
+      "event": "tool_call_args_delta",
+      "call_id": "toolu_sanitized",
+      "args_fragment": "\"Tehran\"}"
+    }
+  },
+  {
+    "result": "ok",
+    "value": {"event": "tool_call_end", "call_id": "toolu_sanitized"}
+  },
+  {
+    "result": "ok",
+    "value": {
+      "event": "usage_update",
+      "input": 472,
+      "output": 89,
+      "reasoning": 0,
+      "cached": 0,
+      "source": "provider_reported"
+    }
+  },
+  {
+    "result": "ok",
+    "value": {"event": "finish", "reason": "tool_use"}
+  }
+]

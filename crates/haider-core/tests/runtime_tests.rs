@@ -13,7 +13,7 @@ use haider_protocol::item::{ItemEvent, ToolStatus, TurnItem};
 use haider_protocol::provider::{CapabilityDoc, FinishReason, Usage, UsageSource};
 use haider_protocol::state::RunState;
 use haider_provider::{
-    FakeProvider, FakeStep, Provider, ProviderError, ProviderStream, TurnRequest,
+    FakeProvider, FakeStep, Provider, ProviderError, ProviderErrorKind, ProviderStream, TurnRequest,
 };
 use std::collections::HashSet;
 use std::future::pending;
@@ -244,6 +244,31 @@ async fn malformed_frame_is_errored_with_typed_error() {
         events.last().map(typed),
         Some(EventPayload::RunState(RunState::Errored))
     ));
+}
+
+#[tokio::test]
+async fn provider_retry_classification_and_retry_after_survive_actor_boundary() {
+    let provider = Arc::new(ImmediateErrorProvider {
+        error: ProviderError::new(ProviderErrorKind::RateLimited, "rate limited")
+            .with_retry_after_ms(Some(3_000)),
+    });
+    let store = Arc::new(MemoryStore::new());
+    let handle = HarnessActor::spawn(config(), provider, store);
+
+    let outcome = handle
+        .submit_turn(SubmitTurn::new("classify"))
+        .await
+        .expect("turn accepted")
+        .wait()
+        .await
+        .expect("outcome");
+
+    let error = outcome.error.expect("typed error");
+    assert_eq!(error.code, ErrorCode::ProviderError);
+    assert!(error.retryable);
+    let details = error.details.expect("provider details");
+    assert_eq!(details["provider_error_kind"], "RateLimited");
+    assert_eq!(details["retry_after_ms"], 3_000);
 }
 
 #[tokio::test]
@@ -679,6 +704,21 @@ impl StoreHandle for BlockingCompletedStore {
 
 struct HangingStartProvider {
     entered: Notify,
+}
+
+struct ImmediateErrorProvider {
+    error: ProviderError,
+}
+
+#[async_trait]
+impl Provider for ImmediateErrorProvider {
+    async fn capabilities(&self) -> CapabilityDoc {
+        FakeProvider::new(Vec::new()).capabilities().await
+    }
+
+    async fn stream_turn(&self, _request: TurnRequest) -> Result<ProviderStream, ProviderError> {
+        Err(self.error.clone())
+    }
 }
 
 #[async_trait]

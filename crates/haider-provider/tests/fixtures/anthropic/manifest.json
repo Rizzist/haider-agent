@@ -1,0 +1,57 @@
+{
+  "schema": "haider.anthropic-fixtures.v1",
+  "provisional": true,
+  "provenance": "Synthesized from docs/research/C1-anthropic-notes.md; replace only through the ignored promotion harness.",
+  "fixtures": [
+    {
+      "name": "text_only",
+      "transport": "sse",
+      "status": 200,
+      "wire": "text_only.sse",
+      "golden": "text_only.events.json"
+    },
+    {
+      "name": "tool_call",
+      "transport": "sse",
+      "status": 200,
+      "wire": "tool_call.sse",
+      "golden": "tool_call.events.json"
+    },
+    {
+      "name": "image_in",
+      "transport": "sse",
+      "status": 200,
+      "wire": "image_in.sse",
+      "golden": "image_in.events.json"
+    },
+    {
+      "name": "usage_heavy",
+      "transport": "sse",
+      "status": 200,
+      "wire": "usage_heavy.sse",
+      "golden": "usage_heavy.events.json"
+    },
+    {
+      "name": "rate_limit",
+      "transport": "http",
+      "status": 429,
+      "retry_after": "3",
+      "wire": "rate_limit.http.json",
+      "golden": "rate_limit.error.json"
+    },
+    {
+      "name": "malformed",
+      "transport": "sse",
+      "status": 200,
+      "wire": "malformed.sse",
+      "golden": "malformed.events.json"
+    },
+    {
+      "name": "overloaded_stream",
+      "transport": "sse",
+      "status": 200,
+      "wire": "overloaded_stream.sse",
+      "golden": "overloaded_stream.events.json"
+    }
+  ]
+}

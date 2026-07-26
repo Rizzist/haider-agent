@@ -1,0 +1,10 @@
+[
+  {
+    "result": "err",
+    "value": {
+      "kind": "malformed_frame",
+      "message": "Anthropic delta references unopened content block index 0",
+      "retryable": false
+    }
+  }
+]

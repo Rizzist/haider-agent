@@ -118,6 +118,72 @@ fn run_jsonl_is_lf_framed_and_every_line_is_a_raw_envelope() {
 }
 
 #[test]
+fn run_jsonl_accepts_explicit_fake_provider_and_model() {
+    let out = haider()
+        .args([
+            "run",
+            "--jsonl",
+            "--provider",
+            "fake",
+            "--model",
+            "fixture-model",
+            "hello",
+        ])
+        .output()
+        .expect("binary runs");
+
+    assert!(out.status.success());
+    let envelopes = parse_jsonl(&out.stdout);
+    assert_eq!(
+        envelopes.last().map(typed),
+        Some(EventPayload::RunState(RunState::Done))
+    );
+}
+
+#[test]
+fn anthropic_provider_requires_an_explicit_model() {
+    let out = haider()
+        .args(["run", "--jsonl", "--provider", "anthropic", "hello"])
+        .output()
+        .expect("binary runs");
+
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("requires --model"));
+}
+
+#[test]
+fn unknown_run_provider_is_usage_error() {
+    let out = haider()
+        .args(["run", "--jsonl", "--provider", "unknown", "hello"])
+        .output()
+        .expect("binary runs");
+
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unknown provider"));
+}
+
+#[test]
+fn anthropic_missing_credential_exits_65_without_network_access() {
+    let out = haider()
+        .args([
+            "run",
+            "--jsonl",
+            "--provider",
+            "anthropic",
+            "--model",
+            "claude-sonnet-5",
+            "hello",
+        ])
+        .env_remove("HAIDER_ANTHROPIC_API_KEY")
+        .output()
+        .expect("binary runs");
+
+    assert_eq!(out.status.code(), Some(65));
+    assert!(out.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("HAIDER_ANTHROPIC_API_KEY"));
+}
+
+#[test]
 fn sequential_cli_runs_use_profile_owned_worker_generations() {
     let profile_parent = tempfile::tempdir().expect("temporary CLI profile parent");
     let profile = profile_parent.path().join("profile");
