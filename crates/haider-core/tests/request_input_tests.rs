@@ -2,6 +2,7 @@
 
 use haider_core::{HarnessActor, HarnessConfig, MemoryStore, SubmitTurn};
 use haider_protocol::EventPayload;
+use haider_protocol::error::ErrorCode;
 use haider_protocol::ids::{DeviceId, SessionId};
 use haider_protocol::item::{ItemEvent, ToolStatus, TurnItem};
 use haider_protocol::menu::{AnswerVia, MenuAnswer, MenuKind};
@@ -189,6 +190,79 @@ async fn request_input_journals_menu_round_trip_and_returns_answer_as_tool_resul
         haider_protocol::provider::Block::ToolResult { preview, .. }
             if serde_json::from_str::<serde_json::Value>(preview).expect("answer JSON")
                 == serde_json::json!({"value":"Binary","option_key":"binary"})
+    ));
+}
+
+#[tokio::test]
+async fn provider_request_ceiling_ends_the_same_turn_with_typed_loop_limit() {
+    let mut config = HarnessConfig::for_session(
+        SessionId::new(SESSION),
+        DeviceId::new("request-input-device"),
+        7,
+        11,
+    )
+    .with_started_at_ms(1_700_000_000_000);
+    config.max_provider_requests_per_turn = 1;
+    let store = Arc::new(MemoryStore::new());
+    let provider = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitRequestInput {
+            call_id: "loop-question".into(),
+            kind: FakeInputKind::Question,
+            title: "Continue the loop?".into(),
+            body: Vec::new(),
+            options: Vec::new(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+    ]));
+    let handle = HarnessActor::spawn(config, provider.clone(), store.clone());
+    let turn = handle
+        .submit_turn(SubmitTurn::new("enforce request ceiling"))
+        .await
+        .expect("turn accepted");
+    let mut state = handle.state_receiver();
+    let parked = state
+        .wait_for(|state| matches!(state, Some(RunState::InputRequired { .. })))
+        .await
+        .expect("request_input parks")
+        .clone();
+    let Some(RunState::InputRequired { menu }) = parked else {
+        panic!("wait predicate guarantees InputRequired");
+    };
+    handle
+        .answer_menu(MenuAnswer {
+            menu,
+            option_key: None,
+            option_index: 0,
+            value: Some("yes".into()),
+            via: AnswerVia::Rpc,
+        })
+        .await
+        .expect("answer accepted");
+
+    let outcome = turn.wait().await.expect("typed turn outcome");
+    assert_eq!(outcome.state, RunState::Errored);
+    let error = outcome.error.expect("loop-limit error");
+    assert_eq!(error.code, ErrorCode::LoopLimit);
+    assert_eq!(
+        error.details.expect("loop-limit details"),
+        serde_json::json!({
+            "provider_request_count": 2,
+            "provider_request_limit": 1,
+        })
+    );
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "the over-limit request is never sent"
+    );
+    let events = store.events(&SessionId::new(SESSION)).await;
+    assert!(matches!(
+        events
+            .last()
+            .map(|event| serde_json::from_value(event.payload.clone()).expect("payload")),
+        Some(EventPayload::RunState(RunState::Errored))
     ));
 }
 

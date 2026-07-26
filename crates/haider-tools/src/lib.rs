@@ -21,9 +21,9 @@ pub use error::{FsPatchConflict, ToolError, ToolResult};
 pub use filesystem::{CasSink, FsList, FsPatch, FsRead, FsSearch, ResultBounds, TurnAttribution};
 pub use ledger::{ChangeLedger, ChangeLedgerSink, FsWriteRecord, TurnChanges};
 pub use process::{
-    CommandOutputSink, NoopCommandOutputSink, ProcessBounds, ProcessControl, ProcessControlAction,
-    ProcessControlResult, ProcessExec, ProcessExecution, ProcessOutputChunk, ProcessResult,
-    ProcessSignal,
+    CommandOutputSink, NoopCommandOutputSink, PROCESS_OUTPUT_CHUNK_BYTES, ProcessBounds,
+    ProcessControl, ProcessControlAction, ProcessControlResult, ProcessExec, ProcessExecution,
+    ProcessLifecycleEvent, ProcessOutputChunk, ProcessResult, ProcessSignal,
 };
 pub use request_input::{RequestInput, RequestInputAnswer, RequestInputKind, RequestInputOption};
 pub use shell::{

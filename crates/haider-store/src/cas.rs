@@ -15,9 +15,13 @@ use crate::{Cas, StoreResult, store_error};
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::ArtifactRef;
 use std::fs::{self, File, OpenOptions};
-use std::io::{ErrorKind, Read, Seek, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+#[cfg(test)]
+#[path = "cas_tests.rs"]
+mod cas_tests;
 
 /// Process-wide counter making temp-file names unique across threads.
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -55,6 +59,89 @@ impl FileCas {
             Ok(file) => Ok(artifact_for_reader(file, path)? == *artifact),
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
             Err(error) => Err(io_error("read CAS object", path, error)),
+        }
+    }
+
+    /// Copies and hashes one reader in the same pass. The temporary lives in
+    /// the CAS root because its digest (and therefore its shard) is not known
+    /// until every byte that will be published has been written.
+    fn put_reader(&self, mut source: impl Read, source_path: &Path) -> StoreResult<ArtifactRef> {
+        let (mut temporary_path, mut temporary) = create_temporary(&self.root)?;
+        let mut hasher = blake3::Hasher::new();
+        let mut buffer = [0_u8; 16 * 1024];
+        let copy_result = (|| {
+            loop {
+                let read = source
+                    .read(&mut buffer)
+                    .map_err(|error| io_error("read CAS source", source_path, error))?;
+                if read == 0 {
+                    break;
+                }
+                temporary.write_all(&buffer[..read]).map_err(|error| {
+                    io_error("persist temporary CAS object", temporary_path.path(), error)
+                })?;
+                // Update only after write_all succeeds: the address covers
+                // exactly the complete bytes eligible for publication.
+                hasher.update(&buffer[..read]);
+            }
+            temporary.sync_all().map_err(|error| {
+                io_error("persist temporary CAS object", temporary_path.path(), error)
+            })?;
+            Ok(ArtifactRef::new(format!(
+                "blake3:{}",
+                hasher.finalize().to_hex()
+            )))
+        })();
+        let artifact = match copy_result {
+            Ok(artifact) => artifact,
+            Err(error) => {
+                drop(temporary);
+                cleanup_temporary(&mut temporary_path, &self.root)?;
+                return Err(error);
+            }
+        };
+        drop(temporary);
+
+        let path = self.path_for(&artifact)?;
+        if self.verify_existing(&artifact, &path)? {
+            cleanup_temporary(&mut temporary_path, &self.root)?;
+            return Ok(artifact);
+        }
+        let parent = path.parent().ok_or_else(|| {
+            store_error(
+                ErrorCode::Internal,
+                format!("CAS object has no parent directory: {}", path.display()),
+                false,
+            )
+        })?;
+        let shard_created = !parent.exists();
+        fs::create_dir_all(parent).map_err(|error| io_error("create CAS shard", parent, error))?;
+        if shard_created {
+            sync_directory(&self.root)?;
+        }
+
+        match fs::hard_link(temporary_path.path(), &path) {
+            Ok(()) => {
+                // Both directory mutations are durability boundaries: unlink
+                // the root staging name and persist the shard publication.
+                cleanup_temporary(&mut temporary_path, &self.root)?;
+                sync_directory(parent)?;
+                Ok(artifact)
+            }
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                let winner_is_valid = self.verify_existing(&artifact, &path);
+                cleanup_temporary(&mut temporary_path, &self.root)?;
+                if winner_is_valid? {
+                    Ok(artifact)
+                } else {
+                    Err(corrupt_object(&path))
+                }
+            }
+            Err(error) => {
+                let publish_error = io_error("publish CAS object", &path, error);
+                cleanup_temporary(&mut temporary_path, &self.root)?;
+                Err(publish_error)
+            }
         }
     }
 }
@@ -119,61 +206,9 @@ impl Cas for FileCas {
     }
 
     fn put_file(&self, source_path: &Path) -> StoreResult<ArtifactRef> {
-        let mut source = File::open(source_path)
+        let source = File::open(source_path)
             .map_err(|error| io_error("open CAS source", source_path, error))?;
-        let artifact = artifact_for_reader(&mut source, source_path)?;
-        source
-            .rewind()
-            .map_err(|error| io_error("rewind CAS source", source_path, error))?;
-        let path = self.path_for(&artifact)?;
-        if self.verify_existing(&artifact, &path)? {
-            return Ok(artifact);
-        }
-
-        let parent = path.parent().ok_or_else(|| {
-            store_error(
-                ErrorCode::Internal,
-                format!("CAS object has no parent directory: {}", path.display()),
-                false,
-            )
-        })?;
-        let shard_created = !parent.exists();
-        fs::create_dir_all(parent).map_err(|error| io_error("create CAS shard", parent, error))?;
-        if shard_created {
-            sync_directory(&self.root)?;
-        }
-        let (mut temporary_path, mut temporary) = create_temporary(parent)?;
-        let write_result =
-            std::io::copy(&mut source, &mut temporary).and_then(|_| temporary.sync_all());
-        if let Err(error) = write_result {
-            drop(temporary);
-            let write_error =
-                io_error("persist temporary CAS object", temporary_path.path(), error);
-            cleanup_temporary(&mut temporary_path, parent)?;
-            return Err(write_error);
-        }
-        drop(temporary);
-
-        match fs::hard_link(temporary_path.path(), &path) {
-            Ok(()) => {
-                cleanup_temporary(&mut temporary_path, parent)?;
-                Ok(artifact)
-            }
-            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-                let winner_is_valid = self.verify_existing(&artifact, &path);
-                cleanup_temporary(&mut temporary_path, parent)?;
-                if winner_is_valid? {
-                    Ok(artifact)
-                } else {
-                    Err(corrupt_object(&path))
-                }
-            }
-            Err(error) => {
-                let publish_error = io_error("publish CAS object", &path, error);
-                cleanup_temporary(&mut temporary_path, parent)?;
-                Err(publish_error)
-            }
-        }
+        self.put_reader(source, source_path)
     }
 
     fn get(&self, artifact: &ArtifactRef) -> StoreResult<Vec<u8>> {

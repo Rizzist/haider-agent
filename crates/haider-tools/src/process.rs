@@ -22,7 +22,9 @@ use haider_protocol::ids::{ArtifactRef, EffectId};
 use haider_protocol::item::{ItemDelta, OutputStream, ToolStatus, TurnItem};
 use rustix::fd::OwnedFd;
 use rustix::fs::{Mode, OFlags};
-use rustix::process::{Pid, Signal, kill_process_group, test_kill_process_group};
+use rustix::process::{
+    Pid, Signal, WaitId, WaitIdOptions, kill_process_group, test_kill_process_group, waitid,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -35,11 +37,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::process::{ChildStdin, Command};
+use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::time::{Sleep, sleep};
 
-const OUTPUT_CHUNK_BYTES: usize = 8 * 1024;
+/// Maximum raw payload retained by one pipe-read chunk.
+pub const PROCESS_OUTPUT_CHUNK_BYTES: usize = 8 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessExec {
@@ -234,6 +237,14 @@ pub struct ProcessResult {
     pub inline_output: Vec<ProcessOutputChunk>,
     pub artifact: Option<ArtifactRef>,
     pub escalation_note: Option<String>,
+    /// Largest raw transcript payload retained in memory at one time.
+    ///
+    /// This excludes the serialized spill file and includes the chunk being
+    /// serviced, making the spill bound observable in regression tests.
+    pub transcript_high_water_bytes: usize,
+    /// Supervisor ordering trace used by process-lifecycle regression tests.
+    #[doc(hidden)]
+    pub lifecycle_events: Vec<ProcessLifecycleEvent>,
 }
 
 impl ProcessResult {
@@ -245,6 +256,18 @@ impl ProcessResult {
             exit_code: self.exit_code,
         }
     }
+}
+
+/// Test-observable milestones around exit, sweeping, reaping, and registry
+/// removal. They are deliberately facts, not control hooks.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessLifecycleEvent {
+    LeaderExitObserved,
+    GroupSweepStarted,
+    GroupSweepCompleted,
+    LeaderReaped,
+    RegistryRemoved,
 }
 
 #[async_trait]
@@ -639,7 +662,7 @@ impl EffectBroker {
         let finish = self.effect_finish(&intent);
         let (result_sender, result) = oneshot::channel();
         let finalizer_id = self.register_finalizer(async move {
-            let process_result = supervise_process(Supervisor {
+            let mut process_result = supervise_process(Supervisor {
                 child,
                 stdout,
                 stderr,
@@ -657,6 +680,11 @@ impl EffectBroker {
             .await;
             if !process_result.leaked {
                 registry.remove(&call_id, &effect).await;
+                if let Ok(result) = &mut process_result.result {
+                    result
+                        .lifecycle_events
+                        .push(ProcessLifecycleEvent::RegistryRemoved);
+                }
             }
             let outcome = match (&process_result.result, process_result.cancelled) {
                 (_, true) => match &process_result.escalation_note {
@@ -825,6 +853,8 @@ async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
     drop(captured_sender);
 
     let mut transcript = Vec::<BufferedOutput>::new();
+    let mut transcript_payload_bytes = 0usize;
+    let mut transcript_high_water_bytes = 0usize;
     let mut spill = None;
     let mut transcript_failed = false;
     let mut output_bytes = 0usize;
@@ -833,24 +863,30 @@ async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
     let mut cancel_open = true;
     let mut output_open = true;
     let mut exit_status = None;
-    let mut wait_open = true;
+    let mut leader_exit_observed = false;
+    let mut leader_is_zombie = false;
+    let mut leader_reaped = false;
     let mut kill_deadline: Option<Pin<Box<Sleep>>> = None;
     let mut pipe_drain_deadline: Option<Pin<Box<Sleep>>> = None;
     let mut escalation_notes = Vec::new();
+    let mut lifecycle_events = Vec::new();
     let mut group_leaked = false;
-    let mut wait = Box::pin(child.wait());
+    let mut exit_observation = Box::pin(observe_process_leader_exit(pid));
 
     if cancelled {
         begin_group_termination(
             pid,
+            false,
             bounds.kill_grace,
             &mut kill_deadline,
             &mut fatal,
             &mut escalation_notes,
+            &mut lifecycle_events,
         );
     }
 
-    while wait_open || output_open || kill_deadline.is_some() || pipe_drain_deadline.is_some() {
+    while !leader_reaped || output_open || kill_deadline.is_some() || pipe_drain_deadline.is_some()
+    {
         tokio::select! {
             biased;
             changed = cancel.changed(), if !cancelled && cancel_open => {
@@ -859,10 +895,12 @@ async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
                         cancelled = true;
                         begin_group_termination(
                             pid,
+                            false,
                             bounds.kill_grace,
                             &mut kill_deadline,
                             &mut fatal,
                             &mut escalation_notes,
+                            &mut lifecycle_events,
                         );
                     }
                     Ok(()) => {}
@@ -885,6 +923,9 @@ async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
             maybe_chunk = captured.recv(), if output_open => {
                 match maybe_chunk {
                     Some(Captured::Chunk(stream, bytes)) => {
+                        transcript_high_water_bytes = transcript_high_water_bytes.max(
+                            transcript_payload_bytes.saturating_add(bytes.len())
+                        );
                         output_bytes = output_bytes.saturating_add(bytes.len());
                         let chunk_b64 = BASE64.encode(&bytes);
                         if let Err(error) = output.emit(
@@ -897,10 +938,12 @@ async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
                             fatal.get_or_insert(error);
                             begin_group_termination(
                                 pid,
+                                false,
                                 bounds.kill_grace,
                                 &mut kill_deadline,
                                 &mut fatal,
                                 &mut escalation_notes,
+                                &mut lifecycle_events,
                             );
                         }
                         if !transcript_failed
@@ -909,6 +952,7 @@ async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
                         {
                             match TranscriptSpill::new() {
                                 Ok(mut created) => {
+                                    transcript_payload_bytes = 0;
                                     for buffered in transcript.drain(..) {
                                         if let Err(error) =
                                             created.append(buffered.stream, &buffered.bytes)
@@ -925,6 +969,7 @@ async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
                                 Err(error) => {
                                     fatal.get_or_insert(error);
                                     transcript.clear();
+                                    transcript_payload_bytes = 0;
                                     transcript_failed = true;
                                 }
                             }
@@ -932,10 +977,12 @@ async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
                         if transcript_failed {
                             begin_group_termination(
                                 pid,
+                                false,
                                 bounds.kill_grace,
                                 &mut kill_deadline,
                                 &mut fatal,
                                 &mut escalation_notes,
+                                &mut lifecycle_events,
                             );
                             continue;
                         }
@@ -946,13 +993,17 @@ async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
                                 transcript_failed = true;
                                 begin_group_termination(
                                     pid,
+                                    false,
                                     bounds.kill_grace,
                                     &mut kill_deadline,
                                     &mut fatal,
                                     &mut escalation_notes,
+                                    &mut lifecycle_events,
                                 );
                             }
                         } else {
+                            transcript_payload_bytes =
+                                transcript_payload_bytes.saturating_add(bytes.len());
                             transcript.push(BufferedOutput { stream, bytes });
                         }
                     }
@@ -962,43 +1013,55 @@ async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
                         });
                         begin_group_termination(
                             pid,
+                            false,
                             bounds.kill_grace,
                             &mut kill_deadline,
                             &mut fatal,
                             &mut escalation_notes,
+                            &mut lifecycle_events,
                         );
                     }
                     None => {
                         output_open = false;
                         pipe_drain_deadline = None;
-                        if kill_deadline.is_some()
-                            && matches!(process_group_exists(pid), Ok(false))
-                        {
-                            kill_deadline = None;
-                        }
                     }
                 }
             }
-            status = &mut wait, if wait_open => {
-                wait_open = false;
-                *stdin.lock().await = None;
-                match status {
-                    Ok(status) => exit_status = Some(status),
-                    Err(error) => {
-                        fatal.get_or_insert_with(|| ToolError::Runtime {
-                            message: format!("wait for process `{call_id}`: {error}"),
-                        });
+            observed = &mut exit_observation, if !leader_exit_observed => {
+                leader_exit_observed = true;
+                leader_is_zombie = match observed {
+                    Ok(()) => {
+                        lifecycle_events.push(ProcessLifecycleEvent::LeaderExitObserved);
+                        true
                     }
-                }
+                    Err(error) => {
+                        fatal.get_or_insert(error);
+                        false
+                    }
+                };
                 if kill_deadline.is_none() {
                     begin_group_termination(
                         pid,
+                        leader_is_zombie,
                         bounds.kill_grace,
                         &mut kill_deadline,
                         &mut fatal,
                         &mut escalation_notes,
+                        &mut lifecycle_events,
                     );
-                    if kill_deadline.is_none() && output_open {
+                }
+                if kill_deadline.is_none() {
+                    reap_process_leader(
+                        &mut child,
+                        &stdin,
+                        &call_id,
+                        &mut exit_status,
+                        &mut fatal,
+                        &mut lifecycle_events,
+                    )
+                    .await;
+                    leader_reaped = true;
+                    if output_open {
                         pipe_drain_deadline = Some(Box::pin(sleep(bounds.kill_grace)));
                     }
                 }
@@ -1011,19 +1074,12 @@ async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
                 match process_group_exists(pid) {
                     Ok(false) => {
                         kill_deadline = None;
-                        if !wait_open && output_open {
-                            pipe_drain_deadline = Some(Box::pin(sleep(bounds.kill_grace)));
-                        }
+                        lifecycle_events.push(ProcessLifecycleEvent::GroupSweepCompleted);
                     }
-                    Ok(true) => match signal_group(pid, Signal::KILL) {
-                        Ok(()) => {
-                            kill_deadline = None;
-                            if !wait_open && output_open {
-                                pipe_drain_deadline =
-                                    Some(Box::pin(sleep(bounds.kill_grace)));
-                            }
-                        }
-                        Err(error) => {
+                    Ok(true) => {
+                        if let Err(error) =
+                            signal_group_for_sweep(pid, Signal::KILL, leader_is_zombie)
+                        {
                             let note = format!(
                                 "SIGKILL escalation failed for process group {}: {error}",
                                 pid.as_raw_nonzero()
@@ -1036,7 +1092,9 @@ async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
                             group_leaked = true;
                             break;
                         }
-                    },
+                        kill_deadline = None;
+                        lifecycle_events.push(ProcessLifecycleEvent::GroupSweepCompleted);
+                    }
                     Err(error) => {
                         let note = format!(
                             "process-group probe failed during SIGKILL escalation: {error}"
@@ -1045,6 +1103,21 @@ async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
                         fatal.get_or_insert(error);
                         group_leaked = true;
                         break;
+                    }
+                }
+                if kill_deadline.is_none() && leader_exit_observed && !leader_reaped {
+                    reap_process_leader(
+                        &mut child,
+                        &stdin,
+                        &call_id,
+                        &mut exit_status,
+                        &mut fatal,
+                        &mut lifecycle_events,
+                    )
+                    .await;
+                    leader_reaped = true;
+                    if output_open {
+                        pipe_drain_deadline = Some(Box::pin(sleep(bounds.kill_grace)));
                     }
                 }
             }
@@ -1068,6 +1141,9 @@ async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
     } else {
         Ok(None)
     };
+    // Cancellation is sticky through artifact ingestion: a request arriving
+    // while put_file is blocked owns both its success and failure arms.
+    cancelled |= *cancel.borrow();
     let artifact = match artifact_result {
         Ok(artifact) => artifact,
         Err(error) => {
@@ -1117,6 +1193,8 @@ async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
         inline_output,
         artifact,
         escalation_note: escalation_note.clone(),
+        transcript_high_water_bytes,
+        lifecycle_events,
     };
     let result = if cancelled {
         Ok(process_result)
@@ -1137,7 +1215,7 @@ async fn read_output<R>(mut reader: R, stream: OutputStream, sender: mpsc::Sende
 where
     R: AsyncRead + Unpin,
 {
-    let mut buffer = vec![0_u8; OUTPUT_CHUNK_BYTES];
+    let mut buffer = vec![0_u8; PROCESS_OUTPUT_CHUNK_BYTES];
     loop {
         match reader.read(&mut buffer).await {
             Ok(0) => return,
@@ -1200,6 +1278,26 @@ fn signal_group(pid: Pid, signal: Signal) -> ToolResult<()> {
     })
 }
 
+/// Signals the original group during a supervisor sweep. `ESRCH` after the
+/// zombie leader has pinned the PGID means no live member remains to signal,
+/// so the sweep is complete rather than failed.
+fn signal_group_for_sweep(pid: Pid, signal: Signal, leader_is_zombie: bool) -> ToolResult<bool> {
+    match kill_process_group(pid, signal) {
+        Ok(()) => Ok(true),
+        Err(rustix::io::Errno::SRCH) => Ok(false),
+        // Darwin reports EPERM when a group contains only the caller's zombie
+        // child. Since that zombie pins this exact PGID, no live member of the
+        // original group remains signalable in this case.
+        Err(rustix::io::Errno::PERM) if leader_is_zombie => Ok(false),
+        Err(error) => Err(ToolError::Runtime {
+            message: format!(
+                "send signal {signal:?} to process group {}: {error}",
+                pid.as_raw_nonzero()
+            ),
+        }),
+    }
+}
+
 fn process_group_exists(pid: Pid) -> ToolResult<bool> {
     match test_kill_process_group(pid) {
         Ok(()) => Ok(true),
@@ -1214,28 +1312,84 @@ fn process_group_exists(pid: Pid) -> ToolResult<bool> {
     }
 }
 
+async fn observe_process_leader_exit(pid: Pid) -> ToolResult<()> {
+    let options = WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG;
+    loop {
+        let exited = match waitid(WaitId::Pid(pid), options) {
+            Ok(Some(status)) => status.exited() || status.killed() || status.dumped(),
+            Ok(None) => false,
+            Err(error) => {
+                return Err(ToolError::Runtime {
+                    message: format!(
+                        "observe process leader {} exit without reaping: {error}",
+                        pid.as_raw_nonzero()
+                    ),
+                });
+            }
+        };
+        if exited {
+            return Ok(());
+        }
+        sleep(Duration::from_millis(1)).await;
+    }
+}
+
+async fn reap_process_leader(
+    child: &mut Child,
+    stdin: &Arc<Mutex<Option<ChildStdin>>>,
+    call_id: &str,
+    exit_status: &mut Option<std::process::ExitStatus>,
+    fatal: &mut Option<ToolError>,
+    lifecycle_events: &mut Vec<ProcessLifecycleEvent>,
+) {
+    match child.wait().await {
+        Ok(status) => *exit_status = Some(status),
+        Err(error) => {
+            fatal.get_or_insert_with(|| ToolError::Runtime {
+                message: format!("wait for process `{call_id}`: {error}"),
+            });
+        }
+    }
+    lifecycle_events.push(ProcessLifecycleEvent::LeaderReaped);
+    *stdin.lock().await = None;
+}
+
+/// Starts or completes a process-group sweep.
+///
+/// Ordering invariant for the post-exit path: the leader exit must first be
+/// observed with non-reaping `waitid(..., WNOWAIT)`, and the caller must keep
+/// that zombie unreaped until this sweep reaches `GroupSweepCompleted`. The
+/// zombie keeps the PGID allocated, so every probe/signal below is guaranteed
+/// to target the original group rather than a recycled one.
 fn begin_group_termination(
     pid: Pid,
+    leader_is_zombie: bool,
     grace: Duration,
     deadline: &mut Option<Pin<Box<Sleep>>>,
     fatal: &mut Option<ToolError>,
     notes: &mut Vec<String>,
+    lifecycle_events: &mut Vec<ProcessLifecycleEvent>,
 ) {
     if deadline.is_some() {
         return;
     }
+    lifecycle_events.push(ProcessLifecycleEvent::GroupSweepStarted);
     match process_group_exists(pid) {
-        Ok(false) => {}
-        Ok(true) => {
-            if let Err(error) = signal_group(pid, Signal::TERM) {
+        Ok(false) => lifecycle_events.push(ProcessLifecycleEvent::GroupSweepCompleted),
+        Ok(true) => match signal_group_for_sweep(pid, Signal::TERM, leader_is_zombie) {
+            Ok(true) => *deadline = Some(Box::pin(sleep(grace))),
+            Ok(false) => {
+                lifecycle_events.push(ProcessLifecycleEvent::GroupSweepCompleted);
+            }
+            Err(error) => {
                 notes.push(format!(
                     "SIGTERM failed for process group {}: {error}",
                     pid.as_raw_nonzero()
                 ));
                 fatal.get_or_insert(error);
+                *deadline = Some(Box::pin(sleep(grace)));
             }
-            *deadline = Some(Box::pin(sleep(grace)));
-        }
+        },
         Err(error) => {
             notes.push(format!(
                 "process-group probe failed before SIGTERM: {error}"

@@ -40,6 +40,9 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
+const DEFAULT_MAX_PROVIDER_REQUESTS_PER_TURN: usize = 32;
+const DEFAULT_DEFERRED_COMMAND_CAPACITY: usize = 64;
+
 /// Immutable identity and fencing parameters for one session actor.
 #[derive(Debug, Clone)]
 pub struct HarnessConfig {
@@ -53,6 +56,10 @@ pub struct HarnessConfig {
     pub max_tokens: u64,
     pub command_capacity: usize,
     pub broadcast_capacity: usize,
+    /// Hard ceiling on provider requests made by one logical turn.
+    pub max_provider_requests_per_turn: usize,
+    /// Maximum number of submissions parked behind the active turn.
+    pub deferred_command_capacity: usize,
     started_at_ms: Option<u64>,
 }
 
@@ -75,6 +82,8 @@ impl HarnessConfig {
             max_tokens: 4096,
             command_capacity: 8,
             broadcast_capacity: 128,
+            max_provider_requests_per_turn: DEFAULT_MAX_PROVIDER_REQUESTS_PER_TURN,
+            deferred_command_capacity: DEFAULT_DEFERRED_COMMAND_CAPACITY,
             started_at_ms: None,
         }
     }
@@ -196,7 +205,7 @@ impl HarnessHandle {
                 "session actor stopped before accepting the turn",
                 true,
             )
-        })
+        })?
     }
 
     /// Answers the currently open input menu. Invalid or stale answers fail
@@ -235,7 +244,7 @@ impl HarnessHandle {
 enum ActorCommand {
     Submit {
         request: SubmitTurn,
-        accepted: oneshot::Sender<TurnHandle>,
+        accepted: oneshot::Sender<Result<TurnHandle, HaiderError>>,
     },
     AnswerMenu {
         answer: MenuAnswer,
@@ -317,7 +326,7 @@ impl HarnessActor {
                         cancel: cancel.clone(),
                         outcome,
                     };
-                    if accepted.send(turn).is_err() {
+                    if accepted.send(Ok(turn)).is_err() {
                         // Submitter vanished before receiving the handle;
                         // drop the turn un-run rather than run it unowned.
                         continue;
@@ -365,8 +374,24 @@ impl HarnessActor {
         let mut message: Option<TextAccumulator> = None;
         let mut reasoning: Option<TextAccumulator> = None;
         let mut tools: Vec<ToolAccumulator> = Vec::new();
+        let mut provider_request_count = 0usize;
 
         'requests: loop {
+            provider_request_count = provider_request_count.saturating_add(1);
+            if provider_request_count > self.config.max_provider_requests_per_turn {
+                return self
+                    .errored_outcome_with_items(
+                        &run_id,
+                        &mut message,
+                        &mut reasoning,
+                        &mut tools,
+                        loop_limit_error(
+                            provider_request_count,
+                            self.config.max_provider_requests_per_turn,
+                        ),
+                    )
+                    .await;
+            }
             let provider_request = TurnRequest {
                 messages: messages.clone(),
                 model: self.config.model.clone(),
@@ -387,6 +412,7 @@ impl HarnessActor {
                             )
                             .await;
                     }
+                    opened = &mut opening => opened,
                     command = self.commands.recv() => {
                         let Some(command) = command else {
                             let error = provider_protocol_error(
@@ -405,7 +431,6 @@ impl HarnessActor {
                         self.service_command_without_menu(command);
                         continue;
                     }
-                    opened = &mut opening => opened,
                 };
                 if cancel.is_cancelled() {
                     return self
@@ -440,8 +465,9 @@ impl HarnessActor {
             let mut tool_results = Vec::new();
             loop {
                 let next = tokio::select! {
-                    // Biased: when cancellation and a buffered provider event
-                    // are both ready, cancellation owns the outcome.
+                    // Cancellation owns ties. Provider progress is polled
+                    // before command service on every round so an unbounded
+                    // command arrival rate cannot starve the active stream.
                     biased;
                     () = cancel.cancelled() => {
                         return self
@@ -453,6 +479,7 @@ impl HarnessActor {
                             )
                             .await;
                     }
+                    item = stream.recv() => item,
                     command = self.commands.recv() => {
                         let Some(command) = command else {
                             let error = provider_protocol_error(
@@ -471,7 +498,6 @@ impl HarnessActor {
                         self.service_command_without_menu(command);
                         continue;
                     }
-                    item = stream.recv() => item,
                 };
 
                 if cancel.is_cancelled() {
@@ -924,7 +950,7 @@ impl HarnessActor {
             };
             match command {
                 command @ ActorCommand::Submit { .. } => {
-                    self.deferred_commands.push_back(command);
+                    self.defer_submit_or_reject(command);
                 }
                 ActorCommand::AnswerMenu { answer, completed } => {
                     if answer.menu != menu.id {
@@ -1288,7 +1314,7 @@ impl HarnessActor {
 
     fn service_command_without_menu(&mut self, command: ActorCommand) {
         match command {
-            command @ ActorCommand::Submit { .. } => self.deferred_commands.push_back(command),
+            command @ ActorCommand::Submit { .. } => self.defer_submit_or_reject(command),
             ActorCommand::AnswerMenu { completed, .. } => {
                 let _ = completed.send(Err(HaiderError::new(
                     ErrorCode::MenuNotFound,
@@ -1296,6 +1322,19 @@ impl HarnessActor {
                     false,
                 )));
             }
+        }
+    }
+
+    fn defer_submit_or_reject(&mut self, command: ActorCommand) {
+        if self.deferred_commands.len() >= self.config.deferred_command_capacity {
+            let ActorCommand::Submit { accepted, .. } = command else {
+                unreachable!("only Submit commands may be deferred");
+            };
+            let _ = accepted.send(Err(submit_busy_error(
+                self.config.deferred_command_capacity,
+            )));
+        } else {
+            self.deferred_commands.push_back(command);
         }
     }
 }
@@ -1359,6 +1398,31 @@ fn tool_args_or_raw(tool: &ToolAccumulator) -> serde_json::Value {
 
 fn provider_protocol_error(message: impl Into<String>) -> ProviderError {
     ProviderError::new(ProviderErrorKind::MalformedFrame, message)
+}
+
+fn loop_limit_error(count: usize, limit: usize) -> HaiderError {
+    let mut error = HaiderError::new(
+        ErrorCode::LoopLimit,
+        format!("provider request loop limit exceeded at request {count} (limit {limit})"),
+        false,
+    );
+    error.details = Some(serde_json::json!({
+        "provider_request_count": count,
+        "provider_request_limit": limit,
+    }));
+    error
+}
+
+fn submit_busy_error(capacity: usize) -> HaiderError {
+    let mut error = HaiderError::new(
+        ErrorCode::Busy,
+        format!("session deferred submission queue is full (capacity {capacity})"),
+        true,
+    );
+    error.details = Some(serde_json::json!({
+        "deferred_command_capacity": capacity,
+    }));
+    error
 }
 
 fn provider_error_to_haider(provider_error: ProviderError) -> HaiderError {

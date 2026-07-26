@@ -11,8 +11,9 @@ use haider_protocol::ids::{ArtifactRef, SessionId};
 use haider_protocol::item::{ItemDelta, ToolStatus};
 use haider_tools::{
     BuiltinResult, CasSink, CommandOutputSink, ComposerSubmission, EffectBroker, JournalSink,
-    PermissionPolicy, ProcessBounds, ProcessControl, ProcessExec, ProcessOutputChunk,
-    REDACTED_ENV_VALUE, ShellSession, ToolError, ToolResult,
+    PROCESS_OUTPUT_CHUNK_BYTES, PermissionPolicy, ProcessBounds, ProcessControl, ProcessExec,
+    ProcessLifecycleEvent, ProcessOutputChunk, REDACTED_ENV_VALUE, ShellSession, ToolError,
+    ToolResult,
 };
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -113,6 +114,31 @@ impl CasSink for FailingCas {
 
     async fn put_file(&mut self, _path: &Path) -> ToolResult<ArtifactRef> {
         Err(ToolError::cas("injected CAS file failure"))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct GatedCas {
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+    fail: bool,
+}
+
+#[async_trait]
+impl CasSink for GatedCas {
+    async fn put(&mut self, bytes: &[u8]) -> ToolResult<ArtifactRef> {
+        Ok(ArtifactRef::new(format!("blake3:{}", blake3::hash(bytes))))
+    }
+
+    async fn put_file(&mut self, path: &Path) -> ToolResult<ArtifactRef> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        if self.fail {
+            return Err(ToolError::cas("gated CAS failure"));
+        }
+        let bytes = std::fs::read(path)
+            .map_err(|error| ToolError::cas(format!("read gated CAS source: {error}")))?;
+        self.put(&bytes).await
     }
 }
 
@@ -291,9 +317,18 @@ async fn output_flood_spills_while_streaming_and_completes_under_paused_time() {
     assert_eq!(result.output_bytes, 1_048_576);
     assert!(result.inline_output.is_empty());
     assert!(result.artifact.is_some());
+    assert!(
+        result.transcript_high_water_bytes <= 1024 + PROCESS_OUTPUT_CHUNK_BYTES,
+        "transcript payload high-water {} exceeded cap + one read chunk",
+        result.transcript_high_water_bytes
+    );
     {
         let artifacts = cas_observer.lock().expect("CAS observer");
         assert_eq!(artifacts.len(), 1);
+        assert!(
+            artifacts[0].len() > 1024,
+            "spill file must grow beyond the in-memory cap"
+        );
         let transcript: Vec<ProcessOutputChunk> =
             serde_json::from_slice(&artifacts[0]).expect("streamed transcript");
         assert_eq!(
@@ -305,6 +340,60 @@ async fn output_flood_spills_while_streaming_and_completes_under_paused_time() {
         );
     }
     broker.close().await.expect("broker closes");
+}
+
+async fn cancellation_during_gated_cas_is_sticky(fail: bool) {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let (mut broker, journal) = broker(workspace.path());
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let execution = broker
+        .process_exec(
+            &ProcessExec::new("cancel-cas", "/usr/bin/head -c 16384 /dev/zero"),
+            &process_policy(),
+            GatedCas {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+                fail,
+            },
+            RecordingOutput::default(),
+            ProcessBounds {
+                max_inline_bytes: 1024,
+                kill_grace: Duration::from_millis(1),
+            },
+        )
+        .await
+        .expect("process starts");
+    tokio::time::timeout(Duration::from_secs(2), entered.notified())
+        .await
+        .expect("CAS ingestion starts");
+    execution.cancel();
+    release.notify_one();
+
+    let result = execution
+        .wait()
+        .await
+        .expect("cancellation masks either CAS completion arm");
+    assert_eq!(result.status, ToolStatus::Cancelled);
+    assert_eq!(result.artifact.is_some(), !fail);
+    assert!(phases(&journal).iter().any(|phase| matches!(
+        phase,
+        EffectPhase::Outcome {
+            outcome: EffectOutcome::Cancelled | EffectOutcome::CancelledEscalated { .. },
+            ..
+        }
+    )));
+    broker.close().await.expect("broker closes");
+}
+
+#[tokio::test]
+async fn cancellation_during_successful_cas_ingestion_is_sticky() {
+    cancellation_during_gated_cas_is_sticky(false).await;
+}
+
+#[tokio::test]
+async fn cancellation_during_failed_cas_ingestion_is_sticky() {
+    cancellation_during_gated_cas_is_sticky(true).await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -381,6 +470,25 @@ async fn shell_exit_sweeps_background_members_of_its_process_group() {
         .await
         .expect("group sweep completes");
     assert_eq!(result.status, ToolStatus::Completed);
+    let event_index = |expected| {
+        result
+            .lifecycle_events
+            .iter()
+            .position(|event| event == &expected)
+            .unwrap_or_else(|| panic!("missing lifecycle event {expected:?}"))
+    };
+    assert!(
+        event_index(ProcessLifecycleEvent::LeaderExitObserved)
+            < event_index(ProcessLifecycleEvent::GroupSweepStarted)
+    );
+    assert!(
+        event_index(ProcessLifecycleEvent::GroupSweepCompleted)
+            < event_index(ProcessLifecycleEvent::LeaderReaped)
+    );
+    assert!(
+        event_index(ProcessLifecycleEvent::LeaderReaped)
+            < event_index(ProcessLifecycleEvent::RegistryRemoved)
+    );
     broker.close().await.expect("broker closes");
 }
 
@@ -693,6 +801,9 @@ fn env_view_redacts_secret_names_and_preserves_non_secret_values() {
     const CHILD: &str = "HAIDER_ENV_VIEW_TEST_CHILD";
     const SECRET: &str = "HAIDER_SHELL_TEST_API_TOKEN";
     const VISIBLE: &str = "HAIDER_SHELL_TEST_REGION";
+    const POSTGRES_SECRET: &str = "PGPASSWORD";
+    const MYSQL_SECRET: &str = "MYSQL_PWD";
+    const LOWERCASE_SECRET: &str = "github_token";
     if std::env::var(CHILD).as_deref() != Ok("1") {
         let status = std::process::Command::new(std::env::current_exe().expect("test executable"))
             .args([
@@ -703,6 +814,11 @@ fn env_view_redacts_secret_names_and_preserves_non_secret_values() {
             .env(CHILD, "1")
             .env(SECRET, "do-not-display")
             .env(VISIBLE, "eu-test-1")
+            .env(POSTGRES_SECRET, "postgres-secret")
+            .env(MYSQL_SECRET, "mysql-secret")
+            .env(LOWERCASE_SECRET, "lowercase-secret")
+            .env("PATH", "/visible/test/bin")
+            .env("HOME", "/visible/test/home")
             .status()
             .expect("spawn isolated env-view test");
         assert!(status.success());
@@ -710,8 +826,19 @@ fn env_view_redacts_secret_names_and_preserves_non_secret_values() {
     }
 
     let workspace = tempfile::tempdir().expect("tempdir");
-    let mut shell =
-        ShellSession::new(workspace.path(), vec![SECRET.into(), VISIBLE.into()]).expect("shell");
+    let mut shell = ShellSession::new(
+        workspace.path(),
+        vec![
+            SECRET.into(),
+            VISIBLE.into(),
+            POSTGRES_SECRET.into(),
+            MYSQL_SECRET.into(),
+            LOWERCASE_SECRET.into(),
+            "PATH".into(),
+            "HOME".into(),
+        ],
+    )
+    .expect("shell");
     let ComposerSubmission::Builtin(BuiltinResult::Environment { entries }) =
         shell.submit("!env-view").expect("env-view")
     else {
@@ -726,5 +853,26 @@ fn env_view_redacts_secret_names_and_preserves_non_secret_values() {
         .find(|entry| entry.name == VISIBLE)
         .expect("visible entry");
     assert_eq!(secret.value.as_deref(), Some(REDACTED_ENV_VALUE));
+    for name in [POSTGRES_SECRET, MYSQL_SECRET, LOWERCASE_SECRET] {
+        let value = entries
+            .iter()
+            .find(|entry| entry.name == name)
+            .and_then(|entry| entry.value.as_deref());
+        assert_eq!(value, Some(REDACTED_ENV_VALUE), "{name} must be redacted");
+    }
     assert_eq!(visible.value.as_deref(), Some("eu-test-1"));
+    assert_eq!(
+        entries
+            .iter()
+            .find(|entry| entry.name == "PATH")
+            .and_then(|entry| entry.value.as_deref()),
+        Some("/visible/test/bin")
+    );
+    assert_eq!(
+        entries
+            .iter()
+            .find(|entry| entry.name == "HOME")
+            .and_then(|entry| entry.value.as_deref()),
+        Some("/visible/test/home")
+    );
 }

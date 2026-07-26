@@ -29,6 +29,8 @@ pub enum ErrorCode {
     MenuNotFound,
     MenuAlreadyAnswered,
     SingleWriterViolation,
+    Busy,
+    LoopLimit,
     // providers
     ProviderError,
     ProviderTimeout,

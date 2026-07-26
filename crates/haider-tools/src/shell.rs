@@ -184,6 +184,14 @@ impl ShellSession {
 }
 
 fn is_secret_env_name(name: &str) -> bool {
+    const KNOWN_SECRET_NAMES: &[&str] = &[
+        "PGPASSWORD",
+        "MYSQL_PWD",
+        "AWS_SECRET_ACCESS_KEY",
+        "GITHUB_TOKEN",
+        "NPM_TOKEN",
+    ];
+    const SECRET_SUBSTRINGS: &[&str] = &["PASSWORD", "PASSWD", "PWD", "PASSPHRASE"];
     const SECRET_WORDS: &[&str] = &[
         "KEY",
         "TOKEN",
@@ -194,11 +202,14 @@ fn is_secret_env_name(name: &str) -> bool {
         "CREDENTIALS",
         "BEARER",
     ];
-    name.split(|character: char| !character.is_ascii_alphanumeric())
-        .any(|word| {
-            let word = word.to_ascii_uppercase();
-            SECRET_WORDS.contains(&word.as_str())
-        })
+    let uppercase = name.to_ascii_uppercase();
+    KNOWN_SECRET_NAMES.contains(&uppercase.as_str())
+        || SECRET_SUBSTRINGS
+            .iter()
+            .any(|secret| uppercase.contains(secret))
+        || uppercase
+            .split(|character: char| !character.is_ascii_alphanumeric())
+            .any(|word| SECRET_WORDS.contains(&word))
 }
 
 fn display_env_value(name: &str, value: Option<String>) -> Option<String> {
