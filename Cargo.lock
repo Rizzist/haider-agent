@@ -613,6 +613,7 @@ dependencies = [
  "haider-protocol",
  "ratatui",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

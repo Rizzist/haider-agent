@@ -5,11 +5,14 @@
 //! reads [`theme::Theme`] tokens and [`format`] helpers so the three themes
 //! stay one identity. Tests live in `tests/` — never inline (workspace rule).
 
+pub mod app;
 pub mod boot;
 pub mod format;
 pub mod mock;
 pub mod plain;
 pub mod projection;
+pub mod render;
+pub mod runtime;
 pub mod sanctum;
 pub mod style;
 pub mod theme;

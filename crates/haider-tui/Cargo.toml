@@ -10,6 +10,7 @@ rust-version.workspace = true
 haider-protocol = { path = "../haider-protocol" }
 base64.workspace = true
 ratatui.workspace = true
+tokio.workspace = true
 serde_json.workspace = true
 
 [lints]
