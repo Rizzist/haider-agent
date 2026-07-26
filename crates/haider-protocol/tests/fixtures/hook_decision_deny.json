@@ -1,0 +1,9 @@
+{
+  "hook": "cost-governor",
+  "point": "tool.authorize",
+  "verdict": {
+    "verdict": "deny",
+    "reason": "budget exceeded"
+  },
+  "op_hash": "op:abc"
+}

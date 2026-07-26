@@ -1,0 +1,13 @@
+{
+  "event": "started",
+  "item_id": "it-1",
+  "item": {
+    "item": "tool_call",
+    "call_id": "c-1",
+    "name": "fs_patch",
+    "args": {
+      "path": "src/lib.rs"
+    },
+    "status": "in_progress"
+  }
+}

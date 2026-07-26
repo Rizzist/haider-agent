@@ -1,0 +1,13 @@
+{
+  "node": "n-9",
+  "parent": "n-8",
+  "kind": {
+    "kind": "compaction",
+    "covers_from": "n-1",
+    "covers_to": "n-7",
+    "summary_artifact": "blake3:sum",
+    "tokens_before": 118000,
+    "tokens_after": 24000,
+    "resume_cause": "auto_mid_turn"
+  }
+}

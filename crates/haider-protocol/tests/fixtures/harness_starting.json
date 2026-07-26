@@ -1,0 +1,10 @@
+{
+  "status": "starting",
+  "checks": [
+    {
+      "name": "store open",
+      "ok": true,
+      "duration_ms": 12
+    }
+  ]
+}

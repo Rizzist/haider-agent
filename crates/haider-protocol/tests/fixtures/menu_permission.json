@@ -1,0 +1,29 @@
+{
+  "id": "m-perm-1",
+  "kind": {
+    "kind": "permission",
+    "effect_summary": "fs_write: src/lib.rs"
+  },
+  "title": "Allow patch to src/lib.rs?",
+  "body": [
+    "+24 −6"
+  ],
+  "options": [
+    {
+      "key": "allow",
+      "label": "Allow",
+      "decision": "allow_once"
+    },
+    {
+      "key": "deny",
+      "label": "Deny",
+      "detail": "blocks the edit",
+      "decision": "reject_once"
+    }
+  ],
+  "blocking": true,
+  "scope": {
+    "scope": "session"
+  },
+  "origin": "fs_patch"
+}

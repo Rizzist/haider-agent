@@ -1,0 +1,4 @@
+{
+  "verdict": "failed_env",
+  "item": "rustfmt missing"
+}

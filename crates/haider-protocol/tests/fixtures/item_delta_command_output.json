@@ -1,0 +1,9 @@
+{
+  "event": "delta",
+  "item_id": "it-2",
+  "delta": {
+    "delta": "command_output",
+    "stream": "stdout",
+    "chunk_b64": "aGk="
+  }
+}

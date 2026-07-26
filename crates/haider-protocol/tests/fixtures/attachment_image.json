@@ -1,0 +1,6 @@
+{
+  "kind": "image",
+  "artifact": "blake3:img",
+  "mime": "image/png",
+  "width": 800
+}

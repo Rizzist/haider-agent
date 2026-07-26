@@ -1,0 +1,23 @@
+{
+  "verdict": {
+    "verdict": "errored_with_report"
+  },
+  "new_errors": [
+    {
+      "file": "src/lib.rs",
+      "line": 42,
+      "col": 9,
+      "severity": "error",
+      "code": "E0308",
+      "message": "expected u32, found &str",
+      "tool": "cargo",
+      "fingerprint": "fp:strict:1",
+      "fingerprint_tolerant": "fp:tol:1"
+    }
+  ],
+  "new_warnings": [],
+  "preexisting": 3,
+  "cycles_used": 3,
+  "duration_ms": 4100,
+  "raw_log": "blake3:log"
+}

@@ -1,0 +1,10 @@
+{
+  "phase": "intent",
+  "effect": "ef-1",
+  "class": {
+    "class": "fs_write"
+  },
+  "summary": "patch src/lib.rs",
+  "args_digest": "d:abc",
+  "workspace_revision": "blake3:r1"
+}

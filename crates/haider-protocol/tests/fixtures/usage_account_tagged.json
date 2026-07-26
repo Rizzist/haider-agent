@@ -1,0 +1,8 @@
+{
+  "input": 1000,
+  "output": 200,
+  "reasoning": 50,
+  "cached": 800,
+  "source": "provider_reported",
+  "account": "personal-max"
+}

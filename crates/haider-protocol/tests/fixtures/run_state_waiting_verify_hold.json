@@ -1,0 +1,6 @@
+{
+  "state": "waiting",
+  "reason": {
+    "reason": "verify_hold"
+  }
+}
