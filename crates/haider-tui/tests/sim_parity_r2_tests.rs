@@ -133,6 +133,9 @@ fn wheel_clamps_to_the_rendered_scroll_range() {
     for _ in 0..50 {
         model.handle_wheel(true);
     }
+    // The wheel records RAW intent (review r4 P3-3); the FRAME is the
+    // authority — after it paints, the view stops exactly at the top.
+    let (_, _, _) = draw(&model, 90, 14);
     assert_eq!(model.scroll_back.get(), max, "wheel-up stops at the top");
     model.handle_wheel(false);
     assert_eq!(

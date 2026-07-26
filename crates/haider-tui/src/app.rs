@@ -186,8 +186,9 @@ pub struct AppModel {
     /// debt — the wheel only expresses intent.
     pub scroll_back: std::cell::Cell<u16>,
     /// Max scroll-back of the LAST rendered frame — written by the
-    /// renderer, read by [`Self::handle_wheel`] to clamp intent early.
-    /// Starts at 0 (review r2 P2-6).
+    /// renderer; sticky jumps clamp against it. The wheel does NOT (review
+    /// r4 P3-3: raw intent, frame-reconciled). Starts at 0 (review r2
+    /// P2-6).
     pub scroll_max: std::cell::Cell<u16>,
     /// The sticky origin line is suppressed after a sticky jump until the
     /// next REAL wheel event (sim jumpToSticky, tui.js:2637-2657: the bar
@@ -876,8 +877,11 @@ impl AppModel {
     }
 
     /// Wheel scroll in the session transcript (⇧-drag selects text
-    /// natively). The wheel only expresses INTENT — the next frame
-    /// reconciles against the true range (review r3 P2-2).
+    /// natively). The wheel records RAW intent — never clamped against a
+    /// possibly-stale `scroll_max` (review r4 P3-3: a notch between resize
+    /// and redraw must not be lost). The frame reconciles against the true
+    /// range before painting, so overshoot is invisible by construction
+    /// (sim reads live DOM geometry, tui.js:2648).
     pub fn handle_wheel(&mut self, up: bool) {
         if self.screen != Screen::Session || self.help_open {
             return;
@@ -887,12 +891,8 @@ impl AppModel {
         // onTranscriptScroll → computeSticky).
         self.sticky_suppressed = false;
         if up {
-            self.scroll_back.set(
-                self.scroll_back
-                    .get()
-                    .saturating_add(3)
-                    .min(self.scroll_max.get()),
-            );
+            self.scroll_back
+                .set(self.scroll_back.get().saturating_add(3));
         } else {
             self.scroll_back
                 .set(self.scroll_back.get().saturating_sub(3));

@@ -428,15 +428,18 @@ fn wheel_before_first_frame_and_resize_never_bank_debt() {
     let mut model = launcher_model();
     model.handle(AppEvent::Envelope(Box::new(user_message("hello"))));
     assert_eq!(model.screen, Screen::Session);
-    // No frame rendered yet: scroll_max starts 0 — wheel-up is inert.
+    // Pre-frame wheel intent is RAW (review r4 P3-3); the first frame of a
+    // short transcript repays it entirely — nothing invisible remains.
     model.handle_wheel(true);
+    let (_, _, _) = draw(&model, 118, 34);
     assert_eq!(model.scroll_back.get(), 0, "no invisible pre-frame debt");
-    // Overflowing frame, scroll to the top…
+    // Overflowing frame, scroll to the top (frame-reconciled)…
     let mut model = session_model();
     let (_, _, _) = draw(&model, 90, 14);
     for _ in 0..50 {
         model.handle_wheel(true);
     }
+    let (_, _, _) = draw(&model, 90, 14);
     let tall_max = model.scroll_max.get();
     assert_eq!(model.scroll_back.get(), tall_max);
     // …then ENLARGE, resize arriving through the production input path

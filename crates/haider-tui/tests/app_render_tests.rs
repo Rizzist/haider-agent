@@ -687,20 +687,20 @@ fn clicks_attach_sessions_and_wheel_scrolls() {
     })));
     assert_eq!(model.screen, Screen::Session);
 
-    // Wheel scroll-back only in session — and CLAMPED to the rendered
-    // range (review r2 P2-6): before any session frame the max is 0, and a
-    // short transcript never scrolls, so wheel-up banks no invisible debt.
+    // Wheel scroll-back only in session. The wheel records RAW intent
+    // (review r4 P3-3); the FRAME is the authority — a short transcript
+    // paints at 0 no matter the intent, so no debt is ever visible.
     model.handle_wheel(true);
+    let (_, _) = draw_with_hits(&model, 118, 34);
+    assert_eq!(model.scroll_max.get(), 0, "everything visible → max 0");
     assert_eq!(
         model.scroll_back.get(),
         0,
-        "no debt before/without overflow"
+        "the frame repaid the pre-frame intent"
     );
-    let (_, _) = draw_with_hits(&model, 118, 34);
-    assert_eq!(model.scroll_max.get(), 0, "everything visible → max 0");
     model.handle_wheel(true);
-    assert_eq!(model.scroll_back.get(), 0);
     model.handle_wheel(false);
+    let (_, _) = draw_with_hits(&model, 118, 34);
     assert_eq!(model.scroll_back.get(), 0);
     model.handle_hit(Hit::BackChip);
     assert_eq!(model.screen, Screen::Launcher);

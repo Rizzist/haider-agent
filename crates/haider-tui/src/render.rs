@@ -365,13 +365,16 @@ fn render_session(
 ) {
     // A blocking menu REPLACES the composer (sim §3 law) and takes its rows.
     //
-    // Sacred-input height ledger (review r3 P2-1) — invariants at ANY size:
+    // Sacred-input height ledger (review r3 P2-1 + r4 P2-1) — invariants
+    // at ANY size:
     // (a) the composer's CURSOR row is visible: growth steals from the
     //     transcript first (up to 5 rows, sim autoGrow); when even that
     //     cannot fit, the composer tail-windows to its allocation instead
     //     of hiding the cursor;
-    // (b) a menu's OPTIONS are always visible: the menu block sheds hint →
-    //     body (top-first) → title under pressure, options NEVER.
+    // (b) a menu's OPTIONS are always visible — they outrank EVERYTHING.
+    //     Full shed order under pressure: gap → hint → body-from-top →
+    //     title → the transcript's sacred row (the sim's flex transcript
+    //     collapses entirely, tui.js:4444) → options never.
     let menu = model.projection.open_menu();
     let menu_wrapped_body_rows = menu.map_or(0, |m| wrapped_menu_body(m, area.width).len());
     let needed_input = menu.map_or_else(
@@ -381,13 +384,21 @@ fn render_session(
     // What the input may claim: everything beyond header(2) + header
     // rule(1) + input rule(1) + gap(1) + one sacred transcript row.
     let mut gap: u16 = 1;
+    let mut transcript_min: u16 = 1;
     let chrome: u16 = 2 + 1 + 1;
     let floor_input = menu.map_or(1, |m| u16::try_from(m.options.len().max(1)).unwrap_or(1));
-    let mut input_avail = area.height.saturating_sub(chrome + gap + 1);
+    let mut input_avail = area.height.saturating_sub(chrome + gap + transcript_min);
     if input_avail < floor_input {
         // The spacer gap yields before any sacred row does.
         gap = 0;
-        input_avail = area.height.saturating_sub(chrome + 1);
+        input_avail = area.height.saturating_sub(chrome + transcript_min);
+    }
+    if input_avail < floor_input && menu.is_some() {
+        // Menu options outrank even the transcript's sacred row (review
+        // r4 P2-1): a hidden blocking control is worse than a collapsed
+        // transcript.
+        transcript_min = 0;
+        input_avail = area.height.saturating_sub(chrome);
     }
     let input_height = needed_input.min(input_avail).max(floor_input.min(
         area.height.saturating_sub(chrome), // absolute best-effort floor
@@ -406,7 +417,7 @@ fn render_session(
         Vec::new()
     };
     let mut palette_height = u16::try_from(palette.len()).unwrap_or(0);
-    let mut budget = area.height.saturating_sub(fixed + 1); // ≥1 transcript row
+    let mut budget = area.height.saturating_sub(fixed + transcript_min);
     if palette_height > budget {
         palette_height = 0;
     } else {
@@ -427,7 +438,7 @@ fn render_session(
     ] = Layout::vertical([
         Constraint::Length(2),
         Constraint::Length(1),
-        Constraint::Min(1),
+        Constraint::Min(transcript_min),
         Constraint::Length(todos_height),
         Constraint::Length(palette_height),
         Constraint::Length(1),
@@ -1351,20 +1362,33 @@ fn item_lines<'a>(lines: &mut Vec<Line<'a>>, block: &'a ItemBlock, theme: &Theme
             // wraps and the rail survives ANY width (review r3 P2-5). At
             // widths ≤ 3 there is no content column at all: the rail
             // stands alone.
+            //
+            // The streaming cursor is wrapped WITH the text (review r4
+            // P2-2): its cell is accounted for by the walker, so a last
+            // row that exactly fills the budget pushes the ▮ onto its own
+            // RAILED row instead of overflowing rail-less. It is split
+            // back out below to keep its gold ink.
             let budget = (width as usize).saturating_sub(3);
             let body = if budget == 0 {
                 vec![String::new()]
+            } else if block.streaming {
+                wrap_body(&format!("{text}▮"), budget)
             } else {
                 wrap_body(text, budget)
             };
             let last = body.len().saturating_sub(1);
-            for (index, row) in body.into_iter().enumerate() {
+            for (index, mut row) in body.into_iter().enumerate() {
+                let cursor_here =
+                    block.streaming && index == last && budget > 0 && row.ends_with('▮');
+                if cursor_here {
+                    row.pop();
+                }
                 let mut spans = vec![
                     Span::raw(" "),
                     Span::styled("▏ ", theme.rail_style()),
                     Span::styled(row, theme.text_style()),
                 ];
-                if block.streaming && index == last {
+                if cursor_here {
                     spans.push(Span::styled("▮", theme.gold_style()));
                 }
                 lines.push(Line::from(spans));
