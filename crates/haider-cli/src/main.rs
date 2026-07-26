@@ -1,6 +1,9 @@
 //! `haider` — the Haider Code harness binary.
 
-use haider_core::{HarnessActor, HarnessConfig, MemoryStore, StoreHandle, SubmitTurn, TurnOutcome};
+use haider_core::{
+    HarnessActor, HarnessConfig, MemoryStore, SqliteStoreHandle, StoreHandle, SubmitTurn,
+    TurnOutcome,
+};
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::{DeviceId, SessionId};
@@ -9,6 +12,7 @@ use haider_protocol::state::RunState;
 use haider_provider::{FakeProvider, FakeStep, Provider};
 use std::fmt;
 use std::io::{self, Write};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 use tokio::sync::broadcast::error::RecvError;
@@ -19,6 +23,7 @@ const EX_SOFTWARE: u8 = 70;
 const EX_IOERR: u8 = 74;
 const EX_CANCELLED: u8 = 130;
 const FAKE_SCRIPT_ENV: &str = "HAIDER_FAKE_SCRIPT_JSON";
+const PROFILE_DIR_ENV: &str = "HAIDER_PROFILE_DIR";
 const READ_PAGE_SIZE: usize = 256;
 
 /// Every workspace crate, asserted linkable by the self-test.
@@ -74,7 +79,20 @@ async fn run_jsonl(prompt: &str) -> ExitCode {
             return ExitCode::from(EX_DATAERR);
         }
     };
-    let store = Arc::new(MemoryStore::new());
+    let profile_dir = match cli_profile_dir() {
+        Ok(profile_dir) => profile_dir,
+        Err(error) => {
+            eprintln!("haider: {}", error.message);
+            return ExitCode::from(EX_SOFTWARE);
+        }
+    };
+    let store = match SqliteStoreHandle::open(profile_dir).await {
+        Ok(store) => Arc::new(store),
+        Err(error) => {
+            eprintln!("haider: cannot open profile: {}", error.message);
+            return ExitCode::from(EX_SOFTWARE);
+        }
+    };
     let stdout = io::stdout();
     let mut output = io::BufWriter::new(stdout.lock());
     let outcome = match stream_jsonl_turn(prompt, cli_config(), provider, store, &mut output).await
@@ -108,6 +126,10 @@ pub(crate) async fn stream_jsonl_turn<W: Write + ?Sized>(
     output: &mut W,
 ) -> Result<TurnOutcome, JsonlRunError> {
     let session_id = config.session_id.clone();
+    let mut last_seq = store
+        .latest_seq(&session_id)
+        .await
+        .map_err(JsonlRunError::Runtime)?;
     let handle = HarnessActor::spawn(config, provider, Arc::clone(&store));
     let mut events = handle.subscribe();
     let turn = handle
@@ -115,8 +137,6 @@ pub(crate) async fn stream_jsonl_turn<W: Write + ?Sized>(
         .await
         .map_err(JsonlRunError::Runtime)?;
     let mut outcome = Box::pin(turn.wait());
-    let mut last_seq = 0;
-
     let outcome = loop {
         tokio::select! {
             biased;
@@ -290,6 +310,20 @@ fn cli_config() -> HarnessConfig {
         1,
         1,
     )
+}
+
+fn cli_profile_dir() -> Result<PathBuf, HaiderError> {
+    if let Some(profile_dir) = std::env::var_os(PROFILE_DIR_ENV) {
+        return Ok(PathBuf::from(profile_dir));
+    }
+    let home = std::env::var_os("HOME").ok_or_else(|| {
+        HaiderError::new(
+            ErrorCode::InvalidArgument,
+            format!("{PROFILE_DIR_ENV} is unset and HOME is unavailable"),
+            false,
+        )
+    })?;
+    Ok(PathBuf::from(home).join(".haider").join("dev-profile"))
 }
 
 /// Offline, ephemeral, deterministic. Structured JSON on stdout.

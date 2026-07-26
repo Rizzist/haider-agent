@@ -3,8 +3,8 @@
 //! [`actor::HarnessActor`] drives one session's turns: provider stream events
 //! become committed protocol envelopes. This crate also owns the runtime side
 //! of the W1 store seam: [`StoreHandle`] mirrors haider-store's `EventStore`
-//! surface so the B1 (store) and B2 (runtime) patches merge cleanly without
-//! this crate depending on haider-store yet.
+//! surface, with [`SqliteStoreHandle`] adapting the synchronous durable store
+//! without blocking a Tokio runtime worker.
 //!
 //! Seam contract (`StoreHandle`, kept in lockstep with B1):
 //! - `append` assigns `seq` and `committed_at_ms` in place; `seq` is
@@ -16,11 +16,13 @@
 
 mod actor;
 mod fake_store;
+mod sqlite_store;
 
 pub use actor::{
     CancelToken, HarnessActor, HarnessConfig, HarnessHandle, SubmitTurn, TurnHandle, TurnOutcome,
 };
 pub use fake_store::MemoryStore;
+pub use sqlite_store::SqliteStoreHandle;
 
 use async_trait::async_trait;
 use haider_protocol::envelope::RawEnvelope;

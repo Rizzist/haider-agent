@@ -1,4 +1,4 @@
-//! In-memory [`StoreHandle`] used by tests, self-test, and the thin v0 CLI.
+//! In-memory [`StoreHandle`] used by tests and the offline self-test.
 //!
 //! Reference semantics for the B1 merge seam: contiguous per-session `seq`
 //! starting at 1, one `committed_at_ms` per batch, batches never span
@@ -12,7 +12,7 @@ use haider_protocol::ids::SessionId;
 use std::collections::HashMap;
 use tokio::sync::Mutex;
 
-/// Ephemeral store used by tests, self-test, and the thin v0 CLI.
+/// Ephemeral store used by tests and the offline self-test.
 #[derive(Debug, Default)]
 pub struct MemoryStore {
     sessions: Mutex<HashMap<SessionId, Vec<RawEnvelope>>>,

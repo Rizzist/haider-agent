@@ -21,6 +21,7 @@ use rusqlite::{
 };
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -75,11 +76,13 @@ pub trait EventStore: Send + Sync {
 
 /// A locked profile containing a SQLite event journal and filesystem CAS.
 ///
-/// Journal operations use short-lived SQLite connections, so concurrent calls
-/// on one opened profile serialize through SQLite's WAL transaction locking.
+/// One connection lives for the full profile lifetime. A mutex serializes its
+/// synchronous journal calls, while SQLite's statement cache avoids preparing
+/// the hot append/read queries again on every event.
 pub struct Store {
     root: PathBuf,
     database_path: PathBuf,
+    connection: Mutex<Connection>,
     cas: FileCas,
     _lock: ProfileLock,
 }
@@ -99,12 +102,13 @@ impl Store {
         let database_path = root.join("store.sqlite");
         let mut connection = open_connection(&database_path)?;
         migrations::migrate(&mut connection)?;
-        drop(connection);
+        connection.set_prepared_statement_cache_capacity(16);
         let cas = FileCas::open(&root)?;
 
         Ok(Self {
             root,
             database_path,
+            connection: Mutex::new(connection),
             cas,
             _lock: profile_lock,
         })
@@ -127,7 +131,7 @@ impl Store {
 
     /// Current supported and migrated SQLite schema version.
     pub fn schema_version(&self) -> StoreResult<u32> {
-        let connection = open_connection(&self.database_path)?;
+        let connection = self.connection()?;
         let version = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .map_err(map_sqlite_error)?;
@@ -147,13 +151,23 @@ impl Store {
             replay.extend(page);
         }
     }
+
+    fn connection(&self) -> StoreResult<MutexGuard<'_, Connection>> {
+        self.connection.lock().map_err(|_| {
+            store_error(
+                ErrorCode::Internal,
+                "SQLite journal connection lock is poisoned",
+                false,
+            )
+        })
+    }
 }
 
 impl EventStore for Store {
     fn append(&self, envelopes: &mut [RawEnvelope]) -> StoreResult<CommittedSeqRange> {
         let (session, batch_len) = same_session_batch(envelopes)?;
 
-        let mut connection = open_connection(&self.database_path)?;
+        let mut connection = self.connection()?;
         // IMMEDIATE takes SQLite's write lock up front, so reading MAX(seq)
         // and inserting the batch form one critical section. Concurrent
         // appenders serialize here; that is what keeps allocated sequences
@@ -162,18 +176,18 @@ impl EventStore for Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_sqlite_error)?;
         let committed_at_ms = now_ms()?;
+        let committed_at_sql = to_sqlite_integer(committed_at_ms)?;
         transaction
-            .execute(
+            .prepare_cached(
                 "INSERT OR IGNORE INTO sessions(id, created_at_ms, meta_json) VALUES (?1, ?2, ?3)",
-                params![session.as_str(), to_sqlite_integer(committed_at_ms)?, "{}"],
             )
+            .and_then(|mut statement| {
+                statement.execute(params![session.as_str(), committed_at_sql, "{}"])
+            })
             .map_err(map_sqlite_error)?;
         let latest: i64 = transaction
-            .query_row(
-                "SELECT COALESCE(MAX(seq), 0) FROM events WHERE session_id = ?1",
-                [session.as_str()],
-                |row| row.get(0),
-            )
+            .prepare_cached("SELECT COALESCE(MAX(seq), 0) FROM events WHERE session_id = ?1")
+            .and_then(|mut statement| statement.query_row([session.as_str()], |row| row.get(0)))
             .map_err(map_sqlite_error)?;
         let first_seq = u64::try_from(latest)
             .map_err(|_| corrupt("database contains a negative event sequence"))?
@@ -187,32 +201,36 @@ impl EventStore for Store {
         // the transaction rolls back and the caller's batch must be exactly
         // as it was passed in.
         let mut stamped = Vec::with_capacity(envelopes.len());
-        for (seq, envelope) in (first_seq..=last_seq).zip(envelopes.iter()) {
-            let mut envelope = envelope.clone();
-            envelope.seq = seq;
-            envelope.committed_at_ms = committed_at_ms;
-            let envelope_json = serde_json::to_string(&envelope).map_err(|error| {
-                store_error(
-                    ErrorCode::InvalidArgument,
-                    format!("cannot serialize event envelope: {error}"),
-                    false,
-                )
-            })?;
-            transaction
-                .execute(
+        {
+            let mut insert = transaction
+                .prepare_cached(
                     "INSERT INTO events(
-                        session_id, seq, envelope_json, event_id, committed_at_ms
-                     ) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![
+                            session_id, seq, envelope_json, event_id, committed_at_ms
+                         ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                )
+                .map_err(map_sqlite_error)?;
+            for (seq, envelope) in (first_seq..=last_seq).zip(envelopes.iter()) {
+                let mut envelope = envelope.clone();
+                envelope.seq = seq;
+                envelope.committed_at_ms = committed_at_ms;
+                let envelope_json = serde_json::to_string(&envelope).map_err(|error| {
+                    store_error(
+                        ErrorCode::InvalidArgument,
+                        format!("cannot serialize event envelope: {error}"),
+                        false,
+                    )
+                })?;
+                insert
+                    .execute(params![
                         session.as_str(),
                         to_sqlite_integer(seq)?,
                         envelope_json,
                         envelope.event_id.as_str(),
-                        to_sqlite_integer(committed_at_ms)?,
-                    ],
-                )
-                .map_err(map_sqlite_error)?;
-            stamped.push(envelope);
+                        committed_at_sql,
+                    ])
+                    .map_err(map_sqlite_error)?;
+                stamped.push(envelope);
+            }
         }
 
         transaction.commit().map_err(map_sqlite_error)?;
@@ -236,11 +254,11 @@ impl EventStore for Store {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let connection = open_connection(&self.database_path)?;
+        let connection = self.connection()?;
         // A limit beyond i64::MAX is effectively unbounded; clamp, don't error.
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let mut statement = connection
-            .prepare(
+            .prepare_cached(
                 "SELECT seq, envelope_json, event_id, committed_at_ms
                  FROM events
                  WHERE session_id = ?1 AND seq > ?2
@@ -279,13 +297,10 @@ impl EventStore for Store {
     }
 
     fn latest_seq(&self, session: &SessionId) -> StoreResult<u64> {
-        let connection = open_connection(&self.database_path)?;
+        let connection = self.connection()?;
         let latest: i64 = connection
-            .query_row(
-                "SELECT COALESCE(MAX(seq), 0) FROM events WHERE session_id = ?1",
-                [session.as_str()],
-                |row| row.get(0),
-            )
+            .prepare_cached("SELECT COALESCE(MAX(seq), 0) FROM events WHERE session_id = ?1")
+            .and_then(|mut statement| statement.query_row([session.as_str()], |row| row.get(0)))
             .map_err(map_sqlite_error)?;
         u64::try_from(latest).map_err(|_| corrupt("database contains a negative event sequence"))
     }
@@ -336,9 +351,8 @@ fn same_session_batch(envelopes: &[RawEnvelope]) -> StoreResult<(SessionId, u64)
     Ok((session, batch_len))
 }
 
-/// Opens a journal connection with the profile's required pragmas
+/// Opens the profile's long-lived journal connection with the required pragmas
 /// (WAL, FULL synchronous, foreign keys, busy timeout).
-/// Every SQLite touch in this crate's runtime path goes through here.
 fn open_connection(path: &Path) -> StoreResult<Connection> {
     let connection = Connection::open(path).map_err(map_sqlite_error)?;
     connection

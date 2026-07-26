@@ -120,7 +120,7 @@ fn sequences_are_monotonic_gap_free_and_per_session() {
 }
 
 #[test]
-fn concurrent_appends_serialize_across_sqlite_connections() {
+fn concurrent_appends_serialize_on_the_persistent_connection() {
     let root = test_root();
     let store = Arc::new(must(Store::open(root.path())));
     let barrier = Arc::new(Barrier::new(3));

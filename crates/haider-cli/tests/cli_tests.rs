@@ -12,6 +12,7 @@ use haider_protocol::provider::FinishReason;
 use haider_protocol::state::RunState;
 use haider_provider::{FakeProvider, FakeStep, Provider};
 use std::io::Read;
+use std::ops::{Deref, DerefMut};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -25,8 +26,33 @@ mod cli_main;
 
 use cli_main::{exit_code_for_outcome, stream_jsonl_turn};
 
-fn haider() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_haider"))
+struct HaiderCommand {
+    command: Command,
+    _profile_root: tempfile::TempDir,
+}
+
+impl Deref for HaiderCommand {
+    type Target = Command;
+
+    fn deref(&self) -> &Self::Target {
+        &self.command
+    }
+}
+
+impl DerefMut for HaiderCommand {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.command
+    }
+}
+
+fn haider() -> HaiderCommand {
+    let profile_root = tempfile::tempdir().expect("temporary CLI profile parent");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_haider"));
+    command.env("HAIDER_PROFILE_DIR", profile_root.path().join("profile"));
+    HaiderCommand {
+        command,
+        _profile_root: profile_root,
+    }
 }
 
 #[test]
@@ -136,7 +162,8 @@ fn run_jsonl_replays_every_envelope_to_a_slow_pipe_consumer() {
         .collect();
     steps.push(serde_json::json!({"step":"finish","reason":"end_turn"}));
     let script = serde_json::to_string(&steps).expect("fixture serializes");
-    let mut child = haider()
+    let mut command = haider();
+    let mut child = command
         .args(["run", "--jsonl", "backpressure"])
         .env("HAIDER_FAKE_SCRIPT_JSON", script)
         .stdout(Stdio::piped())

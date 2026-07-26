@@ -8,6 +8,11 @@ The clean-code reviewer moves entries in/out; adopted entries get the patch tag 
 |---|---|---|---|
 | scripts/supervise-process-lib.sh | Replace 1s ps-polling with kqueue NOTE_TRACK/NOTE_FORK process tracking (needs a tiny compiled helper) | Interim bash tooling; the Rust worker supervisor (W4/E1) owns this properly | planned → E1 |
 | scripts/journal-cat.sh | Per-run monotonic seq field instead of timestamp sort keys | 1s ts + stable sort suffices for human reading | open |
-| crates/haider-store | Persistent connection + cached prepared statements (highest ROI per rider) | Adopt when the daemon's long-lived StoreHandle lands (B1+B2 merge) — natural seam | planned → W1 merge |
 | crates/haider-store | Batch append API for event bursts | API already exists; wire HarnessActor to batch per commit boundary | planned → W1 merge |
 | crates/haider-store | CAS inline-small-blobs-in-SQLite threshold | Thousands-of-events scale doesn't need it | open |
+
+## Adopted
+
+| Where | Idea | Patch |
+|---|---|---|
+| crates/haider-store | Persistent connection + cached prepared statements (highest ROI per rider) | adopted — W1/M1 |
