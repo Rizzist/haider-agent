@@ -19,8 +19,11 @@
 //!   broker must be the sole handle to its underlying journal. The open trait
 //!   cannot make two sink values over shared storage unrepresentable; creating
 //!   them is a protocol violation. Production construction consumes the store
-//!   handle by value. The durable defense is the event store's single-writer
-//!   `worker_generation` fence, which rejects stale-generation commits.
+//!   handle by value. The cross-process defense is the profile store's
+//!   single-opener exclusion (advisory profile lock: one open store per
+//!   profile) plus `worker_generation` identity stamped per store-open —
+//!   envelopes carry which generation wrote them; commit-time stale-generation
+//!   REJECTION is not implemented today and would be an additional guard.
 //! - **Digest-bound approvals.** `args_digest` is BLAKE3 over canonical
 //!   (recursively key-sorted) argument JSON — never a tool name. A persistent
 //!   "always allow" stores class + exact digest, so a mutated operation gets
@@ -61,8 +64,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// A sink value must be the sole handle to its underlying journal. Boxing this
 /// open trait does not enforce that law: constructing two values over the same
 /// journal is a protocol violation. Production adapters must consume their
-/// store handle by value. The underlying event store additionally enforces its
-/// single-writer seam by rejecting stale `worker_generation` commits.
+/// store handle by value. The underlying profile store enforces single-opener
+/// exclusion (advisory profile lock) and stamps `worker_generation` identity
+/// per open; it does not reject stale-generation commits at append time.
 ///
 /// Each append is transactional. `Err` guarantees that no part of `payload`
 /// became durable. More strongly, an append future dropped or unwound before
