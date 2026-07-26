@@ -545,3 +545,84 @@ fn context_tokens_saturate_on_adversarial_usage() {
     }));
     assert_eq!(projection.context_tokens(), u64::MAX);
 }
+
+#[test]
+fn non_ui_envelopes_advance_seq_without_display_mutation() {
+    // §6.1: render targets are law — ui:false events must not paint.
+    let mut projection = SessionProjection::new();
+    let mut hidden = envelope(
+        1,
+        serde_json::to_value(EventPayload::RunState(RunState::Thinking)).expect("serializes"),
+    );
+    hidden.render.ui = false;
+    projection.apply_raw(&hidden);
+    assert_eq!(projection.badge(), "IDLE", "non-ui event painted the badge");
+
+    // Seq accounting DID advance: a duplicate of seq 1 is still skipped…
+    let visible_dup = envelope(
+        1,
+        serde_json::to_value(EventPayload::RunState(RunState::Streaming)).expect("serializes"),
+    );
+    projection.apply_raw(&visible_dup);
+    assert_eq!(projection.badge(), "IDLE");
+    // …and seq 2 applies without recording a gap.
+    let next = envelope(
+        2,
+        serde_json::to_value(EventPayload::RunState(RunState::Streaming)).expect("serializes"),
+    );
+    projection.apply_raw(&next);
+    assert!(!projection.gap_seen());
+    assert_eq!(projection.badge(), "▮ STREAMING");
+}
+
+#[test]
+fn item_lifecycle_is_idempotent_under_redelivery() {
+    let mut projection = SessionProjection::new();
+    let message = TurnItem::AgentMessage {
+        text: "final".to_owned(),
+    };
+    projection.apply(&started(
+        40,
+        TurnItem::AgentMessage {
+            text: String::new(),
+        },
+    ));
+    projection.apply(&completed(40, message.clone()));
+    // Re-delivered Completed under a fresh seq: no duplicate block.
+    projection.apply(&completed(40, message.clone()));
+    // Stale Started for a closed id: no revival.
+    projection.apply(&started(
+        40,
+        TurnItem::AgentMessage {
+            text: String::new(),
+        },
+    ));
+    // Double Started for an OPEN id: no double block.
+    projection.apply(&started(
+        41,
+        TurnItem::AgentMessage {
+            text: String::new(),
+        },
+    ));
+    projection.apply(&started(
+        41,
+        TurnItem::AgentMessage {
+            text: String::new(),
+        },
+    ));
+
+    assert_eq!(projection.entries().len(), 2, "one block per item id, ever");
+    assert_eq!(projection.duplicate_items(), 3);
+}
+
+#[test]
+fn finished_plan_redelivery_does_not_duplicate_history() {
+    let mut projection = SessionProjection::new();
+    let done_plan = TurnItem::Plan {
+        items: vec![todo(0, "a", TodoState::Completed)],
+    };
+    projection.apply(&completed(50, done_plan.clone()));
+    projection.apply(&completed(50, done_plan));
+    assert_eq!(projection.entries().len(), 1, "one history entry per plan");
+    assert_eq!(projection.duplicate_items(), 1);
+}

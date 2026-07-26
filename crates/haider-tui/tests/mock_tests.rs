@@ -28,9 +28,11 @@ fn demo_script_walks_boot_to_done() {
             "● THINKING",
             "▮ STREAMING",
             "⚒ TOOL_RUNNING",
+            "? PERMISSION_REQUIRED",
+            "⚒ TOOL_RUNNING",
             "IDLE",
         ],
-        "badge story: boot → idle → turn → done"
+        "badge story: boot → idle → turn (incl. permission beat) → done"
     );
 }
 

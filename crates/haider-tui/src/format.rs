@@ -7,6 +7,11 @@
 
 /// Token counts for the status bar and session metadata: `842` · `9.0k` ·
 /// `131k` · `1.5M` · `2M`.
+///
+/// Deliberate deviation from JS `toFixed` at exact half boundaries: this is
+/// mathematical half-up (1150 → `1.2k`), while the sim's float
+/// representation yields `1.1k` (1.15 stored as 1.1499…). Predictable
+/// integer rounding wins over emulating float artifacts.
 #[must_use]
 pub fn fmt_tok(n: u64) -> String {
     if n >= 1_000_000 {

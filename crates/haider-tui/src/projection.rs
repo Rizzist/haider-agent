@@ -116,6 +116,10 @@ pub struct SessionProjection {
     run: Option<RunState>,
     interrupted: bool,
     entries: Vec<TranscriptEntry>,
+    /// Item ids whose lifecycle has closed — a re-delivered `Completed` (or a
+    /// stale `Started`) for one of these is idempotently ignored (replace
+    /// semantics: one item, one block, ever).
+    finished_items: std::collections::HashSet<ItemId>,
     menu: Option<Menu>,
     todos: Option<TodoPanel>,
     usage: Option<Usage>,
@@ -123,6 +127,7 @@ pub struct SessionProjection {
     gap_seen: bool,
     orphan_deltas: u64,
     unknown_payloads: u64,
+    duplicate_items: u64,
 }
 
 impl SessionProjection {
@@ -134,6 +139,8 @@ impl SessionProjection {
     /// Consume one raw envelope in stream order. Duplicate seqs are skipped;
     /// gaps are recorded (attach/replay honesty) and processing continues.
     /// Unknown payloads are counted and ignored (forward-compat law).
+    /// Envelopes marked `render.ui == false` advance sequence accounting but
+    /// never mutate display state (§6.1: three surfaces, never conflated).
     pub fn apply_raw(&mut self, envelope: &RawEnvelope) {
         if let Some(last) = self.last_seq {
             if envelope.seq <= last {
@@ -144,6 +151,9 @@ impl SessionProjection {
             }
         }
         self.last_seq = Some(envelope.seq);
+        if !envelope.render.ui {
+            return;
+        }
         match serde_json::from_value::<EventPayload>(envelope.payload.clone()) {
             Ok(payload) => self.apply(&payload),
             Err(_) => self.unknown_payloads += 1,
@@ -199,6 +209,12 @@ impl SessionProjection {
     fn apply_item(&mut self, event: &ItemEvent) {
         match event {
             ItemEvent::Started { item_id, item } => {
+                // Idempotency: a closed id never restarts, an open id never
+                // doubles (replay/re-delivery under fresh seqs).
+                if self.finished_items.contains(item_id) || self.open_block_mut(item_id).is_some() {
+                    self.duplicate_items += 1;
+                    return;
+                }
                 if let TurnItem::Plan { items } = item {
                     self.todos = Some(TodoPanel {
                         item_id: item_id.clone(),
@@ -215,6 +231,10 @@ impl SessionProjection {
             }
             ItemEvent::Delta { item_id, delta } => self.apply_delta(item_id, delta),
             ItemEvent::Completed { item_id, item } => {
+                if self.finished_items.contains(item_id) {
+                    self.duplicate_items += 1;
+                    return;
+                }
                 if let TurnItem::Plan { items } = item {
                     let all_done = items.iter().all(|todo| todo.state == TodoState::Completed);
                     self.todos = Some(TodoPanel {
@@ -223,29 +243,34 @@ impl SessionProjection {
                         pinned: !all_done,
                     });
                     if all_done {
-                        // The completed plan unpins INTO the transcript.
+                        // The completed plan unpins INTO the transcript and
+                        // the id closes — later duplicates are no-ops.
+                        self.finished_items.insert(item_id.clone());
                         self.entries.push(TranscriptEntry::Item(ItemBlock::new(
                             item_id.clone(),
                             item.clone(),
                             false,
                         )));
                     }
-                } else if let Some(block) = self.open_block_mut(item_id) {
-                    // Replace semantics: the final item is authoritative.
-                    block.item = item.clone();
-                    block.streaming = false;
-                    // The completed item carries the parsed args; the raw
-                    // fragment accumulation is a duplicate — release it
-                    // (efficiency rider #3).
-                    block.args_fragments = String::new();
                 } else {
-                    // Attach-mid-stream tolerance: a Completed we never saw
-                    // start still lands as a finished block.
-                    self.entries.push(TranscriptEntry::Item(ItemBlock::new(
-                        item_id.clone(),
-                        item.clone(),
-                        false,
-                    )));
+                    self.finished_items.insert(item_id.clone());
+                    if let Some(block) = self.open_block_mut(item_id) {
+                        // Replace semantics: the final item is authoritative.
+                        block.item = item.clone();
+                        block.streaming = false;
+                        // The completed item carries the parsed args; the raw
+                        // fragment accumulation is a duplicate — release it
+                        // (efficiency rider #3).
+                        block.args_fragments = String::new();
+                    } else {
+                        // Attach-mid-stream tolerance: a Completed we never
+                        // saw start still lands as a finished block.
+                        self.entries.push(TranscriptEntry::Item(ItemBlock::new(
+                            item_id.clone(),
+                            item.clone(),
+                            false,
+                        )));
+                    }
                 }
             }
         }
@@ -341,6 +366,35 @@ impl SessionProjection {
         }
     }
 
+    /// Visual class of the badge (sim vocabulary: outlined for restful
+    /// states, filled gold for active work, maroon for tool/machinery,
+    /// warn for needs-you states, err for failures).
+    #[must_use]
+    pub fn badge_tone(&self) -> BadgeTone {
+        if matches!(self.harness, Some(HarnessStatus::Starting { .. })) {
+            return BadgeTone::Muted;
+        }
+        match &self.run {
+            None | Some(RunState::Queued | RunState::Waiting { .. }) => BadgeTone::Muted,
+            Some(
+                RunState::Thinking
+                | RunState::Streaming
+                | RunState::Concluding
+                | RunState::Verifying { .. },
+            ) => BadgeTone::Active,
+            Some(RunState::RunningTool | RunState::Compacting | RunState::Cancelling) => {
+                BadgeTone::Tool
+            }
+            Some(
+                RunState::InputRequired { .. }
+                | RunState::PermissionRequired { .. }
+                | RunState::EffectOutcomeUnknown,
+            ) => BadgeTone::Attention,
+            Some(RunState::Errored) => BadgeTone::Error,
+            Some(RunState::Done | RunState::Cancelled) => BadgeTone::Muted,
+        }
+    }
+
     /// Boot-screen readiness checklist while the harness is starting.
     #[must_use]
     pub fn boot_checks(&self) -> Option<&[ReadinessCheck]> {
@@ -398,6 +452,21 @@ impl SessionProjection {
     pub fn unknown_payloads(&self) -> u64 {
         self.unknown_payloads
     }
+
+    #[must_use]
+    pub fn duplicate_items(&self) -> u64 {
+        self.duplicate_items
+    }
+}
+
+/// Badge visual class — see [`SessionProjection::badge_tone`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BadgeTone {
+    Muted,
+    Active,
+    Tool,
+    Attention,
+    Error,
 }
 
 fn wait_reason_label(reason: &WaitReason) -> String {

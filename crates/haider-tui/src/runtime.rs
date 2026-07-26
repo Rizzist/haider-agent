@@ -22,14 +22,38 @@ use tokio::sync::mpsc;
 /// RAII terminal state: raw mode + alternate screen + bracketed paste on
 /// construction, restored on drop AND on panic (the panic hook restores
 /// first so the report is readable — rec 18's restoration guarantee).
+///
+/// One-shot per process (review r1 P3): a second `enter` while one guard
+/// lives fails instead of stacking panic hooks and fighting over the screen.
+/// The panic hook stays installed after drop — `restore_terminal` is
+/// idempotent and harmless once the terminal is already restored.
 pub struct TerminalGuard;
 
+static GUARD_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 impl TerminalGuard {
-    /// Enter raw mode + alt screen. Registers a chaining panic hook that
-    /// restores the terminal before the default report prints.
+    /// Enter raw mode + alt screen TRANSACTIONALLY (review r1 P1): if any
+    /// later step fails, everything already entered is rolled back before
+    /// the error returns. Registers a chaining panic hook that restores the
+    /// terminal before the default report prints.
     pub fn enter() -> std::io::Result<Self> {
-        enable_raw_mode()?;
-        execute!(stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
+        use std::sync::atomic::Ordering;
+        if GUARD_ACTIVE.swap(true, Ordering::SeqCst) {
+            return Err(std::io::Error::other("terminal guard already active"));
+        }
+        if let Err(error) = enable_raw_mode() {
+            GUARD_ACTIVE.store(false, Ordering::SeqCst);
+            return Err(error);
+        }
+        if let Err(error) = execute!(stdout(), EnterAlternateScreen, EnableBracketedPaste) {
+            // Roll back the partial setup: raw mode is on, and the alternate
+            // screen may or may not have been entered before the failure —
+            // restore_terminal unwinds both (leaving a screen we never
+            // entered is a no-op escape sequence).
+            restore_terminal();
+            GUARD_ACTIVE.store(false, Ordering::SeqCst);
+            return Err(error);
+        }
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             restore_terminal();
@@ -42,6 +66,7 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         restore_terminal();
+        GUARD_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -87,8 +112,11 @@ pub async fn run_demo(mut model: AppModel) -> std::io::Result<()> {
         }
     });
 
-    // Demo driver: the script plays on its own clock.
+    // Demo driver: the script plays on its own clock. `answer_echo` is the
+    // demo's client seam — user menu answers loop back as MenuAnswered
+    // envelopes, exactly the shape the daemon will publish later.
     let (envelope_tx, mut envelope_rx) = mpsc::channel::<EventPayload>(64);
+    let answer_echo = envelope_tx.clone();
     tokio::spawn(async move {
         for payload in demo_script() {
             tokio::time::sleep(demo_pace(&payload)).await;
@@ -100,6 +128,9 @@ pub async fn run_demo(mut model: AppModel) -> std::io::Result<()> {
 
     let mut frame_tick = tokio::time::interval(Duration::from_millis(33));
     frame_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Fused: after the stream closes this branch is disabled — a closed
+    // receiver must never spin the loop (review r1 P1).
+    let mut stream_open = true;
 
     while !model.should_quit {
         tokio::select! {
@@ -112,9 +143,12 @@ pub async fn run_demo(mut model: AppModel) -> std::io::Result<()> {
                 Some(_) => {}
                 None => break,
             },
-            payload = envelope_rx.recv() => match payload {
+            payload = envelope_rx.recv(), if stream_open => match payload {
                 Some(payload) => model.handle(AppEvent::Envelope(Box::new(payload))),
-                None => model.handle(AppEvent::StreamEnded),
+                None => {
+                    stream_open = false;
+                    model.handle(AppEvent::StreamEnded);
+                }
             },
             // Guarded tick: while the model is clean this branch is disabled,
             // so the idle loop takes NO periodic wakeups (efficiency rider
@@ -125,6 +159,9 @@ pub async fn run_demo(mut model: AppModel) -> std::io::Result<()> {
                 draw(&mut terminal, &model)?;
                 model.dirty = false;
             }
+        }
+        for answer in model.outbox.drain(..) {
+            let _ = answer_echo.try_send(EventPayload::MenuAnswered(answer));
         }
     }
     Ok(())

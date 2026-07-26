@@ -169,3 +169,86 @@ fn demo_plain_path_is_deterministic_and_complete() {
     assert!(first.contains("✓ plan — 3/3 done"));
     assert!(first.lines().last().expect("status").starts_with("IDLE"));
 }
+
+#[test]
+fn open_menu_replaces_the_composer_and_answers_through_the_outbox() {
+    use haider_tui::mock::demo_script;
+    let mut model = AppModel::new();
+    // Play the demo up to (and including) MenuOpened, but not the script's
+    // self-answer.
+    for payload in demo_script() {
+        let is_answer = matches!(payload, EventPayload::MenuAnswered(_));
+        if is_answer {
+            break;
+        }
+        model.handle(AppEvent::Envelope(Box::new(payload)));
+    }
+    assert!(model.projection.open_menu().is_some());
+    let (text, _) = draw(&model, 90, 26);
+    assert!(text.contains("Allow fs_patch — event_store.rs?"));
+    assert!(text.contains("1. Allow once"));
+    assert!(text.contains("2. Deny"));
+    assert!(text.contains("? PERMISSION_REQUIRED"));
+
+    // Keys drive the menu, not the composer.
+    model.handle(key(KeyCode::Char('x')));
+    assert_eq!(
+        model.composer, "",
+        "composer is unmounted while menu is open"
+    );
+    model.handle(key(KeyCode::Down));
+    model.handle(key(KeyCode::Enter));
+    let answer = model.outbox.pop().expect("answer produced");
+    assert_eq!(answer.option_key.as_deref(), Some("deny"));
+    assert_eq!(answer.option_index, 1);
+
+    // Digit quick-answer path.
+    model.handle(key(KeyCode::Char('1')));
+    let answer = model.outbox.pop().expect("digit answer");
+    assert_eq!(answer.option_key.as_deref(), Some("allow"));
+}
+
+#[test]
+fn narrow_status_bar_keeps_the_badge_and_drops_the_meter() {
+    let model = model_after_full_demo();
+    let (text, _) = draw(&model, 30, 12);
+    assert!(text.contains("IDLE"), "badge survives narrow widths");
+    assert!(!text.contains('▰'), "meter yields before the badge clips");
+}
+
+#[test]
+fn stream_ended_never_dirties_the_frame() {
+    let mut model = model_after_full_demo();
+    model.dirty = false;
+    model.handle(AppEvent::StreamEnded);
+    assert!(!model.dirty, "post-stream no-ops must not spin redraws");
+}
+
+#[test]
+fn command_decode_error_is_visible_in_the_session_view() {
+    use haider_protocol::ids::ItemId;
+    use haider_protocol::item::{ItemDelta, ItemEvent, OutputStream, ToolStatus, TurnItem};
+    let mut model = model_after_full_demo();
+    model.handle(AppEvent::Envelope(Box::new(EventPayload::Item(
+        ItemEvent::Started {
+            item_id: ItemId::new("cmd-err"),
+            item: TurnItem::CommandExecution {
+                call_id: "c".to_owned(),
+                command: "cat log.bin".to_owned(),
+                status: ToolStatus::InProgress,
+                exit_code: None,
+            },
+        },
+    ))));
+    model.handle(AppEvent::Envelope(Box::new(EventPayload::Item(
+        ItemEvent::Delta {
+            item_id: ItemId::new("cmd-err"),
+            delta: ItemDelta::CommandOutput {
+                stream: OutputStream::Stdout,
+                chunk_b64: "*** not base64 ***".to_owned(),
+            },
+        },
+    ))));
+    let (text, _) = draw(&model, 90, 30);
+    assert!(text.contains("⚠ some output could not be decoded"));
+}

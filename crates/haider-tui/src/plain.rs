@@ -114,16 +114,17 @@ fn render_item(out: &mut String, block: &ItemBlock) {
                 out.push_str(&format!(" · exit {code}"));
             }
             out.push('\n');
+            if block.output_truncated {
+                out.push_str("  ⋯ earlier output truncated\n");
+            }
+            if block.output_decode_error {
+                out.push_str("  ⚠ some output could not be decoded\n");
+            }
             let tail = block.output_text();
-            if !tail.is_empty() {
-                if block.output_truncated {
-                    out.push_str("  ⋯ earlier output truncated\n");
-                }
-                for line in tail.lines() {
-                    out.push_str("  ");
-                    out.push_str(line);
-                    out.push('\n');
-                }
+            for line in tail.lines() {
+                out.push_str("  ");
+                out.push_str(line);
+                out.push('\n');
             }
         }
         TurnItem::FileChange {

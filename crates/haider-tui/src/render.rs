@@ -116,11 +116,14 @@ fn render_session(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: 
         .todos()
         .filter(|t| t.pinned)
         .map_or(0, |t| u16::try_from(t.items.len() + 1).unwrap_or(4));
+    // A blocking menu REPLACES the composer (sim §3 law) and takes its rows.
+    let menu = model.projection.open_menu();
+    let input_height = menu.map_or(1, |m| u16::try_from(m.options.len() + 1).unwrap_or(6));
     let [transcript_area, todos_area, rule_area, composer_area] = Layout::vertical([
         Constraint::Min(1),
         Constraint::Length(todos_height),
         Constraint::Length(1),
-        Constraint::Length(1),
+        Constraint::Length(input_height),
     ])
     .areas(area);
 
@@ -164,10 +167,39 @@ fn render_session(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: 
         )),
         rule_area,
     );
-    frame.render_widget(
-        Paragraph::new(composer_line(model, theme)).style(theme.input_style()),
-        composer_area,
-    );
+    if let Some(menu) = menu {
+        let mut menu_lines = vec![Line::from(vec![
+            Span::styled("? ", theme.warn_style()),
+            Span::styled(menu.title.as_str(), theme.bright_style()),
+            Span::styled("  ↑↓ select · ⏎ confirm · 1-9 quick", theme.faint_style()),
+        ])];
+        for (index, option) in menu.options.iter().enumerate() {
+            let selected = index == model.menu_selection;
+            let cursor = if selected { "❯" } else { " " };
+            let line = Line::from(vec![
+                Span::styled(format!(" {cursor} "), theme.gold_style()),
+                Span::styled(
+                    format!("{}. {}", index + 1, option.label),
+                    if selected {
+                        theme.bright_style()
+                    } else {
+                        theme.dim_style()
+                    },
+                ),
+            ]);
+            menu_lines.push(if selected {
+                line.style(theme.selection_style())
+            } else {
+                line
+            });
+        }
+        frame.render_widget(Paragraph::new(Text::from(menu_lines)), composer_area);
+    } else {
+        frame.render_widget(
+            Paragraph::new(composer_line(model, theme)).style(theme.input_style()),
+            composer_area,
+        );
+    }
 }
 
 fn composer_line<'a>(model: &'a AppModel, theme: &Theme) -> Line<'a> {
@@ -195,12 +227,21 @@ fn render_status_bar(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, are
         (pct.clamp(0.0, 1.0) * 100.0).round(),
         fmt_tok(identity.context_window)
     );
-    let meter_width = u16::try_from(meter.chars().count()).unwrap_or(0);
+    // Narrow-mode policy (review r1 P3): the badge is primary state — the
+    // meter yields entirely before the badge loses a single cell.
+    let mut meter_width = u16::try_from(meter.chars().count()).unwrap_or(0);
+    let badge_min = u16::try_from(badge.chars().count() + 4).unwrap_or(u16::MAX);
+    if meter_width.saturating_add(badge_min) > area.width {
+        meter_width = 0;
+    }
     let [left, right] =
         Layout::horizontal([Constraint::Min(1), Constraint::Length(meter_width)]).areas(area);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(format!(" {badge} "), theme.badge_style()),
+            Span::styled(
+                format!(" {badge} "),
+                theme.badge_style(model.projection.badge_tone()),
+            ),
             Span::styled(
                 format!(" {} · {}", identity.model_short, identity.provider),
                 theme.dim_style(),
@@ -209,12 +250,14 @@ fn render_status_bar(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, are
         .style(theme.text_style().bg(theme.bar_bg.into())),
         left,
     );
-    frame.render_widget(
-        Paragraph::new(Line::styled(meter, theme.dim_style()))
-            .alignment(Alignment::Right)
-            .style(theme.text_style().bg(theme.bar_bg.into())),
-        right,
-    );
+    if meter_width > 0 {
+        frame.render_widget(
+            Paragraph::new(Line::styled(meter, theme.dim_style()))
+                .alignment(Alignment::Right)
+                .style(theme.text_style().bg(theme.bar_bg.into())),
+            right,
+        );
+    }
 }
 
 fn transcript_lines<'a>(lines: &mut Vec<Line<'a>>, entry: &'a TranscriptEntry, theme: &Theme) {
@@ -274,6 +317,20 @@ fn item_lines<'a>(lines: &mut Vec<Line<'a>>, block: &'a ItemBlock, theme: &Theme
                 spans.push(Span::styled(format!(" · exit {code}"), theme.dim_style()));
             }
             lines.push(Line::from(spans));
+            // Honesty first (review r1 P2): bounded/undecodable output must
+            // never read as complete.
+            if block.output_truncated {
+                lines.push(Line::styled(
+                    "  ⋯ earlier output truncated",
+                    theme.dim_style(),
+                ));
+            }
+            if block.output_decode_error {
+                lines.push(Line::styled(
+                    "  ⚠ some output could not be decoded",
+                    theme.warn_style(),
+                ));
+            }
             for line in block.output_text().lines() {
                 lines.push(Line::styled(format!("  {line}"), theme.faint_style()));
             }

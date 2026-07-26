@@ -16,13 +16,32 @@ fn rgb_converts_to_ratatui_truecolor() {
 }
 
 #[test]
-fn badge_style_is_bold_gold_ground_with_theme_ink() {
+fn badge_styles_follow_the_state_vocabulary() {
+    use haider_tui::projection::BadgeTone;
     for key in ThemeKey::ALL {
         let theme = key.theme();
-        let style = theme.badge_style();
-        assert_eq!(style.fg, Some(theme.badge_fg.into()));
-        assert_eq!(style.bg, Some(theme.gold.into()));
-        assert!(style.add_modifier.contains(Modifier::BOLD));
+        // Active work: gold fill with theme-bg ink.
+        let active = theme.badge_style(BadgeTone::Active);
+        assert_eq!(active.fg, Some(theme.badge_fg.into()));
+        assert_eq!(active.bg, Some(theme.gold.into()));
+        assert!(active.add_modifier.contains(Modifier::BOLD));
+        // Restful states: outlined gold, no fill.
+        let muted = theme.badge_style(BadgeTone::Muted);
+        assert_eq!(muted.fg, Some(theme.gold.into()));
+        assert_eq!(muted.bg, None);
+        // Machinery / attention / failure fills.
+        assert_eq!(
+            theme.badge_style(BadgeTone::Tool).bg,
+            Some(theme.maroon.into())
+        );
+        assert_eq!(
+            theme.badge_style(BadgeTone::Attention).bg,
+            Some(theme.warn.into())
+        );
+        assert_eq!(
+            theme.badge_style(BadgeTone::Error).bg,
+            Some(theme.err.into())
+        );
     }
 }
 

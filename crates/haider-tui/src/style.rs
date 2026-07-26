@@ -54,13 +54,27 @@ impl Theme {
         Style::default().fg(self.frame.into())
     }
 
-    /// The filled state badge (gold ground, theme-bg ink).
+    /// The state badge, per visual class (sim vocabulary: restful states
+    /// outlined in gold; active work filled gold; tool machinery maroon;
+    /// needs-you warn; failure err).
     #[must_use]
-    pub fn badge_style(&self) -> Style {
-        Style::default()
-            .fg(self.badge_fg.into())
-            .bg(self.gold.into())
-            .add_modifier(Modifier::BOLD)
+    pub fn badge_style(&self, tone: crate::projection::BadgeTone) -> Style {
+        use crate::projection::BadgeTone;
+        let filled = |ground: Rgb| {
+            Style::default()
+                .fg(self.badge_fg.into())
+                .bg(ground.into())
+                .add_modifier(Modifier::BOLD)
+        };
+        match tone {
+            BadgeTone::Muted => Style::default()
+                .fg(self.gold.into())
+                .add_modifier(Modifier::BOLD),
+            BadgeTone::Active => filled(self.gold),
+            BadgeTone::Tool => filled(self.maroon),
+            BadgeTone::Attention => filled(self.warn),
+            BadgeTone::Error => filled(self.err),
+        }
     }
 
     /// The composer input field.

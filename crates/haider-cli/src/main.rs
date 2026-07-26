@@ -114,8 +114,16 @@ async fn tui_command(rest: &[String]) -> ExitCode {
         model.sanctum_tier = SanctumTier::Arabic;
     }
     if plain || !io::stdout().is_terminal() {
-        print!("{}", run_demo_plain(model));
-        return ExitCode::SUCCESS;
+        // Fallible write: `print!` panics on BrokenPipe (review r1 P2).
+        // A closed pipe is a normal consumer choice → success; other write
+        // failures are real I/O errors.
+        let text = run_demo_plain(model);
+        let mut out = io::stdout();
+        return match out.write_all(text.as_bytes()).and_then(|()| out.flush()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) if error.kind() == io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
+            Err(_) => ExitCode::from(EX_IOERR),
+        };
     }
     match run_demo(model).await {
         Ok(()) => ExitCode::SUCCESS,

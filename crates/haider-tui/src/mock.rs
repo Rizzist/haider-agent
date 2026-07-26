@@ -9,8 +9,9 @@
 
 use haider_protocol::EventPayload;
 use haider_protocol::history::{TodoItem, TodoState};
-use haider_protocol::ids::ItemId;
+use haider_protocol::ids::{ItemId, MenuId};
 use haider_protocol::item::{ItemDelta, ItemEvent, ToolStatus, TurnItem};
+use haider_protocol::menu::{AnswerVia, Menu, MenuAnswer, MenuKind, MenuOption, MenuScope};
 use haider_protocol::provider::{Usage, UsageSource};
 use haider_protocol::state::{HarnessStatus, ReadinessCheck, RunState};
 
@@ -141,6 +142,49 @@ pub fn demo_script() -> Vec<EventPayload> {
             status: ToolStatus::Completed,
         },
     }));
+
+    // A permission menu replaces the composer (blocking), then the script
+    // self-answers so non-interactive runs stay deterministic — an
+    // interactive answer beats it and the later duplicate is ignored.
+    let menu_id = MenuId::new("demo-menu-1");
+    script.push(EventPayload::MenuOpened(Menu {
+        id: menu_id.clone(),
+        kind: MenuKind::Permission {
+            effect_summary: "patch crates/haider-store/src/event_store.rs".to_owned(),
+        },
+        title: "Allow fs_patch — event_store.rs?".to_owned(),
+        body: vec![],
+        options: vec![
+            MenuOption {
+                key: "allow".to_owned(),
+                label: "Allow once".to_owned(),
+                detail: None,
+                decision: None,
+            },
+            MenuOption {
+                key: "deny".to_owned(),
+                label: "Deny".to_owned(),
+                detail: None,
+                decision: None,
+            },
+        ],
+        blocking: true,
+        scope: MenuScope::Session,
+        origin: "fs_patch".to_owned(),
+        ttl_ms: None,
+        timeout_option: None,
+    }));
+    script.push(EventPayload::RunState(RunState::PermissionRequired {
+        menu: menu_id.clone(),
+    }));
+    script.push(EventPayload::MenuAnswered(MenuAnswer {
+        menu: menu_id,
+        option_key: Some("allow".to_owned()),
+        option_index: 0,
+        value: None,
+        via: AnswerVia::Tui,
+    }));
+    script.push(EventPayload::RunState(RunState::RunningTool));
 
     // Plan progresses; the patch lands as a file change.
     script.push(EventPayload::Item(ItemEvent::Completed {
