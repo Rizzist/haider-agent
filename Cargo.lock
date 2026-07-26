@@ -4,11 +4,11 @@ version = 4
 
 [[package]]
 name = "haider-accounts"
-version = "0.0.3"
+version = "0.0.4"
 
 [[package]]
 name = "haider-cli"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "haider-accounts",
  "haider-core",
@@ -23,11 +23,11 @@ dependencies = [
 
 [[package]]
 name = "haider-core"
-version = "0.0.3"
+version = "0.0.4"
 
 [[package]]
 name = "haider-protocol"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -35,27 +35,27 @@ dependencies = [
 
 [[package]]
 name = "haider-provider"
-version = "0.0.3"
+version = "0.0.4"
 
 [[package]]
 name = "haider-rpc"
-version = "0.0.3"
+version = "0.0.4"
 
 [[package]]
 name = "haider-store"
-version = "0.0.3"
+version = "0.0.4"
 
 [[package]]
 name = "haider-tools"
-version = "0.0.3"
+version = "0.0.4"
 
 [[package]]
 name = "haider-tui"
-version = "0.0.3"
+version = "0.0.4"
 
 [[package]]
 name = "haider-verify"
-version = "0.0.3"
+version = "0.0.4"
 
 [[package]]
 name = "itoa"
@@ -149,7 +149,7 @@ checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 
 [[package]]
 name = "xtask"
-version = "0.0.3"
+version = "0.0.4"
 
 [[package]]
 name = "zmij"
