@@ -326,8 +326,46 @@ pub enum ResponseBody {
         message: String,
         /// Whether retrying after the stated condition changes may succeed.
         retryable: bool,
+        /// Typed recovery coordinates for codes that carry them (report
+        /// §5.4/§5.6): [`ERROR_CODE_CURSOR_AHEAD`] and
+        /// [`ERROR_CODE_ALREADY_RESOLVED`] MUST attach their variant so a
+        /// client can act without parsing `message`. `None` for codes with
+        /// nothing structured to say, and on frames from older daemons.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        data: Option<ErrorData>,
     },
     /// Decode artifact for a method this crate does not know (tolerance
+    /// discipline).
+    #[serde(other)]
+    Unknown,
+}
+
+/// Machine-readable recovery coordinates attached to a correlated
+/// [`ResponseBody::Error`].
+///
+/// Tagged by `code`-matching kind so future codes can add variants without
+/// breaking old clients; an unknown kind decodes as [`ErrorData::Unknown`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ErrorData {
+    /// The client's `after_seq` is beyond the committed head
+    /// ([`ERROR_CODE_CURSOR_AHEAD`]): reattach from a sequence at or below
+    /// `head`.
+    CursorAhead {
+        /// The cursor the client asked to resume after.
+        requested: u64,
+        /// The greatest committed sequence the daemon holds.
+        head: u64,
+    },
+    /// A compare-and-set command lost to an earlier resolution
+    /// ([`ERROR_CODE_ALREADY_RESOLVED`]): the winning resolution is the
+    /// envelope at `resolution_seq` on the event stream.
+    AlreadyResolved {
+        /// Sequence of the envelope recording the winning resolution.
+        resolution_seq: u64,
+    },
+    /// Decode artifact for a data kind this crate does not know (tolerance
     /// discipline).
     #[serde(other)]
     Unknown,

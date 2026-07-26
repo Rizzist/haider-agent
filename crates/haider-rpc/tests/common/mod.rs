@@ -6,8 +6,9 @@ use haider_protocol::envelope::{PromptRender, RawEnvelope, RenderTargets, SCHEMA
 use haider_protocol::ids::{DeviceId, EventId, MenuId, SessionId};
 use haider_rpc::{
     AttachMode, AttachState, AttachmentId, Capability, ClientKind, CommandId,
-    ERROR_CODE_CAPABILITY_DENIED, Hello, LifecyclePhase, MenuInput, ProtocolError, RequestBody,
-    RequestId, ResponseBody, SeqRange, SessionReadResult, SessionSummary, Welcome, WireFrame,
+    ERROR_CODE_ALREADY_RESOLVED, ERROR_CODE_CAPABILITY_DENIED, ERROR_CODE_CURSOR_AHEAD, ErrorData,
+    Hello, LifecyclePhase, MenuInput, ProtocolError, RequestBody, RequestId, ResponseBody,
+    SeqRange, SessionReadResult, SessionSummary, Welcome, WireFrame,
 };
 
 pub const TEST_FRAME_LIMIT: usize = 1024 * 1024;
@@ -147,6 +148,28 @@ pub fn transcript() -> Vec<WireFrame> {
                 code: ERROR_CODE_CAPABILITY_DENIED.into(),
                 message: "control capability required".into(),
                 retryable: false,
+                data: None,
+            },
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-attach-ahead"),
+            body: ResponseBody::Error {
+                code: ERROR_CODE_CURSOR_AHEAD.into(),
+                message: "requested cursor is beyond the committed head".into(),
+                retryable: true,
+                data: Some(ErrorData::CursorAhead {
+                    requested: 40,
+                    head: 10,
+                }),
+            },
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-menu-lost"),
+            body: ResponseBody::Error {
+                code: ERROR_CODE_ALREADY_RESOLVED.into(),
+                message: "an earlier answer won".into(),
+                retryable: false,
+                data: Some(ErrorData::AlreadyResolved { resolution_seq: 9 }),
             },
         },
         WireFrame::Event {

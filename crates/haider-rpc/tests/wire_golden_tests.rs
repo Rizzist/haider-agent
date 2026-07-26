@@ -264,3 +264,32 @@ fn event_frame_has_no_parallel_cursor_field() {
     assert!(!object.contains_key("notification_id"));
     assert!(!object.contains_key("snapshot_generation"));
 }
+
+#[test]
+fn error_data_decodes_tolerantly_when_absent_or_unknown_kind() {
+    // An old daemon's error frame carries no `data` key at all.
+    let old_frame = r#"{"v":1,"kind":"response","request_id":"r-1","body":{"method":"error","code":"capability_denied","message":"nope","retryable":false}}"#;
+    let decoded = ws_codec::decode(old_frame, DEFAULT_FRAME_LIMIT).expect("old error decodes");
+    let WireFrame::Response {
+        body: ResponseBody::Error { data, code, .. },
+        ..
+    } = decoded
+    else {
+        panic!("expected a correlated error response");
+    };
+    assert_eq!(code, ERROR_CODE_CAPABILITY_DENIED);
+    assert!(data.is_none(), "absent data must decode as None");
+
+    // A future daemon's data kind this crate does not know must decode as
+    // ErrorData::Unknown, never fail the frame.
+    let future_frame = r#"{"v":1,"kind":"response","request_id":"r-2","body":{"method":"error","code":"cursor_ahead","message":"ahead","retryable":true,"data":{"kind":"warp_offset","distance":9}}}"#;
+    let decoded = ws_codec::decode(future_frame, DEFAULT_FRAME_LIMIT).expect("future data decodes");
+    let WireFrame::Response {
+        body: ResponseBody::Error { data, .. },
+        ..
+    } = decoded
+    else {
+        panic!("expected a correlated error response");
+    };
+    assert_eq!(data, Some(haider_rpc::ErrorData::Unknown));
+}
