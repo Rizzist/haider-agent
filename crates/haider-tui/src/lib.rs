@@ -1,7 +1,13 @@
-//! haider-tui — part of the Haider Code harness.
+//! haider-tui — the Haider Code terminal UI.
 //!
-//! Scaffold crate (v0.0.1). Contracts land in W0/A2; implementation follows the
-//! build guide waves. Tests live in `tests/` — never inline (workspace rule).
+//! Visual spec: the `/tui` sim (next-diffforge) — panel-for-panel parity is
+//! the acceptance bar. Widgets never hardcode colors or labels; everything
+//! reads [`theme::Theme`] tokens and [`format`] helpers so the three themes
+//! stay one identity. Tests live in `tests/` — never inline (workspace rule).
+
+pub mod format;
+pub mod projection;
+pub mod theme;
 
 /// Crate marker used by the workspace self-test.
 pub const CRATE_NAME: &str = "haider-tui";

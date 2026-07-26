@@ -7,6 +7,9 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+haider-protocol = { path = "../haider-protocol" }
+base64.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true
