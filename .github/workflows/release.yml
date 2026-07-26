@@ -31,6 +31,8 @@ jobs:
           grep -q "^version = \"$TAG\"" Cargo.toml || { echo "tag v$TAG != workspace version"; exit 1; }
       - name: build
         run: cargo build --release --locked -p haider-cli --target ${{ matrix.target }}
+      - name: ad-hoc codesign (diffforge-client trick — quarantine-friendly unsigned distribution)
+        run: codesign --force -s - target/${{ matrix.target }}/release/haider
       - name: smoke (artifact must match tag + pass self-test)
         run: |
           BIN=target/${{ matrix.target }}/release/haider
