@@ -18,8 +18,17 @@
 //! - forced shutdown before startup -> `second_signal_before_startup_prevents_ready_and_forces_termination`
 //! - reconcile-before-ready (R16)  -> `reconcile_before_ready_marks_unknown_exactly_once_and_never_retries_effect`
 //!
+//! Efficiency-rider follow-ups (report §2.5, R12/R17), same matrix discipline:
+//!
+//! - connection admission cap      -> `connection_admission_cap_rejects_over_limit_peers_and_readmits_a_freed_slot`
+//! - queued-byte budget            -> `outbound_byte_budget_refuses_a_frame_the_connection_cannot_hold`
+//! - reserved drain notice         -> `reserved_drain_notice_survives_an_exhausted_outbound_byte_budget`
+//!
 //! All cases use a real UDS in a tempdir runtime dir and poll readiness
-//! states — no sleeps as synchronization.
+//! states — no sleeps as synchronization. Where only the OS can answer (a
+//! child's exit status, a socket appearing), the loop still polls a real
+//! condition against a deadline; [`POLL_BACKOFF`] just keeps that poll from
+//! spinning a core.
 
 #![allow(clippy::expect_used)] // integration failures should name the exact lifecycle boundary
 
@@ -48,6 +57,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
 const DEADLINE: Duration = Duration::from_secs(10);
+/// Interval between polls of an OS-only condition (child exit, endpoint
+/// appearing, a freed connection slot). The deadline is the synchronization;
+/// this only stops the poll loop from burning a core on `yield_now`.
+const POLL_BACKOFF: Duration = Duration::from_millis(5);
 
 fn test_root() -> tempfile::TempDir {
     #[cfg(target_os = "macos")]
@@ -81,20 +94,55 @@ impl TestClient {
         self.stream.write_all(&bytes).await.expect("frame writes");
     }
 
+    /// Best-effort send for retry loops: a rejected connection may already be
+    /// closed by the time the test writes.
+    async fn try_send(&mut self, frame: &WireFrame, limit: usize) -> bool {
+        let bytes = uds_codec::encode(frame, limit).expect("test frame encodes");
+        self.stream.write_all(&bytes).await.is_ok()
+    }
+
     async fn receive(&mut self) -> WireFrame {
+        self.try_receive()
+            .await
+            .expect("connection closed before a frame arrived")
+    }
+
+    /// Next frame, or `None` when the daemon closed the connection first.
+    async fn try_receive(&mut self) -> Option<WireFrame> {
         if let Some(frame) = self.pending.pop_front() {
-            return frame;
+            return Some(frame);
         }
         loop {
             let mut bytes = [0_u8; 8 * 1024];
             let read = self.stream.read(&mut bytes).await.expect("frame reads");
-            assert_ne!(read, 0, "connection closed before a frame arrived");
+            if read == 0 {
+                return None;
+            }
             let batch = self.decoder.push(&bytes[..read]);
             assert!(batch.error.is_none(), "server sent an invalid frame");
             self.pending.extend(batch.frames);
             if let Some(frame) = self.pending.pop_front() {
-                return frame;
+                return Some(frame);
             }
+        }
+    }
+
+    /// Reads at least `at_least` raw bytes into the decoder without waiting for
+    /// a whole frame, leaving a large reply deliberately mid-write (its bytes
+    /// still charged against the connection's queued-byte budget).
+    async fn absorb_at_least(&mut self, at_least: usize) {
+        let mut absorbed = 0;
+        while absorbed < at_least {
+            let mut bytes = [0_u8; 8 * 1024];
+            let read = tokio::time::timeout(DEADLINE, self.stream.read(&mut bytes))
+                .await
+                .expect("partial read deadline")
+                .expect("partial read");
+            assert_ne!(read, 0, "connection closed before the reply started");
+            let batch = self.decoder.push(&bytes[..read]);
+            assert!(batch.error.is_none(), "server sent an invalid frame");
+            self.pending.extend(batch.frames);
+            absorbed += read;
         }
     }
 
@@ -139,7 +187,7 @@ impl ManagedChild {
                 if let Some(status) = self.try_wait() {
                     return status;
                 }
-                tokio::task::yield_now().await;
+                tokio::time::sleep(POLL_BACKOFF).await;
             }
         })
         .await
@@ -243,11 +291,37 @@ async fn poll_process_ready(config: &DaemonConfig) -> TestClient {
                     return client;
                 }
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(POLL_BACKOFF).await;
         }
     })
     .await
     .expect("daemon readiness deadline")
+}
+
+/// Bounded-retry connect + handshake for the admission cap: a freed connection
+/// slot becomes observable only once the previous connection's task has ended,
+/// which no client-visible event announces.
+async fn poll_admission(config: &DaemonConfig) -> TestClient {
+    let announced = u32::try_from(config.frame_limit).expect("frame limit fits");
+    tokio::time::timeout(DEADLINE, async {
+        loop {
+            if let Ok(mut client) =
+                TestClient::connect(&config.endpoint_path(), config.frame_limit).await
+                && client
+                    .try_send(
+                        &hello(WIRE_PROTOCOL_VERSION, WIRE_PROTOCOL_VERSION, announced),
+                        config.frame_limit,
+                    )
+                    .await
+                && let Some(WireFrame::Welcome(_)) = client.try_receive().await
+            {
+                return client;
+            }
+            tokio::time::sleep(POLL_BACKOFF).await;
+        }
+    })
+    .await
+    .expect("connection readmission deadline")
 }
 
 async fn wait_for_state(
@@ -451,7 +525,7 @@ async fn simultaneous_start_n_processes_has_one_winner_and_clean_losers() {
             if statuses.iter().filter(|status| status.is_some()).count() == starters - 1 {
                 return statuses;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(POLL_BACKOFF).await;
         }
     })
     .await
@@ -657,6 +731,174 @@ async fn drain_notifies_every_open_connection_before_close() {
         ));
         client.expect_eof().await;
     }
+    assert_eq!(
+        task.join().await.expect("daemon joins"),
+        ShutdownOutcome::Graceful
+    );
+}
+
+#[tokio::test]
+async fn connection_admission_cap_rejects_over_limit_peers_and_readmits_a_freed_slot() {
+    let root = test_root();
+    let mut config = test_config(&root, "admission-cap");
+    config.max_connections = 2;
+    let task = spawn(config.clone());
+    wait_for_state(task.readiness(), |state| *state == DaemonState::Ready).await;
+
+    // N = cap connections are served normally.
+    let _first = handshake(&config.endpoint_path(), config.frame_limit).await;
+    let second = handshake(&config.endpoint_path(), config.frame_limit).await;
+
+    // The cap+1'th peer is answered typed, then closed — no handshake, no task.
+    let mut refused = TestClient::connect(&config.endpoint_path(), config.frame_limit)
+        .await
+        .expect("connect over the cap");
+    assert!(
+        matches!(
+            refused.receive().await,
+            WireFrame::ProtocolError(ProtocolError {
+                ref code,
+                fatal: true,
+                ..
+            }) if code == "overloaded"
+        ),
+        "over-limit peer must receive the fatal overloaded rejection"
+    );
+    refused.expect_eof().await;
+
+    // A freed slot is readmitted; the cap bounds concurrency, not lifetime use.
+    drop(second);
+    let _readmitted = poll_admission(&config).await;
+
+    task.shutdown_handle().request("test complete");
+    assert_eq!(
+        task.join().await.expect("daemon joins"),
+        ShutdownOutcome::Graceful
+    );
+}
+
+#[tokio::test]
+async fn outbound_byte_budget_refuses_a_frame_the_connection_cannot_hold() {
+    let root = test_root();
+    // The Welcome embeds the profile id, so a profile id larger than the whole
+    // per-connection byte budget makes the first reply unqueueable — the byte
+    // charge happens before the enqueue, so the connection dies there.
+    let profile = format!("byte-budget-{}", "p".repeat(8 * 1024));
+    let mut config = test_config(&root, &profile);
+    config.outbound_queued_bytes = 4 * 1024;
+    assert!(
+        config.outbound_queued_bytes < config.profile_id.len(),
+        "the reply this test expects to be refused must exceed the budget"
+    );
+    assert!(
+        config.outbound_queue_capacity > 1,
+        "the frame-count bound must not be what fires here"
+    );
+    let task = spawn(config.clone());
+    wait_for_state(task.readiness(), |state| *state == DaemonState::Ready).await;
+
+    let mut client = TestClient::connect(&config.endpoint_path(), config.frame_limit)
+        .await
+        .expect("connect");
+    client
+        .send(
+            &hello(
+                WIRE_PROTOCOL_VERSION,
+                WIRE_PROTOCOL_VERSION,
+                u32::try_from(config.frame_limit).expect("frame limit fits"),
+            ),
+            config.frame_limit,
+        )
+        .await;
+    assert!(
+        tokio::time::timeout(DEADLINE, client.try_receive())
+            .await
+            .expect("budget rejection deadline")
+            .is_none(),
+        "an over-budget reply must close the connection, never stall the daemon"
+    );
+
+    // The daemon itself is unharmed: the bound is per connection.
+    task.shutdown_handle().request("test complete");
+    assert_eq!(
+        task.join().await.expect("daemon joins"),
+        ShutdownOutcome::Graceful
+    );
+    assert!(!config.endpoint_path().exists());
+}
+
+#[tokio::test]
+async fn reserved_drain_notice_survives_an_exhausted_outbound_byte_budget() {
+    let root = test_root();
+    // A half-megabyte profile id makes the Welcome larger than any socket
+    // buffer, so it is still mid-write — and still charged — when the drain
+    // fires. Budget = frame limit leaves less headroom than the (deliberately
+    // long-reasoned) ServerDraining frame needs, so only a reserve outside the
+    // ordinary budget can deliver it. W3b2's real responses are the traffic
+    // this budget exists for; the Welcome is the one large daemon-authored
+    // frame a W3b1 test can size.
+    let profile = format!("drain-reserve-{}", "p".repeat(512 * 1024));
+    let mut config = test_config(&root, &profile);
+    config.frame_limit = config.profile_id.len() + 1_024;
+    config.outbound_queued_bytes = config.frame_limit;
+    let reason = format!("maintenance-{}", "r".repeat(4 * 1024));
+    let task = spawn(config.clone());
+    wait_for_state(task.readiness(), |state| *state == DaemonState::Ready).await;
+
+    let mut client = TestClient::connect(&config.endpoint_path(), config.frame_limit)
+        .await
+        .expect("connect");
+    client
+        .send(
+            &hello(
+                WIRE_PROTOCOL_VERSION,
+                WIRE_PROTOCOL_VERSION,
+                u32::try_from(config.frame_limit).expect("frame limit fits"),
+            ),
+            config.frame_limit,
+        )
+        .await;
+    // Enough bytes to prove the Welcome write started, far too few to finish it.
+    client.absorb_at_least(8 * 1024).await;
+
+    task.shutdown_handle().request(&reason);
+    let welcome = client.receive().await;
+    assert!(
+        matches!(welcome, WireFrame::Welcome(_)),
+        "the queued reply must still be delivered, got {welcome:?}"
+    );
+    let notice = client.receive().await;
+    assert!(
+        matches!(
+            notice,
+            WireFrame::ServerDraining {
+                reason: ref notice_reason,
+                deadline_unix_ms,
+                ..
+            } if *notice_reason == reason && deadline_unix_ms > 0
+        ),
+        "the reserved drain notice must arrive last, got {notice:?}"
+    );
+    client.expect_eof().await;
+
+    // Pin the counterfactual: had the notice shared the ordinary budget with
+    // the charged-but-unwritten Welcome, it could not have been queued at all.
+    let welcome_bytes = uds_codec::encode(&welcome, config.frame_limit)
+        .expect("re-encode welcome")
+        .len();
+    let notice_bytes = uds_codec::encode(&notice, config.frame_limit)
+        .expect("re-encode notice")
+        .len();
+    assert!(
+        welcome_bytes <= config.outbound_queued_bytes,
+        "the queued reply itself must fit the budget ({welcome_bytes} bytes)"
+    );
+    assert!(
+        welcome_bytes + notice_bytes > config.outbound_queued_bytes,
+        "budget must be too small for reply + notice, else the reserve is untested \
+         ({welcome_bytes} + {notice_bytes} bytes)"
+    );
+
     assert_eq!(
         task.join().await.expect("daemon joins"),
         ShutdownOutcome::Graceful

@@ -11,7 +11,9 @@
 //!    effect (R16) — no listener exists yet, so nothing can observe
 //!    half-recovered state;
 //! 4. bind the endpoint, then publish `Ready` (unless shutdown already
-//!    intervened) and serve the accept loop;
+//!    intervened) and serve the accept loop — every served connection holds one
+//!    admission permit, and a peer accepted beyond `max_connections` is
+//!    answered `overloaded` and closed without becoming a task;
 //! 5. drain (R17): close the listener, publish `Draining`, broadcast
 //!    `ServerDraining`, wait bounded for connections, flush the store,
 //!    remove the exact owned socket, and close the store LAST — closing
@@ -21,7 +23,7 @@
 //! ([`shutdown_without_store`], [`shutdown_before_listener`]) run the same
 //! tail ordering with whatever resources exist so far.
 
-use crate::connection::{ConnectionContext, DrainNotice, serve};
+use crate::connection::{ConnectionContext, DrainNotice, reject_over_limit, serve};
 use crate::endpoint;
 use crate::lifecycle::{ShutdownObserver, ShutdownRequest, StatePublisher};
 use crate::{
@@ -35,8 +37,9 @@ use std::fs;
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
 /// Handle to one spawned daemon: observe its phases, request shutdown, and
@@ -227,6 +230,8 @@ async fn run_inner(
         daemon_generation,
         frame_limit: config.frame_limit,
         outbound_queue_capacity: config.outbound_queue_capacity,
+        outbound_queued_bytes: config.outbound_queued_bytes,
+        max_connections: config.max_connections,
         owner_uid: endpoint.owner_uid,
         endpoint_path: endpoint.path().to_path_buf(),
     };
@@ -236,6 +241,11 @@ async fn run_inner(
     shutdown_observer.publish_ready_if_idle(states);
 
     let mut connections = JoinSet::new();
+    // Admission cap: one permit per served connection, owned by that
+    // connection's task so it is returned on normal completion, on error, and
+    // on abort alike. Nothing about listener close or drain ordering depends on
+    // it (report §2.5).
+    let admission = Arc::new(Semaphore::new(config.max_connections));
     let mut listener_error = None;
     let request = loop {
         match shutdown.borrow().clone() {
@@ -255,11 +265,22 @@ async fn run_inner(
             accepted = endpoint.accept() => {
                 match accepted {
                     Ok((stream, _)) => {
-                        let connection_context = context.clone();
-                        let connection_drain = drain_receiver.clone();
-                        connections.spawn(async move {
-                            serve(stream, connection_context, connection_drain).await
-                        });
+                        match Arc::clone(&admission).try_acquire_owned() {
+                            Ok(permit) => {
+                                let connection_context = context.clone();
+                                let connection_drain = drain_receiver.clone();
+                                connections.spawn(async move {
+                                    // The owned permit lives inside the task, so
+                                    // every exit path — return, error, or abort —
+                                    // frees the slot exactly once.
+                                    let _permit = permit;
+                                    serve(stream, connection_context, connection_drain).await
+                                });
+                            }
+                            // Over the cap: typed rejection, then close. No task
+                            // and no queue is created for this peer.
+                            Err(_) => reject_over_limit(&stream, &context),
+                        }
                     }
                     Err(error) => {
                         listener_error = Some(DaemonError::io(

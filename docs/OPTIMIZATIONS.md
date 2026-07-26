@@ -60,3 +60,27 @@ Ledgered pending real daemon profiles (rider items 2-9, full text in ~/haider-ru
 | codec decode | Drop explicit UTF-8 pass, let serde_json validate | changes InvalidUtf8→Json error semantics; benchmark first |
 | frame.rs serde | Manual order-independent visitor to avoid flatten/content buffering | DO-NOT-DO casually: tag layout/field order = wire bytes |
 | Event payloads | Typed fast-path decode beside RawEnvelope | DO-NOT-DO: closed enum would break unknown-event tolerance |
+
+## haider-daemon efficiency rider (W3b1, gpt-5.6, 2026-07-27)
+
+Adopted now (rider NOW items 1-2): connection admission cap — every accepted same-UID socket
+entered an unbounded `JoinSet`, so `DaemonConfig::max_connections` (default 64) is now enforced
+by an owned accept-time permit that rides inside the connection task (freed on return, error, and
+abort alike), and an over-cap peer gets a fatal `overloaded` `ProtocolError` (new additive
+`haider_rpc::ERROR_CODE_OVERLOADED`; codes are open wire strings, no fixture change) then close,
+with no task or queue created. Per-connection queued-byte budget —
+`DaemonConfig::outbound_queued_bytes` (default 2 × frame_limit) is charged before enqueue and
+credited after the write completes, so `outbound_queue_capacity × frame_limit` (32 × 8 MiB) can no
+longer be the real memory bound; the frame-count bound and its connection-fatal treatment are
+unchanged, and the final `ServerDraining` frame moved to a reserved one-shot path outside both
+bounds so no volume of ordinary replies can consume the slot or bytes the notice needs. Test
+helper polling in `lifecycle_tests.rs` (child exit, endpoint appearing, freed slot) swapped
+`yield_now` spin for a 5 ms poll interval; production waits and the drain-boundary yield untouched.
+
+| Where | Idea | Why deferred |
+|---|---|---|
+| crates/haider-daemon/src/runtime.rs (pre-ready recovery via `haider_core::reconcile_dispatched_effects`) | Recovery reads a projection instead of full history: an additive, transactionally maintained/indexed recovery projection of only dispatched/outcome rows, with journal backfill for existing stores and a corruption fallback to the full scan | Today's gate enumerates every session and deserializes each one's whole effect history, so peak memory tracks the largest session's history. A casual pending-effects cache is FORBIDDEN: atomic coupling to the append path, migration/backfill, corruption detection, and crash-window equivalence are lifecycle-correctness requirements, not optimizations — slated as its own designed slice alongside W3b2 |
+| crates/haider-daemon/src/connection.rs | Consolidate per-connection allocations (buffers/queues) once W3b2 shows the real traffic shape | Merging the reader and writer tasks is DO-NOT-DO: it can alter socket shutdown and drain-delivery ordering, which R17 pins |
+| crates/haider-daemon (runtime.rs + lifecycle.rs) | Revisit lock-acquisition ordering only against real W3b2 contention profiles | Left unchanged deliberately. DO-NOT-DO: profile-lock-before-store/socket acquisition, endpoint-cleanup-before-store-close, or replacing the shutdown transition mutex with atomics — each is a documented lifecycle law (R1/R3/R17), not a hot path |
+| crates/haider-daemon/src/runtime.rs (drain barrier) | Drain fan-out stays concurrent and deadline-bounded | DO-NOT-DO: serializing per-connection notifications or closing sockets before the notice is enqueued would break "notify every open connection, then bounded completion" (R17) |
+| crates/haider-daemon, crates/haider-daemond | No production O(n²) found in this lane | Nothing to defer; recorded so a later pass does not re-litigate it |

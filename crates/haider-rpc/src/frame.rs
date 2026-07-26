@@ -74,6 +74,10 @@ pub const ERROR_CODE_ALREADY_RESOLVED: &str = "already_resolved";
 pub const ERROR_CODE_NOT_FOUND: &str = "not_found";
 /// Stable code for work rejected after the daemon entered its drain barrier.
 pub const ERROR_CODE_DRAINING: &str = "draining";
+/// Stable code for work refused because a daemon resource limit is already
+/// reached — the connection admission cap is the first user (report §2.5).
+/// Retrying later, after other work finishes, is the intended recovery.
+pub const ERROR_CODE_OVERLOADED: &str = "overloaded";
 
 /// Kind of client taking part in the handshake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -316,8 +320,9 @@ pub enum ResponseBody {
     ///
     /// Stable v0.1 codes include [`ERROR_CODE_CURSOR_AHEAD`],
     /// [`ERROR_CODE_CAPABILITY_DENIED`], [`ERROR_CODE_ALREADY_RESOLVED`],
-    /// [`ERROR_CODE_NOT_FOUND`], and [`ERROR_CODE_DRAINING`]. Unknown future
-    /// string codes remain carryable by older clients.
+    /// [`ERROR_CODE_NOT_FOUND`], [`ERROR_CODE_DRAINING`], and
+    /// [`ERROR_CODE_OVERLOADED`]. Unknown future string codes remain carryable
+    /// by older clients.
     #[serde(rename = "error")]
     Error {
         /// Stable machine-readable `snake_case` code.
