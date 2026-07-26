@@ -1,0 +1,27 @@
+[package]
+name = "haider-daemond"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "haiderd"
+path = "src/main.rs"
+
+[dependencies]
+haider-daemon = { path = "../haider-daemon" }
+tokio.workspace = true
+
+[dev-dependencies]
+haider-core = { path = "../haider-core" }
+haider-protocol = { path = "../haider-protocol" }
+haider-rpc = { path = "../haider-rpc" }
+haider-store = { path = "../haider-store" }
+rustix.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

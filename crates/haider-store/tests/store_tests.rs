@@ -311,23 +311,54 @@ fn worker_generation_strictly_increases_across_sequential_opens() {
 }
 
 #[test]
+fn profile_lease_excludes_before_store_open_and_releases_if_unused() {
+    let root = test_root();
+    let lease = must(Store::acquire_profile(root.path()));
+    let Err(error) = Store::acquire_profile(root.path()) else {
+        panic!("second lease unexpectedly acquired the profile lock");
+    };
+    assert_eq!(error.code, ErrorCode::StoreLocked);
+    drop(lease);
+
+    let reopened = must(Store::acquire_profile(root.path()));
+    let store = must(Store::open_locked(reopened));
+    assert_eq!(store.root(), root.path());
+}
+
+#[test]
+fn daemon_generation_is_distinct_explicit_and_durable() {
+    let root = test_root();
+    let first_worker = {
+        let store = must(Store::open(root.path()));
+        let first_daemon = must(store.advance_daemon_generation());
+        let second_daemon = must(store.advance_daemon_generation());
+        assert_eq!(second_daemon, first_daemon + 1);
+        must(store.flush());
+        store.worker_generation()
+    };
+    let store = must(Store::open(root.path()));
+    assert_eq!(store.worker_generation(), first_worker + 1);
+    assert_eq!(must(store.advance_daemon_generation()), 3);
+}
+
+#[test]
 fn migrations_apply_fresh_and_are_idempotent_on_reopen() {
     let root = test_root();
     let database_path = {
         let store = must(Store::open(root.path()));
-        assert_eq!(must(store.schema_version()), 2);
+        assert_eq!(must(store.schema_version()), 3);
         store.database_path().to_path_buf()
     };
 
     let reopened = must(Store::open(root.path()));
-    assert_eq!(must(reopened.schema_version()), 2);
+    assert_eq!(must(reopened.schema_version()), 3);
     let connection = must(Connection::open(database_path));
     let registered: u32 = must(connection.query_row(
-        "SELECT COUNT(*) FROM schema_migrations WHERE version BETWEEN 1 AND 2",
+        "SELECT COUNT(*) FROM schema_migrations WHERE version BETWEEN 1 AND 3",
         [],
         |row| row.get(0),
     ));
-    assert_eq!(registered, 2);
+    assert_eq!(registered, 3);
     for table in ["sessions", "events", "schema_migrations", "profile_meta"] {
         let count: u32 = must(connection.query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",

@@ -4,6 +4,8 @@ members = [
     "crates/haider-protocol",
     "crates/haider-store",
     "crates/haider-core",
+    "crates/haider-daemon",
+    "crates/haider-daemond",
     "crates/haider-provider",
     "crates/haider-tools",
     "crates/haider-verify",
@@ -25,6 +27,7 @@ rust-version = "1.95"
 async-trait = "0.1"
 base64 = "0.22"
 blake3 = "1"
+getrandom = "0.3"
 httpdate = "1"
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
@@ -34,7 +37,7 @@ serde = { version = "1", features = ["derive"] }
 termbg = "0.6"
 serde_json = "1"
 tempfile = "3"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "test-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "test-util", "net", "signal"] }
 unicode-width = "0.2"
 
 [workspace.lints.rust]

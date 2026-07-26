@@ -14,7 +14,7 @@ use crate::{StoreResult, now_ms, store_error, to_sqlite_integer};
 use haider_protocol::error::{ErrorCode, HaiderError};
 use rusqlite::{Connection, TransactionBehavior, params};
 
-pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 2;
+pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 3;
 
 struct Migration {
     version: u32,
@@ -56,6 +56,14 @@ const MIGRATIONS: &[Migration] = &[
             );
 
             INSERT OR IGNORE INTO profile_meta(singleton, worker_generation) VALUES (1, 0);
+        ",
+    },
+    Migration {
+        version: 3,
+        sql: "
+            ALTER TABLE profile_meta
+            ADD COLUMN daemon_generation INTEGER NOT NULL DEFAULT 0
+            CHECK (daemon_generation >= 0);
         ",
     },
 ];
