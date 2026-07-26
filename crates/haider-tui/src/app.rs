@@ -38,6 +38,8 @@ pub struct IdentityLine {
     pub model_short: String,
     pub account: String,
     pub device: String,
+    /// Working directory shown in the session header (~-abbreviated).
+    pub dir: String,
     pub context_window: u64,
 }
 
@@ -48,6 +50,7 @@ impl Default for IdentityLine {
             model_short: "claude-fable-5".to_owned(),
             account: "none · /login".to_owned(),
             device: "this-mac".to_owned(),
+            dir: "~".to_owned(),
             context_window: 200_000,
         }
     }
@@ -62,6 +65,9 @@ pub struct AppModel {
     pub projection: SessionProjection,
     pub identity: IdentityLine,
     pub composer: String,
+    /// Session title shown in the header — derived from the first user
+    /// message until real session naming arrives (daemon wave).
+    pub session_title: Option<String>,
     /// Selected option index while a blocking menu replaces the composer.
     pub menu_selection: usize,
     /// Answers the user produced; the runtime drains these to the client
@@ -81,6 +87,7 @@ impl Default for AppModel {
             projection: SessionProjection::new(),
             identity: IdentityLine::default(),
             composer: String::new(),
+            session_title: None,
             menu_selection: 0,
             outbox: Vec::new(),
             should_quit: false,
@@ -211,8 +218,15 @@ impl AppModel {
         {
             self.screen = Screen::Launcher;
         }
-        if matches!(payload, EventPayload::UserMessage { .. }) {
+        if let EventPayload::UserMessage { text, .. } = payload {
             self.screen = Screen::Session;
+            if self.session_title.is_none() {
+                let mut title: String = text.chars().take(38).collect();
+                if text.chars().count() > 38 {
+                    title.push('…');
+                }
+                self.session_title = Some(title);
+            }
         }
         if matches!(payload, EventPayload::MenuOpened(_)) {
             self.menu_selection = 0;

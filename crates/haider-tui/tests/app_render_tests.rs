@@ -9,7 +9,7 @@ use haider_tui::app::{AppEvent, AppModel, Screen};
 use haider_tui::mock::demo_script;
 use haider_tui::render::render;
 use haider_tui::runtime::run_demo_plain;
-use haider_tui::sanctum::SHAHADA_TRANSLIT;
+use haider_tui::sanctum::SHAHADA_ARABIC;
 use haider_tui::theme::ThemeKey;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -59,7 +59,7 @@ fn boot_screen_shows_mark_word_and_progressing_checks() {
     let model = model_at_boot_mid_checks();
     assert_eq!(model.screen, Screen::Boot);
     let (text, _) = draw(&model, 80, 24);
-    assert!(text.contains("ḤAYDAR"));
+    assert!(text.contains("حيدر"));
     assert!(text.contains("HAIDER CODE"));
     assert!(text.contains("· starting up"));
     assert!(text.contains("✓ store open · journal replayed"));
@@ -76,8 +76,8 @@ fn launcher_shows_sanctum_identity_and_composer() {
     assert_eq!(model.screen, Screen::Launcher);
     let (text, _) = draw(&model, 80, 24);
     assert!(
-        text.contains(SHAHADA_TRANSLIT),
-        "sanctum line, translit default"
+        text.contains(SHAHADA_ARABIC),
+        "sanctum line, Arabic default"
     );
     assert!(text.contains("the lion"));
     assert!(text.contains("provider"));
@@ -95,7 +95,7 @@ fn narrow_launcher_omits_the_sanctum_whole() {
     let (text, _) = draw(&model, 24, 20);
     // Dignity rule: at 24 columns the shahada cannot fit whole, so NO part
     // of it may appear — never truncated, never ellipsized.
-    for word in SHAHADA_TRANSLIT.split_whitespace().filter(|w| w.len() > 3) {
+    for word in ["الله", "محمد", "رسول"] {
         assert!(
             !text.contains(word),
             "sanctum fragment leaked into narrow frame"
@@ -304,4 +304,32 @@ fn honesty_notices_survive_long_bottom_anchored_output() {
         text.contains("earlier output truncated"),
         "the truncation notice must be visible at the bottom-anchored viewport"
     );
+}
+
+#[test]
+fn session_screen_has_header_and_composer_gap() {
+    let mut model = model_after_full_demo();
+    model.identity.dir = "~/dev/enterprise-suite".to_owned();
+    let (text, _) = draw(&model, 100, 30);
+    // Header: mark + product line + session line (owner ask: sim-parity header).
+    assert!(text.contains("حيدر"));
+    assert!(text.contains("· haider v"), "mark · product separator");
+    assert!(text.contains("~/dev/enterprise-suite"));
+    assert!(text.contains("← esc"));
+    assert!(
+        text.contains("fix the failing boundary test in haid"),
+        "session title from first message"
+    );
+    // Agent blocks carry the ■ haider name header.
+    assert!(text.contains("■ haider"));
+    // Gap row: the line directly above the status bar is empty — the
+    // composer must never sit ON the bottom bar (owner ask).
+    let lines: Vec<&str> = text.lines().collect();
+    let above_status = lines[lines.len() - 2];
+    assert_eq!(
+        above_status.trim(),
+        "",
+        "spacer row between composer and status bar"
+    );
+    assert!(lines[lines.len() - 1].contains("IDLE"));
 }
