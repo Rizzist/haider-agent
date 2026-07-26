@@ -34,6 +34,7 @@ use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Port through which the actor will durably envelope effect payloads.
@@ -220,9 +221,185 @@ struct OneShotRule {
     decision: PolicyDecision,
 }
 
+struct BrokerJournalState {
+    /// Terminal states are retained, never evicted: a duplicate transition on
+    /// a finished effect must fail loudly instead of re-journaling a phase.
+    lifecycles: HashMap<EffectId, LifecycleRecord>,
+    journaled_phases: Vec<EffectPhase>,
+}
+
+/// Shared ownership lets a detached finalizer durably close a dispatched
+/// effect after its caller has been cancelled, while preserving the broker's
+/// lifecycle checks and read-only phase snapshot.
+struct BrokerJournal<J> {
+    sink: Arc<tokio::sync::Mutex<J>>,
+    state: Arc<Mutex<BrokerJournalState>>,
+}
+
+impl<J> BrokerJournal<J>
+where
+    J: JournalSink,
+{
+    fn new(sink: J) -> Self {
+        Self {
+            sink: Arc::new(tokio::sync::Mutex::new(sink)),
+            state: Arc::new(Mutex::new(BrokerJournalState {
+                lifecycles: HashMap::new(),
+                journaled_phases: Vec::new(),
+            })),
+        }
+    }
+
+    fn journal_snapshot(&self) -> Vec<EffectPhase> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .journaled_phases
+            .clone()
+    }
+
+    async fn append_phase(&self, phase: EffectPhase) -> ToolResult<()> {
+        self.sink
+            .lock()
+            .await
+            .append(EventPayload::Effect(phase.clone()))
+            .await?;
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .journaled_phases
+            .push(phase);
+        Ok(())
+    }
+
+    fn insert_intent(&self, intent: EffectIntent) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lifecycles
+            .insert(
+                intent.effect.clone(),
+                LifecycleRecord {
+                    intent,
+                    state: LifecycleState::Intent,
+                },
+            );
+    }
+
+    fn require_state(&self, effect: &EffectId, expected: LifecycleState) -> ToolResult<()> {
+        let actual = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lifecycles
+            .get(effect)
+            .map(|record| record.state);
+        if actual == Some(expected) {
+            return Ok(());
+        }
+        Err(ToolError::Lifecycle {
+            message: format!("effect {effect} is {actual:?}, expected {expected:?}"),
+        })
+    }
+
+    fn require_recorded_intent(&self, intent: &EffectIntent) -> ToolResult<EffectIntent> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(record) = state.lifecycles.get(&intent.effect) else {
+            return Err(ToolError::Lifecycle {
+                message: format!("effect {} has no journaled intent", intent.effect),
+            });
+        };
+        if record.intent != *intent {
+            return Err(ToolError::Lifecycle {
+                message: format!(
+                    "effect {} does not match its journaled intent (expected digest {}, received {})",
+                    intent.effect, record.intent.args_digest, intent.args_digest
+                ),
+            });
+        }
+        Ok(record.intent.clone())
+    }
+
+    fn set_state(&self, effect: &EffectId, state: LifecycleState) -> ToolResult<()> {
+        let mut journal = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let record = journal
+            .lifecycles
+            .get_mut(effect)
+            .ok_or_else(|| ToolError::Lifecycle {
+                message: format!("effect {effect} has no journaled intent"),
+            })?;
+        record.state = state;
+        Ok(())
+    }
+
+    async fn journal_outcome(
+        &self,
+        intent: &EffectIntent,
+        outcome: EffectOutcome,
+    ) -> ToolResult<()> {
+        self.require_recorded_intent(intent)?;
+        self.require_state(&intent.effect, LifecycleState::Dispatched)?;
+        self.append_phase(EffectPhase::Outcome {
+            effect: intent.effect.clone(),
+            outcome,
+        })
+        .await?;
+        self.set_state(&intent.effect, LifecycleState::Outcome)?;
+        Ok(())
+    }
+
+    async fn finish<T>(&self, intent: &EffectIntent, result: ToolResult<T>) -> ToolResult<T> {
+        match result {
+            Ok(value) => {
+                self.journal_outcome(intent, EffectOutcome::Ok).await?;
+                Ok(value)
+            }
+            Err(error) => {
+                self.journal_outcome(
+                    intent,
+                    EffectOutcome::Failed {
+                        error: error.to_string(),
+                    },
+                )
+                .await?;
+                Err(error)
+            }
+        }
+    }
+}
+
+impl<J> Clone for BrokerJournal<J> {
+    fn clone(&self) -> Self {
+        Self {
+            sink: Arc::clone(&self.sink),
+            state: Arc::clone(&self.state),
+        }
+    }
+}
+
+pub(crate) struct DetachedEffectFinish<J> {
+    journal: BrokerJournal<J>,
+    intent: EffectIntent,
+}
+
+impl<J> DetachedEffectFinish<J>
+where
+    J: JournalSink,
+{
+    pub(crate) async fn finish<T>(self, result: ToolResult<T>) -> ToolResult<T> {
+        self.journal.finish(&self.intent, result).await
+    }
+}
+
 /// Normalizes, authorizes, and journals effectful operations.
 pub struct EffectBroker<J> {
-    journal: J,
+    journal: BrokerJournal<J>,
     workspace_root: PathBuf,
     workspace_dir: OwnedFd,
     session_id: SessionId,
@@ -230,12 +407,8 @@ pub struct EffectBroker<J> {
     started_at_ms: u64,
     next_effect: u64,
     next_menu: u64,
-    /// Terminal states are retained, never evicted: a duplicate transition on
-    /// a finished effect must fail loudly instead of re-journaling a phase.
-    lifecycles: HashMap<EffectId, LifecycleRecord>,
     pending_permissions: HashMap<MenuId, PendingPermission>,
     one_shot_rules: Vec<OneShotRule>,
-    journaled_phases: Vec<EffectPhase>,
 }
 
 impl<J> EffectBroker<J>
@@ -287,7 +460,7 @@ where
         )
         .map_err(|error| ToolError::io("open workspace root", &workspace_root, error))?;
         Ok(Self {
-            journal,
+            journal: BrokerJournal::new(journal),
             workspace_root,
             workspace_dir,
             session_id,
@@ -295,10 +468,8 @@ where
             started_at_ms,
             next_effect: 0,
             next_menu: 0,
-            lifecycles: HashMap::new(),
             pending_permissions: HashMap::new(),
             one_shot_rules: Vec::new(),
-            journaled_phases: Vec::new(),
         })
     }
 
@@ -315,7 +486,7 @@ where
     ///
     /// The sink itself is intentionally neither borrowed nor recoverable.
     pub fn journal_snapshot(&self) -> Vec<EffectPhase> {
-        self.journaled_phases.clone()
+        self.journal.journal_snapshot()
     }
 
     /// Produces and journals an intent whose digest is the BLAKE3 hash of
@@ -342,13 +513,7 @@ where
         };
         self.append_phase(EffectPhase::Intent(intent.clone()))
             .await?;
-        self.lifecycles.insert(
-            intent.effect.clone(),
-            LifecycleRecord {
-                intent: intent.clone(),
-                state: LifecycleState::Intent,
-            },
-        );
+        self.journal.insert_intent(intent.clone());
         Ok(intent)
     }
 
@@ -359,7 +524,7 @@ where
         policy: &PermissionPolicy,
     ) -> ToolResult<AuthorizationVerdict> {
         self.require_state(&intent.effect, LifecycleState::Intent)?;
-        let recorded = self.require_recorded_intent(intent)?.clone();
+        let recorded = self.require_recorded_intent(intent)?;
         let decision = match policy.decision(&recorded) {
             PolicyDecision::Ask => self
                 .take_one_shot_decision(&recorded)
@@ -472,15 +637,7 @@ where
         intent: &EffectIntent,
         outcome: EffectOutcome,
     ) -> ToolResult<()> {
-        self.require_recorded_intent(intent)?;
-        self.require_state(&intent.effect, LifecycleState::Dispatched)?;
-        self.append_phase(EffectPhase::Outcome {
-            effect: intent.effect.clone(),
-            outcome,
-        })
-        .await?;
-        self.set_state(&intent.effect, LifecycleState::Outcome)?;
-        Ok(())
+        self.journal.journal_outcome(intent, outcome).await
     }
 
     /// Reconciles the dispatch/outcome crash window explicitly.
@@ -517,68 +674,30 @@ where
         intent: &EffectIntent,
         result: ToolResult<T>,
     ) -> ToolResult<T> {
-        match result {
-            Ok(value) => {
-                self.journal_outcome(intent, EffectOutcome::Ok).await?;
-                Ok(value)
-            }
-            Err(error) => {
-                self.journal_outcome(
-                    intent,
-                    EffectOutcome::Failed {
-                        error: error.to_string(),
-                    },
-                )
-                .await?;
-                Err(error)
-            }
+        self.journal.finish(intent, result).await
+    }
+
+    pub(crate) fn detached_finish(&self, intent: &EffectIntent) -> DetachedEffectFinish<J> {
+        DetachedEffectFinish {
+            journal: self.journal.clone(),
+            intent: intent.clone(),
         }
     }
 
-    async fn append_phase(&mut self, phase: EffectPhase) -> ToolResult<()> {
-        self.journal
-            .append(EventPayload::Effect(phase.clone()))
-            .await?;
-        self.journaled_phases.push(phase);
-        Ok(())
+    async fn append_phase(&self, phase: EffectPhase) -> ToolResult<()> {
+        self.journal.append_phase(phase).await
     }
 
     fn require_state(&self, effect: &EffectId, expected: LifecycleState) -> ToolResult<()> {
-        let actual = self.lifecycles.get(effect).map(|record| record.state);
-        if actual == Some(expected) {
-            return Ok(());
-        }
-        Err(ToolError::Lifecycle {
-            message: format!("effect {effect} is {actual:?}, expected {expected:?}"),
-        })
+        self.journal.require_state(effect, expected)
     }
 
-    fn require_recorded_intent(&self, intent: &EffectIntent) -> ToolResult<&EffectIntent> {
-        let Some(record) = self.lifecycles.get(&intent.effect) else {
-            return Err(ToolError::Lifecycle {
-                message: format!("effect {} has no journaled intent", intent.effect),
-            });
-        };
-        if record.intent != *intent {
-            return Err(ToolError::Lifecycle {
-                message: format!(
-                    "effect {} does not match its journaled intent (expected digest {}, received {})",
-                    intent.effect, record.intent.args_digest, intent.args_digest
-                ),
-            });
-        }
-        Ok(&record.intent)
+    fn require_recorded_intent(&self, intent: &EffectIntent) -> ToolResult<EffectIntent> {
+        self.journal.require_recorded_intent(intent)
     }
 
-    fn set_state(&mut self, effect: &EffectId, state: LifecycleState) -> ToolResult<()> {
-        let record = self
-            .lifecycles
-            .get_mut(effect)
-            .ok_or_else(|| ToolError::Lifecycle {
-                message: format!("effect {effect} has no journaled intent"),
-            })?;
-        record.state = state;
-        Ok(())
+    fn set_state(&self, effect: &EffectId, state: LifecycleState) -> ToolResult<()> {
+        self.journal.set_state(effect, state)
     }
 
     fn permission_menu_for(&mut self, intent: &EffectIntent) -> Menu {

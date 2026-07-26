@@ -10,7 +10,7 @@ use haider_tools::{
 };
 use std::fs;
 use std::path::Path;
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Mutex};
 use std::time::Duration;
 
 #[derive(Debug, Default)]
@@ -22,6 +22,36 @@ struct RecordingJournal {
 impl JournalSink for RecordingJournal {
     async fn append(&mut self, payload: EventPayload) -> ToolResult<()> {
         self.payloads.push(payload);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct SharedRecordingJournal {
+    payloads: Arc<Mutex<Vec<EventPayload>>>,
+}
+
+impl SharedRecordingJournal {
+    fn effect_phases(&self) -> Vec<EffectPhase> {
+        self.payloads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter_map(|payload| match payload {
+                EventPayload::Effect(phase) => Some(phase.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+#[async_trait::async_trait]
+impl JournalSink for SharedRecordingJournal {
+    async fn append(&mut self, payload: EventPayload) -> ToolResult<()> {
+        self.payloads
+            .lock()
+            .map_err(|_| ToolError::journal("shared recording journal lock is poisoned"))?
+            .push(payload);
         Ok(())
     }
 }
@@ -108,6 +138,25 @@ impl ChangeLedgerSink for RejectLedger {
         _record: FsWriteRecord,
     ) -> ToolResult<()> {
         Err(ToolError::ledger("injected change ledger append failure"))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct GatedRejectLedger {
+    reached: Arc<Barrier>,
+    release: Arc<Barrier>,
+}
+
+impl ChangeLedgerSink for GatedRejectLedger {
+    fn record_fs_write(
+        &self,
+        _session: SessionId,
+        _turn: RunId,
+        _record: FsWriteRecord,
+    ) -> ToolResult<()> {
+        self.reached.wait();
+        self.release.wait();
+        Err(ToolError::ledger("injected gated ledger append failure"))
     }
 }
 
@@ -384,6 +433,72 @@ async fn cancelling_apply_cannot_leave_a_write_without_ledger_evidence() {
     })
     .await
     .expect("blocking critical section completes ledger append");
+}
+
+#[tokio::test]
+async fn cancelling_apply_during_ledger_failure_still_journals_failed_outcome() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("cancelled-ledger-failure.txt");
+    fs::write(&path, "before").expect("seed file");
+    let reached = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let ledger = GatedRejectLedger {
+        reached: Arc::clone(&reached),
+        release: Arc::clone(&release),
+    };
+    let attribution = TurnAttribution::new(SessionId::new("session"), RunId::new("turn"));
+    let journal = SharedRecordingJournal::default();
+    let observed_journal = journal.clone();
+    let mut broker = broker_at(journal, directory.path());
+    let task = tokio::spawn(async move {
+        broker
+            .fs_patch(
+                &FsPatch::new(path, "before", "after"),
+                &allow(EffectClass::FsWrite),
+                &attribution,
+                &ledger,
+            )
+            .await
+    });
+
+    tokio::task::spawn_blocking(move || reached.wait())
+        .await
+        .expect("wait for post-rename ledger failure gate");
+    assert_eq!(
+        fs::read_to_string(directory.path().join("cancelled-ledger-failure.txt"))
+            .expect("read renamed target"),
+        "after"
+    );
+
+    task.abort();
+    tokio::task::spawn_blocking(move || release.wait())
+        .await
+        .expect("release failing ledger append");
+    let error = task.await.expect_err("outer patch task is cancelled");
+    assert!(error.is_cancelled());
+
+    let outcome = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(outcome) = observed_journal
+                .effect_phases()
+                .into_iter()
+                .find(|phase| matches!(phase, EffectPhase::Outcome { .. }))
+            {
+                break outcome;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("detached finalizer journals the blocking decision");
+    assert!(matches!(
+        outcome,
+        EffectPhase::Outcome {
+            outcome: EffectOutcome::Failed { error },
+            ..
+        } if error.contains("change ledger failed")
+            && error.contains("injected gated ledger append failure")
+    ));
 }
 
 #[tokio::test]

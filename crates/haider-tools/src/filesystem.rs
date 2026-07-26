@@ -9,10 +9,13 @@
 //! - `fs_patch` proves its pre-image before writing (mismatch is a typed
 //!   [`FsPatchConflict`]) and records applied writes in the
 //!   [`crate::ChangeLedger`],
-//!   attributed to the caller's `(session, turn)`, for the verify gate. Apply
-//!   and ledger append are one cancellation-shielded blocking critical section:
-//!   after an atomic rename succeeds there is no cancellation-aware await
-//!   before the fallible ledger append.
+//!   attributed to the caller's `(session, turn)`, for the verify gate. The
+//!   atomic rename, ledger append, and terminal outcome decision are one
+//!   indivisible blocking critical section. A detached finalizer always
+//!   consumes that decision and journals its outcome, even if the calling task
+//!   is cancelled: once the rename lands, the outcome is journaled as `Ok` or
+//!   as `Failed` carrying the ledger error. No cancellation path can silently
+//!   drop a successful write.
 //! - Every caller-supplied path is resolved to a canonical path under the
 //!   broker's canonical workspace root before it is digested or dispatched.
 //!   Execution then converts that path back to a checked relative path and
@@ -335,6 +338,7 @@ where
     ) -> ToolResult<BoundedResult>
     where
         L: ChangeLedgerSink,
+        J: 'static,
     {
         let operation = FsPatch::new(
             resolve_workspace_path(
@@ -353,30 +357,37 @@ where
         let attribution = attribution.clone();
         let effect = intent.effect.clone();
         let summary = intent.summary.clone();
-        let result = match (relative, workspace_dir) {
-            (Ok(relative), Ok(workspace_dir)) => {
-                run_blocking(move || {
-                    let applied = apply_patch_at(workspace_dir, &relative, &owned_operation)?;
-                    // The rename and this fallible append are one blocking
-                    // critical section. Dropping the awaiting future does not
-                    // cancel a running `spawn_blocking` worker.
-                    critical_ledger.record_fs_write(
-                        attribution.session,
-                        attribution.turn,
-                        FsWriteRecord {
-                            effect,
-                            paths: vec![applied.path],
-                            summary,
-                            bytes_hash: applied.bytes_hash,
-                        },
-                    )?;
-                    Ok(applied.result)
-                })
-                .await
-            }
-            (Err(error), _) | (_, Err(error)) => Err(error),
+        let (relative, workspace_dir) = match (relative, workspace_dir) {
+            (Ok(relative), Ok(workspace_dir)) => (relative, workspace_dir),
+            (Err(error), _) | (_, Err(error)) => return self.finish(&intent, Err(error)).await,
         };
-        self.finish(&intent, result).await
+        let worker = tokio::task::spawn_blocking(move || {
+            apply_patch_and_record(
+                workspace_dir,
+                &relative,
+                &owned_operation,
+                &critical_ledger,
+                attribution,
+                effect,
+                summary,
+            )
+        });
+        let finish = self.detached_finish(&intent);
+        // This task is the cancellation shield: dropping the caller's await
+        // only detaches this join handle. The finalizer itself still consumes
+        // the blocking result and journals the terminal outcome.
+        let finalizer = tokio::spawn(async move {
+            let result = match worker.await {
+                Ok(outcome) => outcome.into_result(),
+                Err(error) => Err(ToolError::Runtime {
+                    message: format!("blocking filesystem worker failed: {error}"),
+                }),
+            };
+            finish.finish(result).await
+        });
+        finalizer.await.map_err(|error| ToolError::Runtime {
+            message: format!("filesystem outcome finalizer failed: {error}"),
+        })?
     }
 }
 
@@ -538,6 +549,64 @@ struct AppliedPatch {
     result: BoundedResult,
     path: PathBuf,
     bytes_hash: String,
+}
+
+enum PatchWorkerOutcome {
+    Applied(BoundedResult),
+    ApplyFailed(ToolError),
+    LedgerFailed { error: ToolError, written: bool },
+}
+
+impl PatchWorkerOutcome {
+    fn into_result(self) -> ToolResult<BoundedResult> {
+        match self {
+            Self::Applied(result) => Ok(result),
+            Self::ApplyFailed(error) => Err(error),
+            Self::LedgerFailed { error, written } => {
+                debug_assert!(written, "ledger failure must follow a successful rename");
+                Err(error)
+            }
+        }
+    }
+}
+
+fn apply_patch_and_record<L>(
+    workspace_dir: OwnedFd,
+    relative: &Path,
+    operation: &FsPatch,
+    ledger: &L,
+    attribution: TurnAttribution,
+    effect: haider_protocol::ids::EffectId,
+    summary: String,
+) -> PatchWorkerOutcome
+where
+    L: ChangeLedgerSink,
+{
+    let applied = match apply_patch_at(workspace_dir, relative, operation) {
+        Ok(applied) => applied,
+        Err(error) => return PatchWorkerOutcome::ApplyFailed(error),
+    };
+    let AppliedPatch {
+        result,
+        path,
+        bytes_hash,
+    } = applied;
+    match ledger.record_fs_write(
+        attribution.session,
+        attribution.turn,
+        FsWriteRecord {
+            effect,
+            paths: vec![path],
+            summary,
+            bytes_hash,
+        },
+    ) {
+        Ok(()) => PatchWorkerOutcome::Applied(result),
+        Err(error) => PatchWorkerOutcome::LedgerFailed {
+            error,
+            written: true,
+        },
+    }
 }
 
 fn apply_patch_at(
