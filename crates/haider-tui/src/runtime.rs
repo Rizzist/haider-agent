@@ -211,49 +211,12 @@ pub async fn run_demo(mut model: AppModel) -> std::io::Result<()> {
         }
     });
 
-    // Demo drivers: the boot beats play immediately; turns play on demand
-    // (typed submits or sample attaches). `answer_echo` is the demo's client
-    // seam — user menu answers loop back as MenuAnswered envelopes, exactly
-    // the shape the daemon will publish later.
-    //
-    // Every envelope travels GENERATION-TAGGED and is re-checked at
-    // consumption (review r2 P1-1): an Esc that bumps the generation must
-    // also invalidate envelopes already BUFFERED in the channel, or a stale
-    // UserMessage re-arms `turn_active` on a dead script.
-    let (envelope_tx, mut envelope_rx) = mpsc::channel::<(u64, EventPayload)>(64);
-    // Script generation: bumping it silences any in-flight script (fresh
-    // session / reset / interrupt) at BOTH ends of the channel.
-    let script_gen = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let answer_echo = envelope_tx.clone();
-    let script_tx = envelope_tx.clone();
-    let boot_gen = std::sync::Arc::clone(&script_gen);
-    tokio::spawn(async move {
-        for payload in crate::mock::boot_script() {
-            tokio::time::sleep(demo_pace(&payload)).await;
-            // Boot beats tag with the CURRENT generation at send: they
-            // belong to the harness, not any turn, and survive bumps.
-            let generation = boot_gen.load(std::sync::atomic::Ordering::SeqCst);
-            if envelope_tx.send((generation, payload)).await.is_err() {
-                return;
-            }
-        }
-    });
-    let play = |payloads: Vec<EventPayload>, generation: u64| {
-        let tx = script_tx.clone();
-        let gen_ref = std::sync::Arc::clone(&script_gen);
-        tokio::spawn(async move {
-            for payload in payloads {
-                tokio::time::sleep(demo_pace(&payload)).await;
-                if gen_ref.load(std::sync::atomic::Ordering::SeqCst) != generation {
-                    return;
-                }
-                if tx.send((generation, payload)).await.is_err() {
-                    return;
-                }
-            }
-        });
-    };
-    let mut turn_counter: u64 = 0;
+    // The demo driver owns the generation-tagged envelope channel and the
+    // script/decay timers — the SAME production seams the tests drive
+    // (review r3 P3-7).
+    let (mut driver, mut envelope_rx) = DemoDriver::new(64);
+    driver.spawn_boot();
+    let answer_echo = driver.sender();
     // Launcher auto-play: if untouched, the classic demo plays once.
     let autoplay = tokio::time::sleep(Duration::from_secs(6));
     tokio::pin!(autoplay);
@@ -269,28 +232,7 @@ pub async fn run_demo(mut model: AppModel) -> std::io::Result<()> {
     while !model.should_quit {
         tokio::select! {
             input = input_rx.recv() => match input {
-                Some(Event::Key(key)) if key.kind != KeyEventKind::Release => {
-                    model.handle(AppEvent::Key(key));
-                }
-                Some(Event::Paste(text)) => model.handle(AppEvent::Paste(text)),
-                Some(Event::Resize(..)) => model.handle_resize(),
-                Some(Event::Mouse(mouse)) => match mouse.kind {
-                    MouseEventKind::Down(MouseButton::Left) => {
-                        let hit = hit_map.iter().find(|(rect, _)| {
-                            mouse.column >= rect.x
-                                && mouse.column < rect.x + rect.width
-                                && mouse.row >= rect.y
-                                && mouse.row < rect.y + rect.height
-                        });
-                        if let Some((_, action)) = hit {
-                            model.handle_hit(action.clone());
-                        }
-                    }
-                    MouseEventKind::ScrollUp => model.handle_wheel(true),
-                    MouseEventKind::ScrollDown => model.handle_wheel(false),
-                    _ => {}
-                },
-                Some(_) => {}
+                Some(event) => dispatch_input(&mut model, &hit_map, event),
                 None => break,
             },
             () = &mut autoplay, if !model.auto_play_spent => {
@@ -298,8 +240,7 @@ pub async fn run_demo(mut model: AppModel) -> std::io::Result<()> {
             }
             tagged = envelope_rx.recv(), if stream_open => match tagged {
                 Some((generation, payload)) => {
-                    let current = script_gen.load(std::sync::atomic::Ordering::SeqCst);
-                    consume_scripted(&mut model, generation, current, payload);
+                    driver.consume(&mut model, generation, payload);
                 }
                 None => {
                     stream_open = false;
@@ -317,37 +258,9 @@ pub async fn run_demo(mut model: AppModel) -> std::io::Result<()> {
             }
         }
         // Reducer-requested side effects.
-        for request in model.requests.drain(..) {
-            match request {
-                AppRequest::SubmitText(text) => {
-                    turn_counter += 1;
-                    let generation = script_gen.load(std::sync::atomic::Ordering::SeqCst);
-                    play(response_script(&text, turn_counter), generation);
-                }
-                AppRequest::AttachSample(_) => {
-                    turn_counter += 1;
-                    let generation = script_gen.load(std::sync::atomic::Ordering::SeqCst);
-                    play(crate::mock::turn_script(turn_counter), generation);
-                }
-                AppRequest::StopScripts => {
-                    script_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                }
-                AppRequest::Interrupt => {
-                    // Stop the playing script (the reducer already settled
-                    // the projection into idle(i)), then schedule the sim's
-                    // 30s idle(i) → idle decay (tui.js:1561-1564). The
-                    // decay is generation-guarded: a newer interrupt/reset
-                    // makes this one stale; typing-decay makes it a no-op.
-                    let decay_gen =
-                        script_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                    let tx = script_tx.clone();
-                    tokio::spawn(async move {
-                        tokio::time::sleep(IDLE_DECAY).await;
-                        let _ = tx.send((decay_gen, EventPayload::IdleDecayed)).await;
-                    });
-                }
-                AppRequest::Quit => model.should_quit = true,
-            }
+        let requests: Vec<AppRequest> = model.requests.drain(..).collect();
+        for request in requests {
+            driver.handle_request(&mut model, request);
         }
         // Theme cycled: re-sync the emulator background.
         if model.theme != active_theme {
@@ -365,7 +278,7 @@ pub async fn run_demo(mut model: AppModel) -> std::io::Result<()> {
         // pending envelopes, so the loop WILL wake and retry. Awaiting the
         // send here instead would deadlock: this loop is the only consumer.
         while let Some(answer) = model.outbox.first().cloned() {
-            let generation = script_gen.load(std::sync::atomic::Ordering::SeqCst);
+            let generation = driver.generation();
             match answer_echo.try_send((generation, EventPayload::MenuAnswered(answer))) {
                 Ok(()) => {
                     model.outbox.remove(0);
@@ -384,9 +297,160 @@ pub async fn run_demo(mut model: AppModel) -> std::io::Result<()> {
 /// The sim's idle(i) decay window (tui.js:1562: 30s of nothing).
 pub const IDLE_DECAY: Duration = Duration::from_secs(30);
 
-/// Consume one generation-tagged script envelope. Stale generations are
-/// dropped whole — the P1-1 law: an interrupt's bump invalidates envelopes
-/// already buffered in the channel, not only future sends.
+/// One terminal input event through the production dispatch — key/paste
+/// into the reducer, resize into [`AppModel::handle_resize`], mouse through
+/// the last frame's hit map. Extracted from the event loop so tests drive
+/// the SAME wiring (review r3 P3-7).
+pub fn dispatch_input(
+    model: &mut AppModel,
+    hit_map: &[(ratatui::layout::Rect, crate::app::Hit)],
+    event: Event,
+) {
+    match event {
+        Event::Key(key) if key.kind != KeyEventKind::Release => {
+            model.handle(AppEvent::Key(key));
+        }
+        Event::Paste(text) => model.handle(AppEvent::Paste(text)),
+        Event::Resize(..) => model.handle_resize(),
+        Event::Mouse(mouse) => match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let hit = hit_map.iter().find(|(rect, _)| {
+                    mouse.column >= rect.x
+                        && mouse.column < rect.x + rect.width
+                        && mouse.row >= rect.y
+                        && mouse.row < rect.y + rect.height
+                });
+                if let Some((_, action)) = hit {
+                    model.handle_hit(action.clone());
+                }
+            }
+            MouseEventKind::ScrollUp => model.handle_wheel(true),
+            MouseEventKind::ScrollDown => model.handle_wheel(false),
+            _ => {}
+        },
+        _ => {}
+    }
+}
+
+/// The demo's script engine — the production seams of [`run_demo`]'s event
+/// loop, extracted whole so tests drive the SAME wiring (review r3 P3-7):
+/// the same generation-tagged channel, the same spawn/bump/decay behavior,
+/// the same consumption guard.
+pub struct DemoDriver {
+    tx: mpsc::Sender<(u64, EventPayload)>,
+    script_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    turn_counter: u64,
+}
+
+impl DemoDriver {
+    /// A driver plus the receiving end of its envelope channel.
+    #[must_use]
+    pub fn new(capacity: usize) -> (Self, mpsc::Receiver<(u64, EventPayload)>) {
+        let (tx, rx) = mpsc::channel(capacity);
+        (
+            Self {
+                tx,
+                script_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                turn_counter: 0,
+            },
+            rx,
+        )
+    }
+
+    /// The current script generation.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.script_gen.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// A clone of the tagged-envelope sender (the menu-answer echo seam).
+    #[must_use]
+    pub fn sender(&self) -> mpsc::Sender<(u64, EventPayload)> {
+        self.tx.clone()
+    }
+
+    /// Spawn the boot beats. They tag with the CURRENT generation at each
+    /// send: they belong to the harness, not any turn, and survive bumps.
+    pub fn spawn_boot(&self) {
+        let tx = self.tx.clone();
+        let gen_ref = std::sync::Arc::clone(&self.script_gen);
+        tokio::spawn(async move {
+            for payload in crate::mock::boot_script() {
+                tokio::time::sleep(demo_pace(&payload)).await;
+                let generation = gen_ref.load(std::sync::atomic::Ordering::SeqCst);
+                if tx.send((generation, payload)).await.is_err() {
+                    return;
+                }
+            }
+        });
+    }
+
+    /// Play one script, generation-captured: bumps at EITHER end of the
+    /// channel silence it (send-side check + consumption guard).
+    fn play(&self, payloads: Vec<EventPayload>, generation: u64) {
+        let tx = self.tx.clone();
+        let gen_ref = std::sync::Arc::clone(&self.script_gen);
+        tokio::spawn(async move {
+            for payload in payloads {
+                tokio::time::sleep(demo_pace(&payload)).await;
+                if gen_ref.load(std::sync::atomic::Ordering::SeqCst) != generation {
+                    return;
+                }
+                if tx.send((generation, payload)).await.is_err() {
+                    return;
+                }
+            }
+        });
+    }
+
+    /// Drain one reducer request — scripts play generation-captured,
+    /// stop/interrupt bump the generation (so buffered envelopes AND
+    /// pending timers of the old context drop at consumption — review r2
+    /// P1-1, r3 P3-6), and an interrupt schedules the sim's 30s idle(i)
+    /// decay (tui.js:1561-1564).
+    pub fn handle_request(&mut self, model: &mut AppModel, request: AppRequest) {
+        match request {
+            AppRequest::SubmitText(text) => {
+                self.turn_counter += 1;
+                self.play(response_script(&text, self.turn_counter), self.generation());
+            }
+            AppRequest::AttachSample(_) => {
+                self.turn_counter += 1;
+                self.play(
+                    crate::mock::turn_script(self.turn_counter),
+                    self.generation(),
+                );
+            }
+            AppRequest::StopScripts => {
+                self.script_gen
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            AppRequest::Interrupt => {
+                let decay_gen = self
+                    .script_gen
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    + 1;
+                let tx = self.tx.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(IDLE_DECAY).await;
+                    let _ = tx.send((decay_gen, EventPayload::IdleDecayed)).await;
+                });
+            }
+            AppRequest::Quit => model.should_quit = true,
+        }
+    }
+
+    /// Consume one generation-tagged envelope. Stale generations are
+    /// dropped whole — the P1-1 law: a bump invalidates envelopes already
+    /// buffered in the channel, not only future sends.
+    pub fn consume(&self, model: &mut AppModel, generation: u64, payload: EventPayload) {
+        consume_scripted(model, generation, self.generation(), payload);
+    }
+}
+
+/// Consume one generation-tagged script envelope against `current`. Kept
+/// public as the driver's inner law (tests may exercise it directly, but
+/// the production path is [`DemoDriver::consume`]).
 pub fn consume_scripted(
     model: &mut AppModel,
     generation: u64,

@@ -180,14 +180,19 @@ pub struct AppModel {
     /// The launcher auto-play fired or was cancelled by interaction.
     pub auto_play_spent: bool,
     /// Wheel scroll-back offset in the session transcript (0 = follow
-    /// bottom; wheel up increases, wheel down decreases).
-    pub scroll_back: u16,
-    /// Max scroll-back of the LAST rendered frame — set by the renderer
-    /// (interior mutability: render reads `&AppModel`), consumed by
-    /// [`Self::handle_wheel`]/[`Self::handle_resize`] to clamp scrolling.
-    /// Starts at 0 (review r2 P2-6): wheel before the first session frame
-    /// must not bank invisible debt.
+    /// bottom; wheel up increases, wheel down decreases). A `Cell` because
+    /// RENDER is the single scroll authority (review r3 P2-2): every frame
+    /// reconciles this against the true max, so no path can bank invisible
+    /// debt — the wheel only expresses intent.
+    pub scroll_back: std::cell::Cell<u16>,
+    /// Max scroll-back of the LAST rendered frame — written by the
+    /// renderer, read by [`Self::handle_wheel`] to clamp intent early.
+    /// Starts at 0 (review r2 P2-6).
     pub scroll_max: std::cell::Cell<u16>,
+    /// The sticky origin line is suppressed after a sticky jump until the
+    /// next REAL wheel event (sim jumpToSticky, tui.js:2637-2657: the bar
+    /// must never cover the row it just revealed).
+    pub sticky_suppressed: bool,
     /// A freshly auto-titled session owes the transcript its
     /// `· session titled` note once the first user message lands.
     pub title_note_pending: bool,
@@ -218,8 +223,9 @@ impl Default for AppModel {
             requests: Vec::new(),
             turn_active: false,
             auto_play_spent: false,
-            scroll_back: 0,
+            scroll_back: std::cell::Cell::new(0),
             scroll_max: std::cell::Cell::new(0),
+            sticky_suppressed: false,
             title_note_pending: false,
             should_quit: false,
             dirty: true,
@@ -563,7 +569,7 @@ impl AppModel {
         }
         self.screen = Screen::Session;
         self.turn_active = true;
-        self.scroll_back = 0;
+        self.scroll_back.set(0);
         self.requests.push(AppRequest::SubmitText(text));
     }
 
@@ -660,17 +666,16 @@ impl AppModel {
                 }
             },
             "clear" | "back" => {
-                // /clear promises a fresh start (review r1 P2).
+                // /clear promises a fresh start (review r1 P2);
+                // fresh_session itself stops scripts + stale timers.
                 self.fresh_session();
                 self.screen = Screen::Launcher;
-                self.requests.push(AppRequest::StopScripts);
             }
             "reset" => {
                 self.fresh_session();
                 self.samples = sample_sessions();
                 self.screen = Screen::Launcher;
                 self.flash = Some("· demo reset".to_owned());
-                self.requests.push(AppRequest::StopScripts);
             }
             "quit" | "exit" => self.requests.push(AppRequest::Quit),
             "" => {}
@@ -776,13 +781,19 @@ impl AppModel {
     }
 
     /// Start-fresh semantics (review r1 P2): a new session begins from an
-    /// empty projection; the previous demo transcript does not leak in.
+    /// empty projection; the previous demo transcript does not leak in —
+    /// including its scroll ceiling and any pending timers (review r3
+    /// P2-2/P3-6: StopScripts bumps the generation, so a stale idle-decay
+    /// or script beat from the OLD session drops at consumption).
     fn fresh_session(&mut self) {
         self.projection = SessionProjection::new();
         self.session_title = None;
         self.title_note_pending = false;
         self.turn_active = false;
-        self.scroll_back = 0;
+        self.scroll_back.set(0);
+        self.scroll_max.set(0);
+        self.sticky_suppressed = false;
+        self.requests.push(AppRequest::StopScripts);
     }
 
     /// Attach a sample session (digit or click) — one turn at a time.
@@ -854,36 +865,45 @@ impl AppModel {
             }
             Hit::HelpHint => self.help_open = true,
             Hit::StickyJump(scroll_back) => {
-                // Stay AT the producing prompt (sim jumpToSticky).
-                self.scroll_back = scroll_back.min(self.scroll_max.get());
+                // Stay AT the producing prompt, and suppress the sticky
+                // until the next REAL wheel (sim jumpToSticky: "the bar is
+                // suppressed … so it never covers the row it just
+                // revealed", tui.js:2637-2657).
+                self.scroll_back.set(scroll_back.min(self.scroll_max.get()));
+                self.sticky_suppressed = true;
             }
         }
     }
 
-    /// Wheel scroll in the session transcript (⇧-drag selects text natively).
+    /// Wheel scroll in the session transcript (⇧-drag selects text
+    /// natively). The wheel only expresses INTENT — the next frame
+    /// reconciles against the true range (review r3 P2-2).
     pub fn handle_wheel(&mut self, up: bool) {
         if self.screen != Screen::Session || self.help_open {
             return;
         }
         self.dirty = true;
+        // A real scroll lifts the post-jump sticky suppression (sim
+        // onTranscriptScroll → computeSticky).
+        self.sticky_suppressed = false;
         if up {
-            // Clamped to the last rendered frame's max scroll (G16):
-            // wheel-up never winds unpayable debt past the top.
-            self.scroll_back = self
-                .scroll_back
-                .saturating_add(3)
-                .min(self.scroll_max.get());
+            self.scroll_back.set(
+                self.scroll_back
+                    .get()
+                    .saturating_add(3)
+                    .min(self.scroll_max.get()),
+            );
         } else {
-            self.scroll_back = self.scroll_back.saturating_sub(3);
+            self.scroll_back
+                .set(self.scroll_back.get().saturating_sub(3));
         }
     }
 
-    /// Terminal resize: re-clamp the scroll debt against the last known
-    /// range and force a redraw (review r2 P2-6 — the next frame rewrites
-    /// the true max).
+    /// Terminal resize: force a redraw. The frame itself reconciles the
+    /// scroll offset against the new true range (review r3 P2-2 — render
+    /// is the single scroll authority, so no resize-ordering bug exists).
     pub fn handle_resize(&mut self) {
         self.dirty = true;
-        self.scroll_back = self.scroll_back.min(self.scroll_max.get());
     }
 
     fn cycle_theme(&mut self) {

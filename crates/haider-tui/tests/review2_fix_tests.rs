@@ -11,7 +11,7 @@ use haider_protocol::state::HarnessStatus;
 use haider_tui::app::{AppEvent, AppModel, AppRequest, Hit, Screen};
 use haider_tui::mock::demo_script;
 use haider_tui::render::render;
-use haider_tui::runtime::{IDLE_DECAY, consume_scripted};
+use haider_tui::runtime::{DemoDriver, IDLE_DECAY};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -89,34 +89,43 @@ fn user_message(text: &str) -> EventPayload {
     }
 }
 
-// ---- P1-1: post-interrupt envelope race ----
+// ---- P1-1 (+ r3 P3-7): post-interrupt envelope race, PRODUCTION wiring ----
 
-#[test]
-fn stale_generation_envelopes_are_dropped_at_consumption() {
-    // The exact race: a turn's envelope is already BUFFERED (tagged gen 0)
-    // when Esc interrupts and bumps the generation to 1. The buffered
-    // payload must be dropped at consumption — not replayed into the model.
+/// Drain the reducer's requests through the driver — the loop's drain arm.
+fn drain(driver: &mut DemoDriver, model: &mut AppModel) {
+    let requests: Vec<AppRequest> = model.requests.drain(..).collect();
+    for request in requests {
+        driver.handle_request(model, request);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn stale_generation_envelopes_are_dropped_at_consumption() {
+    // The real race through the real wiring (review r3 P3-7): the driver's
+    // channel, its spawned script on virtual time, its bump, its guard.
+    let (mut driver, mut rx) = DemoDriver::new(64);
     let mut model = launcher_model();
     model.handle(key(KeyCode::Char('1')));
-    model.requests.clear();
-    consume_scripted(
-        &mut model,
-        0,
-        0,
-        user_message("fix the failing boundary test"),
-    );
-    assert_eq!(model.screen, Screen::Session);
+    drain(&mut driver, &mut model);
+    // Consume script beats until the turn's UserMessage attaches the view.
+    while model.screen != Screen::Session {
+        let (generation, payload) = rx.recv().await.expect("script beat");
+        driver.consume(&mut model, generation, payload);
+    }
     assert!(model.turn_active);
 
-    // Esc → interrupt; the runtime bumps the generation (0 → 1).
+    // Pull the NEXT beat but hold it — this is the buffered envelope of
+    // the race — then Esc lands FIRST and bumps the generation.
+    let (stale_generation, stale_payload) = rx.recv().await.expect("buffered beat");
     model.handle(key(KeyCode::Esc));
+    drain(&mut driver, &mut model);
     assert!(!model.turn_active);
     assert!(model.projection.interrupted());
-    assert_eq!(model.requests, vec![AppRequest::Interrupt]);
+    assert!(stale_generation < driver.generation(), "bump happened");
     let entries_before = model.projection.entries().len();
 
-    // The stale buffered UserMessage (gen 0) arrives AFTER the bump.
-    consume_scripted(&mut model, 0, 1, user_message("stale buffered message"));
+    // The buffered stale beat is consumed AFTER the bump: dropped whole.
+    driver.consume(&mut model, stale_generation, stale_payload);
     assert!(
         !model.turn_active,
         "stale envelope must not re-arm the turn"
@@ -128,32 +137,73 @@ fn stale_generation_envelopes_are_dropped_at_consumption() {
         "stale envelope leaves no transcript trace"
     );
 
-    // A current-generation envelope still flows.
-    consume_scripted(&mut model, 1, 1, EventPayload::IdleDecayed);
-    assert!(!model.projection.interrupted(), "fresh decay applied");
+    // On virtual time the guarded 30s decay arrives through the SAME
+    // channel and lands (its generation is current).
+    assert_eq!(IDLE_DECAY.as_secs(), 30, "sim decay window (tui.js:1562)");
+    loop {
+        let (generation, payload) = rx.recv().await.expect("decay beat");
+        let is_decay = matches!(payload, EventPayload::IdleDecayed);
+        driver.consume(&mut model, generation, payload);
+        if is_decay {
+            break;
+        }
+        assert!(model.projection.interrupted(), "stale beats change nothing");
+    }
+    assert!(!model.projection.interrupted(), "the 30s decay landed");
 }
 
-#[test]
-fn idle_decay_is_generation_guarded_and_thirty_seconds() {
-    assert_eq!(IDLE_DECAY.as_secs(), 30, "sim decay window (tui.js:1562)");
+#[tokio::test(start_paused = true)]
+async fn stale_idle_decay_never_lands_in_a_fresh_session() {
+    // r3 P3-6: interrupt session A, start fresh session B within the 30s
+    // window, interrupt B too — A's pending decay must be dropped (its
+    // generation is stale); only B's OWN decay clears B's idle(i).
+    let (mut driver, mut rx) = DemoDriver::new(64);
     let mut model = launcher_model();
     model.handle(key(KeyCode::Char('1')));
-    model.requests.clear();
-    consume_scripted(
-        &mut model,
-        0,
-        0,
-        user_message("fix the failing boundary test"),
-    );
+    drain(&mut driver, &mut model);
+    while model.screen != Screen::Session {
+        let (generation, payload) = rx.recv().await.expect("script beat");
+        driver.consume(&mut model, generation, payload);
+    }
+    // Interrupt A (schedules A's decay).
     model.handle(key(KeyCode::Esc));
+    drain(&mut driver, &mut model);
     assert!(model.projection.interrupted());
-    // A decay scheduled by an OLDER interrupt (gen 1) is stale once a newer
-    // interrupt bumped to 2 — dropped whole.
-    consume_scripted(&mut model, 1, 2, EventPayload::IdleDecayed);
-    assert!(model.projection.interrupted(), "stale decay dropped");
-    // The decay of the CURRENT interrupt applies.
-    consume_scripted(&mut model, 2, 2, EventPayload::IdleDecayed);
-    assert!(!model.projection.interrupted(), "current decay lands");
+
+    // Fresh session B within the window (esc to launcher, type, submit).
+    model.handle(key(KeyCode::Esc));
+    for c in "start something new".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Enter));
+    drain(&mut driver, &mut model);
+    assert_eq!(model.screen, Screen::Session);
+    // Interrupt B (schedules B's decay, another bump).
+    model.handle(key(KeyCode::Esc));
+    drain(&mut driver, &mut model);
+    assert!(model.projection.interrupted(), "B is idle(i)");
+
+    // Consume everything on virtual time. A's decay carries a stale
+    // generation → dropped, B stays idle(i); B's decay is current → lands.
+    let mut decays_seen = 0;
+    loop {
+        let (generation, payload) = rx.recv().await.expect("beat");
+        let is_decay = matches!(payload, EventPayload::IdleDecayed);
+        let current = generation == driver.generation();
+        driver.consume(&mut model, generation, payload);
+        if is_decay {
+            decays_seen += 1;
+            if current {
+                break;
+            }
+            assert!(
+                model.projection.interrupted(),
+                "A's stale decay left B's idle(i) alone"
+            );
+        }
+    }
+    assert_eq!(decays_seen, 2, "both decays travelled the channel");
+    assert!(!model.projection.interrupted(), "B's own decay cleared it");
 }
 
 // ---- P2-2: stale hit maps ----
@@ -248,11 +298,13 @@ fn alt_and_shift_enter_insert_newlines_and_enter_submits() {
     assert_eq!(model.composer, "line one\nline two\nline three");
     model.handle(key(KeyCode::Enter));
     assert_eq!(model.composer, "", "plain ⏎ still submits");
+    // fresh_session stops the old context first (review r3 P3-6).
     assert_eq!(
         model.requests,
-        vec![AppRequest::SubmitText(
-            "line one\nline two\nline three".to_owned()
-        )]
+        vec![
+            AppRequest::StopScripts,
+            AppRequest::SubmitText("line one\nline two\nline three".to_owned())
+        ]
     );
 }
 
@@ -367,31 +419,67 @@ fn tiny_frame_keeps_a_three_line_composer_visible() {
     assert_eq!(row_of(&rows, "c▮"), first_y + 2, "composer rows intact");
 }
 
-// ---- P2-6: first-frame wheel + resize clamp ----
+// ---- P2-6 / r3 P2-2: render is the single scroll authority ----
 
 #[test]
 fn wheel_before_first_frame_and_resize_never_bank_debt() {
+    use haider_tui::runtime::dispatch_input;
+    use ratatui::crossterm::event::Event;
     let mut model = launcher_model();
     model.handle(AppEvent::Envelope(Box::new(user_message("hello"))));
     assert_eq!(model.screen, Screen::Session);
     // No frame rendered yet: scroll_max starts 0 — wheel-up is inert.
     model.handle_wheel(true);
-    assert_eq!(model.scroll_back, 0, "no invisible pre-frame debt");
-    // Overflowing frame, scroll up, then shrink-resize: the clamp re-runs.
+    assert_eq!(model.scroll_back.get(), 0, "no invisible pre-frame debt");
+    // Overflowing frame, scroll to the top…
     let mut model = session_model();
     let (_, _, _) = draw(&model, 90, 14);
     for _ in 0..50 {
         model.handle_wheel(true);
     }
     let tall_max = model.scroll_max.get();
-    assert_eq!(model.scroll_back, tall_max);
-    // A taller frame shrinks the range; render writes the smaller max…
+    assert_eq!(model.scroll_back.get(), tall_max);
+    // …then ENLARGE, resize arriving through the production input path
+    // (review r3 P3-7): the event only dirties — the NEXT FRAME reconciles
+    // the offset against the new smaller range (render is the authority).
+    model.dirty = false;
+    dispatch_input(&mut model, &[], Event::Resize(90, 30));
+    assert!(model.dirty, "resize forces a redraw");
     let (_, _, _) = draw(&model, 90, 30);
     let short_max = model.scroll_max.get();
     assert!(short_max < tall_max);
-    // …and the resize event re-clamps the banked debt.
-    model.handle_resize();
-    assert_eq!(model.scroll_back, short_max, "resize re-clamps");
+    assert_eq!(
+        model.scroll_back.get(),
+        short_max,
+        "the frame repaid the debt — no invisible remainder"
+    );
+    // Shrinking back does NOT resurrect the old offset.
+    dispatch_input(&mut model, &[], Event::Resize(90, 14));
+    let (_, _, _) = draw(&model, 90, 14);
+    assert_eq!(model.scroll_back.get(), short_max, "no debt resurrection");
+}
+
+#[test]
+fn fresh_session_resets_the_scroll_ceiling() {
+    // A scrolled session's ceiling must not leak into a fresh session
+    // (review r3 P2-2).
+    let mut model = session_model();
+    let (_, _, _) = draw(&model, 90, 14);
+    for _ in 0..50 {
+        model.handle_wheel(true);
+    }
+    assert!(model.scroll_back.get() > 0);
+    for c in "/clear".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Enter));
+    assert_eq!(model.screen, Screen::Launcher);
+    assert_eq!(model.scroll_back.get(), 0, "fresh session starts at tail");
+    assert_eq!(model.scroll_max.get(), 0, "old ceiling gone");
+    // The next session's first frame rebuilds its own truth.
+    model.handle(AppEvent::Envelope(Box::new(user_message("fresh start"))));
+    let (_, _, _) = draw(&model, 90, 14);
+    assert_eq!(model.scroll_back.get(), 0, "new session at its tail");
 }
 
 // ---- P2-7: raw UTF-16 paste thresholds ----
@@ -499,12 +587,9 @@ fn interrupted_idle_badge_is_dim_like_plain_idle() {
     let mut model = launcher_model();
     model.handle(key(KeyCode::Char('1')));
     model.requests.clear();
-    consume_scripted(
-        &mut model,
-        0,
-        0,
-        user_message("fix the failing boundary test"),
-    );
+    model.handle(AppEvent::Envelope(Box::new(user_message(
+        "fix the failing boundary test",
+    ))));
     model.handle(key(KeyCode::Esc));
     assert!(model.projection.interrupted());
     let theme = model.theme.theme();

@@ -420,9 +420,13 @@ fn typed_text_starts_a_session_and_requests_a_turn() {
     }
     model.handle(key(KeyCode::Enter));
     assert_eq!(model.screen, Screen::Session);
+    // fresh_session stops the old context first (review r3 P3-6).
     assert_eq!(
         model.requests,
-        vec![AppRequest::SubmitText("refactor the parser".to_owned())]
+        vec![
+            AppRequest::StopScripts,
+            AppRequest::SubmitText("refactor the parser".to_owned())
+        ]
     );
     // Sim autoBlurb (G47): first seven words, first letter capitalized.
     assert_eq!(model.session_title.as_deref(), Some("Refactor the parser"));
@@ -440,7 +444,11 @@ fn digit_attaches_a_sample_and_autoplay_is_one_shot() {
         HarnessStatus::Ready,
     ))));
     model.handle(key(KeyCode::Char('2')));
-    assert_eq!(model.requests, vec![AppRequest::AttachSample(1)]);
+    // fresh_session stops the old context first (review r3 P3-6).
+    assert_eq!(
+        model.requests,
+        vec![AppRequest::StopScripts, AppRequest::AttachSample(1)]
+    );
     assert_eq!(model.session_head, ("Fatima", "(a)"));
 
     // Interaction spends the auto-play.
@@ -497,14 +505,15 @@ fn one_turn_at_a_time_across_digits_and_submits() {
         HarnessStatus::Ready,
     ))));
     model.handle(key(KeyCode::Char('1')));
-    assert_eq!(model.requests.len(), 1);
+    // [StopScripts, AttachSample] — exactly one turn request.
+    assert_eq!(model.requests.len(), 2);
     assert!(
         model.turn_active,
         "attach marks the turn active immediately"
     );
     // A second digit while active is refused.
     model.handle(key(KeyCode::Char('2')));
-    assert_eq!(model.requests.len(), 1, "no concurrent scripts");
+    assert_eq!(model.requests.len(), 2, "no concurrent scripts");
     assert!(
         model
             .flash
@@ -514,7 +523,7 @@ fn one_turn_at_a_time_across_digits_and_submits() {
     );
     // AutoPlay can never double-fire either.
     model.handle(AppEvent::AutoPlay);
-    assert_eq!(model.requests.len(), 1);
+    assert_eq!(model.requests.len(), 2);
     let _ = AppRequest::Quit;
 }
 
@@ -682,13 +691,17 @@ fn clicks_attach_sessions_and_wheel_scrolls() {
     // range (review r2 P2-6): before any session frame the max is 0, and a
     // short transcript never scrolls, so wheel-up banks no invisible debt.
     model.handle_wheel(true);
-    assert_eq!(model.scroll_back, 0, "no debt before/without overflow");
+    assert_eq!(
+        model.scroll_back.get(),
+        0,
+        "no debt before/without overflow"
+    );
     let (_, _) = draw_with_hits(&model, 118, 34);
     assert_eq!(model.scroll_max.get(), 0, "everything visible → max 0");
     model.handle_wheel(true);
-    assert_eq!(model.scroll_back, 0);
+    assert_eq!(model.scroll_back.get(), 0);
     model.handle_wheel(false);
-    assert_eq!(model.scroll_back, 0);
+    assert_eq!(model.scroll_back.get(), 0);
     model.handle_hit(Hit::BackChip);
     assert_eq!(model.screen, Screen::Launcher);
 }

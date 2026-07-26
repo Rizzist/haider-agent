@@ -133,9 +133,13 @@ fn wheel_clamps_to_the_rendered_scroll_range() {
     for _ in 0..50 {
         model.handle_wheel(true);
     }
-    assert_eq!(model.scroll_back, max, "wheel-up stops at the top");
+    assert_eq!(model.scroll_back.get(), max, "wheel-up stops at the top");
     model.handle_wheel(false);
-    assert_eq!(model.scroll_back, max.saturating_sub(3), "no wound debt");
+    assert_eq!(
+        model.scroll_back.get(),
+        max.saturating_sub(3),
+        "no wound debt"
+    );
 }
 
 #[test]
@@ -170,7 +174,7 @@ fn sticky_origin_line_pins_the_prompt_and_click_stays_at_it() {
     assert_eq!(rect.y, sticky_y);
     model.handle_hit(hit.clone());
     assert!(
-        model.scroll_back > 0,
+        model.scroll_back.get() > 0,
         "click does NOT yank to the live tail"
     );
     let (rows, _, _) = draw(&model, 90, 14);
@@ -193,7 +197,11 @@ fn wheel_is_inert_under_the_help_overlay() {
     let (_, _, _) = draw(&model, 90, 14);
     model.help_open = true;
     model.handle_wheel(true);
-    assert_eq!(model.scroll_back, 0, "hidden transcript never scrolls");
+    assert_eq!(
+        model.scroll_back.get(),
+        0,
+        "hidden transcript never scrolls"
+    );
 }
 
 // ---- G11 + G12: ghost completion + /theme arg slot ----

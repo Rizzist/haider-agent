@@ -178,10 +178,19 @@ fn render_launcher(
         Vec::new()
     };
     let mut palette_height = u16::try_from(palette.len()).unwrap_or(0);
-    // Input sacred: the palette yields entirely before the composer loses a
-    // row (review r1 P2 rule, same as the session layout).
-    let composer_rows = composer_height(model);
-    let fixed = 1 + 1 + composer_rows + 1; // content min + rule + composer + gap
+    // Sacred-input ledger (review r3 P2-1a, launcher form): the composer
+    // grows up to its need but tail-windows to whatever the height allows —
+    // the cursor row is never hidden. The spacer gap yields first, then the
+    // palette, before the composer loses a row.
+    let needed = composer_height(model);
+    let mut gap: u16 = 1;
+    let mut input_avail = area.height.saturating_sub(1 + 1 + gap); // content + rule
+    if input_avail < 1 {
+        gap = 0;
+        input_avail = area.height.saturating_sub(2);
+    }
+    let composer_rows = needed.min(input_avail).max(1);
+    let fixed = 1 + 1 + composer_rows + gap; // content min + rule + composer + gap
     if palette_height > area.height.saturating_sub(fixed) {
         palette_height = 0;
     }
@@ -190,7 +199,7 @@ fn render_launcher(
         Constraint::Length(palette_height),
         Constraint::Length(1),
         Constraint::Length(composer_rows),
-        Constraint::Length(1),
+        Constraint::Length(gap),
     ])
     .areas(area);
 
@@ -354,16 +363,38 @@ fn render_session(
     area: Rect,
     hits: &mut Vec<(Rect, Hit)>,
 ) {
-    // A blocking menu REPLACES the composer (sim §3 law) and takes its rows:
-    // title + body context lines + options + the bottom hint line.
+    // A blocking menu REPLACES the composer (sim §3 law) and takes its rows.
+    //
+    // Sacred-input height ledger (review r3 P2-1) — invariants at ANY size:
+    // (a) the composer's CURSOR row is visible: growth steals from the
+    //     transcript first (up to 5 rows, sim autoGrow); when even that
+    //     cannot fit, the composer tail-windows to its allocation instead
+    //     of hiding the cursor;
+    // (b) a menu's OPTIONS are always visible: the menu block sheds hint →
+    //     body (top-first) → title under pressure, options NEVER.
     let menu = model.projection.open_menu();
-    let input_height = menu.map_or_else(
+    let menu_wrapped_body_rows = menu.map_or(0, |m| wrapped_menu_body(m, area.width).len());
+    let needed_input = menu.map_or_else(
         || composer_height(model),
-        |m| u16::try_from(1 + m.body.len() + m.options.len() + 1).unwrap_or(8),
+        |m| u16::try_from(1 + menu_wrapped_body_rows + m.options.len() + 1).unwrap_or(u16::MAX),
     );
-    // Short windows: the INPUT is sacred — todos, then the palette, yield
-    // entirely before the composer/menu loses a row (review r1 P2).
-    let fixed = 2 + 1 + 1 + input_height + 1; // header + rule + rule + input + gap
+    // What the input may claim: everything beyond header(2) + header
+    // rule(1) + input rule(1) + gap(1) + one sacred transcript row.
+    let mut gap: u16 = 1;
+    let chrome: u16 = 2 + 1 + 1;
+    let floor_input = menu.map_or(1, |m| u16::try_from(m.options.len().max(1)).unwrap_or(1));
+    let mut input_avail = area.height.saturating_sub(chrome + gap + 1);
+    if input_avail < floor_input {
+        // The spacer gap yields before any sacred row does.
+        gap = 0;
+        input_avail = area.height.saturating_sub(chrome + 1);
+    }
+    let input_height = needed_input.min(input_avail).max(floor_input.min(
+        area.height.saturating_sub(chrome), // absolute best-effort floor
+    ));
+    // Short windows: todos, then the palette, yield entirely before the
+    // composer/menu loses a row (review r1 P2).
+    let fixed = chrome + input_height + gap;
     let mut todos_height = model
         .projection
         .todos()
@@ -401,7 +432,7 @@ fn render_session(
         Constraint::Length(palette_height),
         Constraint::Length(1),
         Constraint::Length(input_height),
-        Constraint::Length(1),
+        Constraint::Length(gap),
     ])
     .areas(area);
 
@@ -494,10 +525,14 @@ fn render_session(
         total = total.saturating_add(u16::try_from(height).unwrap_or(1));
     }
     let max_scroll = total.saturating_sub(transcript_area.height);
-    // Render feedback for wheel clamping (G16) — interior mutability by
-    // design: render reads `&AppModel`.
+    // RENDER is the single scroll authority (review r3 P2-2): the frame
+    // writes the true max AND reconciles the model's offset against it, so
+    // resizes/new content can never leave invisible debt banked anywhere.
     model.scroll_max.set(max_scroll);
-    let scroll_back = model.scroll_back.min(max_scroll);
+    model
+        .scroll_back
+        .set(model.scroll_back.get().min(max_scroll));
+    let scroll_back = model.scroll_back.get();
     let scroll = max_scroll - scroll_back;
     let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
     frame.render_widget(paragraph.scroll((scroll, 0)), transcript_area);
@@ -507,8 +542,10 @@ fn render_session(
     // tint), bright nowrap-ellipsized text, maroon bold sigil — no
     // underline. Click keeps the reader AT the prompt (jumpToSticky,
     // tui.js:2637-2645): the hit carries the scroll-back that puts the
-    // prompt's first row at the viewport top.
-    if scroll_back > 0 && scroll > 0 && transcript_area.height > 0 {
+    // prompt's first row at the viewport top; after a jump the sticky is
+    // SUPPRESSED until the next real wheel so it never covers the row it
+    // just revealed.
+    if scroll_back > 0 && scroll > 0 && transcript_area.height > 0 && !model.sticky_suppressed {
         let sticky = user_rows.iter().rev().find(|(line_index, _)| {
             row_of_line
                 .get(*line_index)
@@ -567,9 +604,7 @@ fn render_session(
     }
 
     if let Some(menu) = menu {
-        // Sim InputMenu (tui.js:4932): warn top border, gold-soft ground,
-        // warn title with the kind glyph, ❯-cursor options, faint bottom
-        // hint carrying the answer-by-id contract.
+        // Sim InputMenu (tui.js:4932): warn top border, gold-soft ground.
         frame.render_widget(
             Paragraph::new(Line::styled(
                 "─".repeat(rule_area.width as usize),
@@ -578,63 +613,16 @@ fn render_session(
             .style(theme.text_style()),
             rule_area,
         );
-        let glyph = menu_glyph(&menu.kind);
-        let mut menu_lines = vec![Line::from(vec![Span::styled(
-            format!(" {glyph} {}", menu.title),
-            theme.warn_style(),
-        )])];
-        // Dim context body lines between title and options (sim `.iml`,
-        // tui.js:3063-3067 — permission cards must show what they gate).
-        for body_line in &menu.body {
-            menu_lines.push(Line::from(vec![
-                Span::raw(" "),
-                Span::styled(body_line.as_str(), theme.dim_style()),
-            ]));
-        }
-        for (index, option) in menu.options.iter().enumerate() {
-            let selected = index == model.menu_selection;
-            let cursor = if selected { "❯" } else { " " };
-            let mut spans = vec![
-                Span::styled(format!(" {cursor} "), theme.gold_style()),
-                Span::styled(
-                    format!("{}. {}", index + 1, option.label),
-                    if selected {
-                        theme.bright_style()
-                    } else {
-                        theme.menu_style()
-                    },
-                ),
-            ];
-            menu_lines.push(if selected {
-                // Selection ground spans the full row (sim `.imo.sel`).
-                let pad = (composer_area.width as usize)
-                    .saturating_sub(Line::from(spans.clone()).width());
-                if pad > 0 {
-                    spans.push(Span::raw(" ".repeat(pad)));
-                }
-                Line::from(spans).style(theme.selection_style())
-            } else {
-                Line::from(spans)
-            });
-        }
-        menu_lines.push(Line::from(vec![Span::styled(
-            format!(
-                " ↑↓ select · ⏎ confirm · 1-{} quick · menu {} · menu.answer(\"{}\", n) over RPC",
-                menu.options.len(),
-                menu.id,
-                menu.id
-            ),
-            theme.faint_style(),
-        )]));
+        let (menu_lines, option_rows) =
+            menu_block(menu, model.menu_selection, theme, composer_area);
         frame.render_widget(
             Paragraph::new(Text::from(menu_lines)).style(theme.menu_style()),
             composer_area,
         );
-        // Option rows sit after the title + body lines, before the hint.
-        // Hits carry the menu id (review r2 P2-2): only THIS menu answers.
-        let option_top = 1 + menu.body.len();
-        for offset in 0..menu.options.len() {
-            let y = composer_area.y + u16::try_from(option_top + offset).unwrap_or(u16::MAX);
+        // Hit rows come from what actually RENDERED (review r3 P2-1b/P2-4)
+        // and carry the menu id (review r2 P2-2).
+        for (row_offset, option_index) in option_rows {
+            let y = composer_area.y + row_offset;
             if y < composer_area.y + composer_area.height {
                 hits.push((
                     Rect {
@@ -645,7 +633,7 @@ fn render_session(
                     },
                     Hit::MenuOption {
                         menu: menu.id.clone(),
-                        index: offset,
+                        index: option_index,
                     },
                 ));
             }
@@ -653,6 +641,101 @@ fn render_session(
     } else {
         render_composer(model, theme, frame, rule_area, composer_area, hits);
     }
+}
+
+/// The menu's body lines pre-wrapped by display cells into the menu's
+/// content width (sim `.iml` white-space: pre-wrap, tui.js:4946).
+fn wrapped_menu_body(menu: &haider_protocol::menu::Menu, width: u16) -> Vec<String> {
+    let budget = (width as usize).saturating_sub(2).max(1);
+    menu.body
+        .iter()
+        .flat_map(|body_line| wrap_body(body_line, budget))
+        .collect()
+}
+
+/// The blocking menu's rows within the allocated area (sim InputMenu under
+/// the sacred-input law, review r3 P2-1b): warn title with the kind glyph,
+/// dim pre-wrapped body, ❯-cursor options, faint answer-by-id hint. Under
+/// height pressure rows shed in order — hint first, then body rows from the
+/// TOP (the last ones carry the live context), then the title; options
+/// NEVER. Returns the rendered lines plus each option's (row offset, option
+/// index) for the hit map.
+fn menu_block(
+    menu: &haider_protocol::menu::Menu,
+    selection: usize,
+    theme: &Theme,
+    area: Rect,
+) -> (Vec<Line<'static>>, Vec<(u16, usize)>) {
+    let allocated = area.height as usize;
+    let mut body_rows = wrapped_menu_body(menu, area.width);
+    let needed = 1 + body_rows.len() + menu.options.len() + 1;
+    let mut show_title = true;
+    let mut show_hint = true;
+    let mut over = needed.saturating_sub(allocated.max(menu.options.len()));
+    if over > 0 {
+        show_hint = false;
+        over -= 1;
+    }
+    let shed = over.min(body_rows.len());
+    body_rows.drain(..shed); // shed from the top; keep the freshest context
+    over -= shed;
+    if over > 0 {
+        show_title = false;
+    }
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut option_rows: Vec<(u16, usize)> = Vec::new();
+    if show_title {
+        let glyph = menu_glyph(&menu.kind);
+        lines.push(Line::from(vec![Span::styled(
+            format!(" {glyph} {}", menu.title),
+            theme.warn_style(),
+        )]));
+    }
+    for body_row in body_rows {
+        lines.push(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(body_row, theme.dim_style()),
+        ]));
+    }
+    for (index, option) in menu.options.iter().enumerate() {
+        let selected = index == selection;
+        let cursor = if selected { "❯" } else { " " };
+        let mut spans = vec![
+            Span::styled(format!(" {cursor} "), theme.gold_style()),
+            Span::styled(
+                format!("{}. {}", index + 1, option.label),
+                if selected {
+                    theme.bright_style()
+                } else {
+                    theme.menu_style()
+                },
+            ),
+        ];
+        option_rows.push((u16::try_from(lines.len()).unwrap_or(u16::MAX), index));
+        lines.push(if selected {
+            // Selection ground spans the full row (sim `.imo.sel`).
+            let pad = (area.width as usize).saturating_sub(Line::from(spans.clone()).width());
+            if pad > 0 {
+                spans.push(Span::raw(" ".repeat(pad)));
+            }
+            Line::from(spans).style(theme.selection_style())
+        } else {
+            Line::from(spans)
+        });
+    }
+    if show_hint {
+        lines.push(Line::from(vec![Span::styled(
+            format!(
+                " ↑↓ select · ⏎ confirm · 1-{} quick · menu {} · menu.answer(\"{}\", n) over RPC",
+                menu.options.len(),
+                menu.id,
+                menu.id
+            ),
+            theme.faint_style(),
+        )]));
+    }
+    (lines, option_rows)
 }
 
 /// Sim `MENU_GLYPH` (tui.js:3057) mapped onto the protocol's menu kinds.
@@ -722,7 +805,7 @@ fn render_composer(
         .style(theme.text_style()),
         rule_area,
     );
-    let (lines, chip_at) = composer_lines(model, theme, row_area.width);
+    let (lines, chip_at) = composer_lines(model, theme, row_area.width, row_area.height);
     frame.render_widget(
         Paragraph::new(Text::from(lines)).style(theme.input_style()),
         row_area,
@@ -741,16 +824,22 @@ fn render_composer(
 }
 
 /// The composer rows (sim InputBar textarea): padded off the frame edge,
-/// bold gold ❯ sigil, REAL newlines on their own rows (tail-visible past
-/// [`COMPOSER_MAX_ROWS`], with a faint ⋮ gutter marker), a horizontal
+/// bold gold ❯ sigil, REAL newlines on their own rows, a horizontal
 /// tail-window on any overlong line so the editable end stays visible,
 /// typed text bright with a gold block cursor (or the dim placeholder +
 /// ghost completion), and the right-aligned `[ ◉ talk ]` chip on the first
-/// row. Returns the rows plus the chip's column offset + width.
+/// row.
+///
+/// `allocated` is the height the layout actually granted: the composer
+/// VERTICALLY tail-windows to it (last lines win — the cursor row is
+/// sacred at any size, review r3 P2-1a), with a faint ⋮ gutter marker when
+/// rows are hidden above. Returns the rows plus the chip's column offset +
+/// width.
 fn composer_lines<'a>(
     model: &'a AppModel,
     theme: &Theme,
     width: u16,
+    allocated: u16,
 ) -> (Vec<Line<'a>>, Option<(u16, u16)>) {
     let sigil = Span::styled(
         "❯ ",
@@ -793,7 +882,8 @@ fn composer_lines<'a>(
     }
 
     let all: Vec<&str> = model.composer.split('\n').collect();
-    let skip = all.len().saturating_sub(COMPOSER_MAX_ROWS);
+    let window = (allocated.max(1) as usize).min(COMPOSER_MAX_ROWS);
+    let skip = all.len().saturating_sub(window);
     let visible = &all[skip..];
     let last = visible.len().saturating_sub(1);
     let mut rows = Vec::new();
@@ -1095,62 +1185,105 @@ fn paste_token_len(text: &str) -> Option<usize> {
     None
 }
 
-/// Pre-wrap word wrap by DISPLAY CELLS (sim AgentRow `white-space:
-/// pre-wrap`, tui.js:4508-4513): explicit newlines and leading indentation
-/// survive; words wrap greedily by unicode width; an unbreakable word
-/// longer than the budget hard-splits at the cell boundary — every visual
-/// row stays within budget, so the gold-soft rail never drops off a
-/// continuation (review r2 P2-10: CJK, emoji, long URLs).
+/// TRUE pre-wrap by DISPLAY CELLS (sim AgentRow `white-space: pre-wrap`,
+/// tui.js:4508-4513 — review r3 P2-5): explicit newlines survive; EVERY
+/// space run is preserved exactly (leading indentation, internal runs,
+/// trailing whitespace); lines break at the last breakable point within
+/// the budget (a space-run boundary), overlong unbreakable runs hard-split
+/// at the cell boundary. Tabs expand to a fixed 4 cells — the ONE
+/// deliberate divergence from pre-wrap, since a terminal buffer cell
+/// cannot render `\t`. Every produced row fits the budget, so ratatui
+/// never implicitly wraps and the gold-soft rail survives any width.
 fn wrap_body(text: &str, budget: usize) -> Vec<String> {
-    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
     let budget = budget.max(1);
+    let expanded = text.replace('\t', "    ");
     let mut rows = Vec::new();
-    for source in text.split('\n') {
-        let trimmed = source.trim_start_matches(' ');
-        let indent = &source[..source.len() - trimmed.len()];
-        let mut row = indent.to_owned();
-        let mut row_width = UnicodeWidthStr::width(indent);
-        let mut row_has_word = false;
-        for word in trimmed.split_whitespace() {
-            let word_width = UnicodeWidthStr::width(word);
-            let sep = usize::from(row_has_word);
-            if row_width + sep + word_width > budget {
-                if row_width > 0 {
-                    rows.push(std::mem::take(&mut row));
-                    row_width = 0;
-                    row_has_word = false;
-                }
-                if word_width > budget {
-                    // Hard-split the unbreakable word at cell boundaries.
-                    let mut piece = String::new();
-                    let mut piece_width = 0usize;
-                    for ch in word.chars() {
-                        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-                        if piece_width + ch_width > budget && !piece.is_empty() {
-                            rows.push(std::mem::take(&mut piece));
-                            piece_width = 0;
-                        }
-                        piece.push(ch);
-                        piece_width += ch_width;
-                    }
-                    row = piece;
-                    row_width = piece_width;
-                    row_has_word = true;
-                    continue;
-                }
-            }
-            if row_has_word {
-                row.push(' ');
-                row_width += 1;
-            }
-            row.push_str(word);
-            row_width += word_width;
-            row_has_word = true;
-        }
-        // Blank source lines survive as blank rail rows (pre-wrap).
-        rows.push(row);
+    for source in expanded.split('\n') {
+        wrap_pre_line(source, budget, &mut rows);
     }
+    debug_assert!(
+        rows.iter()
+            .all(|row| unicode_width::UnicodeWidthStr::width(row.as_str()) <= budget),
+        "wrap_body produced a row wider than its budget"
+    );
     rows
+}
+
+/// Wrap one newline-free line, preserving every space (pre-wrap).
+fn wrap_pre_line(line: &str, budget: usize, rows: &mut Vec<String>) {
+    use unicode_width::UnicodeWidthChar;
+    let mut row = String::new();
+    let mut row_width = 0usize;
+    let mut chars = line.chars().peekable();
+    while let Some(&first) = chars.peek() {
+        let is_space = first == ' ';
+        // Collect one run (all-spaces or no-spaces).
+        let mut run = String::new();
+        let mut run_width = 0usize;
+        while let Some(&ch) = chars.peek() {
+            if (ch == ' ') != is_space {
+                break;
+            }
+            chars.next();
+            run.push(ch);
+            run_width += UnicodeWidthChar::width(ch).unwrap_or(0);
+        }
+        if row_width + run_width <= budget {
+            row.push_str(&run);
+            row_width += run_width;
+            continue;
+        }
+        if is_space {
+            // A space run crossing the edge: fill to the edge, break, and
+            // carry the REMAINING spaces onto the next row — none are lost.
+            let mut remaining = run.chars();
+            loop {
+                while row_width < budget {
+                    if remaining.next().is_none() {
+                        break;
+                    }
+                    row.push(' ');
+                    row_width += 1;
+                }
+                if remaining.as_str().is_empty() {
+                    break;
+                }
+                rows.push(std::mem::take(&mut row));
+                row_width = 0;
+            }
+            continue;
+        }
+        // A non-space run: break at the run boundary (the last breakable
+        // point) when it can fit on a fresh row; hard-split otherwise.
+        if run_width <= budget {
+            rows.push(std::mem::take(&mut row));
+            row = run;
+            row_width = run_width;
+            continue;
+        }
+        if row_width > 0 {
+            rows.push(std::mem::take(&mut row));
+            row_width = 0;
+        }
+        for ch in run.chars() {
+            let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if ch_width > budget {
+                // Unrepresentable at this width (e.g. CJK beside a rail in
+                // a 3-col frame) — dropping is the only honest option that
+                // keeps the no-implicit-wrap invariant.
+                continue;
+            }
+            if row_width + ch_width > budget {
+                rows.push(std::mem::take(&mut row));
+                row_width = 0;
+            }
+            row.push(ch);
+            row_width += ch_width;
+        }
+    }
+    // The final row lands even when empty (blank pre-wrap lines keep their
+    // rail row) or when it ends in preserved trailing whitespace.
+    rows.push(row);
 }
 
 /// One pinned-todo row, styled by state (sim `.trow` classes: completed
@@ -1213,8 +1346,17 @@ fn item_lines<'a>(lines: &mut Vec<Line<'a>>, block: &'a ItemBlock, theme: &Theme
                 Span::raw(" "),
                 Span::styled("■ haider", theme.gold_style()),
             ]));
-            let budget = (width as usize).saturating_sub(3).max(8);
-            let body = wrap_body(text, budget);
+            // Content width = area minus margin+rail; never wider — every
+            // produced row fits the frame, so ratatui never implicitly
+            // wraps and the rail survives ANY width (review r3 P2-5). At
+            // widths ≤ 3 there is no content column at all: the rail
+            // stands alone.
+            let budget = (width as usize).saturating_sub(3);
+            let body = if budget == 0 {
+                vec![String::new()]
+            } else {
+                wrap_body(text, budget)
+            };
             let last = body.len().saturating_sub(1);
             for (index, row) in body.into_iter().enumerate() {
                 let mut spans = vec![

@@ -10,8 +10,8 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-fn dump(model: &AppModel, label: &str) {
-    let backend = TestBackend::new(118, 34);
+fn dump_at(model: &AppModel, label: &str, width: u16, height: u16) {
+    let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("terminal");
     terminal
         .draw(|frame| {
@@ -28,6 +28,10 @@ fn dump(model: &AppModel, label: &str) {
         println!("{}", line.trim_end());
     }
     println!();
+}
+
+fn dump(model: &AppModel, label: &str) {
+    dump_at(model, label, 118, 34);
 }
 
 fn main() {
@@ -65,6 +69,9 @@ fn main() {
         menu_model.handle(AppEvent::Envelope(Box::new(payload.clone())));
     }
     dump(&menu_model, "session + blocking menu");
+    // Sacred options at short heights (review r3 P2-1b): hint + body shed,
+    // options never.
+    dump_at(&menu_model, "session + blocking menu @ 90×10", 90, 10);
     // Full session.
     for payload in script.iter().skip(6) {
         model.handle(AppEvent::Envelope(Box::new(payload.clone())));

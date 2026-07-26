@@ -32,6 +32,7 @@ Deliberate gaps against the `/tui` sim, each with its landing wave:
 | crates/haider-tui | Todos collapse toggle + queued-messages panel; multi-menu queue (`· N more queued`) | Demo opens one card and pins one plan; collapse needs persistent UI prefs | planned → daemon wave (W3) |
 | crates/haider-tui | Hover-select/hover-highlight (sim `onMouseEnter`) | Left-click + wheel only — mouse-move reporting floods the input channel for cosmetic gain | open |
 | crates/haider-tui | Mid-composer cursor movement (←→/click editing; the cursor is end-of-text) | TUI2.4 shipped real multi-line entry (⇧⏎ where reported + ⌥⏎ universally, growth to 5 rows, vertical+horizontal tail windows, newline-preserving small pastes); a movable cursor + selection is an editor feature | planned → daemon-era input stack |
+| crates/haider-tui | `\t` in pre-wrap agent bodies expands to a fixed 4 cells | Terminal buffer cells cannot render a tab; a fixed expansion is the one deliberate divergence from CSS pre-wrap (review r3 P2-5, documented at `wrap_body`) | deliberate |
 
 ## Adopted
 
