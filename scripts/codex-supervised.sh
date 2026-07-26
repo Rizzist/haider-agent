@@ -1,7 +1,13 @@
 #!/bin/bash
-# Supervised `codex exec`: output growth drives retry and tree reaping.
-# State, signals, and events are here; shared libraries own the primitives.
+# Supervised `codex exec`: output growth drives retry/reaping; libs own primitives.
 # Exit: codex status, 1 give-up, 2 setup/journal, or 128+signal.
+# GUARANTEES & RESIDUAL WINDOWS (the reviewed contract): guaranteed — group TERM/KILL of
+# the spawned session; identity-checked (lstart-stamped, reuse-safe) sweep of every recorded
+# PID; bounded final verification; honest journaling (reap_incomplete over survivors,
+# reap_unverifiable when nothing was ever recorded, observation_gap on failed samples).
+# RESIDUAL (unclosable via userspace polling): setsid-detach + exit between 1s samples escapes
+# undetected. Mitigations: briefs forbid daemonizing; Rust kqueue supervisor (W4/E1,
+# docs/OPTIMIZATIONS.md) replaces this INTERIM tooling. Reviewed against THIS contract.
 set -u
 usage() {
     echo "Usage: codex-supervised.sh <brief-file> <output-file> [--max-stall-secs N] [--max-retries M]" >&2
@@ -79,22 +85,8 @@ done
 [ -r "$BRIEF_FILE" ] || die "brief file is not readable: $BRIEF_FILE"
 mkdir -p "$JOURNAL_DIR" || die "cannot create journal directory: $JOURNAL_DIR"
 [ -d "$JOURNAL_DIR" ] || die "journal path is not a directory: $JOURNAL_DIR"
-# Also protect the predictable per-run destination itself.
-for destination in "$BRIEF_FILE" "$OUTPUT_FILE" "$STDERR_FILE"; do
-    paths_alias "$destination" "$JOURNAL_FILE"
-    alias_status=$?
-    [ "$alias_status" -ne 2 ] || die "cannot resolve destination or journal file path"
-    [ "$alias_status" -ne 0 ] || die "destination and journal file paths alias each other"
-done
-# No-clobber creation: an existing path (stale run, clock/PID collision, or a
-# pre-planted symlink) must never be truncated — retry with a randomized id.
-if ! (set -o noclobber; : > "$JOURNAL_FILE") 2>/dev/null; then
-    RUN_ID="${RUN_ID}-$RANDOM"
-    JOURNAL_FILE="$JOURNAL_DIR/run-$RUN_ID.jsonl"
-    (set -o noclobber; : > "$JOURNAL_FILE") 2>/dev/null ||
-        die "cannot create unique journal file: $JOURNAL_FILE"
-    echo "journal: $JOURNAL_FILE" >&2
-fi
+# Lib-owned: alias-validates + no-clobber-creates (randomizing on collision).
+create_run_journal || die "cannot create run journal"
 PROMPT=$(cat "$BRIEF_FILE") || die "cannot read brief file: $BRIEF_FILE"
 : > "$OUTPUT_FILE" || die "cannot write output file: $OUTPUT_FILE"
 : > "$STDERR_FILE" || die "cannot write stderr file: $STDERR_FILE"
@@ -214,7 +206,8 @@ ${PROMPT}"
     STALLED=0; TREE_REAP_FAILED=0
     QUICK_SAMPLES=2; FIRST_SNAPSHOT_PENDING=1
     while :; do
-        collect_process_tree "$ACTIVE_PID" "$TREE_FILE" "$PS_FILE" || true
+        collect_process_tree "$ACTIVE_PID" "$TREE_FILE" "$PS_FILE" ||
+            record_event "observation_gap" ',"reason":"process_sample_failed"'
         NOW=$(date +%s)
         CURRENT_OUTPUT_BYTES=$(file_bytes "$OUTPUT_FILE")
         CURRENT_STDERR_BYTES=$(file_bytes "$STDERR_FILE")

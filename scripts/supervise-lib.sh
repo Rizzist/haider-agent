@@ -157,3 +157,27 @@ SUPERVISE_LIB_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd) ||
 # shellcheck source=scripts/supervise-process-lib.sh
 . "$SUPERVISE_LIB_DIR/supervise-process-lib.sh" || return 1
 unset SUPERVISE_LIB_DIR
+
+# create_run_journal: alias-validate and no-clobber-create $JOURNAL_FILE.
+# Uses wrapper globals (BRIEF_FILE/OUTPUT_FILE/STDERR_FILE/JOURNAL_DIR/RUN_ID/
+# JOURNAL_FILE) and may randomize RUN_ID on collision. Dies via wrapper's die.
+check_journal_aliases() {
+    for _dest in "$BRIEF_FILE" "$OUTPUT_FILE" "$STDERR_FILE"; do
+        paths_alias "$_dest" "$1"
+        case $? in
+            2) die "cannot resolve destination or journal file path" ;;
+            0) die "destination and journal file paths alias each other" ;;
+        esac
+    done
+}
+create_run_journal() {
+    check_journal_aliases "$JOURNAL_FILE"
+    if ! (set -o noclobber; : > "$JOURNAL_FILE") 2>/dev/null; then
+        RUN_ID="${RUN_ID}-$RANDOM"
+        JOURNAL_FILE="$JOURNAL_DIR/run-$RUN_ID.jsonl"
+        check_journal_aliases "$JOURNAL_FILE"
+        (set -o noclobber; : > "$JOURNAL_FILE") 2>/dev/null || return 1
+        echo "journal: $JOURNAL_FILE" >&2
+    fi
+    return 0
+}
