@@ -86,7 +86,15 @@ for destination in "$BRIEF_FILE" "$OUTPUT_FILE" "$STDERR_FILE"; do
     [ "$alias_status" -ne 2 ] || die "cannot resolve destination or journal file path"
     [ "$alias_status" -ne 0 ] || die "destination and journal file paths alias each other"
 done
-: > "$JOURNAL_FILE" || die "cannot create journal file: $JOURNAL_FILE"
+# No-clobber creation: an existing path (stale run, clock/PID collision, or a
+# pre-planted symlink) must never be truncated — retry with a randomized id.
+if ! (set -o noclobber; : > "$JOURNAL_FILE") 2>/dev/null; then
+    RUN_ID="${RUN_ID}-$RANDOM"
+    JOURNAL_FILE="$JOURNAL_DIR/run-$RUN_ID.jsonl"
+    (set -o noclobber; : > "$JOURNAL_FILE") 2>/dev/null ||
+        die "cannot create unique journal file: $JOURNAL_FILE"
+    echo "journal: $JOURNAL_FILE" >&2
+fi
 PROMPT=$(cat "$BRIEF_FILE") || die "cannot read brief file: $BRIEF_FILE"
 : > "$OUTPUT_FILE" || die "cannot write output file: $OUTPUT_FILE"
 : > "$STDERR_FILE" || die "cannot write stderr file: $STDERR_FILE"

@@ -16,4 +16,4 @@ fi
 
 set -- "$JOURNAL_DIR"/*.jsonl
 [ -e "$1" ] || exit 0
-LC_ALL=C sort -t '"' -k4,4 "$@"
+LC_ALL=C sort -s -t '"' -k4,4 "$@"
