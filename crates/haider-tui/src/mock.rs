@@ -15,12 +15,14 @@ use haider_protocol::menu::{AnswerVia, Menu, MenuAnswer, MenuKind, MenuOption, M
 use haider_protocol::provider::{Usage, UsageSource};
 use haider_protocol::state::{HarnessStatus, ReadinessCheck, RunState};
 
-/// The boot checklist shown by the demo (sim parity lines).
+/// The boot checklist shown by the demo — the sim's texts VERBATIM
+/// (tui.js:3165-3170): `--demo` IS the sim script, so it plays the sim's
+/// story (owner ruling, TUI3a item 5).
 pub const DEMO_CHECKS: [&str; 4] = [
     "store open · journal replayed",
-    "provider handshake — fake ✓",
-    "hooks loaded — 0 trusted · 0 pending",
-    "worker warm · profile locked",
+    "provider handshake — anthropic ✓",
+    "hooks loaded — 1 trusted · 0 pending",
+    "worker warm · mesh probe done",
 ];
 
 fn check(name: &str, ok: bool) -> ReadinessCheck {

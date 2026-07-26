@@ -255,6 +255,16 @@ pub async fn run_demo(mut model: AppModel) -> std::io::Result<()> {
             _ = frame_tick.tick(), if model.dirty => {
                 hit_map = draw(&mut terminal, &model)?;
                 model.dirty = false;
+                // The hover target may have vanished with the new frame
+                // (screen switch, shed region): drop it WITHOUT dirtying —
+                // the frame just painted reality (TUI3a item 6).
+                if model
+                    .hovered
+                    .as_ref()
+                    .is_some_and(|hovered| !hit_map.iter().any(|(_, hit)| hit == hovered))
+                {
+                    model.hovered = None;
+                }
             }
         }
         // Reducer-requested side effects.
@@ -312,22 +322,34 @@ pub fn dispatch_input(
         }
         Event::Paste(text) => model.handle(AppEvent::Paste(text)),
         Event::Resize(..) => model.handle_resize(),
-        Event::Mouse(mouse) => match mouse.kind {
-            MouseEventKind::Down(MouseButton::Left) => {
-                let hit = hit_map.iter().find(|(rect, _)| {
-                    mouse.column >= rect.x
-                        && mouse.column < rect.x + rect.width
-                        && mouse.row >= rect.y
-                        && mouse.row < rect.y + rect.height
-                });
-                if let Some((_, action)) = hit {
-                    model.handle_hit(action.clone());
+        Event::Mouse(mouse) => {
+            let hit_at = |column: u16, row: u16| {
+                hit_map
+                    .iter()
+                    .find(|(rect, _)| {
+                        column >= rect.x
+                            && column < rect.x + rect.width
+                            && row >= rect.y
+                            && row < rect.y + rect.height
+                    })
+                    .map(|(_, action)| action.clone())
+            };
+            match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if let Some(action) = hit_at(mouse.column, mouse.row) {
+                        model.handle_hit(action);
+                    }
                 }
+                // Hover (owner ask, TUI3a item 6): motion events flood —
+                // handle_hover only dirties when the target CHANGES.
+                MouseEventKind::Moved => {
+                    model.handle_hover(hit_at(mouse.column, mouse.row));
+                }
+                MouseEventKind::ScrollUp => model.handle_wheel(true),
+                MouseEventKind::ScrollDown => model.handle_wheel(false),
+                _ => {}
             }
-            MouseEventKind::ScrollUp => model.handle_wheel(true),
-            MouseEventKind::ScrollDown => model.handle_wheel(false),
-            _ => {}
-        },
+        }
         _ => {}
     }
 }

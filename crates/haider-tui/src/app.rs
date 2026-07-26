@@ -195,6 +195,12 @@ pub struct AppModel {
     /// next REAL wheel event (sim jumpToSticky, tui.js:2637-2657: the bar
     /// must never cover the row it just revealed).
     pub sticky_suppressed: bool,
+    /// The hit region under the mouse cursor (owner ask, TUI3a item 6).
+    /// Value-carrying like clicks: a stale hover can never light up a
+    /// different row than the one it was measured on. Render consults it
+    /// for hover chrome; palette/menu hover moves the SELECTION instead
+    /// (sim onMouseEnter, tui.js:2992/3073).
+    pub hovered: Option<Hit>,
     /// A freshly auto-titled session owes the transcript its
     /// `· session titled` note once the first user message lands.
     pub title_note_pending: bool,
@@ -228,6 +234,7 @@ impl Default for AppModel {
             scroll_back: std::cell::Cell::new(0),
             scroll_max: std::cell::Cell::new(0),
             sticky_suppressed: false,
+            hovered: None,
             title_note_pending: false,
             should_quit: false,
             dirty: true,
@@ -907,6 +914,40 @@ impl AppModel {
     /// is the single scroll authority, so no resize-ordering bug exists).
     pub fn handle_resize(&mut self) {
         self.dirty = true;
+    }
+
+    /// Mouse motion over the frame (owner ask, TUI3a item 6). Motion
+    /// events FLOOD — the model only dirties when the hovered target
+    /// actually changes. Palette rows and menu options move the SELECTION
+    /// on hover (sim onMouseEnter, tui.js:2992/3073); everything else is
+    /// hover chrome the renderer paints from [`Self::hovered`].
+    pub fn handle_hover(&mut self, hit: Option<Hit>) {
+        if self.hovered == hit {
+            return;
+        }
+        self.hovered = hit;
+        self.dirty = true;
+        match self.hovered.clone() {
+            Some(Hit::PaletteRow(item)) => {
+                if self.palette_open()
+                    && let Some(position) = self.palette_items().iter().position(|i| *i == item)
+                {
+                    self.palette_selection = position;
+                    let count = self.palette_items().len();
+                    self.scroll_palette_into_view(count);
+                }
+            }
+            Some(Hit::MenuOption { menu, index }) => {
+                let valid = self
+                    .projection
+                    .open_menu()
+                    .is_some_and(|m| m.id == menu && index < m.options.len());
+                if valid {
+                    self.menu_selection = index;
+                }
+            }
+            _ => {}
+        }
     }
 
     fn cycle_theme(&mut self) {

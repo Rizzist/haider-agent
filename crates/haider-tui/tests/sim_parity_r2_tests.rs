@@ -505,7 +505,9 @@ fn badge_renders_idle_dim_and_permission_warn_outline() {
     let badge_x = col_of(&rows[status_y as usize], "? PERMISSION_REQUIRED");
     let cell = &terminal.backend().buffer()[(badge_x, status_y)];
     assert_eq!(cell.fg, Color::from(theme.warn), "warn OUTLINE ink");
-    assert_eq!(cell.bg, Color::from(theme.bar_bg), "no warn fill");
+    // The status bar ground is TRANSPARENT (sim StatusBar, TUI3a item 1 —
+    // the old bar_bg tint was the owner's "tan band").
+    assert_eq!(cell.bg, Color::from(theme.bg), "no warn fill, no bar tint");
 }
 
 // ---- G42: boot alignment ----

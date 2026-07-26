@@ -113,14 +113,30 @@ fn ellipsize(text: &str, budget: usize) -> String {
     }
 }
 
-/// An outlined chip: `[ label ]` in the given style (the sim's bordered
-/// pills, one-row terminal form).
-fn chip<'a>(label: String, style: ratatui::style::Style) -> Vec<Span<'a>> {
+/// A chip whose CHROME (the `[ ]` border stand-in) and label carry
+/// different inks — the sim's frame-bordered pills with colored text
+/// (`.mic`, `.backbtn`, `.voice`: border frame, label gold/dim).
+fn chip_two_tone<'a>(
+    label: String,
+    chrome: ratatui::style::Style,
+    label_style: ratatui::style::Style,
+) -> Vec<Span<'a>> {
     vec![
-        Span::styled("[ ", style),
-        Span::styled(label, style),
-        Span::styled(" ]", style),
+        Span::styled("[ ", chrome),
+        Span::styled(label, label_style),
+        Span::styled(" ]", chrome),
     ]
+}
+
+/// Pad a span row to a fixed display width — the launcher's `.recent`
+/// column trick: uniform-width lines center to one shared left edge, and
+/// hover bands span the whole column.
+fn pad_spans_to<'s>(mut spans: Vec<Span<'s>>, width: usize) -> Vec<Span<'s>> {
+    let pad = width.saturating_sub(Line::from(spans.clone()).width());
+    if pad > 0 {
+        spans.push(Span::raw(" ".repeat(pad)));
+    }
+    spans
 }
 
 /// Center a block of lines; when the block is taller than the area, keep the
@@ -160,11 +176,15 @@ fn spaced_wordmark() -> String {
 
 fn render_boot(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rect) {
     let sanctum = SanctumLine::new(model.sanctum_tier);
+    // The mark gets breathing room per sim proportions (52px line-height;
+    // a terminal cell cannot scale the glyph — noted divergence).
     let mut lines = vec![
+        Line::default(),
         Line::styled(
             sanctum.mark(),
             theme.maroon_style().add_modifier(Modifier::BOLD),
         ),
+        Line::default(),
         Line::styled(spaced_wordmark(), theme.bright_style()),
         // Sim `.sub` on the boot screen is GOLD (tui.js:5102-5107).
         Line::styled(boot_subline(VERSION), theme.gold_style()),
@@ -245,9 +265,12 @@ fn render_launcher(
 
     let sanctum = SanctumLine::new(model.sanctum_tier);
     let identity = &model.identity;
-    // Sim typography: big maroon mark · gold shahada · gold rule ·
-    // letter-spaced wordmark · dim version line.
+    // Sim typography (.center, tui.js:4243-4308): big maroon mark with
+    // breathing room above and below · gold (NOT bold) shahada · the gold
+    // half-strength rule · bright letter-spaced wordmark · dim version
+    // line · info lines with DIM labels and BRIGHT values.
     let mut lines = vec![
+        Line::default(),
         Line::styled(
             sanctum.mark(),
             theme
@@ -261,35 +284,41 @@ fn render_launcher(
         lines.push(Line::styled(text, theme.gold_style()));
         lines.push(Line::default());
     }
-    lines.push(Line::styled("────────────────", theme.gold_style()));
+    lines.push(Line::styled("────────────────", theme.rule_style()));
     lines.push(Line::default());
     lines.push(Line::styled(spaced_wordmark(), theme.bright_style()));
     lines.push(Line::styled(launcher_subline(VERSION), theme.dim_style()));
     lines.push(Line::default());
     lines.push(Line::from(vec![
-        Span::styled("provider ", theme.faint_style()),
-        Span::styled(identity.provider.clone(), theme.dim_style()),
-        Span::styled(" · model ", theme.faint_style()),
-        Span::styled(identity.model_short.clone(), theme.dim_style()),
-        Span::styled(" · account ", theme.faint_style()),
-        Span::styled(identity.account.clone(), theme.dim_style()),
-        Span::styled(" · device ", theme.faint_style()),
-        Span::styled(identity.device.clone(), theme.dim_style()),
+        Span::styled("provider ", theme.dim_style()),
+        Span::styled(identity.provider.clone(), theme.bright_style()),
+        Span::styled(" · model ", theme.dim_style()),
+        Span::styled(identity.model_short.clone(), theme.bright_style()),
+        Span::styled(" · account ", theme.dim_style()),
+        Span::styled(identity.account.clone(), theme.bright_style()),
+        Span::styled(" · device ", theme.dim_style()),
+        Span::styled(identity.device.clone(), theme.bright_style()),
     ]));
     // Sim `.dirline`: dir {dir} · mesh off.
     lines.push(Line::from(vec![
-        Span::styled("dir ", theme.faint_style()),
-        Span::styled(identity.dir.clone(), theme.dim_style()),
-        Span::styled(" · mesh ", theme.faint_style()),
-        Span::styled("off", theme.dim_style()),
+        Span::styled("dir ", theme.dim_style()),
+        Span::styled(identity.dir.clone(), theme.bright_style()),
+        Span::styled(" · mesh ", theme.dim_style()),
+        Span::styled("off", theme.bright_style()),
     ]));
     lines.push(Line::default());
 
-    // Recent sessions — sim seed rows (`.rhead` + rows, tui.js:3239),
-    // with the gold `· N running` live count (`.livehd`).
+    // ---- The `.recent` COLUMN (tui.js:4331-4334): a fixed-width block,
+    // centered as a whole, text-align LEFT inside — every session row and
+    // Aura/Accounts/Peers row starts at the SAME left column. The column
+    // is the widest row's content, capped by the frame (sim
+    // min(560px, 92%)); every line pads to it so per-line centering yields
+    // one shared left edge and hover bands span the full column.
+    let area_cap = (area.width as usize).saturating_sub(4).max(10);
+    // Sim `.rhead` verbatim + gold `· N running` (`.livehd`).
     let running = model.samples.iter().filter(|s| s.running).count();
     let mut rhead = vec![Span::styled(
-        "recent sessions — click or 1-3 attach · /sessions for all",
+        "recent sessions — click to attach · /sessions for all",
         theme.dim_style(),
     )];
     if running > 0 {
@@ -298,21 +327,25 @@ fn render_launcher(
             theme.gold_style(),
         ));
     }
-    lines.push(Line::from(rhead));
-    let mut sample_rows: Vec<(usize, usize)> = Vec::new();
-    let mut extra_rows: Vec<usize> = Vec::new();
+    // Pass 1: build every row's spans, metas ellipsized to the frame cap.
+    let mut recent: Vec<(Vec<Span<'_>>, Option<Hit>)> = vec![(rhead, None)];
     for (index, sample) in model.samples.iter().enumerate() {
-        // Sim `.dotc`: ok-green idle dot, gold pulsing when running.
+        // Sim row anatomy (tui.js:3252-3277): dot (ok; gold running) ·
+        // name BRIGHT bold · `▸ head hon` DIM (.hd) · meta DIM ellipsized.
+        // No digit prefix (the 1-3 keys stay as silent bindings).
         let (dot, dot_style) = if sample.running {
             ("◉", theme.gold_style())
         } else {
             ("●", theme.ok_style())
         };
         let mut spans = vec![
-            Span::styled(format!("{} ", index + 1), theme.faint_style()),
             Span::styled(format!("{dot} "), dot_style),
-            Span::styled(sample.name, theme.bright_style()),
-            // Sim `.hd`: the head callsign + honorific, dim.
+            Span::styled(
+                sample.name,
+                theme
+                    .bright_style()
+                    .add_modifier(ratatui::style::Modifier::BOLD),
+            ),
             Span::styled(
                 format!(" ▸ {} {}", sample.head, sample.honorific),
                 theme.dim_style(),
@@ -336,17 +369,15 @@ fn render_launcher(
             sample.device,
             sample.ago
         );
-        // Sim `.meta`: ellipsized into the remaining width, never clipped
-        // mid-frame by the centered layout.
-        let meta_budget = (area.width as usize).saturating_sub(Line::from(spans.clone()).width());
+        // Sim `.meta`: ellipsized into the column, never clipped.
+        let meta_budget = area_cap.saturating_sub(Line::from(spans.clone()).width());
         spans.push(Span::styled(
             ellipsize(&meta, meta_budget),
             theme.dim_style(),
         ));
-        sample_rows.push((lines.len(), index));
-        lines.push(Line::from(spans));
+        recent.push((spans, Some(Hit::AttachSample(index))));
     }
-    for (glyph, name, blurb) in [
+    for (order, (glyph, name, blurb)) in [
         (
             "◉",
             "Aura",
@@ -362,14 +393,50 @@ fn render_launcher(
             "Peers",
             "reachability ladder — peers · sponsored nodes · shells",
         ),
-    ] {
-        extra_rows.push(lines.len());
-        // Sim `.aurarow`: gold glyph + gold name, dim meta.
-        lines.push(Line::from(vec![
-            Span::styled(format!("  {glyph} "), theme.gold_style()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        // Sim `.aurarow` (tui.js:4403-4413): gold glyph, gold name, dim
+        // meta — its frame border-top rule is inserted in pass 2.
+        let spans = vec![
+            Span::styled(format!("{glyph} "), theme.gold_style()),
             Span::styled(name, theme.gold_style()),
-            Span::styled(format!("  {blurb}"), theme.dim_style()),
-        ]));
+            Span::styled(
+                ellipsize(
+                    &format!("  {blurb}"),
+                    area_cap.saturating_sub(name.chars().count() + 2),
+                ),
+                theme.dim_style(),
+            ),
+        ];
+        recent.push((spans, Some(Hit::ExtraRow(u8::try_from(order).unwrap_or(2)))));
+    }
+    // Pass 2: one shared column = widest row, capped by the frame.
+    let column = recent
+        .iter()
+        .map(|(spans, _)| Line::from(spans.clone()).width())
+        .max()
+        .unwrap_or(10)
+        .clamp(10, area_cap);
+    let mut sample_rows: Vec<(usize, usize)> = Vec::new();
+    let mut extra_rows: Vec<usize> = Vec::new();
+    for (spans, hit) in recent {
+        if matches!(hit, Some(Hit::ExtraRow(_))) {
+            // The `.aurarow` frame border-top, spanning the column.
+            lines.push(Line::styled("─".repeat(column), theme.frame_style()));
+        }
+        let mut line = Line::from(pad_spans_to(spans, column));
+        // Hover band (sim `.recent button:hover`: selBg across the row).
+        if hit.is_some() && model.hovered == hit {
+            line = line.style(theme.hover_style());
+        }
+        match hit {
+            Some(Hit::AttachSample(index)) => sample_rows.push((lines.len(), index)),
+            Some(Hit::ExtraRow(_)) => extra_rows.push(lines.len()),
+            _ => {}
+        }
+        lines.push(line);
     }
     let (middle, dropped) = centered(frame, content_area, lines);
     let visible = |row: usize| row.checked_sub(dropped);
@@ -537,7 +604,14 @@ fn render_session(
     let identity = &model.identity;
     let title = model.session_title.as_deref().unwrap_or("session");
     let (head, honorific) = model.session_head;
-    let mut header_top = chip("← main".to_owned(), theme.dim_style());
+    // Sim `.backbtn` (tui.js:5190-5205): FRAME border, dim label; hover
+    // turns text and border gold.
+    let back_hovered = model.hovered == Some(Hit::BackChip);
+    let mut header_top = if back_hovered {
+        chip_two_tone("← main".to_owned(), theme.gold_style(), theme.gold_style())
+    } else {
+        chip_two_tone("← main".to_owned(), theme.frame_style(), theme.dim_style())
+    };
     header_top.push(Span::styled(
         format!("  {}  ", sanctum.mark()),
         theme
@@ -970,7 +1044,14 @@ fn composer_lines<'a>(
             .gold_style()
             .add_modifier(ratatui::style::Modifier::BOLD),
     );
-    let chip_spans = chip("◉ talk".to_owned(), theme.gold_style());
+    // Sim `.mic` (tui.js:5467-5489): FRAME chrome, gold label; hover
+    // turns the border gold.
+    let talk_chrome = if model.hovered == Some(Hit::TalkChip) {
+        theme.gold_style()
+    } else {
+        theme.frame_style()
+    };
+    let chip_spans = chip_two_tone("◉ talk".to_owned(), talk_chrome, theme.gold_style());
     let chip_width = Line::from(chip_spans.clone()).width();
     // Right-aligned talk chip when the row leaves room (2-col right pad).
     let chip_fit = |spans: &mut Vec<Span<'a>>| -> Option<(u16, u16)> {
@@ -1170,10 +1251,16 @@ fn render_status_bar(
     );
 
     let mut left = vec![Span::styled(" ", theme.text_style())];
-    left.extend(chip(
-        badge,
-        theme.badge_style(model.projection.badge_tone()),
-    ));
+    // Sim Badge (tui.js:5541-5547): IDLE wears a FRAME border with dim
+    // ink; other outlined states border in their own tone; fills carry the
+    // fill on chrome and label alike.
+    let tone = model.projection.badge_tone();
+    let badge_chrome = if matches!(tone, crate::projection::BadgeTone::Idle) {
+        theme.frame_style()
+    } else {
+        theme.badge_style(tone)
+    };
+    left.extend(chip_two_tone(badge, badge_chrome, theme.badge_style(tone)));
     // Sim `.mid`: model · provider, plus the branch name inside a session.
     let branch = if model.screen == Screen::Session {
         " · main"
@@ -1185,8 +1272,10 @@ fn render_status_bar(
         theme.text_style(),
     ));
     left.push(Span::styled(format!("  {meter}  "), theme.dim_style()));
-    left.extend(chip(
+    // Sim `.voice` (tui.js:5511-5520): FRAME border, gold label.
+    left.extend(chip_two_tone(
         format!("◉ voice · {}", identity.voice),
+        theme.frame_style(),
         theme.gold_style(),
     ));
 
@@ -1204,17 +1293,19 @@ fn render_status_bar(
     let right_width = u16::try_from(right.chars().count()).unwrap_or(0);
     let [left_area, right_area] =
         Layout::horizontal([Constraint::Min(1), Constraint::Length(right_width)]).areas(area);
-    // The sim separates the bar with a frame border-top; a terminal row is
-    // too dear for a rule here, so the bar_bg tint carries the separation.
+    // Sim StatusBar (tui.js:5492-5499): TRANSPARENT ground (its frame
+    // border-top has no row budget here; the dim ink carries the bar) —
+    // the owner's "tan band" was our former bar_bg tint. No tinted rows
+    // may bracket the composer.
     frame.render_widget(
-        Paragraph::new(Line::from(left)).style(theme.text_style().bg(theme.bar_bg.into())),
+        Paragraph::new(Line::from(left)).style(theme.text_style()),
         left_area,
     );
     if right_width > 0 {
         frame.render_widget(
             Paragraph::new(Line::styled(right, theme.dim_style()))
                 .alignment(Alignment::Right)
-                .style(theme.text_style().bg(theme.bar_bg.into())),
+                .style(theme.text_style()),
             right_area,
         );
         if hint_shown {

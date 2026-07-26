@@ -103,6 +103,20 @@ impl Theme {
         Style::default().fg(self.gold_soft.into())
     }
 
+    /// The launcher's dignity rule — gold at half strength (sim `.rule`
+    /// opacity 0.5, tui.js:4280-4286).
+    #[must_use]
+    pub fn rule_style(&self) -> Style {
+        Style::default().fg(self.gold_half.into())
+    }
+
+    /// Hover band: the selection ground alone, span inks untouched (sim
+    /// `:hover { background: selBg }`).
+    #[must_use]
+    pub fn hover_style(&self) -> Style {
+        Style::default().bg(self.sel_bg.into())
+    }
+
     /// The selected row/option.
     #[must_use]
     pub fn selection_style(&self) -> Style {
