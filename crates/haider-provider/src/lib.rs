@@ -1,7 +1,422 @@
-//! haider-provider — part of the Haider Code harness.
+//! Provider boundary and deterministic fake provider for the Haider runtime.
 //!
-//! Scaffold crate (v0.0.1). Contracts land in W0/A2; implementation follows the
-//! build guide waves. Tests live in `tests/` — never inline (workspace rule).
+//! Owned invariants:
+//! - A [`Provider::stream_turn`] stream terminates with a `Finish` event, a
+//!   typed [`ProviderError`], or silence-until-drop (`Hang`); nothing follows
+//!   an error or a `Finish`.
+//! - Text deltas are always complete UTF-8: the fake's [`Utf8Assembler`]
+//!   buffers partial scalars, so an invalid partial string never crosses the
+//!   trait even when a fixture splits a character across frames.
+//! - [`FakeProvider`] is fixture-driven and deterministic — the same script
+//!   yields the same event sequence (`Delay` only adds wall time).
+
+use async_trait::async_trait;
+use haider_protocol::provider::{
+    Block, CapabilityDoc, FeatureResolve, FinishReason, StreamEvent, Usage,
+};
+use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc;
+use tokio::time::{Duration, sleep};
 
 /// Crate marker used by the workspace self-test.
 pub const CRATE_NAME: &str = "haider-provider";
+
+/// One provider-facing conversation message.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Message {
+    pub role: MessageRole,
+    pub blocks: Vec<Block>,
+}
+
+impl Message {
+    pub fn user_text(text: impl Into<String>) -> Self {
+        Self {
+            role: MessageRole::User,
+            blocks: vec![Block::Text { text: text.into() }],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageRole {
+    User,
+    Assistant,
+    Tool,
+}
+
+/// Minimal normalized request accepted by every provider adapter.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TurnRequest {
+    pub messages: Vec<Message>,
+    pub model: String,
+    pub max_tokens: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderErrorKind {
+    MalformedFrame,
+    InvalidUtf8,
+    Internal,
+}
+
+/// Typed failure yielded by a provider stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderError {
+    pub kind: ProviderErrorKind,
+    pub message: String,
+}
+
+impl ProviderError {
+    pub fn new(kind: ProviderErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for ProviderError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{:?}: {}", self.kind, self.message)
+    }
+}
+
+impl std::error::Error for ProviderError {}
+
+pub type ProviderStreamItem = Result<StreamEvent, ProviderError>;
+pub type ProviderStream = mpsc::Receiver<ProviderStreamItem>;
+
+/// Asynchronous provider adapter contract.
+#[async_trait]
+pub trait Provider: Send + Sync {
+    async fn capabilities(&self) -> CapabilityDoc;
+    async fn stream_turn(&self, request: TurnRequest) -> Result<ProviderStream, ProviderError>;
+}
+
+/// One deterministic operation in a [`FakeProvider`] fixture.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "step", rename_all = "snake_case")]
+pub enum FakeStep {
+    EmitText {
+        text: String,
+    },
+    EmitToolCall {
+        call_id: String,
+        name: String,
+        args: serde_json::Value,
+    },
+    /// Opens a tool call without ending it, for terminal-path fixtures.
+    EmitToolCallStart {
+        call_id: String,
+        name: String,
+    },
+    /// Streams a partial argument fragment for an open call (no end), for
+    /// cancel/error-with-partial-args fixtures.
+    EmitToolArgsDelta {
+        call_id: String,
+        fragment: String,
+    },
+    /// Splits the first multibyte scalar after its first byte, then incrementally
+    /// decodes both raw chunks. Invalid partial strings never cross the trait.
+    SplitUtf8 {
+        text: String,
+    },
+    /// Injects a fixed invalid UTF-8 provider frame.
+    MalformedFrame,
+    Delay {
+        ms: u64,
+    },
+    EmitUsage {
+        usage: Usage,
+    },
+    Finish {
+        reason: FinishReason,
+    },
+    /// Produces no more data until the consumer drops the stream.
+    Hang,
+}
+
+/// Fixture-driven provider used by runtime and CLI tests.
+#[derive(Debug, Clone)]
+pub struct FakeProvider {
+    script: Arc<Vec<FakeStep>>,
+    requests: Arc<Mutex<Vec<TurnRequest>>>,
+}
+
+impl FakeProvider {
+    pub fn new(script: Vec<FakeStep>) -> Self {
+        Self {
+            script: Arc::new(script),
+            requests: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(json).map(Self::new)
+    }
+
+    /// Requests observed so far, in call order. Poison-tolerant so a panicked
+    /// test thread cannot hide the requests it already recorded.
+    pub fn requests(&self) -> Vec<TurnRequest> {
+        match self.requests.lock() {
+            Ok(requests) => requests.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    fn record_request(&self, request: TurnRequest) {
+        match self.requests.lock() {
+            Ok(mut requests) => requests.push(request),
+            Err(poisoned) => poisoned.into_inner().push(request),
+        }
+    }
+}
+
+#[async_trait]
+impl Provider for FakeProvider {
+    async fn capabilities(&self) -> CapabilityDoc {
+        CapabilityDoc {
+            provider: "fake".into(),
+            parallel_tools: FeatureResolve::Native,
+            streaming_tool_args: FeatureResolve::Native,
+            vision: FeatureResolve::Unsupported,
+            thinking_visible: FeatureResolve::Native,
+            context_limit: 1_000_000,
+        }
+    }
+
+    async fn stream_turn(&self, request: TurnRequest) -> Result<ProviderStream, ProviderError> {
+        self.record_request(request);
+        let (sender, receiver) = mpsc::channel(32);
+        tokio::spawn(play_script(Arc::clone(&self.script), sender));
+        Ok(receiver)
+    }
+}
+
+/// Plays one fixture script into `sender`. Stops early once the consumer
+/// drops the stream; otherwise ends with `Finish`, a typed error, or (for a
+/// script that ends mid-scalar) a trailing invalid-UTF-8 error.
+async fn play_script(script: Arc<Vec<FakeStep>>, sender: mpsc::Sender<ProviderStreamItem>) {
+    let mut utf8 = Utf8Assembler::default();
+    for step in script.iter().cloned() {
+        match step {
+            FakeStep::EmitText { text } => {
+                if !emit_bytes(&sender, &mut utf8, text.as_bytes()).await {
+                    return;
+                }
+            }
+            FakeStep::EmitToolCall {
+                call_id,
+                name,
+                args,
+            } => {
+                if !emit_tool_call(&sender, call_id, name, args).await {
+                    return;
+                }
+            }
+            FakeStep::EmitToolCallStart { call_id, name } => {
+                if !send_event(&sender, StreamEvent::ToolCallStart { call_id, name }).await {
+                    return;
+                }
+            }
+            FakeStep::EmitToolArgsDelta { call_id, fragment } => {
+                if !send_event(
+                    &sender,
+                    StreamEvent::ToolCallArgsDelta {
+                        call_id,
+                        args_fragment: fragment,
+                    },
+                )
+                .await
+                {
+                    return;
+                }
+            }
+            FakeStep::SplitUtf8 { text } => {
+                let Some(split) = split_inside_multibyte(&text) else {
+                    let _ = sender
+                        .send(Err(ProviderError::new(
+                            ProviderErrorKind::InvalidUtf8,
+                            "split_utf8 requires at least one multibyte character",
+                        )))
+                        .await;
+                    return;
+                };
+                let bytes = text.as_bytes();
+                if !emit_bytes(&sender, &mut utf8, &bytes[..split]).await
+                    || !emit_bytes(&sender, &mut utf8, &bytes[split..]).await
+                {
+                    return;
+                }
+            }
+            FakeStep::MalformedFrame => {
+                // The fixed bytes are invalid UTF-8, so the assembler always
+                // turns this into a typed MalformedFrame stream error.
+                let _ = emit_bytes(&sender, &mut utf8, &[0xf0, 0x28, 0x8c, 0x28]).await;
+                return;
+            }
+            FakeStep::Delay { ms } => sleep(Duration::from_millis(ms)).await,
+            FakeStep::EmitUsage { usage } => {
+                if !send_event(&sender, StreamEvent::UsageUpdate(usage)).await {
+                    return;
+                }
+            }
+            FakeStep::Finish { reason } => {
+                let _ = send_event(&sender, StreamEvent::Finish { reason }).await;
+                return;
+            }
+            FakeStep::Hang => {
+                sender.closed().await;
+                return;
+            }
+        }
+    }
+
+    if utf8.has_pending() {
+        let _ = sender
+            .send(Err(ProviderError::new(
+                ProviderErrorKind::InvalidUtf8,
+                "provider stream ended inside a UTF-8 scalar",
+            )))
+            .await;
+    }
+}
+
+/// Emits start → full-args delta → end for one scripted tool call.
+/// Returns false once the stream should stop (consumer gone or error sent).
+async fn emit_tool_call(
+    sender: &mpsc::Sender<ProviderStreamItem>,
+    call_id: String,
+    name: String,
+    args: serde_json::Value,
+) -> bool {
+    if !send_event(
+        sender,
+        StreamEvent::ToolCallStart {
+            call_id: call_id.clone(),
+            name,
+        },
+    )
+    .await
+    {
+        return false;
+    }
+    let args_fragment = match serde_json::to_string(&args) {
+        Ok(fragment) => fragment,
+        Err(error) => {
+            let _ = sender
+                .send(Err(ProviderError::new(
+                    ProviderErrorKind::Internal,
+                    format!("fake tool arguments could not serialize: {error}"),
+                )))
+                .await;
+            return false;
+        }
+    };
+    send_event(
+        sender,
+        StreamEvent::ToolCallArgsDelta {
+            call_id: call_id.clone(),
+            args_fragment,
+        },
+    )
+    .await
+        && send_event(sender, StreamEvent::ToolCallEnd { call_id }).await
+}
+
+/// Returns false when the consumer has dropped the stream.
+async fn send_event(sender: &mpsc::Sender<ProviderStreamItem>, event: StreamEvent) -> bool {
+    sender.send(Ok(event)).await.is_ok()
+}
+
+/// Decodes raw bytes through the assembler and emits every complete scalar
+/// run as a text delta. Returns false once the stream should stop (consumer
+/// gone or decode error already sent).
+async fn emit_bytes(
+    sender: &mpsc::Sender<ProviderStreamItem>,
+    utf8: &mut Utf8Assembler,
+    bytes: &[u8],
+) -> bool {
+    match utf8.push(bytes) {
+        Ok(parts) => {
+            for text in parts {
+                if !send_event(sender, StreamEvent::TextDelta { text }).await {
+                    return false;
+                }
+            }
+            true
+        }
+        Err(error) => {
+            let _ = sender.send(Err(error)).await;
+            false
+        }
+    }
+}
+
+/// Byte index one past the start of the first multibyte character — i.e. a
+/// split point guaranteed to fall inside that character's encoding.
+fn split_inside_multibyte(text: &str) -> Option<usize> {
+    text.char_indices()
+        .find(|(_, character)| character.len_utf8() > 1)
+        .map(|(index, _)| index + 1)
+}
+
+/// Incremental UTF-8 decoder: buffers a trailing partial scalar between
+/// pushes so only complete, valid text ever leaves the fake provider.
+#[derive(Debug, Default)]
+struct Utf8Assembler {
+    pending: Vec<u8>,
+}
+
+impl Utf8Assembler {
+    /// Returns the complete text now decodable, buffering any trailing
+    /// partial scalar; an invalid (not merely incomplete) sequence is an error.
+    fn push(&mut self, bytes: &[u8]) -> Result<Vec<String>, ProviderError> {
+        self.pending.extend_from_slice(bytes);
+        let mut decoded = Vec::new();
+
+        loop {
+            match std::str::from_utf8(&self.pending) {
+                Ok(text) => {
+                    if !text.is_empty() {
+                        decoded.push(text.to_owned());
+                    }
+                    self.pending.clear();
+                    return Ok(decoded);
+                }
+                Err(error) if error.error_len().is_some() => {
+                    self.pending.clear();
+                    return Err(ProviderError::new(
+                        ProviderErrorKind::MalformedFrame,
+                        format!(
+                            "provider frame contains invalid UTF-8 at byte {}",
+                            error.valid_up_to()
+                        ),
+                    ));
+                }
+                Err(error) => {
+                    let valid = error.valid_up_to();
+                    if valid == 0 {
+                        return Ok(decoded);
+                    }
+                    let prefix = String::from_utf8(self.pending.drain(..valid).collect()).map_err(
+                        |conversion| {
+                            ProviderError::new(
+                                ProviderErrorKind::Internal,
+                                format!("validated UTF-8 prefix failed conversion: {conversion}"),
+                            )
+                        },
+                    )?;
+                    decoded.push(prefix);
+                }
+            }
+        }
+    }
+
+    fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+}

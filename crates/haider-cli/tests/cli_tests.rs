@@ -1,7 +1,29 @@
-//! Black-box tests for the `haider` binary surface (v0.0.1 scope).
+//! Black-box tests for the `haider` binary surface.
 #![allow(clippy::expect_used)] // tests may expect; the lint guards src/ only
 
-use std::process::Command;
+use async_trait::async_trait;
+use haider_core::{CommittedRange, HarnessConfig, MemoryStore, StoreHandle};
+use haider_protocol::EventPayload;
+use haider_protocol::envelope::RawEnvelope;
+use haider_protocol::error::{ErrorCode, HaiderError};
+use haider_protocol::ids::{DeviceId, SessionId};
+use haider_protocol::item::{ItemEvent, TurnItem};
+use haider_protocol::provider::FinishReason;
+use haider_protocol::state::RunState;
+use haider_provider::{FakeProvider, FakeStep, Provider};
+use std::io::Read;
+use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
+use tokio::time::timeout;
+
+#[allow(dead_code)]
+#[path = "../src/main.rs"]
+mod cli_main;
+
+use cli_main::{exit_code_for_outcome, stream_jsonl_turn};
 
 fn haider() -> Command {
     Command::new(env!("CARGO_BIN_EXE_haider"))
@@ -24,10 +46,248 @@ fn self_test_reports_ok_json() {
     assert!(text.contains(r#""ok":true"#));
     assert!(text.contains("link:haider-protocol"));
     assert!(text.contains("link:haider-tui"));
+    assert!(text.contains("fake-provider-turn"));
 }
 
 #[test]
 fn unknown_command_exits_2() {
     let out = haider().arg("frobnicate").output().expect("binary runs");
     assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn run_jsonl_is_lf_framed_and_every_line_is_a_raw_envelope() {
+    let out = haider()
+        .args(["run", "--jsonl", "hello"])
+        .output()
+        .expect("binary runs");
+    assert!(out.status.success());
+    assert!(out.stderr.is_empty());
+    assert!(out.stdout.ends_with(b"\n"));
+    assert!(!out.stdout.contains(&b'\r'));
+
+    let text = String::from_utf8(out.stdout).expect("utf8");
+    let envelopes: Vec<RawEnvelope> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("RawEnvelope JSONL line"))
+        .collect();
+    assert!(!envelopes.is_empty());
+    assert!(
+        envelopes
+            .windows(2)
+            .all(|pair| pair[1].seq == pair[0].seq + 1)
+    );
+    assert_eq!(
+        envelopes.last().map(typed),
+        Some(EventPayload::RunState(RunState::Done))
+    );
+    let response = envelopes.iter().find_map(|envelope| match typed(envelope) {
+        EventPayload::Item(ItemEvent::Completed {
+            item: TurnItem::AgentMessage { text },
+            ..
+        }) => Some(text),
+        _ => None,
+    });
+    assert_eq!(response.as_deref(), Some("fake response: hello"));
+}
+
+#[test]
+fn run_jsonl_exits_65_when_fake_provider_errors() {
+    let out = haider()
+        .args(["run", "--jsonl", "hello"])
+        .env("HAIDER_FAKE_SCRIPT_JSON", r#"[{"step":"malformed_frame"}]"#)
+        .output()
+        .expect("binary runs");
+    assert_eq!(out.status.code(), Some(65));
+    let text = String::from_utf8(out.stdout).expect("utf8");
+    let envelopes: Vec<RawEnvelope> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("RawEnvelope JSONL line"))
+        .collect();
+    assert_eq!(
+        envelopes.last().map(typed),
+        Some(EventPayload::RunState(RunState::Errored))
+    );
+}
+
+#[test]
+fn run_jsonl_cancelled_has_130_exit_and_terminal_envelope() {
+    let out = haider()
+        .args(["run", "--jsonl", "hello"])
+        .env(
+            "HAIDER_FAKE_SCRIPT_JSON",
+            r#"[{"step":"finish","reason":"cancelled"}]"#,
+        )
+        .output()
+        .expect("binary runs");
+    assert_eq!(out.status.code(), Some(130));
+    assert!(out.stderr.is_empty());
+    let envelopes = parse_jsonl(&out.stdout);
+    assert_eq!(
+        envelopes.last().map(typed),
+        Some(EventPayload::RunState(RunState::Cancelled))
+    );
+}
+
+#[test]
+fn run_jsonl_replays_every_envelope_to_a_slow_pipe_consumer() {
+    let mut steps: Vec<_> = (0..500)
+        .map(|index| serde_json::json!({"step":"emit_text","text":index.to_string()}))
+        .collect();
+    steps.push(serde_json::json!({"step":"finish","reason":"end_turn"}));
+    let script = serde_json::to_string(&steps).expect("fixture serializes");
+    let mut child = haider()
+        .args(["run", "--jsonl", "backpressure"])
+        .env("HAIDER_FAKE_SCRIPT_JSON", script)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("binary starts");
+    let mut stdout = child.stdout.take().expect("stdout pipe");
+    let mut stderr = child.stderr.take().expect("stderr pipe");
+
+    // Let the OS pipe fill before beginning consumption. This used to make
+    // the bounded broadcast receiver lag and truncate the JSONL stream.
+    thread::sleep(Duration::from_millis(250));
+    let stdout_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).expect("read stdout");
+        bytes
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).expect("read stderr");
+        bytes
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll child") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            child.kill().expect("kill timed-out child");
+            let _ = child.wait();
+            panic!("slow-consumer run did not terminate");
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    let stdout = stdout_reader.join().expect("stdout reader");
+    let stderr = stderr_reader.join().expect("stderr reader");
+
+    assert!(
+        status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert!(stderr.is_empty());
+    let envelopes = parse_jsonl(&stdout);
+    assert!(
+        envelopes
+            .windows(2)
+            .all(|pair| pair[1].seq == pair[0].seq + 1)
+    );
+    let delta_count = envelopes
+        .iter()
+        .filter(|envelope| matches!(typed(envelope), EventPayload::Item(ItemEvent::Delta { .. })))
+        .count();
+    assert_eq!(delta_count, 500);
+    assert_eq!(
+        envelopes.last().map(typed),
+        Some(EventPayload::RunState(RunState::Done))
+    );
+}
+
+#[tokio::test]
+async fn jsonl_store_failure_emits_errored_and_returns_nonzero_without_hanging() {
+    let provider: Arc<dyn Provider> = Arc::new(FakeProvider::new(vec![FakeStep::Finish {
+        reason: FinishReason::EndTurn,
+    }]));
+    // The first four appends reach Streaming. Failing the attempted Done
+    // append reproduces the former wait-forever path; the next append must
+    // commit Errored and the outcome must wake the JSONL runner.
+    let store: Arc<dyn StoreHandle> = Arc::new(FailOnceStore::new(5));
+    let config = HarnessConfig::for_session(
+        SessionId::new("cli-failing-store"),
+        DeviceId::new("cli-device"),
+        1,
+        9,
+    );
+    let mut output = Vec::new();
+
+    let outcome = timeout(
+        Duration::from_secs(1),
+        stream_jsonl_turn("store failure", config, provider, store, &mut output),
+    )
+    .await
+    .expect("JSONL runner must not hang")
+    .expect("runner reports the turn outcome");
+
+    assert_eq!(outcome.state, RunState::Errored);
+    assert_eq!(
+        outcome.error.as_ref().map(|error| error.code),
+        Some(ErrorCode::StoreCorrupt)
+    );
+    assert_eq!(exit_code_for_outcome(&outcome), 70);
+    let envelopes = parse_jsonl(&output);
+    assert_eq!(
+        envelopes.last().map(typed),
+        Some(EventPayload::RunState(RunState::Errored))
+    );
+}
+
+fn parse_jsonl(output: &[u8]) -> Vec<RawEnvelope> {
+    String::from_utf8(output.to_vec())
+        .expect("utf8")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("RawEnvelope JSONL line"))
+        .collect()
+}
+
+fn typed(envelope: &RawEnvelope) -> EventPayload {
+    serde_json::from_value(envelope.payload.clone()).expect("known payload")
+}
+
+struct FailOnceStore {
+    inner: MemoryStore,
+    fail_on_append: usize,
+    append_count: AtomicUsize,
+}
+
+impl FailOnceStore {
+    fn new(fail_on_append: usize) -> Self {
+        Self {
+            inner: MemoryStore::new(),
+            fail_on_append,
+            append_count: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl StoreHandle for FailOnceStore {
+    async fn append(&self, envelopes: &mut [RawEnvelope]) -> Result<CommittedRange, HaiderError> {
+        let append = self.append_count.fetch_add(1, Ordering::SeqCst) + 1;
+        if append == self.fail_on_append {
+            return Err(HaiderError::new(
+                ErrorCode::StoreCorrupt,
+                "injected append failure",
+                false,
+            ));
+        }
+        self.inner.append(envelopes).await
+    }
+
+    async fn read(
+        &self,
+        session_id: &SessionId,
+        since_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<RawEnvelope>, HaiderError> {
+        self.inner.read(session_id, since_seq, limit).await
+    }
+
+    async fn latest_seq(&self, session_id: &SessionId) -> Result<u64, HaiderError> {
+        self.inner.latest_seq(session_id).await
+    }
 }
