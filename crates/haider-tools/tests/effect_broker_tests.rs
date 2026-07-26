@@ -54,12 +54,12 @@ impl haider_tools::CasSink for UnusedCas {
     }
 }
 
-fn broker_at<J>(journal: J, workspace_root: &Path, generation: u64) -> EffectBroker<J>
+fn broker_at<J>(journal: J, workspace_root: &Path, generation: u64) -> EffectBroker
 where
-    J: JournalSink,
+    J: JournalSink + 'static,
 {
     EffectBroker::new_at(
-        journal,
+        Box::new(journal),
         workspace_root,
         SessionId::new("session"),
         generation,
@@ -72,10 +72,7 @@ fn source_root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
 }
 
-fn effect_phases<J>(broker: &EffectBroker<J>) -> Vec<EffectPhase>
-where
-    J: JournalSink,
-{
+fn effect_phases(broker: &EffectBroker) -> Vec<EffectPhase> {
     broker.journal_snapshot()
 }
 

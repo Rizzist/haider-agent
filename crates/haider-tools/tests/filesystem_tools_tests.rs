@@ -27,12 +27,17 @@ impl JournalSink for RecordingJournal {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 struct SharedRecordingJournal {
     payloads: Arc<Mutex<Vec<EventPayload>>>,
 }
 
-impl SharedRecordingJournal {
+#[derive(Debug, Clone)]
+struct JournalObserver {
+    payloads: Arc<Mutex<Vec<EventPayload>>>,
+}
+
+impl JournalObserver {
     fn effect_phases(&self) -> Vec<EffectPhase> {
         self.payloads
             .lock()
@@ -43,6 +48,14 @@ impl SharedRecordingJournal {
                 _ => None,
             })
             .collect()
+    }
+}
+
+impl SharedRecordingJournal {
+    fn observer(&self) -> JournalObserver {
+        JournalObserver {
+            payloads: Arc::clone(&self.payloads),
+        }
     }
 }
 
@@ -57,31 +70,28 @@ impl JournalSink for SharedRecordingJournal {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Default)]
 struct TerminalGateJournal {
     payloads: Arc<Mutex<Vec<EventPayload>>>,
     reached: Arc<tokio::sync::Notify>,
     release: Arc<tokio::sync::Notify>,
+    terminal_attempts: Arc<AtomicUsize>,
+    terminal_completions: Arc<AtomicUsize>,
 }
 
 impl TerminalGateJournal {
-    fn effect_phases(&self) -> Vec<EffectPhase> {
-        self.payloads
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter()
-            .filter_map(|payload| match payload {
-                EventPayload::Effect(phase) => Some(phase.clone()),
-                _ => None,
-            })
-            .collect()
+    fn observer(&self) -> JournalObserver {
+        JournalObserver {
+            payloads: Arc::clone(&self.payloads),
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl JournalSink for TerminalGateJournal {
     async fn append(&mut self, payload: EventPayload) -> ToolResult<()> {
-        if matches!(payload, EventPayload::Effect(EffectPhase::Outcome { .. })) {
+        let is_terminal = matches!(payload, EventPayload::Effect(EffectPhase::Outcome { .. }));
+        if is_terminal && self.terminal_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
             self.reached.notify_one();
             self.release.notified().await;
         }
@@ -89,27 +99,24 @@ impl JournalSink for TerminalGateJournal {
             .lock()
             .map_err(|_| ToolError::journal("terminal gate journal lock is poisoned"))?
             .push(payload);
+        if is_terminal {
+            self.terminal_completions.fetch_add(1, Ordering::SeqCst);
+        }
         Ok(())
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 struct FailFirstTerminalJournal {
     payloads: Arc<Mutex<Vec<EventPayload>>>,
     terminal_attempts: Arc<AtomicUsize>,
 }
 
 impl FailFirstTerminalJournal {
-    fn effect_phases(&self) -> Vec<EffectPhase> {
-        self.payloads
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter()
-            .filter_map(|payload| match payload {
-                EventPayload::Effect(phase) => Some(phase.clone()),
-                _ => None,
-            })
-            .collect()
+    fn observer(&self) -> JournalObserver {
+        JournalObserver {
+            payloads: Arc::clone(&self.payloads),
+        }
     }
 }
 
@@ -119,6 +126,7 @@ impl JournalSink for FailFirstTerminalJournal {
         if matches!(payload, EventPayload::Effect(EffectPhase::Outcome { .. }))
             && self.terminal_attempts.fetch_add(1, Ordering::SeqCst) == 0
         {
+            // Transactional sink law: fail before recording any durable phase.
             return Err(ToolError::journal(
                 "injected first terminal outcome append failure",
             ));
@@ -235,27 +243,6 @@ impl ChangeLedgerSink for GatedRejectLedger {
     }
 }
 
-#[derive(Debug, Clone)]
-struct RacingLedger {
-    inner: ChangeLedger,
-    reached: Arc<tokio::sync::Notify>,
-    race: Arc<Barrier>,
-}
-
-impl ChangeLedgerSink for RacingLedger {
-    fn record_fs_write(
-        &self,
-        session: SessionId,
-        turn: RunId,
-        record: FsWriteRecord,
-    ) -> ToolResult<()> {
-        self.inner.record_fs_write(session, turn, record)?;
-        self.reached.notify_one();
-        self.race.wait();
-        Ok(())
-    }
-}
-
 #[derive(Debug, Default)]
 struct RecordingCas {
     writes: Vec<Vec<u8>>,
@@ -278,19 +265,19 @@ fn allow(class: EffectClass) -> PermissionPolicy {
     policy
 }
 
-fn broker_at<J>(journal: J, workspace_root: &Path) -> EffectBroker<J>
+fn broker_at<J>(journal: J, workspace_root: &Path) -> EffectBroker
 where
-    J: JournalSink,
+    J: JournalSink + 'static,
 {
     broker_generation(journal, workspace_root, 1)
 }
 
-fn broker_generation<J>(journal: J, workspace_root: &Path, generation: u64) -> EffectBroker<J>
+fn broker_generation<J>(journal: J, workspace_root: &Path, generation: u64) -> EffectBroker
 where
-    J: JournalSink,
+    J: JournalSink + 'static,
 {
     EffectBroker::new_at(
-        journal,
+        Box::new(journal),
         workspace_root,
         SessionId::new("session"),
         generation,
@@ -503,7 +490,7 @@ fn cancelling_before_the_blocking_worker_starts_is_clean() {
         occupied_receiver.await.expect("blocking pool is occupied");
 
         let journal = SharedRecordingJournal::default();
-        let observed_journal = journal.clone();
+        let observed_journal = journal.observer();
         let ledger = ChangeLedger::new();
         let observed_ledger = ledger.clone();
         let attribution = TurnAttribution::new(SessionId::new("session"), RunId::new("turn"));
@@ -519,9 +506,13 @@ fn cancelling_before_the_blocking_worker_starts_is_clean() {
             () = tokio::task::yield_now() => {}
         }
         drop(apply);
+        let effect = match broker.journal_snapshot().first() {
+            Some(EffectPhase::Intent(intent)) => intent.effect.clone(),
+            phase => panic!("expected first intent phase, got {phase:?}"),
+        };
         release_sender.send(()).expect("release blocking pool");
         blocking_occupant.await.expect("blocking occupant exits");
-        broker
+        let report = broker
             .close()
             .await
             .expect("cancelled queued worker closes cleanly");
@@ -531,7 +522,17 @@ fn cancelling_before_the_blocking_worker_starts_is_clean() {
             !observed_ledger
                 .has_fs_writes(&observed_attribution.session, &observed_attribution.turn)
         );
-        assert_eq!(terminal_phases(&observed_journal.effect_phases()).len(), 0);
+        assert_eq!(report.reconciled_effects, vec![effect]);
+        let phases = observed_journal.effect_phases();
+        let outcomes = terminal_phases(&phases);
+        assert_eq!(outcomes.len(), 1);
+        assert!(matches!(
+            outcomes.as_slice(),
+            [EffectPhase::Outcome {
+                outcome: EffectOutcome::Unknown,
+                ..
+            }]
+        ));
     });
 }
 
@@ -593,7 +594,7 @@ async fn cancelling_apply_during_ledger_failure_still_journals_failed_outcome() 
     };
     let attribution = TurnAttribution::new(SessionId::new("session"), RunId::new("turn"));
     let journal = SharedRecordingJournal::default();
-    let observed_journal = journal.clone();
+    let observed_journal = journal.observer();
     let mut broker = broker_at(journal, directory.path());
     let policy = allow(EffectClass::FsWrite);
     let patch = FsPatch::new(&path, "before", "after");
@@ -640,34 +641,59 @@ async fn cancelling_apply_during_ledger_failure_still_journals_failed_outcome() 
 }
 
 #[tokio::test]
-async fn cancelling_after_worker_completion_produces_exactly_one_terminal_phase() {
+async fn cancelled_terminal_claim_rearms_for_the_apply_finalizer() {
     let directory = tempfile::tempdir().expect("temporary directory");
-    let path = directory.path().join("cancel-after-worker.txt");
+    let path = directory.path().join("cancel-terminal-claim.txt");
     fs::write(&path, "before").expect("seed file");
-    let reached = Arc::new(tokio::sync::Notify::new());
-    let release = Arc::new(tokio::sync::Notify::new());
-    let journal = TerminalGateJournal {
-        payloads: Arc::new(Mutex::new(Vec::new())),
-        reached: Arc::clone(&reached),
-        release: Arc::clone(&release),
+    let ledger_reached = Arc::new(Barrier::new(2));
+    let ledger_release = Arc::new(Barrier::new(2));
+    let ledger = GatedLedger {
+        inner: ChangeLedger::new(),
+        reached: Arc::clone(&ledger_reached),
+        release: Arc::clone(&ledger_release),
     };
-    let observed_journal = journal.clone();
-    let ledger = ChangeLedger::new();
+    let journal = TerminalGateJournal::default();
+    let observed_journal = journal.observer();
+    let terminal_reached = Arc::clone(&journal.reached);
+    let terminal_attempts = Arc::clone(&journal.terminal_attempts);
+    let terminal_completions = Arc::clone(&journal.terminal_completions);
     let attribution = TurnAttribution::new(SessionId::new("session"), RunId::new("turn"));
     let mut broker = broker_at(journal, directory.path());
     let policy = allow(EffectClass::FsWrite);
     let patch = FsPatch::new(&path, "before", "after");
     let mut apply = Box::pin(broker.fs_patch(&patch, &policy, &attribution, &ledger));
+    let worker_reached = tokio::task::spawn_blocking(move || ledger_reached.wait());
 
     tokio::select! {
-        result = &mut apply => panic!("apply completed before terminal gate: {result:?}"),
-        () = reached.notified() => {}
+        result = &mut apply => panic!("apply completed before ledger gate: {result:?}"),
+        result = worker_reached => {
+            result.expect("wait for post-rename ledger gate");
+        }
     }
     drop(apply);
-    release.notify_one();
-    broker.close().await.expect("finalizer drains cleanly");
+    let intent = match broker.journal_snapshot().first() {
+        Some(EffectPhase::Intent(intent)) => intent.clone(),
+        phase => panic!("expected first intent phase, got {phase:?}"),
+    };
+
+    let mut abandoned = Box::pin(broker.journal_unknown(&intent));
+    tokio::select! {
+        result = &mut abandoned => panic!("terminal claim completed before cancellation: {result:?}"),
+        () = terminal_reached.notified() => {}
+    }
+    assert_eq!(terminal_attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(terminal_completions.load(Ordering::SeqCst), 0);
+    drop(abandoned);
+
+    tokio::task::spawn_blocking(move || ledger_release.wait())
+        .await
+        .expect("release successful ledger append");
+    let report = broker.close().await.expect("finalizer reclaims and drains");
 
     assert_eq!(fs::read_to_string(&path).expect("read file"), "after");
+    assert!(report.reconciled_effects.is_empty());
+    assert_eq!(terminal_attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(terminal_completions.load(Ordering::SeqCst), 1);
     let phases = observed_journal.effect_phases();
     let outcomes = terminal_phases(&phases);
     assert_eq!(outcomes.len(), 1);
@@ -681,28 +707,86 @@ async fn cancelling_after_worker_completion_produces_exactly_one_terminal_phase(
 }
 
 #[tokio::test]
-async fn finalizer_and_unknown_race_can_claim_only_one_terminal_phase() {
+async fn abandoned_terminal_claim_is_swept_to_unknown_on_close() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("swept-read.txt");
+    fs::write(&path, "contents").expect("seed file");
+    let journal = TerminalGateJournal::default();
+    let observed_journal = journal.observer();
+    let terminal_reached = Arc::clone(&journal.reached);
+    let terminal_attempts = Arc::clone(&journal.terminal_attempts);
+    let terminal_completions = Arc::clone(&journal.terminal_completions);
+    let mut broker = broker_at(journal, directory.path());
+    let intent = broker
+        .normalize(&FsRead::new(&path))
+        .await
+        .expect("normalize read");
+    let policy = allow(EffectClass::FsRead);
+    broker
+        .authorize(&intent, &policy)
+        .await
+        .expect("authorize read");
+    broker
+        .journal_dispatched(&intent)
+        .await
+        .expect("dispatch read");
+
+    let mut abandoned = Box::pin(broker.journal_unknown(&intent));
+    tokio::select! {
+        result = &mut abandoned => panic!("terminal claim completed before cancellation: {result:?}"),
+        () = terminal_reached.notified() => {}
+    }
+    assert_eq!(terminal_attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(terminal_completions.load(Ordering::SeqCst), 0);
+    drop(abandoned);
+
+    let report = broker.close().await.expect("close sweep succeeds");
+
+    assert_eq!(report.reconciled_effects, vec![intent.effect]);
+    assert_eq!(terminal_attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(terminal_completions.load(Ordering::SeqCst), 1);
+    let phases = observed_journal.effect_phases();
+    let outcomes = terminal_phases(&phases);
+    assert_eq!(outcomes.len(), 1);
+    assert!(matches!(
+        outcomes.as_slice(),
+        [EffectPhase::Outcome {
+            outcome: EffectOutcome::Unknown,
+            ..
+        }]
+    ));
+}
+
+#[tokio::test]
+async fn finalizer_and_unknown_race_forces_the_loser_before_the_winner_append() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let path = directory.path().join("terminal-claim-race.txt");
     fs::write(&path, "before").expect("seed file");
-    let race = Arc::new(Barrier::new(3));
-    let worker_reached = Arc::new(tokio::sync::Notify::new());
-    let journal = SharedRecordingJournal::default();
-    let observed_journal = journal.clone();
-    let ledger = RacingLedger {
+    let ledger_reached = Arc::new(Barrier::new(2));
+    let ledger_release = Arc::new(Barrier::new(2));
+    let journal = TerminalGateJournal::default();
+    let observed_journal = journal.observer();
+    let terminal_reached = Arc::clone(&journal.reached);
+    let terminal_release = Arc::clone(&journal.release);
+    let terminal_attempts = Arc::clone(&journal.terminal_attempts);
+    let terminal_completions = Arc::clone(&journal.terminal_completions);
+    let ledger = GatedLedger {
         inner: ChangeLedger::new(),
-        reached: Arc::clone(&worker_reached),
-        race: Arc::clone(&race),
+        reached: Arc::clone(&ledger_reached),
+        release: Arc::clone(&ledger_release),
     };
     let attribution = TurnAttribution::new(SessionId::new("session"), RunId::new("turn"));
     let mut broker = broker_at(journal, directory.path());
     let policy = allow(EffectClass::FsWrite);
     let patch = FsPatch::new(&path, "before", "after");
     let mut apply = Box::pin(broker.fs_patch(&patch, &policy, &attribution, &ledger));
+    let worker_reached = tokio::task::spawn_blocking(move || ledger_reached.wait());
 
     tokio::select! {
-        result = &mut apply => panic!("apply completed before race barrier: {result:?}"),
-        () = worker_reached.notified() => {}
+        result = &mut apply => panic!("apply completed before ledger gate: {result:?}"),
+        result = worker_reached => {
+            result.expect("wait for post-rename ledger gate");
+        }
     }
     drop(apply);
     let phases = broker.journal_snapshot();
@@ -710,18 +794,20 @@ async fn finalizer_and_unknown_race_can_claim_only_one_terminal_phase() {
         Some(EffectPhase::Intent(intent)) => intent.clone(),
         phase => panic!("expected first intent phase, got {phase:?}"),
     };
-    let unknown_race = Arc::clone(&race);
-    let release_race = Arc::clone(&race);
-    let unknown = async {
-        tokio::task::spawn_blocking(move || unknown_race.wait())
-            .await
-            .expect("unknown reaches race barrier");
-        broker.journal_unknown(&intent).await
-    };
-    let release = tokio::task::spawn_blocking(move || release_race.wait());
-    let (unknown_result, release_result) = tokio::join!(unknown, release);
-    unknown_result.expect("claim loser is a no-op");
-    release_result.expect("release race barrier");
+
+    tokio::task::spawn_blocking(move || ledger_release.wait())
+        .await
+        .expect("release successful ledger append");
+    terminal_reached.notified().await;
+    tokio::time::timeout(Duration::from_millis(100), broker.journal_unknown(&intent))
+        .await
+        .expect("claim loser returns before the winner append is released")
+        .expect("claim loser is a no-op");
+    assert_eq!(terminal_attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(terminal_completions.load(Ordering::SeqCst), 0);
+    assert_eq!(terminal_phases(&observed_journal.effect_phases()).len(), 0);
+
+    terminal_release.notify_one();
     broker
         .close()
         .await
@@ -729,6 +815,8 @@ async fn finalizer_and_unknown_race_can_claim_only_one_terminal_phase() {
 
     let phases = observed_journal.effect_phases();
     assert_eq!(terminal_phases(&phases).len(), 1);
+    assert_eq!(terminal_attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(terminal_completions.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -743,7 +831,7 @@ async fn close_waits_for_a_cancelled_callers_failing_finalizer() {
         release: Arc::clone(&release),
     };
     let journal = SharedRecordingJournal::default();
-    let observed_journal = journal.clone();
+    let observed_journal = journal.observer();
     let attribution = TurnAttribution::new(SessionId::new("session"), RunId::new("turn"));
     let mut broker = broker_at(journal, directory.path());
     let policy = allow(EffectClass::FsWrite);
@@ -790,12 +878,13 @@ async fn close_waits_for_a_cancelled_callers_failing_finalizer() {
 }
 
 #[tokio::test]
-async fn failed_terminal_append_escalates_to_unknown_and_surfaces_on_close() {
+async fn failed_terminal_append_is_keyed_and_never_appends_a_fallback() {
     let directory = tempfile::tempdir().expect("temporary directory");
-    let path = directory.path().join("unknown-escalation.txt");
+    let path = directory.path().join("terminal-append-failure.txt");
     fs::write(&path, "before").expect("seed file");
     let journal = FailFirstTerminalJournal::default();
-    let observed_journal = journal.clone();
+    let observed_journal = journal.observer();
+    let terminal_attempts = Arc::clone(&journal.terminal_attempts);
     let ledger = ChangeLedger::new();
     let attribution = TurnAttribution::new(SessionId::new("session"), RunId::new("turn"));
     let mut broker = broker_at(journal, directory.path());
@@ -814,6 +903,10 @@ async fn failed_terminal_append_escalates_to_unknown_and_surfaces_on_close() {
             .to_string()
             .contains("injected first terminal outcome append failure")
     );
+    let effect = match broker.journal_snapshot().first() {
+        Some(EffectPhase::Intent(intent)) => intent.effect.clone(),
+        phase => panic!("expected first intent phase, got {phase:?}"),
+    };
     let close_error = broker
         .close()
         .await
@@ -823,17 +916,17 @@ async fn failed_terminal_append_escalates_to_unknown_and_surfaces_on_close() {
             .to_string()
             .contains("injected first terminal outcome append failure")
     );
+    assert!(close_error.to_string().contains(effect.as_str()));
 
     assert_eq!(fs::read_to_string(&path).expect("read file"), "after");
+    assert_eq!(terminal_attempts.load(Ordering::SeqCst), 1);
     let phases = observed_journal.effect_phases();
     let outcomes = terminal_phases(&phases);
-    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes.len(), 0);
+    assert_eq!(phases.len(), 3);
     assert!(matches!(
-        outcomes.as_slice(),
-        [EffectPhase::Outcome {
-            outcome: EffectOutcome::Unknown,
-            ..
-        }]
+        phases.last(),
+        Some(EffectPhase::Dispatched { .. })
     ));
 }
 

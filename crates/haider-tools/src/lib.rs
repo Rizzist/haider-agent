@@ -11,7 +11,8 @@ mod filesystem;
 mod ledger;
 
 pub use broker::{
-    AlwaysAllowRule, EffectBroker, EffectOperation, JournalSink, PermissionPolicy, PolicyDecision,
+    AlwaysAllowRule, EffectBroker, EffectBrokerCloseReport, EffectOperation, JournalSink,
+    PermissionPolicy, PolicyDecision,
 };
 pub use error::{FsPatchConflict, ToolError, ToolResult};
 pub use filesystem::{CasSink, FsList, FsPatch, FsRead, FsSearch, ResultBounds, TurnAttribution};

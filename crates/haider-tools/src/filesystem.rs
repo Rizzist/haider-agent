@@ -30,7 +30,7 @@
 //!   doctrine every AI write is broker-mediated. Concurrent non-broker writers
 //!   are outside this guarantee and belong to §9.2 external-edit detection.
 
-use crate::broker::{EffectBroker, EffectOperation, JournalSink, PermissionPolicy};
+use crate::broker::{EffectBroker, EffectOperation, PermissionPolicy};
 use crate::ledger::{ChangeLedgerSink, FsWriteRecord};
 use crate::{FsPatchConflict, ToolError, ToolResult};
 use async_trait::async_trait;
@@ -227,10 +227,7 @@ impl EffectOperation for FsPatch {
     }
 }
 
-impl<J> EffectBroker<J>
-where
-    J: JournalSink,
-{
+impl EffectBroker {
     pub async fn fs_read<C>(
         &mut self,
         operation: &FsRead,
@@ -339,7 +336,6 @@ where
     ) -> ToolResult<BoundedResult>
     where
         L: ChangeLedgerSink,
-        J: 'static,
     {
         let operation = FsPatch::new(
             resolve_workspace_path(
