@@ -43,3 +43,17 @@ Laws
 
 Gate: cargo test --workspace, clippy -D warnings (all targets), fmt --check,
 xtask test-count --update, git diff --check. Leave uncommitted.
+
+## Launch addenda (2026-07-26, lane open)
+- RESEARCH FIRST: before implementing, write docs/research/C1-anthropic-notes.md — the
+  exact Messages API SSE event sequence you will map (message_start, content_block_start/
+  delta/stop variants incl. input_json_delta + thinking, message_delta usage, error
+  events), each paired with the ProviderStreamItem you emit. Implement against that
+  document; it becomes the review's oracle.
+- NO REAL KEYS in this lane: build the capture harness (bin or ignored test) but do NOT
+  run it. Fixtures in this lane are SYNTHESIZED from the documented SSE shapes and marked
+  `provisional: true` in a fixture manifest; the promote-after-demonstration rule swaps
+  in sanitized REAL captures when the owner runs the harness with their key. The offline
+  replay tests run against the provisional fixtures now.
+- New workspace deps: pick the minimal HTTP/SSE stack (reqwest with rustls + eventsource
+  parsing by hand is acceptable; avoid heavy SSE crates). Justify in the notes doc.
