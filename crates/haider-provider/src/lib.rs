@@ -11,6 +11,8 @@
 //!   yields the same event sequence (`Delay` only adds wall time).
 
 mod anthropic;
+#[cfg(test)]
+mod anthropic_tests;
 mod wire;
 
 use async_trait::async_trait;
@@ -26,7 +28,8 @@ use tokio::time::{Duration, sleep};
 
 pub use anthropic::{
     ANTHROPIC_API_URL, ANTHROPIC_PROVIDER_NAME, AnthropicCapture, AnthropicProvider,
-    replay_anthropic_http_error, replay_anthropic_sse,
+    AnthropicRetryPolicy, AnthropicTransportConfig, replay_anthropic_http_error,
+    replay_anthropic_sse,
 };
 
 /// Crate marker used by the workspace self-test.

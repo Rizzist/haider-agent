@@ -397,11 +397,7 @@ impl StreamState {
                             Some(StreamEvent::ToolCallStart { call_id: id, name }),
                         )
                     }
-                    WireContentBlock::Thinking { thinking } => (
-                        OpenBlock::Thinking,
-                        (!thinking.is_empty())
-                            .then_some(StreamEvent::ReasoningDelta { text: thinking }),
-                    ),
+                    WireContentBlock::Thinking { .. } => (OpenBlock::Thinking, None),
                     WireContentBlock::RedactedThinking
                     | WireContentBlock::Fallback
                     | WireContentBlock::Unknown => (OpenBlock::Opaque, None),
@@ -624,8 +620,8 @@ enum WireContentBlock {
         input: serde_json::Value,
     },
     Thinking {
-        #[serde(default)]
-        thinking: String,
+        #[serde(default, rename = "thinking")]
+        _thinking: String,
     },
     RedactedThinking,
     Fallback,

@@ -2,14 +2,15 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use haider_accounts::{CredentialAlias, MemoryVault, Vault};
 use haider_protocol::ids::ArtifactRef;
-use haider_protocol::provider::{Block, FeatureResolve, StreamEvent};
+use haider_protocol::provider::{Block, FeatureResolve, FinishReason, StreamEvent};
 use haider_protocol::tool::AttachmentBlock;
 use haider_provider::{
-    AnthropicProvider, Message, MessageRole, Provider, ProviderError, ProviderErrorKind,
-    ProviderStreamItem, ResolvedAttachment, ToolDefinition, TurnRequest,
+    AnthropicProvider, AnthropicRetryPolicy, Message, MessageRole, Provider, ProviderError,
+    ProviderErrorKind, ProviderStreamItem, ResolvedAttachment, ToolDefinition, TurnRequest,
     replay_anthropic_http_error, replay_anthropic_sse,
 };
 use serde::Deserialize;
@@ -51,13 +52,28 @@ impl ExpectedItem {
 }
 
 #[test]
-fn provisional_manifest_replays_every_synthesized_wire_fixture() {
+fn manifest_replays_every_declared_wire_fixture_in_either_promotion_state() {
     let directory = fixture_directory();
-    let manifest: Manifest = read_json(&directory.join("manifest.json"));
+    let manifest_bytes = fs::read(directory.join("manifest.json")).expect("manifest bytes");
+    let raw_manifest: serde_json::Value =
+        serde_json::from_slice(&manifest_bytes).expect("manifest JSON");
+    assert!(
+        matches!(
+            raw_manifest.get("provisional"),
+            Some(serde_json::Value::Bool(_))
+        ),
+        "manifest must declare a boolean provisional flag"
+    );
+    let manifest: Manifest = serde_json::from_slice(&manifest_bytes).expect("typed manifest");
     assert_eq!(manifest.schema, "haider.anthropic-fixtures.v1");
-    assert!(manifest.provisional);
-    assert!(manifest.provenance.contains("Synthesized"));
-    assert_eq!(manifest.fixtures.len(), 7);
+    assert_eq!(
+        raw_manifest
+            .get("provisional")
+            .and_then(serde_json::Value::as_bool),
+        Some(manifest.provisional)
+    );
+    assert!(!manifest.provenance.trim().is_empty());
+    assert!(!manifest.fixtures.is_empty());
 
     for fixture in manifest.fixtures {
         let wire = fs::read(directory.join(&fixture.wire)).expect("fixture wire bytes");
@@ -90,6 +106,48 @@ fn provisional_manifest_replays_every_synthesized_wire_fixture() {
             }
             other => panic!("unknown fixture transport `{other}`"),
         }
+    }
+}
+
+#[test]
+fn constructor_transport_config_disables_retries_and_bounds_connects_and_chunk_idle() {
+    let config = AnthropicProvider::transport_config();
+
+    assert_eq!(config.retry_policy, AnthropicRetryPolicy::Never);
+    assert_eq!(config.connect_timeout, Duration::from_secs(10));
+    assert_eq!(config.chunk_idle_timeout, Duration::from_secs(90));
+}
+
+#[test]
+fn thinking_start_content_is_buffered_and_only_deltas_are_emitted() {
+    for start_content in ["", "must not be emitted from start"] {
+        let bytes = format!(
+            "event: message_start\n\
+             data: {{\"type\":\"message_start\",\"message\":{{\"content\":[],\"usage\":{{\"input_tokens\":1}}}}}}\n\n\
+             event: content_block_start\n\
+             data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"thinking\",\"thinking\":{start_content:?},\"signature\":\"\"}}}}\n\n\
+             event: content_block_delta\n\
+             data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"thinking_delta\",\"thinking\":\"delta only\"}}}}\n\n\
+             event: content_block_stop\n\
+             data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n\
+             event: message_delta\n\
+             data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}}}}\n\n\
+             event: message_stop\n\
+             data: {{\"type\":\"message_stop\"}}\n"
+        );
+
+        assert_eq!(
+            replay_anthropic_sse(bytes.as_bytes()),
+            vec![
+                Ok(StreamEvent::ReasoningDelta {
+                    text: "delta only".into(),
+                }),
+                Ok(StreamEvent::Finish {
+                    reason: FinishReason::EndTurn,
+                }),
+            ],
+            "thinking start content must not cross the provider boundary"
+        );
     }
 }
 

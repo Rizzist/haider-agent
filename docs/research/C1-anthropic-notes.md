@@ -110,8 +110,13 @@ All additions and conversions are checked. Overflow is a malformed frame.
 
 ## Error mapping and retryability
 
-There are no retries, sleeps, or backoff loops in this adapter. Classification
-is returned to the actor.
+There are no retries, sleeps, or backoff loops in this adapter. The reqwest
+client is constructed with `reqwest::retry::never()`, so even its protocol-NACK
+default cannot resend a request behind the actor. Connections have a 10-second
+deadline. Each individual SSE chunk await has a 90-second idle deadline; the
+whole turn does not, so a long generation remains legal while a stalled stream
+returns one retryable `Transport` error. Classification is returned to the
+actor.
 
 | Wire failure | Provider kind | Retryable | Retry-after |
 | --- | --- | --- | --- |
@@ -161,10 +166,15 @@ the sole incremental UTF-8 decoder.
 
 ## Fixture provenance and promotion
 
-The C1 fixture manifest is `provisional: true`. Its SSE/HTTP bytes are
-synthesized strictly from the documented shapes above; they are not described
-as real captures. The ignored capture harness requires both
-`HAIDER_LIVE_PROVIDER_TESTS=1` and an explicit promotion flag, imports
-`HAIDER_ANTHROPIC_API_KEY` through the accounts environment bridge, sanitizes
-message/request/tool IDs, and replaces the provisional files and manifest only
-when the owner deliberately runs it. CI only replays local fixture bytes.
+The C1 fixture manifest initially ships with `provisional: true`. Its SSE/HTTP
+bytes are synthesized strictly from the documented shapes above; they are not
+described as real captures. Offline replay accepts either a provisional or
+promoted manifest and follows every entry it declares.
+
+The ignored capture harness requires both `HAIDER_LIVE_PROVIDER_TESTS=1` and an
+explicit promotion flag, imports `HAIDER_ANTHROPIC_API_KEY` through the accounts
+environment bridge, and uses configured endpoints for real 429, malformed, and
+mid-stream-overload captures. It preserves the full seven-shape manifest,
+sanitizes message/request/tool IDs, and validates each named shape's normalized
+semantics before writing any replacement. Promoted SSE files end with one
+newline and no trailing blank line. CI only replays local fixture bytes.

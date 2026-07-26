@@ -1,6 +1,6 @@
 //! Anthropic Messages API adapter.
 
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use haider_accounts::SecretHandle;
@@ -19,6 +19,26 @@ pub const ANTHROPIC_PROVIDER_NAME: &str = "anthropic";
 pub const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const STREAM_CAPACITY: usize = 32;
+const TRANSPORT_CONFIG: AnthropicTransportConfig = AnthropicTransportConfig {
+    retry_policy: AnthropicRetryPolicy::Never,
+    connect_timeout: Duration::from_secs(10),
+    chunk_idle_timeout: Duration::from_secs(90),
+};
+
+/// Retry behavior owned by the Anthropic HTTP adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnthropicRetryPolicy {
+    /// Surface each transport failure once; the actor owns any retry/backoff.
+    Never,
+}
+
+/// Inspectable transport invariants applied by [`AnthropicProvider::new`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnthropicTransportConfig {
+    pub retry_policy: AnthropicRetryPolicy,
+    pub connect_timeout: Duration,
+    pub chunk_idle_timeout: Duration,
+}
 
 /// Messages API provider backed by one already-resolved account secret.
 ///
@@ -43,8 +63,13 @@ pub struct AnthropicCapture {
 
 impl AnthropicProvider {
     pub fn new(credential: SecretHandle, model: impl Into<String>) -> Result<Self, ProviderError> {
+        let transport = Self::transport_config();
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            .retry(match transport.retry_policy {
+                AnthropicRetryPolicy::Never => reqwest::retry::never(),
+            })
+            .connect_timeout(transport.connect_timeout)
             .build()
             .map_err(|error| {
                 ProviderError::new(
@@ -59,6 +84,13 @@ impl AnthropicProvider {
             model: model.into(),
             api_url: ANTHROPIC_API_URL.into(),
         })
+    }
+
+    /// Returns the exact retry and timeout policy consumed by the constructor
+    /// and per-chunk streaming loop.
+    #[must_use]
+    pub const fn transport_config() -> AnthropicTransportConfig {
+        TRANSPORT_CONFIG
     }
 
     #[must_use]
@@ -183,8 +215,9 @@ impl Provider for AnthropicProvider {
 
         let (sender, receiver) = mpsc::channel(STREAM_CAPACITY);
         let account = self.account.clone();
+        let chunk_idle_timeout = Self::transport_config().chunk_idle_timeout;
         tokio::spawn(async move {
-            stream_response(response, account, sender).await;
+            stream_response(response, account, sender, chunk_idle_timeout).await;
         });
         Ok(receiver)
     }
@@ -219,24 +252,55 @@ fn model_capabilities(model: &str) -> ModelCapabilities {
 }
 
 async fn stream_response(
-    mut response: reqwest::Response,
+    response: reqwest::Response,
     account: Option<CredentialAlias>,
     sender: mpsc::Sender<ProviderStreamItem>,
+    chunk_idle_timeout: Duration,
+) {
+    stream_sse_source(response, account, sender, chunk_idle_timeout).await;
+}
+
+pub(crate) trait SseChunkSource {
+    async fn next_chunk(
+        &mut self,
+    ) -> Result<Option<impl AsRef<[u8]> + Send + 'static>, ProviderError>;
+}
+
+impl SseChunkSource for reqwest::Response {
+    async fn next_chunk(
+        &mut self,
+    ) -> Result<Option<impl AsRef<[u8]> + Send + 'static>, ProviderError> {
+        self.chunk().await.map_err(transport_error)
+    }
+}
+
+pub(crate) async fn stream_sse_source<S: SseChunkSource>(
+    mut source: S,
+    account: Option<CredentialAlias>,
+    sender: mpsc::Sender<ProviderStreamItem>,
+    chunk_idle_timeout: Duration,
 ) {
     let mut decoder = SseDecoder::new(account);
     loop {
-        let chunk = match response.chunk().await {
-            Ok(Some(chunk)) => chunk,
-            Ok(None) => {
+        let chunk = match tokio::time::timeout(chunk_idle_timeout, source.next_chunk()).await {
+            Ok(Ok(Some(chunk))) => chunk,
+            Ok(Ok(None)) => {
                 send_items(&sender, decoder.finish()).await;
                 return;
             }
-            Err(error) => {
-                let _ = sender.send(Err(transport_error(error))).await;
+            Ok(Err(error)) => {
+                let _ = sender.send(Err(error)).await;
+                return;
+            }
+            Err(_) => {
+                let _ = sender
+                    .send(Err(stream_idle_error(chunk_idle_timeout)))
+                    .await;
                 return;
             }
         };
-        if !send_items(&sender, decoder.push(&chunk)).await || decoder.is_terminal() {
+        let items = decoder.push(chunk.as_ref());
+        if !send_items(&sender, items).await || decoder.is_terminal() {
             return;
         }
     }
@@ -258,6 +322,16 @@ fn transport_error(error: reqwest::Error) -> ProviderError {
     ProviderError::new(
         ProviderErrorKind::Transport,
         format!("Anthropic HTTP transport failed: {error}"),
+    )
+}
+
+fn stream_idle_error(timeout: Duration) -> ProviderError {
+    ProviderError::new(
+        ProviderErrorKind::Transport,
+        format!(
+            "Anthropic SSE stream received no data for {} seconds",
+            timeout.as_secs()
+        ),
     )
 }
 
