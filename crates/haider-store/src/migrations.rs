@@ -14,38 +14,51 @@ use crate::{StoreResult, now_ms, store_error, to_sqlite_integer};
 use haider_protocol::error::{ErrorCode, HaiderError};
 use rusqlite::{Connection, TransactionBehavior, params};
 
-pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 1;
+pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 2;
 
 struct Migration {
     version: u32,
     sql: &'static str,
 }
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    sql: "
-        CREATE TABLE IF NOT EXISTS schema_migrations (
-            version         INTEGER PRIMARY KEY,
-            applied_at_ms   INTEGER NOT NULL
-        );
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        sql: "
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                version         INTEGER PRIMARY KEY,
+                applied_at_ms   INTEGER NOT NULL
+            );
 
-        CREATE TABLE IF NOT EXISTS sessions (
-            id              TEXT PRIMARY KEY,
-            created_at_ms   INTEGER NOT NULL,
-            meta_json       TEXT NOT NULL
-        );
+            CREATE TABLE IF NOT EXISTS sessions (
+                id              TEXT PRIMARY KEY,
+                created_at_ms   INTEGER NOT NULL,
+                meta_json       TEXT NOT NULL
+            );
 
-        CREATE TABLE IF NOT EXISTS events (
-            session_id      TEXT NOT NULL,
-            seq             INTEGER NOT NULL CHECK (seq > 0),
-            envelope_json   TEXT NOT NULL,
-            event_id        TEXT NOT NULL UNIQUE,
-            committed_at_ms INTEGER NOT NULL,
-            PRIMARY KEY (session_id, seq),
-            FOREIGN KEY (session_id) REFERENCES sessions(id)
-        );
-    ",
-}];
+            CREATE TABLE IF NOT EXISTS events (
+                session_id      TEXT NOT NULL,
+                seq             INTEGER NOT NULL CHECK (seq > 0),
+                envelope_json   TEXT NOT NULL,
+                event_id        TEXT NOT NULL UNIQUE,
+                committed_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (session_id, seq),
+                FOREIGN KEY (session_id) REFERENCES sessions(id)
+            );
+        ",
+    },
+    Migration {
+        version: 2,
+        sql: "
+            CREATE TABLE IF NOT EXISTS profile_meta (
+                singleton         INTEGER PRIMARY KEY CHECK (singleton = 1),
+                worker_generation INTEGER NOT NULL CHECK (worker_generation >= 0)
+            );
+
+            INSERT OR IGNORE INTO profile_meta(singleton, worker_generation) VALUES (1, 0);
+        ",
+    },
+];
 
 /// Brings a fresh or older-version database up to `CURRENT_SCHEMA_VERSION`.
 /// Idempotent: re-running on an up-to-date database applies nothing.

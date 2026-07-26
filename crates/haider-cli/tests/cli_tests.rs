@@ -118,6 +118,51 @@ fn run_jsonl_is_lf_framed_and_every_line_is_a_raw_envelope() {
 }
 
 #[test]
+fn sequential_cli_runs_use_profile_owned_worker_generations() {
+    let profile_parent = tempfile::tempdir().expect("temporary CLI profile parent");
+    let profile = profile_parent.path().join("profile");
+    let run = |prompt: &str| {
+        Command::new(env!("CARGO_BIN_EXE_haider"))
+            .args(["run", "--jsonl", prompt])
+            .env("HAIDER_PROFILE_DIR", &profile)
+            .output()
+            .expect("binary runs")
+    };
+
+    let first_output = run("first process");
+    assert!(
+        first_output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&first_output.stderr)
+    );
+    let second_output = run("restarted process");
+    assert!(
+        second_output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&second_output.stderr)
+    );
+
+    let first = parse_jsonl(&first_output.stdout);
+    let second = parse_jsonl(&second_output.stdout);
+    let first_generation = first[0].worker_generation;
+    let second_generation = second[0].worker_generation;
+    assert!(
+        first
+            .iter()
+            .all(|envelope| envelope.worker_generation == first_generation)
+    );
+    assert!(
+        second
+            .iter()
+            .all(|envelope| envelope.worker_generation == second_generation)
+    );
+    assert!(
+        second_generation > first_generation,
+        "CLI reused profile generation {first_generation}"
+    );
+}
+
+#[test]
 fn run_jsonl_exits_65_when_fake_provider_errors() {
     let out = haider()
         .args(["run", "--jsonl", "hello"])

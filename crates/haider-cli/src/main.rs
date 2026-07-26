@@ -87,23 +87,33 @@ async fn run_jsonl(prompt: &str) -> ExitCode {
         }
     };
     let store = match SqliteStoreHandle::open(profile_dir).await {
-        Ok(store) => Arc::new(store),
+        Ok(store) => store,
         Err(error) => {
             eprintln!("haider: cannot open profile: {}", error.message);
             return ExitCode::from(EX_SOFTWARE);
         }
     };
+    let config = cli_config(store.worker_generation());
+    let actor_store: Arc<dyn StoreHandle> = Arc::new(store.clone());
     let stdout = io::stdout();
     let mut output = io::BufWriter::new(stdout.lock());
-    let outcome = match stream_jsonl_turn(prompt, cli_config(), provider, store, &mut output).await
-    {
+    let run_result = stream_jsonl_turn(prompt, config, provider, actor_store, &mut output).await;
+    let close_result = store.close().await;
+    let outcome = match run_result {
         Ok(outcome) => outcome,
         Err(error) => {
+            if let Err(close_error) = close_result {
+                eprintln!("haider: profile close also failed: {}", close_error.message);
+            }
             let exit_code = error.exit_code();
             eprintln!("haider: {error}");
             return ExitCode::from(exit_code);
         }
     };
+    if let Err(error) = close_result {
+        eprintln!("haider: cannot close profile: {}", error.message);
+        return ExitCode::from(EX_SOFTWARE);
+    }
 
     if outcome.state == RunState::Errored {
         if let Some(error) = &outcome.error {
@@ -303,12 +313,12 @@ fn provider_for_cli(prompt: &str) -> Result<FakeProvider, serde_json::Error> {
     }
 }
 
-fn cli_config() -> HarnessConfig {
+fn cli_config(worker_generation: u64) -> HarnessConfig {
     HarnessConfig::for_session(
         SessionId::new("cli-session"),
         DeviceId::new("cli-device"),
         1,
-        1,
+        worker_generation,
     )
 }
 
@@ -359,7 +369,7 @@ async fn fake_turn_self_test() -> bool {
         },
     ]));
     let store = Arc::new(MemoryStore::new());
-    let handle = HarnessActor::spawn(cli_config(), provider, store.clone());
+    let handle = HarnessActor::spawn(cli_config(1), provider, store.clone());
     let Ok(turn) = handle.submit_turn(SubmitTurn::new("self-test")).await else {
         return false;
     };

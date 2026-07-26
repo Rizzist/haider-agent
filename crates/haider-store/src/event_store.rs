@@ -8,6 +8,9 @@
 //! - The `envelope_json` column is the authoritative byte-for-byte record;
 //!   the `seq` / `event_id` / `committed_at_ms` columns are denormalized
 //!   copies for indexing, cross-checked against the JSON on every read.
+//! - `worker_generation` is profile-owned and advances once per successful
+//!   open while the exclusive profile lock is held, fencing actor identities
+//!   across process restarts even when the wall clock repeats.
 
 use crate::cas::FileCas;
 use crate::migrations;
@@ -82,6 +85,7 @@ pub trait EventStore: Send + Sync {
 pub struct Store {
     root: PathBuf,
     database_path: PathBuf,
+    worker_generation: u64,
     connection: Mutex<Connection>,
     cas: FileCas,
     _lock: ProfileLock,
@@ -104,10 +108,12 @@ impl Store {
         migrations::migrate(&mut connection)?;
         connection.set_prepared_statement_cache_capacity(16);
         let cas = FileCas::open(&root)?;
+        let worker_generation = next_worker_generation(&mut connection)?;
 
         Ok(Self {
             root,
             database_path,
+            worker_generation,
             connection: Mutex::new(connection),
             cas,
             _lock: profile_lock,
@@ -122,6 +128,11 @@ impl Store {
     /// The SQLite database path.
     pub fn database_path(&self) -> &Path {
         &self.database_path
+    }
+
+    /// Durable fencing generation allocated by this successful profile open.
+    pub fn worker_generation(&self) -> u64 {
+        self.worker_generation
     }
 
     /// The profile's content-addressed storage.
@@ -161,6 +172,42 @@ impl Store {
             )
         })
     }
+}
+
+/// Advances and returns the profile-owned fencing generation.
+///
+/// `Store::open` calls this only after acquiring the exclusive profile lock
+/// and after every other fallible setup step, so each successful open consumes
+/// exactly one generation.
+fn next_worker_generation(connection: &mut Connection) -> StoreResult<u64> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(map_sqlite_error)?;
+    let current: i64 = transaction
+        .query_row(
+            "SELECT worker_generation FROM profile_meta WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(map_sqlite_error)?;
+    let next = current
+        .checked_add(1)
+        .ok_or_else(|| corrupt("worker generation space is exhausted"))?;
+    let updated = transaction
+        .execute(
+            "UPDATE profile_meta
+             SET worker_generation = ?1
+             WHERE singleton = 1 AND worker_generation = ?2",
+            params![next, current],
+        )
+        .map_err(map_sqlite_error)?;
+    if updated != 1 {
+        return Err(corrupt(
+            "profile metadata is missing its worker generation singleton",
+        ));
+    }
+    transaction.commit().map_err(map_sqlite_error)?;
+    u64::try_from(next).map_err(|_| corrupt("database contains a negative worker generation"))
 }
 
 impl EventStore for Store {

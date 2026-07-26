@@ -45,6 +45,7 @@ pub struct HarnessConfig {
     pub max_tokens: u64,
     pub command_capacity: usize,
     pub broadcast_capacity: usize,
+    started_at_ms: Option<u64>,
 }
 
 impl HarnessConfig {
@@ -66,7 +67,18 @@ impl HarnessConfig {
             max_tokens: 4096,
             command_capacity: 8,
             broadcast_capacity: 128,
+            started_at_ms: None,
         }
+    }
+
+    /// Overrides the wall-clock component of minted IDs.
+    ///
+    /// This is an injection seam for deterministic restart tests. Durable
+    /// `worker_generation`, rather than clock uniqueness, must prevent ID
+    /// collisions when two actors receive the same value here.
+    pub fn with_started_at_ms(mut self, started_at_ms: u64) -> Self {
+        self.started_at_ms = Some(started_at_ms);
+        self
     }
 }
 
@@ -221,6 +233,7 @@ impl HarnessActor {
         provider: Arc<dyn Provider>,
         store: Arc<dyn StoreHandle>,
     ) -> (Self, HarnessHandle) {
+        let started_at_ms = config.started_at_ms.unwrap_or_else(unix_time_ms);
         let (command_sender, commands) = mpsc::channel(config.command_capacity.max(1));
         let (events, _) = broadcast::channel(config.broadcast_capacity.max(1));
         let (state, state_receiver) = watch::channel(None);
@@ -239,7 +252,7 @@ impl HarnessActor {
                 state,
                 next_run: 0,
                 next_event: 0,
-                started_at_ms: unix_time_ms(),
+                started_at_ms,
                 next_item: 0,
             },
             handle,

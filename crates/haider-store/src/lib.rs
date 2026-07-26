@@ -12,7 +12,8 @@
 //! - `cas` — artifacts are addressed `blake3:<64 lowercase hex>`, published
 //!   without replacement via a hard link, and re-hashed on read.
 //! - `profile_lock` — at most one process has a profile root open.
-//! - `migrations` — the schema changes only through the numbered registry.
+//! - `migrations` — the schema changes only through the numbered registry;
+//!   profile metadata durably fences worker generations across opens.
 
 mod cas;
 mod event_store;

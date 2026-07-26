@@ -292,24 +292,43 @@ fn profile_lock_is_exclusive_and_released_on_drop() {
 }
 
 #[test]
+fn worker_generation_strictly_increases_across_sequential_opens() {
+    let root = test_root();
+    let first_generation = {
+        let store = must(Store::open(root.path()));
+        store.worker_generation()
+    };
+    let second_generation = {
+        let store = must(Store::open(root.path()));
+        store.worker_generation()
+    };
+
+    assert!(first_generation > 0);
+    assert!(
+        second_generation > first_generation,
+        "profile generation did not advance: {first_generation} -> {second_generation}"
+    );
+}
+
+#[test]
 fn migrations_apply_fresh_and_are_idempotent_on_reopen() {
     let root = test_root();
     let database_path = {
         let store = must(Store::open(root.path()));
-        assert_eq!(must(store.schema_version()), 1);
+        assert_eq!(must(store.schema_version()), 2);
         store.database_path().to_path_buf()
     };
 
     let reopened = must(Store::open(root.path()));
-    assert_eq!(must(reopened.schema_version()), 1);
+    assert_eq!(must(reopened.schema_version()), 2);
     let connection = must(Connection::open(database_path));
     let registered: u32 = must(connection.query_row(
-        "SELECT COUNT(*) FROM schema_migrations WHERE version = 1",
+        "SELECT COUNT(*) FROM schema_migrations WHERE version BETWEEN 1 AND 2",
         [],
         |row| row.get(0),
     ));
-    assert_eq!(registered, 1);
-    for table in ["sessions", "events", "schema_migrations"] {
+    assert_eq!(registered, 2);
+    for table in ["sessions", "events", "schema_migrations", "profile_meta"] {
         let count: u32 = must(connection.query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
             [table],
