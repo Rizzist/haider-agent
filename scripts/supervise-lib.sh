@@ -5,15 +5,11 @@
 #
 # Owns two invariants:
 #   Journal format — one JSON object per line, always carrying
-#   {"ts","run_id","brief","event"} plus event-specific fields, appended
-#   only while holding the journal lock (see journal_event).
-#   Lock ownership — the lock is the directory $JOURNAL_LOCK_DIR; its
-#   owner file records "pid TAB lstart" so staleness can be decided by
-#   process identity, not by PID liveness alone (see acquire_journal_lock).
+#   {"ts","run_id","brief","event"} plus event-specific fields. Each run
+#   writes only its own file, so appends need no cross-process lock.
 #
-# The journal/lock functions read globals owned by codex-supervised.sh:
-# JOURNAL_FILE, JOURNAL_LOCK_DIR, JOURNAL_LOCK_HELD, STALE_LOCK_RECOVERED,
-# RUN_ID, BRIEF_FILE. Pure helpers above process_identity need none.
+# The journal function reads globals owned by codex-supervised.sh:
+# JOURNAL_FILE, RUN_ID, and BRIEF_FILE.
 
 is_nonnegative_integer() {
     case "$1" in
@@ -124,134 +120,10 @@ process_identity() {
         awk 'NF { $1=$1; print; exit }'
 }
 
-# Read and normalize one complete "pid TAB lstart" owner record.
-lock_owner_record() {
-    local owner_pid owner_identity
-    [ -r "$1" ] || return 1
-    read -r owner_pid owner_identity < "$1" || return 1
-    is_nonnegative_integer "$owner_pid" || return 1
-    [ -n "$owner_identity" ] || return 1
-    printf '%s\t%s' "$owner_pid" "$owner_identity"
-}
-
-lock_record_is_current() {
-    local record owner_pid owner_identity current tab
-    record=$1
-    tab=$(printf '\t')
-    IFS="$tab" read -r owner_pid owner_identity <<EOF
-$record
-EOF
-    pid_is_live "$owner_pid" || return 1
-    current=$(process_identity "$owner_pid") || return 1
-    [ -n "$current" ] && [ "$current" = "$owner_identity" ]
-}
-
-# Take the journal lock (mkdir is the atomic acquire; the owner file is
-# written just after, so a fresh lock briefly has no owner — the 4-spin
-# grace below tolerates that window). After ~0.2s of contention a lock
-# whose recorded owner is dead is stolen by renaming the directory aside;
-# the steal is journaled as "stale_lock_recovered" on the next append.
-# Gives up (rc 1) after ~10s of live contention.
-acquire_journal_lock() {
-    local spins owner_file identity stale_dir stale_owner moved_owner restore_spins
-    spins=0
-    owner_file="$JOURNAL_LOCK_DIR/owner"
-    identity=$(process_identity "$$") || identity=
-    if [ -z "$identity" ]; then
-        echo "codex-supervised.sh: cannot identify journal lock owner" >&2
-        return 1
-    fi
-    while ! mkdir "$JOURNAL_LOCK_DIR" 2>/dev/null; do
-        if [ ! -d "$JOURNAL_LOCK_DIR" ]; then
-            echo "codex-supervised.sh: cannot create journal lock: $JOURNAL_LOCK_DIR" >&2
-            return 1
-        fi
-        spins=$((spins + 1))
-        stale_owner=
-        if [ "$spins" -ge 4 ]; then
-            stale_owner=$(lock_owner_record "$owner_file") || stale_owner=
-        fi
-        if [ -n "$stale_owner" ] &&
-           ! lock_record_is_current "$stale_owner"; then
-            stale_dir="${JOURNAL_LOCK_DIR}.stale.$$.$spins.$RANDOM"
-            if [ ! -e "$stale_dir" ] &&
-               mv "$JOURNAL_LOCK_DIR" "$stale_dir" 2>/dev/null; then
-                moved_owner=$(lock_owner_record "$stale_dir/owner") ||
-                    moved_owner=
-                if [ "$moved_owner" = "$stale_owner" ]; then
-                    rm -f "$stale_dir/owner"
-                    rmdir "$stale_dir" 2>/dev/null || true
-                    STALE_LOCK_RECOVERED=1
-                    spins=0
-                    continue
-                fi
-                restore_spins=0
-                while [ -e "$JOURNAL_LOCK_DIR" ] &&
-                      [ "$restore_spins" -lt 200 ]; do
-                    sleep 0.05
-                    restore_spins=$((restore_spins + 1))
-                done
-                if [ -e "$JOURNAL_LOCK_DIR" ] ||
-                   ! mv "$stale_dir" "$JOURNAL_LOCK_DIR" 2>/dev/null; then
-                    echo "codex-supervised.sh: cannot restore changed journal lock" >&2
-                    return 1
-                fi
-                sleep 0.05
-                continue
-            fi
-        fi
-        if [ "$spins" -ge 200 ]; then
-            echo "codex-supervised.sh: timed out waiting for journal lock: $JOURNAL_LOCK_DIR" >&2
-            return 1
-        fi
-        sleep 0.05
-    done
-
-    if ! printf '%s\t%s\n' "$$" "$identity" > "$owner_file"; then
-        rm -f "$owner_file"
-        rmdir "$JOURNAL_LOCK_DIR" 2>/dev/null || true
-        echo "codex-supervised.sh: cannot write journal lock owner" >&2
-        return 1
-    fi
-    JOURNAL_LOCK_HELD=1
-    JOURNAL_LOCK_IDENTITY=$identity
-    return 0
-}
-
-append_lock_not_ours() {
-    local timestamp escaped_brief
-    timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ) || return 1
-    escaped_brief=$(json_escape "$BRIEF_FILE") || return 1
-    printf '{"ts":"%s","run_id":"%s","brief":"%s","event":"lock_not_ours"}\n' \
-        "$timestamp" "$RUN_ID" "$escaped_brief" >> "$JOURNAL_FILE"
-}
-
-release_journal_lock() {
-    local owner expected
-    [ "${JOURNAL_LOCK_HELD:-0}" -eq 1 ] || return 0
-    owner=$(lock_owner_record "$JOURNAL_LOCK_DIR/owner") || owner=
-    expected=$(printf '%s\t%s' "$$" "${JOURNAL_LOCK_IDENTITY:-}")
-    if [ "$owner" != "$expected" ]; then
-        JOURNAL_LOCK_HELD=0
-        append_lock_not_ours || true
-        echo "codex-supervised.sh: journal lock is not ours; leaving it" >&2
-        return 1
-    fi
-    rm -f "$JOURNAL_LOCK_DIR/owner"
-    if ! rmdir "$JOURNAL_LOCK_DIR" 2>/dev/null; then
-        echo "codex-supervised.sh: cannot release journal lock: $JOURNAL_LOCK_DIR" >&2
-        return 1
-    fi
-    JOURNAL_LOCK_HELD=0
-    JOURNAL_LOCK_IDENTITY=
-    return 0
-}
-
-# Append one journal line for `event` under the lock. `extra` must be empty
-# or a raw JSON fragment starting with a comma (e.g. ',"retries":1'). A
-# pending stale-lock recovery is journaled first, in the same lock hold.
+# Append one journal line for `event`. `extra` must be empty or a raw JSON
+# fragment starting with a comma (e.g. ',"retries":1').
 journal_event() {
-    local event extra timestamp escaped_brief append_status
+    local event extra timestamp escaped_brief
     event=$1
     extra=${2:-}
     timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ) || {
@@ -259,25 +131,13 @@ journal_event() {
         return 1
     }
     escaped_brief=$(json_escape "$BRIEF_FILE") || return 1
-    acquire_journal_lock || return 1
-
-    append_status=0
-    if [ "${STALE_LOCK_RECOVERED:-0}" -eq 1 ]; then
-        printf '{"ts":"%s","run_id":"%s","brief":"%s","event":"stale_lock_recovered"}\n' \
-            "$timestamp" "$RUN_ID" "$escaped_brief" >> "$JOURNAL_FILE" ||
-            append_status=$?
-        STALE_LOCK_RECOVERED=0
-    fi
-    if [ "$append_status" -eq 0 ]; then
-        printf '{"ts":"%s","run_id":"%s","brief":"%s","event":"%s"%s}\n' \
-            "$timestamp" "$RUN_ID" "$escaped_brief" "$event" "$extra" \
-            >> "$JOURNAL_FILE" || append_status=$?
-    fi
-    if [ "$append_status" -ne 0 ]; then
+    if ! printf '{"ts":"%s","run_id":"%s","brief":"%s","event":"%s"%s}\n' \
+        "$timestamp" "$RUN_ID" "$escaped_brief" "$event" "$extra" \
+        >> "$JOURNAL_FILE"; then
         echo "codex-supervised.sh: cannot append journal: $JOURNAL_FILE" >&2
+        return 1
     fi
-    release_journal_lock || append_status=1
-    [ "$append_status" -eq 0 ]
+    return 0
 }
 
 # True if the PID exists and is not a zombie (kill -0 alone would count

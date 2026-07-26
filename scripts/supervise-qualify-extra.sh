@@ -1,11 +1,11 @@
 #!/bin/bash
-#
 # Additional qualification cases for codex-supervised.sh. Sourced by
 # supervise-qualify.sh after the shared fake codex, watchdog, and pass/fail
 # helpers exist; it defines run_dirty_git_safety plus the run_extra_cases
-# bundle, and executes nothing on its own (running this file directly is a
-# no-op).
-
+# bundle. Direct execution delegates to the complete qualification gate.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    exec bash "$(dirname -- "$0")/supervise-qualify.sh"
+fi
 # Last-resort, identity-checked kill of every helper process recorded in
 # the suite's *.pids files; invoked from the main suite's EXIT trap.
 cleanup_fake_pids() {
@@ -13,7 +13,6 @@ cleanup_fake_pids() {
     sleep 1
     cleanup_fake_pids_with_signal KILL
 }
-
 cleanup_fake_pids_with_signal() {
     local signal file pid identity current
     signal=$1
@@ -27,14 +26,13 @@ cleanup_fake_pids_with_signal() {
         done < "$file"
     done
 }
-
 run_interrupt_journal() {
     local brief output pids status events marker
     brief="$TMP_ROOT/interrupt.brief"; output="$TMP_ROOT/interrupt.out"
     pids="$TMP_ROOT/interrupt.pids"; marker="$TMP_ROOT/interrupt.timeout"
     printf 'Exercise signal cleanup.' > "$brief"
     run_with_watchdog "$marker" env FAKE_MODE=interrupt FAKE_PID_FILE="$pids" \
-        CODEX_BIN="$FAKE_CODEX" HAIDER_RUN_JOURNAL="$JOURNAL" \
+        CODEX_BIN="$FAKE_CODEX" HAIDER_RUN_JOURNAL="$JOURNAL_DIR" \
         bash "$WRAPPER" "$brief" "$output" --max-stall-secs 30 --max-retries 0
     status=$?; events=$(events_for_brief "$brief")
     if [ "$status" -eq 143 ] && [ "$events" = "start interrupted" ] &&
@@ -45,48 +43,69 @@ run_interrupt_journal() {
             "status=$status events=[$events]"
     fi
 }
-
 run_alias_refusal() {
-    local brief output original status events marker log
+    local brief output original status events marker
     brief="$TMP_ROOT/alias.brief"; marker="$TMP_ROOT/alias.timeout"
-    output="$TMP_ROOT/alias-output"; log="$TMP_ROOT/alias.log"
+    output="$TMP_ROOT/alias-output"
     original='brief must remain intact'
     printf '%s' "$original" > "$brief"
     ln -s "$brief" "$output" || { fail "destination alias refusal" "fixture failed"; return; }
     run_with_watchdog "$marker" env FAKE_MODE=happy CODEX_BIN="$FAKE_CODEX" \
-        HAIDER_RUN_JOURNAL="$JOURNAL" bash "$WRAPPER" "$brief" "$output" \
-        --max-stall-secs 3 --max-retries 0 > "$log" 2>&1
+        HAIDER_RUN_JOURNAL="$JOURNAL_DIR" bash "$WRAPPER" "$brief" "$output" \
+        --max-stall-secs 3 --max-retries 0
     status=$?; events=$(events_for_brief "$brief")
     if [ "$status" -eq 2 ] && [ "$(cat "$brief")" = "$original" ] &&
-       [ -z "$events" ] && grep -q 'paths alias each other' "$log"; then
+       [ -z "$events" ] &&
+       grep -q 'paths alias each other' "$CASE_STDERR_LOG"; then
         pass "destination alias refusal"
     else
         fail "destination alias refusal" "status=$status events=[$events]"
     fi
 }
-
+run_journal_dir_alias_refusal() {
+    local brief output journal_dir status events marker
+    brief="$TMP_ROOT/journal-dir-alias.brief"
+    journal_dir="$TMP_ROOT/journal-dir-alias"
+    output=$journal_dir
+    marker="$TMP_ROOT/journal-dir-alias.timeout"
+    printf 'The fake must not start.' > "$brief"
+    mkdir "$journal_dir" ||
+        { fail "journal-directory alias refusal" "fixture failed"; return; }
+    run_with_watchdog "$marker" env FAKE_MODE=happy CODEX_BIN="$FAKE_CODEX" \
+        HAIDER_RUN_JOURNAL="$journal_dir" bash "$WRAPPER" "$brief" "$output" \
+        --max-stall-secs 3 --max-retries 0
+    status=$?; events=$(events_for_brief "$brief")
+    if [ "$status" -eq 2 ] && [ -z "$events" ] &&
+       grep -q 'output and journal-directory paths alias each other' \
+            "$CASE_STDERR_LOG"; then
+        pass "journal-directory alias refusal"
+    else
+        fail "journal-directory alias refusal" \
+            "status=$status events=[$events]"
+    fi
+}
 run_journal_failure() {
-    local brief output bad_journal status marker log
+    local brief output bad_journal status marker
     brief="$TMP_ROOT/journal-failure.brief"
     output="$TMP_ROOT/journal-failure.out"
-    bad_journal="$TMP_ROOT/journal-as-directory"
+    bad_journal="$TMP_ROOT/journal-as-file"
     marker="$TMP_ROOT/journal-failure.timeout"
-    log="$TMP_ROOT/journal-failure.log"
     printf 'The fake must not start.' > "$brief"
-    mkdir "$bad_journal" || { fail "journal append failure" "fixture failed"; return; }
+    : > "$bad_journal" || { fail "journal directory failure" "fixture failed"; return; }
     run_with_watchdog "$marker" env FAKE_MODE=happy CODEX_BIN="$FAKE_CODEX" \
         HAIDER_RUN_JOURNAL="$bad_journal" bash "$WRAPPER" "$brief" "$output" \
-        --max-stall-secs 3 --max-retries 0 > "$log" 2>&1
+        --max-stall-secs 3 --max-retries 0
     status=$?
-    if [ "$status" -eq 2 ] && grep -q 'cannot append journal' "$log"; then
-        pass "journal append failure is fatal"
+    if [ "$status" -eq 2 ] &&
+       grep -q 'cannot create journal directory' "$CASE_STDERR_LOG"; then
+        pass "journal directory failure is fatal"
     else
-        fail "journal append failure is fatal" "status=$status"
+        fail "journal directory failure is fatal" "status=$status"
     fi
 }
 
 run_json_escape_check() {
-    local input escaped expected piece i quote_slash
+    local input escaped expected piece i quote_slash journal run_id checked bad
     input=$(printf '\001\002\003\004\005\006\007\010\011\012\013\014\015\016\017\020\021\022\023\024\025\026\027\030\031\032\033\034\035\036\037')
     escaped=$(json_escape "$input")
     expected=
@@ -97,10 +116,22 @@ run_json_escape_check() {
         i=$((i + 1))
     done
     quote_slash=$(json_escape '"\')
-    # The awk pass exits nonzero when any journal line lacks a run_id.
+    checked=0; bad=0
+    for journal in "$JOURNAL_DIR"/*.jsonl; do
+        [ -f "$journal" ] || continue
+        checked=$((checked + 1))
+        run_id=$(awk 'NR == 1 {
+            value=$0
+            sub(/^.*"run_id":"/, "", value)
+            sub(/".*$/, "", value)
+            print value
+        }' "$journal")
+        awk -v id="$run_id" \
+            'index($0, "\"run_id\":\"" id "\"") == 0 { exit 1 }' "$journal" || bad=1
+        [ "${journal##*/}" = "run-$run_id.jsonl" ] || bad=1
+    done
     if [ "$escaped" = "$expected" ] && [ "$quote_slash" = '\"\\' ] &&
-       ! awk 'index($0, "\"run_id\":\"") == 0 { bad=1 } END { exit bad }' \
-            "$JOURNAL"; then
+       { [ "$checked" -eq 0 ] || [ "$bad" -ne 0 ]; }; then
         fail "JSON escaping and run IDs" "journal record missing run_id"
     elif [ "$escaped" = "$expected" ] && [ "$quote_slash" = '\"\\' ]; then
         pass "JSON escaping and run IDs"
@@ -122,7 +153,7 @@ run_dirty_git_safety() {
     printf 'dirty\n' >> "$repo/tracked.txt"
     before=$(git -C "$repo" status --porcelain=v1 --untracked-files=all)
     run_with_watchdog "$marker" env FAKE_MODE=no_changes CODEX_BIN="$FAKE_CODEX" \
-        HAIDER_RUN_JOURNAL="$JOURNAL" bash -c \
+        HAIDER_RUN_JOURNAL="$JOURNAL_DIR" bash -c \
         'cd "$1" && exec bash "$2" "$3" "$4" --max-stall-secs 3 --max-retries 0' \
         case "$repo" "$WRAPPER" "$brief" "$output"
     status=$?
@@ -135,7 +166,7 @@ run_dirty_git_safety() {
 }
 
 run_case_folded_alias_refusal() {
-    local brief output journal probe_lower probe_upper status marker log
+    local brief output journal probe_lower probe_upper status marker
     probe_lower="$TMP_ROOT/case-fold-probe"
     probe_upper="$TMP_ROOT/CASE-FOLD-PROBE"
     : > "$probe_lower" || { fail "case-folded alias refusal" "probe failed"; return; }
@@ -150,14 +181,14 @@ run_case_folded_alias_refusal() {
     output="$TMP_ROOT/CASE-FOLD-ALIAS"
     journal="$TMP_ROOT/case-fold-alias"
     marker="$TMP_ROOT/case-fold.timeout"
-    log="$TMP_ROOT/case-fold.log"
     printf 'The fake must not start.' > "$brief"
     run_with_watchdog "$marker" env FAKE_MODE=happy CODEX_BIN="$FAKE_CODEX" \
         HAIDER_RUN_JOURNAL="$journal" bash "$WRAPPER" "$brief" "$output" \
-        --max-stall-secs 3 --max-retries 0 > "$log" 2>&1
+        --max-stall-secs 3 --max-retries 0
     status=$?
     if [ "$status" -eq 2 ] && [ ! -e "$output" ] &&
-       [ ! -e "$journal" ] && grep -q 'paths alias each other' "$log"; then
+       [ ! -e "$journal" ] &&
+       grep -q 'paths alias each other' "$CASE_STDERR_LOG"; then
         pass "case-folded alias refusal"
     else
         fail "case-folded alias refusal" "status=$status"
@@ -172,10 +203,10 @@ run_detached_orphan_reap() {
     printf 'Exercise detached leader-exit cleanup.' > "$brief"
     run_with_watchdog "$marker" env FAKE_MODE="$mode" \
         FAKE_PID_FILE="$pids" CODEX_BIN="$FAKE_CODEX" \
-        HAIDER_RUN_JOURNAL="$JOURNAL" bash "$WRAPPER" "$brief" "$output" \
+        HAIDER_RUN_JOURNAL="$JOURNAL_DIR" bash "$WRAPPER" "$brief" "$output" \
         --max-stall-secs 3 --max-retries 0
     status=$?; events=$(events_for_brief "$brief")
-    sleep 1
+    wait_for_pid_record "$pids" || true
     recorded=0; outcome=0
     [ ! -s "$pids" ] || recorded=1
     if all_pids_reaped "$pids"; then
@@ -194,91 +225,75 @@ run_detached_orphan_reap() {
     fi
 }
 
-run_lock_release_guard() {
-    local lock journal brief identity status
-    lock="$TMP_ROOT/release-guard.lock"
-    journal="$TMP_ROOT/release-guard.jsonl"
-    brief="$TMP_ROOT/release-guard.brief"
-    printf 'release guard' > "$brief"
-    mkdir "$lock" || { fail "lock release ownership guard" "fixture failed"; return; }
-    printf '1\twrong identity\n' > "$lock/owner"
-    identity=$(process_identity "$$")
-    (
-        JOURNAL_FILE=$journal; JOURNAL_LOCK_DIR=$lock
-        BRIEF_FILE=$brief; RUN_ID=release-guard
-        JOURNAL_LOCK_HELD=1; JOURNAL_LOCK_IDENTITY=$identity
-        release_journal_lock
-    )
-    status=$?
-    if [ "$status" -eq 1 ] && [ -d "$lock" ] &&
-       [ "$(lock_owner_record "$lock/owner")" = "$(printf '1\twrong identity')" ] &&
-       grep -q '"event":"lock_not_ours"' "$journal"; then
-        pass "lock release ownership guard"
-    else
-        fail "lock release ownership guard" "status=$status"
-    fi
-    rm -f "$lock/owner"; rmdir "$lock" 2>/dev/null || true
+wait_for_pid_record() {
+    local file elapsed
+    file=$1
+    elapsed=0
+    while [ ! -s "$file" ] && [ "$elapsed" -lt 5 ]; do
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    [ -s "$file" ]
 }
 
-run_lock_steal_reverify() {
-    local lock journal brief marker live_identity stealer restored owner grave
-    lock="$TMP_ROOT/steal-race.lock"; journal="$TMP_ROOT/steal-race.jsonl"
-    brief="$TMP_ROOT/steal-race.brief"; marker="$TMP_ROOT/steal-race.moved"
-    printf 'steal race' > "$brief"
-    mkdir "$lock" || { fail "lock steal re-verification" "fixture failed"; return; }
-    printf '999999\tstale identity\n' > "$lock/owner"
-    live_identity=$(process_identity "$$")
-    (
-        JOURNAL_FILE=$journal; JOURNAL_LOCK_DIR=$lock
-        BRIEF_FILE=$brief; RUN_ID=steal-race
-        JOURNAL_LOCK_HELD=0; STALE_LOCK_RECOVERED=0
-        mv() {
-            if [ ! -e "$marker" ]; then
-                printf '%s\t%s\n' "$$" "$live_identity" > "$1/owner"
-                : > "$marker"
-            fi
-            command mv "$@"
-        }
-        acquire_journal_lock
-    ) &
-    stealer=$!
-    restored=0
-    while [ ! -e "$marker" ] && [ "$restored" -lt 100 ]; do
-        sleep 0.05
-        restored=$((restored + 1))
-    done
-    restored=0
-    while [ "$restored" -lt 100 ]; do
-        owner=$(lock_owner_record "$lock/owner" 2>/dev/null) || owner=
-        [ "$owner" != "$(printf '%s\t%s' "$$" "$live_identity")" ] ||
-            break
-        sleep 0.05
-        restored=$((restored + 1))
-    done
-    kill "$stealer" 2>/dev/null || true
-    wait "$stealer" 2>/dev/null || true
-    grave="$lock.stale.first"
-    for grave in "$lock".stale.*; do break; done
-    if [ -e "$marker" ] &&
-       [ "$owner" = "$(printf '%s\t%s' "$$" "$live_identity")" ] &&
-       [ ! -e "$grave" ]; then
-        pass "lock steal re-verification"
+run_instant_exit_discrimination() {
+    local brief output pids marker status events recorded leaked
+    local unverifiable reaped_case unverifiable_case outcomes
+    brief="$TMP_ROOT/instant.brief"; output="$TMP_ROOT/instant.out"
+    pids="$TMP_ROOT/instant.pids"; marker="$TMP_ROOT/instant.timeout"
+    printf 'Exercise instant leader-exit cleanup.' > "$brief"
+    run_with_watchdog "$marker" env FAKE_MODE=leader_instant_exit \
+        FAKE_PID_FILE="$pids" CODEX_BIN="$FAKE_CODEX" \
+        HAIDER_RUN_JOURNAL="$JOURNAL_DIR" bash "$WRAPPER" "$brief" "$output" \
+        --max-stall-secs 3 --max-retries 0
+    status=$?; events=$(events_for_brief "$brief")
+    wait_for_pid_record "$pids" || true
+
+    recorded=0; leaked=0; reaped_case=0; unverifiable_case=0
+    [ ! -s "$pids" ] || recorded=1
+    pids_survive "$pids" && leaked=1
+    if [ -f "$CASE_JOURNAL" ]; then
+        unverifiable=$(awk '
+            index($0, "\"event\":\"reap_unverifiable\"") { count++ }
+            END { print count + 0 }
+        ' "$CASE_JOURNAL")
     else
-        fail "lock steal re-verification" "replacement owner was not restored"
+        unverifiable=-1
     fi
-    rm -f "$lock/owner"; rmdir "$lock" 2>/dev/null || true
+    if [ "$recorded" -eq 1 ] && [ "$leaked" -eq 0 ] &&
+       [ "$unverifiable" -eq 0 ]; then
+        reaped_case=1
+        rm -f "$pids"
+    fi
+    if [ "$recorded" -eq 1 ] && [ "$leaked" -eq 1 ] &&
+       [ "$unverifiable" -gt 0 ]; then
+        cleanup_fake_pids
+        if all_pids_reaped "$pids"; then
+            unverifiable_case=1
+        fi
+    fi
+    outcomes=$((reaped_case + unverifiable_case))
+    if [ "$leaked" -eq 1 ] && [ "$unverifiable_case" -eq 0 ]; then
+        cleanup_fake_pids
+    fi
+
+    if [ "$status" -eq 0 ] && [ "$outcomes" -eq 1 ] &&
+       [ "${events% done}" != "$events" ]; then
+        pass "leader-instant-exit: reaped XOR admitted-and-cleaned"
+    else
+        fail "leader-instant-exit: reaped XOR admitted-and-cleaned" \
+            "status=$status events=[$events] recorded=$recorded leaked=$leaked outcomes=$outcomes"
+    fi
 }
 
 run_extra_cases() {
     run_interrupt_journal
     run_alias_refusal
+    run_journal_dir_alias_refusal
     run_journal_failure
     run_json_escape_check
     run_case_folded_alias_refusal
     run_detached_orphan_reap detached_leader_exits detached \
         "setsid-detached leader-exit: reaped or admitted"
-    run_detached_orphan_reap leader_instant_exit instant \
-        "leader-instant-exit: reaped or admitted"
-    run_lock_release_guard
-    run_lock_steal_reverify
+    run_instant_exit_discrimination
 }

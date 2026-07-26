@@ -1,5 +1,4 @@
 #!/bin/bash
-#
 # Supervised `codex exec`: output growth drives retry and tree reaping.
 # State, signals, and events are here; shared libraries own the primitives.
 # Exit: codex status, 1 give-up, 2 setup/journal, or 128+signal.
@@ -15,14 +14,11 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) ||
     die "cannot resolve script directory"
 # shellcheck source=scripts/supervise-lib.sh
 . "$SCRIPT_DIR/supervise-lib.sh" || die "cannot load supervise-lib.sh"
-
 [ "$#" -ge 2 ] || { usage; exit 2; }
-
 BRIEF_FILE=$1
 OUTPUT_FILE=$2
 shift 2
 MAX_STALL_SECS=600; MAX_RETRIES=2
-
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --max-stall-secs)
@@ -38,21 +34,22 @@ while [ "$#" -gt 0 ]; do
         *) die "unknown argument: $1" ;;
     esac
 done
-
 is_nonnegative_integer "$MAX_STALL_SECS" && [ "$MAX_STALL_SECS" -gt 0 ] ||
     die "--max-stall-secs must be a positive integer"
 is_nonnegative_integer "$MAX_RETRIES" || die "--max-retries must be a non-negative integer"
-[ -f "$BRIEF_FILE" ] || die "brief file not found: $BRIEF_FILE"
-[ -r "$BRIEF_FILE" ] || die "brief file is not readable: $BRIEF_FILE"
-
 if [ "${HAIDER_RUN_JOURNAL+x}" = x ]; then
     [ -n "$HAIDER_RUN_JOURNAL" ] || die "HAIDER_RUN_JOURNAL must not be empty"
-    JOURNAL_FILE=$HAIDER_RUN_JOURNAL
+    JOURNAL_DIR=$HAIDER_RUN_JOURNAL
 else
-    JOURNAL_FILE="$SCRIPT_DIR/run-journal.jsonl"
+    JOURNAL_DIR="$SCRIPT_DIR/run-journal"
 fi
-JOURNAL_FILE=$(canonical_path "$JOURNAL_FILE") || die "cannot resolve journal path"
+JOURNAL_DIR=$(canonical_path "$JOURNAL_DIR") ||
+    die "cannot resolve journal directory path"
 STDERR_FILE="${OUTPUT_FILE}.stderr"
+START_EPOCH=$(date +%s) || die "cannot read clock"
+RUN_ID="${START_EPOCH}-$$"
+JOURNAL_FILE="$JOURNAL_DIR/run-$RUN_ID.jsonl"
+echo "journal: $JOURNAL_FILE" >&2
 CODEX_COMMAND=${CODEX_BIN:-codex}
 RETRY_PREFIX="Previous run stalled and was killed. Inspect current git status/diff first, do not redo completed work, continue from where it stopped."
 if command -v perl >/dev/null 2>&1; then
@@ -60,10 +57,10 @@ if command -v perl >/dev/null 2>&1; then
 else
     LAUNCH_MODE=plain_spawn
 fi
-
-# Refuse aliases before any destination is opened or truncated.
-PATH_LABELS=(brief output stderr journal)
-PATH_VALUES=("$BRIEF_FILE" "$OUTPUT_FILE" "$STDERR_FILE" "$JOURNAL_FILE")
+# Refuse aliases before any destination is opened or truncated. The journal
+# setting names a directory; no input or output may name that directory.
+PATH_LABELS=(brief output stderr journal-directory)
+PATH_VALUES=("$BRIEF_FILE" "$OUTPUT_FILE" "$STDERR_FILE" "$JOURNAL_DIR")
 i=0
 while [ "$i" -lt "${#PATH_VALUES[@]}" ]; do
     j=$((i + 1))
@@ -78,7 +75,18 @@ while [ "$i" -lt "${#PATH_VALUES[@]}" ]; do
     done
     i=$((i + 1))
 done
-
+[ -f "$BRIEF_FILE" ] || die "brief file not found: $BRIEF_FILE"
+[ -r "$BRIEF_FILE" ] || die "brief file is not readable: $BRIEF_FILE"
+mkdir -p "$JOURNAL_DIR" || die "cannot create journal directory: $JOURNAL_DIR"
+[ -d "$JOURNAL_DIR" ] || die "journal path is not a directory: $JOURNAL_DIR"
+# Also protect the predictable per-run destination itself.
+for destination in "$BRIEF_FILE" "$OUTPUT_FILE" "$STDERR_FILE"; do
+    paths_alias "$destination" "$JOURNAL_FILE"
+    alias_status=$?
+    [ "$alias_status" -ne 2 ] || die "cannot resolve destination or journal file path"
+    [ "$alias_status" -ne 0 ] || die "destination and journal file paths alias each other"
+done
+: > "$JOURNAL_FILE" || die "cannot create journal file: $JOURNAL_FILE"
 PROMPT=$(cat "$BRIEF_FILE") || die "cannot read brief file: $BRIEF_FILE"
 : > "$OUTPUT_FILE" || die "cannot write output file: $OUTPUT_FILE"
 : > "$STDERR_FILE" || die "cannot write stderr file: $STDERR_FILE"
@@ -89,22 +97,14 @@ TREE_FILE=$(mktemp "${TMPDIR:-/tmp}/codex-supervised-tree.XXXXXX") ||
     die "cannot create temporary process-tree file"
 PS_FILE=$(mktemp "${TMPDIR:-/tmp}/codex-supervised-ps.XXXXXX") ||
     die "cannot create temporary process snapshot"
-
-START_EPOCH=$(date +%s) || die "cannot read clock"
-RUN_ID="${START_EPOCH}-$$"
-JOURNAL_LOCK_DIR="${JOURNAL_FILE}.lock"
-JOURNAL_LOCK_HELD=0; STALE_LOCK_RECOVERED=0
 ACTIVE_PID=; RETRIES=0
 # Park signals during journal writes.
 JOURNAL_STARTED=0; IN_JOURNAL=0; JOURNAL_BROKEN=0
 PENDING_SIGNAL=; PENDING_SIGNAL_CODE=
-
 cleanup() {
-    release_journal_lock >/dev/null 2>&1 || true
     rm -f "$JOB_STATUS_FILE" "$TREE_FILE" "$PS_FILE" \
         "${PS_FILE}.next" "${PS_FILE}.survivors"
 }
-
 # Job-table membership is immune to PID reuse.
 job_is_running() {
     local pid job_pid
@@ -115,7 +115,6 @@ job_is_running() {
     done < "$JOB_STATUS_FILE"
     return 1
 }
-
 # Journal or tear down; then deliver any parked signal.
 record_event() {
     local status pending_name pending_code
@@ -220,8 +219,9 @@ ${PROMPT}"
         fi
 
         if ! job_is_running "$ACTIVE_PID"; then
-            if [ "$FIRST_SNAPSHOT_PENDING" -eq 1 ] &&
-               ! pid_file_has_survivors "$TREE_FILE"; then
+            # Unverifiable ONLY if no snapshot ever recorded a single process:
+            # a recorded-then-dead tree is VERIFIED clean, not unverifiable.
+            if [ ! -s "$TREE_FILE" ]; then
                 record_event "reap_unverifiable" \
                     ',"reason":"leader_exited_before_first_snapshot"'
             fi
