@@ -65,6 +65,9 @@ pub enum ToolStatus {
     InProgress,
     Completed,
     Failed,
+    /// Turn was cancelled while the tool was open — an outcome, never a
+    /// failure (frozen law; additive variant, ADR-2).
+    Cancelled,
 }
 
 /// The lifecycle events. Deltas are keyed by `item_id`; `Completed` carries

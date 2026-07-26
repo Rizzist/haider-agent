@@ -20,6 +20,11 @@ haider-verify = { path = "../haider-verify" }
 haider-accounts = { path = "../haider-accounts" }
 haider-rpc = { path = "../haider-rpc" }
 haider-tui = { path = "../haider-tui" }
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
 
 [lints]
 workspace = true

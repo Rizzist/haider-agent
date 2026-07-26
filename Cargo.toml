@@ -22,8 +22,10 @@ repository = "https://github.com/Rizzist/haider-agent"
 rust-version = "1.95"
 
 [workspace.dependencies]
+async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
