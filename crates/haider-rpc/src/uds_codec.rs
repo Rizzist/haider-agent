@@ -49,6 +49,37 @@ enum DecodeState {
     Poisoned,
 }
 
+/// Result of decoding one arbitrary UDS byte chunk.
+///
+/// A chunk can finish valid frames and then reveal a framing/body error. Those
+/// frames are returned in [`Self::frames`] while the terminal violation is
+/// returned in [`Self::error`]. This makes the delivered transcript invariant
+/// to OS read boundaries without delaying poisoning: after an error, the
+/// decoder is immediately poisoned and all remaining chunk bytes are ignored.
+#[derive(Debug)]
+pub struct DecodeBatch {
+    /// Every valid frame completed before any terminal error in this chunk.
+    pub frames: Vec<WireFrame>,
+    /// The terminal error, if this chunk poisoned the decoder.
+    pub error: Option<CodecError>,
+}
+
+impl DecodeBatch {
+    fn complete(frames: Vec<WireFrame>) -> Self {
+        Self {
+            frames,
+            error: None,
+        }
+    }
+
+    fn failed(frames: Vec<WireFrame>, error: CodecError) -> Self {
+        Self {
+            frames,
+            error: Some(error),
+        }
+    }
+}
+
 /// Streaming UDS frame decoder.
 #[derive(Debug)]
 pub struct Decoder {
@@ -74,14 +105,16 @@ impl Decoder {
         matches!(self.state, DecodeState::Poisoned)
     }
 
-    /// Accepts an arbitrary byte chunk and returns every completed frame.
+    /// Accepts an arbitrary byte chunk and returns every completed frame plus
+    /// any terminal error encountered after those frames.
     ///
-    /// Any framing or body violation returns its typed error and permanently
-    /// poisons the decoder (poisoned, not recoverable, is the documented
-    /// choice); the caller must discard the decoder with its connection.
-    pub fn push(&mut self, mut chunk: &[u8]) -> Result<Vec<WireFrame>, CodecError> {
+    /// Any framing or body violation permanently poisons the decoder
+    /// (poisoned, not recoverable, is the documented choice); the caller
+    /// delivers `frames`, observes `error`, then discards the decoder with its
+    /// connection.
+    pub fn push(&mut self, mut chunk: &[u8]) -> DecodeBatch {
         if self.is_poisoned() {
-            return Err(CodecError::DecoderPoisoned);
+            return DecodeBatch::failed(Vec::new(), CodecError::DecoderPoisoned);
         }
 
         let mut frames = Vec::new();
@@ -96,7 +129,9 @@ impl Decoder {
 
                     if *filled == PREFIX_LEN {
                         let announced_len = u32::from_be_bytes(*bytes) as usize;
-                        self.start_body(announced_len)?;
+                        if let Err(error) = self.start_body(announced_len) {
+                            return DecodeBatch::failed(frames, error);
+                        }
                     }
                 }
                 DecodeState::Body {
@@ -119,7 +154,7 @@ impl Decoder {
                             DecodeState::Body { bytes, .. } => bytes,
                             _ => {
                                 self.state = DecodeState::Poisoned;
-                                return Err(CodecError::DecoderPoisoned);
+                                return DecodeBatch::failed(frames, CodecError::DecoderPoisoned);
                             }
                         };
                         match std::str::from_utf8(&body) {
@@ -127,20 +162,22 @@ impl Decoder {
                                 Ok(frame) => frames.push(frame),
                                 Err(error) => {
                                     self.state = DecodeState::Poisoned;
-                                    return Err(error);
+                                    return DecodeBatch::failed(frames, error);
                                 }
                             },
                             Err(error) => {
                                 self.state = DecodeState::Poisoned;
-                                return Err(CodecError::InvalidUtf8(error));
+                                return DecodeBatch::failed(frames, CodecError::InvalidUtf8(error));
                             }
                         }
                     }
                 }
-                DecodeState::Poisoned => return Err(CodecError::DecoderPoisoned),
+                DecodeState::Poisoned => {
+                    return DecodeBatch::failed(frames, CodecError::DecoderPoisoned);
+                }
             }
         }
-        Ok(frames)
+        DecodeBatch::complete(frames)
     }
 
     fn start_body(&mut self, announced_len: usize) -> Result<(), CodecError> {

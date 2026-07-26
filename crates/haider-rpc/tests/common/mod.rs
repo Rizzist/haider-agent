@@ -5,9 +5,9 @@ use std::collections::BTreeSet;
 use haider_protocol::envelope::{PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION};
 use haider_protocol::ids::{DeviceId, EventId, MenuId, SessionId};
 use haider_rpc::{
-    AttachMode, AttachState, AttachmentId, Capability, ClientKind, CommandId, Hello,
-    LifecyclePhase, ProtocolError, RequestBody, RequestId, ResponseBody, SeqRange,
-    SessionReadResult, SessionSummary, Welcome, WireFrame,
+    AttachMode, AttachState, AttachmentId, Capability, ClientKind, CommandId,
+    ERROR_CODE_CAPABILITY_DENIED, Hello, LifecyclePhase, MenuInput, ProtocolError, RequestBody,
+    RequestId, ResponseBody, SeqRange, SessionReadResult, SessionSummary, Welcome, WireFrame,
 };
 
 pub const TEST_FRAME_LIMIT: usize = 1024 * 1024;
@@ -55,22 +55,28 @@ pub fn transcript() -> Vec<WireFrame> {
         WireFrame::Hello(Hello {
             protocol_min: 1,
             protocol_max: 2,
+            client_name: "haider-gui".into(),
+            client_version: "0.0.8".into(),
+            client_instance_id: "client-instance-1".into(),
             client_kind: ClientKind::Gui,
             capabilities_requested: capabilities([Capability::View, Capability::Control]),
+            max_receive_frame: TEST_FRAME_LIMIT as u32,
         }),
         WireFrame::Welcome(Welcome {
             protocol: 1,
             instance_id: "instance-1".into(),
             daemon_generation: 4,
             frame_limit: TEST_FRAME_LIMIT as u32,
+            profile_id: "profile-1".into(),
+            daemon_version: "0.0.8".into(),
             lifecycle_phase: LifecyclePhase::Ready,
             capabilities_granted: capabilities([Capability::View]),
         }),
         WireFrame::Request {
             request_id: RequestId::new("request-list"),
             body: RequestBody::SessionList {
-                page: 2,
-                page_size: 50,
+                cursor: Some("cursor-after-session-0".into()),
+                limit: 50,
             },
         },
         WireFrame::Request {
@@ -94,21 +100,15 @@ pub fn transcript() -> Vec<WireFrame> {
                 attachment_id: attachment_id.clone(),
             },
         },
-        WireFrame::Request {
-            request_id: RequestId::new("request-ping"),
-            body: RequestBody::Ping { nonce: 99 },
-        },
         WireFrame::Response {
             request_id: RequestId::new("request-list"),
             body: ResponseBody::SessionList {
-                page: 2,
-                page_size: 50,
                 sessions: vec![SessionSummary {
                     session_id: session_id.clone(),
                     head_seq: 9,
                     worker_generation: 7,
                 }],
-                next_page: Some(3),
+                next_cursor: Some("cursor-after-session-1".into()),
             },
         },
         WireFrame::Response {
@@ -142,10 +142,15 @@ pub fn transcript() -> Vec<WireFrame> {
             },
         },
         WireFrame::Response {
-            request_id: RequestId::new("request-ping"),
-            body: ResponseBody::Pong { nonce: 99 },
+            request_id: RequestId::new("request-control"),
+            body: ResponseBody::Error {
+                code: ERROR_CODE_CAPABILITY_DENIED.into(),
+                message: "control capability required".into(),
+                retryable: false,
+            },
         },
         WireFrame::Event {
+            attachment_id: attachment_id.clone(),
             session_id: session_id.clone(),
             envelope: raw_envelope(10),
         },
@@ -159,19 +164,40 @@ pub fn transcript() -> Vec<WireFrame> {
             menu_id: MenuId::new("menu-1"),
             request_seq: 8,
             worker_generation: 7,
-            option: "allow".into(),
+            option_key: "other".into(),
+            option_index: 2,
+            input: Some(MenuInput::Text {
+                text: "custom answer".into(),
+            }),
+        },
+        WireFrame::MenuAnswer {
+            command_id: CommandId::new("command-2"),
+            session_id: SessionId::new("session-1"),
+            menu_id: MenuId::new("menu-2"),
+            request_seq: 9,
+            worker_generation: 7,
+            option_key: "submit_secret".into(),
+            option_index: 0,
+            input: Some(MenuInput::SecretVaultReference {
+                vault_reference: "vault-ref-1".into(),
+            }),
         },
         WireFrame::Lagged {
-            attachment_id,
-            resume_after_seq: 10,
+            attachment_id: attachment_id.clone(),
+            last_queued_seq: 10,
         },
         WireFrame::ServerDraining {
-            deadline_ms: 1_753_500_030_000,
+            reason: "upgrade".into(),
+            instance_id: "instance-1".into(),
+            daemon_generation: 4,
+            deadline_unix_ms: 1_753_500_030_000,
         },
+        WireFrame::Ping { nonce: 99 },
+        WireFrame::Pong { nonce: 99 },
         WireFrame::ProtocolError(ProtocolError {
-            code: "capability_denied".into(),
-            message: "control capability required".into(),
-            fatal: false,
+            code: "invalid_frame".into(),
+            message: "connection framing failed".into(),
+            fatal: true,
         }),
         WireFrame::Unknown,
     ]

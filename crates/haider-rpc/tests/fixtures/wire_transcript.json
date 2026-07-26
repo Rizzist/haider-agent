@@ -1,228 +1,86 @@
 [
   {
-    "v": 1,
-    "kind": "hello",
-    "protocol_min": 1,
-    "protocol_max": 2,
-    "client_kind": "gui",
-    "capabilities_requested": [
-      "view",
-      "control"
-    ]
+    "ws_body": "{\"v\":1,\"kind\":\"hello\",\"protocol_min\":1,\"protocol_max\":2,\"client_name\":\"haider-gui\",\"client_version\":\"0.0.8\",\"client_instance_id\":\"client-instance-1\",\"client_kind\":\"gui\",\"capabilities_requested\":[\"view\",\"control\"],\"max_receive_frame\":1048576}",
+    "uds_stream_hex": "000000f17b2276223a312c226b696e64223a2268656c6c6f222c2270726f746f636f6c5f6d696e223a312c2270726f746f636f6c5f6d6178223a322c22636c69656e745f6e616d65223a226861696465722d677569222c22636c69656e745f76657273696f6e223a22302e302e38222c22636c69656e745f696e7374616e63655f6964223a22636c69656e742d696e7374616e63652d31222c22636c69656e745f6b696e64223a22677569222c226361706162696c69746965735f726571756573746564223a5b2276696577222c22636f6e74726f6c225d2c226d61785f726563656976655f6672616d65223a313034383537367d"
   },
   {
-    "v": 1,
-    "kind": "welcome",
-    "protocol": 1,
-    "instance_id": "instance-1",
-    "daemon_generation": 4,
-    "frame_limit": 1048576,
-    "lifecycle_phase": "ready",
-    "capabilities_granted": [
-      "view"
-    ]
+    "ws_body": "{\"v\":1,\"kind\":\"welcome\",\"protocol\":1,\"instance_id\":\"instance-1\",\"daemon_generation\":4,\"frame_limit\":1048576,\"profile_id\":\"profile-1\",\"daemon_version\":\"0.0.8\",\"lifecycle_phase\":\"ready\",\"capabilities_granted\":[\"view\"]}",
+    "uds_stream_hex": "000000d87b2276223a312c226b696e64223a2277656c636f6d65222c2270726f746f636f6c223a312c22696e7374616e63655f6964223a22696e7374616e63652d31222c226461656d6f6e5f67656e65726174696f6e223a342c226672616d655f6c696d6974223a313034383537362c2270726f66696c655f6964223a2270726f66696c652d31222c226461656d6f6e5f76657273696f6e223a22302e302e38222c226c6966656379636c655f7068617365223a227265616479222c226361706162696c69746965735f6772616e746564223a5b2276696577225d7d"
   },
   {
-    "v": 1,
-    "kind": "request",
-    "request_id": "request-list",
-    "body": {
-      "method": "session.list",
-      "page": 2,
-      "page_size": 50
-    }
+    "ws_body": "{\"v\":1,\"kind\":\"request\",\"request_id\":\"request-list\",\"body\":{\"method\":\"session.list\",\"cursor\":\"cursor-after-session-0\",\"limit\":50}}",
+    "uds_stream_hex": "000000827b2276223a312c226b696e64223a2272657175657374222c22726571756573745f6964223a22726571756573742d6c697374222c22626f6479223a7b226d6574686f64223a2273657373696f6e2e6c697374222c22637572736f72223a22637572736f722d61667465722d73657373696f6e2d30222c226c696d6974223a35307d7d"
   },
   {
-    "v": 1,
-    "kind": "request",
-    "request_id": "request-read",
-    "body": {
-      "method": "session.read",
-      "session_id": "session-1",
-      "range": {
-        "start_seq": 5,
-        "end_seq": 9
-      }
-    }
+    "ws_body": "{\"v\":1,\"kind\":\"request\",\"request_id\":\"request-read\",\"body\":{\"method\":\"session.read\",\"session_id\":\"session-1\",\"range\":{\"start_seq\":5,\"end_seq\":9}}}",
+    "uds_stream_hex": "000000927b2276223a312c226b696e64223a2272657175657374222c22726571756573745f6964223a22726571756573742d72656164222c22626f6479223a7b226d6574686f64223a2273657373696f6e2e72656164222c2273657373696f6e5f6964223a2273657373696f6e2d31222c2272616e6765223a7b2273746172745f736571223a352c22656e645f736571223a397d7d7d"
   },
   {
-    "v": 1,
-    "kind": "request",
-    "request_id": "request-attach",
-    "body": {
-      "method": "session.attach",
-      "session_id": "session-1",
-      "after_seq": 4,
-      "mode": "view"
-    }
+    "ws_body": "{\"v\":1,\"kind\":\"request\",\"request_id\":\"request-attach\",\"body\":{\"method\":\"session.attach\",\"session_id\":\"session-1\",\"after_seq\":4,\"mode\":\"view\"}}",
+    "uds_stream_hex": "0000008e7b2276223a312c226b696e64223a2272657175657374222c22726571756573745f6964223a22726571756573742d617474616368222c22626f6479223a7b226d6574686f64223a2273657373696f6e2e617474616368222c2273657373696f6e5f6964223a2273657373696f6e2d31222c2261667465725f736571223a342c226d6f6465223a2276696577227d7d"
   },
   {
-    "v": 1,
-    "kind": "request",
-    "request_id": "request-detach",
-    "body": {
-      "method": "session.detach",
-      "attachment_id": "attachment-1"
-    }
+    "ws_body": "{\"v\":1,\"kind\":\"request\",\"request_id\":\"request-detach\",\"body\":{\"method\":\"session.detach\",\"attachment_id\":\"attachment-1\"}}",
+    "uds_stream_hex": "000000787b2276223a312c226b696e64223a2272657175657374222c22726571756573745f6964223a22726571756573742d646574616368222c22626f6479223a7b226d6574686f64223a2273657373696f6e2e646574616368222c226174746163686d656e745f6964223a226174746163686d656e742d31227d7d"
   },
   {
-    "v": 1,
-    "kind": "request",
-    "request_id": "request-ping",
-    "body": {
-      "method": "ping",
-      "nonce": 99
-    }
+    "ws_body": "{\"v\":1,\"kind\":\"response\",\"request_id\":\"request-list\",\"body\":{\"method\":\"session.list\",\"sessions\":[{\"session_id\":\"session-1\",\"head_seq\":9,\"worker_generation\":7}],\"next_cursor\":\"cursor-after-session-1\"}}",
+    "uds_stream_hex": "000000c87b2276223a312c226b696e64223a22726573706f6e7365222c22726571756573745f6964223a22726571756573742d6c697374222c22626f6479223a7b226d6574686f64223a2273657373696f6e2e6c697374222c2273657373696f6e73223a5b7b2273657373696f6e5f6964223a2273657373696f6e2d31222c22686561645f736571223a392c22776f726b65725f67656e65726174696f6e223a377d5d2c226e6578745f637572736f72223a22637572736f722d61667465722d73657373696f6e2d31227d7d"
   },
   {
-    "v": 1,
-    "kind": "response",
-    "request_id": "request-list",
-    "body": {
-      "method": "session.list",
-      "page": 2,
-      "page_size": 50,
-      "sessions": [
-        {
-          "session_id": "session-1",
-          "head_seq": 9,
-          "worker_generation": 7
-        }
-      ],
-      "next_page": 3
-    }
+    "ws_body": "{\"v\":1,\"kind\":\"response\",\"request_id\":\"request-read\",\"body\":{\"method\":\"session.read\",\"result\":{\"session_id\":\"session-1\",\"range\":{\"start_seq\":5,\"end_seq\":9},\"head_seq\":9,\"envelopes\":[{\"schema_version\":1,\"event_id\":\"ev-9\",\"seq\":9,\"session_id\":\"session-1\",\"device_id\":\"device-1\",\"authority_epoch\":3,\"worker_generation\":7,\"committed_at_ms\":1753500000009,\"render\":{\"ui\":true,\"durable\":true,\"prompt\":\"verbatim\"},\"payload\":{\"detail\":\"kept raw\",\"type\":\"future_event\"}}]}}}",
+    "uds_stream_hex": "000001d07b2276223a312c226b696e64223a22726573706f6e7365222c22726571756573745f6964223a22726571756573742d72656164222c22626f6479223a7b226d6574686f64223a2273657373696f6e2e72656164222c22726573756c74223a7b2273657373696f6e5f6964223a2273657373696f6e2d31222c2272616e6765223a7b2273746172745f736571223a352c22656e645f736571223a397d2c22686561645f736571223a392c22656e76656c6f706573223a5b7b22736368656d615f76657273696f6e223a312c226576656e745f6964223a2265762d39222c22736571223a392c2273657373696f6e5f6964223a2273657373696f6e2d31222c226465766963655f6964223a226465766963652d31222c22617574686f726974795f65706f6368223a332c22776f726b65725f67656e65726174696f6e223a372c22636f6d6d69747465645f61745f6d73223a313735333530303030303030392c2272656e646572223a7b227569223a747275652c2264757261626c65223a747275652c2270726f6d7074223a22766572626174696d227d2c227061796c6f6164223a7b2264657461696c223a226b65707420726177222c2274797065223a226675747572655f6576656e74227d7d5d7d7d7d"
   },
   {
-    "v": 1,
-    "kind": "response",
-    "request_id": "request-read",
-    "body": {
-      "method": "session.read",
-      "result": {
-        "session_id": "session-1",
-        "range": {
-          "start_seq": 5,
-          "end_seq": 9
-        },
-        "head_seq": 9,
-        "envelopes": [
-          {
-            "schema_version": 1,
-            "event_id": "ev-9",
-            "seq": 9,
-            "session_id": "session-1",
-            "device_id": "device-1",
-            "authority_epoch": 3,
-            "worker_generation": 7,
-            "committed_at_ms": 1753500000009,
-            "render": {
-              "ui": true,
-              "durable": true,
-              "prompt": "verbatim"
-            },
-            "payload": {
-              "detail": "kept raw",
-              "type": "future_event"
-            }
-          }
-        ]
-      }
-    }
+    "ws_body": "{\"v\":1,\"kind\":\"response\",\"request_id\":\"request-attach\",\"body\":{\"method\":\"session.attach\",\"attachment_id\":\"attachment-1\",\"attach_state\":{\"session_id\":\"session-1\",\"requested_after_seq\":4,\"replay_through_seq\":9,\"worker_generation\":7,\"authority_epoch\":3}}}",
+    "uds_stream_hex": "000000fc7b2276223a312c226b696e64223a22726573706f6e7365222c22726571756573745f6964223a22726571756573742d617474616368222c22626f6479223a7b226d6574686f64223a2273657373696f6e2e617474616368222c226174746163686d656e745f6964223a226174746163686d656e742d31222c226174746163685f7374617465223a7b2273657373696f6e5f6964223a2273657373696f6e2d31222c227265717565737465645f61667465725f736571223a342c227265706c61795f7468726f7567685f736571223a392c22776f726b65725f67656e65726174696f6e223a372c22617574686f726974795f65706f6368223a337d7d7d"
   },
   {
-    "v": 1,
-    "kind": "response",
-    "request_id": "request-attach",
-    "body": {
-      "method": "session.attach",
-      "attachment_id": "attachment-1",
-      "attach_state": {
-        "session_id": "session-1",
-        "requested_after_seq": 4,
-        "replay_through_seq": 9,
-        "worker_generation": 7,
-        "authority_epoch": 3
-      }
-    }
+    "ws_body": "{\"v\":1,\"kind\":\"response\",\"request_id\":\"request-detach\",\"body\":{\"method\":\"session.detach\",\"attachment_id\":\"attachment-1\"}}",
+    "uds_stream_hex": "000000797b2276223a312c226b696e64223a22726573706f6e7365222c22726571756573745f6964223a22726571756573742d646574616368222c22626f6479223a7b226d6574686f64223a2273657373696f6e2e646574616368222c226174746163686d656e745f6964223a226174746163686d656e742d31227d7d"
   },
   {
-    "v": 1,
-    "kind": "response",
-    "request_id": "request-detach",
-    "body": {
-      "method": "session.detach",
-      "attachment_id": "attachment-1"
-    }
+    "ws_body": "{\"v\":1,\"kind\":\"response\",\"request_id\":\"request-control\",\"body\":{\"method\":\"error\",\"code\":\"capability_denied\",\"message\":\"control capability required\",\"retryable\":false}}",
+    "uds_stream_hex": "000000a77b2276223a312c226b696e64223a22726573706f6e7365222c22726571756573745f6964223a22726571756573742d636f6e74726f6c222c22626f6479223a7b226d6574686f64223a226572726f72222c22636f6465223a226361706162696c6974795f64656e696564222c226d657373616765223a22636f6e74726f6c206361706162696c697479207265717569726564222c22726574727961626c65223a66616c73657d7d"
   },
   {
-    "v": 1,
-    "kind": "response",
-    "request_id": "request-ping",
-    "body": {
-      "method": "pong",
-      "nonce": 99
-    }
+    "ws_body": "{\"v\":1,\"kind\":\"event\",\"attachment_id\":\"attachment-1\",\"session_id\":\"session-1\",\"envelope\":{\"schema_version\":1,\"event_id\":\"ev-10\",\"seq\":10,\"session_id\":\"session-1\",\"device_id\":\"device-1\",\"authority_epoch\":3,\"worker_generation\":7,\"committed_at_ms\":1753500000010,\"render\":{\"ui\":true,\"durable\":true,\"prompt\":\"verbatim\"},\"payload\":{\"detail\":\"kept raw\",\"type\":\"future_event\"}}}",
+    "uds_stream_hex": "000001727b2276223a312c226b696e64223a226576656e74222c226174746163686d656e745f6964223a226174746163686d656e742d31222c2273657373696f6e5f6964223a2273657373696f6e2d31222c22656e76656c6f7065223a7b22736368656d615f76657273696f6e223a312c226576656e745f6964223a2265762d3130222c22736571223a31302c2273657373696f6e5f6964223a2273657373696f6e2d31222c226465766963655f6964223a226465766963652d31222c22617574686f726974795f65706f6368223a332c22776f726b65725f67656e65726174696f6e223a372c22636f6d6d69747465645f61745f6d73223a313735333530303030303031302c2272656e646572223a7b227569223a747275652c2264757261626c65223a747275652c2270726f6d7074223a22766572626174696d227d2c227061796c6f6164223a7b2264657461696c223a226b65707420726177222c2274797065223a226675747572655f6576656e74227d7d7d"
   },
   {
-    "v": 1,
-    "kind": "event",
-    "session_id": "session-1",
-    "envelope": {
-      "schema_version": 1,
-      "event_id": "ev-10",
-      "seq": 10,
-      "session_id": "session-1",
-      "device_id": "device-1",
-      "authority_epoch": 3,
-      "worker_generation": 7,
-      "committed_at_ms": 1753500000010,
-      "render": {
-        "ui": true,
-        "durable": true,
-        "prompt": "verbatim"
-      },
-      "payload": {
-        "detail": "kept raw",
-        "type": "future_event"
-      }
-    }
+    "ws_body": "{\"v\":1,\"kind\":\"attach_caught_up\",\"attachment_id\":\"attachment-1\",\"high_water_seq\":10}",
+    "uds_stream_hex": "000000547b2276223a312c226b696e64223a226174746163685f6361756768745f7570222c226174746163686d656e745f6964223a226174746163686d656e742d31222c22686967685f77617465725f736571223a31307d"
   },
   {
-    "v": 1,
-    "kind": "attach_caught_up",
-    "attachment_id": "attachment-1",
-    "high_water_seq": 10
+    "ws_body": "{\"v\":1,\"kind\":\"menu_answer\",\"command_id\":\"command-1\",\"session_id\":\"session-1\",\"menu_id\":\"menu-1\",\"request_seq\":8,\"worker_generation\":7,\"option_key\":\"other\",\"option_index\":2,\"input\":{\"kind\":\"text\",\"text\":\"custom answer\"}}",
+    "uds_stream_hex": "000000dc7b2276223a312c226b696e64223a226d656e755f616e73776572222c22636f6d6d616e645f6964223a22636f6d6d616e642d31222c2273657373696f6e5f6964223a2273657373696f6e2d31222c226d656e755f6964223a226d656e752d31222c22726571756573745f736571223a382c22776f726b65725f67656e65726174696f6e223a372c226f7074696f6e5f6b6579223a226f74686572222c226f7074696f6e5f696e646578223a322c22696e707574223a7b226b696e64223a2274657874222c2274657874223a22637573746f6d20616e73776572227d7d"
   },
   {
-    "v": 1,
-    "kind": "menu_answer",
-    "command_id": "command-1",
-    "session_id": "session-1",
-    "menu_id": "menu-1",
-    "request_seq": 8,
-    "worker_generation": 7,
-    "option": "allow"
+    "ws_body": "{\"v\":1,\"kind\":\"menu_answer\",\"command_id\":\"command-2\",\"session_id\":\"session-1\",\"menu_id\":\"menu-2\",\"request_seq\":9,\"worker_generation\":7,\"option_key\":\"submit_secret\",\"option_index\":0,\"input\":{\"kind\":\"secret_vault_reference\",\"vault_reference\":\"vault-ref-1\"}}",
+    "uds_stream_hex": "000000ff7b2276223a312c226b696e64223a226d656e755f616e73776572222c22636f6d6d616e645f6964223a22636f6d6d616e642d32222c2273657373696f6e5f6964223a2273657373696f6e2d31222c226d656e755f6964223a226d656e752d32222c22726571756573745f736571223a392c22776f726b65725f67656e65726174696f6e223a372c226f7074696f6e5f6b6579223a227375626d69745f736563726574222c226f7074696f6e5f696e646578223a302c22696e707574223a7b226b696e64223a227365637265745f7661756c745f7265666572656e6365222c227661756c745f7265666572656e6365223a227661756c742d7265662d31227d7d"
   },
   {
-    "v": 1,
-    "kind": "lagged",
-    "attachment_id": "attachment-1",
-    "resume_after_seq": 10
+    "ws_body": "{\"v\":1,\"kind\":\"lagged\",\"attachment_id\":\"attachment-1\",\"last_queued_seq\":10}",
+    "uds_stream_hex": "0000004b7b2276223a312c226b696e64223a226c6167676564222c226174746163686d656e745f6964223a226174746163686d656e742d31222c226c6173745f7175657565645f736571223a31307d"
   },
   {
-    "v": 1,
-    "kind": "server_draining",
-    "deadline_ms": 1753500030000
+    "ws_body": "{\"v\":1,\"kind\":\"server_draining\",\"reason\":\"upgrade\",\"instance_id\":\"instance-1\",\"daemon_generation\":4,\"deadline_unix_ms\":1753500030000}",
+    "uds_stream_hex": "000000857b2276223a312c226b696e64223a227365727665725f647261696e696e67222c22726561736f6e223a2275706772616465222c22696e7374616e63655f6964223a22696e7374616e63652d31222c226461656d6f6e5f67656e65726174696f6e223a342c22646561646c696e655f756e69785f6d73223a313735333530303033303030307d"
   },
   {
-    "v": 1,
-    "kind": "protocol_error",
-    "code": "capability_denied",
-    "message": "control capability required",
-    "fatal": false
+    "ws_body": "{\"v\":1,\"kind\":\"ping\",\"nonce\":99}",
+    "uds_stream_hex": "000000207b2276223a312c226b696e64223a2270696e67222c226e6f6e6365223a39397d"
   },
   {
-    "v": 1,
-    "kind": "unknown"
+    "ws_body": "{\"v\":1,\"kind\":\"pong\",\"nonce\":99}",
+    "uds_stream_hex": "000000207b2276223a312c226b696e64223a22706f6e67222c226e6f6e6365223a39397d"
+  },
+  {
+    "ws_body": "{\"v\":1,\"kind\":\"protocol_error\",\"code\":\"invalid_frame\",\"message\":\"connection framing failed\",\"fatal\":true}",
+    "uds_stream_hex": "000000697b2276223a312c226b696e64223a2270726f746f636f6c5f6572726f72222c22636f6465223a22696e76616c69645f6672616d65222c226d657373616765223a22636f6e6e656374696f6e206672616d696e67206661696c6564222c22666174616c223a747275657d"
+  },
+  {
+    "ws_body": "{\"v\":1,\"kind\":\"unknown\"}",
+    "uds_stream_hex": "000000187b2276223a312c226b696e64223a22756e6b6e6f776e227d"
   }
 ]

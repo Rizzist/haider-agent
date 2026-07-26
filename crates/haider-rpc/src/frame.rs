@@ -20,6 +20,10 @@ pub const WIRE_PROTOCOL_VERSION: u32 = 1;
 /// W3b advertises its actual configured value in [`Welcome::frame_limit`].
 pub const DEFAULT_FRAME_LIMIT: usize = 8 * 1024 * 1024;
 
+const fn default_frame_limit_u32() -> u32 {
+    DEFAULT_FRAME_LIMIT as u32
+}
+
 macro_rules! string_id {
     ($(#[$doc:meta])* $name:ident) => {
         $(#[$doc])*
@@ -59,6 +63,17 @@ string_id!(
     /// A durable, client-generated idempotency key.
     CommandId
 );
+
+/// Stable code for a request whose replay cursor is beyond the committed head.
+pub const ERROR_CODE_CURSOR_AHEAD: &str = "cursor_ahead";
+/// Stable code for a request forbidden by the connection's granted capabilities.
+pub const ERROR_CODE_CAPABILITY_DENIED: &str = "capability_denied";
+/// Stable code for a compare-and-set request that lost to an earlier resolution.
+pub const ERROR_CODE_ALREADY_RESOLVED: &str = "already_resolved";
+/// Stable code for a requested session, attachment, menu, or other resource not found.
+pub const ERROR_CODE_NOT_FOUND: &str = "not_found";
+/// Stable code for work rejected after the daemon entered its drain barrier.
+pub const ERROR_CODE_DRAINING: &str = "draining";
 
 /// Kind of client taking part in the handshake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,11 +116,27 @@ pub struct Hello {
     pub protocol_min: u32,
     /// Highest wire protocol version the client implements (inclusive).
     pub protocol_max: u32,
+    /// Human-readable client product name, such as `haider-tui`.
+    #[serde(default)]
+    pub client_name: String,
+    /// Client build/version string used for diagnostics and compatibility policy.
+    #[serde(default)]
+    pub client_version: String,
+    /// Random identity for this client process instance.
+    #[serde(default)]
+    pub client_instance_id: String,
     pub client_kind: ClientKind,
     /// Ceiling for the grant: negotiation returns a subset of this set and
     /// never invents a capability the client did not ask for.
     #[serde(default)]
     pub capabilities_requested: CapabilitySet,
+    /// Largest JSON body this client can receive.
+    ///
+    /// The daemon must not send a frame larger than the smaller of this value
+    /// and its own configured limit. The default preserves decode tolerance
+    /// for pre-release peers that omitted the additive field.
+    #[serde(default = "default_frame_limit_u32")]
+    pub max_receive_frame: u32,
 }
 
 /// Daemon lifecycle state advertised in [`Welcome`].
@@ -139,6 +170,12 @@ pub struct Welcome {
     /// Maximum JSON body bytes per frame on either transport. Both peers must
     /// enforce this limit before allocating a body buffer.
     pub frame_limit: u32,
+    /// Durable profile identity served by this connection.
+    #[serde(default)]
+    pub profile_id: String,
+    /// Daemon build/version string used for diagnostics and compatibility policy.
+    #[serde(default)]
+    pub daemon_version: String,
     pub lifecycle_phase: LifecyclePhase,
     /// Granted capability set: a subset of [`Hello::capabilities_requested`].
     #[serde(default)]
@@ -212,10 +249,20 @@ pub struct SessionReadResult {
 #[serde(tag = "method")]
 #[non_exhaustive]
 pub enum RequestBody {
-    /// Paginated, non-subscribing session listing. The ordering key that makes
-    /// `page` stable is W3b's contract, not the wire's.
+    /// Cursor-paginated, non-subscribing session listing.
+    ///
+    /// v0.1 ordering is the immutable `session_id` in ascending byte order.
+    /// `cursor` is an opaque server token positioned after the last emitted
+    /// ordering key; clients must return it verbatim and never parse it as an
+    /// array offset.
     #[serde(rename = "session.list")]
-    SessionList { page: u64, page_size: u32 },
+    SessionList {
+        /// Omitted for the first page; otherwise the prior response's token.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<String>,
+        /// Maximum number of summaries to return.
+        limit: u32,
+    },
     /// Non-subscribing read of committed envelopes in an inclusive range.
     #[serde(rename = "session.read")]
     SessionRead {
@@ -235,10 +282,6 @@ pub enum RequestBody {
     /// authority or worker ownership.
     #[serde(rename = "session.detach")]
     SessionDetach { attachment_id: AttachmentId },
-    /// Liveness probe. The nonce is opaque and echoed verbatim by
-    /// [`ResponseBody::Pong`].
-    #[serde(rename = "ping")]
-    Ping { nonce: u64 },
     /// Decode artifact for a method this crate does not know (tolerance
     /// discipline). W3b answers it with a protocol error, not a panic.
     #[serde(other)]
@@ -250,16 +293,15 @@ pub enum RequestBody {
 #[serde(tag = "method")]
 #[non_exhaustive]
 pub enum ResponseBody {
-    /// One page of session summaries. `next_page` is the `page` value to
-    /// request next; it is omitted from the wire on the last page.
+    /// One page in the fixed `session_id` ascending order.
     #[serde(rename = "session.list")]
     SessionList {
-        page: u64,
-        page_size: u32,
         #[serde(default)]
         sessions: Vec<SessionSummary>,
+        /// Omitted on the last page; otherwise pass verbatim as the next
+        /// [`RequestBody::SessionList`] cursor.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        next_page: Option<u64>,
+        next_cursor: Option<String>,
     },
     #[serde(rename = "session.read")]
     SessionRead { result: SessionReadResult },
@@ -270,9 +312,21 @@ pub enum ResponseBody {
     },
     #[serde(rename = "session.detach")]
     SessionDetach { attachment_id: AttachmentId },
-    /// Echoes the nonce of the [`RequestBody::Ping`] it answers.
-    #[serde(rename = "pong")]
-    Pong { nonce: u64 },
+    /// A request-correlated operation failure.
+    ///
+    /// Stable v0.1 codes include [`ERROR_CODE_CURSOR_AHEAD`],
+    /// [`ERROR_CODE_CAPABILITY_DENIED`], [`ERROR_CODE_ALREADY_RESOLVED`],
+    /// [`ERROR_CODE_NOT_FOUND`], and [`ERROR_CODE_DRAINING`]. Unknown future
+    /// string codes remain carryable by older clients.
+    #[serde(rename = "error")]
+    Error {
+        /// Stable machine-readable `snake_case` code.
+        code: String,
+        /// Human-readable detail; never load-bearing for client behavior.
+        message: String,
+        /// Whether retrying after the stated condition changes may succeed.
+        retryable: bool,
+    },
     /// Decode artifact for a method this crate does not know (tolerance
     /// discipline).
     #[serde(other)]
@@ -298,6 +352,25 @@ impl std::fmt::Display for ProtocolError {
 }
 
 impl std::error::Error for ProtocolError {}
+
+/// Optional value submitted with a menu selection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum MenuInput {
+    /// Free-form input for question/file-style menus.
+    Text {
+        /// User-entered non-secret text.
+        text: String,
+    },
+    /// Reference to a secret previously stored through a non-journaled vault RPC.
+    ///
+    /// The raw secret must never appear in this wire frame.
+    SecretVaultReference {
+        /// Opaque vault reference resolvable by the daemon.
+        vault_reference: String,
+    },
+}
 
 /// One versioned logical frame shared by WebSocket and UDS transports.
 ///
@@ -337,6 +410,7 @@ pub enum WireFrame {
     /// generation to compete with it. Delivery is at-least-once; clients drop
     /// `seq <= last_applied` and treat a gap as a signal to reattach.
     Event {
+        attachment_id: AttachmentId,
         session_id: SessionId,
         envelope: RawEnvelope,
     },
@@ -356,20 +430,47 @@ pub enum WireFrame {
         menu_id: MenuId,
         request_seq: u64,
         worker_generation: u64,
-        option: String,
+        /// Stable key from the committed menu option.
+        option_key: String,
+        /// Display-order index from the same committed menu version.
+        option_index: u32,
+        /// Optional free-form text or secret vault reference.
+        input: Option<MenuInput>,
     },
-    /// The daemon dropped this attachment under backpressure. The client
-    /// recovers by reattaching with `after_seq = resume_after_seq`; W3b
-    /// defines how that cursor is computed.
+    /// The daemon dropped this attachment under backpressure.
+    ///
+    /// `last_queued_seq` is informational server telemetry, not resume
+    /// authority: queued does not mean fully applied. Under the R9 cursor law,
+    /// every client reattaches using its own greatest fully applied sequence.
     Lagged {
         attachment_id: AttachmentId,
-        resume_after_seq: u64,
+        last_queued_seq: u64,
     },
-    /// The daemon entered its drain window and will stop accepting work.
-    /// Reserved: W3b pins whether `deadline_ms` is a duration or an absolute
-    /// epoch timestamp when it implements drain.
-    ServerDraining { deadline_ms: u64 },
-    /// See [`ProtocolError`]; `fatal` decides whether the connection closes.
+    /// The daemon entered its drain window and will stop accepting new work.
+    ServerDraining {
+        /// Human-readable/operator-facing drain cause.
+        reason: String,
+        /// Random identity of the draining daemon process.
+        instance_id: String,
+        /// Durable per-profile generation of the draining daemon.
+        daemon_generation: u64,
+        /// Absolute Unix timestamp in milliseconds.
+        ///
+        /// This is never a duration. At or after this instant the daemon may
+        /// force remaining work to stop.
+        deadline_unix_ms: u64,
+    },
+    /// Uncorrelated liveness probe; `nonce` is echoed verbatim by [`Self::Pong`].
+    ///
+    /// Ping/Pong are top-level frames per the binding protocol report. v0.1
+    /// deliberately has no duplicate request-body liveness methods.
+    Ping { nonce: u64 },
+    /// Top-level answer to [`Self::Ping`].
+    Pong { nonce: u64 },
+    /// A connection-level fault; `fatal` decides whether the connection closes.
+    ///
+    /// Request-specific failures use [`ResponseBody::Error`] so they retain
+    /// their `request_id` correlation.
     ProtocolError(ProtocolError),
     /// Decode artifact for a frame kind this crate does not know (tolerance
     /// discipline). Never constructed for sending.
@@ -390,6 +491,7 @@ enum WireFrameRef<'a> {
         body: &'a ResponseBody,
     },
     Event {
+        attachment_id: &'a AttachmentId,
         session_id: &'a SessionId,
         envelope: &'a RawEnvelope,
     },
@@ -403,14 +505,26 @@ enum WireFrameRef<'a> {
         menu_id: &'a MenuId,
         request_seq: u64,
         worker_generation: u64,
-        option: &'a str,
+        option_key: &'a str,
+        option_index: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        input: &'a Option<MenuInput>,
     },
     Lagged {
         attachment_id: &'a AttachmentId,
-        resume_after_seq: u64,
+        last_queued_seq: u64,
     },
     ServerDraining {
-        deadline_ms: u64,
+        reason: &'a str,
+        instance_id: &'a str,
+        daemon_generation: u64,
+        deadline_unix_ms: u64,
+    },
+    Ping {
+        nonce: u64,
+    },
+    Pong {
+        nonce: u64,
     },
     ProtocolError(&'a ProtocolError),
     Unknown,
@@ -430,6 +544,7 @@ enum WireFrameOwned {
         body: ResponseBody,
     },
     Event {
+        attachment_id: AttachmentId,
         session_id: SessionId,
         envelope: RawEnvelope,
     },
@@ -443,14 +558,26 @@ enum WireFrameOwned {
         menu_id: MenuId,
         request_seq: u64,
         worker_generation: u64,
-        option: String,
+        option_key: String,
+        option_index: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input: Option<MenuInput>,
     },
     Lagged {
         attachment_id: AttachmentId,
-        resume_after_seq: u64,
+        last_queued_seq: u64,
     },
     ServerDraining {
-        deadline_ms: u64,
+        reason: String,
+        instance_id: String,
+        daemon_generation: u64,
+        deadline_unix_ms: u64,
+    },
+    Ping {
+        nonce: u64,
+    },
+    Pong {
+        nonce: u64,
     },
     ProtocolError(ProtocolError),
     #[serde(other)]
@@ -484,9 +611,11 @@ impl Serialize for WireFrame {
             Self::Request { request_id, body } => WireFrameRef::Request { request_id, body },
             Self::Response { request_id, body } => WireFrameRef::Response { request_id, body },
             Self::Event {
+                attachment_id,
                 session_id,
                 envelope,
             } => WireFrameRef::Event {
+                attachment_id,
                 session_id,
                 envelope,
             },
@@ -503,25 +632,39 @@ impl Serialize for WireFrame {
                 menu_id,
                 request_seq,
                 worker_generation,
-                option,
+                option_key,
+                option_index,
+                input,
             } => WireFrameRef::MenuAnswer {
                 command_id,
                 session_id,
                 menu_id,
                 request_seq: *request_seq,
                 worker_generation: *worker_generation,
-                option,
+                option_key,
+                option_index: *option_index,
+                input,
             },
             Self::Lagged {
                 attachment_id,
-                resume_after_seq,
+                last_queued_seq,
             } => WireFrameRef::Lagged {
                 attachment_id,
-                resume_after_seq: *resume_after_seq,
+                last_queued_seq: *last_queued_seq,
             },
-            Self::ServerDraining { deadline_ms } => WireFrameRef::ServerDraining {
-                deadline_ms: *deadline_ms,
+            Self::ServerDraining {
+                reason,
+                instance_id,
+                daemon_generation,
+                deadline_unix_ms,
+            } => WireFrameRef::ServerDraining {
+                reason,
+                instance_id,
+                daemon_generation: *daemon_generation,
+                deadline_unix_ms: *deadline_unix_ms,
             },
+            Self::Ping { nonce } => WireFrameRef::Ping { nonce: *nonce },
+            Self::Pong { nonce } => WireFrameRef::Pong { nonce: *nonce },
             Self::ProtocolError(error) => WireFrameRef::ProtocolError(error),
             Self::Unknown => WireFrameRef::Unknown,
         };
@@ -551,9 +694,11 @@ impl<'de> Deserialize<'de> for WireFrame {
             WireFrameOwned::Request { request_id, body } => Self::Request { request_id, body },
             WireFrameOwned::Response { request_id, body } => Self::Response { request_id, body },
             WireFrameOwned::Event {
+                attachment_id,
                 session_id,
                 envelope,
             } => Self::Event {
+                attachment_id,
                 session_id,
                 envelope,
             },
@@ -570,23 +715,39 @@ impl<'de> Deserialize<'de> for WireFrame {
                 menu_id,
                 request_seq,
                 worker_generation,
-                option,
+                option_key,
+                option_index,
+                input,
             } => Self::MenuAnswer {
                 command_id,
                 session_id,
                 menu_id,
                 request_seq,
                 worker_generation,
-                option,
+                option_key,
+                option_index,
+                input,
             },
             WireFrameOwned::Lagged {
                 attachment_id,
-                resume_after_seq,
+                last_queued_seq,
             } => Self::Lagged {
                 attachment_id,
-                resume_after_seq,
+                last_queued_seq,
             },
-            WireFrameOwned::ServerDraining { deadline_ms } => Self::ServerDraining { deadline_ms },
+            WireFrameOwned::ServerDraining {
+                reason,
+                instance_id,
+                daemon_generation,
+                deadline_unix_ms,
+            } => Self::ServerDraining {
+                reason,
+                instance_id,
+                daemon_generation,
+                deadline_unix_ms,
+            },
+            WireFrameOwned::Ping { nonce } => Self::Ping { nonce },
+            WireFrameOwned::Pong { nonce } => Self::Pong { nonce },
             WireFrameOwned::ProtocolError(error) => Self::ProtocolError(error),
             WireFrameOwned::Unknown => Self::Unknown,
         })

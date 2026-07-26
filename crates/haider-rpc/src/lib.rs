@@ -28,9 +28,10 @@ pub mod ws_codec;
 pub use codec::CodecError;
 pub use frame::{
     AttachMode, AttachState, AttachmentId, Capability, CapabilitySet, ClientKind, CommandId,
-    DEFAULT_FRAME_LIMIT, Hello, LifecyclePhase, ProtocolError, RequestBody, RequestId,
-    ResponseBody, SeqRange, SessionReadResult, SessionSummary, WIRE_PROTOCOL_VERSION, Welcome,
-    WireFrame,
+    DEFAULT_FRAME_LIMIT, ERROR_CODE_ALREADY_RESOLVED, ERROR_CODE_CAPABILITY_DENIED,
+    ERROR_CODE_CURSOR_AHEAD, ERROR_CODE_DRAINING, ERROR_CODE_NOT_FOUND, Hello, LifecyclePhase,
+    MenuInput, ProtocolError, RequestBody, RequestId, ResponseBody, SeqRange, SessionReadResult,
+    SessionSummary, WIRE_PROTOCOL_VERSION, Welcome, WireFrame,
 };
 pub use negotiation::{Negotiated, ServerRange, negotiate};
 

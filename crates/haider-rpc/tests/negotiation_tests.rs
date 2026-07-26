@@ -9,12 +9,16 @@ fn hello(protocol_min: u32, protocol_max: u32) -> Hello {
     Hello {
         protocol_min,
         protocol_max,
+        client_name: "haider-tui".into(),
+        client_version: "0.0.8".into(),
+        client_instance_id: "client-instance-negotiation".into(),
         client_kind: ClientKind::Tui,
         capabilities_requested: capabilities([
             Capability::View,
             Capability::Control,
             Capability::Unknown,
         ]),
+        max_receive_frame: 1024 * 1024,
     }
 }
 
