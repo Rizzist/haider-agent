@@ -5,8 +5,10 @@
 //! reads [`theme::Theme`] tokens and [`format`] helpers so the three themes
 //! stay one identity. Tests live in `tests/` — never inline (workspace rule).
 
+pub mod boot;
 pub mod format;
 pub mod projection;
+pub mod sanctum;
 pub mod theme;
 
 /// Crate marker used by the workspace self-test.
