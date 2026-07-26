@@ -124,15 +124,23 @@ process_identity() {
         awk 'NF { $1=$1; print; exit }'
 }
 
-# True iff the "pid TAB lstart" recorded in `owner_file` names a process
-# that is still alive with that same start time.
-lock_owner_is_current() {
-    local owner_file owner_pid owner_identity current
-    owner_file=$1
-    [ -r "$owner_file" ] || return 1
-    read -r owner_pid owner_identity < "$owner_file" || return 1
+# Read and normalize one complete "pid TAB lstart" owner record.
+lock_owner_record() {
+    local owner_pid owner_identity
+    [ -r "$1" ] || return 1
+    read -r owner_pid owner_identity < "$1" || return 1
     is_nonnegative_integer "$owner_pid" || return 1
     [ -n "$owner_identity" ] || return 1
+    printf '%s\t%s' "$owner_pid" "$owner_identity"
+}
+
+lock_record_is_current() {
+    local record owner_pid owner_identity current tab
+    record=$1
+    tab=$(printf '\t')
+    IFS="$tab" read -r owner_pid owner_identity <<EOF
+$record
+EOF
     pid_is_live "$owner_pid" || return 1
     current=$(process_identity "$owner_pid") || return 1
     [ -n "$current" ] && [ "$current" = "$owner_identity" ]
@@ -145,7 +153,7 @@ lock_owner_is_current() {
 # the steal is journaled as "stale_lock_recovered" on the next append.
 # Gives up (rc 1) after ~10s of live contention.
 acquire_journal_lock() {
-    local spins owner_file identity stale_dir
+    local spins owner_file identity stale_dir stale_owner moved_owner restore_spins
     spins=0
     owner_file="$JOURNAL_LOCK_DIR/owner"
     identity=$(process_identity "$$") || identity=
@@ -159,14 +167,36 @@ acquire_journal_lock() {
             return 1
         fi
         spins=$((spins + 1))
-        if [ "$spins" -ge 4 ] && ! lock_owner_is_current "$owner_file"; then
-            stale_dir="${JOURNAL_LOCK_DIR}.stale.$$.$spins"
+        stale_owner=
+        if [ "$spins" -ge 4 ]; then
+            stale_owner=$(lock_owner_record "$owner_file") || stale_owner=
+        fi
+        if [ -n "$stale_owner" ] &&
+           ! lock_record_is_current "$stale_owner"; then
+            stale_dir="${JOURNAL_LOCK_DIR}.stale.$$.$spins.$RANDOM"
             if [ ! -e "$stale_dir" ] &&
                mv "$JOURNAL_LOCK_DIR" "$stale_dir" 2>/dev/null; then
-                rm -f "$stale_dir/owner"
-                rmdir "$stale_dir" 2>/dev/null || true
-                STALE_LOCK_RECOVERED=1
-                spins=0
+                moved_owner=$(lock_owner_record "$stale_dir/owner") ||
+                    moved_owner=
+                if [ "$moved_owner" = "$stale_owner" ]; then
+                    rm -f "$stale_dir/owner"
+                    rmdir "$stale_dir" 2>/dev/null || true
+                    STALE_LOCK_RECOVERED=1
+                    spins=0
+                    continue
+                fi
+                restore_spins=0
+                while [ -e "$JOURNAL_LOCK_DIR" ] &&
+                      [ "$restore_spins" -lt 200 ]; do
+                    sleep 0.05
+                    restore_spins=$((restore_spins + 1))
+                done
+                if [ -e "$JOURNAL_LOCK_DIR" ] ||
+                   ! mv "$stale_dir" "$JOURNAL_LOCK_DIR" 2>/dev/null; then
+                    echo "codex-supervised.sh: cannot restore changed journal lock" >&2
+                    return 1
+                fi
+                sleep 0.05
                 continue
             fi
         fi
@@ -184,17 +214,36 @@ acquire_journal_lock() {
         return 1
     fi
     JOURNAL_LOCK_HELD=1
+    JOURNAL_LOCK_IDENTITY=$identity
     return 0
 }
 
+append_lock_not_ours() {
+    local timestamp escaped_brief
+    timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ) || return 1
+    escaped_brief=$(json_escape "$BRIEF_FILE") || return 1
+    printf '{"ts":"%s","run_id":"%s","brief":"%s","event":"lock_not_ours"}\n' \
+        "$timestamp" "$RUN_ID" "$escaped_brief" >> "$JOURNAL_FILE"
+}
+
 release_journal_lock() {
+    local owner expected
     [ "${JOURNAL_LOCK_HELD:-0}" -eq 1 ] || return 0
+    owner=$(lock_owner_record "$JOURNAL_LOCK_DIR/owner") || owner=
+    expected=$(printf '%s\t%s' "$$" "${JOURNAL_LOCK_IDENTITY:-}")
+    if [ "$owner" != "$expected" ]; then
+        JOURNAL_LOCK_HELD=0
+        append_lock_not_ours || true
+        echo "codex-supervised.sh: journal lock is not ours; leaving it" >&2
+        return 1
+    fi
     rm -f "$JOURNAL_LOCK_DIR/owner"
     if ! rmdir "$JOURNAL_LOCK_DIR" 2>/dev/null; then
         echo "codex-supervised.sh: cannot release journal lock: $JOURNAL_LOCK_DIR" >&2
         return 1
     fi
     JOURNAL_LOCK_HELD=0
+    JOURNAL_LOCK_IDENTITY=
     return 0
 }
 

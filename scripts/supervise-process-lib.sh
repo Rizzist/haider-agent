@@ -168,8 +168,27 @@ signal_pid_file() {
     done < "$file"
 }
 
-# Wait up to `seconds` (1s polls) for every tree-file survivor to exit.
-# Returns 1 if any survivor outlasts the deadline.
+# True if a non-zombie process still belongs to `pgid`.
+process_group_has_survivors() {
+    LC_ALL=C ps -axo pgid=,stat= 2>/dev/null |
+        awk -v pgid="$1" '$1 == pgid && $2 !~ /^Z/ { found=1; exit }
+            END { exit !found }'
+}
+
+# Wait up to `seconds` (1s polls) for a group or recorded PIDs to exit.
+poll_process_group() {
+    local pgid seconds elapsed
+    pgid=$1
+    seconds=$2
+    elapsed=0
+    while process_group_has_survivors "$pgid"; do
+        [ "$elapsed" -lt "$seconds" ] || return 1
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    return 0
+}
+
 poll_survivors() {
     local tree_file seconds elapsed
     tree_file=$1
@@ -197,18 +216,76 @@ reap_survivors() {
     ! pid_file_has_survivors "$tree_file"
 }
 
-# Discover the current descendants of `root`, reap everything recorded in
-# the tree file, and harvest root's exit status so it cannot linger as a
-# zombie. Returns 1 if any identity-matching process survived.
-terminate_process_tree() {
-    local root tree_file ps_file result
+# Capture every live process that still matches root's group or an exact
+# recorded PID+lstart. The survivor file is the final authority for a pass.
+snapshot_reap_survivors() {
+    local root tree_file ps_file survivor_file
     root=$1
     tree_file=$2
     ps_file=$3
-    collect_process_tree "$root" "$tree_file" "$ps_file" || true
-    reap_survivors "$tree_file"
-    result=$?
-    wait "$root" 2>/dev/null || true
-    pid_file_has_survivors "$tree_file" && result=1
-    return "$result"
+    survivor_file=$4
+    LC_ALL=C ps -axo pid=,pgid=,stat=,lstart= > "$ps_file" 2>/dev/null ||
+        return 1
+    awk -v root="$root" '
+        FILENAME == ARGV[1] {
+            identity=$3
+            for (i=4; i<=NF; i++) identity=identity " " $i
+            saved[$1 SUBSEP identity]=1
+            next
+        }
+        NF >= 4 {
+            identity=$4
+            for (i=5; i<=NF; i++) identity=identity " " $i
+            if ($3 !~ /^Z/ &&
+                ($2 == root || saved[$1 SUBSEP identity]) && !seen[$1]++)
+                print $1 "\t" $2 "\t" identity
+        }
+    ' "$tree_file" "$ps_file" > "$survivor_file"
+}
+
+survivor_pid_json() {
+    awk 'BEGIN { printf "[" }
+        { printf "%s%s", separator, $1; separator="," }
+        END { print "]" }' "$1"
+}
+
+# Reap in three ordered layers, retrying the complete sequence at most three
+# times: process group, identity-stamped escapees, then a fresh verification.
+terminate_process_tree() {
+    local root tree_file ps_file survivor_file pass survivors
+    root=$1
+    tree_file=$2
+    ps_file=$3
+    survivor_file="${ps_file}.survivors"
+    pass=1
+    while [ "$pass" -le 3 ]; do
+        collect_process_tree "$root" "$tree_file" "$ps_file" 1 || true
+
+        kill -TERM -- "-$root" 2>/dev/null || true
+        poll_process_group "$root" 2 || true
+        if process_group_has_survivors "$root"; then
+            kill -KILL -- "-$root" 2>/dev/null || true
+            poll_process_group "$root" 3 || true
+        fi
+
+        reap_survivors "$tree_file" || true
+        wait "$root" 2>/dev/null || true
+        collect_process_tree "$root" "$tree_file" "$ps_file" 1 || true
+        if snapshot_reap_survivors \
+            "$root" "$tree_file" "$ps_file" "$survivor_file" &&
+           [ ! -s "$survivor_file" ]; then
+            rm -f "$survivor_file"
+            return 0
+        fi
+        pass=$((pass + 1))
+    done
+
+    survivors=$(survivor_pid_json "$survivor_file")
+    if [ "${JOURNAL_STARTED:-0}" -eq 1 ] &&
+       [ "${JOURNAL_BROKEN:-0}" -eq 0 ] &&
+       type record_event >/dev/null 2>&1; then
+        record_event "reap_incomplete" ',"survivors":'"$survivors"
+    fi
+    echo "codex-supervised.sh: incomplete reap; survivors=$survivors" >&2
+    return 1
 }

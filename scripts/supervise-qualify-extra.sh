@@ -165,23 +165,108 @@ run_case_folded_alias_refusal() {
 }
 
 run_detached_orphan_reap() {
-    local brief output pids status events marker
-    brief="$TMP_ROOT/detached.brief"; output="$TMP_ROOT/detached.out"
-    pids="$TMP_ROOT/detached.pids"; marker="$TMP_ROOT/detached.timeout"
+    local mode stem label brief output pids status events marker recorded outcome
+    mode=$1; stem=$2; label=$3
+    brief="$TMP_ROOT/$stem.brief"; output="$TMP_ROOT/$stem.out"
+    pids="$TMP_ROOT/$stem.pids"; marker="$TMP_ROOT/$stem.timeout"
     printf 'Exercise detached leader-exit cleanup.' > "$brief"
-    run_with_watchdog "$marker" env FAKE_MODE=detached_leader_exits \
+    run_with_watchdog "$marker" env FAKE_MODE="$mode" \
         FAKE_PID_FILE="$pids" CODEX_BIN="$FAKE_CODEX" \
         HAIDER_RUN_JOURNAL="$JOURNAL" bash "$WRAPPER" "$brief" "$output" \
         --max-stall-secs 3 --max-retries 0
     status=$?; events=$(events_for_brief "$brief")
-    if [ "$status" -eq 0 ] &&
-       [ "$events" = "start orphans_reaped done" ] &&
-       [ -s "$pids" ] && all_pids_reaped "$pids"; then
-        pass "setsid-detached leader-exit orphan reap"
+    sleep 1
+    recorded=0; outcome=0
+    [ ! -s "$pids" ] || recorded=1
+    if all_pids_reaped "$pids"; then
+        outcome=1
     else
-        fail "setsid-detached leader-exit orphan reap" \
+        case " $events " in
+            *" reap_unverifiable "*) outcome=1; cleanup_fake_pids ;;
+        esac
+    fi
+    if [ "$status" -eq 0 ] && [ "$recorded" -eq 1 ] &&
+       [ "$outcome" -eq 1 ] && [ "${events% done}" != "$events" ]; then
+        pass "$label"
+    else
+        fail "$label" \
             "status=$status events=[$events]"
     fi
+}
+
+run_lock_release_guard() {
+    local lock journal brief identity status
+    lock="$TMP_ROOT/release-guard.lock"
+    journal="$TMP_ROOT/release-guard.jsonl"
+    brief="$TMP_ROOT/release-guard.brief"
+    printf 'release guard' > "$brief"
+    mkdir "$lock" || { fail "lock release ownership guard" "fixture failed"; return; }
+    printf '1\twrong identity\n' > "$lock/owner"
+    identity=$(process_identity "$$")
+    (
+        JOURNAL_FILE=$journal; JOURNAL_LOCK_DIR=$lock
+        BRIEF_FILE=$brief; RUN_ID=release-guard
+        JOURNAL_LOCK_HELD=1; JOURNAL_LOCK_IDENTITY=$identity
+        release_journal_lock
+    )
+    status=$?
+    if [ "$status" -eq 1 ] && [ -d "$lock" ] &&
+       [ "$(lock_owner_record "$lock/owner")" = "$(printf '1\twrong identity')" ] &&
+       grep -q '"event":"lock_not_ours"' "$journal"; then
+        pass "lock release ownership guard"
+    else
+        fail "lock release ownership guard" "status=$status"
+    fi
+    rm -f "$lock/owner"; rmdir "$lock" 2>/dev/null || true
+}
+
+run_lock_steal_reverify() {
+    local lock journal brief marker live_identity stealer restored owner grave
+    lock="$TMP_ROOT/steal-race.lock"; journal="$TMP_ROOT/steal-race.jsonl"
+    brief="$TMP_ROOT/steal-race.brief"; marker="$TMP_ROOT/steal-race.moved"
+    printf 'steal race' > "$brief"
+    mkdir "$lock" || { fail "lock steal re-verification" "fixture failed"; return; }
+    printf '999999\tstale identity\n' > "$lock/owner"
+    live_identity=$(process_identity "$$")
+    (
+        JOURNAL_FILE=$journal; JOURNAL_LOCK_DIR=$lock
+        BRIEF_FILE=$brief; RUN_ID=steal-race
+        JOURNAL_LOCK_HELD=0; STALE_LOCK_RECOVERED=0
+        mv() {
+            if [ ! -e "$marker" ]; then
+                printf '%s\t%s\n' "$$" "$live_identity" > "$1/owner"
+                : > "$marker"
+            fi
+            command mv "$@"
+        }
+        acquire_journal_lock
+    ) &
+    stealer=$!
+    restored=0
+    while [ ! -e "$marker" ] && [ "$restored" -lt 100 ]; do
+        sleep 0.05
+        restored=$((restored + 1))
+    done
+    restored=0
+    while [ "$restored" -lt 100 ]; do
+        owner=$(lock_owner_record "$lock/owner" 2>/dev/null) || owner=
+        [ "$owner" != "$(printf '%s\t%s' "$$" "$live_identity")" ] ||
+            break
+        sleep 0.05
+        restored=$((restored + 1))
+    done
+    kill "$stealer" 2>/dev/null || true
+    wait "$stealer" 2>/dev/null || true
+    grave="$lock.stale.first"
+    for grave in "$lock".stale.*; do break; done
+    if [ -e "$marker" ] &&
+       [ "$owner" = "$(printf '%s\t%s' "$$" "$live_identity")" ] &&
+       [ ! -e "$grave" ]; then
+        pass "lock steal re-verification"
+    else
+        fail "lock steal re-verification" "replacement owner was not restored"
+    fi
+    rm -f "$lock/owner"; rmdir "$lock" 2>/dev/null || true
 }
 
 run_extra_cases() {
@@ -190,5 +275,10 @@ run_extra_cases() {
     run_journal_failure
     run_json_escape_check
     run_case_folded_alias_refusal
-    run_detached_orphan_reap
+    run_detached_orphan_reap detached_leader_exits detached \
+        "setsid-detached leader-exit: reaped or admitted"
+    run_detached_orphan_reap leader_instant_exit instant \
+        "leader-instant-exit: reaped or admitted"
+    run_lock_release_guard
+    run_lock_steal_reverify
 }

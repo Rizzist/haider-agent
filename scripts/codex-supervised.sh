@@ -1,27 +1,16 @@
 #!/bin/bash
 #
-# Supervised `codex exec` runner. Growth of the stdout/stderr capture files
-# is the only progress signal; after --max-stall-secs of silence the whole
-# process tree is killed and the attempt retried (--max-retries times) with
-# a "continue where you stopped" prompt prefix. This file owns the
-# attempt/retry state machine, signal handling, and the lifecycle events
-# written to the JSONL journal (start, stall_kill, retry, orphans_reaped,
-# done, gave_up, interrupted). Identity, lock, journal, and reaping
-# primitives live in supervise-lib.sh / supervise-process-lib.sh.
-# Exit code: codex's own on completion, 1 on give-up, 2 on setup/journal
-# failure, 128+signal when interrupted. Bash 3.2/BSD-compatible.
-
+# Supervised `codex exec`: output growth drives retry and tree reaping.
+# State, signals, and events are here; shared libraries own the primitives.
+# Exit: codex status, 1 give-up, 2 setup/journal, or 128+signal.
 set -u
-
 usage() {
     echo "Usage: codex-supervised.sh <brief-file> <output-file> [--max-stall-secs N] [--max-retries M]" >&2
 }
-
 die() {
     echo "codex-supervised.sh: $*" >&2
     exit 2
 }
-
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) ||
     die "cannot resolve script directory"
 # shellcheck source=scripts/supervise-lib.sh
@@ -66,9 +55,13 @@ JOURNAL_FILE=$(canonical_path "$JOURNAL_FILE") || die "cannot resolve journal pa
 STDERR_FILE="${OUTPUT_FILE}.stderr"
 CODEX_COMMAND=${CODEX_BIN:-codex}
 RETRY_PREFIX="Previous run stalled and was killed. Inspect current git status/diff first, do not redo completed work, continue from where it stopped."
+if command -v perl >/dev/null 2>&1; then
+    LAUNCH_MODE=setsid_perl
+else
+    LAUNCH_MODE=plain_spawn
+fi
 
-# Refuse any pair of these paths that alias the same file (symlinks, hard
-# links, case-folded names) before anything is opened or truncated.
+# Refuse aliases before any destination is opened or truncated.
 PATH_LABELS=(brief output stderr journal)
 PATH_VALUES=("$BRIEF_FILE" "$OUTPUT_FILE" "$STDERR_FILE" "$JOURNAL_FILE")
 i=0
@@ -91,8 +84,7 @@ PROMPT=$(cat "$BRIEF_FILE") || die "cannot read brief file: $BRIEF_FILE"
 : > "$STDERR_FILE" || die "cannot write stderr file: $STDERR_FILE"
 JOB_STATUS_FILE=$(mktemp "${TMPDIR:-/tmp}/codex-supervised-jobs.XXXXXX") ||
     die "cannot create temporary job-status file"
-# TREE_FILE is the append-only ledger of identity-stamped PIDs discovered
-# for the current attempt; PS_FILE is scratch for whole-table ps snapshots.
+# Append-only identity ledger and process-table snapshot scratch.
 TREE_FILE=$(mktemp "${TMPDIR:-/tmp}/codex-supervised-tree.XXXXXX") ||
     die "cannot create temporary process-tree file"
 PS_FILE=$(mktemp "${TMPDIR:-/tmp}/codex-supervised-ps.XXXXXX") ||
@@ -103,19 +95,17 @@ RUN_ID="${START_EPOCH}-$$"
 JOURNAL_LOCK_DIR="${JOURNAL_FILE}.lock"
 JOURNAL_LOCK_HELD=0; STALE_LOCK_RECOVERED=0
 ACTIVE_PID=; RETRIES=0
-# Signals that land while a journal write is in flight are parked in
-# PENDING_SIGNAL* and delivered after the write completes, so a held lock
-# or half-written journal line is never abandoned.
+# Park signals during journal writes.
 JOURNAL_STARTED=0; IN_JOURNAL=0; JOURNAL_BROKEN=0
 PENDING_SIGNAL=; PENDING_SIGNAL_CODE=
 
 cleanup() {
     release_journal_lock >/dev/null 2>&1 || true
-    rm -f "$JOB_STATUS_FILE" "$TREE_FILE" "$PS_FILE" "${PS_FILE}.next"
+    rm -f "$JOB_STATUS_FILE" "$TREE_FILE" "$PS_FILE" \
+        "${PS_FILE}.next" "${PS_FILE}.survivors"
 }
 
-# True while `pid` is still an unreaped background job of this shell. Job-
-# table membership is immune to PID reuse, unlike a bare kill -0 check.
+# Job-table membership is immune to PID reuse.
 job_is_running() {
     local pid job_pid
     pid=$1
@@ -126,8 +116,7 @@ job_is_running() {
     return 1
 }
 
-# Journal `event` or die: a failed append kills any active codex tree and
-# exits 2. Delivers a signal that was parked during the journal write.
+# Journal or tear down; then deliver any parked signal.
 record_event() {
     local status pending_name pending_code
     IN_JOURNAL=1
@@ -151,8 +140,7 @@ record_event() {
     fi
 }
 
-# On HUP/INT/TERM: defer if a journal write is in flight (see PENDING_SIGNAL
-# above), else kill the codex tree, journal "interrupted", exit 128+signal.
+# Defer signals during journal writes; otherwise reap and journal.
 handle_signal() {
     local signal_name exit_code now output_bytes
     signal_name=$1
@@ -183,7 +171,7 @@ trap 'handle_signal INT 130' INT
 trap 'handle_signal TERM 143' TERM
 
 JOURNAL_STARTED=1
-record_event "start" ',"retries":0'
+record_event "start" ',"retries":0,"launch_mode":"'"$LAUNCH_MODE"'"'
 
 while :; do
     if [ "$RETRIES" -eq 0 ]; then
@@ -202,19 +190,23 @@ ${PROMPT}"
     PREVIOUS_OUTPUT_BYTES=0
     PREVIOUS_STDERR_BYTES=0
 
-    set -m
-    "$CODEX_COMMAND" exec -s workspace-write \
-        -c model_reasoning_effort=xhigh "$ATTEMPT_PROMPT" \
-        </dev/null >"$OUTPUT_FILE" 2>"$STDERR_FILE" &
+    if [ "$LAUNCH_MODE" = setsid_perl ]; then
+        perl -MPOSIX=setsid -e \
+            'defined setsid() or die "setsid: $!"; exec @ARGV; die "exec: $!"' \
+            "$CODEX_COMMAND" exec -s workspace-write \
+            -c model_reasoning_effort=xhigh "$ATTEMPT_PROMPT" \
+            </dev/null >"$OUTPUT_FILE" 2>"$STDERR_FILE" &
+    else
+        set -m
+        "$CODEX_COMMAND" exec -s workspace-write \
+            -c model_reasoning_effort=xhigh "$ATTEMPT_PROMPT" \
+            </dev/null >"$OUTPUT_FILE" 2>"$STDERR_FILE" &
+        set +m
+    fi
     ACTIVE_PID=$!
-    set +m
-    remember_pid "$ACTIVE_PID" "$TREE_FILE" >/dev/null 2>&1 || true
-
     STALLED=0; TREE_REAP_FAILED=0
-    QUICK_SAMPLES=2
+    QUICK_SAMPLES=2; FIRST_SNAPSHOT_PENDING=1
     while :; do
-        # The first snapshot is immediate, so short-lived leaders cannot
-        # detach a descendant before discovery during an initial sleep.
         collect_process_tree "$ACTIVE_PID" "$TREE_FILE" "$PS_FILE" || true
         NOW=$(date +%s)
         CURRENT_OUTPUT_BYTES=$(file_bytes "$OUTPUT_FILE")
@@ -228,8 +220,14 @@ ${PROMPT}"
         fi
 
         if ! job_is_running "$ACTIVE_PID"; then
+            if [ "$FIRST_SNAPSHOT_PENDING" -eq 1 ] &&
+               ! pid_file_has_survivors "$TREE_FILE"; then
+                record_event "reap_unverifiable" \
+                    ',"reason":"leader_exited_before_first_snapshot"'
+            fi
             break
         fi
+        FIRST_SNAPSHOT_PENDING=0
 
         if [ $((NOW - LAST_ACTIVITY)) -ge "$MAX_STALL_SECS" ]; then
             STALLED=1
@@ -268,26 +266,28 @@ ${PROMPT}"
     LEADER_PID=$ACTIVE_PID
     wait "$LEADER_PID"
     EXIT_CODE=$?
-    # include_group=1: also adopt processes left in the exited leader's group.
     collect_process_tree "$LEADER_PID" "$TREE_FILE" "$PS_FILE" 1 || true
-
-    if pid_file_has_survivors "$TREE_FILE"; then
-        if reap_survivors "$TREE_FILE"; then
-            REMAINING=0
-        else
-            REMAINING=1
-        fi
+    snapshot_reap_survivors "$LEADER_PID" "$TREE_FILE" "$PS_FILE" \
+        "${PS_FILE}.survivors" || true
+    ORPHANS=0
+    [ ! -s "${PS_FILE}.survivors" ] || ORPHANS=1
+    if terminate_process_tree "$LEADER_PID" "$TREE_FILE" "$PS_FILE"; then
+        REMAINING=0
+    else
+        REMAINING=1
+    fi
+    if [ "$ORPHANS" -eq 1 ]; then
         NOW=$(date +%s)
         record_event "orphans_reaped" \
             ',"remaining":'"$REMAINING"',"duration_s":'"$((NOW - ATTEMPT_START))"',"retries":'"$RETRIES"
-        if [ "$REMAINING" -ne 0 ]; then
-            echo "codex-supervised.sh: survivors remain after leader exit" >&2
-            ACTIVE_PID=
-            OUTPUT_BYTES=$(file_bytes "$OUTPUT_FILE")
-            record_event "gave_up" \
-                ',"exit_code":1,"duration_s":'"$((NOW - START_EPOCH))"',"retries":'"$RETRIES"',"output_bytes":'"$OUTPUT_BYTES"
-            exit 1
-        fi
+    fi
+    if [ "$REMAINING" -ne 0 ]; then
+        echo "codex-supervised.sh: survivors remain after leader exit" >&2
+        ACTIVE_PID=
+        NOW=$(date +%s); OUTPUT_BYTES=$(file_bytes "$OUTPUT_FILE")
+        record_event "gave_up" \
+            ',"exit_code":1,"duration_s":'"$((NOW - START_EPOCH))"',"retries":'"$RETRIES"',"output_bytes":'"$OUTPUT_BYTES"
+        exit 1
     fi
     ACTIVE_PID=
 

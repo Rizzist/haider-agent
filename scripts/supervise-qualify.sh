@@ -1,6 +1,5 @@
 #!/bin/bash
-# Qualification gate for codex-supervised.sh: every case drives a fake codex
-# binary against a private journal. More cases: supervise-qualify-extra.sh.
+# Qualification gate: fake Codex cases, private journal, and watchdogs.
 set -u
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 1
 WRAPPER="$SCRIPT_DIR/codex-supervised.sh"
@@ -42,10 +41,16 @@ if IFS= read -r unexpected_input; then
     echo "codex stdin was not /dev/null" >&2
     exit 91
 fi
-
 spawn_stall_tree() {
+    spawn_after_term() {
+        sh -c '
+            ps -o pid=,lstart= -p "$$" |
+                awk '"'"'{$1=$1; print}'"'"' >> "$1"
+            while :; do sleep 60; done
+        ' term-child "$FAKE_PID_FILE" &
+    }
+    trap spawn_after_term TERM
     ps -o pid=,lstart= -p "$$" | awk '{$1=$1; print}' >> "$FAKE_PID_FILE"
-    # Include both a child and grandchild in the supervised process group.
     sh -c '
         ps -o pid=,lstart= -p "$$" |
             awk '"'"'{$1=$1; print}'"'"' >> "$1"
@@ -57,7 +62,6 @@ spawn_stall_tree() {
         while :; do sleep 60; done
     ' child "$FAKE_PID_FILE" &
 }
-
 prompt=$6
 case "${FAKE_MODE:-}" in
     happy|no_changes)
@@ -92,7 +96,7 @@ case "${FAKE_MODE:-}" in
         ' orphan "$FAKE_PID_FILE" &
         exit 0
         ;;
-    detached_leader_exits)
+    detached_leader_exits|leader_instant_exit)
         printf 'fake detached leader exited\n'
         if command -v setsid >/dev/null 2>&1; then
             setsid sh -c '
@@ -108,7 +112,6 @@ case "${FAKE_MODE:-}" in
                     "detached", $ARGV[0]
             ' "$FAKE_PID_FILE" &
         fi
-        sleep 0.2
         exit 0
         ;;
     interrupt)
@@ -122,13 +125,9 @@ case "${FAKE_MODE:-}" in
 esac
 FAKE
 chmod +x "$FAKE_CODEX" || exit 1
-
 pass() { echo "PASS: $1"; }
-
 fail() { echo "FAIL: $1${2:+ — $2}"; FAILURES=$((FAILURES + 1)); }
-
-# Run a case command in its own process group, guarded by a 60s watchdog
-# that kills the group and leaves `marker` behind; returns 124 on timeout.
+# Run a case under a 60s process-group watchdog.
 run_with_watchdog() {
     local marker status
     marker=$1
@@ -210,10 +209,12 @@ run_happy_path() {
         HAIDER_RUN_JOURNAL="$JOURNAL" bash "$WRAPPER" "$brief" "$output" \
         --max-stall-secs 3 --max-retries 1
     status=$?; events=$(events_for_brief "$brief")
-    line=$(event_line "$brief" done)
+    events=${events// reap_unverifiable/}
+    line="$(event_line "$brief" done) $(event_line "$brief" start)"
     if [ "$status" -eq 0 ] && [ "$events" = "start done" ] &&
        printf '%s' "$line" | grep -q '"exit_code":0' &&
        printf '%s' "$line" | grep -Eq '"run_id":"[0-9]+-[0-9]+"' &&
+       printf '%s' "$line" | grep -Eq '"launch_mode":"(setsid_perl|plain_spawn)"' &&
        grep -q 'fake codex completed' "$output"; then
         pass "happy path"
     else
@@ -232,6 +233,7 @@ run_stall_retry() {
         HAIDER_RUN_JOURNAL="$JOURNAL" bash "$WRAPPER" "$brief" "$output" \
         --max-stall-secs 3 --max-retries 2
     status=$?; events=$(events_for_brief "$brief")
+    events=${events// reap_unverifiable/}
     if [ "$status" -eq 0 ] &&
        [ "$events" = "start stall_kill retry done" ] &&
        grep -q 'fake codex recovered' "$output" && all_pids_reaped "$pids"; then
@@ -269,6 +271,7 @@ run_orphan_reap() {
         CODEX_BIN="$FAKE_CODEX" HAIDER_RUN_JOURNAL="$JOURNAL" \
         bash "$WRAPPER" "$brief" "$output" --max-stall-secs 3 --max-retries 0
     status=$?; events=$(events_for_brief "$brief")
+    events=${events// reap_unverifiable/}
     if [ "$status" -eq 0 ] &&
        [ "$events" = "start orphans_reaped done" ] && all_pids_reaped "$pids"; then
         pass "leader-exit orphan reap"
@@ -277,7 +280,6 @@ run_orphan_reap() {
     fi
 }
 
-# shellcheck source=scripts/supervise-qualify-extra.sh
 . "$SCRIPT_DIR/supervise-qualify-extra.sh"
 if [ ! -x "$WRAPPER" ]; then
     fail "wrapper executable" "$WRAPPER is not executable"
