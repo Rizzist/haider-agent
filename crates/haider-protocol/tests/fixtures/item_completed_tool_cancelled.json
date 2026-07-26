@@ -1,0 +1,11 @@
+{
+  "event": "completed",
+  "item_id": "it-3",
+  "item": {
+    "item": "tool_call",
+    "call_id": "c-2",
+    "name": "fs_read",
+    "args": {},
+    "status": "cancelled"
+  }
+}

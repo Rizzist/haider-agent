@@ -200,6 +200,18 @@ fn golden_item_lifecycle() {
         },
     );
     golden(
+        "item_completed_tool_cancelled",
+        &ItemEvent::Completed {
+            item_id: ItemId::new("it-3"),
+            item: TurnItem::ToolCall {
+                call_id: "c-2".into(),
+                name: "fs_read".into(),
+                args: serde_json::json!({}),
+                status: ToolStatus::Cancelled,
+            },
+        },
+    );
+    golden(
         "item_delta_command_output",
         &ItemEvent::Delta {
             item_id: ItemId::new("it-2"),

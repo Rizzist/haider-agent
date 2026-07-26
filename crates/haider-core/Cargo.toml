@@ -7,6 +7,15 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+async-trait.workspace = true
+haider-protocol = { path = "../haider-protocol" }
+haider-provider = { path = "../haider-provider" }
+haider-store = { path = "../haider-store" }
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true
