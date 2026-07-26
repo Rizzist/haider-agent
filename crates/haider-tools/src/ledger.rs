@@ -19,6 +19,8 @@ pub struct FsWriteRecord {
     pub effect: EffectId,
     pub paths: Vec<PathBuf>,
     pub summary: String,
+    /// BLAKE3 address of the exact bytes atomically installed on disk.
+    pub bytes_hash: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

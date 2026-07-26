@@ -8,7 +8,11 @@
 //!   preview and freezes the complete payload in the CAS via [`CasSink`].
 //! - `fs_patch` proves its pre-image before writing (mismatch is a typed
 //!   [`FsPatchConflict`]) and records applied writes in the [`ChangeLedger`],
-//!   attributed to the caller's `(session, turn)`, for the verify gate.
+//!   attributed to the caller's `(session, turn)`, for the verify gate. The
+//!   read/verify/replace sequence holds exclusive file locks, writes a
+//!   same-directory temporary file, and atomically renames it over the target.
+//! - Every caller-supplied path is resolved to a canonical path under the
+//!   broker's canonical workspace root before it is digested or dispatched.
 
 use crate::broker::{EffectBroker, EffectOperation, JournalSink, PermissionPolicy};
 use crate::ledger::{ChangeLedger, FsWriteRecord};
@@ -17,9 +21,12 @@ use async_trait::async_trait;
 use haider_protocol::effect::EffectClass;
 use haider_protocol::ids::{ArtifactRef, RunId, SessionId};
 use haider_protocol::tool::BoundedResult;
+use same_file::Handle;
 use serde_json::{Value, json};
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use tempfile::NamedTempFile;
 
 /// Port for storing the complete result when its prompt preview is truncated.
 #[async_trait]
@@ -75,6 +82,11 @@ impl EffectOperation for FsRead {
     fn arguments(&self) -> ToolResult<Value> {
         Ok(json!({ "path": path_argument(&self.path)? }))
     }
+
+    fn canonical_arguments(&self, workspace_root: &Path) -> ToolResult<Value> {
+        let path = resolve_workspace_path(workspace_root, &self.path, PathResolution::Existing)?;
+        Ok(json!({ "path": path_argument(&path)? }))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,6 +111,11 @@ impl EffectOperation for FsList {
 
     fn arguments(&self) -> ToolResult<Value> {
         Ok(json!({ "path": path_argument(&self.path)? }))
+    }
+
+    fn canonical_arguments(&self, workspace_root: &Path) -> ToolResult<Value> {
+        let path = resolve_workspace_path(workspace_root, &self.path, PathResolution::Existing)?;
+        Ok(json!({ "path": path_argument(&path)? }))
     }
 }
 
@@ -130,6 +147,14 @@ impl EffectOperation for FsSearch {
         Ok(json!({
             "query": self.query,
             "root": path_argument(&self.root)?,
+        }))
+    }
+
+    fn canonical_arguments(&self, workspace_root: &Path) -> ToolResult<Value> {
+        let root = resolve_workspace_path(workspace_root, &self.root, PathResolution::Existing)?;
+        Ok(json!({
+            "query": self.query,
+            "root": path_argument(&root)?,
         }))
     }
 }
@@ -171,6 +196,16 @@ impl EffectOperation for FsPatch {
             "replacement": self.replacement,
         }))
     }
+
+    fn canonical_arguments(&self, workspace_root: &Path) -> ToolResult<Value> {
+        let path =
+            resolve_workspace_path(workspace_root, &self.path, PathResolution::MissingLeafOk)?;
+        Ok(json!({
+            "path": path_argument(&path)?,
+            "preimage": self.preimage,
+            "replacement": self.replacement,
+        }))
+    }
 }
 
 impl<J> EffectBroker<J>
@@ -187,8 +222,13 @@ where
     where
         C: CasSink,
     {
+        let operation = FsRead::new(resolve_workspace_path(
+            self.workspace_root(),
+            &operation.path,
+            PathResolution::Existing,
+        )?);
         let path = operation.path.clone();
-        self.bounded_read(operation, policy, cas, bounds, move || read_utf8(&path))
+        self.bounded_read(&operation, policy, cas, bounds, move || read_utf8(&path))
             .await
     }
 
@@ -202,8 +242,13 @@ where
     where
         C: CasSink,
     {
+        let operation = FsList::new(resolve_workspace_path(
+            self.workspace_root(),
+            &operation.path,
+            PathResolution::Existing,
+        )?);
         let path = operation.path.clone();
-        self.bounded_read(operation, policy, cas, bounds, move || {
+        self.bounded_read(&operation, policy, cas, bounds, move || {
             list_directory(&path)
         })
         .await
@@ -219,9 +264,20 @@ where
     where
         C: CasSink,
     {
+        let operation = FsSearch::new(
+            resolve_workspace_path(
+                self.workspace_root(),
+                &operation.root,
+                PathResolution::Existing,
+            )?,
+            operation.query.clone(),
+        );
         let owned = operation.clone();
-        self.bounded_read(operation, policy, cas, bounds, move || search_files(&owned))
-            .await
+        let workspace_root = self.workspace_root().to_path_buf();
+        self.bounded_read(&operation, policy, cas, bounds, move || {
+            search_files(&owned, &workspace_root)
+        })
+        .await
     }
 
     /// Shared read-class envelope: begin (intent → authorize → dispatched),
@@ -255,23 +311,35 @@ where
         attribution: &TurnAttribution,
         ledger: &mut ChangeLedger,
     ) -> ToolResult<BoundedResult> {
-        let intent = self.begin(operation, policy).await?;
+        let operation = FsPatch::new(
+            resolve_workspace_path(
+                self.workspace_root(),
+                &operation.path,
+                PathResolution::MissingLeafOk,
+            )?,
+            operation.preimage.clone(),
+            operation.replacement.clone(),
+        );
+        let intent = self.begin(&operation, policy).await?;
         let owned_operation = operation.clone();
-        let result = run_blocking(move || apply_patch(&owned_operation)).await;
-        if result.is_ok() {
-            // The write is real on disk at this point, so the ledger records
-            // it even if the outcome append below fails — the verify gate's
-            // evidence must never miss an applied write.
+        let workspace_root = self.workspace_root().to_path_buf();
+        let result = run_blocking(move || apply_patch(&owned_operation, &workspace_root)).await;
+        let result = result.map(|applied| {
+            // The atomic rename is real on disk at this point. Record evidence
+            // made from the exact byte buffer written before attempting the
+            // outcome append, which may still fail independently.
             ledger.record_fs_write(
                 attribution.session.clone(),
                 attribution.turn.clone(),
                 FsWriteRecord {
                     effect: intent.effect.clone(),
-                    paths: vec![operation.path.clone()],
+                    paths: vec![applied.path],
                     summary: intent.summary.clone(),
+                    bytes_hash: applied.bytes_hash,
                 },
             );
-        }
+            applied.result
+        });
         self.finish(&intent, result).await
     }
 }
@@ -301,14 +369,14 @@ fn list_directory(path: &Path) -> ToolResult<String> {
     Ok(join_lines(listed))
 }
 
-fn search_files(operation: &FsSearch) -> ToolResult<String> {
+fn search_files(operation: &FsSearch, workspace_root: &Path) -> ToolResult<String> {
     if operation.query.is_empty() {
         return Err(ToolError::invalid_argument(
             "fs_search query cannot be empty",
         ));
     }
     let mut files = Vec::new();
-    collect_files(&operation.root, &mut files)?;
+    collect_files(&operation.root, workspace_root, &operation.root, &mut files)?;
     files.sort();
 
     let mut matches = Vec::new();
@@ -331,7 +399,12 @@ fn search_files(operation: &FsSearch) -> ToolResult<String> {
     Ok(join_lines(matches))
 }
 
-fn collect_files(path: &Path, files: &mut Vec<PathBuf>) -> ToolResult<()> {
+fn collect_files(
+    path: &Path,
+    workspace_root: &Path,
+    search_root: &Path,
+    files: &mut Vec<PathBuf>,
+) -> ToolResult<()> {
     let metadata =
         fs::symlink_metadata(path).map_err(|error| ToolError::io("inspect", path, error))?;
     // Symlinks are skipped entirely: following them risks cycles and reads
@@ -339,8 +412,12 @@ fn collect_files(path: &Path, files: &mut Vec<PathBuf>) -> ToolResult<()> {
     if metadata.file_type().is_symlink() {
         return Ok(());
     }
+    let canonical =
+        fs::canonicalize(path).map_err(|error| ToolError::io("canonicalize", path, error))?;
+    require_under_root(workspace_root, path, &canonical)?;
+    require_under_root(search_root, path, &canonical)?;
     if metadata.is_file() {
-        files.push(path.to_path_buf());
+        files.push(canonical);
         return Ok(());
     }
     if !metadata.is_dir() {
@@ -350,7 +427,7 @@ fn collect_files(path: &Path, files: &mut Vec<PathBuf>) -> ToolResult<()> {
     let entries = fs::read_dir(path).map_err(|error| ToolError::io("list", path, error))?;
     for entry in entries {
         let entry = entry.map_err(|error| ToolError::io("list", path, error))?;
-        collect_files(&entry.path(), files)?;
+        collect_files(&entry.path(), workspace_root, search_root, files)?;
     }
     Ok(())
 }
@@ -360,27 +437,121 @@ fn collect_files(path: &Path, files: &mut Vec<PathBuf>) -> ToolResult<()> {
 /// presence doubles as the staleness check: if the file no longer contains
 /// it, the patch was computed against old contents and fails as a typed
 /// conflict without writing.
-fn apply_patch(operation: &FsPatch) -> ToolResult<BoundedResult> {
+struct AppliedPatch {
+    result: BoundedResult,
+    path: PathBuf,
+    bytes_hash: String,
+}
+
+fn apply_patch(operation: &FsPatch, workspace_root: &Path) -> ToolResult<AppliedPatch> {
     if operation.preimage.is_empty() {
         return Err(ToolError::invalid_argument(
             "fs_patch preimage cannot be empty",
         ));
     }
-    let contents = read_utf8(&operation.path)?;
+    let mut source = open_locked_current(&operation.path)?;
+    let resolved = fs::canonicalize(&operation.path)
+        .map_err(|error| ToolError::io("canonicalize locked patch", &operation.path, error))?;
+    require_under_root(workspace_root, &operation.path, &resolved)?;
+    if resolved != operation.path {
+        return Err(ToolError::Lifecycle {
+            message: format!(
+                "authorized patch path {} now resolves to {}; re-authorization required",
+                operation.path.display(),
+                resolved.display()
+            ),
+        });
+    }
+    let source_metadata = source
+        .metadata()
+        .map_err(|error| ToolError::io("inspect", &operation.path, error))?;
+    let mut bytes = Vec::new();
+    source
+        .read_to_end(&mut bytes)
+        .map_err(|error| ToolError::io("read", &operation.path, error))?;
+    let contents = String::from_utf8(bytes).map_err(|error| ToolError::InvalidArgument {
+        message: format!("{} is not UTF-8 text: {error}", operation.path.display()),
+    })?;
     if !contents.contains(&operation.preimage) {
         return Err(ToolError::Conflict(FsPatchConflict {
             path: operation.path.clone(),
             expected_preimage: operation.preimage.clone(),
         }));
     }
-    let patched = contents.replacen(&operation.preimage, &operation.replacement, 1);
-    fs::write(&operation.path, patched.as_bytes())
-        .map_err(|error| ToolError::io("write", &operation.path, error))?;
-    Ok(BoundedResult {
-        preview: format!("patched {}", operation.path.display()),
-        truncated: false,
-        artifact: None,
-        cursor: None,
+    let patched = contents
+        .replacen(&operation.preimage, &operation.replacement, 1)
+        .into_bytes();
+    let bytes_hash = format!("blake3:{}", blake3::hash(&patched).to_hex());
+    let parent = operation
+        .path
+        .parent()
+        .ok_or_else(|| ToolError::invalid_argument("fs_patch path has no parent directory"))?;
+    let mut temporary = NamedTempFile::new_in(parent)
+        .map_err(|error| ToolError::io("create patch temporary", parent, error))?;
+    temporary
+        .as_file()
+        .set_permissions(source_metadata.permissions())
+        .map_err(|error| ToolError::io("set patch permissions", temporary.path(), error))?;
+    temporary
+        .write_all(&patched)
+        .map_err(|error| ToolError::io("write patch temporary", temporary.path(), error))?;
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|error| ToolError::io("sync patch temporary", temporary.path(), error))?;
+    temporary
+        .as_file()
+        .lock()
+        .map_err(|error| ToolError::io("lock patch temporary", temporary.path(), error))?;
+    let _persisted = temporary
+        .persist(&operation.path)
+        .map_err(|error| ToolError::io("replace patched file", &operation.path, error.error))?;
+
+    Ok(AppliedPatch {
+        result: BoundedResult {
+            preview: format!("patched {}", operation.path.display()),
+            truncated: false,
+            artifact: None,
+            cursor: None,
+        },
+        path: operation.path.clone(),
+        bytes_hash,
+    })
+}
+
+/// Opens and exclusively locks the inode currently named by `path`.
+///
+/// A writer may have opened the old inode before another writer atomically
+/// replaced the path. Comparing handles after the lock detects that stale-open
+/// race and retries against the replacement inode before reading any bytes.
+fn open_locked_current(path: &Path) -> ToolResult<std::fs::File> {
+    const MAX_STALE_OPEN_RETRIES: usize = 16;
+    for _ in 0..MAX_STALE_OPEN_RETRIES {
+        let source = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|error| ToolError::io("open for patch", path, error))?;
+        source
+            .lock()
+            .map_err(|error| ToolError::io("lock for patch", path, error))?;
+        let locked = Handle::from_file(
+            source
+                .try_clone()
+                .map_err(|error| ToolError::io("clone locked patch", path, error))?,
+        )
+        .map_err(|error| ToolError::io("inspect locked patch", path, error))?;
+        let current = Handle::from_path(path)
+            .map_err(|error| ToolError::io("inspect current patch", path, error))?;
+        if locked == current {
+            return Ok(source);
+        }
+    }
+    Err(ToolError::Runtime {
+        message: format!(
+            "patch target {} changed during {MAX_STALE_OPEN_RETRIES} lock attempts",
+            path.display()
+        ),
     })
 }
 
@@ -430,6 +601,78 @@ fn join_lines(lines: Vec<String>) -> String {
 fn path_argument(path: &Path) -> ToolResult<&str> {
     path.to_str().ok_or_else(|| ToolError::InvalidArgument {
         message: format!("path is not valid UTF-8: {}", path.display()),
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PathResolution {
+    Existing,
+    MissingLeafOk,
+}
+
+fn resolve_workspace_path(
+    workspace_root: &Path,
+    requested_path: &Path,
+    resolution: PathResolution,
+) -> ToolResult<PathBuf> {
+    let candidate = if requested_path.is_absolute() {
+        requested_path.to_path_buf()
+    } else {
+        workspace_root.join(requested_path)
+    };
+    let resolved = match fs::canonicalize(&candidate) {
+        Ok(path) => path,
+        Err(error)
+            if matches!(resolution, PathResolution::MissingLeafOk)
+                && error.kind() == std::io::ErrorKind::NotFound =>
+        {
+            if fs::symlink_metadata(&candidate)
+                .is_ok_and(|metadata| metadata.file_type().is_symlink())
+            {
+                return Err(ToolError::WorkspaceBoundary {
+                    workspace_root: workspace_root.to_path_buf(),
+                    requested_path: requested_path.to_path_buf(),
+                    resolved_path: None,
+                });
+            }
+            let parent = candidate
+                .parent()
+                .ok_or_else(|| ToolError::WorkspaceBoundary {
+                    workspace_root: workspace_root.to_path_buf(),
+                    requested_path: requested_path.to_path_buf(),
+                    resolved_path: None,
+                })?;
+            let file_name = candidate
+                .file_name()
+                .ok_or_else(|| ToolError::WorkspaceBoundary {
+                    workspace_root: workspace_root.to_path_buf(),
+                    requested_path: requested_path.to_path_buf(),
+                    resolved_path: None,
+                })?;
+            fs::canonicalize(parent)
+                .map_err(|error| ToolError::io("canonicalize parent", parent, error))?
+                .join(file_name)
+        }
+        Err(error) => {
+            return Err(ToolError::io("canonicalize", &candidate, error));
+        }
+    };
+    require_under_root(workspace_root, requested_path, &resolved)?;
+    Ok(resolved)
+}
+
+fn require_under_root(
+    workspace_root: &Path,
+    requested_path: &Path,
+    resolved_path: &Path,
+) -> ToolResult<()> {
+    if resolved_path.starts_with(workspace_root) {
+        return Ok(());
+    }
+    Err(ToolError::WorkspaceBoundary {
+        workspace_root: workspace_root.to_path_buf(),
+        requested_path: requested_path.to_path_buf(),
+        resolved_path: Some(resolved_path.to_path_buf()),
     })
 }
 

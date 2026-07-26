@@ -10,11 +10,10 @@ rust-version.workspace = true
 async-trait.workspace = true
 blake3.workspace = true
 haider-protocol = { path = "../haider-protocol" }
+same-file.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
-
-[dev-dependencies]
 tempfile.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true

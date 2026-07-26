@@ -11,11 +11,14 @@
 //!   (recursively key-sorted) argument JSON — never a tool name. A persistent
 //!   "always allow" stores class + exact digest, so a mutated operation gets
 //!   a new digest and re-asks.
+//! - **Intent-bound authorization.** Lifecycle state retains the complete
+//!   journaled intent. Authorization and later transitions accept that intent,
+//!   and reject a reused effect id whose digest or other fields differ.
 //! - **Deny wins** over every form of approval, and `Dispatched`/`Outcome`
 //!   can only follow an `Allow` authorization (enforced by `require_state`).
-//! - While a broker owns its sink, effect phases enter the journal only
-//!   through the broker — there is no mutable accessor to append around the
-//!   lifecycle checks.
+//! - The journal sink never leaves the broker. Tests inspect a broker-owned,
+//!   read-only snapshot of successfully appended phases instead of recovering
+//!   or mutating the sink.
 
 use crate::{ToolError, ToolResult};
 use async_trait::async_trait;
@@ -23,16 +26,13 @@ use haider_protocol::EventPayload;
 use haider_protocol::effect::{
     AuthorizationVerdict, EffectClass, EffectIntent, EffectOutcome, EffectPhase,
 };
-use haider_protocol::ids::{EffectId, MenuId, WorkspaceRevision};
+use haider_protocol::ids::{EffectId, MenuId, SessionId, WorkspaceRevision};
 use haider_protocol::menu::{DecisionKind, Menu, MenuAnswer, MenuKind, MenuOption, MenuScope};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-// Process-wide counters so distinct brokers in one harness process can never
-// mint colliding effect or menu ids.
-static NEXT_EFFECT_ID: AtomicU64 = AtomicU64::new(1);
-static NEXT_MENU_ID: AtomicU64 = AtomicU64::new(1);
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Port through which the actor will durably envelope effect payloads.
 ///
@@ -49,6 +49,13 @@ pub trait EffectOperation {
     fn effect_class(&self) -> EffectClass;
     fn summary(&self) -> String;
     fn arguments(&self) -> ToolResult<Value>;
+
+    /// Returns the arguments used for authorization after resolving any
+    /// workspace-relative values. Non-filesystem operations use their regular
+    /// arguments; filesystem operations override this to bind canonical paths.
+    fn canonical_arguments(&self, _workspace_root: &Path) -> ToolResult<Value> {
+        self.arguments()
+    }
 
     fn workspace_revision(&self) -> Option<WorkspaceRevision> {
         None
@@ -192,6 +199,12 @@ enum LifecycleState {
 }
 
 #[derive(Debug, Clone)]
+struct LifecycleRecord {
+    intent: EffectIntent,
+    state: LifecycleState,
+}
+
+#[derive(Debug, Clone)]
 struct PendingPermission {
     menu: Menu,
     class: EffectClass,
@@ -208,34 +221,85 @@ struct OneShotRule {
 /// Normalizes, authorizes, and journals effectful operations.
 pub struct EffectBroker<J> {
     journal: J,
+    workspace_root: PathBuf,
+    session_id: SessionId,
+    worker_generation: u64,
+    started_at_ms: u64,
+    next_effect: u64,
+    next_menu: u64,
     /// Terminal states are retained, never evicted: a duplicate transition on
     /// a finished effect must fail loudly instead of re-journaling a phase.
-    lifecycles: HashMap<EffectId, LifecycleState>,
+    lifecycles: HashMap<EffectId, LifecycleRecord>,
     pending_permissions: HashMap<MenuId, PendingPermission>,
     one_shot_rules: Vec<OneShotRule>,
+    journaled_phases: Vec<EffectPhase>,
 }
 
 impl<J> EffectBroker<J>
 where
     J: JournalSink,
 {
-    pub fn new(journal: J) -> Self {
-        Self {
+    /// Creates a broker rooted at `workspace_root`.
+    ///
+    /// `worker_generation` is the durable actor generation. Together with the
+    /// session, broker start time, and local counters it prevents identity
+    /// reuse across same-millisecond restarts.
+    pub fn new(
+        journal: J,
+        workspace_root: impl AsRef<Path>,
+        session_id: SessionId,
+        worker_generation: u64,
+    ) -> ToolResult<Self> {
+        Self::new_at(
             journal,
+            workspace_root,
+            session_id,
+            worker_generation,
+            unix_time_ms(),
+        )
+    }
+
+    /// Deterministic constructor for restart tests and actor integration.
+    pub fn new_at(
+        journal: J,
+        workspace_root: impl AsRef<Path>,
+        session_id: SessionId,
+        worker_generation: u64,
+        started_at_ms: u64,
+    ) -> ToolResult<Self> {
+        let requested_root = workspace_root.as_ref();
+        let workspace_root = fs::canonicalize(requested_root)
+            .map_err(|error| ToolError::io("canonicalize workspace root", requested_root, error))?;
+        if !workspace_root.is_dir() {
+            return Err(ToolError::invalid_argument(format!(
+                "workspace root is not a directory: {}",
+                workspace_root.display()
+            )));
+        }
+        Ok(Self {
+            journal,
+            workspace_root,
+            session_id,
+            worker_generation,
+            started_at_ms,
+            next_effect: 0,
+            next_menu: 0,
             lifecycles: HashMap::new(),
             pending_permissions: HashMap::new(),
             one_shot_rules: Vec::new(),
-        }
+            journaled_phases: Vec::new(),
+        })
     }
 
-    pub fn journal(&self) -> &J {
-        &self.journal
+    pub fn workspace_root(&self) -> &Path {
+        &self.workspace_root
     }
 
-    /// Consumes the broker to reclaim its sink (e.g. at session teardown).
-    /// Only shared and consuming access exist — see the module header.
-    pub fn into_journal(self) -> J {
-        self.journal
+    /// Read-only copy of every effect phase whose durable append succeeded.
+    ///
+    /// The sink itself is intentionally neither borrowed nor recoverable.
+    pub fn journal_snapshot(&self) -> Vec<EffectPhase> {
+        self.journaled_phases.clone()
     }
 
     /// Produces and journals an intent whose digest is the BLAKE3 hash of
@@ -244,11 +308,17 @@ where
     where
         O: EffectOperation,
     {
-        let canonical = canonical_json(operation.arguments()?)?;
+        let canonical = canonical_json(operation.canonical_arguments(&self.workspace_root)?)?;
         let args_digest = format!("blake3:{}", blake3::hash(&canonical).to_hex());
-        let sequence = NEXT_EFFECT_ID.fetch_add(1, Ordering::Relaxed);
+        self.next_effect += 1;
         let intent = EffectIntent {
-            effect: EffectId::new(format!("effect-{sequence}")),
+            effect: EffectId::new(format!(
+                "effect-{}-{}-{}-{}",
+                self.session_id.as_str(),
+                self.worker_generation,
+                self.started_at_ms,
+                self.next_effect
+            )),
             class: operation.effect_class(),
             summary: operation.summary(),
             args_digest,
@@ -256,8 +326,13 @@ where
         };
         self.append_phase(EffectPhase::Intent(intent.clone()))
             .await?;
-        self.lifecycles
-            .insert(intent.effect.clone(), LifecycleState::Intent);
+        self.lifecycles.insert(
+            intent.effect.clone(),
+            LifecycleRecord {
+                intent: intent.clone(),
+                state: LifecycleState::Intent,
+            },
+        );
         Ok(intent)
     }
 
@@ -268,9 +343,10 @@ where
         policy: &PermissionPolicy,
     ) -> ToolResult<AuthorizationVerdict> {
         self.require_state(&intent.effect, LifecycleState::Intent)?;
-        let decision = match policy.decision(intent) {
+        let recorded = self.require_recorded_intent(intent)?.clone();
+        let decision = match policy.decision(&recorded) {
             PolicyDecision::Ask => self
-                .take_one_shot_decision(intent)
+                .take_one_shot_decision(&recorded)
                 .unwrap_or(PolicyDecision::Ask),
             decision => decision,
         };
@@ -278,14 +354,14 @@ where
         let verdict = match decision {
             PolicyDecision::Allow => AuthorizationVerdict::Allow,
             PolicyDecision::Ask => {
-                let menu = self.permission_menu_for(intent);
+                let menu = self.permission_menu_for(&recorded);
                 let menu_id = menu.id.clone();
                 pending_permission = Some((
                     menu_id.clone(),
                     PendingPermission {
                         menu,
-                        class: intent.class.clone(),
-                        args_digest: intent.args_digest.clone(),
+                        class: recorded.class.clone(),
+                        args_digest: recorded.args_digest.clone(),
                     },
                 ));
                 AuthorizationVerdict::Ask { menu: menu_id }
@@ -307,7 +383,7 @@ where
         } else {
             LifecycleState::AuthorizedBlocked
         };
-        self.lifecycles.insert(intent.effect.clone(), state);
+        self.set_state(&intent.effect, state)?;
         Ok(verdict)
     }
 
@@ -364,36 +440,36 @@ where
         Ok(())
     }
 
-    pub async fn journal_dispatched(&mut self, effect: &EffectId) -> ToolResult<()> {
-        self.require_state(effect, LifecycleState::AuthorizedAllow)?;
+    pub async fn journal_dispatched(&mut self, intent: &EffectIntent) -> ToolResult<()> {
+        self.require_recorded_intent(intent)?;
+        self.require_state(&intent.effect, LifecycleState::AuthorizedAllow)?;
         self.append_phase(EffectPhase::Dispatched {
-            effect: effect.clone(),
+            effect: intent.effect.clone(),
         })
         .await?;
-        self.lifecycles
-            .insert(effect.clone(), LifecycleState::Dispatched);
+        self.set_state(&intent.effect, LifecycleState::Dispatched)?;
         Ok(())
     }
 
     pub async fn journal_outcome(
         &mut self,
-        effect: &EffectId,
+        intent: &EffectIntent,
         outcome: EffectOutcome,
     ) -> ToolResult<()> {
-        self.require_state(effect, LifecycleState::Dispatched)?;
+        self.require_recorded_intent(intent)?;
+        self.require_state(&intent.effect, LifecycleState::Dispatched)?;
         self.append_phase(EffectPhase::Outcome {
-            effect: effect.clone(),
+            effect: intent.effect.clone(),
             outcome,
         })
         .await?;
-        self.lifecycles
-            .insert(effect.clone(), LifecycleState::Outcome);
+        self.set_state(&intent.effect, LifecycleState::Outcome)?;
         Ok(())
     }
 
     /// Reconciles the dispatch/outcome crash window explicitly.
-    pub async fn journal_unknown(&mut self, effect: &EffectId) -> ToolResult<()> {
-        self.journal_outcome(effect, EffectOutcome::Unknown).await
+    pub async fn journal_unknown(&mut self, intent: &EffectIntent) -> ToolResult<()> {
+        self.journal_outcome(intent, EffectOutcome::Unknown).await
     }
 
     /// Runs intent → authorize for one operation and journals `Dispatched`
@@ -410,7 +486,7 @@ where
         let intent = self.normalize(operation).await?;
         match self.authorize(&intent, policy).await? {
             AuthorizationVerdict::Allow => {
-                self.journal_dispatched(&intent.effect).await?;
+                self.journal_dispatched(&intent).await?;
                 Ok(intent)
             }
             AuthorizationVerdict::Ask { menu } => Err(ToolError::AuthorizationRequired { menu }),
@@ -427,13 +503,12 @@ where
     ) -> ToolResult<T> {
         match result {
             Ok(value) => {
-                self.journal_outcome(&intent.effect, EffectOutcome::Ok)
-                    .await?;
+                self.journal_outcome(intent, EffectOutcome::Ok).await?;
                 Ok(value)
             }
             Err(error) => {
                 self.journal_outcome(
-                    &intent.effect,
+                    intent,
                     EffectOutcome::Failed {
                         error: error.to_string(),
                     },
@@ -445,11 +520,15 @@ where
     }
 
     async fn append_phase(&mut self, phase: EffectPhase) -> ToolResult<()> {
-        self.journal.append(EventPayload::Effect(phase)).await
+        self.journal
+            .append(EventPayload::Effect(phase.clone()))
+            .await?;
+        self.journaled_phases.push(phase);
+        Ok(())
     }
 
     fn require_state(&self, effect: &EffectId, expected: LifecycleState) -> ToolResult<()> {
-        let actual = self.lifecycles.get(effect).copied();
+        let actual = self.lifecycles.get(effect).map(|record| record.state);
         if actual == Some(expected) {
             return Ok(());
         }
@@ -458,10 +537,44 @@ where
         })
     }
 
-    fn permission_menu_for(&self, intent: &EffectIntent) -> Menu {
-        let sequence = NEXT_MENU_ID.fetch_add(1, Ordering::Relaxed);
+    fn require_recorded_intent(&self, intent: &EffectIntent) -> ToolResult<&EffectIntent> {
+        let Some(record) = self.lifecycles.get(&intent.effect) else {
+            return Err(ToolError::Lifecycle {
+                message: format!("effect {} has no journaled intent", intent.effect),
+            });
+        };
+        if record.intent != *intent {
+            return Err(ToolError::Lifecycle {
+                message: format!(
+                    "effect {} does not match its journaled intent (expected digest {}, received {})",
+                    intent.effect, record.intent.args_digest, intent.args_digest
+                ),
+            });
+        }
+        Ok(&record.intent)
+    }
+
+    fn set_state(&mut self, effect: &EffectId, state: LifecycleState) -> ToolResult<()> {
+        let record = self
+            .lifecycles
+            .get_mut(effect)
+            .ok_or_else(|| ToolError::Lifecycle {
+                message: format!("effect {effect} has no journaled intent"),
+            })?;
+        record.state = state;
+        Ok(())
+    }
+
+    fn permission_menu_for(&mut self, intent: &EffectIntent) -> Menu {
+        self.next_menu += 1;
         Menu {
-            id: MenuId::new(format!("permission-{sequence}")),
+            id: MenuId::new(format!(
+                "permission-{}-{}-{}-{}",
+                self.session_id.as_str(),
+                self.worker_generation,
+                self.started_at_ms,
+                self.next_menu
+            )),
             kind: MenuKind::Permission {
                 effect_summary: intent.summary.clone(),
             },
@@ -513,21 +626,35 @@ fn permission_option(key: &str, label: &str, decision: DecisionKind) -> MenuOpti
 }
 
 fn selected_decision(menu: &Menu, answer: &MenuAnswer) -> ToolResult<DecisionKind> {
-    let option = answer
-        .option_key
-        .as_ref()
-        .and_then(|key| menu.options.iter().find(|option| &option.key == key))
-        .or_else(|| {
-            usize::try_from(answer.option_index)
-                .ok()
-                .and_then(|index| menu.options.get(index))
-        })
-        .ok_or_else(|| ToolError::InvalidArgument {
-            message: format!("invalid option for permission menu {}", menu.id),
-        })?;
-    option.decision.ok_or_else(|| ToolError::InvalidArgument {
-        message: format!("permission menu option `{}` has no decision", option.key),
+    let option = match &answer.option_key {
+        Some(key) => menu
+            .options
+            .iter()
+            .find(|option| &option.key == key)
+            .ok_or_else(|| ToolError::InvalidMenuAnswer {
+                menu: menu.id.clone(),
+                message: format!("unknown option key `{key}`"),
+            })?,
+        None => usize::try_from(answer.option_index)
+            .ok()
+            .and_then(|index| menu.options.get(index))
+            .ok_or_else(|| ToolError::InvalidMenuAnswer {
+                menu: menu.id.clone(),
+                message: format!("option index {} is out of range", answer.option_index),
+            })?,
+    };
+    option.decision.ok_or_else(|| ToolError::InvalidMenuAnswer {
+        menu: menu.id.clone(),
+        message: format!("option `{}` has no decision", option.key),
     })
+}
+
+fn unix_time_ms() -> u64 {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    u64::try_from(millis).unwrap_or(u64::MAX)
 }
 
 fn canonical_json(value: Value) -> ToolResult<Vec<u8>> {

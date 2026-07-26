@@ -2,8 +2,10 @@
 //!
 //! Blocking variants stay machine-readable so callers can act, not parse:
 //! [`ToolError::AuthorizationRequired`] names the menu to answer before
-//! retrying as a fresh effect, and [`ToolError::Conflict`] carries the exact
-//! pre-image evidence a caller needs to rebase a stale patch.
+//! retrying as a fresh effect, [`ToolError::InvalidMenuAnswer`] keeps malformed
+//! answers closed and retryable, [`ToolError::WorkspaceBoundary`] reports path
+//! escapes, and [`ToolError::Conflict`] carries the exact pre-image evidence a
+//! caller needs to rebase a stale patch.
 
 use haider_protocol::ids::MenuId;
 use std::path::PathBuf;
@@ -28,6 +30,15 @@ pub enum ToolError {
     },
     AuthorizationRequired {
         menu: MenuId,
+    },
+    InvalidMenuAnswer {
+        menu: MenuId,
+        message: String,
+    },
+    WorkspaceBoundary {
+        workspace_root: PathBuf,
+        requested_path: PathBuf,
+        resolved_path: Option<PathBuf>,
     },
     Conflict(FsPatchConflict),
     Io {
@@ -93,6 +104,28 @@ impl std::fmt::Display for ToolError {
                     formatter,
                     "effect requires authorization through menu {menu}"
                 )
+            }
+            Self::InvalidMenuAnswer { menu, message } => {
+                write!(
+                    formatter,
+                    "invalid answer for permission menu {menu}: {message}"
+                )
+            }
+            Self::WorkspaceBoundary {
+                workspace_root,
+                requested_path,
+                resolved_path,
+            } => {
+                write!(
+                    formatter,
+                    "path {} escapes workspace root {}",
+                    requested_path.display(),
+                    workspace_root.display()
+                )?;
+                if let Some(resolved_path) = resolved_path {
+                    write!(formatter, " (resolved to {})", resolved_path.display())?;
+                }
+                Ok(())
             }
             Self::Conflict(conflict) => write!(
                 formatter,

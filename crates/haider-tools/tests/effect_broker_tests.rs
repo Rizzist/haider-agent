@@ -2,11 +2,13 @@
 
 use haider_protocol::EventPayload;
 use haider_protocol::effect::{AuthorizationVerdict, EffectClass, EffectOutcome, EffectPhase};
+use haider_protocol::ids::SessionId;
 use haider_protocol::menu::{AnswerVia, MenuAnswer};
 use haider_tools::{
     EffectBroker, FsPatch, FsRead, JournalSink, PermissionPolicy, ResultBounds, ToolResult,
 };
 use std::fs;
+use std::path::Path;
 
 #[derive(Debug, Default)]
 struct RecordingJournal {
@@ -52,20 +54,34 @@ impl haider_tools::CasSink for UnusedCas {
     }
 }
 
-fn effect_phases(journal: &RecordingJournal) -> Vec<&EffectPhase> {
-    journal
-        .payloads
-        .iter()
-        .map(|payload| match payload {
-            EventPayload::Effect(phase) => phase,
-            other => panic!("journal received non-effect payload: {other:?}"),
-        })
-        .collect()
+fn broker_at<J>(journal: J, workspace_root: &Path, generation: u64) -> EffectBroker<J>
+where
+    J: JournalSink,
+{
+    EffectBroker::new_at(
+        journal,
+        workspace_root,
+        SessionId::new("session"),
+        generation,
+        1_700_000_000_000,
+    )
+    .expect("create broker")
+}
+
+fn source_root() -> &'static Path {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+}
+
+fn effect_phases<J>(broker: &EffectBroker<J>) -> Vec<EffectPhase>
+where
+    J: JournalSink,
+{
+    broker.journal_snapshot()
 }
 
 #[tokio::test]
 async fn always_allow_is_bound_to_class_and_exact_argument_digest() {
-    let mut broker = EffectBroker::new(RecordingJournal::default());
+    let mut broker = broker_at(RecordingJournal::default(), source_root(), 1);
     let mut policy = PermissionPolicy::default();
     policy.ask(EffectClass::FsRead);
     let original = FsRead::new("src/lib.rs");
@@ -97,7 +113,7 @@ async fn always_allow_is_bound_to_class_and_exact_argument_digest() {
     );
 
     let mutated = broker
-        .normalize(&FsRead::new("src/main.rs"))
+        .normalize(&FsRead::new("src/broker.rs"))
         .await
         .expect("normalize mutated op");
     assert_ne!(mutated.args_digest, first.args_digest);
@@ -111,8 +127,90 @@ async fn always_allow_is_bound_to_class_and_exact_argument_digest() {
 }
 
 #[tokio::test]
+async fn authorization_rejects_any_substitute_for_the_journaled_intent() {
+    let mut broker = broker_at(RecordingJournal::default(), source_root(), 1);
+    let original = broker
+        .normalize(&FsPatch::new("src/lib.rs", "mod broker;", "mod bypass;"))
+        .await
+        .expect("normalize write intent");
+    let mut policy = PermissionPolicy::default();
+    policy.allow(EffectClass::FsRead);
+    policy.deny(EffectClass::FsWrite, "writes denied");
+
+    let mut changed_digest = original.clone();
+    changed_digest.args_digest = "blake3:substituted".into();
+    let digest_error = broker
+        .authorize(&changed_digest, &policy)
+        .await
+        .expect_err("same id with another digest must require a new intent");
+    assert!(matches!(
+        digest_error,
+        haider_tools::ToolError::Lifecycle { .. }
+    ));
+
+    let mut changed_class = original.clone();
+    changed_class.class = EffectClass::FsRead;
+    let class_error = broker
+        .authorize(&changed_class, &policy)
+        .await
+        .expect_err("journaled write cannot be authorized as a read");
+    assert!(matches!(
+        class_error,
+        haider_tools::ToolError::Lifecycle { .. }
+    ));
+
+    assert!(matches!(
+        broker
+            .authorize(&original, &policy)
+            .await
+            .expect("original intent remains authorizable"),
+        AuthorizationVerdict::Deny { .. }
+    ));
+}
+
+#[tokio::test]
+async fn frozen_clock_restarts_use_generation_stamped_effect_and_menu_ids() {
+    let mut first = broker_at(RecordingJournal::default(), source_root(), 41);
+    let mut restarted = broker_at(RecordingJournal::default(), source_root(), 42);
+    let operation = FsRead::new("src/lib.rs");
+    let first_intent = first.normalize(&operation).await.expect("first intent");
+    let restarted_intent = restarted
+        .normalize(&operation)
+        .await
+        .expect("restarted intent");
+    let policy = PermissionPolicy::default();
+    let AuthorizationVerdict::Ask { menu: first_menu } = first
+        .authorize(&first_intent, &policy)
+        .await
+        .expect("first menu")
+    else {
+        panic!("default policy asks");
+    };
+    let AuthorizationVerdict::Ask {
+        menu: restarted_menu,
+    } = restarted
+        .authorize(&restarted_intent, &policy)
+        .await
+        .expect("restarted menu")
+    else {
+        panic!("default policy asks");
+    };
+
+    assert_ne!(first_intent.effect, restarted_intent.effect);
+    assert_ne!(first_menu, restarted_menu);
+    assert_eq!(
+        first_intent.effect.as_str(),
+        "effect-session-41-1700000000000-1"
+    );
+    assert_eq!(
+        restarted_menu.as_str(),
+        "permission-session-42-1700000000000-1"
+    );
+}
+
+#[tokio::test]
 async fn allow_always_menu_resolution_creates_the_exact_digest_rule() {
-    let mut broker = EffectBroker::new(RecordingJournal::default());
+    let mut broker = broker_at(RecordingJournal::default(), source_root(), 1);
     let mut policy = PermissionPolicy::default();
     let operation = FsRead::new("src/lib.rs");
     let intent = broker
@@ -162,8 +260,96 @@ async fn allow_always_menu_resolution_creates_the_exact_digest_rule() {
 }
 
 #[tokio::test]
+async fn unknown_permission_key_fails_closed_and_keeps_menu_answerable() {
+    let mut broker = broker_at(RecordingJournal::default(), source_root(), 1);
+    let mut policy = PermissionPolicy::default();
+    let intent = broker
+        .normalize(&FsRead::new("src/lib.rs"))
+        .await
+        .expect("normalize");
+    let AuthorizationVerdict::Ask { menu } = broker.authorize(&intent, &policy).await.expect("ask")
+    else {
+        panic!("default policy asks");
+    };
+    let error = broker
+        .resolve_permission(
+            &MenuAnswer {
+                menu: menu.clone(),
+                option_key: Some("reject_typo".into()),
+                option_index: 0,
+                value: None,
+                via: AnswerVia::Rpc,
+            },
+            &mut policy,
+        )
+        .expect_err("unknown key must not fall back to allow-once index");
+    assert!(matches!(
+        error,
+        haider_tools::ToolError::InvalidMenuAnswer { .. }
+    ));
+    assert!(broker.permission_menu(&menu).is_some());
+
+    broker
+        .resolve_permission(
+            &MenuAnswer {
+                menu,
+                option_key: Some("reject_once".into()),
+                option_index: 0,
+                value: None,
+                via: AnswerVia::Rpc,
+            },
+            &mut policy,
+        )
+        .expect("same menu can be answered correctly");
+}
+
+#[tokio::test]
+async fn out_of_range_permission_index_fails_closed_and_keeps_menu_answerable() {
+    let mut broker = broker_at(RecordingJournal::default(), source_root(), 1);
+    let mut policy = PermissionPolicy::default();
+    let intent = broker
+        .normalize(&FsRead::new("src/lib.rs"))
+        .await
+        .expect("normalize");
+    let AuthorizationVerdict::Ask { menu } = broker.authorize(&intent, &policy).await.expect("ask")
+    else {
+        panic!("default policy asks");
+    };
+    let error = broker
+        .resolve_permission(
+            &MenuAnswer {
+                menu: menu.clone(),
+                option_key: None,
+                option_index: u32::MAX,
+                value: None,
+                via: AnswerVia::Rpc,
+            },
+            &mut policy,
+        )
+        .expect_err("invalid index must fail closed");
+    assert!(matches!(
+        error,
+        haider_tools::ToolError::InvalidMenuAnswer { .. }
+    ));
+    assert!(broker.permission_menu(&menu).is_some());
+
+    broker
+        .resolve_permission(
+            &MenuAnswer {
+                menu,
+                option_key: None,
+                option_index: 2,
+                value: None,
+                via: AnswerVia::Rpc,
+            },
+            &mut policy,
+        )
+        .expect("same menu can be answered correctly");
+}
+
+#[tokio::test]
 async fn allow_once_resolution_grants_a_single_retry() {
-    let mut broker = EffectBroker::new(RecordingJournal::default());
+    let mut broker = broker_at(RecordingJournal::default(), source_root(), 1);
     let mut policy = PermissionPolicy::default();
     let operation = FsRead::new("src/lib.rs");
     let intent = broker.normalize(&operation).await.expect("normalize");
@@ -210,7 +396,7 @@ async fn allow_once_resolution_grants_a_single_retry() {
 
 #[tokio::test]
 async fn reject_once_resolution_denies_a_single_retry() {
-    let mut broker = EffectBroker::new(RecordingJournal::default());
+    let mut broker = broker_at(RecordingJournal::default(), source_root(), 1);
     let mut policy = PermissionPolicy::default();
     let operation = FsRead::new("src/lib.rs");
     let intent = broker.normalize(&operation).await.expect("normalize");
@@ -256,7 +442,7 @@ async fn reject_once_resolution_denies_a_single_retry() {
 
 #[tokio::test]
 async fn dispatch_cannot_follow_a_blocked_authorization() {
-    let mut broker = EffectBroker::new(RecordingJournal::default());
+    let mut broker = broker_at(RecordingJournal::default(), source_root(), 1);
     let mut policy = PermissionPolicy::default();
     policy.deny(EffectClass::FsWrite, "workspace is read-only");
     let intent = broker
@@ -269,12 +455,12 @@ async fn dispatch_cannot_follow_a_blocked_authorization() {
     ));
 
     let error = broker
-        .journal_dispatched(&intent.effect)
+        .journal_dispatched(&intent)
         .await
         .expect_err("dispatch after deny must be refused");
     assert!(matches!(error, haider_tools::ToolError::Lifecycle { .. }));
     assert!(
-        !effect_phases(broker.journal())
+        !effect_phases(&broker)
             .iter()
             .any(|phase| matches!(phase, EffectPhase::Dispatched { .. }))
     );
@@ -288,7 +474,7 @@ async fn deny_is_journaled_and_blocks_filesystem_apply() {
 
     let mut policy = PermissionPolicy::default();
     policy.deny(EffectClass::FsWrite, "workspace is read-only");
-    let mut broker = EffectBroker::new(RecordingJournal::default());
+    let mut broker = broker_at(RecordingJournal::default(), directory.path(), 1);
     let mut ledger = haider_tools::ChangeLedger::new();
     let attribution = haider_tools::TurnAttribution::new(
         haider_protocol::ids::SessionId::new("session"),
@@ -311,7 +497,7 @@ async fn deny_is_journaled_and_blocks_filesystem_apply() {
     ));
     assert_eq!(fs::read_to_string(&path).expect("read file"), "before");
     assert!(!ledger.has_fs_writes(&attribution.session, &attribution.turn));
-    let phases = effect_phases(broker.journal());
+    let phases = effect_phases(&broker);
     assert!(matches!(phases[0], EffectPhase::Intent(_)));
     assert!(matches!(
         phases[1],
@@ -330,7 +516,7 @@ async fn failed_dispatched_append_blocks_filesystem_apply() {
     fs::write(&path, "before").expect("seed file");
     let mut policy = PermissionPolicy::default();
     policy.allow(EffectClass::FsWrite);
-    let mut broker = EffectBroker::new(RejectDispatchJournal::default());
+    let mut broker = broker_at(RejectDispatchJournal::default(), directory.path(), 1);
     let mut ledger = haider_tools::ChangeLedger::new();
     let attribution = haider_tools::TurnAttribution::new(
         haider_protocol::ids::SessionId::new("session"),
@@ -350,7 +536,7 @@ async fn failed_dispatched_append_blocks_filesystem_apply() {
     assert!(matches!(error, haider_tools::ToolError::Journal { .. }));
     assert_eq!(fs::read_to_string(&path).expect("read file"), "before");
     assert!(!ledger.has_fs_writes(&attribution.session, &attribution.turn));
-    assert_eq!(broker.journal().payloads.len(), 2);
+    assert_eq!(broker.journal_snapshot().len(), 2);
 }
 
 #[tokio::test]
@@ -360,7 +546,7 @@ async fn successful_dispatch_has_strict_four_phase_order() {
     fs::write(&path, "small result").expect("seed file");
     let mut policy = PermissionPolicy::default();
     policy.allow(EffectClass::FsRead);
-    let mut broker = EffectBroker::new(RecordingJournal::default());
+    let mut broker = broker_at(RecordingJournal::default(), directory.path(), 1);
 
     let result = broker
         .fs_read(
@@ -373,7 +559,7 @@ async fn successful_dispatch_has_strict_four_phase_order() {
         .expect("read succeeds");
     assert_eq!(result.preview, "small result");
 
-    let phases = effect_phases(broker.journal());
+    let phases = effect_phases(&broker);
     assert!(matches!(phases[0], EffectPhase::Intent(_)));
     assert!(matches!(
         phases[1],
@@ -397,9 +583,9 @@ async fn successful_dispatch_has_strict_four_phase_order() {
 async fn dispatched_effect_can_be_reconciled_as_unknown() {
     let mut policy = PermissionPolicy::default();
     policy.allow(EffectClass::FsRead);
-    let mut broker = EffectBroker::new(RecordingJournal::default());
+    let mut broker = broker_at(RecordingJournal::default(), source_root(), 1);
     let intent = broker
-        .normalize(&FsRead::new("lost-result.txt"))
+        .normalize(&FsRead::new("src/lib.rs"))
         .await
         .expect("normalize");
     assert_eq!(
@@ -407,16 +593,16 @@ async fn dispatched_effect_can_be_reconciled_as_unknown() {
         AuthorizationVerdict::Allow
     );
     broker
-        .journal_dispatched(&intent.effect)
+        .journal_dispatched(&intent)
         .await
         .expect("journal dispatched");
     broker
-        .journal_unknown(&intent.effect)
+        .journal_unknown(&intent)
         .await
         .expect("reconcile unknown");
 
     assert!(matches!(
-        effect_phases(broker.journal()).last(),
+        effect_phases(&broker).last(),
         Some(EffectPhase::Outcome {
             outcome: EffectOutcome::Unknown,
             ..

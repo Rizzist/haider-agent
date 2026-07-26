@@ -8,6 +8,8 @@ use haider_tools::{
     PermissionPolicy, ResultBounds, ToolError, ToolResult, TurnAttribution,
 };
 use std::fs;
+use std::path::Path;
+use std::sync::Arc;
 
 #[derive(Debug, Default)]
 struct RecordingJournal {
@@ -18,6 +20,37 @@ struct RecordingJournal {
 impl JournalSink for RecordingJournal {
     async fn append(&mut self, payload: EventPayload) -> ToolResult<()> {
         self.payloads.push(payload);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Default)]
+struct RejectOutcomeJournal;
+
+#[async_trait::async_trait]
+impl JournalSink for RejectOutcomeJournal {
+    async fn append(&mut self, payload: EventPayload) -> ToolResult<()> {
+        if matches!(payload, EventPayload::Effect(EffectPhase::Outcome { .. })) {
+            return Err(ToolError::journal("outcome append unavailable"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct DispatchBarrierJournal {
+    barrier: Arc<tokio::sync::Barrier>,
+}
+
+#[async_trait::async_trait]
+impl JournalSink for DispatchBarrierJournal {
+    async fn append(&mut self, payload: EventPayload) -> ToolResult<()> {
+        if matches!(
+            payload,
+            EventPayload::Effect(EffectPhase::Dispatched { .. })
+        ) {
+            self.barrier.wait().await;
+        }
         Ok(())
     }
 }
@@ -44,12 +77,33 @@ fn allow(class: EffectClass) -> PermissionPolicy {
     policy
 }
 
+fn broker_at<J>(journal: J, workspace_root: &Path) -> EffectBroker<J>
+where
+    J: JournalSink,
+{
+    broker_generation(journal, workspace_root, 1)
+}
+
+fn broker_generation<J>(journal: J, workspace_root: &Path, generation: u64) -> EffectBroker<J>
+where
+    J: JournalSink,
+{
+    EffectBroker::new_at(
+        journal,
+        workspace_root,
+        SessionId::new("session"),
+        generation,
+        1_700_000_000_000,
+    )
+    .expect("create broker")
+}
+
 #[tokio::test]
 async fn preimage_mismatch_returns_typed_conflict_and_failed_outcome() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let path = directory.path().join("conflict.txt");
     fs::write(&path, "current").expect("seed file");
-    let mut broker = EffectBroker::new(RecordingJournal::default());
+    let mut broker = broker_at(RecordingJournal::default(), directory.path());
     let attribution = TurnAttribution::new(SessionId::new("session"), RunId::new("turn"));
     let mut ledger = ChangeLedger::new();
 
@@ -66,16 +120,19 @@ async fn preimage_mismatch_returns_typed_conflict_and_failed_outcome() {
     let ToolError::Conflict(conflict) = error else {
         panic!("expected typed conflict");
     };
-    assert_eq!(conflict.path, path);
+    assert_eq!(
+        conflict.path,
+        fs::canonicalize(&path).expect("canonical conflict path")
+    );
     assert_eq!(conflict.expected_preimage, "stale");
     assert_eq!(fs::read_to_string(&path).expect("read file"), "current");
     assert!(!ledger.has_fs_writes(&attribution.session, &attribution.turn));
     assert!(matches!(
-        broker.journal().payloads.last(),
-        Some(EventPayload::Effect(EffectPhase::Outcome {
+        broker.journal_snapshot().last(),
+        Some(EffectPhase::Outcome {
             outcome: EffectOutcome::Failed { .. },
             ..
-        }))
+        })
     ));
 }
 
@@ -90,7 +147,7 @@ async fn ledger_attributes_successful_writes_to_the_exact_turn() {
     let first_turn = TurnAttribution::new(session.clone(), RunId::new("turn-1"));
     let second_turn = TurnAttribution::new(session.clone(), RunId::new("turn-2"));
     let policy = allow(EffectClass::FsWrite);
-    let mut broker = EffectBroker::new(RecordingJournal::default());
+    let mut broker = broker_at(RecordingJournal::default(), directory.path());
     let mut ledger = ChangeLedger::new();
 
     broker
@@ -115,17 +172,195 @@ async fn ledger_attributes_successful_writes_to_the_exact_turn() {
     let first = ledger
         .changes_for(&session, &first_turn.turn)
         .expect("first turn changes");
-    assert_eq!(first.paths, vec![first_path.clone()]);
+    let canonical_first = fs::canonicalize(&first_path).expect("canonical first");
+    let canonical_second = fs::canonicalize(&second_path).expect("canonical second");
+    assert_eq!(first.paths, vec![canonical_first.clone()]);
     assert_eq!(first.writes.len(), 1);
-    assert!(ledger.path_touched(&session, &first_turn.turn, &first_path));
-    assert!(!ledger.path_touched(&session, &first_turn.turn, &second_path));
+    assert!(ledger.path_touched(&session, &first_turn.turn, &canonical_first));
+    assert!(!ledger.path_touched(&session, &first_turn.turn, &canonical_second));
+    assert_eq!(
+        first.writes[0].bytes_hash,
+        format!("blake3:{}", blake3::hash(b"b").to_hex())
+    );
     assert_eq!(
         ledger
             .changes_for(&session, &second_turn.turn)
             .expect("second turn changes")
             .paths,
-        vec![second_path]
+        vec![canonical_second]
     );
+}
+
+#[tokio::test]
+async fn concurrent_patches_cannot_both_apply_the_same_stale_preimage() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("concurrent.txt");
+    let original = format!("before\n{}", "padding\n".repeat(256 * 1024));
+    fs::write(&path, &original).expect("seed file");
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let mut first_broker = broker_generation(
+        DispatchBarrierJournal {
+            barrier: barrier.clone(),
+        },
+        directory.path(),
+        1,
+    );
+    let mut second_broker =
+        broker_generation(DispatchBarrierJournal { barrier }, directory.path(), 2);
+    let policy = allow(EffectClass::FsWrite);
+    let first_attribution = TurnAttribution::new(SessionId::new("session"), RunId::new("turn-1"));
+    let second_attribution = TurnAttribution::new(SessionId::new("session"), RunId::new("turn-2"));
+    let mut first_ledger = ChangeLedger::new();
+    let mut second_ledger = ChangeLedger::new();
+    let first_patch = FsPatch::new(&path, "before", "first");
+    let second_patch = FsPatch::new(&path, "before", "second");
+
+    let (first, second) = tokio::join!(
+        first_broker.fs_patch(&first_patch, &policy, &first_attribution, &mut first_ledger,),
+        second_broker.fs_patch(
+            &second_patch,
+            &policy,
+            &second_attribution,
+            &mut second_ledger,
+        )
+    );
+
+    assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
+    let failed = if let Err(error) = first {
+        error
+    } else {
+        second.expect_err("exactly one patch must conflict")
+    };
+    assert!(matches!(failed, ToolError::Conflict(_)));
+    assert_eq!(
+        usize::from(
+            first_ledger.has_fs_writes(&first_attribution.session, &first_attribution.turn)
+        ) + usize::from(
+            second_ledger.has_fs_writes(&second_attribution.session, &second_attribution.turn)
+        ),
+        1
+    );
+}
+
+#[tokio::test]
+async fn applied_write_is_ledgered_before_a_failed_outcome_append() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("outcome-failure.txt");
+    fs::write(&path, "before").expect("seed file");
+    let attribution = TurnAttribution::new(SessionId::new("session"), RunId::new("turn"));
+    let mut broker = broker_at(RejectOutcomeJournal, directory.path());
+    let mut ledger = ChangeLedger::new();
+
+    let error = broker
+        .fs_patch(
+            &FsPatch::new(&path, "before", "after"),
+            &allow(EffectClass::FsWrite),
+            &attribution,
+            &mut ledger,
+        )
+        .await
+        .expect_err("outcome append fails after apply");
+
+    assert!(matches!(error, ToolError::Journal { .. }));
+    let written = fs::read(&path).expect("read applied bytes");
+    assert_eq!(written, b"after");
+    let changes = ledger
+        .changes_for(&attribution.session, &attribution.turn)
+        .expect("applied write remains ledgered");
+    assert_eq!(changes.writes.len(), 1);
+    assert_eq!(
+        changes.writes[0].bytes_hash,
+        format!("blake3:{}", blake3::hash(&written).to_hex())
+    );
+    assert_eq!(broker.journal_snapshot().len(), 3);
+    assert!(matches!(
+        broker.journal_snapshot().last(),
+        Some(EffectPhase::Dispatched { .. })
+    ));
+}
+
+#[tokio::test]
+async fn workspace_traversal_is_rejected_before_authorization_or_read() {
+    let parent = tempfile::tempdir().expect("temporary parent");
+    let workspace = parent.path().join("workspace");
+    fs::create_dir(&workspace).expect("create workspace");
+    fs::write(parent.path().join("outside.txt"), "secret").expect("seed outside");
+    let mut broker = broker_at(RecordingJournal::default(), &workspace);
+    let mut cas = RecordingCas::default();
+
+    let error = broker
+        .fs_read(
+            &FsRead::new("../outside.txt"),
+            &allow(EffectClass::FsRead),
+            &mut cas,
+            ResultBounds::default(),
+        )
+        .await
+        .expect_err("traversal must not leave workspace");
+
+    assert!(matches!(error, ToolError::WorkspaceBoundary { .. }));
+    assert!(broker.journal_snapshot().is_empty());
+    assert!(cas.writes.is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn workspace_symlink_escape_is_rejected_before_authorization_or_read() {
+    use std::os::unix::fs::symlink;
+
+    let parent = tempfile::tempdir().expect("temporary parent");
+    let workspace = parent.path().join("workspace");
+    fs::create_dir(&workspace).expect("create workspace");
+    let outside = parent.path().join("outside.txt");
+    fs::write(&outside, "secret").expect("seed outside");
+    symlink(&outside, workspace.join("escape.txt")).expect("create escape symlink");
+    let mut broker = broker_at(RecordingJournal::default(), &workspace);
+    let mut cas = RecordingCas::default();
+
+    let error = broker
+        .fs_read(
+            &FsRead::new("escape.txt"),
+            &allow(EffectClass::FsRead),
+            &mut cas,
+            ResultBounds::default(),
+        )
+        .await
+        .expect_err("symlink must not leave workspace");
+
+    assert!(matches!(error, ToolError::WorkspaceBoundary { .. }));
+    assert!(broker.journal_snapshot().is_empty());
+}
+
+#[tokio::test]
+async fn canonical_path_aliases_share_a_digest_but_distinct_files_do_not() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    fs::create_dir(directory.path().join("nested")).expect("create nested");
+    fs::write(directory.path().join("nested").join("same.txt"), "same").expect("seed same");
+    fs::write(directory.path().join("other.txt"), "other").expect("seed other");
+    let mut broker = broker_at(RecordingJournal::default(), directory.path());
+
+    let relative = broker
+        .normalize(&FsRead::new("nested/same.txt"))
+        .await
+        .expect("relative alias");
+    let lexical_alias = broker
+        .normalize(&FsRead::new("nested/../nested/same.txt"))
+        .await
+        .expect("lexical alias");
+    let absolute = broker
+        .normalize(&FsRead::new(
+            directory.path().join("nested").join("same.txt"),
+        ))
+        .await
+        .expect("absolute alias");
+    let distinct = broker
+        .normalize(&FsRead::new("other.txt"))
+        .await
+        .expect("distinct path");
+
+    assert_eq!(relative.args_digest, lexical_alias.args_digest);
+    assert_eq!(relative.args_digest, absolute.args_digest);
+    assert_ne!(relative.args_digest, distinct.args_digest);
 }
 
 #[tokio::test]
@@ -134,7 +369,7 @@ async fn oversized_result_keeps_preview_and_freezes_full_payload_in_cas() {
     let path = directory.path().join("large.txt");
     let full = "αβγ delta\n".repeat(16);
     fs::write(&path, &full).expect("seed file");
-    let mut broker = EffectBroker::new(RecordingJournal::default());
+    let mut broker = broker_at(RecordingJournal::default(), directory.path());
     let mut cas = RecordingCas::default();
 
     let result = broker
@@ -166,7 +401,7 @@ async fn list_and_search_are_sorted_bounded_read_effects() {
     fs::write(root.join("nested").join("beta.txt"), "needle b\n").expect("seed beta");
     let policy = allow(EffectClass::FsRead);
     let mut cas = RecordingCas::default();
-    let mut broker = EffectBroker::new(RecordingJournal::default());
+    let mut broker = broker_at(RecordingJournal::default(), directory.path());
 
     let listed = broker
         .fs_list(
