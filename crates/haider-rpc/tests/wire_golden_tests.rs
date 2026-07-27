@@ -194,6 +194,59 @@ fn correlated_errors_pin_the_named_stable_codes() {
     );
 }
 
+/// `MenuAnswer.request_id` is purely additive correlation: it may be absent
+/// (and then leaves no trace on the wire), and it never displaces
+/// `command_id`, which stays the durable compare-and-set identity.
+#[test]
+fn menu_answer_request_id_is_optional_correlation_beside_the_durable_command_id() {
+    let json = format!(
+        r#"{{
+            "v": {WIRE_PROTOCOL_VERSION},
+            "kind": "menu_answer",
+            "command_id": "command-legacy",
+            "session_id": "session-1",
+            "menu_id": "menu-1",
+            "request_seq": 3,
+            "worker_generation": 7,
+            "option_key": "approve",
+            "option_index": 0
+        }}"#
+    );
+    let decoded: WireFrame = serde_json::from_str(&json).expect("decode uncorrelated menu answer");
+    let WireFrame::MenuAnswer {
+        request_id,
+        command_id,
+        ..
+    } = &decoded
+    else {
+        panic!("expected menu answer, got {decoded:?}");
+    };
+    assert!(request_id.is_none(), "the field must stay optional");
+    assert_eq!(command_id.as_str(), "command-legacy");
+    let reserialized = serde_json::to_value(&decoded).expect("re-encode");
+    assert!(
+        reserialized.get("request_id").is_none(),
+        "an absent correlation must not appear on the wire"
+    );
+    assert_eq!(reserialized["command_id"], "command-legacy");
+
+    let correlated = transcript()
+        .into_iter()
+        .find(|frame| {
+            matches!(
+                frame,
+                WireFrame::MenuAnswer {
+                    request_id: Some(_),
+                    ..
+                }
+            )
+        })
+        .expect("correlated menu answer");
+    let value = serde_json::to_value(&correlated).expect("correlated JSON");
+    assert_eq!(value["request_id"], "request-menu-1");
+    assert_eq!(value["command_id"], "command-1");
+}
+
 #[test]
 fn cursor_pagination_and_lag_notice_have_no_numeric_resume_authority() {
     let frames = transcript();

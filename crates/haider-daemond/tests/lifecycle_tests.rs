@@ -24,6 +24,22 @@
 //! - queued-byte budget            -> `outbound_byte_budget_refuses_a_frame_the_connection_cannot_hold`
 //! - reserved drain notice         -> `reserved_drain_notice_survives_an_exhausted_outbound_byte_budget`
 //!
+//! Review round 1 closures (R3/R17/R22):
+//!
+//! - blocked writer, deadline path -> `never_reading_client_is_cut_at_the_drain_deadline_and_releases_everything`
+//! - blocked writer, forced path   -> `forced_shutdown_aborts_a_blocked_writer_instead_of_detaching_it`
+//! - deadline covers finalization  -> `drain_deadline_covers_the_finalization_tail`
+//! - replacement around cleanup    -> `endpoint_replacement_around_cleanup_is_never_deleted`
+//! - live foreign endpoint         -> `live_foreign_endpoint_is_refused_and_left_intact`
+//! - over-limit drain reason       -> `drain_reason_is_truncated_to_fit_a_small_client_frame_limit`
+//! - capability downscoping        -> `view_only_connection_is_denied_the_control_frame`
+//! - pre-Hello slot exhaustion     -> `silent_peer_is_closed_at_the_handshake_deadline_and_frees_its_slot`
+//! - duplicate Hello               -> `duplicate_hello_after_handshake_is_a_fatal_unexpected_frame`
+//!
+//! The bind → identity window has no test because it has no window: the socket
+//! is created under a private name, `statat`-ed there, and renamed into place,
+//! so no replacement can be adopted as this daemon's own node.
+//!
 //! All cases use a real UDS in a tempdir runtime dir and poll readiness
 //! states — no sleeps as synchronization. Where only the OS can answer (a
 //! child's exit status, a socket appearing), the loop still polls a real
@@ -38,10 +54,10 @@ use haider_protocol::effect::{EffectClass, EffectIntent, EffectOutcome, EffectPh
 use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
 };
-use haider_protocol::ids::{DeviceId, EffectId, EventId, SessionId};
+use haider_protocol::ids::{DeviceId, EffectId, EventId, MenuId, SessionId};
 use haider_rpc::{
-    Capability, CapabilitySet, ClientKind, Hello, LifecyclePhase, ProtocolError, RequestBody,
-    RequestId, ResponseBody, WIRE_PROTOCOL_VERSION, WireFrame, uds_codec,
+    Capability, CapabilitySet, ClientKind, CommandId, Hello, LifecyclePhase, ProtocolError,
+    RequestBody, RequestId, ResponseBody, WIRE_PROTOCOL_VERSION, WireFrame, uds_codec,
 };
 use haider_store::{EventStore, Store};
 use rustix::process::{Pid, Signal, kill_process};
@@ -154,6 +170,25 @@ impl TestClient {
             .expect("EOF read");
         assert_eq!(read, 0);
     }
+
+    /// Reads until EOF and reports how many COMPLETE frames the daemon managed
+    /// to put on the wire. Used to prove a blocked writer was cut off rather
+    /// than left running: a writer that survived its connection would keep
+    /// feeding the reader until its whole pending frame arrived.
+    async fn frames_until_eof(&mut self) -> usize {
+        let mut frames = self.pending.len();
+        loop {
+            let mut bytes = [0_u8; 16 * 1024];
+            let read = tokio::time::timeout(DEADLINE, self.stream.read(&mut bytes))
+                .await
+                .expect("EOF deadline")
+                .expect("EOF read");
+            if read == 0 {
+                return frames;
+            }
+            frames += self.decoder.push(&bytes[..read]).frames.len();
+        }
+    }
 }
 
 struct ManagedChild {
@@ -229,6 +264,22 @@ fn child_command(config: &DaemonConfig) -> Command {
     command
 }
 
+/// The one control frame this lane accepts, optionally correlated so the
+/// daemon can answer it with a `Response` (additive `MenuAnswer.request_id`).
+fn menu_answer(request_id: Option<&str>) -> WireFrame {
+    WireFrame::MenuAnswer {
+        request_id: request_id.map(RequestId::new),
+        command_id: CommandId::new("command-test"),
+        session_id: SessionId::new("session-test"),
+        menu_id: MenuId::new("menu-test"),
+        request_seq: 1,
+        worker_generation: 1,
+        option_key: "approve".into(),
+        option_index: 0,
+        input: None,
+    }
+}
+
 fn hello(protocol_min: u32, protocol_max: u32, max_receive_frame: u32) -> WireFrame {
     WireFrame::Hello(Hello {
         protocol_min,
@@ -296,6 +347,26 @@ async fn poll_process_ready(config: &DaemonConfig) -> TestClient {
     })
     .await
     .expect("daemon readiness deadline")
+}
+
+/// Waits for the profile lock to be free, bounded by the usual deadline.
+///
+/// A drain that overruns its deadline stops WAITING on store work; the work
+/// itself is a blocking SQLite call that cannot be cancelled and releases the
+/// lock as soon as it returns. The law being pinned is that the lock is never
+/// leaked — not that the OS hands it back on the same instruction.
+async fn poll_store_release(config: &DaemonConfig) {
+    tokio::time::timeout(DEADLINE, async {
+        loop {
+            if let Ok(store) = Store::open(&config.store_dir) {
+                drop(store);
+                return;
+            }
+            tokio::time::sleep(POLL_BACKOFF).await;
+        }
+    })
+    .await
+    .expect("profile lock release deadline");
 }
 
 /// Bounded-retry connect + handshake for the admission cap: a freed connection
@@ -585,15 +656,17 @@ async fn failed_listener_startup_publishes_failed_and_releases_profile_lock() {
     .await;
     assert!(matches!(failed, DaemonState::Failed { .. }));
     let error = task.join().await.expect_err("listener bind must fail");
+    // The daemon no longer binds onto the public name (it binds under a
+    // private name and renames), so an unusable node there is refused by the
+    // endpoint ownership guard — earlier than the old bind syscall failure,
+    // and without ever creating a socket.
     assert!(
-        matches!(
-            &error,
-            DaemonError::Io {
-                operation: "bind Unix socket",
-                ..
-            }
-        ),
-        "failure must originate at the listener bind syscall, got {error:?}"
+        matches!(&error, DaemonError::Endpoint { .. }),
+        "failure must originate at the endpoint ownership guard, got {error:?}"
+    );
+    assert!(
+        fs::symlink_metadata(config.endpoint_path()).is_ok(),
+        "a squatting node must be refused, never removed"
     );
 
     let store = Store::open(&config.store_dir).expect("failed daemon released profile lock");
@@ -899,6 +972,374 @@ async fn reserved_drain_notice_survives_an_exhausted_outbound_byte_budget() {
          ({welcome_bytes} + {notice_bytes} bytes)"
     );
 
+    assert_eq!(
+        task.join().await.expect("daemon joins"),
+        ShutdownOutcome::Graceful
+    );
+}
+
+/// A client that stops reading leaves a large reply mid-write. The barrier
+/// deadline must cut that writer, not wait behind it: nothing may outlive the
+/// deadline — not the writer task, not the socket, not the profile lock.
+#[tokio::test]
+async fn never_reading_client_is_cut_at_the_drain_deadline_and_releases_everything() {
+    let root = test_root();
+    let profile = format!("never-reads-{}", "p".repeat(512 * 1024));
+    let mut config = test_config(&root, &profile);
+    config.frame_limit = config.profile_id.len() + 1_024;
+    config.outbound_queued_bytes = config.frame_limit;
+    config.drain_timeout = Duration::from_millis(250);
+    let task = spawn(config.clone());
+    wait_for_state(task.readiness(), |state| *state == DaemonState::Ready).await;
+
+    let mut client = TestClient::connect(&config.endpoint_path(), config.frame_limit)
+        .await
+        .expect("connect");
+    client
+        .send(
+            &hello(
+                WIRE_PROTOCOL_VERSION,
+                WIRE_PROTOCOL_VERSION,
+                u32::try_from(config.frame_limit).expect("frame limit fits"),
+            ),
+            config.frame_limit,
+        )
+        .await;
+    // Enough to prove the reply write started; the client then goes silent, so
+    // the daemon's writer is parked inside write_all from here on.
+    client.absorb_at_least(8 * 1024).await;
+
+    task.shutdown_handle().request("deadline");
+    // The barrier must end by itself, and honestly: a connection that never
+    // received its ServerDraining is not a graceful drain.
+    assert_eq!(
+        task.join().await.expect("daemon joins"),
+        ShutdownOutcome::Forced
+    );
+    assert!(
+        !config.endpoint_path().exists(),
+        "socket outlived the barrier"
+    );
+    poll_store_release(&config).await;
+
+    let delivered = client.frames_until_eof().await;
+    assert_eq!(
+        delivered, 0,
+        "the blocked writer was left running: it completed its frame after the barrier"
+    );
+}
+
+/// The forced path aborts connection tasks outright. The writer must die with
+/// its connection: joining it may not hand its handle away, or the abort finds
+/// nothing to cancel and the writer (plus its socket and payload) survives
+/// endpoint cleanup and the profile-lock release.
+#[tokio::test]
+async fn forced_shutdown_aborts_a_blocked_writer_instead_of_detaching_it() {
+    let root = test_root();
+    let profile = format!("forced-writer-{}", "p".repeat(512 * 1024));
+    let mut config = test_config(&root, &profile);
+    config.frame_limit = config.profile_id.len() + 1_024;
+    config.outbound_queued_bytes = config.frame_limit;
+    let task = spawn(config.clone());
+    wait_for_state(task.readiness(), |state| *state == DaemonState::Ready).await;
+
+    let mut client = TestClient::connect(&config.endpoint_path(), config.frame_limit)
+        .await
+        .expect("connect");
+    client
+        .send(
+            &hello(
+                WIRE_PROTOCOL_VERSION,
+                WIRE_PROTOCOL_VERSION,
+                u32::try_from(config.frame_limit).expect("frame limit fits"),
+            ),
+            config.frame_limit,
+        )
+        .await;
+    client.absorb_at_least(8 * 1024).await;
+
+    let shutdown = task.shutdown_handle();
+    shutdown.request("drain");
+    // Let the connection task reach its writer join: that await is exactly
+    // where the abort must still find an abortable writer handle. The drain
+    // timeout is the default 5s, so the writer is parked in write_all — its own
+    // deadline is nowhere near — when the force arrives.
+    wait_for_state(task.readiness(), |state| {
+        matches!(state, DaemonState::Draining { .. })
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    shutdown.request("force");
+    assert_eq!(
+        task.join().await.expect("daemon joins"),
+        ShutdownOutcome::Forced
+    );
+    assert!(!config.endpoint_path().exists());
+    poll_store_release(&config).await;
+
+    let delivered = client.frames_until_eof().await;
+    assert_eq!(
+        delivered, 0,
+        "the writer was detached rather than aborted: it completed its frame after the abort"
+    );
+}
+
+/// The advertised deadline covers the finalization tail too (flush, socket
+/// removal, store close), and an overrun is reported as forced.
+#[tokio::test]
+async fn drain_deadline_covers_the_finalization_tail() {
+    let root = test_root();
+    let mut config = test_config(&root, "finalization-deadline");
+    // Expired before finalization can begin: any barrier step that finds the
+    // deadline already gone must take the forced path rather than block on.
+    config.drain_timeout = Duration::from_nanos(1);
+    let task = spawn(config.clone());
+    wait_for_state(task.readiness(), |state| *state == DaemonState::Ready).await;
+
+    task.shutdown_handle().request("expired deadline");
+    assert_eq!(
+        task.join().await.expect("daemon joins"),
+        ShutdownOutcome::Forced,
+        "an overrun finalization must never be reported as a graceful drain"
+    );
+    // Whatever the deadline did to the store work, the rendezvous node is gone
+    // and the profile lock is released rather than leaked.
+    assert!(!config.endpoint_path().exists());
+    poll_store_release(&config).await;
+}
+
+/// R3/R22: a node that appears at the endpoint path around cleanup is never
+/// this daemon's to delete, whichever side of the claim it lands on. The
+/// bind → identity window is closed by construction (the socket is created
+/// under a private name and renamed into place), so only this side needs a
+/// racing test.
+#[tokio::test]
+async fn endpoint_replacement_around_cleanup_is_never_deleted() {
+    let root = test_root();
+    let config = test_config(&root, "cleanup-replacement");
+    let task = spawn(config.clone());
+    wait_for_state(task.readiness(), |state| *state == DaemonState::Ready).await;
+
+    let socket_path = config.endpoint_path();
+    task.shutdown_handle().request("handover");
+    // Racing the cleanup deliberately: if we win, the daemon claims a node
+    // that is not its own and must restore it; if we lose, we create a node
+    // the daemon has already stopped caring about. Both orderings must leave
+    // this node in place.
+    let _ = fs::remove_file(&socket_path);
+    let replacement = StdUnixListener::bind(&socket_path).expect("bind replacement node");
+    let replacement_metadata = fs::symlink_metadata(&socket_path).expect("replacement metadata");
+    assert_eq!(
+        task.join().await.expect("daemon joins"),
+        ShutdownOutcome::Graceful
+    );
+    let after = fs::symlink_metadata(&socket_path).expect("replacement node survives cleanup");
+    assert_eq!(
+        (after.dev(), after.ino()),
+        (replacement_metadata.dev(), replacement_metadata.ino())
+    );
+    drop(replacement);
+    fs::remove_file(socket_path).expect("remove replacement");
+}
+
+/// The conservative half of R3: a LIVE endpoint owned by someone else is
+/// refused, never unlinked — even though the profile lock was free.
+#[tokio::test]
+async fn live_foreign_endpoint_is_refused_and_left_intact() {
+    let root = test_root();
+    let config = test_config(&root, "live-foreign");
+    fs::create_dir_all(&config.runtime_dir).expect("runtime directory");
+    let foreign = StdUnixListener::bind(config.endpoint_path()).expect("foreign listener");
+    let before = fs::symlink_metadata(config.endpoint_path()).expect("foreign metadata");
+
+    let task = spawn(config.clone());
+    let error = task
+        .join()
+        .await
+        .expect_err("a live endpoint must refuse startup");
+    assert!(
+        matches!(&error, DaemonError::Endpoint { .. }),
+        "expected an endpoint ownership refusal, got {error:?}"
+    );
+    let after = fs::symlink_metadata(config.endpoint_path()).expect("foreign node survives");
+    assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+    drop(foreign);
+
+    let store = Store::open(&config.store_dir).expect("refused startup released the profile lock");
+    drop(store);
+}
+
+/// A client whose negotiated frame limit cannot carry the operator's prose
+/// still gets its last frame: the reason is truncated, the notice is not.
+#[tokio::test]
+async fn drain_reason_is_truncated_to_fit_a_small_client_frame_limit() {
+    let root = test_root();
+    let config = test_config(&root, "small-limit");
+    let task = spawn(config.clone());
+    wait_for_state(task.readiness(), |state| *state == DaemonState::Ready).await;
+
+    let announced = 512;
+    let mut client = TestClient::connect(&config.endpoint_path(), config.frame_limit)
+        .await
+        .expect("connect");
+    client
+        .send(
+            &hello(WIRE_PROTOCOL_VERSION, WIRE_PROTOCOL_VERSION, announced),
+            config.frame_limit,
+        )
+        .await;
+    assert!(matches!(client.receive().await, WireFrame::Welcome(_)));
+
+    let reason = format!("maintenance-{}", "r".repeat(4 * 1024));
+    task.shutdown_handle().request(&reason);
+    let notice = client.receive().await;
+    let WireFrame::ServerDraining {
+        reason: notice_reason,
+        ..
+    } = &notice
+    else {
+        panic!("expected ServerDraining, got {notice:?}");
+    };
+    assert!(
+        reason.starts_with(notice_reason.as_str()) && !notice_reason.is_empty(),
+        "the delivered reason must be a prefix of the operator's reason"
+    );
+    let encoded = uds_codec::encode(&notice, usize::MAX).expect("re-encode notice");
+    assert!(
+        encoded.len() <= announced as usize,
+        "the notice must respect what the client said it can receive"
+    );
+    client.expect_eof().await;
+    assert_eq!(
+        task.join().await.expect("daemon joins"),
+        ShutdownOutcome::Graceful
+    );
+}
+
+/// The negotiated grant is retained and enforced: `MenuAnswer` is a control
+/// frame, so a view-only connection is denied it — and a correlated answer
+/// gets a correlated reply (the additive `MenuAnswer.request_id`).
+#[tokio::test]
+async fn view_only_connection_is_denied_the_control_frame() {
+    let root = test_root();
+    let config = test_config(&root, "capabilities");
+    let task = spawn(config.clone());
+    wait_for_state(task.readiness(), |state| *state == DaemonState::Ready).await;
+
+    let mut viewer = TestClient::connect(&config.endpoint_path(), config.frame_limit)
+        .await
+        .expect("connect viewer");
+    let mut request = hello(
+        WIRE_PROTOCOL_VERSION,
+        WIRE_PROTOCOL_VERSION,
+        u32::try_from(config.frame_limit).expect("frame limit fits"),
+    );
+    if let WireFrame::Hello(hello) = &mut request {
+        hello.capabilities_requested = CapabilitySet::from([Capability::View]);
+    }
+    viewer.send(&request, config.frame_limit).await;
+    match viewer.receive().await {
+        WireFrame::Welcome(welcome) => assert_eq!(
+            welcome.capabilities_granted,
+            CapabilitySet::from([Capability::View]),
+            "the daemon must never grant a capability the client did not ask for"
+        ),
+        frame => panic!("expected Welcome, got {frame:?}"),
+    }
+    viewer
+        .send(&menu_answer(Some("menu-request")), config.frame_limit)
+        .await;
+    assert!(
+        matches!(
+            viewer.receive().await,
+            WireFrame::Response {
+                ref request_id,
+                body: ResponseBody::Error { ref code, .. },
+            } if request_id.as_str() == "menu-request" && code == "capability_denied"
+        ),
+        "a view-only connection must be denied the control frame, correlated to its request"
+    );
+
+    // A control connection gets the W3b2 stub instead, and an uncorrelated
+    // answer still gets the connection-level form.
+    let mut controller = handshake(&config.endpoint_path(), config.frame_limit).await;
+    controller
+        .send(&menu_answer(None), config.frame_limit)
+        .await;
+    assert!(matches!(
+        controller.receive().await,
+        WireFrame::ProtocolError(ProtocolError { ref code, fatal: false, .. })
+            if code == "not_found"
+    ));
+
+    task.shutdown_handle().request("test complete");
+    assert_eq!(
+        task.join().await.expect("daemon joins"),
+        ShutdownOutcome::Graceful
+    );
+}
+
+/// A peer that says nothing must not hold a connection slot: it is closed at
+/// the handshake deadline and its slot is immediately reusable.
+#[tokio::test]
+async fn silent_peer_is_closed_at_the_handshake_deadline_and_frees_its_slot() {
+    let root = test_root();
+    let mut config = test_config(&root, "silent-peer");
+    config.max_connections = 1;
+    config.handshake_timeout = Duration::from_millis(150);
+    let task = spawn(config.clone());
+    wait_for_state(task.readiness(), |state| *state == DaemonState::Ready).await;
+
+    let mut silent = TestClient::connect(&config.endpoint_path(), config.frame_limit)
+        .await
+        .expect("connect silent peer");
+    assert!(
+        matches!(
+            silent.receive().await,
+            WireFrame::ProtocolError(ProtocolError { ref code, fatal: true, .. })
+                if code == "handshake_timeout"
+        ),
+        "a silent peer must be told why it is being closed"
+    );
+    silent.expect_eof().await;
+
+    // The single slot is free again for a peer that does speak.
+    let _speaker = poll_admission(&config).await;
+    task.shutdown_handle().request("test complete");
+    assert_eq!(
+        task.join().await.expect("daemon joins"),
+        ShutdownOutcome::Graceful
+    );
+}
+
+/// A second `Hello` on an established connection is not a handshake — it is a
+/// frame no connected client may send.
+#[tokio::test]
+async fn duplicate_hello_after_handshake_is_a_fatal_unexpected_frame() {
+    let root = test_root();
+    let config = test_config(&root, "duplicate-hello");
+    let task = spawn(config.clone());
+    wait_for_state(task.readiness(), |state| *state == DaemonState::Ready).await;
+
+    let mut client = handshake(&config.endpoint_path(), config.frame_limit).await;
+    client
+        .send(
+            &hello(
+                WIRE_PROTOCOL_VERSION,
+                WIRE_PROTOCOL_VERSION,
+                u32::try_from(config.frame_limit).expect("frame limit fits"),
+            ),
+            config.frame_limit,
+        )
+        .await;
+    assert!(matches!(
+        client.receive().await,
+        WireFrame::ProtocolError(ProtocolError { ref code, fatal: true, .. })
+            if code == "unexpected_frame"
+    ));
+    client.expect_eof().await;
+
+    task.shutdown_handle().request("test complete");
     assert_eq!(
         task.join().await.expect("daemon joins"),
         ShutdownOutcome::Graceful

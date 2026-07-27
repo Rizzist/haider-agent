@@ -181,7 +181,10 @@ pub fn transcript() -> Vec<WireFrame> {
             attachment_id: attachment_id.clone(),
             high_water_seq: 10,
         },
+        // Correlated form: carries a request_id so the daemon can answer a CAS
+        // loser with a Response { already_resolved }.
         WireFrame::MenuAnswer {
+            request_id: Some(RequestId::new("request-menu-1")),
             command_id: CommandId::new("command-1"),
             session_id,
             menu_id: MenuId::new("menu-1"),
@@ -193,7 +196,10 @@ pub fn transcript() -> Vec<WireFrame> {
                 text: "custom answer".into(),
             }),
         },
+        // Uncorrelated form: request_id omitted entirely (older/simpler
+        // clients), so the field must stay off the wire when absent.
         WireFrame::MenuAnswer {
+            request_id: None,
             command_id: CommandId::new("command-2"),
             session_id: SessionId::new("session-1"),
             menu_id: MenuId::new("menu-2"),

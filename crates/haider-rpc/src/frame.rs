@@ -468,6 +468,15 @@ pub enum WireFrame {
     /// fence stale answers. Only the shape lives here — validation,
     /// arbitration, and the append are daemon (W3b) work.
     MenuAnswer {
+        /// Optional connection-scoped correlation for the daemon's answer.
+        ///
+        /// The durable compare-and-set identity is, and stays, `command_id`;
+        /// this field exists only so a CAS loser can be told through a
+        /// [`Self::Response`] — which requires a [`RequestId`] — that it lost
+        /// ([`ERROR_CODE_ALREADY_RESOLVED`]). A client that omits it accepts
+        /// an uncorrelated [`Self::ProtocolError`] instead; older daemons that
+        /// never sent the field keep decoding.
+        request_id: Option<RequestId>,
         command_id: CommandId,
         session_id: SessionId,
         menu_id: MenuId,
@@ -543,6 +552,8 @@ enum WireFrameRef<'a> {
         high_water_seq: u64,
     },
     MenuAnswer {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        request_id: &'a Option<RequestId>,
         command_id: &'a CommandId,
         session_id: &'a SessionId,
         menu_id: &'a MenuId,
@@ -596,6 +607,8 @@ enum WireFrameOwned {
         high_water_seq: u64,
     },
     MenuAnswer {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<RequestId>,
         command_id: CommandId,
         session_id: SessionId,
         menu_id: MenuId,
@@ -670,6 +683,7 @@ impl Serialize for WireFrame {
                 high_water_seq: *high_water_seq,
             },
             Self::MenuAnswer {
+                request_id,
                 command_id,
                 session_id,
                 menu_id,
@@ -679,6 +693,7 @@ impl Serialize for WireFrame {
                 option_index,
                 input,
             } => WireFrameRef::MenuAnswer {
+                request_id,
                 command_id,
                 session_id,
                 menu_id,
@@ -753,6 +768,7 @@ impl<'de> Deserialize<'de> for WireFrame {
                 high_water_seq,
             },
             WireFrameOwned::MenuAnswer {
+                request_id,
                 command_id,
                 session_id,
                 menu_id,
@@ -762,6 +778,7 @@ impl<'de> Deserialize<'de> for WireFrame {
                 option_index,
                 input,
             } => Self::MenuAnswer {
+                request_id,
                 command_id,
                 session_id,
                 menu_id,

@@ -10,11 +10,15 @@
 //!   only singleton authority. It is acquired before any socket cleanup or
 //!   store open and released last, by closing the store after every other
 //!   shutdown step (`runtime.rs`).
-//! - **Probe, then lstat-verified unlink** — a stale rendezvous socket is
-//!   removed only after a connect probe refuses AND the node is verified as a
-//!   same-user socket in the owned runtime directory (`endpoint.rs`).
-//! - **Device+inode identity** — the daemon records its bound socket's
-//!   device+inode and cleanup removes only that exact node, so an old daemon
+//! - **Probe, then verified unlink — descriptor-relative** — a stale
+//!   rendezvous socket is removed only after a connect probe refuses AND the
+//!   node is verified as a same-user socket, with every filesystem step issued
+//!   against the runtime directory's own descriptor so no path swap can
+//!   redirect it (`endpoint.rs`).
+//! - **Device+inode identity, verified where it is removed** — the socket is
+//!   created under a private name and renamed into place, so the recorded
+//!   device+inode is provably this daemon's; cleanup claims the public name
+//!   back under a private one and verifies identity there, so an old daemon
 //!   can never delete a successor's socket (`endpoint.rs`).
 //! - **Reconcile before ready** — the daemon generation is durably bumped and
 //!   every dispatched-without-terminal effect is reconciled (via
@@ -22,8 +26,11 @@
 //!   or `Ready` is advertised (`runtime.rs`).
 //! - **Honest drain** — first shutdown request drains: stop accepting, notify
 //!   every connection with `ServerDraining`, bounded completion, flush,
-//!   remove the exact owned socket, release the lock last. A second request
-//!   forces termination; recovery is the next generation's job (`runtime.rs`).
+//!   remove the exact owned socket, release the lock last. ONE deadline covers
+//!   the whole barrier, finalization included, and a second request forces
+//!   termination at any point in it; an overrun, a force, or a connection that
+//!   never received its notice is reported as `Forced`, never `Graceful`.
+//!   Recovery is the next generation's job (`runtime.rs`).
 //!
 //! The phase machine itself lives in `lifecycle.rs`; its legal transitions are
 //! documented on [`DaemonState`] and enforced by the state publisher.

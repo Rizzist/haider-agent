@@ -17,13 +17,22 @@
 //! 5. drain (R17): close the listener, publish `Draining`, broadcast
 //!    `ServerDraining`, wait bounded for connections, flush the store,
 //!    remove the exact owned socket, and close the store LAST — closing
-//!    the store is what releases the profile lock.
+//!    the store is what releases the profile lock. ONE deadline bounds the
+//!    whole barrier, finalization included, and a second signal forces at any
+//!    point in it.
+//!
+//! Overrun semantics, stated once: a blocking SQLite call cannot be cancelled,
+//! so an overrunning flush/close is STARTED and then abandoned — this task
+//! stops waiting, reports `Forced`, and the abandoned call releases the profile
+//! lock the moment it returns. A caller that restarts the same profile
+//! immediately after a `Forced` outcome may still meet `AlreadyRunning` for
+//! that moment; that is the honest report of a degraded shutdown, not a leak.
 //!
 //! Shutdown may arrive at any point; the early-exit helpers
 //! ([`shutdown_without_store`], [`shutdown_before_listener`]) run the same
 //! tail ordering with whatever resources exist so far.
 
-use crate::connection::{ConnectionContext, DrainNotice, reject_over_limit, serve};
+use crate::connection::{ConnectionContext, ConnectionExit, DrainNotice, reject_over_limit, serve};
 use crate::endpoint;
 use crate::lifecycle::{ShutdownObserver, ShutdownRequest, StatePublisher};
 use crate::{
@@ -38,6 +47,7 @@ use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Semaphore, watch};
 use tokio::task::{JoinHandle, JoinSet};
@@ -207,12 +217,12 @@ async fn run_inner(
         }
         None => {
             let request = shutdown.borrow().clone();
-            return shutdown_before_listener(config, states, store, request).await;
+            return shutdown_before_listener(config, states, store, request, &mut shutdown).await;
         }
     }
     if !matches!(*shutdown.borrow(), ShutdownRequest::None) {
         let request = shutdown.borrow().clone();
-        return shutdown_before_listener(config, states, store, request).await;
+        return shutdown_before_listener(config, states, store, request, &mut shutdown).await;
     }
 
     let mut endpoint = match endpoint::bind(config).await {
@@ -232,6 +242,7 @@ async fn run_inner(
         outbound_queue_capacity: config.outbound_queue_capacity,
         outbound_queued_bytes: config.outbound_queued_bytes,
         max_connections: config.max_connections,
+        handshake_timeout: config.handshake_timeout,
         owner_uid: endpoint.owner_uid,
         endpoint_path: endpoint.path().to_path_buf(),
     };
@@ -303,7 +314,9 @@ async fn run_inner(
     // R17 drain barrier, in order: stop accepting, publish Draining,
     // broadcast ServerDraining to every connection, bounded completion,
     // flush, remove the exact owned socket, close the store (lock release)
-    // LAST.
+    // LAST. ONE deadline covers all of it — including the finalization tail —
+    // so nothing can hold the socket or the profile lock past the deadline the
+    // daemon advertised.
     endpoint.close_listener();
     let (reason, mut forced) = match request {
         ShutdownRequest::Graceful { reason } => (reason, false),
@@ -311,6 +324,7 @@ async fn run_inner(
         // Unreachable: the loop above only breaks with a real request.
         ShutdownRequest::None => ("internal shutdown".into(), true),
     };
+    let barrier_deadline = tokio::time::Instant::now() + config.drain_timeout;
     let deadline_unix_ms = unix_time_ms().saturating_add(duration_ms(config.drain_timeout));
     states.publish(DaemonState::Draining {
         reason: reason.clone(),
@@ -321,18 +335,21 @@ async fn run_inner(
         instance_id,
         daemon_generation,
         deadline_unix_ms,
+        deadline: barrier_deadline,
     }));
 
+    // A connection the daemon could not hand its last frame to is not a
+    // graceful drain, no matter how cleanly everything else stops (R17).
+    let mut undelivered_notices = 0_usize;
     if !forced {
         tokio::task::yield_now().await;
         forced = matches!(*shutdown.borrow(), ShutdownRequest::Forced { .. });
     }
     if !forced {
-        let deadline = tokio::time::Instant::now() + config.drain_timeout;
         while !connections.is_empty() {
             tokio::select! {
                 completed = connections.join_next() => {
-                    let _ = completed;
+                    note_connection_exit(&mut undelivered_notices, completed);
                 }
                 changed = shutdown.changed() => {
                     if changed.is_err()
@@ -342,7 +359,7 @@ async fn run_inner(
                         break;
                     }
                 }
-                () = tokio::time::sleep_until(deadline) => {
+                () = tokio::time::sleep_until(barrier_deadline) => {
                     forced = true;
                     break;
                 }
@@ -355,16 +372,43 @@ async fn run_inner(
     if forced {
         connections.abort_all();
     }
-    while connections.join_next().await.is_some() {}
+    while let Some(completed) = connections.join_next().await {
+        note_connection_exit(&mut undelivered_notices, Some(completed));
+    }
 
-    // Flush is attempted on both paths; only the graceful path treats its
-    // failure as a daemon error (the forced path is already lossy by
-    // contract). The store close below releases the profile lock — it must
-    // stay the last resource released.
-    let flush_result = store.flush().await.err().map(DaemonError::from);
-    let flush_error = if forced { None } else { flush_result };
+    // Finalization is part of the barrier: flush, socket removal, and the
+    // store close each run under the same deadline and the same second-signal
+    // escape. Store work that overruns keeps running on the blocking pool and
+    // releases the lock as soon as it physically can, but this task stops
+    // waiting and reports the forced outcome honestly.
+    let flush_error =
+        match bounded_finalization(store.flush(), barrier_deadline, &mut shutdown).await {
+            Some(result) => {
+                let error = result.err().map(DaemonError::from);
+                if forced { None } else { error }
+            }
+            None => {
+                forced = true;
+                None
+            }
+        };
+    // Socket removal happens even when the flush overran: an abandoned
+    // rendezvous node is worse than a large WAL.
     let cleanup_error = endpoint.cleanup().err();
-    let close_error = store.close().await.err().map(DaemonError::from);
+    let close_error =
+        match bounded_finalization(store.close(), barrier_deadline, &mut shutdown).await {
+            Some(result) => {
+                let error = result.err().map(DaemonError::from);
+                if forced { None } else { error }
+            }
+            None => {
+                forced = true;
+                None
+            }
+        };
+    if undelivered_notices > 0 {
+        forced = true;
+    }
 
     if let Some(error) = listener_error
         .or(flush_error)
@@ -381,28 +425,103 @@ async fn run_inner(
     })
 }
 
+/// Counts connections whose last frame never made it out (R17 honesty). A
+/// connection that simply failed its socket is not counted: that is the peer's
+/// end going away, not the daemon skipping its notice.
+fn note_connection_exit(
+    undelivered: &mut usize,
+    completed: Option<Result<Result<ConnectionExit, DaemonError>, tokio::task::JoinError>>,
+) {
+    if let Some(Ok(Ok(ConnectionExit::NoticeUndelivered))) = completed {
+        *undelivered = undelivered.saturating_add(1);
+    }
+}
+
+/// Runs one finalization step under the drain deadline and the second-signal
+/// escape. `None` means the deadline expired or a force arrived — the caller
+/// takes the forced path and never reports `Graceful`.
+///
+/// The step is always STARTED, even when the barrier is already over: the store
+/// work is what releases the profile lock, and a blocking SQLite call cannot be
+/// cancelled anyway. The deadline decides only whether this task keeps waiting;
+/// abandoned work finishes on the blocking pool and releases the lock as soon
+/// as it physically can.
+async fn bounded_finalization<T>(
+    work: impl Future<Output = T>,
+    deadline: tokio::time::Instant,
+    shutdown: &mut watch::Receiver<ShutdownRequest>,
+) -> Option<T> {
+    tokio::pin!(work);
+    // Exactly one poll: enough to START the step (which spawns its blocking
+    // store call), never enough to wait for it. A zero-duration timeout will
+    // not do — its timer still parks until the next tick, which is long enough
+    // for the step to finish and hide an already-expired deadline.
+    let started = std::future::poll_fn(|context| Poll::Ready(work.as_mut().poll(context))).await;
+    if let Poll::Ready(output) = started {
+        return Some(output);
+    }
+    if tokio::time::Instant::now() >= deadline {
+        return None;
+    }
+    loop {
+        tokio::select! {
+            output = &mut work => return Some(output),
+            () = tokio::time::sleep_until(deadline) => return None,
+            changed = shutdown.changed() => {
+                match changed {
+                    // A second signal during finalization forces, like anywhere
+                    // else in the barrier.
+                    Ok(()) if matches!(*shutdown.borrow(), ShutdownRequest::Forced { .. }) => {
+                        return None;
+                    }
+                    Ok(()) => {}
+                    // A dropped controller is not a second signal: nobody can
+                    // force any more, so keep waiting on the deadline alone.
+                    Err(_) => return tokio::time::timeout_at(deadline, &mut work).await.ok(),
+                }
+            }
+        }
+    }
+}
+
 /// Drain tail for shutdown observed after store open but before the listener
 /// bound: no socket or connections exist yet, so the barrier reduces to
-/// publish Draining -> flush -> close (lock release last).
+/// publish Draining -> flush -> close (lock release last). The same single
+/// deadline and second-signal escape bound this tail as bound the full
+/// barrier — a slow flush here must not hold the profile lock either.
 async fn shutdown_before_listener(
     config: &DaemonConfig,
     states: &StatePublisher,
     store: SqliteStoreHandle,
     request: ShutdownRequest,
+    shutdown: &mut watch::Receiver<ShutdownRequest>,
 ) -> Result<ShutdownOutcome, DaemonError> {
-    let (reason, forced) = match request {
+    let (reason, mut forced) = match request {
         ShutdownRequest::Graceful { reason } => (reason, false),
         ShutdownRequest::Forced { reason } => (reason, true),
         // `None` means the ShutdownHandle was dropped without a request
         // (watch channel closed mid-recovery); treat as forced.
         ShutdownRequest::None => ("startup shutdown controller dropped".into(), true),
     };
+    let barrier_deadline = tokio::time::Instant::now() + config.drain_timeout;
     states.publish(DaemonState::Draining {
         reason,
         deadline_unix_ms: unix_time_ms().saturating_add(duration_ms(config.drain_timeout)),
     });
-    let flush_error = store.flush().await.err().map(DaemonError::from);
-    let close_error = store.close().await.err().map(DaemonError::from);
+    let flush_error = match bounded_finalization(store.flush(), barrier_deadline, shutdown).await {
+        Some(result) => result.err().map(DaemonError::from),
+        None => {
+            forced = true;
+            None
+        }
+    };
+    let close_error = match bounded_finalization(store.close(), barrier_deadline, shutdown).await {
+        Some(result) => result.err().map(DaemonError::from),
+        None => {
+            forced = true;
+            None
+        }
+    };
     if !forced && let Some(error) = flush_error.or(close_error) {
         return Err(error);
     }

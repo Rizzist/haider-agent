@@ -35,7 +35,16 @@ pub struct DaemonConfig {
     /// and closed at once, so a faulty client cannot grow daemon tasks and
     /// queues without bound (report §2.5).
     pub max_connections: usize,
+    /// How long an accepted peer may hold its connection slot without
+    /// completing the `Hello` handshake. Silent peers are closed at this
+    /// deadline so they cannot exhaust `max_connections` by saying nothing.
+    pub handshake_timeout: Duration,
     /// Bounded completion window for the drain barrier (R17).
+    ///
+    /// This bounds the WHOLE barrier — connection completion, store flush,
+    /// socket removal, and store close — not only the connection wait. A
+    /// shutdown that overruns it, or that is forced during finalization,
+    /// reports [`crate::ShutdownOutcome::Forced`], never `Graceful`.
     pub drain_timeout: Duration,
 }
 
@@ -54,6 +63,7 @@ impl DaemonConfig {
             outbound_queue_capacity: 32,
             outbound_queued_bytes: DEFAULT_FRAME_LIMIT.saturating_mul(2),
             max_connections: 64,
+            handshake_timeout: Duration::from_secs(10),
             drain_timeout: Duration::from_secs(5),
         }
     }
@@ -95,6 +105,12 @@ impl DaemonConfig {
                 "maximum connections must be between 1 and {}",
                 Semaphore::MAX_PERMITS
             ));
+        }
+        if self.handshake_timeout.is_zero() {
+            return Err("handshake timeout must be greater than zero".into());
+        }
+        if self.drain_timeout.is_zero() {
+            return Err("drain timeout must be greater than zero".into());
         }
         Ok(())
     }

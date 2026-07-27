@@ -1,9 +1,9 @@
 //! The daemon phase machine and its shutdown controls.
 //!
 //! Every published phase change flows through [`StatePublisher::publish`],
-//! which rejects (loudly, in debug builds) any edge not in the transition
-//! diagram on [`DaemonState`]. `runtime.rs` decides *when* to transition;
-//! this module owns *which* transitions exist.
+//! which rejects any edge not in the transition diagram on [`DaemonState`] —
+//! in every build, not only where assertions survive. `runtime.rs` decides
+//! *when* to transition; this module owns *which* transitions exist.
 
 use haider_rpc::LifecyclePhase;
 use std::sync::Arc;
@@ -116,14 +116,24 @@ impl StatePublisher {
         (Self { sender }, Readiness { receiver })
     }
 
-    /// Publishes a state, rejecting illegal transitions loudly in debug
-    /// builds (release builds publish unconditionally rather than wedge).
+    /// Publishes a state, rejecting illegal transitions in EVERY build.
+    ///
+    /// The relation is contract for clients (they reason about phases through
+    /// `Welcome`/readiness), so a bug must not be able to publish an edge that
+    /// the diagram forbids just because assertions are compiled out. The
+    /// rejected transition is dropped and reported, and the observable phase
+    /// keeps its last legal value; `runtime.rs` reaches no such edge today,
+    /// which is pinned by the transition-matrix test.
     pub(crate) fn publish(&self, state: DaemonState) {
-        let prior = self.sender.send_replace(state.clone());
-        debug_assert!(
-            prior.can_transition_to(&state),
-            "illegal lifecycle transition {prior:?} -> {state:?}"
-        );
+        let prior = self.sender.borrow().clone();
+        if !prior.can_transition_to(&state) {
+            debug_assert!(false, "illegal lifecycle transition {prior:?} -> {state:?}");
+            eprintln!(
+                "haider-daemon: refusing illegal lifecycle transition {prior:?} -> {state:?}"
+            );
+            return;
+        }
+        self.sender.send_replace(state);
     }
 }
 
