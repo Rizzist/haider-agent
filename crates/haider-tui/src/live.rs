@@ -303,6 +303,12 @@ pub struct LiveDriver {
     menus: HashMap<MenuId, MenuCoordinates>,
     /// Latest worker generation per session (create/attach/submit report it).
     generations: HashMap<SessionId, u64>,
+    /// The run a session is CURRENTLY executing, learned from the committed
+    /// envelopes' `run_id` and dropped the moment the run terminalizes.
+    /// `turn.cancel` needs it: cancelling by guess would either name a run
+    /// that already ended (a no-op the user reads as "Esc did nothing") or,
+    /// worse, a later one.
+    active_run: HashMap<SessionId, RunId>,
     /// Command-id minting: `{instance}-{n}`. The instance segment is random
     /// per process so two clients never mint the same durable id.
     instance: String,
@@ -333,6 +339,7 @@ impl LiveDriver {
             outbox: Vec::new(),
             menus: HashMap::new(),
             generations: HashMap::new(),
+            active_run: HashMap::new(),
             instance: instance.into(),
             next_command: 0,
             connected: true,
@@ -667,6 +674,9 @@ impl LiveDriver {
             LiveReply::Disconnected { reason } => {
                 self.connected = false;
                 self.attaching.clear();
+                // The run survives the socket; the ATTACHMENT does not.
+                // `active_run` is stream-derived and the reattach replays
+                // whatever moved while we were away.
                 // Every attachment died with the socket, but the WORKING SET
                 // — which sessions we want attached, in priority order — is
                 // exactly what the resume has to restore, so `lru` survives
@@ -766,6 +776,15 @@ impl LiveDriver {
                 self.retire_menu(&answer.menu);
             }
             haider_protocol::EventPayload::MenuClosed { menu, .. } => self.retire_menu(&menu),
+            // The run a cancel would name. A terminal state releases it, so
+            // Esc after a turn ends cancels nothing rather than a later run.
+            haider_protocol::EventPayload::RunState(state) => {
+                if state.is_terminal() {
+                    self.active_run.remove(session);
+                } else if let Some(run) = envelope.run_id.clone() {
+                    self.active_run.insert(session.clone(), run);
+                }
+            }
             _ => {}
         }
     }
@@ -862,23 +881,26 @@ impl LiveDriver {
                 }
                 vec![LiveCommand::Attach { session, after_seq }]
             }
-            AppRequest::Interrupt => match model.active_session.clone() {
-                Some(session) => {
-                    let command_id = self.mint();
-                    let worker_generation =
-                        self.generations.get(&session).copied().unwrap_or_default();
-                    vec![self.enqueue(LiveCommand::Cancel {
-                        command_id,
-                        session,
-                        worker_generation,
-                        // The run id rides the committed `RunState`
-                        // envelopes; until the daemon exposes it on the
-                        // reducer, the current turn is the only candidate.
-                        run_id: RunId::new(String::new()),
-                    })]
-                }
-                None => Vec::new(),
-            },
+            AppRequest::Interrupt => {
+                // Esc cancels the run the COMMITTED stream says is running.
+                // With no such run there is nothing to cancel, and an
+                // invented run id would be a command the daemon can only
+                // reject.
+                let Some(session) = model.active_session.clone() else {
+                    return Vec::new();
+                };
+                let Some(run_id) = self.active_run.get(&session).cloned() else {
+                    return Vec::new();
+                };
+                let command_id = self.mint();
+                let worker_generation = self.generations.get(&session).copied().unwrap_or_default();
+                vec![self.enqueue(LiveCommand::Cancel {
+                    command_id,
+                    session,
+                    worker_generation,
+                    run_id,
+                })]
+            }
             // Demo-only vocabulary and runtime-owned effects. The catch-all
             // is deliberate: `run_live` must never grow a demo behavior by
             // forgetting to exclude one.

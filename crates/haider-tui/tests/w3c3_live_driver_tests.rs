@@ -9,7 +9,7 @@
 
 use haider_protocol::EventPayload;
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RawEnvelope, RenderTargets};
-use haider_protocol::ids::{AgentId, DeviceId, EventId, MenuId, SessionId};
+use haider_protocol::ids::{AgentId, DeviceId, EventId, MenuId, RunId, SessionId};
 use haider_protocol::menu::{
     AnswerVia, Menu, MenuAnswer, MenuCloseReason, MenuKind, MenuOption, MenuScope,
 };
@@ -602,6 +602,80 @@ fn a_cold_session_attaches_only_when_it_is_selected_and_only_once() {
     assert!(
         driver.is_cold(&sid(5)),
         "the session nobody chose stays cold"
+    );
+}
+
+#[test]
+fn esc_cancels_the_run_the_committed_stream_says_is_running_or_nothing() {
+    // §6.4: "turn cancellation … reaches one terminal state". The client's
+    // half is naming the RIGHT run: a cancel carries a `run_id`, and the
+    // only honest source is the committed envelope stream. An invented id
+    // is a command the daemon can only reject — which the user reads as
+    // "Esc did nothing" — and a STALE id could name a run that already
+    // ended while a later one is live.
+    //
+    // MUTATION CHECK: in `LiveDriver::handle_request`'s Interrupt arm,
+    // replace the `active_run` lookup with `RunId::new(String::new())` and
+    // both the no-run and the correct-run assertions below fail.
+    let mut model = live_model();
+    let mut driver = LiveDriver::new("test");
+    attach_all(&mut driver, &mut model, 1);
+    model.open_session(&sid(0));
+
+    // Nothing running: Esc issues nothing at all.
+    assert!(
+        driver
+            .handle_request(&mut model, AppRequest::Interrupt)
+            .is_empty(),
+        "with no live run there is nothing to cancel"
+    );
+
+    // A run starts, named by the committed envelope.
+    let mut running = envelope(
+        &sid(0),
+        1,
+        &EventPayload::RunState(haider_protocol::state::RunState::Streaming),
+    );
+    running.run_id = Some(RunId::new("run-live-1"));
+    driver.apply(
+        &mut model,
+        LiveReply::Event {
+            attachment: attachment(0),
+            session: sid(0),
+            envelope: Box::new(running),
+        },
+    );
+    let commands = driver.handle_request(&mut model, AppRequest::Interrupt);
+    assert!(
+        matches!(
+            commands.first(),
+            Some(LiveCommand::Cancel { run_id, session, .. })
+                if *run_id == RunId::new("run-live-1") && *session == sid(0)
+        ),
+        "Esc cancels the run the stream named, got {commands:?}"
+    );
+
+    // The run terminalizes: Esc goes back to cancelling nothing, rather
+    // than re-cancelling a finished run.
+    let mut done = envelope(
+        &sid(0),
+        2,
+        &EventPayload::RunState(haider_protocol::state::RunState::Done),
+    );
+    done.run_id = Some(RunId::new("run-live-1"));
+    driver.apply(
+        &mut model,
+        LiveReply::Event {
+            attachment: attachment(0),
+            session: sid(0),
+            envelope: Box::new(done),
+        },
+    );
+    assert!(
+        driver
+            .handle_request(&mut model, AppRequest::Interrupt)
+            .is_empty(),
+        "a terminal run releases the cancel target"
     );
 }
 
