@@ -507,8 +507,10 @@ async fn terminalize_recovery_feed_failure(
         lease.worker_generation(),
         run_id,
     ));
-    let payloads = failed_resumption_payloads(&lease, &session_id, &run_id, &error).await?;
+    let mut payloads = failed_resumption_payloads(&lease, &session_id, &run_id, &error).await?;
+    payloads.retain(|payload| !matches!(payload, EventPayload::SessionState(_)));
     append_payloads(&lease, &device_id, &run_id, &event_ids, payloads).await?;
+    append_session_idle(&lease, &device_id, &event_ids, true).await?;
     let _ = lease.unregister_worker().await;
     tracing::warn!(
         %session_id,
@@ -833,11 +835,23 @@ async fn run_supervisor(
                             )
                             .await
                             {
-                                Ok(payloads) => {
-                                    append_payloads(
+                                Ok(mut payloads) => {
+                                    payloads.retain(|payload| {
+                                        !matches!(payload, EventPayload::SessionState(_))
+                                    });
+                                    match append_payloads(
                                         &lease, &device_id, &run_id, &event_ids, payloads,
                                     )
                                     .await
+                                    {
+                                        Ok(()) => {
+                                            append_session_idle(
+                                                &lease, &device_id, &event_ids, true,
+                                            )
+                                            .await
+                                        }
+                                        Err(error) => Err(error),
+                                    }
                                 }
                                 Err(error) => Err(error),
                             };
@@ -853,11 +867,23 @@ async fn run_supervisor(
                             )
                             .await
                             {
-                                Ok(payloads) => {
-                                    append_payloads(
+                                Ok(mut payloads) => {
+                                    payloads.retain(|payload| {
+                                        !matches!(payload, EventPayload::SessionState(_))
+                                    });
+                                    match append_payloads(
                                         &lease, &device_id, &run_id, &event_ids, payloads,
                                     )
                                     .await
+                                    {
+                                        Ok(()) => {
+                                            append_session_idle(
+                                                &lease, &device_id, &event_ids, true,
+                                            )
+                                            .await
+                                        }
+                                        Err(error) => Err(error),
+                                    }
                                 }
                                 Err(terminalize_error) => Err(terminalize_error),
                             };
@@ -976,15 +1002,25 @@ async fn run_supervisor(
                             )
                             .await
                             {
-                                Ok(payloads) => {
-                                    let _ = append_payloads(
+                                Ok(mut payloads) => {
+                                    payloads.retain(|payload| {
+                                        !matches!(payload, EventPayload::SessionState(_))
+                                    });
+                                    if append_payloads(
                                         &lease,
                                         &device_id,
                                         &finished.run_id,
                                         &event_ids,
                                         payloads,
                                     )
-                                    .await;
+                                    .await
+                                    .is_ok()
+                                    {
+                                        let _ = append_session_idle(
+                                            &lease, &device_id, &event_ids, true,
+                                        )
+                                        .await;
+                                    }
                                 }
                                 Err(terminalize_error) => {
                                     tracing::error!(
@@ -1189,8 +1225,18 @@ async fn admit_pending(
                     match failed_resumption_payloads(store, store.session_id(), &run_id, &error)
                         .await
                     {
-                        Ok(payloads) => {
-                            append_payloads(store, device_id, &run_id, event_ids, payloads).await
+                        Ok(mut payloads) => {
+                            payloads.retain(|payload| {
+                                !matches!(payload, EventPayload::SessionState(_))
+                            });
+                            match append_payloads(store, device_id, &run_id, event_ids, payloads)
+                                .await
+                            {
+                                Ok(()) => {
+                                    append_session_idle(store, device_id, event_ids, true).await
+                                }
+                                Err(error) => Err(error),
+                            }
                         }
                         Err(error) => Err(error),
                     };
@@ -1206,8 +1252,14 @@ async fn admit_pending(
         Some(RunState::Cancelling) => {
             let terminalized =
                 match cancelled_resumption_payloads(store, store.session_id(), &run_id).await {
-                    Ok(payloads) => {
-                        append_payloads(store, device_id, &run_id, event_ids, payloads).await
+                    Ok(mut payloads) => {
+                        payloads
+                            .retain(|payload| !matches!(payload, EventPayload::SessionState(_)));
+                        match append_payloads(store, device_id, &run_id, event_ids, payloads).await
+                        {
+                            Ok(()) => append_session_idle(store, device_id, event_ids, true).await,
+                            Err(error) => Err(error),
+                        }
                     }
                     Err(error) => Err(error),
                 };

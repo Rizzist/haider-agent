@@ -831,3 +831,134 @@ async fn aborting_deliver_frame_before_reoffer_keeps_fifo_admission_live() {
     hub.shutdown().await.expect("hub stops");
     store.close().await.expect("store closes");
 }
+
+/// R3 aggregate-idle law at the terminalization sites (review r2 NF-1): a
+/// per-run terminalization must never commit `SessionState::Idle` while any
+/// other durable run in the session is nonterminal. Site under test: the
+/// recovery-feed degradation path (`terminalize_recovery_feed_failure`),
+/// driven through a legacy metadata-less session so `supervisor_for` fails.
+/// The positive control proves the settle-guarded idle DOES commit once the
+/// last nonterminal run terminalizes — the guard, not the call site, decides.
+///
+/// MUTATION CHECK: restore the unfiltered `failed_resumption_payloads`
+/// append at `terminalize_recovery_feed_failure` (drop the SessionState
+/// retain and the `append_session_idle` call). Expected failure: the
+/// payload-embedded `Idle { interrupted: true }` commits while run A is
+/// durably Queued, and the zero-idle assertion below fails.
+#[tokio::test]
+async fn recovery_terminalization_never_settles_idle_while_another_run_is_active() {
+    let root = tempfile::tempdir().expect("temp store");
+    let store = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("store opens");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub opens");
+    let session_id = SessionId::new("aggregate-idle-law");
+    let run_a = RunId::new("aggregate-idle-run-a");
+    let run_b = RunId::new("aggregate-idle-run-b");
+    let generation = store.worker_generation();
+    // Legacy session: raw appends only, so no typed live-worker metadata
+    // exists and the recovery feed cannot build a supervisor for it.
+    let mut queued = vec![
+        run_state_envelope(
+            &session_id,
+            &run_a,
+            generation,
+            "idle-law-a-queued",
+            RunState::Queued,
+        ),
+        run_state_envelope(
+            &session_id,
+            &run_b,
+            generation,
+            "idle-law-b-queued",
+            RunState::Queued,
+        ),
+    ];
+    hub.append(&mut queued)
+        .await
+        .expect("legacy queued runs commit");
+    let accepted = |run_id: &RunId, seq: u64| haider_store::AcceptedTurn {
+        session_id: session_id.clone(),
+        run_id: run_id.clone(),
+        accepted_seq: seq,
+        worker_generation: generation,
+        disposition: haider_store::TurnAdmissionDisposition::Queued,
+    };
+    let manager =
+        crate::worker::WorkerManager::start(hub.clone(), crate::DaemonDependencies::default());
+    let handle = manager.handle();
+
+    handle
+        .recover_queued(accepted(&run_b, queued[1].seq))
+        .await
+        .expect("feed failure degrades per-item, not fatally");
+
+    let idle_envelopes = |history: &[RawEnvelope]| {
+        history
+            .iter()
+            .filter_map(|envelope| {
+                serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok()
+            })
+            .filter(|payload| {
+                matches!(
+                    payload,
+                    EventPayload::SessionState(haider_protocol::state::SessionState::Idle { .. })
+                )
+            })
+            .count()
+    };
+    let latest_state = |history: &[RawEnvelope], run: &RunId| {
+        history
+            .iter()
+            .filter(|envelope| envelope.run_id.as_ref() == Some(run))
+            .filter_map(|envelope| {
+                match serde_json::from_value::<EventPayload>(envelope.payload.clone()) {
+                    Ok(EventPayload::RunState(state)) => Some(state),
+                    _ => None,
+                }
+            })
+            .next_back()
+    };
+
+    let history = haider_core::StoreHandle::read(&store, &session_id, 0, 128)
+        .await
+        .expect("history reads");
+    assert!(
+        latest_state(&history, &run_b).is_some_and(|state| state.is_terminal()),
+        "run B terminalizes"
+    );
+    assert_eq!(
+        latest_state(&history, &run_a),
+        Some(RunState::Queued),
+        "run A stays durably Queued"
+    );
+    assert_eq!(
+        idle_envelopes(&history),
+        0,
+        "no aggregate Idle commits while run A is nonterminal"
+    );
+
+    // Positive control: terminalizing the last nonterminal run settles the
+    // session — exactly one guarded Idle { interrupted: true } commits.
+    handle
+        .recover_queued(accepted(&run_a, queued[0].seq))
+        .await
+        .expect("second degradation succeeds");
+    let history = haider_core::StoreHandle::read(&store, &session_id, 0, 128)
+        .await
+        .expect("history rereads");
+    assert!(
+        latest_state(&history, &run_a).is_some_and(|state| state.is_terminal()),
+        "run A terminalizes"
+    );
+    assert_eq!(
+        idle_envelopes(&history),
+        1,
+        "the settle-guarded aggregate Idle commits once the session quiesces"
+    );
+
+    handle.begin_draining();
+    manager.shutdown().await.expect("manager drains");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
