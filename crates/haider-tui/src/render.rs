@@ -2452,7 +2452,9 @@ fn login_lines(card: &crate::app::LoginCard, theme: &Theme, width: u16) -> Vec<L
             .map_or_else(String::new, |alias| format!(" · {alias}"))
     );
     let field = match &card.stage {
-        LoginStage::Entry => {
+        // A failed card still shows its mask: it accepts the retype the
+        // recovery text asks for (review P2-1).
+        LoginStage::Entry | LoginStage::Failed(_) if !card.is_empty() => {
             let shown = card.masked_len().min(MASK_CAP);
             let mask = "•".repeat(shown);
             let more = if card.masked_len() > MASK_CAP {
@@ -2464,6 +2466,7 @@ fn login_lines(card: &crate::app::LoginCard, theme: &Theme, width: u16) -> Vec<L
         }
         LoginStage::Submitting => "  ❯ validating…".to_owned(),
         LoginStage::Failed(text) => format!("  ✗ {text}"),
+        LoginStage::Entry => "  ❯ ▏".to_owned(),
         LoginStage::Done(identity) => format!("  ✓ signed in · {identity}"),
     };
     let hint = match &card.stage {

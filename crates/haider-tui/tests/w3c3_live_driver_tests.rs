@@ -321,7 +321,30 @@ fn a_reconnect_resends_the_outbox_under_the_same_durable_command_ids() {
         },
     );
     let resumed = driver.apply(&mut model, LiveReply::Reconnected);
-    let resent: Vec<&CommandId> = resumed.iter().filter_map(LiveCommand::command_id).collect();
+    assert!(
+        !resumed
+            .iter()
+            .any(|command| matches!(command, LiveCommand::Submit { .. })),
+        "a session-scoped mutation must NOT ride the reconnect: `turn.submit` \
+         needs an ESTABLISHED control attachment, and racing the attach earns \
+         a non-retryable capability_denied that would retire the user's turn \
+         (review P1-4)"
+    );
+    // It rides the ATTACH RESPONSE instead — the same discipline the
+    // create→attach→submit path already had.
+    let resent_on_attach = driver.apply(
+        &mut model,
+        LiveReply::Attached {
+            session: sid(0),
+            attachment: attachment(0),
+            worker_generation: 7,
+            replay_through_seq: 0,
+        },
+    );
+    let resent: Vec<&CommandId> = resent_on_attach
+        .iter()
+        .filter_map(LiveCommand::command_id)
+        .collect();
     assert_eq!(
         resent,
         vec![&original],
@@ -340,7 +363,16 @@ fn a_reconnect_resends_the_outbox_under_the_same_durable_command_ids() {
         },
     );
     assert_eq!(driver.outbox_len(), 0);
-    let again = driver.apply(&mut model, LiveReply::Reconnected);
+    driver.apply(&mut model, LiveReply::Reconnected);
+    let again = driver.apply(
+        &mut model,
+        LiveReply::Attached {
+            session: sid(0),
+            attachment: attachment(0),
+            worker_generation: 7,
+            replay_through_seq: 0,
+        },
+    );
     assert!(
         again.iter().all(|command| command.command_id().is_none()),
         "a retired mutation is never resent"
@@ -389,14 +421,23 @@ fn events_for_an_unknown_attachment_are_rejected() {
 }
 
 #[test]
-fn a_gap_on_a_live_attachment_detaches_and_reattaches_from_the_cursor() {
-    // The driver's half of the strict gap law: the reducer stops, and the
-    // driver re-establishes the subscription AFTER the last fully applied
-    // sequence so the daemon replays the hole.
+fn a_gap_reattaches_exactly_once_through_the_single_authority() {
+    // The strict gap law END TO END, through the SAME wiring `run_live`
+    // uses: the reducer stops and emits `AppRequest::Reattach`; the driver
+    // performs detach+attach when that request is drained. Exactly one
+    // pair, ever.
     //
-    // MUTATION CHECK: return `Vec::new()` for `RawOutcome::Gap` in
-    // `LiveDriver::on_event` and no reattach is issued — the session
-    // silently stops updating.
+    // This composes both halves deliberately. They used to be tested
+    // separately — the driver's `[Detach, Attach]` here, the model's one
+    // `Reattach` in w3c3_router_tests — and BOTH fired in production, so a
+    // single gap opened two attachments and detached only one: a permanent
+    // slot against the daemon's 16-per-connection ceiling plus duplicate
+    // delivery of every later envelope (review P1-3). A seam-blind pair of
+    // green tests is exactly how that survived.
+    //
+    // MUTATION CHECK: re-add a `[Detach, Attach]` return to the
+    // `RawOutcome::Gap` arm of `LiveDriver::on_event` and the "exactly one"
+    // count below becomes two.
     let mut model = live_model();
     let mut driver = LiveDriver::new("test");
     attach_all(&mut driver, &mut model, 1);
@@ -408,7 +449,9 @@ fn a_gap_on_a_live_attachment_detaches_and_reattaches_from_the_cursor() {
             envelope: Box::new(envelope(&sid(0), 1, &user("one"))),
         },
     );
-    let commands = driver.apply(
+    model.requests.clear();
+
+    let from_driver = driver.apply(
         &mut model,
         LiveReply::Event {
             attachment: attachment(0),
@@ -416,8 +459,27 @@ fn a_gap_on_a_live_attachment_detaches_and_reattaches_from_the_cursor() {
             envelope: Box::new(envelope(&sid(0), 5, &user("five"))),
         },
     );
+    assert!(
+        from_driver.is_empty(),
+        "the driver observes the gap; it does not act on it independently"
+    );
+
+    // Now drain the reducer's request exactly as `run_live` does.
+    let requests: Vec<AppRequest> = model.requests.drain(..).collect();
     assert_eq!(
-        commands,
+        requests,
+        vec![AppRequest::Reattach {
+            session: sid(0),
+            after_seq: 1
+        }],
+        "one gap, one reattach request"
+    );
+    let mut issued = Vec::new();
+    for request in requests {
+        issued.extend(driver.handle_request(&mut model, request));
+    }
+    assert_eq!(
+        issued,
         vec![
             LiveCommand::Detach {
                 attachment: attachment(0)
@@ -426,7 +488,16 @@ fn a_gap_on_a_live_attachment_detaches_and_reattaches_from_the_cursor() {
                 session: sid(0),
                 after_seq: 1
             },
-        ]
+        ],
+        "…and exactly one detach+attach pair, in that order"
+    );
+    assert_eq!(
+        issued
+            .iter()
+            .filter(|command| matches!(command, LiveCommand::Attach { .. }))
+            .count(),
+        1,
+        "never two attaches for one gap — the second would leak a slot"
     );
 }
 
@@ -524,8 +595,15 @@ fn the_live_launcher_creates_no_row_or_session_until_the_daemon_answers() {
         "the first turn carries the launcher's text, once the attachment exists"
     );
 
-    // The turn is submitted EXACTLY once: a second attach (a reconnect's
-    // reattach, say) must not resubmit it.
+    // A later attach (a reconnect's reattach, say) may RESEND the turn —
+    // it is still unacknowledged and lives in the outbox — but only ever
+    // under the SAME durable command id. A fresh id would be a second
+    // command, and a second command is a second turn.
+    let first_submit = submitted
+        .iter()
+        .find_map(LiveCommand::command_id)
+        .cloned()
+        .expect("the submit is durable");
     let again = driver.apply(
         &mut model,
         LiveReply::Attached {
@@ -535,11 +613,18 @@ fn the_live_launcher_creates_no_row_or_session_until_the_daemon_answers() {
             replay_through_seq: 0,
         },
     );
-    assert!(
-        !again
+    assert_eq!(
+        again
             .iter()
-            .any(|command| matches!(command, LiveCommand::Submit { .. })),
-        "a later attach never replays the first turn"
+            .filter_map(LiveCommand::command_id)
+            .collect::<Vec<_>>(),
+        vec![&first_submit],
+        "a later attach resends the SAME turn, never a second one"
+    );
+    assert_eq!(
+        driver.outbox_len(),
+        1,
+        "…and it is still the one unacknowledged mutation"
     );
 }
 
@@ -679,6 +764,130 @@ fn esc_cancels_the_run_the_committed_stream_says_is_running_or_nothing() {
     );
 }
 
+#[test]
+fn live_mid_turn_input_reaches_the_daemon_instead_of_a_local_queue() {
+    // REVIEW P1-1. The mid-turn arm of `submit_composer` is reached in both
+    // modes. The demo parks the text in `msg_queue` (drained only by
+    // `DemoDriver::finish_turn`) or paints a local steer row with a note
+    // promising delivery — neither of which exists live, so in live mode
+    // every follow-up the user typed while the agent worked was silently
+    // destroyed, and the steer branch fabricated a transcript row the
+    // daemon never committed (a direct R11 cut 4 violation).
+    //
+    // MUTATION CHECK: delete the `RuntimeMode::Live` branch from
+    // `submit_composer`'s mid-turn arm and both assertions below fail — the
+    // request never appears and the local row does.
+    for (queue_mode, expected) in [
+        (false, haider_protocol::DeliveryMode::Steer),
+        (true, haider_protocol::DeliveryMode::Queue),
+    ] {
+        let mut model = live_model();
+        let mut driver = LiveDriver::new("test");
+        attach_all(&mut driver, &mut model, 1);
+        model.open_session(&sid(0));
+        model.screen = Screen::Session;
+        model.turn_active = true;
+        model.queue_mode = queue_mode;
+        let rows_before = model.projection.entries().len();
+
+        for c in "one more thing".chars() {
+            model.handle(key(ratatui::crossterm::event::KeyCode::Char(c)));
+        }
+        model.handle(key(ratatui::crossterm::event::KeyCode::Enter));
+
+        assert!(
+            model.msg_queue.is_empty(),
+            "live mid-turn input must not be parked in a queue nothing drains"
+        );
+        assert_eq!(
+            model.projection.entries().len(),
+            rows_before,
+            "…nor painted as a row the daemon never committed"
+        );
+        let requests: Vec<AppRequest> = model.requests.drain(..).collect();
+        let mut issued = Vec::new();
+        for request in requests {
+            issued.extend(driver.handle_request(&mut model, request));
+        }
+        assert!(
+            matches!(
+                issued.first(),
+                Some(LiveCommand::Submit { text, mode, .. })
+                    if text == "one more thing" && *mode == expected
+            ),
+            "mid-turn input rides turn.submit with the user's delivery mode, \
+             got {issued:?}"
+        );
+    }
+}
+
+#[test]
+fn a_failed_attach_releases_its_latch_so_the_session_is_not_wedged() {
+    // REVIEW P1-5. `sync_selection` latches one attach per selection so an
+    // idle loop pass cannot re-issue it every frame. An attach that FAILS
+    // used to clear nothing and attaches are not in the outbox, so the
+    // selected session was un-attachable for the life of the connection —
+    // an empty transcript behind a flash that had already scrolled away.
+    //
+    // MUTATION CHECK: delete `self.attaching.remove(&session)` from the
+    // `AttachFailed` arm and the retry below never happens.
+    let mut model = live_model();
+    let mut driver = LiveDriver::new("test");
+    driver.apply(
+        &mut model,
+        LiveReply::Listed {
+            sessions: vec![summary(3, 0)],
+            next_cursor: None,
+        },
+    );
+    model.open_session(&sid(3));
+    assert_eq!(driver.sync_selection(&model).len(), 1, "one attach issued");
+    assert!(driver.sync_selection(&model).is_empty(), "latched");
+
+    // A RETRYABLE failure releases the latch and retries at once.
+    let retried = driver.apply(
+        &mut model,
+        LiveReply::AttachFailed {
+            session: sid(3),
+            code: haider_rpc::ERROR_CODE_OVERLOADED.to_owned(),
+            message: "attachment budget".to_owned(),
+            retryable: true,
+        },
+    );
+    assert_eq!(
+        retried,
+        vec![LiveCommand::Attach {
+            session: sid(3),
+            after_seq: 0
+        }],
+        "a retryable attach failure retries rather than wedging"
+    );
+
+    // A PERMANENT one reports and leaves the row cold — but still releases
+    // the latch, so a later selection is not poisoned by this one.
+    driver.apply(
+        &mut model,
+        LiveReply::AttachFailed {
+            session: sid(3),
+            code: haider_rpc::ERROR_CODE_NOT_FOUND.to_owned(),
+            message: "no such session".to_owned(),
+            retryable: false,
+        },
+    );
+    assert!(
+        model
+            .flash
+            .as_deref()
+            .is_some_and(|flash| flash.contains("not_found")),
+        "the failure is reported, not swallowed"
+    );
+    assert_eq!(
+        driver.sync_selection(&model).len(),
+        1,
+        "the latch is released either way"
+    );
+}
+
 // ---- menu coordinates -------------------------------------------------
 
 #[test]
@@ -815,10 +1024,17 @@ fn an_answer_for_a_menu_this_connection_never_saw_open_is_not_invented() {
 // ---- cold sessions ----------------------------------------------------
 
 #[test]
-fn a_cold_session_reads_through_the_same_reducer_as_a_live_one() {
-    // R11 cut 4: cold sessions are represented by list/read metadata. Their
-    // transcript must be built by the SAME router as an attachment's — a
-    // second projector is a second set of bugs.
+fn a_cold_session_is_listable_with_its_head_and_readable_by_selection() {
+    // R11 cut 4: "cold sessions represented by list/read metadata". The
+    // READ is the attach's own replay — selecting a cold session attaches
+    // it from cursor 0 and the daemon replays its full history through the
+    // SAME router a hot session uses, so no second, divergent projector
+    // exists.
+    //
+    // (This test used to hand-feed a `LiveReply::ColdRead` that nothing in
+    // production could emit — it proved the reducer path, not the feature.
+    // The unreachable `session.read` plumbing went with it; what is left is
+    // the path a user actually takes — review P1-6.)
     let mut model = live_model();
     let mut driver = LiveDriver::new("test");
     driver.apply(
@@ -830,18 +1046,45 @@ fn a_cold_session_reads_through_the_same_reducer_as_a_live_one() {
     );
     assert!(driver.is_cold(&sid(5)));
     assert!(!driver.is_attached(&sid(5)));
-    assert_eq!(model.sessions.len(), 1, "a cold session is still listable");
+    assert_eq!(model.sessions.len(), 1, "a cold session is listable");
+    assert_eq!(
+        driver.cold_head_seq(&sid(5)),
+        Some(2),
+        "…with the committed head the daemon reported"
+    );
+    assert_eq!(rows(&model, &sid(5)), 0, "and no invented transcript");
 
+    // Selecting it attaches from zero; the replay lands through the router.
+    model.open_session(&sid(5));
+    assert_eq!(
+        driver.sync_selection(&model),
+        vec![LiveCommand::Attach {
+            session: sid(5),
+            after_seq: 0
+        }],
+        "selection is what makes a cold session readable"
+    );
+    driver.apply(
+        &mut model,
+        LiveReply::Attached {
+            session: sid(5),
+            attachment: attachment(5),
+            worker_generation: 7,
+            replay_through_seq: 2,
+        },
+    );
     for seq in 1..=2 {
         driver.apply(
             &mut model,
-            LiveReply::ColdRead {
+            LiveReply::Event {
+                attachment: attachment(5),
                 session: sid(5),
-                envelope: Box::new(envelope(&sid(5), seq, &user("cold"))),
+                envelope: Box::new(envelope(&sid(5), seq, &user("replayed"))),
             },
         );
     }
-    assert_eq!(rows(&model, &sid(5)), 2, "…and readable");
+    assert_eq!(rows(&model, &sid(5)), 2, "…and the replay is its history");
+    assert!(!driver.is_cold(&sid(5)), "it is hot now");
 }
 
 #[test]

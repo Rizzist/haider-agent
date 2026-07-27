@@ -309,12 +309,29 @@ fn reset_purges_the_state_file_and_restores_seeds() {
             .any(|request| matches!(request, DemoRequest::PurgeStore)),
         "/reset must request the file purge"
     );
+    // …and the SEMANTIC requests still ride the common queue. (The earlier
+    // form of this assertion looked for `AppRequest::Reattach` — LIVE
+    // vocabulary that `/reset` could never emit — so no mutation could
+    // make it fail. What is actually assertable at runtime is that the
+    // split routed each effect to the right queue.)
     assert!(
-        !model
+        model
             .requests
             .iter()
-            .any(|request| matches!(request, AppRequest::Reattach { .. })),
-        "…and the common request queue stays free of demo vocabulary"
+            .any(|request| matches!(request, AppRequest::ResetAllSessions)),
+        "/reset's teardown is semantic and stays on the common queue"
+    );
+    assert!(
+        model
+            .requests
+            .iter()
+            .any(|request| matches!(request, AppRequest::ResetAura)),
+        "…as does the aura reseed"
+    );
+    assert_eq!(
+        model.demo_requests.len(),
+        1,
+        "and the demo-only queue carries exactly the purge, nothing else"
     );
     assert_eq!(model.sessions.len(), 3, "seeds restored");
     assert_eq!(

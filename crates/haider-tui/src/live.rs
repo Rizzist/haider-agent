@@ -39,10 +39,9 @@ use std::collections::HashMap;
 use haider_protocol::DeliveryMode;
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::ids::{MenuId, RunId, SessionId};
-use haider_rpc::{AttachmentId, CommandId, MenuInput, SeqRange, SessionSummary, SubmitDisposition};
+use haider_rpc::{AttachmentId, CommandId, MenuInput, SessionSummary, SubmitDisposition};
 
 use crate::app::{AppModel, AppRequest, OutboundAnswer};
-use crate::identity::UiGeneration;
 use crate::projection::RawOutcome;
 
 /// The daemon's per-connection attachment ceiling
@@ -78,10 +77,6 @@ pub enum LiveCommand {
     },
     Detach {
         attachment: AttachmentId,
-    },
-    Read {
-        session: SessionId,
-        range: SeqRange,
     },
     Create {
         command_id: CommandId,
@@ -153,7 +148,6 @@ impl LiveCommand {
             Self::List { .. }
             | Self::Attach { .. }
             | Self::Detach { .. }
-            | Self::Read { .. }
             // A stage carries no durable identity BY DESIGN (see above).
             | Self::Stage { .. } => None,
         }
@@ -212,15 +206,6 @@ pub enum LiveReply {
     Cancelled {
         command_id: CommandId,
     },
-    /// One committed envelope replayed by a COLD read (`session.read`) —
-    /// no attachment is involved. It reduces through the same router as a
-    /// live event, so a cold session's transcript is never built by a
-    /// second, divergent projector (R11 cut 4: "cold sessions represented
-    /// by list/read metadata").
-    ColdRead {
-        session: SessionId,
-        envelope: Box<RawEnvelope>,
-    },
     /// One committed envelope for an attachment.
     Event {
         attachment: AttachmentId,
@@ -233,6 +218,16 @@ pub enum LiveReply {
     /// law).
     Lagged {
         attachment: AttachmentId,
+    },
+    /// An `session.attach` failed. Carried separately from `Failed`
+    /// because an attach has no durable command id to correlate by, and a
+    /// silent failure would leave the session un-attachable for the life
+    /// of the connection (review P1-5).
+    AttachFailed {
+        session: SessionId,
+        code: String,
+        message: String,
+        retryable: bool,
     },
     /// A correlated operation failed.
     Failed {
@@ -277,9 +272,25 @@ pub struct MenuCoordinates {
 }
 
 /// A live session row the launcher knows about but is not attached to.
+///
+/// "Cold" is a WORKING-SET state, not a lesser one: the row is listable
+/// with its committed head, and SELECTING it attaches and replays its full
+/// history through the same router a hot session uses (R11 cut 4's
+/// list/read metadata — the read is the attach's own replay, so there is
+/// no second, divergent projector and no separate `session.read` path to
+/// keep honest).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Cold {
+    /// The committed head the daemon reported at list time — how far this
+    /// session has progressed while we hold no attachment.
     head_seq: u64,
+}
+
+impl Cold {
+    /// The committed head at list time.
+    const fn head_seq(&self) -> u64 {
+        self.head_seq
+    }
 }
 
 /// The live driver. See the module charter.
@@ -297,6 +308,9 @@ pub struct LiveDriver {
     cold: HashMap<SessionId, Cold>,
     /// Attaches issued and not yet answered — see `sync_selection`.
     attaching: std::collections::HashSet<SessionId>,
+    /// Durable commands belonging to the OPEN login card, so a failure can
+    /// be correlated to it instead of merely coinciding with it (P2-2).
+    login_commands: std::collections::HashSet<CommandId>,
     /// Durable mutations awaiting a response, in issue order.
     outbox: Vec<Pending>,
     /// Committed menu coordinates, by menu id.
@@ -336,6 +350,7 @@ impl LiveDriver {
             lru: Vec::new(),
             cold: HashMap::new(),
             attaching: std::collections::HashSet::new(),
+            login_commands: std::collections::HashSet::new(),
             outbox: Vec::new(),
             menus: HashMap::new(),
             generations: HashMap::new(),
@@ -369,6 +384,13 @@ impl LiveDriver {
     #[must_use]
     pub fn is_cold(&self, session: &SessionId) -> bool {
         self.cold.contains_key(session)
+    }
+
+    /// A cold session's committed head at list time — what the launcher
+    /// knows about a session it holds no attachment for.
+    #[must_use]
+    pub fn cold_head_seq(&self, session: &SessionId) -> Option<u64> {
+        self.cold.get(session).map(Cold::head_seq)
     }
 
     /// Durable mutations still awaiting a response.
@@ -548,12 +570,20 @@ impl LiveDriver {
                 self.routes.insert(attachment.clone(), session.clone());
                 self.attachments.insert(session.clone(), attachment);
                 self.touch(&session);
-                // The first turn of a freshly created session was waiting
-                // for exactly this.
-                match self.pending_first_turn.remove(&session) {
-                    Some(text) => vec![self.submit(model, &session, text)],
-                    None => Vec::new(),
+                // Everything that was waiting for exactly this attachment:
+                // a freshly created session's first turn, and any durable
+                // mutation the outbox is still holding for this session
+                // (the reconnect resend — review P1-4).
+                let mut commands: Vec<LiveCommand> = self
+                    .outbox
+                    .iter()
+                    .filter(|pending| command_session(&pending.command) == Some(&session))
+                    .map(|pending| pending.command.clone())
+                    .collect();
+                if let Some(text) = self.pending_first_turn.remove(&session) {
+                    commands.push(self.submit(model, &session, text));
                 }
+                commands
             }
             LiveReply::Detached { attachment } => {
                 self.drop_attachment(&attachment);
@@ -613,6 +643,7 @@ impl LiveDriver {
                 // Transaction two. The staged reference is single-use and
                 // expiring, so the login follows immediately.
                 let command_id = self.mint();
+                self.login_commands.insert(command_id.clone());
                 vec![self.enqueue(LiveCommand::LoginApi {
                     command_id,
                     provider,
@@ -625,6 +656,7 @@ impl LiveDriver {
                 identity,
             } => {
                 self.retire(&command_id);
+                self.login_commands.remove(&command_id);
                 model.login_result(Ok(identity));
                 Vec::new()
             }
@@ -633,14 +665,6 @@ impl LiveDriver {
                 session,
                 envelope,
             } => self.on_event(model, &attachment, &session, &envelope),
-            LiveReply::ColdRead { session, envelope } => {
-                if envelope.session_id != session {
-                    return Vec::new();
-                }
-                self.record_menu(&session, &envelope);
-                let _ = model.route_raw(&envelope);
-                Vec::new()
-            }
             LiveReply::Lagged { attachment } => {
                 // The daemon dropped us; reattach from OUR cursor, not from
                 // the telemetry the frame carries.
@@ -650,23 +674,60 @@ impl LiveDriver {
                 self.drop_attachment(&attachment);
                 self.ensure_attached(model, &session)
             }
+            LiveReply::AttachFailed {
+                session,
+                code,
+                message,
+                retryable,
+            } => {
+                self.attaching.remove(&session);
+                // Retryable classes (overloaded, a transient cap) are worth
+                // one more try on the next loop pass; a permanent one is
+                // reported and the row stays cold rather than pretending.
+                model.flash = Some(format!("· attach {code} — {message}"));
+                model.dirty = true;
+                if retryable && model.active_session.as_ref() == Some(&session) {
+                    return self.sync_selection(model);
+                }
+                Vec::new()
+            }
             LiveReply::Failed {
                 command_id,
                 code,
                 message,
                 retryable,
             } => {
-                if let Some(id) = &command_id
-                    && !retryable
-                {
-                    self.retire(id);
+                // A rejected TURN must release the optimistic mid-turn UI,
+                // or the session sits in "running" forever with no envelope
+                // ever coming to clear it — and Esc, which now cancels only
+                // a run the stream named, has nothing to cancel (P1-4).
+                if let Some(id) = &command_id {
+                    let was_submit = self.outbox.iter().any(|pending| {
+                        &pending.command_id == id
+                            && matches!(pending.command, LiveCommand::Submit { .. })
+                    });
+                    if was_submit {
+                        model.turn_active = false;
+                    }
+                    if !retryable {
+                        self.retire(id);
+                    }
                 }
-                // A card that is waiting takes the typed recovery text; the
-                // key is already gone either way (the card wipes on submit).
-                if model.login.is_some() {
+                // A card that is waiting takes the typed recovery text —
+                // but ONLY for a failure that belongs to it. "A card is
+                // open" is not correlation: an unrelated `capability_denied`
+                // would otherwise show a login recovery message for a
+                // failure that had nothing to do with the login (P2-2).
+                let owns = command_id
+                    .as_ref()
+                    .is_some_and(|id| self.login_commands.contains(id));
+                if owns && model.login.is_some() {
                     model.login_result(Err((code, message)));
                 } else {
                     model.flash = Some(format!("· {code} — {message}"));
+                }
+                if let Some(id) = &command_id {
+                    self.login_commands.remove(id);
                 }
                 model.dirty = true;
                 Vec::new()
@@ -723,27 +784,22 @@ impl LiveDriver {
             return Vec::new();
         }
         self.touch(session);
-        self.record_menu(session, envelope);
-        match model.route_raw(envelope) {
-            RawOutcome::Gap { after_seq } => {
-                // The reducer stopped with its cursor unmoved. Drop the
-                // attachment and re-establish it AFTER the last fully
-                // applied sequence; the daemon replays the hole.
-                if let Some(held) = self.attachments.get(session).cloned() {
-                    self.drop_attachment(&held);
-                }
-                vec![
-                    LiveCommand::Detach {
-                        attachment: attachment.clone(),
-                    },
-                    LiveCommand::Attach {
-                        session: session.clone(),
-                        after_seq,
-                    },
-                ]
-            }
-            RawOutcome::Applied | RawOutcome::Duplicate | RawOutcome::WrongSession => Vec::new(),
+        // Driver-side bookkeeping happens ONLY for envelopes the reducer
+        // actually applied (review P1: `record_menu` used to run ahead of
+        // the strict gate, so a re-delivered `MenuOpened` reset a menu's
+        // durable command id — breaking the same-command retry law — and a
+        // GAPPED `RunState` set a cancel target the user's screen never
+        // showed).
+        // ONE reattach authority. `route_raw` pushes `AppRequest::Reattach`
+        // on a gap and `handle_request` performs the detach+attach; issuing
+        // a second pair here would open an attachment the daemon never
+        // hears a detach for — a permanent slot against its 16-per-
+        // connection ceiling, plus duplicate delivery of every later
+        // envelope for that session (review P1-3).
+        if model.route_raw(envelope) == RawOutcome::Applied {
+            self.record_menu(session, envelope);
         }
+        Vec::new()
     }
 
     /// Record a menu's COMMITTED opening coordinates, and retire its answer
@@ -816,14 +872,28 @@ impl LiveDriver {
             let hot = is_hot(model, session);
             (!active, !hot)
         });
-        self.lru.clear();
-        for session in wanted.into_iter().take(ATTACHMENT_CAP) {
+        // The working set is REBUILT, not cleared: a second disconnect
+        // before these attaches are acknowledged must not collapse it to
+        // the active session alone (review P2-3).
+        self.lru = wanted.iter().take(ATTACHMENT_CAP).cloned().collect();
+        for session in self.lru.clone() {
             commands.push(LiveCommand::Attach {
                 after_seq: cursor_of(model, &session).unwrap_or(0),
                 session,
             });
         }
-        commands.extend(self.outbox.iter().map(|pending| pending.command.clone()));
+        // Session-scoped mutations WAIT for their attachment: `turn.submit`,
+        // `turn.cancel` and `MenuAnswer` all require an established control
+        // attachment, and a resend issued alongside the attach races it into
+        // a non-retryable `capability_denied` (review P1-4 — the same race
+        // the create→attach→submit path already fixed). Unscoped commands
+        // (a login) have no such dependency and go now.
+        commands.extend(
+            self.outbox
+                .iter()
+                .filter(|pending| command_session(&pending.command).is_none())
+                .map(|pending| pending.command.clone()),
+        );
         commands
     }
 
@@ -921,13 +991,21 @@ impl LiveDriver {
     fn submit(&mut self, model: &AppModel, session: &SessionId, text: String) -> LiveCommand {
         let command_id = self.mint();
         let worker_generation = self.generations.get(session).copied().unwrap_or_default();
-        let _ = model;
+        // `/queue turn` holds mid-turn input to the end of the turn;
+        // `/queue steer` (the default) delivers it at the next safe
+        // boundary. The MODE is the user's standing choice, so it rides
+        // every submit — the daemon, not the client, decides when.
+        let mode = if model.queue_mode {
+            DeliveryMode::Queue
+        } else {
+            DeliveryMode::Steer
+        };
         self.enqueue(LiveCommand::Submit {
             command_id,
             session: session.clone(),
             worker_generation,
             text,
-            mode: DeliveryMode::Steer,
+            mode,
         })
     }
 
@@ -989,6 +1067,17 @@ impl LiveDriver {
     }
 }
 
+/// The session a command is scoped to, if any. Session-scoped mutations
+/// require an established control attachment; unscoped ones do not.
+const fn command_session(command: &LiveCommand) -> Option<&SessionId> {
+    match command {
+        LiveCommand::Submit { session, .. }
+        | LiveCommand::Cancel { session, .. }
+        | LiveCommand::Answer { session, .. } => Some(session),
+        _ => None,
+    }
+}
+
 /// A session's greatest fully applied sequence — read from the reducer,
 /// which is the sole cursor authority (a driver-side copy is how a
 /// reattach ends up asking for the wrong history).
@@ -1014,12 +1103,4 @@ fn is_hot(model: &AppModel, session: &SessionId) -> bool {
         .iter()
         .find(|row| &row.id == session)
         .is_some_and(|row| row.busy() || row.projection.open_menu().is_some())
-}
-
-/// Mint the local generation for a newly-learned live session.
-#[must_use]
-pub fn next_generation(model: &mut AppModel) -> UiGeneration {
-    let generation = UiGeneration::new(model.next_ui_generation);
-    model.next_ui_generation += 1;
-    generation
 }

@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use haider_client::{ClientConfig, ClientError, DisconnectReason, ResolvedProfile, RpcClient};
-use haider_rpc::{AttachMode, RequestBody, ResponseBody, SeqRange, SessionSummary, WireFrame};
+use haider_rpc::{AttachMode, RequestBody, ResponseBody, WireFrame};
 use tokio::sync::mpsc;
 
 use crate::live::{LiveCommand, LiveReply};
@@ -211,6 +211,10 @@ struct CommandContext {
     /// Carried across `vault.stage` so the login that follows knows which
     /// account it is committing. Never a secret.
     login: Option<(String, Option<String>)>,
+    /// The session an ATTACH was for. An attach carries no durable command
+    /// id, so without this a failure cannot be correlated back to the
+    /// session it wedged (review P1-5).
+    attach: Option<haider_protocol::ids::SessionId>,
 }
 
 impl CommandContext {
@@ -232,6 +236,10 @@ impl CommandContext {
                 } => Some((provider.clone(), alias.clone())),
                 _ => None,
             },
+            attach: match command {
+                LiveCommand::Attach { session, .. } => Some(session.clone()),
+                _ => None,
+            },
         }
     }
 }
@@ -249,10 +257,6 @@ fn request_body(command: LiveCommand) -> RequestBody {
         },
         LiveCommand::Detach { attachment } => RequestBody::SessionDetach {
             attachment_id: attachment,
-        },
-        LiveCommand::Read { session, range } => RequestBody::SessionRead {
-            session_id: session,
-            range,
         },
         LiveCommand::Create {
             command_id,
@@ -389,37 +393,33 @@ fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveReply> 
                 }]
             })
         }
-        ResponseBody::SessionRead { result } => read_replies(result),
         ResponseBody::Error {
             code,
             message,
             retryable,
             ..
-        } => vec![LiveReply::Failed {
-            command_id: context.command_id.clone(),
-            code,
-            message,
-            retryable,
-        }],
+        } => context.attach.clone().map_or_else(
+            || {
+                vec![LiveReply::Failed {
+                    command_id: context.command_id.clone(),
+                    code: code.clone(),
+                    message: message.clone(),
+                    retryable,
+                }]
+            },
+            |session| {
+                vec![LiveReply::AttachFailed {
+                    session,
+                    code: code.clone(),
+                    message: message.clone(),
+                    retryable,
+                }]
+            },
+        ),
         // Account/menu bodies belong to M3's login card; unknown bodies are
         // tolerated, never fatal (forward-compat law).
         _ => Vec::new(),
     }
-}
-
-/// A cold read replays as ordinary events for the session's own reducer —
-/// the SAME reduction path an attachment uses, so a cold session's
-/// transcript can never be built by a second, divergent projector.
-fn read_replies(result: haider_rpc::SessionReadResult) -> Vec<LiveReply> {
-    let session = result.session_id;
-    result
-        .envelopes
-        .into_iter()
-        .map(|envelope| LiveReply::ColdRead {
-            session: session.clone(),
-            envelope: Box::new(envelope),
-        })
-        .collect()
 }
 
 fn map_frame(frame: WireFrame) -> Vec<LiveReply> {
@@ -446,23 +446,5 @@ fn map_frame(frame: WireFrame) -> Vec<LiveReply> {
         // AttachCaughtUp carries no state the cursor law needs: events
         // deduplicate by seq alone, and the marker may repeat.
         _ => Vec::new(),
-    }
-}
-
-/// Session summaries the launcher can render before any attach.
-#[must_use]
-pub fn summary_ids(sessions: &[SessionSummary]) -> Vec<String> {
-    sessions
-        .iter()
-        .map(|summary| summary.session_id.as_str().to_owned())
-        .collect()
-}
-
-/// The full range of a cold session, for a metadata read.
-#[must_use]
-pub const fn full_range(head_seq: u64) -> SeqRange {
-    SeqRange {
-        start_seq: 1,
-        end_seq: head_seq,
     }
 }

@@ -780,9 +780,18 @@ impl LoginCard {
         self.secret.is_empty()
     }
 
+    /// True while the card accepts typing — entry, and after a FAILURE
+    /// (the recovery text says "type it again" / "press ⏎ to try again",
+    /// and a card that refused the retry it advertises is a dead end —
+    /// review P2-1). `Submitting` and `Done` are closed to input.
+    #[must_use]
+    pub const fn accepts_input(&self) -> bool {
+        matches!(self.stage, LoginStage::Entry | LoginStage::Failed(_))
+    }
+
     /// Append one typed character. Non-printing keys never reach here.
     pub fn push(&mut self, c: char) {
-        if matches!(self.stage, LoginStage::Entry) {
+        if self.accepts_input() {
             self.secret.push(c);
         }
     }
@@ -790,13 +799,13 @@ impl LoginCard {
     /// Bracketed paste — the whole clipboard at once (keys are pasted far
     /// more often than typed).
     pub fn push_str(&mut self, text: &str) {
-        if matches!(self.stage, LoginStage::Entry) {
+        if self.accepts_input() {
             self.secret.push_str(text.trim());
         }
     }
 
     pub fn backspace(&mut self) {
-        if matches!(self.stage, LoginStage::Entry) {
+        if self.accepts_input() {
             self.secret.pop();
         }
     }
@@ -2179,6 +2188,22 @@ impl AppModel {
         // row now with the sim's note (display-only — the running script
         // is not altered, same as the sim).
         if self.screen == Screen::Session && self.turn_active {
+            // LIVE (review P1-1): mid-turn input is a REAL delivery. The
+            // demo parks it in `msg_queue` (drained by `DemoDriver::
+            // finish_turn`) or paints a steer row locally — neither of
+            // which exists live, so both silently destroyed the user's
+            // text. The wire has carried `DeliveryMode` all along: steer
+            // delivers at the next safe boundary, queue holds to turn end,
+            // and the AUTHORITATIVE `UserMessage` envelope paints the row.
+            // Nothing is fabricated here (R11 cut 4).
+            if self.mode == RuntimeMode::Live {
+                self.requests.push(AppRequest::SubmitText {
+                    text,
+                    voice: false,
+                    title: false,
+                });
+                return;
+            }
             if self.queue_mode {
                 self.msg_queue.push(text);
             } else {
@@ -2238,7 +2263,7 @@ impl AppModel {
                 self.login = None;
             }
             KeyCode::Enter => {
-                if !matches!(card.stage, LoginStage::Entry) || card.is_empty() {
+                if !card.accepts_input() || card.is_empty() {
                     return;
                 }
                 let provider = card.provider.clone();
@@ -2613,6 +2638,18 @@ impl AppModel {
                             Some(format!("· /login {provider} <oauth|api> — pick a method"));
                     }
                 }
+            }
+            // `/reset` reseeds the DEMO world. In live mode the sessions
+            // are the daemon's, so reseeding would replace real rows with
+            // three fabricated ones and strand every attachment the driver
+            // holds — the live stream would then be discarded as
+            // `WrongSession` in silence (review P1-2). `RuntimeMode`'s
+            // charter always named this as one of the three source-
+            // dependent decisions; this is that branch.
+            "reset" if self.mode == RuntimeMode::Live => {
+                self.flash = Some(
+                    "· /reset — demo only; live sessions live in the daemon's store".to_owned(),
+                );
             }
             "reset" => {
                 // TUI5 item 9: park the departing surface first; session

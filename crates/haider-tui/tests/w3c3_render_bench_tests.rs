@@ -131,8 +131,12 @@ fn render_p95_on_1k_3k_and_5k_row_replays_is_recorded_against_the_ledger() {
     // (This is a coarse REGRESSION guard, not a claim of sublinearity: the
     // measured curve today is roughly linear in history, which is exactly
     // why row 17 exists. What must never happen is a super-linear blow-up.)
+    // Generous constants on purpose: the two sizes are measured minutes
+    // apart on a machine that may be building something else, so a tight
+    // ratio would be a flake, not a gate. What must never happen is a
+    // super-linear blow-up (5x the history costing far more than 5x).
     assert!(
-        p95_5k < p95_1k * 8 + Duration::from_millis(4),
+        p95_5k < p95_1k * 12 + Duration::from_millis(50),
         "render cost must not blow up super-linearly with history: \
          1k={p95_1k:?} 5k={p95_5k:?}"
     );
@@ -192,7 +196,21 @@ fn render_p95_on_1k_3k_and_5k_row_replays_is_recorded_against_the_ledger() {
     };
     println!("render cold-frame @ 5000 rows = {first:?}");
     assert!(
-        first < Duration::from_millis(250),
+        first < Duration::from_millis(400),
         "even a cold 5k-row frame must stay far under a human frame budget"
+    );
+    // The stated test: a memoizing cache would make every frame AFTER the
+    // first dramatically cheaper, so the steady-state p95 would collapse
+    // relative to the cold frame. It does not — every frame rebuilds every
+    // line, which is exactly the cost row 17 exists to remove.
+    //
+    // MUTATION CHECK: add a per-block rendered-line cache to `render.rs`
+    // and this fails, correctly: the ledger row would then be DONE, not
+    // TRIGGERED, and the two-way gate above must move with it.
+    assert!(
+        p95_5k > first / 4,
+        "no rendered-line cache is active in W3c3 (R12 keeps the rewrite out \
+         of the seam): steady-state p95 {p95_5k:?} must not collapse against \
+         the cold frame {first:?}"
     );
 }

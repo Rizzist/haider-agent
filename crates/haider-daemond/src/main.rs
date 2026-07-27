@@ -24,11 +24,25 @@ use std::sync::Arc;
 /// binary against the REAL daemon over a real socket, and §6.4 requires
 /// that path to pass "deterministically with `FakeProvider` and no network".
 ///
-/// It is never read unless the variable is present, it can only ever
-/// SUBSTITUTE a provider (it grants no capability, relaxes no auth, and
-/// touches no credential path), and `session.create`'s provider whitelist
-/// becomes `{"fake"}` under it — so a process started this way cannot
-/// create an `anthropic` session by accident.
+/// It is never read unless the variable is present, and it can only ever
+/// SUBSTITUTE a provider implementation: it grants no capability, relaxes
+/// no auth, and touches no credential path. `resolve_for_turn` echoes the
+/// SESSION's own provider name, so the worker's factory check still fires.
+///
+/// It does NOT narrow `session.create`'s whitelist to `{"fake"}`: every
+/// turn resolves to the fake regardless of what the session was created
+/// with, so the release default is accepted too (otherwise a client using
+/// its own profile's provider is rejected for a provider the daemon was
+/// never going to call). The containment that DOES hold is announcement,
+/// not restriction — see below.
+///
+/// Because an auto-spawned daemon inherits the launcher's environment, a
+/// variable left exported in a shell, a `.envrc` or a CI runner would
+/// otherwise produce a lingering singleton answering every later turn from
+/// a fake, with nothing on screen to say so. Two guards close that: the
+/// daemon refuses to start unless the value parses as a script (a typo
+/// exits 64 rather than degrading), and it announces itself loudly on
+/// stderr AND in its log so the profile's daemon.log names the condition.
 const FAKE_PROVIDER_ENV: &str = "HAIDER_TEST_FAKE_PROVIDER";
 
 #[tokio::main]

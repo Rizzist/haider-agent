@@ -335,6 +335,40 @@ fn a_failed_login_returns_the_card_to_entry_with_nothing_retained() {
     let text = frame_text(&model, 118, 36);
     assert!(text.contains("busy"), "the recovery text is on screen");
     assert!(!text.contains(SENTINEL));
+
+    // …AND THE RETRY THE RECOVERY TEXT PROMISES ACTUALLY WORKS (review
+    // P2-1). `busy`/`overloaded` are the daemon's retryable codes, so this
+    // is the most likely path; the card used to refuse both typing and ⏎
+    // from `Failed`, making "press ⏎ to try again" a dead end that three
+    // separate doc comments and the on-screen hint all promised.
+    //
+    // MUTATION CHECK: narrow `LoginCard::accepts_input` back to
+    // `LoginStage::Entry` only and everything below fails.
+    for c in "sk-ant-RETRY-0000".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    assert_eq!(
+        model.login.as_ref().expect("open").masked_len(),
+        "sk-ant-RETRY-0000".chars().count(),
+        "a failed card accepts the retype it asks for"
+    );
+    model.handle(key(KeyCode::Enter));
+    let card = model.login.as_ref().expect("open");
+    assert_eq!(card.stage, LoginStage::Submitting, "…and ⏎ re-submits it");
+    assert_eq!(
+        card.masked_len(),
+        0,
+        "the retry's key is staged and gone too"
+    );
+    assert!(
+        model
+            .requests
+            .iter()
+            .filter(|request| matches!(request, AppRequest::LoginApi { .. }))
+            .count()
+            >= 2,
+        "the retry is a real second staging attempt"
+    );
 }
 
 #[test]
@@ -345,6 +379,49 @@ fn a_committed_login_shows_the_descriptor_identity_and_no_secret() {
     let text = frame_text(&model, 118, 36);
     assert!(text.contains("signed in"), "the card confirms");
     assert!(!text.contains(SENTINEL));
+}
+
+#[test]
+fn reset_is_demo_only_and_never_reseeds_a_live_session_list() {
+    // REVIEW P1-2. `/reset` reseeds the DEMO world. In live mode the rows
+    // are the daemon's: reseeding replaced them with three fabricated
+    // `demo-session-N` rows carrying sim transcripts and stranded every
+    // attachment the driver held, after which `route_raw` answered
+    // `WrongSession` for every live event and the stream was discarded in
+    // silence. `RuntimeMode`'s charter always named this as one of the
+    // three source-dependent decisions; it had no branch.
+    //
+    // MUTATION CHECK: delete the `"reset" if self.mode == RuntimeMode::Live`
+    // arm from `execute_slash` and every assertion below fails.
+    let mut model = live_model();
+    model.sessions.clear();
+    let live = haider_protocol::ids::SessionId::new("session-real");
+    model.upsert_live_session(&live);
+    model.open_session(&live);
+
+    run_slash(&mut model, "/reset");
+
+    assert_eq!(model.sessions.len(), 1, "the daemon's rows survive /reset");
+    assert_eq!(
+        model.sessions[0].id, live,
+        "…unchanged, and still the daemon's"
+    );
+    assert_eq!(
+        model.active_session.as_ref(),
+        Some(&live),
+        "…and the attachment is not stranded"
+    );
+    assert!(
+        model.demo_requests.is_empty(),
+        "a live reset never reaches demo persistence (report R11 cut 3)"
+    );
+    assert!(
+        model
+            .flash
+            .as_deref()
+            .is_some_and(|flash| flash.contains("demo only")),
+        "…and says so honestly"
+    );
 }
 
 #[tokio::test(start_paused = true)]
