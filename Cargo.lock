@@ -808,6 +808,7 @@ dependencies = [
  "haider-provider",
  "haider-rpc",
  "haider-store",
+ "rusqlite",
  "rustix 1.1.4",
  "serde_json",
  "tempfile",

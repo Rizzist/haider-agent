@@ -384,6 +384,16 @@ impl Store {
         }
     }
 
+    /// Atomically appends a live worker batch after validating it against the
+    /// transaction's durable run heads.
+    ///
+    /// This is the ONE authoritative live-worker transition site. Once a run
+    /// is terminal no later run-scoped worker event may commit, and a durable
+    /// `Cancelling` may transition only to `Cancelled`.
+    pub fn append_worker(&self, envelopes: &mut [RawEnvelope]) -> StoreResult<CommittedSeqRange> {
+        append_envelopes(self, envelopes, true)
+    }
+
     /// Looks up a committed `session.create` response before filesystem
     /// validation. This ordering is intentional: after a successful create,
     /// a lost-response retry remains recoverable even if the workspace path
@@ -625,7 +635,7 @@ impl Store {
             transaction.commit().map_err(map_sqlite_error)?;
             return Ok(TurnAcceptOutcome::IdempotentReplay { accepted });
         }
-        require_session(&transaction, &command.session_id)?;
+        require_typed_session(&transaction, &command.session_id)?;
         let states = latest_run_states(&transaction, &command.session_id)?;
         if states.contains_key(&command.run_id) {
             return Err(corrupt("daemon-minted turn run id already exists"));
@@ -789,6 +799,16 @@ impl Store {
                 },
                 None,
             )
+        } else if *state == RunState::Cancelling {
+            (
+                CancelledTurn {
+                    session_id: command.session_id.clone(),
+                    run_id: command.run_id.clone(),
+                    status: TurnCancellationStatus::Accepted,
+                    terminal_seq: None,
+                },
+                None,
+            )
         } else {
             let mut envelopes = vec![unstamped_command_envelope(
                 command.cancelling_event_id.clone(),
@@ -829,6 +849,11 @@ impl Store {
 
     /// Appends aggregate `Idle` only if every durable run is terminal at the
     /// same serialized SQLite write point.
+    ///
+    /// `interrupted: true` means user cancellation, drain-caused cancellation,
+    /// recovery, panic, or failed recovery resumption. Natural `Done` and
+    /// ordinary provider/error completion are `false`; merely being in drain
+    /// does not rewrite a naturally completed turn's cause.
     ///
     /// This is the aggregate-state half of R3. A worker may observe its local
     /// queue as empty while a concurrent submit is already durable; checking
@@ -1262,6 +1287,25 @@ fn require_session(connection: &Connection, session_id: &SessionId) -> StoreResu
     }
 }
 
+fn require_typed_session(connection: &Connection, session_id: &SessionId) -> StoreResult<()> {
+    require_session(connection, session_id)?;
+    let metadata: String = connection
+        .query_row(
+            "SELECT meta_json FROM sessions WHERE id = ?1",
+            [session_id.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(map_sqlite_error)?;
+    if decode_session_metadata(session_id, &metadata)?.is_none() {
+        return Err(store_error(
+            ErrorCode::InvalidArgument,
+            "legacy session has no live-worker metadata",
+            false,
+        ));
+    }
+    Ok(())
+}
+
 fn latest_run_states(
     connection: &Connection,
     session_id: &SessionId,
@@ -1399,6 +1443,13 @@ fn claim_pending_receipt(
     request_json: &str,
     created_at_ms: u64,
 ) -> StoreResult<()> {
+    if resolution_by_command(transaction, command_id)?.is_some() {
+        return Err(store_error(
+            ErrorCode::InvalidArgument,
+            "command id was already used by a menu answer",
+            false,
+        ));
+    }
     transaction
         .execute(
             "INSERT OR IGNORE INTO command_receipts(
@@ -1531,6 +1582,22 @@ fn resolve_menu_transaction(
                 false,
             ))
         };
+    }
+    let receipt_exists = transaction
+        .query_row(
+            "SELECT 1 FROM command_receipts WHERE command_id = ?1",
+            [&command.command_id],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(map_sqlite_error)?
+        .is_some();
+    if receipt_exists {
+        return Err(store_error(
+            ErrorCode::InvalidArgument,
+            "command id was already used by another durable command",
+            false,
+        ));
     }
     if command.worker_generation != current_worker_generation && !command.allow_prior_generation {
         return Err(stale_generation(
@@ -1923,84 +1990,7 @@ fn next_profile_counter(
 
 impl EventStore for Store {
     fn append(&self, envelopes: &mut [RawEnvelope]) -> StoreResult<CommittedSeqRange> {
-        let (session, batch_len) = same_session_batch(envelopes)?;
-
-        let mut connection = self.connection()?;
-        // IMMEDIATE takes SQLite's write lock up front, so reading MAX(seq)
-        // and inserting the batch form one critical section. Concurrent
-        // appenders serialize here; that is what keeps allocated sequences
-        // monotonic and gap-free.
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(map_sqlite_error)?;
-        let committed_at_ms = now_ms()?;
-        let committed_at_sql = to_sqlite_integer(committed_at_ms)?;
-        transaction
-            .prepare_cached(
-                "INSERT OR IGNORE INTO sessions(id, created_at_ms, meta_json) VALUES (?1, ?2, ?3)",
-            )
-            .and_then(|mut statement| {
-                statement.execute(params![session.as_str(), committed_at_sql, "{}"])
-            })
-            .map_err(map_sqlite_error)?;
-        let latest: i64 = transaction
-            .prepare_cached("SELECT COALESCE(MAX(seq), 0) FROM events WHERE session_id = ?1")
-            .and_then(|mut statement| statement.query_row([session.as_str()], |row| row.get(0)))
-            .map_err(map_sqlite_error)?;
-        let first_seq = u64::try_from(latest)
-            .map_err(|_| corrupt("database contains a negative event sequence"))?
-            .checked_add(1)
-            .ok_or_else(|| corrupt("event sequence space is exhausted"))?;
-        let last_seq = first_seq
-            .checked_add(batch_len - 1)
-            .ok_or_else(|| corrupt("event sequence space is exhausted"))?;
-
-        // Stamp clones, not the caller's envelopes: if anything below fails,
-        // the transaction rolls back and the caller's batch must be exactly
-        // as it was passed in.
-        let mut stamped = Vec::with_capacity(envelopes.len());
-        {
-            let mut insert = transaction
-                .prepare_cached(
-                    "INSERT INTO events(
-                            session_id, seq, envelope_json, event_id, committed_at_ms
-                         ) VALUES (?1, ?2, ?3, ?4, ?5)",
-                )
-                .map_err(map_sqlite_error)?;
-            for (seq, envelope) in (first_seq..=last_seq).zip(envelopes.iter()) {
-                let mut envelope = envelope.clone();
-                envelope.seq = seq;
-                envelope.committed_at_ms = committed_at_ms;
-                let envelope_json = serde_json::to_string(&envelope).map_err(|error| {
-                    store_error(
-                        ErrorCode::InvalidArgument,
-                        format!("cannot serialize event envelope: {error}"),
-                        false,
-                    )
-                })?;
-                insert
-                    .execute(params![
-                        session.as_str(),
-                        to_sqlite_integer(seq)?,
-                        envelope_json,
-                        envelope.event_id.as_str(),
-                        committed_at_sql,
-                    ])
-                    .map_err(map_sqlite_error)?;
-                stamped.push(envelope);
-            }
-        }
-
-        transaction.commit().map_err(map_sqlite_error)?;
-        // The batch is durable now; reflect the committed fields to the caller.
-        for (envelope, stamped) in envelopes.iter_mut().zip(stamped) {
-            *envelope = stamped;
-        }
-        Ok(CommittedSeqRange {
-            session_id: session,
-            first_seq,
-            last_seq,
-        })
+        append_envelopes(self, envelopes, false)
     }
 
     fn read(
@@ -2062,6 +2052,131 @@ impl EventStore for Store {
             .map_err(map_sqlite_error)?;
         u64::try_from(latest).map_err(|_| corrupt("database contains a negative event sequence"))
     }
+}
+
+fn append_envelopes(
+    store: &Store,
+    envelopes: &mut [RawEnvelope],
+    validate_worker_transitions: bool,
+) -> StoreResult<CommittedSeqRange> {
+    let (session, batch_len) = same_session_batch(envelopes)?;
+    let mut connection = store.connection()?;
+    // IMMEDIATE makes durable-head validation, sequence allocation, and the
+    // batch insert one indivisible write critical section.
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(map_sqlite_error)?;
+    if validate_worker_transitions {
+        validate_worker_run_transitions(&transaction, &session, envelopes)?;
+    }
+    let committed_at_ms = now_ms()?;
+    let committed_at_sql = to_sqlite_integer(committed_at_ms)?;
+    transaction
+        .prepare_cached(
+            "INSERT OR IGNORE INTO sessions(id, created_at_ms, meta_json) VALUES (?1, ?2, ?3)",
+        )
+        .and_then(|mut statement| {
+            statement.execute(params![session.as_str(), committed_at_sql, "{}"])
+        })
+        .map_err(map_sqlite_error)?;
+    let latest: i64 = transaction
+        .prepare_cached("SELECT COALESCE(MAX(seq), 0) FROM events WHERE session_id = ?1")
+        .and_then(|mut statement| statement.query_row([session.as_str()], |row| row.get(0)))
+        .map_err(map_sqlite_error)?;
+    let first_seq = u64::try_from(latest)
+        .map_err(|_| corrupt("database contains a negative event sequence"))?
+        .checked_add(1)
+        .ok_or_else(|| corrupt("event sequence space is exhausted"))?;
+    let last_seq = first_seq
+        .checked_add(batch_len - 1)
+        .ok_or_else(|| corrupt("event sequence space is exhausted"))?;
+    let mut stamped = Vec::with_capacity(envelopes.len());
+    {
+        let mut insert = transaction
+            .prepare_cached(
+                "INSERT INTO events(
+                    session_id, seq, envelope_json, event_id, committed_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            )
+            .map_err(map_sqlite_error)?;
+        for (seq, envelope) in (first_seq..=last_seq).zip(envelopes.iter()) {
+            let mut envelope = envelope.clone();
+            envelope.seq = seq;
+            envelope.committed_at_ms = committed_at_ms;
+            let envelope_json = serde_json::to_string(&envelope).map_err(|error| {
+                store_error(
+                    ErrorCode::InvalidArgument,
+                    format!("cannot serialize event envelope: {error}"),
+                    false,
+                )
+            })?;
+            insert
+                .execute(params![
+                    session.as_str(),
+                    to_sqlite_integer(seq)?,
+                    envelope_json,
+                    envelope.event_id.as_str(),
+                    committed_at_sql,
+                ])
+                .map_err(map_sqlite_error)?;
+            stamped.push(envelope);
+        }
+    }
+    transaction.commit().map_err(map_sqlite_error)?;
+    for (envelope, stamped) in envelopes.iter_mut().zip(stamped) {
+        *envelope = stamped;
+    }
+    Ok(CommittedSeqRange {
+        session_id: session,
+        first_seq,
+        last_seq,
+    })
+}
+
+fn validate_worker_run_transitions(
+    transaction: &Transaction<'_>,
+    session_id: &SessionId,
+    envelopes: &[RawEnvelope],
+) -> StoreResult<()> {
+    let mut states = latest_run_states(transaction, session_id)?;
+    for envelope in envelopes {
+        let Some(run_id) = envelope.run_id.as_ref() else {
+            continue;
+        };
+        let Some((durable, _)) = states.get(run_id).cloned() else {
+            return Err(store_error(
+                ErrorCode::RunNotActive,
+                format!("worker run {run_id} has no durable accepted state"),
+                false,
+            ));
+        };
+        if durable.is_terminal() {
+            return Err(store_error(
+                ErrorCode::RunNotActive,
+                format!("worker run {run_id} is already terminal"),
+                false,
+            ));
+        }
+        let payload =
+            serde_json::from_value::<EventPayload>(envelope.payload.clone()).map_err(|error| {
+                store_error(
+                    ErrorCode::InvalidArgument,
+                    format!("worker envelope payload is invalid: {error}"),
+                    false,
+                )
+            })?;
+        if let EventPayload::RunState(next) = payload {
+            if durable == RunState::Cancelling && next != RunState::Cancelled {
+                return Err(store_error(
+                    ErrorCode::RunNotActive,
+                    format!("worker run {run_id} is durably cancelling; only Cancelled may follow"),
+                    false,
+                ));
+            }
+            states.insert(run_id.clone(), (next, 0));
+        }
+    }
+    Ok(())
 }
 
 impl Cas for Store {

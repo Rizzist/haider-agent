@@ -83,6 +83,57 @@ fn submit_atomically_commits_receipt_and_runnable_prefix() {
     assert_eq!(store.latest_seq(&session_id).expect("head"), 4);
 }
 
+#[test]
+fn legacy_session_without_typed_metadata_is_rejected_before_acceptance() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("store");
+    let session_id = SessionId::new("legacy-session");
+    let mut legacy = [EventEnvelope {
+        schema_version: SCHEMA_VERSION,
+        event_id: EventId::new("legacy-created"),
+        seq: 0,
+        session_id: session_id.clone(),
+        branch_id: None,
+        run_id: None,
+        agent_id: None,
+        device_id: DeviceId::new("legacy-cli"),
+        authority_epoch: 0,
+        worker_generation: store.worker_generation(),
+        causation_id: None,
+        correlation_id: None,
+        committed_at_ms: 0,
+        render: RenderTargets {
+            ui: true,
+            durable: true,
+            prompt: PromptRender::Omit,
+        },
+        payload: serde_json::to_value(haider_protocol::EventPayload::SessionState(
+            SessionState::Idle { interrupted: false },
+        ))
+        .expect("payload"),
+    }];
+    store.append(&mut legacy).expect("legacy session seed");
+    let command = submit(&store, "legacy-submit", &session_id, "legacy-run");
+    let error = store
+        .accept_turn(&command)
+        .expect_err("acceptance guarantees supervisor metadata");
+    assert_eq!(
+        error.code,
+        haider_protocol::error::ErrorCode::InvalidArgument
+    );
+    assert_eq!(store.latest_seq(&session_id).expect("head"), 1);
+    assert!(
+        store
+            .turn_accept_receipt(
+                "legacy-submit",
+                &command.request_digest,
+                &command.request_json,
+            )
+            .expect("receipt lookup")
+            .is_none()
+    );
+}
+
 /// MUTATION CHECK: compare only command id. Expected failure: the changed
 /// semantic body below replays the first response instead of rejecting it.
 #[test]
@@ -184,6 +235,22 @@ fn cancel_records_intent_and_reports_already_terminal() {
             envelope: Some(_),
         } if cancelled.status == TurnCancellationStatus::Accepted
     ));
+    let head_after_first = store.latest_seq(&session_id).expect("head");
+    let duplicate = store
+        .cancel_turn(&cancel("cancel-d-duplicate", "unused-duplicate"))
+        .expect("duplicate intent");
+    assert!(matches!(
+        duplicate,
+        TurnCancelOutcome::Committed {
+            ref cancelled,
+            envelope: None,
+        } if cancelled.status == TurnCancellationStatus::Accepted
+    ));
+    assert_eq!(
+        store.latest_seq(&session_id).expect("head"),
+        head_after_first,
+        "latest Cancelling is not duplicated"
+    );
 
     let mut terminal = [EventEnvelope {
         schema_version: SCHEMA_VERSION,

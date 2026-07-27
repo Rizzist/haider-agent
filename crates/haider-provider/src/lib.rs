@@ -294,6 +294,13 @@ pub enum FakeStep {
     Finish {
         reason: FinishReason,
     },
+    /// Emits one typed provider error and ends this request segment.
+    Error {
+        kind: ProviderErrorKind,
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry_after_ms: Option<u64>,
+    },
     /// Produces no more data until the consumer drops the stream.
     Hang,
 }
@@ -398,7 +405,10 @@ impl FakeProvider {
             end += 1;
             if matches!(
                 self.script[end - 1],
-                FakeStep::Finish { .. } | FakeStep::Hang | FakeStep::MalformedFrame
+                FakeStep::Finish { .. }
+                    | FakeStep::Error { .. }
+                    | FakeStep::Hang
+                    | FakeStep::MalformedFrame
             ) {
                 break;
             }
@@ -504,6 +514,18 @@ async fn play_script(script: Arc<Vec<FakeStep>>, sender: mpsc::Sender<ProviderSt
             }
             FakeStep::Finish { reason } => {
                 let _ = send_event(&sender, StreamEvent::Finish { reason }).await;
+                return;
+            }
+            FakeStep::Error {
+                kind,
+                message,
+                retry_after_ms,
+            } => {
+                let _ = sender
+                    .send(Err(
+                        ProviderError::new(kind, message).with_retry_after_ms(retry_after_ms)
+                    ))
+                    .await;
                 return;
             }
             FakeStep::Hang => {

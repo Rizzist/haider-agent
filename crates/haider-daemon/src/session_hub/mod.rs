@@ -82,8 +82,8 @@
 //! [`HubConnection::menu_answer`]. The CLI `haider attach` and the TUI's
 //! live-attach path (W3c) and the localhost WebSocket layer (W3d) add
 //! transports over this seam, not new semantics. In-process workers join
-//! through [`SessionHub::register_harness`] and must use the hub as their
-//! `StoreHandle` (see [`SessionHub::append`]).
+//! through [`HubStoreHandle::register_harness`] and retain that same
+//! constrained handle as their only `StoreHandle`.
 
 #[cfg(test)]
 #[path = "../session_hub_private_tests.rs"]
@@ -937,14 +937,13 @@ impl SessionHub {
     /// that bypassed the actor could publish around a registration.
     ///
     /// APPEND EXCLUSIVITY — structural since W3c1: every live worker holds
-    /// only a lease-fenced [`HubStoreHandle`] (`worker.rs` never names
-    /// `SqliteStoreHandle`; grep-enforced), so the W3b2
+    /// only a lease-fenced [`HubStoreHandle`] (pinned by
+    /// `worker_surface_is_structurally_lease_scoped`), so the W3b2
     /// "discipline, not shape" caveat now applies only to the paths that run
     /// while NO hub exists: startup recovery (`turn_recovery.rs`,
     /// `haider_core::recovery`), the standalone CLI, and test seeding. Those
-    /// remain discipline-held. This facade method itself is the residual
-    /// legacy/`register_harness` seam; production workers append through
-    /// their lease instead.
+    /// remain discipline-held. This facade method is actor-routed test and
+    /// non-worker publication; production workers append through their lease.
     pub async fn append(
         &self,
         envelopes: &mut [RawEnvelope],
@@ -1090,21 +1089,6 @@ impl SessionHub {
             .map_err(Into::into)
     }
 
-    /// Registers the live harness that consumes already-committed menu events.
-    ///
-    /// W3c auto-start seam: a worker spawned for a session registers here so
-    /// committed menu resolutions wake it. Harness persistence must use this
-    /// hub as its [`StoreHandle`], keeping every worker append inside the same
-    /// session-actor order as attachment registration and publication.
-    pub async fn register_harness(
-        &self,
-        session_id: SessionId,
-        harness: HarnessHandle,
-    ) -> Result<(), SessionHubError> {
-        let lease = self.acquire_worker_lease(session_id).await?;
-        self.register_leased_harness(&lease, harness).await
-    }
-
     /// Mints and installs a same-process worker lease in actor order (R1).
     ///
     /// Installation REPLACES any current lease in the same serialized actor
@@ -1127,6 +1111,42 @@ impl SessionHub {
     ) -> Result<HubStoreHandle, SessionHubError> {
         self.acquire_worker_lease_inner(session_id, Some(cancellation_wake))
             .await
+    }
+
+    /// Manager-only drain seam. External admission is already closed, but an
+    /// acceptance actor may contain a durable Queued run whose post-commit
+    /// manager hint lost the drain race. After supervisors join, the manager
+    /// may mint one final lease on that EXISTING actor solely to sweep those
+    /// runs to a terminal state.
+    pub(crate) async fn acquire_drain_worker_lease(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<HubStoreHandle>, SessionHubError> {
+        let Some(actor) = self.existing_actor(&session_id)? else {
+            return Ok(None);
+        };
+        let lease_id = WorkerLeaseId(random_id("drain-worker-lease")?);
+        let (completed, response) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::AcquireWorkerLease {
+                lease_id: lease_id.clone(),
+                cancellation_wake: None,
+                completed,
+            })
+            .await
+            .map_err(|_| SessionHubError::Closed)?;
+        response.await.map_err(|_| SessionHubError::Closed)?;
+        Ok(Some(HubStoreHandle {
+            hub: self.clone(),
+            session_id,
+            worker_generation: self.inner.store.worker_generation(),
+            lease_id,
+        }))
+    }
+
+    pub(crate) async fn session_ids(&self) -> Result<Vec<SessionId>, SessionHubError> {
+        self.inner.store.session_ids().await.map_err(Into::into)
     }
 
     async fn acquire_worker_lease_inner(
@@ -1158,77 +1178,6 @@ impl SessionHub {
     /// Installs the harness that committed menu resolutions wake, under the
     /// caller's still-current lease; a superseded lease is rejected instead
     /// of overwriting its successor's registration.
-    pub async fn register_leased_harness(
-        &self,
-        lease: &HubStoreHandle,
-        harness: HarnessHandle,
-    ) -> Result<(), SessionHubError> {
-        let actor = self.actor_for(lease.session_id.clone()).await?;
-        let (completed, response) = oneshot::channel();
-        actor
-            .commands
-            .send(ActorCommand::RegisterHarness {
-                lease_id: lease.lease_id.clone(),
-                harness,
-                completed,
-            })
-            .await
-            .map_err(|_| SessionHubError::Closed)?;
-        response
-            .await
-            .map_err(|_| SessionHubError::Closed)?
-            .map_err(Into::into)
-    }
-
-    /// Registers the one prior-generation menu coordinate that startup
-    /// reconstructed as an intact request_input checkpoint.
-    pub async fn register_recovered_harness(
-        &self,
-        lease: &HubStoreHandle,
-        harness: HarnessHandle,
-        menu_id: MenuId,
-        request_seq: u64,
-        opening_generation: u64,
-    ) -> Result<(), SessionHubError> {
-        let actor = self.actor_for(lease.session_id.clone()).await?;
-        let (completed, response) = oneshot::channel();
-        actor
-            .commands
-            .send(ActorCommand::RegisterRecoveredHarness {
-                lease_id: lease.lease_id.clone(),
-                harness,
-                menu: RecoveredMenuCoordinate {
-                    menu_id,
-                    request_seq,
-                    opening_generation,
-                },
-                completed,
-            })
-            .await
-            .map_err(|_| SessionHubError::Closed)?;
-        response
-            .await
-            .map_err(|_| SessionHubError::Closed)?
-            .map_err(Into::into)
-    }
-
-    /// Releases the worker registration if — and only if — this lease is
-    /// still the current one; a superseded token is a silent no-op so an old
-    /// supervisor's exit can never unregister its successor. Uses
-    /// `existing_actor` so a draining worker can still deregister.
-    pub async fn unregister_worker(&self, lease: &HubStoreHandle) -> Result<(), SessionHubError> {
-        let actor = self
-            .existing_actor(&lease.session_id)?
-            .ok_or(SessionHubError::Closed)?;
-        actor
-            .commands
-            .send(ActorCommand::UnregisterHarness {
-                lease_id: lease.lease_id.clone(),
-            })
-            .await
-            .map_err(|_| SessionHubError::Closed)
-    }
-
     /// Returns the already-running actor, if any — deliberately WITHOUT the
     /// draining check `actor_for` applies. This asymmetry is the hub's half
     /// of the R9 drain gate: `begin_draining` closes every actor-CREATING
@@ -1680,9 +1629,8 @@ impl SessionHub {
     }
 }
 
-/// The worker-facing store surface (see [`SessionHub::append`] for the law and
-/// its discipline caveat). Reads go straight to the store: committed history
-/// needs no actor serialization.
+/// The worker-facing store surface. Reads go straight to the store: committed
+/// history needs no actor serialization.
 #[async_trait]
 impl StoreHandle for HubStoreHandle {
     async fn append(
@@ -1758,6 +1706,75 @@ impl HubStoreHandle {
         self.worker_generation
     }
 
+    /// Installs this lease's harness. The receiver cannot name another
+    /// session or lease, so registration carries the same structural R1 seal
+    /// as reads and appends.
+    pub async fn register_harness(&self, harness: HarnessHandle) -> Result<(), SessionHubError> {
+        let actor = self.hub.actor_for(self.session_id.clone()).await?;
+        let (completed, response) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::RegisterHarness {
+                lease_id: self.lease_id.clone(),
+                harness,
+                completed,
+            })
+            .await
+            .map_err(|_| SessionHubError::Closed)?;
+        response
+            .await
+            .map_err(|_| SessionHubError::Closed)?
+            .map_err(Into::into)
+    }
+
+    /// Registers the prior-generation menu coordinate reconstructed for this
+    /// lease's session; no cross-session facade reaches the worker.
+    pub async fn register_recovered_harness(
+        &self,
+        harness: HarnessHandle,
+        menu_id: MenuId,
+        request_seq: u64,
+        opening_generation: u64,
+    ) -> Result<(), SessionHubError> {
+        let actor = self.hub.actor_for(self.session_id.clone()).await?;
+        let (completed, response) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::RegisterRecoveredHarness {
+                lease_id: self.lease_id.clone(),
+                harness,
+                menu: RecoveredMenuCoordinate {
+                    menu_id,
+                    request_seq,
+                    opening_generation,
+                },
+                completed,
+            })
+            .await
+            .map_err(|_| SessionHubError::Closed)?;
+        response
+            .await
+            .map_err(|_| SessionHubError::Closed)?
+            .map_err(Into::into)
+    }
+
+    /// Releases this lease's registration if it is still current. A
+    /// superseded token is a silent no-op, so predecessor cleanup cannot
+    /// unregister its successor.
+    pub async fn unregister_worker(&self) -> Result<(), SessionHubError> {
+        let actor = self
+            .hub
+            .existing_actor(&self.session_id)?
+            .ok_or(SessionHubError::Closed)?;
+        actor
+            .commands
+            .send(ActorCommand::UnregisterHarness {
+                lease_id: self.lease_id.clone(),
+            })
+            .await
+            .map_err(|_| SessionHubError::Closed)
+    }
+
     pub(crate) async fn put_artifact(
         &self,
         bytes: Vec<u8>,
@@ -1820,29 +1837,6 @@ impl HubStoreHandle {
                 false,
             ))
         }
-    }
-}
-
-#[async_trait]
-impl StoreHandle for SessionHub {
-    async fn append(
-        &self,
-        envelopes: &mut [RawEnvelope],
-    ) -> Result<haider_core::CommittedRange, HaiderError> {
-        SessionHub::append(self, envelopes).await
-    }
-
-    async fn read(
-        &self,
-        session_id: &SessionId,
-        since_seq: u64,
-        limit: usize,
-    ) -> Result<Vec<RawEnvelope>, HaiderError> {
-        self.inner.store.read(session_id, since_seq, limit).await
-    }
-
-    async fn latest_seq(&self, session_id: &SessionId) -> Result<u64, HaiderError> {
-        self.inner.store.latest_seq(session_id).await
     }
 }
 

@@ -247,8 +247,10 @@ impl HubConnection {
             .await
         {
             Ok(Some(accepted)) => {
-                if accepted.worker_generation == self.hub.inner.store.worker_generation() {
-                    self.hub.worker_manager()?.submit(accepted.clone()).await?;
+                if accepted.worker_generation == self.hub.inner.store.worker_generation()
+                    && let Err(error) = self.hub.worker_manager()?.submit(accepted.clone()).await
+                {
+                    return self.respond_turn_error(request_id, error);
                 }
                 return self.respond_turn_accepted(request_id, accepted);
             }
@@ -283,7 +285,9 @@ impl HubConnection {
         };
         // Durable-before-provider: the manager sees this only after the actor
         // committed and synchronously published the acceptance transaction.
-        self.hub.worker_manager()?.submit(accepted.clone()).await?;
+        if let Err(error) = self.hub.worker_manager()?.submit(accepted.clone()).await {
+            return self.respond_turn_error(request_id, error);
+        }
         self.respond_turn_accepted(request_id, accepted)
     }
 

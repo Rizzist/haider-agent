@@ -46,6 +46,9 @@ pub(super) async fn run_session_actor(
 ) {
     let mut attachments = HashMap::<AttachmentId, ActorAttachment>::new();
     let mut worker = Option::<RegisteredWorker>::None;
+    // Retained after resolution on purpose: a prior-generation retry must
+    // reach the durable CAS and receive AlreadyResolved, not be misreported
+    // as stale_generation. Lease replacement clears the coordinate.
     let mut recovered_menu = Option::<RecoveredMenuCoordinate>::None;
     // Graceful drain deliberately has NO early-stop here: every command that
     // reached the queue before `Stop` completes its arm, which is what lets
@@ -189,10 +192,16 @@ pub(super) async fn run_session_actor(
                     )));
                     continue;
                 }
-                let result = store.append(&mut envelopes).await;
+                // DURABLE TERMINAL TRUTH: lease identity is necessary but not
+                // sufficient. This worker-only store transaction validates the
+                // batch against the durable run head atomically with append.
+                // Re-routing this to ordinary `append` must make the
+                // cancel-before-Done mutation pin fail.
+                let result = store.append_worker(envelopes).await;
                 match result {
-                    Ok(range) => {
-                        head = range.last_seq;
+                    Ok(committed) => {
+                        envelopes = committed;
+                        head = envelopes.last().map_or(head, |envelope| envelope.seq);
                         if let Some(last) = envelopes.last() {
                             authority_epoch = last.authority_epoch;
                         }

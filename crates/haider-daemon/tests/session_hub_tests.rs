@@ -5,7 +5,9 @@
 
 #![allow(clippy::expect_used)]
 
-use haider_core::{HarnessActor, HarnessConfig, SqliteStoreHandle, StoreHandle, SubmitTurn};
+use haider_core::{
+    HarnessActor, HarnessConfig, SqliteStoreHandle, StoreHandle, SubmitCommittedTurn,
+};
 use haider_daemon::{
     AdmissionTicket, FrameSendError, FrameSink, HubConnection, HubObservation, SendAdmission,
     SessionHub, SessionHubConfig, SessionHubObserver, SessionHubShutdownOutcome,
@@ -14,11 +16,11 @@ use haider_protocol::EventPayload;
 use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
 };
-use haider_protocol::ids::{DeviceId, EventId, MenuId, SessionId};
+use haider_protocol::ids::{DeviceId, EventId, MenuId, RunId, SessionId};
 use haider_protocol::menu::{Menu, MenuKind, MenuOption, MenuScope};
 use haider_protocol::provider::FinishReason;
 use haider_protocol::state::RunState;
-use haider_provider::{FakeInputKind, FakeInputOption, FakeProvider, FakeStep};
+use haider_provider::{FakeInputKind, FakeInputOption, FakeProvider, FakeStep, Message};
 use haider_rpc::{
     AttachMode, AttachmentId, Capability, CapabilitySet, CommandId, ErrorData, RequestBody,
     RequestId, ResponseBody, SeqRange, WireFrame,
@@ -1266,7 +1268,69 @@ async fn committed_menu_event_wakes_registered_harness_exactly_once() {
             reason: FinishReason::EndTurn,
         },
     ]));
-    let harness_store: Arc<dyn StoreHandle> = Arc::new(hub.clone());
+    // DIRECTED R1 SEAL CHANGE: the old test intentionally coerced
+    // `SessionHub` into an unfenced, cross-session `StoreHandle`. That shape
+    // must no longer compile. Mint one session lease, give that constrained
+    // handle to the harness, and thread the SAME lease into registration.
+    let lease = hub
+        .acquire_worker_lease(session_id.clone())
+        .await
+        .expect("worker lease");
+    let run_id = RunId::new("live-harness-menu-run");
+    let mut accepted_prefix = vec![
+        EventEnvelope {
+            schema_version: SCHEMA_VERSION,
+            event_id: EventId::new("live-harness-menu-queued"),
+            seq: 0,
+            session_id: session_id.clone(),
+            branch_id: None,
+            run_id: Some(run_id.clone()),
+            agent_id: None,
+            device_id: DeviceId::new("hub-harness"),
+            authority_epoch: 0,
+            worker_generation: generation,
+            causation_id: None,
+            correlation_id: None,
+            committed_at_ms: 0,
+            render: RenderTargets {
+                ui: true,
+                durable: true,
+                prompt: PromptRender::Omit,
+            },
+            payload: serde_json::to_value(EventPayload::RunState(RunState::Queued))
+                .expect("queued payload"),
+        },
+        EventEnvelope {
+            schema_version: SCHEMA_VERSION,
+            event_id: EventId::new("live-harness-menu-user"),
+            seq: 0,
+            session_id: session_id.clone(),
+            branch_id: None,
+            run_id: Some(run_id.clone()),
+            agent_id: None,
+            device_id: DeviceId::new("hub-harness"),
+            authority_epoch: 0,
+            worker_generation: generation,
+            causation_id: None,
+            correlation_id: None,
+            committed_at_ms: 0,
+            render: RenderTargets {
+                ui: true,
+                durable: true,
+                prompt: PromptRender::Verbatim,
+            },
+            payload: serde_json::to_value(EventPayload::UserMessage {
+                text: "ask through the hub".into(),
+                attachments: Vec::new(),
+                mode: haider_protocol::DeliveryMode::Queue,
+            })
+            .expect("user payload"),
+        },
+    ];
+    hub.append(&mut accepted_prefix)
+        .await
+        .expect("daemon acceptance prefix");
+    let harness_store: Arc<dyn StoreHandle> = Arc::new(lease.clone());
     let harness = HarnessActor::spawn(
         HarnessConfig::for_session(
             session_id.clone(),
@@ -1278,11 +1342,15 @@ async fn committed_menu_event_wakes_registered_harness_exactly_once() {
         provider,
         harness_store,
     );
-    hub.register_harness(session_id.clone(), harness.clone())
+    lease
+        .register_harness(harness.clone())
         .await
         .expect("harness registers");
     let turn = harness
-        .submit_turn(SubmitTurn::new("ask through the hub"))
+        .submit_committed_turn(SubmitCommittedTurn {
+            run_id,
+            messages: vec![Message::user_text("ask through the hub")],
+        })
         .await
         .expect("turn starts");
     let mut state = harness.state_receiver();
@@ -1376,6 +1444,29 @@ async fn committed_menu_event_wakes_registered_harness_exactly_once() {
     drop(harness);
     hub.shutdown().await.expect("hub stops");
     store.close().await.expect("store closes");
+}
+
+/// Scenario-13 structural guard for the R1 seal. This deliberately scans
+/// production source because Rust has no negative trait-bound assertion: the
+/// forbidden coercion must remain absent, while the session-scoped handle is
+/// threaded into core and registration.
+#[test]
+fn worker_surface_is_structurally_lease_scoped() {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let worker = std::fs::read_to_string(manifest.join("src/worker.rs")).expect("worker source");
+    let hub = std::fs::read_to_string(manifest.join("src/session_hub/mod.rs")).expect("hub source");
+    assert!(!worker.contains("SqliteStoreHandle"));
+    assert!(!worker.contains("Arc::new(hub.clone())"));
+    assert!(!hub.contains("impl StoreHandle for SessionHub"));
+    assert!(!worker.contains("supervisor_hub"));
+    let supervisor = worker
+        .split("async fn run_supervisor(")
+        .nth(1)
+        .and_then(|source| source.split("async fn admit_pending(").next())
+        .expect("supervisor source");
+    assert!(!supervisor.contains("SessionHub"));
+    assert!(worker.contains("Arc::new(lease.clone())"));
+    assert!(worker.contains(".register_harness(harness.clone())"));
 }
 
 /// MUTATION CHECK: make the socket response authoritative or omit the
@@ -1781,15 +1872,10 @@ async fn recovered_menu_coordinate_authorizes_losers_after_the_winner_commits() 
         Arc::new(FakeProvider::new(Vec::new())),
         Arc::new(lease.clone()),
     );
-    hub.register_recovered_harness(
-        &lease,
-        harness,
-        menu_id.clone(),
-        opening[0].seq,
-        opening_generation,
-    )
-    .await
-    .expect("recovered harness registers");
+    lease
+        .register_recovered_harness(harness, menu_id.clone(), opening[0].seq, opening_generation)
+        .await
+        .expect("recovered harness registers");
 
     let sink = Arc::new(CollectSink::default());
     let connection = hub

@@ -2,14 +2,17 @@
 
 #![allow(clippy::expect_used)]
 
-use haider_protocol::EventPayload;
 use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
 };
 use haider_protocol::error::ErrorCode;
-use haider_protocol::ids::{DeviceId, EventId, MenuId, SessionId};
+use haider_protocol::ids::{DeviceId, EventId, MenuId, RunId, SessionId};
 use haider_protocol::menu::{AnswerVia, Menu, MenuAnswer, MenuKind, MenuOption, MenuScope};
-use haider_store::{EventStore, MenuResolutionCommand, MenuResolutionOutcome, Store};
+use haider_protocol::{DeliveryMode, EventPayload};
+use haider_store::{
+    EventStore, MenuResolutionCommand, MenuResolutionOutcome, SessionCreateCommand, Store,
+    TurnAcceptCommand,
+};
 use std::sync::{Arc, Barrier};
 
 fn envelope(
@@ -104,6 +107,43 @@ fn command(
         },
         device_id: DeviceId::new("menu-controller"),
         input_is_secret_reference: false,
+    }
+}
+
+fn create_typed_session(store: &Store, session_id: &SessionId) {
+    store
+        .create_session(&SessionCreateCommand {
+            command_id: format!("create-{session_id}"),
+            request_digest: "create-digest".into(),
+            request_json: r#"{"cwd":"/tmp","max_tokens":4096,"model":"fake-v1","provider":"fake"}"#
+                .into(),
+            session_id: session_id.clone(),
+            cwd: "/tmp".into(),
+            provider: "fake".into(),
+            model: "fake-v1".into(),
+            max_tokens: 4096,
+            system_prompt_version: "test-system-v1".into(),
+            event_id: EventId::new(format!("created-{session_id}")),
+            device_id: DeviceId::new("test-daemon"),
+        })
+        .expect("create session");
+}
+
+fn turn_command(store: &Store, session_id: &SessionId, command_id: &str) -> TurnAcceptCommand {
+    TurnAcceptCommand {
+        command_id: command_id.into(),
+        request_digest: "turn-digest".into(),
+        request_json: r#"{"text":"global namespace"}"#.into(),
+        session_id: session_id.clone(),
+        worker_generation: store.worker_generation(),
+        run_id: RunId::new(format!("run-{command_id}")),
+        text: "global namespace".into(),
+        attachments: Vec::new(),
+        mode: DeliveryMode::Queue,
+        queued_event_id: EventId::new(format!("queued-{command_id}")),
+        user_event_id: EventId::new(format!("user-{command_id}")),
+        active_event_id: EventId::new(format!("active-{command_id}")),
+        device_id: DeviceId::new("test-daemon"),
     }
 }
 
@@ -270,6 +310,53 @@ fn lost_response_retry_after_reopen_is_idempotent_and_never_reappends() {
         2,
         "restart/retry must not append or resend the protected resolution"
     );
+}
+
+#[test]
+fn menu_answers_and_rpc_commands_share_one_global_command_id_namespace() {
+    let root = tempfile::tempdir().expect("temp store");
+    let store = Store::open(root.path()).expect("open store");
+    let session_id = SessionId::new("menu-first-global-command");
+    create_typed_session(&store, &session_id);
+    let menu_id = MenuId::new("menu-first");
+    let request_seq = seed_menu(&store, &session_id, &menu_id);
+    store
+        .resolve_menu(&command(
+            &store,
+            &session_id,
+            &menu_id,
+            request_seq,
+            "global-command",
+            0,
+            "allow",
+        ))
+        .expect("menu answer commits");
+    let error = store
+        .accept_turn(&turn_command(&store, &session_id, "global-command"))
+        .expect_err("turn cannot reuse menu command id");
+    assert_eq!(error.code, ErrorCode::InvalidArgument);
+
+    let root = tempfile::tempdir().expect("second temp store");
+    let store = Store::open(root.path()).expect("second store");
+    let session_id = SessionId::new("turn-first-global-command");
+    create_typed_session(&store, &session_id);
+    store
+        .accept_turn(&turn_command(&store, &session_id, "global-command"))
+        .expect("turn commits");
+    let menu_id = MenuId::new("turn-first");
+    let request_seq = seed_menu(&store, &session_id, &menu_id);
+    let error = store
+        .resolve_menu(&command(
+            &store,
+            &session_id,
+            &menu_id,
+            request_seq,
+            "global-command",
+            0,
+            "allow",
+        ))
+        .expect_err("menu cannot reuse turn command id");
+    assert_eq!(error.code, ErrorCode::InvalidArgument);
 }
 
 /// MUTATION CHECK: delete the post-opening journal scan. Expected failure: a

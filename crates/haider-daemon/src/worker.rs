@@ -7,9 +7,9 @@
 //! settlement), the turn-scoped [`ProviderFactory`]/[`TurnToolFactory`]
 //! ports, and the production broker-backed tool dispatcher with its
 //! hub-owned journal/CAS adapters. What may NOT live here: SQLite (a worker
-//! holds only its lease-fenced `HubStoreHandle`; this module never names
-//! `SqliteStoreHandle` — grep-enforced, the module-side half of the R1
-//! append-exclusivity seal), wire/RPC concerns
+//! holds only its lease-fenced `HubStoreHandle`; a source-scan regression
+//! test enforces the module-side half of the R1 append-exclusivity seal),
+//! wire/RPC concerns
 //! (rpc.rs hands this module a COMMITTED [`AcceptedTurn`], never a raw
 //! request), and session-hub actor work (the hub actor must stay free of
 //! provider/tool awaits; everything slow happens in supervisor tasks).
@@ -23,6 +23,7 @@
 //! buffer.
 
 use crate::session_hub::{HubStoreHandle, SessionHub, SessionHubError};
+use crate::turn_recovery::{cancelled_resumption_payloads, failed_resumption_payloads};
 use async_trait::async_trait;
 use base64::Engine;
 use haider_core::{
@@ -31,10 +32,10 @@ use haider_core::{
     SubmitCommittedTurn, ToolDispatcher, TurnHandle, sanitized_failure_message,
 };
 use haider_protocol::EventPayload;
-use haider_protocol::effect::EffectClass;
+use haider_protocol::effect::{EffectClass, EffectOutcome, EffectPhase};
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
 use haider_protocol::error::{ErrorCode, HaiderError};
-use haider_protocol::ids::{DeviceId, EventId, RunId, SessionId};
+use haider_protocol::ids::{DeviceId, EffectId, EventId, RunId, SessionId};
 use haider_protocol::session::SessionMetadataV1;
 use haider_protocol::state::{RunState, SessionState};
 use haider_protocol::tool::BoundedResult;
@@ -44,7 +45,7 @@ use haider_tools::{
     CasSink, EffectBroker, FsList, FsRead, FsSearch, JournalSink, PermissionPolicy, ResultBounds,
     ToolResult,
 };
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -172,6 +173,7 @@ impl SystemPromptBuilder {
 #[derive(Clone)]
 pub(crate) struct WorkerManagerHandle {
     commands: mpsc::Sender<ManagerCommand>,
+    admission: Arc<std::sync::Mutex<bool>>,
 }
 
 /// Owner of every supervisor task (R1): one lazy supervisor per session,
@@ -188,11 +190,11 @@ enum ManagerCommand {
         accepted: AcceptedTurn,
         completed: oneshot::Sender<Result<(), HaiderError>>,
     },
-    RecoverCheckpoint {
+    Recover {
         pending: Box<PendingTurn>,
     },
     Shutdown {
-        completed: oneshot::Sender<()>,
+        completed: oneshot::Sender<Result<(), HaiderError>>,
     },
 }
 
@@ -206,6 +208,21 @@ struct PendingTurn {
     checkpoint: Option<RequestInputCheckpoint>,
     committed_answer: Option<haider_protocol::envelope::RawEnvelope>,
     recovery_ready: Option<oneshot::Sender<Result<(), HaiderError>>>,
+    /// Recovery semantics outlive the pre-Ready acknowledgement. In
+    /// particular, a queued recovery may be acknowledged behind a parked
+    /// checkpoint but must still use recovery-shaped closure if its eventual
+    /// provider/credential resolution fails.
+    recovering: bool,
+}
+
+struct SupervisorSlot {
+    sender: mpsc::Sender<SupervisorCommand>,
+    task_id: tokio::task::Id,
+}
+
+struct SupervisorExit {
+    session_id: SessionId,
+    terminalize_nonterminal: bool,
 }
 
 impl PendingTurn {
@@ -215,6 +232,7 @@ impl PendingTurn {
             checkpoint: None,
             committed_answer: None,
             recovery_ready: None,
+            recovering: false,
         }
     }
 }
@@ -222,7 +240,10 @@ impl PendingTurn {
 impl WorkerManager {
     pub(crate) fn start(hub: SessionHub, dependencies: DaemonDependencies) -> Self {
         let (commands, receiver) = mpsc::channel(MANAGER_CAPACITY);
-        let handle = WorkerManagerHandle { commands };
+        let handle = WorkerManagerHandle {
+            commands,
+            admission: Arc::new(std::sync::Mutex::new(true)),
+        };
         let task = tokio::spawn(run_manager(hub, dependencies, receiver));
         Self {
             handle,
@@ -234,24 +255,36 @@ impl WorkerManager {
         self.handle.clone()
     }
 
-    pub(crate) async fn shutdown(mut self) {
+    pub(crate) async fn shutdown(mut self) -> Result<(), HaiderError> {
+        self.handle.begin_draining();
         let (completed, response) = oneshot::channel();
-        let _ = self
-            .handle
+        self.handle
             .commands
             .send(ManagerCommand::Shutdown { completed })
-            .await;
-        let _ = response.await;
+            .await
+            .map_err(|_| manager_stopped())?;
+        let result = response.await.map_err(|_| manager_stopped())?;
         if let Some(task) = self.task.take() {
-            let _ = task.await;
+            task.await.map_err(|error| {
+                HaiderError::new(
+                    ErrorCode::Internal,
+                    format!("worker manager shutdown failed: {error}"),
+                    true,
+                )
+            })?;
         }
+        result
     }
 
     /// Abrupt owner teardown for the in-process process-death seam.
     ///
     /// Unlike `shutdown`, this sends no cancellation command and appends no
     /// terminal event. Startup recovery must decide what the durable prefix
-    /// means.
+    /// means. This is intentionally distinct from a child-supervisor panic:
+    /// the live manager observes those through its JoinSet, terminalizes the
+    /// run, evicts the slot, and retains/increments the session incarnation
+    /// before recreation. Eviction and incarnation are inseparable because a
+    /// same-generation EventIdGenerator namespace must never be reused.
     pub(crate) async fn crash(mut self) {
         if let Some(task) = self.task.take() {
             task.abort();
@@ -269,16 +302,35 @@ impl Drop for WorkerManager {
 }
 
 impl WorkerManagerHandle {
+    pub(crate) fn begin_draining(&self) {
+        if let Ok(mut open) = self.admission.lock() {
+            *open = false;
+        }
+    }
+
     pub(crate) async fn submit(&self, accepted: AcceptedTurn) -> Result<(), HaiderError> {
         let (completed, response) = oneshot::channel();
-        self.commands
-            .send(ManagerCommand::Submit {
-                accepted,
-                completed,
-            })
-            .await
-            .map_err(|_| manager_stopped())?;
+        {
+            let open = self.admission.lock().map_err(|_| manager_stopped())?;
+            if !*open {
+                return Err(manager_busy("worker admission is draining"));
+            }
+            self.commands
+                .try_send(ManagerCommand::Submit {
+                    accepted,
+                    completed,
+                })
+                .map_err(manager_try_send)?;
+        }
         response.await.map_err(|_| manager_stopped())?
+    }
+
+    fn send_recovery(&self, pending: PendingTurn) -> Result<(), HaiderError> {
+        self.commands
+            .try_send(ManagerCommand::Recover {
+                pending: Box::new(pending),
+            })
+            .map_err(manager_try_send)
     }
 
     pub(crate) async fn recover_checkpoint(
@@ -288,17 +340,25 @@ impl WorkerManagerHandle {
         committed_answer: Option<haider_protocol::envelope::RawEnvelope>,
     ) -> Result<(), HaiderError> {
         let (completed, response) = oneshot::channel();
-        self.commands
-            .send(ManagerCommand::RecoverCheckpoint {
-                pending: Box::new(PendingTurn {
-                    accepted,
-                    checkpoint: Some(checkpoint),
-                    committed_answer,
-                    recovery_ready: Some(completed),
-                }),
-            })
-            .await
-            .map_err(|_| manager_stopped())?;
+        self.send_recovery(PendingTurn {
+            accepted,
+            checkpoint: Some(checkpoint),
+            committed_answer,
+            recovery_ready: Some(completed),
+            recovering: true,
+        })?;
+        response.await.map_err(|_| manager_stopped())?
+    }
+
+    pub(crate) async fn recover_queued(&self, accepted: AcceptedTurn) -> Result<(), HaiderError> {
+        let (completed, response) = oneshot::channel();
+        self.send_recovery(PendingTurn {
+            accepted,
+            checkpoint: None,
+            committed_answer: None,
+            recovery_ready: Some(completed),
+            recovering: true,
+        })?;
         response.await.map_err(|_| manager_stopped())?
     }
 }
@@ -308,9 +368,30 @@ async fn run_manager(
     dependencies: DaemonDependencies,
     mut commands: mpsc::Receiver<ManagerCommand>,
 ) {
-    let mut supervisors = HashMap::<SessionId, mpsc::Sender<SupervisorCommand>>::new();
-    let mut tasks = JoinSet::new();
-    while let Some(command) = commands.recv().await {
+    let mut supervisors = HashMap::<SessionId, SupervisorSlot>::new();
+    let mut incarnations = HashMap::<SessionId, u64>::new();
+    let mut task_sessions = HashMap::<tokio::task::Id, SessionId>::new();
+    let mut tasks = JoinSet::<SupervisorExit>::new();
+    loop {
+        let command = tokio::select! {
+            biased;
+            outcome = tasks.join_next_with_id(), if !tasks.is_empty() => {
+                if let Some(outcome) = outcome {
+                    handle_supervisor_exit(
+                        &hub,
+                        &mut supervisors,
+                        &mut task_sessions,
+                        &mut incarnations,
+                        outcome,
+                    ).await;
+                }
+                continue;
+            }
+            command = commands.recv() => command,
+        };
+        let Some(command) = command else {
+            break;
+        };
         match command {
             ManagerCommand::Submit {
                 accepted,
@@ -321,76 +402,291 @@ async fn run_manager(
                     &dependencies,
                     &mut supervisors,
                     &mut tasks,
+                    &mut task_sessions,
+                    &mut incarnations,
                     accepted.session_id.clone(),
                 )
                 .await
                 {
                     Ok(supervisor) => supervisor
-                        .send(SupervisorCommand::Submit(Box::new(PendingTurn::accepted(
+                        .try_send(SupervisorCommand::Submit(Box::new(PendingTurn::accepted(
                             accepted,
                         ))))
-                        .await
-                        .map_err(|_| manager_stopped()),
+                        .map_err(supervisor_try_send),
                     Err(error) => Err(error),
                 };
                 let _ = completed.send(result);
             }
-            ManagerCommand::RecoverCheckpoint { mut pending } => {
+            ManagerCommand::Recover { mut pending } => {
                 let session_id = pending.accepted.session_id.clone();
                 match supervisor_for(
                     &hub,
                     &dependencies,
                     &mut supervisors,
                     &mut tasks,
+                    &mut task_sessions,
+                    &mut incarnations,
                     session_id,
                 )
                 .await
                 {
                     Ok(supervisor) => {
-                        if let Err(error) =
-                            supervisor.send(SupervisorCommand::Submit(pending)).await
+                        if let Err(error) = supervisor.try_send(SupervisorCommand::Submit(pending))
                         {
-                            let SupervisorCommand::Submit(mut pending) = error.0 else {
-                                unreachable!();
+                            let (mut pending, error) = match error {
+                                mpsc::error::TrySendError::Full(SupervisorCommand::Submit(
+                                    pending,
+                                )) => (pending, manager_busy("recovered work queue is full")),
+                                mpsc::error::TrySendError::Closed(SupervisorCommand::Submit(
+                                    pending,
+                                )) => (pending, manager_stopped()),
+                                _ => unreachable!(),
                             };
                             if let Some(ready) = pending.recovery_ready.take() {
-                                let _ = ready.send(Err(manager_stopped()));
+                                let result =
+                                    terminalize_recovery_feed_failure(&hub, *pending, error).await;
+                                let _ = ready.send(result);
                             }
                         }
                     }
                     Err(error) => {
                         if let Some(ready) = pending.recovery_ready.take() {
-                            let _ = ready.send(Err(error));
+                            let result =
+                                terminalize_recovery_feed_failure(&hub, *pending, error).await;
+                            let _ = ready.send(result);
                         }
                     }
                 }
             }
             ManagerCommand::Shutdown { completed } => {
                 for supervisor in supervisors.values() {
-                    let _ = supervisor.send(SupervisorCommand::Shutdown).await;
+                    let _ = supervisor.sender.send(SupervisorCommand::Shutdown).await;
                 }
-                while tasks.join_next().await.is_some() {}
-                let _ = completed.send(());
+                while let Some(outcome) = tasks.join_next_with_id().await {
+                    handle_supervisor_exit(
+                        &hub,
+                        &mut supervisors,
+                        &mut task_sessions,
+                        &mut incarnations,
+                        outcome,
+                    )
+                    .await;
+                }
+                let result = drain_accepted_without_handoff(&hub).await;
+                let _ = completed.send(result);
                 return;
             }
         }
-        while tasks.try_join_next().is_some() {}
     }
     for supervisor in supervisors.values() {
-        let _ = supervisor.send(SupervisorCommand::Shutdown).await;
+        let _ = supervisor.sender.send(SupervisorCommand::Shutdown).await;
     }
     while tasks.join_next().await.is_some() {}
+}
+
+async fn terminalize_recovery_feed_failure(
+    hub: &SessionHub,
+    pending: PendingTurn,
+    error: HaiderError,
+) -> Result<(), HaiderError> {
+    let run_id = pending.accepted.run_id;
+    let session_id = pending.accepted.session_id;
+    let lease = hub
+        .acquire_worker_lease(session_id.clone())
+        .await
+        .map_err(hub_error)?;
+    let device_id = DeviceId::new(format!(
+        "recovery-feed-worker-{}-{}-{}",
+        session_id,
+        lease.worker_generation(),
+        run_id,
+    ));
+    let event_ids = EventIdGenerator::new(format!(
+        "recovery-feed-event-{}-{}-{}",
+        session_id,
+        lease.worker_generation(),
+        run_id,
+    ));
+    let payloads = failed_resumption_payloads(&lease, &session_id, &run_id, &error).await?;
+    append_payloads(&lease, &device_id, &run_id, &event_ids, payloads).await?;
+    let _ = lease.unregister_worker().await;
+    tracing::warn!(
+        %session_id,
+        %run_id,
+        ?error,
+        "recovered work could not enter a supervisor and was terminalized"
+    );
+    Ok(())
+}
+
+async fn drain_accepted_without_handoff(hub: &SessionHub) -> Result<(), HaiderError> {
+    let session_ids = hub.session_ids().await.map_err(hub_error)?;
+    for session_id in session_ids {
+        let lease = match hub
+            .acquire_drain_worker_lease(session_id.clone())
+            .await
+            .map_err(hub_error)?
+        {
+            Some(lease) => lease,
+            None => continue,
+        };
+        let device_id = DeviceId::new(format!(
+            "drain-worker-{}-{}",
+            session_id,
+            lease.worker_generation()
+        ));
+        let event_ids = EventIdGenerator::new(format!(
+            "drain-event-{}-{}",
+            session_id,
+            lease.worker_generation()
+        ));
+        let mut terminalized = false;
+        for (run_id, state, _) in durable_runs(&lease).await? {
+            if state.is_terminal() {
+                continue;
+            }
+            if state != RunState::Cancelling {
+                append_run_state(
+                    &lease,
+                    &device_id,
+                    &run_id,
+                    &event_ids,
+                    RunState::Cancelling,
+                )
+                .await?;
+            }
+            reconcile_unknown_effects(&lease, &device_id, &run_id, &event_ids).await?;
+            let mut payloads = cancelled_resumption_payloads(&lease, &session_id, &run_id).await?;
+            payloads.retain(|payload| !matches!(payload, EventPayload::SessionState(_)));
+            append_payloads(&lease, &device_id, &run_id, &event_ids, payloads).await?;
+            terminalized = true;
+        }
+        if terminalized {
+            append_session_idle(&lease, &device_id, &event_ids, true).await?;
+        }
+        lease.unregister_worker().await.map_err(hub_error)?;
+    }
+    Ok(())
+}
+
+async fn handle_supervisor_exit(
+    hub: &SessionHub,
+    supervisors: &mut HashMap<SessionId, SupervisorSlot>,
+    task_sessions: &mut HashMap<tokio::task::Id, SessionId>,
+    incarnations: &mut HashMap<SessionId, u64>,
+    outcome: Result<(tokio::task::Id, SupervisorExit), tokio::task::JoinError>,
+) {
+    let (task_id, session_id, panicked, terminalize_nonterminal) = match outcome {
+        Ok((task_id, exit)) => (
+            task_id,
+            exit.session_id,
+            false,
+            exit.terminalize_nonterminal,
+        ),
+        Err(error) => {
+            let task_id = error.id();
+            let Some(session_id) = task_sessions.get(&task_id).cloned() else {
+                tracing::error!(?error, "unknown supervisor task failed");
+                return;
+            };
+            (task_id, session_id, error.is_panic(), true)
+        }
+    };
+    task_sessions.remove(&task_id);
+    if supervisors
+        .get(&session_id)
+        .is_some_and(|slot| slot.task_id == task_id)
+    {
+        supervisors.remove(&session_id);
+    }
+    // EVICTION + INCARNATION are one law: eviction makes later submissions
+    // usable again, while the next `supervisor_for` increments the retained
+    // incarnation before constructing its EventIdGenerator. Never evict
+    // without retaining this counter or a recreated supervisor could collide
+    // with event IDs minted by its predecessor in the same store generation.
+    let incarnation = *incarnations.entry(session_id.clone()).or_insert(1);
+    if terminalize_nonterminal
+        && let Err(error) = terminalize_supervisor_exit(hub, &session_id, incarnation).await
+    {
+        tracing::error!(
+            %session_id,
+            ?error,
+            panicked,
+            "exited supervisor work could not be terminalized"
+        );
+    }
+}
+
+pub(crate) async fn terminalize_supervisor_exit(
+    hub: &SessionHub,
+    session_id: &SessionId,
+    incarnation: u64,
+) -> Result<(), HaiderError> {
+    let lease = hub
+        .acquire_worker_lease(session_id.clone())
+        .await
+        .map_err(hub_error)?;
+    let device_id = DeviceId::new(format!(
+        "panic-worker-{}-{}-{}",
+        session_id,
+        lease.worker_generation(),
+        incarnation,
+    ));
+    let event_ids = EventIdGenerator::new(format!(
+        "panic-event-{}-{}-{}",
+        session_id,
+        lease.worker_generation(),
+        incarnation,
+    ));
+    let runs = durable_runs(&lease)
+        .await?
+        .into_iter()
+        .filter(|(_, state, _)| !state.is_terminal())
+        .collect::<Vec<_>>();
+    for (run_id, state, _) in &runs {
+        // Panic can strand a dispatched effect regardless of the run state.
+        // Reconcile before either cancellation-shaped or failure-shaped
+        // terminalization; a reconciliation error fences every terminal.
+        reconcile_unknown_effects(&lease, &device_id, run_id, &event_ids).await?;
+        if *state == RunState::Cancelling {
+            let mut payloads = cancelled_resumption_payloads(&lease, session_id, run_id).await?;
+            payloads.retain(|payload| !matches!(payload, EventPayload::SessionState(_)));
+            append_payloads(&lease, &device_id, run_id, &event_ids, payloads).await?;
+            continue;
+        }
+        let error = HaiderError::new(
+            ErrorCode::Internal,
+            "session supervisor exited before the run completed",
+            true,
+        );
+        let mut payloads = failed_resumption_payloads(&lease, session_id, run_id, &error).await?;
+        payloads.retain(|payload| !matches!(payload, EventPayload::SessionState(_)));
+        append_payloads(&lease, &device_id, run_id, &event_ids, payloads).await?;
+    }
+    if !runs.is_empty() {
+        append_session_idle(&lease, &device_id, &event_ids, true).await?;
+    }
+    let _ = lease.unregister_worker().await;
+    Ok(())
 }
 
 async fn supervisor_for(
     hub: &SessionHub,
     dependencies: &DaemonDependencies,
-    supervisors: &mut HashMap<SessionId, mpsc::Sender<SupervisorCommand>>,
-    tasks: &mut JoinSet<()>,
+    supervisors: &mut HashMap<SessionId, SupervisorSlot>,
+    tasks: &mut JoinSet<SupervisorExit>,
+    task_sessions: &mut HashMap<tokio::task::Id, SessionId>,
+    incarnations: &mut HashMap<SessionId, u64>,
     session_id: SessionId,
 ) -> Result<mpsc::Sender<SupervisorCommand>, HaiderError> {
     if let Some(supervisor) = supervisors.get(&session_id) {
-        return Ok(supervisor.clone());
+        return if supervisor.sender.is_closed() {
+            Err(manager_busy(
+                "session supervisor is being evicted after exit",
+            ))
+        } else {
+            Ok(supervisor.sender.clone())
+        };
     }
     let metadata = hub.session_metadata(&session_id).await?.ok_or_else(|| {
         HaiderError::new(
@@ -405,15 +701,36 @@ async fn supervisor_for(
         .await
         .map_err(hub_error)?;
     let (sender, receiver) = mpsc::channel(SUPERVISOR_CAPACITY);
-    tasks.spawn(run_supervisor(
-        hub.clone(),
-        dependencies.clone(),
-        metadata,
-        lease,
-        receiver,
-        cancellation_wakes,
-    ));
-    supervisors.insert(session_id, sender.clone());
+    let incarnation = *incarnations
+        .entry(session_id.clone())
+        .and_modify(|incarnation| *incarnation = incarnation.saturating_add(1))
+        .or_insert(1);
+    let task_session_id = session_id.clone();
+    let supervisor_dependencies = dependencies.clone();
+    let task = tasks.spawn(async move {
+        let terminalize_nonterminal = run_supervisor(
+            supervisor_dependencies,
+            metadata,
+            lease,
+            receiver,
+            cancellation_wakes,
+            incarnation,
+        )
+        .await;
+        SupervisorExit {
+            session_id: task_session_id,
+            terminalize_nonterminal,
+        }
+    });
+    let task_id = task.id();
+    task_sessions.insert(task_id, session_id.clone());
+    supervisors.insert(
+        session_id,
+        SupervisorSlot {
+            sender: sender.clone(),
+            task_id,
+        },
+    );
     Ok(sender)
 }
 
@@ -453,24 +770,26 @@ impl<T> FutureTurn for T where
 /// exits only after the last turn settles; the supervisor deregisters its
 /// lease on the way out.
 async fn run_supervisor(
-    hub: SessionHub,
     dependencies: DaemonDependencies,
     metadata: SessionMetadataV1,
     lease: HubStoreHandle,
     mut commands: mpsc::Receiver<SupervisorCommand>,
     mut cancellation_wakes: tokio::sync::watch::Receiver<u64>,
-) {
+    incarnation: u64,
+) -> bool {
     let mut queue = VecDeque::<PendingTurn>::new();
     let mut active: Option<ActiveTurn> = None;
     let device_id = DeviceId::new(format!(
-        "worker-{}-{}",
+        "worker-{}-{}-{}",
         lease.session_id(),
-        lease.worker_generation()
+        lease.worker_generation(),
+        incarnation,
     ));
     let event_ids = Arc::new(EventIdGenerator::new(format!(
-        "worker-event-{}-{}",
+        "worker-event-{}-{}-{}",
         lease.session_id(),
-        lease.worker_generation()
+        lease.worker_generation(),
+        incarnation,
     )));
     let mut stopping = false;
     let mut rescan_needed = false;
@@ -484,8 +803,8 @@ async fn run_supervisor(
                 let mut pending = pending;
                 let run_id = pending.accepted.run_id.clone();
                 let recovery_ready = pending.recovery_ready.take();
+                let recovering = pending.recovering;
                 match start_turn(
-                    &hub,
                     &dependencies,
                     &metadata,
                     &lease,
@@ -503,12 +822,60 @@ async fn run_supervisor(
                         break;
                     }
                     Err(error) => {
-                        if let Some(ready) = recovery_ready {
-                            let _ = ready.send(Err(error.clone()));
+                        if matches!(
+                            durable_run_state(&lease, &run_id).await,
+                            Some(RunState::Cancelling | RunState::Cancelled)
+                        ) {
+                            let terminalized = match cancelled_resumption_payloads(
+                                &lease,
+                                lease.session_id(),
+                                &run_id,
+                            )
+                            .await
+                            {
+                                Ok(payloads) => {
+                                    append_payloads(
+                                        &lease, &device_id, &run_id, &event_ids, payloads,
+                                    )
+                                    .await
+                                }
+                                Err(error) => Err(error),
+                            };
+                            if let Some(ready) = recovery_ready {
+                                let _ = ready.send(terminalized);
+                            }
+                        } else if recovering {
+                            let terminalized = match failed_resumption_payloads(
+                                &lease,
+                                lease.session_id(),
+                                &run_id,
+                                &error,
+                            )
+                            .await
+                            {
+                                Ok(payloads) => {
+                                    append_payloads(
+                                        &lease, &device_id, &run_id, &event_ids, payloads,
+                                    )
+                                    .await
+                                }
+                                Err(terminalize_error) => Err(terminalize_error),
+                            };
+                            tracing::warn!(
+                                session_id = %lease.session_id(),
+                                %run_id,
+                                ?error,
+                                "recovered work could not resume and was terminalized"
+                            );
+                            if let Some(ready) = recovery_ready {
+                                let _ = ready.send(terminalized);
+                            }
+                        } else {
+                            let _ = append_failure(&lease, &device_id, &run_id, &event_ids, error)
+                                .await;
+                            let _ =
+                                append_session_idle(&lease, &device_id, &event_ids, false).await;
                         }
-                        let _ =
-                            append_failure(&lease, &device_id, &run_id, &event_ids, error).await;
-                        let _ = append_session_idle(&lease, &device_id, &event_ids, false).await;
                     }
                 }
             }
@@ -560,19 +927,150 @@ async fn run_supervisor(
                         ).await;
                     }
                 }
-                _outcome = turn.outcome.as_mut() => {
+                outcome = turn.outcome.as_mut() => {
                     if let Some(mut finished) = active.take() {
+                        let (outcome_state, drive_error) = match outcome {
+                            Ok(outcome) => (Some(outcome.state), None),
+                            Err(error) => (None, Some(error)),
+                        };
                         if let Some(dispatcher) = finished.dispatcher.take()
                             && let Err(error) = dispatcher.close().await
                         {
                             tracing::warn!(run_id = %finished.run_id, ?error, "turn tool dispatcher close failed");
                         }
                         let _ = finished.harness.stop().await;
-                        if let Some(actor) = finished.actor.take() {
-                            let _ = actor.await;
+                        let actor_panicked = if let Some(actor) = finished.actor.take() {
+                            actor.await.is_err()
+                        } else {
+                            false
+                        };
+                        if drive_error.is_some() || actor_panicked {
+                            let error = drive_error.unwrap_or_else(|| {
+                                HaiderError::new(
+                                    ErrorCode::Internal,
+                                    "turn harness actor panicked",
+                                    true,
+                                )
+                            });
+                            if let Err(reconcile_error) = reconcile_unknown_effects(
+                                &lease,
+                                &device_id,
+                                &finished.run_id,
+                                &event_ids,
+                            )
+                            .await
+                            {
+                                tracing::error!(
+                                    run_id = %finished.run_id,
+                                    ?reconcile_error,
+                                    "failed turn effect reconciliation blocked terminal commit"
+                                );
+                                let _ = lease.unregister_worker().await;
+                                return false;
+                            }
+                            match failed_resumption_payloads(
+                                &lease,
+                                lease.session_id(),
+                                &finished.run_id,
+                                &error,
+                            )
+                            .await
+                            {
+                                Ok(payloads) => {
+                                    let _ = append_payloads(
+                                        &lease,
+                                        &device_id,
+                                        &finished.run_id,
+                                        &event_ids,
+                                        payloads,
+                                    )
+                                    .await;
+                                }
+                                Err(terminalize_error) => {
+                                    tracing::error!(
+                                        run_id = %finished.run_id,
+                                        ?terminalize_error,
+                                        "failed turn could not be terminalized"
+                                    );
+                                }
+                            }
+                            // Returning is intentional: the manager observes
+                            // this JoinSet exit, evicts the slot, and retains
+                            // the incarnation counter before a later submit.
+                            let _ = lease.unregister_worker().await;
+                            return true;
                         }
-                        let _ = append_session_idle(&lease, &device_id, &event_ids, stopping)
-                            .await;
+                        // TERMINAL ORDER: core cancellation is deliberately
+                        // non-terminal in daemon mode. Broker close above first
+                        // reconciles every held dispatch to Unknown; only then
+                        // may Cancelled become the durable final envelope.
+                        if let Err(error) = reconcile_unknown_effects(
+                            &lease,
+                            &device_id,
+                            &finished.run_id,
+                            &event_ids,
+                        )
+                        .await
+                        {
+                            // Never cross the terminal boundary while a
+                            // Dispatched effect still lacks an outcome. A
+                            // later startup/fresh supervisor may reconcile
+                            // it, but this exit must not synthesize Cancelled.
+                            tracing::error!(
+                                run_id = %finished.run_id,
+                                ?error,
+                                "effect reconciliation failed; terminal commit remains fenced"
+                            );
+                            let _ = lease.unregister_worker().await;
+                            return false;
+                        }
+                        let durable = durable_run_state(&lease, &finished.run_id).await;
+                        let cancelled =
+                            idle_interrupted_after_outcome(outcome_state.as_ref(), durable.as_ref());
+                        if cancelled {
+                            // Reduce durable lifecycle truth again after the
+                            // harness stops. If core cancellation itself
+                            // failed while closing an item/menu, finish those
+                            // objects before the terminal boundary.
+                            match cancelled_resumption_payloads(
+                                &lease,
+                                lease.session_id(),
+                                &finished.run_id,
+                            )
+                            .await
+                            {
+                                Ok(mut payloads) => {
+                                    payloads.retain(|payload| {
+                                        !matches!(payload, EventPayload::SessionState(_))
+                                    });
+                                    let _ = append_payloads(
+                                        &lease,
+                                        &device_id,
+                                        &finished.run_id,
+                                        &event_ids,
+                                        payloads,
+                                    )
+                                    .await;
+                                }
+                                Err(error) => {
+                                    tracing::error!(
+                                        run_id = %finished.run_id,
+                                        ?error,
+                                        "cancellation lifecycle reduction failed; terminal remains fenced"
+                                    );
+                                }
+                            }
+                        }
+                        // Natural completion remains plain Idle even when it
+                        // wins a drain race. Cancellation (user or drain) owns
+                        // the interrupted marker.
+                        let _ = append_session_idle(
+                            &lease,
+                            &device_id,
+                            &event_ids,
+                            cancelled,
+                        )
+                        .await;
                     }
                 }
             }
@@ -619,7 +1117,21 @@ async fn run_supervisor(
             }
         }
     }
-    let _ = hub.unregister_worker(&lease).await;
+    let _ = lease.unregister_worker().await;
+    true
+}
+
+/// Chooses the one `Idle { interrupted }` meaning after a live outcome.
+///
+/// Drain state is intentionally absent: a turn whose durable terminal is
+/// natural `Done` settles `false` even if drain began before its supervisor
+/// observed the outcome. Only cancellation-shaped truth settles `true`.
+fn idle_interrupted_after_outcome(
+    outcome_state: Option<&RunState>,
+    durable_state: Option<&RunState>,
+) -> bool {
+    matches!(outcome_state, Some(RunState::Cancelled))
+        || matches!(durable_state, Some(RunState::Cancelling))
 }
 
 async fn admit_pending(
@@ -653,10 +1165,38 @@ async fn admit_pending(
             if active_run == Some(&run_id)
                 || queue.iter().any(|queued| queued.accepted.run_id == run_id)
             {
+                if let Some(ready) = pending.recovery_ready.take() {
+                    let _ = ready.send(Ok(()));
+                }
                 return;
             }
             if queue.len() < SUPERVISOR_CAPACITY {
+                if let Some(ready) = pending.recovery_ready.take() {
+                    // Handoff, not provider entry, is the Ready boundary for
+                    // queued recovery. An earlier recovered checkpoint can
+                    // remain parked indefinitely while this durable run waits
+                    // safely in the owned supervisor.
+                    let _ = ready.send(Ok(()));
+                }
                 queue.push_back(pending);
+            } else if pending.recovering {
+                let error = HaiderError::new(
+                    ErrorCode::Busy,
+                    "recovered queued turn exceeded the bounded supervisor queue",
+                    true,
+                );
+                let terminalized =
+                    match failed_resumption_payloads(store, store.session_id(), &run_id, &error)
+                        .await
+                    {
+                        Ok(payloads) => {
+                            append_payloads(store, device_id, &run_id, event_ids, payloads).await
+                        }
+                        Err(error) => Err(error),
+                    };
+                if let Some(ready) = pending.recovery_ready.take() {
+                    let _ = ready.send(terminalized);
+                }
             } else {
                 // The durable Queued/UserMessage pair is the overflow buffer.
                 // A later completion refills from the journal.
@@ -664,12 +1204,22 @@ async fn admit_pending(
             }
         }
         Some(RunState::Cancelling) => {
-            let _ =
-                append_run_state(store, device_id, &run_id, event_ids, RunState::Cancelled).await;
-            let _ = append_session_idle(store, device_id, event_ids, false).await;
+            let terminalized =
+                match cancelled_resumption_payloads(store, store.session_id(), &run_id).await {
+                    Ok(payloads) => {
+                        append_payloads(store, device_id, &run_id, event_ids, payloads).await
+                    }
+                    Err(error) => Err(error),
+                };
+            if let Some(ready) = pending.recovery_ready.take() {
+                let _ = ready.send(terminalized);
+            }
         }
         _ => {
             // Receipt replays for active or terminal runs are response-only.
+            if let Some(ready) = pending.recovery_ready.take() {
+                let _ = ready.send(Ok(()));
+            }
         }
     }
 }
@@ -741,13 +1291,15 @@ async fn reconcile_durable_cancellations(
     }
     queue.retain(|pending| !terminalized.contains(&pending.accepted.run_id));
     if !terminalized.is_empty() {
-        let _ = append_session_idle(store, device_id, event_ids, false).await;
+        let _ = append_session_idle(store, device_id, event_ids, true).await;
     }
 }
 
 /// Reduces the committed journal to `(run, latest state, accepted seq)` in
 /// acceptance order — the durable truth every admission/cancellation/refill
 /// decision reads instead of trusting in-memory hints (module charter).
+/// Its intentional O(journal) cost and projection trigger are ledgered in
+/// `docs/OPTIMIZATIONS.md` under W3c1.
 async fn durable_runs(
     store: &HubStoreHandle,
 ) -> Result<Vec<(RunId, RunState, Option<u64>)>, HaiderError> {
@@ -787,6 +1339,92 @@ async fn durable_runs(
         .collect::<Vec<_>>();
     runs.sort_by_key(|(_, _, accepted)| accepted.unwrap_or(u64::MAX));
     Ok(runs)
+}
+
+/// Live counterpart of startup effect reconciliation, scoped to one run.
+///
+/// Dispatcher close is attempted first, but its return value is not evidence
+/// that every held dispatch reached a terminal journal record. Durable truth
+/// is reduced here and missing outcomes are appended before any run terminal.
+async fn reconcile_unknown_effects(
+    store: &HubStoreHandle,
+    device_id: &DeviceId,
+    run_id: &RunId,
+    event_ids: &EventIdGenerator,
+) -> Result<(), HaiderError> {
+    let mut dispatched = HashSet::<EffectId>::new();
+    let mut terminal = HashSet::<EffectId>::new();
+    let mut cursor = 0;
+    loop {
+        let page = StoreHandle::read(store, store.session_id(), cursor, 512).await?;
+        if page.is_empty() {
+            break;
+        }
+        cursor = page.last().map_or(cursor, |envelope| envelope.seq);
+        for envelope in page {
+            if envelope.run_id.as_ref() != Some(run_id)
+                || envelope
+                    .payload
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    != Some("effect")
+            {
+                continue;
+            }
+            let payload =
+                serde_json::from_value::<EventPayload>(envelope.payload).map_err(|error| {
+                    HaiderError::new(
+                        ErrorCode::StoreCorrupt,
+                        format!(
+                            "invalid effect payload in session {}, seq {}: {error}",
+                            store.session_id(),
+                            envelope.seq
+                        ),
+                        false,
+                    )
+                })?;
+            match payload {
+                EventPayload::Effect(EffectPhase::Dispatched { effect }) => {
+                    dispatched.insert(effect);
+                }
+                EventPayload::Effect(EffectPhase::Outcome { effect, .. }) => {
+                    terminal.insert(effect);
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut pending = dispatched
+        .difference(&terminal)
+        .cloned()
+        .collect::<Vec<_>>();
+    pending.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    if pending.is_empty() {
+        return Ok(());
+    }
+    append_payloads(
+        store,
+        device_id,
+        run_id,
+        event_ids,
+        pending
+            .into_iter()
+            .map(|effect| {
+                EventPayload::Effect(EffectPhase::Outcome {
+                    effect,
+                    outcome: EffectOutcome::Unknown,
+                })
+            })
+            .collect(),
+    )
+    .await
+}
+
+async fn durable_run_state(store: &HubStoreHandle, run_id: &RunId) -> Option<RunState> {
+    durable_runs(store).await.ok().and_then(|runs| {
+        runs.into_iter()
+            .find_map(|(candidate, state, _)| (candidate == *run_id).then_some(state))
+    })
 }
 
 async fn cancel_durable_queued_turns(
@@ -836,7 +1474,6 @@ async fn cancel_durable_queued_turns(
 /// them into one observation — missing the answer is the failure mode this
 /// ordering exists to prevent.
 async fn start_turn(
-    hub: &SessionHub,
     dependencies: &DaemonDependencies,
     metadata: &SessionMetadataV1,
     lease: &HubStoreHandle,
@@ -849,6 +1486,7 @@ async fn start_turn(
         checkpoint,
         mut committed_answer,
         recovery_ready: _,
+        recovering: _,
     } = pending;
     let resolved = dependencies
         .provider_factory
@@ -899,6 +1537,17 @@ async fn start_turn(
     config.usage_account = resolved
         .account_alias
         .map(haider_protocol::ids::CredentialAlias::new);
+    config.supervisor_commits_cancelled = true;
+    // Last uncancellable startup boundary: provider/tool resolution is done,
+    // but the harness actor has not been spawned or submitted. A cancellation
+    // committed while either factory was awaited aborts here. The worker
+    // append transition gate remains the atomic backstop for a later tie.
+    if cancellation_fences_start(durable_run_state(lease, &accepted.run_id).await) {
+        if let Some(dispatcher) = dispatcher.as_ref() {
+            let _ = dispatcher.close().await;
+        }
+        return Err(cancellation_fenced_start());
+    }
     let (actor, harness) = HarnessActor::new_with_dispatcher(
         config,
         resolved.provider,
@@ -907,18 +1556,19 @@ async fn start_turn(
     );
     match checkpoint.as_ref() {
         Some(checkpoint) => {
-            hub.register_recovered_harness(
-                lease,
-                harness.clone(),
-                checkpoint.menu.id.clone(),
-                checkpoint.request_seq,
-                checkpoint.opening_generation,
-            )
-            .await
-            .map_err(hub_error)?;
+            lease
+                .register_recovered_harness(
+                    harness.clone(),
+                    checkpoint.menu.id.clone(),
+                    checkpoint.request_seq,
+                    checkpoint.opening_generation,
+                )
+                .await
+                .map_err(hub_error)?;
         }
         None => {
-            hub.register_leased_harness(lease, harness.clone())
+            lease
+                .register_harness(harness.clone())
                 .await
                 .map_err(hub_error)?;
         }
@@ -1202,8 +1852,94 @@ fn manager_stopped() -> HaiderError {
     HaiderError::new(ErrorCode::Internal, "worker manager is not running", true)
 }
 
+fn manager_busy(message: &str) -> HaiderError {
+    HaiderError::new(ErrorCode::Busy, message, true)
+}
+
+fn manager_try_send(error: mpsc::error::TrySendError<ManagerCommand>) -> HaiderError {
+    match error {
+        mpsc::error::TrySendError::Full(_) => manager_busy("worker manager queue is full"),
+        mpsc::error::TrySendError::Closed(_) => manager_stopped(),
+    }
+}
+
+fn supervisor_try_send(error: mpsc::error::TrySendError<SupervisorCommand>) -> HaiderError {
+    match error {
+        mpsc::error::TrySendError::Full(_) => manager_busy("session worker queue is full"),
+        mpsc::error::TrySendError::Closed(_) => manager_stopped(),
+    }
+}
+
+fn cancellation_fenced_start() -> HaiderError {
+    HaiderError::new(
+        ErrorCode::RunNotActive,
+        "turn start was fenced by durable cancellation",
+        false,
+    )
+}
+
+fn cancellation_fences_start(state: Option<RunState>) -> bool {
+    matches!(state, Some(RunState::Cancelling | RunState::Cancelled))
+}
+
 fn hub_error(error: SessionHubError) -> HaiderError {
     HaiderError::new(ErrorCode::Internal, error.to_string(), true)
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::items_after_test_module)]
+mod manager_law_tests {
+    use super::*;
+
+    #[test]
+    fn full_manager_queue_maps_to_typed_busy_without_waiting() {
+        let (commands, _receiver) = mpsc::channel(1);
+        let (first, _first_response) = oneshot::channel();
+        commands
+            .try_send(ManagerCommand::Shutdown { completed: first })
+            .expect("fills manager queue");
+        let (second, _second_response) = oneshot::channel();
+        let error = commands
+            .try_send(ManagerCommand::Shutdown { completed: second })
+            .map_err(manager_try_send)
+            .expect_err("full queue rejects immediately");
+        assert_eq!(error.code, ErrorCode::Busy);
+        assert!(error.retryable);
+    }
+
+    #[test]
+    fn runtime_closes_worker_admission_before_hub_drain() {
+        let runtime = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/runtime.rs"),
+        )
+        .expect("runtime source");
+        let worker = runtime
+            .find("worker_handle.begin_draining();")
+            .expect("worker admission gate");
+        let hub = runtime
+            .find("hub.begin_draining();")
+            .expect("hub admission gate");
+        assert!(worker < hub);
+    }
+
+    #[test]
+    fn naturally_done_turn_stays_uninterrupted_when_drain_observes_it_late() {
+        assert!(!idle_interrupted_after_outcome(
+            Some(&RunState::Done),
+            Some(&RunState::Done),
+        ));
+        assert!(idle_interrupted_after_outcome(
+            Some(&RunState::Cancelled),
+            Some(&RunState::Cancelling),
+        ));
+    }
+
+    #[test]
+    fn durable_cancelling_fences_the_last_harness_start_boundary() {
+        assert!(cancellation_fences_start(Some(RunState::Cancelling)));
+        assert!(cancellation_fences_start(Some(RunState::Cancelled)));
+        assert!(!cancellation_fences_start(Some(RunState::Queued)));
+    }
 }
 
 // ───────────────── production broker-backed general tools ─────────────────

@@ -27,24 +27,28 @@ use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
 };
 use haider_protocol::error::{ErrorCode, HaiderError};
-use haider_protocol::ids::{EffectId, EventId, RunId, SessionId};
-use haider_protocol::provider::{FinishReason, Usage, UsageSource};
+use haider_protocol::ids::{DeviceId, EffectId, EventId, RunId, SessionId};
+use haider_protocol::provider::{CapabilityDoc, FinishReason, Usage, UsageSource};
 use haider_protocol::session::SessionMetadataV1;
 use haider_protocol::state::{RunState, SessionState};
 use haider_protocol::tool::BoundedResult;
-use haider_provider::{FakeInputKind, FakeInputOption, FakeProvider, FakeStep, ToolDefinition};
+use haider_provider::{
+    FakeInputKind, FakeInputOption, FakeProvider, FakeStep, Provider, ProviderError,
+    ProviderStream, ToolDefinition, TurnRequest,
+};
 use haider_rpc::{
     AttachMode, CancelStatus, Capability, CapabilitySet, ClientKind, CommandId,
     ERROR_CODE_ALREADY_RESOLVED, ERROR_CODE_CAPABILITY_DENIED, ERROR_CODE_INVALID_ARGUMENT,
     FEATURE_SESSION_MUTATION_V1, FEATURE_TURN_CONTROL_V1, RequestBody, RequestId, ResponseBody,
     SeqRange, SessionSummary, WireFrame,
 };
-use haider_store::Store;
+use haider_store::{EventStore, Store};
 use std::fs;
 use std::future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use support::{UdsClient, ready, ready_with_dependencies, test_root};
+use tokio::sync::Semaphore;
 
 #[derive(Clone)]
 struct FakeFactory {
@@ -73,6 +77,115 @@ fn fake_dependencies(script: Vec<FakeStep>) -> (DaemonDependencies, Arc<FakeProv
         ..DaemonDependencies::default()
     };
     (dependencies, fake)
+}
+
+#[derive(Clone)]
+struct DurableEntryFactory {
+    fake: Arc<FakeProvider>,
+    database_path: std::path::PathBuf,
+    inspections: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl ProviderFactory for DurableEntryFactory {
+    async fn resolve_for_turn(
+        &self,
+        metadata: &SessionMetadataV1,
+    ) -> Result<ResolvedTurnProvider, HaiderError> {
+        Ok(ResolvedTurnProvider {
+            provider: Arc::new(DurableEntryProvider {
+                fake: self.fake.clone(),
+                database_path: self.database_path.clone(),
+                inspections: self.inspections.clone(),
+            }),
+            provider_name: "fake".into(),
+            model: metadata.model.clone(),
+            account_alias: None,
+        })
+    }
+}
+
+struct DurableEntryProvider {
+    fake: Arc<FakeProvider>,
+    database_path: std::path::PathBuf,
+    inspections: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Provider for DurableEntryProvider {
+    async fn capabilities(&self) -> CapabilityDoc {
+        self.fake.capabilities().await
+    }
+
+    async fn stream_turn(&self, request: TurnRequest) -> Result<ProviderStream, ProviderError> {
+        {
+            let connection = rusqlite::Connection::open_with_flags(
+                &self.database_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .expect("provider-entry store opens read-only");
+            let mut statement = connection
+                .prepare("SELECT envelope_json FROM events ORDER BY seq ASC")
+                .expect("provider-entry query");
+            let envelopes = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .expect("provider-entry rows")
+                .map(|row| {
+                    serde_json::from_str::<RawEnvelope>(&row.expect("stored envelope"))
+                        .expect("typed stored envelope")
+                })
+                .collect::<Vec<_>>();
+            let run = envelopes.iter().find_map(|envelope| {
+                let payload =
+                    serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok()?;
+                matches!(
+                    payload,
+                    EventPayload::UserMessage { ref text, .. } if text == "say hello"
+                )
+                .then(|| envelope.run_id.clone())
+                .flatten()
+            });
+            let run = run.expect("UserMessage is durable before provider entry");
+            assert!(envelopes.iter().any(|envelope| {
+                envelope.run_id.as_ref() == Some(&run)
+                    && serde_json::from_value::<EventPayload>(envelope.payload.clone())
+                        .is_ok_and(|payload| payload == EventPayload::RunState(RunState::Queued))
+            }));
+            self.inspections.fetch_add(1, Ordering::SeqCst);
+        }
+        self.fake.stream_turn(request).await
+    }
+}
+
+fn recovery_fixture_envelope(
+    session_id: &SessionId,
+    run_id: &RunId,
+    generation: u64,
+    event_id: &str,
+    payload: EventPayload,
+    prompt: PromptRender,
+) -> RawEnvelope {
+    EventEnvelope {
+        schema_version: SCHEMA_VERSION,
+        event_id: EventId::new(event_id),
+        seq: 0,
+        session_id: session_id.clone(),
+        branch_id: None,
+        run_id: Some(run_id.clone()),
+        agent_id: None,
+        device_id: DeviceId::new("recovery-fixture"),
+        authority_epoch: 0,
+        worker_generation: generation,
+        causation_id: None,
+        correlation_id: None,
+        committed_at_ms: 0,
+        render: RenderTargets {
+            ui: true,
+            durable: true,
+            prompt,
+        },
+        payload: serde_json::to_value(payload).expect("recovery payload"),
+    }
 }
 
 fn create_body(command_id: &str, cwd: String) -> RequestBody {
@@ -219,7 +332,7 @@ async fn attach_existing(
     session_id: haider_protocol::ids::SessionId,
     after_seq: u64,
     request_id: &str,
-) {
+) -> Vec<RawEnvelope> {
     send_request(
         client,
         config,
@@ -233,6 +346,7 @@ async fn attach_existing(
     .await;
     let mut response = false;
     let mut caught_up = false;
+    let mut replay = Vec::new();
     while !(response && caught_up) {
         match client.next().await {
             WireFrame::Response {
@@ -240,9 +354,11 @@ async fn attach_existing(
                 ..
             } => response = true,
             WireFrame::AttachCaughtUp { .. } => caught_up = true,
+            WireFrame::Event { envelope, .. } => replay.push(envelope),
             _ => {}
         }
     }
+    replay
 }
 
 async fn events_until_terminal(
@@ -265,6 +381,17 @@ async fn events_until_terminal(
             if terminal {
                 return events;
             }
+        }
+    }
+}
+
+async fn next_idle(client: &mut UdsClient) -> bool {
+    loop {
+        if let WireFrame::Event { envelope, .. } = client.next().await
+            && let Ok(EventPayload::SessionState(SessionState::Idle { interrupted })) =
+                serde_json::from_value::<EventPayload>(envelope.payload)
+        {
+            return interrupted;
         }
     }
 }
@@ -366,7 +493,7 @@ async fn scenario_3_submit_streams_one_contiguous_durable_turn_over_real_uds() {
         source: UsageSource::ProviderReported,
         account: None,
     };
-    let (dependencies, fake) = fake_dependencies(vec![
+    let fake = Arc::new(FakeProvider::new(vec![
         FakeStep::EmitText {
             text: "hello".into(),
         },
@@ -376,7 +503,16 @@ async fn scenario_3_submit_streams_one_contiguous_durable_turn_over_real_uds() {
         FakeStep::Finish {
             reason: FinishReason::EndTurn,
         },
-    ]);
+    ]));
+    let inspections = Arc::new(AtomicUsize::new(0));
+    let dependencies = DaemonDependencies {
+        provider_factory: Arc::new(DurableEntryFactory {
+            fake: fake.clone(),
+            database_path: config.store_dir.join("store.sqlite"),
+            inspections: inspections.clone(),
+        }),
+        ..DaemonDependencies::default()
+    };
     let task = ready_with_dependencies(&config, dependencies.clone()).await;
     let mut client = UdsClient::connect_control(
         &config.endpoint_path(),
@@ -430,6 +566,11 @@ async fn scenario_3_submit_streams_one_contiguous_durable_turn_over_real_uds() {
     assert_eq!(accepted_seq, 3);
     assert_eq!(fake.requests().len(), 1);
     assert_eq!(
+        inspections.load(Ordering::SeqCst),
+        1,
+        "provider entry inspected the already-durable acceptance prefix"
+    );
+    assert_eq!(
         fake.requests()[0]
             .system_prompt
             .as_deref()
@@ -480,6 +621,10 @@ async fn scenario_3_submit_streams_one_contiguous_durable_turn_over_real_uds() {
     assert!(payloads.contains(&&EventPayload::Usage(usage)));
     assert!(payloads.contains(&&EventPayload::RunState(RunState::Done)));
     assert!(!run_id.as_str().is_empty());
+    assert!(
+        !next_idle(&mut client).await,
+        "natural completion settles non-interrupted Idle"
+    );
     let durable = read_session(&mut client, &config, session_id, "full-turn-read").await;
     assert!(durable.iter().enumerate().all(|(index, envelope)| {
         envelope.seq == u64::try_from(index).expect("test index") + 1
@@ -706,9 +851,9 @@ async fn scenario_4_lost_submit_response_replays_one_run_and_one_provider_reques
 /// (haider-core/src/prompt_history.rs) return only the current user message,
 /// or drop its Done-runs-only terminal filter. Expected failure: request two
 /// lacks the completed first exchange, or includes non-terminal content.
-/// (Branch/agent scoping is NOT observable here — this session runs one
-/// head-turn identity; that filter currently has no pinning test and is
-/// listed in the clean-code findings for the review round.)
+/// This live scenario runs one head-turn identity; the negative
+/// branch/agent and nonterminal exclusions are pinned separately in the
+/// `haider-core` MemoryStore prompt-history test.
 #[tokio::test]
 async fn scenario_5_second_turn_contains_prior_completed_conversation() {
     let root = test_root("w3c-live-");
@@ -907,6 +1052,10 @@ async fn scenario_6_request_input_round_trip_uses_second_control_attachment() {
         }
     ));
     let events = events_until_terminal(&mut submitter, &run_id).await;
+    assert!(matches!(
+        events.last(),
+        Some((_, EventPayload::RunState(RunState::Done)))
+    ));
     assert_eq!(
         events
             .iter()
@@ -1251,6 +1400,349 @@ async fn scenario_8_wire_cancel_closes_open_items_and_cancelled_is_run_terminal(
     task.join().await.expect("daemon joins");
 }
 
+#[derive(Clone)]
+struct BlockingProviderFactory {
+    entered: Arc<Semaphore>,
+    release: Arc<Semaphore>,
+    fake: Arc<FakeProvider>,
+}
+
+#[async_trait]
+impl ProviderFactory for BlockingProviderFactory {
+    async fn resolve_for_turn(
+        &self,
+        metadata: &SessionMetadataV1,
+    ) -> Result<ResolvedTurnProvider, HaiderError> {
+        self.entered.add_permits(1);
+        self.release
+            .acquire()
+            .await
+            .expect("test release semaphore")
+            .forget();
+        Ok(ResolvedTurnProvider {
+            provider: self.fake.clone(),
+            provider_name: "fake".into(),
+            model: metadata.model.clone(),
+            account_alias: None,
+        })
+    }
+}
+
+/// Exact P1-2 schedule: provider resolution is blocked, wire cancellation
+/// durably commits, then resolution is released. No provider request may
+/// begin after that durable fence.
+///
+/// MUTATION CHECK: make `cancellation_fences_start` return false (its focused
+/// law test fails); this controlled schedule separately proves the live call
+/// site reaches `Cancelled` with zero provider requests. Verified by revert
+/// on 2026-07-27.
+#[tokio::test]
+async fn cancelling_while_provider_factory_is_blocked_never_starts_provider() {
+    let root = test_root("w3c-live-");
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace");
+    let config = DaemonConfig::new(
+        "cancel-start-fence",
+        root.path().join("store"),
+        root.path().join("runtime"),
+    );
+    let entered = Arc::new(Semaphore::new(0));
+    let release = Arc::new(Semaphore::new(0));
+    let fake = Arc::new(FakeProvider::new(vec![FakeStep::Finish {
+        reason: FinishReason::EndTurn,
+    }]));
+    let task = ready_with_dependencies(
+        &config,
+        DaemonDependencies {
+            provider_factory: Arc::new(BlockingProviderFactory {
+                entered: entered.clone(),
+                release: release.clone(),
+                fake: fake.clone(),
+            }),
+            ..DaemonDependencies::default()
+        },
+    )
+    .await;
+    let mut client = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "w3c-live-test",
+        "cancel-start-client",
+        ClientKind::Headless,
+    )
+    .await;
+    let (session_id, generation) = create_and_attach(&mut client, &config, &workspace).await;
+    send_request(
+        &mut client,
+        &config,
+        "start-fence-submit",
+        submit_body(
+            "start-fence-submit-command",
+            session_id.clone(),
+            generation,
+            "do not start after cancel",
+        ),
+    )
+    .await;
+    let (run_id, _) = next_submit_response(&mut client).await;
+    entered.acquire().await.expect("factory entry").forget();
+    send_request(
+        &mut client,
+        &config,
+        "start-fence-cancel",
+        RequestBody::TurnCancel {
+            command_id: CommandId::new("start-fence-cancel-command"),
+            session_id,
+            worker_generation: generation,
+            run_id: run_id.clone(),
+        },
+    )
+    .await;
+    loop {
+        if matches!(
+            client.next().await,
+            WireFrame::Response {
+                body: ResponseBody::TurnCancel {
+                    status: CancelStatus::Accepted,
+                    ..
+                },
+                ..
+            }
+        ) {
+            break;
+        }
+    }
+    release.add_permits(1);
+    let events = events_until_terminal(&mut client, &run_id).await;
+    assert!(matches!(
+        events.last(),
+        Some((_, EventPayload::RunState(RunState::Cancelled)))
+    ));
+    assert!(
+        next_idle(&mut client).await,
+        "user cancellation settles interrupted Idle"
+    );
+    assert!(fake.requests().is_empty());
+    task.shutdown_handle().request("test complete");
+    task.join().await.expect("daemon joins");
+}
+
+#[derive(Clone)]
+struct ClosingHeldEffectFactory {
+    effect: EffectId,
+    dispatched: Arc<Semaphore>,
+}
+
+#[async_trait]
+impl TurnToolFactory for ClosingHeldEffectFactory {
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        vec![ToolDefinition {
+            name: "held_effect".into(),
+            description: "Hold after durable dispatch until cancellation".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }]
+    }
+
+    async fn create(
+        &self,
+        context: WorkerToolContext,
+    ) -> Result<Option<Arc<dyn ToolDispatcher>>, HaiderError> {
+        Ok(Some(Arc::new(ClosingHeldEffectDispatcher {
+            context,
+            effect: self.effect.clone(),
+            dispatched: self.dispatched.clone(),
+        })))
+    }
+}
+
+struct ClosingHeldEffectDispatcher {
+    context: WorkerToolContext,
+    effect: EffectId,
+    dispatched: Arc<Semaphore>,
+}
+
+impl ClosingHeldEffectDispatcher {
+    async fn append(&self, suffix: &str, payload: EventPayload) -> Result<(), HaiderError> {
+        let mut envelopes = [EventEnvelope {
+            schema_version: SCHEMA_VERSION,
+            event_id: EventId::new(format!("live-held-{}-{suffix}", self.effect)),
+            seq: 0,
+            session_id: self.context.store.session_id().clone(),
+            branch_id: None,
+            run_id: Some(self.context.run_id.clone()),
+            agent_id: None,
+            device_id: self.context.device_id.clone(),
+            authority_epoch: 0,
+            worker_generation: self.context.store.worker_generation(),
+            causation_id: None,
+            correlation_id: None,
+            committed_at_ms: 0,
+            render: RenderTargets {
+                ui: true,
+                durable: true,
+                prompt: PromptRender::Omit,
+            },
+            payload: serde_json::to_value(payload).expect("effect payload"),
+        }];
+        StoreHandle::append(&self.context.store, &mut envelopes).await?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ToolDispatcher for ClosingHeldEffectDispatcher {
+    async fn execute(
+        &self,
+        _run_id: &RunId,
+        _call_id: &str,
+        _name: &str,
+        _args: serde_json::Value,
+        _cancel: &CancelToken,
+    ) -> Result<BoundedResult, HaiderError> {
+        self.append(
+            "dispatched",
+            EventPayload::Effect(EffectPhase::Dispatched {
+                effect: self.effect.clone(),
+            }),
+        )
+        .await?;
+        self.dispatched.add_permits(1);
+        future::pending().await
+    }
+
+    async fn close(&self) -> Result<(), HaiderError> {
+        // Exact close-failure schedule: the dispatcher reports failure before
+        // writing an outcome. The supervisor must reduce durable truth and
+        // synthesize Unknown itself before it may commit Cancelled.
+        Err(HaiderError::new(
+            ErrorCode::EffectUnknownOutcome,
+            "injected dispatcher close failure",
+            true,
+        ))
+    }
+}
+
+/// Exact P1-1 schedule: cancellation drops a held dispatched execution,
+/// dispatcher close fails without recording an outcome, durable
+/// reconciliation appends Unknown, and only then may Cancelled commit.
+///
+/// MUTATION CHECK: remove `reconcile_unknown_effects` or restore the terminal
+/// commit before it. Expected failure: Unknown is absent or follows
+/// Cancelled. Verified by revert in W3c1.1.
+#[tokio::test]
+async fn held_effect_reconciles_unknown_before_cancelled() {
+    let root = test_root("w3c-live-");
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace");
+    let config = DaemonConfig::new(
+        "live-held-cancel",
+        root.path().join("store"),
+        root.path().join("runtime"),
+    );
+    let dispatched = Arc::new(Semaphore::new(0));
+    let effect = EffectId::new("live-held-cancel-effect");
+    let (dependencies, _fake) = fake_dependencies(vec![FakeStep::EmitToolCall {
+        call_id: "held-call".into(),
+        name: "held_effect".into(),
+        args: serde_json::json!({}),
+    }]);
+    let task = ready_with_dependencies(
+        &config,
+        DaemonDependencies {
+            tool_factory: Arc::new(ClosingHeldEffectFactory {
+                effect: effect.clone(),
+                dispatched: dispatched.clone(),
+            }),
+            ..dependencies
+        },
+    )
+    .await;
+    let mut client = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "w3c-live-test",
+        "held-cancel-client",
+        ClientKind::Headless,
+    )
+    .await;
+    let (session_id, generation) = create_and_attach(&mut client, &config, &workspace).await;
+    send_request(
+        &mut client,
+        &config,
+        "held-submit",
+        submit_body(
+            "held-submit-command",
+            session_id.clone(),
+            generation,
+            "dispatch and hold",
+        ),
+    )
+    .await;
+    let (run_id, _) = next_submit_response(&mut client).await;
+    dispatched
+        .acquire()
+        .await
+        .expect("dispatch commits")
+        .forget();
+    send_request(
+        &mut client,
+        &config,
+        "held-cancel",
+        RequestBody::TurnCancel {
+            command_id: CommandId::new("held-cancel-command"),
+            session_id: session_id.clone(),
+            worker_generation: generation,
+            run_id: run_id.clone(),
+        },
+    )
+    .await;
+    let _events = events_until_terminal(&mut client, &run_id).await;
+    assert!(
+        next_idle(&mut client).await,
+        "user cancellation settles interrupted Idle"
+    );
+    let durable = read_session(&mut client, &config, session_id, "held-cancel-read").await;
+    let events = durable
+        .into_iter()
+        .filter(|envelope| envelope.run_id.as_ref() == Some(&run_id))
+        .filter_map(|envelope| {
+            serde_json::from_value::<EventPayload>(envelope.payload)
+                .ok()
+                .map(|payload| (envelope.seq, payload))
+        })
+        .collect::<Vec<_>>();
+    let position = |predicate: &dyn Fn(&EventPayload) -> bool| {
+        events
+            .iter()
+            .position(|(_, payload)| predicate(payload))
+            .expect("expected event")
+    };
+    let dispatched = position(&|payload| {
+        matches!(
+            payload,
+            EventPayload::Effect(EffectPhase::Dispatched { effect: candidate })
+                if *candidate == effect
+        )
+    });
+    let unknown = position(&|payload| {
+        matches!(
+            payload,
+            EventPayload::Effect(EffectPhase::Outcome {
+                effect: candidate,
+                outcome: EffectOutcome::Unknown,
+            }) if *candidate == effect
+        )
+    });
+    let cancelled = position(&|payload| *payload == EventPayload::RunState(RunState::Cancelled));
+    assert!(dispatched < unknown && unknown < cancelled);
+    assert!(matches!(
+        events.last(),
+        Some((_, EventPayload::RunState(RunState::Cancelled)))
+    ));
+    task.shutdown_handle().request("test complete");
+    task.join().await.expect("daemon joins");
+}
+
 /// Worker-aware drain satellite (report §6.1 implementation bullet
 /// "external admission gate and worker-aware drain", R9): a queued run that
 /// never started must reach a durable terminal state during the drain grace,
@@ -1464,6 +1956,511 @@ async fn scenario_9_restart_resumes_only_queued_and_terminalizes_streaming() {
     second_task.join().await.expect("daemon joins");
 }
 
+/// Startup poison fixture (B2).
+///
+/// MUTATION CHECK: return metadata-less prior-generation Queued work from
+/// `recover_startup` instead of terminalizing it. Expected failure: the
+/// daemon stops before Ready. Verified by revert in W3c1.1.
+#[tokio::test]
+async fn metadata_less_prior_generation_queued_run_terminalizes_and_reaches_ready() {
+    let root = test_root("w3c-live-");
+    let config = DaemonConfig::new(
+        "poison-session",
+        root.path().join("store"),
+        root.path().join("runtime"),
+    );
+    let session_id = SessionId::new("poison-session");
+    let run_id = RunId::new("poison-run");
+    {
+        let store = Store::open(&config.store_dir).expect("seed store");
+        let generation = store.worker_generation();
+        let mut events = vec![
+            recovery_fixture_envelope(
+                &session_id,
+                &run_id,
+                generation,
+                "poison-queued",
+                EventPayload::RunState(RunState::Queued),
+                PromptRender::Omit,
+            ),
+            recovery_fixture_envelope(
+                &session_id,
+                &run_id,
+                generation,
+                "poison-user",
+                EventPayload::UserMessage {
+                    text: "cannot resume without metadata".into(),
+                    attachments: Vec::new(),
+                    mode: DeliveryMode::Queue,
+                },
+                PromptRender::Verbatim,
+            ),
+        ];
+        store.append(&mut events).expect("poison prefix");
+    }
+
+    let (dependencies, fake) = fake_dependencies(vec![FakeStep::Hang]);
+    let task = ready_with_dependencies(&config, dependencies).await;
+    task.shutdown_handle().request("fixture inspected");
+    task.join().await.expect("daemon joins");
+    assert!(fake.requests().is_empty());
+
+    let store = Store::open(&config.store_dir).expect("inspect recovery");
+    let events = store.journal_replay(&session_id).expect("history");
+    let payloads = payloads_for_run(&events, &run_id).collect::<Vec<_>>();
+    assert!(payloads.contains(&EventPayload::RunState(RunState::Errored)));
+    assert!(payloads.iter().any(|payload| matches!(
+        payload,
+        EventPayload::RunFailed {
+            code: ErrorCode::Internal,
+            ..
+        }
+    )));
+    assert!(events.iter().any(|envelope| {
+        matches!(
+            serde_json::from_value::<EventPayload>(envelope.payload.clone()),
+            Ok(EventPayload::SessionState(SessionState::Idle {
+                interrupted: true
+            }))
+        )
+    }));
+}
+
+/// B1 wire pin: a legacy session without typed metadata is rejected with the
+/// caller's request correlation before any Queued acceptance can commit.
+#[tokio::test]
+async fn metadata_less_live_submit_is_correlated_invalid_argument_without_acceptance() {
+    let root = test_root("w3c-live-");
+    let config = DaemonConfig::new(
+        "legacy-live-submit",
+        root.path().join("store"),
+        root.path().join("runtime"),
+    );
+    let session_id = SessionId::new("legacy-live-session");
+    {
+        let store = Store::open(&config.store_dir).expect("seed store");
+        let mut events = [EventEnvelope {
+            schema_version: SCHEMA_VERSION,
+            event_id: EventId::new("legacy-idle"),
+            seq: 0,
+            session_id: session_id.clone(),
+            branch_id: None,
+            run_id: None,
+            agent_id: None,
+            device_id: DeviceId::new("legacy-fixture"),
+            authority_epoch: 0,
+            worker_generation: store.worker_generation(),
+            causation_id: None,
+            correlation_id: None,
+            committed_at_ms: 0,
+            render: RenderTargets {
+                ui: true,
+                durable: true,
+                prompt: PromptRender::Omit,
+            },
+            payload: serde_json::to_value(EventPayload::SessionState(SessionState::Idle {
+                interrupted: false,
+            }))
+            .expect("idle payload"),
+        }];
+        store.append(&mut events).expect("legacy session row");
+    }
+
+    let task = ready(&config).await;
+    let mut client = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "w3c-live-test",
+        "legacy-submit-client",
+        ClientKind::Headless,
+    )
+    .await;
+    send_request(
+        &mut client,
+        &config,
+        "legacy-list",
+        RequestBody::SessionList {
+            cursor: None,
+            limit: 10,
+        },
+    )
+    .await;
+    let generation = match client.next().await {
+        WireFrame::Response {
+            body: ResponseBody::SessionList { sessions, .. },
+            ..
+        } => {
+            sessions
+                .into_iter()
+                .find(|summary| summary.session_id == session_id)
+                .expect("legacy summary")
+                .worker_generation
+        }
+        other => panic!("expected session list, got {other:?}"),
+    };
+    let _ = attach_existing(&mut client, &config, session_id.clone(), 0, "legacy-attach").await;
+    send_request(
+        &mut client,
+        &config,
+        "legacy-submit-request",
+        submit_body(
+            "legacy-submit-command",
+            session_id.clone(),
+            generation,
+            "must not commit",
+        ),
+    )
+    .await;
+    let rejection = client.next().await;
+    assert!(
+        matches!(
+        rejection,
+        WireFrame::Response {
+            ref request_id,
+            body: ResponseBody::Error { ref code, .. },
+        } if *request_id == RequestId::new("legacy-submit-request")
+            && code == ERROR_CODE_INVALID_ARGUMENT
+        ),
+        "unexpected legacy-submit response: {rejection:?}"
+    );
+    task.shutdown_handle().request("fixture inspected");
+    task.join().await.expect("daemon joins");
+
+    let store = Store::open(&config.store_dir).expect("inspect store");
+    let events = store.journal_replay(&session_id).expect("history");
+    assert!(!events.iter().any(|envelope| {
+        serde_json::from_value::<EventPayload>(envelope.payload.clone())
+            .is_ok_and(|payload| payload == EventPayload::RunState(RunState::Queued))
+    }));
+}
+
+#[derive(Clone)]
+struct RevokedCredentialFactory;
+
+#[async_trait]
+impl ProviderFactory for RevokedCredentialFactory {
+    async fn resolve_for_turn(
+        &self,
+        _metadata: &SessionMetadataV1,
+    ) -> Result<ResolvedTurnProvider, HaiderError> {
+        Err(HaiderError::new(
+            ErrorCode::CredentialMissing,
+            "test credential was revoked",
+            true,
+        ))
+    }
+}
+
+#[derive(Clone)]
+struct PanicOnceFactory {
+    calls: Arc<AtomicUsize>,
+    fake: Arc<FakeProvider>,
+}
+
+#[async_trait]
+impl ProviderFactory for PanicOnceFactory {
+    async fn resolve_for_turn(
+        &self,
+        metadata: &SessionMetadataV1,
+    ) -> Result<ResolvedTurnProvider, HaiderError> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            panic!("injected provider factory panic");
+        }
+        Ok(ResolvedTurnProvider {
+            provider: self.fake.clone(),
+            provider_name: "fake".into(),
+            model: metadata.model.clone(),
+            account_alias: None,
+        })
+    }
+}
+
+#[tokio::test]
+async fn panicked_supervisor_terminalizes_run_and_fresh_incarnation_is_usable() {
+    let root = test_root("w3c-live-");
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace");
+    let config = DaemonConfig::new(
+        "panic-eviction",
+        root.path().join("store"),
+        root.path().join("runtime"),
+    );
+    let fake = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitText {
+            text: "fresh supervisor".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let dependencies = DaemonDependencies {
+        provider_factory: Arc::new(PanicOnceFactory {
+            calls: Arc::new(AtomicUsize::new(0)),
+            fake: fake.clone(),
+        }),
+        ..DaemonDependencies::default()
+    };
+    let task = ready_with_dependencies(&config, dependencies).await;
+    let mut client = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "w3c-live-test",
+        "panic-client",
+        ClientKind::Headless,
+    )
+    .await;
+    let (session_id, generation) = create_and_attach(&mut client, &config, &workspace).await;
+    send_request(
+        &mut client,
+        &config,
+        "panic-submit",
+        submit_body(
+            "panic-command",
+            session_id.clone(),
+            generation,
+            "panic once",
+        ),
+    )
+    .await;
+    let (panicked_run, _) = next_submit_response(&mut client).await;
+    let panicked = events_until_terminal(&mut client, &panicked_run).await;
+    assert!(
+        panicked
+            .iter()
+            .any(|(_, payload)| matches!(payload, EventPayload::RunFailed { .. }))
+    );
+    assert!(matches!(
+        panicked.last(),
+        Some((_, EventPayload::RunState(RunState::Errored)))
+    ));
+
+    send_request(
+        &mut client,
+        &config,
+        "fresh-submit",
+        submit_body(
+            "fresh-command",
+            session_id,
+            generation,
+            "use fresh supervisor",
+        ),
+    )
+    .await;
+    let (fresh_run, _) = next_submit_response(&mut client).await;
+    let fresh = events_until_terminal(&mut client, &fresh_run).await;
+    assert!(matches!(
+        fresh.last(),
+        Some((_, EventPayload::RunState(RunState::Done)))
+    ));
+    assert_eq!(fake.requests().len(), 1);
+    task.shutdown_handle().request("test complete");
+    task.join().await.expect("daemon joins");
+}
+
+/// Revoked-credential checkpoint fixture (B2).
+///
+/// MUTATION CHECK: propagate a recovered supervisor start error through the
+/// Ready barrier. Expected failure: startup stops instead of closing the
+/// menu and terminalizing the run. Verified by revert in W3c1.1.
+#[tokio::test]
+async fn revoked_credential_checkpoint_terminalizes_menu_and_reaches_ready() {
+    let root = test_root("w3c-live-");
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace");
+    let config = DaemonConfig::new(
+        "revoked-checkpoint",
+        root.path().join("store"),
+        root.path().join("runtime"),
+    );
+    let (first_dependencies, fake) = fake_dependencies(vec![
+        FakeStep::EmitRequestInput {
+            call_id: "revoked-choice".into(),
+            kind: FakeInputKind::Choice,
+            title: "Credential-dependent choice".into(),
+            body: Vec::new(),
+            options: vec![FakeInputOption {
+                key: "continue".into(),
+                label: "Continue".into(),
+                detail: None,
+            }],
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+    ]);
+    let first_task = ready_with_dependencies(&config, first_dependencies).await;
+    let mut client = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "w3c-live-test",
+        "revoked-before",
+        ClientKind::Headless,
+    )
+    .await;
+    let (session_id, generation) = create_and_attach(&mut client, &config, &workspace).await;
+    send_request(
+        &mut client,
+        &config,
+        "revoked-submit",
+        submit_body(
+            "revoked-command",
+            session_id.clone(),
+            generation,
+            "park then revoke",
+        ),
+    )
+    .await;
+    let (run_id, _) = next_submit_response(&mut client).await;
+    let menu_id = loop {
+        if let WireFrame::Event { envelope, .. } = client.next().await
+            && envelope.run_id.as_ref() == Some(&run_id)
+            && let Ok(EventPayload::MenuOpened(menu)) =
+                serde_json::from_value::<EventPayload>(envelope.payload)
+        {
+            break menu.id;
+        }
+    };
+    assert_eq!(fake.requests().len(), 1);
+    drop(client);
+    first_task.crash().await;
+
+    let dependencies = DaemonDependencies {
+        provider_factory: Arc::new(RevokedCredentialFactory),
+        ..DaemonDependencies::default()
+    };
+    let second_task = ready_with_dependencies(&config, dependencies).await;
+    second_task.shutdown_handle().request("fixture inspected");
+    second_task.join().await.expect("daemon joins");
+
+    let store = Store::open(&config.store_dir).expect("inspect recovery");
+    let events = store.journal_replay(&session_id).expect("history");
+    let payloads = payloads_for_run(&events, &run_id).collect::<Vec<_>>();
+    assert!(payloads.contains(&EventPayload::RunState(RunState::Errored)));
+    assert!(payloads.iter().any(|payload| matches!(
+        payload,
+        EventPayload::RunFailed {
+            code: ErrorCode::CredentialMissing,
+            ..
+        }
+    )));
+    assert!(payloads.iter().any(|payload| matches!(
+        payload,
+        EventPayload::MenuClosed { menu, .. } if *menu == menu_id
+    )));
+    assert!(events.iter().any(|envelope| {
+        matches!(
+            serde_json::from_value::<EventPayload>(envelope.payload.clone()),
+            Ok(EventPayload::SessionState(SessionState::Idle {
+                interrupted: true
+            }))
+        )
+    }));
+}
+
+/// B2 mixed fixture: an earlier recovered checkpoint may park indefinitely,
+/// while a later recovered Queued item is acknowledged at safe supervisor
+/// handoff so startup still reaches Ready.
+///
+/// MUTATION CHECK: acknowledge queued recovery only from `start_turn`.
+/// Expected failure: Ready waits forever behind the unanswered checkpoint.
+#[tokio::test]
+async fn checkpoint_then_later_queued_recovery_reaches_ready_without_starting_queued() {
+    let root = test_root("w3c-live-");
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace");
+    let config = DaemonConfig::new(
+        "mixed-recovery",
+        root.path().join("store"),
+        root.path().join("runtime"),
+    );
+    let (first_dependencies, first_fake) = fake_dependencies(vec![
+        FakeStep::EmitRequestInput {
+            call_id: "mixed-choice".into(),
+            kind: FakeInputKind::Choice,
+            title: "Park recovery".into(),
+            body: Vec::new(),
+            options: vec![FakeInputOption {
+                key: "continue".into(),
+                label: "Continue".into(),
+                detail: None,
+            }],
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+    ]);
+    let first_task = ready_with_dependencies(&config, first_dependencies).await;
+    let mut client = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "w3c-live-test",
+        "mixed-before",
+        ClientKind::Headless,
+    )
+    .await;
+    let (session_id, generation) = create_and_attach(&mut client, &config, &workspace).await;
+    send_request(
+        &mut client,
+        &config,
+        "mixed-checkpoint-submit",
+        submit_body(
+            "mixed-checkpoint-command",
+            session_id.clone(),
+            generation,
+            "park first",
+        ),
+    )
+    .await;
+    let (checkpoint_run, _) = next_submit_response(&mut client).await;
+    let menu_id = loop {
+        if let WireFrame::Event { envelope, .. } = client.next().await
+            && envelope.run_id.as_ref() == Some(&checkpoint_run)
+            && let Ok(EventPayload::MenuOpened(menu)) =
+                serde_json::from_value::<EventPayload>(envelope.payload)
+        {
+            break menu.id;
+        }
+    };
+    send_request(
+        &mut client,
+        &config,
+        "mixed-queued-submit",
+        submit_body(
+            "mixed-queued-command",
+            session_id.clone(),
+            generation,
+            "wait behind checkpoint",
+        ),
+    )
+    .await;
+    let (queued_run, _) = next_submit_response(&mut client).await;
+    assert_eq!(first_fake.requests().len(), 1);
+    drop(client);
+    first_task.crash().await;
+
+    let (second_dependencies, second_fake) = fake_dependencies(vec![FakeStep::Hang]);
+    let second_task = ready_with_dependencies(&config, second_dependencies).await;
+    assert!(
+        second_fake.requests().is_empty(),
+        "checkpoint recovery does not replay provider work and queued stays behind it"
+    );
+    second_task
+        .shutdown_handle()
+        .request("mixed fixture inspected");
+    second_task.join().await.expect("daemon joins");
+
+    let store = Store::open(&config.store_dir).expect("inspect recovery");
+    let events = store.journal_replay(&session_id).expect("history");
+    let checkpoint = payloads_for_run(&events, &checkpoint_run).collect::<Vec<_>>();
+    let queued = payloads_for_run(&events, &queued_run).collect::<Vec<_>>();
+    assert!(checkpoint.contains(&EventPayload::RunState(RunState::Cancelled)));
+    assert!(checkpoint.iter().any(|payload| matches!(
+        payload,
+        EventPayload::MenuClosed { menu, .. } if *menu == menu_id
+    )));
+    assert!(queued.contains(&EventPayload::RunState(RunState::Cancelled)));
+}
+
 /// Scenario 10.
 ///
 /// MUTATION CHECK: rerun the provider request that created request_input,
@@ -1556,7 +2553,7 @@ async fn scenario_10_restart_replays_request_input_without_reexecuting_prior_req
         ClientKind::Headless,
     )
     .await;
-    attach_existing(
+    let replay_frames = attach_existing(
         &mut second,
         &config,
         session_id.clone(),
@@ -1564,6 +2561,13 @@ async fn scenario_10_restart_replays_request_input_without_reexecuting_prior_req
         "checkpoint-replay",
     )
     .await;
+    assert!(replay_frames.iter().any(|envelope| {
+        envelope.run_id.as_ref() == Some(&run_id)
+            && matches!(
+                serde_json::from_value::<EventPayload>(envelope.payload.clone()),
+                Ok(EventPayload::MenuOpened(ref menu)) if menu.id == menu_id
+            )
+    }));
     second
         .send(
             &WireFrame::MenuAnswer {
@@ -1635,6 +2639,13 @@ async fn scenario_10_restart_replays_request_input_without_reexecuting_prior_req
             .filter(|payload| matches!(payload, EventPayload::ToolResult { .. }))
             .count(),
         1
+    );
+    assert_eq!(
+        payloads_for_run(&durable, &run_id)
+            .filter(|payload| matches!(payload, EventPayload::MenuOpened(_)))
+            .count(),
+        1,
+        "request_input executes once; restart only replays its durable menu"
     );
     let requests = fake.requests();
     assert_eq!(requests.len(), 2);
@@ -2290,6 +3301,66 @@ async fn session_create_requires_control_and_ready_welcome_advertises_implemente
             body: ResponseBody::SessionList { ref sessions, .. },
             ..
         } if sessions.is_empty()
+    ));
+    send_request(
+        &mut feature_client,
+        &config,
+        "control-create",
+        create_body(
+            "control-create-command",
+            workspace.to_string_lossy().into_owned(),
+        ),
+    )
+    .await;
+    let (session_id, generation) = match feature_client.next().await {
+        WireFrame::Response {
+            body:
+                ResponseBody::SessionCreate {
+                    session_id,
+                    worker_generation,
+                    ..
+                },
+            ..
+        } => (session_id, worker_generation),
+        other => panic!("expected control create, got {other:?}"),
+    };
+    send_request(
+        &mut viewer,
+        &config,
+        "denied-submit",
+        submit_body(
+            "viewer-submit-command",
+            session_id.clone(),
+            generation,
+            "must not submit",
+        ),
+    )
+    .await;
+    assert!(matches!(
+        viewer.next().await,
+        WireFrame::Response {
+            body: ResponseBody::Error { ref code, .. },
+            ..
+        } if code == ERROR_CODE_CAPABILITY_DENIED
+    ));
+    send_request(
+        &mut viewer,
+        &config,
+        "denied-cancel",
+        RequestBody::TurnCancel {
+            command_id: CommandId::new("viewer-cancel-command"),
+            session_id,
+            worker_generation: generation,
+            run_id: RunId::new("not-visible-to-viewer"),
+        },
+    )
+    .await;
+    assert!(matches!(
+        viewer.next().await,
+        WireFrame::Response {
+            body: ResponseBody::Error { ref code, .. },
+            ..
+        } if code == ERROR_CODE_CAPABILITY_DENIED
     ));
 
     // Inspect a fresh raw handshake because connect_control intentionally

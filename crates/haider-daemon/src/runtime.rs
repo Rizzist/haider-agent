@@ -285,7 +285,7 @@ async fn run_inner(
         .map_err(DaemonError::from)?;
     for work in recovered_work {
         let result = match work {
-            RecoveredWork::Queued(accepted) => worker_handle.submit(accepted).await,
+            RecoveredWork::Queued(accepted) => worker_handle.recover_queued(accepted).await,
             RecoveredWork::Checkpoint(recovered) => {
                 worker_handle
                     .recover_checkpoint(
@@ -297,7 +297,7 @@ async fn run_inner(
             }
         };
         if let Err(error) = result {
-            worker_manager.shutdown().await;
+            let _ = worker_manager.shutdown().await;
             let _ = hub.shutdown().await;
             let _ = store.close().await;
             return Err(error.into());
@@ -306,7 +306,7 @@ async fn run_inner(
     let mut endpoint = match endpoint::bind(config).await {
         Ok(endpoint) => endpoint,
         Err(error) => {
-            worker_manager.shutdown().await;
+            let _ = worker_manager.shutdown().await;
             let _ = store.flush().await;
             let _ = store.close().await;
             return Err(error);
@@ -386,6 +386,10 @@ async fn run_inner(
     // final appends reach their existing actors (`SessionHub::existing_actor`
     // documents the asymmetry). The watch broadcast wakes connection tasks
     // on other executor workers.
+    // Linearize manager admission first. Any successful try_send happened
+    // under this gate and is FIFO-before Shutdown; any post-commit hint that
+    // loses the gate is recovered by the manager's durable queued-run sweep.
+    worker_handle.begin_draining();
     hub.begin_draining();
     states.publish(DaemonState::Draining {
         reason: reason.clone(),
@@ -407,8 +411,10 @@ async fn run_inner(
     // envelopes under the same deadline (the ledgered W3b1 relaxation).
     let worker_shutdown =
         bounded_finalization(worker_manager.shutdown(), barrier_deadline, &mut shutdown).await;
-    if worker_shutdown.is_none() {
-        forced = true;
+    match worker_shutdown {
+        Some(Ok(())) => {}
+        Some(Err(error)) => return Err(error.into()),
+        None => forced = true,
     }
     let hub_shutdown = bounded_finalization(hub.shutdown(), barrier_deadline, &mut shutdown).await;
     match hub_shutdown {

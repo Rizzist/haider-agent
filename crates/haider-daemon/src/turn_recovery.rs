@@ -85,6 +85,7 @@ pub(crate) async fn recover_interrupted_turns(
 ) -> Result<Vec<RecoveredWork>, HaiderError> {
     let mut recovered = Vec::new();
     for session_id in store.session_ids().await? {
+        let runnable_metadata = store.session_metadata(&session_id).await?.is_some();
         let mut cursor = 0;
         let mut reductions = HashMap::<RunId, RunReduction>::new();
         loop {
@@ -105,6 +106,21 @@ pub(crate) async fn recover_interrupted_turns(
                 continue;
             };
             if state.is_terminal() || reduction.state_generation == store.worker_generation() {
+                continue;
+            }
+            // Acceptance now requires typed metadata, but legacy/CLI journals
+            // can predate that guarantee. No prior-generation runnable shape
+            // (Queued or checkpointed) may become startup poison.
+            if !runnable_metadata {
+                terminalize_interrupted(
+                    store,
+                    device_id,
+                    &session_id,
+                    &run_id,
+                    reduction,
+                    matches!(state, RunState::Cancelling),
+                )
+                .await?;
                 continue;
             }
             if state == RunState::Queued {
@@ -268,6 +284,93 @@ async fn terminalize_interrupted(
     reduction: RunReduction,
     cancelling: bool,
 ) -> Result<(), HaiderError> {
+    let payloads = interrupted_terminal_payloads(
+        reduction,
+        cancelling,
+        ErrorCode::Internal,
+        "run was interrupted by daemon restart".into(),
+        true,
+    );
+    let mut envelopes = recovery_envelopes(
+        store.worker_generation(),
+        device_id,
+        session_id,
+        run_id,
+        payloads,
+    )?;
+    store.append(&mut envelopes).await?;
+    Ok(())
+}
+
+pub(crate) async fn failed_resumption_payloads(
+    store: &impl StoreHandle,
+    session_id: &SessionId,
+    run_id: &RunId,
+    error: &HaiderError,
+) -> Result<Vec<EventPayload>, HaiderError> {
+    resumption_terminal_payloads(store, session_id, run_id, Some(error)).await
+}
+
+/// Builds cancellation-shaped closure for every run-local lifecycle object.
+///
+/// This is shared by startup cancellation and live supervisor-exit recovery:
+/// a durable `Cancelling` rejects failure-shaped state transitions, but open
+/// items and menus must still close before the final `Cancelled` envelope.
+pub(crate) async fn cancelled_resumption_payloads(
+    store: &impl StoreHandle,
+    session_id: &SessionId,
+    run_id: &RunId,
+) -> Result<Vec<EventPayload>, HaiderError> {
+    resumption_terminal_payloads(store, session_id, run_id, None).await
+}
+
+async fn resumption_terminal_payloads(
+    store: &impl StoreHandle,
+    session_id: &SessionId,
+    run_id: &RunId,
+    error: Option<&HaiderError>,
+) -> Result<Vec<EventPayload>, HaiderError> {
+    let mut reduction = RunReduction::default();
+    let mut cursor = 0;
+    loop {
+        let page = store.read(session_id, cursor, PAGE_SIZE).await?;
+        if page.is_empty() {
+            break;
+        }
+        cursor = page.last().map_or(cursor, |envelope| envelope.seq);
+        for envelope in page {
+            if envelope.run_id.as_ref() == Some(run_id) {
+                let mut reductions = HashMap::from([(run_id.clone(), reduction)]);
+                reduce(&mut reductions, envelope);
+                reduction = reductions.remove(run_id).unwrap_or_default();
+            }
+        }
+    }
+    let (cancelling, failure_code, failure_message, retryable) = match error {
+        Some(error) => (
+            false,
+            error.code,
+            haider_core::sanitized_failure_message(&error.message),
+            error.retryable,
+        ),
+        None => (true, ErrorCode::Internal, "run was cancelled".into(), false),
+    };
+    Ok(interrupted_terminal_payloads(
+        reduction,
+        cancelling,
+        failure_code,
+        failure_message,
+        retryable,
+    ))
+}
+
+fn interrupted_terminal_payloads(
+    reduction: RunReduction,
+    cancelling: bool,
+    failure_code: ErrorCode,
+    failure_message: String,
+    retryable: bool,
+) -> Vec<EventPayload> {
     let terminal = if cancelling {
         RunState::Cancelled
     } else {
@@ -327,24 +430,16 @@ async fn terminalize_interrupted(
     }
     if !cancelling {
         payloads.push(EventPayload::RunFailed {
-            code: ErrorCode::Internal,
-            message: "run was interrupted by daemon restart".into(),
-            retryable: true,
+            code: failure_code,
+            message: failure_message,
+            retryable,
         });
     }
     payloads.push(EventPayload::RunState(terminal));
     payloads.push(EventPayload::SessionState(SessionState::Idle {
         interrupted: true,
     }));
-    let mut envelopes = recovery_envelopes(
-        store.worker_generation(),
-        device_id,
-        session_id,
-        run_id,
-        payloads,
-    )?;
-    store.append(&mut envelopes).await?;
-    Ok(())
+    payloads
 }
 
 async fn append_recovered_active(

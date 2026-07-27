@@ -61,6 +61,10 @@ const DEFAULT_DEFERRED_COMMAND_CAPACITY: usize = 64;
 const MAX_PROVIDER_ATTEMPTS: usize = 3;
 const RETRY_BASE_MS: u64 = 25;
 const RETRY_CEILING_MS: u64 = 2_000;
+/// Provider instructions are respected beyond the computed-jitter ceiling,
+/// but a daemon must not park one request indefinitely on an untrusted value.
+/// Values above one minute terminalize as retryable exhaustion.
+const MAX_PROVIDER_RETRY_AFTER_MS: u64 = 60_000;
 
 /// Immutable identity and fencing parameters for one session actor.
 #[derive(Debug, Clone)]
@@ -87,6 +91,9 @@ pub struct HarnessConfig {
     pub max_provider_requests_per_turn: usize,
     /// Maximum number of submissions parked behind the active turn.
     pub deferred_command_capacity: usize,
+    /// Daemon supervisors close/reconcile their effect broker before writing
+    /// `Cancelled`. Standalone actors retain the direct terminal commit.
+    pub supervisor_commits_cancelled: bool,
     /// Optional supervisor-owned event namespace shared by every turn actor
     /// and effect journal in one worker generation.
     event_ids: Option<Arc<EventIdGenerator>>,
@@ -118,6 +125,7 @@ impl HarnessConfig {
             broadcast_capacity: 128,
             max_provider_requests_per_turn: DEFAULT_MAX_PROVIDER_REQUESTS_PER_TURN,
             deferred_command_capacity: DEFAULT_DEFERRED_COMMAND_CAPACITY,
+            supervisor_commits_cancelled: false,
             event_ids: None,
             started_at_ms: None,
         }
@@ -1180,13 +1188,10 @@ impl HarnessActor {
     /// Commits `Waiting { RateLimit | ProviderBackoff }`, sleeps, then
     /// commits `Thinking` — the R6 backoff between provider attempts.
     ///
-    /// The delay honors `retry_after_ms` when present, otherwise exponential
-    /// backoff with deterministic full jitter (hash of run + attempt, so
-    /// restart tests reproduce). KNOWN LIMITATION (clean-code findings, for
-    /// the review round): the final `min(RETRY_CEILING_MS)` clamps a
-    /// provider-supplied `retry_after_ms` above 2s down to 2s, retrying
-    /// EARLIER than the provider asked — R6 intends the ceiling for the
-    /// jitter formula only.
+    /// The delay honors `retry_after_ms` exactly through the one-minute
+    /// respect cap. The two-second ceiling applies only to locally computed
+    /// deterministic full jitter. Instructions beyond the respect cap are
+    /// terminalized as retryable exhaustion instead of silently shortened.
     async fn wait_before_provider_retry(
         &mut self,
         run_id: &RunId,
@@ -1194,6 +1199,21 @@ impl HarnessActor {
         failed_attempt: usize,
         error: &ProviderError,
     ) -> Result<(), DriveError> {
+        if error
+            .retry_after_ms
+            .is_some_and(|delay| delay > MAX_PROVIDER_RETRY_AFTER_MS)
+        {
+            return Err(DriveError::Provider(ProviderError {
+                kind: error.kind,
+                message: format!(
+                    "provider retry-after {}ms exceeds the {}ms respect cap",
+                    error.retry_after_ms.unwrap_or_default(),
+                    MAX_PROVIDER_RETRY_AFTER_MS
+                ),
+                retryable: true,
+                retry_after_ms: error.retry_after_ms,
+            }));
+        }
         let reason = if error.kind == ProviderErrorKind::RateLimited {
             WaitReason::RateLimit
         } else {
@@ -1219,7 +1239,7 @@ impl HarnessActor {
             biased;
             () = cancel.cancelled() => return Err(DriveError::Cancelled),
             () = tokio::time::sleep(std::time::Duration::from_millis(
-                delay_ms.min(RETRY_CEILING_MS),
+                delay_ms,
             )) => {}
         }
         if cancel.is_cancelled() {
@@ -1688,6 +1708,14 @@ impl HarnessActor {
     }
 
     async fn cancelled_outcome(&mut self, run_id: &RunId) -> TurnOutcome {
+        if self.config.supervisor_commits_cancelled {
+            self.state.send_replace(Some(RunState::Cancelled));
+            return TurnOutcome {
+                state: RunState::Cancelled,
+                finish_reason: FinishReason::Cancelled,
+                error: None,
+            };
+        }
         match self.commit_state(run_id, RunState::Cancelled).await {
             Ok(()) => TurnOutcome {
                 state: RunState::Cancelled,
@@ -2095,21 +2123,49 @@ fn cumulative_usage(completed: Option<&Usage>, current: &Usage) -> Result<Usage,
             "provider account changed inside one logical turn",
         )));
     }
-    let add = |left: u64, right: u64, field: &str| {
-        left.checked_add(right).ok_or_else(|| {
-            DriveError::Provider(provider_protocol_error(format!(
-                "logical-turn usage overflow in {field}"
-            )))
-        })
-    };
     Ok(Usage {
-        input: add(completed.input, current.input, "input")?,
-        output: add(completed.output, current.output, "output")?,
-        reasoning: add(completed.reasoning, current.reasoning, "reasoning")?,
-        cached: add(completed.cached, current.cached, "cached")?,
+        // Usage is accounting telemetry, not a reason to rewrite an otherwise
+        // successful turn into Errored. Saturation preserves monotonic
+        // cumulative snapshots at the protocol's representable maximum.
+        input: completed.input.saturating_add(current.input),
+        output: completed.output.saturating_add(current.output),
+        reasoning: completed.reasoning.saturating_add(current.reasoning),
+        cached: completed.cached.saturating_add(current.cached),
         source: current.source,
         account: current.account.clone(),
     })
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::items_after_test_module)]
+mod usage_tests {
+    use super::*;
+    use haider_protocol::provider::UsageSource;
+
+    #[test]
+    fn cumulative_usage_saturates_each_counter_without_failing_the_turn() {
+        let completed = Usage {
+            input: u64::MAX,
+            output: u64::MAX - 1,
+            reasoning: u64::MAX - 2,
+            cached: u64::MAX - 3,
+            source: UsageSource::ProviderReported,
+            account: None,
+        };
+        let current = Usage {
+            input: 1,
+            output: 2,
+            reasoning: 3,
+            cached: 4,
+            source: UsageSource::ProviderReported,
+            account: None,
+        };
+        let cumulative = cumulative_usage(Some(&completed), &current).expect("same account");
+        assert_eq!(cumulative.input, u64::MAX);
+        assert_eq!(cumulative.output, u64::MAX);
+        assert_eq!(cumulative.reasoning, u64::MAX);
+        assert_eq!(cumulative.cached, u64::MAX);
+    }
 }
 
 /// Bounds and de-controls a message destined for a durable `RunFailed`

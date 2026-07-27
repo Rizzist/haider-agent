@@ -208,6 +208,24 @@ impl SqliteStoreHandle {
         .await
     }
 
+    /// Blocking-pool adapter for the live-worker transition gate. Unlike the
+    /// general startup/test append seam, this validates terminal/Cancelling
+    /// truth in the same SQLite transaction that appends the batch.
+    pub async fn append_worker(
+        &self,
+        envelopes: Vec<RawEnvelope>,
+    ) -> Result<Vec<RawEnvelope>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                let mut envelopes = envelopes;
+                store.append_worker(&mut envelopes)?;
+                Ok(envelopes)
+            })
+        })
+        .await
+    }
+
     /// Reads one true-weight-budgeted replay page (`Store::read_page` law:
     /// retained rows stop at the budget, but a non-empty result always
     /// contains at least one envelope).

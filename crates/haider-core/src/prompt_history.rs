@@ -21,6 +21,8 @@ impl PromptHistoryCompiler {
     /// Builds terminal prior conversation plus the current accepted user
     /// message exactly once. Partial output from errored/interrupted runs is
     /// excluded even when individual envelopes requested prompt rendering.
+    /// The O(journal) projection/cache trigger and its correctness guardrails
+    /// are ledgered in `docs/OPTIMIZATIONS.md` under W3c1.
     pub async fn compile(
         store: &dyn StoreHandle,
         session_id: &SessionId,
@@ -182,6 +184,16 @@ mod tests {
         }
     }
 
+    fn scoped(
+        mut envelope: haider_protocol::envelope::RawEnvelope,
+        branch_id: &BranchId,
+        agent_id: &AgentId,
+    ) -> haider_protocol::envelope::RawEnvelope {
+        envelope.branch_id = Some(branch_id.clone());
+        envelope.agent_id = Some(agent_id.clone());
+        envelope
+    }
+
     /// MUTATION CHECK: emit `ToolResult` immediately in journal order.
     /// Expected failure: the reconstructed provider history begins with a tool
     /// result before its assistant tool call.
@@ -272,5 +284,116 @@ mod tests {
             .position(|message| message.tool_result_for("call-1").is_some())
             .expect("tool result");
         assert_eq!(result, call + 1);
+    }
+
+    /// Fable D2-5 pin: only Done history in the requested branch/agent scope
+    /// may reach the provider; prompt-marked partial output is still excluded.
+    #[tokio::test]
+    async fn branch_agent_and_nonterminal_history_are_excluded_structurally() {
+        let store = MemoryStore::new();
+        let session_id = SessionId::new("scoped-history");
+        let branch = BranchId::new("branch-a");
+        let other_branch = BranchId::new("branch-b");
+        let agent = AgentId::new("agent-a");
+        let other_agent = AgentId::new("agent-b");
+        let matching = RunId::new("matching");
+        let wrong_branch = RunId::new("wrong-branch");
+        let wrong_agent = RunId::new("wrong-agent");
+        let interrupted = RunId::new("interrupted");
+        let current = RunId::new("current");
+        let user = |run: &RunId, id: &str, text: &str| {
+            envelope(
+                &session_id,
+                run,
+                id,
+                EventPayload::UserMessage {
+                    text: text.into(),
+                    attachments: Vec::new(),
+                    mode: DeliveryMode::Queue,
+                },
+                PromptRender::Verbatim,
+            )
+        };
+        let done = |run: &RunId, id: &str| {
+            envelope(
+                &session_id,
+                run,
+                id,
+                EventPayload::RunState(RunState::Done),
+                PromptRender::Omit,
+            )
+        };
+        let mut events = vec![
+            scoped(
+                user(&matching, "matching-user", "matching"),
+                &branch,
+                &agent,
+            ),
+            scoped(done(&matching, "matching-done"), &branch, &agent),
+            scoped(
+                user(&wrong_branch, "wrong-branch-user", "wrong branch"),
+                &other_branch,
+                &agent,
+            ),
+            scoped(
+                done(&wrong_branch, "wrong-branch-done"),
+                &other_branch,
+                &agent,
+            ),
+            scoped(
+                user(&wrong_agent, "wrong-agent-user", "wrong agent"),
+                &branch,
+                &other_agent,
+            ),
+            scoped(
+                done(&wrong_agent, "wrong-agent-done"),
+                &branch,
+                &other_agent,
+            ),
+            scoped(
+                user(&interrupted, "interrupted-user", "partial"),
+                &branch,
+                &agent,
+            ),
+            scoped(
+                envelope(
+                    &session_id,
+                    &interrupted,
+                    "interrupted-stream",
+                    EventPayload::Item(ItemEvent::Completed {
+                        item_id: haider_protocol::ids::ItemId::new("partial-item"),
+                        item: TurnItem::AgentMessage {
+                            text: "partial output".into(),
+                        },
+                    }),
+                    PromptRender::Verbatim,
+                ),
+                &branch,
+                &agent,
+            ),
+            scoped(user(&current, "current-user", "current"), &branch, &agent),
+        ];
+        StoreHandle::append(&store, &mut events)
+            .await
+            .expect("append scoped history");
+
+        let messages = PromptHistoryCompiler::compile(
+            &store,
+            &session_id,
+            Some(&branch),
+            Some(&agent),
+            &current,
+        )
+        .await
+        .expect("compile");
+        let rendered = messages
+            .iter()
+            .flat_map(|message| &message.blocks)
+            .filter_map(|block| match block {
+                Block::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rendered, vec!["matching", "current"]);
     }
 }
