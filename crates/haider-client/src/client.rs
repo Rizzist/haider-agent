@@ -404,12 +404,20 @@ impl RpcClient {
             .map_err(ClientError::Encode)?;
         let (sender, receiver) = oneshot::channel();
         {
-            if let ConnectionState::Disconnected(reason) = self.state() {
-                return Err(ClientError::Disconnected(reason));
-            }
             let Ok(mut pending) = self.shared.pending.lock() else {
                 return Err(ClientError::Disconnected(DisconnectReason::Closed));
             };
+            // The state check sits INSIDE the pending lock: `fail` flips the
+            // state before its one-time clear takes this same lock, so either
+            // the flip is visible here (typed error, nothing inserted) or the
+            // sender is inserted before the clear runs and the clear drops it
+            // — the receiver below then resolves with the typed disconnect.
+            // A pre-lock check leaves a window where the clear completes
+            // between check and insert, orphaning the sender forever (W3c2
+            // review finding 1).
+            if let ConnectionState::Disconnected(reason) = self.state() {
+                return Err(ClientError::Disconnected(reason));
+            }
             pending.insert(id.clone(), sender);
         }
         if self.outbound.send(bytes).await.is_err() {

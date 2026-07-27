@@ -889,27 +889,6 @@ impl Store {
         })
     }
 
-    /// Looks up a committed `account.login_api` response. Obeys the R2
-    /// receipt-idempotency law stated on [`Self::session_create_receipt`]
-    /// (unfenced, cross-restart, digest-checked).
-    pub fn login_receipt(
-        &self,
-        command_id: &str,
-        request_digest: &str,
-        request_json: &str,
-    ) -> StoreResult<Option<LoginReceiptResponse>> {
-        validate_command_identity(command_id, request_digest, request_json)?;
-        let connection = self.connection()?;
-        lookup_command_response(
-            &connection,
-            command_id,
-            LOGIN_METHOD,
-            request_digest,
-            request_json,
-            "account-login",
-        )
-    }
-
     /// Claims the durable login command (transaction A of R10's
     /// two-transaction shape).
     ///

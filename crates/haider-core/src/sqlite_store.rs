@@ -188,23 +188,6 @@ impl SqliteStoreHandle {
         run_blocking(move || owner.with_store(|store| store.cancel_turn(&command))).await
     }
 
-    /// Blocking-pool adapter for `Store::login_receipt` (R2 replay lookup;
-    /// unfenced by design).
-    pub async fn login_receipt(
-        &self,
-        command_id: String,
-        request_digest: String,
-        request_json: String,
-    ) -> Result<Option<haider_store::LoginReceiptResponse>, HaiderError> {
-        let owner = Arc::clone(&self.owner);
-        run_blocking(move || {
-            owner.with_store(|store| {
-                store.login_receipt(&command_id, &request_digest, &request_json)
-            })
-        })
-        .await
-    }
-
     /// Blocking-pool adapter for `Store::login_claim_receipt` (transaction A
     /// of the R10 two-transaction login shape).
     pub async fn login_claim_receipt(

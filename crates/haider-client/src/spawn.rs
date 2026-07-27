@@ -25,7 +25,7 @@ use std::time::Duration;
 use haider_rpc::{
     FEATURE_SESSION_MUTATION_V1, FEATURE_TURN_CONTROL_V1, LifecyclePhase, ProtocolError, Welcome,
 };
-use tokio::time::Instant;
+use tokio::time::{Instant, sleep};
 
 use crate::client::{ClientConfig, ConnectError, Connected, connect};
 use crate::profile::ResolvedProfile;
@@ -256,6 +256,25 @@ pub async fn ensure_daemon(
         match try_attach(profile, &options).await {
             Attach::Ready(connected) => {
                 let Connected { client, welcome } = *connected;
+                // Reap a still-running race-loser candidate before returning:
+                // its store-lock loss makes exit 75 imminent, and the parent
+                // process is long-running from W3c3 on — an unreaped child
+                // would linger as a zombie for the parent's lifetime (W3c2
+                // review finding 6). One bounded grace poll, then release.
+                if let Some(mut active) = child.take() {
+                    for _ in 0..40u8 {
+                        match active.try_wait() {
+                            Ok(Some(status)) => {
+                                if status.code() == Some(RACE_LOSER_EXIT_CODE) {
+                                    race_lost = true;
+                                }
+                                break;
+                            }
+                            Ok(None) => sleep(Duration::from_millis(25)).await,
+                            Err(_) => break,
+                        }
+                    }
+                }
                 return Ok(EnsuredDaemon {
                     client,
                     welcome,

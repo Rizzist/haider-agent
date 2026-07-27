@@ -493,3 +493,85 @@ async fn fatal_protocol_error_frame_fails_pending_requests() {
         other => panic!("expected fatal disconnect, got {other:?}"),
     }
 }
+
+/// W3c2 review finding 1: a `request()` racing `Shared::fail` must never
+/// orphan its pending sender. The fix places the disconnect check INSIDE the
+/// pending lock, so either the flip is visible before insert (typed error,
+/// nothing inserted) or the sender lands before fail's one-time clear and the
+/// clear drops it (the receiver resolves with the typed disconnect). The
+/// race window itself is not black-box constructible, so this is the
+/// r2-precedented executing source guard on the ordering, beside the
+/// behavioral request-after-disconnect pin below.
+///
+/// MUTATION CHECK: move the `ConnectionState::Disconnected` early-return in
+/// `RpcClient::request` back above the `pending.lock()` acquisition.
+/// Expected failure: the position assertions below invert.
+#[test]
+fn request_disconnect_check_sits_inside_the_pending_lock() {
+    let source = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/client.rs"),
+    )
+    .expect("client source");
+    let body_start = source.find("pub async fn request").expect("request fn");
+    let body = &source[body_start..body_start + 2_500];
+    let lock = body
+        .find("self.shared.pending.lock()")
+        .expect("pending lock acquisition inside request");
+    let check = body
+        .find("ConnectionState::Disconnected(reason) = self.state()")
+        .expect("disconnect check inside request");
+    let insert = body.find("pending.insert(").expect("pending insert");
+    assert!(
+        lock < check,
+        "the disconnect check must run under the pending lock (fail flips \
+         state before its one-time clear takes the same lock)"
+    );
+    assert!(
+        check < insert,
+        "the check precedes the insert so nothing is inserted after the flip"
+    );
+}
+
+/// Behavioral half of the pin: once the client observes a disconnect, a new
+/// `request()` resolves with the typed reason — it must never hang.
+#[tokio::test]
+async fn request_after_observed_disconnect_resolves_with_the_typed_reason() {
+    let dir = short_dir();
+    let endpoint = dir.path().join("post-disconnect.sock");
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let _daemon = spawn_fake_daemon(
+        &endpoint,
+        Arc::clone(&accepted),
+        HelloReply::Welcome(welcome(
+            "profile-x",
+            haider_client::required_live_features(),
+        )),
+        |stream, _decoder| async move {
+            // Close immediately after the handshake: the client's reader
+            // observes EOF and fails the connection.
+            drop(stream);
+        },
+    );
+    let connected = connect(&endpoint, ClientConfig::default())
+        .await
+        .expect("connect fake daemon");
+    let reason = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        connected.client.disconnected(),
+    )
+    .await
+    .expect("disconnect observed");
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        connected.client.request(list_body()),
+    )
+    .await
+    .expect("request resolves instead of hanging");
+    match outcome {
+        Err(haider_client::ClientError::Disconnected(observed)) => {
+            assert_eq!(observed, reason, "the first disconnect reason wins");
+        }
+        Err(other) => panic!("expected the typed disconnect, got {other:?}"),
+        Ok(body) => panic!("expected the typed disconnect, got Ok({body:?})"),
+    }
+}
