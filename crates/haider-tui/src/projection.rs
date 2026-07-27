@@ -165,6 +165,33 @@ impl SessionProjection {
         Self::default()
     }
 
+    /// Rebuild a projection from persisted display state (the demo store's
+    /// load — see `crate::demo_store`). Only what the sim persists comes
+    /// back: transcript rows, the open menu, the todo panel, the usage
+    /// meter and the idle(i) marker. Everything stream-scoped starts
+    /// fresh — `run`/`harness` are `None` (every session loads IDLE, sim
+    /// load §6), `voice_live` is off, and the idempotency bookkeeping
+    /// (`finished_items`, seq accounting) is empty: no in-flight delivery
+    /// survives a restart, and a NEW turn's ids must never be swallowed as
+    /// duplicates of rows restored from disk.
+    #[must_use]
+    pub fn hydrate(
+        entries: Vec<TranscriptEntry>,
+        menu: Option<Menu>,
+        todos: Option<TodoPanel>,
+        usage: Option<Usage>,
+        interrupted: bool,
+    ) -> Self {
+        Self {
+            entries,
+            menu,
+            todos,
+            usage,
+            interrupted,
+            ..Self::default()
+        }
+    }
+
     /// Consume one raw envelope in stream order. Duplicate seqs are skipped;
     /// gaps are recorded (attach/replay honesty) and processing continues.
     /// Unknown payloads are counted and ignored (forward-compat law).

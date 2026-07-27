@@ -10,7 +10,7 @@ launcher is quiescent after boot (~3s), a blocking read never returns,
 and the probe hung forever while the app sat healthy. A quiescent-idle
 TUI is correct (dirty-flag rendering, no busy redraw loop); the harness
 must tolerate silence, not the other way round."""
-import os, pty, sys, time, fcntl, termios, struct, signal, re, select
+import os, pty, sys, tempfile, time, fcntl, termios, struct, signal, re, select
 
 cols, rows = int(sys.argv[1]), int(sys.argv[2])
 binary = sys.argv[3] if len(sys.argv) > 3 else "/usr/local/bin/haider"
@@ -18,6 +18,10 @@ resize_to = sys.argv[4] if len(sys.argv) > 4 else None  # "COLSxROWS" mid-run
 
 pid, fd = pty.fork()
 if pid == 0:
+    # TUI4c-13b: the demo persists sessions under the profile dir now.
+    # Isolate every probe run in a throwaway profile unless the caller
+    # pinned one — gates must never read or pollute real demo state.
+    os.environ.setdefault("HAIDER_PROFILE_DIR", tempfile.mkdtemp(prefix="haider-probe-"))
     os.execv(binary, [binary, "tui", "--demo"])
 
 def set_size(fd, cols, rows):

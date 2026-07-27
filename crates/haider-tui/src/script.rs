@@ -293,6 +293,11 @@ impl ChipDisplayState {
 pub struct ChipSeed {
     pub agent: String,
     pub parent: Option<String>,
+    /// The roster index this chip's callsign was claimed at (`None` for
+    /// chips named outside the roster). Persisted so a reload resumes the
+    /// honour-roll past it (sim spreads `rosterAt(i)`'s `ros` into the
+    /// chip, tui.js:559; load reads it at 715-721).
+    pub ros: Option<u64>,
     pub callsign: String,
     pub hon: &'static str,
     pub full: String,
@@ -448,6 +453,10 @@ pub const ROMAN: [&str; 8] = ["", "II", "III", "IV", "V", "VI", "VII", "VIII"];
 /// One claimed roster name (sim `rosterAt`, tui.js:881-886).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RosterName {
+    /// The claimed roster index (sim `rosterAt` returns `{ ros: i, … }`,
+    /// tui.js:398). Recorded on heads and chips so the persistence load can
+    /// resume the honour-roll past every claim (TUI4c-13b guard 3).
+    pub ros: u64,
     pub callsign: String,
     pub hon: &'static str,
     pub full: String,
@@ -477,12 +486,14 @@ pub fn roster_at(index: u64) -> RosterName {
         .map_or_else(|| (generation + 1).to_string(), |roman| (*roman).to_owned());
     if suffix.is_empty() {
         RosterName {
+            ros: index,
             callsign: name.to_owned(),
             hon,
             full: full.to_owned(),
         }
     } else {
         RosterName {
+            ros: index,
             callsign: format!("{name} {suffix}"),
             hon,
             full: format!("{full} {suffix}"),
@@ -920,6 +931,7 @@ fn branch_subagent(b: &mut B, low: &str, roster_counter: &std::sync::atomic::Ato
     b.beats.push(Beat::ChipAdd(Box::new(ChipSeed {
         agent: tests_agent.clone(),
         parent: None,
+        ros: Some(tests_name.ros),
         callsign: tests_name.callsign.clone(),
         hon: tests_name.hon,
         full: tests_name.full.clone(),
@@ -946,6 +958,7 @@ fn branch_subagent(b: &mut B, low: &str, roster_counter: &std::sync::atomic::Ato
         b.beats.push(Beat::ChipAdd(Box::new(ChipSeed {
             agent: docs_agent.clone(),
             parent: None,
+            ros: Some(docs_name.ros),
             callsign: docs_name.callsign.clone(),
             hon: docs_name.hon,
             full: docs_name.full.clone(),
@@ -1127,6 +1140,7 @@ fn branch_auth(b: &mut B, roster_counter: &std::sync::atomic::AtomicU64) {
     b.beats.push(Beat::ChipAdd(Box::new(ChipSeed {
         agent: auth_agent.clone(),
         parent: None,
+        ros: Some(auth_name.ros),
         callsign: auth_name.callsign.clone(),
         hon: auth_name.hon,
         full: auth_name.full.clone(),
@@ -1980,6 +1994,7 @@ pub fn respond_chip_beats(
         beats.push(Beat::ChipAdd(Box::new(ChipSeed {
             agent: child_agent.clone(),
             parent: Some(agent.to_owned()),
+            ros: Some(child_name.ros),
             callsign: child_name.callsign.clone(),
             hon: child_name.hon,
             full: child_name.full.clone(),

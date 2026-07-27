@@ -6,13 +6,17 @@ kernel read boundary and race ESC disambiguation), and the capture ends
 with a resize-forced FULL repaint + silence drain so the check reads the
 final screen, not scheduler luck. Reports the same metrics as pty-probe.py
 plus whether the composer lines appear in the final screen."""
-import os, pty, sys, time, fcntl, termios, struct, signal, re, select
+import os, pty, sys, tempfile, time, fcntl, termios, struct, signal, re, select
 
 cols, rows = int(sys.argv[1]), int(sys.argv[2])
 binary = sys.argv[3] if len(sys.argv) > 3 else "/usr/local/bin/haider"
 
 pid, fd = pty.fork()
 if pid == 0:
+    # TUI4c-13b: the demo persists sessions under the profile dir now.
+    # Isolate every probe run in a throwaway profile unless the caller
+    # pinned one — gates must never read or pollute real demo state.
+    os.environ.setdefault("HAIDER_PROFILE_DIR", tempfile.mkdtemp(prefix="haider-probe-"))
     os.execv(binary, [binary, "tui", "--demo"])
 
 def set_size(fd, cols, rows):

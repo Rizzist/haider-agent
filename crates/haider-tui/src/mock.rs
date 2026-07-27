@@ -442,6 +442,7 @@ pub fn sample_seed_chip(index: usize) -> Option<crate::script::ChipSeed> {
     Some(crate::script::ChipSeed {
         agent: "seed-l1-sub".to_owned(),
         parent: None,
+        ros: Some(name.ros),
         callsign: name.callsign,
         hon: name.hon,
         full: name.full,

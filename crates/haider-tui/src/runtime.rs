@@ -189,7 +189,16 @@ pub fn demo_pace(payload: &EventPayload) -> Duration {
 /// Run `haider tui --demo`: the scripted stream drives every surface.
 /// Returns when the user quits (⌃C from the launcher or boot — elsewhere
 /// ⌃C is navigation back to the launcher, owner item 10) or input closes.
-pub async fn run_demo(mut model: AppModel) -> std::io::Result<()> {
+///
+/// `store` is the DEMO persistence file (TUI4c-13b — see
+/// [`crate::demo_store`]): the loop saves after every drawn frame (the
+/// coalesced form of the sim's save-on-every-change), once more on quit,
+/// and intercepts `/reset`'s purge request. `None` disables persistence
+/// (the headless/plain paths and CI stay deterministic).
+pub async fn run_demo(
+    mut model: AppModel,
+    mut store: Option<crate::demo_store::DemoStore>,
+) -> std::io::Result<()> {
     let _guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
     // Sync the emulator's own background (window padding) to the theme
@@ -221,6 +230,22 @@ pub async fn run_demo(mut model: AppModel) -> std::io::Result<()> {
     // script/decay timers — the SAME production seams the tests drive
     // (review r3 P3-7).
     let (mut driver, mut envelope_rx) = DemoDriver::new(64);
+    // ONE honour roll (sim `rosterRef`, tui.js:681): the driver's chip
+    // claims post-increment the same counter the reducer's head claims do —
+    // and the persistence load's guard-3 restore covers both through it.
+    driver.adopt_roster(std::sync::Arc::clone(&model.roster));
+    // Meter continuity (sim: `branch.tokens` is persisted state the next
+    // turn adds to): every session's demo meter resumes from its restored
+    // (or seeded) usage total instead of resetting to zero on first beat.
+    for entry in &model.sessions {
+        if let Some(usage) = entry.projection.usage() {
+            driver.prime_meter(
+                entry.id,
+                usage.input.saturating_add(usage.cached),
+                usage.output.saturating_add(usage.reasoning),
+            );
+        }
+    }
     driver.spawn_boot();
     let answer_echo = driver.sender();
     // NB: no launcher auto-play. The sim has none — an untouched launcher
@@ -267,6 +292,13 @@ pub async fn run_demo(mut model: AppModel) -> std::io::Result<()> {
                 {
                     model.hovered = None;
                 }
+                // Demo persistence (TUI4c-13b): a drawn frame means state
+                // changed — save here, coalesced to the frame cadence
+                // (hash-skipped when nothing persisted moved). This is the
+                // sim's save-on-every-change without a timer or an arm.
+                if let Some(store) = store.as_mut() {
+                    store.save(&model);
+                }
             }
         }
         // Reducer-requested side effects.
@@ -284,6 +316,16 @@ pub async fn run_demo(mut model: AppModel) -> std::io::Result<()> {
                         let size = terminal.size()?;
                         let text = rendered_selection_text(&model, size, &selection);
                         copy_selection_effects(&mut model, &text);
+                    }
+                }
+                // Runtime-owned like CopySelection: only this loop knows
+                // the store path. /reset deletes the demo state file (sim
+                // tui.js:1918); the reducer already reseeded, and the next
+                // frame's save rewrites the seeds exactly as the sim's save
+                // effect refills localStorage after removeItem.
+                AppRequest::PurgeDemoStore => {
+                    if let Some(store) = store.as_mut() {
+                        store.purge();
                     }
                 }
                 request => driver.handle_request(&mut model, request),
@@ -322,6 +364,11 @@ pub async fn run_demo(mut model: AppModel) -> std::io::Result<()> {
                 }
             }
         }
+    }
+    // The quit-path write (13b brief): mutations between the last drawn
+    // frame and the exit still land on disk.
+    if let Some(store) = store.as_mut() {
+        store.save(&model);
     }
     Ok(())
 }
@@ -547,6 +594,20 @@ impl ArmTable {
                 .is_ok_and(|table| table.1.contains_key(&id))
     }
 
+    /// Any live arm belonging to `session` (its turn engine OR its chips).
+    /// The persistence port's stale-card gate: a session restored from disk
+    /// has NO arms until something runs in it, so an answer to one of its
+    /// hydrated cards has no live run to land on (the sim's missing menu
+    /// RESOLVER after reload, tui.js:870-876).
+    fn has_session_arms(&self, session: u64) -> bool {
+        self.inner.lock().is_ok_and(|table| {
+            table
+                .1
+                .values()
+                .any(|owner| owner.session_id() == Some(session))
+        })
+    }
+
     fn owner(&self, id: u64) -> Option<ArmOwner> {
         self.inner.lock().ok()?.1.get(&id).cloned()
     }
@@ -621,6 +682,25 @@ impl DemoDriver {
     #[must_use]
     pub const fn control_tag(&self) -> u64 {
         CONTROL_ARM
+    }
+
+    /// Share the reducer's roster counter (sim `rosterRef`, tui.js:681):
+    /// heads (reducer claims) and chips (driver claims) draw from ONE
+    /// honour roll, and the persistence load's guard-3 restore reaches
+    /// both. `run_demo` wires this at boot; headless tests that want the
+    /// shared law call it too.
+    pub fn adopt_roster(&mut self, counter: Counter) {
+        self.roster_counter = counter;
+    }
+
+    /// Prime one session's demo token meter (TUI4c-13b: the sim's
+    /// `branch.tokens` is persisted state the next turn ADDS to — without
+    /// priming, the first post-reload beat would reset the meter to its own
+    /// small delta).
+    pub fn prime_meter(&self, session: u64, input: u64, output: u64) {
+        if let Ok(mut meters) = self.meters.lock() {
+            meters.insert(session, (input, output));
+        }
     }
 
     /// True iff this arm is still registered (tests assert cancellation
@@ -953,11 +1033,12 @@ impl DemoDriver {
                 self.reset_aura_state(model);
             }
             AppRequest::Quit => model.should_quit = true,
-            // Runtime-owned (the event loop intercepts it before the
-            // driver): copying reads the rendered frame, which the driver
-            // never has. Reaching here means a headless harness drained it
-            // through the driver — a no-op, never a panic.
-            AppRequest::CopySelection => {}
+            // Runtime-owned (the event loop intercepts them before the
+            // driver): copying reads the rendered frame, and the store
+            // purge needs the state-file path — the driver has neither.
+            // Reaching here means a headless harness drained them through
+            // the driver — no-ops, never a panic.
+            AppRequest::CopySelection | AppRequest::PurgeDemoStore => {}
         }
     }
 
@@ -1192,10 +1273,25 @@ impl DemoDriver {
                 if origin != model.session_epoch {
                     return;
                 }
+                // TUI4c-13b: a card restored from disk has no parked
+                // continuation AND its session has no live arms (nothing
+                // has run in it since boot) — the port of the sim's missing
+                // menu RESOLVER after reload. Answering it closes the card
+                // and lands the sim's note verbatim (tui.js:874-876);
+                // sampled BEFORE resume_parked, though a parked entry
+                // implies a live arm anyway.
+                let stale = !self.table.has_session_arms(origin);
                 self.resume_parked(&answer);
                 model.handle(AppEvent::Envelope(Box::new(EventPayload::MenuAnswered(
                     answer,
                 ))));
+                if stale {
+                    model.projection.push_note(
+                        "· stale menu dismissed — no live run attached (answered after reload)"
+                            .to_owned(),
+                    );
+                    model.dirty = true;
+                }
             }
             DemoEvent::Dispatch { text, voice, turn } => {
                 // The sim picks its branch AFTER the think window

@@ -17,6 +17,7 @@ use haider_provider::{
     ANTHROPIC_PROVIDER_NAME, AnthropicProvider, FakeProvider, FakeStep, Provider, ProviderError,
 };
 use haider_tui::app::AppModel;
+use haider_tui::demo_store::DemoStore;
 use haider_tui::runtime::{detect_system_theme, run_demo, run_demo_plain};
 use haider_tui::sanctum::SanctumTier;
 use haider_tui::theme::ThemeKey;
@@ -114,15 +115,6 @@ async fn tui_command(rest: &[String]) -> ExitCode {
     }
     let interactive = !plain && io::stdout().is_terminal();
     let mut model = AppModel::new();
-    // Explicit --theme wins; otherwise follow the system/terminal appearance
-    // (OSC 11 background luminance): dark ground -> Dark, light -> Dawn.
-    model.theme = theme.unwrap_or_else(|| {
-        if interactive {
-            detect_system_theme()
-        } else {
-            ThemeKey::Dawn
-        }
-    });
     // Arabic is the default sanctum tier (owner decision, sim parity);
     // HAIDER_SHAHADA=translit serves emulators that cannot shape Arabic.
     if matches!(std::env::var("HAIDER_SHAHADA").as_deref(), Ok("translit")) {
@@ -145,6 +137,9 @@ async fn tui_command(rest: &[String]) -> ExitCode {
         model.session_dir = abbreviated;
     }
     if !interactive {
+        // The plain/CI oracle stays deterministic: no demo-store load, no
+        // save — persistence is an interactive-session affordance.
+        model.theme = theme.unwrap_or(ThemeKey::Dawn);
         // Fallible write: `print!` panics on BrokenPipe (review r1 P2).
         // A closed pipe is a normal consumer choice → success; other write
         // failures are real I/O errors.
@@ -156,7 +151,28 @@ async fn tui_command(rest: &[String]) -> ExitCode {
             Err(_) => ExitCode::from(EX_IOERR),
         };
     }
-    match run_demo(model).await {
+    // TUI4c-13b: the DEMO state file (sim localStorage) — load before the
+    // theme decision so a persisted theme can win over system detection.
+    // A missing/corrupt file or an unresolvable path simply keeps the
+    // seeds; the demo never fails to start over persistence.
+    let mut theme_restored = false;
+    let store = DemoStore::default_path().map(|path| {
+        let store = DemoStore::at(path);
+        if let Some(dto) = store.load() {
+            theme_restored = haider_tui::demo_store::hydrate(&mut model, dto).theme_restored;
+        }
+        store
+    });
+    // Explicit --theme wins; then the persisted theme (sim: a known
+    // `data.themeName` restores); otherwise follow the system/terminal
+    // appearance (OSC 11 background luminance): dark ground -> Dark,
+    // light -> Dawn.
+    if let Some(key) = theme {
+        model.theme = key;
+    } else if !theme_restored {
+        model.theme = detect_system_theme();
+    }
+    match run_demo(model, store).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("haider tui: terminal error: {error}");

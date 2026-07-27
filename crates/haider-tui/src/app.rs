@@ -215,6 +215,9 @@ pub struct ChipQuestion {
 #[derive(Debug)]
 pub struct ChipModel {
     pub agent: String,
+    /// The roster index the callsign was claimed at (persistence guard 3:
+    /// the reload's honour-roll restore reads every chip's `ros`).
+    pub ros: Option<u64>,
     pub callsign: String,
     pub hon: &'static str,
     pub full: String,
@@ -270,6 +273,7 @@ impl ChipModel {
         }
         Self {
             agent: seed.agent,
+            ros: seed.ros,
             callsign: seed.callsign,
             hon: seed.hon,
             full: seed.full,
@@ -611,6 +615,11 @@ pub enum AppRequest {
     AuraTalk,
     /// `/reset` reseeded the aura — bump its script guard.
     ResetAura,
+    /// `/reset` also purges the demo state file (sim tui.js:1918:
+    /// `localStorage.removeItem("haider-tui-v1")`). Runtime-owned like
+    /// `CopySelection`: only the interactive loop knows the store path, so
+    /// it intercepts this; the driver treats it as a no-op.
+    PurgeDemoStore,
     /// Quit the app.
     Quit,
 }
@@ -1701,6 +1710,10 @@ impl AppModel {
                 );
                 self.aura = AuraModel::seed();
                 self.requests.push(AppRequest::ResetAura);
+                // Sim tui.js:1918: the state file dies with the reset; the
+                // seeds re-save on the next change exactly as the sim's
+                // save effect refills localStorage after removeItem.
+                self.requests.push(AppRequest::PurgeDemoStore);
                 self.screen = Screen::Launcher;
                 self.flash = Some("· demo reset".to_owned());
             }

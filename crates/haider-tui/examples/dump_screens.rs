@@ -547,6 +547,7 @@ fn chip(
     ChipModel::from_seed(ChipSeed {
         agent: agent.to_owned(),
         parent: None,
+        ros: None,
         callsign: callsign.to_owned(),
         hon,
         full: full.to_owned(),
