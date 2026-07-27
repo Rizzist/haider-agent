@@ -29,3 +29,12 @@ jobs:
         run: |
           cargo build -p haider-cli --locked
           ./target/debug/haider self-test | grep '"ok":true'
+      # The PTY ladder is the only gate that exercises the real terminal
+      # surface, and its live rows are the only proof that bare `haider`
+      # reaches live mode on a real daemon (the v0.0.12 keystone). The
+      # headless suite cannot see either: every live-only defect this lane
+      # shipped was first caught here, not by cargo test.
+      - name: probe ladder (demo + live)
+        run: |
+          cargo build --release -p haider-cli -p haider-daemond --locked
+          NO_COLOR=1 CLICOLOR=0 scripts/tui-probes/ladder.sh
