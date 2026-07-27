@@ -463,9 +463,28 @@ fn tui_demo_plain_flag_matches_piped_output() {
 }
 
 #[test]
-fn tui_without_demo_exits_2() {
-    let out = haider().arg("tui").output().expect("binary runs");
+fn tui_without_demo_rejects_the_demo_only_plain_oracle() {
+    // DIRECTED CHANGE (W3c3, report §6.3: "bare `haider` and `haider tui`
+    // enter live mode"). This test used to pin "only `haider tui --demo` is
+    // available until the daemon lands" — a law the keystone DELETES, so
+    // pinning it would pin the pre-W3c3 world. The usage law that survives
+    // is the one that still has meaning: `--plain` is the DEMO's
+    // deterministic oracle and has no live counterpart, so asking for it
+    // without `--demo` is a usage error (2), never a silent no-op that
+    // leaves the user waiting for text that will never come.
+    //
+    // The live entry itself needs a daemon and is covered by
+    // scripts/tui-probes/pty-probe-live.py, not by an exit-code assertion.
+    let out = haider()
+        .args(["tui", "--plain"])
+        .output()
+        .expect("binary runs");
     assert_eq!(out.status.code(), Some(2));
+    let out = haider()
+        .args(["tui", "--nonsense"])
+        .output()
+        .expect("binary runs");
+    assert_eq!(out.status.code(), Some(2), "an unknown tui flag is usage");
 }
 
 #[test]

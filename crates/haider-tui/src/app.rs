@@ -665,6 +665,21 @@ impl Default for AuraModel {
     }
 }
 
+/// Which runtime is driving this model (W3c3 M2).
+///
+/// The reducer is source-agnostic by design, but three decisions are NOT:
+/// a launcher submit either mints a local demo session or asks the daemon
+/// to create one; `/reset` reseeds a demo world that a live profile does
+/// not have; and menu answers carry demo epochs or live coordinates. Every
+/// other behavior is identical, and the default is [`Self::Demo`] so the
+/// entire pre-W3c3 corpus keeps its exact meaning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RuntimeMode {
+    #[default]
+    Demo,
+    Live,
+}
+
 /// Side effects the reducer requests from the runtime (the reducer itself
 /// never performs IO).
 #[derive(Debug, Clone, PartialEq)]
@@ -716,6 +731,13 @@ pub enum AppRequest {
     AuraTalk,
     /// `/reset` reseeded the aura — bump its script guard.
     ResetAura,
+    /// LIVE launcher submit (W3c3, report R11 cut 4): ask the daemon to
+    /// create a session for `text`. Deliberately NOT accompanied by a row,
+    /// a session id, a screen flip or a turn: in live mode there is no
+    /// local truth to fabricate, so the launcher shows nothing new until
+    /// `session.create` answers. The demo path (`new_session`) is the
+    /// opposite by design — its world IS local.
+    CreateSession { text: String },
     /// The strict gap law fired (W3c3, report R11 cut 2): reduction STOPPED
     /// for `session` with its cursor still at `after_seq`, and NOTHING later
     /// may be applied until the driver reattaches from there. The demo
@@ -1001,6 +1023,8 @@ pub struct AppModel {
     /// seeds. The ATTACHED session's state is checked OUT of its slot into
     /// this model's live fields (see `crate::session`).
     pub sessions: Vec<crate::session::SessionState>,
+    /// Which runtime drives this model (W3c3 M2). Demo by default.
+    pub mode: RuntimeMode,
     /// The checked-out session's PROTOCOL id (sim `activeId`; `None` =
     /// launcher's no-session state, exactly the sim's `setActiveId(null)`).
     pub active_session: Option<SessionId>,
@@ -1123,6 +1147,7 @@ impl Default for AppModel {
             todos_collapsed: false,
             auto_resuming: false,
             aura: AuraModel::seed(),
+            mode: RuntimeMode::Demo,
             sessions: seed_session_states(),
             active_session: None,
             last_detached: None,
@@ -1988,7 +2013,16 @@ impl AppModel {
         // Typing on the LAUNCHER starts a FRESH session (sim promise,
         // tui.js:2013-2016 `newSession`) — the one left behind keeps
         // running and shows as busy in its launcher row.
+        //
+        // LIVE (W3c3, report R11 cut 4): nothing local happens. The daemon
+        // mints the session; the row, the attachment and the first turn all
+        // follow its responses, so no fabricated row or session can ever
+        // need reconciling with the truth that arrives.
         if self.screen == Screen::Launcher {
+            if self.mode == RuntimeMode::Live {
+                self.requests.push(AppRequest::CreateSession { text });
+                return;
+            }
             self.new_session(&text);
         }
         // The blurb is NOT set here: the sim's micro-call names the session
@@ -2035,6 +2069,10 @@ impl AppModel {
     /// own UserMessage and tags streamed rows `♪ speaking`.
     fn submit_voice(&mut self, text: String) {
         if self.screen == Screen::Launcher {
+            if self.mode == RuntimeMode::Live {
+                self.requests.push(AppRequest::CreateSession { text });
+                return;
+            }
             self.new_session(&text);
         }
         self.projection.push_user_voice(text.clone());
@@ -2895,6 +2933,32 @@ impl AppModel {
         self.help_open = false;
         // TUI5 item 9: the launcher's own draft comes back.
         self.restore_draft();
+    }
+
+    /// Learn (or re-learn) a LIVE session row (W3c3 M2). Idempotent: a
+    /// session the model already holds keeps its row, its transcript and
+    /// its generation, so a `session.list` after every reconnect neither
+    /// duplicates rows nor resets the drafts/arms keyed by generation.
+    ///
+    /// A NEW row is minted with the next local generation and NO content:
+    /// the launcher shows the daemon's session, and its transcript arrives
+    /// by attach, never by guess.
+    pub fn upsert_live_session(&mut self, id: &SessionId) -> UiGeneration {
+        if let Some(existing) = self.sessions.iter().find(|row| &row.id == id) {
+            return existing.ui_gen;
+        }
+        let ui_gen = UiGeneration::new(self.next_ui_generation);
+        self.next_ui_generation += 1;
+        let mut entry = crate::session::SessionState::neutral(id.clone(), ui_gen);
+        entry.dir = self.launcher_dir.clone();
+        entry.model_short = self.identity.model_short.clone();
+        entry.device = self.identity.device.clone();
+        entry.ago = "now".to_owned();
+        // Newest first, exactly like `new_session` — the launcher's order
+        // is a display law, not a source law.
+        self.sessions.insert(0, entry);
+        self.dirty = true;
+        ui_gen
     }
 
     /// A NON-attached session's slot (background event routing).

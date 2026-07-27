@@ -13,6 +13,8 @@ pub mod composer;
 pub mod demo_store;
 pub mod format;
 pub mod identity;
+pub mod link;
+pub mod live;
 pub mod mark;
 pub mod mock;
 pub mod plain;

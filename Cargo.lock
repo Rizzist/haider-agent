@@ -899,7 +899,9 @@ name = "haider-tui"
 version = "0.0.11"
 dependencies = [
  "base64",
+ "haider-client",
  "haider-protocol",
+ "haider-rpc",
  "ratatui",
  "serde",
  "serde_json",

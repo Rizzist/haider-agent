@@ -1181,11 +1181,15 @@ impl DemoDriver {
             // Reaching here means a headless harness drained them through
             // the driver — no-ops, never a panic.
             // Runtime/driver split: copy requests are intercepted by the
-            // event loop above, and `Reattach` belongs to `LiveDriver` —
-            // the demo stream has no cursor and never gaps. Reaching here
-            // means a headless harness drained them through the driver:
+            // event loop above; `Reattach` and `CreateSession` belong to
+            // `LiveDriver` — the demo stream has no cursor, never gaps, and
+            // mints its own sessions locally. Reaching here means a
+            // headless harness drained them through the demo driver:
             // no-ops, never a panic.
-            AppRequest::CopySelection | AppRequest::CopyText(_) | AppRequest::Reattach { .. } => {}
+            AppRequest::CopySelection
+            | AppRequest::CopyText(_)
+            | AppRequest::Reattach { .. }
+            | AppRequest::CreateSession { .. } => {}
         }
     }
 
@@ -2040,4 +2044,146 @@ pub fn run_demo_plain(mut model: AppModel) -> String {
         model.handle(AppEvent::Envelope(Box::new(payload)));
     }
     crate::plain::render_plain(&model.projection, model.identity.context_window)
+}
+
+/// Run the LIVE TUI against a real daemon (W3c3 M2 — the swap).
+///
+/// Structurally the twin of [`run_demo`]: same terminal guard, same input
+/// pump, same frame/animation ticks, same request drain, same draw. The
+/// ONLY differences are the event source (a [`crate::link::Link`] instead
+/// of the demo channel), the driver ([`LiveDriver`] instead of
+/// [`DemoDriver`]) and the absence of demo persistence — the daemon's store
+/// is the real one, and `run_live` never touches the demo state file.
+///
+/// The model enters in [`crate::app::RuntimeMode::Live`], so the reducer's
+/// three source-dependent decisions (launcher create, `/reset`, menu
+/// coordinates) take their live branches.
+pub async fn run_live(
+    mut model: AppModel,
+    client: haider_client::RpcClient,
+    profile: haider_client::ResolvedProfile,
+    config: haider_client::ClientConfig,
+) -> std::io::Result<()> {
+    use crate::live::LiveDriver;
+
+    model.mode = crate::app::RuntimeMode::Live;
+    let instance = if config.client_instance_id.is_empty() {
+        format!("haider-tui-{}", std::process::id())
+    } else {
+        config.client_instance_id.clone()
+    };
+    let mut driver = LiveDriver::new(instance);
+    let mut link = crate::link::Link::start(client, profile, config);
+
+    let _guard = TerminalGuard::enter()?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
+    sync_terminal_bg(model.theme);
+    sync_window_title(&model.window_title());
+    let mut active_theme = model.theme;
+    let mut active_title = model.window_title();
+
+    let (input_tx, mut input_rx) = mpsc::channel::<Event>(64);
+    std::thread::spawn(move || {
+        loop {
+            match event::read() {
+                Ok(item) => {
+                    if input_tx.blocking_send(item).is_err() {
+                        return;
+                    }
+                }
+                Err(_) => return,
+            }
+        }
+    });
+
+    // Entering live mode boots on the ready Welcome (already negotiated by
+    // the caller) and LISTS sessions. It attaches only on selection — a
+    // launcher that eagerly attached to everything it can see would burn
+    // the working set before the user chose anything.
+    let mut pending: std::collections::VecDeque<crate::live::LiveCommand> =
+        driver.boot().into_iter().collect();
+    // Boot is over the moment the daemon is reachable: there is no harness
+    // startup script to watch in live mode.
+    model.handle(AppEvent::Envelope(Box::new(EventPayload::HarnessStatus(
+        HarnessStatus::Ready,
+    ))));
+
+    let mut frame_tick = tokio::time::interval(Duration::from_millis(33));
+    frame_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut anim_tick = tokio::time::interval(Duration::from_millis(ANIM_PHASE_MS));
+    anim_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut hit_map: Vec<(ratatui::layout::Rect, crate::app::Hit)> = Vec::new();
+
+    while !model.should_quit {
+        // Issue whatever the driver asked for. `try_send` keeps the UI loop
+        // non-blocking: a full command channel means the link is saturated,
+        // and the command stays queued for the next pass.
+        while let Some(command) = pending.front().cloned() {
+            match link.commands.try_send(command) {
+                Ok(()) => {
+                    pending.pop_front();
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => break,
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    pending.clear();
+                    break;
+                }
+            }
+        }
+        tokio::select! {
+            input = input_rx.recv() => match input {
+                Some(event) => dispatch_input(&mut model, &hit_map, event),
+                None => break,
+            },
+            reply = link.replies.recv() => match reply {
+                Some(reply) => pending.extend(driver.apply(&mut model, reply)),
+                None => break,
+            },
+            _ = anim_tick.tick(), if model.animated() => {
+                model.anim_phase = model.anim_phase.wrapping_add(1);
+                model.dirty = true;
+            }
+            _ = frame_tick.tick(), if model.dirty => {
+                hit_map = draw(&mut terminal, &model)?;
+                model.dirty = false;
+                if model
+                    .hovered
+                    .as_ref()
+                    .is_some_and(|hovered| !hit_map.iter().any(|(_, hit)| hit == hovered))
+                {
+                    model.hovered = None;
+                }
+            }
+        }
+        let requests: Vec<AppRequest> = model.requests.drain(..).collect();
+        for request in requests {
+            match request {
+                AppRequest::CopySelection => {
+                    if let Some(selection) = model.selection {
+                        let size = terminal.size()?;
+                        let text = rendered_selection_text(&model, size, &selection);
+                        copy_selection_effects(&mut model, &text);
+                    }
+                }
+                AppRequest::CopyText(text) => copy_selection_effects(&mut model, &text),
+                AppRequest::Quit => model.should_quit = true,
+                request => pending.extend(driver.handle_request(&mut model, request)),
+            }
+        }
+        // Demo requests are structurally unreachable here (report R11 cut
+        // 3): `/reset` takes its live branch and emits none. Clearing is
+        // belt-and-braces, never an execution.
+        model.demo_requests.clear();
+        pending.extend(driver.drain_answers(&mut model));
+        if model.theme != active_theme {
+            active_theme = model.theme;
+            sync_terminal_bg(active_theme);
+        }
+        let title = model.window_title();
+        if title != active_title {
+            active_title = title;
+            sync_window_title(&active_title);
+        }
+    }
+    Ok(())
 }
