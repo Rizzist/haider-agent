@@ -188,9 +188,15 @@ fn reducer_handles_quit_composer_and_navigation() {
     model.handle(key(KeyCode::Enter));
     assert_eq!(model.screen, Screen::Session, "enter re-attaches");
 
+    // TUI4b item 10 (DIRECTED parity change): ⌃C is NAVIGATION from any
+    // non-launcher surface — this used to pin quit-from-anywhere. Quit now
+    // requires ⌃C at the launcher (or boot).
     assert!(!model.should_quit);
     model.handle(ctrl('c'));
-    assert!(model.should_quit);
+    assert_eq!(model.screen, Screen::Launcher, "session ⌃C navigates");
+    assert!(!model.should_quit);
+    model.handle(ctrl('c'));
+    assert!(model.should_quit, "launcher ⌃C quits");
 }
 
 #[test]

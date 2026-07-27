@@ -240,5 +240,5 @@ pub const HELP_TEXT: &[&str] = &[
     "  /reset             reset the demo to the seed sessions",
     "menus — every card (permission · hook trust · update · recovery · voice · tools) is a typed menu:",
     "  answer by typing [n] ⏎, clicking, by id over RPC (menu.answer), or from Diff Forge web",
-    "keys — ⏎ send · ⇧⏎ newline · esc interrupt / back · type / for the palette (↑↓ pick · tab complete · ⏎ run)",
+    "keys — ⏎ send · ⇧⏎ newline · esc interrupt / back · ⌃C launcher (quit from the launcher) · type / for the palette (↑↓ pick · tab complete · ⏎ run)",
 ];

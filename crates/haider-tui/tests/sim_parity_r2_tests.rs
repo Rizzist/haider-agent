@@ -162,16 +162,27 @@ fn sticky_origin_line_pins_the_prompt_and_click_stays_at_it() {
         "sticky pins the producing prompt: {:?}",
         rows[sticky_y as usize]
     );
-    // Chrome per sim StickyLine (tui.js:4597-4623): near-opaque THEME
-    // ground (no bar tint), maroon bold sigil, bright text, no underline.
+    // Chrome per the sim's ACTUAL StickyLine CSS (tui.js:4597-4623 —
+    // TUI4b item 11, DIRECTED parity change): this test used to pin bare
+    // theme ground and "no underline", from a review round's misread. The
+    // CSS carries `background: ${bg}f0` + `border-bottom: 1px solid
+    // frame`; a cell cannot alpha-cover the row beneath, so per the owner
+    // the band takes the barBg tint, and the border-bottom ports as the
+    // frame-colored underline. Sigil: maroon bold, unchanged.
     let theme = model.theme.theme();
     let buffer = terminal.backend().buffer();
-    assert_eq!(buffer[(0, sticky_y)].bg, Color::from(theme.bg));
+    assert_eq!(buffer[(0, sticky_y)].bg, Color::from(theme.bar_bg));
+    assert!(
+        buffer[(0, sticky_y)]
+            .style()
+            .add_modifier
+            .contains(Modifier::UNDERLINED),
+        "the band's bottom frame edge"
+    );
     let sig_x = col_of(&rows[sticky_y as usize], "❯");
     let sig = &buffer[(sig_x, sticky_y)];
     assert_eq!(sig.fg, Color::from(theme.maroon));
     assert!(sig.modifier.contains(Modifier::BOLD));
-    assert!(!sig.modifier.contains(Modifier::UNDERLINED));
     // Click keeps the reader AT the prompt (sim jumpToSticky): the carried
     // scroll-back puts the prompt's first row at the viewport top.
     let (rect, hit) = hits

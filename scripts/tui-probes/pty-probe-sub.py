@@ -64,6 +64,18 @@ pre2 = mark()
 os.write(fd, b"\x1b")  # exit aura
 pump(0.8)
 back_paint = since(pre2)
+# TUI4b item 11: wheel into history — the sticky origin band pins the
+# producing prompt on the barBg band (Desert Dawn barBg = rgb(237,225,207);
+# only the /help overlay shares that ground and /help is never opened
+# here). The band pins at sizes where the transcript actually overflows —
+# 90x10 is the pinning run; at tall frames the turn fits and no sticky is
+# BY DESIGN.
+pre4 = mark()
+for _ in range(10):
+    os.write(fd, b"\x1b[<64;40;8M")  # SGR mouse wheel-up
+    pump(0.08)
+pump(0.5)
+scrolled = since(pre4)
 # Force a full final repaint.
 pre3 = mark()
 set_size(fd, cols + 2, rows)
@@ -71,6 +83,10 @@ os.kill(pid, signal.SIGWINCH)
 pump(1.5)
 final = since(pre3)
 try:
+    # TUI4b item 10: ctrl-C is NAVIGATION from a session (back to the
+    # launcher); only the second ctrl-C, now at the launcher, quits.
+    os.write(fd, b"\x03")
+    pump(0.4)
     os.write(fd, b"\x03")
     quiet = time.time()
     while time.time() - quiet < 0.8:
@@ -107,3 +123,5 @@ print("aura_spawn_logged =", "tests green" in text)
 # escape splits "haider v" — the session line's dim run is contiguous.
 print("back_to_session =", "branch main" in final)
 print("final_has_subtree =", "subagents" in final)
+print("sticky_prompt_pinned =", "use two subagents" in scrolled)
+print("sticky_band_ground =", "48;2;237;225;207" in scrolled)

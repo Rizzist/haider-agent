@@ -567,6 +567,12 @@ pub enum AppRequest {
     Interrupt,
     /// Manual `/compact` (sim tui.js:1791-1806).
     Compact,
+    /// A drag selection finished (owner item 9): the RUNTIME extracts the
+    /// selected text from its last-drawn frame and copies it (pbcopy, then
+    /// OSC 52 — see [`crate::clipboard`]). A request because the reducer
+    /// never sees the rendered buffer; headless tests assert the request
+    /// itself.
+    CopySelection,
     /// The ◉ talk hold started — fire the canned phrase after 1300 ms.
     Talk,
     /// Steer/message a subagent (respondChip, §2.4) — a full turn on the
@@ -836,6 +842,15 @@ pub struct AppModel {
     /// for hover chrome; palette/menu hover moves the SELECTION instead
     /// (sim onMouseEnter, tui.js:2992/3073).
     pub hovered: Option<Hit>,
+    /// The in-app drag selection (owner item 9): set while dragging, kept
+    /// after release (the highlight survives the auto-copy), cleared by the
+    /// next click or keypress. Screen-space — see [`crate::select`].
+    pub selection: Option<crate::select::Selection>,
+    /// A left button went down here and has not resolved yet: the potential
+    /// selection anchor AND the pending click. On Up with no meaningful
+    /// movement the click dispatches from THESE coordinates; a drag that
+    /// selected suppresses it (owner item 9's disambiguation law).
+    pub mouse_down: Option<(u16, u16)>,
     pub should_quit: bool,
     /// Set by every state change; cleared when a frame is drawn (rec 6).
     pub dirty: bool,
@@ -883,6 +898,8 @@ impl Default for AppModel {
             scroll_max: std::cell::Cell::new(0),
             sticky_suppressed: false,
             hovered: None,
+            selection: None,
+            mouse_down: None,
             should_quit: false,
             dirty: true,
         }
@@ -1035,6 +1052,9 @@ impl AppModel {
             AppEvent::Key(key) => {
                 self.dirty = true;
                 self.flash = None;
+                // A keypress clears a finished selection's highlight
+                // (owner item 9's clearing law; clicks clear via Down).
+                self.selection = None;
                 self.handle_key(key);
             }
             AppEvent::Paste(text) => {
@@ -1071,7 +1091,17 @@ impl AppModel {
     fn handle_key(&mut self, key: KeyEvent) {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
-                KeyCode::Char('c') => self.should_quit = true,
+                // ⌃C is NAVIGATION (owner item 10): from any non-launcher
+                // surface it walks back to the launcher — the ← main chip's
+                // teardown, nothing more. It never interrupts: a running
+                // turn and live chips keep their lifecycle laws (esc owns
+                // interrupt, tui.js:2533-2539). From the launcher — and
+                // from boot, which has no launcher to return to — it quits,
+                // as before.
+                KeyCode::Char('c') => match self.screen {
+                    Screen::Launcher | Screen::Boot => self.should_quit = true,
+                    _ => self.back_to_launcher(),
+                },
                 // Ctrl+T cycles the theme (demo stand-in for /theme).
                 KeyCode::Char('t') => self.cycle_theme(),
                 // ⌃G = the token panel (sim binding) — same honest stub.
@@ -1222,9 +1252,7 @@ impl AppModel {
                     self.projection
                         .push_note("· interrupted — run → cancelled · idle (i)".to_owned());
                 } else {
-                    // Leaving the session cancels a live talk hold (P1-3).
-                    self.listening = false;
-                    self.screen = Screen::Launcher;
+                    self.back_to_launcher();
                 }
             }
             KeyCode::Enter => self.submit_composer(),
@@ -1979,6 +2007,19 @@ impl AppModel {
         self.scroll_back.set(0);
     }
 
+    /// Walk back to the launcher — the ONE teardown every back path shares
+    /// (the ← main chip, idle esc, ⌃C navigation per owner item 10): the
+    /// live talk hold is cancelled (P1-3), the subagent view path and any
+    /// overlay reset. NAVIGATION ONLY — the projection, chips, queue and a
+    /// running turn are untouched, so the session resumes exactly where it
+    /// was left.
+    pub fn back_to_launcher(&mut self) {
+        self.screen = Screen::Launcher;
+        self.listening = false;
+        self.view_path.clear();
+        self.help_open = false;
+    }
+
     /// A left-click resolved through the frame's hit map. The map may be
     /// one frame stale (review r2 P2-2): hits carry values and every
     /// context-sensitive hit re-checks its context — activate exactly what
@@ -2046,9 +2087,7 @@ impl AppModel {
                 }
             }
             Hit::BackChip if self.screen == Screen::Session => {
-                self.screen = Screen::Launcher;
-                // Leaving the session cancels a live talk hold (P1-3).
-                self.listening = false;
+                self.back_to_launcher();
             }
             // ◉ talk (sim `speak`, tui.js:2044-2049): the mic RENDERS on the
             // launcher, but pressing it there does nothing — `speak` returns
@@ -2153,8 +2192,10 @@ impl AppModel {
         }
     }
 
-    /// Wheel scroll in the session transcript (⇧-drag selects text
-    /// natively). Reconcile-then-apply (review r5 P2-2): the offset first
+    /// Wheel scroll in the session transcript (text selection is IN-APP —
+    /// drag-select + auto-copy, owner item 9; the old "left to native
+    /// ⇧-drag" row is retired). Reconcile-then-apply (review r5 P2-2): the
+    /// offset first
     /// folds to the last frame's truth (`scroll_max` is at most one frame
     /// stale), THEN the notch applies clamped to it — queued bursts can
     /// never bank unbounded debt, and a reversal mid-burst always moves

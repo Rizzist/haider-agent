@@ -117,6 +117,35 @@ impl Theme {
         Style::default().bg(self.sel_bg.into())
     }
 
+    /// The sticky origin band (sim StickyLine, tui.js:4597-4623 — owner
+    /// item 11). The CSS is REAL chrome: `background: ${bg}f0` +
+    /// `backdrop-filter: blur` + `border-bottom: 1px solid frame`. A cell
+    /// can neither blur nor alpha-cover the row beneath, so a bg-tinted
+    /// ground renders as no band at all — the owner's complaint — and per
+    /// his direction the band takes the barBg tint instead. The
+    /// border-bottom ports as the frame-colored underline across the row.
+    #[must_use]
+    pub fn sticky_style(&self) -> Style {
+        Style::default()
+            .fg(self.bright.into())
+            .bg(self.bar_bg.into())
+            .add_modifier(Modifier::UNDERLINED)
+            .underline_color(self.frame.into())
+    }
+
+    /// The sticky band under the pointer (sim `&:hover`, tui.js:4614-4617:
+    /// opaque ground + maroon ink — a real hover, not just
+    /// `cursor: pointer`): the selBg hover shift with the maroon ink, the
+    /// band's bottom edge kept.
+    #[must_use]
+    pub fn sticky_hover_style(&self) -> Style {
+        Style::default()
+            .fg(self.maroon.into())
+            .bg(self.sel_bg.into())
+            .add_modifier(Modifier::UNDERLINED)
+            .underline_color(self.frame.into())
+    }
+
     /// The selected row/option.
     #[must_use]
     pub fn selection_style(&self) -> Style {

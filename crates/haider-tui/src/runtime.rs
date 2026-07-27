@@ -187,7 +187,8 @@ pub fn demo_pace(payload: &EventPayload) -> Duration {
 }
 
 /// Run `haider tui --demo`: the scripted stream drives every surface.
-/// Returns when the user quits (Ctrl+C) or input closes.
+/// Returns when the user quits (⌃C from the launcher or boot — elsewhere
+/// ⌃C is navigation back to the launcher, owner item 10) or input closes.
 pub async fn run_demo(mut model: AppModel) -> std::io::Result<()> {
     let _guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
@@ -271,7 +272,22 @@ pub async fn run_demo(mut model: AppModel) -> std::io::Result<()> {
         // Reducer-requested side effects.
         let requests: Vec<AppRequest> = model.requests.drain(..).collect();
         for request in requests {
-            driver.handle_request(&mut model, request);
+            match request {
+                // Runtime-owned: copying reads a RENDERED frame. NB — the
+                // live terminal's `current_buffer_mut()` is the SWAPPED,
+                // reset next-frame buffer after a draw, so the text is
+                // re-rendered into a scratch buffer at the live size
+                // through the same pure `render` the screen and the tests
+                // use; the selection RANGE and model are current.
+                AppRequest::CopySelection => {
+                    if let Some(selection) = model.selection {
+                        let size = terminal.size()?;
+                        let text = rendered_selection_text(&model, size, &selection);
+                        copy_selection_effects(&mut model, &text);
+                    }
+                }
+                request => driver.handle_request(&mut model, request),
+            }
         }
         // Theme cycled: re-sync the emulator background.
         if model.theme != active_theme {
@@ -341,13 +357,60 @@ pub fn dispatch_input(
                     .map(|(_, action)| action.clone())
             };
             match mouse.kind {
+                // Owner item 9: Down is only a POTENTIAL anchor — the click
+                // dispatches on Up, because only Up knows whether the press
+                // was a click or a drag-selection. A previous selection's
+                // highlight clears here (the clearing law's click half).
                 MouseEventKind::Down(MouseButton::Left) => {
-                    if let Some(action) = hit_at(mouse.column, mouse.row) {
+                    if model.selection.take().is_some() {
+                        model.dirty = true;
+                    }
+                    model.mouse_down = Some((mouse.column, mouse.row));
+                }
+                // Movement with the button held: meaningful movement (a
+                // different cell than the anchor) enters selection mode
+                // with a live linear highlight; same-cell jitter is not a
+                // drag. Once selecting, every head change redraws.
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    if let Some(anchor) = model.mouse_down {
+                        let head = (mouse.column, mouse.row);
+                        match &mut model.selection {
+                            Some(selection) if selection.head != head => {
+                                selection.head = head;
+                                model.dirty = true;
+                            }
+                            None if head != anchor => {
+                                model.selection = Some(crate::select::Selection {
+                                    anchor,
+                                    head,
+                                    dragging: true,
+                                });
+                                model.dirty = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                // Up resolves the press: a selection auto-copies (the
+                // runtime extracts from its last frame on the request) and
+                // SUPPRESSES the click-hit; a plain click dispatches from
+                // the Down coordinates exactly as before.
+                MouseEventKind::Up(MouseButton::Left) => {
+                    let down = model.mouse_down.take();
+                    if let Some(selection) = &mut model.selection {
+                        selection.dragging = false;
+                        model.requests.push(crate::app::AppRequest::CopySelection);
+                        model.dirty = true;
+                    } else if let Some((column, row)) = down
+                        && let Some(action) = hit_at(column, row)
+                    {
                         model.handle_hit(action);
                     }
                 }
                 // Hover (owner ask, TUI3a item 6): motion events flood —
-                // handle_hover only dirties when the target CHANGES.
+                // handle_hover only dirties when the target CHANGES. While
+                // a button is held the terminal reports Drag, never Moved,
+                // so hover is naturally unchanged during a selection.
                 MouseEventKind::Moved => {
                     model.handle_hover(hit_at(mouse.column, mouse.row));
                 }
@@ -847,6 +910,11 @@ impl DemoDriver {
                 self.reset_aura_state(model);
             }
             AppRequest::Quit => model.should_quit = true,
+            // Runtime-owned (the event loop intercepts it before the
+            // driver): copying reads the rendered frame, which the driver
+            // never has. Reaching here means a headless harness drained it
+            // through the driver — a no-op, never a panic.
+            AppRequest::CopySelection => {}
         }
     }
 
@@ -1344,6 +1412,39 @@ fn draw(
     let mut hits = Vec::new();
     terminal.draw(|frame| hits = render(model, frame))?;
     Ok(hits)
+}
+
+/// Render the model into a scratch buffer at the live terminal size and
+/// extract the selection's text — the copy path's ground truth. Uses the
+/// same pure [`render`] as the screen, so what copies is exactly what a
+/// redraw of THIS model state shows.
+#[must_use]
+pub fn rendered_selection_text(
+    model: &AppModel,
+    size: ratatui::layout::Size,
+    selection: &crate::select::Selection,
+) -> String {
+    let backend = ratatui::backend::TestBackend::new(size.width, size.height);
+    // TestBackend construction is infallible (uninhabited error type).
+    let Ok(mut scratch) = Terminal::new(backend);
+    if scratch.draw(|frame| drop(render(model, frame))).is_err() {
+        return String::new();
+    }
+    crate::select::selection_text(scratch.backend().buffer(), selection)
+}
+
+/// Auto-copy side effects for a finished selection (owner item 9), in the
+/// documented order: pbcopy (authoritative local clipboard), then OSC 52
+/// (best-effort mirror for remote/embedded terminals — always emitted, but
+/// unverifiable, so it never upgrades the flash: the flash reports the
+/// channel we can actually observe).
+fn copy_selection_effects(model: &mut AppModel, text: &str) {
+    let ok = crate::clipboard::copy_local(text);
+    let mut out = stdout();
+    let _ = out.write_all(crate::clipboard::osc52(text).as_bytes());
+    let _ = out.flush();
+    model.flash = Some(if ok { "· copied" } else { "· copy failed" }.to_owned());
+    model.dirty = true;
 }
 
 /// Run the demo headlessly: play the whole script through the model and

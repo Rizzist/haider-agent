@@ -113,6 +113,28 @@ fn main() {
         model.handle(AppEvent::Envelope(Box::new(payload.clone())));
     }
     dump(&model, "session (end of demo)");
+    // The sticky origin band (TUI4b item 11): scrolled into history, the
+    // producing prompt pins at the transcript top with the barBg band and
+    // its bottom frame edge (colors live in the cell tests; the frame here
+    // shows placement). Warm-up draw first — the wheel clamps against the
+    // LAST frame's scroll range.
+    {
+        let backend = TestBackend::new(90, 14);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render(&model, frame);
+            })
+            .expect("draw");
+    }
+    model.handle_wheel(true);
+    dump_at(
+        &model,
+        "session + sticky origin band @ 90×14 (scrolled)",
+        90,
+        14,
+    );
+    model.scroll_back.set(0);
     // Session palette (session-only commands included) — the ghost
     // completion trails the cursor.
     for c in "/t".chars() {

@@ -51,7 +51,11 @@ os.kill(pid, signal.SIGWINCH)
 pump(1.2)
 final = out[pre:].decode("utf-8", "replace")
 try:
-    os.write(fd, b"\x03")      # Ctrl+C quit
+    # TUI4b item 10: ctrl-C is NAVIGATION from a session (back to the
+    # launcher); only the second ctrl-C, now at the launcher, quits.
+    os.write(fd, b"\x03")
+    pump(0.4)
+    os.write(fd, b"\x03")
     quiet = time.time()
     while time.time() - quiet < 0.8:
         r, _, _ = select.select([fd], [], [], 0.1)

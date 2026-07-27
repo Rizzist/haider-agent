@@ -7,6 +7,7 @@
 
 pub mod app;
 pub mod boot;
+pub mod clipboard;
 pub mod commands;
 pub mod format;
 pub mod mark;
@@ -17,6 +18,7 @@ pub mod render;
 pub mod runtime;
 pub mod sanctum;
 pub mod script;
+pub mod select;
 pub mod style;
 pub mod theme;
 

@@ -72,6 +72,12 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
     if status_height > 0 {
         render_status_bar(model, theme, frame, status, &mut hits);
     }
+    // The in-app selection highlight (owner item 9) paints LAST, over
+    // every widget on every screen — a screen-space overlay, ground only
+    // (the hover-band law: selBg shifts the ground, never the ink).
+    if let Some(selection) = &model.selection {
+        crate::select::apply_highlight(frame.buffer_mut(), selection, theme);
+    }
     // Hit-map seam guard (review r6 P2-1b): a hit must be a real, visible
     // region — non-empty and fully inside the frame. Shed or starved
     // regions can never leak phantom click targets, at ANY size.
@@ -969,13 +975,16 @@ fn render_session(
     frame.render_widget(paragraph.scroll((scroll, 0)), transcript_area);
     // Sticky origin line (sim StickyLine, tui.js:3345-3349 / 4597-4623):
     // while scrolled into history, pin the user prompt that produced the
-    // top-visible content. Chrome per sim: near-opaque THEME ground (no bar
-    // tint), bright nowrap-ellipsized text, maroon bold sigil — no
-    // underline. Click keeps the reader AT the prompt (jumpToSticky,
-    // tui.js:2637-2645): the hit carries the scroll-back that puts the
-    // prompt's first row at the viewport top; after a jump the sticky is
-    // SUPPRESSED until the next real wheel so it never covers the row it
-    // just revealed.
+    // top-visible content. Chrome per the sim's ACTUAL CSS (owner item 11 —
+    // a review round once stripped this to bare theme ground; the CSS says
+    // otherwise): a distinct band with a bottom frame edge (`border-bottom:
+    // 1px solid frame` → the underline), bright nowrap-ellipsized text,
+    // maroon bold sigil, and a REAL `:hover` (opaque ground + maroon ink,
+    // tui.js:4614-4617) through the standard hover path. Click keeps the
+    // reader AT the prompt (jumpToSticky, tui.js:2637-2645): the hit
+    // carries the scroll-back that puts the prompt's first row at the
+    // viewport top; after a jump the sticky is SUPPRESSED until the next
+    // real wheel so it never covers the row it just revealed.
     if scroll_back > 0 && scroll > 0 && transcript_area.height > 0 && !model.sticky_suppressed {
         let sticky = user_rows.iter().rev().find(|(line_index, _)| {
             row_of_line
@@ -992,23 +1001,27 @@ fn render_session(
                 height: 1,
             };
             let budget = (transcript_area.width as usize).saturating_sub(5);
+            // The band style carries the text ink (bright, maroon on
+            // hover), so the prompt text inherits it; the sigil pins its
+            // own maroon bold. The pad span stretches the band — and its
+            // bottom edge — across the full row.
+            let hovered = model.hovered == Some(Hit::StickyJump(jump));
+            let band = if hovered {
+                theme.sticky_hover_style()
+            } else {
+                theme.sticky_style()
+            };
             let mut spans = vec![
                 Span::raw(" "),
                 Span::styled("❯ ", theme.maroon_style().add_modifier(Modifier::BOLD)),
-                Span::styled(
-                    ellipsize(&text.replace('\n', " "), budget),
-                    theme.bright_style(),
-                ),
+                Span::raw(ellipsize(&text.replace('\n', " "), budget)),
             ];
             let pad =
                 (transcript_area.width as usize).saturating_sub(Line::from(spans.clone()).width());
             if pad > 0 {
                 spans.push(Span::raw(" ".repeat(pad)));
             }
-            frame.render_widget(
-                Paragraph::new(Line::from(spans)).style(theme.text_style()),
-                sticky_rect,
-            );
+            frame.render_widget(Paragraph::new(Line::from(spans)).style(band), sticky_rect);
             hits.push((sticky_rect, Hit::StickyJump(jump)));
         }
     }
