@@ -425,6 +425,39 @@ pub fn tree_live_count(chips: &[ChipModel]) -> usize {
         .sum()
 }
 
+/// Any non-closed chip whose DISPLAYED state pulses in the sim (running /
+/// tool maroon · input-required amber, tui.js:4823-4834), recursively.
+/// Waiting (◔), done and error are deliberately still.
+fn chips_animated(chips: &[ChipModel]) -> bool {
+    chips.iter().any(|chip| {
+        (!chip.closed
+            && matches!(
+                chip.display_state(),
+                ChipDisplayState::Running
+                    | ChipDisplayState::Tool
+                    | ChipDisplayState::InputRequired
+            ))
+            || chips_animated(&chip.children)
+    })
+}
+
+/// A tool row still in flight (sim ToolRow `.glyph` while
+/// `$status === "running"`, tui.js:4524-4530). Scanned from the tail —
+/// a live tool is always recent.
+fn streaming_tool_live(entries: &[crate::projection::TranscriptEntry]) -> bool {
+    use haider_protocol::item::{ToolStatus, TurnItem};
+    entries.iter().rev().any(|entry| {
+        matches!(
+            entry,
+            crate::projection::TranscriptEntry::Item(block)
+                if matches!(
+                    &block.item,
+                    TurnItem::ToolCall { status: ToolStatus::InProgress | ToolStatus::Pending, .. }
+                )
+        )
+    })
+}
+
 /// Find a chip anywhere in the tree.
 #[must_use]
 pub fn find_chip<'t>(chips: &'t [ChipModel], agent: &str) -> Option<&'t ChipModel> {
@@ -901,6 +934,14 @@ pub struct AppModel {
     pub should_quit: bool,
     /// Set by every state change; cleared when a frame is drawn (rec 6).
     pub dirty: bool,
+    /// TUI4d item 14 — the ONE shared animation phase (the sim's CSS
+    /// `pulse`/`railShimmer` clocks folded into a single counter). The
+    /// runtime advances it every ~600 ms ONLY while [`Self::animated`]
+    /// reports a live pulsing element; render derives every pulsing
+    /// span's ink from it (even = full ink · odd = the sim's 0.35-opacity
+    /// midpoint; `% 3` drives the rail shimmer). Pure render phase:
+    /// never persisted, never touching projections or arms.
+    pub anim_phase: u8,
 }
 
 impl Default for AppModel {
@@ -957,6 +998,7 @@ impl Default for AppModel {
             mouse_down: None,
             should_quit: false,
             dirty: true,
+            anim_phase: 0,
         }
     }
 }
@@ -1024,6 +1066,69 @@ impl AppModel {
             }
         }
         (badge, self.projection.badge_tone())
+    }
+
+    /// TUI4d item 14 — TRUE while ANY pulsing element is on screen: the
+    /// runtime's shared phase clock ticks only then (the efficiency law
+    /// this port was once deferred over — ZERO wakeups otherwise; the
+    /// dirty-flag economy stays intact). One arm per sim keyframes site
+    /// (tui.js:3943-5563); a new animated state must register HERE or it
+    /// never moves.
+    ///
+    /// STATE-based, not viewport-based: a pulsing element shed by a tiny
+    /// frame still ticks the clock — the frame then diffs to nothing and
+    /// the cost is one bounded render per phase (the CSS analogue: the
+    /// sim's animations run whether or not the element is scrolled into
+    /// view). Tracking visibility would couple the model to layout.
+    #[must_use]
+    pub fn animated(&self) -> bool {
+        // The status badge's pulse set (WAITING / STARTING / PERMISSION /
+        // EFFECT_UNKNOWN, tui.js:5558-5563) — the bar shows on every
+        // screen, the derived ◔ WAITING included.
+        if crate::projection::badge_pulses(&self.status_badge().0) {
+            return true;
+        }
+        // The ◉ talk chip's live hold (sim `.mic.live`, tui.js:5484-5489).
+        if self.listening {
+            return true;
+        }
+        match self.screen {
+            // Boot: the gold `.sub` line pulses for the whole starting
+            // beat (tui.js:5104-5108).
+            Screen::Boot => true,
+            // Launcher: a busy row's ◉ dot pulse + rail shimmer
+            // (tui.js:4386-4394).
+            Screen::Launcher => self.sessions.iter().any(crate::session::SessionState::busy),
+            Screen::Session | Screen::Subagent => {
+                // `● thinking…` (tui.js:4458-4462) · the ⚒ running tool
+                // glyph (tui.js:4524-4530) · the processing todo's box
+                // (tui.js:4694-4697) · chip glyph pulses (tui.js:4823-4834)
+                // — plus the viewed chip's own thinking tail and tool rows
+                // on the subagent screen.
+                self.projection.is_thinking()
+                    || streaming_tool_live(self.projection.entries())
+                    || self
+                        .projection
+                        .todos()
+                        .is_some_and(|panel| panel.pinned && panel.current().is_some())
+                    || chips_animated(&self.chips)
+                    || (self.screen == Screen::Subagent
+                        && self.viewed_chip().is_some_and(|chip| {
+                            chip.state == ChipDisplayState::Thinking
+                                || streaming_tool_live(chip.transcript.entries())
+                        }))
+            }
+            // Aura: running roster rows (tui.js:4128-4131) + its live
+            // hold-to-talk.
+            Screen::Aura => {
+                self.aura.state == AuraState::Listening
+                    || self
+                        .aura
+                        .roster
+                        .iter()
+                        .any(|row| row.state == ChipDisplayState::Running)
+            }
+        }
     }
 
     /// The palette is open while the composer is a single-line slash query,

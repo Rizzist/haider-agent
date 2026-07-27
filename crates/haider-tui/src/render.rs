@@ -156,6 +156,25 @@ fn chip_two_tone<'a>(
 /// Pad a span row to a fixed display width — the launcher's `.recent`
 /// column trick: uniform-width lines center to one shared left edge, and
 /// hover bands span the whole column.
+/// The `● thinking…` tail (sim `.thinking`, tui.js:4458-4462): gold ink
+/// pulsing on the shared clock, the dot breathing ● ↔ ◌ with it (glyph
+/// alternation is a port taste-call — a dimmed cell alone can read flat on
+/// low-contrast terminals; one law for the session and chip views).
+fn thinking_line(theme: &Theme, phase: u8) -> Line<'static> {
+    let dot = if phase.is_multiple_of(2) {
+        "●"
+    } else {
+        "◌"
+    };
+    Line::from(vec![
+        Span::raw(" "),
+        Span::styled(
+            format!("{dot} thinking…"),
+            theme.pulse_ink(theme.gold, phase),
+        ),
+    ])
+}
+
 fn pad_spans_to<'s>(mut spans: Vec<Span<'s>>, width: usize) -> Vec<Span<'s>> {
     let pad = width.saturating_sub(Line::from(spans.clone()).width());
     if pad > 0 {
@@ -243,8 +262,12 @@ fn render_boot(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rec
     lines.extend([
         Line::default(),
         Line::styled(spaced_wordmark(), theme.bright_style()),
-        // Sim `.sub` on the boot screen is GOLD (tui.js:5102-5107).
-        Line::styled(boot_subline(VERSION), theme.gold_style()),
+        // Sim `.sub` on the boot screen is GOLD and PULSES while the
+        // harness starts (tui.js:5104-5108, `pulse` 1.4s).
+        Line::styled(
+            boot_subline(VERSION),
+            theme.pulse_ink(theme.gold, model.anim_phase),
+        ),
         Line::default(),
     ]);
     if let Some(checks) = model.projection.boot_checks() {
@@ -259,7 +282,11 @@ fn render_boot(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rec
         for row in rows {
             let style = match row.marker {
                 crate::boot::CheckMarker::Done => theme.ok_style(),
-                crate::boot::CheckMarker::Current => theme.gold_style(),
+                // The RUNNING check breathes with the `.sub` line — a port
+                // taste-extension (the sim's `.cur` is static gold; the ◌
+                // marker is the boot screen's one moving part and reads
+                // dead without it), on the same shared clock.
+                crate::boot::CheckMarker::Current => theme.pulse_ink(theme.gold, model.anim_phase),
                 crate::boot::CheckMarker::Pending => theme.faint_style(),
             };
             lines.push(Line::styled(format!("{:<widest$}", row.line()), style));
@@ -431,10 +458,18 @@ fn render_launcher(
     // sessions alike; a busy background session shows its liveness HERE
     // (gold pulsing-dot semantics), never in the global badge (item 12).
     let running = model.sessions.iter().filter(|s| s.busy()).count();
-    let mut rhead = vec![Span::styled(
-        "recent sessions — click to attach · /sessions for all",
-        theme.dim_style(),
-    )];
+    // TUI4d item 14 — every row of the block leads with ONE rail cell so
+    // the sim's `.rail` sliver has a home (tui.js:4370-4394: absolute in
+    // the row's left padding, transparent unless running). Idle rows and
+    // the head/extra rows carry a space there — the shared left edge law
+    // holds because EVERY row pays the cell.
+    let mut rhead = vec![
+        Span::raw(" "),
+        Span::styled(
+            "recent sessions — click to attach · /sessions for all",
+            theme.dim_style(),
+        ),
+    ];
     if running > 0 {
         rhead.push(Span::styled(
             format!(" · {running} running"),
@@ -445,18 +480,26 @@ fn render_launcher(
     // Sim shows the first THREE sessions (tui.js:3246 `slice(0, 3)`).
     let mut recent: Vec<(Vec<Span<'_>>, Option<Hit>)> = vec![(rhead, None)];
     for entry in model.sessions.iter().take(3) {
-        // Sim row anatomy (tui.js:3252-3277): dot (ok; gold running) ·
-        // name BRIGHT bold · `▸ head hon` DIM (.hd) · meta DIM ellipsized.
-        // No digit prefix (the 1-3 keys stay as silent bindings).
+        // Sim row anatomy (tui.js:3252-3277): rail · dot (ok; gold
+        // PULSING when running, tui.js:4392-4394) · name BRIGHT bold ·
+        // `▸ head hon` DIM (.hd) · meta DIM ellipsized. No digit prefix
+        // (the 1-3 keys stay as silent bindings).
         let busy = entry.busy();
         let live = entry.live();
-        let (dot, dot_style) = if busy {
-            ("◉", theme.gold_style())
+        let (rail, dot, dot_style) = if busy {
+            (
+                // The gold→maroon→gold gradient crossing the sliver
+                // (railShimmer, 1.8s — three phases of the shared clock).
+                Span::styled("▎", theme.rail_shimmer_style(model.anim_phase)),
+                "◉",
+                theme.pulse_ink(theme.gold, model.anim_phase),
+            )
         } else {
-            ("●", theme.ok_style())
+            (Span::raw(" "), "●", theme.ok_style())
         };
         let name = entry.name.clone().unwrap_or_else(|| "session".to_owned());
         let mut spans = vec![
+            rail,
             Span::styled(format!("{dot} "), dot_style),
             Span::styled(
                 name.clone(),
@@ -544,14 +587,17 @@ fn render_launcher(
         ),
     ] {
         // Sim `.aurarow` (tui.js:4403-4413): gold glyph, gold name, dim
-        // meta — its frame border-top rule is inserted in pass 2.
+        // meta — its frame border-top rule is inserted in pass 2. The
+        // leading cell keeps the block's shared left edge beside the
+        // session rows' rail column (the sim's aurarow has no rail).
         let spans = vec![
+            Span::raw(" "),
             Span::styled(format!("{glyph} "), theme.gold_style()),
             Span::styled(name, theme.gold_style()),
             Span::styled(
                 ellipsize(
                     &format!("  {blurb}"),
-                    area_cap.saturating_sub(name.chars().count() + 2),
+                    area_cap.saturating_sub(name.chars().count() + 3),
                 ),
                 theme.dim_style(),
             ),
@@ -590,14 +636,15 @@ fn render_launcher(
         lines.push(Line::default());
         lines.push(Line::from(pad_spans_to(
             vec![
-                Span::styled("$ ", theme.gold_style()),
+                // The block's rail-cell lead (shared left edge).
+                Span::styled(" $ ", theme.gold_style()),
                 Span::styled(cmd.clone(), theme.bright_style()),
             ],
             column,
         )));
         for row in out.split('\n') {
             lines.push(Line::from(pad_spans_to(
-                vec![Span::styled(row.to_owned(), theme.dim_style())],
+                vec![Span::styled(format!(" {row}"), theme.dim_style())],
                 column,
             )));
         }
@@ -953,14 +1000,19 @@ fn render_session(
             // transcript_lines pushes a spacer, then the prompt row.
             user_rows.push((lines.len() + 1, text.as_str()));
         }
-        transcript_lines(&mut lines, entry, theme, transcript_area.width);
+        transcript_lines(
+            &mut lines,
+            entry,
+            theme,
+            transcript_area.width,
+            model.anim_phase,
+        );
     }
-    // Sim `.thinking` (tui.js:4458): a transient gold tail while thinking.
+    // Sim `.thinking` (tui.js:4458-4462): a transient gold tail while
+    // thinking, pulsing (1.4s). The port also breathes the dot ● ↔ ◌ on
+    // the shared clock — the owner's marquee "alive" element.
     if model.projection.is_thinking() {
-        lines.push(Line::from(vec![
-            Span::raw(" "),
-            Span::styled("● thinking…", theme.gold_style()),
-        ]));
+        lines.push(thinking_line(theme, model.anim_phase));
     }
     // Wrapped-row prefix sums — the sticky line and the wheel clamp need
     // real row math, not logical line counts.
@@ -1078,7 +1130,7 @@ fn render_session(
         if !model.todos_collapsed {
             for item in &todos.items {
                 todo_lines.push(hover_band(
-                    todo_row(item, &todos.items, theme),
+                    todo_row(item, &todos.items, theme, model.anim_phase),
                     model.hovered == Some(Hit::TodoRow(item.id)),
                     todos_area.width,
                     theme,
@@ -1404,9 +1456,26 @@ fn render_subtree(
             } else {
                 theme.dim_style()
             };
+            // Sim chip glyph pulses (tui.js:4823-4834): running/tool wear
+            // maroon, input-required the amber warn — both breathing on
+            // the shared clock; every other state keeps the quiet gold.
+            let glyph_style = if chip.closed {
+                theme.faint_style()
+            } else {
+                match display {
+                    crate::script::ChipDisplayState::Running
+                    | crate::script::ChipDisplayState::Tool => {
+                        theme.pulse_ink(theme.maroon, model.anim_phase)
+                    }
+                    crate::script::ChipDisplayState::InputRequired => {
+                        theme.pulse_ink(theme.warn, model.anim_phase)
+                    }
+                    _ => theme.gold_style(),
+                }
+            };
             let mut spans = vec![
                 Span::styled(format!(" {indent}{connector} "), theme.faint_style()),
-                Span::styled(format!("{glyph} "), theme.gold_style()),
+                Span::styled(format!("{glyph} "), glyph_style),
                 Span::styled(
                     format!("{} {}", chip.callsign, chip.hon),
                     if chip.closed {
@@ -1610,11 +1679,17 @@ fn render_subagent(
         ),
         theme.dim_style(),
     )];
-    header_bottom.extend(chip_two_tone(
-        badge_label,
-        theme.frame_style(),
-        theme.gold_style(),
-    ));
+    // Sim chip-view state badge (tui.js:5320-5330): input_required wears
+    // the warn tone and PULSES (1.2s) until answered; other states keep
+    // the port's quiet frame/gold chrome.
+    let (badge_chrome, badge_ink) =
+        if !chip.closed && display == crate::script::ChipDisplayState::InputRequired {
+            let warn = theme.pulse_ink(theme.warn, model.anim_phase);
+            (warn, warn)
+        } else {
+            (theme.frame_style(), theme.gold_style())
+        };
+    header_bottom.extend(chip_two_tone(badge_label, badge_chrome, badge_ink));
     frame.render_widget(
         Paragraph::new(Text::from(vec![
             Line::from(crumb_spans),
@@ -1647,13 +1722,16 @@ fn render_subagent(
     // ---- The chip's transcript (same Entry renderer) + tail lines ----
     let mut lines: Vec<Line<'_>> = Vec::new();
     for entry in chip.transcript.entries() {
-        transcript_lines(&mut lines, entry, theme, transcript_area.width);
+        transcript_lines(
+            &mut lines,
+            entry,
+            theme,
+            transcript_area.width,
+            model.anim_phase,
+        );
     }
     if chip.state == crate::script::ChipDisplayState::Thinking {
-        lines.push(Line::from(vec![
-            Span::raw(" "),
-            Span::styled("● thinking…", theme.gold_style()),
-        ]));
+        lines.push(thinking_line(theme, model.anim_phase));
     }
     if display == crate::script::ChipDisplayState::Waiting && live_children > 0 {
         lines.push(Line::from(vec![
@@ -1898,12 +1976,17 @@ fn render_aura(
         } else {
             "◉ hold to talk"
         };
-        let talk_chrome = if model.hovered == Some(Hit::AuraTalkBtn) {
-            theme.gold_style()
+        // The live aura hold pulses exactly like the session mic (one
+        // `.live` law across both talk chips).
+        let (talk_chrome, talk_ink) = if aura.state == crate::script::AuraState::Listening {
+            let live = theme.pulse_ink(theme.maroon, model.anim_phase);
+            (live, live)
+        } else if model.hovered == Some(Hit::AuraTalkBtn) {
+            (theme.gold_style(), theme.gold_style())
         } else {
-            theme.frame_style()
+            (theme.frame_style(), theme.gold_style())
         };
-        let talk_spans = chip_two_tone(talk_label.to_owned(), talk_chrome, theme.gold_style());
+        let talk_spans = chip_two_tone(talk_label.to_owned(), talk_chrome, talk_ink);
         let talk_width = Line::from(talk_spans.clone()).width();
         let orb_lines = vec![
             Line::from(Span::styled(
@@ -1954,8 +2037,15 @@ fn render_aura(
             )));
         }
         for row in &aura.roster {
+            // Sim `.rrow.running .g` (tui.js:4128-4131): a running
+            // controlled session's glyph pulses maroon; others stay gold.
+            let glyph_style = if row.state == crate::script::ChipDisplayState::Running {
+                theme.pulse_ink(theme.maroon, model.anim_phase)
+            } else {
+                theme.gold_style()
+            };
             left.push(Line::from(vec![
-                Span::styled(format!("  {} ", row.state.glyph()), theme.gold_style()),
+                Span::styled(format!("  {} ", row.state.glyph()), glyph_style),
                 Span::styled(
                     format!("{} · {}", row.name, row.device),
                     theme.bright_style(),
@@ -2282,17 +2372,23 @@ fn composer_lines<'a>(
     );
     // Sim `.mic` (tui.js:5467-5489): FRAME chrome, gold label; hover
     // turns the border gold; a live hold shows `◉ listening…`.
-    let talk_chrome = if model.hovered == Some(Hit::TalkChip) {
-        theme.gold_style()
+    // A LIVE hold wears the sim's `.mic.live` treatment: maroon ink and
+    // chrome, pulsing (tui.js:5484-5489, 1.1s); otherwise frame chrome,
+    // gold on hover.
+    let (talk_chrome, talk_ink) = if model.listening {
+        let live = theme.pulse_ink(theme.maroon, model.anim_phase);
+        (live, live)
+    } else if model.hovered == Some(Hit::TalkChip) {
+        (theme.gold_style(), theme.gold_style())
     } else {
-        theme.frame_style()
+        (theme.frame_style(), theme.gold_style())
     };
     let talk_label = if model.listening {
         "◉ listening…"
     } else {
         "◉ talk"
     };
-    let chip_spans = chip_two_tone(talk_label.to_owned(), talk_chrome, theme.gold_style());
+    let chip_spans = chip_two_tone(talk_label.to_owned(), talk_chrome, talk_ink);
     let chip_width = Line::from(chip_spans.clone()).width();
     // Right-aligned talk chip when the row leaves room (2-col right pad).
     // Hidden on the subagent and aura screens (sim §4.1 — aura has its own
@@ -2517,7 +2613,18 @@ fn render_status_bar(
     } else {
         theme.badge_style(tone)
     };
-    left.extend(chip_two_tone(badge, badge_chrome, theme.badge_style(tone)));
+    // Sim Badge pulse (tui.js:5558-5563): WAITING/STARTING/PERMISSION/
+    // EFFECT_UNKNOWN breathe (all outlined states, so dimming the fg IS
+    // the sim's opacity dip); everything else holds steady.
+    let (badge_chrome, badge_ink) = if crate::projection::badge_pulses(&badge) {
+        (
+            theme.pulse(badge_chrome, model.anim_phase),
+            theme.pulse(theme.badge_style(tone), model.anim_phase),
+        )
+    } else {
+        (badge_chrome, theme.badge_style(tone))
+    };
+    left.extend(chip_two_tone(badge, badge_chrome, badge_ink));
     // Sim `.mid`: model · provider, plus the branch name inside a session,
     // plus ` · q:turn` while queue mode holds (tui.js:2840-2842).
     let branch = if model.screen == Screen::Session {
@@ -2596,6 +2703,7 @@ fn transcript_lines<'a>(
     entry: &'a TranscriptEntry,
     theme: &Theme,
     width: u16,
+    phase: u8,
 ) {
     match entry {
         TranscriptEntry::User {
@@ -2635,7 +2743,7 @@ fn transcript_lines<'a>(
                 lines.push(Line::from(spans));
             }
         }
-        TranscriptEntry::Item(block) => item_lines(lines, block, theme, width),
+        TranscriptEntry::Item(block) => item_lines(lines, block, theme, width, phase),
         TranscriptEntry::Note { text } => {
             // Sim NoteRow (tui.js:4572-4577): dim, indented off the margin.
             lines.push(Line::from(vec![
@@ -2805,7 +2913,7 @@ fn wrap_pre_line(line: &str, budget: usize, rows: &mut Vec<String>) {
 /// One pinned-todo row, styled by state (sim `.trow` classes: completed
 /// struck faint, processing gold+bright, listed dim, dep-blocked faint with
 /// its `· after #n` tag).
-fn todo_row<'a>(item: &'a TodoItem, all: &[TodoItem], theme: &Theme) -> Line<'a> {
+fn todo_row<'a>(item: &'a TodoItem, all: &[TodoItem], theme: &Theme, phase: u8) -> Line<'a> {
     let blocked = item.state == TodoState::Listed
         && item.dep.is_some_and(|dep| {
             all.get(dep as usize)
@@ -2817,7 +2925,13 @@ fn todo_row<'a>(item: &'a TodoItem, all: &[TodoItem], theme: &Theme) -> Line<'a>
             theme.ok_style(),
             theme.faint_style().add_modifier(Modifier::CROSSED_OUT),
         ),
-        TodoState::Processing => ("■", theme.gold_style(), theme.bright_style()),
+        // Sim `.processing .tbox`: the working item's box pulses gold
+        // (tui.js:4694-4697, 1.2s); its text stays steady bright.
+        TodoState::Processing => (
+            "■",
+            theme.pulse_ink(theme.gold, phase),
+            theme.bright_style(),
+        ),
         TodoState::Listed if blocked => ("☐", theme.faint_style(), theme.faint_style()),
         TodoState::Listed => ("☐", theme.dim_style(), theme.dim_style()),
     };
@@ -2867,7 +2981,13 @@ fn tool_meta(args: &serde_json::Value, status: haider_protocol::item::ToolStatus
         .to_owned()
 }
 
-fn item_lines<'a>(lines: &mut Vec<Line<'a>>, block: &'a ItemBlock, theme: &Theme, width: u16) {
+fn item_lines<'a>(
+    lines: &mut Vec<Line<'a>>,
+    block: &'a ItemBlock,
+    theme: &Theme,
+    width: u16,
+    phase: u8,
+) {
     match &block.item {
         TurnItem::AgentMessage { text } => {
             // Sim AgentRow (tui.js:4494-4513): the ■ haider header is GOLD;
@@ -2935,8 +3055,12 @@ fn item_lines<'a>(lines: &mut Vec<Line<'a>>, block: &'a ItemBlock, theme: &Theme
                     match status {
                         haider_protocol::item::ToolStatus::Failed => theme.err_style(),
                         haider_protocol::item::ToolStatus::Cancelled => theme.dim_style(),
+                        // Sim ToolRow `.glyph` while running: warn ink,
+                        // PULSING (tui.js:4524-4530, 1.1s).
                         haider_protocol::item::ToolStatus::Pending
-                        | haider_protocol::item::ToolStatus::InProgress => theme.warn_style(),
+                        | haider_protocol::item::ToolStatus::InProgress => {
+                            theme.pulse_ink(theme.warn, phase)
+                        }
                         haider_protocol::item::ToolStatus::Completed => theme.ok_style(),
                     },
                 ),

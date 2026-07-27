@@ -629,6 +629,20 @@ impl SessionProjection {
     }
 }
 
+/// The sim's badge PULSE set, verbatim (tui.js:5558-5563:
+/// `["WAITING", "STARTING", "PERMISSION", "EFFECT_UNKNOWN"]`) — and
+/// nothing else: `IDLE_I` and `INPUT_REQUIRED` are outlined but
+/// deliberately still. Keyed on the rendered label so the derived
+/// `◔ WAITING · N subagents` badge pulses exactly like a run-state
+/// WAITING (one vocabulary, tui.js:2815).
+#[must_use]
+pub fn badge_pulses(label: &str) -> bool {
+    label.starts_with("◔ WAITING")
+        || label.starts_with("◌ STARTING")
+        || label.starts_with("? PERMISSION_REQUIRED")
+        || label.starts_with("⌁ EFFECT_UNKNOWN")
+}
+
 /// Badge visual class — see [`SessionProjection::badge_tone`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BadgeTone {

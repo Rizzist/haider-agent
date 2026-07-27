@@ -169,4 +169,52 @@ impl Theme {
     pub fn err_style(&self) -> Style {
         Style::default().fg(self.err.into())
     }
+
+    // ---- TUI4d item 14: the sim's animations, terminal-faithful ----
+
+    /// The sim's `pulse` keyframes (tui.js:3943-3946: opacity 1 ↔ 0.35) on
+    /// a terminal cell: the ON phase carries the full ink, the OFF phase
+    /// the SAME hue at the sim's 0.35 midpoint over the theme ground. One
+    /// shared phase clock (`AppModel::anim_phase`, ticked by the runtime
+    /// only while something animates) drives every pulsing element.
+    #[must_use]
+    pub fn pulse_ink(&self, ink: Rgb, phase: u8) -> Style {
+        if phase.is_multiple_of(2) {
+            Style::default().fg(ink.into())
+        } else {
+            Style::default().fg(ink.over(self.bg, 350).into())
+        }
+    }
+
+    /// Dim an already-built style's foreground on the OFF phase — the
+    /// pulse for composed chrome (the status badge, the talk chip) whose
+    /// ink came from another preset. Non-RGB or absent foregrounds pass
+    /// through untouched.
+    #[must_use]
+    pub fn pulse(&self, style: Style, phase: u8) -> Style {
+        if phase.is_multiple_of(2) {
+            return style;
+        }
+        match style.fg {
+            Some(ratatui::style::Color::Rgb(r, g, b)) => {
+                style.fg(Rgb { r, g, b }.over(self.bg, 350).into())
+            }
+            _ => style,
+        }
+    }
+
+    /// The launcher rail's `railShimmer` (tui.js:3948-3951): a
+    /// gold→maroon→gold gradient scrolling behind a 2px sliver. One
+    /// terminal cell sees the gradient pass as its ink cycling gold →
+    /// maroon → gold; a 3-phase cycle on the shared 600 ms clock lands the
+    /// sim's 1.8 s linear period exactly — subtle, never strobing.
+    #[must_use]
+    pub fn rail_shimmer_style(&self, phase: u8) -> Style {
+        let ink = if phase % 3 == 1 {
+            self.maroon
+        } else {
+            self.gold
+        };
+        Style::default().fg(ink.into())
+    }
 }

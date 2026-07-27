@@ -213,7 +213,11 @@ fn launcher_recent_rows_share_one_left_column_without_digits() {
         let y = row_of(&rows, needle);
         let rule_row = &rows[(y - 1) as usize];
         let rule_x = col_of(rule_row, "─");
-        assert_eq!(rule_x, left, "aurarow rule spans the column");
+        // TUI4d item 14: every block row leads with the one-cell rail
+        // column (the sim's `.rail` sliver floats in the rows' left
+        // padding, tui.js:4370-4394), so the rule spans rail + text —
+        // one column to the left of the shared TEXT edge.
+        assert_eq!(rule_x, left - 1, "aurarow rule spans rail + text");
         assert_eq!(buffer[(rule_x, y - 1)].fg, Color::from(theme.frame));
     }
 }

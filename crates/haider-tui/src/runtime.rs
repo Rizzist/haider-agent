@@ -253,6 +253,16 @@ pub async fn run_demo(
 
     let mut frame_tick = tokio::time::interval(Duration::from_millis(33));
     frame_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // The shared animation clock (TUI4d item 14): guarded exactly like the
+    // frame tick — while nothing on screen pulses the branch is disabled
+    // and the idle loop takes ZERO periodic wakeups (the efficiency law
+    // this port was once deferred over). When the last animated state
+    // ends the gate closes on the next loop pass — the clock stops within
+    // one phase — and no animator outlives any teardown because nothing
+    // is registered anywhere: no timer arm, no per-element state, just
+    // this guarded branch reading `AppModel::animated`.
+    let mut anim_tick = tokio::time::interval(Duration::from_millis(ANIM_PHASE_MS));
+    anim_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Fused: after the stream closes this branch is disabled — a closed
     // receiver must never spin the loop (review r1 P1).
     let mut stream_open = true;
@@ -274,6 +284,14 @@ pub async fn run_demo(
                     model.handle(AppEvent::StreamEnded);
                 }
             },
+            // The phase clock: a pure render-phase toggle — no projection
+            // mutation, no arms, no persistence (the store's snapshot
+            // never carries the phase, so the save-on-frame hash-skip
+            // stays quiet across ticks).
+            _ = anim_tick.tick(), if model.animated() => {
+                model.anim_phase = model.anim_phase.wrapping_add(1);
+                model.dirty = true;
+            }
             // Guarded tick: while the model is clean this branch is disabled,
             // so the idle loop takes NO periodic wakeups (efficiency rider
             // #10 — ~109k/hour otherwise). The first dirtying event re-arms
@@ -375,6 +393,12 @@ pub async fn run_demo(
 
 /// The sim's idle(i) decay window (tui.js:1562: 30s of nothing).
 pub const IDLE_DECAY: Duration = Duration::from_secs(30);
+
+/// TUI4d item 14 — one phase of the shared animation clock. The sim runs
+/// per-element CSS periods (1.1-1.5 s pulses, a 1.8 s rail shimmer); the
+/// port folds them onto ONE clock: 600 ms per phase gives a 1.2 s pulse
+/// (two phases) and, via `% 3`, the shimmer's 1.8 s exactly.
+pub const ANIM_PHASE_MS: u64 = 600;
 
 /// One terminal input event through the production dispatch — key/paste
 /// into the reducer, resize into [`AppModel::handle_resize`], mouse through

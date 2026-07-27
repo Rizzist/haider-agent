@@ -365,7 +365,11 @@ fn the_launcher_column_is_capped_and_centered_at_a_wide_frame() {
         "⇄ Peers",
     ] {
         let row = &frame.rows[frame.row_of(needle)];
-        let start = row.chars().take_while(|c| *c == ' ').count();
+        // TUI4d item 14: every block row leads with a one-cell rail column
+        // (the sim's `.rail` sliver, tui.js:4370-4394) — blank on idle
+        // rows, the ▎ shimmer glyph on a running one. It is PADDING, not
+        // text: the shared TEXT edge starts after it.
+        let start = row.chars().take_while(|c| *c == ' ' || *c == '▎').count();
         let ink = row.trim_end().chars().count() - start;
         assert!(
             ink <= cap,
