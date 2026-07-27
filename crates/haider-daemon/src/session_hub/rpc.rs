@@ -1,3 +1,16 @@
+//! CHARTER — the connection's request surface: transport in, semantics down.
+//!
+//! What lives here: [`HubConnection`]'s method handlers — capability and
+//! control-attachment policy checks, argument validation, receipt-first
+//! command orchestration (R2/R3/R5), workspace validation, and wire
+//! error-code mapping. What may NOT live here: durable mutation (the store
+//! owns every transaction; the session actor serializes it — actor.rs),
+//! delivery pacing (replay.rs), and provider/tool work (`worker.rs`; a
+//! request handler hands the manager a COMMITTED acceptance and returns).
+//! Requests on one connection are handled inline by the connection task, so
+//! nothing here may await provider work — the longest await is one store
+//! transaction or one workspace `spawn_blocking`.
+
 use super::*;
 
 // ─────────── connection RPC surface: list/read/attach/detach/menu ───────────
@@ -128,7 +141,7 @@ impl HubConnection {
                 }
                 if !self
                     .hub
-                    .attachment_for_menu(&self.connection_id, &session_id)?
+                    .holds_control_attachment(&self.connection_id, &session_id)?
                 {
                     return self.respond_error(
                         request_id,
@@ -166,7 +179,7 @@ impl HubConnection {
                 }
                 if !self
                     .hub
-                    .attachment_for_menu(&self.connection_id, &session_id)?
+                    .holds_control_attachment(&self.connection_id, &session_id)?
                 {
                     return self.respond_error(
                         request_id,
@@ -787,7 +800,7 @@ impl HubConnection {
         }
         if !self
             .hub
-            .attachment_for_menu(&self.connection_id, &session_id)?
+            .holds_control_attachment(&self.connection_id, &session_id)?
         {
             return self.menu_error(
                 request_id,

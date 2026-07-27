@@ -1,3 +1,16 @@
+//! CHARTER — the attachment delivery pipeline (§5.5 steps 4-7).
+//!
+//! What lives here: one task per attachment ([`run_replay`]) and every paced
+//! frame it emits — store replay, `AttachCaughtUp`, buffered drain, live
+//! delivery, lag/store-resume, the drain-time final suffix, and the
+//! detach-with-`Lagged` exit. Two laws are stated authoritatively in this
+//! file: the PACING LAW (on [`deliver_frame`]) and the UNKNOWN-ID RULE (on
+//! [`lag_and_detach`]). What may NOT live here: store mutation (all appends
+//! and CAS go through the session actor — actor.rs), attachment ownership
+//! bookkeeping (mod.rs's `attachments`/`attachment_slots` maps own admission
+//! and release; this task only borrows its registration), and RPC semantics
+//! (rpc.rs). A replay task never writes the store and never answers requests.
+
 use super::*;
 
 // ──────── replay pipeline: replay → caught-up → buffered drain → live ───────

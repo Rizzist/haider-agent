@@ -5,6 +5,10 @@
 //! production transport contract.
 
 #![allow(clippy::expect_used)]
+// Each test binary compiles this module independently and uses a different
+// helper subset, so per-binary dead-code warnings would fire on live
+// helpers. The cost: a helper no suite uses anymore will not be flagged —
+// re-audit when helpers are added.
 #![allow(dead_code)]
 
 use haider_daemon::{

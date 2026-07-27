@@ -1,4 +1,26 @@
-//! Owned per-session supervisors and injectable turn dependencies.
+//! CHARTER — the turn engine: owned per-session supervisors and injectable
+//! turn dependencies (report R1).
+//!
+//! What lives here: [`WorkerManager`] (one lazy supervisor per session, all
+//! tasks owned — nothing detached), the supervisor loop (accepted-turn
+//! queue, active cancellation, provider/tool/prompt assembly, drain
+//! settlement), the turn-scoped [`ProviderFactory`]/[`TurnToolFactory`]
+//! ports, and the production broker-backed tool dispatcher with its
+//! hub-owned journal/CAS adapters. What may NOT live here: SQLite (a worker
+//! holds only its lease-fenced `HubStoreHandle`; this module never names
+//! `SqliteStoreHandle` — grep-enforced, the module-side half of the R1
+//! append-exclusivity seal), wire/RPC concerns
+//! (rpc.rs hands this module a COMMITTED [`AcceptedTurn`], never a raw
+//! request), and session-hub actor work (the hub actor must stay free of
+//! provider/tool awaits; everything slow happens in supervisor tasks).
+//!
+//! ADMISSION DISCIPLINE (authoritative statement): a supervisor starts
+//! provider work only from durable facts — a submit reaches it after the
+//! acceptance transaction committed, and `admit_pending`/`refill_queued_turns`
+//! re-derive runnability from journal run states, never from the in-memory
+//! message that delivered the hint. The bounded queue may drop hints
+//! (`rescan_needed`); the durable `Queued`+`UserMessage` pair is the overflow
+//! buffer.
 
 use crate::session_hub::{HubStoreHandle, SessionHub, SessionHubError};
 use async_trait::async_trait;
@@ -6,7 +28,7 @@ use base64::Engine;
 use haider_core::{
     AcceptedTurn, CancelToken, EventIdGenerator, HarnessActor, HarnessConfig,
     PromptHistoryCompiler, RequestInputCheckpoint, StoreHandle, SubmitCheckpointTurn,
-    SubmitCommittedTurn, ToolDispatcher, TurnHandle,
+    SubmitCommittedTurn, ToolDispatcher, TurnHandle, sanitized_failure_message,
 };
 use haider_protocol::EventPayload;
 use haider_protocol::effect::EffectClass;
@@ -32,15 +54,23 @@ use tokio::task::{JoinHandle, JoinSet};
 const MANAGER_CAPACITY: usize = 128;
 const SUPERVISOR_CAPACITY: usize = 64;
 
-/// A provider resolved and pinned for one logical turn.
+/// A provider resolved and pinned for one logical turn (R6).
 pub struct ResolvedTurnProvider {
     pub provider: Arc<dyn Provider>,
     pub provider_name: String,
     pub model: String,
+    /// Stamped into every usage snapshot the turn commits; an account change
+    /// inside one logical turn is a protocol error in core.
     pub account_alias: Option<String>,
 }
 
-/// Injectable, turn-scoped provider resolver.
+/// Injectable, turn-scoped provider resolver (R6, authoritative pinning
+/// site): resolution happens once per logical turn, after durable acceptance
+/// and before `Thinking`/provider work, and the result is pinned across
+/// every provider request in that turn — a login or account switch affects
+/// the NEXT logical turn only. `resolve_for_turn` must return the same
+/// provider name the session's metadata records; `start_turn` rejects a
+/// mismatch.
 #[async_trait]
 pub trait ProviderFactory: Send + Sync {
     async fn resolve_for_turn(
@@ -59,8 +89,15 @@ pub struct WorkerToolContext {
     pub event_ids: Arc<EventIdGenerator>,
 }
 
-/// Injectable tool/effect boundary. Production uses the shipped broker;
+/// Injectable tool/effect boundary (R4). Production uses the shipped broker;
 /// tests can hold a dispatch at an exact crash boundary.
+///
+/// Contract: `definitions` and `create` must agree — every advertised
+/// definition must be executable by the created dispatcher (R4 forbids
+/// advertising tools a dispatcher cannot run, which can trap a real model in
+/// an unproductive loop). `create` returning `None` means the turn runs
+/// without general tools and must then advertise none beyond the
+/// actor-owned `request_input`.
 #[async_trait]
 pub trait TurnToolFactory: Send + Sync {
     fn definitions(&self) -> Vec<ToolDefinition>;
@@ -107,7 +144,13 @@ impl ProviderFactory for UnconfiguredProviderFactory {
     }
 }
 
-/// Versioned, deterministic coding-agent policy.
+/// Versioned, deterministic coding-agent policy (R4).
+///
+/// Guarantees: the same metadata always yields the same prompt; every
+/// provider request in one pinned logical turn receives the same non-`None`
+/// system prompt; [`Self::VERSION`] is recorded in session metadata at
+/// creation so a policy change is a visible, versioned fact, never a silent
+/// drift. Provider adapters must not invent product policy.
 pub struct SystemPromptBuilder;
 
 impl SystemPromptBuilder {
@@ -130,6 +173,10 @@ pub(crate) struct WorkerManagerHandle {
     commands: mpsc::Sender<ManagerCommand>,
 }
 
+/// Owner of every supervisor task (R1): one lazy supervisor per session,
+/// all tasks in one `JoinSet`, nothing detached. `shutdown` broadcasts
+/// Shutdown and joins everything; a drop without shutdown aborts (the
+/// abort-on-drop backstop for a cancelled runtime future).
 pub(crate) struct WorkerManager {
     handle: WorkerManagerHandle,
     task: Option<JoinHandle<()>>,
@@ -395,6 +442,15 @@ impl<T> FutureTurn for T where
 {
 }
 
+/// One session's turn loop: strictly serial turns from the bounded queue,
+/// with three live inputs while a turn runs — submissions (queued behind the
+/// active run), the hub's cancellation wake (durable `Cancelling` reconciled
+/// from the journal, active token cancelled), and the active turn's outcome
+/// (dispatcher closed, harness stopped and joined, then the store-side
+/// conditional Idle settle — `Store::settle_session_idle` owns that law).
+/// Shutdown cancels the active turn, terminalizes durable queued runs, and
+/// exits only after the last turn settles; the supervisor deregisters its
+/// lease on the way out.
 async fn run_supervisor(
     hub: SessionHub,
     dependencies: DaemonDependencies,
@@ -451,8 +507,7 @@ async fn run_supervisor(
                         }
                         let _ =
                             append_failure(&lease, &device_id, &run_id, &event_ids, error).await;
-                        let _ = append_session_idle(&lease, &device_id, &run_id, &event_ids, false)
-                            .await;
+                        let _ = append_session_idle(&lease, &device_id, &event_ids, false).await;
                     }
                 }
             }
@@ -515,13 +570,8 @@ async fn run_supervisor(
                         if let Some(actor) = finished.actor.take() {
                             let _ = actor.await;
                         }
-                        let _ = append_session_idle(
-                            &lease,
-                            &device_id,
-                            &finished.run_id,
-                            &event_ids,
-                            stopping,
-                        ).await;
+                        let _ = append_session_idle(&lease, &device_id, &event_ids, stopping)
+                            .await;
                     }
                 }
             }
@@ -548,14 +598,9 @@ async fn run_supervisor(
                             &event_ids,
                             None,
                         ).await;
-                        if let Some(run_id) = last {
-                            let _ = append_session_idle(
-                                &lease,
-                                &device_id,
-                                &run_id,
-                                &event_ids,
-                                true,
-                            ).await;
+                        if last.is_some() {
+                            let _ = append_session_idle(&lease, &device_id, &event_ids, true)
+                                .await;
                         }
                     }
                 },
@@ -620,7 +665,7 @@ async fn admit_pending(
         Some(RunState::Cancelling) => {
             let _ =
                 append_run_state(store, device_id, &run_id, event_ids, RunState::Cancelled).await;
-            let _ = append_session_idle(store, device_id, &run_id, event_ids, false).await;
+            let _ = append_session_idle(store, device_id, event_ids, false).await;
         }
         _ => {
             // Receipt replays for active or terminal runs are response-only.
@@ -694,11 +739,14 @@ async fn reconcile_durable_cancellations(
         }
     }
     queue.retain(|pending| !terminalized.contains(&pending.accepted.run_id));
-    if let Some(run_id) = terminalized.last() {
-        let _ = append_session_idle(store, device_id, run_id, event_ids, false).await;
+    if !terminalized.is_empty() {
+        let _ = append_session_idle(store, device_id, event_ids, false).await;
     }
 }
 
+/// Reduces the committed journal to `(run, latest state, accepted seq)` in
+/// acceptance order — the durable truth every admission/cancellation/refill
+/// decision reads instead of trusting in-memory hints (module charter).
 async fn durable_runs(
     store: &HubStoreHandle,
 ) -> Result<Vec<(RunId, RunState, Option<u64>)>, HaiderError> {
@@ -771,6 +819,21 @@ async fn cancel_durable_queued_turns(
     last
 }
 
+/// Assembles and starts one accepted turn: provider resolution (R6 pinning —
+/// this is the once-per-logical-turn call), committed-history compilation
+/// (R4), tool dispatcher creation, harness registration under the lease, and
+/// submission.
+///
+/// Checkpoint resumption order is deliberate: the recovered harness
+/// registers FIRST, then the journal is scanned for an already-committed
+/// answer. An answer committed before registration is found by the scan; one
+/// committed after the scan is delivered by the hub's registered-harness
+/// wake; one committed between registration and the scan is sent TWICE (hub
+/// wake at commit, then the scan's apply). The duplicate is safe because
+/// both sends land in the harness's latest-value committed-menu watch before
+/// the checkpoint turn's waiter performs its first read, which collapses
+/// them into one observation — missing the answer is the failure mode this
+/// ordering exists to prevent.
 async fn start_turn(
     hub: &SessionHub,
     dependencies: &DaemonDependencies,
@@ -1043,10 +1106,13 @@ async fn append_run_state(
     .await
 }
 
+/// Offers the aggregate `Idle` settle. Deliberately run-agnostic: aggregate
+/// `SessionState` envelopes carry no run id, and whether Idle actually
+/// commits is decided durably by `Store::settle_session_idle` (all runs
+/// terminal), never by this caller's view of which run just finished.
 async fn append_session_idle(
     store: &HubStoreHandle,
     device_id: &DeviceId,
-    _run_id: &RunId,
     event_ids: &EventIdGenerator,
     interrupted: bool,
 ) -> Result<(), HaiderError> {
@@ -1117,22 +1183,6 @@ fn supervisor_envelope(
             )
         })?,
     })
-}
-
-fn sanitized_failure_message(message: &str) -> String {
-    const LIMIT: usize = 512;
-    let mut sanitized = String::with_capacity(message.len().min(LIMIT));
-    for character in message.chars() {
-        if sanitized.len() >= LIMIT {
-            break;
-        }
-        sanitized.push(if character.is_control() && character != '\n' {
-            ' '
-        } else {
-            character
-        });
-    }
-    sanitized
 }
 
 fn manager_stopped() -> HaiderError {

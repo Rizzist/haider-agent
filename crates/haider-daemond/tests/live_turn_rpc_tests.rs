@@ -1,8 +1,12 @@
 //! W3c1 primary gate: production daemon/runtime over a real UnixStream.
 //!
-//! M2 establishes the durable session-create prefix here. M3/M4 extend this
-//! same file to all thirteen numbered §6.1 scenarios with an injected fake
-//! provider factory; no test in this file may use a live API.
+//! All thirteen numbered report-§6.1 scenarios live here, each headed
+//! `Scenario N` and driven by an injected fake provider factory; no test in
+//! this file may use a live API. File order: scenario 1, scenarios 3-8, the
+//! worker-aware-drain satellite, scenarios 9-12, scenario 2 (the M2 prefix)
+//! with its two session-create satellites, then scenario 13 — the
+//! mutation-seam sweep manifest that names every load-bearing seam and the
+//! focused test observing it.
 
 #![allow(clippy::expect_used)]
 
@@ -307,6 +311,14 @@ fn payloads_for_run<'a>(
 
 /// Scenario 1: the production runtime is constructed with an injected,
 /// deterministic provider factory; no live provider is reachable.
+///
+/// MUTATION CHECK: make `spawn_with_dependencies` (haider-daemon
+/// `runtime.rs`) ignore its `dependencies` argument and construct
+/// `DaemonDependencies::default()`. Expected failure: this boot still
+/// passes (the pinned law here is only that injection is accepted), but
+/// every turn scenario in this file fails — scenario 3 first, with a
+/// `credential_missing` RunFailed instead of a streamed turn — which is why
+/// the scenario-13 manifest lists scenario 3 as this seam's observer.
 #[tokio::test]
 async fn scenario_1_production_runtime_accepts_an_injected_fake_provider_factory() {
     let root = test_root("w3c-live-");
@@ -324,10 +336,18 @@ async fn scenario_1_production_runtime_accepts_an_injected_fake_provider_factory
 
 /// Scenario 3.
 ///
-/// MUTATION CHECK: enqueue provider work before the acceptance transaction
-/// returns, bypass the lease-fenced HubStoreHandle, or publish before append.
-/// Expected failure: sequence order/gap assertions fail or the worker request
-/// appears without its durable Queued/UserMessage prefix.
+/// MUTATION CHECK (three seams, one per revert):
+/// - move `worker_manager()?.submit(..)` before `hub.accept_turn(..)` in
+///   `turn_submit` (session_hub/rpc.rs) — expected failure: the provider
+///   request races the durable prefix and the Queued-before-UserMessage-
+///   before-Thinking position assertions below fail;
+/// - hand the worker the raw store instead of its lease-fenced
+///   `HubStoreHandle` in `start_turn` (worker.rs) — expected failure: worker
+///   envelopes bypass the actor and the contiguous-sequence window check
+///   fails on interleaved publication;
+/// - publish before append in the actor's `WorkerAppend` arm (actor.rs) —
+///   expected failure: a delivered event precedes its durable seq and the
+///   contiguity/durable-read checks disagree.
 #[tokio::test]
 async fn scenario_3_submit_streams_one_contiguous_durable_turn_over_real_uds() {
     let root = test_root("w3c-live-");
@@ -427,13 +447,24 @@ async fn scenario_3_submit_streams_one_contiguous_durable_turn_over_real_uds() {
         .iter()
         .map(|(_, payload)| payload)
         .collect::<Vec<_>>();
-    assert!(payloads.contains(&&EventPayload::RunState(RunState::Queued)));
-    assert!(payloads.iter().any(|payload| matches!(
-        payload,
-        EventPayload::UserMessage { text, .. } if text == "say hello"
-    )));
-    assert!(payloads.contains(&&EventPayload::RunState(RunState::Thinking)));
-    assert!(payloads.contains(&&EventPayload::RunState(RunState::Streaming)));
+    // Position, not just presence: the acceptance transaction commits Queued
+    // then UserMessage, and only then may the worker commit Thinking and
+    // stream (R3's durable-before-provider order).
+    let position = |predicate: &dyn Fn(&EventPayload) -> bool| {
+        payloads
+            .iter()
+            .position(|payload| predicate(payload))
+            .expect("expected payload present")
+    };
+    let queued = position(&|payload| *payload == EventPayload::RunState(RunState::Queued));
+    let user = position(
+        &|payload| matches!(payload, EventPayload::UserMessage { text, .. } if text == "say hello"),
+    );
+    let thinking = position(&|payload| *payload == EventPayload::RunState(RunState::Thinking));
+    let streaming = position(&|payload| *payload == EventPayload::RunState(RunState::Streaming));
+    assert!(queued < user, "Queued must precede UserMessage");
+    assert!(user < thinking, "UserMessage must precede Thinking");
+    assert!(thinking < streaming, "Thinking must precede Streaming");
     assert!(payloads.iter().any(|payload| matches!(
         payload,
         EventPayload::Item(haider_protocol::item::ItemEvent::Started { .. })
@@ -465,9 +496,12 @@ async fn scenario_3_submit_streams_one_contiguous_durable_turn_over_real_uds() {
 
 /// Scenario 4.
 ///
-/// MUTATION CHECK: skip the committed submit-receipt preflight or omit the
-/// supervisor's run-id dedup set. Expected failure: retry starts a second
-/// provider request or commits a second user message.
+/// MUTATION CHECK: skip the `turn_accept_receipt` preflight in `turn_submit`
+/// (session_hub/rpc.rs), or remove `admit_pending`'s active-run compare and
+/// in-queue run-id scan (worker.rs). Expected failure: the same-command
+/// retry starts a second provider request or commits a second user message
+/// (the durable UserMessage count below catches the duplicate even when the
+/// provider-request count race is lost).
 #[tokio::test]
 async fn scenario_4_lost_submit_response_replays_one_run_and_one_provider_request() {
     let root = test_root("w3c-live-");
@@ -620,9 +654,13 @@ async fn scenario_4_lost_submit_response_replays_one_run_and_one_provider_reques
 
 /// Scenario 5.
 ///
-/// MUTATION CHECK: compile only the current user message, omit terminal-state
-/// filtering, or ignore branch/agent identity. Expected failure: request two
-/// lacks the completed first exchange or includes non-terminal content.
+/// MUTATION CHECK: make `PromptHistoryCompiler::compile`
+/// (haider-core/src/prompt_history.rs) return only the current user message,
+/// or drop its Done-runs-only terminal filter. Expected failure: request two
+/// lacks the completed first exchange, or includes non-terminal content.
+/// (Branch/agent scoping is NOT observable here — this session runs one
+/// head-turn identity; that filter currently has no pinning test and is
+/// listed in the clean-code findings for the review round.)
 #[tokio::test]
 async fn scenario_5_second_turn_contains_prior_completed_conversation() {
     let root = test_root("w3c-live-");
@@ -1165,9 +1203,15 @@ async fn scenario_8_wire_cancel_closes_open_items_and_cancelled_is_run_terminal(
     task.join().await.expect("daemon joins");
 }
 
-/// MUTATION CHECK: restore either `queue.clear()` in a supervisor shutdown
-/// arm. Expected failure: the accepted queued run has no terminal state after
-/// the worker-aware drain completes.
+/// Worker-aware drain satellite (report §6.1 implementation bullet
+/// "external admission gate and worker-aware drain", R9): a queued run that
+/// never started must reach a durable terminal state during the drain grace,
+/// not evaporate with the in-memory queue.
+///
+/// MUTATION CHECK: replace the `cancel_durable_queued_turns(..)` call with a
+/// bare queue drop in either `run_supervisor` shutdown arm (worker.rs).
+/// Expected failure: the accepted queued run has no terminal state after the
+/// worker-aware drain completes.
 #[tokio::test]
 async fn worker_aware_drain_terminalizes_durable_queued_turns_before_store_close() {
     let root = test_root("w3c-live-");
@@ -1896,9 +1940,13 @@ async fn scenario_12_reasoning_safe_follow_up_cumulative_usage_and_durable_failu
 
 /// Scenario 2 (M2 prefix).
 ///
-/// MUTATION CHECK: publish `Created` before the receipt/metadata transaction
-/// commits, or capture attach head outside the actor step. Expected failure:
-/// replay misses sequence one or returns metadata without its durable event.
+/// MUTATION CHECK: capture the attach head outside the actor's `Register`
+/// step (actor.rs). Expected failure: `AttachCaughtUp` reports a stale
+/// high-water instead of 1, or the `Created` event misses the replay.
+/// (Publishing `Created` before its transaction commits is NOT
+/// deterministically observable over this wire ordering — the atomicity of
+/// metadata + `Created` + receipt is pinned at the store seam by
+/// `haider-store/tests/session_create_tests.rs`.)
 #[tokio::test]
 async fn scenario_2_real_uds_creates_attaches_and_replays_typed_session() {
     let root = test_root("w3c-live-");
@@ -2022,9 +2070,15 @@ async fn scenario_2_real_uds_creates_attaches_and_replays_typed_session() {
     task.join().await.expect("daemon joins");
 }
 
-/// MUTATION CHECK: validate/canonicalize cwd before consulting a committed
-/// receipt, or omit semantic-body comparison. Expected failure: the retry
-/// after workspace removal fails, or the changed-body reuse is accepted.
+/// Scenario 2 satellite — the R2 receipt-idempotency law on the wire: a
+/// lost `session.create` response is recoverable by same-command retry, and
+/// a same-command different-body reuse is rejected.
+///
+/// MUTATION CHECK: in `session_create` (session_hub/rpc.rs), move
+/// `validate_workspace` before the `session_create_receipt` preflight, or
+/// drop the digest comparison in the store's receipt lookup. Expected
+/// failure: the retry after workspace removal fails, or the changed-body
+/// reuse is accepted.
 #[tokio::test]
 async fn session_create_lost_response_retry_survives_removed_cwd_and_rejects_changed_body() {
     let root = test_root("w3c-live-");
@@ -2120,6 +2174,10 @@ async fn session_create_lost_response_retry_survives_removed_cwd_and_rejects_cha
     task.join().await.expect("daemon joins");
 }
 
+/// Scenario 2 satellite — the R7 capability and feature-advertisement law:
+/// `session.create` requires Control, and the ready `Welcome` advertises
+/// exactly the additive methods this daemon implements.
+///
 /// MUTATION CHECK: authorize `session.create` as View or advertise features
 /// without implementing the receipt-backed method. Expected failure: the
 /// View-only client creates a session, or the ready Welcome lacks the feature.
@@ -2216,84 +2274,127 @@ async fn session_create_requires_control_and_ready_welcome_advertises_implemente
     task.join().await.expect("daemon joins");
 }
 
-/// Scenario 13: executable manifest for the production-seam mutation sweep.
+/// Scenario 13: the manifest for the production-seam mutation sweep.
 ///
-/// Each entry names the focused test that must fail when the listed seam is
-/// reverted. The M4 gate executes those reverts and records the observations
-/// in the prepared commit message.
+/// Each entry is `(test fn, workspace-relative file, seam to revert)`: the
+/// focused test that must fail when the listed seam is reverted, and where a
+/// re-runner finds it (six of thirteen live outside this file). The sweep
+/// itself is executed by hand — revert each seam, run the named test, record
+/// the observation in the commit message; this manifest keeps that procedure
+/// honest by construction: the seven in-file entries are compile-time
+/// references to their test functions (a rename breaks the build), and every
+/// listed file path is asserted to exist in the workspace.
 ///
-/// MUTATION CHECK: delete an entry or point two seams at the same focused
-/// test. Expected failure: completeness or uniqueness below fails.
+/// MUTATION CHECK: delete an entry, point two seams at the same focused
+/// test, or let a listed file move without updating its coordinate.
+/// Expected failure: the completeness, uniqueness, or path-existence
+/// assertions below fail (an in-file test rename fails compilation first).
 #[test]
 fn scenario_13_mutation_seam_sweep_manifest_covers_each_load_bearing_boundary() {
+    // Compile-time linkage for the in-file entries: renaming any of these
+    // seven tests without updating the manifest is a build error.
+    let _in_file_sweep_links: [fn(); 7] = [
+        scenario_4_lost_submit_response_replays_one_run_and_one_provider_request,
+        scenario_7_two_menu_answers_race_and_only_first_commit_wins,
+        scenario_8_wire_cancel_closes_open_items_and_cancelled_is_run_terminal,
+        scenario_9_restart_resumes_only_queued_and_terminalizes_streaming,
+        scenario_10_restart_replays_request_input_without_reexecuting_prior_request,
+        scenario_11_held_effect_becomes_unknown_after_restart_and_never_redispatches,
+        scenario_12_reasoning_safe_follow_up_cumulative_usage_and_durable_failure,
+    ];
+    const HERE: &str = "crates/haider-daemond/tests/live_turn_rpc_tests.rs";
     let sweep = [
         (
             "scenario_4_lost_submit_response_replays_one_run_and_one_provider_request",
-            "durable receipt preflight and supervisor run-id dedup",
+            HERE,
+            "durable receipt preflight and admit_pending's active-run/in-queue run-id dedup",
         ),
         (
             "superseded_worker_lease_is_fenced_before_store_append",
+            "crates/haider-daemon/tests/session_hub_tests.rs",
             "hub WorkerAppend active lease-token validation",
         ),
         (
             "scenario_7_two_menu_answers_race_and_only_first_commit_wins",
+            HERE,
             "SQLite first-committed-wins menu CAS",
         ),
         (
             "scenario_9_restart_resumes_only_queued_and_terminalizes_streaming",
-            "interrupted-run resumability classifier",
+            HERE,
+            "interrupted-run resumability reduction (turn_recovery.rs)",
         ),
         (
             "scenario_11_held_effect_becomes_unknown_after_restart_and_never_redispatches",
+            HERE,
             "pre-Ready ambiguous-effect reconciliation",
         ),
         (
             "scenario_12_reasoning_safe_follow_up_cumulative_usage_and_durable_failure",
+            HERE,
             "reasoning omission, cumulative usage, and RunFailed ordering",
         ),
         (
             "replay_live_barrier_is_contiguous_at_every_forced_boundary",
+            "crates/haider-daemon/tests/session_hub_tests.rs",
             "persist-before-publish and serialized register-plus-head",
         ),
         (
             "full_internal_catch_up_receiver_reregisters_and_resumes_from_store",
+            "crates/haider-daemon/tests/session_hub_tests.rs",
             "bounded catch-up with store as the only lag buffer",
         ),
         (
             "scenario_10_restart_replays_request_input_without_reexecuting_prior_request",
+            HERE,
             "recovery Ready barrier and recovered-menu generation authorization",
         ),
         (
             "scenario_8_wire_cancel_closes_open_items_and_cancelled_is_run_terminal",
+            HERE,
             "lease-bound cancellation wake and terminal event ordering",
         ),
         (
             "aggregate_idle_is_skipped_when_a_new_run_is_durably_active",
+            "crates/haider-store/tests/turn_command_tests.rs",
             "transactional aggregate SessionState ownership",
         ),
         (
             "tool_result_is_presented_after_its_completed_tool_call",
+            "crates/haider-core/src/prompt_history.rs",
             "provider-valid tool history reconstruction",
         ),
         (
             "dropping_an_owned_stream_aborts_its_producer",
+            "crates/haider-provider/tests/fake_provider_tests.rs",
             "owned provider producer cancellation",
         ),
     ];
     let tests = sweep
         .iter()
-        .map(|(test, _)| *test)
+        .map(|(test, _, _)| *test)
         .collect::<std::collections::HashSet<_>>();
     let seams = sweep
         .iter()
-        .map(|(_, seam)| *seam)
+        .map(|(_, _, seam)| *seam)
         .collect::<std::collections::HashSet<_>>();
     assert_eq!(sweep.len(), 13);
     assert_eq!(tests.len(), sweep.len());
     assert_eq!(seams.len(), sweep.len());
-    assert!(
-        sweep
-            .iter()
-            .all(|(test, seam)| !test.is_empty() && !seam.is_empty())
-    );
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .expect("workspace root");
+    for (test, file, _) in &sweep {
+        let path = workspace_root.join(file);
+        assert!(
+            path.is_file(),
+            "manifest coordinate for `{test}` does not exist: {file}"
+        );
+        let source = fs::read_to_string(&path).expect("manifest coordinate is readable");
+        assert!(
+            source.contains(&format!("fn {test}")),
+            "manifest coordinate {file} no longer defines `{test}`"
+        );
+    }
 }

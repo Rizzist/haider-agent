@@ -43,12 +43,30 @@
 //!   `overloaded` error ([`SessionHubConfig`] and
 //!   `SessionHub::reserve_attachment_slot`).
 //!
-//! Two laws this module obeys but does not own:
+//! Laws this module obeys but does not own (each has ONE authoritative site):
 //!
 //! - menu arbitration (first committed answer wins) is stated on
 //!   `haider_store::Store::resolve_menu`;
 //! - the fair-scheduling policy is stated on `connection.rs`'s
-//!   `OutboundLane`.
+//!   `OutboundLane`;
+//! - command-receipt idempotency (R2) is stated on
+//!   `haider_store::Store::session_create_receipt`;
+//! - the recovery reduction rules (R5) are stated in `turn_recovery.rs`;
+//! - the drain barrier order (R9) is stated in `runtime.rs`'s `run_inner`;
+//!   this module contributes the admission asymmetry documented on
+//!   [`SessionHub::actor_for`] vs `SessionHub::existing_actor`.
+//!
+//! # Module map (the W3c split; each file opens with its charter)
+//!
+//! - `mod.rs` — hub state and task ownership, attachment admission ledger,
+//!   worker leases, shutdown, [`HubStoreHandle`], and the types every
+//!   submodule shares. No command arms, no delivery pacing, no RPC handling.
+//! - `actor.rs` — [`run_session_actor`]: the serialized command order that
+//!   proves INVARIANTs 1/2 and owns same-generation lease fencing.
+//! - `replay.rs` — the per-attachment delivery pipeline; owns the pacing law
+//!   and the unknown-id rule.
+//! - `rpc.rs` — [`HubConnection`]'s request surface: policy checks, receipt
+//!   orchestration, wire error mapping.
 //!
 //! # Mechanism
 //!
@@ -615,10 +633,16 @@ struct RegisteredWorker {
     cancellation_wake: Option<watch::Sender<u64>>,
 }
 
-/// Lease-fenced, session-scoped store surface handed to a worker.
+/// Lease-fenced, session-scoped store surface handed to a worker (R1).
 ///
-/// It exposes committed reads and append-through-hub only. SQLite and
-/// cross-session access are structurally unavailable.
+/// This type IS the append-exclusivity seal ([`SessionHub::append`] states
+/// the law): a worker can reach committed reads, append-through-actor, CAS
+/// artifacts, and the idle settle — nothing else. SQLite and cross-session
+/// access are structurally unavailable, every append is identity-checked
+/// against the lease's session and generation before it reaches the actor,
+/// and the actor rejects the lease token itself once a successor supersedes
+/// it (actor.rs charter). Cloning shares the one lease; it does not mint
+/// authority.
 #[derive(Clone)]
 pub struct HubStoreHandle {
     hub: SessionHub,
@@ -906,15 +930,21 @@ impl SessionHub {
         })
     }
 
-    /// Routes a worker append through the owning session actor.
+    /// Routes an append through the owning session actor.
     ///
-    /// This is the only legal live-daemon append seam: INVARIANTs 1 and 2
+    /// Every live-daemon append must pass a session actor: INVARIANTs 1 and 2
     /// (module doc) are properties of the actor's command order, so an append
-    /// that bypassed the actor could publish around a registration. That
-    /// exclusivity holds by DISCIPLINE, not code shape —
-    /// `SqliteStoreHandle::append` remains directly callable (tests seed with
-    /// it; recovery runs before any hub exists). W3c must hand every live
-    /// worker this hub as its [`StoreHandle`], as `register_harness` documents.
+    /// that bypassed the actor could publish around a registration.
+    ///
+    /// APPEND EXCLUSIVITY — structural since W3c1: every live worker holds
+    /// only a lease-fenced [`HubStoreHandle`] (`worker.rs` never names
+    /// `SqliteStoreHandle`; grep-enforced), so the W3b2
+    /// "discipline, not shape" caveat now applies only to the paths that run
+    /// while NO hub exists: startup recovery (`turn_recovery.rs`,
+    /// `haider_core::recovery`), the standalone CLI, and test seeding. Those
+    /// remain discipline-held. This facade method itself is the residual
+    /// legacy/`register_harness` seam; production workers append through
+    /// their lease instead.
     pub async fn append(
         &self,
         envelopes: &mut [RawEnvelope],
@@ -1075,7 +1105,14 @@ impl SessionHub {
         self.register_leased_harness(&lease, harness).await
     }
 
-    /// Mints and installs a same-process worker lease in actor order.
+    /// Mints and installs a same-process worker lease in actor order (R1).
+    ///
+    /// Installation REPLACES any current lease in the same serialized actor
+    /// step, revoking the predecessor before the successor can append,
+    /// register a harness, or receive cancellation wakes (the fencing law is
+    /// stated in actor.rs's charter). The returned [`HubStoreHandle`] is the
+    /// ONLY store surface a worker may hold. Refused while draining: a new
+    /// worker is new admission under the R9 gate.
     pub async fn acquire_worker_lease(
         &self,
         session_id: SessionId,
@@ -1118,6 +1155,9 @@ impl SessionHub {
         })
     }
 
+    /// Installs the harness that committed menu resolutions wake, under the
+    /// caller's still-current lease; a superseded lease is rejected instead
+    /// of overwriting its successor's registration.
     pub async fn register_leased_harness(
         &self,
         lease: &HubStoreHandle,
@@ -1172,6 +1212,10 @@ impl SessionHub {
             .map_err(Into::into)
     }
 
+    /// Releases the worker registration if — and only if — this lease is
+    /// still the current one; a superseded token is a silent no-op so an old
+    /// supervisor's exit can never unregister its successor. Uses
+    /// `existing_actor` so a draining worker can still deregister.
     pub async fn unregister_worker(&self, lease: &HubStoreHandle) -> Result<(), SessionHubError> {
         let actor = self
             .existing_actor(&lease.session_id)?
@@ -1185,6 +1229,12 @@ impl SessionHub {
             .map_err(|_| SessionHubError::Closed)
     }
 
+    /// Returns the already-running actor, if any — deliberately WITHOUT the
+    /// draining check `actor_for` applies. This asymmetry is the hub's half
+    /// of the R9 drain gate: `begin_draining` closes every actor-CREATING
+    /// path (external requests, new leases), while a worker that already
+    /// holds a lease keeps reaching its existing actor so its final
+    /// `Cancelled`/effect/idle appends commit and publish during the grace.
     fn existing_actor(
         &self,
         session_id: &SessionId,
@@ -1192,6 +1242,9 @@ impl SessionHub {
         Ok(lock(&self.inner.actors)?.get(session_id).cloned())
     }
 
+    /// Returns the session's actor, creating it on first use. Refused while
+    /// draining — this is the actor-creating half of the R9 admission gate
+    /// (see `existing_actor` for the worker-side exception).
     async fn actor_for(
         &self,
         session_id: SessionId,
@@ -1459,9 +1512,16 @@ impl SessionHub {
         Ok(())
     }
 
-    /// True when `connection_id` holds a CONTROL attachment to `session_id` —
-    /// the menu-answer policy documented on [`HubConnection::menu_answer`].
-    fn attachment_for_menu(
+    /// True when `connection_id` holds a CONTROL attachment to `session_id`.
+    ///
+    /// CONTROL-ATTACHMENT POLICY (authoritative statement, R7/§5.7):
+    /// session-scoped mutation — `turn.submit`, `turn.cancel`, and
+    /// `MenuAnswer` — requires the Control capability AND a live CONTROL
+    /// attachment to the target session; v0.1 has no controller-without-
+    /// viewport allowance. `session.create` is exempt only because the
+    /// session does not exist yet. The rpc.rs guards all call this one
+    /// predicate; do not restate the rule inline.
+    fn holds_control_attachment(
         &self,
         connection_id: &str,
         session_id: &SessionId,

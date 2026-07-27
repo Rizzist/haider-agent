@@ -1,4 +1,31 @@
-//! Durable interrupted-run reduction performed before Ready.
+//! CHARTER — durable interrupted-run reduction, performed before Ready (R5,
+//! authoritative statement of the recovery rules).
+//!
+//! What lives here: the per-session journal reduction and the R5 verdict for
+//! every prior-generation nonterminal run:
+//!
+//! - only accepted `Queued` (no provider request ever began) re-enqueues,
+//!   with one aggregate `ActiveRun` per session gaining a recovered queue;
+//! - durable `Cancelling` becomes `Cancelled` (items close `Cancelled`, an
+//!   open menu closes `Cancelled`, no `RunFailed` — cancellation is not an
+//!   error);
+//! - a run parked at a durable `request_input` checkpoint (open
+//!   `request_input` tool item without its `ToolResult`, matching
+//!   `InputRequired` state and open menu) is reconstructed as a waiter — its
+//!   menu stays PENDING, and neither the provider request that produced it
+//!   nor any dispatched effect is ever repeated;
+//! - every other nonterminal run terminalizes: open items close `Failed`, an
+//!   open menu closes `RecoveryInterrupted`, one sanitized retryable
+//!   `RunFailed` precedes `Errored`, and the session settles
+//!   `Idle { interrupted: true }` — all in ONE transactional batch per run,
+//!   so a rerun sees the whole terminal batch or none.
+//!
+//! What may NOT live here: starting provider work (the `WorkerManager`
+//! receives the recovered work AFTER this pass; recovery never opens a
+//! provider stream or dispatches an effect), hub or wire concerns (this runs
+//! on the raw pre-hub `SqliteStoreHandle` — the one sanctioned direct-store
+//! writer besides effect reconciliation), and current-generation runs (live
+//! workers own those; the generation fence skips them).
 
 use haider_core::{
     AcceptedTurn, RequestInputCheckpoint, SqliteStoreHandle, StoreHandle, TurnAdmissionDisposition,
@@ -12,7 +39,7 @@ use haider_protocol::ids::{DeviceId, EventId, ItemId, MenuId, RunId, SessionId};
 use haider_protocol::item::{ItemDelta, ItemEvent, ToolStatus, TurnItem};
 use haider_protocol::menu::{Menu, MenuCloseReason};
 use haider_protocol::state::{RunState, SessionState};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 const PAGE_SIZE: usize = 512;
 
@@ -35,7 +62,7 @@ struct RunReduction {
     open_items: HashMap<ItemId, OpenItem>,
     menu: Option<OpenMenu>,
     menu_answers: HashMap<MenuId, RawEnvelope>,
-    tool_results: HashMap<String, ()>,
+    tool_results: HashSet<String>,
 }
 
 struct OpenItem {
@@ -190,7 +217,7 @@ fn reduce(reductions: &mut HashMap<RunId, RunReduction>, envelope: RawEnvelope) 
             reduction.menu = None;
         }
         EventPayload::ToolResult { call_id, .. } => {
-            reduction.tool_results.insert(call_id, ());
+            reduction.tool_results.insert(call_id);
         }
         _ => {}
     }
@@ -203,7 +230,7 @@ fn pending_checkpoint(reduction: &RunReduction) -> Option<RequestInputCheckpoint
         .iter()
         .find_map(|(item_id, open)| match &open.item {
             TurnItem::ToolCall { call_id, name, .. }
-                if name == "request_input" && !reduction.tool_results.contains_key(call_id) =>
+                if name == "request_input" && !reduction.tool_results.contains(call_id) =>
             {
                 Some(RequestInputCheckpoint {
                     menu: open_menu.menu.clone(),

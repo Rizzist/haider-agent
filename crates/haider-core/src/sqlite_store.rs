@@ -134,6 +134,8 @@ impl SqliteStoreHandle {
         run_blocking(move || owner.with_store(|store| store.create_session(&command))).await
     }
 
+    /// Blocking-pool adapter for `Store::turn_accept_receipt` (R2 replay
+    /// lookup; unfenced by design — see the store doc).
     pub async fn turn_accept_receipt(
         &self,
         command_id: String,
@@ -149,6 +151,8 @@ impl SqliteStoreHandle {
         .await
     }
 
+    /// Blocking-pool adapter for `Store::accept_turn` (R3 atomic
+    /// acceptance; see its caller contract on fence-vs-replay order).
     pub async fn accept_turn(
         &self,
         command: TurnAcceptCommand,
@@ -157,6 +161,8 @@ impl SqliteStoreHandle {
         run_blocking(move || owner.with_store(|store| store.accept_turn(&command))).await
     }
 
+    /// Blocking-pool adapter for `Store::turn_cancel_receipt` (R2 replay
+    /// lookup; unfenced by design — see the store doc).
     pub async fn turn_cancel_receipt(
         &self,
         command_id: String,
@@ -172,6 +178,8 @@ impl SqliteStoreHandle {
         .await
     }
 
+    /// Blocking-pool adapter for `Store::cancel_turn` (R5 durable
+    /// cancellation intent; see its caller contract).
     pub async fn cancel_turn(
         &self,
         command: TurnCancelCommand,

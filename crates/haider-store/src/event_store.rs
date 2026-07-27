@@ -388,6 +388,16 @@ impl Store {
     /// validation. This ordering is intentional: after a successful create,
     /// a lost-response retry remains recoverable even if the workspace path
     /// was subsequently removed.
+    ///
+    /// RECEIPT IDEMPOTENCY (R2, authoritative statement for all three
+    /// receipt lookups): the durable key is the client's semantic
+    /// `command_id` — never a transport request id. Same `command_id` +
+    /// same method/digest returns the original committed response, however
+    /// many times it is retried and across daemon restarts (this lookup is
+    /// deliberately NOT generation-fenced). Same `command_id` with a
+    /// different method or semantic body is `invalid_argument`. The wire
+    /// layer MUST consult the unfenced lookup BEFORE the fenced command
+    /// transaction — see `accept_turn` for why.
     pub fn session_create_receipt(
         &self,
         command_id: &str,
@@ -437,26 +447,15 @@ impl Store {
 
         let created_at_ms = now_ms()?;
         let created_at_sql = to_sqlite_integer(created_at_ms)?;
-        transaction
-            .execute(
-                "INSERT OR IGNORE INTO command_receipts(
-                    command_id, method, request_digest, request_json, state,
-                    session_id, run_id, accepted_seq, response_json,
-                    created_at_ms, updated_at_ms
-                 ) VALUES (?1, 'session.create', ?2, ?3, 'pending',
-                           NULL, NULL, NULL, NULL, ?4, ?4)",
-                params![
-                    &command.command_id,
-                    &command.request_digest,
-                    &command.request_json,
-                    created_at_sql,
-                ],
-            )
-            .map_err(map_sqlite_error)?;
+        claim_pending_receipt(
+            &transaction,
+            &command.command_id,
+            "session.create",
+            &command.request_digest,
+            &command.request_json,
+            created_at_ms,
+        )?;
 
-        // An existing same-command pending receipt can only be a recovery
-        // artifact; a committed receipt would have returned above. A
-        // different method/body is rejected by the lookup helper.
         let metadata = SessionMetadataV1 {
             cwd: command.cwd.clone(),
             provider: command.provider.clone(),
@@ -569,6 +568,8 @@ impl Store {
     }
 
     /// Looks up a committed `turn.submit` response before any worker work.
+    /// Obeys the R2 receipt-idempotency law stated on
+    /// [`Self::session_create_receipt`].
     pub fn turn_accept_receipt(
         &self,
         command_id: &str,
@@ -581,7 +582,17 @@ impl Store {
     }
 
     /// Atomically commits the submit receipt, `Queued`, `UserMessage`, and,
-    /// for the first runnable turn, aggregate `SessionState::ActiveRun`.
+    /// for the first runnable turn, aggregate `SessionState::ActiveRun`
+    /// (R3: only after this transaction is durable may provider work start).
+    ///
+    /// CALLER CONTRACT: this method fences `worker_generation` BEFORE its
+    /// in-transaction receipt replay, so calling it directly with a
+    /// pre-restart command returns `stale_generation` instead of the
+    /// committed response. Cross-restart response recovery is owned by the
+    /// unfenced [`Self::turn_accept_receipt`], which the wire layer must
+    /// consult first (R2 law on [`Self::session_create_receipt`]). The
+    /// composition — unfenced replay, then fenced acceptance — reproduces
+    /// the menu CAS's replay-before-fence semantics end to end.
     pub fn accept_turn(&self, command: &TurnAcceptCommand) -> StoreResult<TurnAcceptOutcome> {
         validate_command_identity(
             &command.command_id,
@@ -629,22 +640,14 @@ impl Store {
             TurnAdmissionDisposition::Started
         };
         let now = now_ms()?;
-        transaction
-            .execute(
-                "INSERT OR IGNORE INTO command_receipts(
-                    command_id, method, request_digest, request_json, state,
-                    session_id, run_id, accepted_seq, response_json,
-                    created_at_ms, updated_at_ms
-                 ) VALUES (?1, 'turn.submit', ?2, ?3, 'pending',
-                           NULL, NULL, NULL, NULL, ?4, ?4)",
-                params![
-                    &command.command_id,
-                    &command.request_digest,
-                    &command.request_json,
-                    to_sqlite_integer(now)?,
-                ],
-            )
-            .map_err(map_sqlite_error)?;
+        claim_pending_receipt(
+            &transaction,
+            &command.command_id,
+            "turn.submit",
+            &command.request_digest,
+            &command.request_json,
+            now,
+        )?;
 
         let mut envelopes = vec![
             unstamped_command_envelope(
@@ -708,6 +711,8 @@ impl Store {
     }
 
     /// Looks up a committed `turn.cancel` response before in-memory routing.
+    /// Obeys the R2 receipt-idempotency law stated on
+    /// [`Self::session_create_receipt`].
     pub fn turn_cancel_receipt(
         &self,
         command_id: &str,
@@ -719,7 +724,14 @@ impl Store {
         lookup_turn_cancel_receipt(&connection, command_id, request_digest, request_json)
     }
 
-    /// Atomically records cancellation intent before any worker is signalled.
+    /// Atomically records cancellation intent before any worker is signalled
+    /// (R5: `Cancelling` is durable before any wake; an already-terminal run
+    /// replies `already_terminal` with its terminal sequence).
+    ///
+    /// CALLER CONTRACT: generation-fenced before receipt replay, exactly
+    /// like [`Self::accept_turn`] — cross-restart response recovery belongs
+    /// to the unfenced [`Self::turn_cancel_receipt`], consulted first by
+    /// the wire layer.
     pub fn cancel_turn(&self, command: &TurnCancelCommand) -> StoreResult<TurnCancelOutcome> {
         validate_command_identity(
             &command.command_id,
@@ -758,22 +770,14 @@ impl Store {
             ));
         };
         let now = now_ms()?;
-        transaction
-            .execute(
-                "INSERT OR IGNORE INTO command_receipts(
-                    command_id, method, request_digest, request_json, state,
-                    session_id, run_id, accepted_seq, response_json,
-                    created_at_ms, updated_at_ms
-                 ) VALUES (?1, 'turn.cancel', ?2, ?3, 'pending',
-                           NULL, NULL, NULL, NULL, ?4, ?4)",
-                params![
-                    &command.command_id,
-                    &command.request_digest,
-                    &command.request_json,
-                    to_sqlite_integer(now)?,
-                ],
-            )
-            .map_err(map_sqlite_error)?;
+        claim_pending_receipt(
+            &transaction,
+            &command.command_id,
+            "turn.cancel",
+            &command.request_digest,
+            &command.request_json,
+            now,
+        )?;
 
         let (cancelled, envelope) = if state.is_terminal() {
             (
@@ -1377,6 +1381,41 @@ fn append_transaction_envelopes(
             ])
             .map_err(map_sqlite_error)?;
     }
+    Ok(())
+}
+
+/// Claims (or re-encounters) the pending receipt row for one semantic
+/// command inside the caller's open transaction — the shared first step of
+/// every R2 command transaction. `INSERT OR IGNORE`: a fresh command claims
+/// the row; an existing same-command pending row is a recovery artifact the
+/// caller finishes (a committed row was already returned by the caller's
+/// in-transaction receipt lookup; a different method/body was rejected by
+/// that lookup).
+fn claim_pending_receipt(
+    transaction: &Transaction<'_>,
+    command_id: &str,
+    method: &str,
+    request_digest: &str,
+    request_json: &str,
+    created_at_ms: u64,
+) -> StoreResult<()> {
+    transaction
+        .execute(
+            "INSERT OR IGNORE INTO command_receipts(
+                command_id, method, request_digest, request_json, state,
+                session_id, run_id, accepted_seq, response_json,
+                created_at_ms, updated_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, 'pending',
+                       NULL, NULL, NULL, NULL, ?5, ?5)",
+            params![
+                command_id,
+                method,
+                request_digest,
+                request_json,
+                to_sqlite_integer(created_at_ms)?,
+            ],
+        )
+        .map_err(map_sqlite_error)?;
     Ok(())
 }
 

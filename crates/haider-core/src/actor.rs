@@ -13,11 +13,22 @@
 //! - **Cancellation is an outcome, never an error.** A cancelled turn commits
 //!   `RunState::Cancelled` as its final envelope and emits nothing after it,
 //!   even when cancellation wins a race with a buffered provider event.
+//! - **Retry owner (R6, authoritative site).** Provider retry lives here and
+//!   ONLY here (adapters keep `RetryPolicy::Never`): at most three attempts
+//!   per individual provider request, only retryable transport/rate-limit/
+//!   overload errors, and never after that request emitted a stream event —
+//!   which also fences effects, since a tool can only run after events.
+//!   `wait_before_provider_retry` commits durable `Waiting` state around the
+//!   backoff and cancellation wins every wait.
 //!
-//! General tool calls are surfaced (completed as `ToolStatus::Pending`) for a
-//! later dispatcher. `request_input` is the intentional exception: the actor
-//! owns its blocking menu round trip because only the actor may journal the
-//! session's `MenuOpened`/`MenuAnswered` and run-state envelopes.
+//! General tool calls run through the injected [`ToolDispatcher`] (W3c);
+//! with no dispatcher installed they are surfaced completed-as-
+//! `ToolStatus::Pending`, the pre-W3c standalone behavior. `request_input`
+//! is the intentional exception: the actor owns its blocking menu round trip
+//! because only the actor may journal the session's
+//! `MenuOpened`/`MenuAnswered` and run-state envelopes. Event ids come from
+//! the [`EventIdGenerator`] namespace: supervisor-installed and shared with
+//! the effect journal in the daemon, self-minted in standalone use.
 
 use crate::{StoreHandle, unix_time_ms};
 use async_trait::async_trait;
@@ -1166,6 +1177,16 @@ impl HarnessActor {
         Ok(())
     }
 
+    /// Commits `Waiting { RateLimit | ProviderBackoff }`, sleeps, then
+    /// commits `Thinking` — the R6 backoff between provider attempts.
+    ///
+    /// The delay honors `retry_after_ms` when present, otherwise exponential
+    /// backoff with deterministic full jitter (hash of run + attempt, so
+    /// restart tests reproduce). KNOWN LIMITATION (clean-code findings, for
+    /// the review round): the final `min(RETRY_CEILING_MS)` clamps a
+    /// provider-supplied `retry_after_ms` above 2s down to 2s, retrying
+    /// EARLIER than the provider asked — R6 intends the ceiling for the
+    /// jitter formula only.
     async fn wait_before_provider_retry(
         &mut self,
         run_id: &RunId,
@@ -2059,7 +2080,16 @@ fn cumulative_usage(completed: Option<&Usage>, current: &Usage) -> Result<Usage,
     })
 }
 
-fn sanitized_failure_message(message: &str) -> String {
+/// Bounds and de-controls a message destined for a durable `RunFailed`
+/// payload (R3, authoritative site — daemon writers delegate here).
+///
+/// The durable failure record must be safe to journal and render: no more
+/// characters are accepted once 512 bytes have accumulated (the final
+/// accepted `char` may carry the total a few bytes past the limit — the
+/// bound is hard at 515), and control characters other than `\n` become
+/// spaces. Provider response bodies and secrets are never eligible as input
+/// — callers pass only typed `HaiderError` messages.
+pub fn sanitized_failure_message(message: &str) -> String {
     const LIMIT: usize = 512;
     let mut sanitized = String::with_capacity(message.len().min(LIMIT));
     for character in message.chars() {

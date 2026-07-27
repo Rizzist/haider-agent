@@ -92,8 +92,18 @@ pub const ERROR_CODE_STALE_GENERATION: &str = "stale_generation";
 /// Stable code for a command that requires an active/nonterminal run.
 pub const ERROR_CODE_RUN_NOT_ACTIVE: &str = "run_not_active";
 /// Stable code for a session resource that is already occupied.
+///
+/// RESERVED in W3c1: golden-pinned per the report's R7 taxonomy but not yet
+/// emitted — the daemon currently reports admission pressure (including
+/// domain `Busy`) as the retryable [`ERROR_CODE_OVERLOADED`] family. The
+/// W3c2 account actor is the intended first emitter; the review round owns
+/// the busy-vs-overloaded mapping decision.
 pub const ERROR_CODE_BUSY: &str = "busy";
 /// Stable code for a provider-side turn failure.
+///
+/// RESERVED in W3c1: golden-pinned but not yet emitted — provider failures
+/// currently surface as durable `RunFailed` envelopes, not correlated
+/// responses (R3). Reserved for W3c2 login validation per R7.
 pub const ERROR_CODE_PROVIDER_ERROR: &str = "provider_error";
 
 /// Daemon implements receipt-backed session creation and metadata.
@@ -260,6 +270,9 @@ pub struct SessionSummary {
     /// Greatest committed envelope sequence for the session.
     pub head_seq: u64,
     pub worker_generation: u64,
+    /// Additive R2 field: typed configuration for live-created sessions.
+    /// `None` for legacy `{}` rows and when an old daemon omits the field —
+    /// readers must not infer anything from its absence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<SessionMetadataV1>,
 }
@@ -270,6 +283,8 @@ pub struct SessionReadResult {
     pub session_id: SessionId,
     pub range: SeqRange,
     pub head_seq: u64,
+    /// Additive R2 field; same absence semantics as
+    /// [`SessionSummary::metadata`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<SessionMetadataV1>,
     #[serde(default)]
@@ -358,6 +373,8 @@ pub enum RequestBody {
 #[serde(tag = "method")]
 #[non_exhaustive]
 pub enum ResponseBody {
+    /// Durable acceptance coordinates of an atomic `session.create` (R2):
+    /// a same-command retry receives this exact body from its receipt.
     #[serde(rename = "session.create")]
     SessionCreate {
         session_id: SessionId,
@@ -384,6 +401,10 @@ pub enum ResponseBody {
     },
     #[serde(rename = "session.detach")]
     SessionDetach { attachment_id: AttachmentId },
+    /// Durable acceptance coordinates of `turn.submit` (R3): `run_id` and
+    /// the `UserMessage` sequence committed by the acceptance transaction.
+    /// Socket order relative to that transaction's events is NOT promised —
+    /// the durable coordinates, not frame order, close the correlation.
     #[serde(rename = "turn.submit")]
     TurnSubmit {
         session_id: SessionId,
@@ -392,6 +413,9 @@ pub enum ResponseBody {
         worker_generation: u64,
         disposition: SubmitDisposition,
     },
+    /// Outcome of durable cancellation intent (R5). `terminal_seq` is
+    /// present exactly when `status` is `already_terminal`, naming the
+    /// run's committed terminal sequence.
     #[serde(rename = "turn.cancel")]
     TurnCancel {
         session_id: SessionId,

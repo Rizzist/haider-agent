@@ -364,24 +364,32 @@ async fn run_inner(
     };
     let barrier_deadline = tokio::time::Instant::now() + config.drain_timeout;
     let deadline_unix_ms = unix_time_ms().saturating_add(duration_ms(config.drain_timeout));
-    // Reject new hub work before Draining becomes externally observable. The
-    // watch broadcast wakes connection tasks on other executor workers.
+    // R9 EXTERNAL ADMISSION GATE: this one flag closes every actor-CREATING
+    // path at once — connection requests and menu answers (checked in
+    // rpc.rs), new attachments, new worker leases — before Draining becomes
+    // externally observable. Workers holding leases are NOT gated: their
+    // final appends reach their existing actors (`SessionHub::existing_actor`
+    // documents the asymmetry). The watch broadcast wakes connection tasks
+    // on other executor workers.
     hub.begin_draining();
     states.publish(DaemonState::Draining {
         reason: reason.clone(),
         deadline_unix_ms,
     });
 
-    // §6.6 grace ORDER (W3b2.3, P1-3): the hub drains FIRST — in-flight
-    // appends/CAS complete their persist AND publish, and replay tasks
-    // stream those final committed envelopes into the connection outboxes —
-    // and only then does the drain notice fire. The notice makes each
-    // connection close its hub registration, so broadcasting it earlier
-    // would cancel attachments while committed envelopes were still in
-    // flight to them. The writer then puts `ServerDraining` on the wire at
-    // its next complete-frame boundary and drains the already-queued
-    // checkpoint envelopes under the same deadline (the ledgered W3b1
-    // relaxation).
+    // WORKER-AWARE §6.6 grace ORDER (R9 steps 3-5, extending W3b2.3 P1-3):
+    // (a) workers settle FIRST — the manager cancels active turns, closes
+    // effect brokers, terminalizes durable queued runs, and every terminal
+    // append lands through the still-serving session actors; (b) then the
+    // hub drains — remaining in-flight appends/CAS complete their persist
+    // AND publish, and replay tasks stream those final committed envelopes
+    // into the connection outboxes; (c) only then does the drain notice
+    // fire. Reversing (a) and (b) would reject the workers' own terminal
+    // `Cancelled`/effect/idle appends; firing (c) earlier would cancel
+    // attachments while committed envelopes were still in flight to them.
+    // The writer then puts `ServerDraining` on the wire at its next
+    // complete-frame boundary and drains the already-queued checkpoint
+    // envelopes under the same deadline (the ledgered W3b1 relaxation).
     let worker_shutdown =
         bounded_finalization(worker_manager.shutdown(), barrier_deadline, &mut shutdown).await;
     if worker_shutdown.is_none() {

@@ -278,6 +278,38 @@ fn session_create_ignores_unknown_additive_fields() {
     assert!(matches!(body, RequestBody::SessionCreate { .. }));
 }
 
+/// R7 additive-field tolerance for the two turn mutation methods
+/// (`session_create_ignores_unknown_additive_fields` is the twin).
+///
+/// MUTATION CHECK: make `RequestBody` decoding strict about unknown fields
+/// (e.g. `#[serde(deny_unknown_fields)]`). Expected failure: both decodes
+/// below reject the additive field.
+#[test]
+fn turn_submit_and_cancel_ignore_unknown_additive_fields() {
+    let submit = r#"{
+        "method":"turn.submit",
+        "command_id":"submit-1",
+        "session_id":"session-1",
+        "worker_generation":1,
+        "text":"hello",
+        "attachments":[],
+        "mode":"queue",
+        "future_priority":"high"
+    }"#;
+    let body: RequestBody = serde_json::from_str(submit).expect("submit with additive field");
+    assert!(matches!(body, RequestBody::TurnSubmit { .. }));
+    let cancel = r#"{
+        "method":"turn.cancel",
+        "command_id":"cancel-1",
+        "session_id":"session-1",
+        "worker_generation":1,
+        "run_id":"run-1",
+        "future_reason":"user"
+    }"#;
+    let body: RequestBody = serde_json::from_str(cancel).expect("cancel with additive field");
+    assert!(matches!(body, RequestBody::TurnCancel { .. }));
+}
+
 /// MUTATION CHECK: remove the additive `ResponseBody::MenuAnswer` variant or
 /// rename its method/coordinate. Expected failure: the exact success shape
 /// below no longer round-trips.

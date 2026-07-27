@@ -1,3 +1,23 @@
+//! CHARTER — the session actor: one session's serialized command order.
+//!
+//! What lives here: [`run_session_actor`] (every command arm) and the
+//! synchronous [`publish`] fan-out it calls. Nothing else. What may NOT live
+//! here: provider or tool work (never awaited in an arm — that is R1's
+//! hub-actor purity rule; provider latency must never hold attach, menu, or
+//! cancel liveness hostage), socket writes, RPC/transport concerns (rpc.rs),
+//! and paced delivery (replay.rs). Every await inside a command arm is a
+//! store call (the loop's own `recv` is the one other await in the file).
+//!
+//! Law owned here — **same-generation worker-lease fencing (R1/R5)**: the
+//! actor holds at most one [`RegisteredWorker`]; `AcquireWorkerLease`
+//! replaces it (revoking the predecessor) in one serialized arm, and the
+//! `WorkerAppend`/`WorkerSettleIdle`/`RegisterHarness`/
+//! `RegisterRecoveredHarness`/`UnregisterHarness` arms compare the presented
+//! [`WorkerLeaseId`] against the current one before touching the store or the
+//! registration. The store's `worker_generation` fences RESTARTS; this token
+//! fences a superseded supervisor inside one generation, which a
+//! generation-only check cannot distinguish.
+
 use super::*;
 
 // ──────────── session actor: the serialized command loop (§5.5) ─────────────
@@ -5,11 +25,12 @@ use super::*;
 /// One session's entire command order, in one loop, in one task.
 ///
 /// Both §5.5 invariants (module doc) hold by code shape here: the only awaits
-/// inside any arm are the store calls (`append`, `resolve_menu`), publication
-/// is a synchronous call after they return in the same arm, and the
-/// `Register` arm contains no await at all. Adding an await between a store
-/// return and its `publish`, or anywhere in `Register`, breaks a law — the
-/// forced-boundary tests in `tests/session_hub_tests.rs` will catch it.
+/// inside any arm are the store calls (`append`, `create_session`,
+/// `accept_turn`, `cancel_turn`, `settle_session_idle`, `resolve_menu`),
+/// publication is a synchronous call after they return in the same arm, and
+/// the `Register` arm contains no await at all. Adding an await between a
+/// store return and its `publish`, or anywhere in `Register`, breaks a law —
+/// the forced-boundary tests in `tests/session_hub_tests.rs` will catch it.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_session_actor(
     session_id: SessionId,
@@ -114,8 +135,13 @@ pub(super) async fn run_session_actor(
                 let _ = completed.send(result);
             }
             ActorCommand::CancelTurn { command, completed } => {
-                // Persist-before-wake: the caller signals the worker only
-                // after this arm returns its committed Cancelling fact.
+                // PERSIST-BEFORE-WAKE (R5, authoritative statement): the
+                // durable `Cancelling` intent commits and publishes BEFORE the
+                // registered worker's cancellation wake fires below, in this
+                // same arm — a woken supervisor always finds the intent in the
+                // journal. The wake is notification only, never the record:
+                // worker admission and startup recovery rescan durable run
+                // states, so a missed wake delays reconciliation, not truth.
                 let result = store.cancel_turn(command).await;
                 if let Ok(TurnCancelOutcome::Committed {
                     envelope: Some(envelope),

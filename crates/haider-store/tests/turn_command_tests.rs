@@ -222,6 +222,61 @@ fn cancel_records_intent_and_reports_already_terminal() {
     ));
 }
 
+/// The R2 receipt-idempotency law for `turn.cancel`, matching
+/// `submit_replay_is_idempotent_and_changed_body_is_rejected` for
+/// `turn.submit`.
+///
+/// MUTATION CHECK: compare only command id in the receipt lookup. Expected
+/// failure: the changed semantic body below replays the first cancellation
+/// response instead of rejecting it.
+#[test]
+fn cancel_replay_is_idempotent_and_changed_body_is_rejected() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("store");
+    let session_id = SessionId::new("session-e");
+    create(&store, &session_id);
+    store
+        .accept_turn(&submit(&store, "submit-e", &session_id, "run-e"))
+        .expect("submit");
+    let cancel = |digest: &str, json: &str, event_id: &str| TurnCancelCommand {
+        command_id: "cancel-e".into(),
+        request_digest: digest.into(),
+        request_json: json.into(),
+        session_id: session_id.clone(),
+        worker_generation: store.worker_generation(),
+        run_id: RunId::new("run-e"),
+        cancelling_event_id: EventId::new(event_id),
+        device_id: DeviceId::new("test-daemon"),
+    };
+    let original_json = format!(
+        r#"{{"run_id":"run-e","session_id":"session-e","worker_generation":{}}}"#,
+        store.worker_generation()
+    );
+    let first = store
+        .cancel_turn(&cancel("digest-e", &original_json, "cancelling-e"))
+        .expect("first cancel");
+    assert!(matches!(first, TurnCancelOutcome::Committed { .. }));
+    let head_after_first = store.latest_seq(&session_id).expect("head");
+    let replay = store
+        .cancel_turn(&cancel("digest-e", &original_json, "cancelling-e-replay"))
+        .expect("replay");
+    assert!(matches!(replay, TurnCancelOutcome::IdempotentReplay { .. }));
+    assert!(
+        store
+            .cancel_turn(&cancel(
+                "digest-other",
+                r#"{"run_id":"other"}"#,
+                "cancelling-e-changed",
+            ))
+            .is_err()
+    );
+    // Neither the replay nor the rejected reuse appended anything.
+    assert_eq!(
+        store.latest_seq(&session_id).expect("head"),
+        head_after_first
+    );
+}
+
 /// MUTATION CHECK: replace `settle_session_idle` with an ordinary append.
 /// Expected failure: the stale worker observation commits Idle after the
 /// concurrently accepted run's ActiveRun.
