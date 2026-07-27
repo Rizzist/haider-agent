@@ -15,6 +15,7 @@ pub mod projection;
 pub mod render;
 pub mod runtime;
 pub mod sanctum;
+pub mod script;
 pub mod style;
 pub mod theme;
 

@@ -95,7 +95,11 @@ fn count_tests(root: &Path) -> usize {
                     .is_some_and(|n| n.ends_with("_tests.rs"))
         })
         .filter_map(|p| fs::read_to_string(p).ok())
-        .map(|text| text.matches("#[test]").count() + text.matches("#[tokio::test]").count())
+        // `#[tokio::test` (no closing bracket) also catches the CONFIGURED
+        // forms — `#[tokio::test(start_paused = true)]`, `flavor = …` — which
+        // an exact `#[tokio::test]` match silently skipped, undercounting
+        // every paused-time driver test.
+        .map(|text| text.matches("#[test]").count() + text.matches("#[tokio::test").count())
         .sum()
 }
 

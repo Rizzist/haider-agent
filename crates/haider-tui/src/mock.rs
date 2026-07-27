@@ -15,12 +15,14 @@ use haider_protocol::menu::{AnswerVia, Menu, MenuAnswer, MenuKind, MenuOption, M
 use haider_protocol::provider::{Usage, UsageSource};
 use haider_protocol::state::{HarnessStatus, ReadinessCheck, RunState};
 
-/// The boot checklist shown by the demo (sim parity lines).
+/// The boot checklist shown by the demo — the sim's texts VERBATIM
+/// (tui.js:3165-3170): `--demo` IS the sim script, so it plays the sim's
+/// story (owner ruling, TUI3a item 5).
 pub const DEMO_CHECKS: [&str; 4] = [
     "store open · journal replayed",
-    "provider handshake — fake ✓",
-    "hooks loaded — 0 trusted · 0 pending",
-    "worker warm · profile locked",
+    "provider handshake — anthropic ✓",
+    "hooks loaded — 1 trusted · 0 pending",
+    "worker warm · mesh probe done",
 ];
 
 fn check(name: &str, ok: bool) -> ReadinessCheck {
@@ -251,7 +253,32 @@ pub struct SampleSession {
     pub model: &'static str,
     pub device: &'static str,
     pub ago: &'static str,
+    /// The session's own run state is busy (sim `runStates[s.id] !== IDLE`).
     pub running: bool,
+    /// Live subagent chips this session owns (sim `sessionLive`,
+    /// tui.js:789-792). The L1 seed owns the running `web-index` chip
+    /// (tui.js:556-572), which is what makes it the launcher's one live row
+    /// — the Rust port used to mark `cellular-pool-fix` busy instead
+    /// (review P2-8). `sessionBusy` = `live > 0 || running`.
+    pub live_subagents: usize,
+}
+
+/// The sim's seeded credential list (tui.js:146-154): 7 accounts across 5
+/// providers (openai ×2, anthropic ×2, google, local, huggingface) — the
+/// launcher's Accounts meta quotes both counts verbatim.
+pub const SEED_ACCOUNTS: usize = 7;
+pub const SEED_ACCOUNT_PROVIDERS: usize = 5;
+/// The sim's seeded peer list minus the `shell` rung (tui.js:169-174):
+/// this-mac + workstation (peer) and hetzner-1 (attached) host sessions;
+/// ci-runner-7 is exec-only. The launcher's Peers meta quotes this count.
+pub const SEED_HOST_CAPABLE_PEERS: usize = 3;
+
+impl SampleSession {
+    /// Sim `sessionBusy` (tui.js:789-792): live subagents OR a busy run.
+    #[must_use]
+    pub const fn busy(&self) -> bool {
+        self.live_subagents > 0 || self.running
+    }
 }
 
 /// The sim's seed sessions, verbatim identity (owner default roster).
@@ -270,6 +297,7 @@ pub fn sample_sessions() -> Vec<SampleSession> {
             device: "this-mac",
             ago: "12m",
             running: false,
+            live_subagents: 0,
         },
         SampleSession {
             name: "cellular-pool-fix",
@@ -282,7 +310,8 @@ pub fn sample_sessions() -> Vec<SampleSession> {
             model: "gpt-5.6",
             device: "hetzner-1",
             ago: "2h",
-            running: true,
+            running: false,
+            live_subagents: 0,
         },
         SampleSession {
             name: "l1-remote-projects",
@@ -296,101 +325,10 @@ pub fn sample_sessions() -> Vec<SampleSession> {
             device: "mac-studio",
             ago: "1d",
             running: false,
+            live_subagents: 1,
         },
     ]
 }
 
-/// A canned response turn for user-typed demo input: the same envelope shapes
-/// the real harness emits, themed around the typed text.
-#[must_use]
-pub fn response_script(user_text: &str, turn: u64) -> Vec<EventPayload> {
-    let mut script = vec![
-        EventPayload::UserMessage {
-            text: user_text.to_owned(),
-            attachments: vec![],
-            mode: haider_protocol::DeliveryMode::Steer,
-        },
-        EventPayload::RunState(RunState::Queued),
-        EventPayload::RunState(RunState::Thinking),
-        EventPayload::RunState(RunState::Streaming),
-    ];
-    let reply_id = ItemId::new(format!("t{turn}-reply"));
-    script.push(EventPayload::Item(ItemEvent::Started {
-        item_id: reply_id.clone(),
-        item: TurnItem::AgentMessage {
-            text: String::new(),
-        },
-    }));
-    let head: String = user_text.chars().take(42).collect();
-    for chunk in [
-        "On it — reading the relevant code before ".to_owned(),
-        "changing anything. Task noted: ".to_owned(),
-        format!("“{head}”."),
-    ] {
-        script.push(EventPayload::Item(ItemEvent::Delta {
-            item_id: reply_id.clone(),
-            delta: ItemDelta::Text { text: chunk },
-        }));
-    }
-    script.push(EventPayload::Item(ItemEvent::Completed {
-        item_id: reply_id.clone(),
-        item: TurnItem::AgentMessage {
-            text: format!(
-                "On it — reading the relevant code before changing anything. \
-                 Task noted: “{head}”."
-            ),
-        },
-    }));
-    script.push(EventPayload::RunState(RunState::RunningTool));
-    let search_id = ItemId::new(format!("t{turn}-search"));
-    script.push(EventPayload::Item(ItemEvent::Started {
-        item_id: search_id.clone(),
-        item: TurnItem::ToolCall {
-            call_id: "demo-search".to_owned(),
-            name: "fs_search".to_owned(),
-            args: serde_json::json!({"query": head, "glob": "src/**"}),
-            status: ToolStatus::InProgress,
-        },
-    }));
-    script.push(EventPayload::Item(ItemEvent::Completed {
-        item_id: search_id,
-        item: TurnItem::ToolCall {
-            call_id: "demo-search".to_owned(),
-            name: "fs_search".to_owned(),
-            args: serde_json::json!({"query": head, "glob": "src/**"}),
-            status: ToolStatus::Completed,
-        },
-    }));
-    script.push(EventPayload::RunState(RunState::Streaming));
-    let close_id = ItemId::new(format!("t{turn}-close"));
-    script.push(EventPayload::Item(ItemEvent::Started {
-        item_id: close_id.clone(),
-        item: TurnItem::AgentMessage {
-            text: String::new(),
-        },
-    }));
-    script.push(EventPayload::Item(ItemEvent::Delta {
-        item_id: close_id.clone(),
-        delta: ItemDelta::Text {
-            text: "That's the demo loop — the real turn engine ships with the daemon wave."
-                .to_owned(),
-        },
-    }));
-    script.push(EventPayload::Item(ItemEvent::Completed {
-        item_id: close_id,
-        item: TurnItem::AgentMessage {
-            text: "That's the demo loop — the real turn engine ships with the daemon wave."
-                .to_owned(),
-        },
-    }));
-    script.push(EventPayload::Usage(Usage {
-        input: 6_200,
-        output: 480,
-        reasoning: 120,
-        cached: 2_400,
-        source: UsageSource::ProviderReported,
-        account: None,
-    }));
-    script.push(EventPayload::RunState(RunState::Done));
-    script
-}
+// The old `response_script` placeholder turn is gone: user-typed input now
+// runs the sim-verbatim respond() router (`crate::script::respond_beats`).

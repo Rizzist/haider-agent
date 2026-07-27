@@ -1,0 +1,10 @@
+{
+  "event": "completed",
+  "item_id": "it-4",
+  "item": {
+    "item": "context_compaction",
+    "summary_artifact": "blake3:demo",
+    "tokens_before": 170000,
+    "tokens_after": 12000
+  }
+}

@@ -328,8 +328,9 @@ fn honesty_notices_survive_long_bottom_anchored_output() {
 
 #[test]
 fn session_screen_has_header_and_composer_gap() {
-    let mut model = model_after_full_demo();
-    model.identity.dir = "~/dev/enterprise-suite".to_owned();
+    // The header dir is the session's shell working dir (TUI3b §4 — the
+    // model default matches the sim launcher dir).
+    let model = model_after_full_demo();
     let (text, _) = draw(&model, 100, 30);
     // Header: mark + product line + session line (owner ask: sim-parity header).
     assert!(text.contains("حيدر"));
@@ -338,7 +339,7 @@ fn session_screen_has_header_and_composer_gap() {
     assert!(text.contains("← main"));
     assert!(
         text.contains("fix the failing boundary test in haid"),
-        "session title from first message"
+        "the first user prompt is in the transcript (the header shows the slug NAME since TUI3b)"
     );
     // Agent blocks carry the ■ haider name header.
     assert!(text.contains("■ haider"));
@@ -420,19 +421,29 @@ fn typed_text_starts_a_session_and_requests_a_turn() {
     }
     model.handle(key(KeyCode::Enter));
     assert_eq!(model.screen, Screen::Session);
-    // fresh_session stops the old context first (review r3 P3-6).
+    // fresh_session stops the old context first (review r3 P3-6). The
+    // request only ASKS for the micro-call: the driver names the session
+    // and pushes the note together 1.5 s later (sim tui.js:1219-1227,
+    // TUI3.1 P2-12).
     assert_eq!(
         model.requests,
         vec![
             AppRequest::StopScripts,
-            AppRequest::SubmitText("refactor the parser".to_owned())
+            AppRequest::SubmitText {
+                text: "refactor the parser".to_owned(),
+                voice: false,
+                title: true,
+            }
         ]
     );
-    // Sim autoBlurb (G47): first seven words, first letter capitalized.
-    assert_eq!(model.session_title.as_deref(), Some("Refactor the parser"));
+    // Sim autoBlurb (G47) is the BLURB, applied by the 1.5 s callback; the
+    // header + window title show the session's slug NAME right away (sim
+    // tui.js:2014-2016, TUI3b §4 step 7).
+    assert_eq!(model.session_title, None, "not titled until the callback");
+    assert_eq!(model.session_name.as_deref(), Some("refactor-the-parser"));
     assert_eq!(
         model.window_title(),
-        "haider — Refactor the parser · this-mac"
+        "haider — refactor-the-parser · this-mac"
     );
 }
 
@@ -529,13 +540,24 @@ fn one_turn_at_a_time_across_digits_and_submits() {
 
 #[test]
 fn same_length_prompts_produce_distinct_turn_items() {
-    use haider_tui::mock::response_script;
+    use haider_tui::script::{Beat, respond_beats};
+    let counter = std::sync::atomic::AtomicU64::new;
     let mut projection = haider_tui::projection::SessionProjection::new();
-    for payload in response_script("aaa", 1) {
-        projection.apply(&payload);
-    }
-    for payload in response_script("bbb", 2) {
-        projection.apply(&payload);
+    let (generic, roster) = (counter(0), counter(3));
+    for (text, turn) in [("aaa", 1_u64), ("bbb", 2)] {
+        let beats = respond_beats(
+            text,
+            false,
+            haider_protocol::DeliveryMode::Steer,
+            turn,
+            &generic,
+            &roster,
+        );
+        for beat in beats {
+            if let Beat::Emit(payload) = beat {
+                projection.apply(&payload);
+            }
+        }
     }
     assert_eq!(projection.duplicate_items(), 0, "per-turn id namespace");
     assert_eq!(projection.orphan_deltas(), 0);
@@ -549,12 +571,12 @@ fn same_length_prompts_produce_distinct_turn_items() {
 
 #[test]
 fn window_title_strips_control_characters() {
+    // The window title comes from the session NAME; the slug law already
+    // filters, but the OSC seam must strip control characters for ANY
+    // name source (review r1 P1).
     let mut model = AppModel::new();
-    model.handle(AppEvent::Envelope(Box::new(EventPayload::UserMessage {
-        text: "evil\u{1b}]2;pwned\u{7}title".to_owned(),
-        attachments: vec![],
-        mode: haider_protocol::DeliveryMode::Steer,
-    })));
+    model.screen = Screen::Session;
+    model.session_name = Some("evil\u{1b}]2;pwned\u{7}title".to_owned());
     let title = model.window_title();
     assert!(!title.contains('\u{1b}'), "no ESC in OSC titles");
     assert!(!title.contains('\u{7}'), "no BEL in OSC titles");
@@ -669,13 +691,14 @@ fn clicks_attach_sessions_and_wheel_scrolls() {
     ))));
     let (_, hits) = draw_with_hits(&model, 118, 34);
     assert!(
-        hits.iter().any(|(_, h)| *h == Hit::AttachSample(0)),
+        hits.iter()
+            .any(|(_, h)| *h == Hit::AttachSample("billing-service".to_owned())),
         "sample rows are clickable"
     );
     assert!(hits.iter().any(|(_, h)| *h == Hit::TalkChip));
     assert!(hits.iter().any(|(_, h)| *h == Hit::HelpHint));
 
-    model.handle_hit(Hit::AttachSample(2));
+    model.handle_hit(Hit::AttachSample("l1-remote-projects".to_owned()));
     assert!(model.turn_active);
     assert_eq!(model.session_head, ("Ali", "(a)"));
 

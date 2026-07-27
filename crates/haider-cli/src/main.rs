@@ -131,7 +131,9 @@ async fn tui_command(rest: &[String]) -> ExitCode {
     if let Ok(cwd) = std::env::current_dir() {
         let home = std::env::var("HOME").unwrap_or_default();
         // Component-aware: /Users/alice2 must not abbreviate under ~alice.
-        model.identity.dir = match (!home.is_empty())
+        // Seeds the launcher + session working dirs (TUI3b: the shell
+        // builtins' `cd` retargets these; unknown dirs list VFS defaults).
+        let abbreviated = match (!home.is_empty())
             .then(|| cwd.strip_prefix(&home).ok())
             .flatten()
         {
@@ -139,6 +141,8 @@ async fn tui_command(rest: &[String]) -> ExitCode {
             Some(rest) => format!("~/{}", rest.display()),
             None => cwd.display().to_string(),
         };
+        model.launcher_dir = abbreviated.clone();
+        model.session_dir = abbreviated;
     }
     if !interactive {
         // Fallible write: `print!` panics on BrokenPipe (review r1 P2).

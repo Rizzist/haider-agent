@@ -107,6 +107,9 @@ pub struct Theme {
     pub faint: Rgb,
     pub gold: Rgb,
     pub gold_soft: Rgb,
+    /// Gold at half strength over the ground — the launcher's dignity rule
+    /// (sim `.rule`: gold at opacity 0.5, tui.js:4280-4286).
+    pub gold_half: Rgb,
     pub maroon: Rgb,
     pub maroon_soft: Rgb,
     pub ok: Rgb,
@@ -136,6 +139,7 @@ pub const DAWN: Theme = {
         faint: Rgb::hex(0xcdbd9a),
         gold,
         gold_soft: gold.over(bg, 140),
+        gold_half: gold.over(bg, 500),
         maroon,
         maroon_soft: maroon.over(bg, 80),
         ok: Rgb::hex(0x4c7a45),
@@ -165,6 +169,7 @@ pub const IVORY: Theme = {
         faint: Rgb::hex(0xd9d3c6),
         gold,
         gold_soft: gold.over(bg, 120),
+        gold_half: gold.over(bg, 500),
         maroon,
         maroon_soft: maroon.over(bg, 70),
         ok: Rgb::hex(0x2f6e3f),
@@ -194,6 +199,7 @@ pub const DARK: Theme = {
         faint: Rgb::hex(0x463c2a),
         gold,
         gold_soft: gold.over(bg, 120),
+        gold_half: gold.over(bg, 500),
         maroon,
         maroon_soft: maroon.over(bg, 100),
         ok: Rgb::hex(0x7db98a),

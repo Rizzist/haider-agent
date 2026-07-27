@@ -78,7 +78,7 @@ fn answering_the_menu_at_ninety_by_five_restores_an_editable_composer() {
     // Answer by digit — then the echo envelope closes the card, exactly
     // the production seam.
     model.handle(key(KeyCode::Char('1')));
-    let answer = model.outbox.pop().expect("answer produced");
+    let answer = model.outbox.pop().expect("answer produced").answer;
     model.handle(AppEvent::Envelope(Box::new(EventPayload::MenuAnswered(
         answer,
     ))));

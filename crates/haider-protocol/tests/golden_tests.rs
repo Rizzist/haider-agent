@@ -230,6 +230,20 @@ fn golden_item_lifecycle() {
             },
         },
     );
+    // ADDITIVE (TUI3b): compaction items may carry the before/after token
+    // footprint — optional fields, absent = old shape (fixtures above are
+    // untouched; this is a NEW fixture).
+    golden(
+        "item_completed_compaction_with_tokens",
+        &ItemEvent::Completed {
+            item_id: ItemId::new("it-4"),
+            item: TurnItem::ContextCompaction {
+                summary_artifact: haider_protocol::ids::ArtifactRef::new("blake3:demo"),
+                tokens_before: Some(170_000),
+                tokens_after: Some(12_000),
+            },
+        },
+    );
 }
 
 #[test]

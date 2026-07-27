@@ -34,13 +34,23 @@ pub const OUTPUT_TAIL_MAX: usize = 8 * 1024;
 /// One rendered row of the transcript, in arrival order.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TranscriptEntry {
-    /// A user message (`EventPayload::UserMessage`).
-    User { text: String, attachments: usize },
+    /// A user message (`EventPayload::UserMessage`). `voice` marks a
+    /// spoken submission (◉ sigil + ` · spoken` tag) — demo-local: the
+    /// protocol has no voice surface yet, so the reducer pushes these.
+    User {
+        text: String,
+        attachments: usize,
+        voice: bool,
+    },
     /// A turn item and its streaming accumulation state.
     Item(ItemBlock),
     /// A display-only UI note (sim `NoteRow`): auto-title, interrupt, and
-    /// mid-turn echoes. The ONLY non-envelope entry source.
+    /// mid-turn echoes. The ONLY non-envelope entry source besides Shell.
     Note { text: String },
+    /// A shell builtin run against the demo VFS (sim ShellRow,
+    /// tui.js:3910-3918) — deliberately envelope-free: the sim bypasses
+    /// the model/harness ("local, instant, no model turn").
+    Shell { cmd: String, out: String },
 }
 
 /// A turn item block plus the delta state that `TurnItem` itself cannot hold
@@ -60,6 +70,9 @@ pub struct ItemBlock {
     pub output_truncated: bool,
     /// True if any output chunk failed base64 decoding (chunk skipped).
     pub output_decode_error: bool,
+    /// The block was produced during a voice turn — the agent header tags
+    /// ` · ♪ speaking` (sim tui.js:3895-3897; demo-local voice surface).
+    pub spoken: bool,
 }
 
 impl ItemBlock {
@@ -72,7 +85,14 @@ impl ItemBlock {
             output_tail: Vec::new(),
             output_truncated: false,
             output_decode_error: false,
+            spoken: false,
         }
+    }
+
+    fn new_spoken(item_id: ItemId, item: TurnItem, streaming: bool, spoken: bool) -> Self {
+        let mut block = Self::new(item_id, item, streaming);
+        block.spoken = spoken;
+        block
     }
 
     /// The bounded output tail as text (command output is bytes by law;
@@ -126,6 +146,9 @@ pub struct SessionProjection {
     menu: Option<Menu>,
     todos: Option<TodoPanel>,
     usage: Option<Usage>,
+    /// A voice turn is live: blocks started now render ` · ♪ speaking`
+    /// (demo-local — set by the driver's Voice beats, never an envelope).
+    voice_live: bool,
     // Honesty counters — surfaced, never fatal.
     gap_seen: bool,
     orphan_deltas: u64,
@@ -198,6 +221,7 @@ impl SessionProjection {
             } => self.entries.push(TranscriptEntry::User {
                 text: text.clone(),
                 attachments: attachments.len(),
+                voice: false,
             }),
             EventPayload::Item(event) => self.apply_item(event),
             EventPayload::Usage(usage) => self.usage = Some(usage.clone()),
@@ -239,11 +263,13 @@ impl SessionProjection {
                         pinned: true,
                     });
                 } else {
-                    self.entries.push(TranscriptEntry::Item(ItemBlock::new(
-                        item_id.clone(),
-                        item.clone(),
-                        true,
-                    )));
+                    self.entries
+                        .push(TranscriptEntry::Item(ItemBlock::new_spoken(
+                            item_id.clone(),
+                            item.clone(),
+                            true,
+                            self.voice_live,
+                        )));
                 }
             }
             ItemEvent::Delta { item_id, delta } => self.apply_delta(item_id, delta),
@@ -282,11 +308,13 @@ impl SessionProjection {
                     } else {
                         // Attach-mid-stream tolerance: a Completed we never
                         // saw start still lands as a finished block.
-                        self.entries.push(TranscriptEntry::Item(ItemBlock::new(
-                            item_id.clone(),
-                            item.clone(),
-                            false,
-                        )));
+                        self.entries
+                            .push(TranscriptEntry::Item(ItemBlock::new_spoken(
+                                item_id.clone(),
+                                item.clone(),
+                                false,
+                                self.voice_live,
+                            )));
                     }
                 }
             }
@@ -363,6 +391,33 @@ impl SessionProjection {
     /// interrupt, mid-turn input echoes. Never sourced from envelopes.
     pub fn push_note(&mut self, text: String) {
         self.entries.push(TranscriptEntry::Note { text });
+    }
+
+    /// Append a voice user row (sim /say + talk: ◉ sigil, ` · spoken`).
+    /// Demo-local like notes — the protocol has no voice surface yet.
+    pub fn push_user_voice(&mut self, text: String) {
+        self.entries.push(TranscriptEntry::User {
+            text,
+            attachments: 0,
+            voice: true,
+        });
+    }
+
+    /// Append a shell-builtin row (sim ShellRow — deliberately
+    /// envelope-free; the sim bypasses the model/harness entirely).
+    pub fn push_shell(&mut self, cmd: String, out: String) {
+        self.entries.push(TranscriptEntry::Shell { cmd, out });
+    }
+
+    /// Toggle the voice-turn tag for blocks started from now on.
+    pub fn set_voice_live(&mut self, on: bool) {
+        self.voice_live = on;
+    }
+
+    /// True while a voice turn is live (spoken agent rows streaming).
+    #[must_use]
+    pub const fn voice_live(&self) -> bool {
+        self.voice_live
     }
 
     /// The status-bar badge, sim `BADGE_LABEL` goldens.

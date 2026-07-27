@@ -375,7 +375,8 @@ fn user_messages_and_menus_project() {
         projection.entries(),
         &[TranscriptEntry::User {
             text: "run the tests".to_owned(),
-            attachments: 0
+            attachments: 0,
+            voice: false,
         }]
     );
 

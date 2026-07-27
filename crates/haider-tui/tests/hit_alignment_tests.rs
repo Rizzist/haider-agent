@@ -105,16 +105,17 @@ fn menu_model() -> AppModel {
 fn launcher_row_hits_align_with_their_rendered_rows() {
     let model = launcher_model();
     let (rows, hits, _) = draw(&model, 118, 34);
-    for (index, name) in ["billing-service", "cellular-pool-fix", "l1-remote-projects"]
-        .into_iter()
-        .enumerate()
-    {
-        let rect = rect_for(&hits, Hit::AttachSample(index));
+    for name in ["billing-service", "cellular-pool-fix", "l1-remote-projects"] {
+        let rect = rect_for(&hits, Hit::AttachSample(name.to_owned()));
         assert_eq!(rect.y, row_of(&rows, name), "sample row {name} aligned");
         assert_eq!(rect.height, 1);
     }
-    for (order, name) in ["Aura", "Accounts", "Peers"].into_iter().enumerate() {
-        let rect = rect_for(&hits, Hit::ExtraRow(u8::try_from(order).expect("order")));
+    for (row, name) in [
+        (haider_tui::app::LauncherRow::Aura, "Aura"),
+        (haider_tui::app::LauncherRow::Accounts, "Accounts"),
+        (haider_tui::app::LauncherRow::Peers, "Peers"),
+    ] {
+        let rect = rect_for(&hits, Hit::ExtraRow(row));
         assert_eq!(rect.y, row_of(&rows, name), "extra row {name} aligned");
     }
 }
@@ -129,10 +130,42 @@ fn talk_chip_hit_covers_exactly_the_rendered_chip() {
     let chip_col = col_of(&rows[composer_y as usize], "[ ◉ talk ]");
     assert_eq!(rect.x, chip_col, "hit starts at the chip's [");
     assert_eq!(rect.width, 10, "hit spans exactly [ ◉ talk ]");
-    // Clicking it flashes the honest voice promise.
+    // The launcher mic RENDERS but is inert — sim `speak` returns unless a
+    // session is attached (tui.js:2045, review r2 P2-3).
     let mut model = model;
     model.handle_hit(Hit::TalkChip);
-    assert!(model.flash.as_deref().unwrap_or("").contains("◉ talk"));
+    assert!(!model.listening, "no session → no hold");
+    assert!(model.requests.is_empty(), "and no driver timer");
+
+    // Inside an idle session the same chip starts the 1300 ms hold (TUI3b
+    // §4.1 — voice ships ON): it flips to `◉ listening…`, driver-timed.
+    for c in "walk the harness".chars() {
+        model.handle(AppEvent::Key(KeyEvent::new(
+            KeyCode::Char(c),
+            KeyModifiers::NONE,
+        )));
+    }
+    model.handle(AppEvent::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    )));
+    model.requests.clear();
+    model.handle(AppEvent::Envelope(Box::new(EventPayload::RunState(
+        haider_protocol::state::RunState::Done,
+    ))));
+    assert_eq!(model.screen, Screen::Session);
+    assert!(!model.turn_active, "an idle session");
+    model.handle_hit(Hit::TalkChip);
+    assert!(model.listening, "hold started");
+    assert!(
+        model.requests.contains(&haider_tui::app::AppRequest::Talk),
+        "driver timer requested"
+    );
+    let (rows, _, _) = draw(&model, 118, 34);
+    assert!(
+        rows.iter().any(|row| row.contains("[ ◉ listening… ]")),
+        "chip shows the live hold"
+    );
 }
 
 #[test]
@@ -355,8 +388,12 @@ fn launcher_composer_is_bottom_anchored_with_the_gold_rule() {
     assert_eq!(composer_y, height - 3, "composer anchored above the bar");
     assert_eq!(buffer[(0, composer_y - 1)].fg, Color::from(theme.gold));
     assert_eq!(buffer[(0, composer_y)].bg, Color::from(theme.input_bg));
-    // The launcher shows dir + mesh (sim .dirline).
-    assert!(rows.iter().any(|row| row.contains("dir ~ · mesh off")));
+    // The launcher shows dir + mesh (sim .dirline) — the dir is the
+    // launcher's shell working dir (TUI3b §4: `cd` retargets it).
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("dir ~/dev/enterprise-suite · mesh off"))
+    );
     // Sample metadata carries turns (sim row meta); the tail ellipsizes
     // into the width instead of clipping mid-frame.
     assert!(rows.iter().any(|row| row.contains("2 turns")));
