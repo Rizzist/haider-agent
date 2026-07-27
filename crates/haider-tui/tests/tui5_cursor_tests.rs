@@ -7,7 +7,7 @@
 //! selection ops, the input ring).
 #![allow(clippy::expect_used)]
 
-use haider_tui::app::{AppEvent, AppModel, AppRequest, Hit, Screen};
+use haider_tui::app::{AppEvent, AppModel, AppRequest, Hit, LauncherRow, Screen};
 use haider_tui::composer::Composer;
 use haider_tui::mock::demo_script;
 use haider_tui::render::render;
@@ -719,4 +719,289 @@ fn stale_composer_hit_is_dropped_not_misapplied() {
     model.composer_press(50, "stale content", 3);
     assert_eq!(model.composer.cursor(), 2, "cursor untouched");
     assert!(!model.composer_drag, "no drag armed from a dropped press");
+}
+
+// ---- Item 6: history interplay through the arrow keys ----
+
+#[test]
+fn arrow_history_recalls_submits_and_restores_the_draft() {
+    let mut model = session_model();
+    for text in ["alpha task", "beta task"] {
+        for c in text.chars() {
+            model.handle(key(KeyCode::Char(c)));
+        }
+        model.handle(key(KeyCode::Enter));
+    }
+    assert!(model.composer.is_empty());
+    for c in "draft".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    // ↑ on the FIRST (only) row recalls the previous submit, cursor at
+    // END (Claude Code behavior).
+    model.handle(key(KeyCode::Up));
+    assert_eq!(model.composer, "beta task");
+    assert_eq!(model.composer.cursor(), "beta task".len());
+    model.handle(key(KeyCode::Up));
+    assert_eq!(model.composer, "alpha task");
+    // ↓ walks forward; past the newest entry the DRAFT returns.
+    model.handle(key(KeyCode::Down));
+    assert_eq!(model.composer, "beta task");
+    model.handle(key(KeyCode::Down));
+    assert_eq!(model.composer, "draft");
+}
+
+#[test]
+fn up_moves_rows_first_and_recalls_only_at_the_edge() {
+    let mut model = session_model();
+    for c in "seed".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Enter));
+    // A two-row draft: ↑ from the last row MOVES first (item 6: history
+    // only from the first visual row).
+    for c in "one".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key_mod(KeyCode::Enter, KeyModifiers::ALT));
+    for c in "two".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Up));
+    assert_eq!(model.composer, "one\ntwo", "row move, no recall");
+    assert!(model.composer.on_first_line());
+    model.handle(key(KeyCode::Up));
+    assert_eq!(model.composer, "seed", "the edge row recalls");
+    // ⇧↑ at the edge is a SELECTION gesture, never a recall (item 4).
+    model.handle(key(KeyCode::Down));
+    for c in "x".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    let text_now = model.composer.text().to_owned();
+    model.handle(key_mod(KeyCode::Up, KeyModifiers::SHIFT));
+    assert_eq!(model.composer, text_now.as_str(), "⇧↑ never recalls");
+}
+
+#[test]
+fn palette_owns_the_arrows_while_open() {
+    let mut model = session_model();
+    for c in "seed".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Enter));
+    for c in "/t".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    assert!(model.palette_open());
+    let selection_before = model.palette_selection;
+    model.handle(key(KeyCode::Down));
+    assert_ne!(model.palette_selection, selection_before, "palette moved");
+    assert_eq!(
+        model.composer, "/t",
+        "no history recall through the palette"
+    );
+}
+
+// ---- Item 9: per-surface drafts ----
+
+#[test]
+fn drafts_travel_per_surface_with_cursor_and_selection() {
+    let mut model = launcher_model();
+    for c in "launcher draft".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    let sid = model.sessions[0].id;
+    model.open_session(sid);
+    assert!(model.composer.is_empty(), "a fresh session starts fresh");
+    for c in "session one".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key_mod(KeyCode::Left, KeyModifiers::SHIFT));
+    assert_eq!(model.composer.selected_text(), Some("e"));
+    // Esc first clears the selection (item 4)… so detach via the direct
+    // navigation law instead, selection intact.
+    model.back_to_launcher();
+    assert_eq!(model.composer, "launcher draft", "launcher draft restored");
+    model.open_session(sid);
+    assert_eq!(model.composer, "session one", "session draft restored");
+    assert_eq!(
+        model.composer.selected_text(),
+        Some("e"),
+        "cursor AND selection travelled with the draft"
+    );
+    // A second session has its own (empty) draft.
+    let sid2 = model.sessions[1].id;
+    model.back_to_launcher();
+    model.open_session(sid2);
+    assert!(model.composer.is_empty());
+    // Aura keeps its own instance — enter via the launcher's Aura row
+    // (the value-carrying hit), which must NOT eat the launcher draft.
+    model.back_to_launcher();
+    assert_eq!(model.composer, "launcher draft");
+    model.handle_hit(Hit::ExtraRow(LauncherRow::Aura));
+    assert_eq!(model.screen, Screen::Aura);
+    assert!(model.composer.is_empty(), "aura's own draft, fresh");
+    for c in "aura draft".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Esc));
+    assert_eq!(model.screen, Screen::Launcher);
+    assert_eq!(
+        model.composer, "launcher draft",
+        "launcher draft back after the aura visit"
+    );
+    model.handle_hit(Hit::ExtraRow(LauncherRow::Aura));
+    assert_eq!(model.composer, "aura draft", "aura draft survived the exit");
+}
+
+#[test]
+fn submit_clears_only_that_surfaces_draft() {
+    let mut model = launcher_model();
+    for c in "parked".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    let sid = model.sessions[0].id;
+    model.open_session(sid);
+    for c in "send me".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Enter));
+    assert!(
+        model.composer.is_empty(),
+        "submit cleared the session draft"
+    );
+    model.back_to_launcher();
+    assert_eq!(model.composer, "parked", "the launcher draft is untouched");
+}
+
+#[test]
+fn reset_purges_session_drafts_but_the_launcher_draft_survives() {
+    use haider_tui::app::DraftKey;
+    let mut model = launcher_model();
+    let sid2 = model.sessions[1].id;
+    model.open_session(sid2);
+    for c in "doomed".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.back_to_launcher();
+    assert!(model.drafts.contains_key(&DraftKey::Session(sid2)));
+    for c in "keep me".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    let sid1 = model.sessions[0].id;
+    model.open_session(sid1);
+    for c in "/reset".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Enter));
+    assert_eq!(model.screen, Screen::Launcher);
+    assert_eq!(
+        model.composer, "keep me",
+        "the launcher draft survives /reset (documented choice: the \
+         launcher is not an identity-keyed surface)"
+    );
+    assert!(
+        !model
+            .drafts
+            .keys()
+            .any(|key| matches!(key, DraftKey::Session(_) | DraftKey::Aura)),
+        "session (and aura) drafts die with the reseed: {:?}",
+        model.drafts.keys().collect::<Vec<_>>()
+    );
+}
+
+// ---- Item 8: the persistence DTO must not grow ----
+
+#[test]
+fn dto_carries_no_composer_cursor_or_draft_state() {
+    // MUTATION CHECK: add a composer/draft/cursor field to any DTO (or
+    // serialize the live composer into snapshot()) and the key sweep
+    // below fails. This is the item-8/9 assertion: drafts are transient
+    // BY LAW, not by accident.
+    let mut model = launcher_model();
+    for c in "live draft".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key_mod(KeyCode::Left, KeyModifiers::SHIFT));
+    let sid = model.sessions[0].id;
+    model.open_session(sid);
+    for c in "parked draft".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    let value =
+        serde_json::to_value(haider_tui::demo_store::snapshot(&model)).expect("snapshot json");
+    fn sweep(value: &serde_json::Value, bad: &[&str]) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, inner) in map {
+                    let lower = key.to_ascii_lowercase();
+                    assert!(
+                        !bad.iter().any(|b| lower.contains(b)),
+                        "persisted key {key:?} leaks composer state"
+                    );
+                    sweep(inner, bad);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for inner in items {
+                    sweep(inner, bad);
+                }
+            }
+            _ => {}
+        }
+    }
+    sweep(
+        &value,
+        &[
+            "composer",
+            "draft",
+            "cursor",
+            "anchor",
+            "selection",
+            "history",
+            "sticky",
+        ],
+    );
+    // And the round-trip: hydrating a fresh model from this snapshot
+    // leaves composer and drafts EMPTY — no stale cursor state can ride
+    // a restart (item 8's identity law).
+    let dto: haider_tui::demo_store::StateDto =
+        serde_json::from_value(value).expect("dto round-trip");
+    let mut fresh = AppModel::new();
+    let _ = haider_tui::demo_store::hydrate(&mut fresh, dto);
+    assert!(fresh.composer.is_empty());
+    assert!(fresh.drafts.is_empty());
+}
+
+// ---- TUI4 carried P3-1 + P3-3 (folded here per the brief) ----
+
+#[test]
+fn load_rejects_sentinel_max_and_duplicate_ids() {
+    use haider_tui::demo_store::{DemoStore, snapshot};
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("state.json");
+    let model = launcher_model();
+    let write = |dto: &haider_tui::demo_store::StateDto| {
+        std::fs::write(&path, serde_json::to_string(dto).expect("json")).expect("write");
+    };
+    let store = DemoStore::at(path.clone());
+    // A valid snapshot loads.
+    let good = snapshot(&model);
+    write(&good);
+    assert!(store.load().is_some(), "baseline snapshot loads");
+    // P3-1: id u64::MAX would overflow the guard-2 bump — reject whole.
+    let mut bad = good.clone();
+    bad.sessions[0].id = u64::MAX;
+    write(&bad);
+    assert!(store.load().is_none(), "id u64::MAX rejects to seeds");
+    // …and the matching card_seq bound.
+    let mut bad = good.clone();
+    bad.card_seq = u64::MAX;
+    write(&bad);
+    assert!(store.load().is_none(), "card_seq u64::MAX rejects to seeds");
+    // P3-3: duplicate session ids mirror-corrupt the next save — reject.
+    let mut bad = good.clone();
+    let first = bad.sessions[0].id;
+    bad.sessions[1].id = first;
+    write(&bad);
+    assert!(store.load().is_none(), "duplicate ids reject to seeds");
 }

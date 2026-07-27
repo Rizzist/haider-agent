@@ -792,6 +792,19 @@ pub enum LauncherRow {
     Peers,
 }
 
+/// A composer surface's identity (TUI5 item 9): the launcher, one session
+/// (by id — the monotonic-identity law means a key can never be reworn),
+/// or the aura. The SUBAGENT screen shares its session's key (the
+/// amendment's key list is exactly launcher | session id | aura), and the
+/// scratch surface (screen=Session, no id) shares the launcher's —
+/// documented: scratch is the launcher's envelope-driven lineage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DraftKey {
+    Launcher,
+    Session(u64),
+    Aura,
+}
+
 /// Everything the reducer consumes.
 #[derive(Debug)]
 pub enum AppEvent {
@@ -838,6 +851,12 @@ pub struct AppModel {
     /// The ACTIVE surface's composer (TUI5): text + first-class cursor +
     /// selection + input ring. Nothing in it persists (item 8).
     pub composer: crate::composer::Composer,
+    /// Parked composers for the surfaces NOT on screen (TUI5 item 9):
+    /// every surface — launcher, each session, aura — keeps its own draft
+    /// (text AND cursor/selection/ring travel together, Claude Code's
+    /// per-conversation drafts). Navigation swaps through here; nothing
+    /// in it persists (item 8's DTO assertion covers it).
+    pub drafts: std::collections::HashMap<DraftKey, crate::composer::Composer>,
     /// Session blurb (sim auto-title micro-call) — announced by the 1.5 s
     /// `· session titled` note; the HEADER shows [`Self::session_name`].
     pub session_title: Option<String>,
@@ -980,6 +999,7 @@ impl Default for AppModel {
             projection: SessionProjection::new(),
             identity: IdentityLine::default(),
             composer: crate::composer::Composer::new(),
+            drafts: std::collections::HashMap::new(),
             session_title: None,
             session_name: None,
             // The scratch surface's canonical head (the demo script's
@@ -1048,6 +1068,36 @@ impl AppModel {
     #[must_use]
     pub fn session_identity(&self) -> u64 {
         self.active_session.unwrap_or(0)
+    }
+
+    /// The composer surface currently on screen (TUI5 item 9). Boot maps
+    /// to the launcher key: its composer is swallowed by the boot guard,
+    /// and the launcher is what boot becomes.
+    #[must_use]
+    pub fn surface_key(&self) -> DraftKey {
+        match self.screen {
+            Screen::Aura => DraftKey::Aura,
+            _ => self
+                .active_session
+                .map_or(DraftKey::Launcher, DraftKey::Session),
+        }
+    }
+
+    /// Park the live composer under the CURRENT surface's key. Callers
+    /// pair this with [`Self::restore_draft`] around a surface change —
+    /// exactly one stash/restore per transition (a double stash would park
+    /// an already-empty composer over the real draft).
+    fn stash_draft(&mut self) {
+        let key = self.surface_key();
+        let draft = std::mem::take(&mut self.composer);
+        self.drafts.insert(key, draft);
+    }
+
+    /// Bring the NEW surface's parked composer live (empty for a surface
+    /// never visited — a fresh session starts with a fresh draft).
+    fn restore_draft(&mut self) {
+        let key = self.surface_key();
+        self.composer = self.drafts.remove(&key).unwrap_or_default();
     }
 
     /// The session's display name — the slug (sim `session.name`), never
@@ -1883,9 +1933,24 @@ impl AppModel {
         self.aura_submit(crate::script::AURA_TALK_PHRASE.to_owned(), true);
     }
 
+    /// Enter the aura stage (the `/aura` command and the launcher's Aura
+    /// row share this): the departing surface's draft parks, the aura's
+    /// own comes live (TUI5 item 9 — Aura has its own composer instance).
+    fn enter_aura(&mut self) {
+        if self.screen == Screen::Aura {
+            return;
+        }
+        self.stash_draft();
+        self.screen = Screen::Aura;
+        self.restore_draft();
+    }
+
     /// Esc from the aura stage: back to the session if one is attached,
     /// else the launcher — aura state persists either way.
     fn exit_aura(&mut self) {
+        // TUI5 item 9: the aura's draft parks under its own key; the
+        // return surface's draft comes live below.
+        self.stash_draft();
         // TUI4c: attachment is the map's word now — a checked-out session
         // (or a content-bearing scratch) takes esc back to the session;
         // an aura entered from the menu returns to the menu.
@@ -1897,6 +1962,7 @@ impl AppModel {
         } else {
             Screen::Launcher
         };
+        self.restore_draft();
     }
 
     /// Chip close lifecycle flags (§2.5) — the DRIVER owns the 5 s removal
@@ -2070,6 +2136,14 @@ impl AppModel {
                 self.back_to_launcher();
             }
             "reset" => {
+                // TUI5 item 9: park the departing surface first; session
+                // drafts die with the reseed (the identity law — a
+                // reseeded roster must not wear old drafts) and the
+                // aura's dies with its reseed below. The LAUNCHER draft
+                // SURVIVES — documented choice: the launcher is not an
+                // identity-keyed surface, and the owner's monotonic
+                // rules govern session ids only.
+                self.stash_draft();
                 self.fresh_session();
                 self.sessions = seed_session_states();
                 self.active_session = None;
@@ -2092,10 +2166,12 @@ impl AppModel {
                 // save effect refills localStorage after removeItem.
                 self.requests.push(AppRequest::PurgeDemoStore);
                 self.screen = Screen::Launcher;
+                self.drafts.retain(|key, _| *key == DraftKey::Launcher);
+                self.restore_draft();
                 self.flash = Some("· demo reset".to_owned());
             }
             "quit" | "exit" => self.requests.push(AppRequest::Quit),
-            "aura" => self.screen = Screen::Aura,
+            "aura" => self.enter_aura(),
             "compact" => {
                 // Manual compaction (sim tui.js:1791-1806). Adapted gate:
                 // the sim's single-threaded state writes tolerate /compact
@@ -2433,8 +2509,15 @@ impl AppModel {
             self.screen = Screen::Session;
             return;
         }
+        // TUI5 item 9: park the departing surface's draft BEFORE identity
+        // flips (checkin() itself is draft-free — exactly one stash and
+        // one restore per transition).
+        self.stash_draft();
         self.checkin();
         let Some(index) = self.sessions.iter().position(|entry| entry.id == id) else {
+            // Unknown id: the checkin left us on the no-session surface —
+            // bring ITS (the launcher's) draft live, stranding nothing.
+            self.restore_draft();
             return;
         };
         // Move the slot out so its fields can swap with `self`'s without
@@ -2464,6 +2547,9 @@ impl AppModel {
         self.scroll_back.set(0);
         self.scroll_max.set(0);
         self.sticky_suppressed = false;
+        // TUI5 item 9: the attached session's own draft comes live —
+        // text, cursor, selection and input ring exactly as it left.
+        self.restore_draft();
     }
 
     /// Detach: write the live fields back into the session's slot (sim
@@ -2533,6 +2619,10 @@ impl AppModel {
     /// running turn are untouched, so the session resumes exactly where it
     /// was left.
     pub fn back_to_launcher(&mut self) {
+        // TUI5 item 9: park the departing surface's draft (session, aura,
+        // or the scratch surface — which shares the launcher key, so its
+        // stash/restore is an exact round-trip).
+        self.stash_draft();
         // TUI4c: leaving DETACHES (sim `setActiveId(null)`, tui.js:1956) —
         // the session's state checks into its slot, its scripts keep
         // running, and the launcher's surface derives from NO session
@@ -2551,6 +2641,8 @@ impl AppModel {
         self.listening = false;
         self.view_path.clear();
         self.help_open = false;
+        // TUI5 item 9: the launcher's own draft comes back.
+        self.restore_draft();
     }
 
     /// A NON-attached session's slot (background event routing).
@@ -2582,7 +2674,7 @@ impl AppModel {
                 self.attach_sample_named(&name);
             }
             Hit::ExtraRow(which) if self.screen == Screen::Launcher => match which {
-                LauncherRow::Aura => self.screen = Screen::Aura,
+                LauncherRow::Aura => self.enter_aura(),
                 LauncherRow::Accounts => {
                     self.flash = Some(
                         "· /accounts — UI ready; lands with the account switchboard (W3)"

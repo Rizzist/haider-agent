@@ -134,7 +134,23 @@ impl DemoStore {
         if dto.version != DEMO_STORE_VERSION {
             return None;
         }
-        if dto.sessions.is_empty() || dto.sessions.iter().any(|session| session.id == 0) {
+        // TUI4 carried P3-1 + P3-3 (one clause each, TUI4-review-2-SHIP):
+        // id u64::MAX would overflow the guard-2 bump (debug panic /
+        // release wrap onto the id-0 sentinel) — card_seq has the same
+        // bound; duplicate ids would mirror-corrupt the next save. Both
+        // reject to seeds, the same all-or-nothing law as id 0.
+        if dto.sessions.is_empty()
+            || dto.card_seq == u64::MAX
+            || dto
+                .sessions
+                .iter()
+                .any(|session| session.id == 0 || session.id == u64::MAX)
+            || dto
+                .sessions
+                .iter()
+                .enumerate()
+                .any(|(i, s)| dto.sessions[..i].iter().any(|prior| prior.id == s.id))
+        {
             return None;
         }
         Some(dto)
