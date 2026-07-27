@@ -279,6 +279,23 @@ async fn run_inner(
         reason: reason.clone(),
         deadline_unix_ms,
     });
+
+    // §6.6 grace ORDER (W3b2.3, P1-3): the hub drains FIRST — in-flight
+    // appends/CAS complete their persist AND publish, and replay tasks
+    // stream those final committed envelopes into the connection outboxes —
+    // and only then does the drain notice fire. The notice makes each
+    // connection close its hub registration, so broadcasting it earlier
+    // would cancel attachments while committed envelopes were still in
+    // flight to them. The writer then puts `ServerDraining` on the wire at
+    // its next complete-frame boundary and drains the already-queued
+    // checkpoint envelopes under the same deadline (the ledgered W3b1
+    // relaxation).
+    let hub_shutdown = bounded_finalization(hub.shutdown(), barrier_deadline, &mut shutdown).await;
+    match hub_shutdown {
+        Some(Ok(())) => {}
+        Some(Err(error)) => return Err(DaemonError::from(error)),
+        None => forced = true,
+    }
     drain_sender.send_replace(Some(DrainNotice {
         reason,
         instance_id,
@@ -286,17 +303,6 @@ async fn run_inner(
         deadline_unix_ms,
         deadline: barrier_deadline,
     }));
-
-    // W3b2 deliberate relaxation of W3b1's "notice is last" law: the writer
-    // prioritizes the reserved notice at the next frame boundary, then drains
-    // already-queued checkpoint envelopes under the same deadline. Replays
-    // are cancelled and joined before the store finalization tail.
-    let hub_shutdown = bounded_finalization(hub.shutdown(), barrier_deadline, &mut shutdown).await;
-    match hub_shutdown {
-        Some(Ok(())) => {}
-        Some(Err(error)) => return Err(DaemonError::from(error)),
-        None => forced = true,
-    }
     let undelivered_notices = runtime
         .drain(&mut forced, barrier_deadline, &mut shutdown)
         .await;

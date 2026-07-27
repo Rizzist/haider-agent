@@ -272,9 +272,12 @@ impl Store {
     /// sequence; a different command after any resolution gets
     /// [`MenuResolutionOutcome::AlreadyResolved`] carrying the winner's
     /// `resolution_seq`; a stale `worker_generation` is fenced with
-    /// `SingleWriterViolation` before any winner coordinate is disclosed.
-    /// Every attachment then learns the outcome from the event stream — the
-    /// journal, not any caller's reply, is the source of truth.
+    /// `SingleWriterViolation` before a DIFFERENT command's winner
+    /// coordinate is disclosed — the same-command idempotency lookup
+    /// deliberately precedes the fence, because a lost-response retry must
+    /// recover its own committed coordinate even across a restart's new
+    /// generation. Every attachment then learns the outcome from the event
+    /// stream — the journal, not any caller's reply, is the source of truth.
     ///
     /// `menu_resolutions` is only a uniqueness/idempotency index; historical
     /// journals are scanned so a pre-index `MenuAnswered` still fences a

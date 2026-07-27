@@ -18,15 +18,19 @@ pub struct DaemonConfig {
     /// Maximum inbound frame size; also advertised in `Welcome.frame_limit`,
     /// so it must fit `u32`.
     pub frame_limit: usize,
-    /// Aggregate depth of each connection's fair, attachment-keyed outbound
-    /// queue (R12); an unwritable session lane lags/detaches that attachment,
-    /// while a refused system reply closes the connection.
+    /// Aggregate frame cap on each connection's fair, attachment-keyed
+    /// outbound queue (R12). Admission is class-split — this cap bounds paced
+    /// EVENT delivery, which waits on drain progress instead of failing,
+    /// while reply traffic is bounded per lane and by the byte budget; the
+    /// authoritative policy lives on `connection.rs`'s `OutboundLane`.
     pub outbound_queue_capacity: usize,
     /// Ceiling on encoded bytes a connection may hold queued-but-unwritten
     /// (R12 mechanism). The frame-count bound alone permits
     /// `outbound_queue_capacity × frame_limit` of resident payload, so bytes
-    /// are charged before enqueue and credited once the write completes;
-    /// exceeding the budget is the same connection-fatal error a full queue is.
+    /// are charged before enqueue and credited once the write completes.
+    /// Paced event delivery camps on at most 3/4 of this budget (waiting,
+    /// not failing); a reply that exceeds the full budget is the same
+    /// connection-fatal error it was in W3b1.
     /// Must be at least `frame_limit`, and is validated as such: a budget that
     /// cannot carry one maximum-size frame would make some admissible frames
     /// unsendable. The default leaves room for one in flight plus one queued.

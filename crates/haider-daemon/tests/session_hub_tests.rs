@@ -7,8 +7,8 @@
 
 use haider_core::{HarnessActor, HarnessConfig, SqliteStoreHandle, StoreHandle, SubmitTurn};
 use haider_daemon::{
-    FrameSendError, FrameSink, HubConnection, HubObservation, SessionHub, SessionHubConfig,
-    SessionHubObserver,
+    FrameSendError, FrameSink, HubConnection, HubObservation, SendAdmission, SessionHub,
+    SessionHubConfig, SessionHubObserver,
 };
 use haider_protocol::EventPayload;
 use haider_protocol::envelope::{
@@ -1507,11 +1507,13 @@ async fn cancelled_shutdown_future_still_aborts_every_owned_hub_task() {
     store.close().await.expect("store closes");
 }
 
-/// MUTATION CHECK: stop cancelling/joining replay tasks in `SessionHub::shutdown`.
-/// Expected failure: shutdown reports complete while the gated replay is still
-/// alive, so `shutdown.is_finished()` becomes true before release.
+/// MUTATION CHECK: stop joining replay tasks in `SessionHub::shutdown`
+/// (detach them instead). Expected failure: shutdown reports complete while
+/// the gated replay is still alive, so `shutdown.is_finished()` becomes true
+/// before release. (Under the §6.6 grace the joined replay COMPLETES its
+/// delivery rather than being cancelled; shutdown still owns its lifetime.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn drain_during_replay_cancels_and_joins_before_store_close() {
+async fn drain_during_replay_owns_replay_completion_before_store_close() {
     let (observer, mut control) = gated_observer(vec![GateTarget::ReplayEvent(1)]);
     let (_root, store, hub) = open_hub(Some(observer), 8).await;
     let session_id = SessionId::new("drain-replay");
@@ -1926,8 +1928,8 @@ async fn catch_up_byte_budget_trips_long_before_the_frame_count_and_resumes_from
     store.close().await.expect("store closes");
 }
 
-/// A sink whose lane admits the initial replay and caught-up marker, then
-/// reports zero capacity forever with a drain signal that never advances —
+/// A sink that admits the initial replay and caught-up marker, then answers
+/// `Busy` to every further event with a drain signal that never advances —
 /// the genuinely stuck client shape.
 struct StalledAfterCaughtUpSink {
     collected: CollectSink,
@@ -1947,11 +1949,13 @@ impl FrameSink for StalledAfterCaughtUpSink {
         self.collected.purge_attachment(attachment_id);
     }
 
-    fn capacity_for(&self, _attachment_id: &AttachmentId) -> usize {
-        if self.saw_caught_up.load(Ordering::Acquire) {
-            0
-        } else {
-            usize::MAX
+    fn offer(&self, _attachment_id: &AttachmentId, frame: &WireFrame) -> SendAdmission {
+        if self.saw_caught_up.load(Ordering::Acquire) && matches!(frame, WireFrame::Event { .. }) {
+            return SendAdmission::Busy;
+        }
+        match self.try_send(frame.clone()) {
+            Ok(()) => SendAdmission::Sent,
+            Err(FrameSendError) => SendAdmission::Refused,
         }
     }
 
@@ -1960,10 +1964,10 @@ impl FrameSink for StalledAfterCaughtUpSink {
     }
 }
 
-/// MUTATION CHECK: remove the lagged-while-blocked exit from
-/// `acquire_send_capacity` (wait only for drain progress and cancellation).
-/// Expected failure: the stalled attachment never laggs or detaches, no
-/// `Lagged` frame ever reaches the sink, and the deadline expires.
+/// MUTATION CHECK: remove the lagged-while-busy exit from `deliver_frame`
+/// (wait only for drain progress and cancellation). Expected failure: the
+/// stalled attachment never laggs or detaches, no `Lagged` frame ever
+/// reaches the sink, and the deadline expires.
 /// Verified by revert on 2026-07-27.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn commit_pressure_behind_a_stalled_outbox_laggs_and_detaches() {
@@ -2049,6 +2053,243 @@ async fn commit_pressure_behind_a_stalled_outbox_laggs_and_detaches() {
             body: ResponseBody::Error { ref code, .. },
         } if request_id.as_str() == "detach-after" && code == "not_found"
     ));
+
+    connection.close().await.expect("connection closes");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// MUTATION CHECK: restore the pre-W3b2.3 drain order (sweep owners and
+/// abort replay tasks BEFORE joining actors). Expected failure: the append
+/// that was already inside its store await commits but publishes to orphaned
+/// senders, the committed envelope never reaches the attached sink, and this
+/// test times out waiting for it.
+/// Verified by revert on 2026-07-27.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn graceful_drain_broadcasts_an_in_flight_commit_before_teardown() {
+    let (observer, mut control) = gated_observer(vec![GateTarget::Persisted(2)]);
+    let (_root, store, hub) = open_hub(Some(observer), 8).await;
+    let session_id = SessionId::new("drain-broadcast");
+    let generation = store.worker_generation();
+    append_one(&hub, &session_id, generation, "initial").await;
+    let sink = Arc::new(CollectSink::default());
+    let connection = hub
+        .open_connection(capabilities(), sink.clone())
+        .expect("connection");
+    connection
+        .request(
+            RequestId::new("attach"),
+            RequestBody::SessionAttach {
+                session_id: session_id.clone(),
+                after_seq: 1,
+                mode: AttachMode::View,
+            },
+        )
+        .await
+        .expect("attach routes");
+    let _ = attachment_from(sink.next().await);
+    assert!(matches!(
+        sink.next().await,
+        WireFrame::AttachCaughtUp {
+            high_water_seq: 1,
+            ..
+        }
+    ));
+
+    // The append is INSIDE its actor arm: the store call returned (Persisted
+    // gate), publication has not happened yet.
+    let committing = tokio::spawn({
+        let hub = hub.clone();
+        let session_id = session_id.clone();
+        async move { append_one(&hub, &session_id, generation, "final-checkpoint").await }
+    });
+    assert!(matches!(
+        control.reached().await,
+        HubObservation::Persisted { through_seq: 2, .. }
+    ));
+    let shutdown = tokio::spawn({
+        let hub = hub.clone();
+        async move { hub.shutdown().await }
+    });
+    control.observed_shutdown_guarded().await;
+    control.release();
+
+    assert_eq!(committing.await.expect("append joins"), 2);
+    shutdown
+        .await
+        .expect("shutdown joins")
+        .expect("graceful drain completes");
+    // §6.6: the final committed envelope was broadcast during the grace.
+    loop {
+        match sink.next().await {
+            WireFrame::Event { envelope, .. } if envelope.seq == 2 => break,
+            WireFrame::Event { .. } | WireFrame::AttachCaughtUp { .. } => {}
+            frame => panic!("unexpected drain-broadcast frame: {frame:?}"),
+        }
+    }
+
+    connection.close().await.expect("connection closes");
+    store.close().await.expect("store closes");
+}
+
+/// MUTATION CHECK: replace the RAII admission guard with release-on-return
+/// only. Expected failure: an attach cancelled mid-registration leaks its
+/// slot and the follow-up attach on the same one-slot connection is rejected
+/// `overloaded`.
+/// Verified by revert on 2026-07-27.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_registration_refunds_its_admission_slot() {
+    let (observer, mut control) = gated_observer(vec![GateTarget::ReceiverRegistered]);
+    let config = SessionHubConfig {
+        max_attachments_per_connection: 1,
+        max_attachments: 4,
+        ..SessionHubConfig::default()
+    };
+    let (_root, store, hub) = open_hub_with_config(Some(observer), config).await;
+    let session_id = SessionId::new("cancelled-registration");
+    append_one(&hub, &session_id, store.worker_generation(), "seed").await;
+    let sink = Arc::new(CollectSink::default());
+    let connection = Arc::new(
+        hub.open_connection(capabilities(), sink.clone())
+            .expect("connection"),
+    );
+
+    let attach = tokio::spawn({
+        let connection = Arc::clone(&connection);
+        let session_id = session_id.clone();
+        async move {
+            connection
+                .request(
+                    RequestId::new("cancelled-attach"),
+                    RequestBody::SessionAttach {
+                        session_id,
+                        after_seq: 0,
+                        mode: AttachMode::View,
+                    },
+                )
+                .await
+        }
+    });
+    // The registration holds its reserved slot and is parked at the actor
+    // round trip; abort the requester exactly there.
+    assert!(matches!(
+        control.reached().await,
+        HubObservation::ReceiverRegistered { .. }
+    ));
+    attach.abort();
+    assert!(
+        attach
+            .await
+            .expect_err("attach task was cancelled")
+            .is_cancelled()
+    );
+    control.release();
+
+    // The RAII guard refunded the slot, so the one-slot connection admits a
+    // fresh attachment.
+    let _readmitted = attach_caught_up(&connection, &sink, &session_id, "attach-after").await;
+
+    connection.close().await.expect("connection closes");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// A sink that records HOW each frame was staged: `true` for attachment-keyed
+/// staging (`try_send_for` / `offer`), `false` for the shared system path.
+#[derive(Default)]
+struct LaneRecordingSink {
+    collected: CollectSink,
+    staged: Mutex<Vec<(bool, &'static str)>>,
+}
+
+impl LaneRecordingSink {
+    fn record(&self, keyed: bool, frame: &WireFrame) {
+        let kind = match frame {
+            WireFrame::Response { .. } => "response",
+            WireFrame::Event { .. } => "event",
+            WireFrame::AttachCaughtUp { .. } => "caught-up",
+            _ => "other",
+        };
+        self.staged.lock().expect("staged lock").push((keyed, kind));
+    }
+}
+
+impl FrameSink for LaneRecordingSink {
+    fn try_send(&self, frame: WireFrame) -> Result<(), FrameSendError> {
+        self.record(false, &frame);
+        self.collected.try_send(frame)
+    }
+
+    fn try_send_for(
+        &self,
+        _attachment_id: &AttachmentId,
+        frame: WireFrame,
+    ) -> Result<(), FrameSendError> {
+        self.record(true, &frame);
+        self.collected.try_send(frame)
+    }
+
+    fn offer(&self, _attachment_id: &AttachmentId, frame: &WireFrame) -> SendAdmission {
+        self.record(true, frame);
+        match self.collected.try_send(frame.clone()) {
+            Ok(()) => SendAdmission::Sent,
+            Err(FrameSendError) => SendAdmission::Refused,
+        }
+    }
+
+    fn purge_attachment(&self, attachment_id: &AttachmentId) {
+        self.collected.purge_attachment(attachment_id);
+    }
+}
+
+/// MUTATION CHECK: route the attach response back through the shared system
+/// lane (`self.send` instead of `try_send_for`). Expected failure: the
+/// response's staging record is not attachment-keyed, so round-robin could
+/// pop a replayed event ahead of the response that names the attachment id.
+/// Verified by revert on 2026-07-27.
+#[tokio::test]
+async fn attach_response_is_staged_in_the_attachment_lane_before_its_first_event() {
+    let (_root, store, hub) = open_hub(None, 8).await;
+    let session_id = SessionId::new("response-lane");
+    append_one(&hub, &session_id, store.worker_generation(), "seed").await;
+    let sink = Arc::new(LaneRecordingSink::default());
+    let connection = hub
+        .open_connection(capabilities(), sink.clone())
+        .expect("connection");
+    connection
+        .request(
+            RequestId::new("attach"),
+            RequestBody::SessionAttach {
+                session_id,
+                after_seq: 0,
+                mode: AttachMode::View,
+            },
+        )
+        .await
+        .expect("attach routes");
+    let _ = attachment_from(sink.collected.next().await);
+    assert!(matches!(
+        sink.collected.next().await,
+        WireFrame::Event { envelope, .. } if envelope.seq == 1
+    ));
+    assert!(matches!(
+        sink.collected.next().await,
+        WireFrame::AttachCaughtUp { .. }
+    ));
+
+    let staged = sink.staged.lock().expect("staged lock").clone();
+    let response_at = staged
+        .iter()
+        .position(|(keyed, kind)| *keyed && *kind == "response")
+        .expect("attach response staged in the attachment's own lane");
+    let first_event_at = staged
+        .iter()
+        .position(|(_, kind)| *kind == "event")
+        .expect("replayed event staged");
+    assert!(
+        response_at < first_event_at,
+        "the attach response precedes the first event in its FIFO lane"
+    );
 
     connection.close().await.expect("connection closes");
     hub.shutdown().await.expect("hub stops");

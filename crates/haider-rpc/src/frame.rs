@@ -470,8 +470,14 @@ pub enum WireFrame {
         session_id: SessionId,
         envelope: RawEnvelope,
     },
-    /// Replay for the attachment is complete through `high_water_seq`; every
-    /// later [`WireFrame::Event`] on this attachment is live.
+    /// Replay for the attachment is complete through `high_water_seq`.
+    ///
+    /// This frame may REPEAT on the same attachment with strictly increasing
+    /// `high_water_seq`: the daemon's internal buffering may transparently
+    /// resume an attachment from durable history, replaying the gap and
+    /// announcing the new head. Clients treat every occurrence identically —
+    /// events deduplicate by `seq` alone (R9/R11) — and must not assume the
+    /// first caught-up marker is the last.
     AttachCaughtUp {
         attachment_id: AttachmentId,
         high_water_seq: u64,

@@ -36,7 +36,7 @@
 mod connection_tests;
 
 use crate::DaemonError;
-use crate::session_hub::{FrameSendError, FrameSink, HubConnection, SessionHub};
+use crate::session_hub::{FrameSendError, FrameSink, HubConnection, SendAdmission, SessionHub};
 use haider_rpc::{
     AttachmentId, Capability, CapabilitySet, ERROR_CODE_OVERLOADED, Hello, LifecyclePhase,
     ProtocolError, ServerRange, Welcome, WireFrame, negotiate, uds_codec,
@@ -158,11 +158,19 @@ struct OutboundState {
 /// here): frames are keyed into lanes — one `System` lane for replies plus
 /// one lane per attachment — and the writer drains active lanes round-robin,
 /// one frame per visit, so a hot session cannot starve a cold one's drain
-/// order. Admission is bounded three ways: an aggregate frame cap, an
-/// aggregate byte budget, and a per-lane cap of half the frame cap, so one
-/// hot lane can never consume every admission slot either. Overflow is
-/// per-lane: a refused attachment lane lags/detaches that attachment
-/// (store-resume); a refused system reply is connection-fatal.
+/// order. Admission is CLASS-SPLIT because the two classes fail differently:
+///
+/// - EVENT class ([`Self::offer`], used by paced delivery): atomic
+///   check-and-enqueue under the aggregate frame cap, the per-lane cap
+///   (half the frame cap), and a 3/4 share of the byte budget. `Busy` makes
+///   the replay task wait on drain progress — never detaching a reading
+///   client; `Refused` (closed / over the negotiated limit) and
+///   lag-under-stall are the only detach shapes.
+/// - REPLY class ([`Self::try_push`]: responses, errors, pongs, `Lagged`):
+///   bounded by its lane's cap and the FULL byte budget but exempt from the
+///   aggregate frame cap, so replay traffic camped on that cap can never
+///   starve a correlated reply into a fatal refusal. A refused reply stays
+///   terminal (connection-fatal for system frames).
 ///
 /// Clones carry enqueue authority but cannot keep the writer alive after the
 /// connection owner calls [`Self::close`].
@@ -204,24 +212,56 @@ impl OutboundLane {
         }
     }
 
-    /// Frames this lane can currently admit without refusal, in the
-    /// frame-count dimension only (a byte-budget refusal stays an ACTUAL
-    /// refusal that laggs/detaches). A closed outbox reports one slot so the
-    /// next `try_push` is the arbiter instead of an unwakeable wait.
-    fn capacity_for(&self, key: &LaneKey) -> usize {
-        let Ok(state) = self.inner.state.lock() else {
-            return 1;
+    /// Atomically admits one already-encoded EVENT-CLASS frame under every
+    /// bound (aggregate frame cap, per-lane cap, offer byte share) or
+    /// reports why not, consuming nothing on the non-admitted paths. This
+    /// check-and-enqueue happens under one lock, so concurrent lanes can
+    /// never jointly observe the same headroom and overbook — the admission
+    /// IS the reservation, granted and consumed in the same step.
+    ///
+    /// Offers may camp on capacity while their replay task awaits drain
+    /// progress, so they are confined to a SHARE that always leaves reply
+    /// headroom: at most 3/4 of the byte budget (with an empty-queue
+    /// admission guarantee so one oversized event cannot wedge), while the
+    /// aggregate frame cap applies to offers alone — the reply class is
+    /// bounded per lane and by the full byte budget instead, so camped
+    /// replay traffic can never starve a response into a fatal refusal.
+    fn offer(&self, key: LaneKey, bytes: Vec<u8>) -> SendAdmission {
+        let charged = bytes.len();
+        let offer_byte_share = self
+            .inner
+            .byte_budget
+            .saturating_sub(self.inner.byte_budget / 4);
+        let Ok(mut state) = self.inner.state.lock() else {
+            return SendAdmission::Refused;
         };
         if state.closed {
-            return 1;
+            return SendAdmission::Refused;
         }
-        let lane_len = state.lanes.get(key).map_or(0, VecDeque::len);
-        let lane_room = self.inner.per_lane_capacity.saturating_sub(lane_len);
-        let aggregate_room = self
-            .inner
-            .frame_capacity
-            .saturating_sub(state.queued_frames);
-        lane_room.min(aggregate_room)
+        let lane_len = state.lanes.get(&key).map_or(0, VecDeque::len);
+        let next_bytes = state.queued_bytes.checked_add(charged);
+        let over_share =
+            state.queued_bytes > 0 && next_bytes.is_none_or(|total| total > offer_byte_share);
+        if state.queued_frames >= self.inner.frame_capacity
+            || lane_len >= self.inner.per_lane_capacity
+            || over_share
+        {
+            return SendAdmission::Busy;
+        }
+        let activate = lane_len == 0;
+        state
+            .lanes
+            .entry(key.clone())
+            .or_default()
+            .push_back(QueuedFrame { bytes });
+        if activate {
+            state.round_robin.push_back(key);
+        }
+        state.queued_frames = state.queued_frames.saturating_add(1);
+        state.queued_bytes = state.queued_bytes.saturating_add(charged);
+        drop(state);
+        self.inner.ready.notify_one();
+        SendAdmission::Sent
     }
 
     fn drain_progress(&self) -> watch::Receiver<u64> {
@@ -234,6 +274,14 @@ impl OutboundLane {
         });
     }
 
+    /// Admits one REPLY-CLASS frame (responses, protocol errors, pongs,
+    /// `Lagged`): bounded by its lane's cap and the FULL byte budget, but
+    /// not by the aggregate frame cap that offer traffic camps on — see
+    /// [`Self::offer`]. Refusal here is terminal for the caller (fatal for
+    /// system replies, detach for an attach response). Worst-case queued
+    /// frames are still bounded: offers ≤ the aggregate cap, replies ≤ one
+    /// per-lane cap per lane, lanes ≤ the per-connection attachment cap + 1,
+    /// and every byte is charged against the one byte budget.
     fn try_push(&self, key: LaneKey, bytes: Vec<u8>) -> Result<(), DaemonError> {
         let charged = bytes.len();
         let mut state = self.inner.state.lock().map_err(|_| DaemonError::Task {
@@ -242,7 +290,6 @@ impl OutboundLane {
         let lane_len = state.lanes.get(&key).map_or(0, VecDeque::len);
         let next_bytes = state.queued_bytes.checked_add(charged);
         if state.closed
-            || state.queued_frames >= self.inner.frame_capacity
             || lane_len >= self.inner.per_lane_capacity
             || next_bytes.is_none_or(|total| total > self.inner.byte_budget)
         {
@@ -309,6 +356,10 @@ impl OutboundLane {
         if let Ok(mut state) = self.inner.state.lock() {
             state.queued_bytes = state.queued_bytes.saturating_sub(bytes);
         }
+        // Byte headroom frees only here (after the write settles), so a
+        // byte-bound Busy waiter must be woken by the credit, not only by the
+        // pop.
+        self.mark_drained();
     }
 
     fn purge(&self, attachment_id: &AttachmentId) {
@@ -355,13 +406,29 @@ impl FrameSink for ConnectionFrameSink {
         self.lane.try_push(key, bytes).map_err(|_| FrameSendError)
     }
 
+    fn try_send_for(
+        &self,
+        attachment_id: &AttachmentId,
+        frame: WireFrame,
+    ) -> Result<(), FrameSendError> {
+        let bytes = encode_outbound(&frame, self.outbound_limit).map_err(|_| FrameSendError)?;
+        self.lane
+            .try_push(LaneKey::Attachment(attachment_id.clone()), bytes)
+            .map_err(|_| FrameSendError)
+    }
+
     fn purge_attachment(&self, attachment_id: &AttachmentId) {
         self.lane.purge(attachment_id);
     }
 
-    fn capacity_for(&self, attachment_id: &AttachmentId) -> usize {
+    fn offer(&self, attachment_id: &AttachmentId, frame: &WireFrame) -> SendAdmission {
+        let Ok(bytes) = encode_outbound(frame, self.outbound_limit) else {
+            // Exceeds the negotiated frame limit: no amount of draining can
+            // ever admit it.
+            return SendAdmission::Refused;
+        };
         self.lane
-            .capacity_for(&LaneKey::Attachment(attachment_id.clone()))
+            .offer(LaneKey::Attachment(attachment_id.clone()), bytes)
     }
 
     fn drain_progress(&self) -> Option<tokio::sync::watch::Receiver<u64>> {

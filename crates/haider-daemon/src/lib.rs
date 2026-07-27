@@ -36,9 +36,13 @@
 //! - **Snapshot-free attachment** — one actor serializes each live session.
 //!   Receiver registration and head capture are one actor turn, appends are
 //!   persisted before publication, and replay tasks are cancellable/owned.
-//! - **Store-backed lag and menu CAS** — slow attachments detach and resume by
-//!   `RawEnvelope.seq`; menu answers append through one durable compare-and-set
-//!   and every attachment learns the winner from the event stream.
+//! - **Store-backed lag and menu CAS** — overflow has two responses: internal
+//!   catch-up overflow re-registers and resumes from the store without
+//!   detaching (the client just sees a repeated `AttachCaughtUp`), while
+//!   sink-side refusal or lag-under-stall detaches with `Lagged` and the
+//!   client reattaches after its applied `RawEnvelope.seq`. Menu answers
+//!   append through one durable compare-and-set and every attachment learns
+//!   the winner from the event stream.
 //!
 //! The phase machine itself lives in `lifecycle.rs`; its legal transitions are
 //! documented on [`DaemonState`] and enforced by the state publisher.
@@ -56,8 +60,8 @@ pub use error::{DaemonError, IncumbentDiagnostics};
 pub use lifecycle::{DaemonState, Readiness, ShutdownDisposition, ShutdownHandle, ShutdownOutcome};
 pub use runtime::{DaemonTask, run_with_signals, spawn};
 pub use session_hub::{
-    FrameSendError, FrameSink, HubConnection, HubObservation, SessionHub, SessionHubConfig,
-    SessionHubError, SessionHubObserver,
+    FrameSendError, FrameSink, HubConnection, HubObservation, SendAdmission, SessionHub,
+    SessionHubConfig, SessionHubError, SessionHubObserver,
 };
 
 /// Crate marker used by the workspace self-test.

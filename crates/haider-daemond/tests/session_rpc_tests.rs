@@ -347,11 +347,11 @@ async fn one_hot_attachment_cannot_starve_a_cold_attachment_on_the_same_connecti
     task.join().await.expect("daemon joins");
 }
 
-/// MUTATION CHECK: revert replay pacing — deliver each store page
-/// synchronously, ignoring `capacity_for`/`drain_progress`. Expected failure:
-/// the first page overruns the 16-frame lane quota and this continuously
-/// READING client is purged through `Lagged` instead of receiving the
-/// contiguous 1..=1000 stream.
+/// MUTATION CHECK: treat the sink's `Busy` admission as a hard refusal (the
+/// pre-W3b2.3 behavior of an unpaced burst hitting the bound). Expected
+/// failure: the first page overruns the 16-frame lane quota and this
+/// continuously READING client is purged through `Lagged` instead of
+/// receiving the contiguous 1..=1000 stream.
 /// Verified by revert on 2026-07-27.
 #[tokio::test]
 async fn paced_replay_of_a_long_history_never_laggs_a_reading_client() {
@@ -401,6 +401,154 @@ async fn paced_replay_of_a_long_history_never_laggs_a_reading_client() {
         next_seq, 1_001,
         "every seeded envelope arrived exactly once"
     );
+
+    task.shutdown_handle().request("test complete");
+    task.join().await.expect("daemon joins");
+}
+
+fn seed_with_payload(config: &DaemonConfig, session_id: &SessionId, count: usize, blob: usize) {
+    let store = Store::open(&config.store_dir).expect("seed store");
+    let mut events = (1..=count)
+        .map(|seq| {
+            let mut event = envelope(session_id, &format!("{}-{seq}", session_id.as_str()));
+            event.payload = serde_json::json!({
+                "type": "future_rpc_seed",
+                "blob": "x".repeat(blob),
+            });
+            event
+        })
+        .collect::<Vec<_>>();
+    store.append(&mut events).expect("seed append");
+}
+
+/// MUTATION CHECK: admit on the frame dimension only (ignore bytes in the
+/// sink's atomic offer, so a byte-bound admission refuses instead of
+/// answering `Busy`). Expected failure: a few large replay envelopes fill
+/// the byte budget and this continuously READING client is purged through
+/// `Lagged` mid-replay.
+/// Verified by revert on 2026-07-27.
+#[tokio::test]
+async fn byte_bound_replay_of_large_envelopes_never_laggs_a_reading_client() {
+    let root = test_root();
+    let mut config = DaemonConfig::new(
+        "byte-bound-replay",
+        root.path().join("store"),
+        root.path().join("runtime"),
+    );
+    config.frame_limit = 128 * 1024;
+    config.outbound_queued_bytes = 256 * 1024;
+    let session_id = SessionId::new("large-envelopes");
+    seed_with_payload(&config, &session_id, 30, 60 * 1024);
+    let task = ready(&config).await;
+    let mut client = Client::connect(&config.endpoint_path(), config.frame_limit).await;
+    client
+        .send(
+            &WireFrame::Request {
+                request_id: RequestId::new("attach-large"),
+                body: RequestBody::SessionAttach {
+                    session_id,
+                    after_seq: 0,
+                    mode: AttachMode::View,
+                },
+            },
+            config.frame_limit,
+        )
+        .await;
+
+    let mut next_seq = 1_u64;
+    loop {
+        match client.next().await {
+            WireFrame::Response { .. } => {}
+            WireFrame::Event { envelope, .. } => {
+                assert_eq!(envelope.seq, next_seq, "replay must stay contiguous");
+                next_seq += 1;
+            }
+            WireFrame::AttachCaughtUp {
+                high_water_seq: 30, ..
+            } => break,
+            WireFrame::Lagged { .. } => {
+                panic!("a continuously reading client must never be lagged")
+            }
+            frame => panic!("unexpected byte-bound frame: {frame:?}"),
+        }
+    }
+    assert_eq!(next_seq, 31, "every large envelope arrived exactly once");
+
+    task.shutdown_handle().request("test complete");
+    task.join().await.expect("daemon joins");
+}
+
+/// MUTATION CHECK: treat the sink's `Busy` admission as a hard refusal —
+/// equivalent to the reverted capacity SNAPSHOT, under which three or more
+/// concurrent replay lanes jointly observe the same aggregate headroom and
+/// the overbooked loser is purged. Expected failure: at least one of the
+/// five lanes on this one connection receives `Lagged` although the client
+/// reads continuously.
+/// Verified by revert on 2026-07-27.
+#[tokio::test]
+async fn five_concurrent_replay_lanes_on_one_connection_never_lag_a_reading_client() {
+    let root = test_root();
+    let mut config = DaemonConfig::new(
+        "five-lanes",
+        root.path().join("store"),
+        root.path().join("runtime"),
+    );
+    // Aggregate 6 frames across 5 active lanes: admission contention is
+    // constant, so any snapshot-shaped admission overbooks immediately.
+    config.outbound_queue_capacity = 6;
+    let sessions = (0..5)
+        .map(|index| SessionId::new(format!("lane-{index}")))
+        .collect::<Vec<_>>();
+    for session_id in &sessions {
+        seed(&config, session_id, 30);
+    }
+    let task = ready(&config).await;
+    let mut client = Client::connect(&config.endpoint_path(), config.frame_limit).await;
+    for (index, session_id) in sessions.iter().enumerate() {
+        client
+            .send(
+                &WireFrame::Request {
+                    request_id: RequestId::new(format!("attach-{index}")),
+                    body: RequestBody::SessionAttach {
+                        session_id: session_id.clone(),
+                        after_seq: 0,
+                        mode: AttachMode::View,
+                    },
+                },
+                config.frame_limit,
+            )
+            .await;
+    }
+
+    let mut caught_up = 0_usize;
+    let mut next_seq: std::collections::HashMap<SessionId, u64> = sessions
+        .iter()
+        .map(|session_id| (session_id.clone(), 1_u64))
+        .collect();
+    while caught_up < sessions.len() {
+        match client.next().await {
+            WireFrame::Response { .. } => {}
+            WireFrame::Event {
+                session_id,
+                envelope,
+                ..
+            } => {
+                let expected = next_seq.get_mut(&session_id).expect("known session");
+                assert_eq!(envelope.seq, *expected, "each lane stays contiguous");
+                *expected += 1;
+            }
+            WireFrame::AttachCaughtUp {
+                high_water_seq: 30, ..
+            } => caught_up += 1,
+            WireFrame::Lagged { .. } => {
+                panic!("no reading lane may be purged by admission contention")
+            }
+            frame => panic!("unexpected five-lane frame: {frame:?}"),
+        }
+    }
+    for (session_id, expected) in next_seq {
+        assert_eq!(expected, 31, "lane {session_id} delivered all 30 events");
+    }
 
     task.shutdown_handle().request("test complete");
     task.join().await.expect("daemon joins");
