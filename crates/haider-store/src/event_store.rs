@@ -16,6 +16,7 @@ use crate::cas::FileCas;
 use crate::migrations;
 use crate::profile_lock::ProfileLock;
 use crate::{Cas, StoreResult, now_ms, store_error, to_sqlite_integer};
+use haider_protocol::credential::CredentialDescriptor;
 use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION, envelope_weight_bytes,
 };
@@ -200,6 +201,47 @@ pub struct CancelledTurn {
     pub run_id: RunId,
     pub status: TurnCancellationStatus,
     pub terminal_seq: Option<u64>,
+}
+
+/// Method tag of the durable `account.login_api` command (R10).
+const LOGIN_METHOD: &str = "account.login_api";
+
+/// Committed login response persisted in the receipt: the descriptor only —
+/// receipt metadata NEVER contains the secret or the ephemeral vault
+/// reference.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct LoginReceiptResponse {
+    pub descriptor: CredentialDescriptor,
+}
+
+/// Definitive login failure persisted in a failed receipt (401/403 class):
+/// stable code + human message, never provider body or key text.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LoginReceiptFailure {
+    pub code: String,
+    pub message: String,
+}
+
+/// Outcome of [`Store::login_claim_receipt`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum LoginClaim {
+    /// No prior receipt: this attempt owns the command.
+    Fresh,
+    /// A pending receipt already existed (crashed or retryable earlier
+    /// attempt); the caller reconciles vault/descriptor state first.
+    ResumePending,
+    /// The command already committed; replay this exact response.
+    Committed(Box<LoginReceiptResponse>),
+}
+
+/// One pending/committed login receipt row for startup reconciliation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoginReceiptRow {
+    pub command_id: String,
+    /// `"pending"` or `"committed"`.
+    pub state: String,
+    pub request_json: String,
+    pub response_json: Option<String>,
 }
 
 /// Result of the atomic cancellation-intent transaction.
@@ -845,6 +887,169 @@ impl Store {
             cancelled,
             envelope,
         })
+    }
+
+    /// Looks up a committed `account.login_api` response. Obeys the R2
+    /// receipt-idempotency law stated on [`Self::session_create_receipt`]
+    /// (unfenced, cross-restart, digest-checked).
+    pub fn login_receipt(
+        &self,
+        command_id: &str,
+        request_digest: &str,
+        request_json: &str,
+    ) -> StoreResult<Option<LoginReceiptResponse>> {
+        validate_command_identity(command_id, request_digest, request_json)?;
+        let connection = self.connection()?;
+        lookup_command_response(
+            &connection,
+            command_id,
+            LOGIN_METHOD,
+            request_digest,
+            request_json,
+            "account-login",
+        )
+    }
+
+    /// Claims the durable login command (transaction A of R10's
+    /// two-transaction shape).
+    ///
+    /// FENCE-VS-REPLAY RESOLUTION (`docs/OPTIMIZATIONS.md`, trigger fired by
+    /// this first non-wire receipt caller): login builds on the GENERIC
+    /// receipt path — the required unfenced replay preflight
+    /// ([`lookup_command_response`]) runs INSIDE this claim transaction, so
+    /// the account actor (a direct, non-wire caller) can never silently skip
+    /// it, and no replay moved behind a generation fence (login has no
+    /// generation to fence). Menu CAS and the turn commands keep their two
+    /// explicit mechanisms unchanged.
+    ///
+    /// Unlike the W3c1 single-transaction commands, the claimed receipt STAYS
+    /// `pending` while Keychain + descriptor commit outside SQLite — the
+    /// pending receipt is the recovery protocol, not a claim of impossible
+    /// cross-store atomicity. `Store::login_receipts` +
+    /// `finalize_login_receipt`/`fail_login_receipt` close the loop.
+    pub fn login_claim_receipt(
+        &self,
+        command_id: &str,
+        request_digest: &str,
+        request_json: &str,
+    ) -> StoreResult<LoginClaim> {
+        validate_command_identity(command_id, request_digest, request_json)?;
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        // Replay/mismatch preflight: committed -> replay, digest mismatch or
+        // recorded failure -> typed error, pending/absent -> fall through.
+        if let Some(response) = lookup_command_response::<LoginReceiptResponse>(
+            &transaction,
+            command_id,
+            LOGIN_METHOD,
+            request_digest,
+            request_json,
+            "account-login",
+        )? {
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(LoginClaim::Committed(Box::new(response)));
+        }
+        let existed = transaction
+            .query_row(
+                "SELECT 1 FROM command_receipts WHERE command_id = ?1",
+                [command_id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(map_sqlite_error)?
+            .is_some();
+        claim_pending_receipt(
+            &transaction,
+            command_id,
+            LOGIN_METHOD,
+            request_digest,
+            request_json,
+            now_ms()?,
+        )?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        if existed {
+            // A pending row from a crashed or retryable earlier attempt: the
+            // caller reconciles vault/descriptor state before revalidating.
+            Ok(LoginClaim::ResumePending)
+        } else {
+            Ok(LoginClaim::Fresh)
+        }
+    }
+
+    /// Finalizes a committed login (transaction B): the descriptor is the
+    /// durable response a same-command retry replays. Receipt metadata NEVER
+    /// contains the secret.
+    pub fn finalize_login_receipt(
+        &self,
+        command_id: &str,
+        response: &LoginReceiptResponse,
+    ) -> StoreResult<()> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        finalize_command_receipt(
+            &transaction,
+            command_id,
+            "",
+            None,
+            None,
+            response,
+            now_ms()?,
+            "account-login",
+        )?;
+        transaction.commit().map_err(map_sqlite_error)
+    }
+
+    /// Records a DEFINITIVE login failure (401/403): nothing else persists,
+    /// and a same-command retry is answered from this terminal record.
+    pub fn fail_login_receipt(
+        &self,
+        command_id: &str,
+        failure: &LoginReceiptFailure,
+    ) -> StoreResult<()> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        fail_command_receipt(
+            &transaction,
+            command_id,
+            failure,
+            now_ms()?,
+            "account-login",
+        )?;
+        transaction.commit().map_err(map_sqlite_error)
+    }
+
+    /// Every pending/committed login receipt, for the `run_inner` startup
+    /// reconciliation phase (R10 step 10). Failed receipts are terminal and
+    /// need no reconciliation.
+    pub fn login_receipts(&self) -> StoreResult<Vec<LoginReceiptRow>> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT command_id, state, request_json, response_json
+                 FROM command_receipts
+                 WHERE method = ?1 AND state IN ('pending', 'committed')
+                 ORDER BY created_at_ms, command_id",
+            )
+            .map_err(map_sqlite_error)?;
+        let rows = statement
+            .query_map([LOGIN_METHOD], |row| {
+                Ok(LoginReceiptRow {
+                    command_id: row.get(0)?,
+                    state: row.get(1)?,
+                    request_json: row.get(2)?,
+                    response_json: row.get(3)?,
+                })
+            })
+            .map_err(map_sqlite_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_sqlite_error)?;
+        Ok(rows)
     }
 
     /// Appends aggregate `Idle` only if every durable run is terminal at the
@@ -1510,6 +1715,41 @@ fn finalize_command_receipt<T: serde::Serialize>(
     } else {
         Err(corrupt(format!(
             "{description} command receipt was not pending at finalization"
+        )))
+    }
+}
+
+/// The `failed` twin of [`finalize_command_receipt`] (additive; W3c2's
+/// login command is the first writer of the schema's `failed` state): a
+/// definitive non-retryable outcome recorded terminally, with the same
+/// pending-only guard.
+fn fail_command_receipt<T: serde::Serialize>(
+    transaction: &Transaction<'_>,
+    command_id: &str,
+    failure: &T,
+    updated_at_ms: u64,
+    description: &str,
+) -> StoreResult<()> {
+    let response_json = serde_json::to_string(failure).map_err(|error| {
+        store_error(
+            ErrorCode::InvalidArgument,
+            format!("cannot serialize {description} failure: {error}"),
+            false,
+        )
+    })?;
+    let updated = transaction
+        .execute(
+            "UPDATE command_receipts
+             SET state = 'failed', response_json = ?2, updated_at_ms = ?3
+             WHERE command_id = ?1 AND state = 'pending'",
+            params![command_id, response_json, to_sqlite_integer(updated_at_ms)?],
+        )
+        .map_err(map_sqlite_error)?;
+    if updated == 1 {
+        Ok(())
+    } else {
+        Err(corrupt(format!(
+            "{description} command receipt was not pending at failure record"
         )))
     }
 }

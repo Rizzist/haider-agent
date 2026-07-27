@@ -238,6 +238,17 @@ fn verified_owner_private(path: &Path) -> bool {
     }
 }
 
+/// Resolves the release-owned default model for an EXPLICIT store directory
+/// (the `haiderd --store-dir …` path): identical precedence to
+/// [`resolve_profile`] — `HAIDER_MODEL`, then `config.json`, then the
+/// packaged constant.
+pub fn resolve_default_model_for(
+    store_dir: &Path,
+    env: &ProfileEnv,
+) -> Result<String, ProfileError> {
+    resolve_default_model(store_dir, env)
+}
+
 fn resolve_default_model(store_dir: &Path, env: &ProfileEnv) -> Result<String, ProfileError> {
     if let Some(model) = &env.model {
         return Ok(model.clone());

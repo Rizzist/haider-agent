@@ -48,6 +48,7 @@
 //! The phase machine itself lives in `lifecycle.rs`; its legal transitions are
 //! documented on [`DaemonState`] and enforced by the state publisher.
 
+mod accounts;
 mod config;
 mod connection;
 mod endpoint;
@@ -58,6 +59,10 @@ mod session_hub;
 mod turn_recovery;
 mod worker;
 
+pub use accounts::{
+    AccountsDependencies, AnthropicValidator, ConnectionTransport, CredentialValidator,
+    ValidatedIdentity, ValidationError, ValidationFailureKind, VaultProvision,
+};
 pub use config::DaemonConfig;
 pub use error::{DaemonError, IncumbentDiagnostics};
 pub use lifecycle::{DaemonState, Readiness, ShutdownDisposition, ShutdownHandle, ShutdownOutcome};

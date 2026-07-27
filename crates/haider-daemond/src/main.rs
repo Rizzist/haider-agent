@@ -53,17 +53,27 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<DaemonConfig, String
     }
     match (profile, store_dir, runtime_dir) {
         (Some(profile), Some(store_dir), Some(runtime_dir)) => {
-            Ok(DaemonConfig::new(profile, store_dir, runtime_dir))
+            let env = haider_client::ProfileEnv::capture();
+            // The identity flags are explicit, but the release-owned default
+            // model still resolves through the ONE shared precedence
+            // (HAIDER_MODEL, then <store_dir>/config.json, then packaged).
+            let default_model = haider_client::resolve_default_model_for(&store_dir, &env)
+                .map_err(|error| format!("cannot resolve default model: {error}"))?;
+            let mut config = DaemonConfig::new(profile, store_dir, runtime_dir);
+            config.default_model = default_model;
+            Ok(config)
         }
         (None, None, None) => {
             let env = haider_client::ProfileEnv::capture();
             let resolved = haider_client::resolve_profile(&env)
                 .map_err(|error| format!("cannot resolve profile: {error}"))?;
-            Ok(DaemonConfig::new(
+            let mut config = DaemonConfig::new(
                 resolved.profile_id,
                 resolved.store_dir,
                 resolved.runtime_dir,
-            ))
+            );
+            config.default_model = resolved.default_model;
+            Ok(config)
         }
         _ => Err(
             "--profile, --store-dir, and --runtime-dir must be given together (or all omitted \

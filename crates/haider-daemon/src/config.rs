@@ -63,6 +63,11 @@ pub struct DaemonConfig {
     /// production and injected runtimes from silently using different hub
     /// defaults.
     pub session_hub: SessionHubConfig,
+    /// Release-owned FULL model ID used when `account.login_api` omits
+    /// `validation_model` (R10). `haiderd` resolves it through the shared
+    /// profile resolver; the packaged default is
+    /// `haider_client::PACKAGED_DEFAULT_MODEL`.
+    pub default_model: String,
 }
 
 impl DaemonConfig {
@@ -83,6 +88,7 @@ impl DaemonConfig {
             handshake_timeout: Duration::from_secs(10),
             drain_timeout: Duration::from_secs(5),
             session_hub: SessionHubConfig::default(),
+            default_model: haider_client::PACKAGED_DEFAULT_MODEL.to_owned(),
         }
     }
 
@@ -138,6 +144,9 @@ impl DaemonConfig {
         }
         if self.drain_timeout.is_zero() {
             return Err("drain timeout must be greater than zero".into());
+        }
+        if self.default_model.trim().is_empty() {
+            return Err("default model must not be empty".into());
         }
         self.session_hub.validate()?;
         Ok(())

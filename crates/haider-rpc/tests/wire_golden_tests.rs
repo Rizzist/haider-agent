@@ -483,3 +483,121 @@ fn error_data_decodes_tolerantly_when_absent_or_unknown_kind() {
     };
     assert_eq!(data, Some(haider_rpc::ErrorData::Unknown));
 }
+
+/// MUTATION CHECK: replace `SecretWire`'s manual redacted `Debug` with a
+/// derived one (or format the raw value). Expected failure: the placeholder
+/// leaks into the formatted frame and both assertions below fail.
+#[test]
+fn stage_frame_debug_formatting_never_reveals_the_secret() {
+    let frame = WireFrame::Request {
+        request_id: haider_rpc::RequestId::new("request-stage"),
+        body: RequestBody::VaultStage {
+            stage_id: "stage-1".into(),
+            purpose: haider_rpc::StagePurpose::ApiKey,
+            secret: haider_rpc::SecretWire::new("sk-debug-sentinel-1f2e3d4c"),
+        },
+    };
+    let debug = format!("{frame:?}");
+    assert!(
+        !debug.contains("sk-debug-sentinel-1f2e3d4c"),
+        "ordinary frame formatting must never reveal a staged secret: {debug}"
+    );
+    assert!(
+        debug.contains("[REDACTED]"),
+        "redaction marker missing: {debug}"
+    );
+}
+
+/// The W3c2 account/vault methods obey the same additive tolerance rules as
+/// every v1 method: unknown fields ignored, kind-tagged method names exact,
+/// and the four W3c feature strings golden in sorted order.
+///
+/// MUTATION CHECK: add `#[serde(deny_unknown_fields)]` to `RequestBody` or
+/// rename a `vault.stage`/`account.*` tag. Expected failure: the tolerant
+/// decodes below error, or the tag round-trip changes.
+#[test]
+fn account_methods_are_kind_tagged_and_unknown_field_tolerant() {
+    for method in ["vault.stage", "account.login_api", "account.list"] {
+        let found = transcript().into_iter().any(|frame| {
+            matches!(
+                &frame,
+                WireFrame::Request { body, .. }
+                    if serde_json::to_value(body).expect("body json")["method"] == method
+            )
+        });
+        assert!(found, "transcript must pin request method {method}");
+    }
+    let login_json = format!(
+        r#"{{"v":{WIRE_PROTOCOL_VERSION},"kind":"request","request_id":"r1","body":{{
+            "method":"account.login_api","command_id":"c1","provider":"anthropic",
+            "vault_reference":"vaultref-1","future_login_field":true}}}}"#
+    );
+    let decoded: WireFrame = serde_json::from_str(&login_json).expect("tolerant login decode");
+    match decoded {
+        WireFrame::Request {
+            body:
+                RequestBody::AccountLoginApi {
+                    alias,
+                    validation_model,
+                    ..
+                },
+            ..
+        } => {
+            // Optional additive fields default to None for older writers.
+            assert_eq!(alias, None);
+            assert_eq!(validation_model, None);
+        }
+        other => panic!("expected AccountLoginApi, got {other:?}"),
+    }
+    let stage_json = format!(
+        r#"{{"v":{WIRE_PROTOCOL_VERSION},"kind":"request","request_id":"r2","body":{{
+            "method":"vault.stage","stage_id":"s1","purpose":"quantum_key","secret":"x"}}}}"#
+    );
+    let decoded: WireFrame = serde_json::from_str(&stage_json).expect("tolerant stage decode");
+    match decoded {
+        WireFrame::Request {
+            body: RequestBody::VaultStage { purpose, .. },
+            ..
+        } => assert_eq!(purpose, haider_rpc::StagePurpose::Unknown),
+        other => panic!("expected VaultStage, got {other:?}"),
+    }
+    // The four W3c feature families are golden, sorted, additive.
+    let featured = transcript()
+        .into_iter()
+        .filter_map(|frame| match frame {
+            WireFrame::Welcome(welcome) if welcome.features.len() == 4 => Some(welcome),
+            _ => None,
+        })
+        .next()
+        .expect("four-feature welcome");
+    let value = serde_json::to_value(&featured).expect("welcome json");
+    assert_eq!(
+        value["features"],
+        serde_json::json!([
+            haider_rpc::FEATURE_ACCOUNT_LOGIN_API_V1,
+            haider_rpc::FEATURE_SESSION_MUTATION_V1,
+            haider_rpc::FEATURE_TURN_CONTROL_V1,
+            haider_rpc::FEATURE_VAULT_STAGE_V1,
+        ])
+    );
+}
+
+/// An old daemon that predates the account surface answers the new methods
+/// as `Unknown` (never a panic), and an old CLIENT tolerates the new
+/// response methods the same way — the additive-wire law in both directions.
+#[test]
+fn account_methods_decode_as_unknown_for_older_readers() {
+    // A pre-W3c2 reader is simulated by an arbitrary future method name:
+    // the open enum treats every unimplemented method identically.
+    let future = format!(
+        r#"{{"v":{WIRE_PROTOCOL_VERSION},"kind":"response","request_id":"r9","body":{{"method":"account.future_login_v9","x":1}}}}"#
+    );
+    let decoded: WireFrame = serde_json::from_str(&future).expect("tolerant response decode");
+    assert_eq!(
+        decoded,
+        WireFrame::Response {
+            request_id: haider_rpc::RequestId::new("r9"),
+            body: ResponseBody::Unknown,
+        }
+    );
+}

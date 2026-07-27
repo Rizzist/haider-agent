@@ -8,6 +8,7 @@
 use haider_core::{
     HarnessActor, HarnessConfig, SqliteStoreHandle, StoreHandle, SubmitCommittedTurn,
 };
+use haider_daemon::ConnectionTransport;
 use haider_daemon::{
     AdmissionTicket, FrameSendError, FrameSink, HubConnection, HubObservation, SendAdmission,
     SessionHub, SessionHubConfig, SessionHubObserver, SessionHubShutdownOutcome,
@@ -515,8 +516,12 @@ async fn replay_live_barrier_is_contiguous_at_every_forced_boundary() {
 
     let sink = Arc::new(CollectSink::default());
     let connection = Arc::new(
-        hub.open_connection(capabilities(), sink.clone())
-            .expect("connection opens"),
+        hub.open_connection(
+            capabilities(),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection opens"),
     );
     let attach = tokio::spawn({
         let connection = Arc::clone(&connection);
@@ -633,7 +638,11 @@ async fn full_internal_catch_up_receiver_reregisters_and_resumes_from_store() {
 
     let sink = Arc::new(CollectSink::default());
     let connection = hub
-        .open_connection(capabilities(), sink.clone())
+        .open_connection(
+            capabilities(),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
         .expect("connection");
     connection
         .request(
@@ -687,7 +696,11 @@ async fn cursor_ahead_is_correlated_and_carries_recovery_coordinates() {
     append_one(&hub, &session_id, store.worker_generation(), "one").await;
     let sink = Arc::new(CollectSink::default());
     let connection = hub
-        .open_connection(capabilities(), sink.clone())
+        .open_connection(
+            capabilities(),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
         .expect("connection");
     connection
         .request(
@@ -731,8 +744,12 @@ async fn detach_mid_replay_purges_and_leaks_no_later_event() {
     }
     let sink = Arc::new(CollectSink::default());
     let connection = Arc::new(
-        hub.open_connection(capabilities(), sink.clone())
-            .expect("connection"),
+        hub.open_connection(
+            capabilities(),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection"),
     );
     connection
         .request(
@@ -800,7 +817,11 @@ async fn list_uses_opaque_stable_order_cursor_and_read_does_not_subscribe() {
     }
     let sink = Arc::new(CollectSink::default());
     let connection = hub
-        .open_connection(capabilities(), sink.clone())
+        .open_connection(
+            capabilities(),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
         .expect("connection");
     connection
         .request(
@@ -900,7 +921,11 @@ async fn slow_client_is_lagged_and_store_resume_is_contiguous() {
 
     let slow = Arc::new(SlowSink::new(1));
     let connection = hub
-        .open_connection(capabilities(), slow.clone())
+        .open_connection(
+            capabilities(),
+            slow.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
         .expect("slow connection");
     connection
         .request(
@@ -929,7 +954,11 @@ async fn slow_client_is_lagged_and_store_resume_is_contiguous() {
 
     let resumed = Arc::new(CollectSink::default());
     let resumed_connection = hub
-        .open_connection(capabilities(), resumed.clone())
+        .open_connection(
+            capabilities(),
+            resumed.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
         .expect("resume connection");
     resumed_connection
         .request(
@@ -984,7 +1013,11 @@ async fn many_concurrent_cursors_each_receive_their_exact_suffix() {
             tokio::spawn(async move {
                 let sink = Arc::new(CollectSink::default());
                 let connection = hub
-                    .open_connection(capabilities(), sink.clone())
+                    .open_connection(
+                        capabilities(),
+                        sink.clone(),
+                        ConnectionTransport::LocalSameUid,
+                    )
                     .expect("connection");
                 connection
                     .request(
@@ -1031,7 +1064,11 @@ async fn control_requires_a_control_attachment_to_the_target_session() {
     let (_root, store, hub) = open_hub(None, 8).await;
     let sink = Arc::new(CollectSink::default());
     let connection = hub
-        .open_connection(capabilities(), sink.clone())
+        .open_connection(
+            capabilities(),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
         .expect("connection");
     connection
         .menu_answer(
@@ -1069,7 +1106,11 @@ async fn begin_draining_synchronously_rejects_new_connection_work() {
     append_one(&hub, &session_id, store.worker_generation(), "initial").await;
     let sink = Arc::new(CollectSink::default());
     let connection = hub
-        .open_connection(capabilities(), sink.clone())
+        .open_connection(
+            capabilities(),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
         .expect("connection opens before drain");
 
     hub.begin_draining();
@@ -1090,7 +1131,10 @@ async fn begin_draining_synchronously_rejects_new_connection_work() {
             body: ResponseBody::Error { ref code, .. },
         } if request_id.as_str() == "during-drain" && code == "draining"
     ));
-    assert!(hub.open_connection(capabilities(), sink).is_err());
+    assert!(
+        hub.open_connection(capabilities(), sink, ConnectionTransport::LocalSameUid)
+            .is_err()
+    );
 
     connection.close().await.expect("connection closes");
     hub.shutdown().await.expect("hub stops");
@@ -1117,8 +1161,12 @@ async fn n_way_menu_answer_race_has_one_streamed_winner_and_correlated_losers() 
     for index in 0..8 {
         let sink = Arc::new(CollectSink::default());
         let connection = Arc::new(
-            hub.open_connection(capabilities(), sink.clone())
-                .expect("connection"),
+            hub.open_connection(
+                capabilities(),
+                sink.clone(),
+                ConnectionTransport::LocalSameUid,
+            )
+            .expect("connection"),
         );
         connection
             .request(
@@ -1381,7 +1429,11 @@ async fn committed_menu_event_wakes_registered_harness_exactly_once() {
 
     let sink = Arc::new(CollectSink::default());
     let connection = hub
-        .open_connection(capabilities(), sink.clone())
+        .open_connection(
+            capabilities(),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
         .expect("connection");
     connection
         .request(
@@ -1483,7 +1535,11 @@ async fn lost_menu_success_response_is_recovered_from_stream_and_idempotent_retr
 
     let lost = Arc::new(LostSuccessSink::default());
     let first = hub
-        .open_connection(capabilities(), lost.clone())
+        .open_connection(
+            capabilities(),
+            lost.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
         .expect("first connection");
     first
         .request(
@@ -1523,7 +1579,11 @@ async fn lost_menu_success_response_is_recovered_from_stream_and_idempotent_retr
 
     let retry_sink = Arc::new(CollectSink::default());
     let retry = hub
-        .open_connection(capabilities(), retry_sink.clone())
+        .open_connection(
+            capabilities(),
+            retry_sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
         .expect("retry connection");
     retry
         .request(
@@ -1590,7 +1650,11 @@ async fn cancelled_shutdown_future_still_aborts_every_owned_hub_task() {
 
     let sink = Arc::new(CollectSink::default());
     let connection = hub
-        .open_connection(capabilities(), sink.clone())
+        .open_connection(
+            capabilities(),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
         .expect("connection");
     connection
         .request(
@@ -1674,7 +1738,7 @@ async fn drain_during_replay_owns_replay_completion_before_store_close() {
     }
     let sink = Arc::new(CollectSink::default());
     let connection = Arc::new(
-        hub.open_connection(capabilities(), sink)
+        hub.open_connection(capabilities(), sink, ConnectionTransport::LocalSameUid)
             .expect("connection"),
     );
     let attach = tokio::spawn({
@@ -1747,7 +1811,11 @@ async fn attachment_after_menu_opened_learns_pending_menu_from_replay() {
 
     let sink = Arc::new(CollectSink::default());
     let connection = hub
-        .open_connection(capabilities(), sink.clone())
+        .open_connection(
+            capabilities(),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
         .expect("connection");
     connection
         .request(
@@ -1795,7 +1863,11 @@ async fn stale_worker_generation_menu_answer_is_rejected_and_fenced() {
     hub.append(&mut opening).await.expect("menu opens");
     let sink = Arc::new(CollectSink::default());
     let connection = hub
-        .open_connection(capabilities(), sink.clone())
+        .open_connection(
+            capabilities(),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
         .expect("connection");
     connection
         .request(
@@ -1879,7 +1951,11 @@ async fn recovered_menu_coordinate_authorizes_losers_after_the_winner_commits() 
 
     let sink = Arc::new(CollectSink::default());
     let connection = hub
-        .open_connection(capabilities(), sink.clone())
+        .open_connection(
+            capabilities(),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
         .expect("connection");
     connection
         .request(
@@ -2013,7 +2089,11 @@ async fn per_connection_attachment_cap_rejects_overloaded_and_readmits_after_det
     append_one(&hub, &session_id, store.worker_generation(), "seed").await;
     let sink = Arc::new(CollectSink::default());
     let connection = hub
-        .open_connection(capabilities(), sink.clone())
+        .open_connection(
+            capabilities(),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
         .expect("connection");
 
     let first = attach_caught_up(&connection, &sink, &session_id, "attach-1").await;
@@ -2079,11 +2159,19 @@ async fn global_attachment_cap_binds_independently_of_per_connection_headroom() 
     append_one(&hub, &session_id, store.worker_generation(), "seed").await;
     let first_sink = Arc::new(CollectSink::default());
     let first = hub
-        .open_connection(capabilities(), first_sink.clone())
+        .open_connection(
+            capabilities(),
+            first_sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
         .expect("first connection");
     let second_sink = Arc::new(CollectSink::default());
     let second = hub
-        .open_connection(capabilities(), second_sink.clone())
+        .open_connection(
+            capabilities(),
+            second_sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
         .expect("second connection");
 
     let held = attach_caught_up(&first, &first_sink, &session_id, "first-1").await;
@@ -2155,7 +2243,11 @@ async fn catch_up_byte_budget_trips_long_before_the_frame_count_and_resumes_from
 
     let sink = Arc::new(CollectSink::default());
     let connection = hub
-        .open_connection(capabilities(), sink.clone())
+        .open_connection(
+            capabilities(),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
         .expect("connection");
     connection
         .request(
@@ -2264,7 +2356,11 @@ async fn commit_pressure_behind_a_stalled_outbox_laggs_and_detaches() {
         parked: Mutex::new(Vec::new()),
     });
     let connection = hub
-        .open_connection(capabilities(), sink.clone())
+        .open_connection(
+            capabilities(),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
         .expect("connection");
     connection
         .request(
@@ -2352,7 +2448,11 @@ async fn graceful_drain_broadcasts_an_in_flight_commit_before_teardown() {
     append_one(&hub, &session_id, generation, "initial").await;
     let sink = Arc::new(CollectSink::default());
     let connection = hub
-        .open_connection(capabilities(), sink.clone())
+        .open_connection(
+            capabilities(),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
         .expect("connection");
     connection
         .request(
@@ -2431,8 +2531,12 @@ async fn cancelled_registration_refunds_its_admission_slot() {
     append_one(&hub, &session_id, store.worker_generation(), "seed").await;
     let sink = Arc::new(CollectSink::default());
     let connection = Arc::new(
-        hub.open_connection(capabilities(), sink.clone())
-            .expect("connection"),
+        hub.open_connection(
+            capabilities(),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection"),
     );
 
     let attach = tokio::spawn({
@@ -2577,7 +2681,11 @@ async fn undelivered_attach_response_is_answered_with_a_correlated_error_not_lag
     append_one(&hub, &session_id, generation, "seed").await;
     let sink = Arc::new(UndeliveredResponseSink::default());
     let connection = hub
-        .open_connection(capabilities(), sink.clone())
+        .open_connection(
+            capabilities(),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
         .expect("connection");
     connection
         .request(
@@ -2650,7 +2758,11 @@ async fn graceful_drain_store_resumes_a_pending_lag_suffix() {
     append_one(&hub, &session_id, generation, "seed").await;
     let sink = Arc::new(CollectSink::default());
     let connection = hub
-        .open_connection(capabilities(), sink.clone())
+        .open_connection(
+            capabilities(),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
         .expect("connection");
     connection
         .request(
@@ -2746,7 +2858,11 @@ async fn final_suffix_store_read_failure_forces_the_shutdown_outcome() {
     append_one(&hub, &session_id, generation, "seed").await;
     let sink = Arc::new(CollectSink::default());
     let connection = hub
-        .open_connection(capabilities(), sink.clone())
+        .open_connection(
+            capabilities(),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
         .expect("connection");
     connection
         .request(
@@ -2831,7 +2947,11 @@ async fn oversized_envelope_takes_the_store_resume_path_exactly_once() {
     append_one(&hub, &session_id, generation, "seed").await;
     let sink = Arc::new(CollectSink::default());
     let connection = hub
-        .open_connection(capabilities(), sink.clone())
+        .open_connection(
+            capabilities(),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
         .expect("connection");
     connection
         .request(
@@ -3187,8 +3307,12 @@ async fn combined_pressure_five_lanes_large_envelopes_and_live_commits_lag_no_re
     // Tight bounds: ~6 large frames or ~48 KiB in flight across 6 lanes.
     let sink = Arc::new(BoundedReaderSink::new(6, 48 * 1024));
     let connection = Arc::new(
-        hub.open_connection(capabilities(), sink.clone())
-            .expect("connection"),
+        hub.open_connection(
+            capabilities(),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection"),
     );
     for (index, session_id) in sessions.iter().enumerate() {
         connection

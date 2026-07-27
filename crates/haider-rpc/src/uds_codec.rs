@@ -7,6 +7,7 @@
 
 use crate::codec::{decode_json, encode_json};
 use crate::{CodecError, WireFrame};
+use zeroize::{Zeroize, Zeroizing};
 
 const PREFIX_LEN: usize = 4;
 
@@ -34,6 +35,42 @@ pub fn encode(frame: &WireFrame, frame_limit: usize) -> Result<Vec<u8>, CodecErr
     framed.extend_from_slice(&body_len.to_be_bytes());
     framed.extend_from_slice(&body);
     Ok(framed)
+}
+
+/// Sensitive encode path (R7): identical bytes to [`encode`], but the
+/// intermediate JSON body buffer is zeroized here and the returned framed
+/// buffer zeroizes itself on drop — a writer that drops it after the socket
+/// write leaves no plaintext copy of a staged secret in freed memory.
+///
+/// Residual, stated honestly: serialization may reallocate while growing its
+/// buffer; bytes left in a superseded allocation are not reachable for
+/// scrubbing (the same residual every `Vec`-backed serializer has).
+pub fn encode_zeroizing(
+    frame: &WireFrame,
+    frame_limit: usize,
+) -> Result<Zeroizing<Vec<u8>>, CodecError> {
+    let mut body = encode_json(frame, frame_limit)?;
+    let result = (|| {
+        let body_len = u32::try_from(body.len()).map_err(|_| CodecError::LengthPrefixOverflow {
+            body_len: body.len(),
+        })?;
+        let total_len = PREFIX_LEN
+            .checked_add(body.len())
+            .ok_or(CodecError::AllocationFailed {
+                requested: body.len(),
+            })?;
+        let mut framed = Vec::new();
+        framed
+            .try_reserve_exact(total_len)
+            .map_err(|_| CodecError::AllocationFailed {
+                requested: total_len,
+            })?;
+        framed.extend_from_slice(&body_len.to_be_bytes());
+        framed.extend_from_slice(&body);
+        Ok(Zeroizing::new(framed))
+    })();
+    body.zeroize();
+    result
 }
 
 #[derive(Debug)]
@@ -85,6 +122,10 @@ impl DecodeBatch {
 pub struct Decoder {
     frame_limit: usize,
     state: DecodeState,
+    /// Sensitive inbound path (R7): zeroize every completed body buffer
+    /// after deserialize, and any partial body on drop, so a staged secret's
+    /// wire bytes do not linger in freed decoder memory.
+    zeroize_bodies: bool,
 }
 
 impl Decoder {
@@ -96,7 +137,16 @@ impl Decoder {
                 bytes: [0; PREFIX_LEN],
                 filled: 0,
             },
+            zeroize_bodies: false,
         }
+    }
+
+    /// Creates a decoder that additionally zeroizes inbound body buffers
+    /// after deserialize (the daemon's sensitive same-UID UDS path).
+    pub fn new_zeroizing(frame_limit: usize) -> Self {
+        let mut decoder = Self::new(frame_limit);
+        decoder.zeroize_bodies = true;
+        decoder
     }
 
     /// Returns whether a prior protocol violation permanently poisoned this
@@ -144,7 +194,7 @@ impl Decoder {
                     chunk = &chunk[take..];
 
                     if bytes.len() == *announced_len {
-                        let body = match std::mem::replace(
+                        let mut body = match std::mem::replace(
                             &mut self.state,
                             DecodeState::Prefix {
                                 bytes: [0; PREFIX_LEN],
@@ -157,17 +207,18 @@ impl Decoder {
                                 return DecodeBatch::failed(frames, CodecError::DecoderPoisoned);
                             }
                         };
-                        match std::str::from_utf8(&body) {
-                            Ok(_) => match decode_json(&body, self.frame_limit) {
-                                Ok(frame) => frames.push(frame),
-                                Err(error) => {
-                                    self.state = DecodeState::Poisoned;
-                                    return DecodeBatch::failed(frames, error);
-                                }
-                            },
+                        let decoded = match std::str::from_utf8(&body) {
+                            Ok(_) => decode_json(&body, self.frame_limit),
+                            Err(error) => Err(CodecError::InvalidUtf8(error)),
+                        };
+                        if self.zeroize_bodies {
+                            body.zeroize();
+                        }
+                        match decoded {
+                            Ok(frame) => frames.push(frame),
                             Err(error) => {
                                 self.state = DecodeState::Poisoned;
-                                return DecodeBatch::failed(frames, CodecError::InvalidUtf8(error));
+                                return DecodeBatch::failed(frames, error);
                             }
                         }
                     }
@@ -205,5 +256,17 @@ impl Decoder {
             bytes,
         };
         Ok(())
+    }
+}
+
+impl Drop for Decoder {
+    fn drop(&mut self) {
+        // Sensitive path: a decoder discarded mid-frame (connection close)
+        // must not leave a partially buffered secret body behind.
+        if self.zeroize_bodies
+            && let DecodeState::Body { bytes, .. } = &mut self.state
+        {
+            bytes.zeroize();
+        }
     }
 }

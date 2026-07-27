@@ -41,9 +41,10 @@ use crate::session_hub::{
     AdmissionTicket, FrameSendError, FrameSink, HubConnection, SendAdmission, SessionHub,
 };
 use haider_rpc::{
-    AttachmentId, Capability, CapabilitySet, ERROR_CODE_OVERLOADED, FEATURE_SESSION_MUTATION_V1,
-    FEATURE_TURN_CONTROL_V1, Hello, LifecyclePhase, ProtocolError, RequestId, ServerRange, Welcome,
-    WireFrame, negotiate, uds_codec,
+    AttachmentId, Capability, CapabilitySet, ERROR_CODE_OVERLOADED, FEATURE_ACCOUNT_LOGIN_API_V1,
+    FEATURE_SESSION_MUTATION_V1, FEATURE_TURN_CONTROL_V1, FEATURE_VAULT_STAGE_V1, Hello,
+    LifecyclePhase, ProtocolError, RequestId, ServerRange, Welcome, WireFrame, negotiate,
+    uds_codec,
 };
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::PathBuf;
@@ -816,7 +817,9 @@ pub(crate) async fn serve(
         unowned.0.abort();
     }
 
-    let mut decoder = uds_codec::Decoder::new(context.frame_limit);
+    // Sensitive inbound path (R7): body buffers are zeroized after
+    // deserialize so staged secrets never linger in freed decoder memory.
+    let mut decoder = uds_codec::Decoder::new_zeroizing(context.frame_limit);
     let mut buffer = [0_u8; 16 * 1024];
     // Inbound capacity is deliberately one handler: bytes enter through this
     // fixed read buffer and bounded decoder, and every decoded command is
@@ -1109,7 +1112,13 @@ async fn handle_frame(
             *hub_connection = Some(
                 context
                     .hub
-                    .open_connection(granted.capabilities.clone(), sink)
+                    // UDS with the peer-UID gate already passed: the one
+                    // transport allowed to stage raw secrets (R7).
+                    .open_connection(
+                        granted.capabilities.clone(),
+                        sink,
+                        crate::accounts::ConnectionTransport::LocalSameUid,
+                    )
                     .map_err(DaemonError::from)?,
             );
         }
@@ -1230,8 +1239,10 @@ fn negotiate_hello(
             lifecycle_phase,
             capabilities_granted: negotiated.capabilities_granted.clone(),
             features: BTreeSet::from([
+                FEATURE_ACCOUNT_LOGIN_API_V1.to_owned(),
                 FEATURE_SESSION_MUTATION_V1.to_owned(),
                 FEATURE_TURN_CONTROL_V1.to_owned(),
+                FEATURE_VAULT_STAGE_V1.to_owned(),
             ]),
         }),
         outbound_limit,

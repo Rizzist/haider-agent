@@ -107,7 +107,37 @@ impl StoreLike for JsonFileStore {
             .map_err(|error| file_error("write", &temporary_path, error))?;
         drop(temporary);
         fs::rename(&temporary_path, &self.path)
-            .map_err(|error| file_error("replace", &self.path, error))
+            .map_err(|error| file_error("replace", &self.path, error))?;
+        // R10 hardening: the rename is durable only once the PARENT
+        // DIRECTORY is synced — the pending-login receipt reconciliation
+        // protocol relies on a post-crash descriptor file reflecting every
+        // acknowledged save.
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| file_error("sync parent directory of", &self.path, error))
+    }
+}
+
+/// Boxed stores forward verbatim, so the daemon can inject test persistence
+/// behind one owned `AccountStore<Box<dyn StoreLike>>`.
+impl StoreLike for Box<dyn StoreLike> {
+    fn load(&self) -> AccountsResult<Vec<CredentialDescriptor>> {
+        self.as_ref().load()
+    }
+
+    fn save(&self, descriptors: &[CredentialDescriptor]) -> AccountsResult<()> {
+        self.as_ref().save(descriptors)
+    }
+}
+
+/// Shared stores forward verbatim (cloneable injection seam).
+impl StoreLike for std::sync::Arc<dyn StoreLike> {
+    fn load(&self) -> AccountsResult<Vec<CredentialDescriptor>> {
+        self.as_ref().load()
+    }
+
+    fn save(&self, descriptors: &[CredentialDescriptor]) -> AccountsResult<()> {
+        self.as_ref().save(descriptors)
     }
 }
 

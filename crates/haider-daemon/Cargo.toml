@@ -19,9 +19,11 @@ haider-provider = { path = "../haider-provider" }
 haider-rpc = { path = "../haider-rpc" }
 haider-tools = { path = "../haider-tools" }
 rustix.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 haider-store = { path = "../haider-store" }

@@ -116,6 +116,9 @@ pub trait TurnToolFactory: Send + Sync {
 pub struct DaemonDependencies {
     pub provider_factory: Arc<dyn ProviderFactory>,
     pub tool_factory: Arc<dyn TurnToolFactory>,
+    /// Account machinery (vault, credential validator, descriptor store) —
+    /// the W3c2 login seam (`crate::accounts`).
+    pub accounts: crate::accounts::AccountsDependencies,
 }
 
 impl Default for DaemonDependencies {
@@ -123,6 +126,7 @@ impl Default for DaemonDependencies {
         Self {
             provider_factory: Arc::new(UnconfiguredProviderFactory),
             tool_factory: Arc::new(BrokerToolFactory),
+            accounts: crate::accounts::AccountsDependencies::default(),
         }
     }
 }

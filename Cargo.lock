@@ -807,10 +807,12 @@ dependencies = [
  "haider-store",
  "haider-tools",
  "rustix 1.1.4",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
@@ -818,6 +820,7 @@ name = "haider-daemond"
 version = "0.0.11"
 dependencies = [
  "async-trait",
+ "haider-accounts",
  "haider-client",
  "haider-core",
  "haider-daemon",
@@ -861,6 +864,7 @@ dependencies = [
  "haider-protocol",
  "serde",
  "serde_json",
+ "zeroize",
 ]
 
 [[package]]

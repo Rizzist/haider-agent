@@ -30,7 +30,8 @@ pub use actor::{
 };
 pub use fake_store::MemoryStore;
 pub use haider_store::{
-    AcceptedTurn, CancelledTurn, CreatedSession, MenuResolutionCommand, MenuResolutionOutcome,
+    AcceptedTurn, CancelledTurn, CreatedSession, LoginClaim, LoginReceiptFailure,
+    LoginReceiptResponse, LoginReceiptRow, MenuResolutionCommand, MenuResolutionOutcome,
     SessionCreateCommand, SessionCreateOutcome, TurnAcceptCommand, TurnAcceptOutcome,
     TurnAdmissionDisposition, TurnCancelCommand, TurnCancelOutcome, TurnCancellationStatus,
 };

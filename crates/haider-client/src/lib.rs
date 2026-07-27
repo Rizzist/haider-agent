@@ -27,7 +27,7 @@ pub use client::{
 pub use profile::{
     DEFAULT_MAX_TOKENS, DEFAULT_PROVIDER, MODEL_ENV, PACKAGED_DEFAULT_MODEL, PROFILE_CONFIG_FILE,
     PROFILE_DIR_ENV, ProfileEnv, ProfileError, ResolvedProfile, effective_uid, endpoint_path_for,
-    resolve_profile,
+    resolve_default_model_for, resolve_profile,
 };
 pub use spawn::{
     DAEMON_LOG_FILE, EnsureError, EnsureOptions, EnsuredDaemon, RACE_LOSER_EXIT_CODE,
