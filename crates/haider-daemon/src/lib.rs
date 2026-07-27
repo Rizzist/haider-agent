@@ -61,8 +61,8 @@ pub use error::{DaemonError, IncumbentDiagnostics};
 pub use lifecycle::{DaemonState, Readiness, ShutdownDisposition, ShutdownHandle, ShutdownOutcome};
 pub use runtime::{DaemonTask, run_with_signals, spawn};
 pub use session_hub::{
-    FrameSendError, FrameSink, HubConnection, HubObservation, SendAdmission, SessionHub,
-    SessionHubConfig, SessionHubError, SessionHubObserver,
+    AdmissionTicket, FrameSendError, FrameSink, HubConnection, HubObservation, SendAdmission,
+    SessionHub, SessionHubConfig, SessionHubError, SessionHubObserver, SessionHubShutdownOutcome,
 };
 
 /// Crate marker used by the workspace self-test.

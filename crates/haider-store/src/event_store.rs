@@ -18,7 +18,7 @@ use crate::profile_lock::ProfileLock;
 use crate::{Cas, StoreResult, now_ms, store_error, to_sqlite_integer};
 use haider_protocol::EventPayload;
 use haider_protocol::envelope::{
-    EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
+    EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION, envelope_weight_bytes,
 };
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::{ArtifactRef, DeviceId, EventId, MenuId, SessionId};
@@ -302,16 +302,18 @@ impl Store {
         Ok(outcome)
     }
 
-    /// Reads one byte-budgeted replay page: committed envelopes with
-    /// `seq > since_seq` in sequence order, ending early once the accumulated
-    /// stored-JSON size would exceed `byte_budget`.
+    /// Reads one true-weight-budgeted replay page: committed envelopes with
+    /// `seq > since_seq` in sequence order.
     ///
-    /// Additive daemon seam (like [`Self::resolve_menu`]): it bounds the
-    /// TRANSIENT memory one page may materialize, which an envelope-count
-    /// limit alone cannot. Progress guarantee: a non-empty result always
-    /// contains at least one envelope even when that single envelope exceeds
-    /// the budget, so a byte-paged reader can never stall. Rows past the
-    /// cut-off are never fetched from SQLite; the next page resumes from the
+    /// Additive daemon seam (like [`Self::resolve_menu`]): an envelope-count
+    /// limit alone cannot bound the transient memory. The exact page bound is
+    /// `byte_budget + one maximally-sized committed row` in true-weight units:
+    /// retained rows stop at the budget, while one candidate row may be
+    /// materialized to identify the cut-off. A non-empty result always
+    /// contains at least one envelope even when that first row exceeds the
+    /// budget, and stops immediately afterward. That one-row progress
+    /// guarantee keeps a byte-paged reader from stalling; it is also why the
+    /// extra row must be stated explicitly. The next page resumes from the
     /// caller's last-received sequence (keyset, no prefix re-read).
     pub fn read_page(
         &self,
@@ -347,9 +349,6 @@ impl Store {
         while let Some(row) = rows.next().map_err(map_sqlite_error)? {
             let stored_seq: i64 = row.get(0).map_err(map_sqlite_error)?;
             let envelope_json: String = row.get(1).map_err(map_sqlite_error)?;
-            if !envelopes.is_empty() && spent.saturating_add(envelope_json.len()) > byte_budget {
-                break;
-            }
             let stored_event_id: String = row.get(2).map_err(map_sqlite_error)?;
             let stored_committed_at_ms: i64 = row.get(3).map_err(map_sqlite_error)?;
             let envelope: RawEnvelope = serde_json::from_str(&envelope_json).map_err(|error| {
@@ -364,8 +363,15 @@ impl Store {
                 stored_committed_at_ms,
                 &envelope,
             )?;
-            spent = spent.saturating_add(envelope_json.len());
+            let weight = envelope_weight_bytes(&envelope);
+            if !envelopes.is_empty() && spent.saturating_add(weight) > byte_budget {
+                break;
+            }
+            spent = spent.saturating_add(weight);
             envelopes.push(envelope);
+            if spent >= byte_budget {
+                break;
+            }
         }
         Ok(envelopes)
     }

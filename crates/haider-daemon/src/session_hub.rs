@@ -67,12 +67,16 @@
 //! through [`SessionHub::register_harness`] and must use the hub as their
 //! `StoreHandle` (see [`SessionHub::append`]).
 
+#[cfg(test)]
+#[path = "session_hub_private_tests.rs"]
+mod session_hub_private_tests;
+
 use crate::DaemonError;
 use async_trait::async_trait;
 use haider_core::{
     HarnessHandle, MenuResolutionCommand, MenuResolutionOutcome, SqliteStoreHandle, StoreHandle,
 };
-use haider_protocol::envelope::RawEnvelope;
+use haider_protocol::envelope::{RawEnvelope, envelope_weight_bytes};
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::{DeviceId, SessionId};
 use haider_protocol::menu::{AnswerVia, MenuAnswer as DurableMenuAnswer};
@@ -88,7 +92,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 const REPLAY_PAGE_SIZE: usize = 256;
@@ -105,24 +109,28 @@ pub struct SessionHubConfig {
     /// Commits after `H` retained while one attachment replays (frame count;
     /// `catch_up_byte_budget` bounds the same channel in bytes).
     pub catch_up_capacity: usize,
-    /// Estimated bytes of committed envelopes one attachment's catch-up
-    /// channel may retain — a HARD ceiling. Overflow (including a single
-    /// envelope larger than the whole budget) takes the exact same
-    /// nonblocking lag-then-store-resume transition as a full frame count;
-    /// [`publish`] states the rule.
+    /// True-weight units of committed envelopes one attachment's catch-up
+    /// channel may retain — a HARD ceiling. [`envelope_weight_bytes`] counts
+    /// the full envelope value, every owned ID string, and conservative
+    /// payload heap overhead. Overflow (including a single envelope larger
+    /// than the whole budget) takes the exact same nonblocking
+    /// lag-then-store-resume transition as a full frame count; [`publish`]
+    /// states the rule.
     ///
-    /// Aggregate worst case (W3b1 documentation standard), now exact: at the
-    /// default caps, `max_attachments` × this budget = 256 × 8 MiB = 2 GiB
-    /// of retained catch-up clones, plus up to one
-    /// `replay_page_byte_budget` transient per live replay (≤ 256 MiB at the
-    /// defaults) — ADDITIVE to the per-connection outbox ceiling stated on
-    /// `connection.rs`'s `OutboundLane` (ordinary budget + reply floor +
-    /// drain notice; ~1 GiB ordinary at the defaults across 64 connections).
-    /// Operators sizing small hosts tune these caps together.
+    /// Aggregate catch-up worst case is exactly `max_attachments ×
+    /// catch_up_byte_budget` true-weight units: 256 × 8 MiB = 2 GiB at the
+    /// defaults. Replay pages are additive and have a different exact bound:
+    /// each live replay may materialize `replay_page_byte_budget + one
+    /// maximally-sized committed row`. `read_page` guarantees at least one
+    /// row for progress even when that row exceeds its page budget, so the
+    /// extra row is part of the bound, not hidden inside the nominal 1 MiB.
+    /// These are additive to the per-connection outbox ceiling stated on
+    /// `connection.rs`'s `OutboundLane`. Operators sizing small hosts tune
+    /// these caps together.
     pub catch_up_byte_budget: usize,
-    /// Stored-JSON bytes one replay store page may materialize
-    /// (`Store::read_page`); the page ends early when the budget fills and
-    /// the next page resumes from the last delivered sequence.
+    /// True-weight units one replay store page may retain
+    /// (`Store::read_page`); the page ends when the budget fills and the next
+    /// page resumes from the last delivered sequence.
     pub replay_page_byte_budget: usize,
     /// Attachments one connection may hold concurrently. The N+1th
     /// `SessionAttach` is rejected with the correlated, retryable
@@ -162,6 +170,12 @@ pub enum SendAdmission {
     /// exceeds the negotiated frame limit). The caller detaches.
     Refused,
 }
+
+/// Opaque identity and reusable wake permit for one FIFO admission waiter.
+///
+/// The sink retains weak references in its existing waiter queue; pointer
+/// identity is the reservation token, so no numeric ticket counter exists.
+pub type AdmissionTicket = Arc<Notify>;
 
 /// A nonblocking destination for frames produced by one hub connection.
 ///
@@ -215,14 +229,32 @@ pub trait FrameSink: Send + Sync {
         }
     }
 
-    /// Enqueues one FIFO admission ticket; the sink fires tickets in arrival
-    /// order as capacity frees, so `Busy` waiters are served first-come and
-    /// a hot lane cannot systematically leapfrog a queued cold one. `None`
+    /// Re-offers with the reservation token returned by
+    /// [`Self::drain_ticket`]. A sink that can answer `Busy` must admit
+    /// ordinary attachment traffic only when its waiter queue is empty or
+    /// this token identifies the head waiter. The default suits sinks that
+    /// never answer `Busy`.
+    fn offer_ticketed(
+        &self,
+        attachment_id: &AttachmentId,
+        frame: &WireFrame,
+        _ticket: &AdmissionTicket,
+    ) -> SendAdmission {
+        self.offer(attachment_id, frame)
+    }
+
+    /// Enqueues one FIFO admission ticket. Capacity wakes the head without
+    /// consuming its reservation; only successful admission removes it, so
+    /// a fresh offer cannot barge between notification and service. `None`
     /// (the default) means the sink never answers `Busy` and refusal is the
     /// only arbiter. See the trait-level pairing/liveness contract.
-    fn drain_ticket(&self) -> Option<oneshot::Receiver<()>> {
+    fn drain_ticket(&self) -> Option<AdmissionTicket> {
         None
     }
+
+    /// Removes an unconsumed ticket when delivery is cancelled or refused.
+    /// A bounded sink must wake the next live head if this token owned it.
+    fn cancel_ticket(&self, _ticket: &AdmissionTicket) {}
 }
 
 /// A bounded sink refused a frame.
@@ -288,6 +320,10 @@ pub enum HubObservation {
         attachment_id: AttachmentId,
         seq: u64,
     },
+    FinalSuffixHeadCaptured {
+        attachment_id: AttachmentId,
+        head: u64,
+    },
 }
 
 /// Optional boundary observer. Implementations must return promptly outside
@@ -317,7 +353,7 @@ struct HubInner {
     observer: Arc<dyn SessionHubObserver>,
     actors: Mutex<HashMap<SessionId, SessionActorHandle>>,
     actor_tasks: Mutex<Vec<JoinHandle<()>>>,
-    replay_tasks: Mutex<Vec<JoinHandle<()>>>,
+    replay_tasks: Mutex<Vec<JoinHandle<ReplayCompletion>>>,
     attachments: Mutex<HashMap<AttachmentId, AttachmentOwner>>,
     /// Admission ledger for the per-connection and global attachment caps.
     /// A slot is reserved BEFORE any actor or channel work and released when
@@ -391,28 +427,34 @@ impl Drop for ForcedStopGuard {
 /// `Drop` body, so an actor resuming from a synchronous boundary on another
 /// worker observes the fence before — never after — its task is aborted and
 /// refuses queued work instead of starting an uncancellable store write.
-struct OwnedTasks {
-    handles: Vec<JoinHandle<()>>,
+struct OwnedTasks<T> {
+    handles: Vec<JoinHandle<T>>,
     force_stop: Arc<AtomicBool>,
 }
 
-impl OwnedTasks {
-    fn new(handles: Vec<JoinHandle<()>>, force_stop: Arc<AtomicBool>) -> Self {
+impl<T> OwnedTasks<T> {
+    fn new(handles: Vec<JoinHandle<T>>, force_stop: Arc<AtomicBool>) -> Self {
         Self {
             handles,
             force_stop,
         }
     }
 
-    async fn join_all(&mut self) {
+    async fn join_all(&mut self) -> Vec<Result<T, tokio::task::JoinError>> {
+        let mut outcomes = Vec::with_capacity(self.handles.len());
         while let Some(handle) = self.handles.last_mut() {
-            let _ = handle.await;
+            // Keep the handle inside `self` while it is awaited: cancelling
+            // this join future must leave it visible to `Drop`, which raises
+            // the fence and aborts every still-owned task.
+            let outcome = handle.await;
             self.handles.pop();
+            outcomes.push(outcome);
         }
+        outcomes
     }
 }
 
-impl Drop for OwnedTasks {
+impl<T> Drop for OwnedTasks<T> {
     fn drop(&mut self) {
         if self.handles.is_empty() {
             // Graceful completion: everything was joined, nothing to abort,
@@ -538,6 +580,16 @@ pub enum SessionHubError {
     Delivery,
     Task(String),
     InvalidConfig(String),
+}
+
+/// Whether the hub delivered every committed drain suffix during its grace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionHubShutdownOutcome {
+    Graceful,
+    /// At least one final suffix could not be read or enqueued. The failure is
+    /// recorded before this status is returned, and the daemon must report a
+    /// forced shutdown rather than silently call the drain graceful.
+    Forced,
 }
 
 impl fmt::Display for SessionHubError {
@@ -907,9 +959,7 @@ impl SessionHub {
         // admission so repeated attach/detach cannot grow this registry.
         replay_tasks.retain(|handle| !handle.is_finished());
         let hub = self.clone();
-        let task = tokio::spawn(async move {
-            run_replay(hub, registration, after_seq, sink, cancel).await;
-        });
+        let task = tokio::spawn(run_replay(hub, registration, after_seq, sink, cancel));
         // The lock stays held from the drain recheck through spawn+push, so
         // shutdown's registry take either owns this task or rejects it before
         // it exists. No aborted-but-unjoined admission gap is possible.
@@ -1005,6 +1055,23 @@ impl SessionHub {
         sink.offer(attachment_id, frame)
     }
 
+    fn offer_attachment_ticketed(
+        &self,
+        attachment_id: &AttachmentId,
+        sink: &Arc<dyn FrameSink>,
+        frame: &WireFrame,
+        ticket: &AdmissionTicket,
+    ) -> SendAdmission {
+        let Ok(attachments) = lock(&self.inner.attachments) else {
+            return SendAdmission::Refused;
+        };
+        if !attachments.contains_key(attachment_id) {
+            return SendAdmission::Refused;
+        }
+        // Keep the same admit-vs-detach ownership barrier as the fresh offer.
+        sink.offer_ticketed(attachment_id, frame, ticket)
+    }
+
     /// Rejects new hub work synchronously before the runtime announces drain.
     pub fn begin_draining(&self) {
         self.inner.draining.store(true, Ordering::Release);
@@ -1030,7 +1097,12 @@ impl SessionHub {
     /// client's next attach replays from its applied cursor and receives the
     /// committed-unpublished envelope then. The forced path is allowed to be
     /// lossy on PUBLICATION, never on durability.
-    pub async fn shutdown(&self) -> Result<(), SessionHubError> {
+    ///
+    /// DELIVERED-OR-FORCED LAW: replay tasks report terminal suffix status
+    /// into this join. Any failure to read the durable suffix or enqueue its
+    /// final marker is recorded and returns [`SessionHubShutdownOutcome::Forced`];
+    /// it can never be mistaken for a graceful join.
+    pub async fn shutdown(&self) -> Result<SessionHubShutdownOutcome, SessionHubError> {
         self.begin_draining();
         // Install the abort-on-drop guards (each raises the forced-stop
         // fence before aborting — see OwnedTasks) plus the standalone fence
@@ -1060,13 +1132,39 @@ impl SessionHub {
         for actor in actors {
             let _ = actor.commands.send(ActorCommand::Stop).await;
         }
-        actor_tasks.join_all().await;
+        let _ = actor_tasks.join_all().await;
         // Actor death drops every catch-up sender; each replay task drains
         // what was already buffered, streams it into its sink, and exits on
         // the closed channel. Join WITHOUT aborting so those final committed
         // envelopes reach the connection outboxes (§6.6's final-broadcast
         // grace; the write side runs under the connection drain deadline).
-        replay_tasks.join_all().await;
+        let replay_outcomes = replay_tasks.join_all().await;
+        let mut outcome = SessionHubShutdownOutcome::Graceful;
+        let mut join_failure = None;
+        for replay_outcome in replay_outcomes {
+            match replay_outcome {
+                Ok(ReplayCompletion::Complete) => {}
+                Ok(ReplayCompletion::FinalSuffixFailed(failure)) => {
+                    tracing::error!(
+                        stage = failure.stage,
+                        error = %failure.message,
+                        "final attachment suffix was not delivered during shutdown; forcing outcome"
+                    );
+                    outcome = SessionHubShutdownOutcome::Forced;
+                }
+                Err(error) => {
+                    tracing::error!(
+                        error = ?error,
+                        "attachment replay task failed while shutdown was joining it"
+                    );
+                    join_failure.get_or_insert_with(|| {
+                        SessionHubError::Task(format!(
+                            "attachment replay task failed during shutdown: {error}"
+                        ))
+                    });
+                }
+            }
+        }
         let owners = {
             let mut owners = lock(&self.inner.attachments)?;
             owners.drain().collect::<Vec<_>>()
@@ -1077,9 +1175,13 @@ impl SessionHub {
         for (_, owner) in &owners {
             let _ = owner.cancel.send(true);
         }
-        // Graceful completion: the forced-stop fence stays down.
+        // Every task joined in order, so the abort fence stays down even when
+        // a recorded suffix failure makes the reported outcome Forced.
         forced.armed = false;
-        Ok(())
+        match join_failure {
+            Some(error) => Err(error),
+            None => Ok(outcome),
+        }
     }
 }
 
@@ -1894,40 +1996,17 @@ fn publish(
     }
 }
 
-/// Deterministic, allocation-free estimate of one committed envelope's
-/// serialized size, used only for catch-up budget accounting (never for wire
-/// framing — the negotiated frame limit governs that at encode time).
-fn envelope_weight_bytes(envelope: &RawEnvelope) -> usize {
-    const ENVELOPE_FIELD_OVERHEAD: usize = 256;
-    ENVELOPE_FIELD_OVERHEAD
-        .saturating_add(envelope.event_id.as_str().len())
-        .saturating_add(envelope.session_id.as_str().len())
-        .saturating_add(json_weight_bytes(&envelope.payload))
-}
-
-fn json_weight_bytes(value: &serde_json::Value) -> usize {
-    match value {
-        serde_json::Value::Null | serde_json::Value::Bool(_) => 5,
-        serde_json::Value::Number(_) => 20,
-        serde_json::Value::String(text) => text.len().saturating_add(2),
-        serde_json::Value::Array(items) => items
-            .iter()
-            .map(json_weight_bytes)
-            .fold(2_usize, |total, weight| {
-                total.saturating_add(weight).saturating_add(1)
-            }),
-        serde_json::Value::Object(fields) => fields
-            .iter()
-            .map(|(key, value)| {
-                key.len()
-                    .saturating_add(4)
-                    .saturating_add(json_weight_bytes(value))
-            })
-            .fold(2_usize, |total, weight| total.saturating_add(weight)),
-    }
-}
-
 // ──────── replay pipeline: replay → caught-up → buffered drain → live ───────
+
+enum ReplayCompletion {
+    Complete,
+    FinalSuffixFailed(FinalSuffixFailure),
+}
+
+struct FinalSuffixFailure {
+    stage: &'static str,
+    message: String,
+}
 
 /// One attachment's delivery task, §5.5 steps 4-7.
 ///
@@ -1938,15 +2017,16 @@ fn json_weight_bytes(value: &serde_json::Value) -> usize {
 /// the outer loop with the new head — the store, not memory, carries what was
 /// missed. Exit discipline: `break` still owns the attachment registration
 /// and releases it at the bottom; every `return` path has already released
-/// ownership (via `lag_and_detach`/`take_attachment`) or observed its
-/// cancellation, which only fires after ownership was removed.
+/// ownership (via `lag_and_detach`/`take_attachment`), observed its
+/// cancellation, or reported a final-suffix failure for shutdown's owner
+/// sweep.
 async fn run_replay(
     hub: SessionHub,
     mut registration: Registration,
     mut last_sent_seq: u64,
     sink: Arc<dyn FrameSink>,
     mut cancel: watch::Receiver<bool>,
-) {
+) -> ReplayCompletion {
     let attachment_id = registration.attachment_id.clone();
     let session_id = registration.attach_state.session_id.clone();
     let mut high_water = registration.attach_state.replay_through_seq;
@@ -1976,7 +2056,7 @@ async fn run_replay(
                     None => {
                         // Actor gone (graceful drain) with lag pending: the
                         // committed suffix must still broadcast (§6.6).
-                        final_suffix_resume(
+                        if let Err(failure) = final_suffix_resume(
                             &hub,
                             &sink,
                             &attachment_id,
@@ -1985,15 +2065,18 @@ async fn run_replay(
                             &mut registration.lagged,
                             &mut cancel,
                         )
-                        .await;
+                        .await
+                        {
+                            return ReplayCompletion::FinalSuffixFailed(failure);
+                        }
                         break;
                     }
                 }
             }
-            ReplayStep::Cancelled => break,
+            ReplayStep::Cancelled | ReplayStep::ReadFailed(_) => break,
             ReplayStep::OutboxFull => {
                 lag_and_detach(&hub, &sink, &attachment_id, last_sent_seq).await;
-                return;
+                return ReplayCompletion::Complete;
             }
         }
 
@@ -2017,10 +2100,10 @@ async fn run_replay(
         .await
         {
             FrameDelivery::Delivered => {}
-            FrameDelivery::Cancelled => return,
+            FrameDelivery::Cancelled => return ReplayCompletion::Complete,
             FrameDelivery::Stuck | FrameDelivery::Refused => {
                 lag_and_detach(&hub, &sink, &attachment_id, last_sent_seq).await;
-                return;
+                return ReplayCompletion::Complete;
             }
         }
         hub.inner.observer.observe(HubObservation::CaughtUp {
@@ -2032,7 +2115,7 @@ async fn run_replay(
         // replay, dropping duplicates by seq (at-least-once, R11).
         loop {
             if *cancel.borrow() {
-                return;
+                return ReplayCompletion::Complete;
             }
             match registration.events.try_recv() {
                 Ok(queued) => {
@@ -2055,10 +2138,10 @@ async fn run_replay(
                     .await
                     {
                         Ok(()) => {}
-                        Err(FrameDelivery::Cancelled) => return,
+                        Err(FrameDelivery::Cancelled) => return ReplayCompletion::Complete,
                         Err(_) => {
                             lag_and_detach(&hub, &sink, &attachment_id, last_sent_seq).await;
-                            return;
+                            return ReplayCompletion::Complete;
                         }
                     }
                 }
@@ -2073,7 +2156,7 @@ async fn run_replay(
                                 break;
                             }
                             None => {
-                                final_suffix_resume(
+                                if let Err(failure) = final_suffix_resume(
                                     &hub,
                                     &sink,
                                     &attachment_id,
@@ -2082,12 +2165,15 @@ async fn run_replay(
                                     &mut registration.lagged,
                                     &mut cancel,
                                 )
-                                .await;
-                                return;
+                                .await
+                                {
+                                    return ReplayCompletion::FinalSuffixFailed(failure);
+                                }
+                                return ReplayCompletion::Complete;
                             }
                         }
                     }
-                    return;
+                    return ReplayCompletion::Complete;
                 }
             }
         }
@@ -2109,7 +2195,7 @@ async fn run_replay(
                 biased;
                 changed = cancel.changed() => {
                     if changed.is_err() || *cancel.borrow() {
-                        return;
+                        return ReplayCompletion::Complete;
                     }
                 }
                 queued = registration.events.recv() => {
@@ -2118,8 +2204,8 @@ async fn run_replay(
                         // pending lag means committed envelopes overflowed
                         // past this channel: stream them from the store
                         // before exiting (§6.6 final broadcast).
-                        if registration.lagged.borrow().is_some() {
-                            final_suffix_resume(
+                        if registration.lagged.borrow().is_some()
+                            && let Err(failure) = final_suffix_resume(
                                 &hub,
                                 &sink,
                                 &attachment_id,
@@ -2128,9 +2214,11 @@ async fn run_replay(
                                 &mut registration.lagged,
                                 &mut cancel,
                             )
-                            .await;
+                            .await
+                        {
+                            return ReplayCompletion::FinalSuffixFailed(failure);
                         }
-                        return;
+                        return ReplayCompletion::Complete;
                     };
                     credit_catch_up(&registration.catch_up_bytes, queued.weight);
                     let envelope = queued.envelope;
@@ -2149,10 +2237,10 @@ async fn run_replay(
                         &mut cancel,
                     ).await {
                         Ok(()) => {}
-                        Err(FrameDelivery::Cancelled) => return,
+                        Err(FrameDelivery::Cancelled) => return ReplayCompletion::Complete,
                         Err(_) => {
                             lag_and_detach(&hub, &sink, &attachment_id, last_sent_seq).await;
-                            return;
+                            return ReplayCompletion::Complete;
                         }
                     }
                 }
@@ -2166,7 +2254,7 @@ async fn run_replay(
                                 break;
                             }
                             None => {
-                                final_suffix_resume(
+                                if let Err(failure) = final_suffix_resume(
                                     &hub,
                                     &sink,
                                     &attachment_id,
@@ -2175,8 +2263,11 @@ async fn run_replay(
                                     &mut registration.lagged,
                                     &mut cancel,
                                 )
-                                .await;
-                                return;
+                                .await
+                                {
+                                    return ReplayCompletion::FinalSuffixFailed(failure);
+                                }
+                                return ReplayCompletion::Complete;
                             }
                         }
                     }
@@ -2191,12 +2282,14 @@ async fn run_replay(
     // registration is still owned here; release it (a no-op if a concurrent
     // detach already took it).
     let _ = hub.detach(&attachment_id).await;
+    ReplayCompletion::Complete
 }
 
 enum ReplayStep {
     Continue,
     ReceiverLagged,
     Cancelled,
+    ReadFailed(String),
     OutboxFull,
 }
 
@@ -2220,10 +2313,10 @@ enum FrameDelivery {
 /// admission is the reservation, granted and consumed in one step under the
 /// sink's lock, so concurrent lanes cannot race a capacity snapshot and
 /// overbook, and a byte-bound sink cannot falsely refuse a reading client.
-/// A `Busy` answer makes this task take a FIFO [`FrameSink::drain_ticket`]
-/// (taken BEFORE the confirming re-offer, so a unit freed in between still
-/// reaches this waiter — no lost wakeup) and park until it fires; tickets
-/// fire in arrival order, so waiters are served first-come. Detachment
+/// A `Busy` answer makes this task take one FIFO
+/// [`FrameSink::drain_ticket`] before its confirming re-offer. The token
+/// remains the head reservation across every wake/re-offer until admission,
+/// so notification cannot be barged and service itself is FIFO. Detachment
 /// happens only on [`SendAdmission::Refused`] or when lag pressure arrives
 /// while the sink is busy ([`FrameDelivery::Stuck`]).
 async fn deliver_frame(
@@ -2234,48 +2327,50 @@ async fn deliver_frame(
     lagged: &mut watch::Receiver<Option<u64>>,
     cancel: &mut watch::Receiver<bool>,
 ) -> FrameDelivery {
+    if *cancel.borrow() {
+        return FrameDelivery::Cancelled;
+    }
+    match hub.offer_attachment(attachment_id, sink, frame) {
+        SendAdmission::Sent => return FrameDelivery::Delivered,
+        SendAdmission::Refused => return FrameDelivery::Refused,
+        SendAdmission::Busy => {}
+    }
+    let Some(ticket) = sink.drain_ticket() else {
+        // Pairing-contract violation (see [`FrameSink`]): Busy without a
+        // ticket source degrades to refusal instead of spinning.
+        return FrameDelivery::Refused;
+    };
     loop {
-        if *cancel.borrow() {
-            return FrameDelivery::Cancelled;
-        }
-        match hub.offer_attachment(attachment_id, sink, frame) {
+        // Confirming and later re-offers retain the SAME head token: capacity
+        // freed between the Busy answer and this call cannot be lost, and no
+        // fresh offer may consume it first.
+        match hub.offer_attachment_ticketed(attachment_id, sink, frame, &ticket) {
             SendAdmission::Sent => return FrameDelivery::Delivered,
-            SendAdmission::Refused => return FrameDelivery::Refused,
-            SendAdmission::Busy => {}
-        }
-        let Some(ticket) = sink.drain_ticket() else {
-            // Pairing-contract violation (see [`FrameSink`]): Busy without a
-            // ticket source degrades to refusal instead of spinning.
-            return FrameDelivery::Refused;
-        };
-        // Confirming re-offer AFTER the ticket is queued: capacity freed
-        // between the Busy answer and the ticket cannot be lost.
-        match hub.offer_attachment(attachment_id, sink, frame) {
-            SendAdmission::Sent => return FrameDelivery::Delivered,
-            SendAdmission::Refused => return FrameDelivery::Refused,
+            SendAdmission::Refused => {
+                sink.cancel_ticket(&ticket);
+                return FrameDelivery::Refused;
+            }
             SendAdmission::Busy => {}
         }
         // A closed lag watch means the actor is gone (graceful drain): no
         // further commits can pile up, so the stuck signature is impossible
         // and the wait continues on the ticket alone.
         let lag_open = lagged.has_changed().is_ok();
-        tokio::pin!(ticket);
         tokio::select! {
             biased;
             changed = cancel.changed() => {
                 if changed.is_err() || *cancel.borrow() {
+                    sink.cancel_ticket(&ticket);
                     return FrameDelivery::Cancelled;
                 }
             }
             changed = lagged.changed(), if lag_open => {
                 if changed.is_ok() && lagged.borrow().is_some() {
+                    sink.cancel_ticket(&ticket);
                     return FrameDelivery::Stuck;
                 }
             }
-            // Fired or dropped either way means "re-offer now": a dropped
-            // ticket comes from a closing sink, whose next offer answers
-            // Refused terminally.
-            _ = &mut ticket => {}
+            _ = ticket.notified() => {}
         }
     }
 }
@@ -2336,12 +2431,14 @@ async fn replay_range(
                         error = ?error,
                         "attachment replay store read failed"
                     );
-                    return ReplayStep::Cancelled;
+                    return ReplayStep::ReadFailed(error.message);
                 }
             }
         };
         if page.is_empty() {
-            return ReplayStep::Cancelled;
+            return ReplayStep::ReadFailed(format!(
+                "store returned an empty replay page before durable head {high_water}"
+            ));
         }
         for envelope in page
             .into_iter()
@@ -2471,13 +2568,25 @@ async fn final_suffix_resume(
     last_sent_seq: &mut u64,
     lagged: &mut watch::Receiver<Option<u64>>,
     cancel: &mut watch::Receiver<bool>,
-) {
-    let Ok(head) = hub.inner.store.latest_seq(session_id).await else {
-        return;
-    };
+) -> Result<(), FinalSuffixFailure> {
+    let head = hub
+        .inner
+        .store
+        .latest_seq(session_id)
+        .await
+        .map_err(|error| FinalSuffixFailure {
+            stage: "latest_seq",
+            message: error.message,
+        })?;
     if head <= *last_sent_seq {
-        return;
+        return Ok(());
     }
+    hub.inner
+        .observer
+        .observe(HubObservation::FinalSuffixHeadCaptured {
+            attachment_id: attachment_id.clone(),
+            head,
+        });
     let replayed = replay_range(
         hub,
         sink,
@@ -2489,14 +2598,52 @@ async fn final_suffix_resume(
         cancel,
     )
     .await;
-    if !matches!(replayed, ReplayStep::Continue) {
-        return;
+    match replayed {
+        ReplayStep::Continue => {}
+        ReplayStep::ReadFailed(message) => {
+            return Err(FinalSuffixFailure {
+                stage: "read_page",
+                message,
+            });
+        }
+        ReplayStep::ReceiverLagged => {
+            return Err(FinalSuffixFailure {
+                stage: "read_page",
+                message: "the final suffix receiver reported lag".into(),
+            });
+        }
+        ReplayStep::Cancelled => {
+            return Err(FinalSuffixFailure {
+                stage: "read_page",
+                message: "the final suffix replay was cancelled".into(),
+            });
+        }
+        ReplayStep::OutboxFull => {
+            return Err(FinalSuffixFailure {
+                stage: "event_enqueue",
+                message: "the final suffix event could not enter the attachment outbox".into(),
+            });
+        }
     }
     let caught_up = WireFrame::AttachCaughtUp {
         attachment_id: attachment_id.clone(),
         high_water_seq: head,
     };
-    let _ = deliver_frame(hub, sink, attachment_id, &caught_up, lagged, cancel).await;
+    match deliver_frame(hub, sink, attachment_id, &caught_up, lagged, cancel).await {
+        FrameDelivery::Delivered => Ok(()),
+        FrameDelivery::Cancelled => Err(FinalSuffixFailure {
+            stage: "final_caught_up_enqueue",
+            message: "the final AttachCaughtUp enqueue was cancelled".into(),
+        }),
+        FrameDelivery::Stuck => Err(FinalSuffixFailure {
+            stage: "final_caught_up_enqueue",
+            message: "the final AttachCaughtUp enqueue stalled under lag pressure".into(),
+        }),
+        FrameDelivery::Refused => Err(FinalSuffixFailure {
+            stage: "final_caught_up_enqueue",
+            message: "the final AttachCaughtUp frame was refused".into(),
+        }),
+    }
 }
 
 /// UNKNOWN-ID RULE (authoritative statement): a client never receives a

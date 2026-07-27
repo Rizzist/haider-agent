@@ -7,8 +7,8 @@
 
 use haider_core::{HarnessActor, HarnessConfig, SqliteStoreHandle, StoreHandle, SubmitTurn};
 use haider_daemon::{
-    FrameSendError, FrameSink, HubConnection, HubObservation, SendAdmission, SessionHub,
-    SessionHubConfig, SessionHubObserver,
+    AdmissionTicket, FrameSendError, FrameSink, HubConnection, HubObservation, SendAdmission,
+    SessionHub, SessionHubConfig, SessionHubObserver, SessionHubShutdownOutcome,
 };
 use haider_protocol::EventPayload;
 use haider_protocol::envelope::{
@@ -25,9 +25,9 @@ use haider_rpc::{
 };
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
-use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::sync::{Notify, mpsc};
 
 const DEADLINE: Duration = Duration::from_secs(10);
 
@@ -254,6 +254,7 @@ enum GateTarget {
     ReplayEvent(u64),
     BeforeCaughtUp,
     BufferedEvent(u64),
+    FinalSuffixHeadCaptured(u64),
 }
 
 impl GateTarget {
@@ -264,6 +265,10 @@ impl GateTarget {
             (Self::BeforeEvent(expected), HubObservation::BeforeEvent { seq, .. })
             | (Self::ReplayEvent(expected), HubObservation::ReplayEvent { seq, .. })
             | (Self::BufferedEvent(expected), HubObservation::BufferedEvent { seq, .. })
+            | (
+                Self::FinalSuffixHeadCaptured(expected),
+                HubObservation::FinalSuffixHeadCaptured { head: seq, .. },
+            )
             | (
                 Self::Persisted(expected),
                 HubObservation::Persisted {
@@ -1950,7 +1955,7 @@ struct StalledAfterCaughtUpSink {
     collected: CollectSink,
     saw_caught_up: AtomicBool,
     /// Admission tickets that deliberately never fire — the stuck shape.
-    parked: Mutex<Vec<oneshot::Sender<()>>>,
+    parked: Mutex<Vec<AdmissionTicket>>,
 }
 
 impl FrameSink for StalledAfterCaughtUpSink {
@@ -1975,9 +1980,12 @@ impl FrameSink for StalledAfterCaughtUpSink {
         }
     }
 
-    fn drain_ticket(&self) -> Option<oneshot::Receiver<()>> {
-        let (fire, ticket) = oneshot::channel();
-        self.parked.lock().expect("parked lock").push(fire);
+    fn drain_ticket(&self) -> Option<AdmissionTicket> {
+        let ticket = Arc::new(Notify::new());
+        self.parked
+            .lock()
+            .expect("parked lock")
+            .push(Arc::clone(&ticket));
         Some(ticket)
     }
 }
@@ -1990,7 +1998,7 @@ impl FrameSink for StalledAfterCaughtUpSink {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn commit_pressure_behind_a_stalled_outbox_laggs_and_detaches() {
     let config = SessionHubConfig {
-        catch_up_byte_budget: 600,
+        catch_up_byte_budget: 1_800,
         ..SessionHubConfig::default()
     };
     let (_root, store, hub) = open_hub_with_config(None, config).await;
@@ -2132,10 +2140,13 @@ async fn graceful_drain_broadcasts_an_in_flight_commit_before_teardown() {
     control.release();
 
     assert_eq!(committing.await.expect("append joins"), 2);
-    shutdown
-        .await
-        .expect("shutdown joins")
-        .expect("graceful drain completes");
+    assert_eq!(
+        shutdown
+            .await
+            .expect("shutdown joins")
+            .expect("graceful drain completes"),
+        SessionHubShutdownOutcome::Graceful
+    );
     // §6.6: the final committed envelope was broadcast during the grace.
     loop {
         match sink.next().await {
@@ -2218,7 +2229,25 @@ async fn cancelled_registration_refunds_its_admission_slot() {
 struct UndeliveredResponseSink {
     collected: CollectSink,
     pending: Mutex<Option<RequestId>>,
-    parked: Mutex<Vec<oneshot::Sender<()>>>,
+    parked: Mutex<Vec<AdmissionTicket>>,
+    confirmed_parked: AtomicBool,
+    parked_changed: Notify,
+}
+
+impl UndeliveredResponseSink {
+    async fn wait_until_parked(&self) {
+        tokio::time::timeout(DEADLINE, async {
+            loop {
+                let changed = self.parked_changed.notified();
+                if self.confirmed_parked.load(Ordering::Acquire) {
+                    return;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .expect("replay parking deadline");
+    }
 }
 
 impl FrameSink for UndeliveredResponseSink {
@@ -2249,14 +2278,31 @@ impl FrameSink for UndeliveredResponseSink {
         }
     }
 
+    fn offer_ticketed(
+        &self,
+        attachment_id: &AttachmentId,
+        frame: &WireFrame,
+        _ticket: &AdmissionTicket,
+    ) -> SendAdmission {
+        let admission = self.offer(attachment_id, frame);
+        if matches!(admission, SendAdmission::Busy) {
+            self.confirmed_parked.store(true, Ordering::Release);
+            self.parked_changed.notify_waiters();
+        }
+        admission
+    }
+
     fn purge_attachment(&self, attachment_id: &AttachmentId) -> Option<RequestId> {
         let _ = self.collected.purge_attachment(attachment_id);
         self.pending.lock().expect("pending lock").take()
     }
 
-    fn drain_ticket(&self) -> Option<oneshot::Receiver<()>> {
-        let (fire, ticket) = oneshot::channel();
-        self.parked.lock().expect("parked lock").push(fire);
+    fn drain_ticket(&self) -> Option<AdmissionTicket> {
+        let ticket = Arc::new(Notify::new());
+        self.parked
+            .lock()
+            .expect("parked lock")
+            .push(Arc::clone(&ticket));
         Some(ticket)
     }
 }
@@ -2269,7 +2315,7 @@ impl FrameSink for UndeliveredResponseSink {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn undelivered_attach_response_is_answered_with_a_correlated_error_not_lagged() {
     let config = SessionHubConfig {
-        catch_up_byte_budget: 600,
+        catch_up_byte_budget: 1_800,
         ..SessionHubConfig::default()
     };
     let (_root, store, hub) = open_hub_with_config(None, config).await;
@@ -2291,6 +2337,10 @@ async fn undelivered_attach_response_is_answered_with_a_correlated_error_not_lag
         )
         .await
         .expect("attach routes");
+    // Deterministic barrier: the replay has answered Busy, enqueued its
+    // admission ticket, and confirmed it still cannot deliver. Only now may
+    // pressure trip the catch-up lag. No append can win ahead of parking.
+    sink.wait_until_parked().await;
 
     // One oversized commit trips the hard catch-up byte bound while the
     // replay is parked on its admission ticket: lag-under-stall detaches.
@@ -2338,7 +2388,7 @@ async fn undelivered_attach_response_is_answered_with_a_correlated_error_not_lag
 async fn graceful_drain_store_resumes_a_pending_lag_suffix() {
     let (observer, mut control) = gated_observer(vec![GateTarget::BeforeEvent(2)]);
     let config = SessionHubConfig {
-        catch_up_byte_budget: 600,
+        catch_up_byte_budget: 1_800,
         ..SessionHubConfig::default()
     };
     let (_root, store, hub) = open_hub_with_config(Some(observer), config).await;
@@ -2396,10 +2446,13 @@ async fn graceful_drain_store_resumes_a_pending_lag_suffix() {
     });
     control.observed_shutdown_guarded().await;
     control.release();
-    shutdown
-        .await
-        .expect("shutdown joins")
-        .expect("graceful drain completes");
+    assert_eq!(
+        shutdown
+            .await
+            .expect("shutdown joins")
+            .expect("graceful drain completes"),
+        SessionHubShutdownOutcome::Graceful
+    );
 
     // §6.6: the committed suffix (seq 3) was store-resumed during the grace
     // and announced with a final caught-up at the durable head.
@@ -2420,6 +2473,94 @@ async fn graceful_drain_store_resumes_a_pending_lag_suffix() {
     store.close().await.expect("store closes");
 }
 
+/// MUTATION CHECK: downgrade a `final_suffix_resume` read failure to
+/// `ReplayCompletion::Complete`. Expected failure: shutdown reports
+/// `Graceful` after silently dropping the committed suffix.
+/// Verified by revert on 2026-07-27.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn final_suffix_store_read_failure_forces_the_shutdown_outcome() {
+    let (observer, mut control) = gated_observer(vec![
+        GateTarget::BeforeEvent(2),
+        GateTarget::FinalSuffixHeadCaptured(3),
+    ]);
+    let config = SessionHubConfig {
+        catch_up_byte_budget: 1_800,
+        ..SessionHubConfig::default()
+    };
+    let (_root, store, hub) = open_hub_with_config(Some(observer), config).await;
+    let session_id = SessionId::new("forced-final-suffix");
+    let generation = store.worker_generation();
+    append_one(&hub, &session_id, generation, "seed").await;
+    let sink = Arc::new(CollectSink::default());
+    let connection = hub
+        .open_connection(capabilities(), sink.clone())
+        .expect("connection");
+    connection
+        .request(
+            RequestId::new("attach"),
+            RequestBody::SessionAttach {
+                session_id: session_id.clone(),
+                after_seq: 0,
+                mode: AttachMode::View,
+            },
+        )
+        .await
+        .expect("attach routes");
+    let _ = attachment_from(sink.next().await);
+    assert!(matches!(
+        sink.next().await,
+        WireFrame::Event { envelope, .. } if envelope.seq == 1
+    ));
+    assert!(matches!(
+        sink.next().await,
+        WireFrame::AttachCaughtUp {
+            high_water_seq: 1,
+            ..
+        }
+    ));
+
+    append_one(&hub, &session_id, generation, "small-live").await;
+    assert!(matches!(
+        control.reached().await,
+        HubObservation::BeforeEvent { seq: 2, .. }
+    ));
+    let mut oversized = vec![envelope(&session_id, "oversized", generation)];
+    oversized[0].payload = serde_json::json!({
+        "type": "future_test_event",
+        "blob": "x".repeat(2_000),
+    });
+    hub.append(&mut oversized).await.expect("oversized commits");
+
+    let shutdown = tokio::spawn({
+        let hub = hub.clone();
+        async move { hub.shutdown().await }
+    });
+    control.observed_shutdown_guarded().await;
+    control.release();
+    assert!(matches!(
+        control.reached().await,
+        HubObservation::FinalSuffixHeadCaptured { head: 3, .. }
+    ));
+
+    // `latest_seq` has fixed the final head. Closing the shared store here
+    // makes the immediately-following final `read_page` fail deterministically.
+    store
+        .clone()
+        .close()
+        .await
+        .expect("store closes at fault seam");
+    control.release();
+    assert_eq!(
+        shutdown
+            .await
+            .expect("shutdown joins")
+            .expect("shutdown reports an outcome"),
+        SessionHubShutdownOutcome::Forced,
+        "a final-suffix read failure can never be downgraded to graceful"
+    );
+    connection.close().await.expect("connection closes");
+}
+
 /// MUTATION CHECK: restore the empty-channel oversized-envelope admission in
 /// `publish`. Expected failure: the giant envelope is buffered and delivered
 /// live, so the discriminating SECOND `AttachCaughtUp` at the raised head
@@ -2428,7 +2569,7 @@ async fn graceful_drain_store_resumes_a_pending_lag_suffix() {
 #[tokio::test]
 async fn oversized_envelope_takes_the_store_resume_path_exactly_once() {
     let config = SessionHubConfig {
-        catch_up_byte_budget: 600,
+        catch_up_byte_budget: 1_800,
         ..SessionHubConfig::default()
     };
     let (_root, store, hub) = open_hub_with_config(None, config).await;
@@ -2508,7 +2649,43 @@ struct BoundedReaderSink {
 struct BoundedReaderState {
     queue: VecDeque<(WireFrame, usize)>,
     queued_bytes: usize,
-    tickets: VecDeque<oneshot::Sender<()>>,
+    tickets: VecDeque<Weak<Notify>>,
+}
+
+impl BoundedReaderState {
+    fn prune_dead_tickets(&mut self) {
+        while self
+            .tickets
+            .front()
+            .is_some_and(|ticket| ticket.strong_count() == 0)
+        {
+            self.tickets.pop_front();
+        }
+    }
+
+    fn ticket_is_head(&mut self, ticket: &AdmissionTicket) -> bool {
+        self.prune_dead_tickets();
+        self.tickets
+            .front()
+            .is_some_and(|head| Weak::ptr_eq(head, &Arc::downgrade(ticket)))
+    }
+
+    fn fire_head_ticket(&mut self) {
+        self.prune_dead_tickets();
+        if let Some(ticket) = self.tickets.front().and_then(Weak::upgrade) {
+            ticket.notify_one();
+        }
+    }
+
+    fn remove_ticket(&mut self, ticket: &AdmissionTicket) -> bool {
+        self.prune_dead_tickets();
+        let was_head = self.ticket_is_head(ticket);
+        let token = Arc::downgrade(ticket);
+        self.tickets
+            .retain(|candidate| !Weak::ptr_eq(candidate, &token));
+        self.prune_dead_tickets();
+        was_head
+    }
 }
 
 impl BoundedReaderSink {
@@ -2535,23 +2712,62 @@ impl BoundedReaderSink {
         }
     }
 
-    /// The reading client: pops one frame, credits its weight, fires the
-    /// next admission ticket in order.
+    fn offer_with_ticket(
+        &self,
+        frame: &WireFrame,
+        ticket: Option<&AdmissionTicket>,
+    ) -> SendAdmission {
+        let weight = Self::weight(frame);
+        let Ok(mut state) = self.state.lock() else {
+            return SendAdmission::Refused;
+        };
+        state.prune_dead_tickets();
+        let caller_may_admit =
+            state.tickets.is_empty() || ticket.is_some_and(|ticket| state.ticket_is_head(ticket));
+        if !caller_may_admit
+            || state.queue.len() >= self.frame_cap
+            || state.queued_bytes.saturating_add(weight) > self.byte_cap
+        {
+            return SendAdmission::Busy;
+        }
+        if let Some(ticket) = ticket
+            && state.ticket_is_head(ticket)
+        {
+            state.tickets.pop_front();
+        }
+        state.queue.push_back((frame.clone(), weight));
+        state.queued_bytes = state.queued_bytes.saturating_add(weight);
+        if state.queue.len() < self.frame_cap && state.queued_bytes < self.byte_cap {
+            state.fire_head_ticket();
+        }
+        drop(state);
+        self.changed.notify_waiters();
+        SendAdmission::Sent
+    }
+
+    /// Faithful writer timing: pop frees the frame slot and wakes the FIFO
+    /// head while the frame's bytes remain charged in flight. Only after a
+    /// scheduler turn standing in for write settlement are those bytes
+    /// credited and the same reserved head woken again.
     async fn next(&self) -> WireFrame {
         tokio::time::timeout(DEADLINE, async {
             loop {
                 let notified = self.changed.notified();
-                {
+                let popped = {
                     let mut state = self.state.lock().expect("reader state");
                     if let Some((frame, weight)) = state.queue.pop_front() {
-                        state.queued_bytes = state.queued_bytes.saturating_sub(weight);
-                        while let Some(ticket) = state.tickets.pop_front() {
-                            if ticket.send(()).is_ok() {
-                                break;
-                            }
-                        }
-                        return frame;
+                        state.fire_head_ticket();
+                        Some((frame, weight))
+                    } else {
+                        None
                     }
+                };
+                if let Some((frame, weight)) = popped {
+                    tokio::task::yield_now().await;
+                    let mut state = self.state.lock().expect("reader state");
+                    state.queued_bytes = state.queued_bytes.saturating_sub(weight);
+                    state.fire_head_ticket();
+                    return frame;
                 }
                 notified.await;
             }
@@ -2574,31 +2790,33 @@ impl FrameSink for BoundedReaderSink {
     }
 
     fn offer(&self, _attachment_id: &AttachmentId, frame: &WireFrame) -> SendAdmission {
-        let weight = Self::weight(frame);
-        let Ok(mut state) = self.state.lock() else {
-            return SendAdmission::Refused;
-        };
-        if state.queue.len() >= self.frame_cap
-            || state.queued_bytes.saturating_add(weight) > self.byte_cap
-        {
-            return SendAdmission::Busy;
-        }
-        state.queue.push_back((frame.clone(), weight));
-        state.queued_bytes = state.queued_bytes.saturating_add(weight);
-        drop(state);
-        self.changed.notify_waiters();
-        SendAdmission::Sent
+        self.offer_with_ticket(frame, None)
     }
 
-    fn drain_ticket(&self) -> Option<oneshot::Receiver<()>> {
-        let (fire, ticket) = oneshot::channel();
+    fn offer_ticketed(
+        &self,
+        _attachment_id: &AttachmentId,
+        frame: &WireFrame,
+        ticket: &AdmissionTicket,
+    ) -> SendAdmission {
+        self.offer_with_ticket(frame, Some(ticket))
+    }
+
+    fn drain_ticket(&self) -> Option<AdmissionTicket> {
+        let ticket = Arc::new(Notify::new());
         match self.state.lock() {
-            Ok(mut state) => state.tickets.push_back(fire),
-            Err(_) => {
-                let _ = fire.send(());
-            }
+            Ok(mut state) => state.tickets.push_back(Arc::downgrade(&ticket)),
+            Err(_) => ticket.notify_one(),
         }
         Some(ticket)
+    }
+
+    fn cancel_ticket(&self, ticket: &AdmissionTicket) {
+        if let Ok(mut state) = self.state.lock()
+            && state.remove_ticket(ticket)
+        {
+            state.fire_head_ticket();
+        }
     }
 }
 
@@ -2611,7 +2829,10 @@ impl FrameSink for BoundedReaderSink {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn combined_pressure_five_lanes_large_envelopes_and_live_commits_lag_no_reader() {
     let config = SessionHubConfig {
-        catch_up_byte_budget: 64 * 1024,
+        // The whole eight-commit hot-lane burst fits in the catch-up ledger's
+        // true-weight units. Any Lagged below therefore discriminates outbox
+        // admission/fairness, not a legitimate internal-buffer overflow.
+        catch_up_byte_budget: 96 * 1024,
         ..SessionHubConfig::default()
     };
     let (_root, store, hub) = open_hub_with_config(None, config).await;

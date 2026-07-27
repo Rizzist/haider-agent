@@ -292,7 +292,8 @@ async fn run_inner(
     // relaxation).
     let hub_shutdown = bounded_finalization(hub.shutdown(), barrier_deadline, &mut shutdown).await;
     match hub_shutdown {
-        Some(Ok(())) => {}
+        Some(Ok(crate::SessionHubShutdownOutcome::Graceful)) => {}
+        Some(Ok(crate::SessionHubShutdownOutcome::Forced)) => forced = true,
         Some(Err(error)) => return Err(DaemonError::from(error)),
         None => forced = true,
     }

@@ -37,14 +37,16 @@
 mod connection_tests;
 
 use crate::DaemonError;
-use crate::session_hub::{FrameSendError, FrameSink, HubConnection, SendAdmission, SessionHub};
+use crate::session_hub::{
+    AdmissionTicket, FrameSendError, FrameSink, HubConnection, SendAdmission, SessionHub,
+};
 use haider_rpc::{
     AttachmentId, Capability, CapabilitySet, ERROR_CODE_OVERLOADED, Hello, LifecyclePhase,
     ProtocolError, RequestId, ServerRange, Welcome, WireFrame, negotiate, uds_codec,
 };
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::net::unix::OwnedWriteHalf;
@@ -182,26 +184,50 @@ struct OutboundState {
     /// request id so the hub can answer the request instead of emitting a
     /// `Lagged` for an id the client never learned.
     pending_responses: HashMap<AttachmentId, RequestId>,
-    /// FIFO admission tickets for `Busy` event offers: each freed unit of
-    /// capacity fires exactly the head ticket, so waiters are served in
-    /// arrival order and a hot lane cannot systematically leapfrog a queued
-    /// cold one. (A frame's very first offer can still race one in-flight
-    /// wakeup; the loser parks behind the head, so the next freed unit goes
-    /// to the queued waiter — starvation is impossible, momentary overtaking
-    /// of a single unit is accepted and documented.)
-    tickets: VecDeque<oneshot::Sender<()>>,
+    /// FIFO admission tickets for `Busy` event offers. The weak token remains
+    /// at the head after notification and is removed only by that holder's
+    /// admission (or cancellation), so service itself is FIFO: a fresh hot
+    /// offer cannot barge before a fired cold waiter, and starvation is
+    /// impossible.
+    tickets: VecDeque<Weak<Notify>>,
     closed: bool,
 }
 
 impl OutboundState {
-    /// Fires the oldest still-live admission ticket. Called under the state
-    /// lock whenever capacity frees (pop, credit, purge).
-    fn fire_one_ticket(&mut self) {
-        while let Some(ticket) = self.tickets.pop_front() {
-            if ticket.send(()).is_ok() {
-                break;
-            }
+    fn prune_dead_tickets(&mut self) {
+        while self
+            .tickets
+            .front()
+            .is_some_and(|ticket| ticket.strong_count() == 0)
+        {
+            self.tickets.pop_front();
         }
+    }
+
+    fn ticket_is_head(&mut self, ticket: &AdmissionTicket) -> bool {
+        self.prune_dead_tickets();
+        self.tickets
+            .front()
+            .is_some_and(|head| Weak::ptr_eq(head, &Arc::downgrade(ticket)))
+    }
+
+    /// Fires the oldest still-live admission ticket without consuming its
+    /// reservation. Called under the state lock whenever capacity frees.
+    fn fire_one_ticket(&mut self) {
+        self.prune_dead_tickets();
+        if let Some(ticket) = self.tickets.front().and_then(Weak::upgrade) {
+            ticket.notify_one();
+        }
+    }
+
+    fn remove_ticket(&mut self, ticket: &AdmissionTicket) -> bool {
+        self.prune_dead_tickets();
+        let was_head = self.ticket_is_head(ticket);
+        let token = Arc::downgrade(ticket);
+        self.tickets
+            .retain(|candidate| !Weak::ptr_eq(candidate, &token));
+        self.prune_dead_tickets();
+        was_head
     }
 }
 
@@ -280,7 +306,12 @@ impl OutboundLane {
     /// so concurrent lanes can never jointly observe the same headroom and
     /// overbook. An attachment whose staged attach response has not popped
     /// yet is `Busy` regardless of capacity (response-before-event).
-    fn offer(&self, key: LaneKey, bytes: Vec<u8>) -> SendAdmission {
+    fn offer(
+        &self,
+        key: LaneKey,
+        bytes: Vec<u8>,
+        ticket: Option<&AdmissionTicket>,
+    ) -> SendAdmission {
         let charged = bytes.len();
         let Ok(mut state) = self.inner.state.lock() else {
             return SendAdmission::Refused;
@@ -288,6 +319,9 @@ impl OutboundLane {
         if state.closed {
             return SendAdmission::Refused;
         }
+        state.prune_dead_tickets();
+        let caller_may_admit =
+            state.tickets.is_empty() || ticket.is_some_and(|ticket| state.ticket_is_head(ticket));
         if let LaneKey::Attachment(attachment_id) = &key
             && state.pending_responses.contains_key(attachment_id)
         {
@@ -295,11 +329,17 @@ impl OutboundLane {
         }
         let lane_len = state.lanes.get(&key).map_or(0, VecDeque::len);
         let next_bytes = state.queued_bytes.checked_add(charged);
-        if state.queued_frames >= self.inner.frame_capacity
+        if !caller_may_admit
+            || state.queued_frames >= self.inner.frame_capacity
             || lane_len >= self.inner.per_lane_capacity
             || next_bytes.is_none_or(|total| total > self.inner.byte_budget)
         {
             return SendAdmission::Busy;
+        }
+        if let Some(ticket) = ticket
+            && state.ticket_is_head(ticket)
+        {
+            state.tickets.pop_front();
         }
         let activate = lane_len == 0;
         state
@@ -312,6 +352,11 @@ impl OutboundLane {
         }
         state.queued_frames = state.queued_frames.saturating_add(1);
         state.queued_bytes = state.queued_bytes.saturating_add(charged);
+        if state.queued_frames < self.inner.frame_capacity
+            && state.queued_bytes < self.inner.byte_budget
+        {
+            state.fire_one_ticket();
+        }
         drop(state);
         self.inner.ready.notify_one();
         SendAdmission::Sent
@@ -321,22 +366,30 @@ impl OutboundLane {
     /// capacity frees. Taken BEFORE re-offering (see the hub's
     /// `deliver_frame`) so a unit freed between the answer and the wait
     /// still reaches this waiter — no lost wakeup.
-    fn drain_ticket(&self) -> oneshot::Receiver<()> {
-        let (fire, ticket) = oneshot::channel();
+    fn drain_ticket(&self) -> AdmissionTicket {
+        let ticket = Arc::new(Notify::new());
         match self.inner.state.lock() {
             Ok(mut state) => {
                 if state.closed {
                     // Fire immediately: the next offer answers Refused.
-                    let _ = fire.send(());
+                    ticket.notify_one();
                 } else {
-                    state.tickets.push_back(fire);
+                    state.tickets.push_back(Arc::downgrade(&ticket));
                 }
             }
             Err(_) => {
-                let _ = fire.send(());
+                ticket.notify_one();
             }
         }
         ticket
+    }
+
+    fn cancel_ticket(&self, ticket: &AdmissionTicket) {
+        if let Ok(mut state) = self.inner.state.lock()
+            && state.remove_ticket(ticket)
+        {
+            state.fire_one_ticket();
+        }
     }
 
     /// Admits one REPLY frame (responses, protocol errors, pongs, `Lagged`)
@@ -485,7 +538,9 @@ impl OutboundLane {
             state.closed = true;
             // Every waiter re-offers and observes the refusal.
             while let Some(ticket) = state.tickets.pop_front() {
-                let _ = ticket.send(());
+                if let Some(ticket) = ticket.upgrade() {
+                    ticket.notify_one();
+                }
             }
         }
         self.inner.ready.notify_waiters();
@@ -609,11 +664,31 @@ impl FrameSink for ConnectionFrameSink {
             return SendAdmission::Refused;
         };
         self.lane
-            .offer(LaneKey::Attachment(attachment_id.clone()), bytes)
+            .offer(LaneKey::Attachment(attachment_id.clone()), bytes, None)
     }
 
-    fn drain_ticket(&self) -> Option<tokio::sync::oneshot::Receiver<()>> {
+    fn offer_ticketed(
+        &self,
+        attachment_id: &AttachmentId,
+        frame: &WireFrame,
+        ticket: &AdmissionTicket,
+    ) -> SendAdmission {
+        let Ok(bytes) = encode_outbound(frame, self.outbound_limit) else {
+            return SendAdmission::Refused;
+        };
+        self.lane.offer(
+            LaneKey::Attachment(attachment_id.clone()),
+            bytes,
+            Some(ticket),
+        )
+    }
+
+    fn drain_ticket(&self) -> Option<AdmissionTicket> {
         Some(self.lane.drain_ticket())
+    }
+
+    fn cancel_ticket(&self, ticket: &AdmissionTicket) {
+        self.lane.cancel_ticket(ticket);
     }
 }
 

@@ -892,12 +892,12 @@ async fn outbound_byte_budget_refuses_a_frame_the_connection_cannot_hold() {
     // A half-megabyte Welcome parks the writer inside `write_all` against a
     // peer that never reads, so nothing is ever credited back: replies then
     // accumulate against the byte budget until one is refused. The budget is
-    // exactly one frame limit (the smallest coherent setting), and the pongs
-    // that follow have nowhere left to go.
+    // exactly one maximum encoded frame, `frame_limit + 4` (the smallest
+    // coherent setting), and the pongs that follow have nowhere left to go.
     let profile = format!("byte-budget-{}", "p".repeat(512 * 1024));
     let mut config = test_config(&root, &profile);
     config.frame_limit = config.profile_id.len() + 1_024;
-    config.outbound_queued_bytes = config.frame_limit;
+    config.outbound_queued_bytes = config.frame_limit + 4;
     config.outbound_queue_capacity = 64;
     let pings = 40;
     assert!(
@@ -959,15 +959,15 @@ async fn reserved_drain_notice_survives_an_exhausted_outbound_byte_budget() {
     let root = test_root();
     // A half-megabyte profile id makes the Welcome larger than any socket
     // buffer, so it is still mid-write — and still charged — when the drain
-    // fires. Budget = frame limit leaves less headroom than the (deliberately
-    // long-reasoned) ServerDraining frame needs, so only a reserve outside the
-    // ordinary budget can deliver it. W3b2's real responses are the traffic
-    // this budget exists for; the Welcome is the one large daemon-authored
-    // frame a W3b1 test can size.
+    // fires. A one-maximum-encoded-frame budget leaves less headroom than the
+    // (deliberately long-reasoned) ServerDraining frame needs, so only a
+    // reserve outside the ordinary budget can deliver it. W3b2's real
+    // responses are the traffic this budget exists for; the Welcome is the
+    // one large daemon-authored frame a W3b1 test can size.
     let profile = format!("drain-reserve-{}", "p".repeat(512 * 1024));
     let mut config = test_config(&root, &profile);
     config.frame_limit = config.profile_id.len() + 1_024;
-    config.outbound_queued_bytes = config.frame_limit;
+    config.outbound_queued_bytes = config.frame_limit + 4;
     let reason = format!("maintenance-{}", "r".repeat(4 * 1024));
     let task = spawn(config.clone());
     wait_for_state(task.readiness(), |state| *state == DaemonState::Ready).await;
@@ -1041,7 +1041,7 @@ async fn never_reading_client_is_cut_at_the_drain_deadline_and_releases_everythi
     let profile = format!("never-reads-{}", "p".repeat(512 * 1024));
     let mut config = test_config(&root, &profile);
     config.frame_limit = config.profile_id.len() + 1_024;
-    config.outbound_queued_bytes = config.frame_limit;
+    config.outbound_queued_bytes = config.frame_limit + 4;
     config.drain_timeout = Duration::from_millis(250);
     let task = spawn(config.clone());
     wait_for_state(task.readiness(), |state| *state == DaemonState::Ready).await;
@@ -1093,7 +1093,7 @@ async fn client_that_never_reads_a_byte_cannot_hold_the_barrier_open() {
     let profile = format!("never-reads-strict-{}", "p".repeat(512 * 1024));
     let mut config = test_config(&root, &profile);
     config.frame_limit = config.profile_id.len() + 1_024;
-    config.outbound_queued_bytes = config.frame_limit;
+    config.outbound_queued_bytes = config.frame_limit + 4;
     config.drain_timeout = Duration::from_millis(250);
     let task = spawn(config.clone());
     wait_for_state(task.readiness(), |state| *state == DaemonState::Ready).await;
@@ -1147,7 +1147,7 @@ async fn one_byte_reader_cannot_hold_the_barrier_open() {
     let profile = format!("one-byte-reader-{}", "p".repeat(512 * 1024));
     let mut config = test_config(&root, &profile);
     config.frame_limit = config.profile_id.len() + 1_024;
-    config.outbound_queued_bytes = config.frame_limit;
+    config.outbound_queued_bytes = config.frame_limit + 4;
     config.drain_timeout = Duration::from_millis(250);
     let task = spawn(config.clone());
     wait_for_state(task.readiness(), |state| *state == DaemonState::Ready).await;
@@ -1256,7 +1256,7 @@ async fn forced_shutdown_aborts_a_blocked_writer_instead_of_detaching_it() {
     let profile = format!("forced-writer-{}", "p".repeat(512 * 1024));
     let mut config = test_config(&root, &profile);
     config.frame_limit = config.profile_id.len() + 1_024;
-    config.outbound_queued_bytes = config.frame_limit;
+    config.outbound_queued_bytes = config.frame_limit + 4;
     let task = spawn(config.clone());
     wait_for_state(task.readiness(), |state| *state == DaemonState::Ready).await;
 

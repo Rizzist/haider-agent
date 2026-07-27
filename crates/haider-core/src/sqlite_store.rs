@@ -95,9 +95,9 @@ impl SqliteStoreHandle {
         run_blocking(move || owner.with_store(Store::session_ids)).await
     }
 
-    /// Reads one byte-budgeted replay page (`Store::read_page` law: ends
-    /// early when the accumulated stored-JSON size would exceed the budget,
-    /// but a non-empty result always contains at least one envelope).
+    /// Reads one true-weight-budgeted replay page (`Store::read_page` law:
+    /// retained rows stop at the budget, but a non-empty result always
+    /// contains at least one envelope).
     ///
     /// Additive daemon seam rather than part of [`StoreHandle`]: only the
     /// session hub's replay pipeline pages by transient bytes.

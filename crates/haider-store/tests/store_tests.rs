@@ -1,5 +1,5 @@
 use haider_protocol::envelope::{
-    EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
+    EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION, envelope_weight_bytes,
 };
 use haider_protocol::error::ErrorCode;
 use haider_protocol::ids::{ArtifactRef, DeviceId, EventId, SessionId};
@@ -479,13 +479,9 @@ fn read_page_ends_early_on_byte_budget_and_always_makes_progress() {
         .collect::<Vec<_>>();
     must(store.append(&mut batch));
 
-    // Stored JSON is the budget currency; re-serializing the committed
-    // envelope reproduces it exactly (same struct, same serializer).
-    let row_lengths = batch
-        .iter()
-        .map(|envelope| must(serde_json::to_string(envelope)).len())
-        .collect::<Vec<_>>();
-    let two_rows = row_lengths[0] + row_lengths[1];
+    // The replay page uses the same true-weight units as live catch-up.
+    let row_weights = batch.iter().map(envelope_weight_bytes).collect::<Vec<_>>();
+    let two_rows = row_weights[0] + row_weights[1];
     let first_page = must(store.read_page(&session, 0, 10, two_rows));
     assert_eq!(
         first_page
