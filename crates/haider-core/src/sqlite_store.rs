@@ -9,7 +9,9 @@ use async_trait::async_trait;
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::{ArtifactRef, SessionId};
-use haider_store::{Cas, EventStore, ProfileLease, Store};
+use haider_store::{
+    Cas, EventStore, MenuResolutionCommand, MenuResolutionOutcome, ProfileLease, Store,
+};
 use haider_tools::{CasSink, ToolResult};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -91,6 +93,41 @@ impl SqliteStoreHandle {
     pub async fn session_ids(&self) -> Result<Vec<SessionId>, HaiderError> {
         let owner = Arc::clone(&self.owner);
         run_blocking(move || owner.with_store(Store::session_ids)).await
+    }
+
+    /// Reads one true-weight-budgeted replay page (`Store::read_page` law:
+    /// retained rows stop at the budget, but a non-empty result always
+    /// contains at least one envelope).
+    ///
+    /// Additive daemon seam rather than part of [`StoreHandle`]: only the
+    /// session hub's replay pipeline pages by transient bytes.
+    pub async fn read_page(
+        &self,
+        session_id: &SessionId,
+        since_seq: u64,
+        max_envelopes: usize,
+        byte_budget: usize,
+    ) -> Result<Vec<RawEnvelope>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        let session_id = session_id.clone();
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.read_page(&session_id, since_seq, max_envelopes, byte_budget)
+            })
+        })
+        .await
+    }
+
+    /// Atomically resolves a durable menu and appends its authoritative event.
+    ///
+    /// This is an additive daemon seam rather than part of [`StoreHandle`]:
+    /// ordinary harness appends do not carry compare-and-set coordinates.
+    pub async fn resolve_menu(
+        &self,
+        command: MenuResolutionCommand,
+    ) -> Result<MenuResolutionOutcome, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.resolve_menu(&command))).await
     }
 
     /// Checkpoints committed WAL pages before orderly close.

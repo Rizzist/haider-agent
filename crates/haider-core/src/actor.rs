@@ -187,6 +187,7 @@ pub struct HarnessHandle {
     commands: mpsc::Sender<ActorCommand>,
     events: broadcast::Sender<RawEnvelope>,
     state: watch::Receiver<Option<RunState>>,
+    committed_menus: watch::Sender<Option<RawEnvelope>>,
 }
 
 impl HarnessHandle {
@@ -227,6 +228,31 @@ impl HarnessHandle {
         })?
     }
 
+    /// Wakes a pending menu from an answer envelope that another durable
+    /// authority already committed.
+    ///
+    /// The harness must not append the answer again. This nonblocking watch
+    /// edge is intentionally separate from the bounded command queue: one
+    /// menu can have only one authoritative resolution.
+    pub fn apply_committed_menu_event(&self, envelope: RawEnvelope) -> Result<(), HaiderError> {
+        if !serde_json::from_value::<EventPayload>(envelope.payload.clone())
+            .is_ok_and(|payload| matches!(payload, EventPayload::MenuAnswered(_)))
+        {
+            return Err(HaiderError::new(
+                ErrorCode::InvalidArgument,
+                "committed menu wake must carry MenuAnswered",
+                false,
+            ));
+        }
+        self.committed_menus.send(Some(envelope)).map_err(|_| {
+            HaiderError::new(
+                ErrorCode::Internal,
+                "session actor stopped before applying the committed menu answer",
+                true,
+            )
+        })
+    }
+
     /// Live feed of committed envelopes (from subscription time onward).
     pub fn subscribe(&self) -> broadcast::Receiver<RawEnvelope> {
         self.events.subscribe()
@@ -252,6 +278,11 @@ enum ActorCommand {
     },
 }
 
+enum MenuWake {
+    Command(ActorCommand),
+    Committed(RawEnvelope),
+}
+
 /// Single-session, single-writer run loop.
 pub struct HarnessActor {
     config: HarnessConfig,
@@ -260,6 +291,7 @@ pub struct HarnessActor {
     commands: mpsc::Receiver<ActorCommand>,
     events: broadcast::Sender<RawEnvelope>,
     state: watch::Sender<Option<RunState>>,
+    committed_menus: watch::Receiver<Option<RawEnvelope>>,
     next_run: u64,
     next_event: u64,
     /// Actor start instant (ms) — embedded in event ids for global uniqueness.
@@ -279,10 +311,12 @@ impl HarnessActor {
         let (command_sender, commands) = mpsc::channel(config.command_capacity.max(1));
         let (events, _) = broadcast::channel(config.broadcast_capacity.max(1));
         let (state, state_receiver) = watch::channel(None);
+        let (committed_menus, committed_menu_receiver) = watch::channel(None);
         let handle = HarnessHandle {
             commands: command_sender,
             events: events.clone(),
             state: state_receiver,
+            committed_menus,
         };
         (
             Self {
@@ -292,6 +326,7 @@ impl HarnessActor {
                 commands,
                 events,
                 state,
+                committed_menus: committed_menu_receiver,
                 next_run: 0,
                 next_event: 0,
                 started_at_ms,
@@ -919,7 +954,7 @@ impl HarnessActor {
         .map_err(DriveError::Store)?;
 
         loop {
-            let command = tokio::select! {
+            let wake = tokio::select! {
                 biased;
                 () = cancel.cancelled() => {
                     self.commit_payload(
@@ -934,9 +969,25 @@ impl HarnessActor {
                     .map_err(DriveError::Store)?;
                     return Err(DriveError::Cancelled);
                 },
-                command = self.commands.recv() => command,
+                // Guarded so a dropped wake channel cannot masquerade as
+                // "menu closed" — only the command channel decides closure.
+                // The watch's initial `None` never fires `changed`; a `Some`
+                // here is always a really-committed answer.
+                changed = self.committed_menus.changed(),
+                    if self.committed_menus.has_changed().is_ok() =>
+                {
+                    match changed {
+                        Ok(()) => self
+                            .committed_menus
+                            .borrow_and_update()
+                            .clone()
+                            .map(MenuWake::Committed),
+                        Err(_) => None,
+                    }
+                },
+                command = self.commands.recv() => command.map(MenuWake::Command),
             };
-            let Some(command) = command else {
+            let Some(wake) = wake else {
                 self.commit_payload(
                     run_id,
                     EventPayload::MenuClosed {
@@ -951,79 +1002,121 @@ impl HarnessActor {
                     "session actor command channel closed with request_input unanswered",
                 )));
             };
-            match command {
-                command @ ActorCommand::Submit { .. } => {
+            let (answer, completed, already_committed) = match wake {
+                MenuWake::Command(command @ ActorCommand::Submit { .. }) => {
                     self.defer_submit_or_reject(command);
+                    continue;
                 }
-                ActorCommand::AnswerMenu { answer, completed } => {
-                    if answer.menu != menu.id {
-                        let _ = completed.send(Err(HaiderError::new(
-                            ErrorCode::MenuNotFound,
-                            format!(
-                                "menu {} is not open; request_input is waiting on {}",
-                                answer.menu, menu.id
-                            ),
+                MenuWake::Command(ActorCommand::AnswerMenu { answer, completed }) => {
+                    (answer, Some(completed), false)
+                }
+                MenuWake::Committed(envelope) => {
+                    let payload = serde_json::from_value::<EventPayload>(envelope.payload)
+                        .map_err(|error| {
+                            DriveError::Store(HaiderError::new(
+                                ErrorCode::InvalidArgument,
+                                format!("committed menu wake could not decode: {error}"),
+                                false,
+                            ))
+                        })?;
+                    let EventPayload::MenuAnswered(answer) = payload else {
+                        return Err(DriveError::Store(HaiderError::new(
+                            ErrorCode::InvalidArgument,
+                            "committed menu wake did not contain MenuAnswered",
                             false,
+                        )));
+                    };
+                    (answer, None, true)
+                }
+            };
+            if answer.menu != menu.id {
+                if let Some(completed) = completed {
+                    let _ = completed.send(Err(HaiderError::new(
+                        ErrorCode::MenuNotFound,
+                        format!(
+                            "menu {} is not open; request_input is waiting on {}",
+                            answer.menu, menu.id
+                        ),
+                        false,
+                    )));
+                    continue;
+                }
+                return Err(DriveError::Store(HaiderError::new(
+                    ErrorCode::MenuNotFound,
+                    format!(
+                        "committed answer for menu {} reached waiter for {}",
+                        answer.menu, menu.id
+                    ),
+                    false,
+                )));
+            }
+            let resolved = match request.resolve(&menu, &answer) {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    let error =
+                        HaiderError::new(ErrorCode::InvalidArgument, error.to_string(), false);
+                    if let Some(completed) = completed {
+                        let _ = completed.send(Err(HaiderError::new(
+                            error.code,
+                            error.message,
+                            error.retryable,
                         )));
                         continue;
                     }
-                    let resolved = match request.resolve(&menu, &answer) {
-                        Ok(resolved) => resolved,
-                        Err(error) => {
-                            let _ = completed.send(Err(HaiderError::new(
-                                ErrorCode::InvalidArgument,
-                                error.to_string(),
-                                false,
-                            )));
-                            continue;
-                        }
-                    };
-                    if let Err(error) = self
-                        .commit_payload(
-                            run_id,
-                            EventPayload::MenuAnswered(answer),
-                            prompt_omit_render(),
-                        )
-                        .await
-                    {
-                        let _ = completed.send(Err(error.clone()));
-                        return Err(DriveError::Store(error));
-                    }
-                    let result = serde_json::json!({
-                        "value": resolved.value,
-                        "option_key": resolved.option_key,
-                    })
-                    .to_string();
-                    let call_id = tools[index].call_id.clone();
-                    if let Err(error) = self
-                        .commit_payload(
-                            run_id,
-                            EventPayload::ToolResult {
-                                call_id: call_id.clone(),
-                                result: BoundedResult {
-                                    preview: result.clone(),
-                                    truncated: false,
-                                    artifact: None,
-                                    cursor: None,
-                                },
-                            },
-                            prompt_verbatim_render(),
-                        )
-                        .await
-                    {
-                        let _ = completed.send(Err(error.clone()));
-                        return Err(DriveError::Store(error));
-                    }
-                    self.commit_tool_completed(run_id, &tools[index], ToolStatus::Completed)
-                        .await?;
-                    tools.remove(index);
-                    self.commit_state(run_id, RunState::Streaming)
-                        .await
-                        .map_err(DriveError::Store)?;
-                    let _ = completed.send(Ok(()));
-                    return Ok(Message::tool_result(call_id, result, false));
+                    return Err(DriveError::Store(error));
                 }
+            };
+            if !already_committed
+                && let Err(error) = self
+                    .commit_payload(
+                        run_id,
+                        EventPayload::MenuAnswered(answer),
+                        prompt_omit_render(),
+                    )
+                    .await
+            {
+                if let Some(completed) = completed {
+                    let _ = completed.send(Err(error.clone()));
+                }
+                return Err(DriveError::Store(error));
             }
+            let result = serde_json::json!({
+                "value": resolved.value,
+                "option_key": resolved.option_key,
+            })
+            .to_string();
+            let call_id = tools[index].call_id.clone();
+            if let Err(error) = self
+                .commit_payload(
+                    run_id,
+                    EventPayload::ToolResult {
+                        call_id: call_id.clone(),
+                        result: BoundedResult {
+                            preview: result.clone(),
+                            truncated: false,
+                            artifact: None,
+                            cursor: None,
+                        },
+                    },
+                    prompt_verbatim_render(),
+                )
+                .await
+            {
+                if let Some(completed) = completed {
+                    let _ = completed.send(Err(error.clone()));
+                }
+                return Err(DriveError::Store(error));
+            }
+            self.commit_tool_completed(run_id, &tools[index], ToolStatus::Completed)
+                .await?;
+            tools.remove(index);
+            self.commit_state(run_id, RunState::Streaming)
+                .await
+                .map_err(DriveError::Store)?;
+            if let Some(completed) = completed {
+                let _ = completed.send(Ok(()));
+            }
+            return Ok(Message::tool_result(call_id, result, false));
         }
     }
 

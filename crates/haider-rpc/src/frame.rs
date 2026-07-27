@@ -78,6 +78,14 @@ pub const ERROR_CODE_DRAINING: &str = "draining";
 /// reached — the connection admission cap is the first user (report §2.5).
 /// Retrying later, after other work finishes, is the intended recovery.
 pub const ERROR_CODE_OVERLOADED: &str = "overloaded";
+/// Stable code for an opaque pagination cursor that cannot be decoded.
+pub const ERROR_CODE_INVALID_CURSOR: &str = "invalid_cursor";
+/// Stable code for a structurally invalid request: an unknown method or
+/// attachment mode, a bad range/limit, or menu coordinates that do not match
+/// the committed menu version.
+pub const ERROR_CODE_INVALID_ARGUMENT: &str = "invalid_argument";
+/// Stable code for a control command fenced by a newer worker generation.
+pub const ERROR_CODE_STALE_GENERATION: &str = "stale_generation";
 
 /// Kind of client taking part in the handshake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -316,6 +324,11 @@ pub enum ResponseBody {
     },
     #[serde(rename = "session.detach")]
     SessionDetach { attachment_id: AttachmentId },
+    /// Successful durable menu resolution. The same-command retry receives
+    /// the original sequence; a different command receives
+    /// [`ERROR_CODE_ALREADY_RESOLVED`] instead.
+    #[serde(rename = "menu.answer")]
+    MenuAnswer { resolution_seq: u64 },
     /// A request-correlated operation failure.
     ///
     /// Stable v0.1 codes include [`ERROR_CODE_CURSOR_AHEAD`],
@@ -457,8 +470,14 @@ pub enum WireFrame {
         session_id: SessionId,
         envelope: RawEnvelope,
     },
-    /// Replay for the attachment is complete through `high_water_seq`; every
-    /// later [`WireFrame::Event`] on this attachment is live.
+    /// Replay for the attachment is complete through `high_water_seq`.
+    ///
+    /// This frame may REPEAT on the same attachment with strictly increasing
+    /// `high_water_seq`: the daemon's internal buffering may transparently
+    /// resume an attachment from durable history, replaying the gap and
+    /// announcing the new head. Clients treat every occurrence identically —
+    /// events deduplicate by `seq` alone (R9/R11) — and must not assume the
+    /// first caught-up marker is the last.
     AttachCaughtUp {
         attachment_id: AttachmentId,
         high_water_seq: u64,

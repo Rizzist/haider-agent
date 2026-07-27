@@ -64,6 +64,93 @@ pub struct EventEnvelope<P> {
 /// Envelope with the payload left as raw JSON — the forward-compat reader.
 pub type RawEnvelope = EventEnvelope<serde_json::Value>;
 
+/// Conservative over-approximation of one raw envelope's owned memory.
+///
+/// This is the common accounting unit for replay pages and live catch-up
+/// buffers. It is deliberately independent of wire framing: the negotiated
+/// frame limit governs encoded bytes, while this charge includes the fixed
+/// envelope value, every owned ID string, and the payload's heap storage.
+///
+/// The exhaustive destructure is deliberate. Adding an envelope field must
+/// fail this estimator at compile time until its weight is classified.
+#[must_use]
+pub fn envelope_weight_bytes(envelope: &RawEnvelope) -> usize {
+    let EventEnvelope {
+        schema_version: _,
+        event_id,
+        seq: _,
+        session_id,
+        branch_id,
+        run_id,
+        agent_id,
+        device_id,
+        authority_epoch: _,
+        worker_generation: _,
+        causation_id,
+        correlation_id,
+        committed_at_ms: _,
+        render: _,
+        payload,
+    } = envelope;
+    std::mem::size_of::<RawEnvelope>()
+        .saturating_add(event_id.as_str().len())
+        .saturating_add(session_id.as_str().len())
+        .saturating_add(
+            branch_id
+                .as_ref()
+                .map_or(0, |branch_id| branch_id.as_str().len()),
+        )
+        .saturating_add(run_id.as_ref().map_or(0, |run_id| run_id.as_str().len()))
+        .saturating_add(
+            agent_id
+                .as_ref()
+                .map_or(0, |agent_id| agent_id.as_str().len()),
+        )
+        .saturating_add(device_id.as_str().len())
+        .saturating_add(
+            causation_id
+                .as_ref()
+                .map_or(0, |causation_id| causation_id.as_str().len()),
+        )
+        .saturating_add(
+            correlation_id
+                .as_ref()
+                .map_or(0, |correlation_id| correlation_id.as_str().len()),
+        )
+        .saturating_add(json_owned_heap_bytes(payload))
+}
+
+/// Conservative heap charge for `serde_json::Value`. The root `Value` itself
+/// is already inside `RawEnvelope`; this counts allocations below it.
+fn json_owned_heap_bytes(value: &serde_json::Value) -> usize {
+    // `serde_json::Map` is a BTreeMap in this workspace. One sparse node holds
+    // fixed-capacity key/value arrays and edges; 1 KiB per object plus 128
+    // bytes per populated entry safely covers those nodes, String/Value
+    // headers, and allocator bookkeeping without depending on serialized JSON
+    // length (which badly undercounts arrays of primitives and sparse maps).
+    const OBJECT_BASE_BYTES: usize = 1_024;
+    const OBJECT_ENTRY_BYTES: usize = 128;
+    match value {
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => 0,
+        serde_json::Value::String(text) => text.len(),
+        serde_json::Value::Array(items) => items.iter().map(json_owned_heap_bytes).fold(
+            items
+                .len()
+                .saturating_mul(std::mem::size_of::<serde_json::Value>()),
+            usize::saturating_add,
+        ),
+        serde_json::Value::Object(fields) if fields.is_empty() => 0,
+        serde_json::Value::Object(fields) => fields.iter().fold(
+            OBJECT_BASE_BYTES.saturating_add(fields.len().saturating_mul(OBJECT_ENTRY_BYTES)),
+            |total, (key, value)| {
+                total
+                    .saturating_add(key.len())
+                    .saturating_add(json_owned_heap_bytes(value))
+            },
+        ),
+    }
+}
+
 impl<P> EventEnvelope<P> {
     /// Re-wrap with a different payload, preserving all envelope fields.
     pub fn map_payload<Q>(self, f: impl FnOnce(P) -> Q) -> EventEnvelope<Q> {

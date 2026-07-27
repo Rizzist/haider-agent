@@ -18,23 +18,28 @@ pub struct DaemonConfig {
     /// Maximum inbound frame size; also advertised in `Welcome.frame_limit`,
     /// so it must fit `u32`.
     pub frame_limit: usize,
-    /// Depth of each connection's bounded outbound queue (R12 mechanism);
-    /// an unwritable full queue is a connection-fatal error, never a stall.
+    /// Aggregate frame cap on each connection's fair, attachment-keyed
+    /// outbound queue (R12). One atomic ordinary-offer discipline enforces
+    /// this cap together with the byte budget; attachment traffic waits for
+    /// FIFO service while replies retain their priority path. The
+    /// authoritative policy lives on `connection.rs`'s `OutboundLane`.
     pub outbound_queue_capacity: usize,
-    /// Ceiling on encoded bytes a connection may hold queued-but-unwritten
-    /// (R12 mechanism). The frame-count bound alone permits
+    /// Ordinary encoded-byte budget `B` per connection (R12 mechanism),
+    /// including a frame until its socket write settles. The frame-count bound
+    /// alone permits
     /// `outbound_queue_capacity × frame_limit` of resident payload, so bytes
-    /// are charged before enqueue and credited once the write completes;
-    /// exceeding the budget is the same connection-fatal error a full queue is.
-    /// Must be at least `frame_limit`, and is validated as such: a budget that
-    /// cannot carry one maximum-size frame would make some admissible frames
-    /// unsendable. The default leaves room for one in flight plus one queued.
-    /// The final `ServerDraining` frame never spends this budget (R17).
+    /// are charged before enqueue and credited once the write completes.
+    /// A reply that ordinary traffic cannot admit falls through to one
+    /// reserved `frame_limit + 4` floor; the final `ServerDraining` notice has
+    /// a separate reservation of the same maximum encoded size (R17).
     ///
-    /// Aggregate worst case is `max_connections × outbound_queued_bytes` —
-    /// 64 × 16 MiB = 1 GiB at the defaults, reached only if every admitted
-    /// connection simultaneously stops reading with a full budget charged.
-    /// Tune this pair together, not `frame_limit` alone.
+    /// Therefore the exact encoded-payload ceiling is
+    /// `B + 2 × (frame_limit + 4)` per connection. At the defaults that is
+    /// `16,777,216 + 2 × 8,388,612 = 33,554,440` bytes per connection and
+    /// `64 × 33,554,440 = 2,147,484,160` bytes fleet-wide. Validation requires
+    /// `B >= frame_limit + 4`, because the UDS length prefix is part of the
+    /// ordinary charge and every legal maximum-size Event must fit an empty
+    /// outbox. Tune these bounds together, not `frame_limit` alone.
     pub outbound_queued_bytes: usize,
     /// Simultaneously served connections. A same-UID peer accepted beyond this
     /// cap is answered with a fatal `overloaded` [`haider_rpc::ProtocolError`]
@@ -101,10 +106,15 @@ impl DaemonConfig {
         if self.outbound_queue_capacity == 0 {
             return Err("outbound queue capacity must be greater than zero".into());
         }
-        if self.outbound_queued_bytes < self.frame_limit {
+        let encoded_frame_limit = self.frame_limit.checked_add(4).ok_or_else(|| {
+            "frame limit plus the 4-byte UDS length prefix overflows usize".to_owned()
+        })?;
+        if self.outbound_queued_bytes < encoded_frame_limit {
             return Err(format!(
-                "outbound queued-byte budget ({}) must be at least the frame limit ({})",
-                self.outbound_queued_bytes, self.frame_limit
+                "outbound queued-byte budget ({}) must be at least frame limit + the 4-byte UDS \
+                 length prefix ({} + 4 = {} encoded bytes), so a legal maximum-size frame fits \
+                 an empty outbox",
+                self.outbound_queued_bytes, self.frame_limit, encoded_frame_limit
             ));
         }
         // The upper bound is the admission semaphore's own ceiling: a config

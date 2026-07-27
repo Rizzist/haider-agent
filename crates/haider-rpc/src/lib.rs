@@ -29,10 +29,11 @@ pub use codec::CodecError;
 pub use frame::{
     AttachMode, AttachState, AttachmentId, Capability, CapabilitySet, ClientKind, CommandId,
     DEFAULT_FRAME_LIMIT, ERROR_CODE_ALREADY_RESOLVED, ERROR_CODE_CAPABILITY_DENIED,
-    ERROR_CODE_CURSOR_AHEAD, ERROR_CODE_DRAINING, ERROR_CODE_NOT_FOUND, ERROR_CODE_OVERLOADED,
-    ErrorData, Hello, LifecyclePhase, MenuInput, ProtocolError, RequestBody, RequestId,
-    ResponseBody, SeqRange, SessionReadResult, SessionSummary, WIRE_PROTOCOL_VERSION, Welcome,
-    WireFrame,
+    ERROR_CODE_CURSOR_AHEAD, ERROR_CODE_DRAINING, ERROR_CODE_INVALID_ARGUMENT,
+    ERROR_CODE_INVALID_CURSOR, ERROR_CODE_NOT_FOUND, ERROR_CODE_OVERLOADED,
+    ERROR_CODE_STALE_GENERATION, ErrorData, Hello, LifecyclePhase, MenuInput, ProtocolError,
+    RequestBody, RequestId, ResponseBody, SeqRange, SessionReadResult, SessionSummary,
+    WIRE_PROTOCOL_VERSION, Welcome, WireFrame,
 };
 pub use negotiation::{Negotiated, ServerRange, negotiate};
 

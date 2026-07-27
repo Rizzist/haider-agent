@@ -14,7 +14,7 @@ use crate::{StoreResult, now_ms, store_error, to_sqlite_integer};
 use haider_protocol::error::{ErrorCode, HaiderError};
 use rusqlite::{Connection, TransactionBehavior, params};
 
-pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 3;
+pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 4;
 
 struct Migration {
     version: u32,
@@ -64,6 +64,28 @@ const MIGRATIONS: &[Migration] = &[
             ALTER TABLE profile_meta
             ADD COLUMN daemon_generation INTEGER NOT NULL DEFAULT 0
             CHECK (daemon_generation >= 0);
+        ",
+    },
+    Migration {
+        version: 4,
+        sql: "
+            CREATE TABLE menu_resolutions (
+                session_id        TEXT NOT NULL,
+                menu_id           TEXT NOT NULL,
+                request_seq       INTEGER NOT NULL CHECK (request_seq > 0),
+                worker_generation INTEGER NOT NULL CHECK (worker_generation >= 0),
+                command_id        TEXT NOT NULL UNIQUE,
+                answer_json       TEXT NOT NULL,
+                input_is_secret_reference INTEGER NOT NULL
+                    CHECK (input_is_secret_reference IN (0, 1)),
+                resolution_seq    INTEGER NOT NULL CHECK (resolution_seq > request_seq),
+                PRIMARY KEY (session_id, menu_id),
+                UNIQUE (session_id, resolution_seq),
+                FOREIGN KEY (session_id, request_seq)
+                    REFERENCES events(session_id, seq),
+                FOREIGN KEY (session_id, resolution_seq)
+                    REFERENCES events(session_id, seq)
+            );
         ",
     },
 ];
