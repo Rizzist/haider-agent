@@ -664,6 +664,26 @@ pub enum Hit {
     StickyJump(u16),
 }
 
+/// One answer on its way to the client, tagged with the session epoch that
+/// RENDERED the card (review r2 P1-1). Answers ride the never-cancelled
+/// control tag so delivery is guaranteed, but CONSUMPTION checks the
+/// origin: an answer to a card the user has since replaced must never
+/// reconfigure the session that took its place. The sim gets this for free
+/// — its `askMenu` promise closes over the originating session/branch ids
+/// and its menu ids are per-open `nid()`s (tui.js:849-878).
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutboundAnswer {
+    pub origin: u64,
+    pub answer: MenuAnswer,
+}
+
+impl std::ops::Deref for OutboundAnswer {
+    type Target = MenuAnswer;
+    fn deref(&self) -> &MenuAnswer {
+        &self.answer
+    }
+}
+
 /// The launcher's non-session rows (value-carrying hit payload, P2-9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LauncherRow {
@@ -738,6 +758,10 @@ pub struct AppModel {
     pub launcher_dir: String,
     /// The session's working dir — shown in the header; `cd` retargets it.
     pub session_dir: String,
+    /// Per-open card counter: `/voice` and `/tools` mint a FRESH menu id
+    /// each time, exactly as the sim's `nid()` does (review r2 P1-1 — fixed
+    /// ids let a stale answer apply its consequences to a later card).
+    pub card_seq: u64,
     /// The demo VFS the shell builtins run against (sim tui.js:418-426).
     pub vfs: BTreeMap<String, Vec<String>>,
     /// The launcher's `.shellout` block: last builtin (cmd, output).
@@ -772,7 +796,11 @@ pub struct AppModel {
     pub flash: Option<String>,
     /// Answers the user produced; the runtime drains these to the client
     /// (side effects never happen inside the reducer).
-    pub outbox: Vec<MenuAnswer>,
+    pub outbox: Vec<OutboundAnswer>,
+    /// Bumped by every [`Self::fresh_session`]. Menu answers and the
+    /// auto-title micro-call carry the epoch they were born under, and the
+    /// driver applies them only while it is still current (review r2 P1-1).
+    pub session_epoch: u64,
     /// Reducer-requested side effects; the runtime drains these.
     pub requests: Vec<AppRequest>,
     /// True while a demo turn is playing (submits are ignored, honestly).
@@ -824,6 +852,7 @@ impl Default for AppModel {
             listening: false,
             launcher_dir: "~/dev/enterprise-suite".to_owned(),
             session_dir: "~/dev/enterprise-suite".to_owned(),
+            card_seq: 0,
             vfs: vfs_seed(),
             launcher_shellout: None,
             chips: Vec::new(),
@@ -839,6 +868,7 @@ impl Default for AppModel {
             help_open: false,
             flash: None,
             outbox: Vec::new(),
+            session_epoch: 0,
             requests: Vec::new(),
             turn_active: false,
             auto_play_spent: false,
@@ -1371,13 +1401,9 @@ impl AppModel {
         }
         self.listening = false;
         self.dirty = true;
-        // The mic renders on the session AND the launcher (sim
-        // tui.js:3035-3047), so both are legal targets; every other screen
-        // means the user navigated away mid-hold.
-        if self.turn_active
-            || !self.voice.enabled
-            || !matches!(self.screen, Screen::Session | Screen::Launcher)
-        {
+        // Sim `speak` requires an attached, idle session (tui.js:2045);
+        // the launcher mic is inert, so the hold can never fabricate one.
+        if self.turn_active || !self.voice.enabled || self.screen != Screen::Session {
             return;
         }
         self.submit_voice(TALK_PHRASE.to_owned());
@@ -1489,12 +1515,15 @@ impl AppModel {
         let Some(option) = menu.options.get(self.menu_selection) else {
             return;
         };
-        self.outbox.push(MenuAnswer {
-            menu: menu.id.clone(),
-            option_key: Some(option.key.clone()),
-            option_index: u32::try_from(self.menu_selection).unwrap_or(u32::MAX),
-            value: None,
-            via: AnswerVia::Tui,
+        self.outbox.push(OutboundAnswer {
+            origin: self.session_epoch,
+            answer: MenuAnswer {
+                menu: menu.id.clone(),
+                option_key: Some(option.key.clone()),
+                option_index: u32::try_from(self.menu_selection).unwrap_or(u32::MAX),
+                value: None,
+                via: AnswerVia::Tui,
+            },
         });
         self.menu_selection = 0;
     }
@@ -1668,7 +1697,8 @@ impl AppModel {
             }
             "voice" => {
                 if self.screen == Screen::Session {
-                    let card = voice_card(&self.voice);
+                    self.card_seq += 1;
+                    let card = voice_card(&self.voice, self.card_seq);
                     self.projection.apply(&EventPayload::MenuOpened(card));
                 } else {
                     self.flash = Some("· /voice — session only".to_owned());
@@ -1676,8 +1706,9 @@ impl AppModel {
             }
             "tools" => {
                 if self.screen == Screen::Session {
+                    self.card_seq += 1;
                     self.projection
-                        .apply(&EventPayload::MenuOpened(tools_card()));
+                        .apply(&EventPayload::MenuOpened(tools_card(self.card_seq)));
                 } else {
                     self.flash = Some("· /tools — session only".to_owned());
                 }
@@ -1756,7 +1787,10 @@ impl AppModel {
             value: None,
             via: AnswerVia::Tui,
         };
-        self.outbox.push(answer);
+        self.outbox.push(OutboundAnswer {
+            origin: self.session_epoch,
+            answer,
+        });
         self.menu_selection = 0;
     }
 
@@ -1806,10 +1840,11 @@ impl AppModel {
         // apply AFTER the answer closed the card.
         if let EventPayload::MenuAnswered(answer) = payload {
             let index = usize::try_from(answer.option_index).unwrap_or(usize::MAX);
-            match answer.menu.as_str() {
-                "voice-card" => self.voice_card_answered(index),
-                "tools-card" => self.tools_card_answered(index),
-                _ => {}
+            let id = answer.menu.as_str();
+            if id.starts_with(VOICE_CARD_PREFIX) {
+                self.voice_card_answered(index);
+            } else if id.starts_with(TOOLS_CARD_PREFIX) {
+                self.tools_card_answered(index);
             }
         }
     }
@@ -1873,6 +1908,11 @@ impl AppModel {
     /// P2-2/P3-6: StopScripts bumps the generation, so a stale idle-decay
     /// or script beat from the OLD session drops at consumption).
     fn fresh_session(&mut self) {
+        // A NEW session identity: answers and micro-calls born under the old
+        // one are now stale, and any that never left the outbox are dropped
+        // outright (review r2 P1-1).
+        self.session_epoch = self.session_epoch.wrapping_add(1);
+        self.outbox.clear();
         self.projection = SessionProjection::new();
         self.session_title = None;
         self.session_name = None;
@@ -1970,11 +2010,17 @@ impl AppModel {
                         self.menu_selection = index;
                         self.answer_chip_menu(&card);
                     }
-                } else if self
-                    .projection
-                    .open_menu()
-                    .is_some_and(|m| m.id == menu && index < m.options.len())
+                } else if self.screen == Screen::Session
+                    && self
+                        .projection
+                        .open_menu()
+                        .is_some_and(|m| m.id == menu && index < m.options.len())
                 {
+                    // The card is only answerable while its own surface is
+                    // showing: Back leaves the projection (and its card)
+                    // intact, so without this a queued click on the old
+                    // option rect would answer an invisible card and start
+                    // its parked continuation (review r2 P1-2).
                     self.menu_selection = index;
                     self.submit_menu_answer();
                 }
@@ -1984,9 +2030,12 @@ impl AppModel {
                 // Leaving the session cancels a live talk hold (P1-3).
                 self.listening = false;
             }
-            Hit::TalkChip => {
-                // ◉ talk (sim tui.js:2044-2054): idle-only. The hold is a
-                // driver timer; `◉ listening…` shows meanwhile.
+            // ◉ talk (sim `speak`, tui.js:2044-2049): the mic RENDERS on the
+            // launcher, but pressing it there does nothing — `speak` returns
+            // unless a session is attached and idle (review r2 P2-3). The
+            // screen gate is also the owning-surface guard the other hits
+            // already carry (review r2 P2-4).
+            Hit::TalkChip if self.screen == Screen::Session => {
                 if !self.voice.enabled {
                     self.flash = Some("· enable voice first with /voice".to_owned());
                 } else if !self.turn_active && !self.listening {
@@ -1994,7 +2043,7 @@ impl AppModel {
                     self.requests.push(AppRequest::Talk);
                 }
             }
-            Hit::HelpHint => self.help_open = true,
+            Hit::HelpHint if self.screen == Screen::Launcher => self.help_open = true,
             // The SubTree panel exists only on the session/subagent screens,
             // and its rows only while it is expanded.
             Hit::ChipRow(agent)
@@ -2137,9 +2186,12 @@ impl AppModel {
                         .and_then(ChipModel::question_menu)
                         .is_some_and(|m| m.id == menu && index < m.options.len())
                 } else {
-                    self.projection
-                        .open_menu()
-                        .is_some_and(|m| m.id == menu && index < m.options.len())
+                    // Same surface gate as the click (review r2 P1-2).
+                    self.screen == Screen::Session
+                        && self
+                            .projection
+                            .open_menu()
+                            .is_some_and(|m| m.id == menu && index < m.options.len())
                 };
                 if valid {
                     self.menu_selection = index;
@@ -2157,6 +2209,11 @@ impl AppModel {
     }
 }
 
+/// Command-card id prefixes — each open mints `{prefix}{seq}` so a stale
+/// answer can never drive a later card's consequences (review r2 P1-1).
+pub const VOICE_CARD_PREFIX: &str = "voice-card-";
+pub const TOOLS_CARD_PREFIX: &str = "tools-card-";
+
 fn card_option(key: &str, label: String) -> MenuOption {
     MenuOption {
         key: key.to_owned(),
@@ -2169,14 +2226,14 @@ fn card_option(key: &str, label: String) -> MenuOption {
 /// The `/voice` menu card (sim tui.js:1824-1864, verbatim body/options).
 /// Non-blocking Choice card; `origin: "voice"` selects the ◉ glyph.
 #[must_use]
-pub fn voice_card(voice: &VoiceState) -> Menu {
+pub fn voice_card(voice: &VoiceState, seq: u64) -> Menu {
     let last = if voice.enabled {
         "disable voice"
     } else {
         "keep voice off"
     };
     Menu {
-        id: MenuId::new("voice-card"),
+        id: MenuId::new(format!("{VOICE_CARD_PREFIX}{seq}")),
         kind: MenuKind::Choice,
         title: "voice — enable duplex speech for this session".to_owned(),
         body: vec![
@@ -2208,9 +2265,9 @@ pub fn voice_card(voice: &VoiceState) -> Menu {
 /// The `/tools` menu card (sim tui.js:1876-1906, verbatim body/options).
 /// Non-blocking Choice card; `origin: "tools"` selects the ⚒ glyph.
 #[must_use]
-pub fn tools_card() -> Menu {
+pub fn tools_card(seq: u64) -> Menu {
     Menu {
-        id: MenuId::new("tools-card"),
+        id: MenuId::new(format!("{TOOLS_CARD_PREFIX}{seq}")),
         kind: MenuKind::Choice,
         title: "tools — core surface + custom tools".to_owned(),
         body: vec![

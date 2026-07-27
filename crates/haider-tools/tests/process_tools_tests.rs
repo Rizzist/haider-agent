@@ -640,9 +640,14 @@ async fn cancellation_waits_for_grace_then_kills_the_group_and_is_not_a_failure(
         tokio::task::yield_now().await;
     }
     execution.cancel();
-    tokio::task::yield_now().await;
+    // Let the supervisor actually OBSERVE the cancel and arm its grace
+    // deadline before the clock moves. One yield only reaches it if it
+    // happens to be the next ready task; if the clock advanced first, the
+    // deadline would be armed against the advanced `now` and the assertion
+    // below would pass vacuously instead of proving the grace window.
+    settle().await;
     tokio::time::advance(grace - Duration::from_millis(1)).await;
-    tokio::task::yield_now().await;
+    settle().await;
     assert!(
         phases(&journal)
             .iter()
@@ -655,14 +660,52 @@ async fn cancellation_waits_for_grace_then_kills_the_group_and_is_not_a_failure(
 
     let phases = phases(&journal);
     assert_eq!(phases.len(), 4);
-    assert!(matches!(
-        phases[3],
+    assert!(
+        is_cancelled_outcome(&phases[3]),
+        "supervised termination is journaled as a cancellation, got {:?}",
+        phases[3]
+    );
+    broker.close().await.expect("broker closes");
+}
+
+/// Yield enough times for a spawned supervisor to be scheduled and act on a
+/// state change. `yield_now` hands the current-thread runtime ONE chance to
+/// run other ready tasks; a supervisor that must wake on a watch, issue a
+/// signal and arm a timer can legitimately need more than one, and under
+/// load it competes with the output-reader tasks. Bounded, so a genuinely
+/// stuck supervisor still fails the test rather than hanging.
+async fn settle() {
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+}
+
+/// The legitimate terminal outcomes of a SUPERVISED cancellation.
+///
+/// These tests cancel a child that installs `trap '' TERM`, so it can only
+/// die to SIGKILL after the grace window. That escalation path runs real
+/// syscalls (`killpg` probe, `killpg(SIGKILL)`, reap) against a process
+/// that is concurrently being torn down by the kernel, and any of them may
+/// legitimately observe the group mid-teardown — ESRCH on the probe, the
+/// leader reaped as a zombie, and so on. Each such observation is recorded
+/// as a durable escalation note, which turns the outcome into
+/// `CancelledEscalated` instead of `Cancelled` (process.rs:689-694). BOTH
+/// mean "cancellation won"; which one appears depends on kill-vs-exit
+/// ordering the test cannot pin down, and that is the nondeterminism the
+/// round-2 review caught.
+///
+/// The set deliberately EXCLUDES `Ok` and `Failed`: if cancellation stops
+/// working the process runs to completion or dies some other way, and this
+/// predicate — plus the exact `ToolStatus::Cancelled` assertion each test
+/// keeps — fails.
+fn is_cancelled_outcome(phase: &EffectPhase) -> bool {
+    matches!(
+        phase,
         EffectPhase::Outcome {
-            outcome: EffectOutcome::Cancelled,
+            outcome: EffectOutcome::Cancelled | EffectOutcome::CancelledEscalated { .. },
             ..
         }
-    ));
-    broker.close().await.expect("broker closes");
+    )
 }
 
 #[tokio::test(start_paused = true)]
@@ -730,13 +773,14 @@ async fn process_control_kill_is_brokered_and_cancels_the_original_as_an_outcome
             .count(),
         2
     );
-    assert!(phases.iter().any(|phase| matches!(
-        phase,
-        EffectPhase::Outcome {
-            effect,
-            outcome: EffectOutcome::Cancelled,
-        } if effect == &control.original_effect
-    )));
+    assert!(
+        phases.iter().any(|phase| match phase {
+            EffectPhase::Outcome { effect, .. } =>
+                effect == &control.original_effect && is_cancelled_outcome(phase),
+            _ => false,
+        }),
+        "the brokered kill cancels the ORIGINAL effect, got {phases:?}"
+    );
     broker.close().await.expect("broker closes");
 }
 

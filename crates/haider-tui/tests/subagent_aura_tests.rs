@@ -70,12 +70,15 @@ fn drain(driver: &mut DemoDriver, model: &mut AppModel) {
 
 fn echo_answers(driver: &DemoDriver, model: &mut AppModel) {
     while !model.outbox.is_empty() {
-        let answer = model.outbox.remove(0);
+        let pending = model.outbox.remove(0);
         driver
             .sender()
             .try_send((
                 driver.control_tag(),
-                DemoEvent::Envelope(EventPayload::MenuAnswered(answer)),
+                DemoEvent::Answer {
+                    origin: pending.origin,
+                    answer: pending.answer,
+                },
             ))
             .expect("echo");
     }
@@ -116,12 +119,15 @@ async fn pump_until(
 /// Answer a chip question card directly (the chip-view digit path pushes
 /// the same MenuAnswer).
 fn answer_chip_menu(model: &mut AppModel, menu: &str, index: u32) {
-    model.outbox.push(MenuAnswer {
-        menu: haider_protocol::ids::MenuId::new(menu),
-        option_key: None,
-        option_index: index,
-        value: None,
-        via: AnswerVia::Tui,
+    model.outbox.push(haider_tui::app::OutboundAnswer {
+        origin: model.session_epoch,
+        answer: MenuAnswer {
+            menu: haider_protocol::ids::MenuId::new(menu),
+            option_key: None,
+            option_index: index,
+            value: None,
+            via: AnswerVia::Tui,
+        },
     });
 }
 

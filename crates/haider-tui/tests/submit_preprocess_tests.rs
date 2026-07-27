@@ -65,7 +65,7 @@ fn draw(model: &AppModel, width: u16, height: u16) -> Vec<String> {
 /// Echo one outbox answer back as the runtime does (menu consequences
 /// apply on the echoed envelope).
 fn echo_answer(model: &mut AppModel) {
-    let answer = model.outbox.remove(0);
+    let answer = model.outbox.remove(0).answer;
     model.handle(AppEvent::Envelope(Box::new(EventPayload::MenuAnswered(
         answer,
     ))));

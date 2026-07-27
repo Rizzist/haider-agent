@@ -400,8 +400,9 @@ fn render_launcher(
     }
     // Sim `.aurarow` metas VERBATIM (tui.js:3278-3300) — the earlier port
     // abbreviated all three (review P2-8). The Accounts/Peers counts come
-    // from the sim's own seed lists (4 credentials across 3 providers;
-    // 2 host-capable nodes of the 3 seeded — the shell rung is excluded).
+    // from the sim's own seed lists: 7 credentials across 5 providers
+    // (tui.js:146-154), and 3 host-capable nodes of the 4 seeded — the
+    // `shell` rung does not host (tui.js:165-174).
     for (row, glyph, name, blurb) in [
         (
             LauncherRow::Aura,

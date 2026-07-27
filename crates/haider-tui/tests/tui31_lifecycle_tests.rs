@@ -13,7 +13,7 @@ use haider_tui::app::{AppEvent, AppModel, AppRequest, Hit, LauncherRow, Screen, 
 use haider_tui::projection::TranscriptEntry;
 use haider_tui::render::render;
 use haider_tui::runtime::DemoDriver;
-use haider_tui::script::{AuraState, Beat, ChipDisplayState, DemoEvent, respond_beats};
+use haider_tui::script::{AuraState, ChipDisplayState, DemoEvent};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -68,12 +68,15 @@ fn drain(driver: &mut DemoDriver, model: &mut AppModel) {
 
 fn echo_answers(driver: &DemoDriver, model: &mut AppModel) {
     while !model.outbox.is_empty() {
-        let answer = model.outbox.remove(0);
+        let pending = model.outbox.remove(0);
         driver
             .sender()
             .try_send((
                 driver.control_tag(),
-                DemoEvent::Envelope(EventPayload::MenuAnswered(answer)),
+                DemoEvent::Answer {
+                    origin: pending.origin,
+                    answer: pending.answer,
+                },
             ))
             .expect("echo");
     }
@@ -127,12 +130,15 @@ async fn pump_quiet(
 }
 
 fn answer_menu(model: &mut AppModel, menu: &str, index: u32) {
-    model.outbox.push(MenuAnswer {
-        menu: haider_protocol::ids::MenuId::new(menu),
-        option_key: None,
-        option_index: index,
-        value: None,
-        via: AnswerVia::Tui,
+    model.outbox.push(haider_tui::app::OutboundAnswer {
+        origin: model.session_epoch,
+        answer: MenuAnswer {
+            menu: haider_protocol::ids::MenuId::new(menu),
+            option_key: None,
+            option_index: index,
+            value: None,
+            via: AnswerVia::Tui,
+        },
     });
 }
 
@@ -234,9 +240,9 @@ async fn closing_a_chip_stops_its_script_at_once() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_fresh_session_cancels_chip_and_aura_work() {
-    // Review P1-1/P1-2: StopScripts left aura alone entirely and chips only
-    // half-guarded, so a torn-down session's work bled into the next one.
+async fn a_fresh_session_cancels_chip_work() {
+    // Review r1 P1-1: chip arms were only half-guarded, so a torn-down
+    // session's chip scripts bled into the next one.
     let (mut driver, mut rx) = DemoDriver::new(64);
     let mut model = launcher_model();
     submit(&mut model, "use two subagents to split this work");
@@ -261,9 +267,11 @@ async fn a_fresh_session_cancels_chip_and_aura_work() {
 // ---- P1-2: aura lifecycle ----
 
 #[tokio::test(start_paused = true)]
-async fn aura_work_dies_with_the_session_teardown() {
-    // Review P1-2: aura_gen was bumped only by /reset, so a hidden run kept
-    // mutating the roster, the log and the transcript after navigation.
+async fn aura_runs_survive_clear_but_reset_stops_them() {
+    // Review r2 P2-5 corrected round 1: the sim's `/clear` and main-session
+    // interrupt do NOT advance `auraRunRef` (tui.js:1950-1955) — only
+    // `/reset` (tui.js:1930) and the next `orchestrate` do. A background
+    // orchestration must therefore FINISH across navigation.
     let (mut driver, mut rx) = DemoDriver::new(64);
     let mut model = launcher_model();
     submit(&mut model, "/aura");
@@ -275,21 +283,80 @@ async fn aura_work_dies_with_the_session_teardown() {
         m.aura.roster.len() == 2
     })
     .await;
-    let (roster, log) = (model.aura.roster.len(), model.aura.log.len());
+    let log_at_clear = model.aura.log.len();
     submit(&mut model, "/clear");
     drain(&mut driver, &mut model);
-    pump_quiet(&mut driver, &mut rx, &mut model, 8_000).await;
-    assert_eq!(model.aura.roster.len(), roster, "roster frozen at teardown");
-    assert_eq!(model.aura.log.len(), log, "activity log frozen at teardown");
-    assert_eq!(
-        model.aura.state,
-        AuraState::Idle,
-        "a cancelled run leaves an orb the user can act on"
+    assert_eq!(model.screen, Screen::Launcher);
+    pump_until(&mut driver, &mut rx, &mut model, "run finished", |m| {
+        m.aura.state == AuraState::Idle && m.aura.roster[1].activity == "tests green"
+    })
+    .await;
+    assert!(
+        model.aura.log.len() > log_at_clear,
+        "the orchestration kept reporting after /clear, as the sim does"
     );
     assert!(
-        !model.aura.transcript.voice_live(),
-        "and stops tagging later rows as spoken"
+        model
+            .aura
+            .log
+            .iter()
+            .any(|line| line == "billing on workstation: tests green ✓"),
+        "and ran to its final log line"
     );
+
+    // /reset IS the cancel point — and it reseeds.
+    submit(&mut model, "/aura");
+    submit(&mut model, "spin up the api service on phone");
+    pump_until(
+        &mut driver,
+        &mut rx,
+        &mut model,
+        "second run started",
+        |m| m.aura.roster.iter().any(|row| row.name == "api"),
+    )
+    .await;
+    submit(&mut model, "/reset");
+    drain(&mut driver, &mut model);
+    assert_eq!(model.aura.roster.len(), 1, "reseeded");
+    assert_eq!(model.aura.state, AuraState::Idle);
+    let log = model.aura.log.len();
+    pump_quiet(&mut driver, &mut rx, &mut model, 8_000).await;
+    assert_eq!(
+        model.aura.roster.len(),
+        1,
+        "the cancelled run added nothing"
+    );
+    assert_eq!(model.aura.log.len(), log);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_session_interrupt_leaves_a_background_orchestration_running() {
+    // The other half of review r2 P2-5: an interrupt is session-scoped.
+    let (mut driver, mut rx) = DemoDriver::new(64);
+    let mut model = launcher_model();
+    submit(&mut model, "/aura");
+    submit(
+        &mut model,
+        "spin up billing on workstation and run its tests",
+    );
+    pump_until(&mut driver, &mut rx, &mut model, "run started", |m| {
+        m.aura.roster.len() == 2
+    })
+    .await;
+    // Leave the stage, start a session, then interrupt THAT turn.
+    model.handle(key(KeyCode::Esc));
+    submit(&mut model, "hello world");
+    pump_until(&mut driver, &mut rx, &mut model, "thinking", |m| {
+        m.projection.badge() == "● THINKING"
+    })
+    .await;
+    model.handle(key(KeyCode::Esc));
+    drain(&mut driver, &mut model);
+    assert!(model.projection.interrupted());
+    pump_until(&mut driver, &mut rx, &mut model, "aura finished", |m| {
+        m.aura.state == AuraState::Idle && m.aura.roster[1].activity == "tests green"
+    })
+    .await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -628,65 +695,83 @@ async fn the_voice_tag_clears_even_when_the_branch_parks_on_a_menu() {
 
 // ---- P2-11: token + routing laws ----
 
-#[test]
-fn token_counts_use_utf16_units_like_the_sim() {
+#[tokio::test(start_paused = true)]
+async fn token_counts_use_utf16_units_like_the_sim() {
     // JS `String.length` counts UTF-16 code units: a non-BMP emoji is 2, so
     // it costs 18 tokens, not the 9 a Unicode-scalar count would charge.
-    let generic = std::sync::atomic::AtomicU64::new(0);
-    let roster = std::sync::atomic::AtomicU64::new(3);
-    let beats = respond_beats(
-        "\u{1F600}",
-        false,
-        haider_protocol::DeliveryMode::Steer,
-        1,
-        &generic,
-        &roster,
+    // Driven through production dispatch (review r2 P3-9): the FIRST usage
+    // frame of the turn is the preamble's user-text accrual.
+    let (mut driver, mut rx) = DemoDriver::new(64);
+    let mut model = launcher_model();
+    submit(&mut model, "\u{1F600}");
+    pump_until(&mut driver, &mut rx, &mut model, "first usage", |m| {
+        m.projection.context_tokens() > 0
+    })
+    .await;
+    assert_eq!(
+        model.projection.context_tokens(),
+        18,
+        "one emoji = 2 UTF-16 units × 9"
     );
-    let user_tokens = beats
-        .iter()
-        .find_map(|beat| match beat {
-            Beat::Tokens { n, output: false } => Some(*n),
-            _ => None,
-        })
-        .expect("user tokens");
-    assert_eq!(user_tokens, 18, "one emoji = 2 UTF-16 units × 9");
 }
 
-#[test]
-fn trailing_word_boundaries_route_like_the_sim() {
-    // `/ci\b/` has NO leading boundary, so "ascii" IS a test-branch hit —
-    // the Rust port used to require both sides and routed it generic.
-    let generic = std::sync::atomic::AtomicU64::new(0);
-    let roster = std::sync::atomic::AtomicU64::new(3);
-    let branch_text = |text: &str| -> String {
-        let beats = respond_beats(
-            text,
-            false,
-            haider_protocol::DeliveryMode::Steer,
-            1,
-            &generic,
-            &roster,
-        );
-        beats
+#[tokio::test(start_paused = true)]
+async fn trailing_word_boundaries_route_like_the_sim() {
+    // `/ci\b/` has NO leading boundary, so `pci` IS a test-branch hit — the
+    // Rust port used to require both sides and routed it generic. (NB
+    // "ascii" is NOT a hit in either engine: it ends `ii`.) Driven through
+    // production dispatch (review r2 P3-9).
+    async fn opening_line(text: &str) -> String {
+        let (mut driver, mut rx) = DemoDriver::new(64);
+        let mut model = launcher_model();
+        submit(&mut model, text);
+        pump_until(&mut driver, &mut rx, &mut model, "opening line", |m| {
+            m.projection.entries().iter().any(|entry| {
+                matches!(
+                    entry,
+                    TranscriptEntry::Item(block)
+                        if !block.streaming
+                            && matches!(
+                                &block.item,
+                                haider_protocol::item::TurnItem::AgentMessage { text }
+                                    if !text.is_empty()
+                            )
+                )
+            })
+        })
+        .await;
+        model
+            .projection
+            .entries()
             .iter()
-            .find_map(|beat| match beat {
-                Beat::Emit(EventPayload::Item(haider_protocol::item::ItemEvent::Completed {
-                    item: haider_protocol::item::TurnItem::AgentMessage { text },
-                    ..
-                })) => Some(text.clone()),
+            .find_map(|entry| match entry {
+                TranscriptEntry::Item(block) if !block.streaming => match &block.item {
+                    haider_protocol::item::TurnItem::AgentMessage { text } if !text.is_empty() => {
+                        Some(text.clone())
+                    }
+                    _ => None,
+                },
                 _ => None,
             })
             .expect("an opening line")
-    };
-    assert_eq!(
-        branch_text("audit the pci flow"),
-        "Running the suite first to get a clean failure signature.",
-        "`pci` ends on a boundary → the test branch (no LEADING boundary in /ci\\b/)"
+    }
+    let got = opening_line("audit the pci flow").await;
+    assert!(
+        got.starts_with("Running the suite first"),
+        "`pci` ends on a boundary → the test branch, got {got:?}"
     );
-    // `/subagents\b/` decides PLURAL only; the branch gate itself is a bare
-    // /subagent/, so the singular text still spins one up.
-    assert!(branch_text("use a subagent here").starts_with("Spinning up a subagent — "));
-    assert!(branch_text("use two subagents here").starts_with("Spinning up two subagents — "));
+    // `/subagents\b/` decides PLURAL only; the branch gate is a bare
+    // /subagent/, so the singular text still spins exactly one up.
+    assert!(
+        opening_line("use a subagent here")
+            .await
+            .starts_with("Spinning up a subagent — ")
+    );
+    assert!(
+        opening_line("use two subagents here")
+            .await
+            .starts_with("Spinning up two subagents — ")
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -830,4 +915,272 @@ fn an_attach_hit_follows_its_session_when_the_list_reorders() {
     model.handle_hit(Hit::AttachSample("billing-service".to_owned()));
     assert_eq!(model.session_name, None, "a vanished row attaches nothing");
     assert_eq!(tree_live_count(&model.chips), 0);
+}
+
+// ---- Review r2 P1-1: control-tag answers must prove their origin ----
+
+#[tokio::test(start_paused = true)]
+async fn a_stale_card_answer_cannot_reconfigure_a_replacement_session() {
+    // Repro from the review: answer an old /voice card, then leave for a
+    // replacement session BEFORE the answer is consumed. The answer rides
+    // the never-cancelled control tag, so it still arrives — and must be
+    // dropped on identity, not applied to whoever is showing now.
+    let (mut driver, mut rx) = DemoDriver::new(64);
+    let mut model = launcher_model();
+    submit(&mut model, "hello world");
+    pump_until(&mut driver, &mut rx, &mut model, "turn done", |m| {
+        !m.turn_active && m.projection.badge() == "IDLE"
+    })
+    .await;
+    submit(&mut model, "/voice");
+    let card = model.projection.open_menu().expect("voice card").id.clone();
+    assert!(
+        card.as_str().starts_with("voice-card-"),
+        "cards mint a per-open id, got {card}"
+    );
+    // Answer option 1 (Deepgram · ElevenLabs) but do NOT let the driver
+    // consume it yet: hand it to the channel, then replace the session.
+    model.handle(key(KeyCode::Down));
+    model.handle(key(KeyCode::Enter));
+    let pending = model.outbox.remove(0);
+    assert_eq!(pending.origin, model.session_epoch);
+    let pending_origin = pending.origin;
+    driver
+        .sender()
+        .try_send((
+            driver.control_tag(),
+            DemoEvent::Answer {
+                origin: pending.origin,
+                answer: pending.answer,
+            },
+        ))
+        .expect("queued");
+    // Leave for the launcher — the card is still open (its MenuClosed rides
+    // the answer we are holding), so navigation goes through the chrome,
+    // exactly as a user would — then start a REPLACEMENT session.
+    model.handle_hit(Hit::BackChip);
+    assert_eq!(model.screen, Screen::Launcher);
+    submit(&mut model, "a different task entirely");
+    drain(&mut driver, &mut model);
+    assert_ne!(
+        model.session_epoch, pending_origin,
+        "a new session identity"
+    );
+    let epoch = model.session_epoch;
+    let voice_before = model.voice.clone();
+    pump_quiet(&mut driver, &mut rx, &mut model, 6_000).await;
+    assert_eq!(model.session_epoch, epoch);
+    assert_eq!(
+        model.voice, voice_before,
+        "the stale answer must not reconfigure the replacement session"
+    );
+    let notes: Vec<String> = model
+        .projection
+        .entries()
+        .iter()
+        .filter_map(|entry| match entry {
+            TranscriptEntry::Note { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !notes.iter().any(|text| text.starts_with("· voice enabled")),
+        "and lands no consequence note in it, got {notes:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_card_answered_in_its_own_session_still_applies() {
+    // The identity gate must not break the ordinary path.
+    let (mut driver, mut rx) = DemoDriver::new(64);
+    let mut model = launcher_model();
+    submit(&mut model, "hello world");
+    pump_until(&mut driver, &mut rx, &mut model, "turn done", |m| {
+        !m.turn_active && m.projection.badge() == "IDLE"
+    })
+    .await;
+    submit(&mut model, "/voice");
+    model.handle(key(KeyCode::Down));
+    model.handle(key(KeyCode::Enter));
+    pump_until(&mut driver, &mut rx, &mut model, "voice applied", |m| {
+        m.voice.stt == "deepgram-nova-3"
+    })
+    .await;
+    assert_eq!(model.voice.tts, "elevenlabs");
+    assert!(model.projection.entries().iter().any(|entry| matches!(
+        entry,
+        TranscriptEntry::Note { text } if text.starts_with("· voice enabled · deepgram-nova-3 → elevenlabs")
+    )));
+}
+
+#[test]
+fn each_card_open_mints_a_fresh_id() {
+    // Fixed ids let an answer to card N drive card N+1's consequences.
+    let mut model = launcher_model();
+    submit(&mut model, "hello world");
+    model.turn_active = false;
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        submit(&mut model, "/voice");
+        ids.push(
+            model
+                .projection
+                .open_menu()
+                .expect("voice card")
+                .id
+                .to_string(),
+        );
+        model.handle(key(KeyCode::Esc));
+    }
+    assert_ne!(ids[0], ids[1], "per-open ids");
+    for _ in 0..2 {
+        submit(&mut model, "/tools");
+        ids.push(
+            model
+                .projection
+                .open_menu()
+                .expect("tools card")
+                .id
+                .to_string(),
+        );
+        model.handle(key(KeyCode::Esc));
+    }
+    assert_ne!(ids[2], ids[3]);
+    assert_eq!(
+        ids.iter().collect::<std::collections::BTreeSet<_>>().len(),
+        4,
+        "no id repeats across opens"
+    );
+}
+
+// ---- Review r2 P1-2: the session card dies with its surface ----
+
+#[tokio::test(start_paused = true)]
+async fn a_menu_option_hit_is_inert_once_its_surface_is_gone() {
+    let (mut driver, mut rx) = DemoDriver::new(64);
+    let mut model = launcher_model();
+    submit(&mut model, "this is unreliable");
+    pump_until(&mut driver, &mut rx, &mut model, "recovery card", |m| {
+        m.projection.open_menu().is_some()
+    })
+    .await;
+    let (_, hits) = draw(&model, 118, 34);
+    let option = hits
+        .iter()
+        .find(|(_, hit)| matches!(hit, Hit::MenuOption { .. }))
+        .map(|(_, hit)| hit.clone())
+        .expect("an option row");
+    // Back to the launcher: the projection (and its card) survive, but the
+    // surface is gone, so a queued click must not answer it.
+    model.handle_hit(Hit::BackChip);
+    assert_eq!(model.screen, Screen::Launcher);
+    assert!(model.projection.open_menu().is_some(), "card still parked");
+    model.handle_hit(option.clone());
+    assert!(model.outbox.is_empty(), "no answer from an invisible card");
+    model.handle_hover(Some(option.clone()));
+    assert_eq!(model.menu_selection, 0, "hover is inert too");
+    let entries = model.projection.entries().len();
+    pump_quiet(&mut driver, &mut rx, &mut model, 2_000).await;
+    assert_eq!(
+        model.projection.entries().len(),
+        entries,
+        "no parked continuation started"
+    );
+    // Return to the session and the very same rect works again.
+    model.handle(key(KeyCode::Enter));
+    assert_eq!(model.screen, Screen::Session);
+    model.handle_hit(option);
+    assert_eq!(model.outbox.len(), 1, "answerable on its own surface");
+}
+
+// ---- Review r2 P2-6: the auto-title micro-call outlives an interrupt ----
+
+#[tokio::test(start_paused = true)]
+async fn the_auto_title_micro_call_lands_after_an_interrupt() {
+    // The sim's 1.5 s timeout is a bare setTimeout: interrupting the turn
+    // does not cancel it (tui.js:1219-1227).
+    let (mut driver, mut rx) = DemoDriver::new(64);
+    let mut model = launcher_model();
+    submit(&mut model, "please fix the flaky boundary test suite");
+    pump_until(&mut driver, &mut rx, &mut model, "thinking", |m| {
+        m.projection.badge() == "● THINKING"
+    })
+    .await;
+    model.handle(key(KeyCode::Esc));
+    drain(&mut driver, &mut model);
+    assert!(model.projection.interrupted());
+    assert_eq!(model.session_title, None, "not titled yet");
+    pump_until(&mut driver, &mut rx, &mut model, "titled", |m| {
+        m.session_title.is_some()
+    })
+    .await;
+    assert_eq!(
+        model.session_title.as_deref(),
+        Some("Please fix the flaky boundary test suite")
+    );
+    assert!(model.projection.entries().iter().any(|entry| matches!(
+        entry,
+        TranscriptEntry::Note { text }
+            if text == "· session titled — “Please fix the flaky boundary test suite” (background micro-call · never enters the prompt)"
+    )));
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_auto_title_micro_call_never_names_a_replacement_session() {
+    // …but a session REPLACEMENT does make it irrelevant: the sim's
+    // callback looks its session up by id and finds it gone.
+    let (mut driver, mut rx) = DemoDriver::new(64);
+    let mut model = launcher_model();
+    submit(&mut model, "please fix the flaky boundary test suite");
+    pump_until(&mut driver, &mut rx, &mut model, "thinking", |m| {
+        m.projection.badge() == "● THINKING"
+    })
+    .await;
+    submit(&mut model, "/clear");
+    drain(&mut driver, &mut model);
+    submit(&mut model, "cd web");
+    pump_quiet(&mut driver, &mut rx, &mut model, 4_000).await;
+    assert_eq!(model.session_title, None, "the replacement stays untitled");
+    assert!(
+        !model.projection.entries().iter().any(|entry| matches!(
+            entry,
+            TranscriptEntry::Note { text } if text.starts_with("· session titled")
+        )),
+        "and takes no note from the dead session's micro-call"
+    );
+}
+
+// ---- Review r2 P2-3/P2-4: mic + help owning surfaces ----
+
+#[test]
+fn the_launcher_mic_renders_but_does_nothing() {
+    // Sim `speak` returns unless a session is attached (tui.js:2045).
+    let mut model = launcher_model();
+    let (rows, hits) = draw(&model, 118, 34);
+    assert!(
+        rows.iter().any(|row| row.contains("[ ◉ talk ]")),
+        "the mic still RENDERS on the launcher"
+    );
+    assert!(hits.iter().any(|(_, hit)| *hit == Hit::TalkChip));
+    model.handle_hit(Hit::TalkChip);
+    assert!(!model.listening, "but pressing it starts nothing");
+    assert!(model.requests.is_empty());
+}
+
+#[test]
+fn stale_mic_and_help_hits_respect_their_surfaces() {
+    let mut model = launcher_model();
+    submit(&mut model, "/aura");
+    model.handle_hit(Hit::TalkChip);
+    assert!(
+        !model.listening,
+        "a stale mic rect must not create invisible listening state on aura"
+    );
+    assert!(model.requests.is_empty());
+    // A stale launcher help hit must not open Help over a session.
+    let mut model = launcher_model();
+    submit(&mut model, "hello world");
+    assert_eq!(model.screen, Screen::Session);
+    model.handle_hit(Hit::HelpHint);
+    assert!(!model.help_open, "help belongs to the launcher");
 }

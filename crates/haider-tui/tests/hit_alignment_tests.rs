@@ -130,10 +130,31 @@ fn talk_chip_hit_covers_exactly_the_rendered_chip() {
     let chip_col = col_of(&rows[composer_y as usize], "[ ◉ talk ]");
     assert_eq!(rect.x, chip_col, "hit starts at the chip's [");
     assert_eq!(rect.width, 10, "hit spans exactly [ ◉ talk ]");
-    // Clicking it starts the 1300 ms listening hold (TUI3b §4.1 — voice
-    // ships ON): the chip flips to `◉ listening…`; the driver owns the
-    // timer.
+    // The launcher mic RENDERS but is inert — sim `speak` returns unless a
+    // session is attached (tui.js:2045, review r2 P2-3).
     let mut model = model;
+    model.handle_hit(Hit::TalkChip);
+    assert!(!model.listening, "no session → no hold");
+    assert!(model.requests.is_empty(), "and no driver timer");
+
+    // Inside an idle session the same chip starts the 1300 ms hold (TUI3b
+    // §4.1 — voice ships ON): it flips to `◉ listening…`, driver-timed.
+    for c in "walk the harness".chars() {
+        model.handle(AppEvent::Key(KeyEvent::new(
+            KeyCode::Char(c),
+            KeyModifiers::NONE,
+        )));
+    }
+    model.handle(AppEvent::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    )));
+    model.requests.clear();
+    model.handle(AppEvent::Envelope(Box::new(EventPayload::RunState(
+        haider_protocol::state::RunState::Done,
+    ))));
+    assert_eq!(model.screen, Screen::Session);
+    assert!(!model.turn_active, "an idle session");
     model.handle_hit(Hit::TalkChip);
     assert!(model.listening, "hold started");
     assert!(

@@ -41,8 +41,21 @@ pub enum DemoEvent {
     },
     /// The 1.5 s auto-title micro-call returned: the driver names the
     /// session and pushes the note TOGETHER, inside the callback (sim
-    /// tui.js:1219-1227, review P2-12).
-    AutoTitle(String),
+    /// tui.js:1219-1227, review P2-12). `origin` is the session epoch the
+    /// call was made for — the sim's callback looks the session up by id
+    /// and does nothing if it is gone, and it is NOT cancelled by an
+    /// interrupt (review r2 P2-6).
+    AutoTitle {
+        origin: u64,
+        text: String,
+    },
+    /// A menu answer from the model's outbox. It rides the never-cancelled
+    /// control tag for DELIVERY, but `origin` (the session epoch that
+    /// rendered the card) is checked at consumption (review r2 P1-1).
+    Answer {
+        origin: u64,
+        answer: haider_protocol::menu::MenuAnswer,
+    },
     /// The ◉ talk hold finished — submit the canned voice phrase.
     TalkFire,
     // ---- Chip events (§2), tagged with the owning chip's arm ----
@@ -524,10 +537,11 @@ fn word_match(haystack: &str, needle: &str) -> bool {
     scan(haystack, needle, true, true)
 }
 
-/// JS `/NEEDLE\b/` — a TRAILING boundary only, so "ascii" matches `ci\b`
-/// and "the subagents" matches `subagents\b` mid-word-start (review P2-11:
-/// requiring a leading boundary routed "ascii" to the generic branch while
-/// the sim routes it to the test branch).
+/// JS `/NEEDLE\b/` — a TRAILING boundary only. `pci` therefore matches
+/// `ci\b` (the `p` is a word char, so a two-sided match would reject it)
+/// while `ascii` does NOT (it ends `ii`, never `ci` on a boundary) — the
+/// round-1 review's example was wrong and the round-2 review confirmed the
+/// correction.
 fn suffix_match(haystack: &str, needle: &str) -> bool {
     scan(haystack, needle, false, true)
 }
@@ -1990,13 +2004,13 @@ pub fn respond_chip_beats(
         // the tree live the session shows `◔ WAITING` until the chip is
         // closed. Everything below the return in the sim is dead code.
         //
-        // The INTENDED flow (what the beats would be if `cTool` returned
-        // true) is: parent → waiting; child thinking → 500 ms → streaming →
-        // "On it — scoped the subtask, patching now." → tool → fs_patch
-        // src/subtask.rs 1100 ms +40 −6 → child done; parent → streaming →
-        // "{callsign} {hon} finished — folded its patch into my work. Done."
-        // → parent done → autoResumeParent. TUI3b shipped that version;
-        // TUI3.1 reverts to the sim because tui.js is the authority.
+        // For the record, the beats the sim WOULD have run had `cTool`
+        // returned true are: parent → waiting; child thinking → 500 ms →
+        // streaming → "On it — scoped the subtask, patching now." → tool →
+        // fs_patch src/subtask.rs 1100 ms +40 −6 → child done; parent →
+        // streaming → "{callsign} {hon} finished — folded its patch into my
+        // work. Done." → parent done → autoResumeParent. That flow is NOT
+        // implemented here and must not be: tui.js is the authority.
     } else {
         chip_state(&mut beats, agent, ChipDisplayState::Streaming);
         chip_stream(

@@ -674,12 +674,15 @@ fn drain(driver: &mut DemoDriver, model: &mut AppModel) {
 /// tagged with the CURRENT generation.
 fn echo_answers(driver: &DemoDriver, model: &mut AppModel) {
     while !model.outbox.is_empty() {
-        let answer = model.outbox.remove(0);
+        let pending = model.outbox.remove(0);
         driver
             .sender()
             .try_send((
                 driver.control_tag(),
-                DemoEvent::Envelope(EventPayload::MenuAnswered(answer)),
+                DemoEvent::Answer {
+                    origin: pending.origin,
+                    answer: pending.answer,
+                },
             ))
             .expect("echo");
     }
@@ -988,6 +991,13 @@ async fn manual_compact_runs_1200ms_and_lands_the_numbers() {
 async fn talk_hold_fires_the_canned_phrase_through_the_voice_path() {
     let (mut driver, mut rx) = DemoDriver::new(64);
     let mut model = launcher_model();
+    // The mic needs an attached, idle session (sim `speak`, tui.js:2045 —
+    // review r2 P2-3), so open one first.
+    submit(&mut model, "hello world");
+    pump_until(&mut driver, &mut rx, &mut model, "session idle", |m| {
+        !m.turn_active && m.projection.badge() == "IDLE"
+    })
+    .await;
     model.handle_hit(Hit::TalkChip);
     assert!(model.listening);
     pump_until(&mut driver, &mut rx, &mut model, "voice turn done", |m| {

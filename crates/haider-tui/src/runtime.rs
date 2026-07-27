@@ -292,10 +292,13 @@ pub async fn run_demo(mut model: AppModel) -> std::io::Result<()> {
         // answer queued for the next loop turn — a full channel guarantees
         // pending envelopes, so the loop WILL wake and retry. Awaiting the
         // send here instead would deadlock: this loop is the only consumer.
-        while let Some(answer) = model.outbox.first().cloned() {
+        while let Some(pending) = model.outbox.first().cloned() {
             match answer_echo.try_send((
                 driver.control_tag(),
-                DemoEvent::Envelope(EventPayload::MenuAnswered(answer)),
+                DemoEvent::Answer {
+                    origin: pending.origin,
+                    answer: pending.answer,
+                },
             )) {
                 Ok(()) => {
                     model.outbox.remove(0);
@@ -609,6 +612,37 @@ impl DemoDriver {
         self.play_owned(beats, ArmOwner::Session)
     }
 
+    /// A timer that must land no matter what happens to the session (the
+    /// sim's bare `setTimeout`s). Delivery is unconditional; relevance is
+    /// decided at consumption by the event's own origin identity.
+    fn spawn_control_timer(&self, delay: Duration, event: DemoEvent) {
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let _ = tx.send((CONTROL_ARM, event)).await;
+        });
+    }
+
+    /// A parked script's menu was answered: the option index selects the
+    /// continuation arm (clamped to the last), which plays on a FRESH arm
+    /// owned by the same surface. `alloc_child` re-checks the parked arm
+    /// under one lock, so a continuation can never outlive its owner.
+    fn resume_parked(&self, answer: &haider_protocol::menu::MenuAnswer) {
+        let parked = self
+            .pending_arms
+            .lock()
+            .ok()
+            .and_then(|mut pending| pending.remove(answer.menu.as_str()));
+        if let Some((parked_arm, owner, mut arms)) = parked
+            && !arms.is_empty()
+            && let Some(arm) = self.table.alloc_child(parked_arm, owner)
+        {
+            let index = (answer.option_index as usize).min(arms.len() - 1);
+            let beats = arms.swap_remove(index);
+            self.player().spawn(beats, arm);
+        }
+    }
+
     /// Spawn a guarded timer: it fires `event` after `delay` only while
     /// `parent` is still live, on a fresh arm of its own so a later
     /// teardown drops the event even once it is buffered in the channel.
@@ -636,7 +670,7 @@ impl DemoDriver {
                 // advance — at DISPATCH, after the 750 ms think window, so
                 // an interrupt inside it skips no intro and burns no
                 // callsign (review P2-11, sim tui.js:1259).
-                let arm = self.play_beats(respond_preamble(
+                self.play_beats(respond_preamble(
                     &text,
                     voice,
                     haider_protocol::DeliveryMode::Steer,
@@ -647,11 +681,16 @@ impl DemoDriver {
                 // note land together, and an interrupt in the window drops
                 // both (review P2-12).
                 if title {
-                    self.spawn_timer(
-                        arm,
-                        ArmOwner::Session,
+                    // The sim's micro-call is a bare setTimeout: it lands
+                    // even if the turn is interrupted (review r2 P2-6), so
+                    // it rides the control tag and is gated on identity
+                    // alone.
+                    self.spawn_control_timer(
                         Duration::from_millis(AUTO_TITLE_MS),
-                        DemoEvent::AutoTitle(text),
+                        DemoEvent::AutoTitle {
+                            origin: model.session_epoch,
+                            text,
+                        },
                     );
                 }
             }
@@ -661,11 +700,12 @@ impl DemoDriver {
             }
             AppRequest::StopScripts => {
                 // Session teardown (`/clear`, `/reset`, a fresh session):
-                // EVERY arm dies — session, every chip, and any hidden aura
-                // run (review P1-1/P1-2: aura used to survive navigation
-                // and keep mutating roster/log/transcript).
-                self.cancel_arms(&|_| true);
-                self.reset_aura_state(model);
+                // the session's arms and every chip's die with it. AURA
+                // DOES NOT — the sim's `/clear` leaves `auraRunRef` alone
+                // (tui.js:1950-1955); only `/reset` and the next
+                // orchestrate advance it, so a background orchestration
+                // finishes where the sim finishes it (review r2 P2-5).
+                self.cancel_arms(&|owner| matches!(owner, ArmOwner::Session | ArmOwner::Chip(_)));
                 self.tokens_input
                     .store(0, std::sync::atomic::Ordering::SeqCst);
                 self.tokens_output
@@ -677,10 +717,10 @@ impl DemoDriver {
                 // the note). Chip arms — and their PARKED continuations —
                 // deliberately survive, exactly as the sim's children do, so
                 // a chip card answered after an interrupt still resolves
-                // instead of blocking forever. Any hidden aura run dies with
-                // the session (review P1-2).
-                self.cancel_arms(&|owner| matches!(owner, ArmOwner::Session | ArmOwner::Aura));
-                self.reset_aura_state(model);
+                // instead of blocking forever. AURA survives too: the sim's
+                // interrupt never advances `auraRunRef`, so a background
+                // orchestration finishes (review r2 P2-5 corrected r1 here).
+                self.cancel_arms(&|owner| matches!(owner, ArmOwner::Session));
                 self.spawn_timer(
                     CONTROL_ARM,
                     ArmOwner::Session,
@@ -760,6 +800,8 @@ impl DemoDriver {
             }
             AppRequest::ChipClose { agent } => self.close_chip(model, &agent),
             AppRequest::AuraSubmit { text, voice: _ } => {
+                // Run REPLACEMENT is the other cancel point (sim `++auraRunRef`
+                // at the head of `orchestrate`, tui.js:2060).
                 // Sim: spoken = !muted at turn start; `voice` only shaped
                 // the user row's ◉ sigil (already pushed by the reducer).
                 // Sim `orchestrate` opens with `++auraRunRef` (tui.js:2060):
@@ -799,7 +841,10 @@ impl DemoDriver {
                 );
             }
             AppRequest::ResetAura => {
+                // `/reset` is the ONE navigation that stops an aura run
+                // (sim tui.js:1930 `auraRunRef.current++`).
                 self.cancel_arms(&|owner| matches!(owner, ArmOwner::Aura));
+                self.reset_aura_state(model);
             }
             AppRequest::Quit => model.should_quit = true,
         }
@@ -877,27 +922,27 @@ impl DemoDriver {
         }
         match event {
             DemoEvent::Envelope(payload) => {
-                // A parked script's menu was answered: the option index
-                // selects the continuation arm (clamped to the last arm),
-                // which plays on a FRESH arm owned by the same surface.
-                // `alloc_child` re-checks the parked arm under one lock, so
-                // a continuation can never outlive its owner's teardown.
                 if let EventPayload::MenuAnswered(answer) = &payload {
-                    let parked = self
-                        .pending_arms
-                        .lock()
-                        .ok()
-                        .and_then(|mut pending| pending.remove(answer.menu.as_str()));
-                    if let Some((parked_arm, owner, mut arms)) = parked
-                        && !arms.is_empty()
-                        && let Some(arm) = self.table.alloc_child(parked_arm, owner)
-                    {
-                        let index = (answer.option_index as usize).min(arms.len() - 1);
-                        let beats = arms.swap_remove(index);
-                        self.player().spawn(beats, arm);
-                    }
+                    self.resume_parked(answer);
                 }
                 consume_scripted(model, generation, generation, payload);
+            }
+            DemoEvent::Answer { origin, answer } => {
+                // IDENTITY GATE (review r2 P1-1): the control tag guarantees
+                // delivery, never relevance. An answer to a card rendered by
+                // a session the user has since replaced is dropped whole —
+                // it must not reconfigure the session that took its place,
+                // nor start that card's parked continuation.
+                if origin != model.session_epoch {
+                    return;
+                }
+                self.resume_parked(&answer);
+                consume_scripted(
+                    model,
+                    generation,
+                    generation,
+                    EventPayload::MenuAnswered(answer),
+                );
             }
             DemoEvent::Dispatch { text, voice, turn } => {
                 // The sim picks its branch AFTER the think window
@@ -915,11 +960,13 @@ impl DemoDriver {
                     self.player().spawn(beats, arm);
                 }
             }
-            DemoEvent::AutoTitle(text) => {
-                // Sim tui.js:1219-1227: the callback itself checks the
-                // session is still untitled, sets the blurb and pushes the
-                // note — both inside the 1.5 s window.
-                if model.session_title.is_none() {
+            DemoEvent::AutoTitle { origin, text } => {
+                // Sim tui.js:1219-1227: the callback itself looks the
+                // session up and checks it is still untitled, then sets the
+                // blurb and pushes the note. It is NOT cancelled by an
+                // interrupt (review r2 P2-6) — only a session REPLACEMENT
+                // makes it irrelevant, which `origin` detects.
+                if origin == model.session_epoch && model.session_title.is_none() {
                     let blurb = crate::app::auto_blurb(&text);
                     model.projection.push_note(title_note(&blurb));
                     model.session_title = Some(blurb);
