@@ -21,7 +21,7 @@ mod migrations;
 mod profile_lock;
 
 pub use cas::FileCas;
-pub use event_store::{CommittedSeqRange, EventStore, Store};
+pub use event_store::{CommittedSeqRange, EventStore, ProfileLease, Store};
 pub use haider_protocol::error::{ErrorCode, HaiderError};
 
 use haider_protocol::ids::ArtifactRef;

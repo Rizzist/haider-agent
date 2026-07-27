@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::{ArtifactRef, SessionId};
-use haider_store::{Cas, EventStore, Store};
+use haider_store::{Cas, EventStore, ProfileLease, Store};
 use haider_tools::{CasSink, ToolResult};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -31,22 +31,76 @@ struct StoreOwner {
 }
 
 impl SqliteStoreHandle {
+    /// Acquires the profile lifetime lock before any SQLite open.
+    ///
+    /// W3b1 daemon seam (additive): `haider-daemon` needs the lock — the
+    /// singleton authority — held *before* it inspects or cleans the stale
+    /// rendezvous socket, which is earlier than it wants a store. Pairs with
+    /// [`Self::open_locked`]; dropping the unconsumed lease releases the lock.
+    pub async fn acquire_profile(root: impl AsRef<Path>) -> Result<ProfileLease, HaiderError> {
+        let root = root.as_ref().to_path_buf();
+        run_blocking(move || Store::acquire_profile(root)).await
+    }
+
+    /// Opens a store beneath an already-held profile lifetime lock.
+    ///
+    /// Second half of the [`Self::acquire_profile`] seam. [`Self::open`]
+    /// stays the one-step acquire-and-open for standalone and tests; both
+    /// paths consume one worker generation per successful open.
+    pub async fn open_locked(lease: ProfileLease) -> Result<Self, HaiderError> {
+        let store = run_blocking(move || Store::open_locked(lease)).await?;
+        Ok(Self::from_store(store))
+    }
+
     /// Opens or creates `root` without blocking the calling runtime worker.
     pub async fn open(root: impl AsRef<Path>) -> Result<Self, HaiderError> {
         let root = root.as_ref().to_path_buf();
         let store = run_blocking(move || Store::open(root)).await?;
+        Ok(Self::from_store(store))
+    }
+
+    fn from_store(store: Store) -> Self {
         let worker_generation = store.worker_generation();
-        Ok(Self {
+        Self {
             owner: Arc::new(StoreOwner {
                 worker_generation,
                 store: Mutex::new(Some(store)),
             }),
-        })
+        }
     }
 
     /// Profile-owned fencing generation allocated by this store open.
     pub fn worker_generation(&self) -> u64 {
         self.owner.worker_generation
+    }
+
+    /// Advances and returns the daemon-process generation.
+    ///
+    /// W3b1 daemon seam: called once per daemon start, inside the R16 ready
+    /// gate, before any listener exists. Deliberately distinct from
+    /// [`Self::worker_generation`] — see `Store::advance_daemon_generation`.
+    pub async fn advance_daemon_generation(&self) -> Result<u64, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(Store::advance_daemon_generation)).await
+    }
+
+    /// Lists every durable session in stable order.
+    ///
+    /// W3b1 daemon seam: drives the startup recovery scan
+    /// (`reconcile_dispatched_effects`), which must visit every session.
+    pub async fn session_ids(&self) -> Result<Vec<SessionId>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(Store::session_ids)).await
+    }
+
+    /// Checkpoints committed WAL pages before orderly close.
+    ///
+    /// W3b1 daemon seam: the R17 drain barrier flushes before removing the
+    /// socket and closing the store. Committed data is durable without this;
+    /// flushing just shrinks the successor's WAL replay.
+    pub async fn flush(&self) -> Result<(), HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(Store::flush)).await
     }
 
     /// Closes the SQLite connection and releases the profile lock off runtime

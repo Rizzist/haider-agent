@@ -77,6 +77,19 @@ pub trait EventStore: Send + Sync {
     fn latest_seq(&self, session: &SessionId) -> StoreResult<u64>;
 }
 
+/// Opaque ownership of the profile's OS-held lifetime lock.
+///
+/// W3b1 seam (additive): daemon startup acquires this before opening SQLite
+/// or examining an endpoint — the lock is the singleton authority (d1 report
+/// R1), so it must be held before any stale-socket cleanup. The lease is then
+/// transferred into [`Store::open_locked`]; [`Store::open`] remains the
+/// one-step path for everyone else. Dropping an unconsumed lease releases the
+/// lock. The lease deliberately exposes no store access.
+pub struct ProfileLease {
+    root: PathBuf,
+    lock: ProfileLock,
+}
+
 /// A locked profile containing a SQLite event journal and filesystem CAS.
 ///
 /// One connection lives for the full profile lifetime. A mutex serializes its
@@ -92,8 +105,8 @@ pub struct Store {
 }
 
 impl Store {
-    /// Opens or creates a durable profile at `root`.
-    pub fn open(root: impl AsRef<Path>) -> StoreResult<Self> {
+    /// Acquires the profile lifetime lock without opening its durable store.
+    pub fn acquire_profile(root: impl AsRef<Path>) -> StoreResult<ProfileLease> {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root).map_err(|error| {
             store_error(
@@ -102,7 +115,16 @@ impl Store {
                 false,
             )
         })?;
-        let profile_lock = ProfileLock::acquire(&root)?;
+        let lock = ProfileLock::acquire(&root)?;
+        Ok(ProfileLease { root, lock })
+    }
+
+    /// Opens or creates a durable profile after its lifetime lock is held.
+    pub fn open_locked(lease: ProfileLease) -> StoreResult<Self> {
+        let ProfileLease {
+            root,
+            lock: profile_lock,
+        } = lease;
         let database_path = root.join("store.sqlite");
         let mut connection = open_connection(&database_path)?;
         migrations::migrate(&mut connection)?;
@@ -120,6 +142,12 @@ impl Store {
         })
     }
 
+    /// Acquires the profile lifetime lock and opens its durable store.
+    pub fn open(root: impl AsRef<Path>) -> StoreResult<Self> {
+        let lease = Self::acquire_profile(root)?;
+        Self::open_locked(lease)
+    }
+
     /// The profile root.
     pub fn root(&self) -> &Path {
         &self.root
@@ -133,6 +161,56 @@ impl Store {
     /// Durable fencing generation allocated by this successful profile open.
     pub fn worker_generation(&self) -> u64 {
         self.worker_generation
+    }
+
+    /// Durably advances the daemon-process generation for one guarded start.
+    ///
+    /// W3b1 seam (additive): intentionally distinct from `worker_generation`,
+    /// which is consumed by *every* store open (including read-only tooling).
+    /// The daemon generation counts daemon starts only and is what the daemon
+    /// advertises in `Welcome`/`ServerDraining` for client-side fencing.
+    pub fn advance_daemon_generation(&self) -> StoreResult<u64> {
+        let mut connection = self.connection()?;
+        next_profile_counter(&mut connection, "daemon_generation", "daemon generation")
+    }
+
+    /// Lists every durable session in stable byte order.
+    ///
+    /// W3b1 seam (additive): startup recovery must visit every session; the
+    /// stable order keeps interrupted recovery passes deterministic.
+    pub fn session_ids(&self) -> StoreResult<Vec<SessionId>> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare_cached("SELECT id FROM sessions ORDER BY id ASC")
+            .map_err(map_sqlite_error)?;
+        let ids = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(map_sqlite_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_sqlite_error)?;
+        Ok(ids.into_iter().map(SessionId::new).collect())
+    }
+
+    /// Checkpoints committed WAL pages before orderly profile close.
+    ///
+    /// W3b1 seam (additive), used by the daemon drain barrier. Committed data
+    /// is durable without this; checkpointing shrinks the WAL a successor
+    /// must replay. A busy checkpoint surfaces as retryable `StoreLocked`.
+    pub fn flush(&self) -> StoreResult<()> {
+        let connection = self.connection()?;
+        let (busy, _, _): (u32, u32, u32) = connection
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(map_sqlite_error)?;
+        if busy != 0 {
+            return Err(store_error(
+                ErrorCode::StoreLocked,
+                "SQLite WAL checkpoint could not acquire the required lock",
+                true,
+            ));
+        }
+        Ok(())
     }
 
     /// The profile's content-addressed storage.
@@ -180,34 +258,43 @@ impl Store {
 /// and after every other fallible setup step, so each successful open consumes
 /// exactly one generation.
 fn next_worker_generation(connection: &mut Connection) -> StoreResult<u64> {
+    next_profile_counter(connection, "worker_generation", "worker generation")
+}
+
+/// Compare-and-set increment of one `profile_meta` singleton counter, in an
+/// immediate transaction. `column` is a compile-time-constant identifier
+/// (`worker_generation` / `daemon_generation`) — the `format!` SQL never
+/// carries external input.
+fn next_profile_counter(
+    connection: &mut Connection,
+    column: &str,
+    description: &str,
+) -> StoreResult<u64> {
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(map_sqlite_error)?;
+    let select = format!("SELECT {column} FROM profile_meta WHERE singleton = 1");
     let current: i64 = transaction
-        .query_row(
-            "SELECT worker_generation FROM profile_meta WHERE singleton = 1",
-            [],
-            |row| row.get(0),
-        )
+        .query_row(&select, [], |row| row.get(0))
         .map_err(map_sqlite_error)?;
     let next = current
         .checked_add(1)
-        .ok_or_else(|| corrupt("worker generation space is exhausted"))?;
+        .ok_or_else(|| corrupt(format!("{description} space is exhausted")))?;
+    let update = format!(
+        "UPDATE profile_meta
+         SET {column} = ?1
+         WHERE singleton = 1 AND {column} = ?2"
+    );
     let updated = transaction
-        .execute(
-            "UPDATE profile_meta
-             SET worker_generation = ?1
-             WHERE singleton = 1 AND worker_generation = ?2",
-            params![next, current],
-        )
+        .execute(&update, params![next, current])
         .map_err(map_sqlite_error)?;
     if updated != 1 {
-        return Err(corrupt(
-            "profile metadata is missing its worker generation singleton",
-        ));
+        return Err(corrupt(format!(
+            "profile metadata is missing its {description} singleton"
+        )));
     }
     transaction.commit().map_err(map_sqlite_error)?;
-    u64::try_from(next).map_err(|_| corrupt("database contains a negative worker generation"))
+    u64::try_from(next).map_err(|_| corrupt(format!("database contains a negative {description}")))
 }
 
 impl EventStore for Store {

@@ -74,3 +74,61 @@ Ledgered pending real daemon profiles (rider items 2-9, full text in ~/haider-ru
 | crates/haider-tui/src/render.rs | D3-9: aura streaming cursor wraps `{text}▮` in text ink while item_lines splits it back out gold — aura stream reads deader than session | next aura polish |
 | crates/haider-tui/src/render.rs | D3-10: status bar has no horizontal shed order — at 90 cols the voice chip clips mid-chip (dangling `[ ◉`); ellipsize-or-drop-segments rule | next status-bar touch |
 | crates/haider-tui/src/render.rs | D3-11: session @ 90×5 w/ menu renders header-rule + input-rule adjacent with all content shed — collapse to one rule (taste; behavior pinned) | next ledger touch |
+
+## haider-daemon efficiency rider (W3b1, gpt-5.6, 2026-07-27)
+
+Adopted now (rider NOW items 1-2): connection admission cap — every accepted same-UID socket
+entered an unbounded `JoinSet`, so `DaemonConfig::max_connections` (default 64) is now enforced
+by an owned accept-time permit that rides inside the connection task (freed on return, error, and
+abort alike), and an over-cap peer gets a fatal `overloaded` `ProtocolError` (new additive
+`haider_rpc::ERROR_CODE_OVERLOADED`; codes are open wire strings, no fixture change) then close,
+with no task or queue created. Per-connection queued-byte budget —
+`DaemonConfig::outbound_queued_bytes` (default 2 × frame_limit) is charged before enqueue and
+credited after the write completes, so `outbound_queue_capacity × frame_limit` (32 × 8 MiB) can no
+longer be the real memory bound; the frame-count bound and its connection-fatal treatment are
+unchanged, and the final `ServerDraining` frame moved to a reserved one-shot path outside both
+bounds so no volume of ordinary replies can consume the slot or bytes the notice needs. Test
+helper polling in `lifecycle_tests.rs` (child exit, endpoint appearing, freed slot) swapped
+`yield_now` spin for a 5 ms poll interval; production waits and the drain-boundary yield untouched.
+
+| Where | Idea | Why deferred |
+|---|---|---|
+| crates/haider-daemon/src/runtime.rs (pre-ready recovery via `haider_core::reconcile_dispatched_effects`) | Recovery reads a projection instead of full history: an additive, transactionally maintained/indexed recovery projection of only dispatched/outcome rows, with journal backfill for existing stores and a corruption fallback to the full scan | Today's gate enumerates every session and deserializes each one's whole effect history, so peak memory tracks the largest session's history. A casual pending-effects cache is FORBIDDEN: atomic coupling to the append path, migration/backfill, corruption detection, and crash-window equivalence are lifecycle-correctness requirements, not optimizations — slated as its own designed slice alongside W3b2 |
+| crates/haider-daemon/src/connection.rs | Consolidate per-connection allocations (buffers/queues) once W3b2 shows the real traffic shape | Merging the reader and writer tasks is DO-NOT-DO: it can alter socket shutdown and drain-delivery ordering, which R17 pins |
+| crates/haider-daemon (runtime.rs + lifecycle.rs) | Revisit lock-acquisition ordering only against real W3b2 contention profiles | Left unchanged deliberately. DO-NOT-DO: profile-lock-before-store/socket acquisition, endpoint-cleanup-before-store-close, or replacing the shutdown transition mutex with atomics — each is a documented lifecycle law (R1/R3/R17), not a hot path |
+| crates/haider-daemon/src/runtime.rs (drain barrier) | Drain fan-out stays concurrent and deadline-bounded | DO-NOT-DO: serializing per-connection notifications or closing sockets before the notice is enqueued would break "notify every open connection, then bounded completion" (R17) |
+| crates/haider-daemon, crates/haider-daemond | No production O(n²) found in this lane | Nothing to defer; recorded so a later pass does not re-litigate it |
+
+## haider-daemon residuals ledgered from review r2 (W3b1.4, 2026-07-27)
+
+Not optimizations — accepted limits, recorded so a later round does not re-litigate them or
+mistake them for oversights. Each states the exact trigger.
+
+| Where | Residual | Why it stays |
+|---|---|---|
+| crates/haider-daemon/src/endpoint.rs (`restore`) | A claim that cannot be restored (a third node appeared at the public name meanwhile) leaves the claimed node under its staging name until the next start's sweep. A LIVE foreign socket claimed in that window loses its public path until its owner rebinds. | Restore is non-replacing on purpose: overwriting the third node would destroy someone else's endpoint, which is strictly worse. Trigger: a same-UID process deliberately creating a node at the public name inside a microsecond-scale claim window; the profile lifetime lock (R1) already keeps a normally-starting peer daemon out of this path entirely. |
+| crates/haider-daemon/src/endpoint.rs (`staging_name`) | Unpredictable staging names remove the PRE-KNOWLEDGE race — nothing can be waiting at a name nobody could predict — but they are not secret: `0700` excludes other UIDs, not the owner, so a same-UID process watching the runtime directory (kqueue/FSEvents/polling) can learn each name as it appears and race the pathname operations that follow. | Closing this would need per-operation kernel-level atomicity that POSIX does not offer for socket nodes. Calibration: the adversary here already holds the user's own privileges; the profile lifetime lock (R1) keeps every non-adversarial peer out of this path. |
+| crates/haider-daemon/src/endpoint.rs (`rename_no_replace`) | Non-Apple, non-Linux Unix targets fall back to check-then-rename, so publish and restore keep a replacing race there. | `renameat2`/`renamex_np` have no portable equivalent. Trigger: a racer creating a node at the destination between the check and the rename, on a target this workspace does not build for. Revisit only if another Unix target is added. |
+| crates/haider-daemon/src/endpoint.rs (`probe`) | A liveness probe that does not settle within `PROBE_TIMEOUT` (2s) resolves the node as LIVE, so a wedged peer can make startup refuse instead of reclaiming a genuinely dead endpoint. | `connect(2)` blocks once a listener's backlog fills; hanging startup forever is worse than refusing. Trigger: a socket with a live-but-never-accepting owner. |
+| crates/haider-daemond/tests/lifecycle_tests.rs | No black-box test can distinguish "writer aborted" from "writer aborted AND joined": by the time the daemon reports, an aborted task has been reaped either way. The join is enforced by construction — `ConnectionRuntime` owns every writer handle, collects the registry TWICE (once before the final connection join and once after it, when no sender but the runtime's own remains), and joins under the barrier deadline — but "by construction" is an argument about this code, not a proof that no path escapes it; a design review found exactly such a path once (W3b1.5 D1-1). | Would need a test hook inside teardown. The observable half — that nothing keeps feeding the socket after the barrier — IS tested (never-reading, one-byte, forced-abort cases). |
+| crates/haider-daemond/tests/lifecycle_tests.rs | The pre-fix owned-cleanup window (stat then unlink on the PUBLIC name) is not reachable from a test: hitting it needs the daemon's own node present at the stat and replaced before the unlink, inside a sub-microsecond gap. The racing test pins the invariant but does not discriminate that shape. | The adjacent and much wider window — a node that goes live between the preflight probe and the removal — IS covered by `stale_cleanup_never_removes_a_node_that_went_live`, which does discriminate (mutation-verified). |
+| crates/haider-daemon/src/connection.rs (`reject_over_limit`) | Raw `EAGAIN`/`EPIPE` on the over-limit rejection write is untested. | No deterministic hook to force a partial or failed `write(2)` on a freshly accepted socket; the loop's behaviour (retry `EINTR`, stop otherwise, close regardless) is inspected, not exercised. |
+
+## haider-daemon design review (Fable 5, W3b1.5, 2026-07-27)
+
+Folded this round: writer-registry re-drain after the final connection join (D1-1); the
+`ServerDraining` law re-scoped to "last frame of this lane's traffic" (D2-2); one `barrier_step`
+helper with the error-suppression asymmetry named by `StepFailure` (D2-3); `run_inner` split into
+phase functions in call order (D2-4); exhaustive test-matrix header (D2-5); re-runnable
+`MUTATION CHECK:` comments on every mutation-verified test (D2-6); `outbound_queued_bytes >=
+frame_limit` validated with the aggregate worst case documented (D3-9); the drain-boundary
+`yield_now` now says what it buys (D3-12).
+
+| Where | Idea | Why deferred |
+|---|---|---|
+| crates/haider-daemon/src/connection.rs (`OutboundLane`) | W3b2 fan-out needs a clonable outbound handle that carries its own limit, so the session hub can enqueue without threading `outbound_limit` through every call | Today exactly one task writes to the lane and the limit is a local; a handle type before the fan-out exists would be shaped by guesswork. Trigger: the first W3b2 caller outside `connection.rs`. |
+| crates/haider-daemon/src/runtime.rs (`ConnectionRuntime`) | Barrier task ownership is bespoke per class — connections in a `JoinSet`, writers in a channel-fed `Vec`. Either generalize into one owned-task stratum or keep the split deliberately | The shapes differ for a reason (a JoinSet cannot adopt a handle a child task created), and W3b2 adds a third class (session actors). Decide once all three exist, not twice. |
+| crates/haider-daemon/src/endpoint.rs | `remove_owned` and `remove_verified_stale` share a claim → verify → act skeleton with different verification steps | Two flows do not justify the abstraction, and the verifications are what the laws are about. Trigger: a third claim-based flow. |
+| crates/haider-daemon (whole crate) | Adopt `tracing` — the accept loop discards connection exits (`let _ = completed;`) and refused transitions only reach stderr | No observability dependency has been chosen for the workspace yet, and W3b1 has no real clients. DO THIS before real clients attach: W3b2's session hub is where per-connection faults stop being invisible. |
+| crates/haider-daemon/src/connection.rs (R17 scope) | W3b2 must relax "one `ServerDraining` is the last frame" to "notice, then keep streaming until checkpoint or deadline" (d1 report §6.6 step 10 closes transports only after final envelopes are broadcast) | Deliberate relaxation, not a regression — and it must keep the deadline discipline: the reserve, the mid-frame deadline adoption, and teardown's ownership of writer completion all stay. |
+| crates/haider-daemond/tests/lifecycle_tests.rs | The writer-registry re-drain (D1-1) has no discriminating test: removing it left all 34 cases green across 6 runs. `connections_racing_the_shutdown_request_are_torn_down_completely` exercises the shape (accepts racing the request) but cannot force a registration to land after the first collection | The window is a scheduling coincidence between a connection's first poll on another worker and the barrier's collection. Correct by construction instead: only connection tasks send on that channel, all of them are joined before the second collection, and the runtime's own sender never sends. |
