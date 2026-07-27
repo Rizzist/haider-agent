@@ -265,9 +265,20 @@ impl Store {
     /// Atomically resolves one durable menu and appends its authoritative
     /// `MenuAnswered` envelope.
     ///
-    /// The journal remains the source of truth. `menu_resolutions` is only a
-    /// uniqueness/idempotency index, and historical journals are scanned so a
-    /// pre-index `MenuAnswered` still fences a later answer.
+    /// ARBITRATION LAW (authoritative statement — daemon callers refer here):
+    /// the first COMMITTED answer wins, decided entirely inside one immediate
+    /// SQLite transaction. A retry of the same `command_id` gets
+    /// [`MenuResolutionOutcome::IdempotentReplay`] with the original
+    /// sequence; a different command after any resolution gets
+    /// [`MenuResolutionOutcome::AlreadyResolved`] carrying the winner's
+    /// `resolution_seq`; a stale `worker_generation` is fenced with
+    /// `SingleWriterViolation` before any winner coordinate is disclosed.
+    /// Every attachment then learns the outcome from the event stream — the
+    /// journal, not any caller's reply, is the source of truth.
+    ///
+    /// `menu_resolutions` is only a uniqueness/idempotency index; historical
+    /// journals are scanned so a pre-index `MenuAnswered` still fences a
+    /// later answer.
     pub fn resolve_menu(
         &self,
         command: &MenuResolutionCommand,
@@ -394,8 +405,7 @@ fn resolve_menu_transaction(
     {
         return Ok(MenuResolutionOutcome::AlreadyResolved { resolution_seq });
     }
-    if let Some(resolution_seq) = historical_resolution(transaction, command, command.request_seq)?
-    {
+    if let Some(resolution_seq) = historical_resolution(transaction, command)? {
         return Ok(MenuResolutionOutcome::AlreadyResolved { resolution_seq });
     }
 
@@ -629,10 +639,11 @@ fn validate_answer(
     Ok(())
 }
 
+/// Scans the journal after the menu's opening event (`command.request_seq`)
+/// for a resolution or closure the `menu_resolutions` index predates.
 fn historical_resolution(
     transaction: &Transaction<'_>,
     command: &MenuResolutionCommand,
-    after_seq: u64,
 ) -> StoreResult<Option<u64>> {
     let mut statement = transaction
         .prepare_cached(
@@ -645,7 +656,7 @@ fn historical_resolution(
     let mut rows = statement
         .query(params![
             command.session_id.as_str(),
-            to_sqlite_integer(after_seq)?
+            to_sqlite_integer(command.request_seq)?
         ])
         .map_err(map_sqlite_error)?;
     while let Some(row) = rows.next().map_err(map_sqlite_error)? {

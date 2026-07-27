@@ -1,17 +1,49 @@
 //! Session-scoped actors, attachment replay, and durable menu arbitration.
 //!
 //! One actor owns the serialized command order for each live session. That
-//! order is the proof boundary for both §5.5 invariants:
+//! order is the proof boundary for the laws below.
 //!
-//! - an append returns from the store before the actor publishes it;
-//! - attachment receiver registration and committed-head capture happen in
-//!   one command-loop turn with no await or yield between them.
+//! # Laws stated here (every other comment refers back to this list)
+//!
+//! - **INVARIANT 1 — persist before publish (§5.5).** An envelope is
+//!   published to attachments (and the harness) only after its store append
+//!   has returned. Holds by code shape in [`run_session_actor`]: the store
+//!   call is awaited and `publish` is a synchronous call later in the same
+//!   command arm.
+//! - **INVARIANT 2 — register receiver + observe head `H` in one serialized
+//!   step (§5.5).** Receiver insertion and committed-head capture are
+//!   adjacent synchronous statements inside the actor's `Register` arm; no
+//!   await or yield exists between them, so no append can interleave. Holds
+//!   by code shape, and the forced-boundary tests assert it.
+//! - **The store is the lag buffer (R12).** Replay pages the store; live
+//!   delivery crosses a bounded per-attachment catch-up channel and the
+//!   bounded connection outbox. On any overflow the attachment is lagged and
+//!   detached, then resumes FROM THE STORE after its applied cursor. No
+//!   unbounded queue ever buffers history for a slow client.
+//!
+//! Two laws this module obeys but does not own:
+//!
+//! - menu arbitration (first committed answer wins) is stated on
+//!   `haider_store::Store::resolve_menu`;
+//! - the fair-scheduling policy is stated on `connection.rs`'s
+//!   `OutboundLane`.
+//!
+//! # Mechanism
 //!
 //! Replays are separate cancellable tasks. They page `(after_seq, H]`, emit
 //! `AttachCaughtUp(H)`, drain the already-registered bounded receiver for
-//! `seq > H`, then stay live. If that receiver fills, the task registers a new
-//! receiver and resumes from the store after its last delivered sequence. The
-//! store is therefore the lag buffer; no unbounded attachment history exists.
+//! `seq > H`, then stay live ([`run_replay`] documents the phases).
+//!
+//! # W3c/W3d seams
+//!
+//! A real client reaches sessions only through this surface: after handshake
+//! negotiation, [`SessionHub::open_connection`] with the transport's
+//! [`FrameSink`], then [`HubConnection::request`] and
+//! [`HubConnection::menu_answer`]. The CLI `haider attach` and the TUI's
+//! live-attach path (W3c) and the localhost WebSocket layer (W3d) add
+//! transports over this seam, not new semantics. In-process workers join
+//! through [`SessionHub::register_harness`] and must use the hub as their
+//! `StoreHandle` (see [`SessionHub::append`]).
 
 use crate::DaemonError;
 use async_trait::async_trait;
@@ -39,6 +71,8 @@ use tokio::task::JoinHandle;
 const REPLAY_PAGE_SIZE: usize = 256;
 const MAX_LIST_PAGE: usize = 100;
 const MAX_READ_ENVELOPES: usize = 1_024;
+
+// ────────────────── configuration, sink seam, and observer ──────────────────
 
 /// Bounds for session-actor and catch-up traffic.
 #[derive(Debug, Clone, Copy)]
@@ -149,6 +183,8 @@ impl SessionHubObserver for NoopObserver {
     fn observe(&self, _observation: HubObservation) {}
 }
 
+// ──────────────────── hub state, task ownership, errors ─────────────────────
+
 /// Cloneable owner of every live session actor and replay task.
 #[derive(Clone)]
 pub struct SessionHub {
@@ -204,6 +240,9 @@ struct SessionActorHandle {
     stopping: Arc<AtomicBool>,
 }
 
+/// Hub-level attachment metadata (§5.6): who owns the attachment and with
+/// which mode. Policy checks (e.g. the menu control-attachment requirement)
+/// read this map; the actor keeps only delivery state ([`ActorAttachment`]).
 struct AttachmentOwner {
     connection_id: String,
     session_id: SessionId,
@@ -212,9 +251,8 @@ struct AttachmentOwner {
     cancel: watch::Sender<bool>,
 }
 
+/// Actor-side delivery state for one registered attachment.
 struct ActorAttachment {
-    connection_id: String,
-    mode: AttachMode,
     events: mpsc::Sender<RawEnvelope>,
     lagged: watch::Sender<Option<u64>>,
     last_buffered_seq: u64,
@@ -246,9 +284,7 @@ enum ActorCommand {
     },
     Register {
         attachment_id: AttachmentId,
-        connection_id: String,
         after_seq: u64,
-        mode: AttachMode,
         events: mpsc::Sender<RawEnvelope>,
         lagged: watch::Sender<Option<u64>>,
         completed: oneshot::Sender<ActorRegisterResult>,
@@ -321,6 +357,8 @@ impl From<SessionHubError> for DaemonError {
     }
 }
 
+// ──────────── hub: append seam, attachment lifecycle, shutdown ──────────────
+
 impl SessionHub {
     /// Creates a hub with production's no-op boundary observer.
     pub fn new(
@@ -358,6 +396,10 @@ impl SessionHub {
     }
 
     /// Opens one logical connection after handshake negotiation.
+    ///
+    /// W3c/W3d seam: every real client — CLI attach, TUI live-attach, web —
+    /// reaches sessions only through the returned [`HubConnection`];
+    /// `connection.rs` is the first transport over it.
     pub fn open_connection(
         &self,
         capabilities: CapabilitySet,
@@ -377,8 +419,13 @@ impl SessionHub {
 
     /// Routes a worker append through the owning session actor.
     ///
-    /// This is the only live-daemon append seam: bypassing it would escape the
-    /// actor order that closes the replay/live race.
+    /// This is the only legal live-daemon append seam: INVARIANTs 1 and 2
+    /// (module doc) are properties of the actor's command order, so an append
+    /// that bypassed the actor could publish around a registration. That
+    /// exclusivity holds by DISCIPLINE, not code shape —
+    /// `SqliteStoreHandle::append` remains directly callable (tests seed with
+    /// it; recovery runs before any hub exists). W3c must hand every live
+    /// worker this hub as its [`StoreHandle`], as `register_harness` documents.
     pub async fn append(
         &self,
         envelopes: &mut [RawEnvelope],
@@ -418,9 +465,10 @@ impl SessionHub {
 
     /// Registers the live harness that consumes already-committed menu events.
     ///
-    /// Harness persistence should use this hub as its [`StoreHandle`], keeping
-    /// every worker append inside the same session-actor order as attachment
-    /// registration and publication.
+    /// W3c auto-start seam: a worker spawned for a session registers here so
+    /// committed menu resolutions wake it. Harness persistence must use this
+    /// hub as its [`StoreHandle`], keeping every worker append inside the same
+    /// session-actor order as attachment registration and publication.
     pub async fn register_harness(
         &self,
         session_id: SessionId,
@@ -504,23 +552,18 @@ impl SessionHub {
             .commands
             .send(ActorCommand::Register {
                 attachment_id: attachment_id.clone(),
-                connection_id: connection_id.to_owned(),
                 after_seq,
-                mode,
                 events,
                 lagged,
                 completed,
             })
             .await
             .map_err(|_| SessionHubError::Closed)?;
-        let registered = result.await.map_err(|_| SessionHubError::Closed)?;
-        let ActorRegisterResult::Registered(attach_state) = registered else {
-            let ActorRegisterResult::CursorAhead { requested, head } = registered else {
-                return Err(SessionHubError::Task(
-                    "actor registration changed variants unexpectedly".into(),
-                ));
-            };
-            return Ok(RegisterResult::CursorAhead { requested, head });
+        let attach_state = match result.await.map_err(|_| SessionHubError::Closed)? {
+            ActorRegisterResult::Registered(attach_state) => attach_state,
+            ActorRegisterResult::CursorAhead { requested, head } => {
+                return Ok(RegisterResult::CursorAhead { requested, head });
+            }
         };
         let registration = Registration {
             attachment_id: attachment_id.clone(),
@@ -631,6 +674,8 @@ impl SessionHub {
         Ok(())
     }
 
+    /// True when `connection_id` holds a CONTROL attachment to `session_id` —
+    /// the menu-answer policy documented on [`HubConnection::menu_answer`].
     fn attachment_for_menu(
         &self,
         connection_id: &str,
@@ -698,6 +743,34 @@ impl SessionHub {
     }
 }
 
+/// The worker-facing store surface (see [`SessionHub::append`] for the law and
+/// its discipline caveat). Reads go straight to the store: committed history
+/// needs no actor serialization.
+#[async_trait]
+impl StoreHandle for SessionHub {
+    async fn append(
+        &self,
+        envelopes: &mut [RawEnvelope],
+    ) -> Result<haider_core::CommittedRange, HaiderError> {
+        SessionHub::append(self, envelopes).await
+    }
+
+    async fn read(
+        &self,
+        session_id: &SessionId,
+        since_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<RawEnvelope>, HaiderError> {
+        self.inner.store.read(session_id, since_seq, limit).await
+    }
+
+    async fn latest_seq(&self, session_id: &SessionId) -> Result<u64, HaiderError> {
+        self.inner.store.latest_seq(session_id).await
+    }
+}
+
+// ─────────── connection RPC surface: list/read/attach/detach/menu ───────────
+
 impl HubConnection {
     /// Handles one request and enqueues its correlated response.
     pub async fn request(
@@ -750,15 +823,8 @@ impl HubConnection {
                 let operation = match mode {
                     AttachMode::View => Operation::View,
                     AttachMode::Control => Operation::Control,
-                    AttachMode::Unknown => {
-                        return self.respond_error(
-                            request_id,
-                            ERROR_CODE_INVALID_ARGUMENT,
-                            "unknown attachment mode",
-                            false,
-                            None,
-                        );
-                    }
+                    // `Unknown` and any future mode: never guess an
+                    // authorization level for a mode this daemon predates.
                     _ => {
                         return self.respond_error(
                             request_id,
@@ -793,13 +859,8 @@ impl HubConnection {
                 }
                 self.session_detach(request_id, attachment_id).await
             }
-            RequestBody::Unknown => self.respond_error(
-                request_id,
-                ERROR_CODE_INVALID_ARGUMENT,
-                "unknown session method",
-                false,
-                None,
-            ),
+            // `Unknown` and any future method decode alike: a typed,
+            // correlated rejection instead of a dropped request.
             _ => self.respond_error(
                 request_id,
                 ERROR_CODE_INVALID_ARGUMENT,
@@ -951,23 +1012,21 @@ impl HubConnection {
                 None,
             );
         }
-        let registered = self
+        let registration = match self
             .hub
             .register(&self.connection_id, session_id, after_seq, mode)
-            .await?;
-        let RegisterResult::Registered(registration) = registered else {
-            let RegisterResult::CursorAhead { requested, head } = registered else {
-                return Err(SessionHubError::Task(
-                    "attachment registration changed variants unexpectedly".into(),
-                ));
-            };
-            return self.respond_error(
-                request_id,
-                ERROR_CODE_CURSOR_AHEAD,
-                "replay cursor is beyond the committed session head",
-                false,
-                Some(ErrorData::CursorAhead { requested, head }),
-            );
+            .await?
+        {
+            RegisterResult::Registered(registration) => registration,
+            RegisterResult::CursorAhead { requested, head } => {
+                return self.respond_error(
+                    request_id,
+                    ERROR_CODE_CURSOR_AHEAD,
+                    "replay cursor is beyond the committed session head",
+                    false,
+                    Some(ErrorData::CursorAhead { requested, head }),
+                );
+            }
         };
         let attachment_id = registration.attachment_id.clone();
         let attach_state = registration.attach_state.clone();
@@ -1013,6 +1072,18 @@ impl HubConnection {
     }
 
     /// Handles the durable top-level `MenuAnswer` command.
+    ///
+    /// The arbitration law — first COMMITTED answer wins, losers get the
+    /// winner's `resolution_seq` — is stated on
+    /// `haider_store::Store::resolve_menu`; this method adds transport
+    /// concerns only: capability + attachment policy, wire error mapping, and
+    /// the correlated reply. Every attachment learns the outcome from the
+    /// event stream (the actor publishes the committed envelope); the reply
+    /// is a convenience, never the authority.
+    ///
+    /// Policy decision (brief §6): answering requires a CONTROL attachment to
+    /// the target session — v0.1 has no "controller without a viewport"
+    /// allowance.
     #[allow(clippy::too_many_arguments)]
     pub async fn menu_answer(
         &self,
@@ -1206,6 +1277,16 @@ fn authorize(capabilities: &CapabilitySet, operation: Operation) -> Result<(), &
     })
 }
 
+// ──────────── session actor: the serialized command loop (§5.5) ─────────────
+
+/// One session's entire command order, in one loop, in one task.
+///
+/// Both §5.5 invariants (module doc) hold by code shape here: the only awaits
+/// inside any arm are the store calls (`append`, `resolve_menu`), publication
+/// is a synchronous call after they return in the same arm, and the
+/// `Register` arm contains no await at all. Adding an await between a store
+/// return and its `publish`, or anywhere in `Register`, breaks a law — the
+/// forced-boundary tests in `tests/session_hub_tests.rs` will catch it.
 #[allow(clippy::too_many_arguments)]
 async fn run_session_actor(
     session_id: SessionId,
@@ -1228,6 +1309,8 @@ async fn run_session_actor(
                 mut envelopes,
                 completed,
             } => {
+                // INVARIANT 1 (module doc): the append is awaited here, and
+                // `publish` below is synchronous in this same turn.
                 let result = store.append(&mut envelopes).await;
                 match result {
                     Ok(range) => {
@@ -1239,7 +1322,7 @@ async fn run_session_actor(
                             session_id: session_id.clone(),
                             through_seq: head,
                         });
-                        publish(&mut attachments, &envelopes, &observer, &session_id);
+                        publish(&mut attachments, &envelopes);
                         observer.observe(HubObservation::Published {
                             session_id: session_id.clone(),
                             through_seq: head,
@@ -1253,9 +1336,7 @@ async fn run_session_actor(
             }
             ActorCommand::Register {
                 attachment_id,
-                connection_id,
                 after_seq,
-                mode,
                 events,
                 lagged,
                 completed,
@@ -1270,8 +1351,6 @@ async fn run_session_actor(
                 attachments.insert(
                     attachment_id.clone(),
                     ActorAttachment {
-                        connection_id,
-                        mode,
                         events,
                         lagged,
                         last_buffered_seq: head,
@@ -1281,9 +1360,9 @@ async fn run_session_actor(
                 observer.observe(HubObservation::ReceiverRegistered {
                     attachment_id: attachment_id.clone(),
                 });
-                // Load-bearing §5.5 invariant: receiver insertion and this
-                // head read are adjacent synchronous operations in one actor
-                // turn. There is no await or yield between them.
+                // INVARIANT 2 (module doc): receiver insertion above and this
+                // head read are adjacent synchronous statements in one actor
+                // turn — no await or yield between them.
                 let high_water = head;
                 observer.observe(HubObservation::HeadCaptured {
                     attachment_id: attachment_id.clone(),
@@ -1316,6 +1395,10 @@ async fn run_session_actor(
                 attachments.remove(&attachment_id);
             }
             ActorCommand::MenuAnswer { command, completed } => {
+                // The CAS itself (first-committed-wins) is
+                // `Store::resolve_menu`'s law; this arm only serializes it
+                // with appends and publishes a committed envelope afterwards
+                // (INVARIANT 1 shape).
                 let outcome = store.resolve_menu(command).await;
                 if let Ok(MenuResolutionOutcome::Committed { ref envelope }) = outcome {
                     head = envelope.seq;
@@ -1324,12 +1407,7 @@ async fn run_session_actor(
                         session_id: session_id.clone(),
                         through_seq: head,
                     });
-                    publish(
-                        &mut attachments,
-                        std::slice::from_ref(envelope.as_ref()),
-                        &observer,
-                        &session_id,
-                    );
+                    publish(&mut attachments, std::slice::from_ref(envelope.as_ref()));
                     observer.observe(HubObservation::Published {
                         session_id: session_id.clone(),
                         through_seq: head,
@@ -1355,40 +1433,18 @@ async fn run_session_actor(
     }
 }
 
-#[async_trait]
-impl StoreHandle for SessionHub {
-    async fn append(
-        &self,
-        envelopes: &mut [RawEnvelope],
-    ) -> Result<haider_core::CommittedRange, HaiderError> {
-        SessionHub::append(self, envelopes).await
-    }
-
-    async fn read(
-        &self,
-        session_id: &SessionId,
-        since_seq: u64,
-        limit: usize,
-    ) -> Result<Vec<RawEnvelope>, HaiderError> {
-        self.inner.store.read(session_id, since_seq, limit).await
-    }
-
-    async fn latest_seq(&self, session_id: &SessionId) -> Result<u64, HaiderError> {
-        self.inner.store.latest_seq(session_id).await
-    }
-}
-
-fn publish(
-    attachments: &mut HashMap<AttachmentId, ActorAttachment>,
-    envelopes: &[RawEnvelope],
-    _observer: &Arc<dyn SessionHubObserver>,
-    _session_id: &SessionId,
-) {
+/// Fans committed envelopes out to every active attachment receiver.
+///
+/// Called only from [`run_session_actor`], synchronously, after the store
+/// call returned (INVARIANT 1, module doc). `try_send` never blocks the
+/// actor; a full receiver flips the attachment inactive and reports its last
+/// buffered sequence on the lag channel, and the replay task then resumes
+/// from the store (store-is-the-lag-buffer, module doc).
+fn publish(attachments: &mut HashMap<AttachmentId, ActorAttachment>, envelopes: &[RawEnvelope]) {
     for attachment in attachments.values_mut() {
         if !attachment.active {
             continue;
         }
-        let _metadata = (&attachment.connection_id, attachment.mode);
         for envelope in envelopes {
             match attachment.events.try_send(envelope.clone()) {
                 Ok(()) => attachment.last_buffered_seq = envelope.seq,
@@ -1402,6 +1458,19 @@ fn publish(
     }
 }
 
+// ──────── replay pipeline: replay → caught-up → buffered drain → live ───────
+
+/// One attachment's delivery task, §5.5 steps 4-7.
+///
+/// Each outer iteration replays `(last_sent_seq, H]` from store pages, then
+/// announces `AttachCaughtUp(H)`, drains the already-registered bounded
+/// receiver for `seq > H` (duplicates dropped by seq), and goes live. A
+/// lagged or overflowed receiver re-registers in actor order and re-enters
+/// the outer loop with the new head — the store, not memory, carries what was
+/// missed. Exit discipline: `break` still owns the attachment registration
+/// and releases it at the bottom; every `return` path has already released
+/// ownership (via `lag_and_detach`/`take_attachment`) or observed its
+/// cancellation, which only fires after ownership was removed.
 async fn run_replay(
     hub: SessionHub,
     mut registration: Registration,
@@ -1413,6 +1482,7 @@ async fn run_replay(
     let session_id = registration.attach_state.session_id.clone();
     let mut high_water = registration.attach_state.replay_through_seq;
     loop {
+        // Phase: store replay of (last_sent_seq, high_water].
         let replayed = replay_range(
             &hub,
             &sink,
@@ -1444,6 +1514,7 @@ async fn run_replay(
             }
         }
 
+        // Phase: (after_seq, H] is fully on the wire — announce H.
         hub.inner.observer.observe(HubObservation::BeforeCaughtUp {
             attachment_id: attachment_id.clone(),
             through_seq: high_water,
@@ -1467,6 +1538,8 @@ async fn run_replay(
             through_seq: high_water,
         });
 
+        // Phase: buffered drain — deliver `seq > H` already committed during
+        // replay, dropping duplicates by seq (at-least-once, R11).
         loop {
             if *cancel.borrow() {
                 return;
@@ -1509,9 +1582,12 @@ async fn run_replay(
             }
         }
         if high_water > last_sent_seq {
+            // A mid-drain re-registration raised the head: replay the gap
+            // from the store before going live.
             continue;
         }
 
+        // Phase: live — wait on cancellation, lag, or the next commit.
         loop {
             tokio::select! {
                 biased;
@@ -1556,6 +1632,9 @@ async fn run_replay(
             }
         }
     }
+    // `break` exit: store failure, truncated page, or a closed actor. The
+    // registration is still owned here; release it (a no-op if a concurrent
+    // detach already took it).
     let _ = hub.detach(&attachment_id).await;
 }
 
@@ -1730,6 +1809,8 @@ async fn lag_and_detach(
     });
     let _ = SessionHub::finish_detach(attachment_id, owner).await;
 }
+
+// ────────────────────────────── small helpers ───────────────────────────────
 
 fn encode_cursor(session_id: &SessionId) -> String {
     let mut cursor = String::from("hs1.");

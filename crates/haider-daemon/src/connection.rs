@@ -9,9 +9,10 @@
 //!   max_receive_frame)` — the daemon never sends what the client said it
 //!   cannot receive;
 //! - the outbound queue is bounded in BOTH frames and bytes and never blocks
-//!   the daemon on a slow client (R12's mechanism): exceeding either bound is
-//!   a connection error, and the store — not the socket — is the lag buffer in
-//!   later lanes;
+//!   the daemon on a slow client (R12's mechanism): a refused system reply is
+//!   a connection error, a refused attachment lane lags/detaches only that
+//!   attachment, and the store — not the socket — is the lag buffer (law
+//!   stated in `session_hub`);
 //! - `ServerDraining` travels a reserved path outside ordinary frame/byte
 //!   capacity. W3b2 deliberately relaxes W3b1's scoped "last frame of this
 //!   lane" law: at the next complete-frame boundary the notice is written,
@@ -127,8 +128,8 @@ pub(crate) struct ConnectionGrant {
     pub(crate) capabilities: CapabilitySet,
 }
 
-/// One fair scheduling lane. System replies share one lane; each attachment
-/// owns another. The writer visits active lanes round-robin.
+/// One fair scheduling lane (policy stated on [`OutboundLane`]). System
+/// replies share one lane; each attachment owns another.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum LaneKey {
     System,
@@ -153,9 +154,18 @@ struct OutboundState {
 
 /// Explicit-close, bounded, fair per-connection outbox.
 ///
+/// FAIRNESS POLICY (authoritative statement; the session hub and tests refer
+/// here): frames are keyed into lanes — one `System` lane for replies plus
+/// one lane per attachment — and the writer drains active lanes round-robin,
+/// one frame per visit, so a hot session cannot starve a cold one's drain
+/// order. Admission is bounded three ways: an aggregate frame cap, an
+/// aggregate byte budget, and a per-lane cap of half the frame cap, so one
+/// hot lane can never consume every admission slot either. Overflow is
+/// per-lane: a refused attachment lane lags/detaches that attachment
+/// (store-resume); a refused system reply is connection-fatal.
+///
 /// Clones carry enqueue authority but cannot keep the writer alive after the
-/// connection owner calls [`Self::close`]. One hot attachment is capped at
-/// half the global frame bound, leaving admission room for another lane.
+/// connection owner calls [`Self::close`].
 #[derive(Clone)]
 struct OutboundLane {
     inner: Arc<OutboundQueue>,

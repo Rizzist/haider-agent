@@ -969,6 +969,10 @@ impl HarnessActor {
                     .map_err(DriveError::Store)?;
                     return Err(DriveError::Cancelled);
                 },
+                // Guarded so a dropped wake channel cannot masquerade as
+                // "menu closed" — only the command channel decides closure.
+                // The watch's initial `None` never fires `changed`; a `Some`
+                // here is always a really-committed answer.
                 changed = self.committed_menus.changed(),
                     if self.committed_menus.has_changed().is_ok() =>
                 {

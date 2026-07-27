@@ -80,7 +80,9 @@ pub const ERROR_CODE_DRAINING: &str = "draining";
 pub const ERROR_CODE_OVERLOADED: &str = "overloaded";
 /// Stable code for an opaque pagination cursor that cannot be decoded.
 pub const ERROR_CODE_INVALID_CURSOR: &str = "invalid_cursor";
-/// Stable code for a request whose durable version coordinates are invalid.
+/// Stable code for a structurally invalid request: an unknown method or
+/// attachment mode, a bad range/limit, or menu coordinates that do not match
+/// the committed menu version.
 pub const ERROR_CODE_INVALID_ARGUMENT: &str = "invalid_argument";
 /// Stable code for a control command fenced by a newer worker generation.
 pub const ERROR_CODE_STALE_GENERATION: &str = "stale_generation";
