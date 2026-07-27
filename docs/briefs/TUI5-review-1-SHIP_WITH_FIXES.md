@@ -109,3 +109,11 @@ Additional gates:
 Required before merge: normalize cursor/anchor boundaries after every cluster-changing edit; make tail-windowing grapheme-based; bind mouse hits/drags to surface plus text revision and cancel them on transitions; scope selection gates to a mounted composer; implement Shift-Up/Down edge extension; add regressions for each reproduction.
 
 VERDICT: SHIP_WITH_FIXES
+
+---
+
+## Fix completion (TUI5.1, commit aca510d)
+
+All six enumerated fixes landed and adversarially verified (internal Fable pass: SHIP, no P1/P2): after_edit() boundary normalization at the single mutation seam (interior-byte state unrepresentable), revision+surface-bound composer hits with stash_draft() as the single transition authority, composer_owns_input() gate, ⇧↑/⇧↓ edge extension, grapheme tail_window, eight regression pins with executed mutation checks. Tests 619→627; 14/14 hermetic ladder.
+
+Seven P3 follow-ups ledgered for the next TUI round (priority order): F4 mouse-side composer_owns_input gate in composer_press (one-frame race sibling); F1 clamp nearest_boundary for byte>len; F5/F6 pin tightening (combining-mark budget 4; tautological assert); F3 global revision counter; F7 subagent-question Esc pin. None block v0.0.11.
