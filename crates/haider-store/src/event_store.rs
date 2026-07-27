@@ -16,17 +16,21 @@ use crate::cas::FileCas;
 use crate::migrations;
 use crate::profile_lock::ProfileLock;
 use crate::{Cas, StoreResult, now_ms, store_error, to_sqlite_integer};
-use haider_protocol::EventPayload;
 use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION, envelope_weight_bytes,
 };
 use haider_protocol::error::{ErrorCode, HaiderError};
-use haider_protocol::ids::{ArtifactRef, DeviceId, EventId, MenuId, SessionId};
+use haider_protocol::ids::{ArtifactRef, DeviceId, EventId, MenuId, RunId, SessionId};
 use haider_protocol::menu::{Menu, MenuAnswer, MenuKind};
+use haider_protocol::session::SessionMetadataV1;
+use haider_protocol::state::{RunState, SessionState};
+use haider_protocol::tool::AttachmentBlock;
+use haider_protocol::{DeliveryMode, EventPayload};
 use rusqlite::{
     Connection, Error as SqliteError, ErrorCode as SqliteErrorCode, OptionalExtension, Transaction,
     TransactionBehavior, params,
 };
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
@@ -57,6 +61,10 @@ pub struct MenuResolutionCommand {
     pub session_id: SessionId,
     pub request_seq: u64,
     pub worker_generation: u64,
+    /// Internal recovery authority: only the daemon session actor may elevate
+    /// this after registering the exact durable request_input checkpoint.
+    /// Ordinary wire callers always enter with `false`.
+    pub allow_prior_generation: bool,
     pub answer: MenuAnswer,
     pub device_id: DeviceId,
     /// Preserves the wire distinction between ordinary text and a vault
@@ -74,6 +82,136 @@ pub enum MenuResolutionOutcome {
     IdempotentReplay { resolution_seq: u64 },
     /// A different command already resolved the menu.
     AlreadyResolved { resolution_seq: u64 },
+}
+
+/// Secret-free, stable coordinates for an atomic `session.create`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionCreateCommand {
+    pub command_id: String,
+    pub request_digest: String,
+    pub request_json: String,
+    pub session_id: SessionId,
+    pub cwd: String,
+    pub provider: String,
+    pub model: String,
+    pub max_tokens: u64,
+    pub system_prompt_version: String,
+    pub event_id: EventId,
+    pub device_id: DeviceId,
+}
+
+/// Durable response coordinates stored in a committed command receipt.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CreatedSession {
+    pub session_id: SessionId,
+    pub created_seq: u64,
+    pub worker_generation: u64,
+    pub metadata: SessionMetadataV1,
+}
+
+/// Result of the atomic session-creation transaction.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SessionCreateOutcome {
+    /// This call committed the session, its `Created` event, and the receipt.
+    /// The caller may publish the returned envelope after this result.
+    Committed {
+        created: CreatedSession,
+        envelope: Box<RawEnvelope>,
+    },
+    /// The same semantic command already committed. Nothing may be published
+    /// or executed again.
+    IdempotentReplay { created: CreatedSession },
+}
+
+/// Secret-free coordinates for atomically accepting a live turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnAcceptCommand {
+    pub command_id: String,
+    pub request_digest: String,
+    pub request_json: String,
+    pub session_id: SessionId,
+    pub worker_generation: u64,
+    pub run_id: RunId,
+    pub text: String,
+    pub attachments: Vec<AttachmentBlock>,
+    pub mode: DeliveryMode,
+    pub queued_event_id: EventId,
+    pub user_event_id: EventId,
+    pub active_event_id: EventId,
+    pub device_id: DeviceId,
+}
+
+/// Durable execution disposition selected at the serialized acceptance point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnAdmissionDisposition {
+    Started,
+    Queued,
+    SteerPending,
+}
+
+/// Durable response coordinates stored in a committed `turn.submit` receipt.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AcceptedTurn {
+    pub session_id: SessionId,
+    pub run_id: RunId,
+    pub accepted_seq: u64,
+    pub worker_generation: u64,
+    pub disposition: TurnAdmissionDisposition,
+}
+
+/// Result of the atomic turn-acceptance transaction.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TurnAcceptOutcome {
+    Committed {
+        accepted: AcceptedTurn,
+        envelopes: Vec<RawEnvelope>,
+    },
+    IdempotentReplay {
+        accepted: AcceptedTurn,
+    },
+}
+
+/// Secret-free coordinates for atomically recording cancellation intent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnCancelCommand {
+    pub command_id: String,
+    pub request_digest: String,
+    pub request_json: String,
+    pub session_id: SessionId,
+    pub worker_generation: u64,
+    pub run_id: RunId,
+    pub cancelling_event_id: EventId,
+    pub device_id: DeviceId,
+}
+
+/// Durable cancellation status stored in a committed receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnCancellationStatus {
+    Accepted,
+    AlreadyTerminal,
+}
+
+/// Durable response coordinates for `turn.cancel`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CancelledTurn {
+    pub session_id: SessionId,
+    pub run_id: RunId,
+    pub status: TurnCancellationStatus,
+    pub terminal_seq: Option<u64>,
+}
+
+/// Result of the atomic cancellation-intent transaction.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TurnCancelOutcome {
+    Committed {
+        cancelled: CancelledTurn,
+        envelope: Option<Box<RawEnvelope>>,
+    },
+    IdempotentReplay {
+        cancelled: CancelledTurn,
+    },
 }
 
 impl CommittedSeqRange {
@@ -226,6 +364,507 @@ impl Store {
         Ok(ids.into_iter().map(SessionId::new).collect())
     }
 
+    /// Loads typed session configuration. Legacy `{}` rows return `None`.
+    pub fn session_metadata(
+        &self,
+        session_id: &SessionId,
+    ) -> StoreResult<Option<SessionMetadataV1>> {
+        let connection = self.connection()?;
+        let metadata = connection
+            .query_row(
+                "SELECT meta_json FROM sessions WHERE id = ?1",
+                [session_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(map_sqlite_error)?;
+        match metadata {
+            Some(json) => decode_session_metadata(session_id, &json),
+            None => Ok(None),
+        }
+    }
+
+    /// Looks up a committed `session.create` response before filesystem
+    /// validation. This ordering is intentional: after a successful create,
+    /// a lost-response retry remains recoverable even if the workspace path
+    /// was subsequently removed.
+    pub fn session_create_receipt(
+        &self,
+        command_id: &str,
+        request_digest: &str,
+        request_json: &str,
+    ) -> StoreResult<Option<CreatedSession>> {
+        validate_command_identity(command_id, request_digest, request_json)?;
+        let connection = self.connection()?;
+        lookup_session_create_receipt(&connection, command_id, request_digest, request_json)
+    }
+
+    /// Atomically claims/finalizes a command receipt, inserts typed metadata,
+    /// and commits `SessionState::Created` at sequence one.
+    pub fn create_session(
+        &self,
+        command: &SessionCreateCommand,
+    ) -> StoreResult<SessionCreateOutcome> {
+        validate_command_identity(
+            &command.command_id,
+            &command.request_digest,
+            &command.request_json,
+        )?;
+        if command.cwd.is_empty()
+            || command.provider.is_empty()
+            || command.model.is_empty()
+            || command.max_tokens == 0
+        {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "session metadata fields must be non-empty and max_tokens must be positive",
+                false,
+            ));
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        if let Some(created) = lookup_session_create_receipt(
+            &transaction,
+            &command.command_id,
+            &command.request_digest,
+            &command.request_json,
+        )? {
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(SessionCreateOutcome::IdempotentReplay { created });
+        }
+
+        let created_at_ms = now_ms()?;
+        let created_at_sql = to_sqlite_integer(created_at_ms)?;
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO command_receipts(
+                    command_id, method, request_digest, request_json, state,
+                    session_id, run_id, accepted_seq, response_json,
+                    created_at_ms, updated_at_ms
+                 ) VALUES (?1, 'session.create', ?2, ?3, 'pending',
+                           NULL, NULL, NULL, NULL, ?4, ?4)",
+                params![
+                    &command.command_id,
+                    &command.request_digest,
+                    &command.request_json,
+                    created_at_sql,
+                ],
+            )
+            .map_err(map_sqlite_error)?;
+
+        // An existing same-command pending receipt can only be a recovery
+        // artifact; a committed receipt would have returned above. A
+        // different method/body is rejected by the lookup helper.
+        let metadata = SessionMetadataV1 {
+            cwd: command.cwd.clone(),
+            provider: command.provider.clone(),
+            model: command.model.clone(),
+            max_tokens: command.max_tokens,
+            system_prompt_version: Some(command.system_prompt_version.clone()),
+            created_at_ms,
+        };
+        let metadata_json = serde_json::to_string(&metadata).map_err(|error| {
+            store_error(
+                ErrorCode::InvalidArgument,
+                format!("cannot serialize session metadata: {error}"),
+                false,
+            )
+        })?;
+        transaction
+            .execute(
+                "INSERT INTO sessions(id, created_at_ms, meta_json) VALUES (?1, ?2, ?3)",
+                params![command.session_id.as_str(), created_at_sql, metadata_json,],
+            )
+            .map_err(map_sqlite_error)?;
+
+        let payload = serde_json::to_value(EventPayload::SessionState(SessionState::Created))
+            .map_err(|error| {
+                store_error(
+                    ErrorCode::InvalidArgument,
+                    format!("cannot serialize session-created payload: {error}"),
+                    false,
+                )
+            })?;
+        let envelope = EventEnvelope {
+            schema_version: SCHEMA_VERSION,
+            event_id: command.event_id.clone(),
+            seq: 1,
+            session_id: command.session_id.clone(),
+            branch_id: None,
+            run_id: None,
+            agent_id: None,
+            device_id: command.device_id.clone(),
+            authority_epoch: 0,
+            worker_generation: self.worker_generation,
+            causation_id: None,
+            correlation_id: None,
+            committed_at_ms: created_at_ms,
+            render: RenderTargets {
+                ui: true,
+                durable: true,
+                prompt: PromptRender::Omit,
+            },
+            payload,
+        };
+        let envelope_json = serde_json::to_string(&envelope).map_err(|error| {
+            store_error(
+                ErrorCode::InvalidArgument,
+                format!("cannot serialize session-created envelope: {error}"),
+                false,
+            )
+        })?;
+        transaction
+            .execute(
+                "INSERT INTO events(
+                    session_id, seq, envelope_json, event_id, committed_at_ms
+                 ) VALUES (?1, 1, ?2, ?3, ?4)",
+                params![
+                    command.session_id.as_str(),
+                    envelope_json,
+                    command.event_id.as_str(),
+                    created_at_sql,
+                ],
+            )
+            .map_err(map_sqlite_error)?;
+
+        let created = CreatedSession {
+            session_id: command.session_id.clone(),
+            created_seq: 1,
+            worker_generation: self.worker_generation,
+            metadata,
+        };
+        let response_json = serde_json::to_string(&created).map_err(|error| {
+            store_error(
+                ErrorCode::InvalidArgument,
+                format!("cannot serialize session-create response: {error}"),
+                false,
+            )
+        })?;
+        let updated = transaction
+            .execute(
+                "UPDATE command_receipts
+                 SET state = 'committed', session_id = ?2, accepted_seq = 1,
+                     response_json = ?3, updated_at_ms = ?4
+                 WHERE command_id = ?1 AND state = 'pending'",
+                params![
+                    &command.command_id,
+                    command.session_id.as_str(),
+                    response_json,
+                    created_at_sql,
+                ],
+            )
+            .map_err(map_sqlite_error)?;
+        if updated != 1 {
+            return Err(corrupt(
+                "session-create command receipt was not pending at finalization",
+            ));
+        }
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(SessionCreateOutcome::Committed {
+            created,
+            envelope: Box::new(envelope),
+        })
+    }
+
+    /// Looks up a committed `turn.submit` response before any worker work.
+    pub fn turn_accept_receipt(
+        &self,
+        command_id: &str,
+        request_digest: &str,
+        request_json: &str,
+    ) -> StoreResult<Option<AcceptedTurn>> {
+        validate_command_identity(command_id, request_digest, request_json)?;
+        let connection = self.connection()?;
+        lookup_turn_accept_receipt(&connection, command_id, request_digest, request_json)
+    }
+
+    /// Atomically commits the submit receipt, `Queued`, `UserMessage`, and,
+    /// for the first runnable turn, aggregate `SessionState::ActiveRun`.
+    pub fn accept_turn(&self, command: &TurnAcceptCommand) -> StoreResult<TurnAcceptOutcome> {
+        validate_command_identity(
+            &command.command_id,
+            &command.request_digest,
+            &command.request_json,
+        )?;
+        if command.worker_generation != self.worker_generation {
+            return Err(stale_generation(
+                command.worker_generation,
+                self.worker_generation,
+            ));
+        }
+        if command.text.is_empty() {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "turn text must not be empty",
+                false,
+            ));
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        if let Some(accepted) = lookup_turn_accept_receipt(
+            &transaction,
+            &command.command_id,
+            &command.request_digest,
+            &command.request_json,
+        )? {
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(TurnAcceptOutcome::IdempotentReplay { accepted });
+        }
+        require_session(&transaction, &command.session_id)?;
+        let states = latest_run_states(&transaction, &command.session_id)?;
+        if states.contains_key(&command.run_id) {
+            return Err(corrupt("daemon-minted turn run id already exists"));
+        }
+        let has_active = states.values().any(|(state, _)| !state.is_terminal());
+        let disposition = if has_active {
+            // W3c1 deliberately degrades Steer to an explicitly queued turn
+            // until next-request-boundary injection exists. It never lies by
+            // returning `steer_pending` while implementing a fresh turn.
+            TurnAdmissionDisposition::Queued
+        } else {
+            TurnAdmissionDisposition::Started
+        };
+        let now = now_ms()?;
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO command_receipts(
+                    command_id, method, request_digest, request_json, state,
+                    session_id, run_id, accepted_seq, response_json,
+                    created_at_ms, updated_at_ms
+                 ) VALUES (?1, 'turn.submit', ?2, ?3, 'pending',
+                           NULL, NULL, NULL, NULL, ?4, ?4)",
+                params![
+                    &command.command_id,
+                    &command.request_digest,
+                    &command.request_json,
+                    to_sqlite_integer(now)?,
+                ],
+            )
+            .map_err(map_sqlite_error)?;
+
+        let mut envelopes = vec![
+            unstamped_command_envelope(
+                command.queued_event_id.clone(),
+                &command.session_id,
+                Some(command.run_id.clone()),
+                command.device_id.clone(),
+                self.worker_generation,
+                EventPayload::RunState(RunState::Queued),
+                PromptRender::Omit,
+            )?,
+            unstamped_command_envelope(
+                command.user_event_id.clone(),
+                &command.session_id,
+                Some(command.run_id.clone()),
+                command.device_id.clone(),
+                self.worker_generation,
+                EventPayload::UserMessage {
+                    text: command.text.clone(),
+                    attachments: command.attachments.clone(),
+                    mode: command.mode,
+                },
+                PromptRender::Verbatim,
+            )?,
+        ];
+        if disposition == TurnAdmissionDisposition::Started {
+            envelopes.push(unstamped_command_envelope(
+                command.active_event_id.clone(),
+                &command.session_id,
+                Some(command.run_id.clone()),
+                command.device_id.clone(),
+                self.worker_generation,
+                EventPayload::SessionState(SessionState::ActiveRun),
+                PromptRender::Omit,
+            )?);
+        }
+        append_transaction_envelopes(&transaction, &command.session_id, now, &mut envelopes)?;
+        let accepted_seq = envelopes[1].seq;
+        let accepted = AcceptedTurn {
+            session_id: command.session_id.clone(),
+            run_id: command.run_id.clone(),
+            accepted_seq,
+            worker_generation: self.worker_generation,
+            disposition,
+        };
+        finalize_command_receipt(
+            &transaction,
+            &command.command_id,
+            command.session_id.as_str(),
+            Some(command.run_id.as_str()),
+            Some(accepted_seq),
+            &accepted,
+            now,
+            "turn-submit",
+        )?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(TurnAcceptOutcome::Committed {
+            accepted,
+            envelopes,
+        })
+    }
+
+    /// Looks up a committed `turn.cancel` response before in-memory routing.
+    pub fn turn_cancel_receipt(
+        &self,
+        command_id: &str,
+        request_digest: &str,
+        request_json: &str,
+    ) -> StoreResult<Option<CancelledTurn>> {
+        validate_command_identity(command_id, request_digest, request_json)?;
+        let connection = self.connection()?;
+        lookup_turn_cancel_receipt(&connection, command_id, request_digest, request_json)
+    }
+
+    /// Atomically records cancellation intent before any worker is signalled.
+    pub fn cancel_turn(&self, command: &TurnCancelCommand) -> StoreResult<TurnCancelOutcome> {
+        validate_command_identity(
+            &command.command_id,
+            &command.request_digest,
+            &command.request_json,
+        )?;
+        if command.worker_generation != self.worker_generation {
+            return Err(stale_generation(
+                command.worker_generation,
+                self.worker_generation,
+            ));
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        if let Some(cancelled) = lookup_turn_cancel_receipt(
+            &transaction,
+            &command.command_id,
+            &command.request_digest,
+            &command.request_json,
+        )? {
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(TurnCancelOutcome::IdempotentReplay { cancelled });
+        }
+        require_session(&transaction, &command.session_id)?;
+        let states = latest_run_states(&transaction, &command.session_id)?;
+        let Some((state, state_seq)) = states.get(&command.run_id) else {
+            return Err(store_error(
+                ErrorCode::RunNotActive,
+                format!(
+                    "run {} does not exist in session {}",
+                    command.run_id, command.session_id
+                ),
+                false,
+            ));
+        };
+        let now = now_ms()?;
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO command_receipts(
+                    command_id, method, request_digest, request_json, state,
+                    session_id, run_id, accepted_seq, response_json,
+                    created_at_ms, updated_at_ms
+                 ) VALUES (?1, 'turn.cancel', ?2, ?3, 'pending',
+                           NULL, NULL, NULL, NULL, ?4, ?4)",
+                params![
+                    &command.command_id,
+                    &command.request_digest,
+                    &command.request_json,
+                    to_sqlite_integer(now)?,
+                ],
+            )
+            .map_err(map_sqlite_error)?;
+
+        let (cancelled, envelope) = if state.is_terminal() {
+            (
+                CancelledTurn {
+                    session_id: command.session_id.clone(),
+                    run_id: command.run_id.clone(),
+                    status: TurnCancellationStatus::AlreadyTerminal,
+                    terminal_seq: Some(*state_seq),
+                },
+                None,
+            )
+        } else {
+            let mut envelopes = vec![unstamped_command_envelope(
+                command.cancelling_event_id.clone(),
+                &command.session_id,
+                Some(command.run_id.clone()),
+                command.device_id.clone(),
+                self.worker_generation,
+                EventPayload::RunState(RunState::Cancelling),
+                PromptRender::Omit,
+            )?];
+            append_transaction_envelopes(&transaction, &command.session_id, now, &mut envelopes)?;
+            (
+                CancelledTurn {
+                    session_id: command.session_id.clone(),
+                    run_id: command.run_id.clone(),
+                    status: TurnCancellationStatus::Accepted,
+                    terminal_seq: None,
+                },
+                envelopes.pop().map(Box::new),
+            )
+        };
+        finalize_command_receipt(
+            &transaction,
+            &command.command_id,
+            command.session_id.as_str(),
+            Some(command.run_id.as_str()),
+            cancelled.terminal_seq,
+            &cancelled,
+            now,
+            "turn-cancel",
+        )?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(TurnCancelOutcome::Committed {
+            cancelled,
+            envelope,
+        })
+    }
+
+    /// Appends aggregate `Idle` only if every durable run is terminal at the
+    /// same serialized SQLite write point.
+    ///
+    /// This is the aggregate-state half of R3. A worker may observe its local
+    /// queue as empty while a concurrent submit is already durable; checking
+    /// the journal inside an IMMEDIATE transaction prevents a later false
+    /// `Idle` from overwriting that submit's `ActiveRun`.
+    pub fn settle_session_idle(&self, envelope: &mut RawEnvelope) -> StoreResult<bool> {
+        if envelope.worker_generation != self.worker_generation {
+            return Err(stale_generation(
+                envelope.worker_generation,
+                self.worker_generation,
+            ));
+        }
+        if !matches!(
+            serde_json::from_value::<EventPayload>(envelope.payload.clone()),
+            Ok(EventPayload::SessionState(SessionState::Idle { .. }))
+        ) {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "conditional aggregate settlement requires a SessionState::Idle envelope",
+                false,
+            ));
+        }
+        let session_id = envelope.session_id.clone();
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        require_session(&transaction, &session_id)?;
+        let states = latest_run_states(&transaction, &session_id)?;
+        if states.values().any(|(state, _)| !state.is_terminal()) {
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(false);
+        }
+        let mut stamped = [envelope.clone()];
+        append_transaction_envelopes(&transaction, &session_id, now_ms()?, &mut stamped)?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        *envelope = stamped[0].clone();
+        Ok(true)
+    }
+
     /// Checkpoints committed WAL pages before orderly profile close.
     ///
     /// W3b1 seam (additive), used by the daemon drain barrier. Committed data
@@ -271,9 +910,9 @@ impl Store {
     /// [`MenuResolutionOutcome::IdempotentReplay`] with the original
     /// sequence; a different command after any resolution gets
     /// [`MenuResolutionOutcome::AlreadyResolved`] carrying the winner's
-    /// `resolution_seq`; a stale `worker_generation` is fenced with
-    /// `SingleWriterViolation` before a DIFFERENT command's winner
-    /// coordinate is disclosed — the same-command idempotency lookup
+    /// `resolution_seq`; `worker_generation` identifies and fences the
+    /// durable menu OPENING, while a post-restart answer is stamped with the
+    /// current store generation. The same-command idempotency lookup
     /// deliberately precedes the fence, because a lost-response retry must
     /// recover its own committed coordinate even across a restart's new
     /// generation. Every attachment then learns the outcome from the event
@@ -401,6 +1040,417 @@ impl Store {
     }
 }
 
+fn validate_command_identity(
+    command_id: &str,
+    request_digest: &str,
+    request_json: &str,
+) -> StoreResult<()> {
+    if command_id.is_empty() || request_digest.is_empty() || request_json.is_empty() {
+        return Err(store_error(
+            ErrorCode::InvalidArgument,
+            "command id, request digest, and canonical request JSON must not be empty",
+            false,
+        ));
+    }
+    serde_json::from_str::<serde_json::Value>(request_json).map_err(|error| {
+        store_error(
+            ErrorCode::InvalidArgument,
+            format!("canonical request JSON is invalid: {error}"),
+            false,
+        )
+    })?;
+    Ok(())
+}
+
+fn lookup_session_create_receipt(
+    connection: &Connection,
+    command_id: &str,
+    request_digest: &str,
+    request_json: &str,
+) -> StoreResult<Option<CreatedSession>> {
+    let row = connection
+        .query_row(
+            "SELECT method, request_digest, request_json, state,
+                    session_id, accepted_seq, response_json
+             FROM command_receipts
+             WHERE command_id = ?1",
+            [command_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(map_sqlite_error)?;
+    let Some((method, stored_digest, stored_json, state, session_id, accepted_seq, response_json)) =
+        row
+    else {
+        return Ok(None);
+    };
+    if method != "session.create" || stored_digest != request_digest || stored_json != request_json
+    {
+        return Err(store_error(
+            ErrorCode::InvalidArgument,
+            "command id was already used with a different method or semantic request body",
+            false,
+        ));
+    }
+    match state.as_str() {
+        "pending" => Ok(None),
+        "committed" => {
+            let response_json = response_json.ok_or_else(|| {
+                corrupt("committed session-create receipt is missing response JSON")
+            })?;
+            let created: CreatedSession =
+                serde_json::from_str(&response_json).map_err(|error| {
+                    corrupt(format!(
+                        "committed session-create response JSON is invalid: {error}"
+                    ))
+                })?;
+            let stored_session = session_id.ok_or_else(|| {
+                corrupt("committed session-create receipt is missing its session id")
+            })?;
+            let stored_seq = accepted_seq
+                .ok_or_else(|| corrupt("committed session-create receipt is missing its sequence"))
+                .and_then(|value| {
+                    u64::try_from(value)
+                        .map_err(|_| corrupt("command receipt contains a negative sequence"))
+                })?;
+            if created.session_id.as_str() != stored_session
+                || created.created_seq != stored_seq
+                || created.created_seq != 1
+            {
+                return Err(corrupt(
+                    "session-create receipt response disagrees with indexed coordinates",
+                ));
+            }
+            Ok(Some(created))
+        }
+        "failed" => Err(store_error(
+            ErrorCode::InvalidArgument,
+            "session-create command is already recorded as failed",
+            false,
+        )),
+        other => Err(corrupt(format!(
+            "command receipt has unknown state {other}"
+        ))),
+    }
+}
+
+fn lookup_turn_accept_receipt(
+    connection: &Connection,
+    command_id: &str,
+    request_digest: &str,
+    request_json: &str,
+) -> StoreResult<Option<AcceptedTurn>> {
+    lookup_command_response(
+        connection,
+        command_id,
+        "turn.submit",
+        request_digest,
+        request_json,
+        "turn-submit",
+    )
+}
+
+fn lookup_turn_cancel_receipt(
+    connection: &Connection,
+    command_id: &str,
+    request_digest: &str,
+    request_json: &str,
+) -> StoreResult<Option<CancelledTurn>> {
+    lookup_command_response(
+        connection,
+        command_id,
+        "turn.cancel",
+        request_digest,
+        request_json,
+        "turn-cancel",
+    )
+}
+
+fn lookup_command_response<T>(
+    connection: &Connection,
+    command_id: &str,
+    expected_method: &str,
+    request_digest: &str,
+    request_json: &str,
+    description: &str,
+) -> StoreResult<Option<T>>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let row = connection
+        .query_row(
+            "SELECT method, request_digest, request_json, state, response_json
+             FROM command_receipts WHERE command_id = ?1",
+            [command_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(map_sqlite_error)?;
+    let Some((method, stored_digest, stored_json, state, response_json)) = row else {
+        return Ok(None);
+    };
+    if method != expected_method || stored_digest != request_digest || stored_json != request_json {
+        return Err(store_error(
+            ErrorCode::InvalidArgument,
+            "command id was already used with a different method or semantic request body",
+            false,
+        ));
+    }
+    match state.as_str() {
+        "pending" => Ok(None),
+        "committed" => {
+            let response = response_json.ok_or_else(|| {
+                corrupt(format!("committed {description} receipt has no response"))
+            })?;
+            serde_json::from_str(&response).map(Some).map_err(|error| {
+                corrupt(format!(
+                    "committed {description} response is invalid: {error}"
+                ))
+            })
+        }
+        "failed" => Err(store_error(
+            ErrorCode::InvalidArgument,
+            format!("{description} command is already recorded as failed"),
+            false,
+        )),
+        other => Err(corrupt(format!(
+            "{description} receipt has unknown state {other}"
+        ))),
+    }
+}
+
+fn require_session(connection: &Connection, session_id: &SessionId) -> StoreResult<()> {
+    let exists = connection
+        .query_row(
+            "SELECT 1 FROM sessions WHERE id = ?1",
+            [session_id.as_str()],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(map_sqlite_error)?
+        .is_some();
+    if exists {
+        Ok(())
+    } else {
+        Err(store_error(
+            ErrorCode::SessionNotFound,
+            format!("session {session_id} does not exist"),
+            false,
+        ))
+    }
+}
+
+fn latest_run_states(
+    connection: &Connection,
+    session_id: &SessionId,
+) -> StoreResult<HashMap<RunId, (RunState, u64)>> {
+    let mut statement = connection
+        .prepare_cached(
+            "SELECT seq, envelope_json FROM events
+             WHERE session_id = ?1 ORDER BY seq ASC",
+        )
+        .map_err(map_sqlite_error)?;
+    let mut rows = statement
+        .query([session_id.as_str()])
+        .map_err(map_sqlite_error)?;
+    let mut states = HashMap::new();
+    while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+        let seq = sql_u64(row.get(0).map_err(map_sqlite_error)?).map_err(map_sqlite_error)?;
+        let json: String = row.get(1).map_err(map_sqlite_error)?;
+        let envelope: RawEnvelope = serde_json::from_str(&json).map_err(|error| {
+            corrupt(format!(
+                "invalid envelope JSON for session {session_id}, seq {seq}: {error}"
+            ))
+        })?;
+        let Some(run_id) = envelope.run_id else {
+            continue;
+        };
+        if let Ok(EventPayload::RunState(state)) =
+            serde_json::from_value::<EventPayload>(envelope.payload)
+        {
+            states.insert(run_id, (state, seq));
+        }
+    }
+    Ok(states)
+}
+
+fn unstamped_command_envelope(
+    event_id: EventId,
+    session_id: &SessionId,
+    run_id: Option<RunId>,
+    device_id: DeviceId,
+    worker_generation: u64,
+    payload: EventPayload,
+    prompt: PromptRender,
+) -> StoreResult<RawEnvelope> {
+    Ok(EventEnvelope {
+        schema_version: SCHEMA_VERSION,
+        event_id,
+        seq: 0,
+        session_id: session_id.clone(),
+        branch_id: None,
+        run_id,
+        agent_id: None,
+        device_id,
+        authority_epoch: 0,
+        worker_generation,
+        causation_id: None,
+        correlation_id: None,
+        committed_at_ms: 0,
+        render: RenderTargets {
+            ui: true,
+            durable: true,
+            prompt,
+        },
+        payload: serde_json::to_value(payload).map_err(|error| {
+            store_error(
+                ErrorCode::InvalidArgument,
+                format!("cannot serialize command envelope payload: {error}"),
+                false,
+            )
+        })?,
+    })
+}
+
+fn append_transaction_envelopes(
+    transaction: &Transaction<'_>,
+    session_id: &SessionId,
+    committed_at_ms: u64,
+    envelopes: &mut [RawEnvelope],
+) -> StoreResult<()> {
+    let latest: i64 = transaction
+        .query_row(
+            "SELECT COALESCE(MAX(seq), 0) FROM events WHERE session_id = ?1",
+            [session_id.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(map_sqlite_error)?;
+    let first = u64::try_from(latest)
+        .map_err(|_| corrupt("database contains a negative event sequence"))?
+        .checked_add(1)
+        .ok_or_else(|| corrupt("event sequence space is exhausted"))?;
+    let mut insert = transaction
+        .prepare_cached(
+            "INSERT INTO events(
+                session_id, seq, envelope_json, event_id, committed_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+        )
+        .map_err(map_sqlite_error)?;
+    for (offset, envelope) in envelopes.iter_mut().enumerate() {
+        let offset = u64::try_from(offset).map_err(|_| corrupt("event batch is too large"))?;
+        envelope.seq = first
+            .checked_add(offset)
+            .ok_or_else(|| corrupt("event sequence space is exhausted"))?;
+        envelope.committed_at_ms = committed_at_ms;
+        let json = serde_json::to_string(envelope).map_err(|error| {
+            store_error(
+                ErrorCode::InvalidArgument,
+                format!("cannot serialize command envelope: {error}"),
+                false,
+            )
+        })?;
+        insert
+            .execute(params![
+                session_id.as_str(),
+                to_sqlite_integer(envelope.seq)?,
+                json,
+                envelope.event_id.as_str(),
+                to_sqlite_integer(committed_at_ms)?,
+            ])
+            .map_err(map_sqlite_error)?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finalize_command_receipt<T: serde::Serialize>(
+    transaction: &Transaction<'_>,
+    command_id: &str,
+    session_id: &str,
+    run_id: Option<&str>,
+    accepted_seq: Option<u64>,
+    response: &T,
+    updated_at_ms: u64,
+    description: &str,
+) -> StoreResult<()> {
+    let response_json = serde_json::to_string(response).map_err(|error| {
+        store_error(
+            ErrorCode::InvalidArgument,
+            format!("cannot serialize {description} response: {error}"),
+            false,
+        )
+    })?;
+    let accepted_seq = accepted_seq.map(to_sqlite_integer).transpose()?;
+    let updated = transaction
+        .execute(
+            "UPDATE command_receipts
+             SET state = 'committed', session_id = ?2, run_id = ?3,
+                 accepted_seq = ?4, response_json = ?5, updated_at_ms = ?6
+             WHERE command_id = ?1 AND state = 'pending'",
+            params![
+                command_id,
+                session_id,
+                run_id,
+                accepted_seq,
+                response_json,
+                to_sqlite_integer(updated_at_ms)?,
+            ],
+        )
+        .map_err(map_sqlite_error)?;
+    if updated == 1 {
+        Ok(())
+    } else {
+        Err(corrupt(format!(
+            "{description} command receipt was not pending at finalization"
+        )))
+    }
+}
+
+fn stale_generation(provided: u64, current: u64) -> HaiderError {
+    store_error(
+        ErrorCode::SingleWriterViolation,
+        format!("stale worker generation {provided}; current generation is {current}"),
+        false,
+    )
+}
+
+fn decode_session_metadata(
+    session_id: &SessionId,
+    json: &str,
+) -> StoreResult<Option<SessionMetadataV1>> {
+    let value: serde_json::Value = serde_json::from_str(json).map_err(|error| {
+        corrupt(format!(
+            "session {session_id} metadata JSON is invalid: {error}"
+        ))
+    })?;
+    if value.as_object().is_some_and(serde_json::Map::is_empty) {
+        return Ok(None);
+    }
+    serde_json::from_value(value).map(Some).map_err(|error| {
+        corrupt(format!(
+            "session {session_id} metadata does not match SessionMetadataV1: {error}"
+        ))
+    })
+}
+
 #[derive(Debug)]
 struct ResolutionRow {
     session_id: String,
@@ -443,17 +1493,12 @@ fn resolve_menu_transaction(
             ))
         };
     }
-    if command.worker_generation != current_worker_generation {
-        return Err(store_error(
-            ErrorCode::SingleWriterViolation,
-            format!(
-                "stale worker generation {}; current generation is {}",
-                command.worker_generation, current_worker_generation
-            ),
-            false,
+    if command.worker_generation != current_worker_generation && !command.allow_prior_generation {
+        return Err(stale_generation(
+            command.worker_generation,
+            current_worker_generation,
         ));
     }
-
     let opening = load_envelope(transaction, &command.session_id, command.request_seq)?
         .ok_or_else(|| {
             store_error(
@@ -516,7 +1561,10 @@ fn resolve_menu_transaction(
         agent_id: opening.agent_id.clone(),
         device_id: command.device_id.clone(),
         authority_epoch: opening.authority_epoch,
-        worker_generation: command.worker_generation,
+        // The command presents the durable OPENING generation. A restart may
+        // legitimately answer that still-pending checkpoint, but the newly
+        // committed answer is current-generation work.
+        worker_generation: current_worker_generation,
         causation_id: Some(opening.event_id.clone()),
         correlation_id: opening.correlation_id.clone(),
         committed_at_ms,

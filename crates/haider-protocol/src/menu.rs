@@ -113,6 +113,8 @@ pub struct MenuAnswer {
 pub enum MenuCloseReason {
     Cancelled,
     Dismissed,
+    /// Daemon recovery could not safely resume the interrupted run.
+    RecoveryInterrupted,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

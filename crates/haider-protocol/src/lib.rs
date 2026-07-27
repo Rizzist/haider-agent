@@ -22,6 +22,7 @@ pub mod item;
 pub mod menu;
 pub mod provider;
 pub mod rpc;
+pub mod session;
 pub mod state;
 pub mod tool;
 pub mod verify;
@@ -38,6 +39,12 @@ pub enum EventPayload {
     HarnessStatus(state::HarnessStatus),
     SessionState(state::SessionState),
     RunState(state::RunState),
+    /// Durable, sanitized cause immediately preceding an errored run state.
+    RunFailed {
+        code: error::ErrorCode,
+        message: String,
+        retryable: bool,
+    },
     IdleDecayed,
     // interaction
     MenuOpened(menu::Menu),

@@ -27,13 +27,15 @@ pub mod ws_codec;
 
 pub use codec::CodecError;
 pub use frame::{
-    AttachMode, AttachState, AttachmentId, Capability, CapabilitySet, ClientKind, CommandId,
-    DEFAULT_FRAME_LIMIT, ERROR_CODE_ALREADY_RESOLVED, ERROR_CODE_CAPABILITY_DENIED,
-    ERROR_CODE_CURSOR_AHEAD, ERROR_CODE_DRAINING, ERROR_CODE_INVALID_ARGUMENT,
-    ERROR_CODE_INVALID_CURSOR, ERROR_CODE_NOT_FOUND, ERROR_CODE_OVERLOADED,
-    ERROR_CODE_STALE_GENERATION, ErrorData, Hello, LifecyclePhase, MenuInput, ProtocolError,
-    RequestBody, RequestId, ResponseBody, SeqRange, SessionReadResult, SessionSummary,
-    WIRE_PROTOCOL_VERSION, Welcome, WireFrame,
+    AttachMode, AttachState, AttachmentId, CancelStatus, Capability, CapabilitySet, ClientKind,
+    CommandId, DEFAULT_FRAME_LIMIT, ERROR_CODE_ALREADY_RESOLVED, ERROR_CODE_BUSY,
+    ERROR_CODE_CAPABILITY_DENIED, ERROR_CODE_CURSOR_AHEAD, ERROR_CODE_DRAINING,
+    ERROR_CODE_INVALID_ARGUMENT, ERROR_CODE_INVALID_CURSOR, ERROR_CODE_NOT_FOUND,
+    ERROR_CODE_OVERLOADED, ERROR_CODE_PROVIDER_ERROR, ERROR_CODE_RUN_NOT_ACTIVE,
+    ERROR_CODE_STALE_GENERATION, ErrorData, FEATURE_SESSION_MUTATION_V1, FEATURE_TURN_CONTROL_V1,
+    Hello, LifecyclePhase, MenuInput, ProtocolError, RequestBody, RequestId, ResponseBody,
+    SeqRange, SessionReadResult, SessionSummary, SubmitDisposition, WIRE_PROTOCOL_VERSION, Welcome,
+    WireFrame,
 };
 pub use negotiation::{Negotiated, ServerRange, negotiate};
 

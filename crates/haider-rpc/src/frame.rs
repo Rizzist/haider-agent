@@ -2,8 +2,11 @@
 
 use std::collections::BTreeSet;
 
+use haider_protocol::DeliveryMode;
 use haider_protocol::envelope::RawEnvelope;
-use haider_protocol::ids::{MenuId, SessionId};
+use haider_protocol::ids::{MenuId, RunId, SessionId};
+use haider_protocol::session::SessionMetadataV1;
+use haider_protocol::tool::AttachmentBlock;
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -86,6 +89,17 @@ pub const ERROR_CODE_INVALID_CURSOR: &str = "invalid_cursor";
 pub const ERROR_CODE_INVALID_ARGUMENT: &str = "invalid_argument";
 /// Stable code for a control command fenced by a newer worker generation.
 pub const ERROR_CODE_STALE_GENERATION: &str = "stale_generation";
+/// Stable code for a command that requires an active/nonterminal run.
+pub const ERROR_CODE_RUN_NOT_ACTIVE: &str = "run_not_active";
+/// Stable code for a session resource that is already occupied.
+pub const ERROR_CODE_BUSY: &str = "busy";
+/// Stable code for a provider-side turn failure.
+pub const ERROR_CODE_PROVIDER_ERROR: &str = "provider_error";
+
+/// Daemon implements receipt-backed session creation and metadata.
+pub const FEATURE_SESSION_MUTATION_V1: &str = "session_mutation_v1";
+/// Daemon implements durable submit/cancel turn control.
+pub const FEATURE_TURN_CONTROL_V1: &str = "turn_control_v1";
 
 /// Kind of client taking part in the handshake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -192,6 +206,12 @@ pub struct Welcome {
     /// Granted capability set: a subset of [`Hello::capabilities_requested`].
     #[serde(default)]
     pub capabilities_granted: CapabilitySet,
+    /// Additive method families implemented by this daemon.
+    ///
+    /// Capabilities answer whether this connection may control the daemon;
+    /// features answer whether the negotiated v1 peer implements a method.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub features: BTreeSet<String>,
 }
 
 /// Inclusive sequence range for a non-subscribing session read.
@@ -240,6 +260,8 @@ pub struct SessionSummary {
     /// Greatest committed envelope sequence for the session.
     pub head_seq: u64,
     pub worker_generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<SessionMetadataV1>,
 }
 
 /// Result of a non-subscribing session read.
@@ -248,6 +270,8 @@ pub struct SessionReadResult {
     pub session_id: SessionId,
     pub range: SeqRange,
     pub head_seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<SessionMetadataV1>,
     #[serde(default)]
     pub envelopes: Vec<RawEnvelope>,
 }
@@ -261,6 +285,16 @@ pub struct SessionReadResult {
 #[serde(tag = "method")]
 #[non_exhaustive]
 pub enum RequestBody {
+    /// Atomically creates typed session configuration, a `Created` event, and
+    /// the durable command receipt that makes response-loss retries safe.
+    #[serde(rename = "session.create")]
+    SessionCreate {
+        command_id: CommandId,
+        cwd: String,
+        provider: String,
+        model: String,
+        max_tokens: u64,
+    },
     /// Cursor-paginated, non-subscribing session listing.
     ///
     /// v0.1 ordering is the immutable `session_id` in ascending byte order.
@@ -294,6 +328,25 @@ pub enum RequestBody {
     /// authority or worker ownership.
     #[serde(rename = "session.detach")]
     SessionDetach { attachment_id: AttachmentId },
+    /// Durably accepts one turn before any provider work begins.
+    #[serde(rename = "turn.submit")]
+    TurnSubmit {
+        command_id: CommandId,
+        session_id: SessionId,
+        worker_generation: u64,
+        text: String,
+        #[serde(default)]
+        attachments: Vec<AttachmentBlock>,
+        mode: DeliveryMode,
+    },
+    /// Durably records cancellation intent before waking the worker.
+    #[serde(rename = "turn.cancel")]
+    TurnCancel {
+        command_id: CommandId,
+        session_id: SessionId,
+        worker_generation: u64,
+        run_id: RunId,
+    },
     /// Decode artifact for a method this crate does not know (tolerance
     /// discipline). W3b answers it with a protocol error, not a panic.
     #[serde(other)]
@@ -305,6 +358,13 @@ pub enum RequestBody {
 #[serde(tag = "method")]
 #[non_exhaustive]
 pub enum ResponseBody {
+    #[serde(rename = "session.create")]
+    SessionCreate {
+        session_id: SessionId,
+        created_seq: u64,
+        worker_generation: u64,
+        metadata: SessionMetadataV1,
+    },
     /// One page in the fixed `session_id` ascending order.
     #[serde(rename = "session.list")]
     SessionList {
@@ -324,6 +384,22 @@ pub enum ResponseBody {
     },
     #[serde(rename = "session.detach")]
     SessionDetach { attachment_id: AttachmentId },
+    #[serde(rename = "turn.submit")]
+    TurnSubmit {
+        session_id: SessionId,
+        run_id: RunId,
+        accepted_seq: u64,
+        worker_generation: u64,
+        disposition: SubmitDisposition,
+    },
+    #[serde(rename = "turn.cancel")]
+    TurnCancel {
+        session_id: SessionId,
+        run_id: RunId,
+        status: CancelStatus,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        terminal_seq: Option<u64>,
+    },
     /// Successful durable menu resolution. The same-command retry receives
     /// the original sequence; a different command receives
     /// [`ERROR_CODE_ALREADY_RESOLVED`] instead.
@@ -354,6 +430,29 @@ pub enum ResponseBody {
     },
     /// Decode artifact for a method this crate does not know (tolerance
     /// discipline).
+    #[serde(other)]
+    Unknown,
+}
+
+/// Worker disposition returned after durable turn acceptance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum SubmitDisposition {
+    Started,
+    Queued,
+    SteerPending,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Result of a durable turn-cancellation command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum CancelStatus {
+    Accepted,
+    AlreadyTerminal,
     #[serde(other)]
     Unknown,
 }

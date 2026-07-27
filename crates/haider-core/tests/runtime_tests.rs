@@ -865,6 +865,6 @@ impl Provider for FairnessProvider {
                     .await;
             });
         }
-        Ok(receiver)
+        Ok(receiver.into())
     }
 }

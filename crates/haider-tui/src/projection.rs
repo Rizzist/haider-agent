@@ -227,7 +227,8 @@ impl SessionProjection {
             EventPayload::Usage(usage) => self.usage = Some(usage.clone()),
             // Consumed by later waves (effects timeline, subagent tree, gate
             // panel, accounts). The projection stays tolerant of them now.
-            EventPayload::Effect(_)
+            EventPayload::RunFailed { .. }
+            | EventPayload::Effect(_)
             | EventPayload::ToolResult { .. }
             | EventPayload::NodeCommitted(_)
             | EventPayload::AgentSpawned(_)

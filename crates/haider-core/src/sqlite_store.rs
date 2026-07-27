@@ -9,12 +9,16 @@ use async_trait::async_trait;
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::{ArtifactRef, SessionId};
+use haider_protocol::session::SessionMetadataV1;
 use haider_store::{
-    Cas, EventStore, MenuResolutionCommand, MenuResolutionOutcome, ProfileLease, Store,
+    AcceptedTurn, CancelledTurn, Cas, EventStore, MenuResolutionCommand, MenuResolutionOutcome,
+    ProfileLease, SessionCreateCommand, SessionCreateOutcome, Store, TurnAcceptCommand,
+    TurnAcceptOutcome, TurnCancelCommand, TurnCancelOutcome,
 };
 use haider_tools::{CasSink, ToolResult};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 /// Async, cloneable owner of one locked, persistent SQLite profile.
 ///
@@ -93,6 +97,107 @@ impl SqliteStoreHandle {
     pub async fn session_ids(&self) -> Result<Vec<SessionId>, HaiderError> {
         let owner = Arc::clone(&self.owner);
         run_blocking(move || owner.with_store(Store::session_ids)).await
+    }
+
+    /// Loads typed live-session configuration; legacy `{}` rows return `None`.
+    pub async fn session_metadata(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<SessionMetadataV1>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        let session_id = session_id.clone();
+        run_blocking(move || owner.with_store(|store| store.session_metadata(&session_id))).await
+    }
+
+    /// Preflights a durable session-create receipt before workspace I/O.
+    pub async fn session_create_receipt(
+        &self,
+        command_id: String,
+        request_digest: String,
+        request_json: String,
+    ) -> Result<Option<haider_store::CreatedSession>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.session_create_receipt(&command_id, &request_digest, &request_json)
+            })
+        })
+        .await
+    }
+
+    /// Atomically creates session metadata, `Created`, and its command receipt.
+    pub async fn create_session(
+        &self,
+        command: SessionCreateCommand,
+    ) -> Result<SessionCreateOutcome, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.create_session(&command))).await
+    }
+
+    pub async fn turn_accept_receipt(
+        &self,
+        command_id: String,
+        request_digest: String,
+        request_json: String,
+    ) -> Result<Option<AcceptedTurn>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.turn_accept_receipt(&command_id, &request_digest, &request_json)
+            })
+        })
+        .await
+    }
+
+    pub async fn accept_turn(
+        &self,
+        command: TurnAcceptCommand,
+    ) -> Result<TurnAcceptOutcome, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.accept_turn(&command))).await
+    }
+
+    pub async fn turn_cancel_receipt(
+        &self,
+        command_id: String,
+        request_digest: String,
+        request_json: String,
+    ) -> Result<Option<CancelledTurn>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.turn_cancel_receipt(&command_id, &request_digest, &request_json)
+            })
+        })
+        .await
+    }
+
+    pub async fn cancel_turn(
+        &self,
+        command: TurnCancelCommand,
+    ) -> Result<TurnCancelOutcome, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.cancel_turn(&command))).await
+    }
+
+    /// Conditionally commits aggregate `Idle` after a transactional durable
+    /// quiescence check.
+    pub async fn settle_session_idle(
+        &self,
+        envelope: RawEnvelope,
+    ) -> Result<Option<RawEnvelope>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                let mut envelope = envelope;
+                if store.settle_session_idle(&mut envelope)? {
+                    Ok(Some(envelope))
+                } else {
+                    Ok(None)
+                }
+            })
+        })
+        .await
     }
 
     /// Reads one true-weight-budgeted replay page (`Store::read_page` law:
@@ -270,13 +375,25 @@ where
     T: Send + 'static,
     F: FnOnce() -> Result<T, HaiderError> + Send + 'static,
 {
-    tokio::task::spawn_blocking(operation)
-        .await
-        .map_err(|error| {
-            HaiderError::new(
-                ErrorCode::Internal,
-                format!("SQLite store blocking task failed: {error}"),
-                false,
-            )
-        })?
+    let queued_at = Instant::now();
+    tokio::task::spawn_blocking(move || {
+        let queue_wait = queued_at.elapsed();
+        let started_at = Instant::now();
+        let result = operation();
+        tracing::trace!(
+            target: "haider.store",
+            queue_wait_micros = queue_wait.as_micros(),
+            operation_micros = started_at.elapsed().as_micros(),
+            "store blocking operation completed"
+        );
+        result
+    })
+    .await
+    .map_err(|error| {
+        HaiderError::new(
+            ErrorCode::Internal,
+            format!("SQLite store blocking task failed: {error}"),
+            false,
+        )
+    })?
 }

@@ -2,35 +2,18 @@
 
 #![allow(clippy::expect_used)]
 
-use haider_daemon::{DaemonConfig, DaemonState, spawn};
+mod support;
+
+use haider_daemon::DaemonConfig;
 use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
 };
 use haider_protocol::ids::{DeviceId, EventId, SessionId};
 use haider_rpc::{
-    AttachMode, Capability, CapabilitySet, ClientKind, Hello, RequestBody, RequestId, ResponseBody,
-    SeqRange, WIRE_PROTOCOL_VERSION, WireFrame, uds_codec,
+    AttachMode, ClientKind, RequestBody, RequestId, ResponseBody, SeqRange, WireFrame,
 };
 use haider_store::{EventStore, Store};
-use std::collections::VecDeque;
-use std::path::Path;
-use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
-
-const DEADLINE: Duration = Duration::from_secs(10);
-
-fn test_root() -> tempfile::TempDir {
-    #[cfg(target_os = "macos")]
-    const SHORT_TMP_ROOT: &str = "/private/tmp";
-    #[cfg(not(target_os = "macos"))]
-    const SHORT_TMP_ROOT: &str = "/tmp";
-
-    tempfile::Builder::new()
-        .prefix("w3b2-rpc-")
-        .tempdir_in(SHORT_TMP_ROOT)
-        .expect("short temp root")
-}
+use support::{UdsClient as Client, ready, test_root};
 
 fn envelope(session_id: &SessionId, event_id: &str) -> RawEnvelope {
     EventEnvelope {
@@ -64,91 +47,13 @@ fn seed(config: &DaemonConfig, session_id: &SessionId, count: usize) {
     store.append(&mut events).expect("seed append");
 }
 
-async fn ready(config: &DaemonConfig) -> haider_daemon::DaemonTask {
-    let task = spawn(config.clone());
-    let mut readiness = task.readiness();
-    tokio::time::timeout(DEADLINE, async {
-        loop {
-            if readiness.current() == DaemonState::Ready {
-                return;
-            }
-            readiness
-                .changed()
-                .await
-                .expect("daemon state remains open");
-        }
-    })
-    .await
-    .expect("ready deadline");
-    task
-}
-
-struct Client {
-    stream: UnixStream,
-    decoder: uds_codec::Decoder,
-    pending: VecDeque<WireFrame>,
-}
-
-impl Client {
-    async fn connect(path: &Path, frame_limit: usize) -> Self {
-        let mut client = Self {
-            stream: UnixStream::connect(path).await.expect("connect"),
-            decoder: uds_codec::Decoder::new(frame_limit),
-            pending: VecDeque::new(),
-        };
-        client
-            .send(
-                &WireFrame::Hello(Hello {
-                    protocol_min: WIRE_PROTOCOL_VERSION,
-                    protocol_max: WIRE_PROTOCOL_VERSION,
-                    client_name: "w3b2-test".into(),
-                    client_version: "test".into(),
-                    client_instance_id: "client".into(),
-                    client_kind: ClientKind::Gui,
-                    capabilities_requested: CapabilitySet::from([
-                        Capability::View,
-                        Capability::Control,
-                    ]),
-                    max_receive_frame: u32::try_from(frame_limit).expect("frame limit"),
-                }),
-                frame_limit,
-            )
-            .await;
-        assert!(matches!(client.next().await, WireFrame::Welcome(_)));
-        client
-    }
-
-    async fn send(&mut self, frame: &WireFrame, frame_limit: usize) {
-        let bytes = uds_codec::encode(frame, frame_limit).expect("frame encodes");
-        self.stream.write_all(&bytes).await.expect("frame writes");
-    }
-
-    async fn next(&mut self) -> WireFrame {
-        tokio::time::timeout(DEADLINE, async {
-            loop {
-                if let Some(frame) = self.pending.pop_front() {
-                    return frame;
-                }
-                let mut bytes = [0_u8; 16 * 1024];
-                let read = self.stream.read(&mut bytes).await.expect("frame reads");
-                assert_ne!(read, 0, "connection closed before expected frame");
-                let batch = self.decoder.push(&bytes[..read]);
-                assert!(batch.error.is_none(), "invalid server frame");
-                self.pending.extend(batch.frames);
-            }
-        })
-        .await
-        .expect("frame deadline")
-    }
-}
-
 /// MUTATION CHECK: route list/read through attachment registration or start
 /// replay before enqueueing the attach response. Expected failure: an
 /// unsolicited event follows list/read, or an event precedes the attachment
 /// ID response.
 #[tokio::test]
 async fn uds_session_lifecycle_lists_reads_attaches_replays_and_detaches() {
-    let root = test_root();
+    let root = test_root("w3b2-rpc-");
     let config = DaemonConfig::new(
         "session-lifecycle",
         root.path().join("store"),
@@ -157,7 +62,14 @@ async fn uds_session_lifecycle_lists_reads_attaches_replays_and_detaches() {
     let session_id = SessionId::new("session-a");
     seed(&config, &session_id, 3);
     let task = ready(&config).await;
-    let mut client = Client::connect(&config.endpoint_path(), config.frame_limit).await;
+    let mut client = Client::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "w3b2-test",
+        "client",
+        ClientKind::Gui,
+    )
+    .await;
 
     client
         .send(
@@ -273,7 +185,7 @@ async fn uds_session_lifecycle_lists_reads_attaches_replays_and_detaches() {
 /// the no-lag assertion below trips.
 #[tokio::test]
 async fn one_hot_attachment_cannot_starve_a_cold_attachment_on_the_same_connection() {
-    let root = test_root();
+    let root = test_root("w3b2-rpc-");
     let mut config = DaemonConfig::new(
         "fair-attachments",
         root.path().join("store"),
@@ -285,7 +197,14 @@ async fn one_hot_attachment_cannot_starve_a_cold_attachment_on_the_same_connecti
     seed(&config, &hot, 200);
     seed(&config, &cold, 1);
     let task = ready(&config).await;
-    let mut client = Client::connect(&config.endpoint_path(), config.frame_limit).await;
+    let mut client = Client::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "w3b2-test",
+        "client",
+        ClientKind::Gui,
+    )
+    .await;
 
     for (request_id, session_id) in [("hot", hot.clone()), ("cold", cold.clone())] {
         client
@@ -355,7 +274,7 @@ async fn one_hot_attachment_cannot_starve_a_cold_attachment_on_the_same_connecti
 /// Verified by revert on 2026-07-27.
 #[tokio::test]
 async fn paced_replay_of_a_long_history_never_laggs_a_reading_client() {
-    let root = test_root();
+    let root = test_root("w3b2-rpc-");
     let config = DaemonConfig::new(
         "paced-replay",
         root.path().join("store"),
@@ -364,7 +283,14 @@ async fn paced_replay_of_a_long_history_never_laggs_a_reading_client() {
     let session_id = SessionId::new("long-history");
     seed(&config, &session_id, 1_000);
     let task = ready(&config).await;
-    let mut client = Client::connect(&config.endpoint_path(), config.frame_limit).await;
+    let mut client = Client::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "w3b2-test",
+        "client",
+        ClientKind::Gui,
+    )
+    .await;
     client
         .send(
             &WireFrame::Request {
@@ -429,7 +355,7 @@ fn seed_with_payload(config: &DaemonConfig, session_id: &SessionId, count: usize
 /// Verified by revert on 2026-07-27.
 #[tokio::test]
 async fn byte_bound_replay_of_large_envelopes_never_laggs_a_reading_client() {
-    let root = test_root();
+    let root = test_root("w3b2-rpc-");
     let mut config = DaemonConfig::new(
         "byte-bound-replay",
         root.path().join("store"),
@@ -440,7 +366,14 @@ async fn byte_bound_replay_of_large_envelopes_never_laggs_a_reading_client() {
     let session_id = SessionId::new("large-envelopes");
     seed_with_payload(&config, &session_id, 30, 60 * 1024);
     let task = ready(&config).await;
-    let mut client = Client::connect(&config.endpoint_path(), config.frame_limit).await;
+    let mut client = Client::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "w3b2-test",
+        "client",
+        ClientKind::Gui,
+    )
+    .await;
     client
         .send(
             &WireFrame::Request {
@@ -487,7 +420,7 @@ async fn byte_bound_replay_of_large_envelopes_never_laggs_a_reading_client() {
 /// Verified by revert on 2026-07-27.
 #[tokio::test]
 async fn five_concurrent_replay_lanes_on_one_connection_never_lag_a_reading_client() {
-    let root = test_root();
+    let root = test_root("w3b2-rpc-");
     let mut config = DaemonConfig::new(
         "five-lanes",
         root.path().join("store"),
@@ -503,7 +436,14 @@ async fn five_concurrent_replay_lanes_on_one_connection_never_lag_a_reading_clie
         seed(&config, session_id, 30);
     }
     let task = ready(&config).await;
-    let mut client = Client::connect(&config.endpoint_path(), config.frame_limit).await;
+    let mut client = Client::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "w3b2-test",
+        "client",
+        ClientKind::Gui,
+    )
+    .await;
     for (index, session_id) in sessions.iter().enumerate() {
         client
             .send(

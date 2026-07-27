@@ -8,11 +8,13 @@ use std::path::PathBuf;
 
 use common::{TEST_FRAME_LIMIT, transcript};
 use haider_rpc::{
-    DEFAULT_FRAME_LIMIT, ERROR_CODE_ALREADY_RESOLVED, ERROR_CODE_CAPABILITY_DENIED,
-    ERROR_CODE_CURSOR_AHEAD, ERROR_CODE_DRAINING, ERROR_CODE_INVALID_ARGUMENT,
-    ERROR_CODE_INVALID_CURSOR, ERROR_CODE_NOT_FOUND, ERROR_CODE_OVERLOADED,
-    ERROR_CODE_STALE_GENERATION, Hello, RequestBody, ResponseBody, WIRE_PROTOCOL_VERSION, Welcome,
-    WireFrame, uds_codec, ws_codec,
+    CancelStatus, DEFAULT_FRAME_LIMIT, ERROR_CODE_ALREADY_RESOLVED, ERROR_CODE_BUSY,
+    ERROR_CODE_CAPABILITY_DENIED, ERROR_CODE_CURSOR_AHEAD, ERROR_CODE_DRAINING,
+    ERROR_CODE_INVALID_ARGUMENT, ERROR_CODE_INVALID_CURSOR, ERROR_CODE_NOT_FOUND,
+    ERROR_CODE_OVERLOADED, ERROR_CODE_PROVIDER_ERROR, ERROR_CODE_RUN_NOT_ACTIVE,
+    ERROR_CODE_STALE_GENERATION, FEATURE_SESSION_MUTATION_V1, FEATURE_TURN_CONTROL_V1, Hello,
+    RequestBody, ResponseBody, SubmitDisposition, WIRE_PROTOCOL_VERSION, Welcome, WireFrame,
+    uds_codec, ws_codec,
 };
 use serde::{Deserialize, Serialize};
 
@@ -143,6 +145,7 @@ fn additive_handshake_identity_fields_have_tolerant_decode_defaults() {
     let WireFrame::Welcome(Welcome {
         profile_id,
         daemon_version,
+        features,
         ..
     }) = welcome
     else {
@@ -150,6 +153,7 @@ fn additive_handshake_identity_fields_have_tolerant_decode_defaults() {
     };
     assert!(profile_id.is_empty());
     assert!(daemon_version.is_empty());
+    assert!(features.is_empty());
 }
 
 #[test]
@@ -165,6 +169,9 @@ fn correlated_errors_pin_the_named_stable_codes() {
             ERROR_CODE_INVALID_CURSOR,
             ERROR_CODE_INVALID_ARGUMENT,
             ERROR_CODE_STALE_GENERATION,
+            ERROR_CODE_RUN_NOT_ACTIVE,
+            ERROR_CODE_BUSY,
+            ERROR_CODE_PROVIDER_ERROR,
         ],
         [
             "cursor_ahead",
@@ -176,6 +183,9 @@ fn correlated_errors_pin_the_named_stable_codes() {
             "invalid_cursor",
             "invalid_argument",
             "stale_generation",
+            "run_not_active",
+            "busy",
+            "provider_error",
         ]
     );
 
@@ -199,6 +209,73 @@ fn correlated_errors_pin_the_named_stable_codes() {
         value["body"]["code"],
         serde_json::Value::String(ERROR_CODE_CAPABILITY_DENIED.into())
     );
+}
+
+/// MUTATION CHECK: remove `Welcome.features`' default/skip-empty attributes.
+/// Expected failure: the old Welcome golden changes bytes or the legacy
+/// no-features frame stops decoding.
+#[test]
+fn method_features_are_additive_sorted_and_absent_when_empty() {
+    let frames = transcript();
+    let old = serde_json::to_value(&frames[1]).expect("old welcome");
+    assert!(old.get("features").is_none());
+
+    let featured = frames
+        .iter()
+        .find(|frame| {
+            matches!(
+                frame,
+                WireFrame::Welcome(Welcome { features, .. }) if !features.is_empty()
+            )
+        })
+        .expect("featured welcome");
+    let value = serde_json::to_value(featured).expect("featured welcome JSON");
+    assert_eq!(
+        value["features"],
+        serde_json::json!([FEATURE_SESSION_MUTATION_V1, FEATURE_TURN_CONTROL_V1])
+    );
+}
+
+/// MUTATION CHECK: remove a new method's explicit rename/tag or its
+/// `#[serde(other)]` status fallback. Expected failure: the exact v1 method
+/// name changes, or a future status no longer decodes to `Unknown`.
+#[test]
+fn new_methods_are_kind_tagged_and_new_statuses_are_unknown_tolerant() {
+    let frames = transcript();
+    for method in ["session.create", "turn.submit", "turn.cancel"] {
+        assert!(
+            frames.iter().any(|frame| {
+                serde_json::to_value(frame)
+                    .ok()
+                    .is_some_and(|value| value["body"]["method"] == method)
+            }),
+            "missing golden pair for {method}"
+        );
+    }
+
+    let submit: SubmitDisposition =
+        serde_json::from_str(r#""future_submit_state""#).expect("unknown submit status");
+    let cancel: CancelStatus =
+        serde_json::from_str(r#""future_cancel_state""#).expect("unknown cancel status");
+    assert_eq!(submit, SubmitDisposition::Unknown);
+    assert_eq!(cancel, CancelStatus::Unknown);
+}
+
+/// A new reader ignores additive fields on known W3c methods. An old reader's
+/// open method enum is covered by `unknown_fields_and_future_method_discriminants_are_tolerated`.
+#[test]
+fn session_create_ignores_unknown_additive_fields() {
+    let json = r#"{
+        "method":"session.create",
+        "command_id":"create-1",
+        "cwd":"/tmp",
+        "provider":"fake",
+        "model":"fake-v1",
+        "max_tokens":4096,
+        "future_policy":{"mode":"strict"}
+    }"#;
+    let body: RequestBody = serde_json::from_str(json).expect("known method with additive field");
+    assert!(matches!(body, RequestBody::SessionCreate { .. }));
 }
 
 /// MUTATION CHECK: remove the additive `ResponseBody::MenuAnswer` variant or

@@ -41,10 +41,11 @@ use crate::session_hub::{
     AdmissionTicket, FrameSendError, FrameSink, HubConnection, SendAdmission, SessionHub,
 };
 use haider_rpc::{
-    AttachmentId, Capability, CapabilitySet, ERROR_CODE_OVERLOADED, Hello, LifecyclePhase,
-    ProtocolError, RequestId, ServerRange, Welcome, WireFrame, negotiate, uds_codec,
+    AttachmentId, Capability, CapabilitySet, ERROR_CODE_OVERLOADED, FEATURE_SESSION_MUTATION_V1,
+    FEATURE_TURN_CONTROL_V1, Hello, LifecyclePhase, ProtocolError, RequestId, ServerRange, Welcome,
+    WireFrame, negotiate, uds_codec,
 };
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Weak};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1228,6 +1229,10 @@ fn negotiate_hello(
             daemon_version: env!("CARGO_PKG_VERSION").into(),
             lifecycle_phase,
             capabilities_granted: negotiated.capabilities_granted.clone(),
+            features: BTreeSet::from([
+                FEATURE_SESSION_MUTATION_V1.to_owned(),
+                FEATURE_TURN_CONTROL_V1.to_owned(),
+            ]),
         }),
         outbound_limit,
     )?;

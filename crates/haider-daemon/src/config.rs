@@ -1,3 +1,4 @@
+use crate::session_hub::SessionHubConfig;
 use haider_rpc::DEFAULT_FRAME_LIMIT;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -57,6 +58,11 @@ pub struct DaemonConfig {
     /// shutdown that overruns it, or that is forced during finalization,
     /// reports [`crate::ShutdownOutcome::Forced`], never `Graceful`.
     pub drain_timeout: Duration,
+    /// Bounds for per-session actor commands, attachment admission, catch-up,
+    /// and replay paging. Keeping them in the daemon's single config prevents
+    /// production and injected runtimes from silently using different hub
+    /// defaults.
+    pub session_hub: SessionHubConfig,
 }
 
 impl DaemonConfig {
@@ -76,6 +82,7 @@ impl DaemonConfig {
             max_connections: 64,
             handshake_timeout: Duration::from_secs(10),
             drain_timeout: Duration::from_secs(5),
+            session_hub: SessionHubConfig::default(),
         }
     }
 
@@ -131,6 +138,7 @@ impl DaemonConfig {
         if self.drain_timeout.is_zero() {
             return Err("drain timeout must be greater than zero".into());
         }
+        self.session_hub.validate()?;
         Ok(())
     }
 }

@@ -94,6 +94,7 @@ fn command(
         session_id: session_id.clone(),
         request_seq,
         worker_generation: store.worker_generation(),
+        allow_prior_generation: false,
         answer: MenuAnswer {
             menu: menu_id.clone(),
             option_key: Some(option_key.into()),

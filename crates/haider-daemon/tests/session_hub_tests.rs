@@ -435,6 +435,42 @@ fn capabilities() -> CapabilitySet {
     CapabilitySet::from([Capability::View, Capability::Control])
 }
 
+/// MUTATION CHECK: validate only persisted worker_generation and omit the
+/// active lease token. Expected failure: the superseded first worker appends
+/// successfully in the same daemon generation.
+#[tokio::test]
+async fn superseded_worker_lease_is_fenced_before_store_append() {
+    let (_root, store, hub) = open_hub(None, 8).await;
+    let session_id = SessionId::new("lease-fence");
+    let generation = store.worker_generation();
+    append_one(&hub, &session_id, generation, "seed").await;
+    let first = hub
+        .acquire_worker_lease(session_id.clone())
+        .await
+        .expect("first lease");
+    let second = hub
+        .acquire_worker_lease(session_id.clone())
+        .await
+        .expect("replacement lease");
+
+    let mut stale = [envelope(&session_id, "stale", generation)];
+    let error = StoreHandle::append(&first, &mut stale)
+        .await
+        .expect_err("stale lease must fail");
+    assert_eq!(
+        error.code,
+        haider_protocol::error::ErrorCode::SingleWriterViolation
+    );
+    let mut current = [envelope(&session_id, "current", generation)];
+    StoreHandle::append(&second, &mut current)
+        .await
+        .expect("current lease appends");
+    assert_eq!(current[0].seq, 2);
+
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
 fn attachment_from(frame: WireFrame) -> (AttachmentId, u64) {
     let WireFrame::Response {
         body:
@@ -629,6 +665,10 @@ async fn full_internal_catch_up_receiver_reregisters_and_resumes_from_store() {
         }
     }
     assert_eq!(delivered, [1, 2, 3, 4]);
+    let metrics = hub.metrics();
+    assert!(metrics.catch_up_overflows >= 1);
+    assert!(metrics.reregistrations >= 1);
+    assert!(metrics.store_resumes >= 1);
 
     connection.close().await.expect("connection closes");
     hub.shutdown().await.expect("hub stops");
@@ -1704,6 +1744,133 @@ async fn stale_worker_generation_menu_answer_is_rejected_and_fenced() {
     assert!(
         sink.snapshot().is_empty(),
         "stale answer published no event"
+    );
+
+    connection.close().await.expect("connection closes");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// MUTATION CHECK: clear the recovered menu coordinate after the winning
+/// answer commits. Expected failure: a later prior-generation loser is
+/// rejected as `stale_generation` instead of observing the durable winner as
+/// `already_resolved`.
+/// Verified by revert on 2026-07-27.
+#[tokio::test]
+async fn recovered_menu_coordinate_authorizes_losers_after_the_winner_commits() {
+    let (_root, store, hub) = open_hub(None, 8).await;
+    let session_id = SessionId::new("recovered-menu-losers");
+    let menu_id = MenuId::new("recovered-menu");
+    let generation = store.worker_generation();
+    let opening_generation = generation.saturating_sub(1);
+    let mut opening = vec![menu_opening(&session_id, &menu_id, opening_generation)];
+    hub.append(&mut opening).await.expect("menu opens");
+
+    let lease = hub
+        .acquire_worker_lease(session_id.clone())
+        .await
+        .expect("worker lease");
+    let config = HarnessConfig::for_session(
+        session_id.clone(),
+        DeviceId::new("recovered-worker"),
+        11,
+        generation,
+    );
+    let (_actor, harness) = HarnessActor::new(
+        config,
+        Arc::new(FakeProvider::new(Vec::new())),
+        Arc::new(lease.clone()),
+    );
+    hub.register_recovered_harness(
+        &lease,
+        harness,
+        menu_id.clone(),
+        opening[0].seq,
+        opening_generation,
+    )
+    .await
+    .expect("recovered harness registers");
+
+    let sink = Arc::new(CollectSink::default());
+    let connection = hub
+        .open_connection(capabilities(), sink.clone())
+        .expect("connection");
+    connection
+        .request(
+            RequestId::new("attach"),
+            RequestBody::SessionAttach {
+                session_id: session_id.clone(),
+                after_seq: opening[0].seq,
+                mode: AttachMode::Control,
+            },
+        )
+        .await
+        .expect("attach routes");
+    let _ = attachment_from(sink.next().await);
+    assert!(matches!(
+        sink.next().await,
+        WireFrame::AttachCaughtUp {
+            high_water_seq: 1,
+            ..
+        }
+    ));
+
+    connection
+        .menu_answer(
+            Some(RequestId::new("winner")),
+            CommandId::new("winner-command"),
+            session_id.clone(),
+            menu_id.clone(),
+            opening[0].seq,
+            opening_generation,
+            "allow".into(),
+            0,
+            None,
+        )
+        .await
+        .expect("winner routes");
+    let mut winner_response = false;
+    let mut winner_event = false;
+    while !winner_response || !winner_event {
+        match sink.next().await {
+            WireFrame::Response {
+                request_id,
+                body: ResponseBody::MenuAnswer { resolution_seq: 2 },
+            } if request_id.as_str() == "winner" => winner_response = true,
+            WireFrame::Event { envelope, .. } if envelope.seq == 2 => winner_event = true,
+            frame => panic!("unexpected winner frame: {frame:?}"),
+        }
+    }
+
+    connection
+        .menu_answer(
+            Some(RequestId::new("loser")),
+            CommandId::new("loser-command"),
+            session_id,
+            menu_id,
+            opening[0].seq,
+            opening_generation,
+            "deny".into(),
+            1,
+            None,
+        )
+        .await
+        .expect("loser routes");
+    let loser = sink.next().await;
+    assert!(
+        matches!(
+        loser,
+        WireFrame::Response {
+            ref request_id,
+            body:
+                ResponseBody::Error {
+                    ref code,
+                    data: Some(ErrorData::AlreadyResolved { resolution_seq: 2 }),
+                    ..
+                },
+        } if request_id.as_str() == "loser" && code == "already_resolved"
+        ),
+        "unexpected loser response: {loser:?}"
     );
 
     connection.close().await.expect("connection closes");

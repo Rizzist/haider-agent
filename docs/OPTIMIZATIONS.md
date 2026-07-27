@@ -165,6 +165,19 @@ detaches immediately). Items 4-12 are deferred here with the rider's risk lines 
 | crates/haider-daemon/src/session_hub.rs (`actor_for`, actor registry, `shutdown`) | Rider 12: session actors are never retired — every session ever appended/attached keeps its task, command channel, handle, and registry entry until daemon shutdown. Ledger race-safe idle actor retirement with single-flight recreation after W3c establishes the real session-working-set size | Risk: Very high; naïve eviction can create two actors for one session and directly break both §5.5 invariants. |
 | crates/haider-daemon/src/session_hub.rs (`SessionHub::append`, `StoreHandle` impl) | Append-exclusivity discipline gap (self-flagged in the W3b2 clean-code pass): "the hub is the only live-daemon append seam" holds by discipline, not code shape — `SqliteStoreHandle::append` remains directly callable. Structural fix: W3c hands workers the hub as their `StoreHandle`; until then discipline-only, documented at both sites | Both doc sites (`SessionHub::append` and the `StoreHandle` impl) state the caveat; recovery legitimately appends before any hub exists, so a hard seal needs the W3c worker-spawn shape first. |
 
+### W3c R12 execution note (2026-07-27)
+
+The W3c triggers above have now executed: the hub is split into
+`session_hub/{mod,actor,replay,rpc}.rs`; `SessionHubConfig` is carried by
+`DaemonConfig`; shared UDS support backs the production-runtime gate; workers
+receive only lease-fenced `HubStoreHandle`s. Rider 7 counters now expose
+catch-up overflow, discarded envelopes/store pages, store resumes,
+re-registrations, and outbox detaches. Rider 11 now traces blocking-pool queue
+wait and store-operation hold time under the `haider.store` target. These are
+measurement hooks, not a read-pool/executor rewrite; the very-high-risk
+serialization redesign remains deferred until measurements cross its stated
+trigger.
+
 ## W3b2.3 review residuals + deferred design items (dual review r1, 2026-07-27)
 
 | Where | Idea | Why deferred |
