@@ -335,6 +335,10 @@ pub async fn run_demo(
                         copy_selection_effects(&mut model, &text);
                     }
                 }
+                // TUI5 items 4+5: model-known text (the composer
+                // selection) — same pbcopy + OSC 52 + honest-flash path,
+                // no frame extraction needed.
+                AppRequest::CopyText(text) => copy_selection_effects(&mut model, &text),
                 // Runtime-owned like CopySelection: only this loop knows
                 // the store path. /reset deletes the demo state file (sim
                 // tui.js:1918); the reducer already reseeded, and the next
@@ -431,9 +435,28 @@ pub fn dispatch_input(
                 // dispatches on Up, because only Up knows whether the press
                 // was a click or a drag-selection. A previous selection's
                 // highlight clears here (the clearing law's click half).
+                // TUI5 item 5: a Down on a COMPOSER text row is different —
+                // native inputs place the caret ON the press, and a drag
+                // from there is a composer selection (region
+                // disambiguation by drag START). The composer press never
+                // arms `mouse_down`, so the transcript path stays silent.
                 MouseEventKind::Down(MouseButton::Left) => {
                     if model.selection.take().is_some() {
                         model.dirty = true;
+                    }
+                    if let Some((
+                        rect,
+                        crate::app::Hit::ComposerText {
+                            start,
+                            content,
+                            surface,
+                            revision,
+                        },
+                    )) = hit_rect_at(hit_map, mouse.column, mouse.row)
+                    {
+                        let col = usize::from(mouse.column.saturating_sub(rect.x));
+                        model.composer_press(start, &content, col, surface, revision);
+                        return;
                     }
                     model.mouse_down = Some((mouse.column, mouse.row));
                 }
@@ -442,6 +465,20 @@ pub fn dispatch_input(
                 // with a live linear highlight; same-cell jitter is not a
                 // drag. Once selecting, every head change redraws.
                 MouseEventKind::Drag(MouseButton::Left) => {
+                    // TUI5 item 5: a drag that STARTED in the composer
+                    // extends the composer selection — the pointer maps
+                    // through the frame's composer windows; off the band
+                    // it clamps to the text's start/end (native
+                    // drag-past-the-edge law).
+                    if model.composer_drag {
+                        model.composer_drag_to(composer_byte_at(
+                            hit_map,
+                            model,
+                            mouse.column,
+                            mouse.row,
+                        ));
+                        return;
+                    }
                     if let Some(anchor) = model.mouse_down {
                         let head = (mouse.column, mouse.row);
                         match &mut model.selection {
@@ -464,8 +501,15 @@ pub fn dispatch_input(
                 // Up resolves the press: a selection auto-copies (the
                 // runtime extracts from its last frame on the request) and
                 // SUPPRESSES the click-hit; a plain click dispatches from
-                // the Down coordinates exactly as before.
+                // the Down coordinates exactly as before. A composer press
+                // resolves first (item 5): its selection auto-copies with
+                // the same flash, a plain composer click already placed
+                // the caret on Down.
                 MouseEventKind::Up(MouseButton::Left) => {
+                    if model.composer_drag {
+                        model.composer_release();
+                        return;
+                    }
                     let down = model.mouse_down.take();
                     if let Some(selection) = &mut model.selection {
                         selection.dragging = false;
@@ -490,6 +534,67 @@ pub fn dispatch_input(
             }
         }
         _ => {}
+    }
+}
+
+/// The first hit-map entry containing the cell, WITH its rect (TUI5
+/// item 5: the composer press maps the click column against the rect's
+/// origin — the same first-match rule the `hit_at` closure applies).
+fn hit_rect_at(
+    hit_map: &[(ratatui::layout::Rect, crate::app::Hit)],
+    column: u16,
+    row: u16,
+) -> Option<(ratatui::layout::Rect, crate::app::Hit)> {
+    hit_map
+        .iter()
+        .find(|(rect, _)| {
+            column >= rect.x
+                && column < rect.x + rect.width
+                && row >= rect.y
+                && row < rect.y + rect.height
+        })
+        .cloned()
+}
+
+/// Map a dragging pointer to a composer byte (TUI5 item 5): on a composer
+/// row, through that row's render-time window; above the band, the text
+/// start; below it, the text end — the native "drag past the edge selects
+/// to the boundary" law. With no composer rows in the frame the caret
+/// stays put.
+fn composer_byte_at(
+    hit_map: &[(ratatui::layout::Rect, crate::app::Hit)],
+    model: &AppModel,
+    column: u16,
+    row: u16,
+) -> usize {
+    let mut band = None::<(u16, u16)>;
+    for (rect, hit) in hit_map {
+        let crate::app::Hit::ComposerText {
+            start,
+            content,
+            surface,
+            revision,
+        } = hit
+        else {
+            continue;
+        };
+        // TUI5.1 fix 2: drag rows bind to surface + revision exactly as
+        // the press does — a stale row is no row.
+        if *surface != model.surface_key() || *revision != model.composer.revision() {
+            continue;
+        }
+        let (top, bottom) = band.get_or_insert((rect.y, rect.y));
+        *top = (*top).min(rect.y);
+        *bottom = (*bottom).max(rect.y);
+        if rect.y == row {
+            let col = usize::from(column.saturating_sub(rect.x));
+            return start + crate::composer::byte_at_col(content, col);
+        }
+    }
+    match band {
+        Some((top, _)) if row < top => 0,
+        Some((_, bottom)) if row > bottom => model.composer.text().len(),
+        _ => model.composer.cursor(),
     }
 }
 
@@ -1057,7 +1162,7 @@ impl DemoDriver {
             // purge needs the state-file path — the driver has neither.
             // Reaching here means a headless harness drained them through
             // the driver — no-ops, never a panic.
-            AppRequest::CopySelection | AppRequest::PurgeDemoStore => {}
+            AppRequest::CopySelection | AppRequest::CopyText(_) | AppRequest::PurgeDemoStore => {}
         }
     }
 

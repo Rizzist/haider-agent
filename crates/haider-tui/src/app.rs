@@ -640,6 +640,11 @@ pub enum AppRequest {
     /// never sees the rendered buffer; headless tests assert the request
     /// itself.
     CopySelection,
+    /// TUI5 items 4+5: copy MODEL-known text (the composer selection on
+    /// ⌃C or drag-release). Unlike [`Self::CopySelection`] the reducer
+    /// already holds the exact text, so it travels in the request; the
+    /// runtime runs the same pbcopy + OSC 52 + honest-flash path.
+    CopyText(String),
     /// The ◉ talk hold started — fire the canned phrase after 1300 ms.
     Talk,
     /// Steer/message a subagent (respondChip, §2.4) — a full turn on the
@@ -747,6 +752,23 @@ pub enum Hit {
     /// producing prompt's first row at the viewport top (sim jumpToSticky:
     /// stay AT the prompt, tui.js:2637-2645).
     StickyJump(u16),
+    /// One composer text row (TUI5 item 5). Value-carrying like every
+    /// hit: `start` is the ABSOLUTE byte offset (in the composer text) of
+    /// the row's visible slice at render time, `content` the slice
+    /// itself — a click maps its column through `content`'s graphemes.
+    ///
+    /// TUI5.1 fix 2: the hit also carries the SURFACE it was rendered for
+    /// and the composer's text REVISION at render time — press and drag
+    /// validate both against the live composer and DROP the event on any
+    /// mismatch. One authority, no per-callsite length heuristics: a
+    /// stale frame's hit can never move the caret into fresh text or
+    /// another surface's draft.
+    ComposerText {
+        start: usize,
+        content: String,
+        surface: DraftKey,
+        revision: u64,
+    },
 }
 
 /// One answer on its way to the client, tagged with the session identity that
@@ -775,6 +797,19 @@ pub enum LauncherRow {
     Aura,
     Accounts,
     Peers,
+}
+
+/// A composer surface's identity (TUI5 item 9): the launcher, one session
+/// (by id — the monotonic-identity law means a key can never be reworn),
+/// or the aura. The SUBAGENT screen shares its session's key (the
+/// amendment's key list is exactly launcher | session id | aura), and the
+/// scratch surface (screen=Session, no id) shares the launcher's —
+/// documented: scratch is the launcher's envelope-driven lineage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DraftKey {
+    Launcher,
+    Session(u64),
+    Aura,
 }
 
 /// Everything the reducer consumes.
@@ -820,7 +855,15 @@ pub struct AppModel {
     pub sanctum_tier: SanctumTier,
     pub projection: SessionProjection,
     pub identity: IdentityLine,
-    pub composer: String,
+    /// The ACTIVE surface's composer (TUI5): text + first-class cursor +
+    /// selection + input ring. Nothing in it persists (item 8).
+    pub composer: crate::composer::Composer,
+    /// Parked composers for the surfaces NOT on screen (TUI5 item 9):
+    /// every surface — launcher, each session, aura — keeps its own draft
+    /// (text AND cursor/selection/ring travel together, Claude Code's
+    /// per-conversation drafts). Navigation swaps through here; nothing
+    /// in it persists (item 8's DTO assertion covers it).
+    pub drafts: std::collections::HashMap<DraftKey, crate::composer::Composer>,
     /// Session blurb (sim auto-title micro-call) — announced by the 1.5 s
     /// `· session titled` note; the HEADER shows [`Self::session_name`].
     pub session_title: Option<String>,
@@ -936,6 +979,11 @@ pub struct AppModel {
     /// movement the click dispatches from THESE coordinates; a drag that
     /// selected suppresses it (owner item 9's disambiguation law).
     pub mouse_down: Option<(u16, u16)>,
+    /// TUI5 item 5 — a left button went down INSIDE the composer text: the
+    /// drag (if any) is a COMPOSER selection, never the transcript's
+    /// screen-space drag (region disambiguation by drag START). Transient
+    /// interaction state; never persisted, never arms anything.
+    pub composer_drag: bool,
     pub should_quit: bool,
     /// Set by every state change; cleared when a frame is drawn (rec 6).
     pub dirty: bool,
@@ -957,7 +1005,8 @@ impl Default for AppModel {
             sanctum_tier: SanctumTier::default(),
             projection: SessionProjection::new(),
             identity: IdentityLine::default(),
-            composer: String::new(),
+            composer: crate::composer::Composer::new(),
+            drafts: std::collections::HashMap::new(),
             session_title: None,
             session_name: None,
             // The scratch surface's canonical head (the demo script's
@@ -1000,6 +1049,7 @@ impl Default for AppModel {
             hovered: None,
             selection: None,
             mouse_down: None,
+            composer_drag: false,
             should_quit: false,
             dirty: true,
             anim_phase: 0,
@@ -1025,6 +1075,61 @@ impl AppModel {
     #[must_use]
     pub fn session_identity(&self) -> u64 {
         self.active_session.unwrap_or(0)
+    }
+
+    /// The composer surface currently on screen (TUI5 item 9). Boot maps
+    /// to the launcher key: its composer is swallowed by the boot guard,
+    /// and the launcher is what boot becomes.
+    #[must_use]
+    pub fn surface_key(&self) -> DraftKey {
+        match self.screen {
+            Screen::Aura => DraftKey::Aura,
+            _ => self
+                .active_session
+                .map_or(DraftKey::Launcher, DraftKey::Session),
+        }
+    }
+
+    /// Park the live composer under the CURRENT surface's key. Callers
+    /// pair this with [`Self::restore_draft`] around a surface change —
+    /// exactly one stash/restore per transition (a double stash would park
+    /// an already-empty composer over the real draft).
+    fn stash_draft(&mut self) {
+        // TUI5.1 fix 2: a held composer drag dies with the surface it
+        // started on — every surface transition passes through here, so
+        // this is the single cancellation authority.
+        self.composer_drag = false;
+        let key = self.surface_key();
+        let draft = std::mem::take(&mut self.composer);
+        self.drafts.insert(key, draft);
+    }
+
+    /// Bring the NEW surface's parked composer live (empty for a surface
+    /// never visited — a fresh session starts with a fresh draft).
+    fn restore_draft(&mut self) {
+        let key = self.surface_key();
+        self.composer = self.drafts.remove(&key).unwrap_or_default();
+    }
+
+    /// Flip to the session screen WITH the item-9 draft swap when the
+    /// surface key would change (review P1-2: the UserMessage envelope
+    /// flip from the AURA screen crossed keys without a swap, leaking the
+    /// aura draft onto the session surface and misfiling parked drafts on
+    /// the next stash). Same-key flips (launcher scratch, subagent) swap
+    /// nothing — an empty round-trip would be harmless but this keeps the
+    /// one-stash-one-restore discipline literal.
+    fn goto_session_screen(&mut self) {
+        let from = self.surface_key();
+        let to = self
+            .active_session
+            .map_or(DraftKey::Launcher, DraftKey::Session);
+        if from == to {
+            self.screen = Screen::Session;
+            return;
+        }
+        self.stash_draft();
+        self.screen = Screen::Session;
+        self.restore_draft();
     }
 
     /// The session's display name — the slug (sim `session.name`), never
@@ -1155,8 +1260,8 @@ impl AppModel {
     /// `\n`, tui.js:235).
     #[must_use]
     pub fn palette_open(&self) -> bool {
-        if !self.composer.starts_with('/')
-            || self.composer.contains('\n')
+        if !self.composer.text().starts_with('/')
+            || self.composer.text().contains('\n')
             || self.palette_dismissed
             || self.help_open
         {
@@ -1178,7 +1283,7 @@ impl AppModel {
     #[must_use]
     pub fn palette_items(&self) -> Vec<PaletteItem> {
         palette_items(
-            self.composer.trim_start_matches('/'),
+            self.composer.text().trim_start_matches('/'),
             matches!(
                 self.screen,
                 Screen::Session | Screen::Subagent | Screen::Aura
@@ -1198,7 +1303,7 @@ impl AppModel {
         let item = items
             .get(self.palette_selection.min(items.len().saturating_sub(1)))
             .copied()?;
-        let body = self.composer.strip_prefix('/')?;
+        let body = self.composer.text().strip_prefix('/')?;
         match item {
             // Command rows exist only while the body is one unfinished
             // token, so the whole body is the fragment.
@@ -1230,6 +1335,12 @@ impl AppModel {
             AppEvent::Key(key) => {
                 self.dirty = true;
                 self.flash = None;
+                // TUI5 item 4 — the selection gates run BEFORE the
+                // clear-on-keypress law, or ⌃C/Esc could never see the
+                // selection they govern.
+                if self.composer_owns_input() && self.selection_key(&key) {
+                    return;
+                }
                 // A keypress clears a finished selection's highlight
                 // (owner item 9's clearing law; clicks clear via Down).
                 self.selection = None;
@@ -1247,12 +1358,15 @@ impl AppModel {
                 // (tui.js:2298-2317). Big pastes become a pill token; small
                 // pastes keep their newlines (multi-line composer).
                 let raw_lines = text.split('\n').count();
+                // TUI5 item 3: paste INSERTS at the cursor (replacing an
+                // active selection, item 4) — both the pill token and the
+                // literal small-paste path.
                 if raw_lines > 3 || text.encode_utf16().count() > 300 {
                     self.composer
-                        .push_str(&format!("[Pasted {raw_lines} lines] "));
+                        .insert_str(&format!("[Pasted {raw_lines} lines] "));
                 } else {
                     self.composer
-                        .push_str(&text.replace("\r\n", "\n").replace('\r', "\n"));
+                        .insert_str(&text.replace("\r\n", "\n").replace('\r', "\n"));
                 }
                 // Any composer edit re-opens a dismissed palette (sim
                 // `setMenuDismissed(false)` on change).
@@ -1266,6 +1380,96 @@ impl AppModel {
         }
     }
 
+    /// TUI5 item 4 — the two keys that act ON a COMPOSER selection,
+    /// consumed before anything else sees them:
+    ///
+    /// - Esc with an active composer selection clears it and NOTHING
+    ///   else — "Esc clears selection before any other Esc meaning
+    ///   fires" (brief law; the next Esc interrupts/navigates as before).
+    ///   Native inputs and Claude Code both deselect-only.
+    /// - ⌃C with an active composer selection copies it (the reducer
+    ///   holds the exact text → [`AppRequest::CopyText`]) and clears it.
+    ///   With NO composer selection ⌃C keeps its TUI4 meaning
+    ///   (navigate/quit) exactly — the gate is selection-presence,
+    ///   nothing else.
+    ///
+    /// The gate is scoped to the COMPOSER selection only (review P2-3): a
+    /// transcript drag already auto-copied on release, its highlight
+    /// clears under the TUI4 any-keypress law, and time-sensitive Esc
+    /// (interrupt) / ⌃C (navigate) meanings must not spend a press on a
+    /// leftover highlight.
+    fn selection_key(&mut self, key: &KeyEvent) -> bool {
+        if !self.composer.has_selection() {
+            return false;
+        }
+        if key.code == KeyCode::Esc {
+            self.composer.clear_selection();
+            return true;
+        }
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            if let Some(text) = self.composer.selected_text() {
+                self.requests.push(AppRequest::CopyText(text.to_owned()));
+            }
+            self.composer.clear_selection();
+            return true;
+        }
+        false
+    }
+
+    /// TUI5 item 5 — left button DOWN on a composer text row: place the
+    /// caret at the clicked boundary and arm the composer-drag mode (the
+    /// region-disambiguation law: a drag STARTING here is a composer
+    /// selection). `start` and `content` are the hit's render-time values
+    /// (the value-carrying law); `col` is the clicked display column
+    /// within `content`; `surface` and `revision` bind the hit to the
+    /// composer state it was rendered from (TUI5.1 fix 2) — any mismatch
+    /// drops the press whole.
+    pub fn composer_press(
+        &mut self,
+        start: usize,
+        content: &str,
+        col: usize,
+        surface: DraftKey,
+        revision: u64,
+    ) {
+        if surface != self.surface_key() || revision != self.composer.revision() {
+            return;
+        }
+        // Defense in depth (the revision check subsumes this, but a
+        // violated invariant should still never place a caret).
+        if start > self.composer.text().len() {
+            return;
+        }
+        let byte = start + crate::composer::byte_at_col(content, col);
+        self.composer.press_at(byte);
+        self.composer_drag = true;
+        self.dirty = true;
+    }
+
+    /// Drag with the button held after a composer press: the caret (the
+    /// selection's active end) follows the pointer.
+    pub fn composer_drag_to(&mut self, byte: usize) {
+        if !self.composer_drag {
+            return;
+        }
+        self.composer.drag_to(byte);
+        self.dirty = true;
+    }
+
+    /// Button UP after a composer press: a selection auto-copies (same
+    /// flash as the transcript drag, item 5) and KEEPS its highlight; a
+    /// plain click already placed the caret on Down.
+    pub fn composer_release(&mut self) {
+        if !self.composer_drag {
+            return;
+        }
+        self.composer_drag = false;
+        if let Some(text) = self.composer.selected_text() {
+            self.requests.push(AppRequest::CopyText(text.to_owned()));
+        }
+        self.dirty = true;
+    }
+
     fn handle_key(&mut self, key: KeyEvent) {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
@@ -1275,7 +1479,9 @@ impl AppModel {
                 // turn and live chips keep their lifecycle laws (esc owns
                 // interrupt, tui.js:2533-2539). From the launcher — and
                 // from boot, which has no launcher to return to — it quits,
-                // as before.
+                // as before. TUI5 item 4: with an ACTIVE composer selection
+                // ⌃C COPIES instead (the gate lives in `handle`, before
+                // this arm ever sees the key).
                 KeyCode::Char('c') => match self.screen {
                     Screen::Launcher | Screen::Boot => self.should_quit = true,
                     _ => self.back_to_launcher(),
@@ -1286,6 +1492,28 @@ impl AppModel {
                 KeyCode::Char('g') => {
                     self.flash =
                         Some("· /tokens — UI ready; lands with the daemon wave (W3)".to_owned());
+                }
+                // TUI5 items 2+3 — readline editing keys, Claude Code
+                // parity: ⌃A/⌃E line edges, ⌃W word-back, ⌃K kill-to-end,
+                // ⌃U kill-to-start. Only while the composer actually owns
+                // the input (never boot / help / a blocking menu).
+                KeyCode::Char('a') if self.composer_owns_input() => {
+                    self.composer.line_home(false);
+                }
+                KeyCode::Char('e') if self.composer_owns_input() => {
+                    self.composer.line_end_key(false);
+                }
+                KeyCode::Char('w') if self.composer_owns_input() => {
+                    self.composer.word_backspace();
+                    self.note_composer_edit();
+                }
+                KeyCode::Char('k') if self.composer_owns_input() => {
+                    self.composer.kill_to_line_end();
+                    self.note_composer_edit();
+                }
+                KeyCode::Char('u') if self.composer_owns_input() => {
+                    self.composer.kill_to_line_start();
+                    self.note_composer_edit();
                 }
                 _ => {}
             }
@@ -1338,7 +1566,8 @@ impl AppModel {
                 .modifiers
                 .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
         {
-            self.composer.push('\n');
+            // TUI5 item 3: the newline INSERTS at the cursor like any edit.
+            self.composer.insert_str("\n");
             self.palette_dismissed = false;
             return;
         }
@@ -1373,14 +1602,14 @@ impl AppModel {
                         .copied()
                     {
                         Some(PaletteItem::Cmd(spec)) => {
-                            self.composer = if has_arg_slots(spec.name) {
+                            self.composer.set_text(if has_arg_slots(spec.name) {
                                 format!("/{} ", spec.name)
                             } else {
                                 format!("/{}", spec.name)
-                            };
+                            });
                         }
                         Some(PaletteItem::Arg { cmd, value, .. }) => {
-                            self.composer = format!("/{cmd} {value}");
+                            self.composer.set_text(format!("/{cmd} {value}"));
                         }
                         None => {}
                     }
@@ -1435,10 +1664,73 @@ impl AppModel {
             }
             KeyCode::Enter => self.submit_composer(),
             KeyCode::Backspace => {
-                self.composer.pop();
-                self.palette_selection = 0;
-                self.palette_scroll = 0;
-                self.palette_dismissed = false;
+                // TUI5 item 3: ⌫ deletes the grapheme BEFORE the cursor
+                // (or the active selection); ⌥⌫ deletes the word before
+                // (ESC-⌫ / kitty ALT — Claude Code binds both).
+                if key.modifiers.contains(KeyModifiers::ALT) {
+                    self.composer.word_backspace();
+                } else {
+                    self.composer.backspace();
+                }
+                self.note_composer_edit();
+            }
+            // Delete (fn⌫ / kDEL, CSI 3~): the grapheme AFTER the cursor.
+            KeyCode::Delete => {
+                self.composer.delete_forward();
+                self.note_composer_edit();
+            }
+            // TUI5 item 2 — cursor movement. ⇧ extends a selection
+            // (item 4); ⌥ moves by word (mac law; iTerm CSI 1;3D). The
+            // palette branch above already owns ↑/↓/Tab/⏎ while open, so
+            // these arms never fight it.
+            KeyCode::Left => {
+                let extend = key.modifiers.contains(KeyModifiers::SHIFT);
+                if key.modifiers.contains(KeyModifiers::ALT) {
+                    self.composer.word_left(extend);
+                } else {
+                    self.composer.move_left(extend);
+                }
+            }
+            KeyCode::Right => {
+                let extend = key.modifiers.contains(KeyModifiers::SHIFT);
+                if key.modifiers.contains(KeyModifiers::ALT) {
+                    self.composer.word_right(extend);
+                } else {
+                    self.composer.move_right(extend);
+                }
+            }
+            // ↑/↓ walk the composer's rows column-sticky (item 2). At the
+            // buffer's edge rows they page the input HISTORY instead
+            // (item 6, Claude Code behavior) — only with no selection and
+            // no ⇧ (a ⇧↑ at the top edge is a selection gesture, not a
+            // recall).
+            KeyCode::Up if self.composer_owns_input() => {
+                let extend = key.modifiers.contains(KeyModifiers::SHIFT);
+                if !self.composer.line_up(extend)
+                    && !extend
+                    && !self.composer.has_selection()
+                    && self.composer.history_prev()
+                {
+                    self.note_composer_edit();
+                }
+            }
+            KeyCode::Down if self.composer_owns_input() => {
+                let extend = key.modifiers.contains(KeyModifiers::SHIFT);
+                if !self.composer.line_down(extend)
+                    && !extend
+                    && !self.composer.has_selection()
+                    && self.composer.history_next()
+                {
+                    self.note_composer_edit();
+                }
+            }
+            KeyCode::Home => {
+                self.composer
+                    .line_home(key.modifiers.contains(KeyModifiers::SHIFT));
+            }
+            KeyCode::End => {
+                self.composer
+                    .line_end_key(key.modifiers.contains(KeyModifiers::SHIFT));
             }
             KeyCode::Char(c @ '1'..='3')
                 if self.screen == Screen::Launcher && self.composer.is_empty() =>
@@ -1446,11 +1738,20 @@ impl AppModel {
                 let index = (c as usize) - ('1' as usize);
                 self.attach_sample(index);
             }
+            // ⌥b/⌥f word movement (readline ESC-b/ESC-f — what most mac
+            // terminals actually SEND for Option+arrow; Claude Code
+            // honors both encodings, so we do too).
+            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.composer.word_left(false);
+            }
+            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.composer.word_right(false);
+            }
             KeyCode::Char(c) => {
-                self.composer.push(c);
-                self.palette_selection = 0;
-                self.palette_scroll = 0;
-                self.palette_dismissed = false;
+                // TUI5 item 3: typing INSERTS at the cursor (never
+                // appends) and REPLACES an active selection (item 4).
+                self.composer.insert_str(c.encode_utf8(&mut [0u8; 4]));
+                self.note_composer_edit();
                 // Typing decays interrupted-idle → idle (sim, tui.js:3020).
                 if self.projection.interrupted() {
                     self.projection.apply(&EventPayload::IdleDecayed);
@@ -1460,13 +1761,50 @@ impl AppModel {
         }
     }
 
+    /// The composer is the live input target: no boot screen, no help
+    /// overlay, no blocking menu owning the keys (session card or the
+    /// viewed chip's question). Gates the TUI5 editing keys so ⌃K on a
+    /// menu can never eat a hidden draft.
+    #[must_use]
+    fn composer_owns_input(&self) -> bool {
+        if self.screen == Screen::Boot || self.help_open {
+            return false;
+        }
+        if self.screen == Screen::Session && self.projection.open_menu().is_some() {
+            return false;
+        }
+        !(self.screen == Screen::Subagent
+            && self
+                .viewed_chip()
+                .is_some_and(|chip| chip.question_menu().is_some()))
+    }
+
+    /// The composer-edit epilogue every text-changing key shares (the sim
+    /// resets suggestion state on any change): palette selection/scroll
+    /// reset + a dismissed palette re-opens.
+    fn note_composer_edit(&mut self) {
+        self.palette_selection = 0;
+        self.palette_scroll = 0;
+        self.palette_dismissed = false;
+    }
+
     /// Sim submit() preprocessing, exact order (tui.js:1966-2041 — the
     /// aura/subagent screen steps land with their screens; the boot-queue
     /// step is unreachable here because the boot screen swallows input by
     /// earlier review law r1 P2).
     fn submit_composer(&mut self) {
-        let text = self.composer.trim().to_owned();
-        self.composer.clear();
+        // TUI5: the take records the submitted text in this surface's
+        // input ring (item 6) and clears cursor/selection state (item 8).
+        // Slash submits take SILENTLY — execute_slash records the
+        // canonical form (review P3-9, one entry per invocation).
+        let is_slash = self.composer.text().trim().starts_with('/');
+        let text = if is_slash {
+            self.composer.take_silent()
+        } else {
+            self.composer.take_for_submit()
+        }
+        .trim()
+        .to_owned();
         self.palette_selection = 0;
         self.palette_scroll = 0;
         self.palette_dismissed = false;
@@ -1481,7 +1819,7 @@ impl AppModel {
             return;
         }
         if text.starts_with('/') {
-            self.composer = text;
+            self.composer.set_text(text);
             self.execute_slash();
             return;
         }
@@ -1586,7 +1924,7 @@ impl AppModel {
         self.projection
             .push_note(format!("◉ heard · {}", self.voice.stt));
         let title = self.session_title.is_none();
-        self.screen = Screen::Session;
+        self.goto_session_screen(); // review P1-2: draft-aware flip
         self.turn_active = true;
         self.scroll_back.set(0);
         self.requests.push(AppRequest::SubmitText {
@@ -1648,9 +1986,24 @@ impl AppModel {
         self.aura_submit(crate::script::AURA_TALK_PHRASE.to_owned(), true);
     }
 
+    /// Enter the aura stage (the `/aura` command and the launcher's Aura
+    /// row share this): the departing surface's draft parks, the aura's
+    /// own comes live (TUI5 item 9 — Aura has its own composer instance).
+    fn enter_aura(&mut self) {
+        if self.screen == Screen::Aura {
+            return;
+        }
+        self.stash_draft();
+        self.screen = Screen::Aura;
+        self.restore_draft();
+    }
+
     /// Esc from the aura stage: back to the session if one is attached,
     /// else the launcher — aura state persists either way.
     fn exit_aura(&mut self) {
+        // TUI5 item 9: the aura's draft parks under its own key; the
+        // return surface's draft comes live below.
+        self.stash_draft();
         // TUI4c: attachment is the map's word now — a checked-out session
         // (or a content-bearing scratch) takes esc back to the session;
         // an aura entered from the menu returns to the menu.
@@ -1662,6 +2015,7 @@ impl AppModel {
         } else {
             Screen::Launcher
         };
+        self.restore_draft();
     }
 
     /// Chip close lifecycle flags (§2.5) — the DRIVER owns the 5 s removal
@@ -1749,7 +2103,7 @@ impl AppModel {
     fn activate_palette_item(&mut self, item: PaletteItem) {
         match item {
             PaletteItem::Cmd(spec) if has_arg_slots(spec.name) => {
-                self.composer = format!("/{} ", spec.name);
+                self.composer.set_text(format!("/{} ", spec.name));
                 self.palette_selection = 0;
                 self.palette_scroll = 0;
                 self.palette_dismissed = false;
@@ -1757,27 +2111,40 @@ impl AppModel {
             PaletteItem::Cmd(spec) => {
                 let args: String = self
                     .composer
+                    .text()
                     .trim_start_matches('/')
                     .split_whitespace()
                     .skip(1)
                     .collect::<Vec<_>>()
                     .join(" ");
-                self.composer = if args.is_empty() {
+                self.composer.set_text(if args.is_empty() {
                     format!("/{}", spec.name)
                 } else {
                     format!("/{} {args}", spec.name)
-                };
+                });
                 self.execute_slash();
             }
             PaletteItem::Arg { cmd, value, .. } => {
-                self.composer = format!("/{cmd} {value}");
+                self.composer.set_text(format!("/{cmd} {value}"));
                 self.execute_slash();
             }
         }
     }
 
     fn execute_slash(&mut self) {
-        let raw = self.composer.trim_start_matches('/').trim().to_owned();
+        let raw = self
+            .composer
+            .text()
+            .trim_start_matches('/')
+            .trim()
+            .to_owned();
+        // TUI5 item 6: slash executions are recallable like any submit —
+        // palette-activated commands never pass `take_for_submit`, so the
+        // ring is fed here with the CANONICAL form. The consecutive-dupe
+        // dedupe absorbs the double record on the plain-⏎ path.
+        if !raw.is_empty() {
+            self.composer.record_submitted(&format!("/{raw}"));
+        }
         self.composer.clear();
         self.palette_selection = 0;
         self.palette_scroll = 0;
@@ -1822,6 +2189,14 @@ impl AppModel {
                 self.back_to_launcher();
             }
             "reset" => {
+                // TUI5 item 9: park the departing surface first; session
+                // drafts die with the reseed (the identity law — a
+                // reseeded roster must not wear old drafts) and the
+                // aura's dies with its reseed below. The LAUNCHER draft
+                // SURVIVES — documented choice: the launcher is not an
+                // identity-keyed surface, and the owner's monotonic
+                // rules govern session ids only.
+                self.stash_draft();
                 self.fresh_session();
                 self.sessions = seed_session_states();
                 self.active_session = None;
@@ -1844,10 +2219,12 @@ impl AppModel {
                 // save effect refills localStorage after removeItem.
                 self.requests.push(AppRequest::PurgeDemoStore);
                 self.screen = Screen::Launcher;
+                self.drafts.retain(|key, _| *key == DraftKey::Launcher);
+                self.restore_draft();
                 self.flash = Some("· demo reset".to_owned());
             }
             "quit" | "exit" => self.requests.push(AppRequest::Quit),
-            "aura" => self.screen = Screen::Aura,
+            "aura" => self.enter_aura(),
             "compact" => {
                 // Manual compaction (sim tui.js:1791-1806). Adapted gate:
                 // the sim's single-threaded state writes tolerate /compact
@@ -2022,7 +2399,7 @@ impl AppModel {
             self.screen = Screen::Launcher;
         }
         if let EventPayload::UserMessage { .. } = payload {
-            self.screen = Screen::Session;
+            self.goto_session_screen();
             self.turn_active = true;
             // NB: no titling here. The sim names a session ONLY inside the
             // 1.5 s micro-call callback (tui.js:1219-1227); titling on the
@@ -2185,8 +2562,15 @@ impl AppModel {
             self.screen = Screen::Session;
             return;
         }
+        // TUI5 item 9: park the departing surface's draft BEFORE identity
+        // flips (checkin() itself is draft-free — exactly one stash and
+        // one restore per transition).
+        self.stash_draft();
         self.checkin();
         let Some(index) = self.sessions.iter().position(|entry| entry.id == id) else {
+            // Unknown id: the checkin left us on the no-session surface —
+            // bring ITS (the launcher's) draft live, stranding nothing.
+            self.restore_draft();
             return;
         };
         // Move the slot out so its fields can swap with `self`'s without
@@ -2216,6 +2600,9 @@ impl AppModel {
         self.scroll_back.set(0);
         self.scroll_max.set(0);
         self.sticky_suppressed = false;
+        // TUI5 item 9: the attached session's own draft comes live —
+        // text, cursor, selection and input ring exactly as it left.
+        self.restore_draft();
     }
 
     /// Detach: write the live fields back into the session's slot (sim
@@ -2276,6 +2663,10 @@ impl AppModel {
         entry.ago = "now".to_owned();
         self.sessions.insert(0, entry);
         self.open_session(id);
+        // Review P3-8: the founding message recalls IN the new session
+        // (Claude Code recalls in-conversation); the launcher's own ring
+        // kept its copy via take_for_submit before the surface swap.
+        self.composer.record_submitted(text);
     }
 
     /// Walk back to the launcher — the ONE teardown every back path shares
@@ -2285,6 +2676,10 @@ impl AppModel {
     /// running turn are untouched, so the session resumes exactly where it
     /// was left.
     pub fn back_to_launcher(&mut self) {
+        // TUI5 item 9: park the departing surface's draft (session, aura,
+        // or the scratch surface — which shares the launcher key, so its
+        // stash/restore is an exact round-trip).
+        self.stash_draft();
         // TUI4c: leaving DETACHES (sim `setActiveId(null)`, tui.js:1956) —
         // the session's state checks into its slot, its scripts keep
         // running, and the launcher's surface derives from NO session
@@ -2303,6 +2698,8 @@ impl AppModel {
         self.listening = false;
         self.view_path.clear();
         self.help_open = false;
+        // TUI5 item 9: the launcher's own draft comes back.
+        self.restore_draft();
     }
 
     /// A NON-attached session's slot (background event routing).
@@ -2334,7 +2731,7 @@ impl AppModel {
                 self.attach_sample_named(&name);
             }
             Hit::ExtraRow(which) if self.screen == Screen::Launcher => match which {
-                LauncherRow::Aura => self.screen = Screen::Aura,
+                LauncherRow::Aura => self.enter_aura(),
                 LauncherRow::Accounts => {
                     self.flash = Some(
                         "· /accounts — UI ready; lands with the account switchboard (W3)"

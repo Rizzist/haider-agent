@@ -88,6 +88,29 @@ impl Theme {
             .bg(self.input_bg.into())
     }
 
+    /// The composer's cursor CELL (TUI5 item 1): reverse-video against the
+    /// input band — a gold block carrying the glyph under it in `badge_fg`
+    /// (the theme bg, the same filled-badge contrast rule). Gold is the
+    /// accent on every theme, so the block reads on dawn AND dark; at
+    /// end-of-text the cell is this style over a plain space. STEADY by
+    /// law — no blink, no `animated()` term (zero-idle-wakeup).
+    #[must_use]
+    pub fn cursor_style(&self) -> Style {
+        Style::default()
+            .fg(self.badge_fg.into())
+            .bg(self.gold.into())
+    }
+
+    /// The composer's selection band (TUI5 item 4): the shared selBg
+    /// ground under the bright draft ink — the hover-band law (ground
+    /// shifts, ink stays), matching the transcript drag-select highlight.
+    #[must_use]
+    pub fn composer_selection_style(&self) -> Style {
+        Style::default()
+            .fg(self.bright.into())
+            .bg(self.sel_bg.into())
+    }
+
     /// The blocking input-replacement menu's ground (sim `InputMenu`:
     /// warn border on a gold-soft field).
     #[must_use]

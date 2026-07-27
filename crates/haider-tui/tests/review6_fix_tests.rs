@@ -100,11 +100,14 @@ fn answering_the_menu_at_ninety_by_five_restores_an_editable_composer() {
             assert_eq!(rect.y as usize, composer_y, "chip on the composer row");
         }
     }
-    // And it is EDITABLE: a typed char renders with the cursor.
+    // And it is EDITABLE: a typed char renders after the sigil.
+    // Directed (TUI5 item 1): the appended ▮ is retired; the caret is a
+    // styled cell asserted in the TUI5 suite — here the editability law
+    // is the typed char itself.
     model.handle(key(KeyCode::Char('x')));
     let (rows, _, _) = draw(&model, 90, 5);
     assert!(
-        rows.iter().any(|row| row.contains("x▮")),
+        rows.iter().any(|row| row.contains("❯ x")),
         "typed char renders: {rows:?}"
     );
 }
@@ -114,8 +117,10 @@ fn ninety_by_one_session_has_no_out_of_frame_hits() {
     let mut model = session_model();
     let (rows, hits, _) = draw(&model, 90, 1);
     // The single row is the composer — all chrome shed.
+    // Directed (TUI5 item 1): the placeholder's ▮ became a styled cell,
+    // so the sigil alone identifies the composer row.
     assert!(
-        rows[0].contains('❯') || rows[0].contains('▮'),
+        rows[0].contains('❯'),
         "the one row is the composer: {:?}",
         rows[0]
     );
@@ -123,7 +128,8 @@ fn ninety_by_one_session_has_no_out_of_frame_hits() {
     // Still editable.
     model.handle(key(KeyCode::Char('z')));
     let (rows, hits, _) = draw(&model, 90, 1);
-    assert!(rows[0].contains("z▮"), "typed char renders: {:?}", rows[0]);
+    // Directed (TUI5 item 1): "z▮" → "❯ z" (caret is a styled cell now).
+    assert!(rows[0].contains("❯ z"), "typed char renders: {:?}", rows[0]);
     assert_hits_in_frame(&hits, 90, 1);
 }
 
@@ -141,7 +147,8 @@ fn launcher_composer_survives_two_row_frames() {
     assert_hits_in_frame(&hits, 90, 2);
     model.handle(key(KeyCode::Char('q')));
     let (rows, _, _) = draw(&model, 90, 2);
-    assert!(rows.iter().any(|row| row.contains("q▮")));
+    // Directed (TUI5 item 1): "q▮" → "❯ q" (caret is a styled cell now).
+    assert!(rows.iter().any(|row| row.contains("❯ q")));
 }
 
 #[test]

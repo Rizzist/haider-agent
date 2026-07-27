@@ -98,8 +98,10 @@ fn four_line_composer_at_ninety_by_ten_keeps_the_cursor_row() {
     let (rows, _, _) = draw(&model, 90, 10);
     // The allocation grants 3 rows; the composer tail-windows: the cursor
     // row is ALWAYS visible, the hidden head is signalled by ⋮.
+    // Directed (TUI5 item 1): the appended ▮ is retired — the cursor row
+    // is its TEXT; the caret is a styled cell (asserted in the TUI5 suite).
     assert!(
-        rows.iter().any(|row| row.contains("ddd▮")),
+        rows.iter().any(|row| row.contains("ddd")),
         "cursor row visible at 90×10: {rows:?}"
     );
     assert!(
@@ -113,7 +115,8 @@ fn four_line_composer_at_ninety_by_ten_keeps_the_cursor_row() {
     // Growth still steals from the transcript FIRST when there is room:
     // a taller frame shows all four lines.
     let (rows, _, _) = draw(&model, 90, 24);
-    for needle in ["❯ aaa", "bbb", "ccc", "ddd▮"] {
+    // Directed (TUI5 item 1): "ddd▮" → "ddd" (the caret is a styled cell).
+    for needle in ["❯ aaa", "bbb", "ccc", "ddd"] {
         assert!(
             rows.iter().any(|row| row.contains(needle)),
             "{needle} shown"
@@ -300,8 +303,9 @@ fn launcher_composer_tail_windows_at_tiny_heights() {
     }
     assert_eq!(model.screen, Screen::Launcher);
     let (rows, _, _) = draw(&model, 90, 8);
+    // Directed (TUI5 item 1): "four▮" → "four"; the caret is a styled cell.
     assert!(
-        rows.iter().any(|row| row.contains("four▮")),
+        rows.iter().any(|row| row.contains("four")),
         "launcher cursor row sacred at 90×8: {rows:?}"
     );
 }

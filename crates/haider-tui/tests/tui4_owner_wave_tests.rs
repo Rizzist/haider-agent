@@ -124,7 +124,19 @@ fn the_composer_band_fills_its_whole_region_and_closes_with_a_rule() {
     let band = model.theme.theme().input_bg;
     let expected = Color::Rgb(band.r, band.g, band.b);
     // EVERY cell of the composer row carries the band, edge to edge.
+    // Directed (TUI5 item 1): cell x=4 (pad 2 + sigil 2) is the CURSOR
+    // cell — a gold ground by the new cursor law, the one deliberate
+    // exception to the band sweep.
+    let gold = model.theme.theme().gold;
     for x in 0..118 {
+        if x == 4 {
+            assert_eq!(
+                frame.bg(x, composer_y),
+                Color::Rgb(gold.r, gold.g, gold.b),
+                "cursor cell wears the gold cursor ground"
+            );
+            continue;
+        }
         assert_eq!(
             frame.bg(x, composer_y),
             expected,
@@ -453,7 +465,9 @@ async fn the_todos_panel_hovers_collapses_and_keeps_its_spacer() {
 
     // (d) at 90×10 the breathing rows shed and the composer still shows.
     let tight = draw(&model, 90, 10);
-    assert!(tight.has("❯ ▮"), "the cursor row is sacred");
+    // Directed (TUI5 item 1): the empty composer's appended ▮ became a styled
+    // CELL over a space — "❯  " (sigil + cursor cell) is the signature now.
+    assert!(tight.has("❯  "), "the cursor row is sacred");
 }
 
 // ---- Item 8: the background-agent waiting line ----
@@ -508,7 +522,9 @@ fn the_breathing_rows_shed_before_any_sacred_row() {
     for (width, height) in [(90, 10), (90, 7), (90, 5), (90, 1)] {
         let frame = draw(&model, width, height);
         assert!(
-            frame.has("❯ ▮"),
+            // Directed (TUI5 item 1): the empty composer's appended ▮ became a styled
+            // CELL over a space — "❯  " (sigil + cursor cell) is the signature now.
+            frame.has("❯  "),
             "the composer's cursor row survives {width}×{height}"
         );
     }

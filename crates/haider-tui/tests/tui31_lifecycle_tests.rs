@@ -520,7 +520,9 @@ fn the_aura_stage_never_hides_a_live_composer() {
     for (width, height) in [(90, 10), (90, 5), (90, 1)] {
         let (rows, hits) = draw(&model, width, height);
         assert!(
-            rows.iter().any(|row| row.contains("❯ ▮")),
+            // Directed (TUI5 item 1): the empty composer's appended ▮ became a styled
+            // CELL over a space — "❯  " (sigil + cursor cell) is the signature now.
+            rows.iter().any(|row| row.contains("❯  ")),
             "the composer's cursor row survives {width}×{height}"
         );
         // Nothing interactive may be clickable while unpainted.
@@ -557,7 +559,9 @@ fn the_aura_stage_never_hides_a_live_composer() {
     // At 90×1 only the sacred composer row is left — and NOTHING else is
     // clickable, so no control is invisible-but-active.
     let (rows, hits) = draw(&model, 90, 1);
-    assert!(rows.iter().any(|row| row.contains("❯ ▮")));
+    // Directed (TUI5 item 1): the empty composer's appended ▮ became a styled
+    // CELL over a space — "❯  " (sigil + cursor cell) is the signature now.
+    assert!(rows.iter().any(|row| row.contains("❯  ")));
     assert!(
         !hits.iter().any(|(_, hit)| matches!(
             hit,

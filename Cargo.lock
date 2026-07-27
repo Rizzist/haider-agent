@@ -877,6 +877,7 @@ dependencies = [
  "tempfile",
  "termbg",
  "tokio",
+ "unicode-segmentation",
  "unicode-width",
 ]
 
