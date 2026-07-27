@@ -2659,9 +2659,17 @@ fn composer_plain_row_spans<'s>(
     theme: &Theme,
 ) -> (usize, usize, bool) {
     let windowed = tail_window(segment, budget);
-    let (clipped, visible) = windowed
-        .strip_prefix('…')
-        .map_or((false, windowed.as_str()), |rest| (true, rest));
+    // Review P3-5: clipped-ness by COMPARISON — a row genuinely starting
+    // with a literal '…' must keep it as user text, not lose it to
+    // ellipsis sniffing.
+    let (clipped, visible) = if windowed == segment {
+        (false, windowed.as_str())
+    } else {
+        (
+            true,
+            windowed.strip_prefix('…').unwrap_or(windowed.as_str()),
+        )
+    };
     if clipped {
         spans.push(Span::styled("…", theme.faint_style()));
     }

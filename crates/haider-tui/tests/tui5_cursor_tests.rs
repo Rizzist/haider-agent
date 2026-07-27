@@ -494,20 +494,42 @@ fn ctrl_c_with_selection_copies_instead_of_navigating() {
 }
 
 #[test]
-fn ctrl_c_with_transcript_selection_recopies_the_frame() {
+fn transcript_selection_keeps_tui4_key_meanings_exactly() {
+    // Review P2-3: the item-4 gates are scoped to the COMPOSER selection.
+    // A transcript highlight already auto-copied on release; Esc and ⌃C
+    // keep their time-sensitive TUI4 meanings on the FIRST press, and the
+    // any-keypress law clears the highlight in the same stroke.
     let mut model = session_model();
+    model.turn_active = true;
     model.selection = Some(haider_tui::select::Selection {
         anchor: (0, 2),
         head: (10, 2),
         dragging: false,
     });
+    model.handle(key(KeyCode::Esc));
+    assert!(!model.turn_active, "Esc interrupts on the FIRST press");
+    assert!(model.requests.contains(&AppRequest::Interrupt));
+    assert!(model.selection.is_none(), "…and the highlight cleared");
+    // ⌃C with only a transcript selection navigates as in TUI4.
+    model.selection = Some(haider_tui::select::Selection {
+        anchor: (0, 2),
+        head: (10, 2),
+        dragging: false,
+    });
+    let copies_before = model
+        .requests
+        .iter()
+        .filter(|r| matches!(r, AppRequest::CopySelection))
+        .count();
     model.handle(key_mod(KeyCode::Char('c'), KeyModifiers::CONTROL));
-    assert_eq!(model.screen, Screen::Session, "no navigation");
-    assert!(model.requests.contains(&AppRequest::CopySelection));
-    assert!(
-        model.selection.is_some(),
-        "the highlight survives the copy (mouse-up parity)"
-    );
+    assert_eq!(model.screen, Screen::Launcher, "⌃C navigated, first press");
+    assert!(model.selection.is_none());
+    let copies_after = model
+        .requests
+        .iter()
+        .filter(|r| matches!(r, AppRequest::CopySelection))
+        .count();
+    assert_eq!(copies_before, copies_after, "no re-copy request");
 }
 
 #[test]
@@ -1004,4 +1026,123 @@ fn load_rejects_sentinel_max_and_duplicate_ids() {
     bad.sessions[1].id = first;
     write(&bad);
     assert!(store.load().is_none(), "duplicate ids reject to seeds");
+}
+
+// ---- Review round: P1/P3 regressions ----
+
+#[test]
+fn click_then_plain_arrow_never_fabricates_a_selection() {
+    // Review P1-1: press_at parks the anchor for ⇧/drag extension; a
+    // plain ←/→ after the click must drop it — the phantom 1-grapheme
+    // selection ate text ("heXlo") and hijacked ⌃C.
+    let mut c = Composer::new();
+    c.insert_str("hello");
+    c.press_at(2);
+    c.move_right(false);
+    assert!(!c.has_selection(), "plain → after a click selects nothing");
+    c.insert_str("X");
+    assert_eq!(c.text(), "helXlo", "no grapheme was eaten");
+    // The extension path the fix must preserve: click then ⇧→ selects.
+    c.press_at(0);
+    c.move_right(true);
+    assert_eq!(c.selected_text(), Some("h"));
+    // And plain ← after a click drops the anchor symmetrically.
+    let mut c = Composer::new();
+    c.insert_str("ab");
+    c.press_at(1);
+    c.move_left(false);
+    assert!(!c.has_selection());
+}
+
+#[test]
+fn envelope_session_flip_swaps_the_aura_draft() {
+    // Review P1-2: a UserMessage envelope flips the screen to Session;
+    // from the AURA surface that crosses draft keys and must swap.
+    use haider_protocol::EventPayload;
+    use haider_tui::app::DraftKey;
+    let mut model = launcher_model();
+    let sid = model.sessions[0].id;
+    model.open_session(sid);
+    // The reviewer's reachable path: /aura from the CHECKED-OUT session
+    // (attachment survives — enter_aura never checks in), then a queued
+    // UserMessage drains after the turn.
+    for c in "/aura".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Enter));
+    assert_eq!(model.screen, Screen::Aura);
+    assert_eq!(model.active_session, Some(sid), "still checked out");
+    for c in "aura draft".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(AppEvent::Envelope(Box::new(EventPayload::UserMessage {
+        text: "queued message".to_owned(),
+        attachments: vec![],
+        mode: haider_protocol::DeliveryMode::Steer,
+    })));
+    assert_eq!(model.screen, Screen::Session, "the envelope flipped");
+    assert!(
+        model.composer.is_empty(),
+        "the SESSION's own (empty) draft is live — the aura text did not \
+         ride the flip: {:?}",
+        model.composer.text()
+    );
+    assert_eq!(
+        model
+            .drafts
+            .get(&DraftKey::Aura)
+            .map(haider_tui::composer::Composer::text),
+        Some("aura draft"),
+        "the aura draft parked under its own key, nothing leaked"
+    );
+}
+
+#[test]
+fn wide_glyph_right_cell_rounds_the_caret_after_it() {
+    // Review P3-4: nearest-boundary, not floor — the right cell of a
+    // 2-cell glyph places the caret AFTER it (native behavior).
+    use haider_tui::composer::byte_at_col;
+    let text = "汉a";
+    assert_eq!(byte_at_col(text, 0), 0, "left cell → before");
+    assert_eq!(byte_at_col(text, 1), 3, "right cell → after");
+    assert_eq!(byte_at_col(text, 2), 3, "the 'a' cell → its start");
+    assert_eq!(byte_at_col(text, 9), text.len(), "past-end clamps");
+}
+
+#[test]
+fn plain_up_with_selection_collapses_instead_of_going_dead() {
+    // Review P3-6: ↑ with an active selection on the first row collapses
+    // to the selection start (native inputs) and consumes the press;
+    // recall needs a second, selection-free ↑.
+    let mut model = session_model();
+    for c in "seed".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Enter));
+    for c in "abc".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key_mod(KeyCode::Left, KeyModifiers::SHIFT));
+    model.handle(key(KeyCode::Up));
+    assert!(!model.composer.has_selection(), "collapsed");
+    assert_eq!(model.composer, "abc", "no recall on the collapsing press");
+    assert_eq!(model.composer.cursor(), 2, "caret at the selection start");
+    model.handle(key(KeyCode::Up));
+    assert_eq!(model.composer, "seed", "the NEXT ↑ recalls");
+}
+
+#[test]
+fn founding_message_recalls_in_the_new_session() {
+    // Review P3-8: a launcher submission mints the session AND seeds its
+    // ring with the founding message (Claude Code recalls it
+    // in-conversation).
+    let mut model = launcher_model();
+    for c in "build the thing".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Enter));
+    assert_eq!(model.screen, Screen::Session);
+    assert!(model.composer.is_empty());
+    model.handle(key(KeyCode::Up));
+    assert_eq!(model.composer, "build the thing");
 }

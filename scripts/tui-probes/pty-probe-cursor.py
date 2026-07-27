@@ -126,7 +126,7 @@ send(b"\x1b[F")
 send(b"\x15", 0.3)  # empty the composer again
 
 # Stage D — history: ↑ recalls "hello", typing extends the draft.
-send(b"\x1b[A", 0.3)
+send(b"\x1b[A", 0.8)  # generous: recall must land before the snap (CI-load flake)
 for ch in b" again":
     send(bytes([ch]), 0.04)
 frame_d = snap()

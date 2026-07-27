@@ -152,6 +152,20 @@ impl Composer {
         text
     }
 
+    /// Take the draft WITHOUT recording it (review P3-9): the slash-submit
+    /// path lets [`crate::app::AppModel`]'s `execute_slash` record the
+    /// CANONICAL command form instead, so a verbatim-vs-canonical pair
+    /// can never double-record past the consecutive-dupe check.
+    pub fn take_silent(&mut self) -> String {
+        let text = std::mem::take(&mut self.text);
+        self.cursor = 0;
+        self.anchor = None;
+        self.sticky_col = None;
+        self.history_pos = None;
+        self.history_stash = None;
+        text
+    }
+
     /// Feed the input ring directly — the palette-activation path executes
     /// commands without passing [`Self::take_for_submit`]. Empty and
     /// consecutive-duplicate entries are dropped.
@@ -257,6 +271,13 @@ impl Composer {
             return;
         }
         self.pre_move(extend);
+        if !extend {
+            // Review P1-1: a plain click PARKS the anchor at the caret
+            // (press_at) for ⇧/drag extension; a plain move must drop it
+            // or the next step materializes a phantom 1-grapheme
+            // selection that eats text and hijacks ⌃C.
+            self.anchor = None;
+        }
         if let Some(prev) = prev_boundary(&self.text, self.cursor) {
             self.cursor = prev;
         }
@@ -272,6 +293,9 @@ impl Composer {
             return;
         }
         self.pre_move(extend);
+        if !extend {
+            self.anchor = None; // review P1-1, as move_left
+        }
         if let Some(next) = next_boundary(&self.text, self.cursor) {
             self.cursor = next;
         }
@@ -284,6 +308,11 @@ impl Composer {
         self.sticky_col = None;
         self.pre_move(extend);
         if !extend {
+            // Review P3-7: collapse to the selection's LEFT edge first,
+            // then travel (native option-arrow law).
+            if let Some((start, _)) = self.selection_range() {
+                self.cursor = start;
+            }
             self.anchor = None;
         }
         self.cursor = word_left_of(&self.text, self.cursor);
@@ -294,6 +323,9 @@ impl Composer {
         self.sticky_col = None;
         self.pre_move(extend);
         if !extend {
+            if let Some((_, end)) = self.selection_range() {
+                self.cursor = end; // review P3-7, as word_left
+            }
             self.anchor = None;
         }
         self.cursor = word_right_of(&self.text, self.cursor);
@@ -304,6 +336,9 @@ impl Composer {
         self.sticky_col = None;
         self.pre_move(extend);
         if !extend {
+            if let Some((start, _)) = self.selection_range() {
+                self.cursor = start; // review P3-7
+            }
             self.anchor = None;
         }
         self.cursor = line_start(&self.text, self.cursor);
@@ -314,6 +349,9 @@ impl Composer {
         self.sticky_col = None;
         self.pre_move(extend);
         if !extend {
+            if let Some((_, end)) = self.selection_range() {
+                self.cursor = end; // review P3-7
+            }
             self.anchor = None;
         }
         self.cursor = line_end(&self.text, self.cursor);
@@ -325,6 +363,15 @@ impl Composer {
     /// the logical lines; the brief's "visual wrapped rows" reduces to
     /// this exactly (documented).
     pub fn line_up(&mut self, extend: bool) -> bool {
+        // Review P3-6: plain ↑ with an active selection COLLAPSES to its
+        // start (native inputs) and consumes the press — recall needs a
+        // second, selection-free ↑.
+        if !extend && let Some((sel_start, _)) = self.selection_range() {
+            self.cursor = sel_start;
+            self.anchor = None;
+            self.sticky_col = None;
+            return true;
+        }
         let start = line_start(&self.text, self.cursor);
         if start == 0 {
             return false;
@@ -345,6 +392,13 @@ impl Composer {
     /// ↓ across rows, column-sticky; `false` on the last row (item 6's
     /// forward-history hook).
     pub fn line_down(&mut self, extend: bool) -> bool {
+        // Review P3-6 mirror: plain ↓ collapses to the selection END.
+        if !extend && let Some((_, sel_end)) = self.selection_range() {
+            self.cursor = sel_end;
+            self.anchor = None;
+            self.sticky_col = None;
+            return true;
+        }
         let end = line_end(&self.text, self.cursor);
         if end >= self.text.len() {
             return false;
@@ -525,18 +579,21 @@ fn seek_col(text: &str, start: usize, end: usize, target: usize) -> usize {
     end
 }
 
-/// The byte offset of the grapheme containing display column `col` of
-/// `content` (TUI5 item 5: a click lands the caret at the START of the
-/// clicked grapheme — cell-granular floor, the documented choice; past
-/// the end it clamps to the end, so clicking the empty right half of a
-/// row parks the caret at the line's visible end like every native
-/// input).
+/// The byte offset of the caret boundary NEAREST display column `col`
+/// of `content` (TUI5 item 5, review P3-4): a single-cell grapheme takes
+/// the caret at its start; clicking the RIGHT cell of a wide glyph
+/// rounds the caret to after it (native behavior). Past the end it
+/// clamps to the end, so clicking the empty right half of a row parks
+/// the caret at the line's visible end like every native input.
 #[must_use]
 pub fn byte_at_col(content: &str, col: usize) -> usize {
     let mut acc = 0;
     for (offset, grapheme) in content.grapheme_indices(true) {
         let w = grapheme.width().max(1);
         if acc + w > col {
+            if col - acc >= w.div_ceil(2).max(1) {
+                return offset + grapheme.len();
+            }
             return offset;
         }
         acc += w;

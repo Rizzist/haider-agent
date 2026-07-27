@@ -1100,6 +1100,27 @@ impl AppModel {
         self.composer = self.drafts.remove(&key).unwrap_or_default();
     }
 
+    /// Flip to the session screen WITH the item-9 draft swap when the
+    /// surface key would change (review P1-2: the UserMessage envelope
+    /// flip from the AURA screen crossed keys without a swap, leaking the
+    /// aura draft onto the session surface and misfiling parked drafts on
+    /// the next stash). Same-key flips (launcher scratch, subagent) swap
+    /// nothing — an empty round-trip would be harmless but this keeps the
+    /// one-stash-one-restore discipline literal.
+    fn goto_session_screen(&mut self) {
+        let from = self.surface_key();
+        let to = self
+            .active_session
+            .map_or(DraftKey::Launcher, DraftKey::Session);
+        if from == to {
+            self.screen = Screen::Session;
+            return;
+        }
+        self.stash_draft();
+        self.screen = Screen::Session;
+        self.restore_draft();
+    }
+
     /// The session's display name — the slug (sim `session.name`), never
     /// the blurb (that lives in the `· session titled` note).
     #[must_use]
@@ -1348,38 +1369,38 @@ impl AppModel {
         }
     }
 
-    /// TUI5 item 4 — the two keys that act ON a selection, consumed before
-    /// anything else sees them:
+    /// TUI5 item 4 — the two keys that act ON a COMPOSER selection,
+    /// consumed before anything else sees them:
     ///
-    /// - Esc with ANY active selection (composer or screen-space) clears
-    ///   it and NOTHING else — "Esc clears selection before any other Esc
-    ///   meaning fires" (brief law; the next Esc interrupts/navigates as
-    ///   before). Native inputs and Claude Code both deselect-only.
-    /// - ⌃C with an active COMPOSER selection copies it (the reducer holds
-    ///   the exact text → [`AppRequest::CopyText`]) and clears it; ⌃C with
-    ///   a finished TRANSCRIPT selection re-copies via the runtime's
-    ///   frame-extraction path and keeps the highlight (the mouse-up law).
-    ///   With NO selection ⌃C keeps its TUI4 meaning (navigate/quit)
-    ///   exactly — the gate is selection-presence, nothing else.
+    /// - Esc with an active composer selection clears it and NOTHING
+    ///   else — "Esc clears selection before any other Esc meaning
+    ///   fires" (brief law; the next Esc interrupts/navigates as before).
+    ///   Native inputs and Claude Code both deselect-only.
+    /// - ⌃C with an active composer selection copies it (the reducer
+    ///   holds the exact text → [`AppRequest::CopyText`]) and clears it.
+    ///   With NO composer selection ⌃C keeps its TUI4 meaning
+    ///   (navigate/quit) exactly — the gate is selection-presence,
+    ///   nothing else.
+    ///
+    /// The gate is scoped to the COMPOSER selection only (review P2-3): a
+    /// transcript drag already auto-copied on release, its highlight
+    /// clears under the TUI4 any-keypress law, and time-sensitive Esc
+    /// (interrupt) / ⌃C (navigate) meanings must not spend a press on a
+    /// leftover highlight.
     fn selection_key(&mut self, key: &KeyEvent) -> bool {
-        let composer_sel = self.composer.has_selection();
-        if key.code == KeyCode::Esc && (composer_sel || self.selection.is_some()) {
+        if !self.composer.has_selection() {
+            return false;
+        }
+        if key.code == KeyCode::Esc {
             self.composer.clear_selection();
-            self.selection = None;
             return true;
         }
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            if composer_sel {
-                if let Some(text) = self.composer.selected_text() {
-                    self.requests.push(AppRequest::CopyText(text.to_owned()));
-                }
-                self.composer.clear_selection();
-                return true;
+            if let Some(text) = self.composer.selected_text() {
+                self.requests.push(AppRequest::CopyText(text.to_owned()));
             }
-            if self.selection.is_some() {
-                self.requests.push(AppRequest::CopySelection);
-                return true;
-            }
+            self.composer.clear_selection();
+            return true;
         }
         false
     }
@@ -1751,7 +1772,16 @@ impl AppModel {
     fn submit_composer(&mut self) {
         // TUI5: the take records the submitted text in this surface's
         // input ring (item 6) and clears cursor/selection state (item 8).
-        let text = self.composer.take_for_submit().trim().to_owned();
+        // Slash submits take SILENTLY — execute_slash records the
+        // canonical form (review P3-9, one entry per invocation).
+        let is_slash = self.composer.text().trim().starts_with('/');
+        let text = if is_slash {
+            self.composer.take_silent()
+        } else {
+            self.composer.take_for_submit()
+        }
+        .trim()
+        .to_owned();
         self.palette_selection = 0;
         self.palette_scroll = 0;
         self.palette_dismissed = false;
@@ -1871,7 +1901,7 @@ impl AppModel {
         self.projection
             .push_note(format!("◉ heard · {}", self.voice.stt));
         let title = self.session_title.is_none();
-        self.screen = Screen::Session;
+        self.goto_session_screen(); // review P1-2: draft-aware flip
         self.turn_active = true;
         self.scroll_back.set(0);
         self.requests.push(AppRequest::SubmitText {
@@ -2346,7 +2376,7 @@ impl AppModel {
             self.screen = Screen::Launcher;
         }
         if let EventPayload::UserMessage { .. } = payload {
-            self.screen = Screen::Session;
+            self.goto_session_screen();
             self.turn_active = true;
             // NB: no titling here. The sim names a session ONLY inside the
             // 1.5 s micro-call callback (tui.js:1219-1227); titling on the
@@ -2610,6 +2640,10 @@ impl AppModel {
         entry.ago = "now".to_owned();
         self.sessions.insert(0, entry);
         self.open_session(id);
+        // Review P3-8: the founding message recalls IN the new session
+        // (Claude Code recalls in-conversation); the launcher's own ring
+        // kept its copy via take_for_submit before the surface swap.
+        self.composer.record_submitted(text);
     }
 
     /// Walk back to the launcher — the ONE teardown every back path shares
