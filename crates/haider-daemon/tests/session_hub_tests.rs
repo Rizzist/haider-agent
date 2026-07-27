@@ -2745,6 +2745,24 @@ impl BoundedReaderSink {
         SendAdmission::Sent
     }
 
+    /// Begins one writer turn: the frame slot is free and the FIFO head is
+    /// fired, while the popped frame's bytes remain charged in flight.
+    fn pop_for_write(&self) -> Option<(WireFrame, usize)> {
+        let mut state = self.state.lock().expect("reader state");
+        let popped = state.queue.pop_front();
+        if popped.is_some() {
+            state.fire_head_ticket();
+        }
+        popped
+    }
+
+    /// Completes the writer turn and returns the in-flight byte charge.
+    fn finish_write(&self, weight: usize) {
+        let mut state = self.state.lock().expect("reader state");
+        state.queued_bytes = state.queued_bytes.saturating_sub(weight);
+        state.fire_head_ticket();
+    }
+
     /// Faithful writer timing: pop frees the frame slot and wakes the FIFO
     /// head while the frame's bytes remain charged in flight. Only after a
     /// scheduler turn standing in for write settlement are those bytes
@@ -2753,20 +2771,10 @@ impl BoundedReaderSink {
         tokio::time::timeout(DEADLINE, async {
             loop {
                 let notified = self.changed.notified();
-                let popped = {
-                    let mut state = self.state.lock().expect("reader state");
-                    if let Some((frame, weight)) = state.queue.pop_front() {
-                        state.fire_head_ticket();
-                        Some((frame, weight))
-                    } else {
-                        None
-                    }
-                };
+                let popped = self.pop_for_write();
                 if let Some((frame, weight)) = popped {
                     tokio::task::yield_now().await;
-                    let mut state = self.state.lock().expect("reader state");
-                    state.queued_bytes = state.queued_bytes.saturating_sub(weight);
-                    state.fire_head_ticket();
+                    self.finish_write(weight);
                     return frame;
                 }
                 notified.await;
@@ -2818,6 +2826,72 @@ impl FrameSink for BoundedReaderSink {
             state.fire_head_ticket();
         }
     }
+}
+
+/// The sink-level version of the reviewer's exact schedule: the head token
+/// fires when the writer pops, but a fresh offer runs before the head reoffer.
+///
+/// MUTATION CHECK: remove `BoundedReaderSink::offer_with_ticket`'s
+/// `(tickets empty || presented token is head)` gate. Expected failure: the
+/// fresh frame is admitted instead of parking in the fired-head window.
+/// Verified by revert on 2026-07-27.
+#[tokio::test]
+async fn bounded_reader_sink_fired_head_blocks_a_fresh_barger() {
+    let sink = BoundedReaderSink::new(1, 1_024);
+    let camped_id = AttachmentId::new("camped");
+    let head_id = AttachmentId::new("head");
+    let fresh_id = AttachmentId::new("fresh");
+    let camped = WireFrame::AttachCaughtUp {
+        attachment_id: camped_id.clone(),
+        high_water_seq: 1,
+    };
+    let head_frame = WireFrame::AttachCaughtUp {
+        attachment_id: head_id.clone(),
+        high_water_seq: 2,
+    };
+    let fresh_frame = WireFrame::AttachCaughtUp {
+        attachment_id: fresh_id.clone(),
+        high_water_seq: 3,
+    };
+
+    assert!(matches!(
+        sink.offer(&camped_id, &camped),
+        SendAdmission::Sent
+    ));
+    assert!(matches!(
+        sink.offer(&head_id, &head_frame),
+        SendAdmission::Busy
+    ));
+    let head = sink.drain_ticket().expect("bounded sink issues tickets");
+    assert!(matches!(
+        sink.offer_ticketed(&head_id, &head_frame, &head),
+        SendAdmission::Busy
+    ));
+
+    let (popped, camped_weight) = sink.pop_for_write().expect("camped frame pops");
+    assert_eq!(popped, camped);
+    head.notified().await;
+    assert!(
+        matches!(sink.offer(&fresh_id, &fresh_frame), SendAdmission::Busy),
+        "fresh offer must park behind the fired head"
+    );
+    assert!(matches!(
+        sink.offer_ticketed(&head_id, &head_frame, &head),
+        SendAdmission::Sent
+    ));
+    sink.finish_write(camped_weight);
+
+    let (served_head, head_weight) = sink.pop_for_write().expect("head is served");
+    assert_eq!(served_head, head_frame);
+    assert!(matches!(
+        sink.offer(&fresh_id, &fresh_frame),
+        SendAdmission::Sent
+    ));
+    sink.finish_write(head_weight);
+    assert_eq!(
+        sink.pop_for_write().expect("fresh is served after head").0,
+        fresh_frame
+    );
 }
 
 /// MUTATION CHECK: treat a `Busy` admission as a hard refusal inside

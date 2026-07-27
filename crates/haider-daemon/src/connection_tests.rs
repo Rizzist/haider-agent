@@ -283,6 +283,62 @@ async fn a_fresh_offer_cannot_barge_after_the_head_ticket_fires() {
     ));
     assert_eq!(lane.recv().await.expect("head is served").bytes, b"cold");
     lane.credit(&camped_frame);
+
+    // Exercise the fallback independently: even if a ticket loses its final
+    // strong reference without the guard, a fresh offer that prunes that dead
+    // head must fire the live successor while the frame slot is open.
+    let fallback = OutboundLane::new(1, 1_024, 64);
+    assert!(matches!(
+        fallback.offer(
+            LaneKey::Attachment(AttachmentId::new("fallback-camped")),
+            b"fallback-camped".to_vec(),
+            None
+        ),
+        SendAdmission::Sent
+    ));
+    let dead_head = fallback.drain_ticket();
+    let live_successor = fallback.drain_ticket();
+    let fallback_frame = fallback.recv().await.expect("fallback capacity frees");
+    dead_head.notified().await;
+    drop(dead_head);
+    assert!(matches!(
+        fallback.offer(
+            LaneKey::Attachment(AttachmentId::new("fallback-fresh")),
+            b"fallback-fresh".to_vec(),
+            None
+        ),
+        SendAdmission::Busy
+    ));
+    tokio::time::timeout(std::time::Duration::from_secs(5), live_successor.notified())
+        .await
+        .expect("dead-head pruning fires the live successor");
+    fallback.credit(&fallback_frame);
+
+    // The same defense applies when cancellation, rather than a fresh offer,
+    // is the operation that discovers the dead head.
+    let cancellation_fallback = OutboundLane::new(1, 1_024, 64);
+    assert!(matches!(
+        cancellation_fallback.offer(
+            LaneKey::Attachment(AttachmentId::new("cancel-camped")),
+            b"cancel-camped".to_vec(),
+            None
+        ),
+        SendAdmission::Sent
+    ));
+    let dead_head = cancellation_fallback.drain_ticket();
+    let live_successor = cancellation_fallback.drain_ticket();
+    let cancelled_tail = cancellation_fallback.drain_ticket();
+    let cancellation_frame = cancellation_fallback
+        .recv()
+        .await
+        .expect("cancellation fallback capacity frees");
+    dead_head.notified().await;
+    drop(dead_head);
+    cancellation_fallback.cancel_ticket(&cancelled_tail);
+    tokio::time::timeout(std::time::Duration::from_secs(5), live_successor.notified())
+        .await
+        .expect("cancellation-side pruning fires the live successor");
+    cancellation_fallback.credit(&cancellation_frame);
 }
 
 /// Persistent fresh hot traffic cannot consume even one service turn ahead

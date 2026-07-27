@@ -255,6 +255,61 @@ pub trait FrameSink: Send + Sync {
     /// Removes an unconsumed ticket when delivery is cancelled or refused.
     /// A bounded sink must wake the next live head if this token owned it.
     fn cancel_ticket(&self, _ticket: &AdmissionTicket) {}
+
+    /// Unit-test-only pause inserted after a ticket fires and before the
+    /// confirming re-offer. Production sinks never expose this hook.
+    #[cfg(test)]
+    fn ticket_fired_test_gate(
+        &self,
+    ) -> Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>> {
+        None
+    }
+}
+
+/// Cancellation-safe ownership of one unconsumed admission ticket.
+///
+/// `deliver_frame` can be raw-aborted at any await. Retaining the ticket only
+/// through this guard makes every such drop run the sink's normal cancellation
+/// path, which removes the token and wakes its successor when it owned the
+/// queue head.
+struct AdmissionTicketGuard {
+    sink: Arc<dyn FrameSink>,
+    ticket: AdmissionTicket,
+    armed: bool,
+}
+
+impl AdmissionTicketGuard {
+    fn new(sink: Arc<dyn FrameSink>, ticket: AdmissionTicket) -> Self {
+        Self {
+            sink,
+            ticket,
+            armed: true,
+        }
+    }
+
+    fn ticket(&self) -> &AdmissionTicket {
+        &self.ticket
+    }
+
+    /// The sink consumed the token atomically with successful admission.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    /// Orderly refusal/cancellation uses the same path as an asynchronous
+    /// future drop, then disarms the guard to prevent a second cancellation.
+    fn cancel(&mut self) {
+        if self.armed {
+            self.armed = false;
+            self.sink.cancel_ticket(&self.ticket);
+        }
+    }
+}
+
+impl Drop for AdmissionTicketGuard {
+    fn drop(&mut self) {
+        self.cancel();
+    }
 }
 
 /// A bounded sink refused a frame.
@@ -2340,14 +2395,18 @@ async fn deliver_frame(
         // ticket source degrades to refusal instead of spinning.
         return FrameDelivery::Refused;
     };
+    let mut ticket = AdmissionTicketGuard::new(Arc::clone(sink), ticket);
     loop {
         // Confirming and later re-offers retain the SAME head token: capacity
         // freed between the Busy answer and this call cannot be lost, and no
         // fresh offer may consume it first.
-        match hub.offer_attachment_ticketed(attachment_id, sink, frame, &ticket) {
-            SendAdmission::Sent => return FrameDelivery::Delivered,
+        match hub.offer_attachment_ticketed(attachment_id, sink, frame, ticket.ticket()) {
+            SendAdmission::Sent => {
+                ticket.disarm();
+                return FrameDelivery::Delivered;
+            }
             SendAdmission::Refused => {
-                sink.cancel_ticket(&ticket);
+                ticket.cancel();
                 return FrameDelivery::Refused;
             }
             SendAdmission::Busy => {}
@@ -2360,17 +2419,22 @@ async fn deliver_frame(
             biased;
             changed = cancel.changed() => {
                 if changed.is_err() || *cancel.borrow() {
-                    sink.cancel_ticket(&ticket);
+                    ticket.cancel();
                     return FrameDelivery::Cancelled;
                 }
             }
             changed = lagged.changed(), if lag_open => {
                 if changed.is_ok() && lagged.borrow().is_some() {
-                    sink.cancel_ticket(&ticket);
+                    ticket.cancel();
                     return FrameDelivery::Stuck;
                 }
             }
-            _ = ticket.notified() => {}
+            _ = ticket.ticket().notified() => {
+                #[cfg(test)]
+                if let Some(gate) = sink.ticket_fired_test_gate() {
+                    gate.await;
+                }
+            }
         }
     }
 }

@@ -194,18 +194,23 @@ struct OutboundState {
 }
 
 impl OutboundState {
-    fn prune_dead_tickets(&mut self) {
+    /// Drops a dead head prefix and reports whether at least one reservation
+    /// was removed. A caller that observes ordinary capacity after pruning
+    /// must treat this as a progress event and fire the newly exposed head.
+    fn prune_dead_tickets(&mut self) -> bool {
+        let mut removed = false;
         while self
             .tickets
             .front()
             .is_some_and(|ticket| ticket.strong_count() == 0)
         {
             self.tickets.pop_front();
+            removed = true;
         }
+        removed
     }
 
-    fn ticket_is_head(&mut self, ticket: &AdmissionTicket) -> bool {
-        self.prune_dead_tickets();
+    fn ticket_is_head(&self, ticket: &AdmissionTicket) -> bool {
         self.tickets
             .front()
             .is_some_and(|head| Weak::ptr_eq(head, &Arc::downgrade(ticket)))
@@ -221,13 +226,13 @@ impl OutboundState {
     }
 
     fn remove_ticket(&mut self, ticket: &AdmissionTicket) -> bool {
-        self.prune_dead_tickets();
+        let pruned_dead_head = self.prune_dead_tickets();
         let was_head = self.ticket_is_head(ticket);
         let token = Arc::downgrade(ticket);
         self.tickets
             .retain(|candidate| !Weak::ptr_eq(candidate, &token));
-        self.prune_dead_tickets();
-        was_head
+        let pruned_after_removal = self.prune_dead_tickets();
+        pruned_dead_head || was_head || pruned_after_removal
     }
 }
 
@@ -319,7 +324,17 @@ impl OutboundLane {
         if state.closed {
             return SendAdmission::Refused;
         }
-        state.prune_dead_tickets();
+        let pruned_dead_head = state.prune_dead_tickets();
+        if pruned_dead_head
+            && state.queued_frames < self.inner.frame_capacity
+            && state.queued_bytes < self.inner.byte_budget
+        {
+            // Defense in depth: the RAII holder normally cancels before its
+            // weak token can die. If that cleanup is ever bypassed, discovering
+            // the dead head while capacity is open must still wake its live
+            // successor; no later pop or byte credit may exist.
+            state.fire_one_ticket();
+        }
         let caller_may_admit =
             state.tickets.is_empty() || ticket.is_some_and(|ticket| state.ticket_is_head(ticket));
         if let LaneKey::Attachment(attachment_id) = &key
@@ -387,6 +402,8 @@ impl OutboundLane {
     fn cancel_ticket(&self, ticket: &AdmissionTicket) {
         if let Ok(mut state) = self.inner.state.lock()
             && state.remove_ticket(ticket)
+            && state.queued_frames < self.inner.frame_capacity
+            && state.queued_bytes < self.inner.byte_budget
         {
             state.fire_one_ticket();
         }
