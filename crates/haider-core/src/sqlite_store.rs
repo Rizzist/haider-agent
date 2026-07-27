@@ -95,6 +95,29 @@ impl SqliteStoreHandle {
         run_blocking(move || owner.with_store(Store::session_ids)).await
     }
 
+    /// Reads one byte-budgeted replay page (`Store::read_page` law: ends
+    /// early when the accumulated stored-JSON size would exceed the budget,
+    /// but a non-empty result always contains at least one envelope).
+    ///
+    /// Additive daemon seam rather than part of [`StoreHandle`]: only the
+    /// session hub's replay pipeline pages by transient bytes.
+    pub async fn read_page(
+        &self,
+        session_id: &SessionId,
+        since_seq: u64,
+        max_envelopes: usize,
+        byte_budget: usize,
+    ) -> Result<Vec<RawEnvelope>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        let session_id = session_id.clone();
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.read_page(&session_id, since_seq, max_envelopes, byte_budget)
+            })
+        })
+        .await
+    }
+
     /// Atomically resolves a durable menu and appends its authoritative event.
     ///
     /// This is an additive daemon seam rather than part of [`StoreHandle`]:

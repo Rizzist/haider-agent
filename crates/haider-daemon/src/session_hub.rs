@@ -16,10 +16,21 @@
 //!   await or yield exists between them, so no append can interleave. Holds
 //!   by code shape, and the forced-boundary tests assert it.
 //! - **The store is the lag buffer (R12).** Replay pages the store; live
-//!   delivery crosses a bounded per-attachment catch-up channel and the
-//!   bounded connection outbox. On any overflow the attachment is lagged and
+//!   delivery crosses a bounded per-attachment catch-up channel — bounded in
+//!   frames AND estimated bytes ([`publish`]) — and the bounded connection
+//!   outbox, while replay store pages are byte-budgeted
+//!   (`Store::read_page`). On any overflow the attachment is lagged and
 //!   detached, then resumes FROM THE STORE after its applied cursor. No
 //!   unbounded queue ever buffers history for a slow client.
+//! - **Replay is paced by real writer state.** Delivery bursts never exceed
+//!   the sink's available quota and wait on its drain-progress signal, so a
+//!   reading client is never lagged just because a page outran its writer;
+//!   an actual refusal or lag-under-stall still detaches immediately
+//!   ([`acquire_send_capacity`] states the law).
+//! - **Attachment admission is capped** per connection and hub-wide, refused
+//!   BEFORE any actor or channel work with the correlated, retryable
+//!   `overloaded` error ([`SessionHubConfig`] and
+//!   `SessionHub::reserve_attachment_slot`).
 //!
 //! Two laws this module obeys but does not own:
 //!
@@ -58,12 +69,13 @@ use haider_rpc::{
     AttachMode, AttachState, AttachmentId, Capability, CapabilitySet, CommandId,
     ERROR_CODE_ALREADY_RESOLVED, ERROR_CODE_CAPABILITY_DENIED, ERROR_CODE_CURSOR_AHEAD,
     ERROR_CODE_DRAINING, ERROR_CODE_INVALID_ARGUMENT, ERROR_CODE_INVALID_CURSOR,
-    ERROR_CODE_NOT_FOUND, ERROR_CODE_STALE_GENERATION, ErrorData, MenuInput, ProtocolError,
-    RequestBody, RequestId, ResponseBody, SeqRange, SessionReadResult, SessionSummary, WireFrame,
+    ERROR_CODE_NOT_FOUND, ERROR_CODE_OVERLOADED, ERROR_CODE_STALE_GENERATION, ErrorData, MenuInput,
+    ProtocolError, RequestBody, RequestId, ResponseBody, SeqRange, SessionReadResult,
+    SessionSummary, WireFrame,
 };
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -74,13 +86,32 @@ const MAX_READ_ENVELOPES: usize = 1_024;
 
 // ────────────────── configuration, sink seam, and observer ──────────────────
 
-/// Bounds for session-actor and catch-up traffic.
+/// Bounds for session-actor, attachment-admission, and catch-up traffic.
 #[derive(Debug, Clone, Copy)]
 pub struct SessionHubConfig {
     /// Commands waiting at one live session actor.
     pub actor_command_capacity: usize,
-    /// Commits after `H` retained while one attachment replays.
+    /// Commits after `H` retained while one attachment replays (frame count;
+    /// `catch_up_byte_budget` bounds the same channel in bytes).
     pub catch_up_capacity: usize,
+    /// Estimated bytes of committed envelopes one attachment's catch-up
+    /// channel may retain. Overflow takes the exact same nonblocking
+    /// lag-then-store-resume transition as a full frame count. A single
+    /// envelope is always admitted into an EMPTY channel even when it alone
+    /// exceeds this budget, so an oversized envelope can never wedge an
+    /// attachment in a lag loop.
+    pub catch_up_byte_budget: usize,
+    /// Stored-JSON bytes one replay store page may materialize
+    /// (`Store::read_page`); the page ends early when the budget fills and
+    /// the next page resumes from the last delivered sequence.
+    pub replay_page_byte_budget: usize,
+    /// Attachments one connection may hold concurrently. The N+1th
+    /// `SessionAttach` is rejected with the correlated, retryable
+    /// `overloaded` error before any actor or channel work happens.
+    pub max_attachments_per_connection: usize,
+    /// Attachments the whole hub may hold concurrently, independent of the
+    /// per-connection cap; same rejection shape.
+    pub max_attachments: usize,
 }
 
 impl Default for SessionHubConfig {
@@ -88,6 +119,10 @@ impl Default for SessionHubConfig {
         Self {
             actor_command_capacity: 64,
             catch_up_capacity: 64,
+            catch_up_byte_budget: 8 * 1024 * 1024,
+            replay_page_byte_budget: 1024 * 1024,
+            max_attachments_per_connection: 16,
+            max_attachments: 256,
         }
     }
 }
@@ -103,6 +138,24 @@ pub trait FrameSink: Send + Sync {
     /// Purges queued traffic for a detached attachment when the sink supports
     /// keyed lanes. The default is suitable for sinks without staging queues.
     fn purge_attachment(&self, _attachment_id: &AttachmentId) {}
+
+    /// Frames this attachment's lane can currently admit without refusal
+    /// (frame-count dimension only — a byte-budget refusal by `try_send`
+    /// remains an ACTUAL refusal). Replay pacing sizes its bursts by this
+    /// value so a reading client is never lagged just because a page was
+    /// larger than the lane. Sinks without admission pressure keep the
+    /// unlimited default.
+    fn capacity_for(&self, _attachment_id: &AttachmentId) -> usize {
+        usize::MAX
+    }
+
+    /// Real-state drain signal: the receiver observes a change whenever
+    /// queued frames leave the sink, so replay can await writer progress
+    /// instead of sleeping or guessing. `None` (the default) means the sink
+    /// never exerts admission pressure and `try_send` is the only arbiter.
+    fn drain_progress(&self) -> Option<watch::Receiver<u64>> {
+        None
+    }
 }
 
 /// A bounded sink refused a frame.
@@ -199,8 +252,20 @@ struct HubInner {
     actor_tasks: Mutex<Vec<JoinHandle<()>>>,
     replay_tasks: Mutex<Vec<JoinHandle<()>>>,
     attachments: Mutex<HashMap<AttachmentId, AttachmentOwner>>,
+    /// Admission ledger for the per-connection and global attachment caps.
+    /// A slot is reserved BEFORE any actor or channel work and released when
+    /// registration fails or `take_attachment` removes the owner, so every
+    /// admitted attachment's whole resource footprint sits behind one
+    /// reservation.
+    attachment_slots: Mutex<AttachmentSlots>,
     draining: AtomicBool,
     device_id: DeviceId,
+}
+
+#[derive(Default)]
+struct AttachmentSlots {
+    total: usize,
+    per_connection: HashMap<String, usize>,
 }
 
 /// Join handles that abort every still-owned task if the enclosing shutdown
@@ -251,10 +316,21 @@ struct AttachmentOwner {
     cancel: watch::Sender<bool>,
 }
 
+/// One committed envelope in flight on a catch-up channel, carrying the
+/// weight it was charged so receive-side credit is exactly symmetric.
+struct QueuedEnvelope {
+    weight: usize,
+    envelope: RawEnvelope,
+}
+
 /// Actor-side delivery state for one registered attachment.
 struct ActorAttachment {
-    events: mpsc::Sender<RawEnvelope>,
+    events: mpsc::Sender<QueuedEnvelope>,
     lagged: watch::Sender<Option<u64>>,
+    /// Estimated bytes currently queued on `events` — charged by the actor
+    /// before enqueue, credited by the replay task on receive, reset to zero
+    /// when re-registration replaces the channel wholesale.
+    queued_bytes: Arc<AtomicUsize>,
     last_buffered_seq: u64,
     active: bool,
 }
@@ -263,13 +339,23 @@ struct Registration {
     attachment_id: AttachmentId,
     attach_state: AttachState,
     actor: SessionActorHandle,
-    events: mpsc::Receiver<RawEnvelope>,
+    events: mpsc::Receiver<QueuedEnvelope>,
     lagged: watch::Receiver<Option<u64>>,
+    /// Shared with [`ActorAttachment::queued_bytes`]; the replay task credits
+    /// it as envelopes leave the channel.
+    catch_up_bytes: Arc<AtomicUsize>,
 }
 
 enum RegisterResult {
     Registered(Registration),
-    CursorAhead { requested: u64, head: u64 },
+    CursorAhead {
+        requested: u64,
+        head: u64,
+    },
+    /// An admission cap refused the attachment before any resources existed.
+    Overloaded {
+        message: String,
+    },
 }
 
 enum ActorRegisterResult {
@@ -285,13 +371,14 @@ enum ActorCommand {
     Register {
         attachment_id: AttachmentId,
         after_seq: u64,
-        events: mpsc::Sender<RawEnvelope>,
+        events: mpsc::Sender<QueuedEnvelope>,
         lagged: watch::Sender<Option<u64>>,
+        queued_bytes: Arc<AtomicUsize>,
         completed: oneshot::Sender<ActorRegisterResult>,
     },
     Reregister {
         attachment_id: AttachmentId,
-        events: mpsc::Sender<RawEnvelope>,
+        events: mpsc::Sender<QueuedEnvelope>,
         lagged: watch::Sender<Option<u64>>,
         completed: oneshot::Sender<Option<u64>>,
     },
@@ -374,9 +461,18 @@ impl SessionHub {
         config: SessionHubConfig,
         observer: Arc<dyn SessionHubObserver>,
     ) -> Result<Self, SessionHubError> {
-        if config.actor_command_capacity == 0 || config.catch_up_capacity == 0 {
+        if config.actor_command_capacity == 0
+            || config.catch_up_capacity == 0
+            || config.catch_up_byte_budget == 0
+            || config.replay_page_byte_budget == 0
+        {
             return Err(SessionHubError::InvalidConfig(
-                "session hub queue capacities must be greater than zero".into(),
+                "session hub queue capacities and byte budgets must be greater than zero".into(),
+            ));
+        }
+        if config.max_attachments_per_connection == 0 || config.max_attachments == 0 {
+            return Err(SessionHubError::InvalidConfig(
+                "session hub attachment limits must be greater than zero".into(),
             ));
         }
         let device_id = DeviceId::new(format!("daemon-session-hub-{}", store.worker_generation()));
@@ -389,6 +485,7 @@ impl SessionHub {
                 actor_tasks: Mutex::new(Vec::new()),
                 replay_tasks: Mutex::new(Vec::new()),
                 attachments: Mutex::new(HashMap::new()),
+                attachment_slots: Mutex::new(AttachmentSlots::default()),
                 draining: AtomicBool::new(false),
                 device_id,
             }),
@@ -526,6 +623,7 @@ impl SessionHub {
             head,
             authority_epoch,
             self.inner.store.worker_generation(),
+            self.inner.config.catch_up_byte_budget,
             self.inner.store.clone(),
             Arc::clone(&self.inner.observer),
             stopping,
@@ -543,10 +641,78 @@ impl SessionHub {
         after_seq: u64,
         mode: AttachMode,
     ) -> Result<RegisterResult, SessionHubError> {
+        // Admission cap: the slot is reserved before any actor or channel
+        // work and released on every non-registered outcome; a registered
+        // attachment keeps its slot until `take_attachment` removes it.
+        if let Some(message) = self.reserve_attachment_slot(connection_id)? {
+            return Ok(RegisterResult::Overloaded { message });
+        }
+        let registered = self
+            .register_reserved(connection_id, session_id, after_seq, mode)
+            .await;
+        if !matches!(registered, Ok(RegisterResult::Registered(_))) {
+            self.release_attachment_slot(connection_id);
+        }
+        registered
+    }
+
+    /// Reserves one attachment admission slot, or reports why it cannot.
+    fn reserve_attachment_slot(
+        &self,
+        connection_id: &str,
+    ) -> Result<Option<String>, SessionHubError> {
+        let config = &self.inner.config;
+        let mut slots = lock(&self.inner.attachment_slots)?;
+        let held = slots
+            .per_connection
+            .get(connection_id)
+            .copied()
+            .unwrap_or(0);
+        if held >= config.max_attachments_per_connection {
+            return Ok(Some(format!(
+                "connection already holds its maximum of {} attachments; detach one and retry",
+                config.max_attachments_per_connection
+            )));
+        }
+        if slots.total >= config.max_attachments {
+            return Ok(Some(format!(
+                "daemon already holds its maximum of {} attachments; retry later",
+                config.max_attachments
+            )));
+        }
+        slots.total = slots.total.saturating_add(1);
+        *slots
+            .per_connection
+            .entry(connection_id.to_owned())
+            .or_insert(0) = held.saturating_add(1);
+        Ok(None)
+    }
+
+    fn release_attachment_slot(&self, connection_id: &str) {
+        let Ok(mut slots) = self.inner.attachment_slots.lock() else {
+            return;
+        };
+        slots.total = slots.total.saturating_sub(1);
+        if let Some(held) = slots.per_connection.get_mut(connection_id) {
+            *held = held.saturating_sub(1);
+            if *held == 0 {
+                slots.per_connection.remove(connection_id);
+            }
+        }
+    }
+
+    async fn register_reserved(
+        &self,
+        connection_id: &str,
+        session_id: SessionId,
+        after_seq: u64,
+        mode: AttachMode,
+    ) -> Result<RegisterResult, SessionHubError> {
         let actor = self.actor_for(session_id.clone()).await?;
         let attachment_id = AttachmentId::new(random_id("attachment")?);
         let (events, event_receiver) = mpsc::channel(self.inner.config.catch_up_capacity);
         let (lagged, lag_receiver) = watch::channel(Option::<u64>::None);
+        let catch_up_bytes = Arc::new(AtomicUsize::new(0));
         let (completed, result) = oneshot::channel();
         actor
             .commands
@@ -555,6 +721,7 @@ impl SessionHub {
                 after_seq,
                 events,
                 lagged,
+                queued_bytes: Arc::clone(&catch_up_bytes),
                 completed,
             })
             .await
@@ -571,6 +738,7 @@ impl SessionHub {
             actor: actor.clone(),
             events: event_receiver,
             lagged: lag_receiver,
+            catch_up_bytes,
         };
         let (cancel, _) = watch::channel(false);
         lock(&self.inner.attachments)?.insert(
@@ -632,6 +800,7 @@ impl SessionHub {
         let owner = attachments.remove(attachment_id);
         if let Some(owner) = owner.as_ref() {
             let _ = owner.cancel.send(true);
+            self.release_attachment_slot(&owner.connection_id);
         }
         Ok(owner)
     }
@@ -730,6 +899,9 @@ impl SessionHub {
             let mut owners = lock(&self.inner.attachments)?;
             owners.drain().collect::<Vec<_>>()
         };
+        // The drained owners bypass `take_attachment`; clear their admission
+        // ledger wholesale (no new reservation is admitted while draining).
+        *lock(&self.inner.attachment_slots)? = AttachmentSlots::default();
         for (_, owner) in &owners {
             let _ = owner.cancel.send(true);
         }
@@ -1027,6 +1199,11 @@ impl HubConnection {
                     Some(ErrorData::CursorAhead { requested, head }),
                 );
             }
+            // Same stable code the connection cap uses (its doc names
+            // admission caps as the family); correlated and retryable here.
+            RegisterResult::Overloaded { message } => {
+                return self.respond_error(request_id, ERROR_CODE_OVERLOADED, &message, true, None);
+            }
         };
         let attachment_id = registration.attachment_id.clone();
         let attach_state = registration.attach_state.clone();
@@ -1293,6 +1470,7 @@ async fn run_session_actor(
     mut head: u64,
     mut authority_epoch: u64,
     worker_generation: u64,
+    catch_up_byte_budget: usize,
     store: SqliteStoreHandle,
     observer: Arc<dyn SessionHubObserver>,
     stopping: Arc<AtomicBool>,
@@ -1322,7 +1500,7 @@ async fn run_session_actor(
                             session_id: session_id.clone(),
                             through_seq: head,
                         });
-                        publish(&mut attachments, &envelopes);
+                        publish(&mut attachments, &envelopes, catch_up_byte_budget);
                         observer.observe(HubObservation::Published {
                             session_id: session_id.clone(),
                             through_seq: head,
@@ -1339,6 +1517,7 @@ async fn run_session_actor(
                 after_seq,
                 events,
                 lagged,
+                queued_bytes,
                 completed,
             } => {
                 if after_seq > head {
@@ -1353,6 +1532,7 @@ async fn run_session_actor(
                     ActorAttachment {
                         events,
                         lagged,
+                        queued_bytes,
                         last_buffered_seq: head,
                         active: true,
                     },
@@ -1385,6 +1565,10 @@ async fn run_session_actor(
                 let registered = attachments.get_mut(&attachment_id).map(|attachment| {
                     attachment.events = events;
                     attachment.lagged = lagged;
+                    // The old channel and everything queued on it are dropped
+                    // wholesale, and the replay task credits nothing after it
+                    // requests re-registration, so zero is the exact balance.
+                    attachment.queued_bytes.store(0, Ordering::Release);
                     attachment.last_buffered_seq = head;
                     attachment.active = true;
                     head
@@ -1407,7 +1591,11 @@ async fn run_session_actor(
                         session_id: session_id.clone(),
                         through_seq: head,
                     });
-                    publish(&mut attachments, std::slice::from_ref(envelope.as_ref()));
+                    publish(
+                        &mut attachments,
+                        std::slice::from_ref(envelope.as_ref()),
+                        catch_up_byte_budget,
+                    );
                     observer.observe(HubObservation::Published {
                         session_id: session_id.clone(),
                         through_seq: head,
@@ -1437,24 +1625,81 @@ async fn run_session_actor(
 ///
 /// Called only from [`run_session_actor`], synchronously, after the store
 /// call returned (INVARIANT 1, module doc). `try_send` never blocks the
-/// actor; a full receiver flips the attachment inactive and reports its last
-/// buffered sequence on the lag channel, and the replay task then resumes
-/// from the store (store-is-the-lag-buffer, module doc).
-fn publish(attachments: &mut HashMap<AttachmentId, ActorAttachment>, envelopes: &[RawEnvelope]) {
+/// actor; a full receiver — full in FRAMES or in estimated BYTES — flips the
+/// attachment inactive and reports its last buffered sequence on the lag
+/// channel, and the replay task then resumes from the store
+/// (store-is-the-lag-buffer, module doc). Bytes are charged before enqueue
+/// and credited by the replay task on receive; an envelope is always admitted
+/// into an EMPTY channel so one oversized envelope cannot wedge the
+/// attachment in a lag loop.
+fn publish(
+    attachments: &mut HashMap<AttachmentId, ActorAttachment>,
+    envelopes: &[RawEnvelope],
+    byte_budget: usize,
+) {
+    // Weighed once per envelope, not once per attachment.
+    let weights = envelopes
+        .iter()
+        .map(envelope_weight_bytes)
+        .collect::<Vec<_>>();
     for attachment in attachments.values_mut() {
         if !attachment.active {
             continue;
         }
-        for envelope in envelopes {
-            match attachment.events.try_send(envelope.clone()) {
+        for (envelope, weight) in envelopes.iter().zip(&weights) {
+            let queued = attachment.queued_bytes.load(Ordering::Acquire);
+            if queued > 0 && queued.saturating_add(*weight) > byte_budget {
+                let _ = attachment.lagged.send(Some(attachment.last_buffered_seq));
+                attachment.active = false;
+                break;
+            }
+            attachment.queued_bytes.fetch_add(*weight, Ordering::AcqRel);
+            match attachment.events.try_send(QueuedEnvelope {
+                weight: *weight,
+                envelope: envelope.clone(),
+            }) {
                 Ok(()) => attachment.last_buffered_seq = envelope.seq,
                 Err(_) => {
+                    attachment.queued_bytes.fetch_sub(*weight, Ordering::AcqRel);
                     let _ = attachment.lagged.send(Some(attachment.last_buffered_seq));
                     attachment.active = false;
                     break;
                 }
             }
         }
+    }
+}
+
+/// Deterministic, allocation-free estimate of one committed envelope's
+/// serialized size, used only for catch-up budget accounting (never for wire
+/// framing — the negotiated frame limit governs that at encode time).
+fn envelope_weight_bytes(envelope: &RawEnvelope) -> usize {
+    const ENVELOPE_FIELD_OVERHEAD: usize = 256;
+    ENVELOPE_FIELD_OVERHEAD
+        .saturating_add(envelope.event_id.as_str().len())
+        .saturating_add(envelope.session_id.as_str().len())
+        .saturating_add(json_weight_bytes(&envelope.payload))
+}
+
+fn json_weight_bytes(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Null | serde_json::Value::Bool(_) => 5,
+        serde_json::Value::Number(_) => 20,
+        serde_json::Value::String(text) => text.len().saturating_add(2),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .map(json_weight_bytes)
+            .fold(2_usize, |total, weight| {
+                total.saturating_add(weight).saturating_add(1)
+            }),
+        serde_json::Value::Object(fields) => fields
+            .iter()
+            .map(|(key, value)| {
+                key.len()
+                    .saturating_add(4)
+                    .saturating_add(json_weight_bytes(value))
+            })
+            .fold(2_usize, |total, weight| total.saturating_add(weight)),
     }
 }
 
@@ -1515,6 +1760,16 @@ async fn run_replay(
         }
 
         // Phase: (after_seq, H] is fully on the wire — announce H.
+        match acquire_send_capacity(&sink, &attachment_id, &mut registration.lagged, &mut cancel)
+            .await
+        {
+            CapacityWait::Ready(_) => {}
+            CapacityWait::Cancelled => return,
+            CapacityWait::LaggedWhileBlocked => {
+                lag_and_detach(&hub, &sink, &attachment_id, last_sent_seq).await;
+                return;
+            }
+        }
         hub.inner.observer.observe(HubObservation::BeforeCaughtUp {
             attachment_id: attachment_id.clone(),
             through_seq: high_water,
@@ -1540,15 +1795,36 @@ async fn run_replay(
 
         // Phase: buffered drain — deliver `seq > H` already committed during
         // replay, dropping duplicates by seq (at-least-once, R11).
+        let mut burst = 0_usize;
         loop {
             if *cancel.borrow() {
                 return;
             }
             match registration.events.try_recv() {
-                Ok(envelope) => {
+                Ok(queued) => {
+                    credit_catch_up(&registration.catch_up_bytes, queued.weight);
+                    let envelope = queued.envelope;
                     if envelope.seq <= last_sent_seq || envelope.seq <= high_water {
                         continue;
                     }
+                    if burst == 0 {
+                        burst = match acquire_send_capacity(
+                            &sink,
+                            &attachment_id,
+                            &mut registration.lagged,
+                            &mut cancel,
+                        )
+                        .await
+                        {
+                            CapacityWait::Ready(capacity) => capacity,
+                            CapacityWait::Cancelled => return,
+                            CapacityWait::LaggedWhileBlocked => {
+                                lag_and_detach(&hub, &sink, &attachment_id, last_sent_seq).await;
+                                return;
+                            }
+                        };
+                    }
+                    burst -= 1;
                     if deliver_event(
                         &hub,
                         &sink,
@@ -1609,12 +1885,29 @@ async fn run_replay(
                         }
                     }
                 }
-                envelope = registration.events.recv() => {
-                    let Some(envelope) = envelope else {
+                queued = registration.events.recv() => {
+                    let Some(queued) = queued else {
                         return;
                     };
+                    credit_catch_up(&registration.catch_up_bytes, queued.weight);
+                    let envelope = queued.envelope;
                     if envelope.seq <= last_sent_seq {
                         continue;
+                    }
+                    match acquire_send_capacity(
+                        &sink,
+                        &attachment_id,
+                        &mut registration.lagged,
+                        &mut cancel,
+                    )
+                    .await
+                    {
+                        CapacityWait::Ready(_) => {}
+                        CapacityWait::Cancelled => return,
+                        CapacityWait::LaggedWhileBlocked => {
+                            lag_and_detach(&hub, &sink, &attachment_id, last_sent_seq).await;
+                            return;
+                        }
                     }
                     if deliver_event(
                         &hub,
@@ -1645,6 +1938,77 @@ enum ReplayStep {
     OutboxFull,
 }
 
+enum CapacityWait {
+    /// The sink can admit this many frames right now.
+    Ready(usize),
+    Cancelled,
+    /// Lag pressure arrived while the sink admitted nothing: commits are
+    /// overflowing the catch-up buffer behind a stalled outbox.
+    LaggedWhileBlocked,
+}
+
+/// Waits until the sink can admit at least one frame for this attachment.
+///
+/// Pacing law (NOW-3): delivery bursts never exceed the sink's REAL available
+/// quota, and between bursts the task awaits the sink's drain-progress signal
+/// — actual writer state, never a sleep — so a reading client cannot be
+/// lagged just because a replay page outran its writer's schedule. Detachment
+/// still happens immediately on an ACTUAL refusal (`try_send` failing, e.g.
+/// the byte budget), and on [`CapacityWait::LaggedWhileBlocked`] — the
+/// genuinely stuck shape. Sinks without a progress signal (tests) keep the
+/// pre-pacing behavior: `try_send` is the only arbiter.
+async fn acquire_send_capacity(
+    sink: &Arc<dyn FrameSink>,
+    attachment_id: &AttachmentId,
+    lagged: &mut watch::Receiver<Option<u64>>,
+    cancel: &mut watch::Receiver<bool>,
+) -> CapacityWait {
+    loop {
+        if *cancel.borrow() {
+            return CapacityWait::Cancelled;
+        }
+        // Subscribe BEFORE reading capacity so a frame popped between the
+        // read and the await still marks this receiver changed (no lost
+        // wakeup).
+        let progress = sink.drain_progress();
+        let capacity = sink.capacity_for(attachment_id);
+        if capacity > 0 {
+            return CapacityWait::Ready(capacity);
+        }
+        let Some(mut progress) = progress else {
+            return CapacityWait::Ready(1);
+        };
+        tokio::select! {
+            biased;
+            changed = cancel.changed() => {
+                if changed.is_err() || *cancel.borrow() {
+                    return CapacityWait::Cancelled;
+                }
+            }
+            changed = lagged.changed() => {
+                if changed.is_err() || lagged.borrow().is_some() {
+                    return CapacityWait::LaggedWhileBlocked;
+                }
+            }
+            changed = progress.changed() => {
+                if changed.is_err() {
+                    // The sink dropped its signal; arbitrate via try_send.
+                    return CapacityWait::Ready(1);
+                }
+            }
+        }
+    }
+}
+
+/// Credits bytes back to the shared catch-up ledger as envelopes leave the
+/// channel. Saturating: an (impossible by charge/credit symmetry) underflow
+/// must degrade to zero, never wrap into a permanent phantom backlog.
+fn credit_catch_up(catch_up_bytes: &Arc<AtomicUsize>, weight: usize) {
+    let _ = catch_up_bytes.fetch_update(Ordering::AcqRel, Ordering::Acquire, |bytes| {
+        Some(bytes.saturating_sub(weight))
+    });
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn replay_range(
     hub: &SessionHub,
@@ -1657,10 +2021,14 @@ async fn replay_range(
     cancel: &mut watch::Receiver<bool>,
 ) -> ReplayStep {
     while *last_sent_seq < high_water {
-        let read = hub
-            .inner
-            .store
-            .read(session_id, *last_sent_seq, REPLAY_PAGE_SIZE);
+        // Byte-budgeted page (NOW-2): bounds the transient envelopes one page
+        // may materialize; a short page just resumes from `last_sent_seq`.
+        let read = hub.inner.store.read_page(
+            session_id,
+            *last_sent_seq,
+            REPLAY_PAGE_SIZE,
+            hub.inner.config.replay_page_byte_budget,
+        );
         let page = tokio::select! {
             biased;
             changed = cancel.changed() => {
@@ -1691,6 +2059,10 @@ async fn replay_range(
         if page.is_empty() {
             return ReplayStep::Cancelled;
         }
+        // Pacing (NOW-3): the burst never exceeds what the sink can really
+        // admit, so a page can no longer lag a client whose writer simply
+        // had not run yet. An actual `try_send` refusal still detaches.
+        let mut burst = 0_usize;
         for envelope in page
             .into_iter()
             .take_while(|envelope| envelope.seq <= high_water)
@@ -1701,6 +2073,14 @@ async fn replay_range(
             if envelope.seq <= *last_sent_seq {
                 continue;
             }
+            if burst == 0 {
+                burst = match acquire_send_capacity(sink, attachment_id, lagged, cancel).await {
+                    CapacityWait::Ready(capacity) => capacity,
+                    CapacityWait::Cancelled => return ReplayStep::Cancelled,
+                    CapacityWait::LaggedWhileBlocked => return ReplayStep::OutboxFull,
+                };
+            }
+            burst -= 1;
             if deliver_event(
                 hub,
                 sink,
@@ -1767,12 +2147,15 @@ enum DeliveryPhase {
     Live,
 }
 
+/// Replaces the catch-up channels in actor order after lag/overflow. The
+/// actor resets the shared byte ledger to zero in the same turn, matching the
+/// wholesale drop of the old channel's contents.
 async fn reregister(
     hub: &SessionHub,
     actor: &SessionActorHandle,
     attachment_id: &AttachmentId,
 ) -> Option<(
-    mpsc::Receiver<RawEnvelope>,
+    mpsc::Receiver<QueuedEnvelope>,
     watch::Receiver<Option<u64>>,
     u64,
 )> {

@@ -177,10 +177,15 @@ struct OutboundQueue {
     frame_capacity: usize,
     byte_budget: usize,
     per_lane_capacity: usize,
+    /// Bumped whenever queued frames leave the outbox (writer pop, purge,
+    /// close). Replay pacing awaits this REAL drain state instead of sleeping
+    /// or guessing whether the writer got scheduled.
+    drained: watch::Sender<u64>,
 }
 
 impl OutboundLane {
     fn new(frame_capacity: usize, byte_budget: usize) -> Self {
+        let (drained, _) = watch::channel(0_u64);
         Self {
             inner: Arc::new(OutboundQueue {
                 state: Mutex::new(OutboundState {
@@ -194,8 +199,39 @@ impl OutboundLane {
                 frame_capacity,
                 byte_budget,
                 per_lane_capacity: frame_capacity.saturating_add(1).saturating_div(2).max(1),
+                drained,
             }),
         }
+    }
+
+    /// Frames this lane can currently admit without refusal, in the
+    /// frame-count dimension only (a byte-budget refusal stays an ACTUAL
+    /// refusal that laggs/detaches). A closed outbox reports one slot so the
+    /// next `try_push` is the arbiter instead of an unwakeable wait.
+    fn capacity_for(&self, key: &LaneKey) -> usize {
+        let Ok(state) = self.inner.state.lock() else {
+            return 1;
+        };
+        if state.closed {
+            return 1;
+        }
+        let lane_len = state.lanes.get(key).map_or(0, VecDeque::len);
+        let lane_room = self.inner.per_lane_capacity.saturating_sub(lane_len);
+        let aggregate_room = self
+            .inner
+            .frame_capacity
+            .saturating_sub(state.queued_frames);
+        lane_room.min(aggregate_room)
+    }
+
+    fn drain_progress(&self) -> watch::Receiver<u64> {
+        self.inner.drained.subscribe()
+    }
+
+    fn mark_drained(&self) {
+        self.inner.drained.send_modify(|epoch| {
+            *epoch = epoch.wrapping_add(1);
+        });
     }
 
     fn try_push(&self, key: LaneKey, bytes: Vec<u8>) -> Result<(), DaemonError> {
@@ -256,6 +292,8 @@ impl OutboundLane {
                     }
                     if let Some(frame) = frame {
                         state.queued_frames = state.queued_frames.saturating_sub(1);
+                        drop(state);
+                        self.mark_drained();
                         return Some(frame);
                     }
                 }
@@ -274,19 +312,26 @@ impl OutboundLane {
     }
 
     fn purge(&self, attachment_id: &AttachmentId) {
-        let Ok(mut state) = self.inner.state.lock() else {
-            return;
-        };
-        let key = LaneKey::Attachment(attachment_id.clone());
-        if let Some(frames) = state.lanes.remove(&key) {
-            let count = frames.len();
-            let bytes = frames.iter().fold(0_usize, |total, frame| {
-                total.saturating_add(frame.bytes.len())
-            });
-            state.queued_frames = state.queued_frames.saturating_sub(count);
-            state.queued_bytes = state.queued_bytes.saturating_sub(bytes);
+        let mut removed = false;
+        {
+            let Ok(mut state) = self.inner.state.lock() else {
+                return;
+            };
+            let key = LaneKey::Attachment(attachment_id.clone());
+            if let Some(frames) = state.lanes.remove(&key) {
+                let count = frames.len();
+                let bytes = frames.iter().fold(0_usize, |total, frame| {
+                    total.saturating_add(frame.bytes.len())
+                });
+                state.queued_frames = state.queued_frames.saturating_sub(count);
+                state.queued_bytes = state.queued_bytes.saturating_sub(bytes);
+                removed = count > 0;
+            }
+            state.round_robin.retain(|candidate| candidate != &key);
         }
-        state.round_robin.retain(|candidate| candidate != &key);
+        if removed {
+            self.mark_drained();
+        }
     }
 
     fn close(&self) {
@@ -294,6 +339,7 @@ impl OutboundLane {
             state.closed = true;
         }
         self.inner.ready.notify_waiters();
+        self.mark_drained();
     }
 }
 
@@ -311,6 +357,15 @@ impl FrameSink for ConnectionFrameSink {
 
     fn purge_attachment(&self, attachment_id: &AttachmentId) {
         self.lane.purge(attachment_id);
+    }
+
+    fn capacity_for(&self, attachment_id: &AttachmentId) -> usize {
+        self.lane
+            .capacity_for(&LaneKey::Attachment(attachment_id.clone()))
+    }
+
+    fn drain_progress(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        Some(self.lane.drain_progress())
     }
 }
 

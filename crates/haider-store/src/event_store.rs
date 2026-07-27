@@ -299,6 +299,74 @@ impl Store {
         Ok(outcome)
     }
 
+    /// Reads one byte-budgeted replay page: committed envelopes with
+    /// `seq > since_seq` in sequence order, ending early once the accumulated
+    /// stored-JSON size would exceed `byte_budget`.
+    ///
+    /// Additive daemon seam (like [`Self::resolve_menu`]): it bounds the
+    /// TRANSIENT memory one page may materialize, which an envelope-count
+    /// limit alone cannot. Progress guarantee: a non-empty result always
+    /// contains at least one envelope even when that single envelope exceeds
+    /// the budget, so a byte-paged reader can never stall. Rows past the
+    /// cut-off are never fetched from SQLite; the next page resumes from the
+    /// caller's last-received sequence (keyset, no prefix re-read).
+    pub fn read_page(
+        &self,
+        session: &SessionId,
+        since_seq: u64,
+        max_envelopes: usize,
+        byte_budget: usize,
+    ) -> StoreResult<Vec<RawEnvelope>> {
+        if max_envelopes == 0 {
+            return Ok(Vec::new());
+        }
+        let connection = self.connection()?;
+        // A limit beyond i64::MAX is effectively unbounded; clamp, don't error.
+        let limit = i64::try_from(max_envelopes).unwrap_or(i64::MAX);
+        let mut statement = connection
+            .prepare_cached(
+                "SELECT seq, envelope_json, event_id, committed_at_ms
+                 FROM events
+                 WHERE session_id = ?1 AND seq > ?2
+                 ORDER BY seq ASC
+                 LIMIT ?3",
+            )
+            .map_err(map_sqlite_error)?;
+        let mut rows = statement
+            .query(params![
+                session.as_str(),
+                to_sqlite_integer(since_seq)?,
+                limit
+            ])
+            .map_err(map_sqlite_error)?;
+        let mut envelopes = Vec::new();
+        let mut spent = 0_usize;
+        while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+            let stored_seq: i64 = row.get(0).map_err(map_sqlite_error)?;
+            let envelope_json: String = row.get(1).map_err(map_sqlite_error)?;
+            if !envelopes.is_empty() && spent.saturating_add(envelope_json.len()) > byte_budget {
+                break;
+            }
+            let stored_event_id: String = row.get(2).map_err(map_sqlite_error)?;
+            let stored_committed_at_ms: i64 = row.get(3).map_err(map_sqlite_error)?;
+            let envelope: RawEnvelope = serde_json::from_str(&envelope_json).map_err(|error| {
+                corrupt(format!(
+                    "invalid envelope JSON for session {session}, seq {stored_seq}: {error}"
+                ))
+            })?;
+            validate_stored_envelope(
+                session,
+                stored_seq,
+                &stored_event_id,
+                stored_committed_at_ms,
+                &envelope,
+            )?;
+            spent = spent.saturating_add(envelope_json.len());
+            envelopes.push(envelope);
+        }
+        Ok(envelopes)
+    }
+
     /// Replays a session's complete journal in committed sequence order.
     pub fn journal_replay(&self, session: &SessionId) -> StoreResult<Vec<RawEnvelope>> {
         let mut replay = Vec::new();

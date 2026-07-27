@@ -7,7 +7,8 @@
 
 use haider_core::{HarnessActor, HarnessConfig, SqliteStoreHandle, StoreHandle, SubmitTurn};
 use haider_daemon::{
-    FrameSendError, FrameSink, HubObservation, SessionHub, SessionHubConfig, SessionHubObserver,
+    FrameSendError, FrameSink, HubConnection, HubObservation, SessionHub, SessionHubConfig,
+    SessionHubObserver,
 };
 use haider_protocol::EventPayload;
 use haider_protocol::envelope::{
@@ -23,9 +24,10 @@ use haider_rpc::{
     RequestId, ResponseBody, SeqRange, WireFrame,
 };
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, watch};
 
 const DEADLINE: Duration = Duration::from_secs(10);
 
@@ -373,14 +375,22 @@ async fn open_hub_with_capacities(
     actor_command_capacity: usize,
     catch_up_capacity: usize,
 ) -> (tempfile::TempDir, SqliteStoreHandle, SessionHub) {
+    let config = SessionHubConfig {
+        actor_command_capacity,
+        catch_up_capacity,
+        ..SessionHubConfig::default()
+    };
+    open_hub_with_config(observer, config).await
+}
+
+async fn open_hub_with_config(
+    observer: Option<Arc<dyn SessionHubObserver>>,
+    config: SessionHubConfig,
+) -> (tempfile::TempDir, SqliteStoreHandle, SessionHub) {
     let root = tempfile::tempdir().expect("temp store");
     let store = SqliteStoreHandle::open(root.path())
         .await
         .expect("store opens");
-    let config = SessionHubConfig {
-        actor_command_capacity,
-        catch_up_capacity,
-    };
     let hub = match observer {
         Some(observer) => {
             SessionHub::with_observer(store.clone(), config, observer).expect("hub opens")
@@ -1673,6 +1683,372 @@ async fn stale_worker_generation_menu_answer_is_rejected_and_fenced() {
         sink.snapshot().is_empty(),
         "stale answer published no event"
     );
+
+    connection.close().await.expect("connection closes");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// Attaches from sequence zero and drains this attachment's replay through
+/// its `AttachCaughtUp`, returning the attachment id.
+async fn attach_caught_up(
+    connection: &HubConnection,
+    sink: &Arc<CollectSink>,
+    session_id: &SessionId,
+    request_id: &str,
+) -> AttachmentId {
+    connection
+        .request(
+            RequestId::new(request_id),
+            RequestBody::SessionAttach {
+                session_id: session_id.clone(),
+                after_seq: 0,
+                mode: AttachMode::View,
+            },
+        )
+        .await
+        .expect("attach routes");
+    let (attachment_id, _) = attachment_from(sink.next().await);
+    loop {
+        match sink.next().await {
+            WireFrame::Event { .. } => {}
+            WireFrame::AttachCaughtUp {
+                attachment_id: found,
+                ..
+            } if found == attachment_id => break,
+            frame => panic!("unexpected attach frame: {frame:?}"),
+        }
+    }
+    attachment_id
+}
+
+/// MUTATION CHECK: skip the slot reservation before actor/channel allocation
+/// or the release inside `take_attachment`. Expected failure: the third
+/// attach is admitted, or the post-detach retry stays rejected.
+/// Verified by revert on 2026-07-27.
+#[tokio::test]
+async fn per_connection_attachment_cap_rejects_overloaded_and_readmits_after_detach() {
+    let config = SessionHubConfig {
+        max_attachments_per_connection: 2,
+        max_attachments: 8,
+        ..SessionHubConfig::default()
+    };
+    let (_root, store, hub) = open_hub_with_config(None, config).await;
+    let session_id = SessionId::new("admission-per-connection");
+    append_one(&hub, &session_id, store.worker_generation(), "seed").await;
+    let sink = Arc::new(CollectSink::default());
+    let connection = hub
+        .open_connection(capabilities(), sink.clone())
+        .expect("connection");
+
+    let first = attach_caught_up(&connection, &sink, &session_id, "attach-1").await;
+    let _second = attach_caught_up(&connection, &sink, &session_id, "attach-2").await;
+    connection
+        .request(
+            RequestId::new("attach-3"),
+            RequestBody::SessionAttach {
+                session_id: session_id.clone(),
+                after_seq: 0,
+                mode: AttachMode::View,
+            },
+        )
+        .await
+        .expect("typed rejection enqueues");
+    assert!(matches!(
+        sink.next().await,
+        WireFrame::Response {
+            request_id,
+            body: ResponseBody::Error {
+                ref code,
+                retryable: true,
+                ..
+            },
+        } if request_id.as_str() == "attach-3" && code == "overloaded"
+    ));
+
+    connection
+        .request(
+            RequestId::new("detach-1"),
+            RequestBody::SessionDetach {
+                attachment_id: first,
+            },
+        )
+        .await
+        .expect("detach routes");
+    assert!(matches!(
+        sink.next().await,
+        WireFrame::Response {
+            body: ResponseBody::SessionDetach { .. },
+            ..
+        }
+    ));
+    let _readmitted = attach_caught_up(&connection, &sink, &session_id, "attach-4").await;
+
+    connection.close().await.expect("connection closes");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// MUTATION CHECK: enforce only the per-connection ledger. Expected failure:
+/// the second connection's attach is admitted while the hub sits at its
+/// global attachment cap.
+#[tokio::test]
+async fn global_attachment_cap_binds_independently_of_per_connection_headroom() {
+    let config = SessionHubConfig {
+        max_attachments_per_connection: 4,
+        max_attachments: 2,
+        ..SessionHubConfig::default()
+    };
+    let (_root, store, hub) = open_hub_with_config(None, config).await;
+    let session_id = SessionId::new("admission-global");
+    append_one(&hub, &session_id, store.worker_generation(), "seed").await;
+    let first_sink = Arc::new(CollectSink::default());
+    let first = hub
+        .open_connection(capabilities(), first_sink.clone())
+        .expect("first connection");
+    let second_sink = Arc::new(CollectSink::default());
+    let second = hub
+        .open_connection(capabilities(), second_sink.clone())
+        .expect("second connection");
+
+    let held = attach_caught_up(&first, &first_sink, &session_id, "first-1").await;
+    let _also_held = attach_caught_up(&first, &first_sink, &session_id, "first-2").await;
+    second
+        .request(
+            RequestId::new("second-1"),
+            RequestBody::SessionAttach {
+                session_id: session_id.clone(),
+                after_seq: 0,
+                mode: AttachMode::View,
+            },
+        )
+        .await
+        .expect("typed rejection enqueues");
+    assert!(matches!(
+        second_sink.next().await,
+        WireFrame::Response {
+            request_id,
+            body: ResponseBody::Error {
+                ref code,
+                retryable: true,
+                ..
+            },
+        } if request_id.as_str() == "second-1" && code == "overloaded"
+    ));
+
+    first
+        .request(
+            RequestId::new("first-detach"),
+            RequestBody::SessionDetach {
+                attachment_id: held,
+            },
+        )
+        .await
+        .expect("detach routes");
+    assert!(matches!(
+        first_sink.next().await,
+        WireFrame::Response {
+            body: ResponseBody::SessionDetach { .. },
+            ..
+        }
+    ));
+    let _readmitted = attach_caught_up(&second, &second_sink, &session_id, "second-2").await;
+
+    first.close().await.expect("first closes");
+    second.close().await.expect("second closes");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// MUTATION CHECK: remove the byte charge in `publish` (keep only the
+/// 64-slot frame count). Expected failure: both large envelopes are buffered
+/// without lag, no store-resume happens, and the raised-head AttachCaughtUp
+/// asserted below never arrives.
+/// Verified by revert on 2026-07-27.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn catch_up_byte_budget_trips_long_before_the_frame_count_and_resumes_from_store() {
+    let (observer, mut control) = gated_observer(vec![GateTarget::ReplayEvent(1)]);
+    let config = SessionHubConfig {
+        catch_up_byte_budget: 4_096,
+        ..SessionHubConfig::default()
+    };
+    let (_root, store, hub) = open_hub_with_config(Some(observer), config).await;
+    let session_id = SessionId::new("catch-up-bytes");
+    let generation = store.worker_generation();
+    append_one(&hub, &session_id, generation, "initial-1").await;
+    append_one(&hub, &session_id, generation, "initial-2").await;
+
+    let sink = Arc::new(CollectSink::default());
+    let connection = hub
+        .open_connection(capabilities(), sink.clone())
+        .expect("connection");
+    connection
+        .request(
+            RequestId::new("attach"),
+            RequestBody::SessionAttach {
+                session_id: session_id.clone(),
+                after_seq: 0,
+                mode: AttachMode::View,
+            },
+        )
+        .await
+        .expect("attach routes");
+    assert!(matches!(
+        control.reached().await,
+        HubObservation::ReplayEvent { seq: 1, .. }
+    ));
+
+    for name in ["giant-1", "giant-2"] {
+        let mut event = vec![envelope(&session_id, name, generation)];
+        event[0].payload = serde_json::json!({
+            "type": "future_test_event",
+            "blob": "x".repeat(3_000),
+        });
+        hub.append(&mut event).await.expect("giant append commits");
+    }
+    control.release();
+
+    let mut delivered = Vec::new();
+    loop {
+        match sink.next().await {
+            WireFrame::Event { envelope, .. } => delivered.push(envelope.seq),
+            WireFrame::AttachCaughtUp {
+                high_water_seq: 4, ..
+            } => break,
+            WireFrame::Response { .. } | WireFrame::AttachCaughtUp { .. } => {}
+            frame => panic!("unexpected byte-budget frame: {frame:?}"),
+        }
+    }
+    assert_eq!(delivered, [1, 2, 3, 4]);
+
+    connection.close().await.expect("connection closes");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// A sink whose lane admits the initial replay and caught-up marker, then
+/// reports zero capacity forever with a drain signal that never advances —
+/// the genuinely stuck client shape.
+struct StalledAfterCaughtUpSink {
+    collected: CollectSink,
+    saw_caught_up: AtomicBool,
+    progress: watch::Sender<u64>,
+}
+
+impl FrameSink for StalledAfterCaughtUpSink {
+    fn try_send(&self, frame: WireFrame) -> Result<(), FrameSendError> {
+        if matches!(frame, WireFrame::AttachCaughtUp { .. }) {
+            self.saw_caught_up.store(true, Ordering::Release);
+        }
+        self.collected.try_send(frame)
+    }
+
+    fn purge_attachment(&self, attachment_id: &AttachmentId) {
+        self.collected.purge_attachment(attachment_id);
+    }
+
+    fn capacity_for(&self, _attachment_id: &AttachmentId) -> usize {
+        if self.saw_caught_up.load(Ordering::Acquire) {
+            0
+        } else {
+            usize::MAX
+        }
+    }
+
+    fn drain_progress(&self) -> Option<watch::Receiver<u64>> {
+        Some(self.progress.subscribe())
+    }
+}
+
+/// MUTATION CHECK: remove the lagged-while-blocked exit from
+/// `acquire_send_capacity` (wait only for drain progress and cancellation).
+/// Expected failure: the stalled attachment never laggs or detaches, no
+/// `Lagged` frame ever reaches the sink, and the deadline expires.
+/// Verified by revert on 2026-07-27.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn commit_pressure_behind_a_stalled_outbox_laggs_and_detaches() {
+    let config = SessionHubConfig {
+        catch_up_byte_budget: 600,
+        ..SessionHubConfig::default()
+    };
+    let (_root, store, hub) = open_hub_with_config(None, config).await;
+    let session_id = SessionId::new("stalled-outbox");
+    let generation = store.worker_generation();
+    append_one(&hub, &session_id, generation, "initial").await;
+    let (progress, _keep_progress_open) = watch::channel(0_u64);
+    let sink = Arc::new(StalledAfterCaughtUpSink {
+        collected: CollectSink::default(),
+        saw_caught_up: AtomicBool::new(false),
+        progress,
+    });
+    let connection = hub
+        .open_connection(capabilities(), sink.clone())
+        .expect("connection");
+    connection
+        .request(
+            RequestId::new("attach"),
+            RequestBody::SessionAttach {
+                session_id: session_id.clone(),
+                after_seq: 0,
+                mode: AttachMode::View,
+            },
+        )
+        .await
+        .expect("attach routes");
+    let (attachment_id, _) = attachment_from(sink.collected.next().await);
+    assert!(matches!(
+        sink.collected.next().await,
+        WireFrame::Event { envelope, .. } if envelope.seq == 1
+    ));
+    assert!(matches!(
+        sink.collected.next().await,
+        WireFrame::AttachCaughtUp {
+            high_water_seq: 1,
+            ..
+        }
+    ));
+
+    // Each append either fits the momentarily-empty catch-up channel or trips
+    // the byte ledger while the replay task is blocked awaiting outbox
+    // capacity that never comes; the trip converges within a few commits.
+    for index in 0..8 {
+        let mut event = vec![envelope(
+            &session_id,
+            format!("pressure-{index}"),
+            generation,
+        )];
+        event[0].payload = serde_json::json!({
+            "type": "future_test_event",
+            "blob": "x".repeat(400),
+        });
+        hub.append(&mut event)
+            .await
+            .expect("pressure append commits");
+    }
+    assert!(matches!(
+        sink.collected.next().await,
+        WireFrame::Lagged {
+            attachment_id: ref found,
+            ..
+        } if found == &attachment_id
+    ));
+
+    connection
+        .request(
+            RequestId::new("detach-after"),
+            RequestBody::SessionDetach {
+                attachment_id: attachment_id.clone(),
+            },
+        )
+        .await
+        .expect("detach routes");
+    assert!(matches!(
+        sink.collected.next().await,
+        WireFrame::Response {
+            request_id,
+            body: ResponseBody::Error { ref code, .. },
+        } if request_id.as_str() == "detach-after" && code == "not_found"
+    ));
 
     connection.close().await.expect("connection closes");
     hub.shutdown().await.expect("hub stops");

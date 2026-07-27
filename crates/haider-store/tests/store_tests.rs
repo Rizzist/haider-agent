@@ -457,3 +457,62 @@ fn dropping_a_connection_mid_transaction_leaves_no_partial_journal() {
     assert_eq!(must(reopened.latest_seq(&session)), 0);
     assert!(must(reopened.journal_replay(&session)).is_empty());
 }
+
+/// MUTATION CHECK: drop the byte cut-off (or the at-least-one-envelope
+/// progress guarantee) from `Store::read_page`. Expected failure: the
+/// budgeted page returns all five envelopes, or the one-byte budget returns
+/// an empty page and a byte-paged reader could stall.
+/// Verified by revert on 2026-07-27.
+#[test]
+fn read_page_ends_early_on_byte_budget_and_always_makes_progress() {
+    let root = test_root();
+    let store = must(Store::open(root.path()));
+    let session = SessionId::new("read-page-budget");
+    let mut batch = (1..=5)
+        .map(|index| {
+            envelope(
+                &session,
+                &format!("page-{index}"),
+                json!({"type": "user_message", "text": format!("payload {index}")}),
+            )
+        })
+        .collect::<Vec<_>>();
+    must(store.append(&mut batch));
+
+    // Stored JSON is the budget currency; re-serializing the committed
+    // envelope reproduces it exactly (same struct, same serializer).
+    let row_lengths = batch
+        .iter()
+        .map(|envelope| must(serde_json::to_string(envelope)).len())
+        .collect::<Vec<_>>();
+    let two_rows = row_lengths[0] + row_lengths[1];
+    let first_page = must(store.read_page(&session, 0, 10, two_rows));
+    assert_eq!(
+        first_page
+            .iter()
+            .map(|envelope| envelope.seq)
+            .collect::<Vec<_>>(),
+        [1, 2],
+        "the page ends before the third row would exceed the budget"
+    );
+
+    let resumed = must(store.read_page(&session, 2, 10, usize::MAX));
+    assert_eq!(
+        resumed
+            .iter()
+            .map(|envelope| envelope.seq)
+            .collect::<Vec<_>>(),
+        [3, 4, 5],
+        "the next page resumes from the caller's last-received sequence"
+    );
+
+    let oversized = must(store.read_page(&session, 0, 10, 1));
+    assert_eq!(
+        oversized
+            .iter()
+            .map(|envelope| envelope.seq)
+            .collect::<Vec<_>>(),
+        [1],
+        "a single envelope larger than the budget is still returned"
+    );
+}

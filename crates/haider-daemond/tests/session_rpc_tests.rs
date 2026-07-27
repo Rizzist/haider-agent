@@ -265,10 +265,12 @@ async fn uds_session_lifecycle_lists_reads_attaches_replays_and_detaches() {
     task.join().await.expect("daemon joins");
 }
 
-/// MUTATION CHECK: remove the per-attachment quota/round-robin key and enqueue
-/// every event in one FIFO lane. Expected failure: the cold attachment's
-/// event/caught-up marker does not arrive while the hot attachment saturates
-/// the bounded connection outbox.
+/// MUTATION CHECK: remove the per-attachment quota/round-robin key and
+/// enqueue every event in one FIFO lane. Expected failure: the cold
+/// attachment's caught-up marker no longer precedes the hot replay's
+/// completion. Companion mutation: restore the unpaced page bursts —
+/// expected failure: the hot READING client is purged through `Lagged` and
+/// the no-lag assertion below trips.
 #[tokio::test]
 async fn one_hot_attachment_cannot_starve_a_cold_attachment_on_the_same_connection() {
     let root = test_root();
@@ -280,7 +282,7 @@ async fn one_hot_attachment_cannot_starve_a_cold_attachment_on_the_same_connecti
     config.outbound_queue_capacity = 6;
     let hot = SessionId::new("hot-session");
     let cold = SessionId::new("cold-session");
-    seed(&config, &hot, 40);
+    seed(&config, &hot, 200);
     seed(&config, &cold, 1);
     let task = ready(&config).await;
     let mut client = Client::connect(&config.endpoint_path(), config.frame_limit).await;
@@ -301,27 +303,104 @@ async fn one_hot_attachment_cannot_starve_a_cold_attachment_on_the_same_connecti
             .await;
     }
 
-    let mut cold_event = false;
     let mut cold_caught_up = false;
-    let mut hot_lagged = false;
-    while !cold_event || !cold_caught_up || !hot_lagged {
+    let mut hot_events = 0_u64;
+    loop {
         match client.next().await {
             WireFrame::Event {
                 session_id,
                 envelope,
                 ..
-            } if session_id == cold => {
-                assert_eq!(envelope.seq, 1);
-                cold_event = true;
+            } if session_id == cold => assert_eq!(envelope.seq, 1),
+            WireFrame::Event {
+                session_id,
+                envelope,
+                ..
+            } if session_id == hot => {
+                hot_events += 1;
+                assert_eq!(envelope.seq, hot_events);
             }
             WireFrame::AttachCaughtUp {
                 high_water_seq: 1, ..
             } => cold_caught_up = true,
-            WireFrame::Lagged { .. } => hot_lagged = true,
-            WireFrame::Response { .. } | WireFrame::Event { .. } => {}
+            WireFrame::AttachCaughtUp {
+                high_water_seq: 200,
+                ..
+            } => break,
+            WireFrame::Lagged { .. } => {
+                panic!("a continuously reading client must never be lagged")
+            }
+            WireFrame::Response { .. } => {}
             frame => panic!("unexpected fairness frame: {frame:?}"),
         }
+        if !cold_caught_up {
+            assert!(
+                hot_events < 200,
+                "round-robin must serve the cold lane before the hot replay completes"
+            );
+        }
     }
+    assert!(cold_caught_up, "cold attachment fully served");
+    assert_eq!(hot_events, 200, "hot attachment fully served, unlagged");
+
+    task.shutdown_handle().request("test complete");
+    task.join().await.expect("daemon joins");
+}
+
+/// MUTATION CHECK: revert replay pacing — deliver each store page
+/// synchronously, ignoring `capacity_for`/`drain_progress`. Expected failure:
+/// the first page overruns the 16-frame lane quota and this continuously
+/// READING client is purged through `Lagged` instead of receiving the
+/// contiguous 1..=1000 stream.
+/// Verified by revert on 2026-07-27.
+#[tokio::test]
+async fn paced_replay_of_a_long_history_never_laggs_a_reading_client() {
+    let root = test_root();
+    let config = DaemonConfig::new(
+        "paced-replay",
+        root.path().join("store"),
+        root.path().join("runtime"),
+    );
+    let session_id = SessionId::new("long-history");
+    seed(&config, &session_id, 1_000);
+    let task = ready(&config).await;
+    let mut client = Client::connect(&config.endpoint_path(), config.frame_limit).await;
+    client
+        .send(
+            &WireFrame::Request {
+                request_id: RequestId::new("attach-long"),
+                body: RequestBody::SessionAttach {
+                    session_id,
+                    after_seq: 0,
+                    mode: AttachMode::View,
+                },
+            },
+            config.frame_limit,
+        )
+        .await;
+
+    let mut next_seq = 1_u64;
+    loop {
+        match client.next().await {
+            WireFrame::Response { .. } => {}
+            WireFrame::Event { envelope, .. } => {
+                assert_eq!(envelope.seq, next_seq, "replay must stay contiguous");
+                next_seq += 1;
+            }
+            WireFrame::AttachCaughtUp {
+                high_water_seq: 1_000,
+                ..
+            } => break,
+            WireFrame::Lagged { .. } => {
+                panic!("a continuously reading client must never be lagged")
+            }
+            frame => panic!("unexpected paced-replay frame: {frame:?}"),
+        }
+    }
+    assert_eq!(
+        next_seq, 1_001,
+        "every seeded envelope arrived exactly once"
+    );
 
     task.shutdown_handle().request("test complete");
     task.join().await.expect("daemon joins");
