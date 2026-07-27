@@ -14,6 +14,7 @@ serde.workspace = true
 termbg.workspace = true
 tokio.workspace = true
 serde_json.workspace = true
+unicode-segmentation.workspace = true
 unicode-width.workspace = true
 
 [dev-dependencies]

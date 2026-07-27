@@ -287,20 +287,42 @@ fn composer_carries_the_sim_signature() {
     // Placeholder ink is the dim token (sim placeholder: dim @ 0.8).
     let ph_x = col_of(&rows[composer_y as usize], "message haider");
     assert_eq!(buffer[(ph_x, composer_y)].fg, Color::from(theme.dim));
-    // Typed text renders bright with a trailing gold block cursor.
+    // Typed text renders bright with the CURSOR CELL after it. Directed
+    // change (TUI5 item 1, owner law): this assertion used to pin the
+    // appended `▮` glyph — the very bug the owner reported ("half into
+    // the ground"). The cursor is now a styled CELL: gold ground,
+    // badge_fg ink, a block over a space at end-of-text.
+    // MUTATION CHECK (cursor-is-styled-cell-not-appended-glyph): revert
+    // composer_cursor_row_spans to appending "▮" and this fails on the
+    // no-▮ assertion AND the cell-style assertions.
     let mut model = model;
     for c in "hi".chars() {
         model.handle(key(KeyCode::Char(c)));
     }
     let (rows, _, terminal) = draw(&model, 118, 34);
     let buffer = terminal.backend().buffer();
-    let typed_y = row_of(&rows, "❯ hi▮");
-    let typed_x = col_of(&rows[typed_y as usize], "hi▮");
+    let typed_y = row_of(&rows, "❯ hi");
+    assert!(
+        !rows[typed_y as usize].contains('▮'),
+        "the composer cursor is a styled cell, never an appended ▮ glyph"
+    );
+    let typed_x = col_of(&rows[typed_y as usize], "hi");
     assert_eq!(buffer[(typed_x, typed_y)].fg, Color::from(theme.bright));
+    let cursor_cell = &buffer[(typed_x + 2, typed_y)];
     assert_eq!(
-        buffer[(typed_x + 2, typed_y)].fg,
+        cursor_cell.symbol(),
+        " ",
+        "end-of-text cursor is a block over a space"
+    );
+    assert_eq!(
+        cursor_cell.bg,
         Color::from(theme.gold),
-        "block cursor is gold"
+        "cursor cell ground is gold"
+    );
+    assert_eq!(
+        cursor_cell.fg,
+        Color::from(theme.badge_fg),
+        "cursor cell ink is the badge_fg reverse-video contrast"
     );
 }
 

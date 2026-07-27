@@ -820,7 +820,9 @@ pub struct AppModel {
     pub sanctum_tier: SanctumTier,
     pub projection: SessionProjection,
     pub identity: IdentityLine,
-    pub composer: String,
+    /// The ACTIVE surface's composer (TUI5): text + first-class cursor +
+    /// selection + input ring. Nothing in it persists (item 8).
+    pub composer: crate::composer::Composer,
     /// Session blurb (sim auto-title micro-call) — announced by the 1.5 s
     /// `· session titled` note; the HEADER shows [`Self::session_name`].
     pub session_title: Option<String>,
@@ -957,7 +959,7 @@ impl Default for AppModel {
             sanctum_tier: SanctumTier::default(),
             projection: SessionProjection::new(),
             identity: IdentityLine::default(),
-            composer: String::new(),
+            composer: crate::composer::Composer::new(),
             session_title: None,
             session_name: None,
             // The scratch surface's canonical head (the demo script's
@@ -1155,8 +1157,8 @@ impl AppModel {
     /// `\n`, tui.js:235).
     #[must_use]
     pub fn palette_open(&self) -> bool {
-        if !self.composer.starts_with('/')
-            || self.composer.contains('\n')
+        if !self.composer.text().starts_with('/')
+            || self.composer.text().contains('\n')
             || self.palette_dismissed
             || self.help_open
         {
@@ -1178,7 +1180,7 @@ impl AppModel {
     #[must_use]
     pub fn palette_items(&self) -> Vec<PaletteItem> {
         palette_items(
-            self.composer.trim_start_matches('/'),
+            self.composer.text().trim_start_matches('/'),
             matches!(
                 self.screen,
                 Screen::Session | Screen::Subagent | Screen::Aura
@@ -1198,7 +1200,7 @@ impl AppModel {
         let item = items
             .get(self.palette_selection.min(items.len().saturating_sub(1)))
             .copied()?;
-        let body = self.composer.strip_prefix('/')?;
+        let body = self.composer.text().strip_prefix('/')?;
         match item {
             // Command rows exist only while the body is one unfinished
             // token, so the whole body is the fragment.
@@ -1247,12 +1249,15 @@ impl AppModel {
                 // (tui.js:2298-2317). Big pastes become a pill token; small
                 // pastes keep their newlines (multi-line composer).
                 let raw_lines = text.split('\n').count();
+                // TUI5 item 3: paste INSERTS at the cursor (replacing an
+                // active selection, item 4) — both the pill token and the
+                // literal small-paste path.
                 if raw_lines > 3 || text.encode_utf16().count() > 300 {
                     self.composer
-                        .push_str(&format!("[Pasted {raw_lines} lines] "));
+                        .insert_str(&format!("[Pasted {raw_lines} lines] "));
                 } else {
                     self.composer
-                        .push_str(&text.replace("\r\n", "\n").replace('\r', "\n"));
+                        .insert_str(&text.replace("\r\n", "\n").replace('\r', "\n"));
                 }
                 // Any composer edit re-opens a dismissed palette (sim
                 // `setMenuDismissed(false)` on change).
@@ -1275,7 +1280,9 @@ impl AppModel {
                 // turn and live chips keep their lifecycle laws (esc owns
                 // interrupt, tui.js:2533-2539). From the launcher — and
                 // from boot, which has no launcher to return to — it quits,
-                // as before.
+                // as before. TUI5 item 4: with an ACTIVE composer selection
+                // ⌃C COPIES instead (the gate lives in `handle`, before
+                // this arm ever sees the key).
                 KeyCode::Char('c') => match self.screen {
                     Screen::Launcher | Screen::Boot => self.should_quit = true,
                     _ => self.back_to_launcher(),
@@ -1286,6 +1293,28 @@ impl AppModel {
                 KeyCode::Char('g') => {
                     self.flash =
                         Some("· /tokens — UI ready; lands with the daemon wave (W3)".to_owned());
+                }
+                // TUI5 items 2+3 — readline editing keys, Claude Code
+                // parity: ⌃A/⌃E line edges, ⌃W word-back, ⌃K kill-to-end,
+                // ⌃U kill-to-start. Only while the composer actually owns
+                // the input (never boot / help / a blocking menu).
+                KeyCode::Char('a') if self.composer_owns_input() => {
+                    self.composer.line_home(false);
+                }
+                KeyCode::Char('e') if self.composer_owns_input() => {
+                    self.composer.line_end_key(false);
+                }
+                KeyCode::Char('w') if self.composer_owns_input() => {
+                    self.composer.word_backspace();
+                    self.note_composer_edit();
+                }
+                KeyCode::Char('k') if self.composer_owns_input() => {
+                    self.composer.kill_to_line_end();
+                    self.note_composer_edit();
+                }
+                KeyCode::Char('u') if self.composer_owns_input() => {
+                    self.composer.kill_to_line_start();
+                    self.note_composer_edit();
                 }
                 _ => {}
             }
@@ -1338,7 +1367,8 @@ impl AppModel {
                 .modifiers
                 .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
         {
-            self.composer.push('\n');
+            // TUI5 item 3: the newline INSERTS at the cursor like any edit.
+            self.composer.insert_str("\n");
             self.palette_dismissed = false;
             return;
         }
@@ -1373,14 +1403,14 @@ impl AppModel {
                         .copied()
                     {
                         Some(PaletteItem::Cmd(spec)) => {
-                            self.composer = if has_arg_slots(spec.name) {
+                            self.composer.set_text(if has_arg_slots(spec.name) {
                                 format!("/{} ", spec.name)
                             } else {
                                 format!("/{}", spec.name)
-                            };
+                            });
                         }
                         Some(PaletteItem::Arg { cmd, value, .. }) => {
-                            self.composer = format!("/{cmd} {value}");
+                            self.composer.set_text(format!("/{cmd} {value}"));
                         }
                         None => {}
                     }
@@ -1435,10 +1465,73 @@ impl AppModel {
             }
             KeyCode::Enter => self.submit_composer(),
             KeyCode::Backspace => {
-                self.composer.pop();
-                self.palette_selection = 0;
-                self.palette_scroll = 0;
-                self.palette_dismissed = false;
+                // TUI5 item 3: ⌫ deletes the grapheme BEFORE the cursor
+                // (or the active selection); ⌥⌫ deletes the word before
+                // (ESC-⌫ / kitty ALT — Claude Code binds both).
+                if key.modifiers.contains(KeyModifiers::ALT) {
+                    self.composer.word_backspace();
+                } else {
+                    self.composer.backspace();
+                }
+                self.note_composer_edit();
+            }
+            // Delete (fn⌫ / kDEL, CSI 3~): the grapheme AFTER the cursor.
+            KeyCode::Delete => {
+                self.composer.delete_forward();
+                self.note_composer_edit();
+            }
+            // TUI5 item 2 — cursor movement. ⇧ extends a selection
+            // (item 4); ⌥ moves by word (mac law; iTerm CSI 1;3D). The
+            // palette branch above already owns ↑/↓/Tab/⏎ while open, so
+            // these arms never fight it.
+            KeyCode::Left => {
+                let extend = key.modifiers.contains(KeyModifiers::SHIFT);
+                if key.modifiers.contains(KeyModifiers::ALT) {
+                    self.composer.word_left(extend);
+                } else {
+                    self.composer.move_left(extend);
+                }
+            }
+            KeyCode::Right => {
+                let extend = key.modifiers.contains(KeyModifiers::SHIFT);
+                if key.modifiers.contains(KeyModifiers::ALT) {
+                    self.composer.word_right(extend);
+                } else {
+                    self.composer.move_right(extend);
+                }
+            }
+            // ↑/↓ walk the composer's rows column-sticky (item 2). At the
+            // buffer's edge rows they page the input HISTORY instead
+            // (item 6, Claude Code behavior) — only with no selection and
+            // no ⇧ (a ⇧↑ at the top edge is a selection gesture, not a
+            // recall).
+            KeyCode::Up if self.composer_owns_input() => {
+                let extend = key.modifiers.contains(KeyModifiers::SHIFT);
+                if !self.composer.line_up(extend)
+                    && !extend
+                    && !self.composer.has_selection()
+                    && self.composer.history_prev()
+                {
+                    self.note_composer_edit();
+                }
+            }
+            KeyCode::Down if self.composer_owns_input() => {
+                let extend = key.modifiers.contains(KeyModifiers::SHIFT);
+                if !self.composer.line_down(extend)
+                    && !extend
+                    && !self.composer.has_selection()
+                    && self.composer.history_next()
+                {
+                    self.note_composer_edit();
+                }
+            }
+            KeyCode::Home => {
+                self.composer
+                    .line_home(key.modifiers.contains(KeyModifiers::SHIFT));
+            }
+            KeyCode::End => {
+                self.composer
+                    .line_end_key(key.modifiers.contains(KeyModifiers::SHIFT));
             }
             KeyCode::Char(c @ '1'..='3')
                 if self.screen == Screen::Launcher && self.composer.is_empty() =>
@@ -1446,11 +1539,20 @@ impl AppModel {
                 let index = (c as usize) - ('1' as usize);
                 self.attach_sample(index);
             }
+            // ⌥b/⌥f word movement (readline ESC-b/ESC-f — what most mac
+            // terminals actually SEND for Option+arrow; Claude Code
+            // honors both encodings, so we do too).
+            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.composer.word_left(false);
+            }
+            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.composer.word_right(false);
+            }
             KeyCode::Char(c) => {
-                self.composer.push(c);
-                self.palette_selection = 0;
-                self.palette_scroll = 0;
-                self.palette_dismissed = false;
+                // TUI5 item 3: typing INSERTS at the cursor (never
+                // appends) and REPLACES an active selection (item 4).
+                self.composer.insert_str(c.encode_utf8(&mut [0u8; 4]));
+                self.note_composer_edit();
                 // Typing decays interrupted-idle → idle (sim, tui.js:3020).
                 if self.projection.interrupted() {
                     self.projection.apply(&EventPayload::IdleDecayed);
@@ -1460,13 +1562,41 @@ impl AppModel {
         }
     }
 
+    /// The composer is the live input target: no boot screen, no help
+    /// overlay, no blocking menu owning the keys (session card or the
+    /// viewed chip's question). Gates the TUI5 editing keys so ⌃K on a
+    /// menu can never eat a hidden draft.
+    #[must_use]
+    fn composer_owns_input(&self) -> bool {
+        if self.screen == Screen::Boot || self.help_open {
+            return false;
+        }
+        if self.screen == Screen::Session && self.projection.open_menu().is_some() {
+            return false;
+        }
+        !(self.screen == Screen::Subagent
+            && self
+                .viewed_chip()
+                .is_some_and(|chip| chip.question_menu().is_some()))
+    }
+
+    /// The composer-edit epilogue every text-changing key shares (the sim
+    /// resets suggestion state on any change): palette selection/scroll
+    /// reset + a dismissed palette re-opens.
+    fn note_composer_edit(&mut self) {
+        self.palette_selection = 0;
+        self.palette_scroll = 0;
+        self.palette_dismissed = false;
+    }
+
     /// Sim submit() preprocessing, exact order (tui.js:1966-2041 — the
     /// aura/subagent screen steps land with their screens; the boot-queue
     /// step is unreachable here because the boot screen swallows input by
     /// earlier review law r1 P2).
     fn submit_composer(&mut self) {
-        let text = self.composer.trim().to_owned();
-        self.composer.clear();
+        // TUI5: the take records the submitted text in this surface's
+        // input ring (item 6) and clears cursor/selection state (item 8).
+        let text = self.composer.take_for_submit().trim().to_owned();
         self.palette_selection = 0;
         self.palette_scroll = 0;
         self.palette_dismissed = false;
@@ -1481,7 +1611,7 @@ impl AppModel {
             return;
         }
         if text.starts_with('/') {
-            self.composer = text;
+            self.composer.set_text(text);
             self.execute_slash();
             return;
         }
@@ -1749,7 +1879,7 @@ impl AppModel {
     fn activate_palette_item(&mut self, item: PaletteItem) {
         match item {
             PaletteItem::Cmd(spec) if has_arg_slots(spec.name) => {
-                self.composer = format!("/{} ", spec.name);
+                self.composer.set_text(format!("/{} ", spec.name));
                 self.palette_selection = 0;
                 self.palette_scroll = 0;
                 self.palette_dismissed = false;
@@ -1757,27 +1887,40 @@ impl AppModel {
             PaletteItem::Cmd(spec) => {
                 let args: String = self
                     .composer
+                    .text()
                     .trim_start_matches('/')
                     .split_whitespace()
                     .skip(1)
                     .collect::<Vec<_>>()
                     .join(" ");
-                self.composer = if args.is_empty() {
+                self.composer.set_text(if args.is_empty() {
                     format!("/{}", spec.name)
                 } else {
                     format!("/{} {args}", spec.name)
-                };
+                });
                 self.execute_slash();
             }
             PaletteItem::Arg { cmd, value, .. } => {
-                self.composer = format!("/{cmd} {value}");
+                self.composer.set_text(format!("/{cmd} {value}"));
                 self.execute_slash();
             }
         }
     }
 
     fn execute_slash(&mut self) {
-        let raw = self.composer.trim_start_matches('/').trim().to_owned();
+        let raw = self
+            .composer
+            .text()
+            .trim_start_matches('/')
+            .trim()
+            .to_owned();
+        // TUI5 item 6: slash executions are recallable like any submit —
+        // palette-activated commands never pass `take_for_submit`, so the
+        // ring is fed here with the CANONICAL form. The consecutive-dupe
+        // dedupe absorbs the double record on the plain-⏎ path.
+        if !raw.is_empty() {
+            self.composer.record_submitted(&format!("/{raw}"));
+        }
         self.composer.clear();
         self.palette_selection = 0;
         self.palette_scroll = 0;

@@ -329,7 +329,9 @@ fn composer_grows_rows_and_shows_multiline_text() {
     let (rows, _, terminal) = draw(&model, 118, 34);
     let first_y = row_of(&rows, "❯ alpha");
     let second_y = row_of(&rows, "beta");
-    let third_y = row_of(&rows, "gamma▮");
+    // Directed (TUI5 item 1): the trailing `▮` glyph is retired — the
+    // cursor row is found by its text; the cursor is asserted as a CELL.
+    let third_y = row_of(&rows, "gamma");
     assert_eq!(second_y, first_y + 1);
     assert_eq!(third_y, first_y + 2, "one row per line");
     let buffer = terminal.backend().buffer();
@@ -339,6 +341,9 @@ fn composer_grows_rows_and_shows_multiline_text() {
     for y in [first_y, second_y, third_y] {
         assert_eq!(buffer[(0, y)].bg, Color::from(theme.input_bg));
     }
+    // TUI5 item 1: the cursor CELL sits after "gamma" — gutter(2+2) +
+    // text(5) puts it at x=9 on the cursor row.
+    assert_eq!(buffer[(9, third_y)].bg, Color::from(theme.gold));
 }
 
 #[test]
@@ -352,14 +357,23 @@ fn composer_caps_at_five_rows_showing_the_tail() {
     }
     // Composer now holds 8 lines (trailing empty); only the LAST five rows
     // render, with a ⋮ marker in the scrolled gutter.
-    let (rows, _, _) = draw(&model, 118, 34);
+    let (rows, _, terminal) = draw(&model, 118, 34);
     assert!(
         !rows.iter().any(|row| row.contains("❯ one")),
         "head scrolled"
     );
     let marker_y = row_of(&rows, "⋮ four");
-    let last_y = row_of(&rows, "▮");
-    assert_eq!(last_y - marker_y, 4, "five visible composer rows");
+    assert_eq!(row_of(&rows, "seven"), marker_y + 3, "tail rows visible");
+    // Directed (TUI5 item 1): the last row is the trailing EMPTY line —
+    // its cursor is now a styled cell (gold ground over a space) in the
+    // text column (pad 2 + gutter 2), not a `▮` glyph to grep for.
+    let theme = model.theme.theme();
+    let buffer = terminal.backend().buffer();
+    assert_eq!(
+        buffer[(4, marker_y + 4)].bg,
+        Color::from(theme.gold),
+        "cursor cell on the fifth visible row"
+    );
 }
 
 #[test]
@@ -371,11 +385,21 @@ fn overlong_composer_line_keeps_the_cursor_visible() {
     for c in "TAIL".chars() {
         model.handle(key(KeyCode::Char(c)));
     }
-    let (rows, _, _) = draw(&model, 90, 34);
-    let composer_y = row_of(&rows, "TAIL▮");
+    // Directed (TUI5 item 1): the cursor row is found by its tail text;
+    // the caret itself is a styled cell directly after it.
+    let (rows, _, terminal) = draw(&model, 90, 34);
+    let composer_y = row_of(&rows, "TAIL");
     assert!(
         rows[composer_y as usize].contains('…'),
         "horizontal tail-window marker present"
+    );
+    let theme = model.theme.theme();
+    let buffer = terminal.backend().buffer();
+    let tail_x = col_of(&rows[composer_y as usize], "TAIL");
+    assert_eq!(
+        buffer[(tail_x + 4, composer_y)].bg,
+        Color::from(theme.gold),
+        "cursor cell right after the visible tail"
     );
 }
 
@@ -417,9 +441,21 @@ fn tiny_frame_keeps_a_three_line_composer_visible() {
         model.handle(key(KeyCode::Char(c)));
     }
     // Input-sacred at 90×10: all three composer rows stay on screen.
-    let (rows, _, _) = draw(&model, 90, 10);
+    // Directed (TUI5 item 1): "c▮" became the styled cursor cell after
+    // "c" — the row is located by geometry, the caret by cell style.
+    let (rows, _, terminal) = draw(&model, 90, 10);
     let first_y = row_of(&rows, "❯ a");
-    assert_eq!(row_of(&rows, "c▮"), first_y + 2, "composer rows intact");
+    assert!(
+        rows[(first_y + 2) as usize].starts_with("    c"),
+        "composer rows intact"
+    );
+    let theme = model.theme.theme();
+    let buffer = terminal.backend().buffer();
+    assert_eq!(
+        buffer[(5, first_y + 2)].bg,
+        Color::from(theme.gold),
+        "cursor cell after the third row's text"
+    );
 }
 
 // ---- P2-6 / r3 P2-2: render is the single scroll authority ----

@@ -223,9 +223,18 @@ fn ghost_completes_the_highlighted_row_inline() {
     assert_eq!(model.ghost().as_deref(), Some("heme"));
     let theme = model.theme.theme();
     let (rows, _, terminal) = draw(&model, 118, 34);
-    let composer_y = row_of(&rows, "❯ /t▮heme");
+    // Directed (TUI5 item 1): the ▮ between text and ghost became the
+    // cursor CELL — a styled space — so the needle carries a space and
+    // the cell's ground is asserted below.
+    let composer_y = row_of(&rows, "❯ /t heme");
     assert!(rows[composer_y as usize].contains("⇥ tab"), "tab tag");
     let buffer = terminal.backend().buffer();
+    let cursor_x = col_of(&rows[composer_y as usize], " heme");
+    assert_eq!(
+        buffer[(cursor_x, composer_y)].bg,
+        Color::from(theme.gold),
+        "cursor cell sits between the typed text and the ghost"
+    );
     let ghost_x = col_of(&rows[composer_y as usize], "heme");
     assert_eq!(buffer[(ghost_x, composer_y)].fg, Color::from(theme.dim));
     let tab_x = col_of(&rows[composer_y as usize], "⇥");

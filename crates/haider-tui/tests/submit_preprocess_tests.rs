@@ -260,7 +260,9 @@ fn queue_panel_renders_between_todos_and_composer_with_the_verbatim_header() {
     assert!(rows[panel_row + 2].contains("2. second queued message"));
     let composer_row = rows
         .iter()
-        .position(|row| row.contains("❯ ▮"))
+        // Directed (TUI5 item 1): the empty composer's appended ▮ became a styled
+        // CELL over a space — "❯  " (sigil + cursor cell) is the signature now.
+        .position(|row| row.contains("❯  "))
         .expect("composer");
     assert!(panel_row < composer_row, "panel sits above the composer");
     // Singular header.
@@ -296,7 +298,9 @@ fn queue_panel_joins_the_sacred_ledger_at_90x10() {
         "a 1-message panel fits the 90×10 budget"
     );
     assert!(
-        rows.iter().any(|row| row.contains("❯ ▮")),
+        // Directed (TUI5 item 1): the empty composer's appended ▮ became a styled
+        // CELL over a space — "❯  " (sigil + cursor cell) is the signature now.
+        rows.iter().any(|row| row.contains("❯  ")),
         "composer intact"
     );
     submit(&mut model, "second line");
@@ -306,7 +310,9 @@ fn queue_panel_joins_the_sacred_ledger_at_90x10() {
         "over budget the panel sheds WHOLE — never the composer"
     );
     assert!(
-        rows.iter().any(|row| row.contains("❯ ▮")),
+        // Directed (TUI5 item 1): the empty composer's appended ▮ became a styled
+        // CELL over a space — "❯  " (sigil + cursor cell) is the signature now.
+        rows.iter().any(|row| row.contains("❯  ")),
         "composer intact"
     );
     // With a pinned plan competing, todos yield FIRST (shed order:

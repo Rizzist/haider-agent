@@ -735,7 +735,9 @@ async fn subtree_sheds_after_todos_but_before_the_composer_at_90x10() {
         "panel fits"
     );
     assert!(
-        rows.iter().any(|row| row.contains("❯ ▮")),
+        // Directed (TUI5 item 1): the empty composer's appended ▮ became a styled
+        // CELL over a space — "❯  " (sigil + cursor cell) is the signature now.
+        rows.iter().any(|row| row.contains("❯  ")),
         "composer intact"
     );
     // With a TODOS panel competing, the todos shed and the SubTree holds —
@@ -763,7 +765,9 @@ async fn subtree_sheds_after_todos_but_before_the_composer_at_90x10() {
     );
     assert!(!rows.iter().any(|row| row.contains("▾ todos")));
     assert!(
-        rows.iter().any(|row| row.contains("❯ ▮")),
+        // Directed (TUI5 item 1): the empty composer's appended ▮ became a styled
+        // CELL over a space — "❯  " (sigil + cursor cell) is the signature now.
+        rows.iter().any(|row| row.contains("❯  ")),
         "composer intact"
     );
     // With a queue panel competing, the SUBTREE sheds first (the queue
@@ -774,7 +778,9 @@ async fn subtree_sheds_after_todos_but_before_the_composer_at_90x10() {
     assert!(rows.iter().any(|row| row.contains("⧗ queued — 1 message")));
     assert!(!rows.iter().any(|row| row.contains("▾ subagents")));
     assert!(
-        rows.iter().any(|row| row.contains("❯ ▮")),
+        // Directed (TUI5 item 1): the empty composer's appended ▮ became a styled
+        // CELL over a space — "❯  " (sigil + cursor cell) is the signature now.
+        rows.iter().any(|row| row.contains("❯  ")),
         "composer intact"
     );
 }

@@ -9,6 +9,7 @@ pub mod app;
 pub mod boot;
 pub mod clipboard;
 pub mod commands;
+pub mod composer;
 pub mod demo_store;
 pub mod format;
 pub mod mark;
