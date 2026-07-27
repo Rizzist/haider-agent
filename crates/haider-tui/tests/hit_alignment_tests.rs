@@ -5,7 +5,6 @@
 #![allow(clippy::expect_used)]
 
 use haider_protocol::EventPayload;
-use haider_protocol::state::HarnessStatus;
 use haider_tui::app::{AppEvent, AppModel, Hit, Screen};
 use haider_tui::mock::demo_script;
 use haider_tui::render::render;
@@ -15,6 +14,9 @@ use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier};
+
+mod common;
+use common::{key, launcher_model};
 
 fn draw(
     model: &AppModel,
@@ -37,10 +39,6 @@ fn draw(
         rows.push(line);
     }
     (rows, hits, terminal)
-}
-
-fn key(code: KeyCode) -> AppEvent {
-    AppEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))
 }
 
 /// The y-coordinate of the first rendered row containing `needle`.
@@ -72,14 +70,6 @@ fn rect_for(hits: &[(Rect, Hit)], hit: Hit) -> Rect {
         "duplicate hit regions for {hit:?}"
     );
     *rect
-}
-
-fn launcher_model() -> AppModel {
-    let mut model = AppModel::new();
-    model.handle(AppEvent::Envelope(Box::new(EventPayload::HarnessStatus(
-        HarnessStatus::Ready,
-    ))));
-    model
 }
 
 fn session_model() -> AppModel {
@@ -394,12 +384,27 @@ fn launcher_composer_is_bottom_anchored_with_the_gold_rule() {
         rows.iter()
             .any(|row| row.contains("dir ~/dev/enterprise-suite · mesh off"))
     );
-    // Sample metadata carries turns (sim row meta); the tail ellipsizes
-    // into the width instead of clipping mid-frame.
-    assert!(rows.iter().any(|row| row.contains("2 turns")));
+    // Sample metadata carries the blurb and branch count; TUI4 item 5 caps
+    // the column at 70 cells, so the tail ellipsizes INTO the column rather
+    // than running the frame's full width.
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("“Stripe webhooks + invoice backfill”"))
+    );
+    for needle in ["billing-service", "◉ Aura", "recent sessions"] {
+        let row = rows
+            .iter()
+            .find(|row| row.contains(needle))
+            .expect("column row");
+        let start = row.chars().take_while(|c| *c == ' ').count();
+        assert!(
+            row.trim_end().chars().count().saturating_sub(start) <= 70,
+            "{needle:?} exceeds the capped column"
+        );
+    }
     let (wide_rows, _, _) = draw(&model, 170, 34);
     assert!(
-        wide_rows.iter().any(|row| row.contains("gpt-5.6")),
+        wide_rows.iter().any(|row| row.contains("billing-service")),
         "full meta (model · device · ago) appears when the width allows"
     );
 }

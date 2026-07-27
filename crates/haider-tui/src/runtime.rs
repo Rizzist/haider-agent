@@ -8,7 +8,7 @@ use crate::mock::demo_script;
 use crate::render::render;
 use crate::script::{
     AUTO_TITLE_MS, Beat, COMPACT_IDLE_GAP_MS, DemoEvent, TALK_HOLD_MS, compaction_beats,
-    from_legacy, respond_preamble, title_note,
+    respond_preamble, title_note,
 };
 use crate::theme::{Rgb, ThemeKey};
 use haider_protocol::EventPayload;
@@ -187,8 +187,18 @@ pub fn demo_pace(payload: &EventPayload) -> Duration {
 }
 
 /// Run `haider tui --demo`: the scripted stream drives every surface.
-/// Returns when the user quits (Ctrl+C) or input closes.
-pub async fn run_demo(mut model: AppModel) -> std::io::Result<()> {
+/// Returns when the user quits (⌃C from the launcher or boot — elsewhere
+/// ⌃C is navigation back to the launcher, owner item 10) or input closes.
+///
+/// `store` is the DEMO persistence file (TUI4c-13b — see
+/// [`crate::demo_store`]): the loop saves after every drawn frame (the
+/// coalesced form of the sim's save-on-every-change), once more on quit,
+/// and intercepts `/reset`'s purge request. `None` disables persistence
+/// (the headless/plain paths and CI stay deterministic).
+pub async fn run_demo(
+    mut model: AppModel,
+    mut store: Option<crate::demo_store::DemoStore>,
+) -> std::io::Result<()> {
     let _guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
     // Sync the emulator's own background (window padding) to the theme
@@ -219,15 +229,39 @@ pub async fn run_demo(mut model: AppModel) -> std::io::Result<()> {
     // The demo driver owns the generation-tagged envelope channel and the
     // script/decay timers — the SAME production seams the tests drive
     // (review r3 P3-7).
-    let (mut driver, mut envelope_rx) = DemoDriver::new(64);
+    // ONE honour roll (sim `rosterRef`, tui.js:681): the driver's chip
+    // claims post-increment the same counter the reducer's head claims do —
+    // and the persistence load's guard-3 restore covers both through it.
+    let (mut driver, mut envelope_rx) = DemoDriver::new(64, std::sync::Arc::clone(&model.roster));
+    // Meter continuity (sim: `branch.tokens` is persisted state the next
+    // turn adds to): every session's demo meter resumes from its restored
+    // (or seeded) usage total instead of resetting to zero on first beat.
+    for entry in &model.sessions {
+        if let Some(usage) = entry.projection.usage() {
+            driver.prime_meter(
+                entry.id,
+                usage.input.saturating_add(usage.cached),
+                usage.output.saturating_add(usage.reasoning),
+            );
+        }
+    }
     driver.spawn_boot();
     let answer_echo = driver.sender();
-    // Launcher auto-play: if untouched, the classic demo plays once.
-    let autoplay = tokio::time::sleep(Duration::from_secs(6));
-    tokio::pin!(autoplay);
+    // NB: no launcher auto-play. The sim has none — an untouched launcher
+    // simply waits (owner item 1: opening/idling must not start a sequence).
 
     let mut frame_tick = tokio::time::interval(Duration::from_millis(33));
     frame_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // The shared animation clock (TUI4d item 14): guarded exactly like the
+    // frame tick — while nothing on screen pulses the branch is disabled
+    // and the idle loop takes ZERO periodic wakeups (the efficiency law
+    // this port was once deferred over). When the last animated state
+    // ends the gate closes on the next loop pass — the clock stops within
+    // one phase — and no animator outlives any teardown because nothing
+    // is registered anywhere: no timer arm, no per-element state, just
+    // this guarded branch reading `AppModel::animated`.
+    let mut anim_tick = tokio::time::interval(Duration::from_millis(ANIM_PHASE_MS));
+    anim_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Fused: after the stream closes this branch is disabled — a closed
     // receiver must never spin the loop (review r1 P1).
     let mut stream_open = true;
@@ -240,9 +274,6 @@ pub async fn run_demo(mut model: AppModel) -> std::io::Result<()> {
                 Some(event) => dispatch_input(&mut model, &hit_map, event),
                 None => break,
             },
-            () = &mut autoplay, if !model.auto_play_spent => {
-                model.handle(AppEvent::AutoPlay);
-            }
             tagged = envelope_rx.recv(), if stream_open => match tagged {
                 Some((generation, event)) => {
                     driver.consume(&mut model, generation, event);
@@ -252,6 +283,14 @@ pub async fn run_demo(mut model: AppModel) -> std::io::Result<()> {
                     model.handle(AppEvent::StreamEnded);
                 }
             },
+            // The phase clock: a pure render-phase toggle — no projection
+            // mutation, no arms, no persistence (the store's snapshot
+            // never carries the phase, so the save-on-frame hash-skip
+            // stays quiet across ticks).
+            _ = anim_tick.tick(), if model.animated() => {
+                model.anim_phase = model.anim_phase.wrapping_add(1);
+                model.dirty = true;
+            }
             // Guarded tick: while the model is clean this branch is disabled,
             // so the idle loop takes NO periodic wakeups (efficiency rider
             // #10 — ~109k/hour otherwise). The first dirtying event re-arms
@@ -270,12 +309,44 @@ pub async fn run_demo(mut model: AppModel) -> std::io::Result<()> {
                 {
                     model.hovered = None;
                 }
+                // Demo persistence (TUI4c-13b): a drawn frame means state
+                // changed — save here, coalesced to the frame cadence
+                // (hash-skipped when nothing persisted moved). This is the
+                // sim's save-on-every-change without a timer or an arm.
+                if let Some(store) = store.as_mut() {
+                    store.save(&model);
+                }
             }
         }
         // Reducer-requested side effects.
         let requests: Vec<AppRequest> = model.requests.drain(..).collect();
         for request in requests {
-            driver.handle_request(&mut model, request);
+            match request {
+                // Runtime-owned: copying reads a RENDERED frame. NB — the
+                // live terminal's `current_buffer_mut()` is the SWAPPED,
+                // reset next-frame buffer after a draw, so the text is
+                // re-rendered into a scratch buffer at the live size
+                // through the same pure `render` the screen and the tests
+                // use; the selection RANGE and model are current.
+                AppRequest::CopySelection => {
+                    if let Some(selection) = model.selection {
+                        let size = terminal.size()?;
+                        let text = rendered_selection_text(&model, size, &selection);
+                        copy_selection_effects(&mut model, &text);
+                    }
+                }
+                // Runtime-owned like CopySelection: only this loop knows
+                // the store path. /reset deletes the demo state file (sim
+                // tui.js:1918); the reducer already reseeded, and the next
+                // frame's save rewrites the seeds exactly as the sim's save
+                // effect refills localStorage after removeItem.
+                AppRequest::PurgeDemoStore => {
+                    if let Some(store) = store.as_mut() {
+                        store.purge();
+                    }
+                }
+                request => driver.handle_request(&mut model, request),
+            }
         }
         // Theme cycled: re-sync the emulator background.
         if model.theme != active_theme {
@@ -311,11 +382,22 @@ pub async fn run_demo(mut model: AppModel) -> std::io::Result<()> {
             }
         }
     }
+    // The quit-path write (13b brief): mutations between the last drawn
+    // frame and the exit still land on disk.
+    if let Some(store) = store.as_mut() {
+        store.save(&model);
+    }
     Ok(())
 }
 
 /// The sim's idle(i) decay window (tui.js:1562: 30s of nothing).
 pub const IDLE_DECAY: Duration = Duration::from_secs(30);
+
+/// TUI4d item 14 — one phase of the shared animation clock. The sim runs
+/// per-element CSS periods (1.1-1.5 s pulses, a 1.8 s rail shimmer); the
+/// port folds them onto ONE clock: 600 ms per phase gives a 1.2 s pulse
+/// (two phases) and, via `% 3`, the shimmer's 1.8 s exactly.
+pub const ANIM_PHASE_MS: u64 = 600;
 
 /// One terminal input event through the production dispatch — key/paste
 /// into the reducer, resize into [`AppModel::handle_resize`], mouse through
@@ -345,13 +427,60 @@ pub fn dispatch_input(
                     .map(|(_, action)| action.clone())
             };
             match mouse.kind {
+                // Owner item 9: Down is only a POTENTIAL anchor — the click
+                // dispatches on Up, because only Up knows whether the press
+                // was a click or a drag-selection. A previous selection's
+                // highlight clears here (the clearing law's click half).
                 MouseEventKind::Down(MouseButton::Left) => {
-                    if let Some(action) = hit_at(mouse.column, mouse.row) {
+                    if model.selection.take().is_some() {
+                        model.dirty = true;
+                    }
+                    model.mouse_down = Some((mouse.column, mouse.row));
+                }
+                // Movement with the button held: meaningful movement (a
+                // different cell than the anchor) enters selection mode
+                // with a live linear highlight; same-cell jitter is not a
+                // drag. Once selecting, every head change redraws.
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    if let Some(anchor) = model.mouse_down {
+                        let head = (mouse.column, mouse.row);
+                        match &mut model.selection {
+                            Some(selection) if selection.head != head => {
+                                selection.head = head;
+                                model.dirty = true;
+                            }
+                            None if head != anchor => {
+                                model.selection = Some(crate::select::Selection {
+                                    anchor,
+                                    head,
+                                    dragging: true,
+                                });
+                                model.dirty = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                // Up resolves the press: a selection auto-copies (the
+                // runtime extracts from its last frame on the request) and
+                // SUPPRESSES the click-hit; a plain click dispatches from
+                // the Down coordinates exactly as before.
+                MouseEventKind::Up(MouseButton::Left) => {
+                    let down = model.mouse_down.take();
+                    if let Some(selection) = &mut model.selection {
+                        selection.dragging = false;
+                        model.requests.push(crate::app::AppRequest::CopySelection);
+                        model.dirty = true;
+                    } else if let Some((column, row)) = down
+                        && let Some(action) = hit_at(column, row)
+                    {
                         model.handle_hit(action);
                     }
                 }
                 // Hover (owner ask, TUI3a item 6): motion events flood —
-                // handle_hover only dirties when the target CHANGES.
+                // handle_hover only dirties when the target CHANGES. While
+                // a button is held the terminal reports Drag, never Moved,
+                // so hover is naturally unchanged during a selection.
                 MouseEventKind::Moved => {
                     model.handle_hover(hit_at(mouse.column, mouse.row));
                 }
@@ -388,17 +517,22 @@ pub const CONTROL_ARM: u64 = 0;
 /// Who owns a spawned arm — the surface whose teardown cancels it.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum ArmOwner {
-    /// The attached session's turn engine: interrupt and fresh-session
-    /// cancel it (sim per-session `runTokensRef`, tui.js:1551-1567).
-    Session,
+    /// One session's turn engine, keyed by SESSION ID (TUI4c: the sim's
+    /// per-session `runTokensRef`, tui.js:1551-1567 — an interrupt cancels
+    /// only ITS session's turn; other sessions' turns keep running in the
+    /// background). Id 0 is the surface/scratch lineage (boot, pre-map
+    /// tests) and routes to the model's live fields.
+    Session(u64),
     /// One subagent chip's script. Its own close/removal cancels it, and a
     /// fresh session cancels every chip — but a session INTERRUPT does
     /// NOT: the sim's `interrupt` touches only the run token, the queue and
     /// the note (tui.js:1551-1567), so children outlive their parent's
     /// cancelled turn. Because the chip's PARKED arms survive with them,
     /// answering such a child's card still resolves cleanly — that is what
-    /// closes the review's "permanently blocked chip" hole.
-    Chip(String),
+    /// closes the review's "permanently blocked chip" hole. Carries the
+    /// owning SESSION's id so background chip events route to their
+    /// session's tree.
+    Chip { session: u64, agent: String },
     /// An aura orchestrate run or its talk timer. The next submit cancels
     /// the previous run (sim `++auraRunRef`, tui.js:2060) and `/reset`
     /// cancels it outright; `/clear`, a session interrupt, and a fresh
@@ -407,7 +541,22 @@ pub enum ArmOwner {
     Aura,
 }
 
+impl ArmOwner {
+    /// The session this arm belongs to (`None` for aura arms).
+    const fn session_id(&self) -> Option<u64> {
+        match self {
+            Self::Session(sid) | Self::Chip { session: sid, .. } => Some(*sid),
+            Self::Aura => None,
+        }
+    }
+}
+
 type Counter = std::sync::Arc<std::sync::atomic::AtomicU64>;
+
+/// Per-session demo token meters, keyed by session id (TUI4c item 13a:
+/// the sim's `branch.tokens` is per-session; one global pair would bleed
+/// one session's turn into another's meter).
+type SessionMeters = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u64, (u64, u64)>>>;
 
 /// The live-arm table. A poisoned lock degrades to "nothing is live" — it
 /// can never resurrect cancelled work.
@@ -468,6 +617,20 @@ impl ArmTable {
                 .is_ok_and(|table| table.1.contains_key(&id))
     }
 
+    /// Any live arm belonging to `session` (its turn engine OR its chips).
+    /// The persistence port's stale-card gate: a session restored from disk
+    /// has NO arms until something runs in it, so an answer to one of its
+    /// hydrated cards has no live run to land on (the sim's missing menu
+    /// RESOLVER after reload, tui.js:870-876).
+    fn has_session_arms(&self, session: u64) -> bool {
+        self.inner.lock().is_ok_and(|table| {
+            table
+                .1
+                .values()
+                .any(|owner| owner.session_id() == Some(session))
+        })
+    }
+
     fn owner(&self, id: u64) -> Option<ArmOwner> {
         self.inner.lock().ok()?.1.get(&id).cloned()
     }
@@ -500,10 +663,9 @@ pub struct DemoDriver {
     generic_counter: Counter,
     /// Sim `rosterRef` (tui.js:681): starts at 3 (seed heads claim 0-2).
     roster_counter: Counter,
-    /// Demo token meter, input bucket (user text 9/unit + tools 2400).
-    tokens_input: Counter,
-    /// Demo token meter, output bucket (streamed words 9/unit).
-    tokens_output: Counter,
+    /// Demo token meters, PER SESSION (input bucket: user text 9/unit +
+    /// tools 2400; output bucket: streamed words 9/unit).
+    meters: SessionMeters,
     /// Menus a script parked on: menu id → (arm, owner, continuation arms).
     /// `MenuAnswered` at consume selects `arms[option_index]` (clamped) and
     /// plays it under a FRESH arm owned by the same surface; a cancelled
@@ -513,23 +675,26 @@ pub struct DemoDriver {
 }
 
 impl DemoDriver {
-    /// A driver plus the receiving end of its demo-event channel.
+    /// A driver plus the receiving end of its demo-event channel. `roster`
+    /// is the MODEL's claim counter (sim `rosterRef`, tui.js:681) — a
+    /// constructor argument on purpose (review TUI4.1, Fable D2-2): heads
+    /// (reducer claims) and chips (driver claims) draw from ONE honour
+    /// roll, and taking the counter here makes the split-brain
+    /// unrepresentable — there is no second counter to forget to replace.
     #[must_use]
-    pub fn new(capacity: usize) -> (Self, mpsc::Receiver<(u64, DemoEvent)>) {
+    pub fn new(capacity: usize, roster: Counter) -> (Self, mpsc::Receiver<(u64, DemoEvent)>) {
         let (tx, rx) = mpsc::channel(capacity);
-        let counter = || std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         (
             Self {
                 tx,
                 table: ArmTable::new(),
                 turn_counter: 0,
                 compact_counter: 0,
-                generic_counter: counter(),
-                roster_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
-                    crate::script::ROSTER_FIRST_CLAIM,
-                )),
-                tokens_input: counter(),
-                tokens_output: counter(),
+                generic_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                roster_counter: roster,
+                meters: std::sync::Arc::new(
+                    std::sync::Mutex::new(std::collections::HashMap::new()),
+                ),
                 pending_arms: std::sync::Arc::new(std::sync::Mutex::new(
                     std::collections::HashMap::new(),
                 )),
@@ -542,6 +707,16 @@ impl DemoDriver {
     #[must_use]
     pub const fn control_tag(&self) -> u64 {
         CONTROL_ARM
+    }
+
+    /// Prime one session's demo token meter (TUI4c-13b: the sim's
+    /// `branch.tokens` is persisted state the next turn ADDS to — without
+    /// priming, the first post-reload beat would reset the meter to its own
+    /// small delta).
+    pub fn prime_meter(&self, session: u64, input: u64, output: u64) {
+        if let Ok(mut meters) = self.meters.lock() {
+            meters.insert(session, (input, output));
+        }
     }
 
     /// True iff this arm is still registered (tests assert cancellation
@@ -563,19 +738,20 @@ impl DemoDriver {
     fn player(&self) -> Player {
         Player {
             tx: self.tx.clone(),
-            input: std::sync::Arc::clone(&self.tokens_input),
-            output: std::sync::Arc::clone(&self.tokens_output),
+            meters: std::sync::Arc::clone(&self.meters),
             parked: std::sync::Arc::clone(&self.pending_arms),
             table: self.table.clone(),
         }
     }
 
-    /// The demo token meter's current total (both buckets).
+    /// One session's demo token meter total (both buckets).
     #[must_use]
-    pub fn tokens_total(&self) -> u64 {
-        self.tokens_input
-            .load(std::sync::atomic::Ordering::SeqCst)
-            .saturating_add(self.tokens_output.load(std::sync::atomic::Ordering::SeqCst))
+    pub fn tokens_total(&self, session: u64) -> u64 {
+        self.meters
+            .lock()
+            .ok()
+            .and_then(|meters| meters.get(&session).copied())
+            .map_or(0, |(input, output)| input.saturating_add(output))
     }
 
     /// A clone of the tagged-event sender (the menu-answer echo seam).
@@ -609,9 +785,9 @@ impl DemoDriver {
         arm
     }
 
-    /// Play a session script (the turn engine's own arm).
-    pub fn play_beats(&self, beats: Vec<Beat>) -> u64 {
-        self.play_owned(beats, ArmOwner::Session)
+    /// Play a session script (the turn engine's own arm) for `session`.
+    pub fn play_beats(&self, beats: Vec<Beat>, session: u64) -> u64 {
+        self.play_owned(beats, ArmOwner::Session(session))
     }
 
     /// A timer that must land no matter what happens to the session (the
@@ -661,11 +837,14 @@ impl DemoDriver {
 
     /// Drain one reducer request — scripts play under an ArmTable arm id
     /// captured at spawn; stop/interrupt CANCEL the owning arms (Session,
-    /// and Chip only for StopScripts — see `ArmOwner`) so buffered
+    /// and Chip only for ResetAllSessions — see `ArmOwner`) so buffered
     /// envelopes AND pending timers of a cancelled arm drop at
     /// consumption, and an interrupt schedules the sim's 30s idle(i)
     /// decay (tui.js:1561-1564).
     pub fn handle_request(&mut self, model: &mut AppModel, request: AppRequest) {
+        // Requests are pushed by the reducer while its session is attached
+        // (or from the no-session scratch surface = 0).
+        let active = model.active_session.unwrap_or(0);
         match request {
             AppRequest::SubmitText { text, voice, title } => {
                 self.turn_counter += 1;
@@ -673,17 +852,20 @@ impl DemoDriver {
                 // advance — at DISPATCH, after the 750 ms think window, so
                 // an interrupt inside it skips no intro and burns no
                 // callsign (review P2-11, sim tui.js:1259).
-                self.play_beats(respond_preamble(
-                    &text,
-                    voice,
-                    haider_protocol::DeliveryMode::Steer,
-                    self.turn_counter,
-                ));
+                self.play_beats(
+                    respond_preamble(
+                        &text,
+                        voice,
+                        haider_protocol::DeliveryMode::Steer,
+                        self.turn_counter,
+                    ),
+                    active,
+                );
                 // Auto-title (sim tui.js:1219-1227): the micro-call names
                 // the session INSIDE the 1.5 s callback — the title and the
                 // note land together. It SURVIVES an interrupt (the sim's
                 // timeout is bare) and is voided only by a session
-                // replacement via the origin epoch (review r2 P2-6).
+                // replacement via the origin identity (review r2 P2-6).
                 if title {
                     // The sim's micro-call is a bare setTimeout: it lands
                     // even if the turn is interrupted (review r2 P2-6), so
@@ -692,28 +874,33 @@ impl DemoDriver {
                     self.spawn_control_timer(
                         Duration::from_millis(AUTO_TITLE_MS),
                         DemoEvent::AutoTitle {
-                            origin: model.session_epoch,
+                            // TUI4c: origin is the SESSION ID — the
+                            // callback looks the session up wherever it
+                            // now lives (attached or background) and does
+                            // nothing if it is gone, exactly the sim's
+                            // by-id lookup (tui.js:1219-1227).
+                            origin: active,
                             text,
                         },
                     );
                 }
             }
-            AppRequest::AttachSample(_) => {
-                self.turn_counter += 1;
-                self.play_beats(from_legacy(crate::mock::turn_script(self.turn_counter)));
-            }
-            AppRequest::StopScripts => {
-                // Session teardown (`/clear`, `/reset`, a fresh session):
-                // the session's arms and every chip's die with it. AURA
-                // DOES NOT — the sim's `/clear` leaves `auraRunRef` alone
-                // (tui.js:1950-1955); only `/reset` and the next
-                // orchestrate advance it, so a background orchestration
-                // finishes where the sim finishes it (review r2 P2-5).
-                self.cancel_arms(&|owner| matches!(owner, ArmOwner::Session | ArmOwner::Chip(_)));
-                self.tokens_input
-                    .store(0, std::sync::atomic::Ordering::SeqCst);
-                self.tokens_output
-                    .store(0, std::sync::atomic::Ordering::SeqCst);
+            AppRequest::ResetAllSessions => {
+                // GLOBAL session teardown (pushed only by fresh_session:
+                // the `/reset` arm and the scratch surface's fresh start —
+                // `/clear` no longer reaches here, it detaches instead):
+                // every session's arms and every chip's die, and all
+                // meters clear. AURA DOES NOT — the sim's `/clear` leaves
+                // `auraRunRef` alone (tui.js:1950-1955); only `/reset`
+                // and the next orchestrate advance it, so a background
+                // orchestration finishes where the sim finishes it
+                // (review r2 P2-5).
+                self.cancel_arms(&|owner| {
+                    matches!(owner, ArmOwner::Session(_) | ArmOwner::Chip { .. })
+                });
+                if let Ok(mut meters) = self.meters.lock() {
+                    meters.clear();
+                }
             }
             AppRequest::Interrupt => {
                 // Esc mid-turn cancels THIS session's turn (sim
@@ -724,10 +911,15 @@ impl DemoDriver {
                 // instead of blocking forever. AURA survives too: the sim's
                 // interrupt never advances `auraRunRef`, so a background
                 // orchestration finishes (review r2 P2-5 corrected r1 here).
-                self.cancel_arms(&|owner| matches!(owner, ArmOwner::Session));
+                // TUI4c: only THIS session's turn dies — a background
+                // session's running turn is untouchable from here (sim:
+                // `runTokensRef.current[sid]` bumps one key).
+                self.cancel_arms(
+                    &|owner| matches!(owner, ArmOwner::Session(sid) if *sid == active),
+                );
                 self.spawn_timer(
                     CONTROL_ARM,
-                    ArmOwner::Session,
+                    ArmOwner::Session(active),
                     IDLE_DECAY,
                     DemoEvent::Envelope(EventPayload::IdleDecayed),
                 );
@@ -735,10 +927,13 @@ impl DemoDriver {
             AppRequest::Compact => {
                 // Manual /compact (sim tui.js:1791-1806): before = current
                 // meter, after = 6% of the window — 1200 ms, then IDLE.
-                let before = self.tokens_total();
+                let before = self.tokens_total(active);
                 let after = model.identity.context_window * 6 / 100;
                 self.compact_counter += 1;
-                self.play_beats(compaction_beats(before, after, true, self.compact_counter));
+                self.play_beats(
+                    compaction_beats(before, after, true, self.compact_counter),
+                    active,
+                );
             }
             AppRequest::Talk => {
                 // ◉ talk hold (sim tui.js:2044-2054): 1300 ms of
@@ -750,7 +945,7 @@ impl DemoDriver {
                 // brand-new canned session).
                 self.spawn_timer(
                     CONTROL_ARM,
-                    ArmOwner::Session,
+                    ArmOwner::Session(active),
                     Duration::from_millis(TALK_HOLD_MS),
                     DemoEvent::TalkFire,
                 );
@@ -800,9 +995,15 @@ impl DemoDriver {
                         &self.roster_counter,
                     )
                 };
-                self.play_owned(beats, ArmOwner::Chip(agent));
+                self.play_owned(
+                    beats,
+                    ArmOwner::Chip {
+                        session: active,
+                        agent,
+                    },
+                );
             }
-            AppRequest::ChipClose { agent } => self.close_chip(model, &agent),
+            AppRequest::ChipClose { agent } => self.close_chip(model, active, &agent),
             AppRequest::AuraSubmit { text, voice: _ } => {
                 // Run REPLACEMENT is the other cancel point (sim `++auraRunRef`
                 // at the head of `orchestrate`, tui.js:2060).
@@ -851,6 +1052,12 @@ impl DemoDriver {
                 self.reset_aura_state(model);
             }
             AppRequest::Quit => model.should_quit = true,
+            // Runtime-owned (the event loop intercepts them before the
+            // driver): copying reads the rendered frame, and the store
+            // purge needs the state-file path — the driver has neither.
+            // Reaching here means a headless harness drained them through
+            // the driver — no-ops, never a panic.
+            AppRequest::CopySelection | AppRequest::PurgeDemoStore => {}
         }
     }
 
@@ -873,45 +1080,168 @@ impl DemoDriver {
     /// used to keep streaming into its own transcript), subtree included —
     /// a closed parent's children leave the tree with it. The removal timer
     /// is allocated AFTER the cancellation so it is not swept up by it.
-    fn close_chip(&mut self, model: &mut AppModel, agent: &str) {
-        let doomed = crate::app::find_chip(&model.chips, agent)
-            .map(|chip| {
-                let mut ids = vec![chip.agent.clone()];
-                ids.extend(
-                    crate::app::flatten_chips(&chip.children)
-                        .into_iter()
-                        .map(|(_, child)| child.agent.clone()),
-                );
-                ids
-            })
-            .unwrap_or_default();
-        let Some(was_live) = model.close_chip_state(agent) else {
-            return;
+    fn close_chip(&mut self, model: &mut AppModel, session: u64, agent: &str) {
+        let attached = model.active_session == Some(session)
+            || (session == 0 && model.active_session.is_none());
+        let doomed_of = |chips: &[crate::app::ChipModel]| {
+            crate::app::find_chip(chips, agent)
+                .map(|chip| {
+                    let mut ids = vec![chip.agent.clone()];
+                    ids.extend(
+                        crate::app::flatten_chips(&chip.children)
+                            .into_iter()
+                            .map(|(_, child)| child.agent.clone()),
+                    );
+                    ids
+                })
+                .unwrap_or_default()
+        };
+        let (doomed, was_live) = if attached {
+            let doomed = doomed_of(&model.chips);
+            let Some(was_live) = model.close_chip_state(agent) else {
+                return;
+            };
+            (doomed, was_live)
+        } else {
+            // Background close: same law against the session's slot — the
+            // attached surface's screen/view-path concerns do not apply.
+            let (doomed, closed) = match model.session_entry_mut(session) {
+                Some(entry) => {
+                    let doomed = doomed_of(&entry.chips);
+                    let closed =
+                        crate::app::close_chip_core(&mut entry.chips, &mut entry.projection, agent);
+                    (doomed, closed)
+                }
+                None => return,
+            };
+            let Some(was_live) = closed else {
+                return;
+            };
+            model.dirty = true;
+            (doomed, was_live)
         };
         self.cancel_arms(&|owner| match owner {
-            ArmOwner::Chip(id) => doomed.iter().any(|dead| dead == id),
+            ArmOwner::Chip { agent: id, .. } => doomed.iter().any(|dead| dead == id),
             _ => false,
         });
         self.spawn_timer(
             CONTROL_ARM,
-            ArmOwner::Chip(agent.to_owned()),
+            ArmOwner::Chip {
+                session,
+                agent: agent.to_owned(),
+            },
             Duration::from_millis(crate::script::CHIP_REMOVE_MS),
             DemoEvent::ChipRemove {
                 agent: agent.to_owned(),
             },
         );
         if was_live {
-            self.arm_auto_resume(CONTROL_ARM);
+            self.arm_auto_resume(CONTROL_ARM, session);
+        }
+    }
+
+    /// The §2.7 auto-resume guards + kick-off for `session` — attached or
+    /// background, ONE law: every child settled, the session idle (an
+    /// interrupted `⏸ IDLE (i)` is NOT overwritten), no resume in flight.
+    fn auto_resume_check(&mut self, model: &mut AppModel, session: u64) {
+        let attached = model.active_session == Some(session)
+            || (session == 0 && model.active_session.is_none());
+        let reports = if attached {
+            if crate::app::tree_live_count(&model.chips) != 0
+                || model.turn_active
+                || model.auto_resuming
+                || model.projection.badge() != "IDLE"
+            {
+                return;
+            }
+            model.auto_resuming = true;
+            model.turn_active = true;
+            model.dirty = true;
+            count_done_reports(&model.chips)
+        } else {
+            let Some(entry) = model.session_entry_mut(session) else {
+                return;
+            };
+            if entry.live() != 0
+                || entry.turn_active
+                || entry.auto_resuming
+                || entry.projection.badge() != "IDLE"
+            {
+                return;
+            }
+            entry.auto_resuming = true;
+            entry.turn_active = true;
+            let reports = count_done_reports(&entry.chips);
+            model.dirty = true;
+            reports
+        };
+        self.turn_counter += 1;
+        self.play_beats(
+            crate::script::auto_resume_beats(reports, self.turn_counter),
+            session,
+        );
+    }
+
+    /// Background event application (TUI4c): the state-mutating events go
+    /// through [`crate::session::SessionState::absorb`]; the driver-owned
+    /// ones (dispatch, turn end, close lifecycle, auto-resume) run their
+    /// usual logic against the owning session's slot.
+    fn consume_background(
+        &mut self,
+        model: &mut AppModel,
+        session: u64,
+        generation: u64,
+        event: DemoEvent,
+    ) {
+        match event {
+            DemoEvent::Envelope(payload) => {
+                // Script self-answers resume their parked continuations in
+                // the background exactly as they would attached.
+                if let EventPayload::MenuAnswered(answer) = &payload {
+                    self.resume_parked(answer);
+                }
+                if let Some(entry) = model.session_entry_mut(session) {
+                    entry.absorb(DemoEvent::Envelope(payload));
+                    model.dirty = true;
+                }
+            }
+            DemoEvent::Dispatch { text, voice, turn } => {
+                let beats = crate::script::respond_branch(
+                    &text,
+                    voice,
+                    turn,
+                    &self.generic_counter,
+                    &self.roster_counter,
+                );
+                if let Some(arm) = self
+                    .table
+                    .alloc_child(generation, ArmOwner::Session(session))
+                {
+                    self.player().spawn(beats, arm);
+                }
+            }
+            DemoEvent::TurnEnd => self.finish_turn(model, session),
+            DemoEvent::ChipCloseReq { agent } => self.close_chip(model, session, &agent),
+            DemoEvent::AutoResume => self.auto_resume_check(model, session),
+            // TalkFire's hold cannot survive a detach (`listening` clears
+            // on leave), and aura events never carry a session — both fall
+            // through absorb's no-op arm if they ever land here.
+            other => {
+                if let Some(entry) = model.session_entry_mut(session) {
+                    entry.absorb(other);
+                    model.dirty = true;
+                }
+            }
         }
     }
 
     /// Spawn the 120 ms autoResumeParent defer (§2.7). It resumes the
     /// SESSION's parked turn, so the arm is session-owned: an interrupt
     /// drops it, and the §2.7 guards re-check the world at consumption.
-    fn arm_auto_resume(&self, parent: u64) {
+    fn arm_auto_resume(&self, parent: u64, session: u64) {
         self.spawn_timer(
             parent,
-            ArmOwner::Session,
+            ArmOwner::Session(session),
             Duration::from_millis(crate::script::AUTO_RESUME_DEFER_MS),
             DemoEvent::AutoResume,
         );
@@ -923,6 +1253,28 @@ impl DemoDriver {
     pub fn consume(&mut self, model: &mut AppModel, generation: u64, event: DemoEvent) {
         if !self.table.is_live(generation) {
             return;
+        }
+        // TUI4c background routing: an arm owned by a session that is NOT
+        // attached applies to that session's slot — never to the visible
+        // surface (item 12's law from the driver's side). Control-tagged
+        // and aura arms have no session and take the surface path; the
+        // by-id events (AutoTitle, Answer) do their own lookup there.
+        if let Some(sid) = self
+            .table
+            .owner(generation)
+            .and_then(|owner| owner.session_id())
+        {
+            if sid == 0 {
+                // Scratch-lineage arms (no session id) belong to the live
+                // fields ONLY while the surface is still the scratch — a
+                // later attached session must never receive their events.
+                if model.active_session.is_some() {
+                    return;
+                }
+            } else if model.active_session != Some(sid) {
+                self.consume_background(model, sid, generation, event);
+                return;
+            }
         }
         match event {
             DemoEvent::Envelope(payload) => {
@@ -937,13 +1289,28 @@ impl DemoDriver {
                 // a session the user has since replaced is dropped whole —
                 // it must not reconfigure the session that took its place,
                 // nor start that card's parked continuation.
-                if origin != model.session_epoch {
+                if origin != model.session_identity() {
                     return;
                 }
+                // TUI4c-13b: a card restored from disk has no parked
+                // continuation AND its session has no live arms (nothing
+                // has run in it since boot) — the port of the sim's missing
+                // menu RESOLVER after reload. Answering it closes the card
+                // and lands the sim's note verbatim (tui.js:874-876);
+                // sampled BEFORE resume_parked, though a parked entry
+                // implies a live arm anyway.
+                let stale = !self.table.has_session_arms(origin);
                 self.resume_parked(&answer);
                 model.handle(AppEvent::Envelope(Box::new(EventPayload::MenuAnswered(
                     answer,
                 ))));
+                if stale {
+                    model.projection.push_note(
+                        "· stale menu dismissed — no live run attached (answered after reload)"
+                            .to_owned(),
+                    );
+                    model.dirty = true;
+                }
             }
             DemoEvent::Dispatch { text, voice, turn } => {
                 // The sim picks its branch AFTER the think window
@@ -957,20 +1324,36 @@ impl DemoDriver {
                     &self.generic_counter,
                     &self.roster_counter,
                 );
-                if let Some(arm) = self.table.alloc_child(generation, ArmOwner::Session) {
+                let session = self
+                    .table
+                    .owner(generation)
+                    .and_then(|owner| owner.session_id())
+                    .unwrap_or(0);
+                if let Some(arm) = self
+                    .table
+                    .alloc_child(generation, ArmOwner::Session(session))
+                {
                     self.player().spawn(beats, arm);
                 }
             }
             DemoEvent::AutoTitle { origin, text } => {
-                // Sim tui.js:1219-1227: the callback itself looks the
-                // session up and checks it is still untitled, then sets the
-                // blurb and pushes the note. It is NOT cancelled by an
-                // interrupt (review r2 P2-6) — only a session REPLACEMENT
-                // makes it irrelevant, which `origin` detects.
-                if origin == model.session_epoch && model.session_title.is_none() {
-                    let blurb = crate::app::auto_blurb(&text);
-                    model.projection.push_note(title_note(&blurb));
-                    model.session_title = Some(blurb);
+                // Sim tui.js:1219-1227: the callback looks the session up
+                // BY ID wherever it now lives — attached or background —
+                // and does nothing if it is gone (cleared/reset) or
+                // already titled. It is NOT cancelled by an interrupt
+                // (review r2 P2-6).
+                let blurb = crate::app::auto_blurb(&text);
+                if origin == model.session_identity() {
+                    if model.session_title.is_none() {
+                        model.projection.push_note(title_note(&blurb));
+                        model.session_title = Some(blurb);
+                        model.dirty = true;
+                    }
+                } else if let Some(entry) = model.session_entry_mut(origin)
+                    && entry.title.is_none()
+                {
+                    entry.projection.push_note(title_note(&blurb));
+                    entry.title = Some(blurb);
                     model.dirty = true;
                 }
             }
@@ -982,7 +1365,10 @@ impl DemoDriver {
                 model.projection.set_voice_live(on);
                 model.dirty = true;
             }
-            DemoEvent::TurnEnd => self.finish_turn(model),
+            DemoEvent::TurnEnd => {
+                let active = model.active_session.unwrap_or(0);
+                self.finish_turn(model, active);
+            }
             DemoEvent::TalkFire => model.talk_fire(),
             // ---- Chip events (§2) ----
             DemoEvent::ChipAdd(seed) => {
@@ -1059,7 +1445,10 @@ impl DemoDriver {
                     model.dirty = true;
                 }
             }
-            DemoEvent::ChipCloseReq { agent } => self.close_chip(model, &agent),
+            DemoEvent::ChipCloseReq { agent } => {
+                let active = model.active_session.unwrap_or(0);
+                self.close_chip(model, active, &agent);
+            }
             DemoEvent::ChipRemove { agent } => {
                 if crate::app::remove_chip(&mut model.chips, &agent) {
                     if model.view_path.contains(&agent) {
@@ -1072,22 +1461,8 @@ impl DemoDriver {
                 }
             }
             DemoEvent::AutoResume => {
-                // §2.7 guards: every child settled, the session idle (an
-                // interrupted session is NOT overwritten — its badge is
-                // `⏸ IDLE (i)`, not `IDLE`), no resume already in flight.
-                let idle = model.projection.badge() == "IDLE";
-                if crate::app::tree_live_count(&model.chips) == 0
-                    && !model.turn_active
-                    && !model.auto_resuming
-                    && idle
-                {
-                    let reports = count_done_reports(&model.chips);
-                    model.auto_resuming = true;
-                    model.turn_active = true;
-                    model.dirty = true;
-                    self.turn_counter += 1;
-                    self.play_beats(crate::script::auto_resume_beats(reports, self.turn_counter));
-                }
+                let active = model.active_session.unwrap_or(0);
+                self.auto_resume_check(model, active);
             }
             // ---- Aura events (§3) ----
             DemoEvent::AuraState(state) => {
@@ -1146,10 +1521,29 @@ impl DemoDriver {
     /// queued input consumes directly — the session never passes through
     /// idle; else IDLE, then (review P2-13) the sim's own transient
     /// `IDLE → 30 ms → COMPACTING` transition when the window is hot.
-    pub fn finish_turn(&mut self, model: &mut AppModel) {
-        if !model.msg_queue.is_empty() {
-            let text = model.msg_queue.remove(0);
-            model.dirty = true;
+    pub fn finish_turn(&mut self, model: &mut AppModel, session: u64) {
+        // The end-of-turn law runs for the OWNING session — attached, or a
+        // background slot whose queue consumes just the same (the sim's
+        // finishTurn is per-session, tui.js:1507-1543).
+        let attached = model.active_session == Some(session)
+            || (session == 0 && model.active_session.is_none());
+        let queued = if attached {
+            if model.msg_queue.is_empty() {
+                None
+            } else {
+                model.dirty = true;
+                Some(model.msg_queue.remove(0))
+            }
+        } else {
+            model.session_entry_mut(session).and_then(|entry| {
+                if entry.msg_queue.is_empty() {
+                    None
+                } else {
+                    Some(entry.msg_queue.remove(0))
+                }
+            })
+        };
+        if let Some(text) = queued {
             self.turn_counter += 1;
             let mut beats = vec![Beat::Note(
                 "· turn ended with queued input — consuming it directly, no idle".to_owned(),
@@ -1160,13 +1554,13 @@ impl DemoDriver {
                 haider_protocol::DeliveryMode::Queue,
                 self.turn_counter,
             ));
-            self.play_beats(beats);
+            self.play_beats(beats, session);
             return;
         }
         // `hot` is sampled BEFORE the 30 ms window, exactly as the sim
         // samples `b.tokens` before its `await sleep(30)` (tui.js:1510-1518).
         let window = model.identity.context_window;
-        let total = self.tokens_total();
+        let total = self.tokens_total(session);
         let mut beats = vec![Beat::Emit(EventPayload::RunState(RunState::Done))];
         if window > 0 && total.saturating_mul(100) >= window.saturating_mul(85) {
             beats.push(Beat::Sleep(COMPACT_IDLE_GAP_MS));
@@ -1178,7 +1572,7 @@ impl DemoDriver {
                 self.compact_counter,
             ));
         }
-        self.play_beats(beats);
+        self.play_beats(beats, session);
     }
 }
 
@@ -1199,8 +1593,7 @@ fn count_done_reports(chips: &[crate::app::ChipModel]) -> usize {
 #[derive(Clone)]
 struct Player {
     tx: mpsc::Sender<(u64, DemoEvent)>,
-    input: Counter,
-    output: Counter,
+    meters: SessionMeters,
     parked: PendingArms,
     table: ArmTable,
 }
@@ -1215,13 +1608,29 @@ impl Player {
         tokio::spawn(future);
     }
 
+    /// Mutate one session's token meter and return its new totals.
+    fn meter(&self, session: u64, apply: impl FnOnce(&mut (u64, u64))) -> (u64, u64) {
+        let Ok(mut meters) = self.meters.lock() else {
+            return (0, 0);
+        };
+        let entry = meters.entry(session).or_insert((0, 0));
+        apply(entry);
+        *entry
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn run(&self, beats: Vec<Beat>, arm: u64) {
-        use std::sync::atomic::Ordering::SeqCst;
-        let usage_event = |player: &Self| {
+        // Every token beat lands in the OWNING session's meter (TUI4c —
+        // one global pair would bleed concurrent sessions together).
+        let session = self
+            .table
+            .owner(arm)
+            .and_then(|owner| owner.session_id())
+            .unwrap_or(0);
+        let usage_event = |(input, output): (u64, u64)| {
             DemoEvent::Envelope(EventPayload::Usage(Usage {
-                input: player.input.load(SeqCst),
-                output: player.output.load(SeqCst),
+                input,
+                output,
                 reasoning: 0,
                 cached: 0,
                 source: UsageSource::Estimated,
@@ -1241,17 +1650,18 @@ impl Player {
                 Beat::Note(text) => DemoEvent::Note(text),
                 Beat::Voice(on) => DemoEvent::Voice(on),
                 Beat::Tokens { n, output } => {
-                    if output {
-                        self.output.fetch_add(n, SeqCst);
-                    } else {
-                        self.input.fetch_add(n, SeqCst);
-                    }
-                    usage_event(self)
+                    let totals = self.meter(session, |(input_b, output_b)| {
+                        if output {
+                            *output_b = output_b.saturating_add(n);
+                        } else {
+                            *input_b = input_b.saturating_add(n);
+                        }
+                    });
+                    usage_event(totals)
                 }
                 Beat::TokensReset(n) => {
-                    self.input.store(n, SeqCst);
-                    self.output.store(0, SeqCst);
-                    usage_event(self)
+                    let totals = self.meter(session, |entry| *entry = (n, 0));
+                    usage_event(totals)
                 }
                 Beat::Dispatch { text, voice, turn } => {
                     // Park the branch choice for the driver: the counters
@@ -1259,7 +1669,7 @@ impl Player {
                     DemoEvent::Dispatch { text, voice, turn }
                 }
                 Beat::AwaitMenu { menu, arms } => {
-                    let owner = self.table.owner(arm).unwrap_or(ArmOwner::Session);
+                    let owner = self.table.owner(arm).unwrap_or(ArmOwner::Session(session));
                     if let Ok(mut pending) = self.parked.lock() {
                         pending.insert(menu.as_str().to_owned(), (arm, owner, arms));
                     }
@@ -1294,7 +1704,10 @@ impl Player {
                     // allocated against THIS arm under one lock — a
                     // teardown between the check and the spawn can no
                     // longer be adopted (review P1-1).
-                    if let Some(child) = self.table.alloc_child(arm, ArmOwner::Chip(agent)) {
+                    if let Some(child) = self
+                        .table
+                        .alloc_child(arm, ArmOwner::Chip { session, agent })
+                    {
                         self.spawn(beats, child);
                     }
                     continue;
@@ -1303,7 +1716,7 @@ impl Player {
                     // The 120 ms defer resumes the SESSION's parked turn,
                     // so its arm is session-owned; the §2.7 state guards
                     // are re-checked at consumption.
-                    if let Some(timer) = self.table.alloc_child(arm, ArmOwner::Session) {
+                    if let Some(timer) = self.table.alloc_child(arm, ArmOwner::Session(session)) {
                         let tx = self.tx.clone();
                         tokio::spawn(async move {
                             tokio::time::sleep(Duration::from_millis(
@@ -1348,6 +1761,50 @@ fn draw(
     let mut hits = Vec::new();
     terminal.draw(|frame| hits = render(model, frame))?;
     Ok(hits)
+}
+
+/// Render the model into a scratch buffer at the live terminal size and
+/// extract the selection's text — the copy path's ground truth. Uses the
+/// same pure [`render`] as the screen, so what copies is exactly what a
+/// redraw of THIS model state shows.
+#[must_use]
+pub fn rendered_selection_text(
+    model: &AppModel,
+    size: ratatui::layout::Size,
+    selection: &crate::select::Selection,
+) -> String {
+    let backend = ratatui::backend::TestBackend::new(size.width, size.height);
+    // TestBackend construction is infallible (uninhabited error type).
+    let Ok(mut scratch) = Terminal::new(backend);
+    if scratch.draw(|frame| drop(render(model, frame))).is_err() {
+        return String::new();
+    }
+    crate::select::selection_text(scratch.backend().buffer(), selection)
+}
+
+/// Auto-copy side effects for a finished selection (owner item 9), in the
+/// documented order: pbcopy (authoritative local clipboard), then OSC 52
+/// (best-effort mirror for remote/embedded terminals — always emitted, but
+/// unverifiable, so it never upgrades the flash: the flash reports the
+/// channel we can actually observe).
+fn copy_selection_effects(model: &mut AppModel, text: &str) {
+    let confirmed = crate::clipboard::copy_local(text);
+    let mut out = stdout();
+    let _ = out.write_all(crate::clipboard::osc52(text).as_bytes());
+    let _ = out.flush();
+    // Honest wording (review TUI4.1 P3-5): `· copied` only on a CONFIRMED
+    // local copy (pbcopy exit 0). Otherwise the OSC 52 mirror already
+    // went out — best-effort remains, and the flash says exactly that
+    // instead of claiming a copy nobody verified.
+    model.flash = Some(
+        if confirmed {
+            "· copied"
+        } else {
+            "· copy unconfirmed — sent via OSC 52 only"
+        }
+        .to_owned(),
+    );
+    model.dirty = true;
 }
 
 /// Run the demo headlessly: play the whole script through the model and

@@ -12,10 +12,11 @@ use haider_tui::render::render;
 use haider_tui::runtime::dispatch_input;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
-use ratatui::crossterm::event::{
-    Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind,
-};
+use ratatui::crossterm::event::{Event, KeyCode, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
+
+mod common;
+use common::key;
 
 fn draw(
     model: &AppModel,
@@ -38,10 +39,6 @@ fn draw(
         rows.push(line);
     }
     (rows, hits, terminal)
-}
-
-fn key(code: KeyCode) -> AppEvent {
-    AppEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))
 }
 
 fn wheel(up: bool) -> Event {

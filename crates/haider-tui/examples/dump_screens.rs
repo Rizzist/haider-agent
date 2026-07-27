@@ -48,6 +48,25 @@ fn main() {
         model.handle(AppEvent::Envelope(Box::new(payload.clone())));
     }
     dump(&model, "launcher");
+    // The capped column on a WIDE frame (owner item 5 — his screenshot was
+    // ~165 cols): the block keeps the sim's proportions instead of spanning.
+    dump_at(&model, "launcher @ 165×40 (wide — column capped)", 165, 40);
+    // The banner's dignity tiers: too narrow for the art → the one-line
+    // text mark; too short for the art → the banner yields FIRST, keeping
+    // the sanctum, the wordmark and the recent list.
+    dump_at(&model, "launcher @ 31×26 (text-mark tier)", 31, 26);
+    dump_at(
+        &model,
+        "launcher @ 118×29 (banner yields, head intact)",
+        118,
+        29,
+    );
+    dump_at(
+        &model,
+        "launcher @ 118×15 (deep shed — list and composer hold)",
+        118,
+        15,
+    );
     // Palette open.
     model.handle(AppEvent::Key(KeyEvent::new(
         KeyCode::Char('/'),
@@ -94,6 +113,28 @@ fn main() {
         model.handle(AppEvent::Envelope(Box::new(payload.clone())));
     }
     dump(&model, "session (end of demo)");
+    // The sticky origin band (TUI4b item 11): scrolled into history, the
+    // producing prompt pins at the transcript top with the barBg band and
+    // its bottom frame edge (colors live in the cell tests; the frame here
+    // shows placement). Warm-up draw first — the wheel clamps against the
+    // LAST frame's scroll range.
+    {
+        let backend = TestBackend::new(90, 14);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render(&model, frame);
+            })
+            .expect("draw");
+    }
+    model.handle_wheel(true);
+    dump_at(
+        &model,
+        "session + sticky origin band @ 90×14 (scrolled)",
+        90,
+        14,
+    );
+    model.scroll_back.set(0);
     // Session palette (session-only commands included) — the ghost
     // completion trails the cursor.
     for c in "/t".chars() {
@@ -195,6 +236,15 @@ fn main() {
     }
     dump(&todos_model, "session + todos pinned (dep chain)");
 
+    // Collapsed todos (owner item 7): the header is a button; the collapsed
+    // form summarises the item being worked.
+    todos_model.todos_collapsed = true;
+    dump(
+        &todos_model,
+        "session + todos collapsed (header summarises)",
+    );
+    todos_model.todos_collapsed = false;
+
     // The ⧗ queue panel between the todos and the composer.
     todos_model.queue_mode = true;
     todos_model
@@ -263,6 +313,16 @@ fn main() {
     shell_launcher.handle(AppEvent::Envelope(Box::new(ready.clone())));
     submit(&mut shell_launcher, "ls");
     dump(&shell_launcher, "launcher + shellout");
+
+    // TUI4c items 12+13a: a USER session left mid-turn — the launcher
+    // badge stays IDLE and the meter reads 0; the busy-ness lives in the
+    // row (gold ◉ + `running… ·` + the gold running count).
+    let mut left_running = AppModel::new();
+    left_running.handle(AppEvent::Envelope(Box::new(ready.clone())));
+    submit(&mut left_running, "migrate the billing store to sqlite");
+    left_running.requests.clear();
+    submit(&mut left_running, "/clear");
+    dump(&left_running, "launcher + user session left running");
 
     // ---- TUI3b commit 2: subagent chips (§2) + aura mode (§3) ----
     let mut sub_model = AppModel::new();
@@ -408,6 +468,12 @@ fn main() {
     sub_model.chips = vec![tests, docs, lint];
     dump(&sub_model, "session + SubTree panel (live chips)");
 
+    // The ✳ waiting line's needs-input tail (owner item 8b): a chip holding
+    // an amber ? is unfinished ON THE USER, and the line says so.
+    sub_model.chips[1].state = ChipDisplayState::InputRequired;
+    dump(&sub_model, "session + ✳ waiting line — 1 needs input");
+    sub_model.chips[1].state = ChipDisplayState::Error;
+
     // The subagent view: breadcrumb head, the chip's own transcript, and the
     // question card replacing ITS composer (the parent is never blocked).
     sub_model.screen = Screen::Subagent;
@@ -481,6 +547,7 @@ fn chip(
     ChipModel::from_seed(ChipSeed {
         agent: agent.to_owned(),
         parent: None,
+        ros: None,
         callsign: callsign.to_owned(),
         hon,
         full: full.to_owned(),

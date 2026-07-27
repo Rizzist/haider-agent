@@ -241,7 +241,7 @@ pub fn turn_script(turn: u64) -> Vec<EventPayload> {
 
 /// A launcher sample session row (sim seed parity — display data only until
 /// real sessions arrive with the daemon).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct SampleSession {
     pub name: &'static str,
     pub head: &'static str,
@@ -261,6 +261,9 @@ pub struct SampleSession {
     /// — the Rust port used to mark `cellular-pool-fix` busy instead
     /// (review P2-8). `sessionBusy` = `live > 0 || running`.
     pub live_subagents: usize,
+    /// The session's working dir (sim `session.dir`) — the header shows it
+    /// and `cd` retargets it from there.
+    pub dir: &'static str,
 }
 
 /// The sim's seeded credential list (tui.js:146-154): 7 accounts across 5
@@ -287,6 +290,7 @@ pub fn sample_sessions() -> Vec<SampleSession> {
     vec![
         SampleSession {
             name: "billing-service",
+            dir: "~/dev/diffforge/cloud",
             head: "Muhammad",
             honorific: "ﷺ",
             blurb: "Stripe webhooks + invoice backfill",
@@ -301,6 +305,7 @@ pub fn sample_sessions() -> Vec<SampleSession> {
         },
         SampleSession {
             name: "cellular-pool-fix",
+            dir: "~/dev/diffforge/cellular",
             head: "Fatima",
             honorific: "(a)",
             blurb: "Deploy-drain pool orphan hunt",
@@ -315,6 +320,7 @@ pub fn sample_sessions() -> Vec<SampleSession> {
         },
         SampleSession {
             name: "l1-remote-projects",
+            dir: "~/dev/diffforge/web",
             head: "Ali",
             honorific: "(a)",
             blurb: "L1 remote-projects contract read",
@@ -332,3 +338,186 @@ pub fn sample_sessions() -> Vec<SampleSession> {
 
 // The old `response_script` placeholder turn is gone: user-typed input now
 // runs the sim-verbatim respond() router (`crate::script::respond_beats`).
+
+/// One seeded transcript row of a sample session (sim `U`/`A`/`T`/`N`
+/// helpers, tui.js:469-472). Attaching a session REPLAYS these into its
+/// projection — it does not start a turn (sim `openSession`, tui.js:1606).
+#[derive(Debug, Clone, Copy)]
+pub enum SeedRow {
+    User(&'static str),
+    Agent(&'static str),
+    Tool {
+        name: &'static str,
+        desc: &'static str,
+        meta: &'static str,
+    },
+    Note(&'static str),
+}
+
+/// The sim's seeded transcripts, verbatim (tui.js:474-581). Indexed like
+/// [`sample_sessions`].
+#[must_use]
+pub fn sample_seed(index: usize) -> &'static [SeedRow] {
+    use SeedRow::{Agent, Note, Tool, User};
+    const BILLING: &[SeedRow] = &[
+        User("wire stripe webhooks into the billing service and backfill the missing invoices"),
+        Agent(
+            "Reading the billing module first — the webhook surface lives in cloud/src/billing/. I'll add the endpoint, verify signatures, then replay the missed events.",
+        ),
+        Tool {
+            name: "fs_search",
+            desc: "\"invoice.paid\" cloud/src/billing/**",
+            meta: "14 matches",
+        },
+        Tool {
+            name: "fs_patch",
+            desc: "cloud/src/billing/webhooks.rs",
+            meta: "+128 −12",
+        },
+        Tool {
+            name: "process_exec",
+            desc: "cargo test -p billing",
+            meta: "34 passed",
+        },
+        Agent(
+            "Webhook endpoint is in with signature verification and idempotent event handling. Backfill replays events since the last cursor against the new handler — 212 invoices restored.",
+        ),
+        Note("◇ checkpoint 7 committed"),
+        User("now add retry with idempotency keys on the outbound charge calls"),
+        Agent(
+            "Wrapping the charge client in a retry budget keyed by an idempotency header — replays can never double-charge.",
+        ),
+        Tool {
+            name: "fs_patch",
+            desc: "cloud/src/billing/charge.rs",
+            meta: "+64 −9",
+        },
+        Tool {
+            name: "process_exec",
+            desc: "cargo test -p billing retry",
+            meta: "9 passed",
+        },
+    ];
+    const CELLULAR: &[SeedRow] = &[
+        User("find why the cellular DB pool orphans connections after a deploy drain"),
+        Agent(
+            "Tracing the drain path. The pool guard is dropped before in-flight calls settle, so their connections never return to the pool.",
+        ),
+        Tool {
+            name: "fs_search",
+            desc: "pool.acquire cellular/src",
+            meta: "23 matches",
+        },
+        Tool {
+            name: "fs_read",
+            desc: "cellular/src/pbx/route.rs",
+            meta: "412 lines",
+        },
+        Agent(
+            "Fix direction: hold the guard until the call registry empties, then close. Want me to patch it?",
+        ),
+    ];
+    const L1: &[SeedRow] = &[
+        User("summarize the L1 remote-projects contract"),
+        Agent(
+            "L1 keeps remote project state as turn_diff hunks over a pinned base; the dark theme stays default and the light theme is opt-in per stored toggle.",
+        ),
+    ];
+    match index {
+        0 => BILLING,
+        1 => CELLULAR,
+        _ => L1,
+    }
+}
+
+/// The sim's seeded chip on `s-l1` (tui.js:556-572): `web-index`, claimed
+/// at roster index 15 (`Salman (r)`), still running — this is the launcher's
+/// one live row, and its background animation is part of the seed.
+#[must_use]
+pub fn sample_seed_chip(index: usize) -> Option<crate::script::ChipSeed> {
+    if index != 2 {
+        return None;
+    }
+    let name = crate::script::roster_at(15);
+    Some(crate::script::ChipSeed {
+        agent: "seed-l1-sub".to_owned(),
+        parent: None,
+        ros: Some(name.ros),
+        callsign: name.callsign,
+        hon: name.hon,
+        full: name.full,
+        name: "web-index".to_owned(),
+        model: "gpt-5.6".to_owned(),
+        device: "mac-studio".to_owned(),
+        state: crate::script::ChipDisplayState::Running,
+        tokens: 2100,
+        prefill: vec![
+            crate::script::ChipPrefill::Note(
+                "· delegated locally — indexing the web workspace".to_owned(),
+            ),
+            crate::script::ChipPrefill::Agent(
+                "Building the remote-projects index; I'll report once the hunks are pinned against the base."
+                    .to_owned(),
+            ),
+            crate::script::ChipPrefill::ToolOk {
+                name: "fs_search".to_owned(),
+                desc: "turn_diff hunks web/src/**".to_owned(),
+                meta: "312 matches".to_owned(),
+            },
+        ],
+    })
+}
+
+/// A unique item id for a seeded transcript row.
+#[must_use]
+pub fn seed_item_id(seq: u64) -> haider_protocol::ids::ItemId {
+    haider_protocol::ids::ItemId::new(format!("seed-{seq}"))
+}
+
+/// Materialize the three seed sessions as full [`SessionState`]s (sim
+/// seeds, tui.js:497-579) — ids 1-3, roster heads 0-2, seed transcripts
+/// applied verbatim, the L1 seed's live `web-index` chip attached, and the
+/// token meter Usage-seeded. `turns_offset` keeps each seed's advertised
+/// turn count while real turns still move the number.
+#[must_use]
+pub fn seed_session_states() -> Vec<crate::session::SessionState> {
+    sample_sessions()
+        .iter()
+        .enumerate()
+        .map(|(index, sample)| {
+            let mut entry =
+                crate::session::SessionState::neutral(u64::try_from(index).unwrap_or(0) + 1);
+            entry.name = Some(sample.name.to_owned());
+            entry.title = Some(sample.blurb.to_owned());
+            entry.head = (sample.head.to_owned(), sample.honorific.to_owned());
+            entry.head_ros = Some(u64::try_from(index).unwrap_or(0));
+            entry.dir = sample.dir.to_owned();
+            entry.model_short = sample.model.to_owned();
+            entry.device = sample.device.to_owned();
+            entry.ago = sample.ago.to_owned();
+            entry.branches = sample.branches;
+            for row in sample_seed(index) {
+                entry.projection.apply_seed_row(row);
+            }
+            entry
+                .projection
+                .apply(&haider_protocol::EventPayload::Usage(
+                    haider_protocol::provider::Usage {
+                        input: sample.tokens,
+                        output: 0,
+                        reasoning: 0,
+                        cached: 0,
+                        source: haider_protocol::provider::UsageSource::Estimated,
+                        account: None,
+                    },
+                ));
+            if let Some(seed) = sample_seed_chip(index) {
+                entry.chips.push(crate::app::ChipModel::from_seed(seed));
+            }
+            entry.turns_offset = sample
+                .turns
+                .saturating_sub(entry.projection.user_row_count());
+            entry
+        })
+        .collect()
+}

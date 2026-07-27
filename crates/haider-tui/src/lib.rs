@@ -7,8 +7,11 @@
 
 pub mod app;
 pub mod boot;
+pub mod clipboard;
 pub mod commands;
+pub mod demo_store;
 pub mod format;
+pub mod mark;
 pub mod mock;
 pub mod plain;
 pub mod projection;
@@ -16,6 +19,8 @@ pub mod render;
 pub mod runtime;
 pub mod sanctum;
 pub mod script;
+pub mod select;
+pub mod session;
 pub mod style;
 pub mod theme;
 

@@ -9,7 +9,6 @@ use haider_protocol::EventPayload;
 use haider_protocol::history::{TodoItem, TodoState};
 use haider_protocol::ids::ItemId;
 use haider_protocol::item::{ItemEvent, TurnItem};
-use haider_protocol::state::HarnessStatus;
 use haider_tui::app::{AppEvent, AppModel, AppRequest, Hit, Screen};
 use haider_tui::mock::demo_script;
 use haider_tui::render::render;
@@ -19,6 +18,9 @@ use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier};
+
+mod common;
+use common::{key, launcher_model};
 
 fn draw(
     model: &AppModel,
@@ -43,10 +45,6 @@ fn draw(
     (rows, hits, terminal)
 }
 
-fn key(code: KeyCode) -> AppEvent {
-    AppEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))
-}
-
 fn ctrl(c: char) -> AppEvent {
     AppEvent::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL))
 }
@@ -67,14 +65,6 @@ fn col_of(row: &str, needle: &str) -> u16 {
     u16::try_from(row[..byte].chars().count()).expect("col fits u16")
 }
 
-fn launcher_model() -> AppModel {
-    let mut model = AppModel::new();
-    model.handle(AppEvent::Envelope(Box::new(EventPayload::HarnessStatus(
-        HarnessStatus::Ready,
-    ))));
-    model
-}
-
 fn session_model() -> AppModel {
     let mut model = AppModel::new();
     for payload in demo_script() {
@@ -88,7 +78,11 @@ fn session_model() -> AppModel {
 #[test]
 fn esc_mid_turn_interrupts_and_stays_on_the_session() {
     let mut model = launcher_model();
-    model.handle(key(KeyCode::Char('1')));
+    // TUI4 item 1: attaching starts no turn — type to get a live one.
+    for c in "walk me through the harness".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Enter));
     assert!(model.turn_active);
     model.requests.clear();
     // The script's user message flips to the session view.
@@ -158,16 +152,27 @@ fn sticky_origin_line_pins_the_prompt_and_click_stays_at_it() {
         "sticky pins the producing prompt: {:?}",
         rows[sticky_y as usize]
     );
-    // Chrome per sim StickyLine (tui.js:4597-4623): near-opaque THEME
-    // ground (no bar tint), maroon bold sigil, bright text, no underline.
+    // Chrome per the sim's ACTUAL StickyLine CSS (tui.js:4597-4623 —
+    // TUI4b item 11, DIRECTED parity change): this test used to pin bare
+    // theme ground and "no underline", from a review round's misread. The
+    // CSS carries `background: ${bg}f0` + `border-bottom: 1px solid
+    // frame`; a cell cannot alpha-cover the row beneath, so per the owner
+    // the band takes the barBg tint, and the border-bottom ports as the
+    // frame-colored underline. Sigil: maroon bold, unchanged.
     let theme = model.theme.theme();
     let buffer = terminal.backend().buffer();
-    assert_eq!(buffer[(0, sticky_y)].bg, Color::from(theme.bg));
+    assert_eq!(buffer[(0, sticky_y)].bg, Color::from(theme.bar_bg));
+    assert!(
+        buffer[(0, sticky_y)]
+            .style()
+            .add_modifier
+            .contains(Modifier::UNDERLINED),
+        "the band's bottom frame edge"
+    );
     let sig_x = col_of(&rows[sticky_y as usize], "❯");
     let sig = &buffer[(sig_x, sticky_y)];
     assert_eq!(sig.fg, Color::from(theme.maroon));
     assert!(sig.modifier.contains(Modifier::BOLD));
-    assert!(!sig.modifier.contains(Modifier::UNDERLINED));
     // Click keeps the reader AT the prompt (sim jumpToSticky): the carried
     // scroll-back puts the prompt's first row at the viewport top.
     let (rect, hit) = hits
@@ -311,7 +316,11 @@ fn mid_turn_submit_flashes_and_echoes_a_note() {
     // the user row immediately plus the sim's steer note — typed text is
     // still never lost, now with the sim's real delivery semantics.
     let mut model = launcher_model();
-    model.handle(key(KeyCode::Char('1')));
+    // TUI4 item 1: attaching starts no turn — type to get a live one.
+    for c in "walk me through the harness".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Enter));
     assert!(model.turn_active);
     // The script's user message flips to the session view mid-turn.
     model.handle(AppEvent::Envelope(Box::new(EventPayload::UserMessage {

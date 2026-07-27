@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""TUI3b commit-2 probe: drive the REAL runtime through the subagent tree and
+the aura stage. Starts a two-subagent turn, waits for the chips + the amber ?
+question, then opens /aura, runs an orchestrate turn, and escapes back.
+GATES (review TUI4.1 P2-3): every surface paint the size can show, plus
+alt-screen balance, no panic, clean child exit on ⌃C ⌃C. Size-shed checks
+(chip glyphs / the amber question / the aura spawn log at short frames, the
+sticky band at tall frames where the turn fits) print SKIP explicitly —
+bypassed by design, never silently folded into a pass."""
+import os, re, signal, sys, time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import probelib
+
+cols, rows = int(sys.argv[1]), int(sys.argv[2])
+binary = sys.argv[3] if len(sys.argv) > 3 else "/usr/local/bin/haider"
+
+pid, fd = probelib.spawn(cols, rows, binary)
+sink = [b""]
+pump = probelib.make_pump(fd, sink)
+
+
+def mark():
+    return len(sink[0])
+
+
+def since(pre):
+    return sink[0][pre:].decode("utf-8", "replace")
+
+
+pump(4.5)  # boot -> launcher (cold-build tolerant)
+os.write(fd, b"use two subagents to split this work\r")
+pump(9.0)  # parent turn + both child scripts up to their cards
+sub_paint = since(0)
+# The tests chip is holding its amber ? — the parent turn is idle by now.
+pre = mark()
+# TUI4c: an idle esc now really DETACHES (the session checks into its
+# slot), so /aura is typed from the SESSION — entered that way, esc from
+# the aura returns to it (sim: exit goes back to where you came from).
+os.write(fd, b"/aura\r")
+pump(1.2)
+aura_paint = since(pre)
+os.write(fd, b"spin up billing on workstation and run its tests\r")
+pump(4.5)
+pre2 = mark()
+os.write(fd, b"\x1b")  # exit aura
+pump(0.8)
+final = since(pre2)
+# TUI4b item 11: wheel into history — the sticky origin band pins the
+# producing prompt on the barBg band (Desert Dawn barBg = rgb(237,225,207);
+# only the /help overlay shares that ground and /help is never opened
+# here). The band pins at sizes where the transcript actually overflows —
+# 90x10 is the pinning run; at tall frames the turn fits and no sticky is
+# BY DESIGN.
+pre4 = mark()
+for _ in range(10):
+    os.write(fd, b"\x1b[<64;40;8M")  # SGR mouse wheel-up
+    pump(0.08)
+pump(0.5)
+scrolled = since(pre4)
+# Force a full final repaint, refreshing `final` for the back-to-session
+# checks.
+pre3 = mark()
+probelib.set_size(fd, cols + 2, rows)
+os.kill(pid, signal.SIGWINCH)
+pump(1.5)
+final = since(pre3)
+try:
+    # TUI4b item 10: ctrl-C is NAVIGATION from a session (back to the
+    # launcher); only the second ctrl-C, now at the launcher, quits.
+    os.write(fd, b"\x03")
+    pump(0.4)
+    os.write(fd, b"\x03")
+except OSError:
+    pass
+probelib.drain_quiet(fd, sink)
+child_clean = probelib.reap(pid)
+out = sink[0]
+text = out.decode("utf-8", "replace")
+
+cups = re.findall(rb"\x1b\[(\d+);(\d+)H", out)
+max_row = max((int(r) for r, c in cups), default=0)
+print(
+    f"bytes={len(out)} alt_enter={out.count(b'\x1b[?1049h')} "
+    f"alt_leave={out.count(b'\x1b[?1049l')} max_row_addressed={max_row}"
+)
+# Which checks this SIZE can show: short frames shed the chip rows and the
+# activity column; tall frames fit the whole turn so no sticky band pins.
+tall = rows >= 30
+detail = "SKIP" if not tall else None
+sticky = "SKIP" if tall else None
+probelib.verdict(
+    "PTY_PROBE_SUB",
+    out,
+    child_clean,
+    [
+        ("subtree_header_painted", "subagents" in sub_paint),
+        ("chip_glyph_painted", detail or (("├─" in sub_paint) or ("└─" in sub_paint))),
+        ("amber_question_painted", detail or ("testcontainers" in sub_paint)),
+        ("aura_bar_painted", "AURA" in aura_paint),
+        ("aura_orb_painted", ("IDLE" in aura_paint) or ("THINKING" in aura_paint)),
+        ("aura_spawn_logged", detail or ("tests green" in text)),
+        # NB: the header's product/version are separate styled spans, so an
+        # SGR escape splits "haider v" — the session line's dim run is
+        # contiguous.
+        ("back_to_session", "branch main" in final),
+        ("final_has_subtree", "subagents" in final),
+        ("sticky_prompt_pinned", sticky or ("use two subagents" in scrolled)),
+        ("sticky_band_ground", sticky or ("48;2;237;225;207" in scrolled)),
+    ],
+)

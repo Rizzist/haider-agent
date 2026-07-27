@@ -5,7 +5,6 @@
 #![allow(clippy::expect_used)]
 
 use haider_protocol::EventPayload;
-use haider_protocol::state::HarnessStatus;
 use haider_tui::app::{AppEvent, AppModel, Hit};
 use haider_tui::mock::demo_script;
 use haider_tui::render::render;
@@ -13,11 +12,12 @@ use haider_tui::runtime::dispatch_input;
 use haider_tui::theme::{Rgb, ThemeKey};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
-use ratatui::crossterm::event::{
-    Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind,
-};
+use ratatui::crossterm::event::{Event, KeyCode, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier};
+
+mod common;
+use common::{key, launcher_model};
 
 fn draw(
     model: &AppModel,
@@ -40,10 +40,6 @@ fn draw(
         rows.push(line);
     }
     (rows, hits, terminal)
-}
-
-fn key(code: KeyCode) -> AppEvent {
-    AppEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))
 }
 
 fn moved(column: u16, row: u16) -> Event {
@@ -69,14 +65,6 @@ fn col_of(row: &str, needle: &str) -> u16 {
         .find(needle)
         .unwrap_or_else(|| panic!("column of {needle:?} not found in row {row:?}"));
     u16::try_from(row[..byte].chars().count()).expect("col fits u16")
-}
-
-fn launcher_model() -> AppModel {
-    let mut model = AppModel::new();
-    model.handle(AppEvent::Envelope(Box::new(EventPayload::HarnessStatus(
-        HarnessStatus::Ready,
-    ))));
-    model
 }
 
 fn session_model() -> AppModel {
@@ -141,7 +129,11 @@ fn composer_band_is_the_exact_sim_blend_in_all_three_themes() {
         // status row — no stray tinted rows bracket the band.
         assert_eq!(buffer[(0, composer_y - 1)].fg, Color::from(theme.gold));
         assert_eq!(buffer[(0, composer_y - 1)].bg, Color::from(theme.bg));
-        assert_eq!(buffer[(0, composer_y + 1)].bg, Color::from(theme.bg));
+        // TUI4 item 2: the row BELOW the composer is the band's padding row
+        // — the band is one complete panel, not a stripe behind the text —
+        // and the row after that is its closing frame rule on plain ground.
+        assert_eq!(buffer[(0, composer_y + 1)].bg, Color::from(rgb));
+        assert_eq!(buffer[(0, composer_y + 2)].bg, Color::from(theme.bg));
         let status_y = u16::try_from(rows.len() - 1).expect("status row");
         assert_eq!(
             buffer[(0, status_y)].bg,
@@ -209,7 +201,11 @@ fn launcher_recent_rows_share_one_left_column_without_digits() {
         let y = row_of(&rows, needle);
         let rule_row = &rows[(y - 1) as usize];
         let rule_x = col_of(rule_row, "─");
-        assert_eq!(rule_x, left, "aurarow rule spans the column");
+        // TUI4d item 14: every block row leads with the one-cell rail
+        // column (the sim's `.rail` sliver floats in the rows' left
+        // padding, tui.js:4370-4394), so the rule spans rail + text —
+        // one column to the left of the shared TEXT edge.
+        assert_eq!(rule_x, left - 1, "aurarow rule spans rail + text");
         assert_eq!(buffer[(rule_x, y - 1)].fg, Color::from(theme.frame));
     }
 }
@@ -221,8 +217,9 @@ fn launcher_typography_uses_exact_theme_inks() {
     let (rows, _, terminal) = draw(&model, 118, 34);
     let buffer = terminal.backend().buffer();
     // Mark: BOLD maroon (#7c2d12 on dawn).
-    let mark_y = row_of(&rows, "حيدر");
-    let mark_x = col_of(&rows[mark_y as usize], "حيدر");
+    // TUI4 item 4: the mark is half-block art at this width.
+    let mark_y = row_of(&rows, &haider_tui::mark::banner_rows()[2]);
+    let mark_x = col_of(&rows[mark_y as usize], "█");
     let mark = &buffer[(mark_x, mark_y)];
     assert_eq!(mark.fg, Color::Rgb(0x7c, 0x2d, 0x12));
     assert!(mark.modifier.contains(Modifier::BOLD));

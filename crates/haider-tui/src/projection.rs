@@ -149,6 +149,9 @@ pub struct SessionProjection {
     /// A voice turn is live: blocks started now render ` · ♪ speaking`
     /// (demo-local — set by the driver's Voice beats, never an envelope).
     voice_live: bool,
+    /// Per-projection counter minting unique ids for SEEDED rows, so two
+    /// sample sessions replayed in a row never collide on a closed item id.
+    seed_seq: u64,
     // Honesty counters — surfaced, never fatal.
     gap_seen: bool,
     orphan_deltas: u64,
@@ -160,6 +163,33 @@ impl SessionProjection {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Rebuild a projection from persisted display state (the demo store's
+    /// load — see `crate::demo_store`). Only what the sim persists comes
+    /// back: transcript rows, the open menu, the todo panel, the usage
+    /// meter and the idle(i) marker. Everything stream-scoped starts
+    /// fresh — `run`/`harness` are `None` (every session loads IDLE, sim
+    /// load §6), `voice_live` is off, and the idempotency bookkeeping
+    /// (`finished_items`, seq accounting) is empty: no in-flight delivery
+    /// survives a restart, and a NEW turn's ids must never be swallowed as
+    /// duplicates of rows restored from disk.
+    #[must_use]
+    pub fn hydrate(
+        entries: Vec<TranscriptEntry>,
+        menu: Option<Menu>,
+        todos: Option<TodoPanel>,
+        usage: Option<Usage>,
+        interrupted: bool,
+    ) -> Self {
+        Self {
+            entries,
+            menu,
+            todos,
+            usage,
+            interrupted,
+            ..Self::default()
+        }
     }
 
     /// Consume one raw envelope in stream order. Duplicate seqs are skipped;
@@ -405,6 +435,40 @@ impl SessionProjection {
 
     /// Append a shell-builtin row (sim ShellRow — deliberately
     /// envelope-free; the sim bypasses the model/harness entirely).
+    /// Apply one SEEDED transcript row (sim `U`/`A`/`T`/`N`, tui.js:469-472).
+    /// Attaching a sample session replays these; it starts no turn, so the
+    /// rows arrive already complete and no run state moves.
+    pub fn apply_seed_row(&mut self, row: &crate::mock::SeedRow) {
+        use crate::mock::SeedRow;
+        self.seed_seq += 1;
+        let id = crate::mock::seed_item_id(self.seed_seq);
+        match row {
+            SeedRow::User(text) => self.apply(&EventPayload::UserMessage {
+                text: (*text).to_owned(),
+                attachments: vec![],
+                mode: haider_protocol::DeliveryMode::Steer,
+            }),
+            SeedRow::Agent(text) => self.apply(&EventPayload::Item(ItemEvent::Completed {
+                item_id: id,
+                item: TurnItem::AgentMessage {
+                    text: (*text).to_owned(),
+                },
+            })),
+            SeedRow::Tool { name, desc, meta } => {
+                self.apply(&EventPayload::Item(ItemEvent::Completed {
+                    item_id: id.clone(),
+                    item: TurnItem::ToolCall {
+                        call_id: id.as_str().to_owned(),
+                        name: (*name).to_owned(),
+                        args: serde_json::json!({ "desc": desc, "meta": meta }),
+                        status: haider_protocol::item::ToolStatus::Completed,
+                    },
+                }));
+            }
+            SeedRow::Note(text) => self.push_note((*text).to_owned()),
+        }
+    }
+
     pub fn push_shell(&mut self, cmd: String, out: String) {
         self.entries.push(TranscriptEntry::Shell { cmd, out });
     }
@@ -516,6 +580,19 @@ impl SessionProjection {
         &self.entries
     }
 
+    /// User prompt rows — the launcher row's turn count (sim tui.js:3248:
+    /// `entries.filter((e) => e.kind === "user").length`).
+    #[must_use]
+    pub fn user_row_count(&self) -> u32 {
+        u32::try_from(
+            self.entries
+                .iter()
+                .filter(|entry| matches!(entry, TranscriptEntry::User { .. }))
+                .count(),
+        )
+        .unwrap_or(u32::MAX)
+    }
+
     #[must_use]
     pub fn open_menu(&self) -> Option<&Menu> {
         self.menu.as_ref()
@@ -550,6 +627,20 @@ impl SessionProjection {
     pub fn duplicate_items(&self) -> u64 {
         self.duplicate_items
     }
+}
+
+/// The sim's badge PULSE set, verbatim (tui.js:5558-5563:
+/// `["WAITING", "STARTING", "PERMISSION", "EFFECT_UNKNOWN"]`) — and
+/// nothing else: `IDLE_I` and `INPUT_REQUIRED` are outlined but
+/// deliberately still. Keyed on the rendered label so the derived
+/// `◔ WAITING · N subagents` badge pulses exactly like a run-state
+/// WAITING (one vocabulary, tui.js:2815).
+#[must_use]
+pub fn badge_pulses(label: &str) -> bool {
+    label.starts_with("◔ WAITING")
+        || label.starts_with("◌ STARTING")
+        || label.starts_with("? PERMISSION_REQUIRED")
+        || label.starts_with("⌁ EFFECT_UNKNOWN")
 }
 
 /// Badge visual class — see [`SessionProjection::badge_tone`].

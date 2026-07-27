@@ -7,7 +7,6 @@
 use haider_protocol::EventPayload;
 use haider_protocol::ids::ItemId;
 use haider_protocol::item::{ItemEvent, TurnItem};
-use haider_protocol::state::HarnessStatus;
 use haider_tui::app::{AppEvent, AppModel, Hit, Screen};
 use haider_tui::mock::demo_script;
 use haider_tui::render::render;
@@ -15,6 +14,9 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
+
+mod common;
+use common::{key, launcher_model};
 
 fn draw(
     model: &AppModel,
@@ -39,10 +41,6 @@ fn draw(
     (rows, hits, terminal)
 }
 
-fn key(code: KeyCode) -> AppEvent {
-    AppEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))
-}
-
 fn alt_enter() -> AppEvent {
     AppEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT))
 }
@@ -54,14 +52,6 @@ fn row_of(rows: &[String], needle: &str) -> u16 {
             .unwrap_or_else(|| panic!("row containing {needle:?} not rendered")),
     )
     .expect("row fits u16")
-}
-
-fn launcher_model() -> AppModel {
-    let mut model = AppModel::new();
-    model.handle(AppEvent::Envelope(Box::new(EventPayload::HarnessStatus(
-        HarnessStatus::Ready,
-    ))));
-    model
 }
 
 fn session_model() -> AppModel {
