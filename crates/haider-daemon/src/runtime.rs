@@ -61,7 +61,7 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::Poll;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Semaphore, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
@@ -240,6 +240,7 @@ async fn run_inner(
         }
     };
     let device_id = DeviceId::new(format!("daemon-{instance_id}"));
+    let effect_recovery_started = Instant::now();
     match reconcile_before_ready(&store, &device_id, &mut shutdown).await {
         Some(Ok(_)) => {}
         Some(Err(error)) => {
@@ -251,10 +252,17 @@ async fn run_inner(
             return shutdown_before_listener(config, states, store, request, &mut shutdown).await;
         }
     }
+    tracing::trace!(
+        target: "haider.recovery",
+        phase = "effects",
+        operation_micros = effect_recovery_started.elapsed().as_micros(),
+        "pre-ready recovery phase completed"
+    );
     if !matches!(*shutdown.borrow(), ShutdownRequest::None) {
         let request = shutdown.borrow().clone();
         return shutdown_before_listener(config, states, store, request, &mut shutdown).await;
     }
+    let turn_recovery_started = Instant::now();
     let recovered_work = match recover_interrupted_turns(&store, &device_id).await {
         Ok(work) => work,
         Err(error) => {
@@ -262,6 +270,13 @@ async fn run_inner(
             return Err(error.into());
         }
     };
+    tracing::trace!(
+        target: "haider.recovery",
+        phase = "turns",
+        recovered_work = recovered_work.len(),
+        operation_micros = turn_recovery_started.elapsed().as_micros(),
+        "pre-ready recovery phase completed"
+    );
 
     let hub = SessionHub::new(store.clone(), config.session_hub).map_err(DaemonError::from)?;
     let worker_manager = WorkerManager::start(hub.clone(), dependencies);

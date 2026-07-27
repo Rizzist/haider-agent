@@ -311,6 +311,44 @@ async fn provider_error_mid_tool_completes_failed_item_before_errored() {
     ));
 }
 
+/// MUTATION CHECK: split `commit_terminal_error` back into separate
+/// `commit_payload(RunFailed)` and `commit_state(Errored)` calls. Expected
+/// failure: no append batch contains the adjacent durable failure terminal.
+/// Verified by revert on 2026-07-27.
+#[tokio::test]
+async fn provider_failure_commits_run_failed_and_errored_in_one_batch() {
+    let provider = Arc::new(FakeProvider::new(vec![FakeStep::MalformedFrame]));
+    let store = Arc::new(BatchRecordingStore::new());
+    let handle = HarnessActor::spawn(config(), provider, store.clone());
+
+    let outcome = handle
+        .submit_turn(SubmitTurn::new("fail atomically"))
+        .await
+        .expect("turn accepted")
+        .wait()
+        .await
+        .expect("outcome");
+    assert_eq!(outcome.state, RunState::Errored);
+
+    let terminal_batches = store
+        .batches()
+        .into_iter()
+        .filter(|batch| {
+            batch
+                .iter()
+                .any(|payload| matches!(payload, EventPayload::RunState(RunState::Errored)))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(terminal_batches.len(), 1);
+    assert!(matches!(
+        terminal_batches[0].as_slice(),
+        [
+            EventPayload::RunFailed { .. },
+            EventPayload::RunState(RunState::Errored)
+        ]
+    ));
+}
+
 #[tokio::test]
 async fn cancellation_mid_tool_completes_tool_as_cancelled_never_failed() {
     // Frozen law: cancellation is an outcome, never a failure — an open tool at
@@ -736,6 +774,63 @@ fn completed_tool_call_is_pending_execution() {
             ..
         }
     ));
+}
+
+struct BatchRecordingStore {
+    inner: MemoryStore,
+    batches: Mutex<Vec<Vec<EventPayload>>>,
+}
+
+impl BatchRecordingStore {
+    fn new() -> Self {
+        Self {
+            inner: MemoryStore::new(),
+            batches: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn batches(&self) -> Vec<Vec<EventPayload>> {
+        self.batches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+#[async_trait]
+impl StoreHandle for BatchRecordingStore {
+    async fn append(&self, envelopes: &mut [RawEnvelope]) -> Result<CommittedRange, HaiderError> {
+        let batch = envelopes
+            .iter()
+            .map(|envelope| {
+                serde_json::from_value(envelope.payload.clone()).map_err(|error| {
+                    HaiderError::new(
+                        ErrorCode::Internal,
+                        format!("recorded payload did not decode: {error}"),
+                        false,
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.batches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(batch);
+        self.inner.append(envelopes).await
+    }
+
+    async fn read(
+        &self,
+        session_id: &SessionId,
+        since_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<RawEnvelope>, HaiderError> {
+        self.inner.read(session_id, since_seq, limit).await
+    }
+
+    async fn latest_seq(&self, session_id: &SessionId) -> Result<u64, HaiderError> {
+        self.inner.latest_seq(session_id).await
+    }
 }
 
 struct BlockingCompletedStore {

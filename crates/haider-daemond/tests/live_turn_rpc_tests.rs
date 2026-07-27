@@ -499,9 +499,8 @@ async fn scenario_3_submit_streams_one_contiguous_durable_turn_over_real_uds() {
 /// MUTATION CHECK: skip the `turn_accept_receipt` preflight in `turn_submit`
 /// (session_hub/rpc.rs), or remove `admit_pending`'s active-run compare and
 /// in-queue run-id scan (worker.rs). Expected failure: the same-command
-/// retry starts a second provider request or commits a second user message
-/// (the durable UserMessage count below catches the duplicate even when the
-/// provider-request count race is lost).
+/// retry takes the provider slot reserved for the positive fence turn or
+/// commits a second user message.
 #[tokio::test]
 async fn scenario_4_lost_submit_response_replays_one_run_and_one_provider_request() {
     let root = test_root("w3c-live-");
@@ -515,6 +514,12 @@ async fn scenario_4_lost_submit_response_replays_one_run_and_one_provider_reques
     let (dependencies, fake) = fake_dependencies(vec![
         FakeStep::EmitText {
             text: "only once".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+        FakeStep::EmitText {
+            text: "fence".into(),
         },
         FakeStep::Finish {
             reason: FinishReason::EndTurn,
@@ -565,35 +570,54 @@ async fn scenario_4_lost_submit_response_replays_one_run_and_one_provider_reques
         &mut retry,
         &config,
         "retry",
-        submit_body("same-submit-command", session_id, generation, "one turn"),
+        submit_body(
+            "same-submit-command",
+            session_id.clone(),
+            generation,
+            "one turn",
+        ),
     )
     .await;
     let (run_id, _) = next_submit_response(&mut retry).await;
-    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-    assert_eq!(fake.requests().len(), 1);
 
-    send_request(
-        &mut retry,
-        &config,
-        "read",
-        RequestBody::SessionRead {
-            session_id: session_for_read.clone(),
-            range: SeqRange {
-                start_seq: 1,
-                end_seq: 64,
-            },
-        },
-    )
-    .await;
-    let events = loop {
-        if let WireFrame::Response {
-            body: ResponseBody::SessionRead { result },
-            ..
-        } = retry.next().await
-        {
-            break result.envelopes;
+    let events = tokio::time::timeout(support::DEADLINE, async {
+        'until_terminal: loop {
+            send_request(
+                &mut retry,
+                &config,
+                "read-until-terminal",
+                RequestBody::SessionRead {
+                    session_id: session_for_read.clone(),
+                    range: SeqRange {
+                        start_seq: 1,
+                        end_seq: 64,
+                    },
+                },
+            )
+            .await;
+            loop {
+                if let WireFrame::Response {
+                    body: ResponseBody::SessionRead { result },
+                    ..
+                } = retry.next().await
+                {
+                    if result.envelopes.iter().any(|envelope| {
+                        envelope.run_id.as_ref() == Some(&run_id)
+                            && serde_json::from_value::<EventPayload>(envelope.payload.clone())
+                                .is_ok_and(|payload| {
+                                    matches!(payload, EventPayload::RunState(ref state) if state.is_terminal())
+                                })
+                    }) {
+                        break 'until_terminal result.envelopes;
+                    }
+                    break;
+                }
+            }
+            tokio::task::yield_now().await;
         }
-    };
+    })
+    .await
+    .expect("original run becomes durably terminal");
     assert_eq!(
         events
             .iter()
@@ -606,8 +630,35 @@ async fn scenario_4_lost_submit_response_replays_one_run_and_one_provider_reques
         1
     );
 
+    // Positive quiescence fence: this distinct turn entered the manager
+    // after the replay hint. Supervisor FIFO plus serial execution means the
+    // second provider request must be this turn; a duplicate queued from the
+    // replay would necessarily take that slot first.
+    send_request(
+        &mut retry,
+        &config,
+        "fence",
+        submit_body("fence-command", session_id, generation, "fence turn"),
+    )
+    .await;
+    let _ = next_submit_response(&mut retry).await;
+    tokio::time::timeout(support::DEADLINE, async {
+        while fake.requests().len() < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("fence provider request begins");
+    let requests = fake.requests();
+    assert!(requests[1].messages.iter().any(|message| {
+        message.blocks.iter().any(
+            |block| matches!(block, haider_protocol::provider::Block::Text { text } if text == "fence turn"),
+        )
+    }));
+
     task.shutdown_handle().request("test complete");
     task.join().await.expect("daemon joins");
+    assert_eq!(fake.requests().len(), 2);
 
     let restarted = ready_with_dependencies(&config, dependencies).await;
     let mut after_restart = UdsClient::connect_control(
@@ -640,16 +691,13 @@ async fn scenario_4_lost_submit_response_replays_one_run_and_one_provider_reques
     .await;
     let (replayed_run, _) = next_submit_response(&mut after_restart).await;
     assert_eq!(replayed_run, run_id);
-    for _ in 0..8 {
-        tokio::task::yield_now().await;
-    }
-    assert_eq!(
-        fake.requests().len(),
-        1,
-        "old-generation receipt replay is response-only"
-    );
     restarted.shutdown_handle().request("test complete");
     restarted.join().await.expect("restarted daemon joins");
+    assert_eq!(
+        fake.requests().len(),
+        2,
+        "old-generation receipt replay is response-only"
+    );
 }
 
 /// Scenario 5.

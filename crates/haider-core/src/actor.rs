@@ -1787,21 +1787,7 @@ impl HarnessActor {
 
     /// Commits `Errored` (best effort) and reports the original error.
     async fn errored_state_outcome(&mut self, run_id: &RunId, error: HaiderError) -> TurnOutcome {
-        if let Err(commit_error) = self
-            .commit_payload(
-                run_id,
-                EventPayload::RunFailed {
-                    code: error.code,
-                    message: sanitized_failure_message(&error.message),
-                    retryable: error.retryable,
-                },
-                prompt_omit_render(),
-            )
-            .await
-        {
-            return errored_outcome(commit_error);
-        }
-        if let Err(commit_error) = self.commit_state(run_id, RunState::Errored).await {
+        if let Err(commit_error) = self.commit_terminal_error(run_id, &error).await {
             return errored_outcome(commit_error);
         }
         TurnOutcome {
@@ -1809,6 +1795,43 @@ impl HarnessActor {
             finish_reason: FinishReason::Error,
             error: Some(error),
         }
+    }
+
+    /// Atomically commits durable failure detail plus its terminal run state.
+    ///
+    /// ATOMIC FAILURE TERMINAL (R3): `RunFailed` immediately precedes
+    /// `Errored` in one store append. Besides removing a redundant
+    /// transaction/actor round trip, this prevents a crash between two
+    /// appends from leaving durable failure detail without a terminal state.
+    async fn commit_terminal_error(
+        &mut self,
+        run_id: &RunId,
+        error: &HaiderError,
+    ) -> Result<(), HaiderError> {
+        let mut envelopes = [
+            self.uncommitted_envelope(
+                run_id,
+                EventPayload::RunFailed {
+                    code: error.code,
+                    message: sanitized_failure_message(&error.message),
+                    retryable: error.retryable,
+                },
+                prompt_omit_render(),
+            )?,
+            self.uncommitted_envelope(
+                run_id,
+                EventPayload::RunState(RunState::Errored),
+                prompt_omit_render(),
+            )?,
+        ];
+        self.store.append(&mut envelopes).await?;
+        for committed in envelopes {
+            // No live subscribers is fine — the store already has the
+            // complete failure terminal.
+            let _ = self.events.send(committed);
+        }
+        self.state.send_replace(Some(RunState::Errored));
+        Ok(())
     }
 
     /// Commits the run-state envelope, then mirrors it to the state watch.
@@ -1840,6 +1863,20 @@ impl HarnessActor {
         payload: EventPayload,
         render: RenderTargets,
     ) -> Result<RawEnvelope, HaiderError> {
+        let mut envelopes = [self.uncommitted_envelope(run_id, payload, render)?];
+        self.store.append(&mut envelopes).await?;
+        let [committed] = envelopes;
+        // No live subscribers is fine — the store already has the envelope.
+        let _ = self.events.send(committed.clone());
+        Ok(committed)
+    }
+
+    fn uncommitted_envelope(
+        &self,
+        run_id: &RunId,
+        payload: EventPayload,
+        render: RenderTargets,
+    ) -> Result<RawEnvelope, HaiderError> {
         let payload = serde_json::to_value(payload).map_err(|error| {
             HaiderError::new(
                 ErrorCode::Internal,
@@ -1847,7 +1884,7 @@ impl HarnessActor {
                 false,
             )
         })?;
-        let mut envelopes = [EventEnvelope {
+        Ok(EventEnvelope {
             schema_version: SCHEMA_VERSION,
             event_id: self.next_event_id(),
             seq: 0,
@@ -1863,12 +1900,7 @@ impl HarnessActor {
             committed_at_ms: 0,
             render,
             payload,
-        }];
-        self.store.append(&mut envelopes).await?;
-        let [committed] = envelopes;
-        // No live subscribers is fine — the store already has the envelope.
-        let _ = self.events.send(committed.clone());
-        Ok(committed)
+        })
     }
 
     fn next_run_id(&mut self) -> RunId {

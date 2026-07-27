@@ -48,6 +48,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 
@@ -860,9 +861,18 @@ async fn start_turn(
             false,
         ));
     }
+    let prompt_compile_started = Instant::now();
     let mut messages =
         PromptHistoryCompiler::compile(lease, lease.session_id(), None, None, &accepted.run_id)
             .await?;
+    tracing::trace!(
+        target: "haider.worker",
+        session_id = %lease.session_id(),
+        run_id = %accepted.run_id,
+        prompt_messages = messages.len(),
+        compile_micros = prompt_compile_started.elapsed().as_micros(),
+        "prompt history compiled"
+    );
     let attachments = resolve_prompt_attachments(lease, &mut messages).await?;
     let dispatcher = dependencies
         .tool_factory
@@ -979,16 +989,17 @@ async fn resolve_prompt_attachments(
     let mut resolved = Vec::<ResolvedAttachment>::new();
     for message in messages {
         for block in &mut message.blocks {
-            match block.clone() {
+            match block {
                 haider_protocol::provider::Block::Attachment(
                     haider_protocol::tool::AttachmentBlock::Image { artifact, .. },
                 ) => {
                     if resolved
                         .iter()
-                        .any(|attachment| attachment.artifact == artifact)
+                        .any(|attachment| attachment.artifact.as_str() == artifact.as_str())
                     {
                         continue;
                     }
+                    let artifact = artifact.clone();
                     let bytes = store.get_artifact(artifact.clone()).await?;
                     resolved.push(ResolvedAttachment {
                         artifact,
@@ -998,6 +1009,7 @@ async fn resolve_prompt_attachments(
                 haider_protocol::provider::Block::Attachment(
                     haider_protocol::tool::AttachmentBlock::PastedText { artifact, .. },
                 ) => {
+                    let artifact = artifact.clone();
                     let bytes = store.get_artifact(artifact.clone()).await?;
                     let text = String::from_utf8(bytes).map_err(|_| {
                         HaiderError::new(
@@ -1011,6 +1023,7 @@ async fn resolve_prompt_attachments(
                 haider_protocol::provider::Block::Attachment(
                     haider_protocol::tool::AttachmentBlock::Skill { name, .. },
                 ) => {
+                    let name = name.clone();
                     return Err(HaiderError::new(
                         ErrorCode::InvalidArgument,
                         format!("skill attachment `{name}` is reserved but not yet supported"),
