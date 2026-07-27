@@ -88,13 +88,14 @@ impl DaemonConfig {
 
     /// Fixed-length, profile-derived rendezvous path (R2).
     ///
-    /// Hashing the profile id keeps the socket name a constant 32 hex chars
-    /// regardless of profile-id length or charset, which protects the tight
-    /// OS limit on Unix socket path length (`sun_path`, ~104 bytes on macOS).
+    /// Delegates to the ONE shared derivation in `haider-client`
+    /// (`endpoint_path_for`), which both `haider` and `haiderd` resolve
+    /// through — the R8 no-duplicated-path-logic law. Hashing the profile id
+    /// keeps the socket name a constant 32 hex chars regardless of
+    /// profile-id length or charset, which protects the tight OS limit on
+    /// Unix socket path length (`sun_path`, ~104 bytes on macOS).
     pub fn endpoint_path(&self) -> PathBuf {
-        let digest = blake3::hash(self.profile_id.as_bytes()).to_hex();
-        self.runtime_dir
-            .join(format!("haider-{}.sock", &digest.as_str()[..32]))
+        haider_client::endpoint_path_for(&self.runtime_dir, &self.profile_id)
     }
 
     pub(crate) fn validate(&self) -> Result<(), String> {

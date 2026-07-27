@@ -18,6 +18,7 @@ haider-provider = { path = "../haider-provider" }
 haider-tools = { path = "../haider-tools" }
 haider-verify = { path = "../haider-verify" }
 haider-accounts = { path = "../haider-accounts" }
+haider-client = { path = "../haider-client" }
 haider-rpc = { path = "../haider-rpc" }
 haider-tui = { path = "../haider-tui" }
 serde_json.workspace = true

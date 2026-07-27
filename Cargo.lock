@@ -746,6 +746,7 @@ version = "0.0.11"
 dependencies = [
  "async-trait",
  "haider-accounts",
+ "haider-client",
  "haider-core",
  "haider-protocol",
  "haider-provider",
@@ -757,6 +758,20 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "haider-client"
+version = "0.0.11"
+dependencies = [
+ "blake3",
+ "haider-rpc",
+ "rustix 1.1.4",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "zeroize",
 ]
 
 [[package]]
@@ -784,6 +799,7 @@ dependencies = [
  "blake3",
  "getrandom 0.3.4",
  "haider-accounts",
+ "haider-client",
  "haider-core",
  "haider-protocol",
  "haider-provider",
@@ -802,6 +818,7 @@ name = "haider-daemond"
 version = "0.0.11"
 dependencies = [
  "async-trait",
+ "haider-client",
  "haider-core",
  "haider-daemon",
  "haider-protocol",

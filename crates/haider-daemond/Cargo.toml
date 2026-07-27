@@ -11,6 +11,7 @@ name = "haiderd"
 path = "src/main.rs"
 
 [dependencies]
+haider-client = { path = "../haider-client" }
 haider-daemon = { path = "../haider-daemon" }
 tokio.workspace = true
 
