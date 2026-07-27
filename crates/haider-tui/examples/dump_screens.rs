@@ -48,6 +48,25 @@ fn main() {
         model.handle(AppEvent::Envelope(Box::new(payload.clone())));
     }
     dump(&model, "launcher");
+    // The capped column on a WIDE frame (owner item 5 — his screenshot was
+    // ~165 cols): the block keeps the sim's proportions instead of spanning.
+    dump_at(&model, "launcher @ 165×40 (wide — column capped)", 165, 40);
+    // The banner's dignity tiers: too narrow for the art → the one-line
+    // text mark; too short for the art → the banner yields FIRST, keeping
+    // the sanctum, the wordmark and the recent list.
+    dump_at(&model, "launcher @ 31×26 (text-mark tier)", 31, 26);
+    dump_at(
+        &model,
+        "launcher @ 118×29 (banner yields, head intact)",
+        118,
+        29,
+    );
+    dump_at(
+        &model,
+        "launcher @ 118×15 (deep shed — list and composer hold)",
+        118,
+        15,
+    );
     // Palette open.
     model.handle(AppEvent::Key(KeyEvent::new(
         KeyCode::Char('/'),
@@ -194,6 +213,15 @@ fn main() {
         }
     }
     dump(&todos_model, "session + todos pinned (dep chain)");
+
+    // Collapsed todos (owner item 7): the header is a button; the collapsed
+    // form summarises the item being worked.
+    todos_model.todos_collapsed = true;
+    dump(
+        &todos_model,
+        "session + todos collapsed (header summarises)",
+    );
+    todos_model.todos_collapsed = false;
 
     // The ⧗ queue panel between the todos and the composer.
     todos_model.queue_mode = true;
@@ -407,6 +435,12 @@ fn main() {
     lint.removing = true;
     sub_model.chips = vec![tests, docs, lint];
     dump(&sub_model, "session + SubTree panel (live chips)");
+
+    // The ✳ waiting line's needs-input tail (owner item 8b): a chip holding
+    // an amber ? is unfinished ON THE USER, and the line says so.
+    sub_model.chips[1].state = ChipDisplayState::InputRequired;
+    dump(&sub_model, "session + ✳ waiting line — 1 needs input");
+    sub_model.chips[1].state = ChipDisplayState::Error;
 
     // The subagent view: breadcrumb head, the chip's own transcript, and the
     // question card replacing ITS composer (the parent is never blocked).

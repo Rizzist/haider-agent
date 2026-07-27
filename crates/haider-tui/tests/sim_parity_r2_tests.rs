@@ -88,7 +88,11 @@ fn session_model() -> AppModel {
 #[test]
 fn esc_mid_turn_interrupts_and_stays_on_the_session() {
     let mut model = launcher_model();
-    model.handle(key(KeyCode::Char('1')));
+    // TUI4 item 1: attaching starts no turn — type to get a live one.
+    for c in "walk me through the harness".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Enter));
     assert!(model.turn_active);
     model.requests.clear();
     // The script's user message flips to the session view.
@@ -311,7 +315,11 @@ fn mid_turn_submit_flashes_and_echoes_a_note() {
     // the user row immediately plus the sim's steer note — typed text is
     // still never lost, now with the sim's real delivery semantics.
     let mut model = launcher_model();
-    model.handle(key(KeyCode::Char('1')));
+    // TUI4 item 1: attaching starts no turn — type to get a live one.
+    for c in "walk me through the harness".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Enter));
     assert!(model.turn_active);
     // The script's user message flips to the session view mid-turn.
     model.handle(AppEvent::Envelope(Box::new(EventPayload::UserMessage {

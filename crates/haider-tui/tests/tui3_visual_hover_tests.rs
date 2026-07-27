@@ -141,7 +141,11 @@ fn composer_band_is_the_exact_sim_blend_in_all_three_themes() {
         // status row — no stray tinted rows bracket the band.
         assert_eq!(buffer[(0, composer_y - 1)].fg, Color::from(theme.gold));
         assert_eq!(buffer[(0, composer_y - 1)].bg, Color::from(theme.bg));
-        assert_eq!(buffer[(0, composer_y + 1)].bg, Color::from(theme.bg));
+        // TUI4 item 2: the row BELOW the composer is the band's padding row
+        // — the band is one complete panel, not a stripe behind the text —
+        // and the row after that is its closing frame rule on plain ground.
+        assert_eq!(buffer[(0, composer_y + 1)].bg, Color::from(rgb));
+        assert_eq!(buffer[(0, composer_y + 2)].bg, Color::from(theme.bg));
         let status_y = u16::try_from(rows.len() - 1).expect("status row");
         assert_eq!(
             buffer[(0, status_y)].bg,
@@ -221,8 +225,9 @@ fn launcher_typography_uses_exact_theme_inks() {
     let (rows, _, terminal) = draw(&model, 118, 34);
     let buffer = terminal.backend().buffer();
     // Mark: BOLD maroon (#7c2d12 on dawn).
-    let mark_y = row_of(&rows, "حيدر");
-    let mark_x = col_of(&rows[mark_y as usize], "حيدر");
+    // TUI4 item 4: the mark is half-block art at this width.
+    let mark_y = row_of(&rows, &haider_tui::mark::banner_rows()[2]);
+    let mark_x = col_of(&rows[mark_y as usize], "█");
     let mark = &buffer[(mark_x, mark_y)];
     assert_eq!(mark.fg, Color::Rgb(0x7c, 0x2d, 0x12));
     assert!(mark.modifier.contains(Modifier::BOLD));

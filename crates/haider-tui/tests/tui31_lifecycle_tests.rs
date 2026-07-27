@@ -875,18 +875,13 @@ fn launcher_liveness_and_metas_follow_the_sim_seeds() {
         "no fabricated liveness elsewhere"
     );
     assert!(row_with("recent sessions").contains("· 1 running"));
-    // Verbatim Aura/Accounts/Peers metas (tui.js:3278-3300).
-    assert!(row_with("◉ Aura").contains(
-        "voice session · orchestrator — spawns & steers sessions across devices, never codes"
-    ));
-    assert!(
-        row_with("⚿ Accounts").contains(
-            "provider credentials — OAuth & API keys, harness-owned · 7 across 5 providers"
-        )
-    );
-    assert!(row_with("⇄ Peers").contains(
-        "reachability ladder — enrolled peers · sponsored SSH nodes · shell targets · 3 host-capable"
-    ));
+    // TUI4 item 5 caps the column at 70 cells, so these verbatim metas now
+    // ELLIPSIZE into it exactly as the sim's `.meta` does (text-overflow:
+    // ellipsis inside `min(560px, 92%)`). The visible prefix is still the
+    // sim's text character for character.
+    assert!(row_with("◉ Aura").contains("voice session · orchestrator — spawns & steers"));
+    assert!(row_with("⚿ Accounts").contains("provider credentials — OAuth & API keys, har"));
+    assert!(row_with("⇄ Peers").contains("reachability ladder — enrolled peers · sponsored"));
     // P2-9: hits carry identity, never a mutable ordinal.
     assert!(hits.iter().any(|(_, hit)| matches!(
         hit,

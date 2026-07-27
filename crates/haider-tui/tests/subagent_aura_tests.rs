@@ -745,10 +745,12 @@ async fn subtree_sheds_after_todos_but_before_the_composer_at_90x10() {
         !m.chips.is_empty()
     })
     .await;
-    // 90×10 budget: status(1) + header(2) + rule(1) + transcript(1) +
-    // input rule(1) + composer(1) + gap(1) leaves 2 rows — a 1-chip panel
-    // (header + row = 2) fits; the composer never yields.
-    let (rows, _) = draw(&model, 90, 10);
+    // TUI4 retuned this budget: the panel always carries the ⌂ main row
+    // (item 3), the band gained a padding row and a closing rule (item 2),
+    // and the lower region gained breathing rows (item 8). A 1-chip panel is
+    // 3 rows now, so it fits at 90×16 and sheds below that — the composer's
+    // cursor row never yields either way.
+    let (rows, _) = draw(&model, 90, 16);
     assert!(
         rows.iter().any(|row| row.contains("subagents —")),
         "panel fits"
@@ -775,7 +777,7 @@ async fn subtree_sheds_after_todos_but_before_the_composer_at_90x10() {
             },
         },
     ));
-    let (rows, _) = draw(&model, 90, 10);
+    let (rows, _) = draw(&model, 90, 14);
     assert!(
         rows.iter().any(|row| row.contains("▾ subagents")),
         "the SubTree outranks the todos"
@@ -789,7 +791,7 @@ async fn subtree_sheds_after_todos_but_before_the_composer_at_90x10() {
     // holds unsent user input — ledger order documented in render.rs).
     model.queue_mode = true;
     model.msg_queue.push("queued line".to_owned());
-    let (rows, _) = draw(&model, 90, 10);
+    let (rows, _) = draw(&model, 90, 12);
     assert!(rows.iter().any(|row| row.contains("⧗ queued — 1 message")));
     assert!(!rows.iter().any(|row| row.contains("▾ subagents")));
     assert!(

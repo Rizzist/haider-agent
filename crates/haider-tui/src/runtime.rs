@@ -222,9 +222,8 @@ pub async fn run_demo(mut model: AppModel) -> std::io::Result<()> {
     let (mut driver, mut envelope_rx) = DemoDriver::new(64);
     driver.spawn_boot();
     let answer_echo = driver.sender();
-    // Launcher auto-play: if untouched, the classic demo plays once.
-    let autoplay = tokio::time::sleep(Duration::from_secs(6));
-    tokio::pin!(autoplay);
+    // NB: no launcher auto-play. The sim has none — an untouched launcher
+    // simply waits (owner item 1: opening/idling must not start a sequence).
 
     let mut frame_tick = tokio::time::interval(Duration::from_millis(33));
     frame_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -240,9 +239,6 @@ pub async fn run_demo(mut model: AppModel) -> std::io::Result<()> {
                 Some(event) => dispatch_input(&mut model, &hit_map, event),
                 None => break,
             },
-            () = &mut autoplay, if !model.auto_play_spent => {
-                model.handle(AppEvent::AutoPlay);
-            }
             tagged = envelope_rx.recv(), if stream_open => match tagged {
                 Some((generation, event)) => {
                     driver.consume(&mut model, generation, event);

@@ -394,12 +394,27 @@ fn launcher_composer_is_bottom_anchored_with_the_gold_rule() {
         rows.iter()
             .any(|row| row.contains("dir ~/dev/enterprise-suite · mesh off"))
     );
-    // Sample metadata carries turns (sim row meta); the tail ellipsizes
-    // into the width instead of clipping mid-frame.
-    assert!(rows.iter().any(|row| row.contains("2 turns")));
+    // Sample metadata carries the blurb and branch count; TUI4 item 5 caps
+    // the column at 70 cells, so the tail ellipsizes INTO the column rather
+    // than running the frame's full width.
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("“Stripe webhooks + invoice backfill”"))
+    );
+    for needle in ["billing-service", "◉ Aura", "recent sessions"] {
+        let row = rows
+            .iter()
+            .find(|row| row.contains(needle))
+            .expect("column row");
+        let start = row.chars().take_while(|c| *c == ' ').count();
+        assert!(
+            row.trim_end().chars().count().saturating_sub(start) <= 70,
+            "{needle:?} exceeds the capped column"
+        );
+    }
     let (wide_rows, _, _) = draw(&model, 170, 34);
     assert!(
-        wide_rows.iter().any(|row| row.contains("gpt-5.6")),
+        wide_rows.iter().any(|row| row.contains("billing-service")),
         "full meta (model · device · ago) appears when the width allows"
     );
 }

@@ -9,6 +9,7 @@ pub mod app;
 pub mod boot;
 pub mod commands;
 pub mod format;
+pub mod mark;
 pub mod mock;
 pub mod plain;
 pub mod projection;

@@ -149,6 +149,9 @@ pub struct SessionProjection {
     /// A voice turn is live: blocks started now render ` · ♪ speaking`
     /// (demo-local — set by the driver's Voice beats, never an envelope).
     voice_live: bool,
+    /// Per-projection counter minting unique ids for SEEDED rows, so two
+    /// sample sessions replayed in a row never collide on a closed item id.
+    seed_seq: u64,
     // Honesty counters — surfaced, never fatal.
     gap_seen: bool,
     orphan_deltas: u64,
@@ -405,6 +408,40 @@ impl SessionProjection {
 
     /// Append a shell-builtin row (sim ShellRow — deliberately
     /// envelope-free; the sim bypasses the model/harness entirely).
+    /// Apply one SEEDED transcript row (sim `U`/`A`/`T`/`N`, tui.js:469-472).
+    /// Attaching a sample session replays these; it starts no turn, so the
+    /// rows arrive already complete and no run state moves.
+    pub fn apply_seed_row(&mut self, row: &crate::mock::SeedRow) {
+        use crate::mock::SeedRow;
+        self.seed_seq += 1;
+        let id = crate::mock::seed_item_id(self.seed_seq);
+        match row {
+            SeedRow::User(text) => self.apply(&EventPayload::UserMessage {
+                text: (*text).to_owned(),
+                attachments: vec![],
+                mode: haider_protocol::DeliveryMode::Steer,
+            }),
+            SeedRow::Agent(text) => self.apply(&EventPayload::Item(ItemEvent::Completed {
+                item_id: id,
+                item: TurnItem::AgentMessage {
+                    text: (*text).to_owned(),
+                },
+            })),
+            SeedRow::Tool { name, desc, meta } => {
+                self.apply(&EventPayload::Item(ItemEvent::Completed {
+                    item_id: id.clone(),
+                    item: TurnItem::ToolCall {
+                        call_id: id.as_str().to_owned(),
+                        name: (*name).to_owned(),
+                        args: serde_json::json!({ "desc": desc, "meta": meta }),
+                        status: haider_protocol::item::ToolStatus::Completed,
+                    },
+                }));
+            }
+            SeedRow::Note(text) => self.push_note((*text).to_owned()),
+        }
+    }
+
     pub fn push_shell(&mut self, cmd: String, out: String) {
         self.entries.push(TranscriptEntry::Shell { cmd, out });
     }

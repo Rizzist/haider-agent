@@ -106,7 +106,10 @@ async fn stale_generation_envelopes_are_dropped_at_consumption() {
     // channel, its spawned script on virtual time, its bump, its guard.
     let (mut driver, mut rx) = DemoDriver::new(64);
     let mut model = launcher_model();
-    model.handle(key(KeyCode::Char('1')));
+    for c in "walk me through the harness".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Enter));
     drain(&mut driver, &mut model);
     // Consume script beats until the turn's UserMessage attaches the view.
     while model.screen != Screen::Session {
@@ -163,7 +166,10 @@ async fn stale_idle_decay_never_lands_in_a_fresh_session() {
     // generation is stale); only B's OWN decay clears B's idle(i).
     let (mut driver, mut rx) = DemoDriver::new(64);
     let mut model = launcher_model();
-    model.handle(key(KeyCode::Char('1')));
+    for c in "walk me through the harness".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Enter));
     drain(&mut driver, &mut model);
     while model.screen != Screen::Session {
         let (generation, payload) = rx.recv().await.expect("script beat");

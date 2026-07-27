@@ -92,6 +92,16 @@ const PLACEHOLDER_SESSION: &str =
 const PALETTE_HINT: &str = "↑↓ options · tab complete · ⏎ run · esc dismiss";
 /// Fixed command-name column (sim `.cname` flex-basis), in cells.
 const PALETTE_NAME_COL: usize = 14;
+/// The centered launcher column's cell cap — the sim's `min(560px, 92%)`
+/// `.recent` block translated to mono cells (see `render_launcher`).
+const LAUNCHER_COLS: usize = 70;
+
+/// The `[ ← main ]` chip's cells — the header's second line indents past it.
+const BACK_CHIP_COLS: usize = 10;
+/// Cells the header reserves around the mark before it may be drawn: the
+/// back chip, its margins, and a readable minimum for the info block.
+const HEADER_MARK_RESERVED: u16 = 38;
+
 /// Left/right composer padding in cells (sim InputBar `padding: … 16px`).
 const COMPOSER_PAD: usize = 2;
 /// Max composer rows before it scrolls internally (sim textarea autoGrow
@@ -183,22 +193,54 @@ fn spaced_wordmark() -> String {
         .to_owned()
 }
 
+/// The wordmark block for a centered surface: the half-block banner when the
+/// frame can hold it WHOLE, else the single-line text mark.
+///
+/// DIGNITY (sanctum rule 2, `mark` module): the art is never clipped or
+/// scaled to fit. Below the threshold the mark steps down a tier — exactly
+/// as the shahada does — rather than rendering a mangled version of itself.
+fn mark_lines(model: &AppModel, theme: &Theme, width: u16) -> Vec<Line<'static>> {
+    mark_lines_within(model, theme, width, u16::MAX)
+}
+
+/// The mark block, HEIGHT-aware: the banner also steps down to the text mark
+/// when the surrounding block would not fit the frame. The art is the FIRST
+/// thing to yield — it must never push the sanctum, the wordmark or the
+/// recent list off the screen (TUI4 item 6: the banner joins the ledger).
+fn mark_lines_within(
+    model: &AppModel,
+    theme: &Theme,
+    width: u16,
+    banner_budget: u16,
+) -> Vec<Line<'static>> {
+    let ink = theme.maroon_style().add_modifier(Modifier::BOLD);
+    if crate::mark::banner_fits(width) && banner_budget >= crate::mark::BANNER_ROWS {
+        return crate::mark::banner_rows()
+            .into_iter()
+            .map(|row| Line::styled(row, ink))
+            .collect();
+    }
+    vec![Line::styled(
+        SanctumLine::new(model.sanctum_tier).mark().to_owned(),
+        ink,
+    )]
+}
+
 fn render_boot(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rect) {
-    let sanctum = SanctumLine::new(model.sanctum_tier);
+    let _sanctum = SanctumLine::new(model.sanctum_tier);
     // The mark gets breathing room per sim proportions (52px line-height;
     // a terminal cell cannot scale the glyph — noted divergence).
-    let mut lines = vec![
-        Line::default(),
-        Line::styled(
-            sanctum.mark(),
-            theme.maroon_style().add_modifier(Modifier::BOLD),
-        ),
+    let mark_block = mark_lines(model, theme, area.width);
+    let mark_rows = mark_block.len();
+    let mut lines = vec![Line::default()];
+    lines.extend(mark_block);
+    lines.extend([
         Line::default(),
         Line::styled(spaced_wordmark(), theme.bright_style()),
         // Sim `.sub` on the boot screen is GOLD (tui.js:5102-5107).
         Line::styled(boot_subline(VERSION), theme.gold_style()),
         Line::default(),
-    ];
+    ]);
     if let Some(checks) = model.projection.boot_checks() {
         // Sim `.checks`: a LEFT-ALIGNED column inside the centered block —
         // pad every row to the widest so the marker glyphs align.
@@ -216,6 +258,16 @@ fn render_boot(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rec
             };
             lines.push(Line::styled(format!("{:<widest$}", row.line()), style));
         }
+    }
+    // The banner yields before any other boot row does. The rebuild skips
+    // exactly the mark block it emitted — when the head was already the
+    // one-line text mark this is the identity, never an eaten row.
+    if lines.len() > area.height as usize {
+        let mut compact = vec![Line::default()];
+        compact.extend(mark_lines_within(model, theme, area.width, 0));
+        compact.extend(lines.into_iter().skip(1 + mark_rows));
+        let _ = centered(frame, area, compact);
+        return;
     }
     let _ = centered(frame, area, lines);
 }
@@ -278,16 +330,11 @@ fn render_launcher(
     // breathing room above and below · gold (NOT bold) shahada · the gold
     // half-strength rule · bright letter-spaced wordmark · dim version
     // line · info lines with DIM labels and BRIGHT values.
-    let mut lines = vec![
-        Line::default(),
-        Line::styled(
-            sanctum.mark(),
-            theme
-                .maroon_style()
-                .add_modifier(ratatui::style::Modifier::BOLD),
-        ),
-        Line::default(),
-    ];
+    let mark_block = mark_lines(model, theme, area.width);
+    let mark_rows = mark_block.len();
+    let mut lines = vec![Line::default()];
+    lines.extend(mark_block);
+    lines.push(Line::default());
     // Dignity rule: the sanctum renders whole or not at all, always alone.
     if let Some(text) = sanctum.fit(area.width.saturating_sub(2) as usize) {
         lines.push(Line::styled(text, theme.gold_style()));
@@ -298,16 +345,57 @@ fn render_launcher(
     lines.push(Line::styled(spaced_wordmark(), theme.bright_style()));
     lines.push(Line::styled(launcher_subline(VERSION), theme.dim_style()));
     lines.push(Line::default());
-    lines.push(Line::from(vec![
+    let column_cap = (area.width as usize)
+        .saturating_sub(4)
+        .clamp(10, LAUNCHER_COLS);
+    // The info line belongs to the same capped column (owner item 5); when
+    // it cannot fit, it WRAPS at a `·` boundary instead of running the full
+    // width of a wide frame (the sim's `.info` is a wrapping flex row).
+    let provider_half = vec![
         Span::styled("provider ", theme.dim_style()),
         Span::styled(identity.provider.clone(), theme.bright_style()),
         Span::styled(" · model ", theme.dim_style()),
         Span::styled(identity.model_short.clone(), theme.bright_style()),
-        Span::styled(" · account ", theme.dim_style()),
+    ];
+    let account_half = vec![
+        Span::styled("account ", theme.dim_style()),
         Span::styled(identity.account.clone(), theme.bright_style()),
         Span::styled(" · device ", theme.dim_style()),
         Span::styled(identity.device.clone(), theme.bright_style()),
-    ]));
+    ];
+    let one_line: Vec<Span<'_>> = provider_half
+        .into_iter()
+        .chain(std::iter::once(Span::styled(" · ", theme.dim_style())))
+        .chain(account_half)
+        .collect();
+    // ELLIPSIZED to the column, not wrapped: the launcher's vertical budget
+    // is the scarce one, and the owner asked for "metas ellipsized to it".
+    let info = Line::from(one_line);
+    if info.width() <= column_cap {
+        lines.push(info);
+    } else {
+        // Ellipsize the SPANS, never a flattened string: the info line's law
+        // is DIM labels beside BRIGHT values (TUI3a), and collapsing it to
+        // one styled string would silently drop that.
+        let mut used = 0usize;
+        let mut kept: Vec<Span<'_>> = Vec::new();
+        for span in info.spans {
+            let width = span.content.chars().count();
+            if used + width <= column_cap.saturating_sub(1) {
+                used += width;
+                kept.push(span);
+                continue;
+            }
+            let room = column_cap.saturating_sub(1).saturating_sub(used);
+            if room > 0 {
+                let cut: String = span.content.chars().take(room).collect();
+                kept.push(Span::styled(cut, span.style));
+            }
+            kept.push(Span::styled("…", theme.dim_style()));
+            break;
+        }
+        lines.push(Line::from(kept));
+    }
     // Sim `.dirline`: dir {dir} · mesh off — `cd` on the launcher
     // retargets this dir (shell builtins, §4).
     lines.push(Line::from(vec![
@@ -324,7 +412,13 @@ fn render_launcher(
     // is the widest row's content, capped by the frame (sim
     // min(560px, 92%)); every line pads to it so per-line centering yields
     // one shared left edge and hover bands span the full column.
-    let area_cap = (area.width as usize).saturating_sub(4).max(10);
+    // Sim `.recent { width: min(560px, 92%) }` (tui.js:4331-4334) at 12.5px
+    // mono ≈ 7.5px/cell → ~74 cells. Capped at LAUNCHER_COLS so a wide
+    // terminal keeps the sim's proportions instead of letting the block span
+    // the frame (owner item 5 — his screenshot was ~165 cols).
+    let area_cap = (area.width as usize)
+        .saturating_sub(4)
+        .clamp(10, LAUNCHER_COLS);
     // Sim `.rhead` verbatim + gold `· N running` (`.livehd`). The count is
     // `sessionBusy` = live subagents OR a busy run state (tui.js:789-792).
     let running = model.samples.iter().filter(|s| s.busy()).count();
@@ -490,6 +584,20 @@ fn render_launcher(
             )));
         }
     }
+    // The banner yields before any other launcher row (TUI4 item 6): if the
+    // block overflows the content area, redraw it with the one-line mark
+    // rather than letting `centered` drop the sanctum or the recent list.
+    // The rebuild skips exactly the mark block it emitted — when the head
+    // was already the one-line text mark this is the identity, never an
+    // eaten sanctum or rule.
+    let lines = if lines.len() > content_area.height as usize {
+        let mut compact = vec![Line::default()];
+        compact.extend(mark_lines_within(model, theme, content_area.width, 0));
+        compact.extend(lines.into_iter().skip(1 + mark_rows));
+        compact
+    } else {
+        lines
+    };
     let (middle, dropped) = centered(frame, content_area, lines);
     let visible = |row: usize| row.checked_sub(dropped);
     for (row, name) in sample_rows {
@@ -615,12 +723,25 @@ fn render_session(
     // palette, a live interaction under the cursor. All four shed ENTIRELY
     // before the composer's cursor row or a blocking menu's options give up
     // a single row; those stay sacred at any size.
+    // BREATHING ROWS (owner item 8a, Claude Code's rhythm): distinct blocks
+    // in the lower region are separated by a blank row so the stream, the
+    // waiting line, the todos and the SubTree read as separate things
+    // instead of one wall. They are the FIRST thing to shed — before any
+    // panel, long before a sacred row.
     let fixed = chrome + input_height + gap;
+    let waiting_line = waiting_for_agents(model);
+    let mut waiting_height = u16::from(waiting_line.is_some());
     let mut todos_height = model
         .projection
         .todos()
         .filter(|t| t.pinned)
-        .map_or(0, |t| u16::try_from(t.items.len() + 1).unwrap_or(4));
+        .map_or(0, |t| {
+            if model.todos_collapsed {
+                1
+            } else {
+                u16::try_from(t.items.len() + 1).unwrap_or(4)
+            }
+        });
     let mut queue_height = if model.msg_queue.is_empty() {
         0
     } else {
@@ -649,29 +770,73 @@ fn render_session(
     } else {
         budget -= subtree_height;
     }
+    if waiting_height > budget {
+        waiting_height = 0;
+    } else {
+        budget -= waiting_height;
+    }
     if todos_height > budget {
         todos_height = 0;
+    } else {
+        budget -= todos_height;
     }
+    // One breathing row above each block that is actually present, taken
+    // last and given up first.
+    let want_lead = u16::from(waiting_height > 0);
+    let want_todos_lead = u16::from(todos_height > 0);
+    let want_subtree_lead = u16::from(subtree_height > 0);
+    let breathe = |want: u16, budget: &mut u16| -> u16 {
+        if want > 0 && *budget >= want {
+            *budget -= want;
+            want
+        } else {
+            0
+        }
+    };
+    let lead_waiting = breathe(want_lead, &mut budget);
+    let lead_todos = breathe(want_todos_lead, &mut budget);
+    let lead_subtree = breathe(want_subtree_lead, &mut budget);
+    // The composer band closes with a frame rule — the sim draws it as the
+    // border-top of whatever follows the InputBar (SubTree tui.js:4764 /
+    // StatusBar tui.js:5497), which is the "bottom line" the owner's
+    // screenshot was missing (item 2).
+    let band_pad = u16::from(budget > 0 && input_rule_h > 0);
+    if band_pad > 0 {
+        budget -= band_pad;
+    }
+    let band_rule_h = u16::from(budget > 0 && input_rule_h > 0);
     let [
         header_area,
         header_rule,
         transcript_area,
+        _lead_waiting,
+        waiting_area,
+        _lead_todos,
         todos_area,
         queue_area,
         palette_area,
         rule_area,
         composer_area,
+        band_pad_area,
+        band_rule_area,
+        _lead_subtree,
         subtree_area,
         _gap,
     ] = Layout::vertical([
         Constraint::Length(header_h),
         Constraint::Length(header_rule_h),
         Constraint::Min(transcript_min),
+        Constraint::Length(lead_waiting),
+        Constraint::Length(waiting_height),
+        Constraint::Length(lead_todos),
         Constraint::Length(todos_height),
         Constraint::Length(queue_height),
         Constraint::Length(palette_height),
         Constraint::Length(input_rule_h),
         Constraint::Length(input_height),
+        Constraint::Length(band_pad),
+        Constraint::Length(band_rule_h),
+        Constraint::Length(lead_subtree),
         Constraint::Length(subtree_height),
         Constraint::Length(gap),
     ])
@@ -694,12 +859,23 @@ fn render_session(
     } else {
         chip_two_tone("← main".to_owned(), theme.frame_style(), theme.dim_style())
     };
-    header_top.push(Span::styled(
-        format!("  {}  ", sanctum.mark()),
-        theme
-            .maroon_style()
-            .add_modifier(ratatui::style::Modifier::BOLD),
-    ));
+    let mut header_bottom: Vec<Span<'_>> = vec![Span::raw(" ".repeat(BACK_CHIP_COLS))];
+    // The mark spans BOTH header lines (owner item 6): the half-block art in
+    // a fixed slot, with the info block beside it. Whole-or-nothing — a
+    // header too tight for the art keeps the one-line text mark inline.
+    let mark_ink = theme.maroon_style().add_modifier(Modifier::BOLD);
+    if crate::mark::header_fits(area.width, HEADER_MARK_RESERVED) {
+        let rows = crate::mark::header_rows();
+        header_top.push(Span::raw("  "));
+        header_top.push(Span::styled(rows[0].clone(), mark_ink));
+        header_top.push(Span::raw("  "));
+        header_bottom.push(Span::raw("  "));
+        header_bottom.push(Span::styled(rows[1].clone(), mark_ink));
+        header_bottom.push(Span::raw("  "));
+    } else {
+        header_top.push(Span::styled(format!("  {}  ", sanctum.mark()), mark_ink));
+        header_bottom.push(Span::raw(" ".repeat(sanctum.mark().chars().count() + 4)));
+    }
     header_top.push(Span::styled(
         "haider",
         theme
@@ -713,15 +889,14 @@ fn render_session(
         format!(" · {}", model.session_dir),
         theme.bright_style(),
     ));
-    let header_bottom = vec![
-        Span::styled("         ", theme.dim_style()),
+    header_bottom.extend([
         Span::styled(title, theme.dim_style()),
         Span::styled(format!(" ▸ {head} {honorific}"), theme.gold_style()),
         Span::styled(
             format!(" · branch main · {}", identity.device),
             theme.dim_style(),
         ),
-    ];
+    ]);
     // Shed chrome renders nothing: a 1-row header keeps only the product
     // line (the area clips line 2), a 0-row header/rule disappears whole.
     frame.render_widget(
@@ -839,19 +1014,97 @@ fn render_session(
     }
 
     if let Some(todos) = model.projection.todos().filter(|t| t.pinned) {
-        // Sim TodoPanel (tui.js:2863-2888, 4667-4709): dim header with a
-        // GOLD count; rows styled by state.
-        let mut todo_lines = vec![Line::from(vec![
-            Span::styled("▾ todos", theme.dim_style()),
+        // Sim TodoPanel (tui.js:2863-2888, 4667-4709): the header is a BUTTON
+        // that toggles collapse, and the collapsed form summarises the item
+        // being worked. Owner item 7 promotes it from the deferred ledger and
+        // adds hover chrome on the header and every row.
+        let arrow = if model.todos_collapsed { "▸" } else { "▾" };
+        let mut header = vec![
+            Span::styled(format!("{arrow} todos"), theme.dim_style()),
             Span::styled(
                 format!(" — {}/{} done", todos.done_count(), todos.items.len()),
                 theme.gold_style(),
             ),
-        ])];
-        for item in &todos.items {
-            todo_lines.push(todo_row(item, &todos.items, theme));
+        ];
+        if model.todos_collapsed {
+            let current = todos
+                .items
+                .iter()
+                .find(|item| item.state == TodoState::Processing)
+                .or_else(|| {
+                    todos
+                        .items
+                        .iter()
+                        .find(|item| item.state != TodoState::Completed)
+                });
+            if let Some(item) = current {
+                header.push(Span::styled(
+                    format!(" · ■ {}", item.text),
+                    theme.bright_style(),
+                ));
+            }
+        }
+        let mut todo_lines = vec![hover_band(
+            Line::from(header),
+            model.hovered == Some(Hit::TodosToggle),
+            todos_area.width,
+            theme,
+        )];
+        if !model.todos_collapsed {
+            for item in &todos.items {
+                todo_lines.push(hover_band(
+                    todo_row(item, &todos.items, theme),
+                    model.hovered == Some(Hit::TodoRow(item.id)),
+                    todos_area.width,
+                    theme,
+                ));
+            }
         }
         frame.render_widget(Paragraph::new(Text::from(todo_lines)), todos_area);
+        if todos_area.height > 0 {
+            hits.push((
+                Rect {
+                    x: todos_area.x,
+                    y: todos_area.y,
+                    width: todos_area.width,
+                    height: 1,
+                },
+                Hit::TodosToggle,
+            ));
+            if !model.todos_collapsed {
+                for (index, item) in todos.items.iter().enumerate() {
+                    let y = todos_area.y + u16::try_from(index + 1).unwrap_or(u16::MAX);
+                    if y < todos_area.y + todos_area.height {
+                        hits.push((
+                            Rect {
+                                x: todos_area.x,
+                                y,
+                                width: todos_area.width,
+                                height: 1,
+                            },
+                            Hit::TodoRow(item.id),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    // The background-agent waiting line (item 8b) — plain text, never a hit.
+    if let Some(line) = &waiting_line
+        && waiting_area.height > 0
+    {
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::raw(" "),
+                Span::styled("✳", theme.gold_style()),
+                Span::styled(
+                    line.strip_prefix('✳').unwrap_or(line).to_owned(),
+                    theme.dim_style(),
+                ),
+            ])),
+            waiting_area,
+        );
     }
 
     if queue_height > 0 {
@@ -929,9 +1182,63 @@ fn render_session(
     } else {
         render_composer(model, theme, frame, rule_area, composer_area, hits);
     }
+    // The inputBg band is one panel: the composer rows AND the padding row
+    // below them carry it edge to edge (owner item 2 — the band used to sit
+    // behind the text row only, so it read as "cut in half").
+    if band_pad > 0 {
+        frame.render_widget(Block::default().style(theme.input_style()), band_pad_area);
+    }
+    if band_rule_h > 0 {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                "─".repeat(band_rule_area.width as usize),
+                theme.frame_style(),
+            ))
+            .style(theme.text_style()),
+            band_rule_area,
+        );
+    }
     if subtree_height > 0 {
         render_subtree(model, theme, frame, subtree_area, false, hits);
     }
+}
+
+/// Wrap a row in the shared hover band (sim `:hover { background: selBg }`),
+/// padding it to the full region width so the band reads as one strip.
+fn hover_band<'a>(mut line: Line<'a>, hovered: bool, width: u16, theme: &Theme) -> Line<'a> {
+    if !hovered {
+        return line;
+    }
+    let pad = (width as usize).saturating_sub(line.width());
+    if pad > 0 {
+        line.push_span(Span::raw(" ".repeat(pad)));
+    }
+    line.style(theme.hover_style())
+}
+
+/// The background-agent waiting line (owner item 8b, styled after Claude
+/// Code's): `✳ Waiting for N background agents to finish`, shown only while
+/// live chips exist. N is `treeLiveCount` — the same count that derives the
+/// `◔ WAITING · N` badge, so the two can never disagree. A chip holding a
+/// question is still unfinished, but it is unfinished ON THE USER, so the
+/// line says so rather than implying the agent is busy.
+fn waiting_for_agents(model: &AppModel) -> Option<String> {
+    let live = crate::app::tree_live_count(&model.chips);
+    if live == 0 {
+        return None;
+    }
+    let plural = if live > 1 { "s" } else { "" };
+    let needs_input = crate::app::flatten_chips(&model.chips)
+        .iter()
+        .filter(|(_, chip)| {
+            !chip.closed && chip.state == crate::script::ChipDisplayState::InputRequired
+        })
+        .count();
+    let mut line = format!("✳ Waiting for {live} background agent{plural} to finish");
+    if needs_input > 0 {
+        line = format!("✳ Waiting for {live} background agent{plural} — {needs_input} needs input");
+    }
+    Some(line)
 }
 
 /// The SubTree panel's needed height (0 when there are no chips):
@@ -944,7 +1251,10 @@ fn subtree_needed(model: &AppModel, on_subagent: bool) -> u16 {
     if model.subtree_collapsed {
         return 1;
     }
-    let rows = crate::app::flatten_chips(&model.chips).len() + usize::from(on_subagent);
+    // The ⌂ main row is part of the map on BOTH screens (owner item 3), so
+    // it always costs a row while the panel is open.
+    let _ = on_subagent;
+    let rows = crate::app::flatten_chips(&model.chips).len() + 1;
     u16::try_from(rows + 1).unwrap_or(u16::MAX)
 }
 
@@ -1015,16 +1325,30 @@ fn render_subtree(
     ])];
     let mut row_hits: Vec<(usize, Hit)> = vec![(0, Hit::SubTreeToggle)];
     if !model.subtree_collapsed {
-        if on_subagent {
-            row_hits.push((lines.len(), Hit::SessionHome));
-            lines.push(Line::from(vec![
-                Span::styled(" ⌂ ", theme.gold_style()),
-                Span::styled(
-                    format!("{} — back to the main transcript", model.display_name()),
-                    theme.dim_style(),
-                ),
-            ]));
-        }
+        // Owner item 3: the main row is ALWAYS in the map, not just in the
+        // subagent view, and whichever node is being VIEWED is bold — so the
+        // panel always answers "where am I?". (The sim only draws this row on
+        // the subagent screen, tui.js:2915-2920; the owner's direction wins.)
+        let on_main = !on_subagent;
+        row_hits.push((lines.len(), Hit::SessionHome));
+        let mut home = Line::from(vec![
+            Span::styled(" ⌂ ", theme.gold_style()),
+            Span::styled(
+                format!("{} — back to the main transcript", model.display_name()),
+                if on_main {
+                    theme.bright_style().add_modifier(Modifier::BOLD)
+                } else {
+                    theme.dim_style()
+                },
+            ),
+        ]);
+        home = hover_band(
+            home,
+            model.hovered == Some(Hit::SessionHome),
+            area.width,
+            theme,
+        );
+        lines.push(home);
         let rows = crate::app::flatten_chips(&model.chips);
         let total = rows.len();
         for (index, (depth, chip)) in rows.iter().enumerate() {
@@ -1062,6 +1386,9 @@ fn render_subtree(
                     format!("{} {}", chip.callsign, chip.hon),
                     if chip.closed {
                         theme.faint_style()
+                    } else if viewing {
+                        // The viewed node is bold (owner item 3).
+                        theme.bright_style().add_modifier(Modifier::BOLD)
                     } else {
                         theme.bright_style()
                     },
@@ -1072,14 +1399,12 @@ fn render_subtree(
                 spans.push(Span::styled(format!(" · {}", chip.device), ink));
             }
             spans.push(Span::styled(format!(" — {activity}"), ink));
-            let mut line = Line::from(spans);
-            if model.hovered == Some(Hit::ChipRow(chip.agent.clone())) {
-                let pad = (area.width as usize).saturating_sub(line.width());
-                if pad > 0 {
-                    line.push_span(Span::raw(" ".repeat(pad)));
-                }
-                line = line.style(theme.hover_style());
-            }
+            let line = hover_band(
+                Line::from(spans),
+                model.hovered == Some(Hit::ChipRow(chip.agent.clone())),
+                area.width,
+                theme,
+            );
             row_hits.push((lines.len(), Hit::ChipRow(chip.agent.clone())));
             lines.push(line);
         }
@@ -1884,6 +2209,10 @@ fn render_composer(
         .style(theme.text_style()),
         rule_area,
     );
+    // Ground the WHOLE region in inputBg before any text lands, so every row
+    // of the band — including rows the composer does not fill — is covered
+    // edge to edge (owner item 2).
+    frame.render_widget(Block::default().style(theme.input_style()), row_area);
     let (lines, chip_at) = composer_lines(model, theme, row_area.width, row_area.height);
     frame.render_widget(
         Paragraph::new(Text::from(lines)).style(theme.input_style()),

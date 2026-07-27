@@ -647,6 +647,13 @@ pub enum Hit {
     ChipRow(String),
     /// The SubTree header (collapse toggle).
     SubTreeToggle,
+    /// The pinned-todos header (collapse toggle, owner item 7).
+    TodosToggle,
+    /// One pinned-todo row. Carries the todo's id so a stale rect can only
+    /// ever light the row it was measured on. Clicking a row does nothing —
+    /// the sim's rows are not buttons; the hit exists so the row can take
+    /// hover chrome like every other list row.
+    TodoRow(u32),
     /// `⌂ {session} — back to the main transcript` (subagent screen).
     SessionHome,
     /// The chip view's `✕ close`.
@@ -702,8 +709,6 @@ pub enum AppEvent {
     Envelope(Box<EventPayload>),
     /// The demo script (or stream) ended.
     StreamEnded,
-    /// The launcher sat untouched long enough — play the classic demo.
-    AutoPlay,
 }
 
 /// Identity shown in the status bar and launcher info line. Real values come
@@ -772,6 +777,10 @@ pub struct AppModel {
     pub view_path: Vec<String>,
     /// The SubTree header collapse toggle (`▾`/`▸ subagents`).
     pub subtree_collapsed: bool,
+    /// The pinned-todos header collapse toggle (sim tui.js:2863-2888 — the
+    /// header is a button and the collapsed form summarises the current
+    /// item; owner item 7 promotes it from the deferred ledger).
+    pub todos_collapsed: bool,
     /// An auto-resume turn is in flight (§2.7 guard).
     pub auto_resuming: bool,
     /// The aura orchestrator surface (persists across screen exits).
@@ -805,8 +814,6 @@ pub struct AppModel {
     pub requests: Vec<AppRequest>,
     /// True while a demo turn is playing (submits are ignored, honestly).
     pub turn_active: bool,
-    /// The launcher auto-play fired or was cancelled by interaction.
-    pub auto_play_spent: bool,
     /// Wheel scroll-back offset in the session transcript (0 = follow
     /// bottom; wheel up increases, wheel down decreases). A `Cell` because
     /// RENDER is the single scroll authority (review r3 P2-2). The wheel
@@ -858,6 +865,7 @@ impl Default for AppModel {
             chips: Vec::new(),
             view_path: Vec::new(),
             subtree_collapsed: false,
+            todos_collapsed: false,
             auto_resuming: false,
             aura: AuraModel::seed(),
             samples: sample_sessions(),
@@ -871,7 +879,6 @@ impl Default for AppModel {
             session_epoch: 0,
             requests: Vec::new(),
             turn_active: false,
-            auto_play_spent: false,
             scroll_back: std::cell::Cell::new(0),
             scroll_max: std::cell::Cell::new(0),
             sticky_suppressed: false,
@@ -1028,12 +1035,10 @@ impl AppModel {
             AppEvent::Key(key) => {
                 self.dirty = true;
                 self.flash = None;
-                self.auto_play_spent = true;
                 self.handle_key(key);
             }
             AppEvent::Paste(text) => {
                 self.dirty = true;
-                self.auto_play_spent = true;
                 // While a blocking menu replaces the composer, paste has no
                 // target (r2 P2).
                 if self.projection.open_menu().is_some() && self.screen == Screen::Session {
@@ -1058,13 +1063,6 @@ impl AppModel {
             AppEvent::Envelope(payload) => {
                 self.dirty = true;
                 self.handle_envelope(&payload);
-            }
-            AppEvent::AutoPlay => {
-                if !self.auto_play_spent && self.screen == Screen::Launcher && !self.turn_active {
-                    self.auto_play_spent = true;
-                    self.dirty = true;
-                    self.attach_sample(0);
-                }
             }
             AppEvent::StreamEnded => {}
         }
@@ -1927,6 +1925,7 @@ impl AppModel {
         self.chips.clear();
         self.view_path.clear();
         self.subtree_collapsed = false;
+        self.todos_collapsed = false;
         self.auto_resuming = false;
         self.scroll_back.set(0);
         self.scroll_max.set(0);
@@ -1947,17 +1946,37 @@ impl AppModel {
             self.flash = Some("· a turn is already running".to_owned());
             return;
         }
-        if let Some(sample) = self.samples.get(index) {
-            let (blurb, head, honorific, name) =
-                (sample.blurb, sample.head, sample.honorific, sample.name);
-            self.fresh_session();
-            self.session_title = Some(blurb.to_owned());
-            self.session_name = Some(name.to_owned());
-            self.session_head = (head, honorific);
-            self.flash = Some(format!("· attached {name} — demo replay"));
-            self.turn_active = true;
-            self.requests.push(AppRequest::AttachSample(index));
+        let Some(sample) = self.samples.get(index).copied() else {
+            return;
+        };
+        self.fresh_session();
+        self.session_title = Some(sample.blurb.to_owned());
+        self.session_name = Some(sample.name.to_owned());
+        self.session_head = (sample.head, sample.honorific);
+        self.session_dir = sample.dir.to_owned();
+        // Sim `openSession` (tui.js:1606-1615) attaches and NOTHING else —
+        // no turn is started. The session opens showing the transcript it
+        // already has (owner item 1: opening a session must not kick off a
+        // canned sequence).
+        for row in crate::mock::sample_seed(index) {
+            self.projection.apply_seed_row(row);
         }
+        // The launcher row advertises this session's context; the meter is
+        // Usage-authoritative, so seed it rather than showing 0 tok.
+        self.projection
+            .apply(&EventPayload::Usage(haider_protocol::provider::Usage {
+                input: sample.tokens,
+                output: 0,
+                reasoning: 0,
+                cached: 0,
+                source: haider_protocol::provider::UsageSource::Estimated,
+                account: None,
+            }));
+        if let Some(seed) = crate::mock::sample_seed_chip(index) {
+            self.chips.push(ChipModel::from_seed(seed));
+        }
+        self.screen = Screen::Session;
+        self.scroll_back.set(0);
     }
 
     /// A left-click resolved through the frame's hit map. The map may be
@@ -1967,7 +1986,6 @@ impl AppModel {
     pub fn handle_hit(&mut self, hit: Hit) {
         self.dirty = true;
         self.flash = None;
-        self.auto_play_spent = true;
         // A visible overlay owns the screen; hits from the covered frame
         // must not act through it.
         if self.help_open {
@@ -2065,6 +2083,11 @@ impl AppModel {
             {
                 self.subtree_collapsed = !self.subtree_collapsed;
             }
+            Hit::TodosToggle if self.screen == Screen::Session => {
+                self.todos_collapsed = !self.todos_collapsed;
+            }
+            // Hover-only affordance (see the variant's doc comment).
+            Hit::TodoRow(_) => {}
             // The ⌂ home row and the ✕ close button belong to the subagent
             // screen; ✕ closes only the chip actually being VIEWED.
             Hit::SessionHome if self.screen == Screen::Subagent => {
