@@ -8,8 +8,7 @@
 
 use haider_protocol::EventPayload;
 use haider_protocol::menu::{AnswerVia, MenuAnswer};
-use haider_protocol::state::HarnessStatus;
-use haider_tui::app::{AppEvent, AppModel, AppRequest, Hit, Screen, tree_live_count};
+use haider_tui::app::{AppModel, AppRequest, Hit, Screen, tree_live_count};
 use haider_tui::projection::TranscriptEntry;
 use haider_tui::render::render;
 use haider_tui::runtime::DemoDriver;
@@ -19,26 +18,10 @@ use haider_tui::script::{
 };
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::KeyCode;
 
-fn key(code: KeyCode) -> AppEvent {
-    AppEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))
-}
-
-fn launcher_model() -> AppModel {
-    let mut model = AppModel::new();
-    model.handle(AppEvent::Envelope(Box::new(EventPayload::HarnessStatus(
-        HarnessStatus::Ready,
-    ))));
-    model
-}
-
-fn submit(model: &mut AppModel, text: &str) {
-    for c in text.chars() {
-        model.handle(key(KeyCode::Char(c)));
-    }
-    model.handle(key(KeyCode::Enter));
-}
+mod common;
+use common::{drain, driver_for, key, launcher_model, submit};
 
 fn draw(
     model: &AppModel,
@@ -60,13 +43,6 @@ fn draw(
         })
         .collect();
     (rows, hits)
-}
-
-fn drain(driver: &mut DemoDriver, model: &mut AppModel) {
-    let requests: Vec<AppRequest> = model.requests.drain(..).collect();
-    for request in requests {
-        driver.handle_request(model, request);
-    }
 }
 
 fn echo_answers(driver: &DemoDriver, model: &mut AppModel) {
@@ -121,7 +97,7 @@ async fn pump_until(
 /// the same MenuAnswer).
 fn answer_chip_menu(model: &mut AppModel, menu: &str, index: u32) {
     model.outbox.push(haider_tui::app::OutboundAnswer {
-        origin: model.session_epoch,
+        origin: model.session_identity(),
         answer: MenuAnswer {
             menu: haider_protocol::ids::MenuId::new(menu),
             option_key: None,
@@ -320,8 +296,8 @@ fn auto_resume_and_aura_builders_are_verbatim() {
 
 #[tokio::test(start_paused = true)]
 async fn two_subagents_question_recovery_collect_and_auto_resume() {
-    let (mut driver, mut rx) = DemoDriver::new(64);
     let mut model = launcher_model();
+    let (mut driver, mut rx) = driver_for(&model);
     submit(&mut model, "use two subagents to split this work");
     // The tests chip parks on its question; the parent turn finishes.
     pump_until(&mut driver, &mut rx, &mut model, "tests question", |m| {
@@ -419,8 +395,8 @@ async fn two_subagents_question_recovery_collect_and_auto_resume() {
 
 #[tokio::test(start_paused = true)]
 async fn docs_close_arm_runs_the_close_lifecycle_and_5s_removal() {
-    let (mut driver, mut rx) = DemoDriver::new(64);
     let mut model = launcher_model();
+    let (mut driver, mut rx) = driver_for(&model);
     submit(&mut model, "use two subagents please");
     pump_until(&mut driver, &mut rx, &mut model, "docs recovery", |m| {
         haider_tui::app::find_chip(&m.chips, "t1-docs")
@@ -456,8 +432,8 @@ async fn docs_close_arm_runs_the_close_lifecycle_and_5s_removal() {
 
 #[tokio::test(start_paused = true)]
 async fn respond_chip_steers_queue_when_blocked_and_delegates_nested_when_asked() {
-    let (mut driver, mut rx) = DemoDriver::new(64);
     let mut model = launcher_model();
+    let (mut driver, mut rx) = driver_for(&model);
     submit(&mut model, "use a subagent for the webhook tests");
     pump_until(&mut driver, &mut rx, &mut model, "tests question", |m| {
         haider_tui::app::find_chip(&m.chips, "t1-tests")
@@ -508,7 +484,8 @@ async fn respond_chip_steers_queue_when_blocked_and_delegates_nested_when_asked(
     assert_eq!(nested.name, "subtask");
     assert!(nested.transcript.entries().iter().any(|entry| matches!(
         entry,
-        TranscriptEntry::Note { text } if text == "· spawned by Hasan — nested delegation"
+        // one honour roll (TUI4.1 D2-2): chip claims interleave with head claims
+        TranscriptEntry::Note { text } if text == "· spawned by Husayn — nested delegation"
     )));
     assert_eq!(
         nested.state,
@@ -555,8 +532,8 @@ async fn respond_chip_steers_queue_when_blocked_and_delegates_nested_when_asked(
 
 #[tokio::test(start_paused = true)]
 async fn aura_orchestrates_spawn_and_status_with_talk_and_toggles() {
-    let (mut driver, mut rx) = DemoDriver::new(64);
     let mut model = launcher_model();
+    let (mut driver, mut rx) = driver_for(&model);
     submit(&mut model, "/aura");
     assert_eq!(model.screen, Screen::Aura);
     assert!(model.window_title().ends_with("· aura"));
@@ -661,8 +638,8 @@ async fn aura_orchestrates_spawn_and_status_with_talk_and_toggles() {
 
 #[tokio::test(start_paused = true)]
 async fn subtree_panel_and_subagent_view_render_the_sim_anatomy() {
-    let (mut driver, mut rx) = DemoDriver::new(64);
     let mut model = launcher_model();
+    let (mut driver, mut rx) = driver_for(&model);
     submit(&mut model, "use two subagents for this");
     pump_until(&mut driver, &mut rx, &mut model, "tests question", |m| {
         haider_tui::app::find_chip(&m.chips, "t1-tests")
@@ -681,7 +658,8 @@ async fn subtree_panel_and_subagent_view_render_the_sim_anatomy() {
     assert!(header.contains("? 1 needs input"));
     assert!(
         rows.iter()
-            .any(|row| row.contains("Hasan (a) · tests · gpt-5.6 · local"))
+            // one honour roll (TUI4.1 D2-2): chip claims interleave with head claims
+            .any(|row| row.contains("Husayn (a) · tests · gpt-5.6 · local"))
     );
     assert!(
         rows.iter()
@@ -705,7 +683,8 @@ async fn subtree_panel_and_subagent_view_render_the_sim_anatomy() {
     let (rows, hits) = draw(&model, 130, 40);
     assert!(
         rows.iter()
-            .any(|row| row.contains("Hasan (a)") && row.contains("✕ close")),
+            // one honour roll (TUI4.1 D2-2): chip claims interleave with head claims
+            .any(|row| row.contains("Husayn (a)") && row.contains("✕ close")),
         "breadcrumb head + close"
     );
     assert!(
@@ -738,8 +717,8 @@ async fn subtree_panel_and_subagent_view_render_the_sim_anatomy() {
 
 #[tokio::test(start_paused = true)]
 async fn subtree_sheds_after_todos_but_before_the_composer_at_90x10() {
-    let (mut driver, mut rx) = DemoDriver::new(64);
     let mut model = launcher_model();
+    let (mut driver, mut rx) = driver_for(&model);
     submit(&mut model, "use a subagent here");
     pump_until(&mut driver, &mut rx, &mut model, "chip live", |m| {
         !m.chips.is_empty()

@@ -621,8 +621,14 @@ pub enum AppRequest {
         voice: bool,
         title: bool,
     },
-    /// Stop any playing script (fresh session / reset).
-    StopScripts,
+    /// Cancel EVERY session's and every chip's arms and clear all demo
+    /// token meters — a GLOBAL reset, not a polite stop (renamed from
+    /// `StopScripts`, review TUI4.1 D3-4: the old name undersold the
+    /// blast radius). Pushed only by [`AppModel::fresh_session`] — the
+    /// `/reset` teardown and the scratch surface's fresh start. Aura
+    /// deliberately survives (sim tui.js:1950-1955); `/reset` resets it
+    /// separately via [`Self::ResetAura`].
+    ResetAllSessions,
     /// Esc mid-turn: stop the playing script; the reducer already settled
     /// the projection into idle(i) (sim interrupt, tui.js:1551-1567).
     Interrupt,
@@ -743,7 +749,7 @@ pub enum Hit {
     StickyJump(u16),
 }
 
-/// One answer on its way to the client, tagged with the session epoch that
+/// One answer on its way to the client, tagged with the session identity that
 /// RENDERED the card (review r2 P1-1). Answers ride the never-cancelled
 /// control tag so delivery is guaranteed, but CONSUMPTION checks the
 /// origin: an answer to a card the user has since replaced must never
@@ -869,6 +875,9 @@ pub struct AppModel {
     /// The most recently detached session — the empty-⏎ re-attach target.
     pub last_detached: Option<u64>,
     /// Session id allocator (seeds take 1-3; sim uses `Date.now()`).
+    /// MONOTONIC for the process lifetime — never reset, not even by
+    /// `/reset` (review TUI4.1 P1-2): an id-keyed control callback must
+    /// never find a replacement session wearing a dead session's id.
     pub next_session_id: u64,
     /// The roster claim counter (sim `rosterRef`, tui.js:681) — shared
     /// with the driver so heads and chips draw from ONE honour roll.
@@ -892,10 +901,6 @@ pub struct AppModel {
     /// Answers the user produced; the runtime drains these to the client
     /// (side effects never happen inside the reducer).
     pub outbox: Vec<OutboundAnswer>,
-    /// Bumped by every [`Self::fresh_session`]. Menu answers and the
-    /// auto-title micro-call carry the epoch they were born under, and the
-    /// driver applies them only while it is still current (review r2 P1-1).
-    pub session_epoch: u64,
     /// Reducer-requested side effects; the runtime drains these.
     pub requests: Vec<AppRequest>,
     /// True while a demo turn is playing (submits are ignored, honestly).
@@ -987,7 +992,6 @@ impl Default for AppModel {
             help_open: false,
             flash: None,
             outbox: Vec::new(),
-            session_epoch: 0,
             requests: Vec::new(),
             turn_active: false,
             scroll_back: std::cell::Cell::new(0),
@@ -1007,6 +1011,20 @@ impl AppModel {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The identity that outbound answers and the auto-title micro-call
+    /// carry as their `origin`, and that the driver's consumption gates
+    /// check (review r2 P1-1): the ATTACHED session's id, or 0 for the
+    /// no-session scratch surface. DERIVED, never stored (review TUI4.1,
+    /// Fable D2-1 — the old `session_epoch` field was a hand-maintained
+    /// twin of `active_session` with a stale monotonicity doc). Identities
+    /// themselves never recur: `next_session_id` is monotonic for the
+    /// process lifetime (the sim's `s-${Date.now()}` law), so an id-keyed
+    /// callback can never find a replacement wearing an old id.
+    #[must_use]
+    pub fn session_identity(&self) -> u64 {
+        self.active_session.unwrap_or(0)
     }
 
     /// The session's display name — the slug (sim `session.name`), never
@@ -1521,7 +1539,7 @@ impl AppModel {
         // The blurb is NOT set here: the sim's micro-call names the session
         // inside its own 1.5 s callback. The callback SURVIVES an interrupt
         // (bare setTimeout in the sim) — only a session replacement voids it,
-        // via the origin epoch (review r2 P2-6).
+        // via the origin identity (review r2 P2-6).
         let title = self.session_title.is_none();
         self.screen = Screen::Session;
         self.turn_active = true;
@@ -1698,7 +1716,7 @@ impl AppModel {
             return;
         };
         self.outbox.push(OutboundAnswer {
-            origin: self.session_epoch,
+            origin: self.session_identity(),
             answer: MenuAnswer {
                 menu: menu.id.clone(),
                 option_key: Some(option.key.clone()),
@@ -1808,7 +1826,13 @@ impl AppModel {
                 self.sessions = seed_session_states();
                 self.active_session = None;
                 self.last_detached = None;
-                self.next_session_id = 4;
+                // `next_session_id` is deliberately NOT reset (review
+                // TUI4.1 P1-2): the control-tagged auto-title callback is
+                // keyed by session id and survives /reset by design (sim:
+                // a bare setTimeout); resetting the allocator let a
+                // replacement session reuse the old id and receive the old
+                // title. The sim's `s-${Date.now()}` ids never recur —
+                // monotonicity ports that law, killing the whole class.
                 self.roster.store(
                     crate::script::ROSTER_FIRST_CLAIM,
                     std::sync::atomic::Ordering::SeqCst,
@@ -1983,7 +2007,7 @@ impl AppModel {
             via: AnswerVia::Tui,
         };
         self.outbox.push(OutboundAnswer {
-            origin: self.session_epoch,
+            origin: self.session_identity(),
             answer,
         });
         self.menu_selection = 0;
@@ -2099,18 +2123,16 @@ impl AppModel {
 
     /// Start-fresh semantics (review r1 P2): a new session begins from an
     /// empty projection; the previous demo transcript does not leak in —
-    /// including its scroll ceiling and any pending timers (StopScripts
-    /// cancels the Session and Chip ARMS in the ArmTable — Aura
+    /// including its scroll ceiling and any pending timers
+    /// (ResetAllSessions cancels the Session and Chip ARMS — Aura
     /// deliberately survives, see `ArmOwner` — so a stale idle-decay or
     /// script beat from the OLD session drops at consumption).
     fn fresh_session(&mut self) {
-        // A NEW session identity: answers and micro-calls born under the old
-        // one are now stale, and any that never left the outbox are dropped
-        // outright (review r2 P1-1).
-        // TUI4c: the epoch IS the active session id; a reset surface has
-        // none, so stale answers/titles fail their identity check against
-        // 0 exactly as they failed the old bumped epoch.
-        self.session_epoch = 0;
+        // Answers and micro-calls born under the old surface are now
+        // stale: any that never left the outbox are dropped outright
+        // (review r2 P1-1); in-flight ones fail the driver's
+        // [`Self::session_identity`] gate — the reset surface has no
+        // session, so their by-id origin can never match.
         self.outbox.clear();
         self.projection = SessionProjection::new();
         self.session_title = None;
@@ -2129,7 +2151,7 @@ impl AppModel {
         self.scroll_back.set(0);
         self.scroll_max.set(0);
         self.sticky_suppressed = false;
-        self.requests.push(AppRequest::StopScripts);
+        self.requests.push(AppRequest::ResetAllSessions);
     }
 
     /// Attach a sample session by NAME (the clicked row's identity, P2-9).
@@ -2188,7 +2210,6 @@ impl AppModel {
         self.session_dir = std::mem::take(&mut slot.dir);
         self.sessions[index] = slot;
         self.active_session = Some(id);
-        self.session_epoch = id;
         self.menu_selection = 0;
         self.view_path.clear();
         self.screen = Screen::Session;
@@ -2203,7 +2224,6 @@ impl AppModel {
     /// item 12 requires of the launcher.
     pub fn checkin(&mut self) {
         let Some(active) = self.active_session.take() else {
-            self.session_epoch = 0;
             return;
         };
         if let Some(index) = self.sessions.iter().position(|entry| entry.id == active) {
@@ -2225,7 +2245,6 @@ impl AppModel {
             slot.dir = std::mem::replace(&mut self.session_dir, self.launcher_dir.clone());
         }
         self.last_detached = Some(active);
-        self.session_epoch = 0;
         self.msg_queue.clear();
         self.queue_mode = false;
         self.view_path.clear();

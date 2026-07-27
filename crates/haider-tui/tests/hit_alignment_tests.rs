@@ -5,7 +5,6 @@
 #![allow(clippy::expect_used)]
 
 use haider_protocol::EventPayload;
-use haider_protocol::state::HarnessStatus;
 use haider_tui::app::{AppEvent, AppModel, Hit, Screen};
 use haider_tui::mock::demo_script;
 use haider_tui::render::render;
@@ -15,6 +14,9 @@ use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier};
+
+mod common;
+use common::{key, launcher_model};
 
 fn draw(
     model: &AppModel,
@@ -37,10 +39,6 @@ fn draw(
         rows.push(line);
     }
     (rows, hits, terminal)
-}
-
-fn key(code: KeyCode) -> AppEvent {
-    AppEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))
 }
 
 /// The y-coordinate of the first rendered row containing `needle`.
@@ -72,14 +70,6 @@ fn rect_for(hits: &[(Rect, Hit)], hit: Hit) -> Rect {
         "duplicate hit regions for {hit:?}"
     );
     *rect
-}
-
-fn launcher_model() -> AppModel {
-    let mut model = AppModel::new();
-    model.handle(AppEvent::Envelope(Box::new(EventPayload::HarnessStatus(
-        HarnessStatus::Ready,
-    ))));
-    model
 }
 
 fn session_model() -> AppModel {

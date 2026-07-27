@@ -4,7 +4,6 @@
 #![allow(clippy::expect_used)]
 
 use haider_protocol::EventPayload;
-use haider_protocol::state::HarnessStatus;
 use haider_tui::app::{AppEvent, AppModel, AppRequest, Hit, Screen};
 use haider_tui::mock::demo_script;
 use haider_tui::render::render;
@@ -19,9 +18,8 @@ use ratatui::crossterm::event::{
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier};
 
-fn key(code: KeyCode) -> AppEvent {
-    AppEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))
-}
+mod common;
+use common::{key, launcher_model};
 
 fn ctrl(c: char) -> AppEvent {
     AppEvent::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL))
@@ -34,14 +32,6 @@ fn mouse(kind: MouseEventKind, column: u16, row: u16) -> Event {
         row,
         modifiers: KeyModifiers::NONE,
     })
-}
-
-fn launcher_model() -> AppModel {
-    let mut model = AppModel::new();
-    model.handle(AppEvent::Envelope(Box::new(EventPayload::HarnessStatus(
-        HarnessStatus::Ready,
-    ))));
-    model
 }
 
 fn session_model() -> AppModel {

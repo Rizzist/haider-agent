@@ -41,7 +41,7 @@ pub enum DemoEvent {
     },
     /// The 1.5 s auto-title micro-call returned: the driver names the
     /// session and pushes the note TOGETHER, inside the callback (sim
-    /// tui.js:1219-1227, review P2-12). `origin` is the session epoch the
+    /// tui.js:1219-1227, review P2-12). `origin` is the session identity the
     /// call was made for — the sim's callback looks the session up by id
     /// and does nothing if it is gone, and it is NOT cancelled by an
     /// interrupt (review r2 P2-6).
@@ -50,7 +50,7 @@ pub enum DemoEvent {
         text: String,
     },
     /// A menu answer from the model's outbox. It rides the never-cancelled
-    /// control tag for DELIVERY, but `origin` (the session epoch that
+    /// control tag for DELIVERY, but `origin` (the session identity that
     /// rendered the card) is checked at consumption (review r2 P1-1).
     Answer {
         origin: u64,

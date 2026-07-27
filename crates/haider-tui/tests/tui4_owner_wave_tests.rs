@@ -4,34 +4,15 @@
 //! spacing/hover/collapse, and the background-agent waiting line.
 #![allow(clippy::expect_used)]
 
-use haider_protocol::EventPayload;
-use haider_protocol::state::HarnessStatus;
 use haider_tui::app::{AppEvent, AppModel, Hit, Screen};
 use haider_tui::projection::TranscriptEntry;
 use haider_tui::render::render;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::Color;
 
-fn key(code: KeyCode) -> AppEvent {
-    AppEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))
-}
-
-fn launcher_model() -> AppModel {
-    let mut model = AppModel::new();
-    model.handle(AppEvent::Envelope(Box::new(EventPayload::HarnessStatus(
-        HarnessStatus::Ready,
-    ))));
-    model
-}
-
-fn submit(model: &mut AppModel, text: &str) {
-    for c in text.chars() {
-        model.handle(key(KeyCode::Char(c)));
-    }
-    model.handle(key(KeyCode::Enter));
-}
+mod common;
+use common::{launcher_model, submit};
 
 struct Frame {
     rows: Vec<String>,

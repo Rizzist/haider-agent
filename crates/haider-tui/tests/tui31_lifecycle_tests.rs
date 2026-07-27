@@ -6,36 +6,18 @@
 //! a mutation that arrives after the teardown, never as an internal call.
 #![allow(clippy::expect_used)]
 
-use haider_protocol::EventPayload;
 use haider_protocol::menu::{AnswerVia, MenuAnswer};
-use haider_protocol::state::HarnessStatus;
-use haider_tui::app::{AppEvent, AppModel, AppRequest, Hit, LauncherRow, Screen, tree_live_count};
+use haider_tui::app::{AppModel, AppRequest, Hit, LauncherRow, Screen, tree_live_count};
 use haider_tui::projection::TranscriptEntry;
 use haider_tui::render::render;
 use haider_tui::runtime::DemoDriver;
 use haider_tui::script::{AuraState, ChipDisplayState, DemoEvent};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::KeyCode;
 
-fn key(code: KeyCode) -> AppEvent {
-    AppEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))
-}
-
-fn launcher_model() -> AppModel {
-    let mut model = AppModel::new();
-    model.handle(AppEvent::Envelope(Box::new(EventPayload::HarnessStatus(
-        HarnessStatus::Ready,
-    ))));
-    model
-}
-
-fn submit(model: &mut AppModel, text: &str) {
-    for c in text.chars() {
-        model.handle(key(KeyCode::Char(c)));
-    }
-    model.handle(key(KeyCode::Enter));
-}
+mod common;
+use common::{drain, driver_for, key, launcher_model, submit};
 
 fn draw(
     model: &AppModel,
@@ -57,13 +39,6 @@ fn draw(
         })
         .collect();
     (rows, hits)
-}
-
-fn drain(driver: &mut DemoDriver, model: &mut AppModel) {
-    let requests: Vec<AppRequest> = model.requests.drain(..).collect();
-    for request in requests {
-        driver.handle_request(model, request);
-    }
 }
 
 fn echo_answers(driver: &DemoDriver, model: &mut AppModel) {
@@ -131,7 +106,7 @@ async fn pump_quiet(
 
 fn answer_menu(model: &mut AppModel, menu: &str, index: u32) {
     model.outbox.push(haider_tui::app::OutboundAnswer {
-        origin: model.session_epoch,
+        origin: model.session_identity(),
         answer: MenuAnswer {
             menu: haider_protocol::ids::MenuId::new(menu),
             option_key: None,
@@ -158,8 +133,8 @@ async fn interrupt_leaves_chips_running_and_their_card_still_resolves() {
     // (tui.js:1551-1567) touches only the run token, the queue and the
     // note, so children outlive the cancelled parent turn — and now their
     // parked arms do too.
-    let (mut driver, mut rx) = DemoDriver::new(64);
     let mut model = launcher_model();
+    let (mut driver, mut rx) = driver_for(&model);
     submit(&mut model, "use a subagent for the webhook tests");
     pump_until(&mut driver, &mut rx, &mut model, "chip card", |m| {
         haider_tui::app::find_chip(&m.chips, "t1-tests")
@@ -203,8 +178,8 @@ async fn interrupt_leaves_chips_running_and_their_card_still_resolves() {
 async fn closing_a_chip_stops_its_script_at_once() {
     // Review P1-1: closing only set closed/removing while the chip's script
     // kept streaming into its transcript.
-    let (mut driver, mut rx) = DemoDriver::new(64);
     let mut model = launcher_model();
+    let (mut driver, mut rx) = driver_for(&model);
     submit(&mut model, "use two subagents to split this work");
     pump_until(&mut driver, &mut rx, &mut model, "docs streaming", |m| {
         haider_tui::app::find_chip(&m.chips, "t1-docs")
@@ -243,8 +218,8 @@ async fn closing_a_chip_stops_its_script_at_once() {
 async fn a_fresh_session_cancels_chip_work() {
     // Review r1 P1-1: chip arms were only half-guarded, so a torn-down
     // session's chip scripts bled into the next one.
-    let (mut driver, mut rx) = DemoDriver::new(64);
     let mut model = launcher_model();
+    let (mut driver, mut rx) = driver_for(&model);
     submit(&mut model, "use two subagents to split this work");
     pump_until(&mut driver, &mut rx, &mut model, "chips live", |m| {
         m.chips.len() == 2
@@ -272,8 +247,8 @@ async fn aura_runs_survive_clear_but_reset_stops_them() {
     // interrupt do NOT advance `auraRunRef` (tui.js:1950-1955) — only
     // `/reset` (tui.js:1930) and the next `orchestrate` do. A background
     // orchestration must therefore FINISH across navigation.
-    let (mut driver, mut rx) = DemoDriver::new(64);
     let mut model = launcher_model();
+    let (mut driver, mut rx) = driver_for(&model);
     submit(&mut model, "/aura");
     submit(
         &mut model,
@@ -332,8 +307,8 @@ async fn aura_runs_survive_clear_but_reset_stops_them() {
 #[tokio::test(start_paused = true)]
 async fn a_session_interrupt_leaves_a_background_orchestration_running() {
     // The other half of review r2 P2-5: an interrupt is session-scoped.
-    let (mut driver, mut rx) = DemoDriver::new(64);
     let mut model = launcher_model();
+    let (mut driver, mut rx) = driver_for(&model);
     submit(&mut model, "/aura");
     submit(
         &mut model,
@@ -363,8 +338,8 @@ async fn a_session_interrupt_leaves_a_background_orchestration_running() {
 async fn two_rapid_aura_submits_cannot_interleave() {
     // Review P1-2: the state stayed Idle until an async beat, so the sim's
     // `state === "idle"` gate let a second submit start concurrently.
-    let (mut driver, mut rx) = DemoDriver::new(64);
     let mut model = launcher_model();
+    let (mut driver, mut rx) = driver_for(&model);
     submit(&mut model, "/aura");
     submit(&mut model, "spin up billing on workstation");
     assert_ne!(model.aura.state, AuraState::Idle, "the orb leaves idle NOW");
@@ -389,8 +364,8 @@ async fn two_rapid_aura_submits_cannot_interleave() {
 async fn a_talk_hold_cancelled_by_esc_never_starts_a_session() {
     // Review P1-3: Esc navigated to the Launcher without touching the 1.3 s
     // timer, and TalkFire then called fresh_session from there.
-    let (mut driver, mut rx) = DemoDriver::new(64);
     let mut model = launcher_model();
+    let (mut driver, mut rx) = driver_for(&model);
     submit(&mut model, "hello world");
     pump_until(&mut driver, &mut rx, &mut model, "turn done", |m| {
         !m.turn_active && m.projection.badge() == "IDLE"
@@ -419,8 +394,8 @@ async fn a_talk_hold_cancelled_by_esc_never_starts_a_session() {
 async fn a_second_message_to_a_chip_renders_in_full() {
     // Review P1-4: fixed `g1`/`g2` suffixes made the second chip turn reuse
     // closed item ids, and the projection dropped every row of it.
-    let (mut driver, mut rx) = DemoDriver::new(64);
     let mut model = launcher_model();
+    let (mut driver, mut rx) = driver_for(&model);
     submit(&mut model, "use a subagent for the webhook tests");
     pump_until(&mut driver, &mut rx, &mut model, "chip card", |m| {
         haider_tui::app::find_chip(&m.chips, "t1-tests")
@@ -596,8 +571,8 @@ fn the_aura_stage_never_hides_a_live_composer() {
 
 #[tokio::test(start_paused = true)]
 async fn chip_question_rows_answer_on_click_and_move_on_hover() {
-    let (mut driver, mut rx) = DemoDriver::new(64);
     let mut model = launcher_model();
+    let (mut driver, mut rx) = driver_for(&model);
     submit(&mut model, "use a subagent for the webhook tests");
     pump_until(&mut driver, &mut rx, &mut model, "chip card", |m| {
         haider_tui::app::find_chip(&m.chips, "t1-tests")
@@ -643,8 +618,8 @@ async fn chip_question_rows_answer_on_click_and_move_on_hover() {
 
 #[tokio::test(start_paused = true)]
 async fn the_voice_tag_clears_even_when_the_branch_parks_on_a_menu() {
-    let (mut driver, mut rx) = DemoDriver::new(64);
     let mut model = launcher_model();
+    let (mut driver, mut rx) = driver_for(&model);
     submit(&mut model, "hello world");
     pump_until(&mut driver, &mut rx, &mut model, "first turn", |m| {
         !m.turn_active && m.projection.badge() == "IDLE"
@@ -701,8 +676,8 @@ async fn token_counts_use_utf16_units_like_the_sim() {
     // it costs 18 tokens, not the 9 a Unicode-scalar count would charge.
     // Driven through production dispatch (review r2 P3-9): the FIRST usage
     // frame of the turn is the preamble's user-text accrual.
-    let (mut driver, mut rx) = DemoDriver::new(64);
     let mut model = launcher_model();
+    let (mut driver, mut rx) = driver_for(&model);
     submit(&mut model, "\u{1F600}");
     pump_until(&mut driver, &mut rx, &mut model, "first usage", |m| {
         m.projection.context_tokens() > 0
@@ -722,8 +697,8 @@ async fn trailing_word_boundaries_route_like_the_sim() {
     // "ascii" is NOT a hit in either engine: it ends `ii`.) Driven through
     // production dispatch (review r2 P3-9).
     async fn opening_line(text: &str) -> String {
-        let (mut driver, mut rx) = DemoDriver::new(64);
         let mut model = launcher_model();
+        let (mut driver, mut rx) = driver_for(&model);
         submit(&mut model, text);
         pump_until(&mut driver, &mut rx, &mut model, "opening line", |m| {
             m.projection.entries().iter().any(|entry| {
@@ -779,8 +754,8 @@ async fn an_interrupted_think_window_burns_no_intro_and_no_callsign() {
     // Review P2-11: the counters advanced while BUILDING beats, so a turn
     // killed inside its 750 ms think window still consumed GENERIC_INTROS[0]
     // and a roster callsign. The sim picks the branch after the window.
-    let (mut driver, mut rx) = DemoDriver::new(64);
     let mut model = launcher_model();
+    let (mut driver, mut rx) = driver_for(&model);
     submit(&mut model, "hello world");
     pump_until(&mut driver, &mut rx, &mut model, "thinking", |m| {
         m.projection.badge() == "● THINKING"
@@ -822,8 +797,8 @@ async fn an_interrupted_think_window_burns_no_intro_and_no_callsign() {
 async fn two_manual_compactions_both_land_their_rows() {
     // Review P2-13: `compact-{before}` repeated when the meter had not
     // moved, and the projection dropped the second row.
-    let (mut driver, mut rx) = DemoDriver::new(64);
     let mut model = launcher_model();
+    let (mut driver, mut rx) = driver_for(&model);
     submit(&mut model, "hello world");
     pump_until(&mut driver, &mut rx, &mut model, "turn done", |m| {
         !m.turn_active && m.projection.badge() == "IDLE"
@@ -922,8 +897,8 @@ async fn a_stale_card_answer_cannot_reconfigure_a_replacement_session() {
     // replacement session BEFORE the answer is consumed. The answer rides
     // the never-cancelled control tag, so it still arrives — and must be
     // dropped on identity, not applied to whoever is showing now.
-    let (mut driver, mut rx) = DemoDriver::new(64);
     let mut model = launcher_model();
+    let (mut driver, mut rx) = driver_for(&model);
     submit(&mut model, "hello world");
     pump_until(&mut driver, &mut rx, &mut model, "turn done", |m| {
         !m.turn_active && m.projection.badge() == "IDLE"
@@ -940,7 +915,7 @@ async fn a_stale_card_answer_cannot_reconfigure_a_replacement_session() {
     model.handle(key(KeyCode::Down));
     model.handle(key(KeyCode::Enter));
     let pending = model.outbox.remove(0);
-    assert_eq!(pending.origin, model.session_epoch);
+    assert_eq!(pending.origin, model.session_identity());
     let pending_origin = pending.origin;
     driver
         .sender()
@@ -960,13 +935,14 @@ async fn a_stale_card_answer_cannot_reconfigure_a_replacement_session() {
     submit(&mut model, "a different task entirely");
     drain(&mut driver, &mut model);
     assert_ne!(
-        model.session_epoch, pending_origin,
+        model.session_identity(),
+        pending_origin,
         "a new session identity"
     );
-    let epoch = model.session_epoch;
+    let epoch = model.session_identity();
     let voice_before = model.voice.clone();
     pump_quiet(&mut driver, &mut rx, &mut model, 6_000).await;
-    assert_eq!(model.session_epoch, epoch);
+    assert_eq!(model.session_identity(), epoch);
     assert_eq!(
         model.voice, voice_before,
         "the stale answer must not reconfigure the replacement session"
@@ -989,8 +965,8 @@ async fn a_stale_card_answer_cannot_reconfigure_a_replacement_session() {
 #[tokio::test(start_paused = true)]
 async fn a_card_answered_in_its_own_session_still_applies() {
     // The identity gate must not break the ordinary path.
-    let (mut driver, mut rx) = DemoDriver::new(64);
     let mut model = launcher_model();
+    let (mut driver, mut rx) = driver_for(&model);
     submit(&mut model, "hello world");
     pump_until(&mut driver, &mut rx, &mut model, "turn done", |m| {
         !m.turn_active && m.projection.badge() == "IDLE"
@@ -1054,8 +1030,8 @@ fn each_card_open_mints_a_fresh_id() {
 
 #[tokio::test(start_paused = true)]
 async fn a_menu_option_hit_is_inert_once_its_surface_is_gone() {
-    let (mut driver, mut rx) = DemoDriver::new(64);
     let mut model = launcher_model();
+    let (mut driver, mut rx) = driver_for(&model);
     submit(&mut model, "this is unreliable");
     pump_until(&mut driver, &mut rx, &mut model, "recovery card", |m| {
         m.projection.open_menu().is_some()
@@ -1114,8 +1090,8 @@ async fn a_menu_option_hit_is_inert_once_its_surface_is_gone() {
 async fn the_auto_title_micro_call_lands_after_an_interrupt() {
     // The sim's 1.5 s timeout is a bare setTimeout: interrupting the turn
     // does not cancel it (tui.js:1219-1227).
-    let (mut driver, mut rx) = DemoDriver::new(64);
     let mut model = launcher_model();
+    let (mut driver, mut rx) = driver_for(&model);
     submit(&mut model, "please fix the flaky boundary test suite");
     pump_until(&mut driver, &mut rx, &mut model, "thinking", |m| {
         m.projection.badge() == "● THINKING"
@@ -1144,8 +1120,8 @@ async fn the_auto_title_micro_call_lands_after_an_interrupt() {
 async fn the_auto_title_micro_call_never_names_a_replacement_session() {
     // …but a session REPLACEMENT does make it irrelevant: the sim's
     // callback looks its session up by id and finds it gone.
-    let (mut driver, mut rx) = DemoDriver::new(64);
     let mut model = launcher_model();
+    let (mut driver, mut rx) = driver_for(&model);
     submit(&mut model, "please fix the flaky boundary test suite");
     pump_until(&mut driver, &mut rx, &mut model, "thinking", |m| {
         m.projection.badge() == "● THINKING"

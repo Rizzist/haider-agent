@@ -61,6 +61,11 @@ use std::path::{Path, PathBuf};
 /// The state file's name — `demo-` prefixed on purpose (see module docs).
 pub const DEMO_STORE_FILE: &str = "demo-tui-state.json";
 
+/// The on-disk format version. Checked as part of guard 1: any other
+/// value (or its absence) rejects the whole file back to seeds — the
+/// demo store never guesses at a foreign format (review TUI4.1 P1-1).
+pub const DEMO_STORE_VERSION: u32 = 1;
+
 /// Handle on the demo state file: knows the path and the hash of the last
 /// write, so unchanged frames skip the disk entirely.
 #[derive(Debug)]
@@ -99,14 +104,37 @@ impl DemoStore {
         &self.path
     }
 
-    /// Guard 1 (sim tui.js:700-704 + its whole-body `catch {}`): a missing
-    /// file, unreadable bytes, ANY parse error, or an empty session array
-    /// all yield `None` — the caller keeps the seeds. Never a crash.
+    /// Guard 1 (sim tui.js:700-704 + its whole-body `catch {}`), STRICT
+    /// (review TUI4.1 P1-1 — the sim throws before `setSessions`, so any
+    /// structural surprise preserves the seeds whole; per-field defaulting
+    /// on the structural core was quietly accepting partial state):
+    /// - missing file, unreadable bytes, ANY parse error → seeds;
+    /// - a `version` other than [`DEMO_STORE_VERSION`] (or absent) →
+    ///   seeds — serde ignores unknown fields, so without the check a
+    ///   future format hydrated as if it were ours AND was rewritten
+    ///   without its version;
+    /// - `deny_unknown_fields` on every DTO: within a version, an
+    ///   unknown key is tampering, not tolerance;
+    /// - a session missing its required shape fails the WHOLE file
+    ///   (all-or-nothing, the sim's throw), never a blank-field session;
+    /// - an EMPTY session array → seeds;
+    /// - a session id 0 → seeds: 0 is the scratch-lineage sentinel
+    ///   (Fable D3-3 — the driver drops `Session(0)` events while a
+    ///   session is attached, so an id-0 session's turns silently die).
+    ///
+    /// The strict tier is the SESSION CORE — the shape the sim's
+    /// `s.branches.map(…)` throws on. ONE LEVEL BELOW it (`ProjectionDto`
+    /// and `ChipDto` interiors) fields deliberately keep their defaults:
+    /// those are the sim's per-item `b.menus || []` tolerances, and an
+    /// absent transcript is an empty transcript, not a damaged session.
     #[must_use]
     pub fn load(&self) -> Option<StateDto> {
         let raw = std::fs::read_to_string(&self.path).ok()?;
         let dto: StateDto = serde_json::from_str(&raw).ok()?;
-        if dto.sessions.is_empty() {
+        if dto.version != DEMO_STORE_VERSION {
+            return None;
+        }
+        if dto.sessions.is_empty() || dto.sessions.iter().any(|session| session.id == 0) {
             return None;
         }
         Some(dto)
@@ -151,9 +179,15 @@ impl DemoStore {
 // ---------------------------------------------------------------- DTOs ----
 
 /// The on-disk root — the sim's `haider-tui-v1` payload, minus the singles
-/// whose surfaces are not persisted yet (module docs).
+/// whose surfaces are not persisted yet (module docs). Strict on the
+/// structural core (guard 1); the SINGLES keep `#[serde(default)]`
+/// because the sim guards each individually (`if (data.themeName …)`,
+/// guard 5) — their absence is tolerance, not damage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StateDto {
+    /// [`DEMO_STORE_VERSION`] — required, checked first.
+    pub version: u32,
     pub sessions: Vec<SessionDto>,
     #[serde(default)]
     pub theme: String,
@@ -170,40 +204,33 @@ pub struct StateDto {
     pub card_seq: u64,
 }
 
+/// STRICT structural core (review TUI4.1 P1-1): every field is required —
+/// a session that fails to carry its full shape rejects the whole file
+/// back to seeds, exactly as the sim's `s.branches.map(…)` throw does.
+/// The ONE tolerated absence is `head`, because guard 4's backfill
+/// (`s.head || rosterAt(next++)`, tui.js:725) is itself sim law.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionDto {
     pub id: u64,
-    #[serde(default)]
     pub name: Option<String>,
-    #[serde(default)]
     pub title: Option<String>,
     /// Absent for sessions stored before heads were named (sim guard 4
     /// backfills `rosterAt(next++)`).
     #[serde(default)]
     pub head: Option<HeadDto>,
-    #[serde(default)]
     pub dir: String,
-    #[serde(default)]
     pub model_short: String,
-    #[serde(default)]
     pub device: String,
-    #[serde(default)]
     pub ago: String,
-    #[serde(default = "one")]
     pub branches: u32,
-    #[serde(default)]
     pub turns_offset: u32,
-    #[serde(default)]
     pub projection: ProjectionDto,
-    #[serde(default)]
     pub chips: Vec<ChipDto>,
 }
 
-fn one() -> u32 {
-    1
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HeadDto {
     pub callsign: String,
     #[serde(default)]
@@ -218,6 +245,7 @@ pub struct HeadDto {
 /// state (run state, seq accounting, idempotency sets) deliberately absent:
 /// every session loads IDLE (sim §6).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectionDto {
     #[serde(default)]
     pub entries: Vec<EntryDto>,
@@ -232,6 +260,7 @@ pub struct ProjectionDto {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TodosDto {
     pub item_id: ItemId,
     pub items: Vec<TodoItem>,
@@ -243,7 +272,7 @@ pub struct TodosDto {
 /// dropped at save and every restored block is complete (the sim's entries
 /// hold whatever text had accumulated, rendered as a finished row).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum EntryDto {
     User {
         text: String,
@@ -275,6 +304,7 @@ pub enum EntryDto {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChipDto {
     pub agent: String,
     #[serde(default)]
@@ -312,6 +342,7 @@ pub struct ChipDto {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QuestionDto {
     pub recovery: bool,
     pub text: String,
@@ -322,6 +353,7 @@ pub struct QuestionDto {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VoiceDto {
     pub enabled: bool,
     #[serde(default)]
@@ -385,6 +417,7 @@ pub fn snapshot(model: &AppModel) -> StateDto {
         })
         .collect();
     StateDto {
+        version: DEMO_STORE_VERSION,
         sessions,
         theme: model.theme.name().to_owned(),
         vfs: model.vfs.clone(),
@@ -475,8 +508,10 @@ pub struct HydrateOutcome {
 }
 
 /// Guards 2-5 of the sim's load (tui.js:706-745), in order, against a
-/// freshly seeded model. Guard 1 (parse/non-empty) lives in
-/// [`DemoStore::load`] — reaching here means the payload is usable.
+/// freshly seeded model. Guard 1 lives in [`DemoStore::load`] — version,
+/// strict shape, non-empty, no id-0 — so reaching here means the payload
+/// is structurally sound and every session id is a real (non-sentinel)
+/// identity.
 pub fn hydrate(model: &mut AppModel, dto: StateDto) -> HydrateOutcome {
     // Guard 2 — id-collision bump (sim: scan `e(\d+)`, `bumpEid(max+1000)`,
     // tui.js:706-710). The port's minted ids are session ids and the

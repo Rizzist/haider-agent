@@ -4,64 +4,14 @@
 //! restores exactly.
 #![allow(clippy::expect_used)]
 
-use haider_protocol::EventPayload;
-use haider_protocol::state::HarnessStatus;
-use haider_tui::app::{AppEvent, AppModel, AppRequest, Hit, Screen};
+use haider_tui::app::{AppEvent, AppModel, Hit, Screen};
 use haider_tui::render::render;
-use haider_tui::runtime::DemoDriver;
-use haider_tui::script::DemoEvent;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-fn key(code: KeyCode) -> AppEvent {
-    AppEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))
-}
-
-fn launcher_model() -> AppModel {
-    let mut model = AppModel::new();
-    model.handle(AppEvent::Envelope(Box::new(EventPayload::HarnessStatus(
-        HarnessStatus::Ready,
-    ))));
-    model
-}
-
-fn submit(model: &mut AppModel, text: &str) {
-    for c in text.chars() {
-        model.handle(key(KeyCode::Char(c)));
-    }
-    model.handle(key(KeyCode::Enter));
-}
-
-fn drain(driver: &mut DemoDriver, model: &mut AppModel) {
-    let requests: Vec<AppRequest> = model.requests.drain(..).collect();
-    for request in requests {
-        driver.handle_request(model, request);
-    }
-}
-
-async fn pump_until(
-    driver: &mut DemoDriver,
-    rx: &mut tokio::sync::mpsc::Receiver<(u64, DemoEvent)>,
-    model: &mut AppModel,
-    what: &str,
-    stop: impl Fn(&AppModel) -> bool,
-) {
-    drain(driver, model);
-    for _ in 0..400_000 {
-        if stop(model) {
-            return;
-        }
-        let (generation, event) =
-            tokio::time::timeout(std::time::Duration::from_secs(3600), rx.recv())
-                .await
-                .unwrap_or_else(|_| panic!("pump_until({what}): the driver went silent"))
-                .expect("channel open");
-        driver.consume(model, generation, event);
-        drain(driver, model);
-    }
-    panic!("pump_until({what}): condition never satisfied");
-}
+mod common;
+use common::{driver_for, key, launcher_model, pump_until, submit};
 
 fn rows(model: &AppModel, width: u16, height: u16) -> Vec<String> {
     let backend = TestBackend::new(width, height);
@@ -97,8 +47,8 @@ async fn leaving_mid_turn_shows_idle_badge_and_a_running_row() {
     // the checkin, or read the slot's projection in the status bar) and
     // the launcher frame shows ⚒ TOOL_RUNNING / a non-zero meter — the
     // owner's screenshot bug.
-    let (mut driver, mut rx) = DemoDriver::new(64);
     let mut model = launcher_model();
+    let (mut driver, mut rx) = driver_for(&model);
     submit(&mut model, "walk me through the harness");
     pump_until(&mut driver, &mut rx, &mut model, "mid-turn", |m| {
         m.turn_active && !m.projection.entries().is_empty() && m.projection.badge() != "IDLE"
@@ -154,8 +104,8 @@ async fn background_events_land_in_the_slot_and_reopen_restores_exactly() {
     // (drop the consume prelude) and the launcher's neutral projection
     // grows entries; drop the slot application instead and the reopened
     // transcript is missing everything streamed while away.
-    let (mut driver, mut rx) = DemoDriver::new(64);
     let mut model = launcher_model();
+    let (mut driver, mut rx) = driver_for(&model);
     submit(&mut model, "walk me through the harness");
     pump_until(&mut driver, &mut rx, &mut model, "mid-turn", |m| {
         m.turn_active && !m.projection.entries().is_empty()

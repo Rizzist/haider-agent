@@ -9,7 +9,6 @@ use haider_protocol::EventPayload;
 use haider_protocol::history::{TodoItem, TodoState};
 use haider_protocol::ids::ItemId;
 use haider_protocol::item::{ItemEvent, TurnItem};
-use haider_protocol::state::HarnessStatus;
 use haider_tui::app::{AppEvent, AppModel, AppRequest, Hit, Screen};
 use haider_tui::mock::demo_script;
 use haider_tui::render::render;
@@ -19,6 +18,9 @@ use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier};
+
+mod common;
+use common::{key, launcher_model};
 
 fn draw(
     model: &AppModel,
@@ -43,10 +45,6 @@ fn draw(
     (rows, hits, terminal)
 }
 
-fn key(code: KeyCode) -> AppEvent {
-    AppEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))
-}
-
 fn ctrl(c: char) -> AppEvent {
     AppEvent::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL))
 }
@@ -65,14 +63,6 @@ fn col_of(row: &str, needle: &str) -> u16 {
         .find(needle)
         .unwrap_or_else(|| panic!("column of {needle:?} not found in row {row:?}"));
     u16::try_from(row[..byte].chars().count()).expect("col fits u16")
-}
-
-fn launcher_model() -> AppModel {
-    let mut model = AppModel::new();
-    model.handle(AppEvent::Envelope(Box::new(EventPayload::HarnessStatus(
-        HarnessStatus::Ready,
-    ))));
-    model
 }
 
 fn session_model() -> AppModel {

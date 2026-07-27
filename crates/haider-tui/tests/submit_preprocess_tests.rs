@@ -5,7 +5,6 @@
 #![allow(clippy::expect_used)]
 
 use haider_protocol::EventPayload;
-use haider_protocol::state::HarnessStatus;
 use haider_tui::app::{
     AppEvent, AppModel, AppRequest, Screen, resolve_path, run_shell, slug_name, vfs_seed,
 };
@@ -13,19 +12,10 @@ use haider_tui::projection::TranscriptEntry;
 use haider_tui::render::render;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::KeyCode;
 
-fn key(code: KeyCode) -> AppEvent {
-    AppEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))
-}
-
-fn launcher_model() -> AppModel {
-    let mut model = AppModel::new();
-    model.handle(AppEvent::Envelope(Box::new(EventPayload::HarnessStatus(
-        HarnessStatus::Ready,
-    ))));
-    model
-}
+mod common;
+use common::{key, launcher_model, submit};
 
 fn session_model() -> AppModel {
     let mut model = launcher_model();
@@ -35,13 +25,6 @@ fn session_model() -> AppModel {
     model.requests.clear();
     model.turn_active = false;
     model
-}
-
-fn submit(model: &mut AppModel, text: &str) {
-    for c in text.chars() {
-        model.handle(key(KeyCode::Char(c)));
-    }
-    model.handle(key(KeyCode::Enter));
 }
 
 fn draw(model: &AppModel, width: u16, height: u16) -> Vec<String> {

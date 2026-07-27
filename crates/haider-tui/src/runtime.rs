@@ -229,11 +229,10 @@ pub async fn run_demo(
     // The demo driver owns the generation-tagged envelope channel and the
     // script/decay timers — the SAME production seams the tests drive
     // (review r3 P3-7).
-    let (mut driver, mut envelope_rx) = DemoDriver::new(64);
     // ONE honour roll (sim `rosterRef`, tui.js:681): the driver's chip
     // claims post-increment the same counter the reducer's head claims do —
     // and the persistence load's guard-3 restore covers both through it.
-    driver.adopt_roster(std::sync::Arc::clone(&model.roster));
+    let (mut driver, mut envelope_rx) = DemoDriver::new(64, std::sync::Arc::clone(&model.roster));
     // Meter continuity (sim: `branch.tokens` is persisted state the next
     // turn adds to): every session's demo meter resumes from its restored
     // (or seeded) usage total instead of resetting to zero on first beat.
@@ -676,21 +675,23 @@ pub struct DemoDriver {
 }
 
 impl DemoDriver {
-    /// A driver plus the receiving end of its demo-event channel.
+    /// A driver plus the receiving end of its demo-event channel. `roster`
+    /// is the MODEL's claim counter (sim `rosterRef`, tui.js:681) — a
+    /// constructor argument on purpose (review TUI4.1, Fable D2-2): heads
+    /// (reducer claims) and chips (driver claims) draw from ONE honour
+    /// roll, and taking the counter here makes the split-brain
+    /// unrepresentable — there is no second counter to forget to replace.
     #[must_use]
-    pub fn new(capacity: usize) -> (Self, mpsc::Receiver<(u64, DemoEvent)>) {
+    pub fn new(capacity: usize, roster: Counter) -> (Self, mpsc::Receiver<(u64, DemoEvent)>) {
         let (tx, rx) = mpsc::channel(capacity);
-        let counter = || std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         (
             Self {
                 tx,
                 table: ArmTable::new(),
                 turn_counter: 0,
                 compact_counter: 0,
-                generic_counter: counter(),
-                roster_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
-                    crate::script::ROSTER_FIRST_CLAIM,
-                )),
+                generic_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                roster_counter: roster,
                 meters: std::sync::Arc::new(
                     std::sync::Mutex::new(std::collections::HashMap::new()),
                 ),
@@ -706,15 +707,6 @@ impl DemoDriver {
     #[must_use]
     pub const fn control_tag(&self) -> u64 {
         CONTROL_ARM
-    }
-
-    /// Share the reducer's roster counter (sim `rosterRef`, tui.js:681):
-    /// heads (reducer claims) and chips (driver claims) draw from ONE
-    /// honour roll, and the persistence load's guard-3 restore reaches
-    /// both. `run_demo` wires this at boot; headless tests that want the
-    /// shared law call it too.
-    pub fn adopt_roster(&mut self, counter: Counter) {
-        self.roster_counter = counter;
     }
 
     /// Prime one session's demo token meter (TUI4c-13b: the sim's
@@ -845,7 +837,7 @@ impl DemoDriver {
 
     /// Drain one reducer request — scripts play under an ArmTable arm id
     /// captured at spawn; stop/interrupt CANCEL the owning arms (Session,
-    /// and Chip only for StopScripts — see `ArmOwner`) so buffered
+    /// and Chip only for ResetAllSessions — see `ArmOwner`) so buffered
     /// envelopes AND pending timers of a cancelled arm drop at
     /// consumption, and an interrupt schedules the sim's 30s idle(i)
     /// decay (tui.js:1561-1564).
@@ -873,7 +865,7 @@ impl DemoDriver {
                 // the session INSIDE the 1.5 s callback — the title and the
                 // note land together. It SURVIVES an interrupt (the sim's
                 // timeout is bare) and is voided only by a session
-                // replacement via the origin epoch (review r2 P2-6).
+                // replacement via the origin identity (review r2 P2-6).
                 if title {
                     // The sim's micro-call is a bare setTimeout: it lands
                     // even if the turn is interrupted (review r2 P2-6), so
@@ -893,13 +885,16 @@ impl DemoDriver {
                     );
                 }
             }
-            AppRequest::StopScripts => {
-                // Session teardown (`/clear`, `/reset`, a fresh session):
-                // the session's arms and every chip's die with it. AURA
-                // DOES NOT — the sim's `/clear` leaves `auraRunRef` alone
-                // (tui.js:1950-1955); only `/reset` and the next
-                // orchestrate advance it, so a background orchestration
-                // finishes where the sim finishes it (review r2 P2-5).
+            AppRequest::ResetAllSessions => {
+                // GLOBAL session teardown (pushed only by fresh_session:
+                // the `/reset` arm and the scratch surface's fresh start —
+                // `/clear` no longer reaches here, it detaches instead):
+                // every session's arms and every chip's die, and all
+                // meters clear. AURA DOES NOT — the sim's `/clear` leaves
+                // `auraRunRef` alone (tui.js:1950-1955); only `/reset`
+                // and the next orchestrate advance it, so a background
+                // orchestration finishes where the sim finishes it
+                // (review r2 P2-5).
                 self.cancel_arms(&|owner| {
                     matches!(owner, ArmOwner::Session(_) | ArmOwner::Chip { .. })
                 });
@@ -1294,7 +1289,7 @@ impl DemoDriver {
                 // a session the user has since replaced is dropped whole —
                 // it must not reconfigure the session that took its place,
                 // nor start that card's parked continuation.
-                if origin != model.session_epoch {
+                if origin != model.session_identity() {
                     return;
                 }
                 // TUI4c-13b: a card restored from disk has no parked
@@ -1348,7 +1343,7 @@ impl DemoDriver {
                 // already titled. It is NOT cancelled by an interrupt
                 // (review r2 P2-6).
                 let blurb = crate::app::auto_blurb(&text);
-                if origin == model.session_epoch {
+                if origin == model.session_identity() {
                     if model.session_title.is_none() {
                         model.projection.push_note(title_note(&blurb));
                         model.session_title = Some(blurb);
@@ -1793,11 +1788,22 @@ pub fn rendered_selection_text(
 /// unverifiable, so it never upgrades the flash: the flash reports the
 /// channel we can actually observe).
 fn copy_selection_effects(model: &mut AppModel, text: &str) {
-    let ok = crate::clipboard::copy_local(text);
+    let confirmed = crate::clipboard::copy_local(text);
     let mut out = stdout();
     let _ = out.write_all(crate::clipboard::osc52(text).as_bytes());
     let _ = out.flush();
-    model.flash = Some(if ok { "· copied" } else { "· copy failed" }.to_owned());
+    // Honest wording (review TUI4.1 P3-5): `· copied` only on a CONFIRMED
+    // local copy (pbcopy exit 0). Otherwise the OSC 52 mirror already
+    // went out — best-effort remains, and the flash says exactly that
+    // instead of claiming a copy nobody verified.
+    model.flash = Some(
+        if confirmed {
+            "· copied"
+        } else {
+            "· copy unconfirmed — sent via OSC 52 only"
+        }
+        .to_owned(),
+    );
     model.dirty = true;
 }
 

@@ -5,68 +5,20 @@
 //! `DemoDriver` seams the interactive loop uses) wherever a turn is needed.
 #![allow(clippy::expect_used)]
 
-use haider_protocol::EventPayload;
-use haider_protocol::state::HarnessStatus;
-use haider_tui::app::{AppEvent, AppModel, AppRequest, ChipModel, Hit, Screen};
+use haider_tui::app::{AppModel, AppRequest, ChipModel, Hit, Screen};
 use haider_tui::demo_store::{
-    ChipDto, DemoStore, HeadDto, ProjectionDto, SessionDto, StateDto, hydrate, snapshot,
+    ChipDto, DEMO_STORE_VERSION, DemoStore, HeadDto, ProjectionDto, SessionDto, StateDto, hydrate,
+    snapshot,
 };
 use haider_tui::render::render;
-use haider_tui::runtime::DemoDriver;
 use haider_tui::script::{ChipDisplayState, DemoEvent, ROSTER_FIRST_CLAIM, roster_at};
 use haider_tui::theme::ThemeKey;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::KeyCode;
 
-fn key(code: KeyCode) -> AppEvent {
-    AppEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))
-}
-
-fn launcher_model() -> AppModel {
-    let mut model = AppModel::new();
-    model.handle(AppEvent::Envelope(Box::new(EventPayload::HarnessStatus(
-        HarnessStatus::Ready,
-    ))));
-    model
-}
-
-fn submit(model: &mut AppModel, text: &str) {
-    for c in text.chars() {
-        model.handle(key(KeyCode::Char(c)));
-    }
-    model.handle(key(KeyCode::Enter));
-}
-
-fn drain(driver: &mut DemoDriver, model: &mut AppModel) {
-    let requests: Vec<AppRequest> = model.requests.drain(..).collect();
-    for request in requests {
-        driver.handle_request(model, request);
-    }
-}
-
-async fn pump_until(
-    driver: &mut DemoDriver,
-    rx: &mut tokio::sync::mpsc::Receiver<(u64, DemoEvent)>,
-    model: &mut AppModel,
-    what: &str,
-    stop: impl Fn(&AppModel) -> bool,
-) {
-    drain(driver, model);
-    for _ in 0..400_000 {
-        if stop(model) {
-            return;
-        }
-        let (generation, event) =
-            tokio::time::timeout(std::time::Duration::from_secs(3600), rx.recv())
-                .await
-                .unwrap_or_else(|_| panic!("pump_until({what}): the driver went silent"))
-                .expect("channel open");
-        driver.consume(model, generation, event);
-        drain(driver, model);
-    }
-    panic!("pump_until({what}): condition never satisfied");
-}
+mod common;
+use common::{drain, driver_for, key, launcher_model, pump_until, submit};
 
 fn rows(model: &AppModel, width: u16, height: u16) -> Vec<String> {
     let backend = TestBackend::new(width, height);
@@ -193,10 +145,9 @@ async fn two_user_sessions_and_the_seeds_round_trip_through_the_file() {
     // `model.roster.store(next)` in hydrate) and the hydrated roster stays
     // at 3 — the fresh claim below re-issues Hasan, which the persisted
     // session 4 already wears, and the counter/uniqueness asserts fail.
-    let (mut driver, mut rx) = DemoDriver::new(64);
     let mut model = launcher_model();
     // Production wiring (run_demo does exactly this): ONE honour roll.
-    driver.adopt_roster(std::sync::Arc::clone(&model.roster));
+    let (mut driver, mut rx) = driver_for(&model);
 
     // Session A (id 4, head Hasan @ ros 3): a generic turn to completion,
     // auto-title included.
@@ -347,7 +298,13 @@ fn reset_purges_the_state_file_and_restores_seeds() {
         ROSTER_FIRST_CLAIM,
         "honour-roll reset"
     );
-    assert_eq!(model.next_session_id, 4);
+    // Review TUI4.1 P1-2: the allocator is MONOTONIC — /reset must NOT
+    // rewind it, or a replacement session reuses a dead id and the
+    // surviving control-tagged auto-title callback retitles it.
+    assert!(
+        model.next_session_id >= 5,
+        "/reset never rewinds the id allocator (monotonic identity law)"
+    );
 
     // The runtime intercepts the request and purges (run_demo's arm).
     store.purge();
@@ -388,6 +345,7 @@ fn closed_chips_are_swept_and_callsigns_backfilled_on_load() {
     );
     session.chips = chips;
     let dto = StateDto {
+        version: DEMO_STORE_VERSION,
         sessions: vec![session],
         theme: String::new(),
         vfs: std::collections::BTreeMap::new(),
@@ -554,6 +512,7 @@ async fn answering_a_hydrated_card_lands_the_stale_menu_note() {
     );
     session.projection.menu = Some(card);
     let dto = StateDto {
+        version: DEMO_STORE_VERSION,
         sessions: vec![session],
         theme: String::new(),
         vfs: std::collections::BTreeMap::new(),
@@ -561,9 +520,8 @@ async fn answering_a_hydrated_card_lands_the_stale_menu_note() {
         voice: None,
         card_seq: 0,
     };
-    let (mut driver, _rx) = DemoDriver::new(64);
     let mut model = launcher_model();
-    driver.adopt_roster(std::sync::Arc::clone(&model.roster));
+    let (mut driver, _rx) = driver_for(&model);
     hydrate(&mut model, dto);
     model.open_session(7);
     assert!(model.projection.open_menu().is_some(), "the card came back");

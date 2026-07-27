@@ -10,8 +10,11 @@ use haider_tui::mock::demo_script;
 use haider_tui::render::render;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::KeyCode;
 use ratatui::layout::Rect;
+
+mod common;
+use common::key;
 
 fn draw(
     model: &AppModel,
@@ -34,10 +37,6 @@ fn draw(
         rows.push(line);
     }
     (rows, hits, terminal)
-}
-
-fn key(code: KeyCode) -> AppEvent {
-    AppEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))
 }
 
 fn session_model() -> AppModel {

@@ -15,6 +15,13 @@ no startup gates yet, so skip until they exist.
 
 **Load** (tui.js:699-754), guards IN ORDER — each was a sim bug fix, verify each by revert:
 1. Proceed only if `sessions` is a non-empty array; ANY parse error → seeds (`catch {}`).
+   SUPERSEDED BY TUI4.1 (review P1-1 + D3-3 — this line as written shipped too permissive):
+   guard 1 is STRICT. A `version` discriminator (`DEMO_STORE_VERSION`) is checked FIRST,
+   every DTO is `deny_unknown_fields`, `SessionDto`'s structural core carries NO
+   `#[serde(default)]` (only `head`, whose backfill is guard 4 below), and a persisted
+   session id 0 is rejected. A session missing its shape rejects the WHOLE file back to
+   seeds — the sim's `s.branches.map(…)` throws before `setSessions`, so per-field
+   defaulting was never the sim's contract.
 2. Entry-id collision guard: sim scans `e(\d+)` and bumps its id counter +1000. Our
    equivalent: persist `card_seq` (menu ids `voice-card-N` collide otherwise) and restore
    `next_session_id` past the max persisted session id.

@@ -15,6 +15,9 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+mod common;
+use common::key;
+
 fn draw(model: &AppModel, width: u16, height: u16) -> (String, Terminal<TestBackend>) {
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("test terminal");
@@ -32,10 +35,6 @@ fn draw(model: &AppModel, width: u16, height: u16) -> (String, Terminal<TestBack
         text.push('\n');
     }
     (text, terminal)
-}
-
-fn key(code: KeyCode) -> AppEvent {
-    AppEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))
 }
 
 fn ctrl(c: char) -> AppEvent {

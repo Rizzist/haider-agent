@@ -27,7 +27,7 @@ use crate::projection::SessionProjection;
 #[derive(Debug)]
 pub struct SessionState {
     /// Stable identity (sim `s.id`). Never reused; guards stale answers
-    /// and auto-titles the way `session_epoch` always did.
+    /// and auto-titles the way the origin-identity gates always did.
     pub id: u64,
     /// Row name (sim `s.name` — kebab of the first message's words).
     pub name: Option<String>,

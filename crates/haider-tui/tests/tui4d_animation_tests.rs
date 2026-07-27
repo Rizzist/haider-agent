@@ -10,7 +10,7 @@ use haider_protocol::EventPayload;
 use haider_protocol::history::{TodoItem, TodoState};
 use haider_protocol::ids::ItemId;
 use haider_protocol::item::{ItemEvent, ToolStatus, TurnItem};
-use haider_protocol::state::{HarnessStatus, RunState};
+use haider_protocol::state::RunState;
 use haider_tui::app::{AppEvent, AppModel, Hit, Screen};
 use haider_tui::projection::badge_pulses;
 use haider_tui::render::render;
@@ -19,13 +19,8 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::style::Color;
 
-fn launcher_model() -> AppModel {
-    let mut model = AppModel::new();
-    model.handle(AppEvent::Envelope(Box::new(EventPayload::HarnessStatus(
-        HarnessStatus::Ready,
-    ))));
-    model
-}
+mod common;
+use common::launcher_model;
 
 fn draw(model: &AppModel, width: u16, height: u16) -> (Vec<String>, Terminal<TestBackend>) {
     let backend = TestBackend::new(width, height);

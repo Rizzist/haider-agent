@@ -6,30 +6,21 @@
 
 use haider_protocol::state::RunState;
 use haider_protocol::{DeliveryMode, EventPayload};
-use haider_tui::app::{AppEvent, AppModel, AppRequest, Hit, Screen};
+use haider_tui::app::{AppModel, AppRequest, Hit, Screen};
 use haider_tui::projection::TranscriptEntry;
 use haider_tui::runtime::DemoDriver;
 use haider_tui::script::{
     Beat, DemoEvent, GENERIC_INTROS, GENERIC_OUTROS, TALK_PHRASE, compaction_beats, respond_beats,
     roster_at, title_note,
 };
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::KeyCode;
+
+mod common;
+use common::{drain, driver_for, key, launcher_model, submit};
 
 /// A shared sim counter (`genRef` / `rosterRef`) for beat-level builders.
 fn counter(start: u64) -> std::sync::atomic::AtomicU64 {
     std::sync::atomic::AtomicU64::new(start)
-}
-
-fn key(code: KeyCode) -> AppEvent {
-    AppEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))
-}
-
-fn launcher_model() -> AppModel {
-    let mut model = AppModel::new();
-    model.handle(AppEvent::Envelope(Box::new(EventPayload::HarnessStatus(
-        haider_protocol::state::HarnessStatus::Ready,
-    ))));
-    model
 }
 
 /// Build a turn's beats with fresh sim counters (genRef 0, rosterRef 3).
@@ -663,13 +654,6 @@ fn title_note_is_the_sim_full_text() {
 
 // ---- Driver integration (paused time, production wiring) ----
 
-fn drain(driver: &mut DemoDriver, model: &mut AppModel) {
-    let requests: Vec<AppRequest> = model.requests.drain(..).collect();
-    for request in requests {
-        driver.handle_request(model, request);
-    }
-}
-
 /// The event loop's outbox echo (runtime.rs): answers ride the channel
 /// tagged with the CURRENT generation.
 fn echo_answers(driver: &DemoDriver, model: &mut AppModel) {
@@ -720,17 +704,10 @@ async fn pump_until(
     panic!("pump_until({what}): condition never satisfied");
 }
 
-fn submit(model: &mut AppModel, text: &str) {
-    for c in text.chars() {
-        model.handle(key(KeyCode::Char(c)));
-    }
-    model.handle(key(KeyCode::Enter));
-}
-
 #[tokio::test(start_paused = true)]
 async fn generic_turn_plays_end_to_end_with_the_delayed_title_note() {
-    let (mut driver, mut rx) = DemoDriver::new(64);
     let mut model = launcher_model();
+    let (mut driver, mut rx) = driver_for(&model);
     submit(&mut model, "hello world");
     pump_until(&mut driver, &mut rx, &mut model, "turn done", |m| {
         !m.turn_active && m.projection.badge() == "IDLE"
@@ -782,8 +759,8 @@ async fn generic_turn_plays_end_to_end_with_the_delayed_title_note() {
 
 #[tokio::test(start_paused = true)]
 async fn crash_menu_errored_arm_holds_then_idles_without_compaction() {
-    let (mut driver, mut rx) = DemoDriver::new(64);
     let mut model = launcher_model();
+    let (mut driver, mut rx) = driver_for(&model);
     submit(&mut model, "reproduce the crash please");
     pump_until(&mut driver, &mut rx, &mut model, "menu open", |m| {
         m.projection.open_menu().is_some()
@@ -825,8 +802,8 @@ async fn crash_menu_errored_arm_holds_then_idles_without_compaction() {
 
 #[tokio::test(start_paused = true)]
 async fn queued_input_consumes_at_turn_end_without_passing_through_idle() {
-    let (mut driver, mut rx) = DemoDriver::new(64);
     let mut model = launcher_model();
+    let (mut driver, mut rx) = driver_for(&model);
     submit(&mut model, "hello world");
     pump_until(&mut driver, &mut rx, &mut model, "turn running", |m| {
         m.turn_active && m.screen == Screen::Session
@@ -903,8 +880,8 @@ async fn queued_input_consumes_at_turn_end_without_passing_through_idle() {
 
 #[tokio::test(start_paused = true)]
 async fn auto_compaction_fires_at_85_percent_and_drops_the_meter_to_6_percent() {
-    let (mut driver, mut rx) = DemoDriver::new(64);
     let mut model = launcher_model();
+    let (mut driver, mut rx) = driver_for(&model);
     // A demo-sized window makes one generic turn cross 85%.
     model.identity.context_window = 2_000;
     submit(&mut model, "hello there friend");
@@ -953,8 +930,8 @@ async fn auto_compaction_fires_at_85_percent_and_drops_the_meter_to_6_percent() 
 
 #[tokio::test(start_paused = true)]
 async fn manual_compact_runs_1200ms_and_lands_the_numbers() {
-    let (mut driver, mut rx) = DemoDriver::new(64);
     let mut model = launcher_model();
+    let (mut driver, mut rx) = driver_for(&model);
     submit(&mut model, "hello world");
     pump_until(&mut driver, &mut rx, &mut model, "turn done", |m| {
         !m.turn_active && m.projection.badge() == "IDLE"
@@ -996,8 +973,8 @@ async fn manual_compact_runs_1200ms_and_lands_the_numbers() {
 
 #[tokio::test(start_paused = true)]
 async fn talk_hold_fires_the_canned_phrase_through_the_voice_path() {
-    let (mut driver, mut rx) = DemoDriver::new(64);
     let mut model = launcher_model();
+    let (mut driver, mut rx) = driver_for(&model);
     // The mic needs an attached, idle session (sim `speak`, tui.js:2045 —
     // review r2 P2-3), so open one first.
     submit(&mut model, "hello world");
@@ -1038,8 +1015,8 @@ async fn talk_hold_fires_the_canned_phrase_through_the_voice_path() {
 
 #[tokio::test(start_paused = true)]
 async fn stop_scripts_cancels_parked_menu_arms() {
-    let (mut driver, mut rx) = DemoDriver::new(64);
     let mut model = launcher_model();
+    let (mut driver, mut rx) = driver_for(&model);
     submit(&mut model, "this is unreliable");
     pump_until(&mut driver, &mut rx, &mut model, "menu open", |m| {
         m.projection.open_menu().is_some()
@@ -1047,7 +1024,7 @@ async fn stop_scripts_cancels_parked_menu_arms() {
     .await;
     let menu_id = model.projection.open_menu().expect("open").id.clone();
     // A fresh session bumps the generation and clears parked arms.
-    driver.handle_request(&mut model, AppRequest::StopScripts);
+    driver.handle_request(&mut model, AppRequest::ResetAllSessions);
     driver
         .sender()
         .try_send((
@@ -1071,7 +1048,7 @@ async fn stop_scripts_cancels_parked_menu_arms() {
     tokio::task::yield_now().await;
     assert!(
         rx.try_recv().is_err(),
-        "no arm beats after StopScripts — the park was cancelled"
+        "no arm beats after ResetAllSessions — the park was cancelled"
     );
     assert_eq!(
         driver.tokens_total(model.active_session.unwrap_or(0)),

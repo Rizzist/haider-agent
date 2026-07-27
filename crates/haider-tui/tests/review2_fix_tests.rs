@@ -7,17 +7,19 @@
 use haider_protocol::EventPayload;
 use haider_protocol::ids::{ItemId, MenuId};
 use haider_protocol::item::{ItemEvent, TurnItem};
-use haider_protocol::state::HarnessStatus;
 use haider_tui::app::{AppEvent, AppModel, AppRequest, Hit, Screen};
 use haider_tui::mock::demo_script;
 use haider_tui::render::render;
-use haider_tui::runtime::{DemoDriver, IDLE_DECAY};
+use haider_tui::runtime::IDLE_DECAY;
 use haider_tui::script::DemoEvent;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::style::Color;
+
+mod common;
+use common::{drain, driver_for, key, launcher_model};
 
 fn draw(
     model: &AppModel,
@@ -42,10 +44,6 @@ fn draw(
     (rows, hits, terminal)
 }
 
-fn key(code: KeyCode) -> AppEvent {
-    AppEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))
-}
-
 fn key_mod(code: KeyCode, modifiers: KeyModifiers) -> AppEvent {
     AppEvent::Key(KeyEvent::new(code, modifiers))
 }
@@ -66,14 +64,6 @@ fn col_of(row: &str, needle: &str) -> u16 {
     u16::try_from(row[..byte].chars().count()).expect("col fits u16")
 }
 
-fn launcher_model() -> AppModel {
-    let mut model = AppModel::new();
-    model.handle(AppEvent::Envelope(Box::new(EventPayload::HarnessStatus(
-        HarnessStatus::Ready,
-    ))));
-    model
-}
-
 fn session_model() -> AppModel {
     let mut model = AppModel::new();
     for payload in demo_script() {
@@ -92,20 +82,12 @@ fn user_message(text: &str) -> EventPayload {
 
 // ---- P1-1 (+ r3 P3-7): post-interrupt envelope race, PRODUCTION wiring ----
 
-/// Drain the reducer's requests through the driver — the loop's drain arm.
-fn drain(driver: &mut DemoDriver, model: &mut AppModel) {
-    let requests: Vec<AppRequest> = model.requests.drain(..).collect();
-    for request in requests {
-        driver.handle_request(model, request);
-    }
-}
-
 #[tokio::test(start_paused = true)]
 async fn stale_generation_envelopes_are_dropped_at_consumption() {
     // The real race through the real wiring (review r3 P3-7): the driver's
     // channel, its spawned script on virtual time, its bump, its guard.
-    let (mut driver, mut rx) = DemoDriver::new(64);
     let mut model = launcher_model();
+    let (mut driver, mut rx) = driver_for(&model);
     for c in "walk me through the harness".chars() {
         model.handle(key(KeyCode::Char(c)));
     }
@@ -164,8 +146,8 @@ async fn stale_idle_decay_never_lands_in_a_fresh_session() {
     // r3 P3-6: interrupt session A, start fresh session B within the 30s
     // window, interrupt B too — A's pending decay must be dropped (its
     // generation is stale); only B's OWN decay clears B's idle(i).
-    let (mut driver, mut rx) = DemoDriver::new(64);
     let mut model = launcher_model();
+    let (mut driver, mut rx) = driver_for(&model);
     for c in "walk me through the harness".chars() {
         model.handle(key(KeyCode::Char(c)));
     }

@@ -9,19 +9,30 @@
 //! detached thread; OSC 52 is a single buffered write the caller flushes
 //! with the frame.
 //!
-//! Failure is a FLASH, never a crash: a spawn or write error reports
-//! `false` and the caller shows `· copy failed`. A missing `pbcopy`
-//! (non-macOS host) degrades the same way — OSC 52 still goes out, so the
-//! copy can still land via the terminal.
+//! Failure is a FLASH, never a crash: an unconfirmed local copy reports
+//! `false` and the caller words the flash honestly (OSC 52 already went
+//! out, so the copy may still land via the terminal). A missing `pbcopy`
+//! (non-macOS host) degrades the same way.
 
 use std::io::Write as _;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 
-/// Hand `text` to the local clipboard via `pbcopy`. Returns `true` when the
-/// handoff succeeded (spawn + stdin write); the child is reaped on a
-/// detached thread so the event loop never waits on it.
+/// How long [`copy_local`] will poll for `pbcopy`'s exit before declaring
+/// the local copy unconfirmed. pbcopy exits within a few ms of stdin
+/// closing; the bound only exists so a wedged child cannot stall the
+/// event loop.
+const CONFIRM_BOUND: Duration = Duration::from_millis(300);
+
+/// Hand `text` to the local clipboard via `pbcopy`. Returns `true` ONLY
+/// once the child's EXIT STATUS confirms success (review TUI4.1 P3-5 —
+/// success used to be claimed after spawn + stdin write, so a failing
+/// `pbcopy` still flashed `· copied`). The wait is bounded: a child that
+/// has not exited within [`CONFIRM_BOUND`] is reaped on a detached thread
+/// and the copy reports UNCONFIRMED (`false`) — a bounded process-exit
+/// poll, not a synchronization sleep.
 #[must_use]
 pub fn copy_local(text: &str) -> bool {
     let mut child = match Command::new("pbcopy")
@@ -33,16 +44,27 @@ pub fn copy_local(text: &str) -> bool {
         Ok(child) => child,
         Err(_) => return false,
     };
-    let ok = child
+    let wrote = child
         .stdin
         .take()
         .is_some_and(|mut stdin| stdin.write_all(text.as_bytes()).is_ok());
-    // Reap off-loop: pbcopy exits as soon as stdin closes, but wait()ing
-    // here would still block the event loop on process teardown.
-    std::thread::spawn(move || {
-        let _ = child.wait();
-    });
-    ok
+    // stdin is closed (dropped) either way — pbcopy sees EOF and exits.
+    let deadline = Instant::now() + CONFIRM_BOUND;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return wrote && status.success(),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            // Timed out or errored: reap off-loop, report unconfirmed.
+            _ => {
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                return false;
+            }
+        }
+    }
 }
 
 /// The OSC 52 clipboard-set sequence for `text` (`c` = the system

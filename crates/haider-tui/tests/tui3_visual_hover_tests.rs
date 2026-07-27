@@ -5,7 +5,6 @@
 #![allow(clippy::expect_used)]
 
 use haider_protocol::EventPayload;
-use haider_protocol::state::HarnessStatus;
 use haider_tui::app::{AppEvent, AppModel, Hit};
 use haider_tui::mock::demo_script;
 use haider_tui::render::render;
@@ -13,11 +12,12 @@ use haider_tui::runtime::dispatch_input;
 use haider_tui::theme::{Rgb, ThemeKey};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
-use ratatui::crossterm::event::{
-    Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind,
-};
+use ratatui::crossterm::event::{Event, KeyCode, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier};
+
+mod common;
+use common::{key, launcher_model};
 
 fn draw(
     model: &AppModel,
@@ -40,10 +40,6 @@ fn draw(
         rows.push(line);
     }
     (rows, hits, terminal)
-}
-
-fn key(code: KeyCode) -> AppEvent {
-    AppEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))
 }
 
 fn moved(column: u16, row: u16) -> Event {
@@ -69,14 +65,6 @@ fn col_of(row: &str, needle: &str) -> u16 {
         .find(needle)
         .unwrap_or_else(|| panic!("column of {needle:?} not found in row {row:?}"));
     u16::try_from(row[..byte].chars().count()).expect("col fits u16")
-}
-
-fn launcher_model() -> AppModel {
-    let mut model = AppModel::new();
-    model.handle(AppEvent::Envelope(Box::new(EventPayload::HarnessStatus(
-        HarnessStatus::Ready,
-    ))));
-    model
 }
 
 fn session_model() -> AppModel {
