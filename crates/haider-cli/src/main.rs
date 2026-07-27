@@ -132,7 +132,7 @@ async fn front_door(mode: FrontDoor) -> ExitCode {
                 ensured.client.close();
                 return ExitCode::SUCCESS;
             }
-            let model = live_model();
+            let model = live_model(&profile);
             match run_live(model, ensured.client, profile, live_client_config()).await {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) => {
@@ -290,10 +290,17 @@ fn live_client_config() -> haider_client::ClientConfig {
 /// A model for LIVE mode: no demo seeds, the real cwd, and the sanctum
 /// tier. The session list arrives from the daemon (R11 cut 4: no locally
 /// fabricated row exists), so the launcher starts empty and fills in.
-fn live_model() -> AppModel {
+fn live_model(profile: &haider_client::ResolvedProfile) -> AppModel {
     let mut model = AppModel::new();
     model.sessions.clear();
     model.mode = haider_tui::app::RuntimeMode::Live;
+    // The RESOLVED PROFILE owns the defaults every new session is created
+    // with — never a UI constant. `session.create` validates the provider
+    // against the daemon's own whitelist, so a client that hardcoded one
+    // would be rejected by the very daemon it just resolved.
+    model.identity.provider = profile.default_provider.clone();
+    model.identity.model_short = profile.default_model.clone();
+    model.identity.context_window = profile.default_max_tokens;
     if matches!(std::env::var("HAIDER_SHAHADA").as_deref(), Ok("translit")) {
         model.sanctum_tier = SanctumTier::Translit;
     }
@@ -318,6 +325,7 @@ fn apply_cwd(model: &mut AppModel) {
     };
     model.launcher_dir = abbreviated.clone();
     model.session_dir = abbreviated;
+    model.cwd = cwd.display().to_string();
 }
 
 async fn run_command(rest: &[String]) -> ExitCode {

@@ -487,25 +487,121 @@ fn the_live_launcher_creates_no_row_or_session_until_the_daemon_answers() {
     assert_eq!(model.sessions.len(), 1, "the daemon's session became a row");
     assert_eq!(model.sessions[0].id, sid(1), "…under the DAEMON's id");
     assert_eq!(model.active_session.as_ref(), Some(&sid(1)));
-    let kinds: Vec<&str> = after
-        .iter()
-        .map(|command| match command {
-            LiveCommand::Attach { .. } => "attach",
-            LiveCommand::Submit { .. } => "submit",
-            _ => "other",
-        })
-        .collect();
     assert_eq!(
-        kinds,
-        vec!["attach", "submit"],
-        "create response → attach → turn.submit, in order"
+        after,
+        vec![LiveCommand::Attach {
+            session: sid(1),
+            after_seq: 0
+        }],
+        "the create response asks for the ATTACHMENT and nothing else"
+    );
+    assert!(
+        !after
+            .iter()
+            .any(|command| matches!(command, LiveCommand::Submit { .. })),
+        "the turn must NOT ride the create response: `turn.submit` requires an \
+         ESTABLISHED control attachment, and issuing both at once races the \
+         daemon into `capability_denied` (found by pty-probe-live)"
+    );
+
+    // …and the turn follows the ATTACH RESPONSE — create → attach → submit,
+    // each waiting for the last.
+    let submitted = driver.apply(
+        &mut model,
+        LiveReply::Attached {
+            session: sid(1),
+            attachment: attachment(1),
+            worker_generation: 7,
+            replay_through_seq: 0,
+        },
     );
     assert!(
         matches!(
-            after.iter().find(|c| matches!(c, LiveCommand::Submit { .. })),
-            Some(LiveCommand::Submit { text, .. }) if text == "ship the thing"
+            submitted.first(),
+            Some(LiveCommand::Submit { text, session, .. })
+                if text == "ship the thing" && *session == sid(1)
         ),
-        "the first turn carries the text the user typed on the launcher"
+        "the first turn carries the launcher's text, once the attachment exists"
+    );
+
+    // The turn is submitted EXACTLY once: a second attach (a reconnect's
+    // reattach, say) must not resubmit it.
+    let again = driver.apply(
+        &mut model,
+        LiveReply::Attached {
+            session: sid(1),
+            attachment: attachment(1),
+            worker_generation: 7,
+            replay_through_seq: 0,
+        },
+    );
+    assert!(
+        !again
+            .iter()
+            .any(|command| matches!(command, LiveCommand::Submit { .. })),
+        "a later attach never replays the first turn"
+    );
+}
+
+#[test]
+fn a_cold_session_attaches_only_when_it_is_selected_and_only_once() {
+    // R11 cut 4: "entering live mode … attaches only on selection". A
+    // launcher that eagerly attached to everything it listed would burn the
+    // whole working set before the user chose anything — and a SECOND
+    // terminal would never see a session's history at all if selection did
+    // not attach (found by pty-probe-live's §6.4 second-terminal row: the
+    // row opened to an empty transcript).
+    //
+    // MUTATION CHECK: delete the `driver.sync_selection(&model)` call in
+    // `runtime::run_live` — headlessly, make `sync_selection` return
+    // `Vec::new()` — and the attach below never happens.
+    let mut model = live_model();
+    let mut driver = LiveDriver::new("test");
+    driver.apply(
+        &mut model,
+        LiveReply::Listed {
+            sessions: vec![summary(4, 9), summary(5, 3)],
+            next_cursor: None,
+        },
+    );
+    assert!(
+        driver.sync_selection(&model).is_empty(),
+        "listing alone attaches nothing"
+    );
+    assert!(driver.is_cold(&sid(4)) && driver.is_cold(&sid(5)));
+
+    model.open_session(&sid(4));
+    assert_eq!(
+        driver.sync_selection(&model),
+        vec![LiveCommand::Attach {
+            session: sid(4),
+            after_seq: 0
+        }],
+        "selecting a cold session attaches it from its own cursor"
+    );
+    // The loop calls this every pass: it must not re-issue while the first
+    // attach is still in flight.
+    assert!(
+        driver.sync_selection(&model).is_empty(),
+        "one attach per selection, not one per frame"
+    );
+    driver.apply(
+        &mut model,
+        LiveReply::Attached {
+            session: sid(4),
+            attachment: attachment(4),
+            worker_generation: 7,
+            replay_through_seq: 9,
+        },
+    );
+    assert!(
+        driver.sync_selection(&model).is_empty(),
+        "…and none once it is attached"
+    );
+    assert!(driver.is_attached(&sid(4)));
+    assert!(
+        driver.is_cold(&sid(5)),
+        "the session nobody chose stays cold"
     );
 }
 

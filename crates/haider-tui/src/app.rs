@@ -512,6 +512,46 @@ pub fn find_chip<'t>(chips: &'t [ChipModel], agent: &str) -> Option<&'t ChipMode
     None
 }
 
+/// Recovery text for a typed login failure (W3c3 M3, report §6.3: "typed
+/// `restage_required`/`busy` result handling").
+///
+/// The daemon's STABLE CODE decides what to say; `message` is human detail
+/// and is never load-bearing. Every one of these leaves the card in Entry
+/// with an EMPTY buffer, so the user's next act is a retype — the key is
+/// never held across a retry.
+#[must_use]
+pub fn login_recovery(code: &str, message: &str) -> String {
+    match code {
+        // The staged secret expired (or was already claimed) before the
+        // login committed: stage a FRESH one — there is nothing to resend.
+        haider_rpc::ERROR_CODE_RESTAGE_REQUIRED => {
+            "the staged key expired before it was committed — type it again".to_owned()
+        }
+        // Retryable: the account actor is mid-transaction.
+        haider_rpc::ERROR_CODE_BUSY | haider_rpc::ERROR_CODE_OVERLOADED => {
+            "the daemon is busy — press ⏎ to try again".to_owned()
+        }
+        // The provider rejected the key itself.
+        haider_rpc::ERROR_CODE_UNAUTHORIZED => {
+            "the provider rejected this key — check it and type it again".to_owned()
+        }
+        // This connection may not stage secrets (not same-UID / no Control).
+        haider_rpc::ERROR_CODE_PERMISSION_DENIED => {
+            "this connection may not stage secrets — run haider as the profile owner".to_owned()
+        }
+        // No vault on this platform (W3c's vault gate is macOS).
+        haider_rpc::ERROR_CODE_VAULT_UNSUPPORTED => {
+            "no credential vault on this platform — API login lands with the file vault".to_owned()
+        }
+        // Committed a descriptor whose secret cannot be found.
+        haider_rpc::ERROR_CODE_CREDENTIAL_MISSING => {
+            "the stored credential is gone — type the key again to re-commit".to_owned()
+        }
+        _ if message.is_empty() => format!("login failed ({code})"),
+        _ => format!("login failed ({code}) — {message}"),
+    }
+}
+
 /// The transcript note one `AgentReport` becomes (W3c3, report R11 cut 2:
 /// "maps `AgentReport` only to report summary/verification content" —
 /// never to chip STATE, which stays `AgentChipState`'s alone). The
@@ -665,6 +705,110 @@ impl Default for AuraModel {
     }
 }
 
+/// The `/login <provider> api` masked key card (W3c3 M3 — report R10).
+///
+/// SECRET HYGIENE is the whole point of this type existing instead of
+/// reusing the composer:
+///
+/// * the key lives in a [`Zeroizing`] buffer that wipes on drop, on
+///   submit, and on cancel;
+/// * `Debug` is REDACTED, so `{:?}` on the whole `AppModel` (panic
+///   teardown, a stray log) cannot print it;
+/// * the renderer is given the LENGTH, never the text, so no frame — and
+///   therefore no snapshot, no scrollback, no selection copy — can carry
+///   it;
+/// * nothing in it reaches the composer's input ring, the per-surface
+///   drafts, or the demo store's DTO.
+pub struct LoginCard {
+    /// Provider being logged into (`anthropic`).
+    pub provider: String,
+    /// Optional display alias for the credential.
+    pub alias: Option<String>,
+    /// The typed key. Never rendered, never persisted, never logged.
+    secret: zeroize::Zeroizing<String>,
+    pub stage: LoginStage,
+}
+
+/// Where the login card is in its two-transaction flow (stage → login).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoginStage {
+    /// Typing the key.
+    Entry,
+    /// `vault.stage` + `account.login_api` are in flight; the local copy of
+    /// the key is ALREADY wiped (it lives only in the staged frame).
+    Submitting,
+    /// A typed failure, carrying its recovery text.
+    Failed(String),
+    /// Committed: the descriptor's identity, for the confirmation row.
+    Done(String),
+}
+
+impl std::fmt::Debug for LoginCard {
+    /// Redacted by construction (the W3c2 precedent: `SecretWire`'s Debug
+    /// was mutation-killed TWICE for exactly this). The length is omitted
+    /// too — a key's length is itself a hint.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LoginCard")
+            .field("provider", &self.provider)
+            .field("alias", &self.alias)
+            .field("secret", &"<redacted>")
+            .field("stage", &self.stage)
+            .finish()
+    }
+}
+
+impl LoginCard {
+    #[must_use]
+    pub fn new(provider: String, alias: Option<String>) -> Self {
+        Self {
+            provider,
+            alias,
+            secret: zeroize::Zeroizing::new(String::new()),
+            stage: LoginStage::Entry,
+        }
+    }
+
+    /// How many MASK GLYPHS to draw — the only thing the renderer learns.
+    #[must_use]
+    pub fn masked_len(&self) -> usize {
+        self.secret.chars().count()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.secret.is_empty()
+    }
+
+    /// Append one typed character. Non-printing keys never reach here.
+    pub fn push(&mut self, c: char) {
+        if matches!(self.stage, LoginStage::Entry) {
+            self.secret.push(c);
+        }
+    }
+
+    /// Bracketed paste — the whole clipboard at once (keys are pasted far
+    /// more often than typed).
+    pub fn push_str(&mut self, text: &str) {
+        if matches!(self.stage, LoginStage::Entry) {
+            self.secret.push_str(text.trim());
+        }
+    }
+
+    pub fn backspace(&mut self) {
+        if matches!(self.stage, LoginStage::Entry) {
+            self.secret.pop();
+        }
+    }
+
+    /// TAKE the key for staging: the card's copy is emptied in the same
+    /// move, so between here and the wire there is exactly one live copy.
+    fn take_secret(&mut self) -> haider_rpc::SecretWire {
+        let taken = std::mem::replace(&mut self.secret, zeroize::Zeroizing::new(String::new()));
+        haider_rpc::SecretWire::new(taken.as_str())
+    }
+}
+
 /// Which runtime is driving this model (W3c3 M2).
 ///
 /// The reducer is source-agnostic by design, but three decisions are NOT:
@@ -731,6 +875,21 @@ pub enum AppRequest {
     AuraTalk,
     /// `/reset` reseeded the aura — bump its script guard.
     ResetAura,
+    /// The masked login card was submitted (W3c3 M3, report R10): stage
+    /// the secret over the non-journaled vault RPC, then commit the login.
+    /// The raw key rides HERE and nowhere else — it never enters the
+    /// composer, a draft, the input ring, a transcript row or the store.
+    LoginApi {
+        provider: String,
+        alias: Option<String>,
+        /// The wire's own secret carrier: zeroized on drop and REDACTED in
+        /// `Debug`, so `AppRequest`'s derived `Debug` — and any panic
+        /// teardown that prints it — cannot leak the key. (W3c2's review
+        /// mutation-killed an un-redacted `SecretWire` Debug TWICE; reusing
+        /// that type is how this lane inherits the guarantee instead of
+        /// re-earning it.)
+        secret: haider_rpc::SecretWire,
+    },
     /// LIVE launcher submit (W3c3, report R11 cut 4): ask the daemon to
     /// create a session for `text`. Deliberately NOT accompanied by a row,
     /// a session id, a screen flip or a turn: in live mode there is no
@@ -992,8 +1151,14 @@ pub struct AppModel {
     pub voice: VoiceState,
     /// The ◉ talk hold is live (`◉ listening…` chip + status segment).
     pub listening: bool,
-    /// The launcher's working dir for shell builtins (sim `~/dev/enterprise-suite`).
+    /// The launcher's working dir for shell builtins, in DISPLAY form
+    /// (`~`-abbreviated, sim `~/dev/enterprise-suite`).
     pub launcher_dir: String,
+    /// The process working directory, ABSOLUTE (W3c3 M2). `session.create`
+    /// carries this, never [`Self::launcher_dir`]: the daemon rejects a
+    /// non-absolute cwd, and `~` is a display convention the wire has never
+    /// heard of.
+    pub cwd: String,
     /// The session's working dir — shown in the header; `cd` retargets it.
     pub session_dir: String,
     /// Per-open card counter: `/voice` and `/tools` mint a FRESH menu id
@@ -1025,6 +1190,8 @@ pub struct AppModel {
     pub sessions: Vec<crate::session::SessionState>,
     /// Which runtime drives this model (W3c3 M2). Demo by default.
     pub mode: RuntimeMode,
+    /// The masked `/login … api` card, while it is open (W3c3 M3).
+    pub login: Option<LoginCard>,
     /// The checked-out session's PROTOCOL id (sim `activeId`; `None` =
     /// launcher's no-session state, exactly the sim's `setActiveId(null)`).
     pub active_session: Option<SessionId>,
@@ -1137,6 +1304,7 @@ impl Default for AppModel {
             voice: VoiceState::default(),
             listening: false,
             launcher_dir: "~/dev/enterprise-suite".to_owned(),
+            cwd: "/".to_owned(),
             session_dir: "~/dev/enterprise-suite".to_owned(),
             card_seq: 0,
             vfs: vfs_seed(),
@@ -1148,6 +1316,7 @@ impl Default for AppModel {
             auto_resuming: false,
             aura: AuraModel::seed(),
             mode: RuntimeMode::Demo,
+            login: None,
             sessions: seed_session_states(),
             active_session: None,
             last_detached: None,
@@ -1477,6 +1646,14 @@ impl AppModel {
             AppEvent::Key(key) => {
                 self.dirty = true;
                 self.flash = None;
+                // The masked login card OWNS the keyboard while it is open
+                // (W3c3 M3): a key must never reach the composer, the
+                // palette, the input ring or a selection gate, because
+                // every one of those would keep a copy of it.
+                if self.login.is_some() {
+                    self.login_key(&key);
+                    return;
+                }
                 // TUI5 item 4 — the selection gates run BEFORE the
                 // clear-on-keypress law, or ⌃C/Esc could never see the
                 // selection they govern.
@@ -1490,6 +1667,13 @@ impl AppModel {
             }
             AppEvent::Paste(text) => {
                 self.dirty = true;
+                // Keys are pasted more often than typed; the paste lands in
+                // the masked buffer and NOWHERE else (no pill token, no
+                // draft, no ring).
+                if let Some(card) = self.login.as_mut() {
+                    card.push_str(&text);
+                    return;
+                }
                 // While a blocking menu replaces the composer, paste has no
                 // target (r2 P2).
                 if self.projection.open_menu().is_some() && self.screen == Screen::Session {
@@ -2040,6 +2224,66 @@ impl AppModel {
         });
     }
 
+    /// The masked card's keyboard (W3c3 M3). Printable characters extend
+    /// the key, ⌫ shortens it, ⏎ submits, Esc cancels — and every exit
+    /// path wipes the buffer, because a card left open is a key left in
+    /// memory.
+    fn login_key(&mut self, key: &KeyEvent) {
+        let Some(card) = self.login.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                // Drop wipes: `Zeroizing` on the way out.
+                self.login = None;
+            }
+            KeyCode::Enter => {
+                if !matches!(card.stage, LoginStage::Entry) || card.is_empty() {
+                    return;
+                }
+                let provider = card.provider.clone();
+                let alias = card.alias.clone();
+                let secret = card.take_secret();
+                card.stage = LoginStage::Submitting;
+                self.requests.push(AppRequest::LoginApi {
+                    provider,
+                    alias,
+                    secret,
+                });
+            }
+            KeyCode::Backspace => card.backspace(),
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => card.push(c),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.login = None;
+            }
+            _ => {}
+        }
+    }
+
+    /// The login card's outcome, from the driver (W3c3 M3). Every failure
+    /// returns the card to ENTRY with an empty buffer: the key is never
+    /// retained across a retry, so a `busy` retry costs a retype and a
+    /// `restage_required` cannot resend an expired stage.
+    pub fn login_result(&mut self, outcome: Result<String, (String, String)>) {
+        let Some(card) = self.login.as_mut() else {
+            return;
+        };
+        self.dirty = true;
+        match outcome {
+            Ok(identity) => card.stage = LoginStage::Done(identity),
+            Err((code, message)) => {
+                card.stage = LoginStage::Failed(login_recovery(&code, &message))
+            }
+        }
+    }
+
+    /// Open the masked card for `/login <provider> api`.
+    fn open_login_card(&mut self, provider: &str, alias: Option<String>) {
+        self.stash_draft();
+        self.login = Some(LoginCard::new(provider.to_owned(), alias));
+        self.dirty = true;
+    }
+
     /// One shell-builtin line against the VFS: a session gets a transcript
     /// `$` row; the launcher gets its `.shellout` block (sim tui.js:3302).
     fn run_shell_line(&mut self, line: &str) {
@@ -2343,6 +2587,33 @@ impl AppModel {
                 // message starts a brand-new session, never this one.
                 self.back_to_launcher();
             }
+            // W3c3 M3 (report R10 + §6.3's `/login` argument slots): the
+            // ONE account command this release makes executable.
+            "login" => {
+                let mut words = remainder.split_whitespace();
+                let provider = words.next().unwrap_or("");
+                let method = words.next().unwrap_or("");
+                let alias = words.next().map(str::to_owned);
+                match (provider, method) {
+                    ("", _) => {
+                        self.flash = Some(
+                            "· /login <provider> <oauth|api> — e.g. /login anthropic api"
+                                .to_owned(),
+                        );
+                    }
+                    (provider, "api") => self.open_login_card(provider, alias),
+                    (_, "oauth") => {
+                        self.flash = Some(
+                            "· /login … oauth — UI ready; the loopback flow lands after v0.0.12"
+                                .to_owned(),
+                        );
+                    }
+                    (provider, _) => {
+                        self.flash =
+                            Some(format!("· /login {provider} <oauth|api> — pick a method"));
+                    }
+                }
+            }
             "reset" => {
                 // TUI5 item 9: park the departing surface first; session
                 // drafts die with the reseed (the identity law — a
@@ -2468,7 +2739,7 @@ impl AppModel {
             other => {
                 // Known stubs name their wave; typos say so (review r1 P2).
                 let wave = match other {
-                    "model" | "provider" | "login" | "account" | "accounts" => {
+                    "model" | "provider" | "account" | "accounts" => {
                         Some("the account switchboard (W3)")
                     }
                     "sessions" | "tree" | "fork" | "rename" | "tokens" => {

@@ -208,6 +208,9 @@ struct CommandContext {
     command_id: Option<haider_rpc::CommandId>,
     cwd: String,
     model: String,
+    /// Carried across `vault.stage` so the login that follows knows which
+    /// account it is committing. Never a secret.
+    login: Option<(String, Option<String>)>,
 }
 
 impl CommandContext {
@@ -220,6 +223,15 @@ impl CommandContext {
             command_id: command.command_id().cloned(),
             cwd,
             model,
+            login: match command {
+                LiveCommand::Stage {
+                    provider, alias, ..
+                }
+                | LiveCommand::LoginApi {
+                    provider, alias, ..
+                } => Some((provider.clone(), alias.clone())),
+                _ => None,
+            },
         }
     }
 }
@@ -281,6 +293,27 @@ fn request_body(command: LiveCommand) -> RequestBody {
             worker_generation,
             run_id,
         },
+        LiveCommand::Stage {
+            stage_id, secret, ..
+        } => RequestBody::VaultStage {
+            stage_id,
+            purpose: haider_rpc::StagePurpose::ApiKey,
+            secret,
+        },
+        LiveCommand::LoginApi {
+            command_id,
+            provider,
+            alias,
+            vault_reference,
+        } => RequestBody::AccountLoginApi {
+            command_id,
+            provider,
+            alias,
+            vault_reference,
+            // `None` means the release-owned full model id in the resolved
+            // profile — the client never invents a validation model.
+            validation_model: None,
+        },
         LiveCommand::Answer { .. } => unreachable!("answers ride send_frame, not request"),
     }
 }
@@ -336,6 +369,26 @@ fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveReply> 
             .command_id
             .clone()
             .map_or_else(Vec::new, |id| vec![LiveReply::Cancelled { command_id: id }]),
+        ResponseBody::VaultStage {
+            vault_reference, ..
+        } => context
+            .login
+            .clone()
+            .map_or_else(Vec::new, |(provider, alias)| {
+                vec![LiveReply::Staged {
+                    vault_reference,
+                    provider,
+                    alias,
+                }]
+            }),
+        ResponseBody::AccountLoginApi { descriptor } => {
+            context.command_id.clone().map_or_else(Vec::new, |id| {
+                vec![LiveReply::LoggedIn {
+                    command_id: id,
+                    identity: descriptor.identity.clone(),
+                }]
+            })
+        }
         ResponseBody::SessionRead { result } => read_replies(result),
         ResponseBody::Error {
             code,

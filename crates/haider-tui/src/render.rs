@@ -2292,6 +2292,11 @@ fn menu_glyph(menu: &haider_protocol::menu::Menu) -> &'static str {
 /// [`COMPOSER_MAX_ROWS`] (sim textarea autoGrow, tui.js:2799-2803); beyond
 /// the cap the composer scrolls to its tail.
 fn composer_height(model: &AppModel) -> u16 {
+    // The masked login card REPLACES the composer while it is open
+    // (W3c3 M3): title, masked field, hint.
+    if model.login.is_some() {
+        return LOGIN_CARD_ROWS;
+    }
     let rows = model
         .composer
         .text()
@@ -2426,12 +2431,73 @@ struct ComposerRowWindow {
 /// rows are hidden above. Returns the rows plus the chip's column offset +
 /// width.
 #[allow(clippy::type_complexity)]
+/// Rows the masked login card claims: title · field · hint.
+const LOGIN_CARD_ROWS: u16 = 3;
+
+/// The masked `/login … api` card (W3c3 M3 — report R10).
+///
+/// The renderer is handed a LENGTH, never the key. That is the whole
+/// design: no frame can carry the secret, so no snapshot, no scrollback,
+/// no drag-selection copy and no `⌃C` can either. The mask is also CAPPED,
+/// so a long key does not advertise its length across the terminal.
+fn login_lines(card: &crate::app::LoginCard, theme: &Theme, width: u16) -> Vec<Line<'static>> {
+    use crate::app::LoginStage;
+    const MASK_CAP: usize = 32;
+    let inner = usize::from(width).saturating_sub(4).max(1);
+    let title = format!(
+        "  ⚿ {} · API key{}",
+        card.provider,
+        card.alias
+            .as_ref()
+            .map_or_else(String::new, |alias| format!(" · {alias}"))
+    );
+    let field = match &card.stage {
+        LoginStage::Entry => {
+            let shown = card.masked_len().min(MASK_CAP);
+            let mask = "•".repeat(shown);
+            let more = if card.masked_len() > MASK_CAP {
+                "…"
+            } else {
+                ""
+            };
+            format!("  ❯ {mask}{more}▏")
+        }
+        LoginStage::Submitting => "  ❯ validating…".to_owned(),
+        LoginStage::Failed(text) => format!("  ✗ {text}"),
+        LoginStage::Done(identity) => format!("  ✓ signed in · {identity}"),
+    };
+    let hint = match &card.stage {
+        LoginStage::Entry => {
+            "    the key is masked and never stored locally · ⏎ commit · esc cancel"
+        }
+        LoginStage::Submitting => "    staging and validating with the provider…",
+        LoginStage::Failed(_) => "    ⏎ try again · esc cancel",
+        LoginStage::Done(_) => "    esc closes",
+    };
+    let clip = |text: String| -> String { text.chars().take(inner + 2).collect() };
+    vec![
+        Line::styled(clip(title), theme.gold_style()),
+        Line::styled(clip(field), theme.text_style()),
+        Line::styled(clip(hint.to_owned()), theme.dim_style()),
+    ]
+}
+
+#[allow(clippy::type_complexity)]
 fn composer_lines<'a>(
     model: &'a AppModel,
     theme: &Theme,
     width: u16,
     allocated: u16,
 ) -> (Vec<Line<'a>>, Option<(u16, u16)>, Vec<ComposerRowWindow>) {
+    // The masked login card owns the input band while it is open. It emits
+    // NO click/drag windows and NO talk chip: a composer text window
+    // carries its CONTENT for caret mapping, which is precisely the thing
+    // that must not exist for a secret.
+    if let Some(card) = model.login.as_ref() {
+        let mut lines = login_lines(card, theme, width);
+        lines.truncate(usize::from(allocated).max(1));
+        return (lines, None, Vec::new());
+    }
     let sigil = Span::styled(
         "❯ ",
         theme

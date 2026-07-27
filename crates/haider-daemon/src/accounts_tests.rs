@@ -6,6 +6,8 @@
 use super::*;
 use haider_core::SqliteStoreHandle;
 
+use crate::session_hub::FrameSendError;
+
 fn test_store_dir() -> tempfile::TempDir {
     tempfile::Builder::new()
         .prefix("hacct")
@@ -142,6 +144,266 @@ async fn open_store(dir: &std::path::Path) -> SqliteStoreHandle {
     SqliteStoreHandle::open(dir)
         .await
         .unwrap_or_else(|error| panic!("open store: {}", error.message))
+}
+
+// ─────────────────── pending-command secret TTL (R7/R10) ────────────────────
+
+/// Correlated responses land in an unbounded channel (the account actor
+/// never awaits delivery, so the sink must never block).
+struct ChannelSink(mpsc::UnboundedSender<WireFrame>);
+
+impl FrameSink for ChannelSink {
+    fn try_send(&self, frame: WireFrame) -> Result<(), FrameSendError> {
+        self.0.send(frame).map_err(|_| FrameSendError)
+    }
+}
+
+fn channel_sink() -> (Arc<dyn FrameSink>, mpsc::UnboundedReceiver<WireFrame>) {
+    let (sender, receiver) = mpsc::unbounded_channel();
+    (Arc::new(ChannelSink(sender)), receiver)
+}
+
+/// Always reports the R10 "validation unavailable" arm — the retryable
+/// failure that leaves the secret with the COMMAND — and counts its calls,
+/// so a reused expired secret is visible as a second validation.
+#[derive(Default)]
+struct UnavailableValidator {
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl UnavailableValidator {
+    fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl CredentialValidator for UnavailableValidator {
+    fn supports(&self, provider: &str) -> bool {
+        provider == "anthropic"
+    }
+
+    async fn validate(
+        &self,
+        _provider: &str,
+        _model: &str,
+        _secret: &[u8],
+    ) -> Result<ValidatedIdentity, ValidationError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(ValidationError {
+            kind: ValidationFailureKind::Unavailable,
+            message: "credential validation reported Overloaded".into(),
+        })
+    }
+}
+
+fn login_job(
+    command_id: &str,
+    request_id: &str,
+    secret: Option<&[u8]>,
+    sink: &Arc<dyn FrameSink>,
+) -> LoginJob {
+    LoginJob {
+        command_id: command_id.to_owned(),
+        provider: "anthropic".into(),
+        display_alias: Some("work".into()),
+        validation_model: Some("claude-test".into()),
+        secret: secret.map(|bytes| Zeroizing::new(bytes.to_vec())),
+        route: LoginRoute {
+            request_id: RequestId::new(request_id),
+            sink: Arc::clone(sink),
+        },
+    }
+}
+
+fn expect_error(frame: WireFrame) -> (String, bool) {
+    match frame {
+        WireFrame::Response {
+            body: ResponseBody::Error {
+                code, retryable, ..
+            },
+            ..
+        } => (code, retryable),
+        other => panic!("expected a correlated error, got {other:?}"),
+    }
+}
+
+// MUTATION CHECK (R7/R10 pending-command secret TTL): disable BOTH
+// enforcement sites — `handle_login`'s claim guard
+// `Some(entry) if entry.claimed_at.elapsed() < SECRET_TTL` and the actor
+// loop's `pending.retain(|_, entry| entry.claimed_at.elapsed() < SECRET_TTL)`
+// — by replacing each condition with `true`. Expected failure: the expired
+// secret is reused, so the stage-less retry validates a SECOND time and
+// answers `provider_error` instead of `restage_required`, the pending map is
+// not empty at the assertion, and the validator call count is 2.
+#[tokio::test(start_paused = true)]
+async fn pending_login_secret_past_the_ttl_is_wiped_and_forces_restage() {
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let mut accounts = memory_accounts();
+    let vault = MemoryVault::default();
+    let validator = UnavailableValidator::default();
+    let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(Vec::new()));
+    let mut pending: HashMap<String, PendingSecret> = HashMap::new();
+    let (sink, mut frames) = channel_sink();
+
+    // Retryable validation failure: the COMMAND keeps the claimed secret so
+    // the same command can retry without retyping the key.
+    handle_login(
+        &store,
+        &mut accounts,
+        &vault,
+        &validator,
+        &snapshot,
+        "profile-ttl",
+        "claude-test",
+        &mut pending,
+        login_job("command-ttl", "req-1", Some(b"sk-retained"), &sink),
+    )
+    .await;
+    let (code, retryable) = expect_error(
+        frames
+            .try_recv()
+            .unwrap_or_else(|error| panic!("first login response: {error}")),
+    );
+    assert_eq!(code, ERROR_CODE_PROVIDER_ERROR);
+    assert!(retryable, "validation unavailability must be retryable");
+    assert!(
+        pending.contains_key("command-ttl"),
+        "a retryable validation must retain the command-owned secret"
+    );
+    assert_eq!(validator.calls(), 1);
+
+    tokio::time::advance(SECRET_TTL + Duration::from_secs(1)).await;
+
+    // Stage-less retry of the SAME command, now past the TTL.
+    handle_login(
+        &store,
+        &mut accounts,
+        &vault,
+        &validator,
+        &snapshot,
+        "profile-ttl",
+        "claude-test",
+        &mut pending,
+        login_job("command-ttl", "req-2", None, &sink),
+    )
+    .await;
+    let (code, retryable) = expect_error(
+        frames
+            .try_recv()
+            .unwrap_or_else(|error| panic!("retry response: {error}")),
+    );
+    // The WIRE literal, not just the constant (see the haider-rpc golden
+    // `account_and_vault_stable_codes_pin_their_wire_literals`).
+    assert_eq!(
+        code, "restage_required",
+        "an expired command-owned secret must force an explicit restage"
+    );
+    assert_eq!(code, ERROR_CODE_RESTAGE_REQUIRED);
+    assert!(retryable, "restage_required is retryable once re-staged");
+
+    // WIPED, not merely unreachable: the entry is gone from the pending map,
+    // dropping (and zeroizing) the secret with it.
+    assert!(
+        pending.is_empty(),
+        "an expired pending secret must be wiped, not parked"
+    );
+    assert_eq!(
+        validator.calls(),
+        1,
+        "an expired secret must never reach the validator again"
+    );
+
+    // Neither leg persisted anything.
+    assert!(
+        vault
+            .list()
+            .unwrap_or_else(|error| panic!("{error:?}"))
+            .is_empty(),
+        "no vault entries"
+    );
+    assert!(accounts.list().is_empty(), "no descriptors");
+
+    store
+        .close()
+        .await
+        .unwrap_or_else(|error| panic!("{}", error.message));
+}
+
+// MUTATION CHECK (same two TTL sites, driven through the ACTOR loop): with
+// both conditions replaced by `true` the expired secret survives the actor's
+// pre-command sweep and is handed to validation again, so the second
+// response below is `provider_error`, not `restage_required`.
+#[tokio::test(start_paused = true)]
+async fn account_actor_answers_restage_required_after_the_pending_ttl() {
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let validator = Arc::new(UnavailableValidator::default());
+    let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(Vec::new()));
+    let actor = start_account_actor(AccountActorConfig {
+        store: store.clone(),
+        accounts: memory_accounts(),
+        vault: Arc::new(MemoryVault::default()) as Arc<dyn Vault>,
+        validator: Arc::clone(&validator) as Arc<dyn CredentialValidator>,
+        snapshot,
+        profile_id: "profile-ttl-actor".into(),
+        default_model: "claude-test".into(),
+    });
+    let commands = actor.commands();
+    let (sink, mut frames) = channel_sink();
+
+    commands
+        .send(AccountCommand::Login(Box::new(login_job(
+            "command-actor-ttl",
+            "req-actor-1",
+            Some(b"sk-retained"),
+            &sink,
+        ))))
+        .await
+        .unwrap_or_else(|_| panic!("actor admits the first login"));
+    let (code, retryable) = expect_error(
+        frames
+            .recv()
+            .await
+            .unwrap_or_else(|| panic!("first login response")),
+    );
+    assert_eq!(code, ERROR_CODE_PROVIDER_ERROR);
+    assert!(retryable);
+
+    tokio::time::advance(SECRET_TTL + Duration::from_secs(1)).await;
+
+    commands
+        .send(AccountCommand::Login(Box::new(login_job(
+            "command-actor-ttl",
+            "req-actor-2",
+            None,
+            &sink,
+        ))))
+        .await
+        .unwrap_or_else(|_| panic!("actor admits the stage-less retry"));
+    let (code, retryable) = expect_error(
+        frames
+            .recv()
+            .await
+            .unwrap_or_else(|| panic!("retry response")),
+    );
+    assert_eq!(
+        code, "restage_required",
+        "the actor must not hand an expired secret back to validation"
+    );
+    assert!(retryable);
+    assert_eq!(
+        validator.calls(),
+        1,
+        "an expired secret must never reach the validator again"
+    );
+
+    actor.shutdown().await;
+    store
+        .close()
+        .await
+        .unwrap_or_else(|error| panic!("{}", error.message));
 }
 
 /// Receipt-shape laws for the login command (the first non-wire receipt

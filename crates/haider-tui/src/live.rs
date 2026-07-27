@@ -106,6 +106,27 @@ pub enum LiveCommand {
         worker_generation: u64,
         run_id: RunId,
     },
+    /// Stage a raw secret in connection-scoped daemon memory (R7/R10).
+    /// Deliberately NON-durable and NOT in the outbox: no command receipt
+    /// may ever contain a secret, so a lost response is answered by
+    /// staging a FRESH one, never by replaying this.
+    Stage {
+        stage_id: String,
+        secret: haider_rpc::SecretWire,
+        provider: String,
+        alias: Option<String>,
+    },
+    /// Commit an API login against an already-staged reference. DURABLE:
+    /// its command identity deliberately EXCLUDES the ephemeral
+    /// `vault_reference`, so a lost-response retry may supply a freshly
+    /// staged reference under the same command id and still recover the
+    /// original committed result.
+    LoginApi {
+        command_id: CommandId,
+        provider: String,
+        alias: Option<String>,
+        vault_reference: String,
+    },
     /// A menu answer at its EXACT committed opening coordinates.
     Answer {
         command_id: CommandId,
@@ -128,9 +149,13 @@ impl LiveCommand {
             | Self::Submit { command_id, .. }
             | Self::Cancel { command_id, .. }
             | Self::Answer { command_id, .. } => Some(command_id),
-            Self::List { .. } | Self::Attach { .. } | Self::Detach { .. } | Self::Read { .. } => {
-                None
-            }
+            Self::LoginApi { command_id, .. } => Some(command_id),
+            Self::List { .. }
+            | Self::Attach { .. }
+            | Self::Detach { .. }
+            | Self::Read { .. }
+            // A stage carries no durable identity BY DESIGN (see above).
+            | Self::Stage { .. } => None,
         }
     }
 }
@@ -171,6 +196,18 @@ pub enum LiveReply {
     },
     Answered {
         command_id: CommandId,
+    },
+    /// `vault.stage` answered with an opaque single-use reference.
+    Staged {
+        vault_reference: String,
+        provider: String,
+        alias: Option<String>,
+    },
+    /// `account.login_api` committed; `identity` is the descriptor's
+    /// display identity (never a secret).
+    LoggedIn {
+        command_id: CommandId,
+        identity: String,
     },
     Cancelled {
         command_id: CommandId,
@@ -258,6 +295,8 @@ pub struct LiveDriver {
     lru: Vec<SessionId>,
     /// Sessions the daemon listed that we hold no attachment for.
     cold: HashMap<SessionId, Cold>,
+    /// Attaches issued and not yet answered — see `sync_selection`.
+    attaching: std::collections::HashSet<SessionId>,
     /// Durable mutations awaiting a response, in issue order.
     outbox: Vec<Pending>,
     /// Committed menu coordinates, by menu id.
@@ -270,9 +309,14 @@ pub struct LiveDriver {
     next_command: u64,
     /// Generation minting for live session rows.
     connected: bool,
-    /// The last create we issued that still owes its first turn.
-    #[allow(clippy::type_complexity)]
-    pending_first_turn: HashMap<CommandId, String>,
+    /// Sessions whose first turn is waiting for their attachment. Keyed by
+    /// SESSION, not by the create's command id: the turn cannot be
+    /// submitted until the attach RESPONSE lands, because `turn.submit`
+    /// requires an established control attachment to that session.
+    pending_first_turn: HashMap<SessionId, String>,
+    /// Text handed to `session.create`, held until the daemon names the
+    /// session it created.
+    creating: HashMap<CommandId, String>,
 }
 
 impl LiveDriver {
@@ -285,6 +329,7 @@ impl LiveDriver {
             routes: HashMap::new(),
             lru: Vec::new(),
             cold: HashMap::new(),
+            attaching: std::collections::HashSet::new(),
             outbox: Vec::new(),
             menus: HashMap::new(),
             generations: HashMap::new(),
@@ -292,6 +337,7 @@ impl LiveDriver {
             next_command: 0,
             connected: true,
             pending_first_turn: HashMap::new(),
+            creating: HashMap::new(),
         }
     }
 
@@ -362,6 +408,30 @@ impl LiveDriver {
     }
 
     // ------------------------------------------------------- working set --
+
+    /// Attach whatever the user has SELECTED, if it is not attached yet.
+    ///
+    /// R11 cut 4: "entering live mode … attaches only on selection". The
+    /// launcher lists cold sessions from `session.list`; opening one is the
+    /// moment its history is actually wanted, so this is called once per
+    /// loop pass and is a no-op unless the attached surface changed. It is
+    /// also what makes a SECOND terminal see the same session's contiguous
+    /// events (§6.4) — its launcher row is cold until it is chosen.
+    pub fn sync_selection(&mut self, model: &AppModel) -> Vec<LiveCommand> {
+        let Some(active) = model.active_session.clone() else {
+            return Vec::new();
+        };
+        if self.attachments.contains_key(&active) {
+            self.touch(&active);
+            return Vec::new();
+        }
+        // One attach per selection: without this an idle loop pass would
+        // re-issue the attach every frame until the response landed.
+        if !self.attaching.insert(active.clone()) {
+            return Vec::new();
+        }
+        self.ensure_attached(model, &active)
+    }
 
     /// Ensure `session` is attached, evicting the coldest EVICTABLE session
     /// first when the cap is already full (report §6.3: "LRU-detaches
@@ -466,11 +536,17 @@ impl LiveDriver {
                 ..
             } => {
                 self.cold.remove(&session);
+                self.attaching.remove(&session);
                 self.generations.insert(session.clone(), worker_generation);
                 self.routes.insert(attachment.clone(), session.clone());
                 self.attachments.insert(session.clone(), attachment);
                 self.touch(&session);
-                Vec::new()
+                // The first turn of a freshly created session was waiting
+                // for exactly this.
+                match self.pending_first_turn.remove(&session) {
+                    Some(text) => vec![self.submit(model, &session, text)],
+                    None => Vec::new(),
+                }
             }
             LiveReply::Detached { attachment } => {
                 self.drop_attachment(&attachment);
@@ -490,13 +566,20 @@ impl LiveDriver {
                 // fabricated locally, so nothing has to be reconciled.
                 model.upsert_live_session(&session);
                 if let Some(row) = model.sessions.iter_mut().find(|row| row.id == session) {
-                    row.dir = cwd;
+                    // The ROW shows the display form; `cwd` is the absolute
+                    // path the daemon was given.
+                    let _ = cwd;
                     row.model_short = model_name;
                 }
-                let mut commands = self.ensure_attached(model, &session);
+                let commands = self.ensure_attached(model, &session);
                 model.open_session(&session);
-                if let Some(text) = self.pending_first_turn.remove(&command_id) {
-                    commands.push(self.submit(model, &session, text));
+                // THE ORDER (R11 cut 4): create response → attach response
+                // → turn.submit. The turn waits for the ATTACHMENT, not
+                // merely for the attach to be requested: the daemon rejects
+                // a submit from a connection with no control attachment to
+                // that session, and issuing both in one batch races.
+                if let Some(text) = self.creating.remove(&command_id) {
+                    self.pending_first_turn.insert(session, text);
                 }
                 model.dirty = true;
                 commands
@@ -513,6 +596,29 @@ impl LiveDriver {
             }
             LiveReply::Answered { command_id } | LiveReply::Cancelled { command_id } => {
                 self.retire(&command_id);
+                Vec::new()
+            }
+            LiveReply::Staged {
+                vault_reference,
+                provider,
+                alias,
+            } => {
+                // Transaction two. The staged reference is single-use and
+                // expiring, so the login follows immediately.
+                let command_id = self.mint();
+                vec![self.enqueue(LiveCommand::LoginApi {
+                    command_id,
+                    provider,
+                    alias,
+                    vault_reference,
+                })]
+            }
+            LiveReply::LoggedIn {
+                command_id,
+                identity,
+            } => {
+                self.retire(&command_id);
+                model.login_result(Ok(identity));
                 Vec::new()
             }
             LiveReply::Event {
@@ -548,12 +654,19 @@ impl LiveDriver {
                 {
                     self.retire(id);
                 }
-                model.flash = Some(format!("· {code} — {message}"));
+                // A card that is waiting takes the typed recovery text; the
+                // key is already gone either way (the card wipes on submit).
+                if model.login.is_some() {
+                    model.login_result(Err((code, message)));
+                } else {
+                    model.flash = Some(format!("· {code} — {message}"));
+                }
                 model.dirty = true;
                 Vec::new()
             }
             LiveReply::Disconnected { reason } => {
                 self.connected = false;
+                self.attaching.clear();
                 // Every attachment died with the socket, but the WORKING SET
                 // — which sessions we want attached, in priority order — is
                 // exactly what the resume has to restore, so `lru` survives
@@ -707,11 +820,10 @@ impl LiveDriver {
         match request {
             AppRequest::CreateSession { text } => {
                 let command_id = self.mint();
-                self.pending_first_turn
-                    .insert(command_id.clone(), text.clone());
+                self.creating.insert(command_id.clone(), text.clone());
                 vec![self.enqueue(LiveCommand::Create {
                     command_id,
-                    cwd: model.launcher_dir.clone(),
+                    cwd: model.cwd.clone(),
                     provider: model.identity.provider.clone(),
                     model: model.identity.model_short.clone(),
                     max_tokens: model.identity.context_window,
@@ -722,6 +834,24 @@ impl LiveDriver {
                 Some(session) => vec![self.submit(model, &session, text)],
                 None => Vec::new(),
             },
+            AppRequest::LoginApi {
+                provider,
+                alias,
+                secret,
+            } => {
+                // The stage id is an EPHEMERAL same-connection retry nonce,
+                // not a durable key: the same id with the same bytes
+                // returns the same reference, and a reconnect must stage
+                // afresh because the daemon's staged memory is
+                // connection-scoped.
+                self.next_command += 1;
+                vec![LiveCommand::Stage {
+                    stage_id: format!("{}-stage-{}", self.instance, self.next_command),
+                    secret,
+                    provider,
+                    alias,
+                }]
+            }
             AppRequest::Reattach { session, after_seq } => {
                 if let Some(attachment) = self.attachments.get(&session).cloned() {
                     self.drop_attachment(&attachment);

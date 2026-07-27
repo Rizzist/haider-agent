@@ -4,9 +4,32 @@
 //! convention), otherwise `DaemonError::exit_code` (sysexits; 75 = a daemon
 //! for this profile is already running).
 
-use haider_daemon::{DaemonConfig, ShutdownOutcome, run_with_signals};
+use haider_daemon::{
+    DaemonConfig, DaemonDependencies, ProviderFactory, ProviderFactoryConfig, ResolvedTurnProvider,
+    ShutdownOutcome, run_with_signals_and_dependencies,
+};
+use haider_protocol::error::HaiderError;
+use haider_protocol::session::SessionMetadataV1;
+use haider_provider::FakeProvider;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
+
+/// TEST-ONLY seam, OFF by default (W3c3 M3).
+///
+/// When set to a `FakeProvider` step script (the same JSON the CLI's
+/// `HAIDER_FAKE_SCRIPT_JSON` takes), the daemon resolves EVERY turn to that
+/// deterministic provider instead of the account store. This exists for one
+/// reason: `scripts/tui-probes/pty-probe-live.py` drives the REAL `haider`
+/// binary against the REAL daemon over a real socket, and §6.4 requires
+/// that path to pass "deterministically with `FakeProvider` and no network".
+///
+/// It is never read unless the variable is present, it can only ever
+/// SUBSTITUTE a provider (it grants no capability, relaxes no auth, and
+/// touches no credential path), and `session.create`'s provider whitelist
+/// becomes `{"fake"}` under it — so a process started this way cannot
+/// create an `anthropic` session by accident.
+const FAKE_PROVIDER_ENV: &str = "HAIDER_TEST_FAKE_PROVIDER";
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -17,13 +40,74 @@ async fn main() -> ExitCode {
             return ExitCode::from(64);
         }
     };
-    match run_with_signals(config).await {
+    let dependencies = match test_dependencies() {
+        Ok(dependencies) => dependencies,
+        Err(message) => {
+            eprintln!("haiderd: {message}");
+            return ExitCode::from(64);
+        }
+    };
+    match run_with_signals_and_dependencies(config, dependencies).await {
         Ok(ShutdownOutcome::Graceful) => ExitCode::SUCCESS,
         Ok(ShutdownOutcome::Forced) => ExitCode::from(130),
         Err(error) => {
             eprintln!("haiderd: {error}");
             ExitCode::from(error.exit_code())
         }
+    }
+}
+
+/// Production dependencies, unless the test seam above is armed.
+fn test_dependencies() -> Result<DaemonDependencies, String> {
+    let Some(script) = std::env::var_os(FAKE_PROVIDER_ENV) else {
+        return Ok(DaemonDependencies::default());
+    };
+    let script = script
+        .into_string()
+        .map_err(|_| format!("{FAKE_PROVIDER_ENV} is not valid UTF-8"))?;
+    let fake = FakeProvider::from_json(&script)
+        .map_err(|error| format!("{FAKE_PROVIDER_ENV} is not a fake-provider script: {error}"))?;
+    eprintln!("haiderd: TEST MODE — every turn resolves to the injected fake provider");
+    // Every turn resolves to the fake regardless of what the session was
+    // created with, so the creatable set includes the release default too:
+    // otherwise a client using the profile's own provider is rejected at
+    // `session.create` for a provider the daemon was never going to call.
+    let providers = std::collections::BTreeSet::from([
+        "fake".to_owned(),
+        haider_provider::ANTHROPIC_PROVIDER_NAME.to_owned(),
+    ]);
+    Ok(DaemonDependencies {
+        provider_factory: ProviderFactoryConfig::Injected {
+            factory: Arc::new(FakeFactory {
+                fake: Arc::new(fake),
+            }),
+            providers,
+        },
+        ..DaemonDependencies::default()
+    })
+}
+
+/// The injected factory: one deterministic provider for every turn.
+struct FakeFactory {
+    fake: Arc<FakeProvider>,
+}
+
+#[async_trait::async_trait]
+impl ProviderFactory for FakeFactory {
+    async fn resolve_for_turn(
+        &self,
+        metadata: &SessionMetadataV1,
+    ) -> Result<ResolvedTurnProvider, HaiderError> {
+        Ok(ResolvedTurnProvider {
+            provider: self.fake.clone(),
+            // Echo the SESSION's own provider: the worker rejects a
+            // factory that returns a different provider than the session
+            // was created with, and the point of this seam is to substitute
+            // the IMPLEMENTATION, not to rewrite the session.
+            provider_name: metadata.provider.clone(),
+            model: metadata.model.clone(),
+            account_alias: None,
+        })
     }
 }
 

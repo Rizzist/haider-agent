@@ -1190,6 +1190,15 @@ impl DemoDriver {
             | AppRequest::CopyText(_)
             | AppRequest::Reattach { .. }
             | AppRequest::CreateSession { .. } => {}
+            // `/login … api` needs a daemon. The demo answers honestly
+            // rather than pretending to store a key (and the secret drops —
+            // zeroized — right here).
+            AppRequest::LoginApi { .. } => {
+                model.login = None;
+                model.flash =
+                    Some("· /login — needs the daemon; run `haider` (not --demo)".to_owned());
+                model.dirty = true;
+            }
         }
     }
 
@@ -2174,6 +2183,9 @@ pub async fn run_live(
         // 3): `/reset` takes its live branch and emits none. Clearing is
         // belt-and-braces, never an execution.
         model.demo_requests.clear();
+        // Attach-on-selection (R11 cut 4): the launcher lists cold
+        // sessions; opening one is when its history is wanted.
+        pending.extend(driver.sync_selection(&model));
         pending.extend(driver.drain_answers(&mut model));
         if model.theme != active_theme {
             active_theme = model.theme;

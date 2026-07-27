@@ -11,8 +11,11 @@ name = "haiderd"
 path = "src/main.rs"
 
 [dependencies]
+async-trait.workspace = true
 haider-client = { path = "../haider-client" }
 haider-daemon = { path = "../haider-daemon" }
+haider-protocol = { path = "../haider-protocol" }
+haider-provider = { path = "../haider-provider" }
 tokio.workspace = true
 
 [dev-dependencies]
