@@ -2304,8 +2304,13 @@ fn composer_height(model: &AppModel) -> u16 {
 /// Keep the editable TAIL of an overlong composer line visible (sim: the
 /// textarea scrolls its caret into view): a leading … plus the last cells
 /// that fit.
-fn tail_window(text: &str, budget: usize) -> String {
-    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+/// (TUI5.1 fix 5: the walk is GRAPHEME-wise — a char walk could clip
+/// inside a cluster, rendering an orphaned combining mark after the …
+/// or splitting a ZWJ emoji. `pub` for the regression tests only.)
+#[doc(hidden)]
+pub fn tail_window(text: &str, budget: usize) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
     if budget == 0 {
         return String::new();
     }
@@ -2314,17 +2319,16 @@ fn tail_window(text: &str, budget: usize) -> String {
     }
     let keep = budget.saturating_sub(1);
     let mut cells = 0usize;
-    let mut reversed: Vec<char> = Vec::new();
-    for ch in text.chars().rev() {
-        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if cells + ch_width > keep {
+    let mut start = text.len();
+    for (offset, grapheme) in text.grapheme_indices(true).rev() {
+        let w = UnicodeWidthStr::width(grapheme).max(1);
+        if cells + w > keep {
             break;
         }
-        cells += ch_width;
-        reversed.push(ch);
+        cells += w;
+        start = offset;
     }
-    let tail: String = reversed.into_iter().rev().collect();
-    format!("…{tail}")
+    format!("…{}", &text[start..])
 }
 
 /// The gold rule + composer rows on the input ground (sim InputBar,
@@ -2391,6 +2395,8 @@ fn render_composer(
             Hit::ComposerText {
                 start: window.start,
                 content: window.content,
+                surface: model.surface_key(),
+                revision: model.composer.revision(),
             },
         ));
     }

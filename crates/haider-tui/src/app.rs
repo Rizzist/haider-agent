@@ -755,12 +755,19 @@ pub enum Hit {
     /// One composer text row (TUI5 item 5). Value-carrying like every
     /// hit: `start` is the ABSOLUTE byte offset (in the composer text) of
     /// the row's visible slice at render time, `content` the slice
-    /// itself — a click maps its column through `content`'s graphemes, so
-    /// a stale frame can only ever place the caret where that frame's
-    /// cells actually were (or be dropped by the press guard).
+    /// itself — a click maps its column through `content`'s graphemes.
+    ///
+    /// TUI5.1 fix 2: the hit also carries the SURFACE it was rendered for
+    /// and the composer's text REVISION at render time — press and drag
+    /// validate both against the live composer and DROP the event on any
+    /// mismatch. One authority, no per-callsite length heuristics: a
+    /// stale frame's hit can never move the caret into fresh text or
+    /// another surface's draft.
     ComposerText {
         start: usize,
         content: String,
+        surface: DraftKey,
+        revision: u64,
     },
 }
 
@@ -1088,6 +1095,10 @@ impl AppModel {
     /// exactly one stash/restore per transition (a double stash would park
     /// an already-empty composer over the real draft).
     fn stash_draft(&mut self) {
+        // TUI5.1 fix 2: a held composer drag dies with the surface it
+        // started on — every surface transition passes through here, so
+        // this is the single cancellation authority.
+        self.composer_drag = false;
         let key = self.surface_key();
         let draft = std::mem::take(&mut self.composer);
         self.drafts.insert(key, draft);
@@ -1327,7 +1338,7 @@ impl AppModel {
                 // TUI5 item 4 — the selection gates run BEFORE the
                 // clear-on-keypress law, or ⌃C/Esc could never see the
                 // selection they govern.
-                if self.selection_key(&key) {
+                if self.composer_owns_input() && self.selection_key(&key) {
                     return;
                 }
                 // A keypress clears a finished selection's highlight
@@ -1410,10 +1421,22 @@ impl AppModel {
     /// region-disambiguation law: a drag STARTING here is a composer
     /// selection). `start` and `content` are the hit's render-time values
     /// (the value-carrying law); `col` is the clicked display column
-    /// within `content`.
-    pub fn composer_press(&mut self, start: usize, content: &str, col: usize) {
-        // Value-carrying guard: a one-frame-stale hit whose window no
-        // longer exists in the CURRENT text drops the press.
+    /// within `content`; `surface` and `revision` bind the hit to the
+    /// composer state it was rendered from (TUI5.1 fix 2) — any mismatch
+    /// drops the press whole.
+    pub fn composer_press(
+        &mut self,
+        start: usize,
+        content: &str,
+        col: usize,
+        surface: DraftKey,
+        revision: u64,
+    ) {
+        if surface != self.surface_key() || revision != self.composer.revision() {
+            return;
+        }
+        // Defense in depth (the revision check subsumes this, but a
+        // violated invariant should still never place a caret).
         if start > self.composer.text().len() {
             return;
         }

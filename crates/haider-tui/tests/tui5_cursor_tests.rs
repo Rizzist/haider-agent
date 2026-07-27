@@ -587,7 +587,7 @@ fn mouse(kind: MouseEventKind, column: u16, row: u16) -> Event {
 fn composer_text_rect(hits: &[(Rect, Hit)]) -> (Rect, usize, String) {
     hits.iter()
         .find_map(|(rect, hit)| match hit {
-            Hit::ComposerText { start, content } => Some((*rect, *start, content.clone())),
+            Hit::ComposerText { start, content, .. } => Some((*rect, *start, content.clone())),
             _ => None,
         })
         .expect("a composer text region in the hit map")
@@ -738,7 +738,12 @@ fn stale_composer_hit_is_dropped_not_misapplied() {
     }
     // A hit whose window starts beyond the CURRENT text (stale frame after
     // a kill) must drop the press whole — never place a phantom caret.
-    model.composer_press(50, "stale content", 3);
+    // (TUI5.1: the hit now binds surface + revision; even a hit wearing
+    // the CURRENT pair but an impossible window is dropped by the
+    // defense-in-depth guard.)
+    let surface = model.surface_key();
+    let revision = model.composer.revision();
+    model.composer_press(50, "stale content", 3, surface, revision);
     assert_eq!(model.composer.cursor(), 2, "cursor untouched");
     assert!(!model.composer_drag, "no drag armed from a dropped press");
 }
@@ -1145,4 +1150,237 @@ fn founding_message_recalls_in_the_new_session() {
     assert!(model.composer.is_empty());
     model.handle(key(KeyCode::Up));
     assert_eq!(model.composer, "build the thing");
+}
+
+// ---- TUI5.1 review round: the six required fixes, one pin per repro ----
+
+#[test]
+fn zwj_insert_normalizes_the_cursor_to_the_joined_cluster() {
+    // Reviewer repro (P1-1): inserting a ZWJ between 👩👩 makes ONE
+    // grapheme; the cursor must land on a boundary of the NEW text, never
+    // byte 7 inside the cluster (where the render has no cell to style
+    // and further edits would split it).
+    // MUTATION CHECK: drop the normalize step from after_edit() and this
+    // (and the flag test below) fail — Verified by revert.
+    use unicode_segmentation::UnicodeSegmentation;
+    let mut c = Composer::new();
+    c.insert_str("👩👩");
+    c.move_left(false); // between the two women (byte 4)
+    assert_eq!(c.cursor(), 4);
+    c.insert_str("\u{200D}");
+    let boundaries: Vec<usize> = c
+        .text()
+        .grapheme_indices(true)
+        .map(|(i, _)| i)
+        .chain(std::iter::once(c.text().len()))
+        .collect();
+    assert!(
+        boundaries.contains(&c.cursor()),
+        "cursor {} is not a grapheme boundary of {:?} ({boundaries:?})",
+        c.cursor(),
+        c.text()
+    );
+    // Editing on from here never splits the joined cluster.
+    c.insert_str("x");
+    assert!(c.text().ends_with('x'), "insert landed at a boundary");
+    assert_eq!(c.text().graphemes(true).count(), 2, "cluster + x, intact");
+}
+
+#[test]
+fn flag_join_after_delete_normalizes_cursor_and_anchor() {
+    // Reviewer repro (P1-1): deleting the x from 🇦x🇧 joins the regional
+    // indicators into ONE flag grapheme around the caret.
+    use unicode_segmentation::UnicodeSegmentation;
+    let mut c = Composer::new();
+    c.insert_str("🇦x🇧");
+    // Caret after the x (byte 5 — each regional indicator is 4 bytes):
+    // ⌫ removes it, the flags join into ONE grapheme (0..8).
+    c.move_left(false);
+    assert_eq!(c.cursor(), 5);
+    c.backspace();
+    assert_eq!(c.text(), "🇦🇧");
+    let ok = c.text().is_char_boundary(c.cursor())
+        && c.text()
+            .grapheme_indices(true)
+            .map(|(i, _)| i)
+            .chain(std::iter::once(c.text().len()))
+            .any(|b| b == c.cursor());
+    assert!(ok, "cursor {} inside the joined flag", c.cursor());
+    // The anchor normalizes through the same seam: select across the
+    // join point, delete, and the survivors are boundary-clean.
+    let mut c = Composer::new();
+    c.insert_str("🇦x🇧");
+    c.move_left(true); // anchor parked at end, cursor into the text
+    c.backspace();
+    assert!(!c.has_selection() || c.selected_text().is_some());
+}
+
+#[test]
+fn stale_hit_with_old_content_never_moves_the_caret() {
+    // Reviewer repro (P1-2): against "fresh text" (cursor 10), a stale
+    // hit carrying "stale text" moved the cursor to 3 and armed a drag.
+    // The hit now binds (surface, revision); the mismatch drops it whole.
+    // MUTATION CHECK: drop the surface/revision guard from
+    // composer_press and this fails — Verified by revert.
+    let mut model = session_model();
+    let surface = model.surface_key();
+    for c in "stale text".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    let stale_revision = model.composer.revision();
+    // The text changes — every keystroke bumps the revision.
+    model.composer.set_text("fresh text");
+    assert_ne!(model.composer.revision(), stale_revision);
+    assert_eq!(model.composer.cursor(), 10);
+    model.composer_press(0, "stale text", 3, surface, stale_revision);
+    assert_eq!(model.composer.cursor(), 10, "stale press dropped whole");
+    assert!(!model.composer_drag, "no drag armed from a stale press");
+    // The same press wearing the CURRENT revision lands.
+    model.composer_press(0, "fresh text", 3, surface, model.composer.revision());
+    assert_eq!(model.composer.cursor(), 3);
+    assert!(model.composer_drag);
+    model.composer_release();
+}
+
+#[test]
+fn held_drag_dies_with_the_surface_it_started_on() {
+    // Reviewer repro (P1-2): a held drag survived a surface transition
+    // and acted on another draft. stash_draft is the single cancellation
+    // authority — every transition passes through it.
+    let mut model = session_model();
+    for c in "drag me".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.composer_press(
+        0,
+        "drag me",
+        2,
+        model.surface_key(),
+        model.composer.revision(),
+    );
+    assert!(model.composer_drag, "armed on the session surface");
+    model.back_to_launcher();
+    assert!(!model.composer_drag, "the transition cancelled the drag");
+    // A drag event arriving after the flip is a no-op on the new draft.
+    model.composer_drag_to(5);
+    assert!(!model.composer.has_selection());
+}
+
+#[test]
+fn hidden_selection_never_preempts_ctrl_c_when_a_menu_owns_input() {
+    // Reviewer repro (P2-3): select in the composer, an inbound menu
+    // replaces it — first-press ⌃C must NAVIGATE (the selection is not
+    // even on screen), not copy the hidden selection.
+    let mut model = AppModel::new();
+    for payload in demo_script() {
+        if matches!(payload, haider_protocol::EventPayload::MenuOpened(_)) {
+            // Select BEFORE the menu arrives.
+            for c in "hidden".chars() {
+                model.handle(key(KeyCode::Char(c)));
+            }
+            model.handle(key_mod(KeyCode::Left, KeyModifiers::SHIFT));
+            assert!(model.composer.has_selection());
+        }
+        model.handle(AppEvent::Envelope(Box::new(payload)));
+        if model.projection.open_menu().is_some() {
+            break;
+        }
+    }
+    assert!(model.projection.open_menu().is_some(), "a menu is open");
+    assert_eq!(model.screen, Screen::Session);
+    model.handle(key_mod(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert_eq!(
+        model.screen,
+        Screen::Launcher,
+        "⌃C navigated on the FIRST press — the hidden selection did not \
+         preempt it"
+    );
+    assert!(
+        !model
+            .requests
+            .iter()
+            .any(|r| matches!(r, AppRequest::CopyText(_))),
+        "nothing was copied from a selection the user cannot see"
+    );
+}
+
+#[test]
+fn hidden_selection_never_eats_esc_when_a_menu_owns_input() {
+    // Reviewer repro (P2-3) Esc half: with the composer replaced by a
+    // menu, Esc must go to the MENU meaning, not silently clear an
+    // invisible selection.
+    let mut model = AppModel::new();
+    for payload in demo_script() {
+        if matches!(payload, haider_protocol::EventPayload::MenuOpened(_)) {
+            for c in "hidden".chars() {
+                model.handle(key(KeyCode::Char(c)));
+            }
+            model.handle(key_mod(KeyCode::Left, KeyModifiers::SHIFT));
+        }
+        model.handle(AppEvent::Envelope(Box::new(payload)));
+        if model.projection.open_menu().is_some() {
+            break;
+        }
+    }
+    assert!(model.projection.open_menu().is_some());
+    let had_selection = model.composer.has_selection();
+    assert!(had_selection);
+    model.handle(key(KeyCode::Esc));
+    assert!(
+        model.composer.has_selection(),
+        "the press went to the menu handler; the hidden selection was \
+         not silently consumed"
+    );
+}
+
+#[test]
+fn shift_up_and_down_extend_to_the_buffer_edges() {
+    // Reviewer repro (P2-4): on one-line "abc", ⇧↑ from the end and ⇧↓
+    // from the start were no-ops; item 4 requires extension to the
+    // buffer start/end at the outer rows.
+    let mut c = Composer::new();
+    c.insert_str("abc");
+    assert!(c.line_up(true), "⇧↑ at the first row is NOT a no-op");
+    assert_eq!(c.selected_text(), Some("abc"), "extended to buffer start");
+    assert_eq!(c.cursor(), 0);
+    assert!(c.line_down(true), "⇧↓ back down extends the other way");
+    assert_eq!(c.cursor(), 3);
+    // From a collapsed caret at the start, ⇧↓ selects to the end.
+    let mut c = Composer::new();
+    c.insert_str("abc");
+    c.line_home(false);
+    assert!(c.line_down(true));
+    assert_eq!(c.selected_text(), Some("abc"));
+    // Plain ↑ at the edge still reports false — the history hook.
+    let mut c = Composer::new();
+    c.insert_str("abc");
+    assert!(!c.line_up(false));
+}
+
+#[test]
+fn tail_window_never_splits_a_grapheme() {
+    // Reviewer repro (P2-5): a char-wise walk could clip inside a
+    // cluster — "…◌́x" orphans the combining mark; ZWJ emoji split.
+    use haider_tui::render::tail_window;
+    use unicode_segmentation::UnicodeSegmentation;
+    // Combining sequence at the clip edge: the é (e + U+0301) is either
+    // wholly in or wholly out — never a bare mark after the ….
+    let text = format!("{}e\u{301}xyz", "a".repeat(40));
+    let clipped = tail_window(&text, 6);
+    let after = clipped.strip_prefix('…').expect("clipped");
+    assert!(
+        !after.starts_with('\u{301}'),
+        "orphaned combining mark: {clipped:?}"
+    );
+    assert!(text.ends_with(after), "the window is a true suffix");
+    // ZWJ family at the edge: clusters survive whole.
+    let text = format!("{}👩\u{200D}👩\u{200D}👧tail", "b".repeat(40));
+    let clipped = tail_window(&text, 8);
+    let after = clipped.strip_prefix('…').expect("clipped");
+    assert!(text.ends_with(after));
+    let first = after.graphemes(true).next().unwrap_or("");
+    assert!(
+        !first.starts_with('\u{200D}'),
+        "window began mid-ZWJ-cluster: {clipped:?}"
+    );
 }

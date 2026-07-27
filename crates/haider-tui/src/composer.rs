@@ -52,6 +52,13 @@ pub struct Composer {
     /// recalled entry: the edit becomes the new draft (documented,
     /// minimal-ring law).
     history_stash: Option<String>,
+    /// Text-mutation counter (TUI5.1 fix 2): every change to `text` bumps
+    /// it, and every rendered composer hit carries the revision it was
+    /// drawn from — the press/drag path drops any hit whose revision (or
+    /// surface) no longer matches, so a stale frame can never move the
+    /// caret into fresh text. Selection/cursor moves do NOT bump it: they
+    /// leave the rendered windows byte-accurate.
+    revision: u64,
 }
 
 /// Text-equality against string literals: the pre-TUI5 test corpus (and
@@ -96,6 +103,12 @@ impl Composer {
         self.cursor
     }
 
+    /// The text-mutation revision this composer is at (TUI5.1 fix 2).
+    #[must_use]
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
     /// The active selection as an ordered byte range, or `None` when the
     /// anchor is unset or zero-width.
     #[must_use]
@@ -130,6 +143,7 @@ impl Composer {
     /// set text is the new draft).
     pub fn set_text(&mut self, text: impl Into<String>) {
         self.text = text.into();
+        self.revision = self.revision.wrapping_add(1);
         self.cursor = self.text.len();
         self.anchor = None;
         self.sticky_col = None;
@@ -143,6 +157,7 @@ impl Composer {
     /// resets (item 8's submit-clears law).
     pub fn take_for_submit(&mut self) -> String {
         let text = std::mem::take(&mut self.text);
+        self.revision = self.revision.wrapping_add(1);
         self.record_submitted(text.trim());
         self.cursor = 0;
         self.anchor = None;
@@ -158,6 +173,7 @@ impl Composer {
     /// can never double-record past the consecutive-dupe check.
     pub fn take_silent(&mut self) -> String {
         let text = std::mem::take(&mut self.text);
+        self.revision = self.revision.wrapping_add(1);
         self.cursor = 0;
         self.anchor = None;
         self.sticky_col = None;
@@ -374,6 +390,15 @@ impl Composer {
         }
         let start = line_start(&self.text, self.cursor);
         if start == 0 {
+            // TUI5.1 fix 4: ⇧↑ on the FIRST row extends the selection to
+            // the buffer start (item 4's outer-edge law); plain ↑ still
+            // falls through to the caller's history hook.
+            if extend && self.cursor > 0 {
+                self.pre_move(true);
+                self.sticky_col = None;
+                self.cursor = 0;
+                return true;
+            }
             return false;
         }
         self.pre_move(extend);
@@ -401,6 +426,14 @@ impl Composer {
         }
         let end = line_end(&self.text, self.cursor);
         if end >= self.text.len() {
+            // TUI5.1 fix 4 mirror: ⇧↓ on the LAST row extends to the
+            // buffer end.
+            if extend && self.cursor < self.text.len() {
+                self.pre_move(true);
+                self.sticky_col = None;
+                self.cursor = self.text.len();
+                return true;
+            }
             return false;
         }
         self.pre_move(extend);
@@ -460,6 +493,7 @@ impl Composer {
         };
         self.history_pos = Some(next_pos);
         self.text = self.history[next_pos].clone();
+        self.revision = self.revision.wrapping_add(1);
         self.cursor = self.text.len();
         self.anchor = None;
         self.sticky_col = None;
@@ -479,6 +513,7 @@ impl Composer {
             self.history_pos = None;
             self.text = self.history_stash.take().unwrap_or_default();
         }
+        self.revision = self.revision.wrapping_add(1);
         self.cursor = self.text.len();
         self.anchor = None;
         self.sticky_col = None;
@@ -508,10 +543,43 @@ impl Composer {
     /// Every edit drops sticky state and detaches a history browse (the
     /// edited text becomes the draft; the pre-browse stash is dropped —
     /// documented minimal-ring law).
+    ///
+    /// TUI5.1 fix 1: it also NORMALIZES cursor and anchor to grapheme
+    /// boundaries of the NEW text and bumps the hit revision. An edit can
+    /// merge clusters around the caret (inserting a ZWJ between 👩👩,
+    /// deleting the x from 🇦x🇧 joins the flags) leaving byte offsets
+    /// INSIDE the merged grapheme — the render styles only grapheme
+    /// starts, so the cursor cell would vanish and further edits could
+    /// split the cluster. Normalizing here, at the single seam every
+    /// mutation passes through, makes interior-byte state unrepresentable
+    /// post-edit rather than patched per-callsite.
     fn after_edit(&mut self) {
+        self.cursor = nearest_boundary(&self.text, self.cursor);
+        self.anchor = self
+            .anchor
+            .map(|anchor| nearest_boundary(&self.text, anchor))
+            .filter(|anchor| *anchor != self.cursor);
+        self.revision = self.revision.wrapping_add(1);
         self.sticky_col = None;
         self.history_pos = None;
         self.history_stash = None;
+    }
+}
+
+/// The grapheme boundary of `text` NEAREST `byte` (ties round FORWARD —
+/// after an edit the caret stays past what was just typed/joined). The
+/// post-edit normalization seam (TUI5.1 fix 1).
+#[must_use]
+pub fn nearest_boundary(text: &str, byte: usize) -> usize {
+    let floor = snap(text, byte);
+    if floor == byte {
+        return byte;
+    }
+    let ceil = next_boundary(text, floor).unwrap_or(text.len());
+    if byte - floor < ceil - byte {
+        floor
+    } else {
+        ceil
     }
 }
 

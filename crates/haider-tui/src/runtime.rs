@@ -444,11 +444,18 @@ pub fn dispatch_input(
                     if model.selection.take().is_some() {
                         model.dirty = true;
                     }
-                    if let Some((rect, crate::app::Hit::ComposerText { start, content })) =
-                        hit_rect_at(hit_map, mouse.column, mouse.row)
+                    if let Some((
+                        rect,
+                        crate::app::Hit::ComposerText {
+                            start,
+                            content,
+                            surface,
+                            revision,
+                        },
+                    )) = hit_rect_at(hit_map, mouse.column, mouse.row)
                     {
                         let col = usize::from(mouse.column.saturating_sub(rect.x));
-                        model.composer_press(start, &content, col);
+                        model.composer_press(start, &content, col, surface, revision);
                         return;
                     }
                     model.mouse_down = Some((mouse.column, mouse.row));
@@ -562,9 +569,20 @@ fn composer_byte_at(
 ) -> usize {
     let mut band = None::<(u16, u16)>;
     for (rect, hit) in hit_map {
-        let crate::app::Hit::ComposerText { start, content } = hit else {
+        let crate::app::Hit::ComposerText {
+            start,
+            content,
+            surface,
+            revision,
+        } = hit
+        else {
             continue;
         };
+        // TUI5.1 fix 2: drag rows bind to surface + revision exactly as
+        // the press does — a stale row is no row.
+        if *surface != model.surface_key() || *revision != model.composer.revision() {
+            continue;
+        }
         let (top, bottom) = band.get_or_insert((rect.y, rect.y));
         *top = (*top).min(rect.y);
         *bottom = (*bottom).max(rect.y);
