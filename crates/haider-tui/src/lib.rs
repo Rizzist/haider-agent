@@ -12,6 +12,7 @@ pub mod commands;
 pub mod composer;
 pub mod demo_store;
 pub mod format;
+pub mod identity;
 pub mod mark;
 pub mod mock;
 pub mod plain;

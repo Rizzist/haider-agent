@@ -485,8 +485,14 @@ pub fn seed_session_states() -> Vec<crate::session::SessionState> {
         .iter()
         .enumerate()
         .map(|(index, sample)| {
-            let mut entry =
-                crate::session::SessionState::neutral(u64::try_from(index).unwrap_or(0) + 1);
+            // W3c3: generation 1-3 (the old numeric ids, verbatim) and the
+            // matching stable demo session ids — `demo-session-1..3`. The
+            // `+ 1` still skips `UiGeneration::SCRATCH`.
+            let ui_gen = crate::identity::UiGeneration::new(u64::try_from(index).unwrap_or(0) + 1);
+            let mut entry = crate::session::SessionState::neutral(
+                crate::identity::demo_session_id(ui_gen),
+                ui_gen,
+            );
             entry.name = Some(sample.name.to_owned());
             entry.title = Some(sample.blurb.to_owned());
             entry.head = (sample.head.to_owned(), sample.honorific.to_owned());

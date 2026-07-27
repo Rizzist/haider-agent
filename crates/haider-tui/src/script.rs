@@ -41,19 +41,19 @@ pub enum DemoEvent {
     },
     /// The 1.5 s auto-title micro-call returned: the driver names the
     /// session and pushes the note TOGETHER, inside the callback (sim
-    /// tui.js:1219-1227, review P2-12). `origin` is the session identity the
-    /// call was made for — the sim's callback looks the session up by id
-    /// and does nothing if it is gone, and it is NOT cancelled by an
+    /// tui.js:1219-1227, review P2-12). `origin` is the surface GENERATION
+    /// the call was made for — the sim's callback looks the session up by
+    /// id and does nothing if it is gone, and it is NOT cancelled by an
     /// interrupt (review r2 P2-6).
     AutoTitle {
-        origin: u64,
+        origin: crate::identity::UiGeneration,
         text: String,
     },
     /// A menu answer from the model's outbox. It rides the never-cancelled
-    /// control tag for DELIVERY, but `origin` (the session identity that
+    /// control tag for DELIVERY, but `origin` (the surface GENERATION that
     /// rendered the card) is checked at consumption (review r2 P1-1).
     Answer {
-        origin: u64,
+        origin: crate::identity::UiGeneration,
         answer: haider_protocol::menu::MenuAnswer,
     },
     /// The ◉ talk hold finished — submit the canned voice phrase.
@@ -254,6 +254,27 @@ pub enum ChipDisplayState {
 }
 
 impl ChipDisplayState {
+    /// The protocol's `ChipState` → this display vocabulary (W3c3, report
+    /// R11 cut 2: `AgentChipState` is the SOLE chip-state authority on the
+    /// live stream). `Running` has no protocol twin, so it stays demo-only;
+    /// `Closed` maps to `Done` because closing is the `ChipModel::closed`
+    /// flag plus the sweep, not a badge — a closed child's last honest
+    /// badge is that it finished.
+    #[must_use]
+    pub const fn from_protocol(state: &haider_protocol::agent::ChipState) -> Self {
+        use haider_protocol::agent::ChipState;
+        match state {
+            ChipState::Idle => Self::Idle,
+            ChipState::Thinking => Self::Thinking,
+            ChipState::Streaming => Self::Streaming,
+            ChipState::Tool => Self::Tool,
+            ChipState::Waiting => Self::Waiting,
+            ChipState::InputRequired => Self::InputRequired,
+            ChipState::Done | ChipState::Closed => Self::Done,
+            ChipState::Error => Self::Error,
+        }
+    }
+
     /// `CHIP_GLYPH` (tui.js:332-342); closed chips render `⊘` everywhere.
     #[must_use]
     pub const fn glyph(self) -> &'static str {

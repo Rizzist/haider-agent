@@ -106,7 +106,7 @@ async fn pump_quiet(
 
 fn answer_menu(model: &mut AppModel, menu: &str, index: u32) {
     model.outbox.push(haider_tui::app::OutboundAnswer {
-        origin: model.session_identity(),
+        origin: model.ui_generation(),
         answer: MenuAnswer {
             menu: haider_protocol::ids::MenuId::new(menu),
             option_key: None,
@@ -919,7 +919,7 @@ async fn a_stale_card_answer_cannot_reconfigure_a_replacement_session() {
     model.handle(key(KeyCode::Down));
     model.handle(key(KeyCode::Enter));
     let pending = model.outbox.remove(0);
-    assert_eq!(pending.origin, model.session_identity());
+    assert_eq!(pending.origin, model.ui_generation());
     let pending_origin = pending.origin;
     driver
         .sender()
@@ -939,14 +939,14 @@ async fn a_stale_card_answer_cannot_reconfigure_a_replacement_session() {
     submit(&mut model, "a different task entirely");
     drain(&mut driver, &mut model);
     assert_ne!(
-        model.session_identity(),
+        model.ui_generation(),
         pending_origin,
-        "a new session identity"
+        "a new surface generation"
     );
-    let epoch = model.session_identity();
+    let epoch = model.ui_generation();
     let voice_before = model.voice.clone();
     pump_quiet(&mut driver, &mut rx, &mut model, 6_000).await;
-    assert_eq!(model.session_identity(), epoch);
+    assert_eq!(model.ui_generation(), epoch);
     assert_eq!(
         model.voice, voice_before,
         "the stale answer must not reconfigure the replacement session"
@@ -1052,7 +1052,7 @@ async fn a_menu_option_hit_is_inert_once_its_surface_is_gone() {
     // so a queued click must not answer it.
     model.handle_hit(Hit::BackChip);
     assert_eq!(model.screen, Screen::Launcher);
-    let sid = model.last_detached.expect("detached id");
+    let sid = model.last_detached.clone().expect("detached id");
     let slot_menu = |m: &haider_tui::app::AppModel| {
         m.sessions
             .iter()

@@ -7,15 +7,16 @@
 //!   payload hydrated as if it were ours and `{"sessions":[{"id":99}]}`
 //!   replaced all three seeds with one blank session.
 //! - **P1-2 monotonic identity** (`app.rs`, `runtime.rs`): `/reset` used to
-//!   rewind `next_session_id`, so a replacement session could wear a dead
-//!   session's id — and the control-tagged auto-title micro-call, which
+//!   rewind the identity allocator (`next_session_id`, W3c3's
+//!   `next_ui_generation`), so a replacement session could wear a dead
+//!   session's identity — and the control-tagged auto-title micro-call, which
 //!   SURVIVES `/reset` by design (the sim's bare `setTimeout`), retitled
 //!   the replacement. The sim's `s-${Date.now()}` ids never recur;
 //!   monotonicity ports that law and makes the whole class unrepresentable.
 #![allow(clippy::expect_used)]
 
 use haider_tui::app::AppModel;
-use haider_tui::demo_store::{DEMO_STORE_VERSION, DemoStore, hydrate, snapshot};
+use haider_tui::demo_store::{DEMO_STORE_VERSION, DemoStore, StateDto, hydrate, snapshot};
 use haider_tui::projection::TranscriptEntry;
 use haider_tui::script::DemoEvent;
 
@@ -135,15 +136,23 @@ fn a_structurally_partial_session_rejects_the_whole_file() {
 }
 
 #[test]
-fn a_persisted_session_id_0_rejects_the_file() {
+fn a_persisted_scratch_generation_rejects_the_file() {
     // Fable D3-3: 0 is the scratch-lineage sentinel — the driver drops
-    // `Session(0)`-owned events while a session is attached (runtime.rs),
-    // so a hydrated id-0 session is a session whose turns silently vanish.
-    // A corrupt or hand-edited file must never mint one.
+    // `Session(SCRATCH)`-owned events while a session is attached
+    // (runtime.rs), so a hydrated generation-0 session is a session whose
+    // turns silently vanish. A corrupt or hand-edited file must never mint
+    // one.
     //
-    // MUTATION CHECK: drop the `session.id == 0` clause in `DemoStore::load`
-    // and the id-0 payload loads (the positive control proves it is
-    // otherwise identical to a good file).
+    // W3c3 (report R11 cut 1) split identity in two: the persisted session
+    // id became the protocol's opaque STRING and the scratch sentinel
+    // moved to the row's `ui_gen`. The LAW is unchanged and this test is
+    // re-pointed at the field that now carries it — in a v1 file the
+    // numeric id IS the generation, so a legacy `id: 0` still rejects
+    // through exactly this clause (see the v1 upcast test below).
+    //
+    // MUTATION CHECK: drop the `identity.1.is_scratch()` clause in
+    // `DemoStore::load` and the generation-0 payload loads (the positive
+    // control proves it is otherwise identical to a good file).
     let dir = tempfile::tempdir().expect("tempdir");
     let store = store_at(dir.path());
     let model = model_with_user_session();
@@ -156,7 +165,7 @@ fn a_persisted_session_id_0_rejects_the_file() {
     .expect("write");
     assert!(store.load().is_some(), "control: the good file loads");
 
-    dto.sessions[0].id = 0;
+    dto.sessions[0].ui_gen = Some(0);
     std::fs::write(
         store.path(),
         serde_json::to_string(&dto).expect("serialize"),
@@ -164,8 +173,113 @@ fn a_persisted_session_id_0_rejects_the_file() {
     .expect("write");
     assert!(
         store.load().is_none(),
-        "a persisted id 0 collides with the scratch sentinel → seeds"
+        "a persisted generation 0 collides with the scratch sentinel → seeds"
     );
+}
+
+#[test]
+fn a_persisted_nameless_session_id_rejects_the_file() {
+    // W3c3: the other half of the identity guard. An opaque id has no
+    // numeric sentinel, so "cannot name itself" is the empty string — a
+    // row that carries no id at all must reject the file, not hydrate a
+    // session nothing can ever address.
+    //
+    // MUTATION CHECK: drop the `identity.0.as_str().is_empty()` clause in
+    // `DemoStore::load` and the nameless payload loads.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = store_at(dir.path());
+    let model = model_with_user_session();
+    let mut dto = snapshot(&model);
+    assert!(
+        store_roundtrips(&store, &dto),
+        "control: the good file loads"
+    );
+
+    dto.sessions[0].id = haider_tui::demo_store::SessionIdDto::Current(String::new());
+    assert!(
+        !store_roundtrips(&store, &dto),
+        "a persisted empty session id → seeds"
+    );
+}
+
+#[test]
+fn a_v1_numeric_fixture_upcasts_without_reseeding_and_rewrites_as_v2() {
+    // Report §6.3's test: "a persisted v1 numeric-ID demo fixture upcasts
+    // without reseeding and rewrites as v2 strings."
+    //
+    // MUTATION CHECK: remove `DEMO_STORE_VERSION_V1` from
+    // `SUPPORTED_VERSIONS` and the v1 fixture is rejected back to seeds —
+    // `hydrated.sessions[0].name` becomes the seed's, not `old-work`.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut store = store_at(dir.path());
+
+    // A v1 payload, written by hand exactly as the pre-W3c3 store wrote
+    // it: `"version": 1`, numeric ids, and no `ui_gen` field at all.
+    let v1 = serde_json::json!({
+        "version": haider_tui::demo_store::DEMO_STORE_VERSION_V1,
+        "sessions": [{
+            "id": 9,
+            "name": "old-work",
+            "title": null,
+            "dir": "~/dev/old",
+            "model_short": "fable-5",
+            "device": "this-mac",
+            "ago": "1h",
+            "branches": 1,
+            "turns_offset": 2,
+            "projection": {},
+            "chips": []
+        }],
+        "theme": "dark",
+        "card_seq": 7
+    });
+    std::fs::write(store.path(), v1.to_string()).expect("write");
+    let dto = store.load().expect("a v1 fixture still hydrates");
+
+    let mut model = launcher_model();
+    hydrate(&mut model, dto);
+    assert_eq!(
+        model.sessions.len(),
+        1,
+        "the v1 fixture hydrated — it did NOT silently reseed"
+    );
+    assert_eq!(model.sessions[0].name.as_deref(), Some("old-work"));
+    assert_eq!(
+        model.sessions[0].id,
+        haider_tui::identity::demo_session_id(haider_tui::identity::UiGeneration::new(9)),
+        "the numeric id upcast through the ONE demo-id function"
+    );
+    assert_eq!(
+        model.sessions[0].ui_gen,
+        haider_tui::identity::UiGeneration::new(9),
+        "the v1 numeric id IS the generation"
+    );
+    assert!(
+        model.next_ui_generation > 9,
+        "guard 2 resumed past the upcast generation"
+    );
+
+    // …and the next save rewrites the file as v2 with a STRING id.
+    store.save(&model);
+    let rewritten: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(store.path()).expect("read")).expect("parse");
+    assert_eq!(
+        rewritten["version"],
+        serde_json::json!(haider_tui::demo_store::DEMO_STORE_VERSION),
+        "the rewrite carries the CURRENT version"
+    );
+    assert_eq!(
+        rewritten["sessions"][0]["id"],
+        serde_json::json!("demo-session-9"),
+        "the rewritten id is the opaque string, not the legacy number"
+    );
+    assert_eq!(rewritten["sessions"][0]["ui_gen"], serde_json::json!(9));
+}
+
+/// Write `dto` and report whether the store accepts it.
+fn store_roundtrips(store: &haider_tui::demo_store::DemoStore, dto: &StateDto) -> bool {
+    std::fs::write(store.path(), serde_json::to_string(dto).expect("serialize")).expect("write");
+    store.load().is_some()
 }
 
 // ---- P1-2: monotonic identity — a dead id never comes back ----
@@ -179,8 +293,9 @@ async fn a_dead_sessions_auto_title_never_lands_on_its_replacement() {
     // control-tagged micro-call (keyed by session id, uncancelled by
     // design) found a live session wearing the dead id.
     //
-    // MUTATION CHECK: restore `self.next_session_id = 4;` in the reducer's
-    // `"reset"` arm (app.rs) and the replacement is minted with the DEAD id
+    // MUTATION CHECK: restore `self.next_ui_generation = 4;` in the
+    // reducer's `"reset"` arm (app.rs) and the replacement is minted with
+    // the DEAD generation
     // — the identity assert below fires immediately, and the stale title
     // then lands on the live surface (the launcher-row assert is the
     // background-row half of the law and does not participate in this
@@ -190,18 +305,33 @@ async fn a_dead_sessions_auto_title_never_lands_on_its_replacement() {
     let (mut driver, mut rx) = driver_for(&model);
 
     submit(&mut model, "zzz old epoch leak");
-    let dead = model.active_session.expect("the first session attached");
+    let dead_id = model
+        .active_session
+        .clone()
+        .expect("the first session attached");
+    // W3c3: the auto-title callback is keyed by the surface GENERATION
+    // (report R11 cut 1 — an asynchronous response guard is never a
+    // session id). Both identities are asserted below.
+    let dead = model.ui_generation();
     // Dispatch spawns the 1.5 s auto-title micro-call keyed `origin: dead`.
     drain(&mut driver, &mut model);
 
     submit(&mut model, "/reset");
     drain(&mut driver, &mut model);
     submit(&mut model, "fresh replacement");
-    let replacement = model.active_session.expect("the replacement attached");
+    let replacement_id = model
+        .active_session
+        .clone()
+        .expect("the replacement attached");
+    let replacement = model.ui_generation();
     drain(&mut driver, &mut model);
     assert_ne!(
         replacement, dead,
-        "monotonic identity: a replacement session NEVER wears a dead id"
+        "monotonic identity: a replacement session NEVER wears a dead generation"
+    );
+    assert_ne!(
+        replacement_id, dead_id,
+        "…nor a dead session id: both identities are monotonic"
     );
 
     // Pump the REAL channel until the dead session's micro-call arrives.
@@ -255,42 +385,54 @@ async fn a_dead_sessions_auto_title_never_lands_on_its_replacement() {
 
 #[test]
 fn the_session_id_allocator_never_rewinds() {
-    // The law behind the repro above, stated directly: `next_session_id` is
-    // monotonic for the PROCESS lifetime — neither `/reset` nor a hydrate
-    // carrying older ids may move it backwards.
+    // The law behind the repro above, stated directly: the identity
+    // allocator is monotonic for the PROCESS lifetime — neither `/reset`
+    // nor a hydrate carrying older identities may move it backwards.
     //
-    // MUTATION CHECK: re-add `self.next_session_id = 4;` to the `"reset"`
-    // arm and the post-reset assert fails; weaken hydrate's
-    // `next_session_id.max(max_id + 1)` to a plain assignment and the
-    // hydrate assert fails.
+    // W3c3: the allocator is `next_ui_generation` (the opaque session id is
+    // no longer minted by arithmetic — report R11 cut 1). Ordering is the
+    // law and `UiGeneration` keeps `Ord` precisely so it stays assertable.
+    //
+    // MUTATION CHECK: re-add `self.next_ui_generation = 4;` to the
+    // `"reset"` arm and the post-reset assert fails; weaken hydrate's
+    // `next_ui_generation.max(max_generation + 1)` to a plain assignment
+    // and the hydrate assert fails.
     let mut model = launcher_model();
     submit(&mut model, "first user session");
-    let first = model.active_session.expect("attached");
+    let first = model.ui_generation();
+    let first_id = model.active_session.clone().expect("attached");
 
     submit(&mut model, "/reset");
     assert!(
-        model.next_session_id > first,
+        model.next_ui_generation > first.get(),
         "/reset reseeds the rows but NEVER rewinds the allocator"
     );
 
     submit(&mut model, "second user session");
-    let second = model.active_session.expect("attached");
+    let second = model.ui_generation();
     assert!(
         second > first,
-        "the session after a reset takes a brand-new identity"
+        "the session after a reset takes a brand-new generation"
+    );
+    assert_ne!(
+        model.active_session.as_ref(),
+        Some(&first_id),
+        "…and a brand-new session id with it"
     );
 
-    // A hydrate whose ids are all BELOW the live counter may only push it
-    // forward (guard 2 is a `max`, not an assignment).
-    let before = model.next_session_id;
+    // A hydrate whose generations are all BELOW the live counter may only
+    // push it forward (guard 2 is a `max`, not an assignment).
+    let before = model.next_ui_generation;
     let mut dto = snapshot(&launcher_model());
     for (offset, session) in dto.sessions.iter_mut().enumerate() {
-        session.id = 1 + offset as u64;
+        session.ui_gen = Some(1 + offset as u64);
+        session.id =
+            haider_tui::demo_store::SessionIdDto::Current(format!("demo-session-{}", 1 + offset));
     }
     let mut fresh = model;
     hydrate(&mut fresh, dto);
     assert!(
-        fresh.next_session_id >= before,
-        "hydrating older ids never rewinds the allocator either"
+        fresh.next_ui_generation >= before,
+        "hydrating older generations never rewinds the allocator either"
     );
 }

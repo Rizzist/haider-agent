@@ -15,10 +15,18 @@
 //! nothing reads it: the launcher (the only reader of the vec) renders
 //! only while NO session is attached, and event routing sends the active
 //! session's events through the model path. Background sessions receive
-//! their events through [`SessionState::absorb`].
+//! their events through [`SessionState::absorb_raw`].
+//!
+//! IDENTITY (W3c3, report R11 cut 1): a session is keyed by the protocol's
+//! opaque [`SessionId`] and carries a separate local [`UiGeneration`] — see
+//! [`crate::identity`] for why the two must never be the same value.
 
 use crate::app::ChipModel;
-use crate::projection::SessionProjection;
+use crate::identity::UiGeneration;
+use crate::projection::{Admission, MenuScopeOwner, RawOutcome, SessionProjection};
+use haider_protocol::EventPayload;
+use haider_protocol::envelope::RawEnvelope;
+use haider_protocol::ids::{AgentId, SessionId};
 
 /// One session, fully owned — the sim's `sessions[i]` (tui.js:497-579
 /// seeds, 1617-1650 `newSession`). The single-branch port folds the sim's
@@ -26,9 +34,13 @@ use crate::projection::SessionProjection;
 /// session itself.
 #[derive(Debug)]
 pub struct SessionState {
-    /// Stable identity (sim `s.id`). Never reused; guards stale answers
-    /// and auto-titles the way the origin-identity gates always did.
-    pub id: u64,
+    /// The PROTOCOL's opaque session identity (sim `s.id`) — the daemon's
+    /// string in live mode, `demo-session-{n}` in the demo. Never parsed.
+    pub id: SessionId,
+    /// This row's local generation: monotonic, never reused, and the key
+    /// the demo driver's arms/meters and the answer outbox's origin use
+    /// (report R11 cut 1 — a session id is not a stale-timer epoch).
+    pub ui_gen: UiGeneration,
     /// Row name (sim `s.name` — kebab of the first message's words).
     pub name: Option<String>,
     /// The blurb (sim `s.blurb`, auto-set by the 1.5 s micro-call).
@@ -66,9 +78,10 @@ impl SessionState {
     /// A neutral scratch slot — what the model's live fields hold when no
     /// session is attached, and what a checked-out slot holds meanwhile.
     #[must_use]
-    pub fn neutral(id: u64) -> Self {
+    pub fn neutral(id: SessionId, ui_gen: UiGeneration) -> Self {
         Self {
             id,
+            ui_gen,
             name: None,
             title: None,
             head: (String::new(), String::new()),
@@ -112,96 +125,51 @@ impl SessionState {
         self.turns_offset + self.projection.user_row_count()
     }
 
-    /// Apply one background event to this (non-attached) session — the
-    /// state-mutating half of the driver's active-session `consume` arms,
-    /// against THIS session's fields. The active path's screen flips,
-    /// menu-selection resets and view-path edits are attached-surface
-    /// concerns and deliberately have no counterpart here; everything that
-    /// is SESSION state must stay law-identical with the active arms.
-    pub fn absorb(&mut self, event: crate::script::DemoEvent) {
-        use crate::script::DemoEvent;
-        match event {
-            DemoEvent::Envelope(payload) => self.absorb_envelope(&payload),
-            DemoEvent::Note(text) => self.projection.push_note(text),
-            DemoEvent::Voice(on) => self.projection.set_voice_live(on),
-            DemoEvent::ChipAdd(seed) => {
-                let parent = seed.parent.clone();
-                let chip = ChipModel::from_seed(*seed);
-                match parent.and_then(|agent| crate::app::find_chip_mut(&mut self.chips, &agent)) {
-                    Some(parent_chip) => parent_chip.children.push(chip),
-                    None => self.chips.push(chip),
+    /// Route one RAW envelope into this (non-attached) session — the
+    /// background half of the W3c3 router (report R11 cut 2).
+    ///
+    /// Validates the frame's session id, runs the STRICT cursor gate, and
+    /// only then reduces. A gap stops reduction with the cursor unmoved so
+    /// the caller can reattach after the last fully applied sequence BEFORE
+    /// any later envelope mutates state.
+    pub fn absorb_raw(&mut self, envelope: &RawEnvelope) -> RawOutcome {
+        if envelope.session_id != self.id {
+            return RawOutcome::WrongSession;
+        }
+        match self.projection.admit(envelope) {
+            Admission::Duplicate => RawOutcome::Duplicate,
+            Admission::Gap { after_seq } => RawOutcome::Gap { after_seq },
+            Admission::Skip => RawOutcome::Applied,
+            Admission::Apply => {
+                match serde_json::from_value::<EventPayload>(envelope.payload.clone()) {
+                    Ok(payload) => self.absorb_scoped(&payload, envelope.agent_id.as_ref()),
+                    Err(_) => self.projection.count_unknown_payload(),
                 }
+                RawOutcome::Applied
             }
-            DemoEvent::ChipState { agent, state } => {
-                if let Some(chip) = crate::app::find_chip_mut(&mut self.chips, &agent) {
-                    chip.state = state;
-                }
-            }
-            DemoEvent::ChipEmit { agent, payload } => {
-                if let Some(chip) = crate::app::find_chip_mut(&mut self.chips, &agent) {
-                    chip.transcript.apply(&payload);
-                }
-            }
-            DemoEvent::ChipNote { agent, text } => {
-                if let Some(chip) = crate::app::find_chip_mut(&mut self.chips, &agent) {
-                    chip.transcript.push_note(text);
-                }
-            }
-            DemoEvent::ChipTokens { agent, n } => {
-                if let Some(chip) = crate::app::find_chip_mut(&mut self.chips, &agent) {
-                    chip.tokens = chip.tokens.saturating_add(n);
-                }
-            }
-            DemoEvent::ChipQuestion {
-                agent,
-                recovery,
-                text,
-                options,
-            } => {
-                if let Some(chip) = crate::app::find_chip_mut(&mut self.chips, &agent) {
-                    // Atomic with the state, exactly as the active arm.
-                    chip.state = if recovery {
-                        crate::script::ChipDisplayState::Error
-                    } else {
-                        crate::script::ChipDisplayState::InputRequired
-                    };
-                    chip.question = Some(crate::app::ChipQuestion {
-                        recovery,
-                        text,
-                        options,
-                        resolved: false,
-                    });
-                }
-            }
-            DemoEvent::ChipResolve { agent, state } => {
-                if let Some(chip) = crate::app::find_chip_mut(&mut self.chips, &agent) {
-                    if let Some(question) = &mut chip.question {
-                        question.resolved = true;
-                    }
-                    chip.state = state;
-                }
-            }
-            DemoEvent::ChipQuestionClear { agent, state } => {
-                if let Some(chip) = crate::app::find_chip_mut(&mut self.chips, &agent) {
-                    chip.question = None;
-                    chip.state = state;
-                }
-            }
-            DemoEvent::ChipRemove { agent } => {
-                let _ = crate::app::remove_chip(&mut self.chips, &agent);
-            }
-            // Driver-owned events (Dispatch, TurnEnd, AutoResume, Answer,
-            // AutoTitle, chip close lifecycle, aura, talk) are routed by
-            // `consume` itself — they spawn scripts or touch surfaces this
-            // struct does not own.
-            _ => {}
         }
     }
 
-    /// The envelope half of [`Self::absorb`] — mirrors the SESSION-scoped
-    /// part of `AppModel::handle_envelope` (screen flips excluded).
-    fn absorb_envelope(&mut self, payload: &haider_protocol::EventPayload) {
-        use haider_protocol::EventPayload;
+    /// One admitted payload, routed by SCOPE (report R11 cut 2) — the
+    /// BACKGROUND half. [`classify`] makes the decision so this path and
+    /// the attached path in `AppModel` can never diverge.
+    pub fn absorb_scoped(&mut self, payload: &EventPayload, agent: Option<&AgentId>) {
+        match classify(&mut self.projection, &self.chips, payload, agent) {
+            Destination::Agent => apply_agent_payload(&mut self.chips, payload),
+            Destination::Chip(target) => {
+                if let Some(chip) = crate::app::find_chip_mut(&mut self.chips, &target) {
+                    chip.transcript.apply(payload);
+                }
+            }
+            Destination::Session => self.absorb_envelope(payload),
+        }
+    }
+
+    /// The SESSION-scoped half of the router — mirrors the session-scoped
+    /// part of `AppModel::handle_envelope` (screen flips excluded). The
+    /// demo driver's background arm calls this directly with its scripted
+    /// payloads (which carry no envelope, so no scope and no cursor).
+    pub fn absorb_envelope(&mut self, payload: &EventPayload) {
         if let EventPayload::UserMessage { .. } = payload {
             self.turn_active = true;
         }
@@ -216,14 +184,116 @@ impl SessionState {
         }
         self.projection.apply(payload);
         if matches!(payload, EventPayload::MenuAnswered(_)) {
-            fn route(chips: &mut [ChipModel], payload: &EventPayload) {
-                for chip in chips {
-                    chip.transcript.apply(payload);
-                    route(&mut chip.children, payload);
-                }
-            }
-            route(&mut self.chips, payload);
+            broadcast(&mut self.chips, payload);
         }
+    }
+}
+
+/// Where an admitted payload must land (report R11 cut 2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Destination {
+    /// The session's own reducer — `AppModel::handle_envelope` on the
+    /// attached path, [`SessionState::absorb_envelope`] in the background.
+    Session,
+    /// The named agent's chip transcript.
+    Chip(String),
+    /// Chip-TREE bookkeeping — see [`apply_agent_payload`].
+    Agent,
+}
+
+/// Decide where one admitted payload lands, recording menu ownership on the
+/// way (report R11 cut 2). Shared by BOTH routes on purpose: the attached
+/// session and a background session must reduce the same stream the same
+/// way, and a second copy of this decision is exactly how they would drift.
+///
+/// * agent lifecycle → [`Destination::Agent`] (it names its own agent, so
+///   the envelope's scope is irrelevant);
+/// * `MenuOpened` → records the opening scope, then routes like any payload;
+/// * `MenuAnswered`/`MenuClosed` → the RECORDED opener, so a subagent's
+///   answer can never close the session's blocking card. With no recorded
+///   opening it falls back to the session reducer, which broadcasts the
+///   answer to every chip transcript exactly as it did before W3c3 — the
+///   demo answers every card through that fallback (its chip cards never
+///   ride an envelope), so the map is purely additive for live streams;
+/// * everything else → the chip named by `agent_id` when this session knows
+///   it, else the session.
+pub fn classify(
+    projection: &mut SessionProjection,
+    chips: &[ChipModel],
+    payload: &EventPayload,
+    agent: Option<&AgentId>,
+) -> Destination {
+    match payload {
+        EventPayload::AgentSpawned(_)
+        | EventPayload::AgentChipState { .. }
+        | EventPayload::AgentReport(_) => Destination::Agent,
+        EventPayload::MenuOpened(menu) => {
+            let owner = agent.map_or(MenuScopeOwner::Session, |agent| {
+                MenuScopeOwner::Agent(agent.clone())
+            });
+            projection.note_menu_owner(menu.id.clone(), owner);
+            chip_or_session(chips, agent)
+        }
+        EventPayload::MenuAnswered(haider_protocol::menu::MenuAnswer { menu, .. })
+        | EventPayload::MenuClosed { menu, .. } => match projection.menu_owner(menu) {
+            Some(MenuScopeOwner::Agent(owner)) => Destination::Chip(owner.as_str().to_owned()),
+            _ => Destination::Session,
+        },
+        _ => chip_or_session(chips, agent),
+    }
+}
+
+fn chip_or_session(chips: &[ChipModel], agent: Option<&AgentId>) -> Destination {
+    match agent {
+        Some(agent) if crate::app::find_chip(chips, agent.as_str()).is_some() => {
+            Destination::Chip(agent.as_str().to_owned())
+        }
+        _ => Destination::Session,
+    }
+}
+
+/// Chip-tree bookkeeping for the three agent payloads (report R11 cut 2).
+///
+/// `AgentSpawned` creates the chip from its manifest (idempotent under
+/// replay), `AgentChipState` is the SOLE chip-state authority, and
+/// `AgentReport` contributes ONLY summary/verification content — never
+/// state. Shared by the attached and background routes.
+pub fn apply_agent_payload(chips: &mut Vec<ChipModel>, payload: &EventPayload) {
+    match payload {
+        EventPayload::AgentSpawned(manifest) => {
+            if crate::app::find_chip_mut(chips, manifest.agent.as_str()).is_some() {
+                return;
+            }
+            let chip = ChipModel::from_manifest(manifest);
+            match manifest
+                .parent
+                .as_ref()
+                .and_then(|parent| crate::app::find_chip_mut(chips, parent.as_str()))
+            {
+                Some(parent) => parent.children.push(chip),
+                None => chips.push(chip),
+            }
+        }
+        EventPayload::AgentChipState { agent, chip } => {
+            if let Some(model) = crate::app::find_chip_mut(chips, agent.as_str()) {
+                model.state = crate::script::ChipDisplayState::from_protocol(chip);
+            }
+        }
+        EventPayload::AgentReport(report) => {
+            if let Some(model) = crate::app::find_chip_mut(chips, report.agent.as_str()) {
+                model.transcript.push_note(crate::app::report_note(report));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Apply one payload to every chip transcript in the tree — the answer
+/// fallback for menus with no recorded opening (see [`classify`]).
+pub fn broadcast(chips: &mut [ChipModel], payload: &EventPayload) {
+    for chip in chips {
+        chip.transcript.apply(payload);
+        broadcast(&mut chip.children, payload);
     }
 }
 

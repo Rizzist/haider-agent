@@ -44,13 +44,14 @@
 //! wire format and serialize as themselves.
 
 use crate::app::{AppModel, ChipModel, ChipQuestion, VoiceState};
+use crate::identity::UiGeneration;
 use crate::projection::{ItemBlock, SessionProjection, TodoPanel, TranscriptEntry};
 use crate::script::{ChipDisplayState, roster_at};
 use crate::session::SessionState;
 use crate::theme::ThemeKey;
 use base64::Engine as _;
 use haider_protocol::history::TodoItem;
-use haider_protocol::ids::ItemId;
+use haider_protocol::ids::{ItemId, SessionId};
 use haider_protocol::item::TurnItem;
 use haider_protocol::menu::Menu;
 use haider_protocol::provider::Usage;
@@ -61,10 +62,22 @@ use std::path::{Path, PathBuf};
 /// The state file's name — `demo-` prefixed on purpose (see module docs).
 pub const DEMO_STORE_FILE: &str = "demo-tui-state.json";
 
-/// The on-disk format version. Checked as part of guard 1: any other
-/// value (or its absence) rejects the whole file back to seeds — the
-/// demo store never guesses at a foreign format (review TUI4.1 P1-1).
-pub const DEMO_STORE_VERSION: u32 = 1;
+/// The on-disk format version. Checked as part of guard 1: any value
+/// outside [`SUPPORTED_VERSIONS`] (or its absence) rejects the whole file
+/// back to seeds — the demo store never guesses at a foreign format
+/// (review TUI4.1 P1-1).
+///
+/// **v2 (W3c3, report R11 cut 1)**: `SessionDto.id` became the protocol's
+/// opaque STRING session id and gained the row's local `ui_gen`. A v1 file
+/// (numeric ids, no generation) still hydrates — see [`SessionIdDto`] and
+/// the upcast in [`hydrate`] — and the next save rewrites it as v2.
+pub const DEMO_STORE_VERSION: u32 = 2;
+
+/// The pre-W3c3 version: numeric session ids, no recorded generation.
+pub const DEMO_STORE_VERSION_V1: u32 = 1;
+
+/// Versions this build hydrates. Anything else → seeds.
+pub const SUPPORTED_VERSIONS: [u32; 2] = [DEMO_STORE_VERSION_V1, DEMO_STORE_VERSION];
 
 /// Handle on the demo state file: knows the path and the hash of the last
 /// write, so unchanged frames skip the disk entirely.
@@ -109,7 +122,7 @@ impl DemoStore {
     /// structural surprise preserves the seeds whole; per-field defaulting
     /// on the structural core was quietly accepting partial state):
     /// - missing file, unreadable bytes, ANY parse error → seeds;
-    /// - a `version` other than [`DEMO_STORE_VERSION`] (or absent) →
+    /// - a `version` outside [`SUPPORTED_VERSIONS`] (or absent) →
     ///   seeds — serde ignores unknown fields, so without the check a
     ///   future format hydrated as if it were ours AND was rewritten
     ///   without its version;
@@ -118,9 +131,16 @@ impl DemoStore {
     /// - a session missing its required shape fails the WHOLE file
     ///   (all-or-nothing, the sim's throw), never a blank-field session;
     /// - an EMPTY session array → seeds;
-    /// - a session id 0 → seeds: 0 is the scratch-lineage sentinel
-    ///   (Fable D3-3 — the driver drops `Session(0)` events while a
-    ///   session is attached, so an id-0 session's turns silently die).
+    /// - a session GENERATION of 0 → seeds: 0 is the scratch-lineage
+    ///   sentinel (Fable D3-3 — the driver drops `Session(SCRATCH)` events
+    ///   while a session is attached, so a generation-0 session's turns
+    ///   silently die). In v1 the generation IS the numeric id, so this is
+    ///   the same guard the pre-W3c3 store applied to `id == 0`;
+    /// - an EMPTY string session id, or a v2 row with no generation →
+    ///   seeds (a row that cannot name itself is damage, not tolerance);
+    /// - duplicate ids OR duplicate generations → seeds: two rows sharing
+    ///   either would collide in the session map, the arm table, the token
+    ///   meters and the draft map.
     ///
     /// The strict tier is the SESSION CORE — the shape the sim's
     /// `s.branches.map(…)` throws on. ONE LEVEL BELOW it (`ProjectionDto`
@@ -131,27 +151,33 @@ impl DemoStore {
     pub fn load(&self) -> Option<StateDto> {
         let raw = std::fs::read_to_string(&self.path).ok()?;
         let dto: StateDto = serde_json::from_str(&raw).ok()?;
-        if dto.version != DEMO_STORE_VERSION {
+        if !SUPPORTED_VERSIONS.contains(&dto.version) {
             return None;
         }
-        // TUI4 carried P3-1 + P3-3 (one clause each, TUI4-review-2-SHIP):
-        // id u64::MAX would overflow the guard-2 bump (debug panic /
-        // release wrap onto the id-0 sentinel) — card_seq has the same
-        // bound; duplicate ids would mirror-corrupt the next save. Both
-        // reject to seeds, the same all-or-nothing law as id 0.
-        if dto.sessions.is_empty()
-            || dto.card_seq == u64::MAX
-            || dto
-                .sessions
-                .iter()
-                .any(|session| session.id == 0 || session.id == u64::MAX)
-            || dto
-                .sessions
-                .iter()
-                .enumerate()
-                .any(|(i, s)| dto.sessions[..i].iter().any(|prior| prior.id == s.id))
-        {
+        if dto.sessions.is_empty() || dto.card_seq == u64::MAX {
             return None;
+        }
+        // Every row must be able to name itself in BOTH identities before
+        // anything is hydrated (the all-or-nothing law). TUI4 carried
+        // P3-1 + P3-3 survive verbatim, re-expressed on the generation:
+        // `u64::MAX` would overflow guard 2's bump (debug panic / release
+        // wrap onto the scratch sentinel) — card_seq has the same bound —
+        // and duplicates would mirror-corrupt the next save.
+        let mut identities = Vec::with_capacity(dto.sessions.len());
+        for session in &dto.sessions {
+            let identity = session.identity()?;
+            if identity.1.is_scratch()
+                || identity.1.get() == u64::MAX
+                || identity.0.as_str().is_empty()
+                || identities
+                    .iter()
+                    .any(|(id, generation): &(SessionId, UiGeneration)| {
+                        *id == identity.0 || *generation == identity.1
+                    })
+            {
+                return None;
+            }
+            identities.push(identity);
         }
         Some(dto)
     }
@@ -228,7 +254,13 @@ pub struct StateDto {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionDto {
-    pub id: u64,
+    /// v2 writes the protocol's opaque STRING id; v1 files carry the old
+    /// numeric one and upcast on load (see [`SessionIdDto`]).
+    pub id: SessionIdDto,
+    /// The row's local generation (v2). Absent in v1, where the numeric
+    /// `id` WAS the generation — [`SessionDto::identity`] resolves both.
+    #[serde(default)]
+    pub ui_gen: Option<u64>,
     pub name: Option<String>,
     pub title: Option<String>,
     /// Absent for sessions stored before heads were named (sim guard 4
@@ -243,6 +275,40 @@ pub struct SessionDto {
     pub turns_offset: u32,
     pub projection: ProjectionDto,
     pub chips: Vec<ChipDto>,
+}
+
+/// A persisted session id, in either on-disk shape.
+///
+/// Untagged on purpose: v1 wrote `"id": 4`, v2 writes
+/// `"id": "demo-session-4"`, and serde picks the arm by JSON type. The
+/// upcast is total and one-way — [`SessionDto::identity`] maps a legacy
+/// number `n` through [`crate::identity::demo_session_id`], the SAME
+/// function the seeds and `new_session` use, so a v1 file's `id: 2` and a
+/// freshly seeded session 2 are the identical string by construction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SessionIdDto {
+    /// v1: the pre-W3c3 numeric id, which doubled as the generation.
+    Legacy(u64),
+    /// v2: the protocol's opaque string id.
+    Current(String),
+}
+
+impl SessionDto {
+    /// This row's two identities, or `None` when it carries neither
+    /// honestly (a v2 row with no generation cannot be placed).
+    #[must_use]
+    pub fn identity(&self) -> Option<(SessionId, UiGeneration)> {
+        match &self.id {
+            SessionIdDto::Legacy(n) => {
+                let generation = UiGeneration::new(*n);
+                Some((crate::identity::demo_session_id(generation), generation))
+            }
+            SessionIdDto::Current(id) => {
+                Some((SessionId::new(id.clone()), UiGeneration::new(self.ui_gen?)))
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -391,9 +457,10 @@ pub fn snapshot(model: &AppModel) -> StateDto {
         .sessions
         .iter()
         .map(|slot| {
-            if model.active_session == Some(slot.id) {
+            if model.active_session.as_ref() == Some(&slot.id) {
                 SessionDto {
-                    id: slot.id,
+                    id: SessionIdDto::Current(slot.id.as_str().to_owned()),
+                    ui_gen: Some(slot.ui_gen.get()),
                     name: model.session_name.clone(),
                     title: model.session_title.clone(),
                     head: Some(HeadDto {
@@ -412,7 +479,8 @@ pub fn snapshot(model: &AppModel) -> StateDto {
                 }
             } else {
                 SessionDto {
-                    id: slot.id,
+                    id: SessionIdDto::Current(slot.id.as_str().to_owned()),
+                    ui_gen: Some(slot.ui_gen.get()),
                     name: slot.name.clone(),
                     title: slot.title.clone(),
                     head: Some(HeadDto {
@@ -530,10 +598,20 @@ pub struct HydrateOutcome {
 /// identity.
 pub fn hydrate(model: &mut AppModel, dto: StateDto) -> HydrateOutcome {
     // Guard 2 — id-collision bump (sim: scan `e(\d+)`, `bumpEid(max+1000)`,
-    // tui.js:706-710). The port's minted ids are session ids and the
+    // tui.js:706-710). The port's minted identities are the local
+    // GENERATION (from which a demo session id is derived) and the
     // `voice-card-N` menu counter; both resume PAST everything persisted.
-    let max_id = dto.sessions.iter().map(|s| s.id).max().unwrap_or(0);
-    model.next_session_id = model.next_session_id.max(max_id.saturating_add(1));
+    // W3c3: the bump reads the generation, not the opaque id — a v1 file's
+    // numeric id IS its generation, so the arithmetic is unchanged.
+    let max_generation = dto
+        .sessions
+        .iter()
+        .filter_map(|s| s.identity().map(|(_, generation)| generation.get()))
+        .max()
+        .unwrap_or(0);
+    model.next_ui_generation = model
+        .next_ui_generation
+        .max(max_generation.saturating_add(1));
     model.card_seq = model.card_seq.max(dto.card_seq);
 
     // Guard 3 — resume the honour-roll where prior claims left off
@@ -554,7 +632,13 @@ pub fn hydrate(model: &mut AppModel, dto: StateDto) -> HydrateOutcome {
     // backfill consuming `next++` only for chips with no recorded ros.
     let mut sessions = Vec::with_capacity(dto.sessions.len());
     for s in dto.sessions {
-        let mut entry = SessionState::neutral(s.id);
+        // `load`'s guard 1 already proved every row resolves; a `None`
+        // here would mean hydrating something that never passed the gate,
+        // so skip it rather than invent an identity.
+        let Some((id, ui_gen)) = s.identity() else {
+            continue;
+        };
+        let mut entry = SessionState::neutral(id, ui_gen);
         entry.name = s.name;
         entry.title = s.title;
         match s.head {

@@ -3,7 +3,8 @@
 //! (research rec 3/6). Alternate screen for v0.1 (rec 1); native-scrollback
 //! insertion is explicitly deferred (rec 19).
 
-use crate::app::{AppEvent, AppModel, AppRequest};
+use crate::app::{AppEvent, AppModel, AppRequest, DemoRequest};
+use crate::identity::UiGeneration;
 use crate::mock::demo_script;
 use crate::render::render;
 use crate::script::{
@@ -239,7 +240,7 @@ pub async fn run_demo(
     for entry in &model.sessions {
         if let Some(usage) = entry.projection.usage() {
             driver.prime_meter(
-                entry.id,
+                entry.ui_gen,
                 usage.input.saturating_add(usage.cached),
                 usage.output.saturating_add(usage.reasoning),
             );
@@ -339,17 +340,25 @@ pub async fn run_demo(
                 // selection) — same pbcopy + OSC 52 + honest-flash path,
                 // no frame extraction needed.
                 AppRequest::CopyText(text) => copy_selection_effects(&mut model, &text),
+                request => driver.handle_request(&mut model, request),
+            }
+        }
+        // Demo-only side effects (W3c3, report R11 cut 3) — their own
+        // queue, drained ONLY here. `run_live` never sees this vocabulary,
+        // so a live reset can never delete demo persistence.
+        let demo_requests: Vec<DemoRequest> = model.demo_requests.drain(..).collect();
+        for demo_request in demo_requests {
+            match demo_request {
                 // Runtime-owned like CopySelection: only this loop knows
                 // the store path. /reset deletes the demo state file (sim
                 // tui.js:1918); the reducer already reseeded, and the next
                 // frame's save rewrites the seeds exactly as the sim's save
                 // effect refills localStorage after removeItem.
-                AppRequest::PurgeDemoStore => {
+                DemoRequest::PurgeStore => {
                     if let Some(store) = store.as_mut() {
                         store.purge();
                     }
                 }
-                request => driver.handle_request(&mut model, request),
             }
         }
         // Theme cycled: re-sync the emulator background.
@@ -622,12 +631,17 @@ pub const CONTROL_ARM: u64 = 0;
 /// Who owns a spawned arm — the surface whose teardown cancels it.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum ArmOwner {
-    /// One session's turn engine, keyed by SESSION ID (TUI4c: the sim's
-    /// per-session `runTokensRef`, tui.js:1551-1567 — an interrupt cancels
-    /// only ITS session's turn; other sessions' turns keep running in the
-    /// background). Id 0 is the surface/scratch lineage (boot, pre-map
-    /// tests) and routes to the model's live fields.
-    Session(u64),
+    /// One session's turn engine, keyed by its LOCAL GENERATION (TUI4c:
+    /// the sim's per-session `runTokensRef`, tui.js:1551-1567 — an
+    /// interrupt cancels only ITS session's turn; other sessions' turns
+    /// keep running in the background). [`UiGeneration::SCRATCH`] is the
+    /// surface/scratch lineage (boot, pre-map tests) and routes to the
+    /// model's live fields.
+    ///
+    /// W3c3: a generation, never the protocol `SessionId` (report R11
+    /// cut 1) — arms are demo-local stale-work tags, and the scratch
+    /// sentinel has no opaque-string analogue.
+    Session(UiGeneration),
     /// One subagent chip's script. Its own close/removal cancels it, and a
     /// fresh session cancels every chip — but a session INTERRUPT does
     /// NOT: the sim's `interrupt` touches only the run token, the queue and
@@ -637,7 +651,10 @@ pub enum ArmOwner {
     /// closes the review's "permanently blocked chip" hole. Carries the
     /// owning SESSION's id so background chip events route to their
     /// session's tree.
-    Chip { session: u64, agent: String },
+    Chip {
+        session: UiGeneration,
+        agent: String,
+    },
     /// An aura orchestrate run or its talk timer. The next submit cancels
     /// the previous run (sim `++auraRunRef`, tui.js:2060) and `/reset`
     /// cancels it outright; `/clear`, a session interrupt, and a fresh
@@ -647,8 +664,8 @@ pub enum ArmOwner {
 }
 
 impl ArmOwner {
-    /// The session this arm belongs to (`None` for aura arms).
-    const fn session_id(&self) -> Option<u64> {
+    /// The generation this arm belongs to (`None` for aura arms).
+    const fn generation(&self) -> Option<UiGeneration> {
         match self {
             Self::Session(sid) | Self::Chip { session: sid, .. } => Some(*sid),
             Self::Aura => None,
@@ -661,7 +678,8 @@ type Counter = std::sync::Arc<std::sync::atomic::AtomicU64>;
 /// Per-session demo token meters, keyed by session id (TUI4c item 13a:
 /// the sim's `branch.tokens` is per-session; one global pair would bleed
 /// one session's turn into another's meter).
-type SessionMeters = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u64, (u64, u64)>>>;
+type SessionMeters =
+    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<UiGeneration, (u64, u64)>>>;
 
 /// The live-arm table. A poisoned lock degrades to "nothing is live" — it
 /// can never resurrect cancelled work.
@@ -727,12 +745,12 @@ impl ArmTable {
     /// has NO arms until something runs in it, so an answer to one of its
     /// hydrated cards has no live run to land on (the sim's missing menu
     /// RESOLVER after reload, tui.js:870-876).
-    fn has_session_arms(&self, session: u64) -> bool {
+    fn has_session_arms(&self, session: UiGeneration) -> bool {
         self.inner.lock().is_ok_and(|table| {
             table
                 .1
                 .values()
-                .any(|owner| owner.session_id() == Some(session))
+                .any(|owner| owner.generation() == Some(session))
         })
     }
 
@@ -818,7 +836,7 @@ impl DemoDriver {
     /// `branch.tokens` is persisted state the next turn ADDS to — without
     /// priming, the first post-reload beat would reset the meter to its own
     /// small delta).
-    pub fn prime_meter(&self, session: u64, input: u64, output: u64) {
+    pub fn prime_meter(&self, session: UiGeneration, input: u64, output: u64) {
         if let Ok(mut meters) = self.meters.lock() {
             meters.insert(session, (input, output));
         }
@@ -851,7 +869,7 @@ impl DemoDriver {
 
     /// One session's demo token meter total (both buckets).
     #[must_use]
-    pub fn tokens_total(&self, session: u64) -> u64 {
+    pub fn tokens_total(&self, session: UiGeneration) -> u64 {
         self.meters
             .lock()
             .ok()
@@ -891,7 +909,7 @@ impl DemoDriver {
     }
 
     /// Play a session script (the turn engine's own arm) for `session`.
-    pub fn play_beats(&self, beats: Vec<Beat>, session: u64) -> u64 {
+    pub fn play_beats(&self, beats: Vec<Beat>, session: UiGeneration) -> u64 {
         self.play_owned(beats, ArmOwner::Session(session))
     }
 
@@ -949,7 +967,7 @@ impl DemoDriver {
     pub fn handle_request(&mut self, model: &mut AppModel, request: AppRequest) {
         // Requests are pushed by the reducer while its session is attached
         // (or from the no-session scratch surface = 0).
-        let active = model.active_session.unwrap_or(0);
+        let active = model.ui_generation();
         match request {
             AppRequest::SubmitText { text, voice, title } => {
                 self.turn_counter += 1;
@@ -1162,7 +1180,12 @@ impl DemoDriver {
             // purge needs the state-file path — the driver has neither.
             // Reaching here means a headless harness drained them through
             // the driver — no-ops, never a panic.
-            AppRequest::CopySelection | AppRequest::CopyText(_) | AppRequest::PurgeDemoStore => {}
+            // Runtime/driver split: copy requests are intercepted by the
+            // event loop above, and `Reattach` belongs to `LiveDriver` —
+            // the demo stream has no cursor and never gaps. Reaching here
+            // means a headless harness drained them through the driver:
+            // no-ops, never a panic.
+            AppRequest::CopySelection | AppRequest::CopyText(_) | AppRequest::Reattach { .. } => {}
         }
     }
 
@@ -1185,9 +1208,10 @@ impl DemoDriver {
     /// used to keep streaming into its own transcript), subtree included —
     /// a closed parent's children leave the tree with it. The removal timer
     /// is allocated AFTER the cancellation so it is not swept up by it.
-    fn close_chip(&mut self, model: &mut AppModel, session: u64, agent: &str) {
-        let attached = model.active_session == Some(session)
-            || (session == 0 && model.active_session.is_none());
+    fn close_chip(&mut self, model: &mut AppModel, session: UiGeneration, agent: &str) {
+        // W3c3: ONE expression covers both arms of the old disjunction —
+        // `ui_generation()` is SCRATCH exactly when nothing is attached.
+        let attached = model.ui_generation() == session;
         let doomed_of = |chips: &[crate::app::ChipModel]| {
             crate::app::find_chip(chips, agent)
                 .map(|chip| {
@@ -1210,7 +1234,7 @@ impl DemoDriver {
         } else {
             // Background close: same law against the session's slot — the
             // attached surface's screen/view-path concerns do not apply.
-            let (doomed, closed) = match model.session_entry_mut(session) {
+            let (doomed, closed) = match model.session_entry_by_generation(session) {
                 Some(entry) => {
                     let doomed = doomed_of(&entry.chips);
                     let closed =
@@ -1248,9 +1272,8 @@ impl DemoDriver {
     /// The §2.7 auto-resume guards + kick-off for `session` — attached or
     /// background, ONE law: every child settled, the session idle (an
     /// interrupted `⏸ IDLE (i)` is NOT overwritten), no resume in flight.
-    fn auto_resume_check(&mut self, model: &mut AppModel, session: u64) {
-        let attached = model.active_session == Some(session)
-            || (session == 0 && model.active_session.is_none());
+    fn auto_resume_check(&mut self, model: &mut AppModel, session: UiGeneration) {
+        let attached = model.ui_generation() == session;
         let reports = if attached {
             if crate::app::tree_live_count(&model.chips) != 0
                 || model.turn_active
@@ -1264,7 +1287,7 @@ impl DemoDriver {
             model.dirty = true;
             count_done_reports(&model.chips)
         } else {
-            let Some(entry) = model.session_entry_mut(session) else {
+            let Some(entry) = model.session_entry_by_generation(session) else {
                 return;
             };
             if entry.live() != 0
@@ -1288,13 +1311,13 @@ impl DemoDriver {
     }
 
     /// Background event application (TUI4c): the state-mutating events go
-    /// through [`crate::session::SessionState::absorb`]; the driver-owned
-    /// ones (dispatch, turn end, close lifecycle, auto-resume) run their
-    /// usual logic against the owning session's slot.
+    /// through [`absorb_demo_event`]; the driver-owned ones (dispatch, turn
+    /// end, close lifecycle, auto-resume) run their usual logic against the
+    /// owning session's slot.
     fn consume_background(
         &mut self,
         model: &mut AppModel,
-        session: u64,
+        session: UiGeneration,
         generation: u64,
         event: DemoEvent,
     ) {
@@ -1305,8 +1328,8 @@ impl DemoDriver {
                 if let EventPayload::MenuAnswered(answer) = &payload {
                     self.resume_parked(answer);
                 }
-                if let Some(entry) = model.session_entry_mut(session) {
-                    entry.absorb(DemoEvent::Envelope(payload));
+                if let Some(entry) = model.session_entry_by_generation(session) {
+                    absorb_demo_event(entry, DemoEvent::Envelope(payload));
                     model.dirty = true;
                 }
             }
@@ -1332,8 +1355,8 @@ impl DemoDriver {
             // on leave), and aura events never carry a session — both fall
             // through absorb's no-op arm if they ever land here.
             other => {
-                if let Some(entry) = model.session_entry_mut(session) {
-                    entry.absorb(other);
+                if let Some(entry) = model.session_entry_by_generation(session) {
+                    absorb_demo_event(entry, other);
                     model.dirty = true;
                 }
             }
@@ -1343,7 +1366,7 @@ impl DemoDriver {
     /// Spawn the 120 ms autoResumeParent defer (§2.7). It resumes the
     /// SESSION's parked turn, so the arm is session-owned: an interrupt
     /// drops it, and the §2.7 guards re-check the world at consumption.
-    fn arm_auto_resume(&self, parent: u64, session: u64) {
+    fn arm_auto_resume(&self, parent: u64, session: UiGeneration) {
         self.spawn_timer(
             parent,
             ArmOwner::Session(session),
@@ -1367,16 +1390,16 @@ impl DemoDriver {
         if let Some(sid) = self
             .table
             .owner(generation)
-            .and_then(|owner| owner.session_id())
+            .and_then(|owner| owner.generation())
         {
-            if sid == 0 {
+            if sid.is_scratch() {
                 // Scratch-lineage arms (no session id) belong to the live
                 // fields ONLY while the surface is still the scratch — a
                 // later attached session must never receive their events.
                 if model.active_session.is_some() {
                     return;
                 }
-            } else if model.active_session != Some(sid) {
+            } else if model.ui_generation() != sid {
                 self.consume_background(model, sid, generation, event);
                 return;
             }
@@ -1394,7 +1417,7 @@ impl DemoDriver {
                 // a session the user has since replaced is dropped whole —
                 // it must not reconfigure the session that took its place,
                 // nor start that card's parked continuation.
-                if origin != model.session_identity() {
+                if origin != model.ui_generation() {
                     return;
                 }
                 // TUI4c-13b: a card restored from disk has no parked
@@ -1432,8 +1455,8 @@ impl DemoDriver {
                 let session = self
                     .table
                     .owner(generation)
-                    .and_then(|owner| owner.session_id())
-                    .unwrap_or(0);
+                    .and_then(|owner| owner.generation())
+                    .unwrap_or(UiGeneration::SCRATCH);
                 if let Some(arm) = self
                     .table
                     .alloc_child(generation, ArmOwner::Session(session))
@@ -1448,13 +1471,13 @@ impl DemoDriver {
                 // already titled. It is NOT cancelled by an interrupt
                 // (review r2 P2-6).
                 let blurb = crate::app::auto_blurb(&text);
-                if origin == model.session_identity() {
+                if origin == model.ui_generation() {
                     if model.session_title.is_none() {
                         model.projection.push_note(title_note(&blurb));
                         model.session_title = Some(blurb);
                         model.dirty = true;
                     }
-                } else if let Some(entry) = model.session_entry_mut(origin)
+                } else if let Some(entry) = model.session_entry_by_generation(origin)
                     && entry.title.is_none()
                 {
                     entry.projection.push_note(title_note(&blurb));
@@ -1471,7 +1494,7 @@ impl DemoDriver {
                 model.dirty = true;
             }
             DemoEvent::TurnEnd => {
-                let active = model.active_session.unwrap_or(0);
+                let active = model.ui_generation();
                 self.finish_turn(model, active);
             }
             DemoEvent::TalkFire => model.talk_fire(),
@@ -1551,7 +1574,7 @@ impl DemoDriver {
                 }
             }
             DemoEvent::ChipCloseReq { agent } => {
-                let active = model.active_session.unwrap_or(0);
+                let active = model.ui_generation();
                 self.close_chip(model, active, &agent);
             }
             DemoEvent::ChipRemove { agent } => {
@@ -1566,7 +1589,7 @@ impl DemoDriver {
                 }
             }
             DemoEvent::AutoResume => {
-                let active = model.active_session.unwrap_or(0);
+                let active = model.ui_generation();
                 self.auto_resume_check(model, active);
             }
             // ---- Aura events (§3) ----
@@ -1626,12 +1649,11 @@ impl DemoDriver {
     /// queued input consumes directly — the session never passes through
     /// idle; else IDLE, then (review P2-13) the sim's own transient
     /// `IDLE → 30 ms → COMPACTING` transition when the window is hot.
-    pub fn finish_turn(&mut self, model: &mut AppModel, session: u64) {
+    pub fn finish_turn(&mut self, model: &mut AppModel, session: UiGeneration) {
         // The end-of-turn law runs for the OWNING session — attached, or a
         // background slot whose queue consumes just the same (the sim's
         // finishTurn is per-session, tui.js:1507-1543).
-        let attached = model.active_session == Some(session)
-            || (session == 0 && model.active_session.is_none());
+        let attached = model.ui_generation() == session;
         let queued = if attached {
             if model.msg_queue.is_empty() {
                 None
@@ -1640,13 +1662,15 @@ impl DemoDriver {
                 Some(model.msg_queue.remove(0))
             }
         } else {
-            model.session_entry_mut(session).and_then(|entry| {
-                if entry.msg_queue.is_empty() {
-                    None
-                } else {
-                    Some(entry.msg_queue.remove(0))
-                }
-            })
+            model
+                .session_entry_by_generation(session)
+                .and_then(|entry| {
+                    if entry.msg_queue.is_empty() {
+                        None
+                    } else {
+                        Some(entry.msg_queue.remove(0))
+                    }
+                })
         };
         if let Some(text) = queued {
             self.turn_counter += 1;
@@ -1692,6 +1716,102 @@ fn count_done_reports(chips: &[crate::app::ChipModel]) -> usize {
         .sum()
 }
 
+/// Apply one DEMO event to a NON-attached session's slot — the demo half
+/// of background routing (W3c3, report R11 cut 3).
+///
+/// This lived on `SessionState` until W3c3. It moved here because
+/// `DemoEvent`'s chip variants are DEMO VOCABULARY: live subagent state
+/// arrives as `AgentSpawned`/`AgentChipState`/`AgentReport` envelopes
+/// through `SessionState::absorb_raw`, and a common session type that still
+/// spoke `DemoEvent` would have kept the demo inside the layer the swap
+/// must outlive. `SessionState` now knows only envelopes; this function is
+/// reachable only from `DemoDriver`.
+///
+/// It is the state-mutating half of the driver's active-session `consume`
+/// arms, against THIS session's fields. The active path's screen flips,
+/// menu-selection resets and view-path edits are attached-surface concerns
+/// and deliberately have no counterpart here; everything that is SESSION
+/// state stays law-identical with the active arms.
+pub fn absorb_demo_event(state: &mut crate::session::SessionState, event: DemoEvent) {
+    use crate::app::{ChipModel, ChipQuestion, find_chip_mut, remove_chip};
+    match event {
+        DemoEvent::Envelope(payload) => state.absorb_envelope(&payload),
+        DemoEvent::Note(text) => state.projection.push_note(text),
+        DemoEvent::Voice(on) => state.projection.set_voice_live(on),
+        DemoEvent::ChipAdd(seed) => {
+            let parent = seed.parent.clone();
+            let chip = ChipModel::from_seed(*seed);
+            match parent.and_then(|agent| find_chip_mut(&mut state.chips, &agent)) {
+                Some(parent_chip) => parent_chip.children.push(chip),
+                None => state.chips.push(chip),
+            }
+        }
+        DemoEvent::ChipState { agent, state: next } => {
+            if let Some(chip) = find_chip_mut(&mut state.chips, &agent) {
+                chip.state = next;
+            }
+        }
+        DemoEvent::ChipEmit { agent, payload } => {
+            if let Some(chip) = find_chip_mut(&mut state.chips, &agent) {
+                chip.transcript.apply(&payload);
+            }
+        }
+        DemoEvent::ChipNote { agent, text } => {
+            if let Some(chip) = find_chip_mut(&mut state.chips, &agent) {
+                chip.transcript.push_note(text);
+            }
+        }
+        DemoEvent::ChipTokens { agent, n } => {
+            if let Some(chip) = find_chip_mut(&mut state.chips, &agent) {
+                chip.tokens = chip.tokens.saturating_add(n);
+            }
+        }
+        DemoEvent::ChipQuestion {
+            agent,
+            recovery,
+            text,
+            options,
+        } => {
+            if let Some(chip) = find_chip_mut(&mut state.chips, &agent) {
+                // Atomic with the state, exactly as the active arm.
+                chip.state = if recovery {
+                    crate::script::ChipDisplayState::Error
+                } else {
+                    crate::script::ChipDisplayState::InputRequired
+                };
+                chip.question = Some(ChipQuestion {
+                    recovery,
+                    text,
+                    options,
+                    resolved: false,
+                });
+            }
+        }
+        DemoEvent::ChipResolve { agent, state: next } => {
+            if let Some(chip) = find_chip_mut(&mut state.chips, &agent) {
+                if let Some(question) = &mut chip.question {
+                    question.resolved = true;
+                }
+                chip.state = next;
+            }
+        }
+        DemoEvent::ChipQuestionClear { agent, state: next } => {
+            if let Some(chip) = find_chip_mut(&mut state.chips, &agent) {
+                chip.question = None;
+                chip.state = next;
+            }
+        }
+        DemoEvent::ChipRemove { agent } => {
+            let _ = remove_chip(&mut state.chips, &agent);
+        }
+        // Driver-owned events (Dispatch, TurnEnd, AutoResume, Answer,
+        // AutoTitle, chip close lifecycle, aura, talk) are routed by
+        // `consume` itself — they spawn scripts or touch surfaces this
+        // function does not own.
+        _ => {}
+    }
+}
+
 /// The beat player: one spawned task per script, ARM-captured. Cloned into
 /// child tasks so `ChipScript` beats can spawn concurrently (the future is
 /// boxed at each spawn to break the recursive type).
@@ -1714,7 +1834,7 @@ impl Player {
     }
 
     /// Mutate one session's token meter and return its new totals.
-    fn meter(&self, session: u64, apply: impl FnOnce(&mut (u64, u64))) -> (u64, u64) {
+    fn meter(&self, session: UiGeneration, apply: impl FnOnce(&mut (u64, u64))) -> (u64, u64) {
         let Ok(mut meters) = self.meters.lock() else {
             return (0, 0);
         };
@@ -1730,8 +1850,8 @@ impl Player {
         let session = self
             .table
             .owner(arm)
-            .and_then(|owner| owner.session_id())
-            .unwrap_or(0);
+            .and_then(|owner| owner.generation())
+            .unwrap_or(UiGeneration::SCRATCH);
         let usage_event = |(input, output): (u64, u64)| {
             DemoEvent::Envelope(EventPayload::Usage(Usage {
                 input,

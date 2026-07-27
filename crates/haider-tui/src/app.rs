@@ -3,12 +3,14 @@
 //! mutates it. The reducer is pure enough to test headlessly.
 
 use crate::commands::{PALETTE_MAX_ROWS, PaletteItem, has_arg_slots, palette_items};
+use crate::identity::UiGeneration;
 use crate::mock::seed_session_states;
 use crate::projection::SessionProjection;
 use crate::sanctum::SanctumTier;
 use crate::script::{AuraState, ChipDisplayState, ChipPrefill, ChipSeed, TALK_PHRASE};
 use crate::theme::ThemeKey;
-use haider_protocol::ids::MenuId;
+use haider_protocol::envelope::RawEnvelope;
+use haider_protocol::ids::{MenuId, SessionId};
 use haider_protocol::menu::{
     AnswerVia, Menu, MenuAnswer, MenuCloseReason, MenuKind, MenuOption, MenuScope,
 };
@@ -290,6 +292,44 @@ impl ChipModel {
         }
     }
 
+    /// A chip built from a live `AgentSpawned` manifest (W3c3, report R11
+    /// cut 2). The manifest is the ONLY source: `callsign` is display-only
+    /// identity (§5.1 — never an address), `model_profile` is the model
+    /// line, and `placement` names the device. The chip starts IDLE because
+    /// `AgentChipState` is the sole chip-state authority; nothing here
+    /// guesses at a running state the stream has not reported.
+    #[must_use]
+    pub fn from_manifest(manifest: &haider_protocol::agent::AgentManifest) -> Self {
+        let callsign = manifest.callsign.clone().unwrap_or_default();
+        // The honorific/full name are roster facts, not wire fields: when a
+        // callsign is one we minted, re-derive its pair; otherwise carry the
+        // bare callsign with no honorific rather than inventing one.
+        let roster = crate::script::ROSTER
+            .iter()
+            .find(|(name, _, _)| *name == callsign);
+        let device = match &manifest.placement {
+            haider_protocol::agent::Placement::Local => "this-mac".to_owned(),
+            haider_protocol::agent::Placement::Device { device } => device.as_str().to_owned(),
+        };
+        Self {
+            agent: manifest.agent.as_str().to_owned(),
+            ros: None,
+            callsign: callsign.clone(),
+            hon: roster.map_or("", |(_, hon, _)| *hon),
+            full: roster.map_or(callsign, |(_, _, full)| (*full).to_owned()),
+            name: String::new(),
+            model: manifest.model_profile.clone(),
+            device,
+            state: ChipDisplayState::Idle,
+            tokens: 0,
+            question: None,
+            closed: false,
+            removing: false,
+            children: Vec::new(),
+            transcript: SessionProjection::new(),
+        }
+    }
+
     /// The chip's question card, per the sim's `chipMenu` gate
     /// (tui.js:2360-2364): open only while the chip is `input_required`/
     /// `error` AND holds an UNRESOLVED question. A closed chip has its
@@ -470,6 +510,23 @@ pub fn find_chip<'t>(chips: &'t [ChipModel], agent: &str) -> Option<&'t ChipMode
         }
     }
     None
+}
+
+/// The transcript note one `AgentReport` becomes (W3c3, report R11 cut 2:
+/// "maps `AgentReport` only to report summary/verification content" —
+/// never to chip STATE, which stays `AgentChipState`'s alone). The
+/// vocabulary matches the `ChildResult` row the transcript already renders
+/// (`render.rs`: `└ subagent report — {summary}`).
+#[must_use]
+pub fn report_note(report: &haider_protocol::agent::ChildReport) -> String {
+    use haider_protocol::agent::ReportVerification;
+    let verdict = match report.verified {
+        ReportVerification::Verified => "verified",
+        ReportVerification::Red => "red",
+        ReportVerification::Waived => "waived",
+        ReportVerification::Unverified => "unverified",
+    };
+    format!("└ subagent report ({verdict}) — {}", report.summary)
 }
 
 pub fn find_chip_mut<'t>(chips: &'t mut [ChipModel], agent: &str) -> Option<&'t mut ChipModel> {
@@ -659,13 +716,32 @@ pub enum AppRequest {
     AuraTalk,
     /// `/reset` reseeded the aura — bump its script guard.
     ResetAura,
-    /// `/reset` also purges the demo state file (sim tui.js:1918:
-    /// `localStorage.removeItem("haider-tui-v1")`). Runtime-owned like
-    /// `CopySelection`: only the interactive loop knows the store path, so
-    /// it intercepts this; the driver treats it as a no-op.
-    PurgeDemoStore,
+    /// The strict gap law fired (W3c3, report R11 cut 2): reduction STOPPED
+    /// for `session` with its cursor still at `after_seq`, and NOTHING later
+    /// may be applied until the driver reattaches from there. The demo
+    /// driver never produces gaps and ignores this; `LiveDriver` reattaches.
+    Reattach {
+        session: haider_protocol::ids::SessionId,
+        after_seq: u64,
+    },
     /// Quit the app.
     Quit,
+}
+
+/// Side effects only the DEMO runtime can perform (W3c3, report R11 cut 3).
+///
+/// Deliberately NOT an [`AppRequest`]: the common request vocabulary must
+/// carry no demo concepts, so `run_live` cannot even name these. They ride
+/// their own [`AppModel::demo_requests`] queue, which only `run_demo`
+/// drains — a live reset therefore can never delete demo persistence, and a
+/// demo reset can never reach a profile mutation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DemoRequest {
+    /// `/reset` reseeded the demo world; the state file dies with it (sim
+    /// tui.js:1918: `localStorage.removeItem("haider-tui-v1")`). Runtime-
+    /// owned like `CopySelection`: only the interactive loop knows the
+    /// store path.
+    PurgeStore,
 }
 
 /// Per-session voice pipeline (sim `DEFAULT_VOICE`, tui.js:110 — voice
@@ -771,16 +847,22 @@ pub enum Hit {
     },
 }
 
-/// One answer on its way to the client, tagged with the session identity that
-/// RENDERED the card (review r2 P1-1). Answers ride the never-cancelled
+/// One answer on its way to the client, tagged with the SURFACE GENERATION
+/// that RENDERED the card (review r2 P1-1). Answers ride the never-cancelled
 /// control tag so delivery is guaranteed, but CONSUMPTION checks the
 /// origin: an answer to a card the user has since replaced must never
 /// reconfigure the session that took its place. The sim gets this for free
 /// — its `askMenu` promise closes over the originating session/branch ids
 /// and its menu ids are per-open `nid()`s (tui.js:849-878).
+///
+/// W3c3 (report R11 cut 1): the origin is a [`UiGeneration`], not the
+/// protocol [`SessionId`]. This is an ASYNCHRONOUS RESPONSE GUARD — the
+/// exact role the report forbids a session id from playing — and the
+/// generation carries the old numeric id's semantics unchanged (monotonic,
+/// never reused, `SCRATCH` for the no-session surface).
 #[derive(Debug, Clone, PartialEq)]
 pub struct OutboundAnswer {
-    pub origin: u64,
+    pub origin: UiGeneration,
     pub answer: MenuAnswer,
 }
 
@@ -800,15 +882,22 @@ pub enum LauncherRow {
 }
 
 /// A composer surface's identity (TUI5 item 9): the launcher, one session
-/// (by id — the monotonic-identity law means a key can never be reworn),
-/// or the aura. The SUBAGENT screen shares its session's key (the
-/// amendment's key list is exactly launcher | session id | aura), and the
-/// scratch surface (screen=Session, no id) shares the launcher's —
+/// (by its LOCAL generation — the monotonic-identity law means a key can
+/// never be reworn), or the aura. The SUBAGENT screen shares its session's
+/// key (the amendment's key list is exactly launcher | session | aura), and
+/// the scratch surface (screen=Session, no session) shares the launcher's —
 /// documented: scratch is the launcher's envelope-driven lineage.
+///
+/// W3c3: keyed by [`UiGeneration`], not [`SessionId`]. A draft key is a
+/// LOCAL SURFACE identity in the same family as the demo driver's arms and
+/// meters — report R11 cut 1's assignment for the generation — and keeping
+/// it `Copy` keeps the per-frame hit map and the stash/restore round trip
+/// allocation-free. The law it must satisfy is "never reworn", which the
+/// generation satisfies exactly as the old id did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DraftKey {
     Launcher,
-    Session(u64),
+    Session(UiGeneration),
     Aura,
 }
 
@@ -912,19 +1001,26 @@ pub struct AppModel {
     /// seeds. The ATTACHED session's state is checked OUT of its slot into
     /// this model's live fields (see `crate::session`).
     pub sessions: Vec<crate::session::SessionState>,
-    /// The checked-out session's id (sim `activeId`; `None` = launcher's
-    /// no-session state, exactly the sim's `setActiveId(null)`).
-    pub active_session: Option<u64>,
+    /// The checked-out session's PROTOCOL id (sim `activeId`; `None` =
+    /// launcher's no-session state, exactly the sim's `setActiveId(null)`).
+    pub active_session: Option<SessionId>,
     /// The most recently detached session — the empty-⏎ re-attach target.
-    pub last_detached: Option<u64>,
-    /// Session id allocator (seeds take 1-3; sim uses `Date.now()`).
-    /// MONOTONIC for the process lifetime — never reset, not even by
-    /// `/reset` (review TUI4.1 P1-2): an id-keyed control callback must
-    /// never find a replacement session wearing a dead session's id.
-    pub next_session_id: u64,
+    pub last_detached: Option<SessionId>,
+    /// Local generation allocator (seeds take 1-3; `0` is the scratch
+    /// sentinel). MONOTONIC for the process lifetime — never reset, not
+    /// even by `/reset` (review TUI4.1 P1-2): a generation-keyed control
+    /// callback must never find a replacement session wearing a dead
+    /// session's generation. W3c3 renamed it from `next_session_id`: the
+    /// PROTOCOL id is no longer minted by arithmetic (report R11 cut 1),
+    /// only the local generation is.
+    pub next_ui_generation: u64,
     /// The roster claim counter (sim `rosterRef`, tui.js:681) — shared
     /// with the driver so heads and chips draw from ONE honour roll.
     pub roster: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Demo-runtime side effects (W3c3, report R11 cut 3) — a channel
+    /// SEPARATE from `requests` so `run_live` never even sees demo
+    /// vocabulary. Only `run_demo` drains it.
+    pub demo_requests: Vec<DemoRequest>,
     /// Selected option index while a blocking menu replaces the composer.
     pub menu_selection: usize,
     /// Selected row in the slash palette (open while composer starts with /).
@@ -1030,10 +1126,11 @@ impl Default for AppModel {
             sessions: seed_session_states(),
             active_session: None,
             last_detached: None,
-            next_session_id: 4,
+            next_ui_generation: 4,
             roster: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
                 crate::script::ROSTER_FIRST_CLAIM,
             )),
+            demo_requests: Vec::new(),
             menu_selection: 0,
             palette_selection: 0,
             palette_scroll: 0,
@@ -1063,18 +1160,33 @@ impl AppModel {
         Self::default()
     }
 
-    /// The identity that outbound answers and the auto-title micro-call
+    /// The generation that outbound answers and the auto-title micro-call
     /// carry as their `origin`, and that the driver's consumption gates
-    /// check (review r2 P1-1): the ATTACHED session's id, or 0 for the
-    /// no-session scratch surface. DERIVED, never stored (review TUI4.1,
-    /// Fable D2-1 — the old `session_epoch` field was a hand-maintained
-    /// twin of `active_session` with a stale monotonicity doc). Identities
-    /// themselves never recur: `next_session_id` is monotonic for the
-    /// process lifetime (the sim's `s-${Date.now()}` law), so an id-keyed
-    /// callback can never find a replacement wearing an old id.
+    /// check (review r2 P1-1): the ATTACHED session's generation, or
+    /// [`UiGeneration::SCRATCH`] for the no-session scratch surface.
+    /// DERIVED from the attached row, never stored (review TUI4.1, Fable
+    /// D2-1 — the old `session_epoch` field was a hand-maintained twin of
+    /// `active_session` with a stale monotonicity doc). Generations never
+    /// recur: `next_ui_generation` is monotonic for the process lifetime
+    /// (the sim's `s-${Date.now()}` law), so a generation-keyed callback
+    /// can never find a replacement wearing a dead one.
+    ///
+    /// W3c3 renamed this from `session_identity`: the value is no longer
+    /// the session's identity, it is the SURFACE's generation (report R11
+    /// cut 1 — a session id must not double as a stale-timer epoch).
     #[must_use]
-    pub fn session_identity(&self) -> u64 {
-        self.active_session.unwrap_or(0)
+    pub fn ui_generation(&self) -> UiGeneration {
+        self.active_session
+            .as_ref()
+            .and_then(|id| self.sessions.iter().find(|entry| &entry.id == id))
+            .map_or(UiGeneration::SCRATCH, |entry| entry.ui_gen)
+    }
+
+    /// The attached session's protocol id, if any — the coordinate every
+    /// live RPC (`turn.submit`, `turn.cancel`, `MenuAnswer`) carries.
+    #[must_use]
+    pub fn active_session_id(&self) -> Option<&SessionId> {
+        self.active_session.as_ref()
     }
 
     /// The composer surface currently on screen (TUI5 item 9). Boot maps
@@ -1084,9 +1196,16 @@ impl AppModel {
     pub fn surface_key(&self) -> DraftKey {
         match self.screen {
             Screen::Aura => DraftKey::Aura,
-            _ => self
-                .active_session
-                .map_or(DraftKey::Launcher, DraftKey::Session),
+            _ => self.session_draft_key(),
+        }
+    }
+
+    /// The draft key of the attached session (the launcher's when nothing
+    /// is attached) — the ONE place a generation becomes a surface key.
+    fn session_draft_key(&self) -> DraftKey {
+        match self.active_session {
+            Some(_) => DraftKey::Session(self.ui_generation()),
+            None => DraftKey::Launcher,
         }
     }
 
@@ -1120,9 +1239,7 @@ impl AppModel {
     /// one-stash-one-restore discipline literal.
     fn goto_session_screen(&mut self) {
         let from = self.surface_key();
-        let to = self
-            .active_session
-            .map_or(DraftKey::Launcher, DraftKey::Session);
+        let to = self.session_draft_key();
         if from == to {
             self.screen = Screen::Session;
             return;
@@ -1812,9 +1929,9 @@ impl AppModel {
             // Empty ⏎ on the launcher re-attaches the most recently left
             // session (a port law; the detach model keeps it honest by id).
             if self.screen == Screen::Launcher
-                && let Some(id) = self.last_detached
+                && let Some(id) = self.last_detached.clone()
             {
-                self.open_session(id);
+                self.open_session(&id);
             }
             return;
         }
@@ -2070,7 +2187,7 @@ impl AppModel {
             return;
         };
         self.outbox.push(OutboundAnswer {
-            origin: self.session_identity(),
+            origin: self.ui_generation(),
             answer: MenuAnswer {
                 menu: menu.id.clone(),
                 option_key: Some(option.key.clone()),
@@ -2201,13 +2318,13 @@ impl AppModel {
                 self.sessions = seed_session_states();
                 self.active_session = None;
                 self.last_detached = None;
-                // `next_session_id` is deliberately NOT reset (review
+                // `next_ui_generation` is deliberately NOT reset (review
                 // TUI4.1 P1-2): the control-tagged auto-title callback is
-                // keyed by session id and survives /reset by design (sim:
+                // keyed by generation and survives /reset by design (sim:
                 // a bare setTimeout); resetting the allocator let a
-                // replacement session reuse the old id and receive the old
-                // title. The sim's `s-${Date.now()}` ids never recur —
-                // monotonicity ports that law, killing the whole class.
+                // replacement session reuse the old generation and receive
+                // the old title. The sim's `s-${Date.now()}` ids never
+                // recur — monotonicity ports that law, killing the class.
                 self.roster.store(
                     crate::script::ROSTER_FIRST_CLAIM,
                     std::sync::atomic::Ordering::SeqCst,
@@ -2217,7 +2334,7 @@ impl AppModel {
                 // Sim tui.js:1918: the state file dies with the reset; the
                 // seeds re-save on the next change exactly as the sim's
                 // save effect refills localStorage after removeItem.
-                self.requests.push(AppRequest::PurgeDemoStore);
+                self.demo_requests.push(DemoRequest::PurgeStore);
                 self.screen = Screen::Launcher;
                 self.drafts.retain(|key, _| *key == DraftKey::Launcher);
                 self.restore_draft();
@@ -2384,10 +2501,82 @@ impl AppModel {
             via: AnswerVia::Tui,
         };
         self.outbox.push(OutboundAnswer {
-            origin: self.session_identity(),
+            origin: self.ui_generation(),
             answer,
         });
         self.menu_selection = 0;
+    }
+
+    /// Route one RAW envelope to whichever session owns it (W3c3, report
+    /// R11 cut 2) — the single live entry point for the event stream.
+    ///
+    /// The attached session reduces through the model's checked-out live
+    /// fields; every other session reduces in its own slot. A gap STOPS
+    /// reduction with the cursor unmoved and emits
+    /// [`AppRequest::Reattach`] BEFORE any later state can mutate — the
+    /// store is the lag buffer (R9), so the client never papers over a
+    /// hole. An envelope for a session this model does not know is
+    /// rejected, not invented.
+    pub fn route_raw(&mut self, envelope: &RawEnvelope) -> crate::projection::RawOutcome {
+        use crate::projection::RawOutcome;
+        let outcome = if self.active_session.as_ref() == Some(&envelope.session_id) {
+            self.absorb_raw_active(envelope)
+        } else if let Some(entry) = self
+            .sessions
+            .iter_mut()
+            .find(|entry| entry.id == envelope.session_id)
+        {
+            entry.absorb_raw(envelope)
+        } else {
+            RawOutcome::WrongSession
+        };
+        match outcome {
+            RawOutcome::Applied => self.dirty = true,
+            RawOutcome::Gap { after_seq } => self.requests.push(AppRequest::Reattach {
+                session: envelope.session_id.clone(),
+                after_seq,
+            }),
+            RawOutcome::Duplicate | RawOutcome::WrongSession => {}
+        }
+        outcome
+    }
+
+    /// The ATTACHED session's half of [`Self::route_raw`]: the cursor lives
+    /// on the checked-out projection, so it travels with checkout/checkin
+    /// and no second cursor authority exists.
+    fn absorb_raw_active(&mut self, envelope: &RawEnvelope) -> crate::projection::RawOutcome {
+        use crate::projection::{Admission, RawOutcome};
+        match self.projection.admit(envelope) {
+            Admission::Duplicate => RawOutcome::Duplicate,
+            Admission::Gap { after_seq } => RawOutcome::Gap { after_seq },
+            Admission::Skip => RawOutcome::Applied,
+            Admission::Apply => {
+                match serde_json::from_value::<EventPayload>(envelope.payload.clone()) {
+                    Ok(payload) => self.absorb_scoped(&payload, envelope.agent_id.as_ref()),
+                    Err(_) => self.projection.count_unknown_payload(),
+                }
+                RawOutcome::Applied
+            }
+        }
+    }
+
+    /// The attached path's scope router — the same [`crate::session::classify`]
+    /// decision the background path takes, applied to the live fields.
+    fn absorb_scoped(
+        &mut self,
+        payload: &EventPayload,
+        agent: Option<&haider_protocol::ids::AgentId>,
+    ) {
+        use crate::session::Destination;
+        match crate::session::classify(&mut self.projection, &self.chips, payload, agent) {
+            Destination::Agent => crate::session::apply_agent_payload(&mut self.chips, payload),
+            Destination::Chip(target) => {
+                if let Some(chip) = find_chip_mut(&mut self.chips, &target) {
+                    chip.transcript.apply(payload);
+                }
+            }
+            Destination::Session => self.handle_envelope(payload),
+        }
     }
 
     fn handle_envelope(&mut self, payload: &EventPayload) {
@@ -2537,9 +2726,9 @@ impl AppModel {
             .sessions
             .iter()
             .find(|entry| entry.name.as_deref() == Some(name))
-            .map(|entry| entry.id)
+            .map(|entry| entry.id.clone())
         {
-            self.open_session(id);
+            self.open_session(&id);
         }
     }
 
@@ -2549,16 +2738,16 @@ impl AppModel {
     /// one-turn-at-a-time flash guarded a single shared projection that no
     /// longer exists.
     fn attach_sample(&mut self, index: usize) {
-        if let Some(id) = self.sessions.get(index).map(|entry| entry.id) {
-            self.open_session(id);
+        if let Some(id) = self.sessions.get(index).map(|entry| entry.id.clone()) {
+            self.open_session(&id);
         }
     }
 
     /// Sim `openSession` (tui.js:1606-1615): sweep closed chips whose 5 s
     /// removal never fired, attach, and NOTHING else — no turn starts
     /// (owner item 1), and the one left behind keeps running.
-    pub fn open_session(&mut self, id: u64) {
-        if self.active_session == Some(id) {
+    pub fn open_session(&mut self, id: &SessionId) {
+        if self.active_session.as_ref() == Some(id) {
             self.screen = Screen::Session;
             return;
         }
@@ -2567,7 +2756,7 @@ impl AppModel {
         // one restore per transition).
         self.stash_draft();
         self.checkin();
-        let Some(index) = self.sessions.iter().position(|entry| entry.id == id) else {
+        let Some(index) = self.sessions.iter().position(|entry| &entry.id == id) else {
             // Unknown id: the checkin left us on the no-session surface —
             // bring ITS (the launcher's) draft live, stranding nothing.
             self.restore_draft();
@@ -2575,9 +2764,10 @@ impl AppModel {
         };
         // Move the slot out so its fields can swap with `self`'s without
         // aliasing; the slot keeps a neutral placeholder meanwhile.
+        let ui_gen = self.sessions[index].ui_gen;
         let mut slot = std::mem::replace(
             &mut self.sessions[index],
-            crate::session::SessionState::neutral(id),
+            crate::session::SessionState::neutral(id.clone(), ui_gen),
         );
         crate::session::sweep_closed_chips(&mut slot.chips);
         self.projection = std::mem::replace(&mut slot.projection, SessionProjection::new());
@@ -2593,7 +2783,7 @@ impl AppModel {
         self.session_head = std::mem::take(&mut slot.head);
         self.session_dir = std::mem::take(&mut slot.dir);
         self.sessions[index] = slot;
-        self.active_session = Some(id);
+        self.active_session = Some(id.clone());
         self.menu_selection = 0;
         self.view_path.clear();
         self.screen = Screen::Session;
@@ -2614,6 +2804,7 @@ impl AppModel {
             return;
         };
         if let Some(index) = self.sessions.iter().position(|entry| entry.id == active) {
+            // (identity is the protocol id; the row's generation stays put)
             let slot = &mut self.sessions[index];
             slot.projection = std::mem::replace(&mut self.projection, SessionProjection::new());
             slot.chips = std::mem::take(&mut self.chips);
@@ -2647,13 +2838,17 @@ impl AppModel {
     /// session left behind is checked in, never cancelled.
     fn new_session(&mut self, text: &str) {
         self.checkin();
-        let id = self.next_session_id;
-        self.next_session_id += 1;
+        let ui_gen = UiGeneration::new(self.next_ui_generation);
+        self.next_ui_generation += 1;
+        // The DEMO mints its own protocol id from the generation (report
+        // R11 cut 1). `run_live` never reaches here: a live session exists
+        // only once `session.create` answers with the daemon's id.
+        let id = crate::identity::demo_session_id(ui_gen);
         let ros = self
             .roster
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let head = crate::script::roster_at(ros);
-        let mut entry = crate::session::SessionState::neutral(id);
+        let mut entry = crate::session::SessionState::neutral(id.clone(), ui_gen);
         entry.name = Some(slug_name(text));
         entry.head = (head.callsign, head.hon.to_owned());
         entry.head_ros = Some(ros);
@@ -2662,7 +2857,7 @@ impl AppModel {
         entry.device = self.identity.device.clone();
         entry.ago = "now".to_owned();
         self.sessions.insert(0, entry);
-        self.open_session(id);
+        self.open_session(&id);
         // Review P3-8: the founding message recalls IN the new session
         // (Claude Code recalls in-conversation); the launcher's own ring
         // kept its copy via take_for_submit before the surface swap.
@@ -2703,11 +2898,28 @@ impl AppModel {
     }
 
     /// A NON-attached session's slot (background event routing).
-    pub fn session_entry_mut(&mut self, id: u64) -> Option<&mut crate::session::SessionState> {
-        if self.active_session == Some(id) {
+    pub fn session_entry_mut(
+        &mut self,
+        id: &SessionId,
+    ) -> Option<&mut crate::session::SessionState> {
+        if self.active_session.as_ref() == Some(id) {
             return None;
         }
-        self.sessions.iter_mut().find(|entry| entry.id == id)
+        self.sessions.iter_mut().find(|entry| &entry.id == id)
+    }
+
+    /// A non-attached session's slot BY GENERATION — the demo driver's
+    /// lookup, whose arms are generation-keyed (report R11 cut 1).
+    pub fn session_entry_by_generation(
+        &mut self,
+        generation: UiGeneration,
+    ) -> Option<&mut crate::session::SessionState> {
+        if self.ui_generation() == generation && self.active_session.is_some() {
+            return None;
+        }
+        self.sessions
+            .iter_mut()
+            .find(|entry| entry.ui_gen == generation)
     }
 
     /// A left-click resolved through the frame's hit map. The map may be

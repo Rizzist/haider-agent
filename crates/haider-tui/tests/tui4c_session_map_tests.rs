@@ -4,6 +4,7 @@
 //! restores exactly.
 #![allow(clippy::expect_used)]
 
+use haider_protocol::ids::SessionId;
 use haider_tui::app::{AppEvent, AppModel, Hit, Screen};
 use haider_tui::render::render;
 use ratatui::Terminal;
@@ -31,11 +32,11 @@ fn rows(model: &AppModel, width: u16, height: u16) -> Vec<String> {
         .collect()
 }
 
-fn slot(model: &AppModel, id: u64) -> &haider_tui::session::SessionState {
+fn slot<'a>(model: &'a AppModel, id: &SessionId) -> &'a haider_tui::session::SessionState {
     model
         .sessions
         .iter()
-        .find(|entry| entry.id == id)
+        .find(|entry| &entry.id == id)
         .expect("session slot")
 }
 
@@ -54,7 +55,7 @@ async fn leaving_mid_turn_shows_idle_badge_and_a_running_row() {
         m.turn_active && !m.projection.entries().is_empty() && m.projection.badge() != "IDLE"
     })
     .await;
-    let sid = model.active_session.expect("attached");
+    let sid = model.active_session.clone().expect("attached");
     let busy_badge = model.projection.badge();
 
     model.handle(AppEvent::Key(KeyEvent::new(
@@ -95,7 +96,7 @@ async fn leaving_mid_turn_shows_idle_badge_and_a_running_row() {
         "header running count (the L1 seed's live chip + this one)"
     );
     // The turn is still live in the slot.
-    assert!(slot(&model, sid).turn_active, "leaving cancels nothing");
+    assert!(slot(&model, &sid).turn_active, "leaving cancels nothing");
 }
 
 #[tokio::test(start_paused = true)]
@@ -111,7 +112,7 @@ async fn background_events_land_in_the_slot_and_reopen_restores_exactly() {
         m.turn_active && !m.projection.entries().is_empty()
     })
     .await;
-    let sid = model.active_session.expect("attached");
+    let sid = model.active_session.clone().expect("attached");
     // Interrupt the first turn (esc), settle to idle, then run a SECOND
     // turn and leave IT mid-flight via /clear — the leave under test.
     model.handle(key(KeyCode::Esc));
@@ -132,11 +133,11 @@ async fn background_events_land_in_the_slot_and_reopen_restores_exactly() {
         &mut rx,
         &mut model,
         "background turn end",
-        |m| !slot(m, sid).turn_active && slot(m, sid).projection.badge() == "IDLE",
+        |m| !slot(m, &sid).turn_active && slot(m, &sid).projection.badge() == "IDLE",
     )
     .await;
     assert!(
-        slot(&model, sid).projection.entries().len() > seen,
+        slot(&model, &sid).projection.entries().len() > seen,
         "the background stream kept landing in the slot"
     );
     assert!(
@@ -147,7 +148,7 @@ async fn background_events_land_in_the_slot_and_reopen_restores_exactly() {
     // Empty ⏎ re-attaches the same session with everything restored.
     model.handle(key(KeyCode::Enter));
     assert_eq!(model.screen, Screen::Session);
-    assert_eq!(model.active_session, Some(sid));
+    assert_eq!(model.active_session.as_ref(), Some(&sid));
     assert!(model.projection.entries().len() > seen, "restored exactly");
     assert_eq!(model.projection.badge(), "IDLE");
 }
@@ -162,12 +163,12 @@ fn interrupt_marks_only_its_own_session_and_survives_a_round_trip() {
     model.requests.clear();
     model.handle(key(KeyCode::Esc)); // mid-turn esc = interrupt
     assert!(model.projection.interrupted(), "idle (i)");
-    let first = model.active_session.expect("attached");
+    let first = model.active_session.clone().expect("attached");
     model.handle(key(KeyCode::Esc)); // idle esc = leave
     assert_eq!(model.screen, Screen::Launcher);
 
     submit(&mut model, "second task here");
-    let second = model.active_session.expect("attached");
+    let second = model.active_session.clone().expect("attached");
     assert_ne!(first, second);
     assert!(
         !model.projection.interrupted(),
@@ -175,13 +176,13 @@ fn interrupt_marks_only_its_own_session_and_survives_a_round_trip() {
     );
     // Heads come from the roster in claim order — never a duplicate
     // (sim claimName, tui.js:882-886; seeds hold 0-2).
-    assert_eq!(slot(&model, first).head.0, "Hasan");
+    assert_eq!(slot(&model, &first).head.0, "Hasan");
     assert_eq!(model.session_head.0, "Husayn");
 
     // Reopen the first: its idle(i) marker survived the round trip.
     model.handle_hit(Hit::BackChip);
     model.handle_hit(Hit::AttachSample("first-task-here".to_owned()));
-    assert_eq!(model.active_session, Some(first));
+    assert_eq!(model.active_session.as_ref(), Some(&first));
     assert!(
         model.projection.interrupted(),
         "⏸ IDLE (i) restored with the session"
@@ -216,12 +217,12 @@ fn launcher_typing_starts_fresh_and_the_left_session_keeps_its_row() {
     // /clear fresh-start promise breaks.
     let mut model = launcher_model();
     submit(&mut model, "first task here");
-    let first = model.active_session.expect("attached");
+    let first = model.active_session.clone().expect("attached");
     submit(&mut model, "/clear");
     assert_eq!(model.screen, Screen::Launcher);
 
     submit(&mut model, "totally new work");
-    let second = model.active_session.expect("attached");
+    let second = model.active_session.clone().expect("attached");
     assert_ne!(first, second, "a brand-new session id");
     assert_eq!(model.session_name.as_deref(), Some("totally-new-work"));
     assert!(
@@ -235,7 +236,7 @@ fn launcher_typing_starts_fresh_and_the_left_session_keeps_its_row() {
     // Both appear in the map; the seeds keep their rows too.
     assert_eq!(model.sessions.len(), 5, "3 seeds + 2 user sessions");
     assert!(
-        slot(&model, first).name.as_deref() == Some("first-task-here"),
+        slot(&model, &first).name.as_deref() == Some("first-task-here"),
         "the left session kept its row"
     );
 }

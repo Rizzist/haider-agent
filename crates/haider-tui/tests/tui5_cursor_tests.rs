@@ -836,8 +836,8 @@ fn drafts_travel_per_surface_with_cursor_and_selection() {
     for c in "launcher draft".chars() {
         model.handle(key(KeyCode::Char(c)));
     }
-    let sid = model.sessions[0].id;
-    model.open_session(sid);
+    let sid = model.sessions[0].id.clone();
+    model.open_session(&sid);
     assert!(model.composer.is_empty(), "a fresh session starts fresh");
     for c in "session one".chars() {
         model.handle(key(KeyCode::Char(c)));
@@ -848,7 +848,7 @@ fn drafts_travel_per_surface_with_cursor_and_selection() {
     // navigation law instead, selection intact.
     model.back_to_launcher();
     assert_eq!(model.composer, "launcher draft", "launcher draft restored");
-    model.open_session(sid);
+    model.open_session(&sid);
     assert_eq!(model.composer, "session one", "session draft restored");
     assert_eq!(
         model.composer.selected_text(),
@@ -856,9 +856,9 @@ fn drafts_travel_per_surface_with_cursor_and_selection() {
         "cursor AND selection travelled with the draft"
     );
     // A second session has its own (empty) draft.
-    let sid2 = model.sessions[1].id;
+    let sid2 = model.sessions[1].id.clone();
     model.back_to_launcher();
-    model.open_session(sid2);
+    model.open_session(&sid2);
     assert!(model.composer.is_empty());
     // Aura keeps its own instance — enter via the launcher's Aura row
     // (the value-carrying hit), which must NOT eat the launcher draft.
@@ -886,8 +886,8 @@ fn submit_clears_only_that_surfaces_draft() {
     for c in "parked".chars() {
         model.handle(key(KeyCode::Char(c)));
     }
-    let sid = model.sessions[0].id;
-    model.open_session(sid);
+    let sid = model.sessions[0].id.clone();
+    model.open_session(&sid);
     for c in "send me".chars() {
         model.handle(key(KeyCode::Char(c)));
     }
@@ -904,18 +904,20 @@ fn submit_clears_only_that_surfaces_draft() {
 fn reset_purges_session_drafts_but_the_launcher_draft_survives() {
     use haider_tui::app::DraftKey;
     let mut model = launcher_model();
-    let sid2 = model.sessions[1].id;
-    model.open_session(sid2);
+    let sid2 = model.sessions[1].id.clone();
+    // The draft key is the row's local GENERATION, not its session id.
+    let gen2 = model.sessions[1].ui_gen;
+    model.open_session(&sid2);
     for c in "doomed".chars() {
         model.handle(key(KeyCode::Char(c)));
     }
     model.back_to_launcher();
-    assert!(model.drafts.contains_key(&DraftKey::Session(sid2)));
+    assert!(model.drafts.contains_key(&DraftKey::Session(gen2)));
     for c in "keep me".chars() {
         model.handle(key(KeyCode::Char(c)));
     }
-    let sid1 = model.sessions[0].id;
-    model.open_session(sid1);
+    let sid1 = model.sessions[0].id.clone();
+    model.open_session(&sid1);
     for c in "/reset".chars() {
         model.handle(key(KeyCode::Char(c)));
     }
@@ -949,8 +951,8 @@ fn dto_carries_no_composer_cursor_or_draft_state() {
         model.handle(key(KeyCode::Char(c)));
     }
     model.handle(key_mod(KeyCode::Left, KeyModifiers::SHIFT));
-    let sid = model.sessions[0].id;
-    model.open_session(sid);
+    let sid = model.sessions[0].id.clone();
+    model.open_session(&sid);
     for c in "parked draft".chars() {
         model.handle(key(KeyCode::Char(c)));
     }
@@ -1015,11 +1017,16 @@ fn load_rejects_sentinel_max_and_duplicate_ids() {
     let good = snapshot(&model);
     write(&good);
     assert!(store.load().is_some(), "baseline snapshot loads");
-    // P3-1: id u64::MAX would overflow the guard-2 bump — reject whole.
+    // P3-1: generation u64::MAX would overflow the guard-2 bump — reject
+    // whole (W3c3: the bump reads the row's local generation, so that is
+    // where the sentinel bound now lives).
     let mut bad = good.clone();
-    bad.sessions[0].id = u64::MAX;
+    bad.sessions[0].ui_gen = Some(u64::MAX);
     write(&bad);
-    assert!(store.load().is_none(), "id u64::MAX rejects to seeds");
+    assert!(
+        store.load().is_none(),
+        "generation u64::MAX rejects to seeds"
+    );
     // …and the matching card_seq bound.
     let mut bad = good.clone();
     bad.card_seq = u64::MAX;
@@ -1027,7 +1034,7 @@ fn load_rejects_sentinel_max_and_duplicate_ids() {
     assert!(store.load().is_none(), "card_seq u64::MAX rejects to seeds");
     // P3-3: duplicate session ids mirror-corrupt the next save — reject.
     let mut bad = good.clone();
-    let first = bad.sessions[0].id;
+    let first = bad.sessions[0].id.clone();
     bad.sessions[1].id = first;
     write(&bad);
     assert!(store.load().is_none(), "duplicate ids reject to seeds");
@@ -1066,8 +1073,8 @@ fn envelope_session_flip_swaps_the_aura_draft() {
     use haider_protocol::EventPayload;
     use haider_tui::app::DraftKey;
     let mut model = launcher_model();
-    let sid = model.sessions[0].id;
-    model.open_session(sid);
+    let sid = model.sessions[0].id.clone();
+    model.open_session(&sid);
     // The reviewer's reachable path: /aura from the CHECKED-OUT session
     // (attachment survives — enter_aura never checks in), then a queued
     // UserMessage drains after the turn.
@@ -1076,7 +1083,11 @@ fn envelope_session_flip_swaps_the_aura_draft() {
     }
     model.handle(key(KeyCode::Enter));
     assert_eq!(model.screen, Screen::Aura);
-    assert_eq!(model.active_session, Some(sid), "still checked out");
+    assert_eq!(
+        model.active_session.as_ref(),
+        Some(&sid),
+        "still checked out"
+    );
     for c in "aura draft".chars() {
         model.handle(key(KeyCode::Char(c)));
     }

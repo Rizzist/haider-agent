@@ -5,11 +5,12 @@
 //! `DemoDriver` seams the interactive loop uses) wherever a turn is needed.
 #![allow(clippy::expect_used)]
 
-use haider_tui::app::{AppModel, AppRequest, ChipModel, Hit, Screen};
+use haider_tui::app::{AppModel, AppRequest, ChipModel, DemoRequest, Hit, Screen};
 use haider_tui::demo_store::{
-    ChipDto, DEMO_STORE_VERSION, DemoStore, HeadDto, ProjectionDto, SessionDto, StateDto, hydrate,
-    snapshot,
+    ChipDto, DEMO_STORE_VERSION, DemoStore, HeadDto, ProjectionDto, SessionDto, SessionIdDto,
+    StateDto, hydrate, snapshot,
 };
+use haider_tui::identity::{UiGeneration, demo_session_id};
 use haider_tui::render::render;
 use haider_tui::script::{ChipDisplayState, DemoEvent, ROSTER_FIRST_CLAIM, roster_at};
 use haider_tui::theme::ThemeKey;
@@ -38,12 +39,23 @@ fn rows(model: &AppModel, width: u16, height: u16) -> Vec<String> {
         .collect()
 }
 
-fn slot(model: &AppModel, id: u64) -> &haider_tui::session::SessionState {
-    model
+/// A session slot BY GENERATION. W3c3 split identity in two (report R11
+/// cut 1): the demo's stable numbering `1..n` is now the row's `ui_gen`
+/// and its protocol id is `demo-session-{ui_gen}`, so every call site here
+/// keeps naming exactly the row it always did.
+fn slot(model: &AppModel, generation: u64) -> &haider_tui::session::SessionState {
+    let generation = UiGeneration::new(generation);
+    let entry = model
         .sessions
         .iter()
-        .find(|entry| entry.id == id)
-        .expect("session slot")
+        .find(|entry| entry.ui_gen == generation)
+        .expect("session slot");
+    assert_eq!(
+        entry.id,
+        demo_session_id(generation),
+        "the demo's protocol id is derived from its generation, always"
+    );
+    entry
 }
 
 /// Deep chip equality on everything the store persists (the runtime types
@@ -98,7 +110,8 @@ fn chip_state_by_name(model: &AppModel, name: &str) -> Option<ChipDisplayState> 
 /// A minimal hand-built session DTO (the corrupt/backfill fixtures).
 fn bare_session(id: u64, name: &str, head: Option<HeadDto>) -> SessionDto {
     SessionDto {
-        id,
+        id: SessionIdDto::Current(demo_session_id(UiGeneration::new(id)).as_str().to_owned()),
+        ui_gen: Some(id),
         name: Some(name.to_owned()),
         title: None,
         head,
@@ -285,12 +298,23 @@ fn reset_purges_the_state_file_and_restores_seeds() {
     assert!(store.path().exists());
 
     submit(&mut model, "/reset");
+    // W3c3 (report R11 cut 3): the purge left the COMMON `AppRequest`
+    // vocabulary for a demo-only queue, so `run_live` cannot even name it
+    // — a live reset can never delete demo persistence. Same law, same
+    // /reset trigger, different (narrower) channel.
     assert!(
         model
+            .demo_requests
+            .iter()
+            .any(|request| matches!(request, DemoRequest::PurgeStore)),
+        "/reset must request the file purge"
+    );
+    assert!(
+        !model
             .requests
             .iter()
-            .any(|request| matches!(request, AppRequest::PurgeDemoStore)),
-        "/reset must request the file purge"
+            .any(|request| matches!(request, AppRequest::Reattach { .. })),
+        "…and the common request queue stays free of demo vocabulary"
     );
     assert_eq!(model.sessions.len(), 3, "seeds restored");
     assert_eq!(
@@ -302,8 +326,8 @@ fn reset_purges_the_state_file_and_restores_seeds() {
     // rewind it, or a replacement session reuses a dead id and the
     // surviving control-tagged auto-title callback retitles it.
     assert!(
-        model.next_session_id >= 5,
-        "/reset never rewinds the id allocator (monotonic identity law)"
+        model.next_ui_generation >= 5,
+        "/reset never rewinds the identity allocator (monotonic identity law)"
     );
 
     // The runtime intercepts the request and purges (run_demo's arm).
@@ -407,11 +431,11 @@ fn id_collision_bump_restores_card_seq_and_session_id_allocator() {
     hydrate(&mut hydrated, dto);
     assert_eq!(hydrated.card_seq, 1, "card counter restored");
     assert_eq!(
-        hydrated.next_session_id, 5,
-        "session ids resume past the persisted max"
+        hydrated.next_ui_generation, 5,
+        "identities resume past the persisted max"
     );
 
-    hydrated.open_session(4);
+    hydrated.open_session(&demo_session_id(UiGeneration::new(4)));
     // The open card itself round-tripped; dismiss it (non-blocking) so the
     // composer is back for a fresh /voice.
     assert_eq!(
@@ -523,7 +547,7 @@ async fn answering_a_hydrated_card_lands_the_stale_menu_note() {
     let mut model = launcher_model();
     let (mut driver, _rx) = driver_for(&model);
     hydrate(&mut model, dto);
-    model.open_session(7);
+    model.open_session(&demo_session_id(UiGeneration::new(7)));
     assert!(model.projection.open_menu().is_some(), "the card came back");
 
     // Answer it — no live arms exist for session 7 (nothing ran since
