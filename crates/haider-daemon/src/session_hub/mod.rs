@@ -511,6 +511,7 @@ struct HubInner {
     device_id: DeviceId,
     worker_manager: Mutex<Option<WorkerManagerHandle>>,
     accounts: Mutex<Option<crate::accounts::AccountsFacade>>,
+    creatable_providers: Mutex<Option<std::collections::BTreeSet<String>>>,
 }
 
 #[derive(Default)]
@@ -879,6 +880,7 @@ impl SessionHub {
                 device_id,
                 worker_manager: Mutex::new(None),
                 accounts: Mutex::new(None),
+                creatable_providers: Mutex::new(None),
             }),
         })
     }
@@ -917,6 +919,29 @@ impl SessionHub {
         &self,
     ) -> Result<Option<crate::accounts::AccountsFacade>, SessionHubError> {
         Ok(lock(&self.inner.accounts)?.clone())
+    }
+
+    /// Installs the ONE `session.create` provider whitelist (D3-5): the
+    /// dependency configuration answers "creatable providers"; nothing else
+    /// may.
+    pub(crate) fn install_creatable_providers(
+        &self,
+        providers: std::collections::BTreeSet<String>,
+    ) -> Result<(), SessionHubError> {
+        let mut installed = lock(&self.inner.creatable_providers)?;
+        if installed.is_some() {
+            return Err(SessionHubError::Task(
+                "creatable-provider registry is already installed".into(),
+            ));
+        }
+        *installed = Some(providers);
+        Ok(())
+    }
+
+    pub(crate) fn creatable_providers(
+        &self,
+    ) -> Result<Option<std::collections::BTreeSet<String>>, SessionHubError> {
+        Ok(lock(&self.inner.creatable_providers)?.clone())
     }
 
     /// Snapshot of monotonic lag-buffer and delivery-pressure counters.

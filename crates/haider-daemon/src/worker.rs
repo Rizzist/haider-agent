@@ -45,7 +45,7 @@ use haider_tools::{
     CasSink, EffectBroker, FsList, FsRead, FsSearch, JournalSink, PermissionPolicy, ResultBounds,
     ToolResult,
 };
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -110,11 +110,51 @@ pub trait TurnToolFactory: Send + Sync {
     ) -> Result<Option<Arc<dyn ToolDispatcher>>, HaiderError>;
 }
 
+/// How the daemon obtains its per-turn provider factory, and — the D3-5
+/// whitelist unification — the ONE authority on which providers
+/// `session.create` may accept. The rpc.rs hardcoded list is dead; `"fake"`
+/// is creatable only when an injected test configuration says so, never on
+/// the production wire path.
+#[derive(Clone)]
+pub enum ProviderFactoryConfig {
+    /// Production: resolve each logical turn from the daemon-owned account
+    /// store + vault (`crate::accounts::AccountsProviderFactory`), giving
+    /// `/login` next-turn pickup with zero worker changes.
+    Accounts,
+    /// Accounts-backed resolution with an injected provider constructor —
+    /// the login→next-turn test seam.
+    AccountsWith(Arc<dyn crate::accounts::AccountProviderBuilder>),
+    /// Fully injected factory plus its creatable-provider set.
+    Injected {
+        factory: Arc<dyn ProviderFactory>,
+        providers: BTreeSet<String>,
+    },
+}
+
+impl ProviderFactoryConfig {
+    /// Injected test factory whose creatable set is `{"fake"}`.
+    pub fn injected(factory: Arc<dyn ProviderFactory>) -> Self {
+        Self::Injected {
+            factory,
+            providers: BTreeSet::from(["fake".to_owned()]),
+        }
+    }
+
+    /// The providers `session.create` may accept under this configuration.
+    pub fn creatable_providers(&self) -> BTreeSet<String> {
+        match self {
+            Self::Accounts => BTreeSet::from([haider_provider::ANTHROPIC_PROVIDER_NAME.to_owned()]),
+            Self::AccountsWith(builder) => builder.providers(),
+            Self::Injected { providers, .. } => providers.clone(),
+        }
+    }
+}
+
 /// Runtime dependency bundle. A test replaces factories without changing the
 /// production connection, hub, worker, or core execution path.
 #[derive(Clone)]
 pub struct DaemonDependencies {
-    pub provider_factory: Arc<dyn ProviderFactory>,
+    pub provider_factory: ProviderFactoryConfig,
     pub tool_factory: Arc<dyn TurnToolFactory>,
     /// Account machinery (vault, credential validator, descriptor store) —
     /// the W3c2 login seam (`crate::accounts`).
@@ -124,15 +164,39 @@ pub struct DaemonDependencies {
 impl Default for DaemonDependencies {
     fn default() -> Self {
         Self {
-            provider_factory: Arc::new(UnconfiguredProviderFactory),
+            provider_factory: ProviderFactoryConfig::Accounts,
             tool_factory: Arc::new(BrokerToolFactory),
             accounts: crate::accounts::AccountsDependencies::default(),
         }
     }
 }
 
+/// The RESOLVED per-worker dependency bundle `run_inner` hands the manager
+/// (the factory selection above collapses to one concrete factory before
+/// any worker exists).
+#[derive(Clone)]
+pub(crate) struct WorkerDependencies {
+    pub(crate) provider_factory: Arc<dyn ProviderFactory>,
+    pub(crate) tool_factory: Arc<dyn TurnToolFactory>,
+}
+
+impl WorkerDependencies {
+    /// A resolved bundle with NO credential source — the in-crate test
+    /// stand-in for a daemon whose account store has nothing to offer.
+    #[cfg(test)]
+    pub(crate) fn unconfigured_for_tests() -> Self {
+        Self {
+            provider_factory: Arc::new(UnconfiguredProviderFactory),
+            tool_factory: Arc::new(BrokerToolFactory),
+        }
+    }
+}
+
+/// Always fails with `CredentialMissing` (test-only resolution stand-in).
+#[cfg(test)]
 struct UnconfiguredProviderFactory;
 
+#[cfg(test)]
 #[async_trait]
 impl ProviderFactory for UnconfiguredProviderFactory {
     async fn resolve_for_turn(
@@ -242,7 +306,7 @@ impl PendingTurn {
 }
 
 impl WorkerManager {
-    pub(crate) fn start(hub: SessionHub, dependencies: DaemonDependencies) -> Self {
+    pub(crate) fn start(hub: SessionHub, dependencies: WorkerDependencies) -> Self {
         let (commands, receiver) = mpsc::channel(MANAGER_CAPACITY);
         let handle = WorkerManagerHandle {
             commands,
@@ -369,7 +433,7 @@ impl WorkerManagerHandle {
 
 async fn run_manager(
     hub: SessionHub,
-    dependencies: DaemonDependencies,
+    dependencies: WorkerDependencies,
     mut commands: mpsc::Receiver<ManagerCommand>,
 ) {
     let mut supervisors = HashMap::<SessionId, SupervisorSlot>::new();
@@ -551,6 +615,14 @@ async fn drain_accepted_without_handoff(hub: &SessionHub) -> Result<(), HaiderEr
             if state.is_terminal() {
                 continue;
             }
+            if matches!(state, RunState::InputRequired { .. }) {
+                // P3-4 (park, don't cancel): a `request_input` checkpoint is
+                // durable, resumable state — the P2-6 sweep exists for
+                // accepted-WITHOUT-HANDOFF (Queued) runs, and must preserve
+                // a parked checkpoint exactly as a crash would; the next
+                // generation's recovery reconstructs it (scenario 10).
+                continue;
+            }
             if state != RunState::Cancelling {
                 append_run_state(
                     &lease,
@@ -678,7 +750,7 @@ pub(crate) async fn terminalize_supervisor_exit(
 
 async fn supervisor_for(
     hub: &SessionHub,
-    dependencies: &DaemonDependencies,
+    dependencies: &WorkerDependencies,
     supervisors: &mut HashMap<SessionId, SupervisorSlot>,
     tasks: &mut JoinSet<SupervisorExit>,
     task_sessions: &mut HashMap<tokio::task::Id, SessionId>,
@@ -776,7 +848,7 @@ impl<T> FutureTurn for T where
 /// exits only after the last turn settles; the supervisor deregisters its
 /// lease on the way out.
 async fn run_supervisor(
-    dependencies: DaemonDependencies,
+    dependencies: WorkerDependencies,
     metadata: SessionMetadataV1,
     lease: HubStoreHandle,
     mut commands: mpsc::Receiver<SupervisorCommand>,
@@ -934,7 +1006,24 @@ async fn run_supervisor(
                         }
                         Some(SupervisorCommand::Shutdown) | None => {
                             stopping = true;
-                            turn.cancel.cancel();
+                            // P3-4 (park, don't cancel): a turn parked on
+                            // `request_input` is fully durable
+                            // (InputRequired + MenuOpened), and graceful
+                            // drain must preserve exactly what a crash
+                            // preserves. Unregister without cancel and let
+                            // next-generation recovery reconstruct the
+                            // checkpoint (scenario 10's path); every other
+                            // active turn is cancelled as before.
+                            if matches!(
+                                durable_run_state(&lease, &active_run).await,
+                                Some(RunState::InputRequired { .. })
+                            ) {
+                                if let Some(parked) = active.take() {
+                                    park_request_input_checkpoint(parked).await;
+                                }
+                            } else {
+                                active_cancel.cancel();
+                            }
                             cancel_durable_queued_turns(
                                 &mut queue,
                                 &lease,
@@ -1483,6 +1572,32 @@ async fn durable_run_state(store: &HubStoreHandle, run_id: &RunId) -> Option<Run
     })
 }
 
+/// Parks a `request_input` checkpoint across a GRACEFUL drain (P3-4): stop
+/// the harness actor and close the broker WITHOUT cancelling, appending a
+/// terminal, or reconciling effects — the durable InputRequired + MenuOpened
+/// pair IS the checkpoint, and the next generation's recovery reconstructs
+/// it exactly as it would after a crash. The supervisor's exit unregisters
+/// the lease (registration removal without menu resolution).
+async fn park_request_input_checkpoint(mut turn: ActiveTurn) {
+    // Abort the harness actor FIRST — `HarnessHandle::stop` would drive the
+    // core cancellation ladder (MenuClosed, item cancellation, Cancelling),
+    // which is exactly what parking must not do. Aborting at the actor's
+    // menu-watch await point appends nothing, the same silence a crash
+    // leaves behind.
+    if let Some(actor) = turn.actor.take() {
+        actor.abort();
+        let _ = actor.await;
+    }
+    if let Some(dispatcher) = turn.dispatcher.take() {
+        // Quiet broker close AFTER the actor is gone: a parked run has no
+        // in-flight effect dispatch (the provider request completed and the
+        // tool is awaiting input), so closing releases resources without
+        // producing outcomes.
+        let _ = dispatcher.close().await;
+    }
+    // Dropping the turn (harness handle + outcome future) appends nothing.
+}
+
 async fn cancel_durable_queued_turns(
     queue: &mut VecDeque<PendingTurn>,
     store: &HubStoreHandle,
@@ -1530,7 +1645,7 @@ async fn cancel_durable_queued_turns(
 /// them into one observation — missing the answer is the failure mode this
 /// ordering exists to prevent.
 async fn start_turn(
-    dependencies: &DaemonDependencies,
+    dependencies: &WorkerDependencies,
     metadata: &SessionMetadataV1,
     lease: &HubStoreHandle,
     device_id: &DeviceId,

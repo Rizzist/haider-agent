@@ -32,6 +32,7 @@ const LIMIT: usize = DEFAULT_FRAME_LIMIT;
 /// Scripted validator: pops one scripted outcome per call; an empty script
 /// succeeds. Never touches the network.
 struct ScriptedValidator {
+    provider: &'static str,
     script: StdMutex<VecDeque<Result<ValidatedIdentity, ValidationError>>>,
     calls: AtomicUsize,
     /// Secrets observed by validation calls, for sweep assertions only —
@@ -41,7 +42,15 @@ struct ScriptedValidator {
 
 impl ScriptedValidator {
     fn new(script: Vec<Result<ValidatedIdentity, ValidationError>>) -> Arc<Self> {
+        Self::for_provider("anthropic", script)
+    }
+
+    fn for_provider(
+        provider: &'static str,
+        script: Vec<Result<ValidatedIdentity, ValidationError>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
+            provider,
             script: StdMutex::new(script.into()),
             calls: AtomicUsize::new(0),
             observed: StdMutex::new(Vec::new()),
@@ -56,7 +65,7 @@ impl ScriptedValidator {
 #[async_trait::async_trait]
 impl CredentialValidator for ScriptedValidator {
     fn supports(&self, provider: &str) -> bool {
-        provider == "anthropic"
+        provider == self.provider
     }
 
     async fn validate(
@@ -99,10 +108,12 @@ fn unavailable() -> Result<ValidatedIdentity, ValidationError> {
     })
 }
 
-/// Shared in-memory descriptor store surviving in-process daemon restarts.
+/// Shared in-memory descriptor store surviving in-process daemon restarts;
+/// `fail_saves` injects the R10 descriptor-save failure boundary.
 #[derive(Default)]
 struct SharedDescriptors {
     rows: StdMutex<Vec<CredentialDescriptor>>,
+    fail_saves: std::sync::atomic::AtomicBool,
 }
 
 impl SharedDescriptors {
@@ -110,6 +121,10 @@ impl SharedDescriptors {
         if let Ok(mut rows) = self.rows.lock() {
             rows.clear();
         }
+    }
+
+    fn set_fail_saves(&self, fail: bool) {
+        self.fail_saves.store(fail, Ordering::SeqCst);
     }
 
     fn dump(&self) -> Vec<CredentialDescriptor> {
@@ -126,6 +141,13 @@ impl StoreLike for SharedDescriptors {
     }
 
     fn save(&self, descriptors: &[CredentialDescriptor]) -> Result<(), HaiderError> {
+        if self.fail_saves.load(Ordering::SeqCst) {
+            return Err(HaiderError::new(
+                haider_protocol::error::ErrorCode::Internal,
+                "injected descriptor save failure",
+                true,
+            ));
+        }
         if let Ok(mut rows) = self.rows.lock() {
             *rows = descriptors.to_vec();
         }
@@ -727,4 +749,320 @@ async fn sentinel_secret_is_absent_from_store_files_receipts_and_formatted_frame
     let accounts_text =
         std::fs::read_to_string(&accounts_path).unwrap_or_else(|error| panic!("{error}"));
     assert!(accounts_text.contains(descriptor.alias.as_str()));
+}
+
+// ─────────────── D3-5 whitelist + login→next-turn e2e ───────────────────────
+
+// MUTATION CHECK (D3-5 whitelist unification): restore rpc.rs's deleted
+// hardcoded `matches!(provider, "anthropic" | "fake")` in place of the
+// installed creatable-provider registry. Expected failure: the production
+// wire path below accepts "fake".
+// Verified by revert on 2026-07-27.
+#[tokio::test]
+async fn production_wire_path_never_accepts_the_fake_provider() {
+    let root = test_root("hacP");
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap_or_else(|error| panic!("workspace: {error}"));
+    let config = DaemonConfig::new("profile-prod", root.path().join("store"), root.path());
+    // PRODUCTION-DEFAULT dependencies: the Accounts factory configuration.
+    let task = ready_with_dependencies(&config, DaemonDependencies::default()).await;
+    let mut client = control_client(&config).await;
+
+    let workspace_text = workspace.display().to_string();
+    let rejected = request(
+        &mut client,
+        "req-prod-fake",
+        RequestBody::SessionCreate {
+            command_id: CommandId::new("command-prod-fake"),
+            cwd: workspace_text.clone(),
+            provider: "fake".into(),
+            model: "fake-model".into(),
+            max_tokens: 64,
+        },
+    )
+    .await;
+    let (code, _) = expect_error(rejected);
+    assert_eq!(
+        code, "invalid_argument",
+        "fake is never creatable in production"
+    );
+
+    // The production whitelist is exactly {"anthropic"}: creation succeeds
+    // without a credential (resolution happens per logical turn).
+    let accepted = request(
+        &mut client,
+        "req-prod-anthropic",
+        RequestBody::SessionCreate {
+            command_id: CommandId::new("command-prod-anthropic"),
+            cwd: workspace_text,
+            provider: "anthropic".into(),
+            model: "claude-test".into(),
+            max_tokens: 64,
+        },
+    )
+    .await;
+    assert!(
+        matches!(accepted, ResponseBody::SessionCreate { .. }),
+        "anthropic must be creatable on the production path"
+    );
+
+    task.shutdown_handle().request("test complete");
+    let _ = task.join().await;
+}
+
+/// The e2e builder: accounts-backed RESOLUTION (active descriptor → vault
+/// secret) with a fake provider adapter, recording what it was handed.
+struct FakeAccountBuilder {
+    fake: Arc<haider_provider::FakeProvider>,
+    built: StdMutex<Vec<(String, Vec<u8>)>>,
+}
+
+impl haider_daemon::AccountProviderBuilder for FakeAccountBuilder {
+    fn providers(&self) -> std::collections::BTreeSet<String> {
+        std::collections::BTreeSet::from(["fake".to_owned()])
+    }
+
+    fn build(
+        &self,
+        _provider: &str,
+        credential: haider_accounts::SecretHandle,
+        _model: &str,
+        alias: &haider_protocol::ids::CredentialAlias,
+    ) -> Result<Arc<dyn haider_provider::Provider>, HaiderError> {
+        if let Ok(mut built) = self.built.lock() {
+            built.push((
+                alias.as_str().to_owned(),
+                credential.expose_secret().to_vec(),
+            ));
+        }
+        Ok(self.fake.clone())
+    }
+}
+
+// MUTATION CHECK (R6/R10 next-turn pickup): make the accounts-backed factory
+// resolve anything but the ACTIVE descriptor's vault secret (or stop
+// stamping `account_alias`). Expected failure: the builder-observed
+// alias/secret assertions or the Usage-envelope account assertion below.
+#[tokio::test]
+async fn committed_login_is_picked_up_by_the_next_fake_turn() {
+    use haider_protocol::EventPayload;
+    use haider_provider::{FakeProvider, FakeStep};
+
+    let root = test_root("hacE");
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap_or_else(|error| panic!("workspace: {error}"));
+    let config = DaemonConfig::new("profile-e2e", root.path().join("store"), root.path());
+
+    let fake = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitText {
+            text: "hello from the account-backed turn".into(),
+        },
+        FakeStep::EmitUsage {
+            usage: haider_protocol::provider::Usage {
+                input: 3,
+                output: 2,
+                reasoning: 0,
+                cached: 0,
+                source: haider_protocol::provider::UsageSource::ProviderReported,
+                account: None,
+            },
+        },
+        FakeStep::Finish {
+            reason: haider_protocol::provider::FinishReason::EndTurn,
+        },
+    ]));
+    let builder = Arc::new(FakeAccountBuilder {
+        fake: fake.clone(),
+        built: StdMutex::new(Vec::new()),
+    });
+    let vault = Arc::new(MemoryVault::default());
+    let validator = ScriptedValidator::for_provider("fake", Vec::new());
+    let dependencies = DaemonDependencies {
+        provider_factory: haider_daemon::ProviderFactoryConfig::AccountsWith(builder.clone()),
+        accounts: AccountsDependencies {
+            vault: VaultProvision::Available(vault.clone() as Arc<dyn Vault>),
+            validator: validator.clone(),
+            descriptor_store: None,
+        },
+        ..DaemonDependencies::default()
+    };
+    let task = ready_with_dependencies(&config, dependencies).await;
+    let mut client = control_client(&config).await;
+
+    // /login for the fake provider (fake validator success writes the
+    // MemoryVault + descriptor).
+    let reference = stage_secret(&mut client, "stage-e2e", "sk-e2e-fake-key").await;
+    let descriptor = expect_descriptor(
+        request(
+            &mut client,
+            "req-e2e-login",
+            RequestBody::AccountLoginApi {
+                command_id: CommandId::new("command-e2e-login"),
+                provider: "fake".into(),
+                alias: Some("e2e".into()),
+                vault_reference: reference,
+                validation_model: None,
+            },
+        )
+        .await,
+    );
+
+    // Next logical turn: create + attach + submit, then read the run to its
+    // terminal and inspect the usage stamping.
+    let workspace_text = workspace.display().to_string();
+    let created = request(
+        &mut client,
+        "req-e2e-create",
+        RequestBody::SessionCreate {
+            command_id: CommandId::new("command-e2e-create"),
+            cwd: workspace_text,
+            provider: "fake".into(),
+            model: "fake-model".into(),
+            max_tokens: 64,
+        },
+    )
+    .await;
+    let (session_id, generation) = match created {
+        ResponseBody::SessionCreate {
+            session_id,
+            worker_generation,
+            ..
+        } => (session_id, worker_generation),
+        other => panic!("expected session.create response, got {other:?}"),
+    };
+    client
+        .send(
+            &WireFrame::Request {
+                request_id: RequestId::new("req-e2e-attach"),
+                body: RequestBody::SessionAttach {
+                    session_id: session_id.clone(),
+                    after_seq: 0,
+                    mode: haider_rpc::AttachMode::Control,
+                },
+            },
+            LIMIT,
+        )
+        .await;
+    // Wait for the attach response (events may interleave afterwards).
+    loop {
+        if let WireFrame::Response { request_id, body } = client.next().await {
+            assert_eq!(request_id.as_str(), "req-e2e-attach");
+            assert!(matches!(body, ResponseBody::SessionAttach { .. }));
+            break;
+        }
+    }
+    client
+        .send(
+            &WireFrame::Request {
+                request_id: RequestId::new("req-e2e-submit"),
+                body: RequestBody::TurnSubmit {
+                    command_id: CommandId::new("command-e2e-submit"),
+                    session_id: session_id.clone(),
+                    worker_generation: generation,
+                    text: "use my logged-in account".into(),
+                    attachments: Vec::new(),
+                    mode: haider_protocol::DeliveryMode::Queue,
+                },
+            },
+            LIMIT,
+        )
+        .await;
+    // Drain frames until the run reaches a terminal state, collecting usage.
+    let mut usage_accounts = Vec::new();
+    loop {
+        if let WireFrame::Event { envelope, .. } = client.next().await {
+            match serde_json::from_value::<EventPayload>(envelope.payload) {
+                Ok(EventPayload::Usage(usage)) => {
+                    usage_accounts.push(usage.account.clone());
+                }
+                Ok(EventPayload::RunState(state)) if state.is_terminal() => {
+                    assert_eq!(
+                        state,
+                        haider_protocol::state::RunState::Done,
+                        "the account-backed turn must complete"
+                    );
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // The builder resolved the ACTIVE descriptor's vault secret.
+    let built = builder
+        .built
+        .lock()
+        .map(|built| built.clone())
+        .unwrap_or_default();
+    assert_eq!(built.len(), 1, "one logical turn resolves once");
+    assert_eq!(built[0].0, descriptor.alias.as_str());
+    assert_eq!(built[0].1, b"sk-e2e-fake-key");
+    // The turn's usage is stamped with the selected account alias.
+    assert!(
+        usage_accounts
+            .iter()
+            .any(|account| account.as_ref().map(|alias| alias.as_str())
+                == Some(descriptor.alias.as_str())),
+        "the next fake turn must observe the selected alias in its usage: {usage_accounts:?}"
+    );
+    assert_eq!(fake.requests().len(), 1);
+
+    task.shutdown_handle().request("test complete");
+    let _ = task.join().await;
+}
+
+// MUTATION CHECK (R10 step 9 compensation): remove the actor's
+// `vault.delete` on a synchronous descriptor-save failure. Expected
+// failure: the vault still holds the alias after the failed login below.
+#[tokio::test]
+async fn descriptor_save_failure_deletes_the_just_written_vault_alias_and_recovers() {
+    let root = test_root("hacF");
+    let config = DaemonConfig::new("profile-savefail", root.path().join("store"), root.path());
+    let fixture = AccountFixture::new(Vec::new());
+    fixture.descriptors.set_fail_saves(true);
+    let task = ready_with_dependencies(&config, fixture.dependencies()).await;
+    let mut client = control_client(&config).await;
+
+    let reference = stage_secret(&mut client, "stage-sf", "sk-save-fail").await;
+    let (code, retryable) = expect_error(
+        request(
+            &mut client,
+            "req-sf-1",
+            login_body("command-savefail", &reference, None),
+        )
+        .await,
+    );
+    assert_eq!(code, ERROR_CODE_PROVIDER_ERROR);
+    assert!(
+        retryable,
+        "a save failure is a retryable infrastructure fault"
+    );
+    // The compensation ran: no orphaned vault alias, no descriptor.
+    assert!(
+        fixture
+            .vault
+            .list()
+            .unwrap_or_else(|error| panic!("{error:?}"))
+            .is_empty(),
+        "the just-written vault alias must be deleted on descriptor-save failure"
+    );
+    assert!(fixture.descriptors.dump().is_empty());
+
+    // The receipt stayed pending: once persistence heals, the SAME durable
+    // command completes with a fresh stage.
+    fixture.descriptors.set_fail_saves(false);
+    let fresh = stage_secret(&mut client, "stage-sf-2", "sk-save-fail").await;
+    let descriptor = expect_descriptor(
+        request(
+            &mut client,
+            "req-sf-2",
+            login_body("command-savefail", &fresh, None),
+        )
+        .await,
+    );
+    assert_eq!(descriptor.provider, "anthropic");
+    assert_eq!(fixture.descriptors.dump().len(), 1);
+
+    task.shutdown_handle().request("test complete");
+    let _ = task.join().await;
 }

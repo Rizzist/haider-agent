@@ -60,8 +60,8 @@ mod turn_recovery;
 mod worker;
 
 pub use accounts::{
-    AccountsDependencies, AnthropicValidator, ConnectionTransport, CredentialValidator,
-    ValidatedIdentity, ValidationError, ValidationFailureKind, VaultProvision,
+    AccountProviderBuilder, AccountsDependencies, AnthropicValidator, ConnectionTransport,
+    CredentialValidator, ValidatedIdentity, ValidationError, ValidationFailureKind, VaultProvision,
 };
 pub use config::DaemonConfig;
 pub use error::{DaemonError, IncumbentDiagnostics};
@@ -73,8 +73,8 @@ pub use session_hub::{
     SessionHubObserver, SessionHubShutdownOutcome,
 };
 pub use worker::{
-    DaemonDependencies, ProviderFactory, ResolvedTurnProvider, SystemPromptBuilder,
-    TurnToolFactory, WorkerToolContext,
+    DaemonDependencies, ProviderFactory, ProviderFactoryConfig, ResolvedTurnProvider,
+    SystemPromptBuilder, TurnToolFactory, WorkerToolContext,
 };
 
 /// Crate marker used by the workspace self-test.

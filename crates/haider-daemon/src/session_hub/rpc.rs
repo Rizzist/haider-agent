@@ -721,7 +721,14 @@ impl HubConnection {
             Err(error) => return Err(error),
         }
 
-        if !matches!(provider.as_str(), "anthropic" | "fake") {
+        // D3-5: the dependency configuration is the ONE authority on
+        // creatable providers. Production (Accounts) answers {"anthropic"};
+        // "fake" exists only under injected test configurations.
+        let creatable = self.hub.creatable_providers()?;
+        if !creatable
+            .as_ref()
+            .is_some_and(|providers| providers.contains(provider.as_str()))
+        {
             return self.respond_error(
                 request_id,
                 ERROR_CODE_INVALID_ARGUMENT,

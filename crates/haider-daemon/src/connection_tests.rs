@@ -439,3 +439,190 @@ fn queued_byte_budget_covers_the_four_byte_prefix_at_the_exact_boundary() {
         "a maximum-size legal Event must enter an empty ordinary outbox"
     );
 }
+
+// ───────────────────────── R9 dead-peer policy ──────────────────────────────
+
+// MUTATION CHECK (R9 verdict arithmetic): weaken either deadline comparison
+// (`>=` -> `>` at the exact boundary, or drop the backlog gate). Expected
+// failure: the exact-boundary assertions below.
+#[tokio::test(start_paused = true)]
+async fn liveness_verdict_pins_both_deadlines_exactly() {
+    let start = Instant::now();
+    tokio::time::advance(READ_IDLE_DEADLINE - std::time::Duration::from_millis(1)).await;
+    let now = Instant::now();
+    // One millisecond before the read deadline: alive.
+    assert_eq!(liveness_breach(now, start, now, false), None);
+    tokio::time::advance(std::time::Duration::from_millis(1)).await;
+    let now = Instant::now();
+    // Exactly at the read deadline: closed.
+    assert_eq!(
+        liveness_breach(now, start, now, false),
+        Some("idle_timeout")
+    );
+
+    // Write progress: stalled backlog closes at exactly 45s WITHOUT read
+    // idleness; no backlog never trips the write deadline.
+    let progress_start = Instant::now();
+    tokio::time::advance(WRITE_PROGRESS_DEADLINE).await;
+    let now = Instant::now();
+    assert_eq!(
+        liveness_breach(now, now, progress_start, true),
+        Some("write_stalled")
+    );
+    assert_eq!(liveness_breach(now, now, progress_start, false), None);
+}
+
+fn liveness_context(hub: crate::session_hub::SessionHub) -> ConnectionContext {
+    let (writers, receiver) = mpsc::unbounded_channel();
+    // Leak the receiver so writer registration succeeds; the test joins the
+    // connection task itself.
+    std::mem::forget(receiver);
+    ConnectionContext {
+        profile_id: "profile-liveness".into(),
+        instance_id: "instance-liveness".into(),
+        daemon_generation: 1,
+        frame_limit: 1024 * 1024,
+        outbound_queue_capacity: 8,
+        outbound_queued_bytes: 4 * 1024 * 1024,
+        max_connections: 4,
+        handshake_timeout: std::time::Duration::from_secs(10),
+        writers,
+        owner_uid: rustix::process::geteuid().as_raw(),
+        hub,
+        endpoint_path: std::path::PathBuf::from("/tmp/liveness-test.sock"),
+    }
+}
+
+async fn handshake_over(client: &mut UnixStream) {
+    use tokio::io::AsyncWriteExt;
+    let hello = haider_rpc::WireFrame::Hello(haider_rpc::Hello {
+        protocol_min: haider_rpc::WIRE_PROTOCOL_VERSION,
+        protocol_max: haider_rpc::WIRE_PROTOCOL_VERSION,
+        client_name: "liveness-test".into(),
+        client_version: "test".into(),
+        client_instance_id: "client-liveness".into(),
+        client_kind: haider_rpc::ClientKind::Cli,
+        capabilities_requested: CapabilitySet::from([Capability::View, Capability::Control]),
+        max_receive_frame: 1024 * 1024,
+    });
+    let bytes = uds_codec::encode(&hello, 1024 * 1024).expect("hello encodes");
+    client.write_all(&bytes).await.expect("hello writes");
+    let mut decoder = uds_codec::Decoder::new(1024 * 1024);
+    let mut buffer = [0_u8; 4096];
+    loop {
+        let read = client.read(&mut buffer).await.expect("welcome reads");
+        assert_ne!(read, 0, "server closed during handshake");
+        let batch = decoder.push(&buffer[..read]);
+        if batch
+            .frames
+            .iter()
+            .any(|frame| matches!(frame, haider_rpc::WireFrame::Welcome(_)))
+        {
+            return;
+        }
+    }
+}
+
+async fn liveness_hub() -> (tempfile::TempDir, crate::session_hub::SessionHub) {
+    let dir = tempfile::Builder::new()
+        .prefix("hlive")
+        .tempdir_in("/tmp")
+        .expect("tempdir");
+    let store = haider_core::SqliteStoreHandle::open(dir.path())
+        .await
+        .expect("open store");
+    let hub =
+        crate::session_hub::SessionHub::new(store, crate::session_hub::SessionHubConfig::default())
+            .expect("hub");
+    (dir, hub)
+}
+
+// MUTATION CHECK (R9 server read deadline): remove the liveness tick arm (or
+// stop updating `last_read` on reads). Expected failure: this paused-time
+// test never observes the close and times out at its outer bound / the
+// elapsed window assertion fails.
+#[tokio::test]
+async fn silent_negotiated_peer_is_closed_at_the_read_idle_deadline() {
+    let (_dir, hub) = liveness_hub().await;
+    let (server, mut client) = UnixStream::pair().expect("socket pair");
+    let (_drain_tx, drain_rx) = watch::channel(Option::<DrainNotice>::None);
+    let serve_task = tokio::spawn(serve(server, liveness_context(hub.clone()), drain_rx));
+    handshake_over(&mut client).await;
+
+    // From here the peer is SILENT (never pings, never writes).
+    tokio::time::pause();
+    let quiet_since = Instant::now();
+    let mut decoder = uds_codec::Decoder::new(1024 * 1024);
+    let mut closed_with_code = None;
+    let mut buffer = [0_u8; 4096];
+    loop {
+        let read = client.read(&mut buffer).await.expect("read until close");
+        if read == 0 {
+            break;
+        }
+        for frame in decoder.push(&buffer[..read]).frames {
+            if let haider_rpc::WireFrame::ProtocolError(error) = frame {
+                closed_with_code = Some(error.code);
+            }
+        }
+    }
+    let elapsed = quiet_since.elapsed();
+    assert!(
+        elapsed >= READ_IDLE_DEADLINE && elapsed <= READ_IDLE_DEADLINE + LIVENESS_TICK * 2,
+        "close must land at the 45s deadline (tick granularity), was {elapsed:?}"
+    );
+    assert_eq!(closed_with_code.as_deref(), Some("idle_timeout"));
+    let exit = serve_task
+        .await
+        .expect("serve joins")
+        .expect("serve result");
+    assert_eq!(exit, ConnectionExit::ClosedBeforeDrain);
+    let _ = hub.shutdown().await;
+}
+
+// MUTATION CHECK (R9 liveness reset): make `last_read` never reset (treat
+// pings as non-activity). Expected failure: the pinging peer below is closed
+// around 45s instead of staying attached for five virtual minutes.
+#[tokio::test]
+async fn pinging_peer_stays_attached_across_quiescence() {
+    let (_dir, hub) = liveness_hub().await;
+    let (server, mut client) = UnixStream::pair().expect("socket pair");
+    let (_drain_tx, drain_rx) = watch::channel(Option::<DrainNotice>::None);
+    let serve_task = tokio::spawn(serve(server, liveness_context(hub.clone()), drain_rx));
+    handshake_over(&mut client).await;
+
+    tokio::time::pause();
+    use tokio::io::AsyncWriteExt;
+    let mut decoder = uds_codec::Decoder::new(1024 * 1024);
+    let mut pongs = 0_u64;
+    // Five virtual minutes of nothing but the R9 heartbeat cadence.
+    for nonce in 0..20_u64 {
+        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+        let ping = uds_codec::encode(&haider_rpc::WireFrame::Ping { nonce }, 1024 * 1024)
+            .expect("ping encodes");
+        client.write_all(&ping).await.expect("ping writes");
+        let mut buffer = [0_u8; 1024];
+        loop {
+            let read = client.read(&mut buffer).await.expect("pong reads");
+            assert_ne!(read, 0, "server must not close a pinging peer");
+            let frames = decoder.push(&buffer[..read]).frames;
+            if frames
+                .iter()
+                .any(|frame| matches!(frame, haider_rpc::WireFrame::Pong { .. }))
+            {
+                pongs += 1;
+                break;
+            }
+        }
+    }
+    assert_eq!(pongs, 20);
+    assert!(
+        !serve_task.is_finished(),
+        "connection must still be serving"
+    );
+    drop(client);
+    // Peer-initiated teardown: macOS reports the racing writer shutdown as
+    // NotConnected; either shape ends the task, which is the law under test.
+    let _ = serve_task.await.expect("serve joins");
+    let _ = hub.shutdown().await;
+}

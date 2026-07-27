@@ -66,6 +66,38 @@ use tokio::time::Instant;
 /// writer when it ends early) and a one-shot for the writer's result.
 pub(crate) type WriterRegistry = mpsc::UnboundedSender<tokio::task::JoinHandle<()>>;
 
+/// R9 dead-peer policy, server half (client half: `haider-client`):
+/// a negotiated peer with no read activity for this long is closed.
+pub(crate) const READ_IDLE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(45);
+/// R9: queued outbound traffic (Pongs included — they ride the normal
+/// bounded/fair accounting) that makes no write progress for this long
+/// closes the connection, covering a peer that writes but never reads.
+pub(crate) const WRITE_PROGRESS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(45);
+/// Cadence of the liveness check; both deadlines are evaluated on this tick.
+const LIVENESS_TICK: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The R9 liveness verdict, kept pure so paused-time unit tests can pin the
+/// deadline arithmetic exactly.
+///
+/// The constants are initial policy, not eternal truth (the ledgered
+/// quiescent-stuck-client trigger): instrument no-progress detach and tune
+/// from W3c traces.
+fn liveness_breach(
+    now: Instant,
+    last_read: Instant,
+    last_write_progress: Instant,
+    has_backlog: bool,
+) -> Option<&'static str> {
+    if now.saturating_duration_since(last_read) >= READ_IDLE_DEADLINE {
+        return Some("idle_timeout");
+    }
+    if has_backlog && now.saturating_duration_since(last_write_progress) >= WRITE_PROGRESS_DEADLINE
+    {
+        return Some("write_stalled");
+    }
+    None
+}
+
 /// Connection-side handle to the writer: abort authority without join
 /// authority (the runtime owns the join).
 struct WriterGuard {
@@ -272,6 +304,8 @@ struct OutboundLane {
 struct OutboundQueue {
     state: Mutex<OutboundState>,
     ready: Notify,
+    /// Monotonic count of settled writes (R9 write-progress evidence).
+    settled: std::sync::atomic::AtomicU64,
     frame_capacity: usize,
     byte_budget: usize,
     per_lane_capacity: usize,
@@ -298,6 +332,7 @@ impl OutboundLane {
                     closed: false,
                 }),
                 ready: Notify::new(),
+                settled: std::sync::atomic::AtomicU64::new(0),
                 frame_capacity,
                 byte_budget,
                 per_lane_capacity: frame_capacity.saturating_add(1).saturating_div(2).max(1),
@@ -512,6 +547,9 @@ impl OutboundLane {
     /// admission ticket (byte headroom frees HERE, after the write settles —
     /// not at the pop).
     fn credit(&self, frame: &QueuedFrame) {
+        self.inner
+            .settled
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Ok(mut state) = self.inner.state.lock() {
             if frame.floor {
                 state.floor_in_use = 0;
@@ -550,6 +588,26 @@ impl OutboundLane {
             state.fire_one_ticket();
         }
         pending
+    }
+
+    /// R9 write-progress marker: changes whenever any queued frame's write
+    /// settles.
+    fn progress_marker(&self) -> u64 {
+        self.inner
+            .settled
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether ordinary/floor traffic is queued (an in-flight frame counts:
+    /// its bytes are only credited when the write settles).
+    fn has_backlog(&self) -> bool {
+        self.inner
+            .state
+            .lock()
+            .map(|state| {
+                state.queued_frames > 0 || state.queued_bytes > 0 || state.floor_in_use > 0
+            })
+            .unwrap_or(false)
     }
 
     fn close(&self) {
@@ -835,6 +893,13 @@ pub(crate) async fn serve(
     // A peer that never speaks must not hold its connection slot forever.
     let handshake_deadline = tokio::time::sleep(context.handshake_timeout);
     tokio::pin!(handshake_deadline);
+    // R9 liveness bookkeeping: reads reset the idle deadline; settled writes
+    // reset the progress deadline (sampled on the tick).
+    let mut last_read = Instant::now();
+    let mut progress_marker = lane.progress_marker();
+    let mut last_write_progress = Instant::now();
+    let mut liveness = tokio::time::interval(LIVENESS_TICK);
+    liveness.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     let processing = async {
         while !close {
@@ -867,6 +932,27 @@ pub(crate) async fn serve(
                     );
                     close = true;
                 }
+                _ = liveness.tick(), if grant.is_some() => {
+                    let now = Instant::now();
+                    let marker = lane.progress_marker();
+                    if marker != progress_marker {
+                        progress_marker = marker;
+                        last_write_progress = now;
+                    }
+                    if let Some(code) =
+                        liveness_breach(now, last_read, last_write_progress, lane.has_backlog())
+                    {
+                        // Best effort: an idle peer may never read this, and
+                        // a stalled writer cannot; the close is the point.
+                        let _ = enqueue_fatal(
+                            &lane,
+                            code,
+                            "connection made no ping/read or write progress within the deadline",
+                            outbound_limit,
+                        );
+                        close = true;
+                    }
+                }
                 read = reader.read(&mut buffer) => {
                     let read = read.map_err(|error| {
                         DaemonError::io("read Unix connection", &context.endpoint_path, error)
@@ -874,6 +960,7 @@ pub(crate) async fn serve(
                     if read == 0 {
                         break;
                     }
+                    last_read = Instant::now();
                     let batch = decoder.push(&buffer[..read]);
                     for frame in batch.frames {
                         close = handle_frame(

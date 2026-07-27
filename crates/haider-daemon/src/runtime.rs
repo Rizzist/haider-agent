@@ -306,13 +306,47 @@ async fn run_inner(
     );
 
     let hub = SessionHub::new(store.clone(), config.session_hub).map_err(DaemonError::from)?;
-    let worker_manager = WorkerManager::start(hub.clone(), dependencies);
+    // D3-5 whitelist unification + the production factory swap: the ONE
+    // provider authority is the dependency configuration. `Accounts` (the
+    // default) resolves per logical turn from the daemon-owned account
+    // snapshot + vault, so a committed login is picked up by the NEXT
+    // logical turn; `"fake"` is creatable only under an injected test
+    // configuration, never on the production wire path.
+    let creatable_providers = dependencies.provider_factory.creatable_providers();
+    let provider_factory: std::sync::Arc<dyn crate::worker::ProviderFactory> =
+        match &dependencies.provider_factory {
+            crate::worker::ProviderFactoryConfig::Accounts => {
+                std::sync::Arc::new(crate::accounts::AccountsProviderFactory::new(
+                    std::sync::Arc::clone(&accounts_runtime.facade.snapshot),
+                    accounts_runtime.vault.clone(),
+                    std::sync::Arc::new(crate::accounts::AnthropicAccountBuilder),
+                ))
+            }
+            crate::worker::ProviderFactoryConfig::AccountsWith(builder) => {
+                std::sync::Arc::new(crate::accounts::AccountsProviderFactory::new(
+                    std::sync::Arc::clone(&accounts_runtime.facade.snapshot),
+                    accounts_runtime.vault.clone(),
+                    std::sync::Arc::clone(builder),
+                ))
+            }
+            crate::worker::ProviderFactoryConfig::Injected { factory, .. } => {
+                std::sync::Arc::clone(factory)
+            }
+        };
+    hub.install_creatable_providers(creatable_providers)
+        .map_err(DaemonError::from)?;
+    let worker_dependencies = crate::worker::WorkerDependencies {
+        provider_factory,
+        tool_factory: std::sync::Arc::clone(&dependencies.tool_factory),
+    };
+    let worker_manager = WorkerManager::start(hub.clone(), worker_dependencies);
     let worker_handle = worker_manager.handle();
     hub.install_worker_manager(worker_handle.clone())
         .map_err(DaemonError::from)?;
     let crate::accounts::AccountsRuntime {
         facade: accounts_facade,
         actor: account_actor,
+        vault: _,
     } = accounts_runtime;
     hub.install_accounts(accounts_facade)
         .map_err(DaemonError::from)?;

@@ -3426,3 +3426,53 @@ async fn combined_pressure_five_lanes_large_envelopes_and_live_commits_lag_no_re
     hub.shutdown().await.expect("hub stops");
     store.close().await.expect("store closes");
 }
+
+/// P3-2 (W3c1 review r2): the `cancellation_fences_start` CALL SITE in
+/// `start_turn` is load-bearing and pinned by an EXECUTING guard. The
+/// blocked-factory live schedule proves the observable (zero provider
+/// requests after a durable cancel), but its enforcement there rides an
+/// unbiased wake-race; deleting the call-site block survived that suite
+/// 10/10. This guard discriminates the exact production mutation instead.
+///
+/// MUTATION CHECK: delete the fence block in `start_turn` (the
+/// `cancellation_fences_start(durable_run_state(...))` check between tool
+/// resolution and `HarnessActor::new_with_dispatcher`). Expected failure:
+/// the ordering assertions below — the fence must sit AFTER both factory
+/// awaits (the last uncancellable boundary) and BEFORE the harness actor is
+/// constructed. Verified by revert on 2026-07-27.
+#[test]
+fn cancellation_fence_call_site_is_pinned_between_factories_and_harness_spawn() {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let worker = std::fs::read_to_string(manifest.join("src/worker.rs")).expect("worker source");
+    let start_turn = worker
+        .split("async fn start_turn(")
+        .nth(1)
+        .and_then(|source| source.split("\nasync fn ").next())
+        .expect("start_turn source");
+    let fence = start_turn
+        .find("if cancellation_fences_start(durable_run_state(lease, &accepted.run_id).await)")
+        .expect("start_turn must recheck durable cancellation at its last uncancellable boundary");
+    let provider_resolution = start_turn
+        .find("resolve_for_turn(metadata)")
+        .expect("provider resolution present");
+    let tool_resolution = start_turn
+        .find(".tool_factory")
+        .expect("tool resolution present");
+    let harness_spawn = start_turn
+        .find("HarnessActor::new_with_dispatcher")
+        .expect("harness construction present");
+    assert!(
+        provider_resolution < fence && tool_resolution < fence,
+        "the fence must run AFTER both cancellable factory awaits"
+    );
+    assert!(
+        fence < harness_spawn,
+        "the fence must run BEFORE the harness actor exists (no provider start after durable Cancelling)"
+    );
+    // The fenced branch closes the dispatcher and returns the typed error.
+    let fenced_branch = &start_turn[fence..harness_spawn];
+    assert!(
+        fenced_branch.contains("cancellation_fenced_start()"),
+        "the fenced branch must return the typed RunNotActive reason"
+    );
+}

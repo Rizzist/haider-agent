@@ -814,6 +814,146 @@ async fn finalize_and_respond(
     respond(route, ResponseBody::AccountLoginApi { descriptor });
 }
 
+// ─────────────────── accounts-backed provider factory ──────────────────────
+
+/// Constructs a provider adapter from a vault-resolved credential — the
+/// injectable half of the production factory, so the login→next-turn law is
+/// testable with a fake provider while the RESOLUTION path (active
+/// descriptor → vault secret → adapter) stays production code.
+pub trait AccountProviderBuilder: Send + Sync {
+    /// The provider names `session.create` may accept under this builder.
+    fn providers(&self) -> std::collections::BTreeSet<String>;
+
+    /// Builds the per-turn provider adapter.
+    fn build(
+        &self,
+        provider: &str,
+        credential: haider_accounts::SecretHandle,
+        model: &str,
+        alias: &CredentialAlias,
+    ) -> Result<Arc<dyn Provider>, HaiderError>;
+}
+
+/// Production builder: Anthropic only.
+pub(crate) struct AnthropicAccountBuilder;
+
+impl AccountProviderBuilder for AnthropicAccountBuilder {
+    fn providers(&self) -> std::collections::BTreeSet<String> {
+        std::collections::BTreeSet::from([ANTHROPIC_PROVIDER_NAME.to_owned()])
+    }
+
+    fn build(
+        &self,
+        provider: &str,
+        credential: haider_accounts::SecretHandle,
+        model: &str,
+        alias: &CredentialAlias,
+    ) -> Result<Arc<dyn Provider>, HaiderError> {
+        if provider != ANTHROPIC_PROVIDER_NAME {
+            return Err(HaiderError::new(
+                ErrorCode::InvalidArgument,
+                format!("no account-backed adapter for provider {provider}"),
+                false,
+            ));
+        }
+        let adapter = AnthropicProvider::new(credential, model)
+            .map_err(|error| {
+                HaiderError::new(
+                    ErrorCode::ProviderError,
+                    format!("cannot construct anthropic adapter: {error}"),
+                    false,
+                )
+            })?
+            .with_account(alias.clone());
+        Ok(Arc::new(adapter))
+    }
+}
+
+/// The production `ProviderFactory` (R6/R10): resolves the ACTIVE descriptor
+/// for the session's provider once per logical turn — after durable
+/// acceptance, before any provider work — so a committed login is picked up
+/// by the NEXT logical turn with zero worker changes, while an in-flight
+/// turn stays pinned to the provider it resolved.
+pub(crate) struct AccountsProviderFactory {
+    snapshot: AccountsSnapshot,
+    vault: VaultProvision,
+    builder: Arc<dyn AccountProviderBuilder>,
+}
+
+impl AccountsProviderFactory {
+    pub(crate) fn new(
+        snapshot: AccountsSnapshot,
+        vault: VaultProvision,
+        builder: Arc<dyn AccountProviderBuilder>,
+    ) -> Self {
+        Self {
+            snapshot,
+            vault,
+            builder,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::worker::ProviderFactory for AccountsProviderFactory {
+    async fn resolve_for_turn(
+        &self,
+        metadata: &haider_protocol::session::SessionMetadataV1,
+    ) -> Result<crate::worker::ResolvedTurnProvider, HaiderError> {
+        let descriptor = self
+            .snapshot
+            .lock()
+            .ok()
+            .and_then(|view| {
+                view.iter()
+                    .find(|descriptor| {
+                        descriptor.provider == metadata.provider && descriptor.active
+                    })
+                    .cloned()
+            })
+            .ok_or_else(|| {
+                HaiderError::new(
+                    ErrorCode::CredentialMissing,
+                    format!(
+                        "no active credential for provider {}; run /login",
+                        metadata.provider
+                    ),
+                    false,
+                )
+            })?;
+        if descriptor.status != CredentialStatus::Ok {
+            return Err(HaiderError::new(
+                ErrorCode::Unauthorized,
+                format!(
+                    "active credential {} is not usable ({:?}); run /login again",
+                    descriptor.alias, descriptor.status
+                ),
+                false,
+            ));
+        }
+        let VaultProvision::Available(vault) = &self.vault else {
+            return Err(HaiderError::new(
+                ErrorCode::CredentialMissing,
+                "this platform has no supported secret vault",
+                false,
+            ));
+        };
+        let credential = vault.resolve(&descriptor.alias)?;
+        let provider = self.builder.build(
+            &metadata.provider,
+            credential,
+            &metadata.model,
+            &descriptor.alias,
+        )?;
+        Ok(crate::worker::ResolvedTurnProvider {
+            provider,
+            provider_name: metadata.provider.clone(),
+            model: metadata.model.clone(),
+            account_alias: Some(descriptor.alias.as_str().to_owned()),
+        })
+    }
+}
+
 // ─────────────────────── startup receipt reconciliation ─────────────────────
 
 /// The R10 step-10 `run_inner` startup phase: reconcile pending AND
@@ -919,6 +1059,8 @@ async fn finalize_reconciled(
 pub(crate) struct AccountsRuntime {
     pub facade: AccountsFacade,
     pub actor: Option<AccountActorHandle>,
+    /// The vault provision the production provider factory shares.
+    pub vault: VaultProvision,
 }
 
 impl AccountsRuntime {
@@ -956,6 +1098,7 @@ impl AccountsRuntime {
                         vault_supported: true,
                     },
                     actor: Some(actor),
+                    vault: dependencies.vault.clone(),
                 })
             }
             VaultProvision::Unsupported => Ok(Self {
@@ -965,6 +1108,7 @@ impl AccountsRuntime {
                     vault_supported: false,
                 },
                 actor: None,
+                vault: VaultProvision::Unsupported,
             }),
         }
     }

@@ -237,8 +237,10 @@ async fn accepted_commit_then_shutdown_before_handoff_is_swept_terminal() {
         haider_store::TurnAcceptOutcome::Committed { accepted, .. }
         | haider_store::TurnAcceptOutcome::IdempotentReplay { accepted } => accepted,
     };
-    let manager =
-        crate::worker::WorkerManager::start(hub.clone(), crate::DaemonDependencies::default());
+    let manager = crate::worker::WorkerManager::start(
+        hub.clone(),
+        crate::worker::WorkerDependencies::unconfigured_for_tests(),
+    );
     let handle = manager.handle();
     handle.begin_draining();
     let shutdown = tokio::spawn(manager.shutdown());
@@ -884,8 +886,10 @@ async fn recovery_terminalization_never_settles_idle_while_another_run_is_active
         worker_generation: generation,
         disposition: haider_store::TurnAdmissionDisposition::Queued,
     };
-    let manager =
-        crate::worker::WorkerManager::start(hub.clone(), crate::DaemonDependencies::default());
+    let manager = crate::worker::WorkerManager::start(
+        hub.clone(),
+        crate::worker::WorkerDependencies::unconfigured_for_tests(),
+    );
     let handle = manager.handle();
 
     handle
