@@ -640,6 +640,11 @@ pub enum AppRequest {
     /// never sees the rendered buffer; headless tests assert the request
     /// itself.
     CopySelection,
+    /// TUI5 items 4+5: copy MODEL-known text (the composer selection on
+    /// ⌃C or drag-release). Unlike [`Self::CopySelection`] the reducer
+    /// already holds the exact text, so it travels in the request; the
+    /// runtime runs the same pbcopy + OSC 52 + honest-flash path.
+    CopyText(String),
     /// The ◉ talk hold started — fire the canned phrase after 1300 ms.
     Talk,
     /// Steer/message a subagent (respondChip, §2.4) — a full turn on the
@@ -747,6 +752,16 @@ pub enum Hit {
     /// producing prompt's first row at the viewport top (sim jumpToSticky:
     /// stay AT the prompt, tui.js:2637-2645).
     StickyJump(u16),
+    /// One composer text row (TUI5 item 5). Value-carrying like every
+    /// hit: `start` is the ABSOLUTE byte offset (in the composer text) of
+    /// the row's visible slice at render time, `content` the slice
+    /// itself — a click maps its column through `content`'s graphemes, so
+    /// a stale frame can only ever place the caret where that frame's
+    /// cells actually were (or be dropped by the press guard).
+    ComposerText {
+        start: usize,
+        content: String,
+    },
 }
 
 /// One answer on its way to the client, tagged with the session identity that
@@ -938,6 +953,11 @@ pub struct AppModel {
     /// movement the click dispatches from THESE coordinates; a drag that
     /// selected suppresses it (owner item 9's disambiguation law).
     pub mouse_down: Option<(u16, u16)>,
+    /// TUI5 item 5 — a left button went down INSIDE the composer text: the
+    /// drag (if any) is a COMPOSER selection, never the transcript's
+    /// screen-space drag (region disambiguation by drag START). Transient
+    /// interaction state; never persisted, never arms anything.
+    pub composer_drag: bool,
     pub should_quit: bool,
     /// Set by every state change; cleared when a frame is drawn (rec 6).
     pub dirty: bool,
@@ -1002,6 +1022,7 @@ impl Default for AppModel {
             hovered: None,
             selection: None,
             mouse_down: None,
+            composer_drag: false,
             should_quit: false,
             dirty: true,
             anim_phase: 0,
@@ -1232,6 +1253,12 @@ impl AppModel {
             AppEvent::Key(key) => {
                 self.dirty = true;
                 self.flash = None;
+                // TUI5 item 4 — the selection gates run BEFORE the
+                // clear-on-keypress law, or ⌃C/Esc could never see the
+                // selection they govern.
+                if self.selection_key(&key) {
+                    return;
+                }
                 // A keypress clears a finished selection's highlight
                 // (owner item 9's clearing law; clicks clear via Down).
                 self.selection = None;
@@ -1269,6 +1296,84 @@ impl AppModel {
             }
             AppEvent::StreamEnded => {}
         }
+    }
+
+    /// TUI5 item 4 — the two keys that act ON a selection, consumed before
+    /// anything else sees them:
+    ///
+    /// - Esc with ANY active selection (composer or screen-space) clears
+    ///   it and NOTHING else — "Esc clears selection before any other Esc
+    ///   meaning fires" (brief law; the next Esc interrupts/navigates as
+    ///   before). Native inputs and Claude Code both deselect-only.
+    /// - ⌃C with an active COMPOSER selection copies it (the reducer holds
+    ///   the exact text → [`AppRequest::CopyText`]) and clears it; ⌃C with
+    ///   a finished TRANSCRIPT selection re-copies via the runtime's
+    ///   frame-extraction path and keeps the highlight (the mouse-up law).
+    ///   With NO selection ⌃C keeps its TUI4 meaning (navigate/quit)
+    ///   exactly — the gate is selection-presence, nothing else.
+    fn selection_key(&mut self, key: &KeyEvent) -> bool {
+        let composer_sel = self.composer.has_selection();
+        if key.code == KeyCode::Esc && (composer_sel || self.selection.is_some()) {
+            self.composer.clear_selection();
+            self.selection = None;
+            return true;
+        }
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            if composer_sel {
+                if let Some(text) = self.composer.selected_text() {
+                    self.requests.push(AppRequest::CopyText(text.to_owned()));
+                }
+                self.composer.clear_selection();
+                return true;
+            }
+            if self.selection.is_some() {
+                self.requests.push(AppRequest::CopySelection);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// TUI5 item 5 — left button DOWN on a composer text row: place the
+    /// caret at the clicked boundary and arm the composer-drag mode (the
+    /// region-disambiguation law: a drag STARTING here is a composer
+    /// selection). `start` and `content` are the hit's render-time values
+    /// (the value-carrying law); `col` is the clicked display column
+    /// within `content`.
+    pub fn composer_press(&mut self, start: usize, content: &str, col: usize) {
+        // Value-carrying guard: a one-frame-stale hit whose window no
+        // longer exists in the CURRENT text drops the press.
+        if start > self.composer.text().len() {
+            return;
+        }
+        let byte = start + crate::composer::byte_at_col(content, col);
+        self.composer.press_at(byte);
+        self.composer_drag = true;
+        self.dirty = true;
+    }
+
+    /// Drag with the button held after a composer press: the caret (the
+    /// selection's active end) follows the pointer.
+    pub fn composer_drag_to(&mut self, byte: usize) {
+        if !self.composer_drag {
+            return;
+        }
+        self.composer.drag_to(byte);
+        self.dirty = true;
+    }
+
+    /// Button UP after a composer press: a selection auto-copies (same
+    /// flash as the transcript drag, item 5) and KEEPS its highlight; a
+    /// plain click already placed the caret on Down.
+    pub fn composer_release(&mut self) {
+        if !self.composer_drag {
+            return;
+        }
+        self.composer_drag = false;
+        if let Some(text) = self.composer.selected_text() {
+            self.requests.push(AppRequest::CopyText(text.to_owned()));
+        }
+        self.dirty = true;
     }
 
     fn handle_key(&mut self, key: KeyEvent) {

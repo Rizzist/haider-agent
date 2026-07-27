@@ -7,14 +7,17 @@
 //! selection ops, the input ring).
 #![allow(clippy::expect_used)]
 
-use haider_tui::app::{AppEvent, AppModel, Hit, Screen};
+use haider_tui::app::{AppEvent, AppModel, AppRequest, Hit, Screen};
 use haider_tui::composer::Composer;
 use haider_tui::mock::demo_script;
 use haider_tui::render::render;
+use haider_tui::runtime::dispatch_input;
 use haider_tui::theme::ThemeKey;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::layout::Rect;
 use ratatui::style::Color;
 
@@ -448,4 +451,272 @@ fn aura_and_arg_slot_composers_carry_the_cursor_cell() {
         Color::from(theme.gold),
         "aura composer caret cell"
     );
+}
+
+// ---- Item 4: the selection keys ----
+
+#[test]
+fn ctrl_c_with_selection_copies_instead_of_navigating() {
+    // MUTATION CHECK (⌃C selection-vs-navigation gate): drop the
+    // selection_key call from handle() and the FIRST ⌃C below navigates
+    // to the launcher (and the launcher half quits) — both asserts fail.
+    let mut model = session_model();
+    for c in "secret".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    for _ in 0..3 {
+        model.handle(key_mod(KeyCode::Left, KeyModifiers::SHIFT));
+    }
+    assert_eq!(model.composer.selected_text(), Some("ret"));
+    model.handle(key_mod(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert_eq!(model.screen, Screen::Session, "⌃C with selection stays put");
+    assert!(
+        model
+            .requests
+            .contains(&AppRequest::CopyText("ret".to_owned())),
+        "the selection copied: {:?}",
+        model.requests
+    );
+    assert!(!model.composer.has_selection(), "copy clears the selection");
+    // The SECOND ⌃C has no selection — the TUI4 navigation law fires
+    // unchanged.
+    model.handle(key_mod(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert_eq!(model.screen, Screen::Launcher, "bare ⌃C navigates");
+    // Launcher half of the gate: a selection blocks the quit too.
+    for c in "draft".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key_mod(KeyCode::Left, KeyModifiers::SHIFT));
+    model.handle(key_mod(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert!(!model.should_quit, "⌃C with selection never quits");
+    model.handle(key_mod(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert!(model.should_quit, "bare ⌃C on the launcher quits");
+}
+
+#[test]
+fn ctrl_c_with_transcript_selection_recopies_the_frame() {
+    let mut model = session_model();
+    model.selection = Some(haider_tui::select::Selection {
+        anchor: (0, 2),
+        head: (10, 2),
+        dragging: false,
+    });
+    model.handle(key_mod(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert_eq!(model.screen, Screen::Session, "no navigation");
+    assert!(model.requests.contains(&AppRequest::CopySelection));
+    assert!(
+        model.selection.is_some(),
+        "the highlight survives the copy (mouse-up parity)"
+    );
+}
+
+#[test]
+fn esc_clears_the_selection_before_any_other_esc_meaning() {
+    let mut model = session_model();
+    model.turn_active = true;
+    for c in "hi".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key_mod(KeyCode::Left, KeyModifiers::SHIFT));
+    assert!(model.composer.has_selection());
+    model.handle(key(KeyCode::Esc));
+    assert!(!model.composer.has_selection(), "esc deselects first");
+    assert!(model.turn_active, "…and does NOT interrupt on that press");
+    assert!(!model.requests.contains(&AppRequest::Interrupt));
+    model.handle(key(KeyCode::Esc));
+    assert!(!model.turn_active, "the NEXT esc interrupts as before");
+    assert!(model.requests.contains(&AppRequest::Interrupt));
+}
+
+#[test]
+fn selection_band_renders_with_a_distinct_cursor_cell() {
+    let mut model = session_model();
+    for c in "hello".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    // ⇧← twice: selection over "lo", caret at its LEFT (active) end.
+    model.handle(key_mod(KeyCode::Left, KeyModifiers::SHIFT));
+    model.handle(key_mod(KeyCode::Left, KeyModifiers::SHIFT));
+    let theme = model.theme.theme();
+    let (rows, _, terminal) = draw(&model, 118, 34);
+    let buffer = terminal.backend().buffer();
+    let y = row_of(&rows, "❯ hello");
+    // pad(2)+sigil(2)+"hel" → 'l' at x=7 wears the CURSOR cell (the
+    // active end stays distinct, item 4)…
+    assert_eq!(buffer[(7, y)].bg, Color::from(theme.gold));
+    // …and 'o' at x=8 wears the selection band.
+    assert_eq!(buffer[(8, y)].bg, Color::from(theme.sel_bg));
+    assert_eq!(buffer[(8, y)].fg, Color::from(theme.bright));
+    // Unselected cells keep the input ground.
+    assert_eq!(buffer[(5, y)].bg, Color::from(theme.input_bg));
+}
+
+// ---- Item 5: mouse in the composer ----
+
+fn mouse(kind: MouseEventKind, column: u16, row: u16) -> Event {
+    Event::Mouse(MouseEvent {
+        kind,
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    })
+}
+
+fn composer_text_rect(hits: &[(Rect, Hit)]) -> (Rect, usize, String) {
+    hits.iter()
+        .find_map(|(rect, hit)| match hit {
+            Hit::ComposerText { start, content } => Some((*rect, *start, content.clone())),
+            _ => None,
+        })
+        .expect("a composer text region in the hit map")
+}
+
+#[test]
+fn click_places_the_caret_at_the_clicked_grapheme() {
+    let mut model = session_model();
+    for c in "hello world".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    let (_, hits, _) = draw(&model, 118, 34);
+    let (rect, start, _) = composer_text_rect(&hits);
+    assert_eq!(start, 0, "single unclipped row starts at byte 0");
+    dispatch_input(
+        &mut model,
+        &hits,
+        mouse(MouseEventKind::Down(MouseButton::Left), rect.x + 3, rect.y),
+    );
+    assert_eq!(model.composer.cursor(), 3, "caret at the clicked column");
+    assert!(model.composer_drag, "press arms the composer drag mode");
+    dispatch_input(
+        &mut model,
+        &hits,
+        mouse(MouseEventKind::Up(MouseButton::Left), rect.x + 3, rect.y),
+    );
+    assert!(!model.composer_drag);
+    assert!(
+        !model
+            .requests
+            .iter()
+            .any(|r| matches!(r, AppRequest::CopyText(_))),
+        "a plain click copies nothing"
+    );
+    // Clicking PAST the text end parks the caret at the line end.
+    dispatch_input(
+        &mut model,
+        &hits,
+        mouse(MouseEventKind::Down(MouseButton::Left), rect.x + 60, rect.y),
+    );
+    assert_eq!(model.composer.cursor(), "hello world".len());
+    dispatch_input(
+        &mut model,
+        &hits,
+        mouse(MouseEventKind::Up(MouseButton::Left), rect.x + 60, rect.y),
+    );
+}
+
+#[test]
+fn composer_drag_selects_and_autocopies_on_release() {
+    let mut model = session_model();
+    for c in "hello world".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    let (_, hits, _) = draw(&model, 118, 34);
+    let (rect, _, _) = composer_text_rect(&hits);
+    dispatch_input(
+        &mut model,
+        &hits,
+        mouse(MouseEventKind::Down(MouseButton::Left), rect.x, rect.y),
+    );
+    dispatch_input(
+        &mut model,
+        &hits,
+        mouse(MouseEventKind::Drag(MouseButton::Left), rect.x + 5, rect.y),
+    );
+    assert_eq!(model.composer.selected_text(), Some("hello"));
+    assert!(
+        model.selection.is_none(),
+        "a drag STARTING in the composer is never a screen selection \
+         (region disambiguation, item 5)"
+    );
+    dispatch_input(
+        &mut model,
+        &hits,
+        mouse(MouseEventKind::Up(MouseButton::Left), rect.x + 5, rect.y),
+    );
+    assert!(
+        model
+            .requests
+            .contains(&AppRequest::CopyText("hello".to_owned())),
+        "auto-copy on release, transcript parity: {:?}",
+        model.requests
+    );
+    assert!(
+        model.composer.has_selection(),
+        "the highlight survives the release"
+    );
+    // Dragging BELOW the band clamps to the text end (native law).
+    model.requests.clear();
+    dispatch_input(
+        &mut model,
+        &hits,
+        mouse(MouseEventKind::Down(MouseButton::Left), rect.x + 6, rect.y),
+    );
+    dispatch_input(
+        &mut model,
+        &hits,
+        mouse(MouseEventKind::Drag(MouseButton::Left), rect.x, rect.y + 3),
+    );
+    assert_eq!(model.composer.selected_text(), Some("world"));
+    dispatch_input(
+        &mut model,
+        &hits,
+        mouse(MouseEventKind::Up(MouseButton::Left), rect.x, rect.y + 3),
+    );
+}
+
+#[test]
+fn transcript_drag_still_makes_a_screen_selection() {
+    let mut model = session_model();
+    let (_, hits, _) = draw(&model, 118, 34);
+    let (rect, _, _) = composer_text_rect(&hits);
+    // Start WELL above the composer band, on transcript rows.
+    let y = rect.y.saturating_sub(10);
+    dispatch_input(
+        &mut model,
+        &hits,
+        mouse(MouseEventKind::Down(MouseButton::Left), 5, y),
+    );
+    assert!(
+        !model.composer_drag,
+        "transcript press never arms the composer"
+    );
+    dispatch_input(
+        &mut model,
+        &hits,
+        mouse(MouseEventKind::Drag(MouseButton::Left), 30, y + 1),
+    );
+    assert!(
+        model.selection.is_some(),
+        "screen-space selection as in TUI4b"
+    );
+    assert!(!model.composer.has_selection());
+    dispatch_input(
+        &mut model,
+        &hits,
+        mouse(MouseEventKind::Up(MouseButton::Left), 30, y + 1),
+    );
+    assert!(model.requests.contains(&AppRequest::CopySelection));
+}
+
+#[test]
+fn stale_composer_hit_is_dropped_not_misapplied() {
+    let mut model = session_model();
+    for c in "ab".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    // A hit whose window starts beyond the CURRENT text (stale frame after
+    // a kill) must drop the press whole — never place a phantom caret.
+    model.composer_press(50, "stale content", 3);
+    assert_eq!(model.composer.cursor(), 2, "cursor untouched");
+    assert!(!model.composer_drag, "no drag armed from a dropped press");
 }

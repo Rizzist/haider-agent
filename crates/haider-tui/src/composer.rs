@@ -525,6 +525,25 @@ fn seek_col(text: &str, start: usize, end: usize, target: usize) -> usize {
     end
 }
 
+/// The byte offset of the grapheme containing display column `col` of
+/// `content` (TUI5 item 5: a click lands the caret at the START of the
+/// clicked grapheme — cell-granular floor, the documented choice; past
+/// the end it clamps to the end, so clicking the empty right half of a
+/// row parks the caret at the line's visible end like every native
+/// input).
+#[must_use]
+pub fn byte_at_col(content: &str, col: usize) -> usize {
+    let mut acc = 0;
+    for (offset, grapheme) in content.grapheme_indices(true) {
+        let w = grapheme.width().max(1);
+        if acc + w > col {
+            return offset;
+        }
+        acc += w;
+    }
+    content.len()
+}
+
 /// A word for ⌥-movement: a unicode word-bound segment containing an
 /// alphanumeric (whitespace and punctuation runs are skipped over).
 fn is_wordy(seg: &str) -> bool {
