@@ -75,6 +75,8 @@
 
 #![allow(clippy::expect_used)] // integration failures should name the exact lifecycle boundary
 
+mod support;
+
 use haider_daemon::{DaemonConfig, DaemonError, DaemonState, ShutdownOutcome, spawn};
 use haider_protocol::EventPayload;
 use haider_protocol::effect::{EffectClass, EffectIntent, EffectOutcome, EffectPhase};
@@ -88,7 +90,6 @@ use haider_rpc::{
 };
 use haider_store::{EventStore, Store};
 use rustix::process::{Pid, Signal, kill_process};
-use std::collections::VecDeque;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::os::unix::net::UnixListener as StdUnixListener;
@@ -97,127 +98,13 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Barrier};
 use std::time::Duration;
+use support::{DEADLINE, UdsClient as TestClient, test_root};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
 
-const DEADLINE: Duration = Duration::from_secs(10);
 /// Interval between polls of an OS-only condition (child exit, endpoint
 /// appearing, a freed connection slot). The deadline is the synchronization;
 /// this only stops the poll loop from burning a core on `yield_now`.
 const POLL_BACKOFF: Duration = Duration::from_millis(5);
-
-fn test_root() -> tempfile::TempDir {
-    #[cfg(target_os = "macos")]
-    const SHORT_TMP_ROOT: &str = "/private/tmp";
-    #[cfg(not(target_os = "macos"))]
-    const SHORT_TMP_ROOT: &str = "/tmp";
-
-    tempfile::Builder::new()
-        .prefix("w3b1-")
-        .tempdir_in(SHORT_TMP_ROOT)
-        .expect("short temporary root")
-}
-
-struct TestClient {
-    stream: UnixStream,
-    decoder: uds_codec::Decoder,
-    pending: VecDeque<WireFrame>,
-}
-
-impl TestClient {
-    async fn connect(path: &Path, frame_limit: usize) -> std::io::Result<Self> {
-        Ok(Self {
-            stream: UnixStream::connect(path).await?,
-            decoder: uds_codec::Decoder::new(frame_limit),
-            pending: VecDeque::new(),
-        })
-    }
-
-    async fn send(&mut self, frame: &WireFrame, limit: usize) {
-        let bytes = uds_codec::encode(frame, limit).expect("test frame encodes");
-        self.stream.write_all(&bytes).await.expect("frame writes");
-    }
-
-    /// Best-effort send for retry loops: a rejected connection may already be
-    /// closed by the time the test writes.
-    async fn try_send(&mut self, frame: &WireFrame, limit: usize) -> bool {
-        let bytes = uds_codec::encode(frame, limit).expect("test frame encodes");
-        self.stream.write_all(&bytes).await.is_ok()
-    }
-
-    async fn receive(&mut self) -> WireFrame {
-        self.try_receive()
-            .await
-            .expect("connection closed before a frame arrived")
-    }
-
-    /// Next frame, or `None` when the daemon closed the connection first.
-    async fn try_receive(&mut self) -> Option<WireFrame> {
-        if let Some(frame) = self.pending.pop_front() {
-            return Some(frame);
-        }
-        loop {
-            let mut bytes = [0_u8; 8 * 1024];
-            let read = self.stream.read(&mut bytes).await.expect("frame reads");
-            if read == 0 {
-                return None;
-            }
-            let batch = self.decoder.push(&bytes[..read]);
-            assert!(batch.error.is_none(), "server sent an invalid frame");
-            self.pending.extend(batch.frames);
-            if let Some(frame) = self.pending.pop_front() {
-                return Some(frame);
-            }
-        }
-    }
-
-    /// Reads at least `at_least` raw bytes into the decoder without waiting for
-    /// a whole frame, leaving a large reply deliberately mid-write (its bytes
-    /// still charged against the connection's queued-byte budget).
-    async fn absorb_at_least(&mut self, at_least: usize) {
-        let mut absorbed = 0;
-        while absorbed < at_least {
-            let mut bytes = [0_u8; 8 * 1024];
-            let read = tokio::time::timeout(DEADLINE, self.stream.read(&mut bytes))
-                .await
-                .expect("partial read deadline")
-                .expect("partial read");
-            assert_ne!(read, 0, "connection closed before the reply started");
-            let batch = self.decoder.push(&bytes[..read]);
-            assert!(batch.error.is_none(), "server sent an invalid frame");
-            self.pending.extend(batch.frames);
-            absorbed += read;
-        }
-    }
-
-    async fn expect_eof(&mut self) {
-        let mut byte = [0_u8; 1];
-        let read = tokio::time::timeout(DEADLINE, self.stream.read(&mut byte))
-            .await
-            .expect("EOF deadline")
-            .expect("EOF read");
-        assert_eq!(read, 0);
-    }
-
-    /// Reads until EOF and reports how many COMPLETE frames the daemon managed
-    /// to put on the wire. Used to prove a blocked writer was cut off rather
-    /// than left running: a writer that survived its connection would keep
-    /// feeding the reader until its whole pending frame arrived.
-    async fn frames_until_eof(&mut self) -> usize {
-        let mut frames = self.pending.len();
-        loop {
-            let mut bytes = [0_u8; 16 * 1024];
-            let read = tokio::time::timeout(DEADLINE, self.stream.read(&mut bytes))
-                .await
-                .expect("EOF deadline")
-                .expect("EOF read");
-            if read == 0 {
-                return frames;
-            }
-            frames += self.decoder.push(&bytes[..read]).frames.len();
-        }
-    }
-}
 
 struct ManagedChild {
     child: Child,
@@ -492,7 +379,7 @@ fn unknown_outcomes(events: &[RawEnvelope], effect: &EffectId) -> usize {
 
 #[tokio::test]
 async fn cold_start_socket_missing_serves_handshake_ping_and_session_list() {
-    let root = test_root();
+    let root = test_root("w3b1-");
     let config = test_config(&root, "cold-start");
     assert!(!config.endpoint_path().exists());
     let task = spawn(config.clone());
@@ -553,7 +440,7 @@ async fn cold_start_socket_missing_serves_handshake_ping_and_session_list() {
 
 #[tokio::test]
 async fn stale_pid_reuse_is_diagnostic_only_and_does_not_block_start() {
-    let root = test_root();
+    let root = test_root("w3b1-");
     let config = test_config(&root, "stale-pid");
     fs::create_dir_all(&config.store_dir).expect("store root");
     fs::write(
@@ -573,7 +460,7 @@ async fn stale_pid_reuse_is_diagnostic_only_and_does_not_block_start() {
 
 #[tokio::test]
 async fn already_running_error_carries_incumbent_diagnostics() {
-    let root = test_root();
+    let root = test_root("w3b1-");
     let config = test_config(&root, "diagnostics");
     let incumbent = spawn(config.clone());
     wait_for_state(incumbent.readiness(), |state| *state == DaemonState::Ready).await;
@@ -600,7 +487,7 @@ async fn already_running_error_carries_incumbent_diagnostics() {
 
 #[tokio::test]
 async fn simultaneous_start_n_processes_has_one_winner_and_clean_losers() {
-    let root = test_root();
+    let root = test_root("w3b1-");
     let config = test_config(&root, "simultaneous");
     let starters = 6;
     let barrier = Arc::new(Barrier::new(starters));
@@ -648,7 +535,7 @@ async fn simultaneous_start_n_processes_has_one_winner_and_clean_losers() {
 
 #[tokio::test]
 async fn successor_socket_deletion_guard_preserves_replacement_identity() {
-    let root = test_root();
+    let root = test_root("w3b1-");
     let config = test_config(&root, "successor");
     let task = spawn(config.clone());
     wait_for_state(task.readiness(), |state| *state == DaemonState::Ready).await;
@@ -673,7 +560,7 @@ async fn successor_socket_deletion_guard_preserves_replacement_identity() {
 
 #[tokio::test]
 async fn failed_listener_startup_publishes_failed_and_releases_profile_lock() {
-    let root = test_root();
+    let root = test_root("w3b1-");
     let config = test_config(&root, "bind-failure");
     fs::create_dir_all(&config.runtime_dir).expect("runtime directory");
     symlink(
@@ -707,7 +594,7 @@ async fn failed_listener_startup_publishes_failed_and_releases_profile_lock() {
 
 #[tokio::test]
 async fn abrupt_death_kill_9_leaves_recoverable_socket_and_next_start_serves() {
-    let root = test_root();
+    let root = test_root("w3b1-");
     let config = test_config(&root, "abrupt");
     let mut first = ManagedChild::new(child_command(&config).spawn().expect("first daemon"));
     let _client = poll_process_ready(&config).await;
@@ -728,7 +615,7 @@ async fn abrupt_death_kill_9_leaves_recoverable_socket_and_next_start_serves() {
 
 #[tokio::test]
 async fn handshake_version_mismatch_returns_fatal_rejection() {
-    let root = test_root();
+    let root = test_root("w3b1-");
     let config = test_config(&root, "version-mismatch");
     let task = spawn(config.clone());
     wait_for_state(task.readiness(), |state| *state == DaemonState::Ready).await;
@@ -764,7 +651,7 @@ async fn handshake_version_mismatch_returns_fatal_rejection() {
 
 #[tokio::test]
 async fn oversize_frame_is_rejected_at_connection_layer_before_body_allocation() {
-    let root = test_root();
+    let root = test_root("w3b1-");
     let mut config = test_config(&root, "oversize");
     config.frame_limit = 1_024;
     let task = spawn(config.clone());
@@ -793,7 +680,7 @@ async fn oversize_frame_is_rejected_at_connection_layer_before_body_allocation()
 
 #[tokio::test]
 async fn client_max_receive_frame_is_enforced_on_welcome() {
-    let root = test_root();
+    let root = test_root("w3b1-");
     let config = test_config(&root, "client-frame-limit");
     let task = spawn(config.clone());
     wait_for_state(task.readiness(), |state| *state == DaemonState::Ready).await;
@@ -817,7 +704,7 @@ async fn client_max_receive_frame_is_enforced_on_welcome() {
 
 #[tokio::test]
 async fn drain_notifies_every_open_connection_before_close() {
-    let root = test_root();
+    let root = test_root("w3b1-");
     let config = test_config(&root, "drain-notify");
     let task = spawn(config.clone());
     wait_for_state(task.readiness(), |state| *state == DaemonState::Ready).await;
@@ -844,7 +731,7 @@ async fn drain_notifies_every_open_connection_before_close() {
 
 #[tokio::test]
 async fn connection_admission_cap_rejects_over_limit_peers_and_readmits_a_freed_slot() {
-    let root = test_root();
+    let root = test_root("w3b1-");
     let mut config = test_config(&root, "admission-cap");
     config.max_connections = 2;
     let task = spawn(config.clone());
@@ -888,7 +775,7 @@ async fn connection_admission_cap_rejects_over_limit_peers_and_readmits_a_freed_
 /// instead of EOF.
 #[tokio::test]
 async fn outbound_byte_budget_refuses_a_frame_the_connection_cannot_hold() {
-    let root = test_root();
+    let root = test_root("w3b1-");
     // A half-megabyte Welcome parks the writer inside `write_all` against a
     // peer that never reads, so nothing is ever credited back: replies then
     // accumulate against the byte budget until one is refused. The budget is
@@ -956,7 +843,7 @@ async fn outbound_byte_budget_refuses_a_frame_the_connection_cannot_hold() {
 /// arrived". Verified 2026-07-27.
 #[tokio::test]
 async fn reserved_drain_notice_survives_an_exhausted_outbound_byte_budget() {
-    let root = test_root();
+    let root = test_root("w3b1-");
     // A half-megabyte profile id makes the Welcome larger than any socket
     // buffer, so it is still mid-write — and still charged — when the drain
     // fires. A one-maximum-encoded-frame budget leaves less headroom than the
@@ -1037,7 +924,7 @@ async fn reserved_drain_notice_survives_an_exhausted_outbound_byte_budget() {
 /// deadline — not the writer task, not the socket, not the profile lock.
 #[tokio::test]
 async fn never_reading_client_is_cut_at_the_drain_deadline_and_releases_everything() {
-    let root = test_root();
+    let root = test_root("w3b1-");
     let profile = format!("never-reads-{}", "p".repeat(512 * 1024));
     let mut config = test_config(&root, &profile);
     config.frame_limit = config.profile_id.len() + 1_024;
@@ -1089,7 +976,7 @@ async fn never_reading_client_is_cut_at_the_drain_deadline_and_releases_everythi
 /// the writer must be gone (aborted AND joined) before the daemon reports.
 #[tokio::test]
 async fn client_that_never_reads_a_byte_cannot_hold_the_barrier_open() {
-    let root = test_root();
+    let root = test_root("w3b1-");
     let profile = format!("never-reads-strict-{}", "p".repeat(512 * 1024));
     let mut config = test_config(&root, &profile);
     config.frame_limit = config.profile_id.len() + 1_024;
@@ -1143,7 +1030,7 @@ async fn client_that_never_reads_a_byte_cannot_hold_the_barrier_open() {
 /// the barrier still has to end everything on time.
 #[tokio::test]
 async fn one_byte_reader_cannot_hold_the_barrier_open() {
-    let root = test_root();
+    let root = test_root("w3b1-");
     let profile = format!("one-byte-reader-{}", "p".repeat(512 * 1024));
     let mut config = test_config(&root, &profile);
     config.frame_limit = config.profile_id.len() + 1_024;
@@ -1202,7 +1089,7 @@ async fn one_byte_reader_cannot_hold_the_barrier_open() {
 /// barrier are still torn down completely and the daemon stays honest.
 #[tokio::test]
 async fn connections_racing_the_shutdown_request_are_torn_down_completely() {
-    let root = test_root();
+    let root = test_root("w3b1-");
     let config = test_config(&root, "late-registration");
     let task = spawn(config.clone());
     wait_for_state(task.readiness(), |state| *state == DaemonState::Ready).await;
@@ -1252,7 +1139,7 @@ async fn connections_racing_the_shutdown_request_are_torn_down_completely() {
 /// instead of 0. Verified 2026-07-27.
 #[tokio::test]
 async fn forced_shutdown_aborts_a_blocked_writer_instead_of_detaching_it() {
-    let root = test_root();
+    let root = test_root("w3b1-");
     let profile = format!("forced-writer-{}", "p".repeat(512 * 1024));
     let mut config = test_config(&root, &profile);
     config.frame_limit = config.profile_id.len() + 1_024;
@@ -1309,7 +1196,7 @@ async fn forced_shutdown_aborts_a_blocked_writer_instead_of_detaching_it() {
 /// `Forced`. Verified 2026-07-27.
 #[tokio::test]
 async fn drain_deadline_covers_the_finalization_tail() {
-    let root = test_root();
+    let root = test_root("w3b1-");
     let mut config = test_config(&root, "finalization-deadline");
     // Expired before finalization can begin: any barrier step that finds the
     // deadline already gone must take the forced path rather than block on.
@@ -1333,7 +1220,7 @@ async fn drain_deadline_covers_the_finalization_tail() {
 /// runs is left completely alone.
 #[tokio::test]
 async fn endpoint_replacement_before_cleanup_is_never_deleted() {
-    let root = test_root();
+    let root = test_root("w3b1-");
     let config = test_config(&root, "cleanup-replacement");
     let task = spawn(config.clone());
     wait_for_state(task.readiness(), |state| *state == DaemonState::Ready).await;
@@ -1363,7 +1250,7 @@ async fn endpoint_replacement_before_cleanup_is_never_deleted() {
 /// racer created must NEVER disappear under it.
 #[tokio::test]
 async fn endpoint_replacement_racing_cleanup_is_never_deleted() {
-    let root = test_root();
+    let root = test_root("w3b1-");
     let config = test_config(&root, "cleanup-race");
     let task = spawn(config.clone());
     wait_for_state(task.readiness(), |state| *state == DaemonState::Ready).await;
@@ -1456,7 +1343,7 @@ fn inode_exists_in(directory: &Path, identity: (u64, u64)) -> bool {
 /// 2026-07-27.
 #[tokio::test]
 async fn stale_cleanup_never_removes_a_node_that_went_live() {
-    let root = test_root();
+    let root = test_root("w3b1-");
     let config = test_config(&root, "stale-flip");
     fs::create_dir_all(&config.runtime_dir).expect("runtime directory");
     let socket_path = config.endpoint_path();
@@ -1538,7 +1425,7 @@ async fn stale_cleanup_never_removes_a_node_that_went_live() {
 /// 2026-07-27.
 #[tokio::test]
 async fn stranded_staging_nodes_are_swept_but_live_ones_are_left() {
-    let root = test_root();
+    let root = test_root("w3b1-");
     let config = test_config(&root, "staging-sweep");
     fs::create_dir_all(&config.runtime_dir).expect("runtime directory");
     let stranded = config
@@ -1579,7 +1466,7 @@ async fn stranded_staging_nodes_are_swept_but_live_ones_are_left() {
 /// refused, never unlinked — even though the profile lock was free.
 #[tokio::test]
 async fn live_foreign_endpoint_is_refused_and_left_intact() {
-    let root = test_root();
+    let root = test_root("w3b1-");
     let config = test_config(&root, "live-foreign");
     fs::create_dir_all(&config.runtime_dir).expect("runtime directory");
     let foreign = StdUnixListener::bind(config.endpoint_path()).expect("foreign listener");
@@ -1606,7 +1493,7 @@ async fn live_foreign_endpoint_is_refused_and_left_intact() {
 /// still gets its last frame: the reason is truncated, the notice is not.
 #[tokio::test]
 async fn drain_reason_is_truncated_to_fit_a_small_client_frame_limit() {
-    let root = test_root();
+    let root = test_root("w3b1-");
     let config = test_config(&root, "small-limit");
     let task = spawn(config.clone());
     wait_for_state(task.readiness(), |state| *state == DaemonState::Ready).await;
@@ -1654,7 +1541,7 @@ async fn drain_reason_is_truncated_to_fit_a_small_client_frame_limit() {
 /// gets a correlated reply (the additive `MenuAnswer.request_id`).
 #[tokio::test]
 async fn view_only_connection_is_denied_the_control_frame() {
-    let root = test_root();
+    let root = test_root("w3b1-");
     let config = test_config(&root, "capabilities");
     let task = spawn(config.clone());
     wait_for_state(task.readiness(), |state| *state == DaemonState::Ready).await;
@@ -1716,7 +1603,7 @@ async fn view_only_connection_is_denied_the_control_frame() {
 /// the handshake deadline and its slot is immediately reusable.
 #[tokio::test]
 async fn silent_peer_is_closed_at_the_handshake_deadline_and_frees_its_slot() {
-    let root = test_root();
+    let root = test_root("w3b1-");
     let mut config = test_config(&root, "silent-peer");
     config.max_connections = 1;
     config.handshake_timeout = Duration::from_millis(150);
@@ -1749,7 +1636,7 @@ async fn silent_peer_is_closed_at_the_handshake_deadline_and_frees_its_slot() {
 /// frame no connected client may send.
 #[tokio::test]
 async fn duplicate_hello_after_handshake_is_a_fatal_unexpected_frame() {
-    let root = test_root();
+    let root = test_root("w3b1-");
     let config = test_config(&root, "duplicate-hello");
     let task = spawn(config.clone());
     wait_for_state(task.readiness(), |state| *state == DaemonState::Ready).await;
@@ -1781,7 +1668,7 @@ async fn duplicate_hello_after_handshake_is_a_fatal_unexpected_frame() {
 
 #[tokio::test]
 async fn second_signal_request_selects_immediate_forced_termination_path() {
-    let root = test_root();
+    let root = test_root("w3b1-");
     let config = test_config(&root, "forced");
     let task = spawn(config);
     wait_for_state(task.readiness(), |state| *state == DaemonState::Ready).await;
@@ -1796,7 +1683,7 @@ async fn second_signal_request_selects_immediate_forced_termination_path() {
 
 #[tokio::test]
 async fn first_signal_before_startup_drains_without_advertising_ready() {
-    let root = test_root();
+    let root = test_root("w3b1-");
     let config = test_config(&root, "drain-before-startup");
     let task = spawn(config.clone());
     assert_eq!(
@@ -1819,7 +1706,7 @@ async fn first_signal_before_startup_drains_without_advertising_ready() {
 
 #[tokio::test]
 async fn second_signal_before_startup_prevents_ready_and_forces_termination() {
-    let root = test_root();
+    let root = test_root("w3b1-");
     let config = test_config(&root, "forced-before-startup");
     let task = spawn(config.clone());
     let shutdown = task.shutdown_handle();
@@ -1847,7 +1734,7 @@ async fn second_signal_before_startup_prevents_ready_and_forces_termination() {
 
 #[tokio::test]
 async fn second_os_signal_terminates_the_daemon_through_the_forced_exit_path() {
-    let root = test_root();
+    let root = test_root("w3b1-");
     let config = test_config(&root, "forced-signals");
     let mut child = ManagedChild::new(child_command(&config).spawn().expect("daemon process"));
     let _client = poll_process_ready(&config).await;
@@ -1858,7 +1745,7 @@ async fn second_os_signal_terminates_the_daemon_through_the_forced_exit_path() {
 
 #[tokio::test]
 async fn reconcile_before_ready_marks_unknown_exactly_once_and_never_retries_effect() {
-    let root = test_root();
+    let root = test_root("w3b1-");
     let config = test_config(&root, "reconcile");
     let session = SessionId::new("session-recovery");
     let pending = EffectId::new("effect-pending");

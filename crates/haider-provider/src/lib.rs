@@ -184,7 +184,49 @@ impl fmt::Display for ProviderError {
 impl std::error::Error for ProviderError {}
 
 pub type ProviderStreamItem = Result<StreamEvent, ProviderError>;
-pub type ProviderStream = mpsc::Receiver<ProviderStreamItem>;
+
+/// Receiver plus ownership of the adapter/script producer task.
+///
+/// Dropping a turn stream aborts its producer immediately, so cancellation
+/// cannot leave an HTTP decoder or fake script detached until an idle timeout.
+#[derive(Debug)]
+pub struct ProviderStream {
+    receiver: mpsc::Receiver<ProviderStreamItem>,
+    producer: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl ProviderStream {
+    pub fn owned(
+        receiver: mpsc::Receiver<ProviderStreamItem>,
+        producer: tokio::task::JoinHandle<()>,
+    ) -> Self {
+        Self {
+            receiver,
+            producer: Some(producer),
+        }
+    }
+
+    pub async fn recv(&mut self) -> Option<ProviderStreamItem> {
+        self.receiver.recv().await
+    }
+}
+
+impl From<mpsc::Receiver<ProviderStreamItem>> for ProviderStream {
+    fn from(receiver: mpsc::Receiver<ProviderStreamItem>) -> Self {
+        Self {
+            receiver,
+            producer: None,
+        }
+    }
+}
+
+impl Drop for ProviderStream {
+    fn drop(&mut self) {
+        if let Some(producer) = &self.producer {
+            producer.abort();
+        }
+    }
+}
 
 /// Asynchronous provider adapter contract.
 #[async_trait]
@@ -204,6 +246,9 @@ pub enum FakeStep {
         call_id: String,
     },
     EmitText {
+        text: String,
+    },
+    EmitReasoning {
         text: String,
     },
     EmitToolCall {
@@ -248,6 +293,13 @@ pub enum FakeStep {
     },
     Finish {
         reason: FinishReason,
+    },
+    /// Emits one typed provider error and ends this request segment.
+    Error {
+        kind: ProviderErrorKind,
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry_after_ms: Option<u64>,
     },
     /// Produces no more data until the consumer drops the stream.
     Hang,
@@ -336,8 +388,8 @@ impl Provider for FakeProvider {
             }
         }
         let (sender, receiver) = mpsc::channel(32);
-        tokio::spawn(play_script(segment, sender));
-        Ok(receiver)
+        let producer = tokio::spawn(play_script(segment, sender));
+        Ok(ProviderStream::owned(receiver, producer))
     }
 }
 
@@ -353,7 +405,10 @@ impl FakeProvider {
             end += 1;
             if matches!(
                 self.script[end - 1],
-                FakeStep::Finish { .. } | FakeStep::Hang | FakeStep::MalformedFrame
+                FakeStep::Finish { .. }
+                    | FakeStep::Error { .. }
+                    | FakeStep::Hang
+                    | FakeStep::MalformedFrame
             ) {
                 break;
             }
@@ -373,6 +428,11 @@ async fn play_script(script: Arc<Vec<FakeStep>>, sender: mpsc::Sender<ProviderSt
             FakeStep::ExpectToolResult { .. } => {}
             FakeStep::EmitText { text } => {
                 if !emit_bytes(&sender, &mut utf8, text.as_bytes()).await {
+                    return;
+                }
+            }
+            FakeStep::EmitReasoning { text } => {
+                if !send_event(&sender, StreamEvent::ReasoningDelta { text }).await {
                     return;
                 }
             }
@@ -454,6 +514,18 @@ async fn play_script(script: Arc<Vec<FakeStep>>, sender: mpsc::Sender<ProviderSt
             }
             FakeStep::Finish { reason } => {
                 let _ = send_event(&sender, StreamEvent::Finish { reason }).await;
+                return;
+            }
+            FakeStep::Error {
+                kind,
+                message,
+                retry_after_ms,
+            } => {
+                let _ = sender
+                    .send(Err(
+                        ProviderError::new(kind, message).with_retry_after_ms(retry_after_ms)
+                    ))
+                    .await;
                 return;
             }
             FakeStep::Hang => {

@@ -55,14 +55,21 @@ mod error;
 mod lifecycle;
 mod runtime;
 mod session_hub;
+mod turn_recovery;
+mod worker;
 
 pub use config::DaemonConfig;
 pub use error::{DaemonError, IncumbentDiagnostics};
 pub use lifecycle::{DaemonState, Readiness, ShutdownDisposition, ShutdownHandle, ShutdownOutcome};
-pub use runtime::{DaemonTask, run_with_signals, spawn};
+pub use runtime::{DaemonTask, run_with_signals, spawn, spawn_with_dependencies};
 pub use session_hub::{
-    AdmissionTicket, FrameSendError, FrameSink, HubConnection, HubObservation, SendAdmission,
-    SessionHub, SessionHubConfig, SessionHubError, SessionHubObserver, SessionHubShutdownOutcome,
+    AdmissionTicket, FrameSendError, FrameSink, HubConnection, HubObservation, HubStoreHandle,
+    SendAdmission, SessionHub, SessionHubConfig, SessionHubError, SessionHubMetrics,
+    SessionHubObserver, SessionHubShutdownOutcome,
+};
+pub use worker::{
+    DaemonDependencies, ProviderFactory, ResolvedTurnProvider, SystemPromptBuilder,
+    TurnToolFactory, WorkerToolContext,
 };
 
 /// Crate marker used by the workspace self-test.

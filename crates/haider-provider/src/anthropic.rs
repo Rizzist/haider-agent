@@ -22,6 +22,7 @@ const STREAM_CAPACITY: usize = 32;
 const TRANSPORT_CONFIG: AnthropicTransportConfig = AnthropicTransportConfig {
     retry_policy: AnthropicRetryPolicy::Never,
     connect_timeout: Duration::from_secs(10),
+    response_open_timeout: Duration::from_secs(30),
     chunk_idle_timeout: Duration::from_secs(90),
 };
 
@@ -37,6 +38,7 @@ pub enum AnthropicRetryPolicy {
 pub struct AnthropicTransportConfig {
     pub retry_policy: AnthropicRetryPolicy,
     pub connect_timeout: Duration,
+    pub response_open_timeout: Duration,
     pub chunk_idle_timeout: Duration,
 }
 
@@ -168,15 +170,20 @@ impl AnthropicProvider {
         request: &TurnRequest,
     ) -> Result<reqwest::Response, ProviderError> {
         let payload = self.request_payload(request)?;
-        self.client
+        let opening = self
+            .client
             .post(&self.api_url)
             .header(CONTENT_TYPE, "application/json")
             .header(ACCEPT, "text/event-stream")
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("x-api-key", self.api_key_header()?)
             .json(&payload)
-            .send()
+            .send();
+        tokio::time::timeout(Self::transport_config().response_open_timeout, opening)
             .await
+            .map_err(|_| {
+                response_open_timeout_error(Self::transport_config().response_open_timeout)
+            })?
             .map_err(transport_error)
     }
 }
@@ -216,10 +223,10 @@ impl Provider for AnthropicProvider {
         let (sender, receiver) = mpsc::channel(STREAM_CAPACITY);
         let account = self.account.clone();
         let chunk_idle_timeout = Self::transport_config().chunk_idle_timeout;
-        tokio::spawn(async move {
+        let producer = tokio::spawn(async move {
             stream_response(response, account, sender, chunk_idle_timeout).await;
         });
-        Ok(receiver)
+        Ok(ProviderStream::owned(receiver, producer))
     }
 }
 
@@ -330,6 +337,16 @@ fn stream_idle_error(timeout: Duration) -> ProviderError {
         ProviderErrorKind::Transport,
         format!(
             "Anthropic SSE stream received no data for {} seconds",
+            timeout.as_secs()
+        ),
+    )
+}
+
+fn response_open_timeout_error(timeout: Duration) -> ProviderError {
+    ProviderError::new(
+        ProviderErrorKind::Transport,
+        format!(
+            "Anthropic response did not open within {} seconds",
             timeout.as_secs()
         ),
     )

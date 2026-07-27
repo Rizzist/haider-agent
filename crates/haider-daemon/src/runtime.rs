@@ -46,9 +46,11 @@ mod runtime_tests;
 use crate::connection::{ConnectionContext, ConnectionExit, DrainNotice, reject_over_limit, serve};
 use crate::endpoint;
 use crate::lifecycle::{ShutdownObserver, ShutdownRequest, StatePublisher};
+use crate::turn_recovery::{RecoveredWork, recover_interrupted_turns};
+use crate::worker::WorkerManager;
 use crate::{
-    DaemonConfig, DaemonError, DaemonState, IncumbentDiagnostics, Readiness, SessionHub,
-    SessionHubConfig, ShutdownHandle, ShutdownOutcome,
+    DaemonConfig, DaemonDependencies, DaemonError, DaemonState, IncumbentDiagnostics, Readiness,
+    SessionHub, ShutdownHandle, ShutdownOutcome,
 };
 use haider_core::{SqliteStoreHandle, reconcile_dispatched_effects};
 use haider_protocol::error::ErrorCode;
@@ -59,7 +61,7 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::Poll;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Semaphore, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
@@ -68,6 +70,7 @@ use tokio::task::{JoinHandle, JoinSet};
 pub struct DaemonTask {
     readiness: Readiness,
     shutdown: ShutdownHandle,
+    crash: watch::Sender<bool>,
     task: JoinHandle<Result<ShutdownOutcome, DaemonError>>,
 }
 
@@ -89,21 +92,43 @@ impl DaemonTask {
             message: format!("daemon owner task failed: {error}"),
         })?
     }
+
+    /// Abruptly aborts the owner task without running the drain barrier.
+    ///
+    /// This is the in-process equivalent of process death used by restart
+    /// recovery tests. Owned manager/supervisor drops abort their children;
+    /// no graceful terminalization is attempted.
+    pub async fn crash(self) {
+        self.crash.send_replace(true);
+        let _ = self.task.await;
+    }
 }
 
 /// Starts one owned daemon task and returns observable lifecycle controls.
 pub fn spawn(config: DaemonConfig) -> DaemonTask {
+    spawn_with_dependencies(config, DaemonDependencies::default())
+}
+
+/// Starts the production runtime with injectable provider/tool factories.
+pub fn spawn_with_dependencies(
+    config: DaemonConfig,
+    dependencies: DaemonDependencies,
+) -> DaemonTask {
     let (states, readiness) = StatePublisher::channel();
     let (shutdown, shutdown_receiver, shutdown_observer) = ShutdownHandle::channel();
+    let (crash, crash_receiver) = watch::channel(false);
     let task = tokio::spawn(run_owner(
         config,
+        dependencies,
         states,
         shutdown_receiver,
         shutdown_observer,
+        crash_receiver,
     ));
     DaemonTask {
         readiness,
         shutdown,
+        crash,
         task,
     }
 }
@@ -144,11 +169,21 @@ pub async fn run_with_signals(config: DaemonConfig) -> Result<ShutdownOutcome, D
 
 async fn run_owner(
     config: DaemonConfig,
+    dependencies: DaemonDependencies,
     states: StatePublisher,
     shutdown: watch::Receiver<ShutdownRequest>,
     shutdown_observer: ShutdownObserver,
+    crash: watch::Receiver<bool>,
 ) -> Result<ShutdownOutcome, DaemonError> {
-    let result = run_inner(&config, &states, shutdown, &shutdown_observer).await;
+    let result = run_inner(
+        &config,
+        dependencies,
+        &states,
+        shutdown,
+        &shutdown_observer,
+        crash,
+    )
+    .await;
     if let Err(error) = &result {
         states.publish(DaemonState::Failed {
             message: error.to_string(),
@@ -159,9 +194,11 @@ async fn run_owner(
 
 async fn run_inner(
     config: &DaemonConfig,
+    dependencies: DaemonDependencies,
     states: &StatePublisher,
     mut shutdown: watch::Receiver<ShutdownRequest>,
     shutdown_observer: &ShutdownObserver,
+    mut crash: watch::Receiver<bool>,
 ) -> Result<ShutdownOutcome, DaemonError> {
     config
         .validate()
@@ -203,6 +240,7 @@ async fn run_inner(
         }
     };
     let device_id = DeviceId::new(format!("daemon-{instance_id}"));
+    let effect_recovery_started = Instant::now();
     match reconcile_before_ready(&store, &device_id, &mut shutdown).await {
         Some(Ok(_)) => {}
         Some(Err(error)) => {
@@ -214,16 +252,61 @@ async fn run_inner(
             return shutdown_before_listener(config, states, store, request, &mut shutdown).await;
         }
     }
+    tracing::trace!(
+        target: "haider.recovery",
+        phase = "effects",
+        operation_micros = effect_recovery_started.elapsed().as_micros(),
+        "pre-ready recovery phase completed"
+    );
     if !matches!(*shutdown.borrow(), ShutdownRequest::None) {
         let request = shutdown.borrow().clone();
         return shutdown_before_listener(config, states, store, request, &mut shutdown).await;
     }
+    let turn_recovery_started = Instant::now();
+    let recovered_work = match recover_interrupted_turns(&store, &device_id).await {
+        Ok(work) => work,
+        Err(error) => {
+            let _ = store.close().await;
+            return Err(error.into());
+        }
+    };
+    tracing::trace!(
+        target: "haider.recovery",
+        phase = "turns",
+        recovered_work = recovered_work.len(),
+        operation_micros = turn_recovery_started.elapsed().as_micros(),
+        "pre-ready recovery phase completed"
+    );
 
-    let hub =
-        SessionHub::new(store.clone(), SessionHubConfig::default()).map_err(DaemonError::from)?;
+    let hub = SessionHub::new(store.clone(), config.session_hub).map_err(DaemonError::from)?;
+    let worker_manager = WorkerManager::start(hub.clone(), dependencies);
+    let worker_handle = worker_manager.handle();
+    hub.install_worker_manager(worker_handle.clone())
+        .map_err(DaemonError::from)?;
+    for work in recovered_work {
+        let result = match work {
+            RecoveredWork::Queued(accepted) => worker_handle.recover_queued(accepted).await,
+            RecoveredWork::Checkpoint(recovered) => {
+                worker_handle
+                    .recover_checkpoint(
+                        recovered.accepted,
+                        recovered.checkpoint,
+                        recovered.committed_answer,
+                    )
+                    .await
+            }
+        };
+        if let Err(error) = result {
+            let _ = worker_manager.shutdown().await;
+            let _ = hub.shutdown().await;
+            let _ = store.close().await;
+            return Err(error.into());
+        }
+    }
     let mut endpoint = match endpoint::bind(config).await {
         Ok(endpoint) => endpoint,
         Err(error) => {
+            let _ = worker_manager.shutdown().await;
             let _ = store.flush().await;
             let _ = store.close().await;
             return Err(error);
@@ -253,9 +336,33 @@ async fn run_inner(
     shutdown_observer.publish_ready_if_idle(states);
 
     let mut runtime = ConnectionRuntime::new(config.max_connections, writer_receiver);
-    let (request, listener_error) = runtime
-        .accept_until_shutdown(&endpoint, &context, &drain_receiver, &mut shutdown)
+    let (stop, listener_error) = runtime
+        .accept_until_shutdown(
+            &endpoint,
+            &context,
+            &drain_receiver,
+            &mut shutdown,
+            &mut crash,
+        )
         .await;
+
+    if matches!(&stop, RuntimeStop::Crash) {
+        // In-process process-death seam: tear down ownership without sending
+        // cancellation to workers and without appending terminal run events.
+        // The next generation alone interprets the durable prefix.
+        endpoint.close_listener();
+        runtime.crash().await;
+        worker_manager.crash().await;
+        let _ = hub.shutdown().await;
+        drop(context);
+        drop(hub);
+        drop(endpoint);
+        store.close().await?;
+        return Ok(ShutdownOutcome::Forced);
+    }
+    let RuntimeStop::Shutdown(request) = stop else {
+        unreachable!("crash returned above")
+    };
 
     // R17 drain barrier, in order: stop accepting, publish Draining,
     // broadcast ServerDraining to every connection, bounded completion,
@@ -272,24 +379,43 @@ async fn run_inner(
     };
     let barrier_deadline = tokio::time::Instant::now() + config.drain_timeout;
     let deadline_unix_ms = unix_time_ms().saturating_add(duration_ms(config.drain_timeout));
-    // Reject new hub work before Draining becomes externally observable. The
-    // watch broadcast wakes connection tasks on other executor workers.
+    // R9 EXTERNAL ADMISSION GATE: this one flag closes every actor-CREATING
+    // path at once — connection requests and menu answers (checked in
+    // rpc.rs), new attachments, new worker leases — before Draining becomes
+    // externally observable. Workers holding leases are NOT gated: their
+    // final appends reach their existing actors (`SessionHub::existing_actor`
+    // documents the asymmetry). The watch broadcast wakes connection tasks
+    // on other executor workers.
+    // Linearize manager admission first. Any successful try_send happened
+    // under this gate and is FIFO-before Shutdown; any post-commit hint that
+    // loses the gate is recovered by the manager's durable queued-run sweep.
+    worker_handle.begin_draining();
     hub.begin_draining();
     states.publish(DaemonState::Draining {
         reason: reason.clone(),
         deadline_unix_ms,
     });
 
-    // §6.6 grace ORDER (W3b2.3, P1-3): the hub drains FIRST — in-flight
-    // appends/CAS complete their persist AND publish, and replay tasks
-    // stream those final committed envelopes into the connection outboxes —
-    // and only then does the drain notice fire. The notice makes each
-    // connection close its hub registration, so broadcasting it earlier
-    // would cancel attachments while committed envelopes were still in
-    // flight to them. The writer then puts `ServerDraining` on the wire at
-    // its next complete-frame boundary and drains the already-queued
-    // checkpoint envelopes under the same deadline (the ledgered W3b1
-    // relaxation).
+    // WORKER-AWARE §6.6 grace ORDER (R9 steps 3-5, extending W3b2.3 P1-3):
+    // (a) workers settle FIRST — the manager cancels active turns, closes
+    // effect brokers, terminalizes durable queued runs, and every terminal
+    // append lands through the still-serving session actors; (b) then the
+    // hub drains — remaining in-flight appends/CAS complete their persist
+    // AND publish, and replay tasks stream those final committed envelopes
+    // into the connection outboxes; (c) only then does the drain notice
+    // fire. Reversing (a) and (b) would reject the workers' own terminal
+    // `Cancelled`/effect/idle appends; firing (c) earlier would cancel
+    // attachments while committed envelopes were still in flight to them.
+    // The writer then puts `ServerDraining` on the wire at its next
+    // complete-frame boundary and drains the already-queued checkpoint
+    // envelopes under the same deadline (the ledgered W3b1 relaxation).
+    let worker_shutdown =
+        bounded_finalization(worker_manager.shutdown(), barrier_deadline, &mut shutdown).await;
+    match worker_shutdown {
+        Some(Ok(())) => {}
+        Some(Err(error)) => return Err(error.into()),
+        None => forced = true,
+    }
     let hub_shutdown = bounded_finalization(hub.shutdown(), barrier_deadline, &mut shutdown).await;
     match hub_shutdown {
         Some(Ok(crate::SessionHubShutdownOutcome::Graceful)) => {}
@@ -376,6 +502,12 @@ struct ConnectionRuntime {
     admission: Arc<Semaphore>,
 }
 
+#[derive(Debug, Clone)]
+enum RuntimeStop {
+    Shutdown(ShutdownRequest),
+    Crash,
+}
+
 impl ConnectionRuntime {
     fn new(
         max_connections: usize,
@@ -397,21 +529,30 @@ impl ConnectionRuntime {
         context: &ConnectionContext,
         drain_receiver: &watch::Receiver<Option<DrainNotice>>,
         shutdown: &mut watch::Receiver<ShutdownRequest>,
-    ) -> (ShutdownRequest, Option<DaemonError>) {
+        crash: &mut watch::Receiver<bool>,
+    ) -> (RuntimeStop, Option<DaemonError>) {
         let mut listener_error = None;
-        let request = loop {
+        let stop = loop {
+            if *crash.borrow() {
+                break RuntimeStop::Crash;
+            }
             match shutdown.borrow().clone() {
                 request @ (ShutdownRequest::Graceful { .. } | ShutdownRequest::Forced { .. }) => {
-                    break request;
+                    break RuntimeStop::Shutdown(request);
                 }
                 ShutdownRequest::None => {}
             }
             tokio::select! {
+                changed = crash.changed() => {
+                    if changed.is_err() || *crash.borrow() {
+                        break RuntimeStop::Crash;
+                    }
+                }
                 changed = shutdown.changed() => {
                     if changed.is_err() {
-                        break ShutdownRequest::Forced {
+                        break RuntimeStop::Shutdown(ShutdownRequest::Forced {
                             reason: "shutdown controller dropped".into(),
-                        };
+                        });
                     }
                 }
                 accepted = endpoint.accept() => {
@@ -440,9 +581,9 @@ impl ConnectionRuntime {
                                 endpoint.path(),
                                 error,
                             ));
-                            break ShutdownRequest::Graceful {
+                            break RuntimeStop::Shutdown(ShutdownRequest::Graceful {
                                 reason: "listener failure".into(),
-                            };
+                            });
                         }
                     }
                 }
@@ -470,7 +611,25 @@ impl ConnectionRuntime {
                 }
             }
         };
-        (request, listener_error)
+        (stop, listener_error)
+    }
+
+    /// Abruptly aborts and joins every connection/writer child without a
+    /// `ServerDraining` broadcast.
+    async fn crash(&mut self) {
+        self.collect_writers();
+        self.connections.abort_all();
+        for writer in &self.writers {
+            writer.abort();
+        }
+        while self.connections.join_next().await.is_some() {}
+        self.collect_writers();
+        for writer in &self.writers {
+            writer.abort();
+        }
+        for writer in std::mem::take(&mut self.writers) {
+            let _ = writer.await;
+        }
     }
 
     /// Phase 5a: bounded completion, then take ownership of every child.

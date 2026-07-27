@@ -32,7 +32,10 @@ pub struct ReadinessCheck {
 }
 
 /// Session lifecycle. `Idle { interrupted: true }` is the visible idle(i)
-/// marker after an interrupt; it decays to plain idle via `IdleDecayed`.
+/// marker after user cancellation, drain-caused cancellation, recovery,
+/// panic, or failed recovery resumption; it decays to plain idle via
+/// `IdleDecayed`. Natural `Done` and ordinary provider/error completion use
+/// `false`, including a natural completion that happens to win a drain race.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum SessionState {
@@ -116,7 +119,8 @@ pub enum VerifyStep {
 }
 
 impl RunState {
-    /// Terminal states never change (freeze rule).
+    /// Terminal states never change (freeze rule). Live-worker enforcement is
+    /// transactionally centralized in `haider-store`'s worker append gate.
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,

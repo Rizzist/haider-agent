@@ -2,13 +2,15 @@
 
 use std::collections::BTreeSet;
 
+use haider_protocol::DeliveryMode;
 use haider_protocol::envelope::{PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION};
-use haider_protocol::ids::{DeviceId, EventId, MenuId, SessionId};
+use haider_protocol::ids::{DeviceId, EventId, MenuId, RunId, SessionId};
+use haider_protocol::session::SessionMetadataV1;
 use haider_rpc::{
-    AttachMode, AttachState, AttachmentId, Capability, ClientKind, CommandId,
+    AttachMode, AttachState, AttachmentId, CancelStatus, Capability, ClientKind, CommandId,
     ERROR_CODE_ALREADY_RESOLVED, ERROR_CODE_CAPABILITY_DENIED, ERROR_CODE_CURSOR_AHEAD, ErrorData,
     Hello, LifecyclePhase, MenuInput, ProtocolError, RequestBody, RequestId, ResponseBody,
-    SeqRange, SessionReadResult, SessionSummary, Welcome, WireFrame,
+    SeqRange, SessionReadResult, SessionSummary, SubmitDisposition, Welcome, WireFrame,
 };
 
 pub const TEST_FRAME_LIMIT: usize = 1024 * 1024;
@@ -72,6 +74,7 @@ pub fn transcript() -> Vec<WireFrame> {
             daemon_version: "0.0.8".into(),
             lifecycle_phase: LifecyclePhase::Ready,
             capabilities_granted: capabilities([Capability::View]),
+            features: BTreeSet::new(),
         }),
         WireFrame::Request {
             request_id: RequestId::new("request-list"),
@@ -108,6 +111,7 @@ pub fn transcript() -> Vec<WireFrame> {
                     session_id: session_id.clone(),
                     head_seq: 9,
                     worker_generation: 7,
+                    metadata: None,
                 }],
                 next_cursor: Some("cursor-after-session-1".into()),
             },
@@ -119,6 +123,7 @@ pub fn transcript() -> Vec<WireFrame> {
                     session_id: session_id.clone(),
                     range,
                     head_seq: 9,
+                    metadata: None,
                     envelopes: vec![raw_envelope(9)],
                 },
             },
@@ -227,6 +232,85 @@ pub fn transcript() -> Vec<WireFrame> {
         },
         WireFrame::Ping { nonce: 99 },
         WireFrame::Pong { nonce: 99 },
+        WireFrame::Request {
+            request_id: RequestId::new("request-create"),
+            body: RequestBody::SessionCreate {
+                command_id: CommandId::new("command-create"),
+                cwd: "/tmp/workspace".into(),
+                provider: "anthropic".into(),
+                model: "claude-test".into(),
+                max_tokens: 4096,
+            },
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-create"),
+            body: ResponseBody::SessionCreate {
+                session_id: SessionId::new("session-created"),
+                created_seq: 1,
+                worker_generation: 7,
+                metadata: SessionMetadataV1 {
+                    cwd: "/tmp/workspace".into(),
+                    provider: "anthropic".into(),
+                    model: "claude-test".into(),
+                    max_tokens: 4096,
+                    system_prompt_version: None,
+                    created_at_ms: 1_753_500_040_000,
+                },
+            },
+        },
+        WireFrame::Request {
+            request_id: RequestId::new("request-submit"),
+            body: RequestBody::TurnSubmit {
+                command_id: CommandId::new("command-submit"),
+                session_id: SessionId::new("session-created"),
+                worker_generation: 7,
+                text: "hello".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-submit"),
+            body: ResponseBody::TurnSubmit {
+                session_id: SessionId::new("session-created"),
+                run_id: RunId::new("run-1"),
+                accepted_seq: 3,
+                worker_generation: 7,
+                disposition: SubmitDisposition::Started,
+            },
+        },
+        WireFrame::Request {
+            request_id: RequestId::new("request-cancel"),
+            body: RequestBody::TurnCancel {
+                command_id: CommandId::new("command-cancel"),
+                session_id: SessionId::new("session-created"),
+                worker_generation: 7,
+                run_id: RunId::new("run-1"),
+            },
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-cancel"),
+            body: ResponseBody::TurnCancel {
+                session_id: SessionId::new("session-created"),
+                run_id: RunId::new("run-1"),
+                status: CancelStatus::Accepted,
+                terminal_seq: None,
+            },
+        },
+        WireFrame::Welcome(Welcome {
+            protocol: 1,
+            instance_id: "instance-featured".into(),
+            daemon_generation: 5,
+            frame_limit: TEST_FRAME_LIMIT as u32,
+            profile_id: "profile-1".into(),
+            daemon_version: "0.0.9".into(),
+            lifecycle_phase: LifecyclePhase::Ready,
+            capabilities_granted: capabilities([Capability::View, Capability::Control]),
+            features: BTreeSet::from([
+                "session_mutation_v1".to_owned(),
+                "turn_control_v1".to_owned(),
+            ]),
+        }),
         WireFrame::ProtocolError(ProtocolError {
             code: "invalid_frame".into(),
             message: "connection framing failed".into(),

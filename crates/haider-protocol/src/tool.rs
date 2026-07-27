@@ -40,7 +40,7 @@ pub struct BoundedResult {
 
 /// Attachment blocks — composer paste tokens and skill inclusions (§10, §9.4).
 /// The tree stores refs, never copies; the prompt compiler injects content.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AttachmentBlock {
     Image {

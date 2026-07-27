@@ -22,8 +22,10 @@ mod profile_lock;
 
 pub use cas::FileCas;
 pub use event_store::{
-    CommittedSeqRange, EventStore, MenuResolutionCommand, MenuResolutionOutcome, ProfileLease,
-    Store,
+    AcceptedTurn, CancelledTurn, CommittedSeqRange, CreatedSession, EventStore,
+    MenuResolutionCommand, MenuResolutionOutcome, ProfileLease, SessionCreateCommand,
+    SessionCreateOutcome, Store, TurnAcceptCommand, TurnAcceptOutcome, TurnAdmissionDisposition,
+    TurnCancelCommand, TurnCancelOutcome, TurnCancellationStatus,
 };
 pub use haider_protocol::error::{ErrorCode, HaiderError};
 

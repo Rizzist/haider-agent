@@ -19,14 +19,22 @@
 
 mod actor;
 mod fake_store;
+mod prompt_history;
 mod recovery;
 mod sqlite_store;
 
 pub use actor::{
-    CancelToken, HarnessActor, HarnessConfig, HarnessHandle, SubmitTurn, TurnHandle, TurnOutcome,
+    CancelToken, EventIdGenerator, HarnessActor, HarnessConfig, HarnessHandle,
+    RequestInputCheckpoint, SubmitCheckpointTurn, SubmitCommittedTurn, SubmitTurn, ToolDispatcher,
+    TurnHandle, TurnOutcome, sanitized_failure_message,
 };
 pub use fake_store::MemoryStore;
-pub use haider_store::{MenuResolutionCommand, MenuResolutionOutcome};
+pub use haider_store::{
+    AcceptedTurn, CancelledTurn, CreatedSession, MenuResolutionCommand, MenuResolutionOutcome,
+    SessionCreateCommand, SessionCreateOutcome, TurnAcceptCommand, TurnAcceptOutcome,
+    TurnAdmissionDisposition, TurnCancelCommand, TurnCancelOutcome, TurnCancellationStatus,
+};
+pub use prompt_history::PromptHistoryCompiler;
 pub use recovery::{RecoveryReport, reconcile_dispatched_effects};
 pub use sqlite_store::SqliteStoreHandle;
 

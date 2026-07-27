@@ -5,7 +5,9 @@
 
 #![allow(clippy::expect_used)]
 
-use haider_core::{HarnessActor, HarnessConfig, SqliteStoreHandle, StoreHandle, SubmitTurn};
+use haider_core::{
+    HarnessActor, HarnessConfig, SqliteStoreHandle, StoreHandle, SubmitCommittedTurn,
+};
 use haider_daemon::{
     AdmissionTicket, FrameSendError, FrameSink, HubConnection, HubObservation, SendAdmission,
     SessionHub, SessionHubConfig, SessionHubObserver, SessionHubShutdownOutcome,
@@ -14,11 +16,11 @@ use haider_protocol::EventPayload;
 use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
 };
-use haider_protocol::ids::{DeviceId, EventId, MenuId, SessionId};
+use haider_protocol::ids::{DeviceId, EventId, MenuId, RunId, SessionId};
 use haider_protocol::menu::{Menu, MenuKind, MenuOption, MenuScope};
 use haider_protocol::provider::FinishReason;
 use haider_protocol::state::RunState;
-use haider_provider::{FakeInputKind, FakeInputOption, FakeProvider, FakeStep};
+use haider_provider::{FakeInputKind, FakeInputOption, FakeProvider, FakeStep, Message};
 use haider_rpc::{
     AttachMode, AttachmentId, Capability, CapabilitySet, CommandId, ErrorData, RequestBody,
     RequestId, ResponseBody, SeqRange, WireFrame,
@@ -435,6 +437,42 @@ fn capabilities() -> CapabilitySet {
     CapabilitySet::from([Capability::View, Capability::Control])
 }
 
+/// MUTATION CHECK: validate only persisted worker_generation and omit the
+/// active lease token. Expected failure: the superseded first worker appends
+/// successfully in the same daemon generation.
+#[tokio::test]
+async fn superseded_worker_lease_is_fenced_before_store_append() {
+    let (_root, store, hub) = open_hub(None, 8).await;
+    let session_id = SessionId::new("lease-fence");
+    let generation = store.worker_generation();
+    append_one(&hub, &session_id, generation, "seed").await;
+    let first = hub
+        .acquire_worker_lease(session_id.clone())
+        .await
+        .expect("first lease");
+    let second = hub
+        .acquire_worker_lease(session_id.clone())
+        .await
+        .expect("replacement lease");
+
+    let mut stale = [envelope(&session_id, "stale", generation)];
+    let error = StoreHandle::append(&first, &mut stale)
+        .await
+        .expect_err("stale lease must fail");
+    assert_eq!(
+        error.code,
+        haider_protocol::error::ErrorCode::SingleWriterViolation
+    );
+    let mut current = [envelope(&session_id, "current", generation)];
+    StoreHandle::append(&second, &mut current)
+        .await
+        .expect("current lease appends");
+    assert_eq!(current[0].seq, 2);
+
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
 fn attachment_from(frame: WireFrame) -> (AttachmentId, u64) {
     let WireFrame::Response {
         body:
@@ -629,6 +667,10 @@ async fn full_internal_catch_up_receiver_reregisters_and_resumes_from_store() {
         }
     }
     assert_eq!(delivered, [1, 2, 3, 4]);
+    let metrics = hub.metrics();
+    assert!(metrics.catch_up_overflows >= 1);
+    assert!(metrics.reregistrations >= 1);
+    assert!(metrics.store_resumes >= 1);
 
     connection.close().await.expect("connection closes");
     hub.shutdown().await.expect("hub stops");
@@ -1226,7 +1268,69 @@ async fn committed_menu_event_wakes_registered_harness_exactly_once() {
             reason: FinishReason::EndTurn,
         },
     ]));
-    let harness_store: Arc<dyn StoreHandle> = Arc::new(hub.clone());
+    // DIRECTED R1 SEAL CHANGE: the old test intentionally coerced
+    // `SessionHub` into an unfenced, cross-session `StoreHandle`. That shape
+    // must no longer compile. Mint one session lease, give that constrained
+    // handle to the harness, and thread the SAME lease into registration.
+    let lease = hub
+        .acquire_worker_lease(session_id.clone())
+        .await
+        .expect("worker lease");
+    let run_id = RunId::new("live-harness-menu-run");
+    let mut accepted_prefix = vec![
+        EventEnvelope {
+            schema_version: SCHEMA_VERSION,
+            event_id: EventId::new("live-harness-menu-queued"),
+            seq: 0,
+            session_id: session_id.clone(),
+            branch_id: None,
+            run_id: Some(run_id.clone()),
+            agent_id: None,
+            device_id: DeviceId::new("hub-harness"),
+            authority_epoch: 0,
+            worker_generation: generation,
+            causation_id: None,
+            correlation_id: None,
+            committed_at_ms: 0,
+            render: RenderTargets {
+                ui: true,
+                durable: true,
+                prompt: PromptRender::Omit,
+            },
+            payload: serde_json::to_value(EventPayload::RunState(RunState::Queued))
+                .expect("queued payload"),
+        },
+        EventEnvelope {
+            schema_version: SCHEMA_VERSION,
+            event_id: EventId::new("live-harness-menu-user"),
+            seq: 0,
+            session_id: session_id.clone(),
+            branch_id: None,
+            run_id: Some(run_id.clone()),
+            agent_id: None,
+            device_id: DeviceId::new("hub-harness"),
+            authority_epoch: 0,
+            worker_generation: generation,
+            causation_id: None,
+            correlation_id: None,
+            committed_at_ms: 0,
+            render: RenderTargets {
+                ui: true,
+                durable: true,
+                prompt: PromptRender::Verbatim,
+            },
+            payload: serde_json::to_value(EventPayload::UserMessage {
+                text: "ask through the hub".into(),
+                attachments: Vec::new(),
+                mode: haider_protocol::DeliveryMode::Queue,
+            })
+            .expect("user payload"),
+        },
+    ];
+    hub.append(&mut accepted_prefix)
+        .await
+        .expect("daemon acceptance prefix");
+    let harness_store: Arc<dyn StoreHandle> = Arc::new(lease.clone());
     let harness = HarnessActor::spawn(
         HarnessConfig::for_session(
             session_id.clone(),
@@ -1238,11 +1342,15 @@ async fn committed_menu_event_wakes_registered_harness_exactly_once() {
         provider,
         harness_store,
     );
-    hub.register_harness(session_id.clone(), harness.clone())
+    lease
+        .register_harness(harness.clone())
         .await
         .expect("harness registers");
     let turn = harness
-        .submit_turn(SubmitTurn::new("ask through the hub"))
+        .submit_committed_turn(SubmitCommittedTurn {
+            run_id,
+            messages: vec![Message::user_text("ask through the hub")],
+        })
         .await
         .expect("turn starts");
     let mut state = harness.state_receiver();
@@ -1336,6 +1444,29 @@ async fn committed_menu_event_wakes_registered_harness_exactly_once() {
     drop(harness);
     hub.shutdown().await.expect("hub stops");
     store.close().await.expect("store closes");
+}
+
+/// Scenario-13 structural guard for the R1 seal. This deliberately scans
+/// production source because Rust has no negative trait-bound assertion: the
+/// forbidden coercion must remain absent, while the session-scoped handle is
+/// threaded into core and registration.
+#[test]
+fn worker_surface_is_structurally_lease_scoped() {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let worker = std::fs::read_to_string(manifest.join("src/worker.rs")).expect("worker source");
+    let hub = std::fs::read_to_string(manifest.join("src/session_hub/mod.rs")).expect("hub source");
+    assert!(!worker.contains("SqliteStoreHandle"));
+    assert!(!worker.contains("Arc::new(hub.clone())"));
+    assert!(!hub.contains("impl StoreHandle for SessionHub"));
+    assert!(!worker.contains("supervisor_hub"));
+    let supervisor = worker
+        .split("async fn run_supervisor(")
+        .nth(1)
+        .and_then(|source| source.split("async fn admit_pending(").next())
+        .expect("supervisor source");
+    assert!(!supervisor.contains("SessionHub"));
+    assert!(worker.contains("Arc::new(lease.clone())"));
+    assert!(worker.contains(".register_harness(harness.clone())"));
 }
 
 /// MUTATION CHECK: make the socket response authoritative or omit the
@@ -1704,6 +1835,128 @@ async fn stale_worker_generation_menu_answer_is_rejected_and_fenced() {
     assert!(
         sink.snapshot().is_empty(),
         "stale answer published no event"
+    );
+
+    connection.close().await.expect("connection closes");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// MUTATION CHECK: clear the recovered menu coordinate after the winning
+/// answer commits. Expected failure: a later prior-generation loser is
+/// rejected as `stale_generation` instead of observing the durable winner as
+/// `already_resolved`.
+/// Verified by revert on 2026-07-27.
+#[tokio::test]
+async fn recovered_menu_coordinate_authorizes_losers_after_the_winner_commits() {
+    let (_root, store, hub) = open_hub(None, 8).await;
+    let session_id = SessionId::new("recovered-menu-losers");
+    let menu_id = MenuId::new("recovered-menu");
+    let generation = store.worker_generation();
+    let opening_generation = generation.saturating_sub(1);
+    let mut opening = vec![menu_opening(&session_id, &menu_id, opening_generation)];
+    hub.append(&mut opening).await.expect("menu opens");
+
+    let lease = hub
+        .acquire_worker_lease(session_id.clone())
+        .await
+        .expect("worker lease");
+    let config = HarnessConfig::for_session(
+        session_id.clone(),
+        DeviceId::new("recovered-worker"),
+        11,
+        generation,
+    );
+    let (_actor, harness) = HarnessActor::new(
+        config,
+        Arc::new(FakeProvider::new(Vec::new())),
+        Arc::new(lease.clone()),
+    );
+    lease
+        .register_recovered_harness(harness, menu_id.clone(), opening[0].seq, opening_generation)
+        .await
+        .expect("recovered harness registers");
+
+    let sink = Arc::new(CollectSink::default());
+    let connection = hub
+        .open_connection(capabilities(), sink.clone())
+        .expect("connection");
+    connection
+        .request(
+            RequestId::new("attach"),
+            RequestBody::SessionAttach {
+                session_id: session_id.clone(),
+                after_seq: opening[0].seq,
+                mode: AttachMode::Control,
+            },
+        )
+        .await
+        .expect("attach routes");
+    let _ = attachment_from(sink.next().await);
+    assert!(matches!(
+        sink.next().await,
+        WireFrame::AttachCaughtUp {
+            high_water_seq: 1,
+            ..
+        }
+    ));
+
+    connection
+        .menu_answer(
+            Some(RequestId::new("winner")),
+            CommandId::new("winner-command"),
+            session_id.clone(),
+            menu_id.clone(),
+            opening[0].seq,
+            opening_generation,
+            "allow".into(),
+            0,
+            None,
+        )
+        .await
+        .expect("winner routes");
+    let mut winner_response = false;
+    let mut winner_event = false;
+    while !winner_response || !winner_event {
+        match sink.next().await {
+            WireFrame::Response {
+                request_id,
+                body: ResponseBody::MenuAnswer { resolution_seq: 2 },
+            } if request_id.as_str() == "winner" => winner_response = true,
+            WireFrame::Event { envelope, .. } if envelope.seq == 2 => winner_event = true,
+            frame => panic!("unexpected winner frame: {frame:?}"),
+        }
+    }
+
+    connection
+        .menu_answer(
+            Some(RequestId::new("loser")),
+            CommandId::new("loser-command"),
+            session_id,
+            menu_id,
+            opening[0].seq,
+            opening_generation,
+            "deny".into(),
+            1,
+            None,
+        )
+        .await
+        .expect("loser routes");
+    let loser = sink.next().await;
+    assert!(
+        matches!(
+        loser,
+        WireFrame::Response {
+            ref request_id,
+            body:
+                ResponseBody::Error {
+                    ref code,
+                    data: Some(ErrorData::AlreadyResolved { resolution_seq: 2 }),
+                    ..
+                },
+        } if request_id.as_str() == "loser" && code == "already_resolved"
+        ),
+        "unexpected loser response: {loser:?}"
     );
 
     connection.close().await.expect("connection closes");

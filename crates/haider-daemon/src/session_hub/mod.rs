@@ -1,0 +1,1901 @@
+//! Session-scoped actors, attachment replay, and durable menu arbitration.
+//!
+//! One actor owns the serialized command order for each live session. That
+//! order is the proof boundary for the laws below.
+//!
+//! # Laws stated here (every other comment refers back to this list)
+//!
+//! - **INVARIANT 1 — persist before publish (§5.5).** An envelope is
+//!   published to attachments (and the harness) only after its store append
+//!   has returned. Holds by code shape in [`run_session_actor`]: the store
+//!   call is awaited and `publish` is a synchronous call later in the same
+//!   command arm.
+//! - **INVARIANT 2 — register receiver + observe head `H` in one serialized
+//!   step (§5.5).** Receiver insertion and committed-head capture are
+//!   adjacent synchronous statements inside the actor's `Register` arm; no
+//!   await or yield exists between them, so no append can interleave. Holds
+//!   by code shape, and the forced-boundary tests assert it.
+//! - **The store is the lag buffer (R12), with TWO distinct overflow
+//!   responses.** Replay pages the store (byte-budgeted via
+//!   `Store::read_page`); live delivery crosses a bounded per-attachment
+//!   catch-up channel — bounded in frames AND estimated bytes ([`publish`])
+//!   — and the bounded connection outbox. (a) INTERNAL catch-up overflow is
+//!   invisible on the wire: the attachment re-registers in actor order and
+//!   resumes from the store, and the client sees only a repeated
+//!   `AttachCaughtUp` at a higher head. The catch-up byte bound is HARD —
+//!   an oversized envelope is never buffered; it arrives via the same
+//!   store resume. (b) Sink-side refusal or lag-under-stall detaches: the
+//!   client gets `Lagged` (a control notice on the system reply lane) and
+//!   reattaches after its applied cursor. No unbounded queue ever buffers
+//!   history for a slow client either way.
+//! - **Unknown-id rule.** A client never receives a frame referencing an
+//!   attachment id it has not been told about ([`lag_and_detach`] states
+//!   the rule and its one interesting case — a detach that outruns the
+//!   staged attach response answers the request instead).
+//! - **Delivery is paced by atomic sink admission.** Every attachment frame
+//!   is admitted through [`FrameSink::offer`] — both dimensions, checked
+//!   and consumed in one step — and a busy sink is awaited on a FIFO
+//!   admission ticket, so a reading client is never detached by a capacity
+//!   race or a page burst and a hot lane cannot starve a queued cold one
+//!   ([`deliver_frame`] states the law).
+//! - **Attachment admission is capped** per connection and hub-wide, refused
+//!   BEFORE any actor or channel work with the correlated, retryable
+//!   `overloaded` error ([`SessionHubConfig`] and
+//!   `SessionHub::reserve_attachment_slot`).
+//!
+//! Laws this module obeys but does not own (each has ONE authoritative site):
+//!
+//! - menu arbitration (first committed answer wins) is stated on
+//!   `haider_store::Store::resolve_menu`;
+//! - the fair-scheduling policy is stated on `connection.rs`'s
+//!   `OutboundLane`;
+//! - command-receipt idempotency (R2) is stated on
+//!   `haider_store::Store::session_create_receipt`;
+//! - the recovery reduction rules (R5) are stated in `turn_recovery.rs`;
+//! - the drain barrier order (R9) is stated in `runtime.rs`'s `run_inner`;
+//!   this module contributes the admission asymmetry documented on
+//!   [`SessionHub::actor_for`] vs `SessionHub::existing_actor`.
+//!
+//! # Module map (the W3c split; each file opens with its charter)
+//!
+//! - `mod.rs` — hub state and task ownership, attachment admission ledger,
+//!   worker leases, shutdown, [`HubStoreHandle`], and the types every
+//!   submodule shares. No command arms, no delivery pacing, no RPC handling.
+//! - `actor.rs` — [`run_session_actor`]: the serialized command order that
+//!   proves INVARIANTs 1/2 and owns same-generation lease fencing.
+//! - `replay.rs` — the per-attachment delivery pipeline; owns the pacing law
+//!   and the unknown-id rule.
+//! - `rpc.rs` — [`HubConnection`]'s request surface: policy checks, receipt
+//!   orchestration, wire error mapping.
+//!
+//! # Mechanism
+//!
+//! Replays are separate cancellable tasks. They page `(after_seq, H]`, emit
+//! `AttachCaughtUp(H)`, drain the already-registered bounded receiver for
+//! `seq > H`, then stay live ([`run_replay`] documents the phases).
+//!
+//! # W3c/W3d seams
+//!
+//! A real client reaches sessions only through this surface: after handshake
+//! negotiation, [`SessionHub::open_connection`] with the transport's
+//! [`FrameSink`], then [`HubConnection::request`] and
+//! [`HubConnection::menu_answer`]. The CLI `haider attach` and the TUI's
+//! live-attach path (W3c) and the localhost WebSocket layer (W3d) add
+//! transports over this seam, not new semantics. In-process workers join
+//! through [`HubStoreHandle::register_harness`] and retain that same
+//! constrained handle as their only `StoreHandle`.
+
+#[cfg(test)]
+#[path = "../session_hub_private_tests.rs"]
+mod session_hub_private_tests;
+
+mod actor;
+mod replay;
+mod rpc;
+
+use crate::DaemonError;
+use crate::worker::WorkerManagerHandle;
+use actor::run_session_actor;
+use async_trait::async_trait;
+use haider_core::{
+    AcceptedTurn, CancelledTurn, CreatedSession, HarnessHandle, MenuResolutionCommand,
+    MenuResolutionOutcome, SessionCreateCommand, SessionCreateOutcome, SqliteStoreHandle,
+    StoreHandle, TurnAcceptCommand, TurnAcceptOutcome, TurnAdmissionDisposition, TurnCancelCommand,
+    TurnCancelOutcome, TurnCancellationStatus,
+};
+use haider_protocol::envelope::{RawEnvelope, envelope_weight_bytes};
+use haider_protocol::error::{ErrorCode, HaiderError};
+use haider_protocol::ids::{DeviceId, EventId, MenuId, SessionId};
+use haider_protocol::menu::{AnswerVia, MenuAnswer as DurableMenuAnswer};
+use haider_rpc::{
+    AttachMode, AttachState, AttachmentId, CancelStatus, Capability, CapabilitySet, CommandId,
+    ERROR_CODE_ALREADY_RESOLVED, ERROR_CODE_CAPABILITY_DENIED, ERROR_CODE_CURSOR_AHEAD,
+    ERROR_CODE_DRAINING, ERROR_CODE_INVALID_ARGUMENT, ERROR_CODE_INVALID_CURSOR,
+    ERROR_CODE_NOT_FOUND, ERROR_CODE_OVERLOADED, ERROR_CODE_RUN_NOT_ACTIVE,
+    ERROR_CODE_STALE_GENERATION, ErrorData, MenuInput, ProtocolError, RequestBody, RequestId,
+    ResponseBody, SeqRange, SessionReadResult, SessionSummary, SubmitDisposition, WireFrame,
+};
+use std::collections::HashMap;
+use std::fmt;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
+use tokio::task::JoinHandle;
+
+#[cfg(test)]
+use replay::{FrameDelivery, deliver_frame};
+use replay::{ReplayCompletion, run_replay};
+
+const REPLAY_PAGE_SIZE: usize = 256;
+const MAX_LIST_PAGE: usize = 100;
+const MAX_READ_ENVELOPES: usize = 1_024;
+
+// ────────────────── configuration, sink seam, and observer ──────────────────
+
+/// Bounds for session-actor, attachment-admission, and catch-up traffic.
+#[derive(Debug, Clone, Copy)]
+pub struct SessionHubConfig {
+    /// Commands waiting at one live session actor.
+    pub actor_command_capacity: usize,
+    /// Commits after `H` retained while one attachment replays (frame count;
+    /// `catch_up_byte_budget` bounds the same channel in bytes).
+    pub catch_up_capacity: usize,
+    /// True-weight units of committed envelopes one attachment's catch-up
+    /// channel may retain — a HARD ceiling. [`envelope_weight_bytes`] counts
+    /// the full envelope value, every owned ID string, and conservative
+    /// payload heap overhead. Overflow (including a single envelope larger
+    /// than the whole budget) takes the exact same nonblocking
+    /// lag-then-store-resume transition as a full frame count; [`publish`]
+    /// states the rule.
+    ///
+    /// Aggregate catch-up worst case is exactly `max_attachments ×
+    /// catch_up_byte_budget` true-weight units: 256 × 8 MiB = 2 GiB at the
+    /// defaults. Replay pages are additive and have a different exact bound:
+    /// each live replay may materialize `replay_page_byte_budget + one
+    /// maximally-sized committed row`. `read_page` guarantees at least one
+    /// row for progress even when that row exceeds its page budget, so the
+    /// extra row is part of the bound, not hidden inside the nominal 1 MiB.
+    /// These are additive to the per-connection outbox ceiling stated on
+    /// `connection.rs`'s `OutboundLane`. Operators sizing small hosts tune
+    /// these caps together.
+    pub catch_up_byte_budget: usize,
+    /// True-weight units one replay store page may retain
+    /// (`Store::read_page`); the page ends when the budget fills and the next
+    /// page resumes from the last delivered sequence.
+    pub replay_page_byte_budget: usize,
+    /// Attachments one connection may hold concurrently. The N+1th
+    /// `SessionAttach` is rejected with the correlated, retryable
+    /// `overloaded` error before any actor or channel work happens.
+    pub max_attachments_per_connection: usize,
+    /// Attachments the whole hub may hold concurrently, independent of the
+    /// per-connection cap; same rejection shape.
+    pub max_attachments: usize,
+}
+
+impl Default for SessionHubConfig {
+    fn default() -> Self {
+        Self {
+            actor_command_capacity: 64,
+            catch_up_capacity: 64,
+            catch_up_byte_budget: 8 * 1024 * 1024,
+            replay_page_byte_budget: 1024 * 1024,
+            max_attachments_per_connection: 16,
+            max_attachments: 256,
+        }
+    }
+}
+
+impl SessionHubConfig {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.actor_command_capacity == 0
+            || self.catch_up_capacity == 0
+            || self.catch_up_byte_budget == 0
+            || self.replay_page_byte_budget == 0
+        {
+            return Err(
+                "session hub queue capacities and byte budgets must be greater than zero".into(),
+            );
+        }
+        if self.max_attachments_per_connection == 0 || self.max_attachments == 0 {
+            return Err("session hub attachment limits must be greater than zero".into());
+        }
+        Ok(())
+    }
+}
+
+/// How a sink answered an [`FrameSink::offer`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendAdmission {
+    /// The frame was admitted; its frames-and-bytes reservation was granted
+    /// and consumed in the same atomic step.
+    Sent,
+    /// Admitting the frame right now would exceed a bound in EITHER
+    /// dimension (frame slots or byte budget), or the attachment's staged
+    /// attach response has not been delivered yet. Nothing was consumed; the
+    /// caller takes a [`FrameSink::drain_ticket`] and re-offers when it
+    /// fires.
+    Busy,
+    /// The sink can never admit this frame (it is closed, or the frame
+    /// exceeds the negotiated frame limit). The caller detaches.
+    Refused,
+}
+
+/// Opaque identity and reusable wake permit for one FIFO admission waiter.
+///
+/// The sink retains weak references in its existing waiter queue; pointer
+/// identity is the reservation token, so no numeric ticket counter exists.
+pub type AdmissionTicket = Arc<Notify>;
+
+/// A nonblocking destination for frames produced by one hub connection.
+///
+/// The production implementation is the connection's bounded fair outbox.
+/// Tests may use a deterministic sink to stop at replay boundaries.
+///
+/// PAIRING/LIVENESS CONTRACT: a sink whose [`Self::offer`] can answer
+/// [`SendAdmission::Busy`] MUST return `Some` from [`Self::drain_ticket`],
+/// and every issued ticket must eventually fire (or drop) as capacity frees
+/// — otherwise a paced delivery task would wait forever. A sink without
+/// tickets must never answer `Busy`; if one does anyway, the hub degrades
+/// the answer to a refusal rather than spin or hang.
+pub trait FrameSink: Send + Sync {
+    /// Admits one complete frame without waiting on a socket.
+    fn try_send(&self, frame: WireFrame) -> Result<(), FrameSendError>;
+
+    /// Stages a `SessionAttach` RESPONSE with response-before-event
+    /// ordering: a sink with keyed event lanes must not admit this
+    /// attachment's event offers until the response has left the queue, and
+    /// [`Self::purge_attachment`] must report the response's request id if
+    /// it is still staged when the attachment dies. The default is correct
+    /// for sinks with one totally-ordered queue and no admission pressure.
+    fn try_send_for(
+        &self,
+        _attachment_id: &AttachmentId,
+        frame: WireFrame,
+    ) -> Result<(), FrameSendError> {
+        self.try_send(frame)
+    }
+
+    /// Purges queued traffic for a detached attachment when the sink keeps
+    /// keyed lanes, returning the request id of a staged-but-undelivered
+    /// attach response so the hub can answer the request instead of emitting
+    /// a frame for an attachment id the client never learned. The default is
+    /// suitable for sinks without staging queues.
+    fn purge_attachment(&self, _attachment_id: &AttachmentId) -> Option<RequestId> {
+        None
+    }
+
+    /// Atomically admits one frame for this attachment under EVERY bound the
+    /// sink enforces (frame slots AND bytes), or reports why it cannot. The
+    /// admission is the reservation: it is granted and consumed in one step
+    /// under the sink's own lock, so concurrent attachment lanes can never
+    /// jointly observe the same headroom and overbook, and there is no
+    /// unused grant to release. The default delegates to [`Self::try_send`]
+    /// (test sinks keep refusal as their only arbiter).
+    fn offer(&self, _attachment_id: &AttachmentId, frame: &WireFrame) -> SendAdmission {
+        match self.try_send(frame.clone()) {
+            Ok(()) => SendAdmission::Sent,
+            Err(FrameSendError) => SendAdmission::Refused,
+        }
+    }
+
+    /// Re-offers with the reservation token returned by
+    /// [`Self::drain_ticket`]. A sink that can answer `Busy` must admit
+    /// ordinary attachment traffic only when its waiter queue is empty or
+    /// this token identifies the head waiter. The default suits sinks that
+    /// never answer `Busy`.
+    fn offer_ticketed(
+        &self,
+        attachment_id: &AttachmentId,
+        frame: &WireFrame,
+        _ticket: &AdmissionTicket,
+    ) -> SendAdmission {
+        self.offer(attachment_id, frame)
+    }
+
+    /// Enqueues one FIFO admission ticket. Capacity wakes the head without
+    /// consuming its reservation; only successful admission removes it, so
+    /// a fresh offer cannot barge between notification and service. `None`
+    /// (the default) means the sink never answers `Busy` and refusal is the
+    /// only arbiter. See the trait-level pairing/liveness contract.
+    fn drain_ticket(&self) -> Option<AdmissionTicket> {
+        None
+    }
+
+    /// Removes an unconsumed ticket when delivery is cancelled or refused.
+    /// A bounded sink must wake the next live head if this token owned it.
+    fn cancel_ticket(&self, _ticket: &AdmissionTicket) {}
+
+    /// Unit-test-only pause inserted after a ticket fires and before the
+    /// confirming re-offer. Production sinks never expose this hook.
+    #[cfg(test)]
+    fn ticket_fired_test_gate(
+        &self,
+    ) -> Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>> {
+        None
+    }
+}
+
+/// Cancellation-safe ownership of one unconsumed admission ticket.
+///
+/// `deliver_frame` can be raw-aborted at any await. Retaining the ticket only
+/// through this guard makes every such drop run the sink's normal cancellation
+/// path, which removes the token and wakes its successor when it owned the
+/// queue head.
+struct AdmissionTicketGuard {
+    sink: Arc<dyn FrameSink>,
+    ticket: AdmissionTicket,
+    armed: bool,
+}
+
+impl AdmissionTicketGuard {
+    fn new(sink: Arc<dyn FrameSink>, ticket: AdmissionTicket) -> Self {
+        Self {
+            sink,
+            ticket,
+            armed: true,
+        }
+    }
+
+    fn ticket(&self) -> &AdmissionTicket {
+        &self.ticket
+    }
+
+    /// The sink consumed the token atomically with successful admission.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    /// Orderly refusal/cancellation uses the same path as an asynchronous
+    /// future drop, then disarms the guard to prevent a second cancellation.
+    fn cancel(&mut self) {
+        if self.armed {
+            self.armed = false;
+            self.sink.cancel_ticket(&self.ticket);
+        }
+    }
+}
+
+impl Drop for AdmissionTicketGuard {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
+/// A bounded sink refused a frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameSendError;
+
+impl fmt::Display for FrameSendError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("bounded connection outbox refused a frame")
+    }
+}
+
+impl std::error::Error for FrameSendError {}
+
+/// Semantic boundary emitted by the hub's optional observer.
+///
+/// Production uses the no-op observer. The observer contract is nonblocking;
+/// deterministic tests may deliberately gate a replay task or actor turn to
+/// force every §5.5 interleaving.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum HubObservation {
+    AppendEnqueued {
+        session_id: SessionId,
+    },
+    ShutdownGuarded,
+    ReceiverRegistered {
+        attachment_id: AttachmentId,
+    },
+    HeadCaptured {
+        attachment_id: AttachmentId,
+        head: u64,
+    },
+    Persisted {
+        session_id: SessionId,
+        through_seq: u64,
+    },
+    Published {
+        session_id: SessionId,
+        through_seq: u64,
+    },
+    ReplayEvent {
+        attachment_id: AttachmentId,
+        seq: u64,
+    },
+    BeforeCaughtUp {
+        attachment_id: AttachmentId,
+        through_seq: u64,
+    },
+    CaughtUp {
+        attachment_id: AttachmentId,
+        through_seq: u64,
+    },
+    BufferedEvent {
+        attachment_id: AttachmentId,
+        seq: u64,
+    },
+    LiveEvent {
+        attachment_id: AttachmentId,
+        seq: u64,
+    },
+    BeforeEvent {
+        attachment_id: AttachmentId,
+        seq: u64,
+    },
+    FinalSuffixHeadCaptured {
+        attachment_id: AttachmentId,
+        head: u64,
+    },
+}
+
+/// Optional boundary observer. Implementations must return promptly outside
+/// deterministic tests.
+pub trait SessionHubObserver: Send + Sync {
+    fn observe(&self, observation: HubObservation);
+}
+
+/// Monotonic W3c operational counters for the store-as-lag-buffer path.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SessionHubMetrics {
+    pub catch_up_overflows: u64,
+    pub discarded_envelopes: u64,
+    pub discarded_store_pages: u64,
+    pub store_resumes: u64,
+    pub reregistrations: u64,
+    pub outbox_detaches: u64,
+}
+
+#[derive(Default)]
+struct HubMetrics {
+    catch_up_overflows: AtomicU64,
+    discarded_envelopes: AtomicU64,
+    discarded_store_pages: AtomicU64,
+    store_resumes: AtomicU64,
+    reregistrations: AtomicU64,
+    outbox_detaches: AtomicU64,
+}
+
+impl HubMetrics {
+    fn snapshot(&self) -> SessionHubMetrics {
+        SessionHubMetrics {
+            catch_up_overflows: self.catch_up_overflows.load(Ordering::Relaxed),
+            discarded_envelopes: self.discarded_envelopes.load(Ordering::Relaxed),
+            discarded_store_pages: self.discarded_store_pages.load(Ordering::Relaxed),
+            store_resumes: self.store_resumes.load(Ordering::Relaxed),
+            reregistrations: self.reregistrations.load(Ordering::Relaxed),
+            outbox_detaches: self.outbox_detaches.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct NoopObserver;
+
+impl SessionHubObserver for NoopObserver {
+    fn observe(&self, _observation: HubObservation) {}
+}
+
+// ──────────────────── hub state, task ownership, errors ─────────────────────
+
+/// Cloneable owner of every live session actor and replay task.
+#[derive(Clone)]
+pub struct SessionHub {
+    inner: Arc<HubInner>,
+}
+
+struct HubInner {
+    store: SqliteStoreHandle,
+    config: SessionHubConfig,
+    observer: Arc<dyn SessionHubObserver>,
+    metrics: Arc<HubMetrics>,
+    actors: Mutex<HashMap<SessionId, SessionActorHandle>>,
+    actor_tasks: Mutex<Vec<JoinHandle<()>>>,
+    replay_tasks: Mutex<Vec<JoinHandle<ReplayCompletion>>>,
+    attachments: Mutex<HashMap<AttachmentId, AttachmentOwner>>,
+    /// Admission ledger for the per-connection and global attachment caps.
+    /// A slot is reserved BEFORE any actor or channel work and released when
+    /// registration fails or `take_attachment` removes the owner, so every
+    /// admitted attachment's whole resource footprint sits behind one
+    /// reservation.
+    attachment_slots: Mutex<AttachmentSlots>,
+    draining: AtomicBool,
+    /// Set ONLY when a cancelled (deadline-forced) shutdown drops its future.
+    /// Actors check it after every command receive: a task abort cannot
+    /// interrupt an actor resuming from a synchronous boundary, and without
+    /// this fence it would start one more store append that nothing will
+    /// ever observe. A graceful drain never sets it — queued commands must
+    /// complete their persist+publish during the §6.6 grace.
+    force_stop: Arc<AtomicBool>,
+    device_id: DeviceId,
+    worker_manager: Mutex<Option<WorkerManagerHandle>>,
+}
+
+#[derive(Default)]
+struct AttachmentSlots {
+    total: usize,
+    per_connection: HashMap<String, usize>,
+}
+
+/// RAII admission slot: refunds itself on drop unless ownership was
+/// transferred to the attachments map. Registration can be cancelled at any
+/// await (the requesting connection task may be aborted); this guard makes
+/// the refund unconditional on every such exit.
+struct AttachmentSlotGuard {
+    hub: SessionHub,
+    connection_id: String,
+    armed: bool,
+}
+
+impl AttachmentSlotGuard {
+    /// Ownership moved into the attachments map; `take_attachment` releases
+    /// the slot from now on.
+    fn transfer(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for AttachmentSlotGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.hub.release_attachment_slot(&self.connection_id);
+        }
+    }
+}
+
+/// Raises the hub-wide forced-stop fence ([`HubInner::force_stop`]) when a
+/// shutdown future is dropped before completing gracefully.
+struct ForcedStopGuard {
+    fence: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl Drop for ForcedStopGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.fence.store(true, Ordering::Release);
+        }
+    }
+}
+
+/// Join handles that abort every still-owned task if the enclosing shutdown
+/// future is itself cancelled at the global drain deadline.
+///
+/// FENCE-BEFORE-ABORT (by code shape): when live handles are about to be
+/// aborted, the hub-wide forced-stop fence is raised FIRST, in the same
+/// `Drop` body, so an actor resuming from a synchronous boundary on another
+/// worker observes the fence before — never after — its task is aborted and
+/// refuses queued work instead of starting an uncancellable store write.
+struct OwnedTasks<T> {
+    handles: Vec<JoinHandle<T>>,
+    force_stop: Arc<AtomicBool>,
+}
+
+impl<T> OwnedTasks<T> {
+    fn new(handles: Vec<JoinHandle<T>>, force_stop: Arc<AtomicBool>) -> Self {
+        Self {
+            handles,
+            force_stop,
+        }
+    }
+
+    async fn join_all(&mut self) -> Vec<Result<T, tokio::task::JoinError>> {
+        let mut outcomes = Vec::with_capacity(self.handles.len());
+        while let Some(handle) = self.handles.last_mut() {
+            // Keep the handle inside `self` while it is awaited: cancelling
+            // this join future must leave it visible to `Drop`, which raises
+            // the fence and aborts every still-owned task.
+            let outcome = handle.await;
+            self.handles.pop();
+            outcomes.push(outcome);
+        }
+        outcomes
+    }
+}
+
+impl<T> Drop for OwnedTasks<T> {
+    fn drop(&mut self) {
+        if self.handles.is_empty() {
+            // Graceful completion: everything was joined, nothing to abort,
+            // the fence stays down.
+            return;
+        }
+        self.force_stop.store(true, Ordering::Release);
+        for handle in &self.handles {
+            handle.abort();
+        }
+    }
+}
+
+#[derive(Clone)]
+struct SessionActorHandle {
+    commands: mpsc::Sender<ActorCommand>,
+}
+
+/// Opaque same-process worker authority. Store generation fences restarts;
+/// this token additionally fences a replaced supervisor in one generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkerLeaseId(String);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecoveredMenuCoordinate {
+    menu_id: MenuId,
+    request_seq: u64,
+    opening_generation: u64,
+}
+
+struct RegisteredWorker {
+    lease_id: WorkerLeaseId,
+    harness: Option<HarnessHandle>,
+    /// Nonblocking notification only; the durable journal is the cancellation
+    /// lag buffer. Replacement swaps this sender in actor order.
+    cancellation_wake: Option<watch::Sender<u64>>,
+}
+
+/// Lease-fenced, session-scoped store surface handed to a worker (R1).
+///
+/// This type IS the append-exclusivity seal ([`SessionHub::append`] states
+/// the law): a worker can reach committed reads, append-through-actor, CAS
+/// artifacts, and the idle settle — nothing else. SQLite and cross-session
+/// access are structurally unavailable, every append is identity-checked
+/// against the lease's session and generation before it reaches the actor,
+/// and the actor rejects the lease token itself once a successor supersedes
+/// it (actor.rs charter). Cloning shares the one lease; it does not mint
+/// authority.
+#[derive(Clone)]
+pub struct HubStoreHandle {
+    hub: SessionHub,
+    session_id: SessionId,
+    worker_generation: u64,
+    lease_id: WorkerLeaseId,
+}
+
+/// Hub-level attachment metadata (§5.6): who owns the attachment and with
+/// which mode. Policy checks (e.g. the menu control-attachment requirement)
+/// read this map; the actor keeps only delivery state ([`ActorAttachment`]).
+struct AttachmentOwner {
+    connection_id: String,
+    session_id: SessionId,
+    mode: AttachMode,
+    actor: SessionActorHandle,
+    cancel: watch::Sender<bool>,
+}
+
+/// One committed envelope in flight on a catch-up channel, carrying the
+/// weight it was charged so receive-side credit is exactly symmetric.
+struct QueuedEnvelope {
+    weight: usize,
+    envelope: RawEnvelope,
+}
+
+/// Actor-side delivery state for one registered attachment.
+struct ActorAttachment {
+    events: mpsc::Sender<QueuedEnvelope>,
+    lagged: watch::Sender<Option<u64>>,
+    /// Estimated bytes currently queued on `events` — charged by the actor
+    /// before enqueue, credited by the replay task on receive, reset to zero
+    /// when re-registration replaces the channel wholesale.
+    queued_bytes: Arc<AtomicUsize>,
+    last_buffered_seq: u64,
+    active: bool,
+}
+
+struct Registration {
+    attachment_id: AttachmentId,
+    attach_state: AttachState,
+    actor: SessionActorHandle,
+    events: mpsc::Receiver<QueuedEnvelope>,
+    lagged: watch::Receiver<Option<u64>>,
+    /// Shared with [`ActorAttachment::queued_bytes`]; the replay task credits
+    /// it as envelopes leave the channel.
+    catch_up_bytes: Arc<AtomicUsize>,
+}
+
+enum RegisterResult {
+    Registered(Registration),
+    CursorAhead {
+        requested: u64,
+        head: u64,
+    },
+    /// An admission cap refused the attachment before any resources existed.
+    Overloaded {
+        message: String,
+    },
+}
+
+enum ActorRegisterResult {
+    Registered(AttachState),
+    CursorAhead { requested: u64, head: u64 },
+}
+
+enum ActorCommand {
+    Append {
+        envelopes: Vec<RawEnvelope>,
+        completed: oneshot::Sender<Result<Vec<RawEnvelope>, HaiderError>>,
+    },
+    CreateSession {
+        command: SessionCreateCommand,
+        completed: oneshot::Sender<Result<SessionCreateOutcome, HaiderError>>,
+    },
+    AcceptTurn {
+        command: TurnAcceptCommand,
+        completed: oneshot::Sender<Result<TurnAcceptOutcome, HaiderError>>,
+    },
+    CancelTurn {
+        command: TurnCancelCommand,
+        completed: oneshot::Sender<Result<TurnCancelOutcome, HaiderError>>,
+    },
+    WorkerAppend {
+        lease_id: WorkerLeaseId,
+        envelopes: Vec<RawEnvelope>,
+        completed: oneshot::Sender<Result<Vec<RawEnvelope>, HaiderError>>,
+    },
+    WorkerSettleIdle {
+        lease_id: WorkerLeaseId,
+        envelope: RawEnvelope,
+        completed: oneshot::Sender<Result<Option<RawEnvelope>, HaiderError>>,
+    },
+    Register {
+        attachment_id: AttachmentId,
+        after_seq: u64,
+        events: mpsc::Sender<QueuedEnvelope>,
+        lagged: watch::Sender<Option<u64>>,
+        queued_bytes: Arc<AtomicUsize>,
+        completed: oneshot::Sender<ActorRegisterResult>,
+    },
+    Reregister {
+        attachment_id: AttachmentId,
+        events: mpsc::Sender<QueuedEnvelope>,
+        lagged: watch::Sender<Option<u64>>,
+        completed: oneshot::Sender<Option<u64>>,
+    },
+    Detach {
+        attachment_id: AttachmentId,
+    },
+    MenuAnswer {
+        command: MenuResolutionCommand,
+        completed: oneshot::Sender<Result<MenuResolutionOutcome, HaiderError>>,
+    },
+    AcquireWorkerLease {
+        lease_id: WorkerLeaseId,
+        cancellation_wake: Option<watch::Sender<u64>>,
+        completed: oneshot::Sender<()>,
+    },
+    RegisterHarness {
+        lease_id: WorkerLeaseId,
+        harness: HarnessHandle,
+        completed: oneshot::Sender<Result<(), HaiderError>>,
+    },
+    RegisterRecoveredHarness {
+        lease_id: WorkerLeaseId,
+        harness: HarnessHandle,
+        menu: RecoveredMenuCoordinate,
+        completed: oneshot::Sender<Result<(), HaiderError>>,
+    },
+    UnregisterHarness {
+        lease_id: WorkerLeaseId,
+    },
+    Stop,
+}
+
+/// One negotiated connection's authorization and attachment ownership.
+pub struct HubConnection {
+    hub: SessionHub,
+    connection_id: String,
+    capabilities: CapabilitySet,
+    sink: Arc<dyn FrameSink>,
+    closed: AtomicBool,
+}
+
+/// Infrastructure failure while routing a frame.
+#[derive(Debug)]
+pub enum SessionHubError {
+    Closed,
+    Store(HaiderError),
+    Delivery,
+    Task(String),
+    InvalidConfig(String),
+}
+
+/// Whether the hub delivered every committed drain suffix during its grace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionHubShutdownOutcome {
+    Graceful,
+    /// At least one final suffix could not be read or enqueued. The failure is
+    /// recorded before this status is returned, and the daemon must report a
+    /// forced shutdown rather than silently call the drain graceful.
+    Forced,
+}
+
+impl fmt::Display for SessionHubError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Closed => formatter.write_str("session hub is draining or closed"),
+            Self::Store(error) => write!(formatter, "session store failed: {error:?}"),
+            Self::Delivery => formatter.write_str("connection outbox refused a frame"),
+            Self::Task(message) | Self::InvalidConfig(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for SessionHubError {}
+
+impl From<HaiderError> for SessionHubError {
+    fn from(error: HaiderError) -> Self {
+        Self::Store(error)
+    }
+}
+
+impl From<SessionHubError> for DaemonError {
+    fn from(error: SessionHubError) -> Self {
+        match error {
+            SessionHubError::Store(error) => Self::Store(error),
+            other => Self::Task {
+                message: other.to_string(),
+            },
+        }
+    }
+}
+
+// ──────────── hub: append seam, attachment lifecycle, shutdown ──────────────
+
+impl SessionHub {
+    /// Creates a hub with production's no-op boundary observer.
+    pub fn new(
+        store: SqliteStoreHandle,
+        config: SessionHubConfig,
+    ) -> Result<Self, SessionHubError> {
+        Self::with_observer(store, config, Arc::new(NoopObserver))
+    }
+
+    /// Creates a hub with a semantic-boundary observer.
+    pub fn with_observer(
+        store: SqliteStoreHandle,
+        config: SessionHubConfig,
+        observer: Arc<dyn SessionHubObserver>,
+    ) -> Result<Self, SessionHubError> {
+        config.validate().map_err(SessionHubError::InvalidConfig)?;
+        let device_id = DeviceId::new(format!("daemon-session-hub-{}", store.worker_generation()));
+        Ok(Self {
+            inner: Arc::new(HubInner {
+                store,
+                config,
+                observer,
+                metrics: Arc::new(HubMetrics::default()),
+                actors: Mutex::new(HashMap::new()),
+                actor_tasks: Mutex::new(Vec::new()),
+                replay_tasks: Mutex::new(Vec::new()),
+                attachments: Mutex::new(HashMap::new()),
+                attachment_slots: Mutex::new(AttachmentSlots::default()),
+                draining: AtomicBool::new(false),
+                force_stop: Arc::new(AtomicBool::new(false)),
+                device_id,
+                worker_manager: Mutex::new(None),
+            }),
+        })
+    }
+
+    pub(crate) fn install_worker_manager(
+        &self,
+        manager: WorkerManagerHandle,
+    ) -> Result<(), SessionHubError> {
+        let mut installed = lock(&self.inner.worker_manager)?;
+        if installed.is_some() {
+            return Err(SessionHubError::Task(
+                "worker manager is already installed".into(),
+            ));
+        }
+        *installed = Some(manager);
+        Ok(())
+    }
+
+    /// Snapshot of monotonic lag-buffer and delivery-pressure counters.
+    pub fn metrics(&self) -> SessionHubMetrics {
+        self.inner.metrics.snapshot()
+    }
+
+    fn worker_manager(&self) -> Result<WorkerManagerHandle, SessionHubError> {
+        lock(&self.inner.worker_manager)?
+            .clone()
+            .ok_or_else(|| SessionHubError::Task("worker manager is not installed".into()))
+    }
+
+    pub(crate) async fn session_metadata(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<haider_protocol::session::SessionMetadataV1>, HaiderError> {
+        self.inner.store.session_metadata(session_id).await
+    }
+
+    /// Opens one logical connection after handshake negotiation.
+    ///
+    /// W3c/W3d seam: every real client — CLI attach, TUI live-attach, web —
+    /// reaches sessions only through the returned [`HubConnection`];
+    /// `connection.rs` is the first transport over it.
+    pub fn open_connection(
+        &self,
+        capabilities: CapabilitySet,
+        sink: Arc<dyn FrameSink>,
+    ) -> Result<HubConnection, SessionHubError> {
+        if self.inner.draining.load(Ordering::Acquire) {
+            return Err(SessionHubError::Closed);
+        }
+        Ok(HubConnection {
+            hub: self.clone(),
+            connection_id: random_id("connection")?,
+            capabilities,
+            sink,
+            closed: AtomicBool::new(false),
+        })
+    }
+
+    /// Routes an append through the owning session actor.
+    ///
+    /// Every live-daemon append must pass a session actor: INVARIANTs 1 and 2
+    /// (module doc) are properties of the actor's command order, so an append
+    /// that bypassed the actor could publish around a registration.
+    ///
+    /// APPEND EXCLUSIVITY — structural since W3c1: every live worker holds
+    /// only a lease-fenced [`HubStoreHandle`] (pinned by
+    /// `worker_surface_is_structurally_lease_scoped`), so the W3b2
+    /// "discipline, not shape" caveat now applies only to the paths that run
+    /// while NO hub exists: startup recovery (`turn_recovery.rs`,
+    /// `haider_core::recovery`), the standalone CLI, and test seeding. Those
+    /// remain discipline-held. This facade method is actor-routed test and
+    /// non-worker publication; production workers append through their lease.
+    pub async fn append(
+        &self,
+        envelopes: &mut [RawEnvelope],
+    ) -> Result<haider_core::CommittedRange, HaiderError> {
+        let Some(first) = envelopes.first() else {
+            return Err(HaiderError::new(
+                ErrorCode::InvalidArgument,
+                "cannot append an empty envelope batch",
+                false,
+            ));
+        };
+        let actor = self
+            .actor_for(first.session_id.clone())
+            .await
+            .map_err(hub_error_as_store)?;
+        let (completed, result) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::Append {
+                envelopes: envelopes.to_vec(),
+                completed,
+            })
+            .await
+            .map_err(|_| hub_closed_store_error())?;
+        self.inner.observer.observe(HubObservation::AppendEnqueued {
+            session_id: first.session_id.clone(),
+        });
+        let committed = result.await.map_err(|_| hub_closed_store_error())??;
+        envelopes.clone_from_slice(&committed);
+        let first_seq = committed.first().map_or(0, |envelope| envelope.seq);
+        let last_seq = committed.last().map_or(0, |envelope| envelope.seq);
+        Ok(haider_core::CommittedRange {
+            first_seq,
+            last_seq,
+        })
+    }
+
+    /// Routes atomic session creation through the candidate session actor.
+    /// A guessed concurrent attachment is therefore ordered with the
+    /// `Created` commit/publication by the same INV-1/INV-2 actor step.
+    async fn create_session(
+        &self,
+        command: SessionCreateCommand,
+    ) -> Result<SessionCreateOutcome, SessionHubError> {
+        let actor = self.actor_for(command.session_id.clone()).await?;
+        let (completed, result) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::CreateSession { command, completed })
+            .await
+            .map_err(|_| SessionHubError::Closed)?;
+        result
+            .await
+            .map_err(|_| SessionHubError::Closed)?
+            .map_err(Into::into)
+    }
+
+    /// Preflights a durable receipt before workspace I/O. A same-command
+    /// retry must recover its committed response even if that workspace path
+    /// disappeared after the original commit.
+    async fn session_create_receipt(
+        &self,
+        command_id: &CommandId,
+        request_digest: &str,
+        request_json: &str,
+    ) -> Result<Option<CreatedSession>, SessionHubError> {
+        self.inner
+            .store
+            .session_create_receipt(
+                command_id.0.clone(),
+                request_digest.to_owned(),
+                request_json.to_owned(),
+            )
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn turn_accept_receipt(
+        &self,
+        command_id: &CommandId,
+        request_digest: &str,
+        request_json: &str,
+    ) -> Result<Option<AcceptedTurn>, SessionHubError> {
+        self.inner
+            .store
+            .turn_accept_receipt(
+                command_id.0.clone(),
+                request_digest.to_owned(),
+                request_json.to_owned(),
+            )
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn accept_turn(
+        &self,
+        command: TurnAcceptCommand,
+    ) -> Result<TurnAcceptOutcome, SessionHubError> {
+        let actor = self.actor_for(command.session_id.clone()).await?;
+        let (completed, result) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::AcceptTurn { command, completed })
+            .await
+            .map_err(|_| SessionHubError::Closed)?;
+        result
+            .await
+            .map_err(|_| SessionHubError::Closed)?
+            .map_err(Into::into)
+    }
+
+    async fn turn_cancel_receipt(
+        &self,
+        command_id: &CommandId,
+        request_digest: &str,
+        request_json: &str,
+    ) -> Result<Option<CancelledTurn>, SessionHubError> {
+        self.inner
+            .store
+            .turn_cancel_receipt(
+                command_id.0.clone(),
+                request_digest.to_owned(),
+                request_json.to_owned(),
+            )
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn cancel_turn(
+        &self,
+        command: TurnCancelCommand,
+    ) -> Result<TurnCancelOutcome, SessionHubError> {
+        let actor = self.actor_for(command.session_id.clone()).await?;
+        let (completed, result) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::CancelTurn { command, completed })
+            .await
+            .map_err(|_| SessionHubError::Closed)?;
+        result
+            .await
+            .map_err(|_| SessionHubError::Closed)?
+            .map_err(Into::into)
+    }
+
+    /// Mints and installs a same-process worker lease in actor order (R1).
+    ///
+    /// Installation REPLACES any current lease in the same serialized actor
+    /// step, revoking the predecessor before the successor can append,
+    /// register a harness, or receive cancellation wakes (the fencing law is
+    /// stated in actor.rs's charter). The returned [`HubStoreHandle`] is the
+    /// ONLY store surface a worker may hold. Refused while draining: a new
+    /// worker is new admission under the R9 gate.
+    pub async fn acquire_worker_lease(
+        &self,
+        session_id: SessionId,
+    ) -> Result<HubStoreHandle, SessionHubError> {
+        self.acquire_worker_lease_inner(session_id, None).await
+    }
+
+    pub(crate) async fn acquire_worker_lease_with_cancellation_wake(
+        &self,
+        session_id: SessionId,
+        cancellation_wake: watch::Sender<u64>,
+    ) -> Result<HubStoreHandle, SessionHubError> {
+        self.acquire_worker_lease_inner(session_id, Some(cancellation_wake))
+            .await
+    }
+
+    /// Manager-only drain seam. External admission is already closed, but an
+    /// acceptance actor may contain a durable Queued run whose post-commit
+    /// manager hint lost the drain race. After supervisors join, the manager
+    /// may mint one final lease on that EXISTING actor solely to sweep those
+    /// runs to a terminal state.
+    pub(crate) async fn acquire_drain_worker_lease(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<HubStoreHandle>, SessionHubError> {
+        let Some(actor) = self.existing_actor(&session_id)? else {
+            return Ok(None);
+        };
+        let lease_id = WorkerLeaseId(random_id("drain-worker-lease")?);
+        let (completed, response) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::AcquireWorkerLease {
+                lease_id: lease_id.clone(),
+                cancellation_wake: None,
+                completed,
+            })
+            .await
+            .map_err(|_| SessionHubError::Closed)?;
+        response.await.map_err(|_| SessionHubError::Closed)?;
+        Ok(Some(HubStoreHandle {
+            hub: self.clone(),
+            session_id,
+            worker_generation: self.inner.store.worker_generation(),
+            lease_id,
+        }))
+    }
+
+    pub(crate) async fn session_ids(&self) -> Result<Vec<SessionId>, SessionHubError> {
+        self.inner.store.session_ids().await.map_err(Into::into)
+    }
+
+    async fn acquire_worker_lease_inner(
+        &self,
+        session_id: SessionId,
+        cancellation_wake: Option<watch::Sender<u64>>,
+    ) -> Result<HubStoreHandle, SessionHubError> {
+        let actor = self.actor_for(session_id.clone()).await?;
+        let lease_id = WorkerLeaseId(random_id("worker-lease")?);
+        let (completed, response) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::AcquireWorkerLease {
+                lease_id: lease_id.clone(),
+                cancellation_wake,
+                completed,
+            })
+            .await
+            .map_err(|_| SessionHubError::Closed)?;
+        response.await.map_err(|_| SessionHubError::Closed)?;
+        Ok(HubStoreHandle {
+            hub: self.clone(),
+            session_id,
+            worker_generation: self.inner.store.worker_generation(),
+            lease_id,
+        })
+    }
+
+    /// Installs the harness that committed menu resolutions wake, under the
+    /// caller's still-current lease; a superseded lease is rejected instead
+    /// of overwriting its successor's registration.
+    /// Returns the already-running actor, if any — deliberately WITHOUT the
+    /// draining check `actor_for` applies. This asymmetry is the hub's half
+    /// of the R9 drain gate: `begin_draining` closes every actor-CREATING
+    /// path (external requests, new leases), while a worker that already
+    /// holds a lease keeps reaching its existing actor so its final
+    /// `Cancelled`/effect/idle appends commit and publish during the grace.
+    fn existing_actor(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<SessionActorHandle>, SessionHubError> {
+        Ok(lock(&self.inner.actors)?.get(session_id).cloned())
+    }
+
+    /// Returns the session's actor, creating it on first use. Refused while
+    /// draining — this is the actor-creating half of the R9 admission gate
+    /// (see `existing_actor` for the worker-side exception).
+    async fn actor_for(
+        &self,
+        session_id: SessionId,
+    ) -> Result<SessionActorHandle, SessionHubError> {
+        if self.inner.draining.load(Ordering::Acquire) {
+            return Err(SessionHubError::Closed);
+        }
+        {
+            let actors = lock(&self.inner.actors)?;
+            if let Some(actor) = actors.get(&session_id) {
+                return Ok(actor.clone());
+            }
+        }
+        let head = self.inner.store.latest_seq(&session_id).await?;
+        let last = if head == 0 {
+            None
+        } else {
+            self.inner
+                .store
+                .read(&session_id, head.saturating_sub(1), 1)
+                .await?
+                .into_iter()
+                .next()
+        };
+        let mut actors = lock(&self.inner.actors)?;
+        if self.inner.draining.load(Ordering::Acquire) {
+            return Err(SessionHubError::Closed);
+        }
+        if let Some(actor) = actors.get(&session_id) {
+            return Ok(actor.clone());
+        }
+        let authority_epoch = last.as_ref().map_or(0, |envelope| envelope.authority_epoch);
+        let (commands, receiver) = mpsc::channel(self.inner.config.actor_command_capacity);
+        let actor = SessionActorHandle { commands };
+        let mut actor_tasks = lock(&self.inner.actor_tasks)?;
+        let task = tokio::spawn(run_session_actor(
+            session_id.clone(),
+            head,
+            authority_epoch,
+            self.inner.store.worker_generation(),
+            self.inner.config.catch_up_byte_budget,
+            self.inner.store.clone(),
+            Arc::clone(&self.inner.observer),
+            Arc::clone(&self.inner.metrics),
+            Arc::clone(&self.inner.force_stop),
+            receiver,
+        ));
+        actor_tasks.push(task);
+        actors.insert(session_id, actor.clone());
+        Ok(actor)
+    }
+
+    async fn register(
+        &self,
+        connection_id: &str,
+        session_id: SessionId,
+        after_seq: u64,
+        mode: AttachMode,
+    ) -> Result<RegisterResult, SessionHubError> {
+        // Admission cap: the slot is reserved before any actor or channel
+        // work. The RAII guard refunds it on EVERY exit — error, cursor
+        // rejection, or cancellation at any await inside registration — and
+        // is disarmed only once ownership sits in the attachments map, whose
+        // `take_attachment` then owns the release. No await separates the
+        // owner insertion (the last step of `register_reserved`) from the
+        // disarm, so the refund and the map release can never both run.
+        if let Some(message) = self.reserve_attachment_slot(connection_id)? {
+            return Ok(RegisterResult::Overloaded { message });
+        }
+        let slot = AttachmentSlotGuard {
+            hub: self.clone(),
+            connection_id: connection_id.to_owned(),
+            armed: true,
+        };
+        let registered = self
+            .register_reserved(connection_id, session_id, after_seq, mode)
+            .await;
+        if matches!(registered, Ok(RegisterResult::Registered(_))) {
+            slot.transfer();
+        }
+        registered
+    }
+
+    /// Reserves one attachment admission slot, or reports why it cannot.
+    fn reserve_attachment_slot(
+        &self,
+        connection_id: &str,
+    ) -> Result<Option<String>, SessionHubError> {
+        let config = &self.inner.config;
+        let mut slots = lock(&self.inner.attachment_slots)?;
+        let held = slots
+            .per_connection
+            .get(connection_id)
+            .copied()
+            .unwrap_or(0);
+        if held >= config.max_attachments_per_connection {
+            return Ok(Some(format!(
+                "connection already holds its maximum of {} attachments; detach one and retry",
+                config.max_attachments_per_connection
+            )));
+        }
+        if slots.total >= config.max_attachments {
+            return Ok(Some(format!(
+                "daemon already holds its maximum of {} attachments; retry later",
+                config.max_attachments
+            )));
+        }
+        slots.total = slots.total.saturating_add(1);
+        *slots
+            .per_connection
+            .entry(connection_id.to_owned())
+            .or_insert(0) = held.saturating_add(1);
+        Ok(None)
+    }
+
+    fn release_attachment_slot(&self, connection_id: &str) {
+        let Ok(mut slots) = self.inner.attachment_slots.lock() else {
+            return;
+        };
+        slots.total = slots.total.saturating_sub(1);
+        if let Some(held) = slots.per_connection.get_mut(connection_id) {
+            *held = held.saturating_sub(1);
+            if *held == 0 {
+                slots.per_connection.remove(connection_id);
+            }
+        }
+    }
+
+    async fn register_reserved(
+        &self,
+        connection_id: &str,
+        session_id: SessionId,
+        after_seq: u64,
+        mode: AttachMode,
+    ) -> Result<RegisterResult, SessionHubError> {
+        let actor = self.actor_for(session_id.clone()).await?;
+        let attachment_id = AttachmentId::new(random_id("attachment")?);
+        let (events, event_receiver) = mpsc::channel(self.inner.config.catch_up_capacity);
+        let (lagged, lag_receiver) = watch::channel(Option::<u64>::None);
+        let catch_up_bytes = Arc::new(AtomicUsize::new(0));
+        let (completed, result) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::Register {
+                attachment_id: attachment_id.clone(),
+                after_seq,
+                events,
+                lagged,
+                queued_bytes: Arc::clone(&catch_up_bytes),
+                completed,
+            })
+            .await
+            .map_err(|_| SessionHubError::Closed)?;
+        let attach_state = match result.await.map_err(|_| SessionHubError::Closed)? {
+            ActorRegisterResult::Registered(attach_state) => attach_state,
+            ActorRegisterResult::CursorAhead { requested, head } => {
+                return Ok(RegisterResult::CursorAhead { requested, head });
+            }
+        };
+        let registration = Registration {
+            attachment_id: attachment_id.clone(),
+            attach_state,
+            actor: actor.clone(),
+            events: event_receiver,
+            lagged: lag_receiver,
+            catch_up_bytes,
+        };
+        let (cancel, _) = watch::channel(false);
+        lock(&self.inner.attachments)?.insert(
+            attachment_id,
+            AttachmentOwner {
+                connection_id: connection_id.to_owned(),
+                session_id,
+                mode,
+                actor,
+                cancel,
+            },
+        );
+        Ok(RegisterResult::Registered(registration))
+    }
+
+    fn spawn_replay(
+        &self,
+        registration: Registration,
+        after_seq: u64,
+        sink: Arc<dyn FrameSink>,
+    ) -> Result<(), SessionHubError> {
+        if self.inner.draining.load(Ordering::Acquire) {
+            return Err(SessionHubError::Closed);
+        }
+        let cancel = lock(&self.inner.attachments)?
+            .get(&registration.attachment_id)
+            .map(|owner| owner.cancel.subscribe())
+            .ok_or(SessionHubError::Closed)?;
+        let mut replay_tasks = lock(&self.inner.replay_tasks)?;
+        if self.inner.draining.load(Ordering::Acquire) {
+            return Err(SessionHubError::Closed);
+        }
+        // Finished handles carry no live task ownership. Reap them on each
+        // admission so repeated attach/detach cannot grow this registry.
+        replay_tasks.retain(|handle| !handle.is_finished());
+        let hub = self.clone();
+        let task = tokio::spawn(run_replay(hub, registration, after_seq, sink, cancel));
+        // The lock stays held from the drain recheck through spawn+push, so
+        // shutdown's registry take either owns this task or rejects it before
+        // it exists. No aborted-but-unjoined admission gap is possible.
+        replay_tasks.push(task);
+        Ok(())
+    }
+
+    fn take_attachment(
+        &self,
+        attachment_id: &AttachmentId,
+        connection_id: Option<&str>,
+    ) -> Result<Option<AttachmentOwner>, SessionHubError> {
+        let mut attachments = lock(&self.inner.attachments)?;
+        let owned = attachments
+            .get(attachment_id)
+            .is_some_and(|owner| connection_id.is_none_or(|id| owner.connection_id == id));
+        if !owned {
+            return Ok(None);
+        }
+        let owner = attachments.remove(attachment_id);
+        if let Some(owner) = owner.as_ref() {
+            let _ = owner.cancel.send(true);
+            self.release_attachment_slot(&owner.connection_id);
+        }
+        Ok(owner)
+    }
+
+    /// Actor-side cleanup after `take_attachment` removed ownership — which
+    /// is the authoritative detach. Best effort: a dead actor (forced
+    /// teardown) has already dropped its whole attachment map.
+    async fn finish_detach(attachment_id: &AttachmentId, owner: AttachmentOwner) {
+        let _ = owner
+            .actor
+            .commands
+            .send(ActorCommand::Detach {
+                attachment_id: attachment_id.clone(),
+            })
+            .await;
+    }
+
+    async fn detach(&self, attachment_id: &AttachmentId) -> Result<bool, SessionHubError> {
+        let owner = self.take_attachment(attachment_id, None)?;
+        let Some(owner) = owner else {
+            return Ok(false);
+        };
+        Self::finish_detach(attachment_id, owner).await;
+        Ok(true)
+    }
+
+    async fn detach_connection(&self, connection_id: &str) -> Result<(), SessionHubError> {
+        let attachments = {
+            let owners = lock(&self.inner.attachments)?;
+            owners
+                .iter()
+                .filter(|(_, owner)| owner.connection_id == connection_id)
+                .map(|(attachment_id, _)| attachment_id.clone())
+                .collect::<Vec<_>>()
+        };
+        for attachment_id in attachments {
+            let _ = self.detach(&attachment_id).await?;
+        }
+        Ok(())
+    }
+
+    /// True when `connection_id` holds a CONTROL attachment to `session_id`.
+    ///
+    /// CONTROL-ATTACHMENT POLICY (authoritative statement, R7/§5.7):
+    /// session-scoped mutation — `turn.submit`, `turn.cancel`, and
+    /// `MenuAnswer` — requires the Control capability AND a live CONTROL
+    /// attachment to the target session; v0.1 has no controller-without-
+    /// viewport allowance. `session.create` is exempt only because the
+    /// session does not exist yet. The rpc.rs guards all call this one
+    /// predicate; do not restate the rule inline.
+    fn holds_control_attachment(
+        &self,
+        connection_id: &str,
+        session_id: &SessionId,
+    ) -> Result<bool, SessionHubError> {
+        Ok(lock(&self.inner.attachments)?.values().any(|owner| {
+            owner.connection_id == connection_id
+                && owner.session_id == *session_id
+                && matches!(owner.mode, AttachMode::Control)
+        }))
+    }
+
+    fn offer_attachment(
+        &self,
+        attachment_id: &AttachmentId,
+        sink: &Arc<dyn FrameSink>,
+        frame: &WireFrame,
+    ) -> SendAdmission {
+        let Ok(attachments) = lock(&self.inner.attachments) else {
+            return SendAdmission::Refused;
+        };
+        if !attachments.contains_key(attachment_id) {
+            return SendAdmission::Refused;
+        }
+        // The ownership lock makes admit-vs-detach atomic: detach removes the
+        // owner before purging its lane, so no frame can appear after purge.
+        sink.offer(attachment_id, frame)
+    }
+
+    fn offer_attachment_ticketed(
+        &self,
+        attachment_id: &AttachmentId,
+        sink: &Arc<dyn FrameSink>,
+        frame: &WireFrame,
+        ticket: &AdmissionTicket,
+    ) -> SendAdmission {
+        let Ok(attachments) = lock(&self.inner.attachments) else {
+            return SendAdmission::Refused;
+        };
+        if !attachments.contains_key(attachment_id) {
+            return SendAdmission::Refused;
+        }
+        // Keep the same admit-vs-detach ownership barrier as the fresh offer.
+        sink.offer_ticketed(attachment_id, frame, ticket)
+    }
+
+    /// Rejects new hub work synchronously before the runtime announces drain.
+    pub fn begin_draining(&self) {
+        self.inner.draining.store(true, Ordering::Release);
+    }
+
+    /// Begins drain with §6.6's bounded checkpoint grace: new work is
+    /// rejected, but commands that already reached their actor complete
+    /// their persist AND publish to still-registered attachments, and the
+    /// replay tasks stream those final committed envelopes into the
+    /// connection sinks before winding down. Only then is attachment
+    /// ownership swept. The enclosing barrier deadline bounds the whole
+    /// grace: cancelling this future aborts every owned task through the
+    /// abort-on-drop guards (the forced path).
+    ///
+    /// After this method returns, no hub-OWNED task retains the store. One
+    /// ledgered exception can outlive it: an already-started blocking store
+    /// operation — read, append, or menu CAS, which all share the
+    /// `spawn_blocking` adapter — cannot be cancelled and may finish on the
+    /// blocking pool afterwards (OPTIMIZATIONS, rider item 6).
+    ///
+    /// FORCED-PATH LAW: on the forced path an append/CAS may therefore
+    /// COMMIT WITHOUT PUBLICATION. That is safe by seq-resume (R9/R11): the
+    /// client's next attach replays from its applied cursor and receives the
+    /// committed-unpublished envelope then. The forced path is allowed to be
+    /// lossy on PUBLICATION, never on durability.
+    ///
+    /// DELIVERED-OR-FORCED LAW: replay tasks report terminal suffix status
+    /// into this join. Any failure to read the durable suffix or enqueue its
+    /// final marker is recorded and returns [`SessionHubShutdownOutcome::Forced`];
+    /// it can never be mistaken for a graceful join.
+    pub async fn shutdown(&self) -> Result<SessionHubShutdownOutcome, SessionHubError> {
+        self.begin_draining();
+        // Install the abort-on-drop guards (each raises the forced-stop
+        // fence before aborting — see OwnedTasks) plus the standalone fence
+        // backstop, all before the first await. If the global drain deadline
+        // cancels this future, no hub task is detached and no actor starts
+        // another store command.
+        let replay_tasks = std::mem::take(&mut *lock(&self.inner.replay_tasks)?);
+        let mut replay_tasks = OwnedTasks::new(replay_tasks, Arc::clone(&self.inner.force_stop));
+        let actors = {
+            let mut actors = lock(&self.inner.actors)?;
+            actors.drain().map(|(_, actor)| actor).collect::<Vec<_>>()
+        };
+        let actor_tasks = std::mem::take(&mut *lock(&self.inner.actor_tasks)?);
+        let mut actor_tasks = OwnedTasks::new(actor_tasks, Arc::clone(&self.inner.force_stop));
+        // Backstop: dropped-without-disarm covers any cancellation window the
+        // task guards cannot see (declared LAST so it drops FIRST).
+        let mut forced = ForcedStopGuard {
+            fence: Arc::clone(&self.inner.force_stop),
+            armed: true,
+        };
+        self.inner.observer.observe(HubObservation::ShutdownGuarded);
+        // GRACE ORDER (P1-3): actors first, gracefully. `Stop` queues behind
+        // whatever already reached each actor, so an append or CAS inside its
+        // store await commits AND publishes to receivers that are still
+        // registered — never to orphaned senders. New commands were already
+        // rejected at every hub seam by the draining flag.
+        for actor in actors {
+            let _ = actor.commands.send(ActorCommand::Stop).await;
+        }
+        let _ = actor_tasks.join_all().await;
+        // Actor death drops every catch-up sender; each replay task drains
+        // what was already buffered, streams it into its sink, and exits on
+        // the closed channel. Join WITHOUT aborting so those final committed
+        // envelopes reach the connection outboxes (§6.6's final-broadcast
+        // grace; the write side runs under the connection drain deadline).
+        let replay_outcomes = replay_tasks.join_all().await;
+        let mut outcome = SessionHubShutdownOutcome::Graceful;
+        let mut join_failure = None;
+        for replay_outcome in replay_outcomes {
+            match replay_outcome {
+                Ok(ReplayCompletion::Complete) => {}
+                Ok(ReplayCompletion::FinalSuffixFailed(failure)) => {
+                    tracing::error!(
+                        stage = failure.stage,
+                        error = %failure.message,
+                        "final attachment suffix was not delivered during shutdown; forcing outcome"
+                    );
+                    outcome = SessionHubShutdownOutcome::Forced;
+                }
+                Err(error) => {
+                    tracing::error!(
+                        error = ?error,
+                        "attachment replay task failed while shutdown was joining it"
+                    );
+                    join_failure.get_or_insert_with(|| {
+                        SessionHubError::Task(format!(
+                            "attachment replay task failed during shutdown: {error}"
+                        ))
+                    });
+                }
+            }
+        }
+        let owners = {
+            let mut owners = lock(&self.inner.attachments)?;
+            owners.drain().collect::<Vec<_>>()
+        };
+        // The drained owners bypass `take_attachment`; clear their admission
+        // ledger wholesale (no new reservation is admitted while draining).
+        *lock(&self.inner.attachment_slots)? = AttachmentSlots::default();
+        for (_, owner) in &owners {
+            let _ = owner.cancel.send(true);
+        }
+        // Every task joined in order, so the abort fence stays down even when
+        // a recorded suffix failure makes the reported outcome Forced.
+        forced.armed = false;
+        match join_failure {
+            Some(error) => Err(error),
+            None => Ok(outcome),
+        }
+    }
+}
+
+/// The worker-facing store surface. Reads go straight to the store: committed
+/// history needs no actor serialization.
+#[async_trait]
+impl StoreHandle for HubStoreHandle {
+    async fn append(
+        &self,
+        envelopes: &mut [RawEnvelope],
+    ) -> Result<haider_core::CommittedRange, HaiderError> {
+        let Some(first) = envelopes.first() else {
+            return Err(HaiderError::new(
+                ErrorCode::InvalidArgument,
+                "cannot append an empty worker envelope batch",
+                false,
+            ));
+        };
+        if envelopes.iter().any(|envelope| {
+            envelope.session_id != self.session_id
+                || envelope.worker_generation != self.worker_generation
+        }) {
+            return Err(HaiderError::new(
+                ErrorCode::SingleWriterViolation,
+                "worker envelope identity does not match its lease",
+                false,
+            ));
+        }
+        let actor = self
+            .hub
+            .existing_actor(&first.session_id)
+            .map_err(hub_error_as_store)?
+            .ok_or_else(hub_closed_store_error)?;
+        let (completed, response) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::WorkerAppend {
+                lease_id: self.lease_id.clone(),
+                envelopes: envelopes.to_vec(),
+                completed,
+            })
+            .await
+            .map_err(|_| hub_closed_store_error())?;
+        let committed = response.await.map_err(|_| hub_closed_store_error())??;
+        envelopes.clone_from_slice(&committed);
+        Ok(haider_core::CommittedRange {
+            first_seq: committed.first().map_or(0, |envelope| envelope.seq),
+            last_seq: committed.last().map_or(0, |envelope| envelope.seq),
+        })
+    }
+
+    async fn read(
+        &self,
+        session_id: &SessionId,
+        since_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<RawEnvelope>, HaiderError> {
+        self.ensure_session(session_id)?;
+        self.hub
+            .inner
+            .store
+            .read(session_id, since_seq, limit)
+            .await
+    }
+
+    async fn latest_seq(&self, session_id: &SessionId) -> Result<u64, HaiderError> {
+        self.ensure_session(session_id)?;
+        self.hub.inner.store.latest_seq(session_id).await
+    }
+}
+
+impl HubStoreHandle {
+    pub fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    pub fn worker_generation(&self) -> u64 {
+        self.worker_generation
+    }
+
+    /// Installs this lease's harness. The receiver cannot name another
+    /// session or lease, so registration carries the same structural R1 seal
+    /// as reads and appends.
+    pub async fn register_harness(&self, harness: HarnessHandle) -> Result<(), SessionHubError> {
+        let actor = self.hub.actor_for(self.session_id.clone()).await?;
+        let (completed, response) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::RegisterHarness {
+                lease_id: self.lease_id.clone(),
+                harness,
+                completed,
+            })
+            .await
+            .map_err(|_| SessionHubError::Closed)?;
+        response
+            .await
+            .map_err(|_| SessionHubError::Closed)?
+            .map_err(Into::into)
+    }
+
+    /// Registers the prior-generation menu coordinate reconstructed for this
+    /// lease's session; no cross-session facade reaches the worker.
+    pub async fn register_recovered_harness(
+        &self,
+        harness: HarnessHandle,
+        menu_id: MenuId,
+        request_seq: u64,
+        opening_generation: u64,
+    ) -> Result<(), SessionHubError> {
+        let actor = self.hub.actor_for(self.session_id.clone()).await?;
+        let (completed, response) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::RegisterRecoveredHarness {
+                lease_id: self.lease_id.clone(),
+                harness,
+                menu: RecoveredMenuCoordinate {
+                    menu_id,
+                    request_seq,
+                    opening_generation,
+                },
+                completed,
+            })
+            .await
+            .map_err(|_| SessionHubError::Closed)?;
+        response
+            .await
+            .map_err(|_| SessionHubError::Closed)?
+            .map_err(Into::into)
+    }
+
+    /// Releases this lease's registration if it is still current. A
+    /// superseded token is a silent no-op, so predecessor cleanup cannot
+    /// unregister its successor.
+    pub async fn unregister_worker(&self) -> Result<(), SessionHubError> {
+        let actor = self
+            .hub
+            .existing_actor(&self.session_id)?
+            .ok_or(SessionHubError::Closed)?;
+        actor
+            .commands
+            .send(ActorCommand::UnregisterHarness {
+                lease_id: self.lease_id.clone(),
+            })
+            .await
+            .map_err(|_| SessionHubError::Closed)
+    }
+
+    pub(crate) async fn put_artifact(
+        &self,
+        bytes: Vec<u8>,
+    ) -> Result<haider_protocol::ids::ArtifactRef, HaiderError> {
+        self.hub.inner.store.put(bytes).await
+    }
+
+    pub(crate) async fn put_artifact_file(
+        &self,
+        path: std::path::PathBuf,
+    ) -> Result<haider_protocol::ids::ArtifactRef, HaiderError> {
+        self.hub.inner.store.put_file(path).await
+    }
+
+    pub(crate) async fn get_artifact(
+        &self,
+        artifact: haider_protocol::ids::ArtifactRef,
+    ) -> Result<Vec<u8>, HaiderError> {
+        self.hub.inner.store.get(&artifact).await
+    }
+
+    pub(crate) async fn settle_idle(
+        &self,
+        envelope: RawEnvelope,
+    ) -> Result<Option<RawEnvelope>, HaiderError> {
+        if envelope.session_id != self.session_id
+            || envelope.worker_generation != self.worker_generation
+        {
+            return Err(HaiderError::new(
+                ErrorCode::SingleWriterViolation,
+                "aggregate-state envelope identity does not match its worker lease",
+                false,
+            ));
+        }
+        let actor = self
+            .hub
+            .existing_actor(&self.session_id)
+            .map_err(hub_error_as_store)?
+            .ok_or_else(hub_closed_store_error)?;
+        let (completed, response) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::WorkerSettleIdle {
+                lease_id: self.lease_id.clone(),
+                envelope,
+                completed,
+            })
+            .await
+            .map_err(|_| hub_closed_store_error())?;
+        response.await.map_err(|_| hub_closed_store_error())?
+    }
+
+    fn ensure_session(&self, session_id: &SessionId) -> Result<(), HaiderError> {
+        if *session_id == self.session_id {
+            Ok(())
+        } else {
+            Err(HaiderError::new(
+                ErrorCode::SingleWriterViolation,
+                "worker lease cannot access another session",
+                false,
+            ))
+        }
+    }
+}
+
+// ────────────────────────────── small helpers ───────────────────────────────
+
+fn encode_cursor(session_id: &SessionId) -> String {
+    let mut cursor = String::from("hs1.");
+    for byte in session_id.as_str().as_bytes() {
+        use std::fmt::Write as _;
+        let _ = write!(&mut cursor, "{byte:02x}");
+    }
+    cursor
+}
+
+fn decode_cursor(cursor: &str) -> Result<SessionId, ()> {
+    let encoded = cursor.strip_prefix("hs1.").ok_or(())?;
+    if encoded.len() % 2 != 0 {
+        return Err(());
+    }
+    let mut bytes = Vec::with_capacity(encoded.len() / 2);
+    for pair in encoded.as_bytes().chunks_exact(2) {
+        let pair = std::str::from_utf8(pair).map_err(|_| ())?;
+        bytes.push(u8::from_str_radix(pair, 16).map_err(|_| ())?);
+    }
+    String::from_utf8(bytes).map(SessionId::new).map_err(|_| ())
+}
+
+fn random_id(prefix: &str) -> Result<String, SessionHubError> {
+    let mut bytes = [0_u8; 16];
+    getrandom::fill(&mut bytes).map_err(|error| {
+        SessionHubError::Task(format!("cannot generate {prefix} identity: {error}"))
+    })?;
+    let mut id = String::with_capacity(prefix.len().saturating_add(33));
+    id.push_str(prefix);
+    id.push('-');
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut id, "{byte:02x}");
+    }
+    Ok(id)
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> Result<std::sync::MutexGuard<'_, T>, SessionHubError> {
+    mutex
+        .lock()
+        .map_err(|_| SessionHubError::Task("session hub mutex is poisoned".into()))
+}
+
+fn hub_error_as_store(error: SessionHubError) -> HaiderError {
+    match error {
+        SessionHubError::Store(error) => error,
+        other => HaiderError::new(ErrorCode::Internal, other.to_string(), false),
+    }
+}
+
+fn hub_closed_store_error() -> HaiderError {
+    HaiderError::new(
+        ErrorCode::Internal,
+        "session actor stopped before completing append",
+        false,
+    )
+}

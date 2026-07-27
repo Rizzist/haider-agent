@@ -20,7 +20,7 @@ use std::future::pending;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{Notify, mpsc};
-use tokio::time::{Duration, sleep, timeout};
+use tokio::time::{Duration, advance, sleep, timeout};
 
 const SESSION: &str = "session-test";
 
@@ -271,6 +271,125 @@ async fn provider_retry_classification_and_retry_after_survive_actor_boundary() 
     assert_eq!(details["retry_after_ms"], 3_000);
 }
 
+/// MUTATION CHECK: restore the old `min(RETRY_CEILING_MS)` clamp for an
+/// explicit Retry-After. Expected failure: the second request starts before
+/// the provider's 3s instruction expires. Verified by revert in W3c1.1.
+#[tokio::test(start_paused = true)]
+async fn explicit_retry_after_is_respected_beyond_computed_jitter_ceiling() {
+    let (handle, _store, provider) = runtime(vec![
+        FakeStep::Error {
+            kind: ProviderErrorKind::RateLimited,
+            message: "wait three seconds".into(),
+            retry_after_ms: Some(3_000),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]);
+    let turn = handle
+        .submit_turn(SubmitTurn::new("respect retry-after"))
+        .await
+        .expect("turn accepted");
+    tokio::task::yield_now().await;
+    assert_eq!(provider.requests().len(), 1);
+
+    advance(Duration::from_millis(2_999)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(provider.requests().len(), 1);
+
+    advance(Duration::from_millis(1)).await;
+    let outcome = turn.wait().await.expect("outcome");
+    assert_eq!(outcome.state, RunState::Done);
+    assert_eq!(provider.requests().len(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn retry_after_above_respect_cap_terminalizes_retryable_exhaustion() {
+    let (handle, _store, provider) = runtime(vec![FakeStep::Error {
+        kind: ProviderErrorKind::RateLimited,
+        message: "wait too long".into(),
+        retry_after_ms: Some(60_001),
+    }]);
+    let outcome = handle
+        .submit_turn(SubmitTurn::new("cap retry-after"))
+        .await
+        .expect("turn accepted")
+        .wait()
+        .await
+        .expect("outcome");
+    assert_eq!(outcome.state, RunState::Errored);
+    let error = outcome.error.expect("retryable exhaustion");
+    assert!(error.retryable);
+    assert!(error.message.contains("respect cap"));
+    assert_eq!(provider.requests().len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn provider_error_after_first_event_is_never_retried() {
+    let (handle, _store, provider) = runtime(vec![
+        FakeStep::EmitText {
+            text: "observable".into(),
+        },
+        FakeStep::Error {
+            kind: ProviderErrorKind::Transport,
+            message: "stream broke".into(),
+            retry_after_ms: Some(1),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]);
+    let outcome = handle
+        .submit_turn(SubmitTurn::new("do not duplicate output"))
+        .await
+        .expect("turn accepted")
+        .wait()
+        .await
+        .expect("outcome");
+    assert_eq!(outcome.state, RunState::Errored);
+    assert_eq!(provider.requests().len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancellation_wins_provider_retry_backoff_without_second_request() {
+    let (handle, store, provider) = runtime(vec![
+        FakeStep::Error {
+            kind: ProviderErrorKind::Overloaded,
+            message: "back off".into(),
+            retry_after_ms: Some(60_000),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]);
+    let mut events = handle.subscribe();
+    let turn = handle
+        .submit_turn(SubmitTurn::new("cancel backoff"))
+        .await
+        .expect("turn accepted");
+    loop {
+        let envelope = events.recv().await.expect("waiting event");
+        if matches!(
+            typed(&envelope),
+            EventPayload::RunState(RunState::Waiting { .. })
+        ) {
+            break;
+        }
+    }
+    turn.cancel();
+    let outcome = turn.wait().await.expect("outcome");
+    assert_eq!(outcome.state, RunState::Cancelled);
+    assert_eq!(provider.requests().len(), 1);
+    assert!(matches!(
+        store
+            .events(&SessionId::new(SESSION))
+            .await
+            .last()
+            .map(typed),
+        Some(EventPayload::RunState(RunState::Cancelled))
+    ));
+}
+
 #[tokio::test]
 async fn provider_error_mid_tool_completes_failed_item_before_errored() {
     let (handle, store, _) = runtime(vec![
@@ -308,6 +427,44 @@ async fn provider_error_mid_tool_completes_failed_item_before_errored() {
     assert!(matches!(
         events.last().map(typed),
         Some(EventPayload::RunState(RunState::Errored))
+    ));
+}
+
+/// MUTATION CHECK: split `commit_terminal_error` back into separate
+/// `commit_payload(RunFailed)` and `commit_state(Errored)` calls. Expected
+/// failure: no append batch contains the adjacent durable failure terminal.
+/// Verified by revert on 2026-07-27.
+#[tokio::test]
+async fn provider_failure_commits_run_failed_and_errored_in_one_batch() {
+    let provider = Arc::new(FakeProvider::new(vec![FakeStep::MalformedFrame]));
+    let store = Arc::new(BatchRecordingStore::new());
+    let handle = HarnessActor::spawn(config(), provider, store.clone());
+
+    let outcome = handle
+        .submit_turn(SubmitTurn::new("fail atomically"))
+        .await
+        .expect("turn accepted")
+        .wait()
+        .await
+        .expect("outcome");
+    assert_eq!(outcome.state, RunState::Errored);
+
+    let terminal_batches = store
+        .batches()
+        .into_iter()
+        .filter(|batch| {
+            batch
+                .iter()
+                .any(|payload| matches!(payload, EventPayload::RunState(RunState::Errored)))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(terminal_batches.len(), 1);
+    assert!(matches!(
+        terminal_batches[0].as_slice(),
+        [
+            EventPayload::RunFailed { .. },
+            EventPayload::RunState(RunState::Errored)
+        ]
     ));
 }
 
@@ -738,6 +895,63 @@ fn completed_tool_call_is_pending_execution() {
     ));
 }
 
+struct BatchRecordingStore {
+    inner: MemoryStore,
+    batches: Mutex<Vec<Vec<EventPayload>>>,
+}
+
+impl BatchRecordingStore {
+    fn new() -> Self {
+        Self {
+            inner: MemoryStore::new(),
+            batches: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn batches(&self) -> Vec<Vec<EventPayload>> {
+        self.batches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+#[async_trait]
+impl StoreHandle for BatchRecordingStore {
+    async fn append(&self, envelopes: &mut [RawEnvelope]) -> Result<CommittedRange, HaiderError> {
+        let batch = envelopes
+            .iter()
+            .map(|envelope| {
+                serde_json::from_value(envelope.payload.clone()).map_err(|error| {
+                    HaiderError::new(
+                        ErrorCode::Internal,
+                        format!("recorded payload did not decode: {error}"),
+                        false,
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.batches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(batch);
+        self.inner.append(envelopes).await
+    }
+
+    async fn read(
+        &self,
+        session_id: &SessionId,
+        since_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<RawEnvelope>, HaiderError> {
+        self.inner.read(session_id, since_seq, limit).await
+    }
+
+    async fn latest_seq(&self, session_id: &SessionId) -> Result<u64, HaiderError> {
+        self.inner.latest_seq(session_id).await
+    }
+}
+
 struct BlockingCompletedStore {
     inner: MemoryStore,
     did_block: AtomicBool,
@@ -865,6 +1079,6 @@ impl Provider for FairnessProvider {
                     .await;
             });
         }
-        Ok(receiver)
+        Ok(receiver.into())
     }
 }

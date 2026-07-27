@@ -10,6 +10,7 @@ rust-version.workspace = true
 blake3.workspace = true
 haider-protocol = { path = "../haider-protocol" }
 rusqlite.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]

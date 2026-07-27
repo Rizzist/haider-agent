@@ -772,6 +772,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -779,13 +780,16 @@ name = "haider-daemon"
 version = "0.0.11"
 dependencies = [
  "async-trait",
+ "base64",
  "blake3",
  "getrandom 0.3.4",
+ "haider-accounts",
  "haider-core",
  "haider-protocol",
  "haider-provider",
  "haider-rpc",
  "haider-store",
+ "haider-tools",
  "rustix 1.1.4",
  "serde_json",
  "tempfile",
@@ -797,11 +801,14 @@ dependencies = [
 name = "haider-daemond"
 version = "0.0.11"
 dependencies = [
+ "async-trait",
  "haider-core",
  "haider-daemon",
  "haider-protocol",
+ "haider-provider",
  "haider-rpc",
  "haider-store",
+ "rusqlite",
  "rustix 1.1.4",
  "serde_json",
  "tempfile",
@@ -846,6 +853,7 @@ dependencies = [
  "blake3",
  "haider-protocol",
  "rusqlite",
+ "serde",
  "serde_json",
  "tempfile",
 ]
