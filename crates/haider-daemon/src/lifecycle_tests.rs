@@ -7,6 +7,10 @@
 
 use super::*;
 
+/// MUTATION CHECK: disable the guard in `StatePublisher::publish` (e.g.
+/// `if false && !prior.can_transition_to(&state)`). Expected failure: the
+/// illegal edge lands and `current()` returns `Stopped` instead of
+/// `Recovering`. Verified 2026-07-27.
 #[test]
 fn publish_refuses_an_illegal_edge_in_every_build_and_keeps_the_last_legal_phase() {
     let (publisher, readiness) = StatePublisher::channel();

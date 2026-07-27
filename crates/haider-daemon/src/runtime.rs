@@ -31,6 +31,13 @@
 //! Shutdown may arrive at any point; the early-exit helpers
 //! ([`shutdown_without_store`], [`shutdown_before_listener`]) run the same
 //! tail ordering with whatever resources exist so far.
+//!
+//! The phases above are separate functions ([`reconcile_before_ready`],
+//! [`ConnectionRuntime::accept_until_shutdown`], [`ConnectionRuntime::drain`],
+//! [`finalize`]), each with exactly ONE call site, written in the same order
+//! they run and in that order in this file. The split moved no statement across
+//! a phase boundary: [`run_inner`] still reads as the sequence, which is the
+//! contract.
 
 #[cfg(test)]
 #[path = "runtime_tests.rs"]
@@ -196,24 +203,7 @@ async fn run_inner(
         }
     };
     let device_id = DeviceId::new(format!("daemon-{instance_id}"));
-    // Recovery is shutdown-interruptible: a request during the scan abandons
-    // the pass (the next generation redoes it idempotently) and drains.
-    let mut recovery = Box::pin(reconcile_dispatched_effects(&store, &device_id));
-    let recovery_result = loop {
-        if !matches!(*shutdown.borrow(), ShutdownRequest::None) {
-            break None;
-        }
-        tokio::select! {
-            result = &mut recovery => break Some(result),
-            changed = shutdown.changed() => {
-                if changed.is_err() || !matches!(*shutdown.borrow(), ShutdownRequest::None) {
-                    break None;
-                }
-            }
-        }
-    };
-    drop(recovery);
-    match recovery_result {
+    match reconcile_before_ready(&store, &device_id, &mut shutdown).await {
         Some(Ok(_)) => {}
         Some(Err(error)) => {
             let _ = store.close().await;
@@ -240,8 +230,7 @@ async fn run_inner(
     let (drain_sender, drain_receiver) = watch::channel(Option::<DrainNotice>::None);
     // Every connection hands its writer task here; the barrier below owns
     // aborting and JOINING them, so no child outlives teardown (R17).
-    let (writer_sender, mut writer_receiver) = tokio::sync::mpsc::unbounded_channel();
-    let mut writers = Vec::new();
+    let (writer_sender, writer_receiver) = tokio::sync::mpsc::unbounded_channel();
     let context = ConnectionContext {
         profile_id: config.profile_id.clone(),
         instance_id: instance_id.clone(),
@@ -260,73 +249,10 @@ async fn run_inner(
     // Recovering) or loses (Ready, then a normal drain).
     shutdown_observer.publish_ready_if_idle(states);
 
-    let mut connections = JoinSet::new();
-    // Admission cap: one permit per served connection, owned by that
-    // connection's task so it is returned on normal completion, on error, and
-    // on abort alike. Nothing about listener close or drain ordering depends on
-    // it (report §2.5).
-    let admission = Arc::new(Semaphore::new(config.max_connections));
-    let mut listener_error = None;
-    let request = loop {
-        match shutdown.borrow().clone() {
-            request @ (ShutdownRequest::Graceful { .. } | ShutdownRequest::Forced { .. }) => {
-                break request;
-            }
-            ShutdownRequest::None => {}
-        }
-        tokio::select! {
-            changed = shutdown.changed() => {
-                if changed.is_err() {
-                    break ShutdownRequest::Forced {
-                        reason: "shutdown controller dropped".into(),
-                    };
-                }
-            }
-            accepted = endpoint.accept() => {
-                match accepted {
-                    Ok((stream, _)) => {
-                        match Arc::clone(&admission).try_acquire_owned() {
-                            Ok(permit) => {
-                                let connection_context = context.clone();
-                                let connection_drain = drain_receiver.clone();
-                                connections.spawn(async move {
-                                    // The owned permit lives inside the task, so
-                                    // every exit path — return, error, or abort —
-                                    // frees the slot exactly once.
-                                    let _permit = permit;
-                                    serve(stream, connection_context, connection_drain).await
-                                });
-                            }
-                            // Over the cap: typed rejection, then close. No task
-                            // and no queue is created for this peer.
-                            Err(_) => reject_over_limit(&stream, &context),
-                        }
-                    }
-                    Err(error) => {
-                        listener_error = Some(DaemonError::io(
-                            "accept Unix connection",
-                            endpoint.path(),
-                            error,
-                        ));
-                        break ShutdownRequest::Graceful {
-                            reason: "listener failure".into(),
-                        };
-                    }
-                }
-            }
-            registered = writer_receiver.recv() => {
-                if let Some(handle) = registered {
-                    // Opportunistic pruning keeps the registry proportional to
-                    // live connections, not to connections ever served.
-                    writers.retain(|writer: &JoinHandle<()>| !writer.is_finished());
-                    writers.push(handle);
-                }
-            }
-            completed = connections.join_next(), if !connections.is_empty() => {
-                let _ = completed;
-            }
-        }
-    };
+    let mut runtime = ConnectionRuntime::new(config.max_connections, writer_receiver);
+    let (request, listener_error) = runtime
+        .accept_until_shutdown(&endpoint, &context, &drain_receiver, &mut shutdown)
+        .await;
 
     // R17 drain barrier, in order: stop accepting, publish Draining,
     // broadcast ServerDraining to every connection, bounded completion,
@@ -355,101 +281,24 @@ async fn run_inner(
         deadline: barrier_deadline,
     }));
 
-    // A connection the daemon could not hand its last frame to is not a
-    // graceful drain, no matter how cleanly everything else stops (R17).
-    let mut undelivered_notices = 0_usize;
-    if !forced {
-        tokio::task::yield_now().await;
-        forced = matches!(*shutdown.borrow(), ShutdownRequest::Forced { .. });
-    }
-    if !forced {
-        while !connections.is_empty() {
-            tokio::select! {
-                completed = connections.join_next() => {
-                    note_connection_exit(&mut undelivered_notices, completed);
-                }
-                changed = shutdown.changed() => {
-                    if changed.is_err()
-                        || matches!(*shutdown.borrow(), ShutdownRequest::Forced { .. })
-                    {
-                        forced = true;
-                        break;
-                    }
-                }
-                () = tokio::time::sleep_until(barrier_deadline) => {
-                    forced = true;
-                    break;
-                }
-            }
-        }
-    }
-    forced |= barrier_breached(barrier_deadline, &shutdown);
-    // Collect writers registered since the accept loop's last turn, then take
-    // ownership of their completion: abort first so every connection parked on
-    // its writer can finish, and JOIN below so no writer future — with its
-    // socket half and payload — can still exist when the endpoint and store go.
-    while let Ok(handle) = writer_receiver.try_recv() {
-        writers.push(handle);
-    }
-    if forced {
-        for writer in &writers {
-            writer.abort();
-        }
-        connections.abort_all();
-    }
-    while let Some(completed) = connections.join_next().await {
-        note_connection_exit(&mut undelivered_notices, Some(completed));
-    }
-    let joined_writers = bounded_finalization(
-        async {
-            for writer in writers {
-                let _ = writer.await;
-            }
-        },
-        barrier_deadline,
-        &mut shutdown,
-    )
-    .await;
-    // An unjoined writer is exactly what P1-1 forbids: report it, never
-    // pretend the barrier completed cleanly.
-    forced |= joined_writers.is_none() || barrier_breached(barrier_deadline, &shutdown);
-
-    // Finalization is part of the barrier: flush, socket removal, and the
-    // store close each run under the same deadline and the same second-signal
-    // escape, and EVERY step is arbitrated afterwards — a step that completed
-    // is not evidence that the barrier held. Store work that overruns keeps
-    // running on the blocking pool and releases the lock as soon as it
-    // physically can, but this task stops waiting and reports forced honestly.
-    let flush = bounded_finalization(store.flush(), barrier_deadline, &mut shutdown).await;
-    let flush_overran = flush.is_none();
-    let flush_result = flush.and_then(|result| result.err()).map(DaemonError::from);
-    forced |= flush_overran || barrier_breached(barrier_deadline, &shutdown);
-    let flush_error = if forced { None } else { flush_result };
-
-    // Socket removal happens even when the flush overran: an abandoned
-    // rendezvous node is worse than a large WAL. It is synchronous, so its
-    // arbitration is the recheck that follows it.
-    let cleanup_error = endpoint.cleanup().err();
-    forced |= barrier_breached(barrier_deadline, &shutdown);
-
-    let close = bounded_finalization(store.close(), barrier_deadline, &mut shutdown).await;
-    let close_overran = close.is_none();
-    let close_result = close.and_then(|result| result.err()).map(DaemonError::from);
-    forced |= close_overran || barrier_breached(barrier_deadline, &shutdown);
-    let close_error = if forced { None } else { close_result };
-
+    let undelivered_notices = runtime
+        .drain(&mut forced, barrier_deadline, &mut shutdown)
+        .await;
     if undelivered_notices > 0 {
         forced = true;
     }
-    // Final arbitration: a second signal that arrived during any synchronous
-    // step above still decides the outcome.
-    forced |= barrier_breached(barrier_deadline, &shutdown);
+    let finalize_error = finalize(
+        store,
+        &mut endpoint,
+        barrier_deadline,
+        &mut shutdown,
+        &mut forced,
+    )
+    .await;
 
-    if let Some(error) = listener_error
-        .or(flush_error)
-        .or(cleanup_error)
-        .or(close_error)
-    {
+    // Precedence: a listener failure is the daemon's own fault and outranks
+    // whatever the barrier then reported.
+    if let Some(error) = listener_error.or(finalize_error) {
         return Err(error);
     }
     states.publish(DaemonState::Stopped);
@@ -458,6 +307,311 @@ async fn run_inner(
     } else {
         ShutdownOutcome::Graceful
     })
+}
+
+/// Phase 3 (R16 tail): run C4a reconciliation, interruptibly.
+///
+/// A shutdown request during the scan abandons the pass — the next daemon
+/// generation redoes it idempotently — and `None` tells the caller to take the
+/// pre-listener drain instead of advertising `Ready`.
+async fn reconcile_before_ready(
+    store: &SqliteStoreHandle,
+    device_id: &DeviceId,
+    shutdown: &mut watch::Receiver<ShutdownRequest>,
+) -> Option<Result<(), haider_protocol::error::HaiderError>> {
+    let mut recovery = Box::pin(reconcile_dispatched_effects(store, device_id));
+    let outcome = loop {
+        if !matches!(*shutdown.borrow(), ShutdownRequest::None) {
+            break None;
+        }
+        tokio::select! {
+            result = &mut recovery => break Some(result),
+            changed = shutdown.changed() => {
+                if changed.is_err() || !matches!(*shutdown.borrow(), ShutdownRequest::None) {
+                    break None;
+                }
+            }
+        }
+    };
+    drop(recovery);
+    outcome.map(|result| result.map(|_| ()))
+}
+
+/// Phase 4+5 state: the connection tasks, their writer tasks, and the
+/// admission permits — everything the accept loop creates and the drain
+/// barrier must account for.
+struct ConnectionRuntime {
+    connections: JoinSet<Result<ConnectionExit, DaemonError>>,
+    /// Writer handles registered by connections. Teardown owns their abort and
+    /// their JOIN; the connection itself only holds an abort handle (R17).
+    writers: Vec<JoinHandle<()>>,
+    writer_receiver: tokio::sync::mpsc::UnboundedReceiver<JoinHandle<()>>,
+    /// Admission cap: one permit per served connection, owned by that
+    /// connection's task so it is returned on normal completion, on error, and
+    /// on abort alike. Nothing about listener close or drain ordering depends
+    /// on it (report §2.5).
+    admission: Arc<Semaphore>,
+}
+
+impl ConnectionRuntime {
+    fn new(
+        max_connections: usize,
+        writer_receiver: tokio::sync::mpsc::UnboundedReceiver<JoinHandle<()>>,
+    ) -> Self {
+        Self {
+            connections: JoinSet::new(),
+            writers: Vec::new(),
+            writer_receiver,
+            admission: Arc::new(Semaphore::new(max_connections)),
+        }
+    }
+
+    /// Phase 4: serve until a shutdown request (or a listener failure, which is
+    /// reported alongside the graceful request it triggers).
+    async fn accept_until_shutdown(
+        &mut self,
+        endpoint: &endpoint::BoundEndpoint,
+        context: &ConnectionContext,
+        drain_receiver: &watch::Receiver<Option<DrainNotice>>,
+        shutdown: &mut watch::Receiver<ShutdownRequest>,
+    ) -> (ShutdownRequest, Option<DaemonError>) {
+        let mut listener_error = None;
+        let request = loop {
+            match shutdown.borrow().clone() {
+                request @ (ShutdownRequest::Graceful { .. } | ShutdownRequest::Forced { .. }) => {
+                    break request;
+                }
+                ShutdownRequest::None => {}
+            }
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() {
+                        break ShutdownRequest::Forced {
+                            reason: "shutdown controller dropped".into(),
+                        };
+                    }
+                }
+                accepted = endpoint.accept() => {
+                    match accepted {
+                        Ok((stream, _)) => {
+                            match Arc::clone(&self.admission).try_acquire_owned() {
+                                Ok(permit) => {
+                                    let connection_context = context.clone();
+                                    let connection_drain = drain_receiver.clone();
+                                    self.connections.spawn(async move {
+                                        // The owned permit lives inside the task, so
+                                        // every exit path — return, error, or abort —
+                                        // frees the slot exactly once.
+                                        let _permit = permit;
+                                        serve(stream, connection_context, connection_drain).await
+                                    });
+                                }
+                                // Over the cap: typed rejection, then close. No task
+                                // and no queue is created for this peer.
+                                Err(_) => reject_over_limit(&stream, context),
+                            }
+                        }
+                        Err(error) => {
+                            listener_error = Some(DaemonError::io(
+                                "accept Unix connection",
+                                endpoint.path(),
+                                error,
+                            ));
+                            break ShutdownRequest::Graceful {
+                                reason: "listener failure".into(),
+                            };
+                        }
+                    }
+                }
+                registered = self.writer_receiver.recv() => {
+                    if let Some(handle) = registered {
+                        // Opportunistic pruning keeps the registry proportional to
+                        // live connections, not to connections ever served.
+                        self.writers.retain(|writer: &JoinHandle<()>| !writer.is_finished());
+                        self.writers.push(handle);
+                    }
+                }
+                completed = self.connections.join_next(), if !self.connections.is_empty() => {
+                    // W3b1 has nothing to do with a connection's exit before the
+                    // barrier; W3b2's session hub is where per-connection faults
+                    // become observable (ledgered: adopt tracing before then).
+                    let _ = completed;
+                }
+            }
+        };
+        (request, listener_error)
+    }
+
+    /// Phase 5a: bounded completion, then take ownership of every child.
+    ///
+    /// Returns how many connections the daemon could not hand their last frame
+    /// to. `forced` is raised — never lowered — by anything that breaches the
+    /// barrier here.
+    async fn drain(
+        &mut self,
+        forced: &mut bool,
+        deadline: tokio::time::Instant,
+        shutdown: &mut watch::Receiver<ShutdownRequest>,
+    ) -> usize {
+        let mut undelivered = 0_usize;
+        if !*forced {
+            // One scheduling turn so a connection that is already parked on the
+            // drain broadcast can react before the daemon starts waiting on it;
+            // it also lets a force that raced the broadcast be seen below.
+            tokio::task::yield_now().await;
+            *forced = matches!(*shutdown.borrow(), ShutdownRequest::Forced { .. });
+        }
+        if !*forced {
+            while !self.connections.is_empty() {
+                tokio::select! {
+                    completed = self.connections.join_next() => {
+                        note_connection_exit(&mut undelivered, completed);
+                    }
+                    changed = shutdown.changed() => {
+                        if changed.is_err()
+                            || matches!(*shutdown.borrow(), ShutdownRequest::Forced { .. })
+                        {
+                            *forced = true;
+                            break;
+                        }
+                    }
+                    () = tokio::time::sleep_until(deadline) => {
+                        *forced = true;
+                        break;
+                    }
+                }
+            }
+        }
+        *forced |= barrier_breached(deadline, shutdown);
+        // Collect writers registered since the accept loop's last turn, then
+        // take ownership of their completion: abort first so every connection
+        // parked on its writer can finish, and JOIN below so no writer future —
+        // with its socket half and payload — can still exist when the endpoint
+        // and the store go.
+        self.collect_writers();
+        if *forced {
+            for writer in &self.writers {
+                writer.abort();
+            }
+            self.connections.abort_all();
+        }
+        while let Some(completed) = self.connections.join_next().await {
+            note_connection_exit(&mut undelivered, Some(completed));
+        }
+        // RE-DRAIN. A connection accepted just before shutdown can register its
+        // writer AFTER the collection above — its first poll may run on another
+        // worker while this task is already draining. Every sender is a
+        // connection task (the runtime's own context clone is a sender that
+        // never sends), and all of them are joined by the line above, so this
+        // second collection is provably the last one.
+        self.collect_writers();
+        if *forced {
+            for writer in &self.writers {
+                writer.abort();
+            }
+        }
+        let writers = std::mem::take(&mut self.writers);
+        let joined = bounded_finalization(
+            async {
+                for writer in writers {
+                    let _ = writer.await;
+                }
+            },
+            deadline,
+            shutdown,
+        )
+        .await;
+        // An unjoined writer is exactly what P1-1 forbids: report it, never
+        // pretend the barrier completed cleanly.
+        *forced |= joined.is_none() || barrier_breached(deadline, shutdown);
+        undelivered
+    }
+
+    fn collect_writers(&mut self) {
+        while let Ok(handle) = self.writer_receiver.try_recv() {
+            self.writers.push(handle);
+        }
+    }
+}
+
+/// Phase 5b: flush, remove the exact owned socket, close the store (lock
+/// release) LAST. Every step runs under the same barrier discipline; the
+/// returned error is the first one worth reporting, in that order.
+async fn finalize(
+    store: SqliteStoreHandle,
+    endpoint: &mut endpoint::BoundEndpoint,
+    deadline: tokio::time::Instant,
+    shutdown: &mut watch::Receiver<ShutdownRequest>,
+    forced: &mut bool,
+) -> Option<DaemonError> {
+    let flush_error = barrier_step(
+        store.flush(),
+        StepFailure::SuppressedWhenForced,
+        deadline,
+        shutdown,
+        forced,
+    )
+    .await;
+    // Socket removal happens even when the flush overran: an abandoned
+    // rendezvous node is worse than a large WAL.
+    let cleanup_error = barrier_step(
+        std::future::ready(endpoint.cleanup()),
+        StepFailure::AlwaysReported,
+        deadline,
+        shutdown,
+        forced,
+    )
+    .await;
+    let close_error = barrier_step(
+        store.close(),
+        StepFailure::SuppressedWhenForced,
+        deadline,
+        shutdown,
+        forced,
+    )
+    .await;
+    flush_error.or(cleanup_error).or(close_error)
+}
+
+/// What a barrier step's failure means once the barrier has been breached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StepFailure {
+    /// Lossy by contract (R17): a store flush or close that fails after a force
+    /// or an overrun is an expected consequence of the forced path, not the
+    /// daemon's report. The outcome already says `Forced`.
+    SuppressedWhenForced,
+    /// Reported on every path: a rendezvous node the daemon could not remove
+    /// outlives the process and confuses the next start, forced or not.
+    AlwaysReported,
+}
+
+/// Runs one step of the barrier and arbitrates it.
+///
+/// This is the single place the barrier's idiom lives: bound the step by the
+/// deadline and the second-signal escape, then re-check BOTH afterwards,
+/// because a step completing is not evidence that the barrier held. `forced` is
+/// only ever raised. A synchronous step passes `std::future::ready(..)` so it
+/// gets the same arbitration.
+async fn barrier_step<T, E>(
+    work: impl Future<Output = Result<T, E>>,
+    failure: StepFailure,
+    deadline: tokio::time::Instant,
+    shutdown: &mut watch::Receiver<ShutdownRequest>,
+    forced: &mut bool,
+) -> Option<DaemonError>
+where
+    DaemonError: From<E>,
+{
+    let outcome = bounded_finalization(work, deadline, shutdown).await;
+    let overran = outcome.is_none();
+    let error = outcome
+        .and_then(|result| result.err())
+        .map(DaemonError::from);
+    *forced |= overran || barrier_breached(deadline, shutdown);
+    match failure {
+        StepFailure::SuppressedWhenForced if *forced => None,
+        StepFailure::SuppressedWhenForced | StepFailure::AlwaysReported => error,
+    }
 }
 
 /// Counts connections whose last frame never made it out (R17 honesty). A
@@ -561,19 +715,25 @@ async fn shutdown_before_listener(
         reason,
         deadline_unix_ms: unix_time_ms().saturating_add(duration_ms(config.drain_timeout)),
     });
-    // Same discipline as the full barrier: bound each step, then arbitrate the
-    // deadline and any force AFTER it, and once more before reporting.
-    let flush = bounded_finalization(store.flush(), barrier_deadline, shutdown).await;
-    let flush_overran = flush.is_none();
-    let flush_error = flush.and_then(|result| result.err()).map(DaemonError::from);
-    forced |= flush_overran || barrier_breached(barrier_deadline, shutdown);
-
-    let close = bounded_finalization(store.close(), barrier_deadline, shutdown).await;
-    let close_overran = close.is_none();
-    let close_error = close.and_then(|result| result.err()).map(DaemonError::from);
-    forced |= close_overran || barrier_breached(barrier_deadline, shutdown);
-
-    if !forced && let Some(error) = flush_error.or(close_error) {
+    // The same barrier steps the full drain runs, through the same helper:
+    // there is no socket and no connection here, so the tail is flush → close.
+    let flush_error = barrier_step(
+        store.flush(),
+        StepFailure::SuppressedWhenForced,
+        barrier_deadline,
+        shutdown,
+        &mut forced,
+    )
+    .await;
+    let close_error = barrier_step(
+        store.close(),
+        StepFailure::SuppressedWhenForced,
+        barrier_deadline,
+        shutdown,
+        &mut forced,
+    )
+    .await;
+    if let Some(error) = flush_error.or(close_error) {
         return Err(error);
     }
     states.publish(DaemonState::Stopped);

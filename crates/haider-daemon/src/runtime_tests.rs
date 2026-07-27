@@ -71,6 +71,9 @@ async fn a_second_signal_during_a_step_forces_the_outcome() {
     );
 }
 
+/// MUTATION CHECK: drop the force arm from `barrier_breached` (leave only the
+/// deadline comparison). Expected failure: the force delivered without any
+/// `changed()` poll goes unseen and this assertion fails. Verified 2026-07-27.
 #[tokio::test]
 async fn a_force_that_arrives_during_a_synchronous_step_is_still_observed() {
     let (sender, shutdown) = shutdown_channel();

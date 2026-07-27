@@ -12,12 +12,17 @@
 //!   the daemon on a slow client (R12's mechanism): exceeding either bound is
 //!   a connection error, and the store — not the socket — is the lag buffer in
 //!   later lanes;
-//! - one `ServerDraining` is the last frame of a draining connection (R17),
-//!   and it travels a reserved path so ordinary replies can never spend the
-//!   queue slot or the bytes that last frame needs. Once the notice is
-//!   reserved, EVERY write is bounded by the drain deadline, so the last frame
-//!   can neither be starved behind an in-flight ordinary write nor outlive the
-//!   barrier;
+//! - one `ServerDraining` is the last frame of THIS LANE's traffic on a
+//!   draining connection (R17), and it travels a reserved path so ordinary
+//!   replies can never spend the queue slot or the bytes that last frame
+//!   needs. Once the notice is reserved, EVERY write is bounded by the drain
+//!   deadline, so the last frame can neither be starved behind an in-flight
+//!   ordinary write nor outlive the barrier. SCOPE, for W3b2: the binding
+//!   spec closes transports only AFTER the final committed envelopes are
+//!   broadcast during the grace period (d1 report §6.6 step 10), so once
+//!   attachments stream through this barrier the rule becomes "notice, then
+//!   keep streaming until checkpoint or deadline" — a deliberate relaxation,
+//!   not a regression, and it must keep the deadline discipline intact;
 //! - a peer that never finishes its handshake is closed at
 //!   `handshake_timeout`, so silent peers cannot hold connection slots;
 //! - a peer accepted beyond the daemon's connection cap is answered with a

@@ -1,44 +1,70 @@
-//! W3b1 acceptance matrix (brief deliverable 7; d1 report R19/R22 named
-//! cases). Traceability, matrix case -> test:
+//! W3b1 acceptance matrix — EXHAUSTIVE. Every `#[tokio::test]` in this file
+//! appears below; a case added without a row here is a gap in the matrix, not
+//! a shortcut. Cases are grouped by the law they defend (d1 report
+//! R1/R2/R3/R12/R16/R17/R19/R22, report §2.5).
+//!
+//! Singleton and startup (R1/R16/R19/R22):
 //!
 //! - simultaneous-start            -> `simultaneous_start_n_processes_has_one_winner_and_clean_losers`
-//! - loser diagnostics (R1)        -> `already_running_error_carries_incumbent_diagnostics`
+//! - loser diagnostics             -> `already_running_error_carries_incumbent_diagnostics`
 //! - stale-PID-reuse               -> `stale_pid_reuse_is_diagnostic_only_and_does_not_block_start`
 //! - cold-start socket-missing     -> `cold_start_socket_missing_serves_handshake_ping_and_stub_with_private_modes`
-//! - successor-socket-deletion     -> `successor_socket_deletion_guard_preserves_replacement_identity`
-//! - failed-listener-startup       -> `failed_listener_startup_publishes_failed_and_releases_profile_lock`
+//! - failed-listener startup       -> `failed_listener_startup_publishes_failed_and_releases_profile_lock`
 //! - abrupt-death (kill -9)        -> `abrupt_death_kill_9_leaves_recoverable_socket_and_next_start_serves`
+//! - reconcile-before-ready        -> `reconcile_before_ready_marks_unknown_exactly_once_and_never_retries_effect`
+//!
+//! Endpoint ownership (R2/R3/R22):
+//!
+//! - successor-socket-deletion     -> `successor_socket_deletion_guard_preserves_replacement_identity`
+//! - replacement before cleanup    -> `endpoint_replacement_before_cleanup_is_never_deleted`
+//! - replacement RACING cleanup    -> `endpoint_replacement_racing_cleanup_is_never_deleted`
+//! - node that goes live in the
+//!   probe → removal window        -> `stale_cleanup_never_removes_a_node_that_went_live`
+//! - staging leftovers swept,
+//!   live staging left alone       -> `stranded_staging_nodes_are_swept_but_live_ones_are_left`
+//! - live foreign endpoint         -> `live_foreign_endpoint_is_refused_and_left_intact`
+//!
+//! Connection layer and its bounds (R12, report §2.5):
+//!
 //! - version-mismatch rejection    -> `handshake_version_mismatch_returns_fatal_rejection`
 //! - oversize frame                -> `oversize_frame_is_rejected_at_connection_layer_before_body_allocation`
 //! - client frame-limit honored    -> `client_max_receive_frame_is_enforced_on_welcome`
+//! - duplicate Hello               -> `duplicate_hello_after_handshake_is_a_fatal_unexpected_frame`
+//! - capability downscoping        -> `view_only_connection_is_denied_the_control_frame`
+//! - pre-Hello slot exhaustion     -> `silent_peer_is_closed_at_the_handshake_deadline_and_frees_its_slot`
+//! - connection admission cap      -> `connection_admission_cap_rejects_over_limit_peers_and_readmits_a_freed_slot`
+//! - queued-byte budget            -> `outbound_byte_budget_refuses_a_frame_the_connection_cannot_hold`
+//!
+//! Drain barrier (R17):
+//!
 //! - drain-notifies-connections    -> `drain_notifies_every_open_connection_before_close`
+//! - reserved drain notice         -> `reserved_drain_notice_survives_an_exhausted_outbound_byte_budget`
+//! - over-limit drain reason       -> `drain_reason_is_truncated_to_fit_a_small_client_frame_limit`
+//! - blocked writer, deadline path -> `never_reading_client_is_cut_at_the_drain_deadline_and_releases_everything`
+//! - peer that reads NOTHING       -> `client_that_never_reads_a_byte_cannot_hold_the_barrier_open`
+//! - peer that reads ONE byte      -> `one_byte_reader_cannot_hold_the_barrier_open`
+//! - blocked writer, forced path   -> `forced_shutdown_aborts_a_blocked_writer_instead_of_detaching_it`
+//! - deadline covers finalization  -> `drain_deadline_covers_the_finalization_tail`
 //! - second-signal termination     -> `second_signal_request_selects_immediate_forced_termination_path`
 //! - second OS signal, end to end  -> `second_os_signal_terminates_the_daemon_through_the_forced_exit_path`
 //! - shutdown before startup       -> `first_signal_before_startup_drains_without_advertising_ready`
 //! - forced shutdown before startup -> `second_signal_before_startup_prevents_ready_and_forces_termination`
-//! - reconcile-before-ready (R16)  -> `reconcile_before_ready_marks_unknown_exactly_once_and_never_retries_effect`
 //!
-//! Efficiency-rider follow-ups (report §2.5, R12/R17), same matrix discipline:
+//! Covered by crate-internal unit tests instead (they need types this
+//! integration crate cannot see): the phase publisher's refusal of illegal
+//! edges (`haider-daemon/src/lifecycle_tests.rs`) and the barrier's arbitration
+//! helpers, including second-signal-during-finalization
+//! (`haider-daemon/src/runtime_tests.rs`).
 //!
-//! - connection admission cap      -> `connection_admission_cap_rejects_over_limit_peers_and_readmits_a_freed_slot`
-//! - queued-byte budget            -> `outbound_byte_budget_refuses_a_frame_the_connection_cannot_hold`
-//! - reserved drain notice         -> `reserved_drain_notice_survives_an_exhausted_outbound_byte_budget`
+//! Two windows have no test, by construction rather than by omission: the
+//! bind → identity window (the socket is created under an unguessable name and
+//! renamed into place, so no replacement can be adopted), and abort-vs-join of
+//! a child writer (indistinguishable once the daemon has reported). Both are
+//! recorded in docs/OPTIMIZATIONS.md.
 //!
-//! Review round 1 closures (R3/R17/R22):
-//!
-//! - blocked writer, deadline path -> `never_reading_client_is_cut_at_the_drain_deadline_and_releases_everything`
-//! - blocked writer, forced path   -> `forced_shutdown_aborts_a_blocked_writer_instead_of_detaching_it`
-//! - deadline covers finalization  -> `drain_deadline_covers_the_finalization_tail`
-//! - replacement around cleanup    -> `endpoint_replacement_around_cleanup_is_never_deleted`
-//! - live foreign endpoint         -> `live_foreign_endpoint_is_refused_and_left_intact`
-//! - over-limit drain reason       -> `drain_reason_is_truncated_to_fit_a_small_client_frame_limit`
-//! - capability downscoping        -> `view_only_connection_is_denied_the_control_frame`
-//! - pre-Hello slot exhaustion     -> `silent_peer_is_closed_at_the_handshake_deadline_and_frees_its_slot`
-//! - duplicate Hello               -> `duplicate_hello_after_handshake_is_a_fatal_unexpected_frame`
-//!
-//! The bind → identity window has no test because it has no window: the socket
-//! is created under a private name, `statat`-ed there, and renamed into place,
-//! so no replacement can be adopted as this daemon's own node.
+//! Tests that were mutation-checked carry a `MUTATION CHECK:` comment naming
+//! the change to revert and the failure to expect, so the evidence is
+//! re-executable rather than a claim in a commit message.
 //!
 //! All cases use a real UDS in a tempdir runtime dir and poll readiness
 //! states — no sleeps as synchronization. Where only the OS can answer (a
@@ -851,22 +877,27 @@ async fn connection_admission_cap_rejects_over_limit_peers_and_readmits_a_freed_
     );
 }
 
+/// MUTATION CHECK: drop the `charge` call in `connection.rs::enqueue` (enqueue
+/// straight into the frame queue). Expected failure: the pongs keep queueing,
+/// the connection never dies, and the `try_receive` below returns a frame
+/// instead of EOF.
 #[tokio::test]
 async fn outbound_byte_budget_refuses_a_frame_the_connection_cannot_hold() {
     let root = test_root();
-    // The Welcome embeds the profile id, so a profile id larger than the whole
-    // per-connection byte budget makes the first reply unqueueable — the byte
-    // charge happens before the enqueue, so the connection dies there.
-    let profile = format!("byte-budget-{}", "p".repeat(8 * 1024));
+    // A half-megabyte Welcome parks the writer inside `write_all` against a
+    // peer that never reads, so nothing is ever credited back: replies then
+    // accumulate against the byte budget until one is refused. The budget is
+    // exactly one frame limit (the smallest coherent setting), and the pongs
+    // that follow have nowhere left to go.
+    let profile = format!("byte-budget-{}", "p".repeat(512 * 1024));
     let mut config = test_config(&root, &profile);
-    config.outbound_queued_bytes = 4 * 1024;
+    config.frame_limit = config.profile_id.len() + 1_024;
+    config.outbound_queued_bytes = config.frame_limit;
+    config.outbound_queue_capacity = 64;
+    let pings = 40;
     assert!(
-        config.outbound_queued_bytes < config.profile_id.len(),
-        "the reply this test expects to be refused must exceed the budget"
-    );
-    assert!(
-        config.outbound_queue_capacity > 1,
-        "the frame-count bound must not be what fires here"
+        config.outbound_queue_capacity > pings + 1,
+        "the frame-count bound must not be what fires here — only the bytes"
     );
     let task = spawn(config.clone());
     wait_for_state(task.readiness(), |state| *state == DaemonState::Ready).await;
@@ -884,6 +915,18 @@ async fn outbound_byte_budget_refuses_a_frame_the_connection_cannot_hold() {
             config.frame_limit,
         )
         .await;
+    for nonce in 0..pings {
+        client
+            .send(
+                &WireFrame::Ping {
+                    nonce: nonce as u64,
+                },
+                config.frame_limit,
+            )
+            .await;
+    }
+    // The client never reads, so the only way this returns is the connection
+    // being closed by the refused charge.
     assert!(
         tokio::time::timeout(DEADLINE, client.try_receive())
             .await
@@ -901,6 +944,11 @@ async fn outbound_byte_budget_refuses_a_frame_the_connection_cannot_hold() {
     assert!(!config.endpoint_path().exists());
 }
 
+/// MUTATION CHECK: in `connection.rs`, replace the reserve `try_send` with an
+/// ordinary `enqueue(&lane, &frame, outbound_limit)`. Expected failure: the
+/// notice is refused by the exhausted budget, the client sees EOF after the
+/// Welcome, and `receive()` panics with "connection closed before a frame
+/// arrived". Verified 2026-07-27.
 #[tokio::test]
 async fn reserved_drain_notice_survives_an_exhausted_outbound_byte_budget() {
     let root = test_root();
@@ -1136,6 +1184,67 @@ async fn one_byte_reader_cannot_hold_the_barrier_open() {
 /// its connection: joining it may not hand its handle away, or the abort finds
 /// nothing to cancel and the writer (plus its socket and payload) survives
 /// endpoint cleanup and the profile-lock release.
+/// A connection accepted in the same instant as the shutdown request: its
+/// first poll can run while the barrier is already draining, so its writer may
+/// be registered AFTER the barrier's first collection. The re-drain that
+/// follows the final connection join is what keeps that writer from being
+/// aborted-but-never-joined.
+///
+/// MUTATION CHECK: delete the second `self.collect_writers()` (and the abort
+/// loop that follows it) in `ConnectionRuntime::drain`. The window is a
+/// scheduling coincidence, so this test cannot force it — see the honest note
+/// in docs/OPTIMIZATIONS.md; what it does pin is that connections racing the
+/// barrier are still torn down completely and the daemon stays honest.
+#[tokio::test]
+async fn connections_racing_the_shutdown_request_are_torn_down_completely() {
+    let root = test_root();
+    let config = test_config(&root, "late-registration");
+    let task = spawn(config.clone());
+    wait_for_state(task.readiness(), |state| *state == DaemonState::Ready).await;
+
+    // Fire a burst of connects and the shutdown request together, so some
+    // connections are accepted (and register their writers) while the barrier
+    // is already running.
+    let endpoint = config.endpoint_path();
+    let limit = config.frame_limit;
+    let racers = (0..8)
+        .map(|_| {
+            let endpoint = endpoint.clone();
+            tokio::spawn(async move {
+                let Ok(mut client) = TestClient::connect(&endpoint, limit).await else {
+                    return;
+                };
+                let announced = u32::try_from(limit).expect("frame limit fits");
+                let _ = client
+                    .try_send(
+                        &hello(WIRE_PROTOCOL_VERSION, WIRE_PROTOCOL_VERSION, announced),
+                        limit,
+                    )
+                    .await;
+                let _ = client.try_receive().await;
+            })
+        })
+        .collect::<Vec<_>>();
+    task.shutdown_handle().request("racing accepts");
+
+    let outcome = task.join().await.expect("daemon joins");
+    assert!(matches!(
+        outcome,
+        ShutdownOutcome::Graceful | ShutdownOutcome::Forced
+    ));
+    for racer in racers {
+        let _ = racer.await;
+    }
+    // Whatever the ordering did, teardown completed: no socket, no lock.
+    assert!(!config.endpoint_path().exists());
+    poll_store_release(&config).await;
+}
+
+/// MUTATION CHECK: remove BOTH writer cancellations — the `abort` in
+/// `WriterGuard::drop` and the runtime's `writer.abort()` loop in
+/// `ConnectionRuntime::drain`. Expected failure: the detached writer finishes
+/// its half-megabyte frame after the abort, so `frames_until_eof` returns 2
+/// instead of 0. Verified 2026-07-27.
 #[tokio::test]
 async fn forced_shutdown_aborts_a_blocked_writer_instead_of_detaching_it() {
     let root = test_root();
@@ -1189,6 +1298,10 @@ async fn forced_shutdown_aborts_a_blocked_writer_instead_of_detaching_it() {
 
 /// The advertised deadline covers the finalization tail too (flush, socket
 /// removal, store close), and an overrun is reported as forced.
+/// MUTATION CHECK: in `finalize`, call `store.flush()`/`store.close()`
+/// directly instead of through `barrier_step`. Expected failure: the overrun
+/// goes unnoticed and the daemon reports `Graceful` where the test demands
+/// `Forced`. Verified 2026-07-27.
 #[tokio::test]
 async fn drain_deadline_covers_the_finalization_tail() {
     let root = test_root();
@@ -1330,6 +1443,12 @@ fn inode_exists_in(directory: &Path, identity: (u64, u64)) -> bool {
 /// daemon repeatedly tries to start, so the gap is genuinely exercised; the
 /// daemon may legitimately refuse (live at probe) or start (stale at probe),
 /// and either way a LIVE node of the racer's must never be removed.
+/// MUTATION CHECK: replace `remove_verified_stale` with the pre-fix shape —
+/// `statat` the PUBLIC name, then `unlinkat` it, with no claim and no liveness
+/// re-probe. Expected failure: a node that went live inside the probe → unlink
+/// window is deleted, so `stolen` is non-zero (observed in 5 of 6 runs; the
+/// window is real but not certain, so re-run a few times). Verified
+/// 2026-07-27.
 #[tokio::test]
 async fn stale_cleanup_never_removes_a_node_that_went_live() {
     let root = test_root();
@@ -1408,6 +1527,10 @@ async fn stale_cleanup_never_removes_a_node_that_went_live() {
 /// A daemon that died between claim and restore leaves a staging node behind.
 /// The next start sweeps its own leftovers — and only those: a staging name
 /// that is still LIVE belongs to someone else's in-flight bind and is left.
+/// MUTATION CHECK: delete the `sweep_staging(..)` call in `endpoint::bind`.
+/// Expected failure: the stranded node is still there after the daemon reaches
+/// Ready ("a stale staging leftover must be swept at startup"). Verified
+/// 2026-07-27.
 #[tokio::test]
 async fn stranded_staging_nodes_are_swept_but_live_ones_are_left() {
     let root = test_root();

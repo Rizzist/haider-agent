@@ -26,9 +26,15 @@ pub struct DaemonConfig {
     /// `outbound_queue_capacity × frame_limit` of resident payload, so bytes
     /// are charged before enqueue and credited once the write completes;
     /// exceeding the budget is the same connection-fatal error a full queue is.
-    /// Values below `frame_limit` cannot carry a maximum-size frame at all —
-    /// the default deliberately leaves room for one in flight plus one queued.
+    /// Must be at least `frame_limit`, and is validated as such: a budget that
+    /// cannot carry one maximum-size frame would make some admissible frames
+    /// unsendable. The default leaves room for one in flight plus one queued.
     /// The final `ServerDraining` frame never spends this budget (R17).
+    ///
+    /// Aggregate worst case is `max_connections × outbound_queued_bytes` —
+    /// 64 × 16 MiB = 1 GiB at the defaults, reached only if every admitted
+    /// connection simultaneously stops reading with a full budget charged.
+    /// Tune this pair together, not `frame_limit` alone.
     pub outbound_queued_bytes: usize,
     /// Simultaneously served connections. A same-UID peer accepted beyond this
     /// cap is answered with a fatal `overloaded` [`haider_rpc::ProtocolError`]
@@ -95,8 +101,11 @@ impl DaemonConfig {
         if self.outbound_queue_capacity == 0 {
             return Err("outbound queue capacity must be greater than zero".into());
         }
-        if self.outbound_queued_bytes == 0 {
-            return Err("outbound queued-byte budget must be greater than zero".into());
+        if self.outbound_queued_bytes < self.frame_limit {
+            return Err(format!(
+                "outbound queued-byte budget ({}) must be at least the frame limit ({})",
+                self.outbound_queued_bytes, self.frame_limit
+            ));
         }
         // The upper bound is the admission semaphore's own ceiling: a config
         // that cannot be represented must fail here, not panic at accept time.
