@@ -396,7 +396,12 @@ impl RpcClient {
             request_id: RequestId::new(id.clone()),
             body,
         };
-        let bytes = uds_codec::encode(&frame, self.outbound_limit).map_err(ClientError::Encode)?;
+        // Sensitive encode path for EVERY outbound frame: `vault.stage`
+        // bodies carry raw secrets, and uniform hygiene is cheaper than a
+        // per-method split — the intermediate JSON body is scrubbed inside
+        // the codec and the framed buffer zeroizes when the writer drops it.
+        let bytes = uds_codec::encode_zeroizing(&frame, self.outbound_limit)
+            .map_err(ClientError::Encode)?;
         let (sender, receiver) = oneshot::channel();
         {
             if let ConnectionState::Disconnected(reason) = self.state() {
@@ -407,7 +412,7 @@ impl RpcClient {
             };
             pending.insert(id.clone(), sender);
         }
-        if self.outbound.send(Zeroizing::new(bytes)).await.is_err() {
+        if self.outbound.send(bytes).await.is_err() {
             if let Ok(mut pending) = self.shared.pending.lock() {
                 pending.remove(&id);
             }
@@ -421,9 +426,10 @@ impl RpcClient {
 
     /// Sends one uncorrelated frame (`MenuAnswer` is the intended user).
     pub async fn send_frame(&self, frame: WireFrame) -> Result<(), ClientError> {
-        let bytes = uds_codec::encode(&frame, self.outbound_limit).map_err(ClientError::Encode)?;
+        let bytes = uds_codec::encode_zeroizing(&frame, self.outbound_limit)
+            .map_err(ClientError::Encode)?;
         self.outbound
-            .send(Zeroizing::new(bytes))
+            .send(bytes)
             .await
             .map_err(|_| ClientError::Disconnected(self.disconnect_reason()))
     }
@@ -522,8 +528,10 @@ async fn route_frame(
         }
         WireFrame::Ping { nonce } => {
             // The daemon does not ping today; answer anyway (tolerance).
-            if let Ok(bytes) = uds_codec::encode(&WireFrame::Pong { nonce }, outbound_limit) {
-                let _ = outbound.try_send(Zeroizing::new(bytes));
+            if let Ok(bytes) =
+                uds_codec::encode_zeroizing(&WireFrame::Pong { nonce }, outbound_limit)
+            {
+                let _ = outbound.try_send(bytes);
             }
         }
         WireFrame::ProtocolError(error) => {
@@ -614,12 +622,11 @@ async fn run_heartbeat(
                 }
                 let nonce = next_nonce;
                 next_nonce = next_nonce.saturating_add(1);
-                if let Ok(bytes) =
-                    uds_codec::encode(&WireFrame::Ping { nonce }, outbound_limit)
+                if let Ok(bytes) = uds_codec::encode_zeroizing(&WireFrame::Ping { nonce }, outbound_limit)
                 {
                     // A full outbound queue is itself no-progress evidence;
                     // the unanswered ping deadline will catch it.
-                    let _ = outbound.try_send(Zeroizing::new(bytes));
+                    let _ = outbound.try_send(bytes);
                 }
                 unacked.push_back((nonce, Instant::now()));
             }

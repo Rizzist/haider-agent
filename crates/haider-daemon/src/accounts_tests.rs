@@ -410,3 +410,31 @@ async fn reconciliation_closes_every_login_crash_boundary() {
         .await
         .unwrap_or_else(|error| panic!("{}", error.message));
 }
+
+/// Release evidence, never the merge gate (§6.2): the PACKAGED default
+/// model ID must validate a real key through the production
+/// `AnthropicValidator` (the same audited one-token Messages path `/login`
+/// uses). Run manually: `HAIDER_ANTHROPIC_API_KEY=... cargo test -p
+/// haider-daemon --lib live_smoke -- --ignored`.
+#[tokio::test]
+#[ignore = "live Anthropic API smoke; requires HAIDER_ANTHROPIC_API_KEY"]
+async fn live_smoke_packaged_default_model_validates_a_real_key() {
+    let key = std::env::var("HAIDER_ANTHROPIC_API_KEY")
+        .unwrap_or_else(|_| panic!("HAIDER_ANTHROPIC_API_KEY must be set for the live smoke"));
+    let identity = AnthropicValidator
+        .validate(
+            "anthropic",
+            haider_client::PACKAGED_DEFAULT_MODEL,
+            key.trim().as_bytes(),
+        )
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "packaged default model {} failed live validation: {:?} {}",
+                haider_client::PACKAGED_DEFAULT_MODEL,
+                error.kind,
+                error.message
+            )
+        });
+    assert!(!identity.identity.is_empty());
+}

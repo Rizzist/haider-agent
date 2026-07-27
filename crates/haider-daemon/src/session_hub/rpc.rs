@@ -432,7 +432,10 @@ impl HubConnection {
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => self.respond_error(
                 request_id,
                 haider_rpc::ERROR_CODE_BUSY,
-                "account actor is busy; retry shortly",
+                // Honest recovery: the single-use stage was already claimed
+                // and dropped with this rejected job, so the retry needs a
+                // fresh stage (the restage protocol covers it).
+                "account actor is busy; stage the key again and retry",
                 true,
                 None,
             ),

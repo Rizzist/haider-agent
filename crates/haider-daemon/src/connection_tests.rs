@@ -567,8 +567,14 @@ async fn silent_negotiated_peer_is_closed_at_the_read_idle_deadline() {
         }
     }
     let elapsed = quiet_since.elapsed();
+    // Lower-bound epsilon: the serve task stamps `last_read` at the Hello
+    // read a few REAL milliseconds before this test pauses time and
+    // captures `quiet_since`, so the virtual close can land that skew
+    // early. One second dwarfs any scheduler delay while still pinning the
+    // 45 s deadline against the 5 s tick granularity.
     assert!(
-        elapsed >= READ_IDLE_DEADLINE && elapsed <= READ_IDLE_DEADLINE + LIVENESS_TICK * 2,
+        elapsed >= READ_IDLE_DEADLINE - std::time::Duration::from_secs(1)
+            && elapsed <= READ_IDLE_DEADLINE + LIVENESS_TICK * 2,
         "close must land at the 45s deadline (tick granularity), was {elapsed:?}"
     );
     assert_eq!(closed_with_code.as_deref(), Some("idle_timeout"));

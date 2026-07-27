@@ -261,3 +261,59 @@ fn parent_exit_leaves_the_daemon_running() {
 
     guard.terminate_and_wait(&profile.endpoint_path);
 }
+
+// MUTATION CHECK (W3b1/R8 numeric race-loser contract): map
+// `DaemonError::AlreadyRunning` to any exit code other than 75 in
+// `DaemonError::exit_code`. Expected failure: the deterministic
+// second-candidate assertion below (the CLI race test exercises the same
+// contract probabilistically; this pins the NUMBER the poll loop trusts).
+#[test]
+fn a_second_daemon_candidate_for_one_profile_exits_seventy_five() {
+    let haiderd = ensure_haiderd_built();
+    let store = tempfile::tempdir().expect("store dir");
+    let profile = resolved_for(store.path());
+    let guard = DaemonGuard {
+        store: store.path().to_path_buf(),
+    };
+
+    let mut winner = Command::new(&haiderd)
+        .arg("--profile")
+        .arg(&profile.profile_id)
+        .arg("--store-dir")
+        .arg(&profile.store_dir)
+        .arg("--runtime-dir")
+        .arg(&profile.runtime_dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn winning daemon");
+    // Wait until the winner serves its endpoint.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !profile.endpoint_path.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        profile.endpoint_path.exists(),
+        "winner must bind its endpoint"
+    );
+
+    let loser = Command::new(&haiderd)
+        .arg("--profile")
+        .arg(&profile.profile_id)
+        .arg("--store-dir")
+        .arg(&profile.store_dir)
+        .arg("--runtime-dir")
+        .arg(&profile.runtime_dir)
+        .output()
+        .expect("second candidate output");
+    assert_eq!(
+        loser.status.code(),
+        Some(75),
+        "the race loser exits EX_TEMPFAIL(75): {}",
+        String::from_utf8_lossy(&loser.stderr)
+    );
+
+    guard.terminate_and_wait(&profile.endpoint_path);
+    let _ = winner.wait();
+}

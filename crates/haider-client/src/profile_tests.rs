@@ -12,6 +12,10 @@ fn env_for(dir: &Path) -> ProfileEnv {
     }
 }
 
+// MUTATION CHECK (R8 one-resolver law): drop the version tag or the
+// canonicalization step from the profile-id derivation. Expected failure:
+// the determinism/path-scoping assertions below (two resolutions of one
+// path must agree; two paths must differ).
 #[test]
 fn profile_id_is_deterministic_and_path_scoped() {
     let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
@@ -86,6 +90,10 @@ fn malformed_profile_config_is_loud() {
     assert!(matches!(error, Err(ProfileError::InvalidConfig { .. })));
 }
 
+// MUTATION CHECK (R8/D1 short-private-directory rule): honor a
+// HAIDER_RUNTIME_DIR-style override or an unverified XDG value in
+// `runtime_dir`. Expected failure: the resolved runtime dir below moves
+// off /tmp/haider-<uid>.
 #[test]
 fn runtime_dir_is_never_env_overridable_and_defaults_to_tmp_uid() {
     let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));

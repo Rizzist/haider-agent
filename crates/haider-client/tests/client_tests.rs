@@ -352,6 +352,10 @@ async fn live_but_old_daemon_is_diagnosed_and_never_killed() {
     assert!(accepted.load(Ordering::SeqCst) >= 2);
 }
 
+// MUTATION CHECK (R8 version skew): treat `protocol_version_mismatch` as a
+// spawnable failure in `try_attach`. Expected failure: ensure_daemon tries
+// the impossible daemon binary and this test sees EnsureError::Spawn
+// instead of ProtocolMismatch.
 #[tokio::test]
 async fn no_wire_overlap_is_a_fatal_mismatch_and_never_spawns() {
     let dir = short_dir();
@@ -394,6 +398,9 @@ async fn no_wire_overlap_is_a_fatal_mismatch_and_never_spawns() {
     assert!(matches!(error, ConnectError::Rejected(_)));
 }
 
+// MUTATION CHECK (R8 step 4): skip the Welcome.profile_id comparison in
+// `try_attach`. Expected failure: the foreign-profile daemon below is
+// attached instead of rejected with ProfileMismatch.
 #[tokio::test]
 async fn profile_mismatch_is_fatal() {
     let dir = short_dir();
@@ -430,6 +437,10 @@ async fn profile_mismatch_is_fatal() {
     }
 }
 
+// MUTATION CHECK (client failure propagation): stop `route_frame` from
+// failing the connection on a fatal ProtocolError. Expected failure: the
+// pending request below hangs instead of resolving to the typed
+// Fatal disconnect (bounded by the suite timeout).
 #[tokio::test]
 async fn fatal_protocol_error_frame_fails_pending_requests() {
     let dir = short_dir();
