@@ -510,6 +510,8 @@ struct HubInner {
     force_stop: Arc<AtomicBool>,
     device_id: DeviceId,
     worker_manager: Mutex<Option<WorkerManagerHandle>>,
+    accounts: Mutex<Option<crate::accounts::AccountsFacade>>,
+    creatable_providers: Mutex<Option<std::collections::BTreeSet<String>>>,
 }
 
 #[derive(Default)]
@@ -785,6 +787,11 @@ pub struct HubConnection {
     connection_id: String,
     capabilities: CapabilitySet,
     sink: Arc<dyn FrameSink>,
+    /// Which transport carried this connection: raw-secret staging is
+    /// LocalSameUid-only (R7), independent of the capability grant.
+    transport: crate::accounts::ConnectionTransport,
+    /// Connection-scoped staged secrets (R7): wiped on close/disconnect.
+    stages: Mutex<crate::accounts::StagedSecrets>,
     closed: AtomicBool,
 }
 
@@ -872,6 +879,8 @@ impl SessionHub {
                 force_stop: Arc::new(AtomicBool::new(false)),
                 device_id,
                 worker_manager: Mutex::new(None),
+                accounts: Mutex::new(None),
+                creatable_providers: Mutex::new(None),
             }),
         })
     }
@@ -888,6 +897,51 @@ impl SessionHub {
         }
         *installed = Some(manager);
         Ok(())
+    }
+
+    /// Installs the account facade (actor route + descriptor snapshot),
+    /// mirroring the worker-manager installation seam.
+    pub(crate) fn install_accounts(
+        &self,
+        facade: crate::accounts::AccountsFacade,
+    ) -> Result<(), SessionHubError> {
+        let mut installed = lock(&self.inner.accounts)?;
+        if installed.is_some() {
+            return Err(SessionHubError::Task(
+                "account facade is already installed".into(),
+            ));
+        }
+        *installed = Some(facade);
+        Ok(())
+    }
+
+    pub(crate) fn accounts(
+        &self,
+    ) -> Result<Option<crate::accounts::AccountsFacade>, SessionHubError> {
+        Ok(lock(&self.inner.accounts)?.clone())
+    }
+
+    /// Installs the ONE `session.create` provider whitelist (D3-5): the
+    /// dependency configuration answers "creatable providers"; nothing else
+    /// may.
+    pub(crate) fn install_creatable_providers(
+        &self,
+        providers: std::collections::BTreeSet<String>,
+    ) -> Result<(), SessionHubError> {
+        let mut installed = lock(&self.inner.creatable_providers)?;
+        if installed.is_some() {
+            return Err(SessionHubError::Task(
+                "creatable-provider registry is already installed".into(),
+            ));
+        }
+        *installed = Some(providers);
+        Ok(())
+    }
+
+    pub(crate) fn creatable_providers(
+        &self,
+    ) -> Result<Option<std::collections::BTreeSet<String>>, SessionHubError> {
+        Ok(lock(&self.inner.creatable_providers)?.clone())
     }
 
     /// Snapshot of monotonic lag-buffer and delivery-pressure counters.
@@ -917,6 +971,7 @@ impl SessionHub {
         &self,
         capabilities: CapabilitySet,
         sink: Arc<dyn FrameSink>,
+        transport: crate::accounts::ConnectionTransport,
     ) -> Result<HubConnection, SessionHubError> {
         if self.inner.draining.load(Ordering::Acquire) {
             return Err(SessionHubError::Closed);
@@ -926,6 +981,8 @@ impl SessionHub {
             connection_id: random_id("connection")?,
             capabilities,
             sink,
+            transport,
+            stages: Mutex::new(crate::accounts::StagedSecrets::default()),
             closed: AtomicBool::new(false),
         })
     }

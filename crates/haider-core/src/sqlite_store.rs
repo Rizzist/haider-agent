@@ -188,6 +188,58 @@ impl SqliteStoreHandle {
         run_blocking(move || owner.with_store(|store| store.cancel_turn(&command))).await
     }
 
+    /// Blocking-pool adapter for `Store::login_claim_receipt` (transaction A
+    /// of the R10 two-transaction login shape).
+    pub async fn login_claim_receipt(
+        &self,
+        command_id: String,
+        request_digest: String,
+        request_json: String,
+    ) -> Result<haider_store::LoginClaim, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.login_claim_receipt(&command_id, &request_digest, &request_json)
+            })
+        })
+        .await
+    }
+
+    /// Blocking-pool adapter for `Store::finalize_login_receipt`
+    /// (transaction B: committed).
+    pub async fn finalize_login_receipt(
+        &self,
+        command_id: String,
+        response: haider_store::LoginReceiptResponse,
+    ) -> Result<(), HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| store.finalize_login_receipt(&command_id, &response))
+        })
+        .await
+    }
+
+    /// Blocking-pool adapter for `Store::fail_login_receipt` (definitive
+    /// 401/403 outcomes).
+    pub async fn fail_login_receipt(
+        &self,
+        command_id: String,
+        failure: haider_store::LoginReceiptFailure,
+    ) -> Result<(), HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| store.fail_login_receipt(&command_id, &failure))
+        })
+        .await
+    }
+
+    /// Blocking-pool adapter for `Store::login_receipts` (startup
+    /// reconciliation scan).
+    pub async fn login_receipts(&self) -> Result<Vec<haider_store::LoginReceiptRow>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.login_receipts())).await
+    }
+
     /// Conditionally commits aggregate `Idle` after a transactional durable
     /// quiescence check.
     pub async fn settle_session_idle(

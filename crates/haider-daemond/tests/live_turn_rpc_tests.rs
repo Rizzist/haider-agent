@@ -14,6 +14,7 @@ mod support;
 
 use async_trait::async_trait;
 use haider_core::{CancelToken, StoreHandle, ToolDispatcher};
+use haider_daemon::ProviderFactoryConfig;
 use haider_daemon::{
     DaemonConfig, DaemonDependencies, ProviderFactory, ResolvedTurnProvider, TurnToolFactory,
     WorkerToolContext,
@@ -73,7 +74,9 @@ impl ProviderFactory for FakeFactory {
 fn fake_dependencies(script: Vec<FakeStep>) -> (DaemonDependencies, Arc<FakeProvider>) {
     let fake = Arc::new(FakeProvider::new(script));
     let dependencies = DaemonDependencies {
-        provider_factory: Arc::new(FakeFactory { fake: fake.clone() }),
+        provider_factory: ProviderFactoryConfig::injected(Arc::new(FakeFactory {
+            fake: fake.clone(),
+        })),
         ..DaemonDependencies::default()
     };
     (dependencies, fake)
@@ -506,11 +509,11 @@ async fn scenario_3_submit_streams_one_contiguous_durable_turn_over_real_uds() {
     ]));
     let inspections = Arc::new(AtomicUsize::new(0));
     let dependencies = DaemonDependencies {
-        provider_factory: Arc::new(DurableEntryFactory {
+        provider_factory: ProviderFactoryConfig::injected(Arc::new(DurableEntryFactory {
             fake: fake.clone(),
             database_path: config.store_dir.join("store.sqlite"),
             inspections: inspections.clone(),
-        }),
+        })),
         ..DaemonDependencies::default()
     };
     let task = ready_with_dependencies(&config, dependencies.clone()).await;
@@ -1454,11 +1457,11 @@ async fn cancelling_while_provider_factory_is_blocked_never_starts_provider() {
     let task = ready_with_dependencies(
         &config,
         DaemonDependencies {
-            provider_factory: Arc::new(BlockingProviderFactory {
+            provider_factory: ProviderFactoryConfig::injected(Arc::new(BlockingProviderFactory {
                 entered: entered.clone(),
                 release: release.clone(),
                 fake: fake.clone(),
-            }),
+            })),
             ..DaemonDependencies::default()
         },
     )
@@ -2194,10 +2197,10 @@ async fn panicked_supervisor_terminalizes_run_and_fresh_incarnation_is_usable() 
         },
     ]));
     let dependencies = DaemonDependencies {
-        provider_factory: Arc::new(PanicOnceFactory {
+        provider_factory: ProviderFactoryConfig::injected(Arc::new(PanicOnceFactory {
             calls: Arc::new(AtomicUsize::new(0)),
             fake: fake.clone(),
-        }),
+        })),
         ..DaemonDependencies::default()
     };
     let task = ready_with_dependencies(&config, dependencies).await;
@@ -2325,7 +2328,7 @@ async fn revoked_credential_checkpoint_terminalizes_menu_and_reaches_ready() {
     first_task.crash().await;
 
     let dependencies = DaemonDependencies {
-        provider_factory: Arc::new(RevokedCredentialFactory),
+        provider_factory: ProviderFactoryConfig::injected(Arc::new(RevokedCredentialFactory)),
         ..DaemonDependencies::default()
     };
     let second_task = ready_with_dependencies(&config, dependencies).await;
@@ -2453,11 +2456,30 @@ async fn checkpoint_then_later_queued_recovery_reaches_ready_without_starting_qu
     let events = store.journal_replay(&session_id).expect("history");
     let checkpoint = payloads_for_run(&events, &checkpoint_run).collect::<Vec<_>>();
     let queued = payloads_for_run(&events, &queued_run).collect::<Vec<_>>();
-    assert!(checkpoint.contains(&EventPayload::RunState(RunState::Cancelled)));
-    assert!(checkpoint.iter().any(|payload| matches!(
-        payload,
-        EventPayload::MenuClosed { menu, .. } if *menu == menu_id
-    )));
+    // DIRECTED CHANGE (W3c2 P3-4): the graceful drain now PARKS the
+    // reconstructed request_input checkpoint instead of destroying it — the
+    // pre-W3c2 assertions here pinned the P3-4 bug ("a graceful restart
+    // destroys what a crash preserves"). The checkpoint run must survive
+    // NONTERMINAL with its menu still open; the queued run behind it is
+    // still terminalized at drain, which is what this test exists to pin.
+    assert!(
+        !checkpoint
+            .iter()
+            .any(|payload| matches!(payload, EventPayload::RunState(state) if state.is_terminal())),
+        "the parked checkpoint must survive a graceful drain"
+    );
+    assert!(
+        checkpoint.contains(&EventPayload::RunState(RunState::InputRequired {
+            menu: menu_id.clone()
+        }))
+    );
+    assert!(
+        !checkpoint.iter().any(|payload| matches!(
+            payload,
+            EventPayload::MenuClosed { menu, .. } if *menu == menu_id
+        )),
+        "the parked menu stays open for the next generation's recovery"
+    );
     assert!(queued.contains(&EventPayload::RunState(RunState::Cancelled)));
 }
 
@@ -3016,7 +3038,14 @@ async fn scenario_2_real_uds_creates_attaches_and_replays_typed_session() {
         root.path().join("store"),
         root.path().join("runtime"),
     );
-    let task = ready(&config).await;
+    // DIRECTED CHANGE (W3c2 D3-5): the production wire path no longer
+    // accepts "fake" — the creatable-provider whitelist comes from the
+    // dependency configuration, so this create/attach/replay scenario boots
+    // with the injected fake configuration like every turn scenario. The
+    // production-path rejection is pinned separately by
+    // `production_wire_path_never_accepts_the_fake_provider`.
+    let (dependencies, _fake) = fake_dependencies(Vec::new());
+    let task = ready_with_dependencies(&config, dependencies).await;
     let mut client = UdsClient::connect_control(
         &config.endpoint_path(),
         config.frame_limit,
@@ -3150,7 +3179,12 @@ async fn session_create_lost_response_retry_survives_removed_cwd_and_rejects_cha
         root.path().join("store"),
         root.path().join("runtime"),
     );
-    let task = ready(&config).await;
+    // DIRECTED CHANGE (W3c2 D3-5): "fake" is no longer creatable on the
+    // production wire path; this receipt-idempotency scenario boots with
+    // the injected fake configuration (the production rejection is pinned
+    // by `production_wire_path_never_accepts_the_fake_provider`).
+    let (dependencies, _fake) = fake_dependencies(Vec::new());
+    let task = ready_with_dependencies(&config, dependencies).await;
     let mut submitter = UdsClient::connect_control(
         &config.endpoint_path(),
         config.frame_limit,
@@ -3250,7 +3284,11 @@ async fn session_create_requires_control_and_ready_welcome_advertises_implemente
         root.path().join("store"),
         root.path().join("runtime"),
     );
-    let task = ready(&config).await;
+    // DIRECTED CHANGE (W3c2 D3-5): same injected-configuration boot as the
+    // other fake-provider scenarios; capability policy under test is
+    // provider-independent.
+    let (dependencies, _fake) = fake_dependencies(Vec::new());
+    let task = ready_with_dependencies(&config, dependencies).await;
     let mut viewer = UdsClient::connect_with_capabilities(
         &config.endpoint_path(),
         config.frame_limit,
@@ -3516,4 +3554,191 @@ fn scenario_13_mutation_seam_sweep_manifest_covers_each_load_bearing_boundary() 
             "manifest coordinate {file} no longer defines `{test}`"
         );
     }
+}
+
+// MUTATION CHECK (P3-4 park-not-cancel): revert the supervisor's drain arm
+// to cancel a parked `request_input` turn (replace the InputRequired park
+// with `active_cancel.cancel()`). Expected failure: the graceful drain
+// terminalizes the run, the post-restart attach replays no reconstructable
+// checkpoint, and the answer below cannot complete the run — the requests()
+// == 2 and no-terminal-during-drain assertions fail.
+// Verified by revert on 2026-07-27.
+#[tokio::test]
+async fn graceful_drain_parks_a_request_input_checkpoint_for_recovery() {
+    let root = test_root("w3c-live-");
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace");
+    let config = DaemonConfig::new(
+        "drain-parks-request-input",
+        root.path().join("store"),
+        root.path().join("runtime"),
+    );
+    let (dependencies, fake) = fake_dependencies(vec![
+        FakeStep::EmitRequestInput {
+            call_id: "park-choice".into(),
+            kind: FakeInputKind::Choice,
+            title: "Park me".into(),
+            body: vec!["This menu survives a GRACEFUL restart".into()],
+            options: vec![FakeInputOption {
+                key: "continue".into(),
+                label: "Continue".into(),
+                detail: None,
+            }],
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "park-choice".into(),
+        },
+        FakeStep::EmitText {
+            text: "resumed after graceful drain".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]);
+    let first_task = ready_with_dependencies(&config, dependencies.clone()).await;
+    let mut first = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "w3c-live-test",
+        "park-before",
+        ClientKind::Headless,
+    )
+    .await;
+    let (session_id, generation) = create_and_attach(&mut first, &config, &workspace).await;
+    send_request(
+        &mut first,
+        &config,
+        "park-submit",
+        submit_body(
+            "park-command",
+            session_id.clone(),
+            generation,
+            "ask across graceful restart",
+        ),
+    )
+    .await;
+    let (run_id, _) = next_submit_response(&mut first).await;
+    let (menu_id, request_seq, opening_generation) = loop {
+        if let WireFrame::Event { envelope, .. } = first.next().await
+            && envelope.run_id.as_ref() == Some(&run_id)
+            && let Ok(EventPayload::MenuOpened(menu)) =
+                serde_json::from_value::<EventPayload>(envelope.payload)
+        {
+            break (menu.id, envelope.seq, envelope.worker_generation);
+        }
+    };
+    // Wait for the checkpoint to be DURABLY parked (InputRequired commits
+    // after MenuOpened): the park law covers a parked run; a drain racing
+    // the parking commit itself legitimately cancels.
+    loop {
+        if let WireFrame::Event { envelope, .. } = first.next().await
+            && envelope.run_id.as_ref() == Some(&run_id)
+            && matches!(
+                serde_json::from_value::<EventPayload>(envelope.payload),
+                Ok(EventPayload::RunState(RunState::InputRequired { .. }))
+            )
+        {
+            break;
+        }
+    }
+    assert_eq!(fake.requests().len(), 1);
+    drop(first);
+
+    // THE law under test: a GRACEFUL drain (not a crash) must preserve the
+    // parked checkpoint exactly as the crash path does.
+    first_task.shutdown_handle().request("routine restart");
+    let outcome = first_task.join().await.expect("daemon joins");
+    assert!(
+        matches!(outcome, haider_daemon::ShutdownOutcome::Graceful),
+        "parking must not force the drain: {outcome:?}"
+    );
+
+    let second_task = ready_with_dependencies(&config, dependencies).await;
+    assert_eq!(
+        fake.requests().len(),
+        1,
+        "recovery reconstructs the parked checkpoint without a provider request"
+    );
+    let mut second = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "w3c-live-test",
+        "park-after",
+        ClientKind::Headless,
+    )
+    .await;
+    let replay_frames =
+        attach_existing(&mut second, &config, session_id.clone(), 0, "park-replay").await;
+    assert!(replay_frames.iter().any(|envelope| {
+        envelope.run_id.as_ref() == Some(&run_id)
+            && matches!(
+                serde_json::from_value::<EventPayload>(envelope.payload.clone()),
+                Ok(EventPayload::MenuOpened(ref menu)) if menu.id == menu_id
+            )
+    }));
+    // The graceful drain appended NO terminal and NO cancellation for the
+    // parked run: its durable tail is still the open request_input state.
+    assert!(
+        !replay_frames.iter().any(|envelope| {
+            envelope.run_id.as_ref() == Some(&run_id)
+                && matches!(
+                    serde_json::from_value::<EventPayload>(envelope.payload.clone()),
+                    Ok(EventPayload::RunState(
+                        RunState::Cancelled | RunState::Cancelling | RunState::Errored
+                    )) | Ok(EventPayload::RunFailed { .. })
+                )
+        }),
+        "graceful drain must park, never cancel, a request_input checkpoint"
+    );
+    second
+        .send(
+            &WireFrame::MenuAnswer {
+                request_id: Some(RequestId::new("park-answer")),
+                command_id: CommandId::new("park-answer-command"),
+                session_id: session_id.clone(),
+                menu_id: menu_id.clone(),
+                request_seq,
+                worker_generation: opening_generation,
+                option_key: "continue".into(),
+                option_index: 0,
+                input: None,
+            },
+            config.frame_limit,
+        )
+        .await;
+    assert!(matches!(
+        next_response(&mut second).await,
+        WireFrame::Response {
+            body: ResponseBody::MenuAnswer { .. },
+            ..
+        }
+    ));
+    let events = events_until_terminal(&mut second, &run_id).await;
+    assert!(
+        events
+            .iter()
+            .any(|(_, payload)| *payload == EventPayload::RunState(RunState::Done))
+    );
+    let durable = read_session(&mut second, &config, session_id, "park-durable-read").await;
+    assert_eq!(
+        payloads_for_run(&durable, &run_id)
+            .filter(|payload| matches!(payload, EventPayload::MenuOpened(_)))
+            .count(),
+        1,
+        "request_input executes once; the graceful restart only replays its durable menu"
+    );
+    let requests = fake.requests();
+    assert_eq!(requests.len(), 2, "only the post-answer request runs");
+    assert!(
+        requests[1]
+            .messages
+            .iter()
+            .any(|message| message.tool_result_for("park-choice").is_some())
+    );
+
+    second_task.shutdown_handle().request("test complete");
+    second_task.join().await.expect("daemon joins");
 }

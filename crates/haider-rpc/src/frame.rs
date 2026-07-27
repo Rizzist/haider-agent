@@ -101,15 +101,37 @@ pub const ERROR_CODE_RUN_NOT_ACTIVE: &str = "run_not_active";
 pub const ERROR_CODE_BUSY: &str = "busy";
 /// Stable code for a provider-side turn failure.
 ///
-/// RESERVED in W3c1: golden-pinned but not yet emitted — provider failures
-/// currently surface as durable `RunFailed` envelopes, not correlated
-/// responses (R3). Reserved for W3c2 login validation per R7.
+/// First emitted by W3c2 login validation (R7): a retryable 429/529/5xx or
+/// transport failure during credential validation reports this family with
+/// `retryable: true`. Durable turn failures still surface as `RunFailed`
+/// envelopes, not correlated responses (R3).
 pub const ERROR_CODE_PROVIDER_ERROR: &str = "provider_error";
+/// Stable code for a credential that failed authentication (HTTP 401):
+/// the key is invalid. Non-retryable.
+pub const ERROR_CODE_UNAUTHORIZED: &str = "unauthorized";
+/// Stable code for an authenticated identity that lacks permission for the
+/// selected model/endpoint (HTTP 403). Non-retryable.
+pub const ERROR_CODE_PERMISSION_DENIED: &str = "permission_denied";
+/// Stable code for an operation that needs a credential no account provides.
+pub const ERROR_CODE_CREDENTIAL_MISSING: &str = "credential_missing";
+/// Stable code for a platform without a working secret vault (R10: the W3c
+/// vault gate is macOS; non-macOS rejects login before staging/validation
+/// with this code, never a generic internal message).
+pub const ERROR_CODE_VAULT_UNSUPPORTED: &str = "vault_unsupported";
+/// Stable code for a login retry whose staged secret no longer exists
+/// (stage/pending-command TTL expiry, disconnect, or daemon restart): the
+/// client must stage the secret again — an explicit recovery action, and
+/// retryable once re-staged.
+pub const ERROR_CODE_RESTAGE_REQUIRED: &str = "restage_required";
 
 /// Daemon implements receipt-backed session creation and metadata.
 pub const FEATURE_SESSION_MUTATION_V1: &str = "session_mutation_v1";
 /// Daemon implements durable submit/cancel turn control.
 pub const FEATURE_TURN_CONTROL_V1: &str = "turn_control_v1";
+/// Daemon implements the durable `account.login_api` command (R7/R10).
+pub const FEATURE_ACCOUNT_LOGIN_API_V1: &str = "account_login_api_v1";
+/// Daemon implements connection-scoped `vault.stage` secret staging (R7).
+pub const FEATURE_VAULT_STAGE_V1: &str = "vault_stage_v1";
 
 /// Kind of client taking part in the handshake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -222,6 +244,70 @@ pub struct Welcome {
     /// features answer whether the negotiated v1 peer implements a method.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub features: BTreeSet<String>,
+}
+
+/// A raw secret in transit on the sensitive same-UID UDS staging path (R7).
+///
+/// This type exists ONLY in the transport crate — domain `haider-protocol`
+/// stays secret-free — and only inside [`RequestBody::VaultStage`], which the
+/// daemon serves exclusively on an authenticated same-UID local UDS
+/// connection. Laws:
+///
+/// - `Debug` is unconditionally redacted; ordinary frame formatting can
+///   never reveal the value (test-pinned).
+/// - The value is zeroized on drop, and both peers zeroize the encoded
+///   frame buffers around it (`uds_codec::encode_zeroizing`, the daemon's
+///   zeroizing decoder, the client's zeroizing writer).
+/// - It must never be converted through a loggable `serde_json::Value`.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SecretWire(String);
+
+impl SecretWire {
+    /// Wraps a raw secret for staging.
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// Grants access to the raw secret bytes; callers copy into their own
+    /// zeroizing storage and drop this frame promptly.
+    pub fn expose_secret(&self) -> &str {
+        &self.0
+    }
+
+    /// Whether the staged secret is empty (invalid to stage).
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl std::fmt::Debug for SecretWire {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SecretWire([REDACTED])")
+    }
+}
+
+impl Drop for SecretWire {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.0.zeroize();
+    }
+}
+
+/// Why a secret is being staged (R7): the daemon validates the reference is
+/// consumed by a matching operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum StagePurpose {
+    /// A provider API key headed for `account.login_api`.
+    ApiKey,
+    /// A provider-requested menu secret (`MenuInput::SecretVaultReference`).
+    MenuSecret,
+    /// Decode artifact for a purpose this crate does not know (tolerance
+    /// discipline).
+    #[serde(other)]
+    Unknown,
 }
 
 /// Inclusive sequence range for a non-subscribing session read.
@@ -362,6 +448,43 @@ pub enum RequestBody {
         worker_generation: u64,
         run_id: RunId,
     },
+    /// Stages a raw secret in connection-scoped daemon memory and returns an
+    /// opaque single-use reference (R7). Intentionally NON-durable: no
+    /// command receipt may ever contain a secret. `stage_id` is an ephemeral
+    /// client nonce for same-connection retry dedupe only: the same id with
+    /// the same bytes returns the same reference; the same id with
+    /// different bytes is invalid. Served only on authenticated same-UID
+    /// local UDS connections with connection-level Control.
+    #[serde(rename = "vault.stage")]
+    VaultStage {
+        stage_id: String,
+        purpose: StagePurpose,
+        secret: SecretWire,
+    },
+    /// Durable API-key login (R10): claims a staged secret, validates it,
+    /// commits Keychain + descriptor recoverably, and answers with the
+    /// descriptor. Command identity covers provider/resolved-model/alias and
+    /// deliberately EXCLUDES the ephemeral `vault_reference`, so a
+    /// lost-response retry may supply a freshly staged reference under the
+    /// same command id and still recover the original committed result.
+    /// `validation_model: None` means the release-owned full model ID in
+    /// the resolved profile.
+    #[serde(rename = "account.login_api")]
+    AccountLoginApi {
+        command_id: CommandId,
+        provider: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        alias: Option<String>,
+        vault_reference: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        validation_model: Option<String>,
+    },
+    /// Lists credential descriptors (View); never secrets.
+    #[serde(rename = "account.list")]
+    AccountList {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+    },
     /// Decode artifact for a method this crate does not know (tolerance
     /// discipline). W3b answers it with a protocol error, not a panic.
     #[serde(other)]
@@ -423,6 +546,28 @@ pub enum ResponseBody {
         status: CancelStatus,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         terminal_seq: Option<u64>,
+    },
+    /// Opaque staged-secret reference (R7): random, connection- and
+    /// daemon-instance-scoped, single-use, and expired at
+    /// `expires_at_ms` (absolute Unix ms). Disconnect or drain wipes it.
+    #[serde(rename = "vault.stage")]
+    VaultStage {
+        stage_id: String,
+        vault_reference: String,
+        expires_at_ms: u64,
+    },
+    /// Committed login result (R10): the descriptor now active for its
+    /// provider. A same-command retry receives this exact body from the
+    /// durable receipt. Never carries secret material.
+    #[serde(rename = "account.login_api")]
+    AccountLoginApi {
+        descriptor: haider_protocol::credential::CredentialDescriptor,
+    },
+    /// Credential descriptors (never secrets).
+    #[serde(rename = "account.list")]
+    AccountList {
+        #[serde(default)]
+        descriptors: Vec<haider_protocol::credential::CredentialDescriptor>,
     },
     /// Successful durable menu resolution. The same-command retry receives
     /// the original sequence; a different command receives

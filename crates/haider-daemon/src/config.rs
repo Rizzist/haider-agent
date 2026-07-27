@@ -63,6 +63,11 @@ pub struct DaemonConfig {
     /// production and injected runtimes from silently using different hub
     /// defaults.
     pub session_hub: SessionHubConfig,
+    /// Release-owned FULL model ID used when `account.login_api` omits
+    /// `validation_model` (R10). `haiderd` resolves it through the shared
+    /// profile resolver; the packaged default is
+    /// `haider_client::PACKAGED_DEFAULT_MODEL`.
+    pub default_model: String,
 }
 
 impl DaemonConfig {
@@ -83,18 +88,20 @@ impl DaemonConfig {
             handshake_timeout: Duration::from_secs(10),
             drain_timeout: Duration::from_secs(5),
             session_hub: SessionHubConfig::default(),
+            default_model: haider_client::PACKAGED_DEFAULT_MODEL.to_owned(),
         }
     }
 
     /// Fixed-length, profile-derived rendezvous path (R2).
     ///
-    /// Hashing the profile id keeps the socket name a constant 32 hex chars
-    /// regardless of profile-id length or charset, which protects the tight
-    /// OS limit on Unix socket path length (`sun_path`, ~104 bytes on macOS).
+    /// Delegates to the ONE shared derivation in `haider-client`
+    /// (`endpoint_path_for`), which both `haider` and `haiderd` resolve
+    /// through — the R8 no-duplicated-path-logic law. Hashing the profile id
+    /// keeps the socket name a constant 32 hex chars regardless of
+    /// profile-id length or charset, which protects the tight OS limit on
+    /// Unix socket path length (`sun_path`, ~104 bytes on macOS).
     pub fn endpoint_path(&self) -> PathBuf {
-        let digest = blake3::hash(self.profile_id.as_bytes()).to_hex();
-        self.runtime_dir
-            .join(format!("haider-{}.sock", &digest.as_str()[..32]))
+        haider_client::endpoint_path_for(&self.runtime_dir, &self.profile_id)
     }
 
     pub(crate) fn validate(&self) -> Result<(), String> {
@@ -137,6 +144,9 @@ impl DaemonConfig {
         }
         if self.drain_timeout.is_zero() {
             return Err("drain timeout must be greater than zero".into());
+        }
+        if self.default_model.trim().is_empty() {
+            return Err("default model must not be empty".into());
         }
         self.session_hub.validate()?;
         Ok(())

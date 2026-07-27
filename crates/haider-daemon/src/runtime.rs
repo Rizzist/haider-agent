@@ -278,10 +278,77 @@ async fn run_inner(
         "pre-ready recovery phase completed"
     );
 
+    // W3c2 R10 startup phase: load the descriptor store and reconcile
+    // pending/committed LOGIN receipts against vault + descriptor truth
+    // before anything can observe Ready (run_inner's receipt-reconciliation
+    // phase — W3c1 receipts never persist `pending`; login's can).
+    let accounts_started = tokio::time::Instant::now();
+    let accounts_runtime = match crate::accounts::AccountsRuntime::initialize(
+        &store,
+        &dependencies.accounts,
+        &config.store_dir,
+        &config.profile_id,
+        &config.default_model,
+    )
+    .await
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let _ = store.close().await;
+            return Err(error.into());
+        }
+    };
+    tracing::trace!(
+        target: "haider.recovery",
+        phase = "login_receipts",
+        operation_micros = accounts_started.elapsed().as_micros(),
+        "pre-ready recovery phase completed"
+    );
+
     let hub = SessionHub::new(store.clone(), config.session_hub).map_err(DaemonError::from)?;
-    let worker_manager = WorkerManager::start(hub.clone(), dependencies);
+    // D3-5 whitelist unification + the production factory swap: the ONE
+    // provider authority is the dependency configuration. `Accounts` (the
+    // default) resolves per logical turn from the daemon-owned account
+    // snapshot + vault, so a committed login is picked up by the NEXT
+    // logical turn; `"fake"` is creatable only under an injected test
+    // configuration, never on the production wire path.
+    let creatable_providers = dependencies.provider_factory.creatable_providers();
+    let provider_factory: std::sync::Arc<dyn crate::worker::ProviderFactory> =
+        match &dependencies.provider_factory {
+            crate::worker::ProviderFactoryConfig::Accounts => {
+                std::sync::Arc::new(crate::accounts::AccountsProviderFactory::new(
+                    std::sync::Arc::clone(&accounts_runtime.facade.snapshot),
+                    accounts_runtime.vault.clone(),
+                    std::sync::Arc::new(crate::accounts::AnthropicAccountBuilder),
+                ))
+            }
+            crate::worker::ProviderFactoryConfig::AccountsWith(builder) => {
+                std::sync::Arc::new(crate::accounts::AccountsProviderFactory::new(
+                    std::sync::Arc::clone(&accounts_runtime.facade.snapshot),
+                    accounts_runtime.vault.clone(),
+                    std::sync::Arc::clone(builder),
+                ))
+            }
+            crate::worker::ProviderFactoryConfig::Injected { factory, .. } => {
+                std::sync::Arc::clone(factory)
+            }
+        };
+    hub.install_creatable_providers(creatable_providers)
+        .map_err(DaemonError::from)?;
+    let worker_dependencies = crate::worker::WorkerDependencies {
+        provider_factory,
+        tool_factory: std::sync::Arc::clone(&dependencies.tool_factory),
+    };
+    let worker_manager = WorkerManager::start(hub.clone(), worker_dependencies);
     let worker_handle = worker_manager.handle();
     hub.install_worker_manager(worker_handle.clone())
+        .map_err(DaemonError::from)?;
+    let crate::accounts::AccountsRuntime {
+        facade: accounts_facade,
+        actor: account_actor,
+        vault: _,
+    } = accounts_runtime;
+    hub.install_accounts(accounts_facade)
         .map_err(DaemonError::from)?;
     for work in recovered_work {
         let result = match work {
@@ -353,6 +420,9 @@ async fn run_inner(
         endpoint.close_listener();
         runtime.crash().await;
         worker_manager.crash().await;
+        if let Some(actor) = account_actor {
+            actor.crash();
+        }
         let _ = hub.shutdown().await;
         drop(context);
         drop(hub);
@@ -415,6 +485,17 @@ async fn run_inner(
         Some(Ok(())) => {}
         Some(Err(error)) => return Err(error.into()),
         None => forced = true,
+    }
+    // R10 drain: new account commands were already rejected by the hub's
+    // draining flag; join the account actor (its in-flight login finishes or
+    // the deadline forces it — pending receipts + reconciliation carry the
+    // truth either way) under the SAME global deadline.
+    if let Some(actor) = account_actor
+        && bounded_finalization(actor.shutdown(), barrier_deadline, &mut shutdown)
+            .await
+            .is_none()
+    {
+        forced = true;
     }
     let hub_shutdown = bounded_finalization(hub.shutdown(), barrier_deadline, &mut shutdown).await;
     match hub_shutdown {

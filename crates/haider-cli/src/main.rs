@@ -39,7 +39,7 @@ const ANTHROPIC_KEY_ENV: &str = "HAIDER_ANTHROPIC_API_KEY";
 const READ_PAGE_SIZE: usize = 256;
 
 /// Every workspace crate, asserted linkable by the self-test.
-const CRATES: [&str; 9] = [
+const CRATES: [&str; 10] = [
     haider_protocol::CRATE_NAME,
     haider_store::CRATE_NAME,
     haider_core::CRATE_NAME,
@@ -48,6 +48,7 @@ const CRATES: [&str; 9] = [
     haider_verify::CRATE_NAME,
     haider_accounts::CRATE_NAME,
     haider_rpc::CRATE_NAME,
+    haider_client::CRATE_NAME,
     haider_tui::CRATE_NAME,
 ];
 
@@ -71,13 +72,68 @@ async fn main() -> ExitCode {
             );
             ExitCode::from(2)
         }
-        [] => {
+        // The keystone front door (report R8): bare `haider` connects to —
+        // or spawns — the profile daemon and reports readiness. The live
+        // TUI swap onto this connection is W3c3.
+        [] => front_door().await,
+    }
+}
+
+/// Bare `haider`: resolve the shared profile, connect-or-spawn the daemon,
+/// verify features, report, and exit — leaving the daemon running.
+async fn front_door() -> ExitCode {
+    let env = haider_client::ProfileEnv::capture();
+    let profile = match haider_client::resolve_profile(&env) {
+        Ok(profile) => profile,
+        Err(error) => {
+            eprintln!("haider: {error}");
+            return ExitCode::from(EX_SOFTWARE);
+        }
+    };
+    match haider_client::ensure_daemon(&profile, haider_client::EnsureOptions::default()).await {
+        Ok(ensured) => {
+            let how = match (ensured.spawned, ensured.race_lost) {
+                (false, _) => "already running".to_owned(),
+                (true, false) => "spawned".to_owned(),
+                (true, true) => format!(
+                    "spawned; our candidate lost the startup race (exit {}) and we attached to \
+                     the winner",
+                    haider_client::RACE_LOSER_EXIT_CODE
+                ),
+            };
             println!(
-                "haider {VERSION} — run `haider self-test`, \
-                 `haider run --jsonl \"<prompt>\"`, or `haider tui --demo`"
+                "haider {VERSION} — daemon ready ({how}): profile {} at {} \
+                 (daemon v{}, generation {})",
+                &profile.profile_id[..12],
+                profile.endpoint_path.display(),
+                ensured.welcome.daemon_version,
+                ensured.welcome.daemon_generation,
             );
+            println!("the live TUI arrives with W3c3; run `haider tui --demo` meanwhile");
+            // Parent exit leaves the daemon running (R8 shutdown policy):
+            // closing this connection never implies daemon shutdown.
+            ensured.client.close();
             ExitCode::SUCCESS
         }
+        Err(error) => {
+            eprintln!("haider: {error}");
+            ExitCode::from(front_door_exit_code(&error))
+        }
+    }
+}
+
+/// sysexits mapping for front-door failures: 76 `EX_PROTOCOL` for wire/skew
+/// diagnostics, 69 `EX_UNAVAILABLE` for a daemon that never became ready,
+/// 74 `EX_IOERR` for transport faults, 70 otherwise.
+fn front_door_exit_code(error: &haider_client::EnsureError) -> u8 {
+    use haider_client::EnsureError;
+    match error {
+        EnsureError::ProtocolMismatch(_)
+        | EnsureError::MissingFeatures { .. }
+        | EnsureError::ProfileMismatch { .. } => 76,
+        EnsureError::DaemonExited { .. } | EnsureError::StartupTimeout { .. } => 69,
+        EnsureError::Connect(_) => EX_IOERR,
+        EnsureError::Spawn { .. } => EX_SOFTWARE,
     }
 }
 

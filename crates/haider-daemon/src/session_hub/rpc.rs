@@ -198,6 +198,59 @@ impl HubConnection {
                 )
                 .await
             }
+            RequestBody::VaultStage {
+                stage_id,
+                purpose,
+                secret,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.vault_stage(request_id, stage_id, purpose, secret)
+            }
+            RequestBody::AccountLoginApi {
+                command_id,
+                provider,
+                alias,
+                vault_reference,
+                validation_model,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.account_login(
+                    request_id,
+                    command_id,
+                    provider,
+                    alias,
+                    vault_reference,
+                    validation_model,
+                )
+            }
+            RequestBody::AccountList { provider } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::View) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.account_list(request_id, provider)
+            }
             // `Unknown` and any future method decode alike: a typed,
             // correlated rejection instead of a dropped request.
             _ => self.respond_error(
@@ -208,6 +261,227 @@ impl HubConnection {
                 None,
             ),
         }
+    }
+
+    /// The transport + vault gate shared by `vault.stage` and
+    /// `account.login_api` (R7/R10): Control alone must not expose raw-secret
+    /// staging to a remote transport, and a vaultless platform answers the
+    /// stable `vault_unsupported` BEFORE staging/validation.
+    fn secret_surface_facade(
+        &self,
+        request_id: &RequestId,
+    ) -> Result<Option<crate::accounts::AccountsFacade>, SessionHubError> {
+        if self.transport != crate::accounts::ConnectionTransport::LocalSameUid {
+            self.respond_error(
+                request_id.clone(),
+                ERROR_CODE_CAPABILITY_DENIED,
+                "secret staging is only served on authenticated same-UID local connections",
+                false,
+                None,
+            )?;
+            return Ok(None);
+        }
+        let facade = self.hub.accounts()?;
+        match facade {
+            Some(facade) if facade.vault_supported => Ok(Some(facade)),
+            _ => {
+                self.respond_error(
+                    request_id.clone(),
+                    haider_rpc::ERROR_CODE_VAULT_UNSUPPORTED,
+                    "this platform has no supported secret vault (W3c supports macOS Keychain)",
+                    false,
+                    None,
+                )?;
+                Ok(None)
+            }
+        }
+    }
+
+    /// `vault.stage`: connection-scoped, non-durable, inline (no I/O). The
+    /// secret enters zeroizing storage here and the wire frame drops
+    /// (zeroized) with this call.
+    fn vault_stage(
+        &self,
+        request_id: RequestId,
+        stage_id: String,
+        purpose: haider_rpc::StagePurpose,
+        secret: haider_rpc::SecretWire,
+    ) -> Result<(), SessionHubError> {
+        if self.secret_surface_facade(&request_id)?.is_none() {
+            return Ok(());
+        }
+        if stage_id.trim().is_empty() || secret.is_empty() {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "stage id and secret must not be empty",
+                false,
+                None,
+            );
+        }
+        if matches!(purpose, haider_rpc::StagePurpose::Unknown) {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "unknown stage purpose",
+                false,
+                None,
+            );
+        }
+        let staged = {
+            let mut stages = lock(&self.stages)?;
+            stages.stage(&stage_id, purpose, secret.expose_secret().as_bytes())
+        };
+        match staged {
+            Ok((vault_reference, expires_at_ms)) => self.send(WireFrame::Response {
+                request_id,
+                body: ResponseBody::VaultStage {
+                    stage_id,
+                    vault_reference,
+                    expires_at_ms,
+                },
+            }),
+            Err(crate::accounts::StageError::Mismatch) => self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "stage id was already used with different secret bytes",
+                false,
+                None,
+            ),
+            Err(crate::accounts::StageError::Mint(message)) => self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                &format!("cannot mint stage reference: {message}"),
+                true,
+                None,
+            ),
+        }
+    }
+
+    /// `account.login_api`: claims the stage and HANDS OFF to the account
+    /// actor (R7: the connection task never awaits validation/Keychain work
+    /// inline). The correlated response arrives from the actor through this
+    /// connection's sink; disconnect drops only that route, never the
+    /// durable command.
+    fn account_login(
+        &self,
+        request_id: RequestId,
+        command_id: CommandId,
+        provider: String,
+        alias: Option<String>,
+        vault_reference: String,
+        validation_model: Option<String>,
+    ) -> Result<(), SessionHubError> {
+        let Some(facade) = self.secret_surface_facade(&request_id)? else {
+            return Ok(());
+        };
+        if command_id.as_str().trim().is_empty()
+            || provider.trim().is_empty()
+            || vault_reference.trim().is_empty()
+        {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "login command id, provider, and vault reference must not be empty",
+                false,
+                None,
+            );
+        }
+        let claimed = {
+            let mut stages = lock(&self.stages)?;
+            stages.claim(&vault_reference)
+        };
+        let secret = match claimed {
+            Some((haider_rpc::StagePurpose::ApiKey, secret)) => Some(secret),
+            Some(_) => {
+                return self.respond_error(
+                    request_id,
+                    ERROR_CODE_INVALID_ARGUMENT,
+                    "staged secret was not staged for api_key use",
+                    false,
+                    None,
+                );
+            }
+            // Unknown/expired reference: the actor may still hold the
+            // pending command's secret (retry-after-retryable), else it
+            // answers restage_required.
+            None => None,
+        };
+        let Some(login) = facade.login else {
+            return self.respond_error(
+                request_id,
+                haider_rpc::ERROR_CODE_VAULT_UNSUPPORTED,
+                "this platform has no supported secret vault (W3c supports macOS Keychain)",
+                false,
+                None,
+            );
+        };
+        let job = crate::accounts::LoginJob {
+            command_id: command_id.0,
+            provider,
+            display_alias: alias.filter(|value| !value.trim().is_empty()),
+            validation_model: validation_model.filter(|value| !value.trim().is_empty()),
+            secret,
+            route: crate::accounts::LoginRoute {
+                request_id: request_id.clone(),
+                sink: Arc::clone(&self.sink),
+            },
+        };
+        match login.try_send(crate::accounts::AccountCommand::Login(Box::new(job))) {
+            Ok(()) => Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => self.respond_error(
+                request_id,
+                haider_rpc::ERROR_CODE_BUSY,
+                // Honest recovery: the single-use stage was already claimed
+                // and dropped with this rejected job, so the retry needs a
+                // fresh stage (the restage protocol covers it).
+                "account actor is busy; stage the key again and retry",
+                true,
+                None,
+            ),
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => self.respond_error(
+                request_id,
+                ERROR_CODE_DRAINING,
+                "account actor is shut down",
+                true,
+                None,
+            ),
+        }
+    }
+
+    /// `account.list`: inline snapshot read (short command; the actor is the
+    /// only writer, so a queued login never head-of-line-blocks listing).
+    fn account_list(
+        &self,
+        request_id: RequestId,
+        provider: Option<String>,
+    ) -> Result<(), SessionHubError> {
+        let Some(facade) = self.hub.accounts()? else {
+            return self.send(WireFrame::Response {
+                request_id,
+                body: ResponseBody::AccountList {
+                    descriptors: Vec::new(),
+                },
+            });
+        };
+        let descriptors = facade
+            .snapshot
+            .lock()
+            .map(|view| {
+                view.iter()
+                    .filter(|descriptor| {
+                        provider
+                            .as_deref()
+                            .is_none_or(|provider| descriptor.provider == provider)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::AccountList { descriptors },
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -450,7 +724,14 @@ impl HubConnection {
             Err(error) => return Err(error),
         }
 
-        if !matches!(provider.as_str(), "anthropic" | "fake") {
+        // D3-5: the dependency configuration is the ONE authority on
+        // creatable providers. Production (Accounts) answers {"anthropic"};
+        // "fake" exists only under injected test configurations.
+        let creatable = self.hub.creatable_providers()?;
+        if !creatable
+            .as_ref()
+            .is_some_and(|providers| providers.contains(provider.as_str()))
+        {
             return self.respond_error(
                 request_id,
                 ERROR_CODE_INVALID_ARGUMENT,
@@ -950,10 +1231,15 @@ impl HubConnection {
             .map_err(|_| SessionHubError::Delivery)
     }
 
-    /// Detaches every attachment owned by this connection.
+    /// Detaches every attachment owned by this connection and wipes every
+    /// staged secret (R7: disconnect wipes all staged secrets; a secret a
+    /// login command already claimed lives on with the command).
     pub async fn close(&self) -> Result<(), SessionHubError> {
         if self.closed.swap(true, Ordering::AcqRel) {
             return Ok(());
+        }
+        if let Ok(mut stages) = self.stages.lock() {
+            *stages = crate::accounts::StagedSecrets::default();
         }
         self.hub.detach_connection(&self.connection_id).await
     }

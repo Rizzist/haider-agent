@@ -27,8 +27,14 @@ async fn main() -> ExitCode {
     }
 }
 
-/// `haiderd --profile <id> --store-dir <path> --runtime-dir <path>`; every
-/// other knob keeps its `DaemonConfig` default.
+/// `haiderd [--profile <id> --store-dir <path> --runtime-dir <path>]`.
+///
+/// All three identity flags together, or none: a bare `haiderd` resolves the
+/// SAME shared profile `haider` resolves (R8's one-resolver law), while a
+/// spawning `haider` passes the exact resolved values explicitly. A partial
+/// set is refused — mixing resolved and explicit identity could bind a
+/// socket for one profile against another profile's store. Every other knob
+/// keeps its `DaemonConfig` default.
 fn parse_args(args: impl Iterator<Item = String>) -> Result<DaemonConfig, String> {
     let mut profile = None;
     let mut store_dir = None;
@@ -45,9 +51,34 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<DaemonConfig, String
             other => return Err(format!("unknown argument `{other}`")),
         }
     }
-    Ok(DaemonConfig::new(
-        profile.ok_or_else(|| "--profile is required".to_owned())?,
-        store_dir.ok_or_else(|| "--store-dir is required".to_owned())?,
-        runtime_dir.ok_or_else(|| "--runtime-dir is required".to_owned())?,
-    ))
+    match (profile, store_dir, runtime_dir) {
+        (Some(profile), Some(store_dir), Some(runtime_dir)) => {
+            let env = haider_client::ProfileEnv::capture();
+            // The identity flags are explicit, but the release-owned default
+            // model still resolves through the ONE shared precedence
+            // (HAIDER_MODEL, then <store_dir>/config.json, then packaged).
+            let default_model = haider_client::resolve_default_model_for(&store_dir, &env)
+                .map_err(|error| format!("cannot resolve default model: {error}"))?;
+            let mut config = DaemonConfig::new(profile, store_dir, runtime_dir);
+            config.default_model = default_model;
+            Ok(config)
+        }
+        (None, None, None) => {
+            let env = haider_client::ProfileEnv::capture();
+            let resolved = haider_client::resolve_profile(&env)
+                .map_err(|error| format!("cannot resolve profile: {error}"))?;
+            let mut config = DaemonConfig::new(
+                resolved.profile_id,
+                resolved.store_dir,
+                resolved.runtime_dir,
+            );
+            config.default_model = resolved.default_model;
+            Ok(config)
+        }
+        _ => Err(
+            "--profile, --store-dir, and --runtime-dir must be given together (or all omitted \
+             to resolve the shared default profile)"
+                .into(),
+        ),
+    }
 }

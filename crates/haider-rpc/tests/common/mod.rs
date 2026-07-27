@@ -3,14 +3,18 @@
 use std::collections::BTreeSet;
 
 use haider_protocol::DeliveryMode;
+use haider_protocol::credential::{AuthMethod, CredentialDescriptor, CredentialStatus};
 use haider_protocol::envelope::{PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION};
+use haider_protocol::ids::CredentialAlias;
 use haider_protocol::ids::{DeviceId, EventId, MenuId, RunId, SessionId};
 use haider_protocol::session::SessionMetadataV1;
 use haider_rpc::{
     AttachMode, AttachState, AttachmentId, CancelStatus, Capability, ClientKind, CommandId,
     ERROR_CODE_ALREADY_RESOLVED, ERROR_CODE_CAPABILITY_DENIED, ERROR_CODE_CURSOR_AHEAD, ErrorData,
-    Hello, LifecyclePhase, MenuInput, ProtocolError, RequestBody, RequestId, ResponseBody,
-    SeqRange, SessionReadResult, SessionSummary, SubmitDisposition, Welcome, WireFrame,
+    FEATURE_ACCOUNT_LOGIN_API_V1, FEATURE_SESSION_MUTATION_V1, FEATURE_TURN_CONTROL_V1,
+    FEATURE_VAULT_STAGE_V1, Hello, LifecyclePhase, MenuInput, ProtocolError, RequestBody,
+    RequestId, ResponseBody, SecretWire, SeqRange, SessionReadResult, SessionSummary, StagePurpose,
+    SubmitDisposition, Welcome, WireFrame,
 };
 
 pub const TEST_FRAME_LIMIT: usize = 1024 * 1024;
@@ -317,5 +321,82 @@ pub fn transcript() -> Vec<WireFrame> {
             fatal: true,
         }),
         WireFrame::Unknown,
+        // ── W3c2 additive account/vault surface (R7) ─────────────────────
+        // Existing entries above stay byte-identical; everything below is
+        // append-only. The staged "secret" is a golden placeholder pinning
+        // the WIRE shape — Debug redaction is pinned separately.
+        WireFrame::Request {
+            request_id: RequestId::new("request-stage"),
+            body: RequestBody::VaultStage {
+                stage_id: "stage-1".into(),
+                purpose: StagePurpose::ApiKey,
+                secret: SecretWire::new("golden-placeholder-key"),
+            },
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-stage"),
+            body: ResponseBody::VaultStage {
+                stage_id: "stage-1".into(),
+                vault_reference: "vaultref-0123456789abcdef".into(),
+                expires_at_ms: 1_753_500_060_000,
+            },
+        },
+        WireFrame::Request {
+            request_id: RequestId::new("request-login"),
+            body: RequestBody::AccountLoginApi {
+                command_id: CommandId::new("command-login"),
+                provider: "anthropic".into(),
+                alias: Some("work".into()),
+                vault_reference: "vaultref-0123456789abcdef".into(),
+                validation_model: None,
+            },
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-login"),
+            body: ResponseBody::AccountLoginApi {
+                descriptor: golden_descriptor(),
+            },
+        },
+        WireFrame::Request {
+            request_id: RequestId::new("request-accounts"),
+            body: RequestBody::AccountList {
+                provider: Some("anthropic".into()),
+            },
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-accounts"),
+            body: ResponseBody::AccountList {
+                descriptors: vec![golden_descriptor()],
+            },
+        },
+        WireFrame::Welcome(Welcome {
+            protocol: 1,
+            instance_id: "instance-accounts".into(),
+            daemon_generation: 6,
+            frame_limit: TEST_FRAME_LIMIT as u32,
+            profile_id: "profile-1".into(),
+            daemon_version: "0.0.11".into(),
+            lifecycle_phase: LifecyclePhase::Ready,
+            capabilities_granted: capabilities([Capability::View, Capability::Control]),
+            features: BTreeSet::from([
+                FEATURE_ACCOUNT_LOGIN_API_V1.to_owned(),
+                FEATURE_SESSION_MUTATION_V1.to_owned(),
+                FEATURE_TURN_CONTROL_V1.to_owned(),
+                FEATURE_VAULT_STAGE_V1.to_owned(),
+            ]),
+        }),
     ]
+}
+
+/// Golden credential descriptor: physical (vault) alias identity, display
+/// identity in `identity`, never secret material.
+pub fn golden_descriptor() -> CredentialDescriptor {
+    CredentialDescriptor {
+        alias: CredentialAlias::new("anthropic-0123456789abcdef01234567"),
+        provider: "anthropic".into(),
+        auth_method: AuthMethod::ApiKey,
+        identity: "work".into(),
+        status: CredentialStatus::Ok,
+        active: true,
+    }
 }
