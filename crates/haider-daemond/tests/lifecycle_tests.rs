@@ -1815,7 +1815,23 @@ async fn reconcile_before_ready_marks_unknown_exactly_once_and_never_retries_eff
         );
     }
 
-    let store = Store::open(&config.store_dir).expect("inspect recovered store");
+    // Directed hardening (W3c2 review P3-7, twice-observed flake): the joined
+    // daemon's store-lock release can lag the join under full-workspace
+    // parallel load, so the immediate inspect open raced it and failed with
+    // the RETRYABLE StoreLocked. Honor the retryable contract with a bounded
+    // retry; the law under test (exactly-once Unknown reconciliation) is
+    // unchanged.
+    let mut store = Store::open(&config.store_dir);
+    for _ in 0..200u32 {
+        match &store {
+            Err(error) if error.retryable => {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                store = Store::open(&config.store_dir);
+            }
+            _ => break,
+        }
+    }
+    let store = store.expect("inspect recovered store");
     let events = store
         .journal_replay(&session)
         .expect("replay recovered session");
