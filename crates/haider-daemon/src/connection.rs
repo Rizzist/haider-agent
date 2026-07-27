@@ -9,10 +9,11 @@
 //!   max_receive_frame)` — the daemon never sends what the client said it
 //!   cannot receive;
 //! - the outbound queue is bounded in BOTH frames and bytes and never blocks
-//!   the daemon on a slow client (R12's mechanism): a refused system reply is
-//!   a connection error, a refused attachment lane lags/detaches only that
-//!   attachment, and the store — not the socket — is the lag buffer (law
-//!   stated in `session_hub`);
+//!   the daemon on a slow client (R12's mechanism): event admission answers
+//!   `Busy` and waits its FIFO ticket, replies fall through to the reserved
+//!   floor, a reply refused even there is a connection error, and the store —
+//!   not the socket — is the lag buffer (laws stated on `OutboundLane` and in
+//!   `session_hub`);
 //! - `ServerDraining` travels a reserved path outside ordinary frame/byte
 //!   capacity. W3b2 deliberately relaxes W3b1's scoped "last frame of this
 //!   lane" law: at the next complete-frame boundary the notice is written,
@@ -39,7 +40,7 @@ use crate::DaemonError;
 use crate::session_hub::{FrameSendError, FrameSink, HubConnection, SendAdmission, SessionHub};
 use haider_rpc::{
     AttachmentId, Capability, CapabilitySet, ERROR_CODE_OVERLOADED, Hello, LifecyclePhase,
-    ProtocolError, ServerRange, Welcome, WireFrame, negotiate, uds_codec,
+    ProtocolError, RequestId, ServerRange, Welcome, WireFrame, negotiate, uds_codec,
 };
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -139,38 +140,94 @@ enum LaneKey {
 #[derive(Debug)]
 struct QueuedFrame {
     bytes: Vec<u8>,
+    /// Set for a staged attach response: popping it clears this attachment's
+    /// pending-response marker (response-before-event ordering), and a purge
+    /// that still finds it uses the request id to answer the request.
+    response_for: Option<(AttachmentId, RequestId)>,
+    /// Admitted through the reserved reply floor, outside the ordinary byte
+    /// budget; frees the floor when its write settles.
+    floor: bool,
+}
+
+impl QueuedFrame {
+    fn ordinary(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            response_for: None,
+            floor: false,
+        }
+    }
 }
 
 #[derive(Debug)]
 struct OutboundState {
     lanes: HashMap<LaneKey, VecDeque<QueuedFrame>>,
     round_robin: VecDeque<LaneKey>,
+    /// Reply frames admitted through the reserved floor; the writer serves
+    /// this deque before the fair ring so floor turnover never waits behind
+    /// camped event traffic (the drain notice's discipline, applied to
+    /// replies).
+    floor: VecDeque<QueuedFrame>,
     queued_frames: usize,
-    /// Includes the frame currently being written; credited only when that
-    /// write settles, preserving W3b1's real allocation bound.
+    /// Ordinary-budget bytes, including the frame currently being written;
+    /// credited only when that write settles, preserving W3b1's real
+    /// allocation bound. Floor bytes are accounted separately.
     queued_bytes: usize,
+    /// Frames currently admitted through the reply floor (queued or in
+    /// flight): at most one.
+    floor_in_use: usize,
+    /// Attachments whose staged attach response has not yet been popped:
+    /// their event offers answer `Busy` until it pops, and a purge that
+    /// still finds the marker removes the staged response and reports its
+    /// request id so the hub can answer the request instead of emitting a
+    /// `Lagged` for an id the client never learned.
+    pending_responses: HashMap<AttachmentId, RequestId>,
+    /// FIFO admission tickets for `Busy` event offers: each freed unit of
+    /// capacity fires exactly the head ticket, so waiters are served in
+    /// arrival order and a hot lane cannot systematically leapfrog a queued
+    /// cold one. (A frame's very first offer can still race one in-flight
+    /// wakeup; the loser parks behind the head, so the next freed unit goes
+    /// to the queued waiter — starvation is impossible, momentary overtaking
+    /// of a single unit is accepted and documented.)
+    tickets: VecDeque<oneshot::Sender<()>>,
     closed: bool,
+}
+
+impl OutboundState {
+    /// Fires the oldest still-live admission ticket. Called under the state
+    /// lock whenever capacity frees (pop, credit, purge).
+    fn fire_one_ticket(&mut self) {
+        while let Some(ticket) = self.tickets.pop_front() {
+            if ticket.send(()).is_ok() {
+                break;
+            }
+        }
+    }
 }
 
 /// Explicit-close, bounded, fair per-connection outbox.
 ///
 /// FAIRNESS POLICY (authoritative statement; the session hub and tests refer
 /// here): frames are keyed into lanes — one `System` lane for replies plus
-/// one lane per attachment — and the writer drains active lanes round-robin,
-/// one frame per visit, so a hot session cannot starve a cold one's drain
-/// order. Admission is CLASS-SPLIT because the two classes fail differently:
+/// one lane per attachment for events — and the writer drains active lanes
+/// round-robin, one frame per visit, so a hot session cannot starve a cold
+/// one's drain order. ONE ordinary admission discipline covers every frame:
+/// the aggregate frame cap, the per-lane cap (half the frame cap), and the
+/// byte budget, exactly W3b1's bounds. On top of it:
 ///
-/// - EVENT class ([`Self::offer`], used by paced delivery): atomic
-///   check-and-enqueue under the aggregate frame cap, the per-lane cap
-///   (half the frame cap), and a 3/4 share of the byte budget. `Busy` makes
-///   the replay task wait on drain progress — never detaching a reading
-///   client; `Refused` (closed / over the negotiated limit) and
-///   lag-under-stall are the only detach shapes.
-/// - REPLY class ([`Self::try_push`]: responses, errors, pongs, `Lagged`):
-///   bounded by its lane's cap and the FULL byte budget but exempt from the
-///   aggregate frame cap, so replay traffic camped on that cap can never
-///   starve a correlated reply into a fatal refusal. A refused reply stays
-///   terminal (connection-fatal for system frames).
+/// - EVENT offers ([`Self::offer`]) answer `Busy` instead of refusing and
+///   wait their turn through the FIFO ticket queue; `Refused` (closed or
+///   over the negotiated limit) and lag-under-stall are the only detach
+///   shapes, so a reading client is never purged by admission pressure.
+/// - REPLIES ([`Self::try_push`]) that the ordinary bounds cannot admit
+///   (event traffic may legitimately camp them) fall through to a RESERVED
+///   FLOOR of one frame and `frame_limit + 4` bytes, priority-popped by the
+///   writer; only a reply that finds the floor occupied too is refused, and
+///   that refusal stays terminal (connection-fatal for system frames).
+///
+/// EXACT WORST CASE, per connection: `outbound_queued_bytes` (ordinary,
+/// UDS 4-byte prefixes included in every charge) + `frame_limit + 4` (the
+/// reply floor) + one reserved `ServerDraining` notice. Nothing else queues.
 ///
 /// Clones carry enqueue authority but cannot keep the writer alive after the
 /// connection owner calls [`Self::close`].
@@ -185,66 +242,62 @@ struct OutboundQueue {
     frame_capacity: usize,
     byte_budget: usize,
     per_lane_capacity: usize,
-    /// Bumped whenever queued frames leave the outbox (writer pop, purge,
-    /// close). Replay pacing awaits this REAL drain state instead of sleeping
-    /// or guessing whether the writer got scheduled.
-    drained: watch::Sender<u64>,
+    /// Byte allowance of the reserved reply floor: one maximum encoded frame
+    /// (`frame_limit` body + 4-byte UDS prefix), so every legal reply is
+    /// admissible when the floor is free — including a full-size
+    /// `SessionRead` result.
+    floor_byte_allowance: usize,
 }
 
 impl OutboundLane {
-    fn new(frame_capacity: usize, byte_budget: usize) -> Self {
-        let (drained, _) = watch::channel(0_u64);
+    fn new(frame_capacity: usize, byte_budget: usize, floor_byte_allowance: usize) -> Self {
         Self {
             inner: Arc::new(OutboundQueue {
                 state: Mutex::new(OutboundState {
                     lanes: HashMap::new(),
                     round_robin: VecDeque::new(),
+                    floor: VecDeque::new(),
                     queued_frames: 0,
                     queued_bytes: 0,
+                    floor_in_use: 0,
+                    pending_responses: HashMap::new(),
+                    tickets: VecDeque::new(),
                     closed: false,
                 }),
                 ready: Notify::new(),
                 frame_capacity,
                 byte_budget,
                 per_lane_capacity: frame_capacity.saturating_add(1).saturating_div(2).max(1),
-                drained,
+                floor_byte_allowance,
             }),
         }
     }
 
-    /// Atomically admits one already-encoded EVENT-CLASS frame under every
-    /// bound (aggregate frame cap, per-lane cap, offer byte share) or
-    /// reports why not, consuming nothing on the non-admitted paths. This
-    /// check-and-enqueue happens under one lock, so concurrent lanes can
-    /// never jointly observe the same headroom and overbook — the admission
-    /// IS the reservation, granted and consumed in the same step.
-    ///
-    /// Offers may camp on capacity while their replay task awaits drain
-    /// progress, so they are confined to a SHARE that always leaves reply
-    /// headroom: at most 3/4 of the byte budget (with an empty-queue
-    /// admission guarantee so one oversized event cannot wedge), while the
-    /// aggregate frame cap applies to offers alone — the reply class is
-    /// bounded per lane and by the full byte budget instead, so camped
-    /// replay traffic can never starve a response into a fatal refusal.
+    /// Atomically admits one already-encoded EVENT frame under the ordinary
+    /// bounds (aggregate frame cap, per-lane cap, byte budget — all
+    /// dimensions, one lock) or answers `Busy` without consuming anything.
+    /// The admission is the reservation: granted and consumed in one step,
+    /// so concurrent lanes can never jointly observe the same headroom and
+    /// overbook. An attachment whose staged attach response has not popped
+    /// yet is `Busy` regardless of capacity (response-before-event).
     fn offer(&self, key: LaneKey, bytes: Vec<u8>) -> SendAdmission {
         let charged = bytes.len();
-        let offer_byte_share = self
-            .inner
-            .byte_budget
-            .saturating_sub(self.inner.byte_budget / 4);
         let Ok(mut state) = self.inner.state.lock() else {
             return SendAdmission::Refused;
         };
         if state.closed {
             return SendAdmission::Refused;
         }
+        if let LaneKey::Attachment(attachment_id) = &key
+            && state.pending_responses.contains_key(attachment_id)
+        {
+            return SendAdmission::Busy;
+        }
         let lane_len = state.lanes.get(&key).map_or(0, VecDeque::len);
         let next_bytes = state.queued_bytes.checked_add(charged);
-        let over_share =
-            state.queued_bytes > 0 && next_bytes.is_none_or(|total| total > offer_byte_share);
         if state.queued_frames >= self.inner.frame_capacity
             || lane_len >= self.inner.per_lane_capacity
-            || over_share
+            || next_bytes.is_none_or(|total| total > self.inner.byte_budget)
         {
             return SendAdmission::Busy;
         }
@@ -253,7 +306,7 @@ impl OutboundLane {
             .lanes
             .entry(key.clone())
             .or_default()
-            .push_back(QueuedFrame { bytes });
+            .push_back(QueuedFrame::ordinary(bytes));
         if activate {
             state.round_robin.push_back(key);
         }
@@ -264,56 +317,81 @@ impl OutboundLane {
         SendAdmission::Sent
     }
 
-    fn drain_progress(&self) -> watch::Receiver<u64> {
-        self.inner.drained.subscribe()
+    /// Enqueues a FIFO admission ticket; the sink fires tickets in order as
+    /// capacity frees. Taken BEFORE re-offering (see the hub's
+    /// `deliver_frame`) so a unit freed between the answer and the wait
+    /// still reaches this waiter — no lost wakeup.
+    fn drain_ticket(&self) -> oneshot::Receiver<()> {
+        let (fire, ticket) = oneshot::channel();
+        match self.inner.state.lock() {
+            Ok(mut state) => {
+                if state.closed {
+                    // Fire immediately: the next offer answers Refused.
+                    let _ = fire.send(());
+                } else {
+                    state.tickets.push_back(fire);
+                }
+            }
+            Err(_) => {
+                let _ = fire.send(());
+            }
+        }
+        ticket
     }
 
-    fn mark_drained(&self) {
-        self.inner.drained.send_modify(|epoch| {
-            *epoch = epoch.wrapping_add(1);
-        });
-    }
-
-    /// Admits one REPLY-CLASS frame (responses, protocol errors, pongs,
-    /// `Lagged`): bounded by its lane's cap and the FULL byte budget, but
-    /// not by the aggregate frame cap that offer traffic camps on — see
-    /// [`Self::offer`]. Refusal here is terminal for the caller (fatal for
-    /// system replies, detach for an attach response). Worst-case queued
-    /// frames are still bounded: offers ≤ the aggregate cap, replies ≤ one
-    /// per-lane cap per lane, lanes ≤ the per-connection attachment cap + 1,
-    /// and every byte is charged against the one byte budget.
-    fn try_push(&self, key: LaneKey, bytes: Vec<u8>) -> Result<(), DaemonError> {
-        let charged = bytes.len();
+    /// Admits one REPLY frame (responses, protocol errors, pongs, `Lagged`)
+    /// through the ordinary bounds, falling through to the reserved floor
+    /// (one frame, one maximum encoded reply) when event traffic has the
+    /// ordinary capacity camped. Refusal — ordinary full AND floor occupied
+    /// — is terminal for the caller.
+    fn try_push(&self, key: LaneKey, frame: QueuedFrame) -> Result<(), DaemonError> {
+        let charged = frame.bytes.len();
         let mut state = self.inner.state.lock().map_err(|_| DaemonError::Task {
             message: "connection outbox mutex is poisoned".into(),
         })?;
-        let lane_len = state.lanes.get(&key).map_or(0, VecDeque::len);
-        let next_bytes = state.queued_bytes.checked_add(charged);
-        if state.closed
-            || lane_len >= self.inner.per_lane_capacity
-            || next_bytes.is_none_or(|total| total > self.inner.byte_budget)
-        {
+        if state.closed {
             return Err(DaemonError::Protocol {
-                message: format!(
-                    "bounded fair connection outbox unavailable: {charged} more bytes with {} frames and {} bytes queued",
-                    state.queued_frames, state.queued_bytes
-                ),
+                message: "connection outbox is closed".into(),
             });
         }
-        let activate = lane_len == 0;
-        state
-            .lanes
-            .entry(key.clone())
-            .or_default()
-            .push_back(QueuedFrame { bytes });
-        if activate {
-            state.round_robin.push_back(key);
+        let lane_len = state.lanes.get(&key).map_or(0, VecDeque::len);
+        let next_bytes = state.queued_bytes.checked_add(charged);
+        let ordinary_admits = state.queued_frames < self.inner.frame_capacity
+            && lane_len < self.inner.per_lane_capacity
+            && next_bytes.is_some_and(|total| total <= self.inner.byte_budget);
+        if ordinary_admits {
+            if let Some((attachment_id, request_id)) = frame.response_for.clone() {
+                state.pending_responses.insert(attachment_id, request_id);
+            }
+            let activate = lane_len == 0;
+            state.lanes.entry(key.clone()).or_default().push_back(frame);
+            if activate {
+                state.round_robin.push_back(key);
+            }
+            state.queued_frames = state.queued_frames.saturating_add(1);
+            state.queued_bytes = state.queued_bytes.saturating_add(charged);
+            drop(state);
+            self.inner.ready.notify_one();
+            return Ok(());
         }
-        state.queued_frames = state.queued_frames.saturating_add(1);
-        state.queued_bytes = next_bytes.unwrap_or(state.queued_bytes);
-        drop(state);
-        self.inner.ready.notify_one();
-        Ok(())
+        if state.floor_in_use == 0 && charged <= self.inner.floor_byte_allowance {
+            let mut frame = frame;
+            frame.floor = true;
+            if let Some((attachment_id, request_id)) = frame.response_for.clone() {
+                state.pending_responses.insert(attachment_id, request_id);
+            }
+            state.floor.push_back(frame);
+            state.floor_in_use = 1;
+            drop(state);
+            self.inner.ready.notify_one();
+            return Ok(());
+        }
+        Err(DaemonError::Protocol {
+            message: format!(
+                "bounded fair connection outbox unavailable: {charged} more bytes with {} frames and {} bytes queued and the reply floor in use",
+                state.queued_frames, state.queued_bytes
+            ),
+        })
     }
 
     async fn recv(&self) -> Option<QueuedFrame> {
@@ -324,6 +402,12 @@ impl OutboundLane {
                     Ok(state) => state,
                     Err(_) => return None,
                 };
+                // Floor first: reply turnover must not wait behind camped
+                // event traffic.
+                if let Some(frame) = state.floor.pop_front() {
+                    finish_pop(&mut state, &frame);
+                    return Some(frame);
+                }
                 while let Some(key) = state.round_robin.pop_front() {
                     let (frame, still_active) = match state.lanes.get_mut(&key) {
                         Some(lane) => {
@@ -339,8 +423,7 @@ impl OutboundLane {
                     }
                     if let Some(frame) = frame {
                         state.queued_frames = state.queued_frames.saturating_sub(1);
-                        drop(state);
-                        self.mark_drained();
+                        finish_pop(&mut state, &frame);
                         return Some(frame);
                     }
                 }
@@ -352,46 +435,128 @@ impl OutboundLane {
         }
     }
 
-    fn credit(&self, bytes: usize) {
+    /// Settles one written frame: ordinary bytes credit back to the budget,
+    /// a floor frame frees the floor, and the freed capacity fires the next
+    /// admission ticket (byte headroom frees HERE, after the write settles —
+    /// not at the pop).
+    fn credit(&self, frame: &QueuedFrame) {
         if let Ok(mut state) = self.inner.state.lock() {
-            state.queued_bytes = state.queued_bytes.saturating_sub(bytes);
+            if frame.floor {
+                state.floor_in_use = 0;
+            } else {
+                state.queued_bytes = state.queued_bytes.saturating_sub(frame.bytes.len());
+            }
+            state.fire_one_ticket();
         }
-        // Byte headroom frees only here (after the write settles), so a
-        // byte-bound Busy waiter must be woken by the credit, not only by the
-        // pop.
-        self.mark_drained();
     }
 
-    fn purge(&self, attachment_id: &AttachmentId) {
+    /// Removes the attachment's event lane. If its staged attach response
+    /// has not popped yet, the response is removed too — a client must never
+    /// see attach-success for an attachment that already failed — and its
+    /// request id is returned so the hub can answer the request instead.
+    fn purge(&self, attachment_id: &AttachmentId) -> Option<RequestId> {
+        let Ok(mut state) = self.inner.state.lock() else {
+            return None;
+        };
+        let key = LaneKey::Attachment(attachment_id.clone());
         let mut removed = false;
-        {
-            let Ok(mut state) = self.inner.state.lock() else {
-                return;
-            };
-            let key = LaneKey::Attachment(attachment_id.clone());
-            if let Some(frames) = state.lanes.remove(&key) {
-                let count = frames.len();
-                let bytes = frames.iter().fold(0_usize, |total, frame| {
-                    total.saturating_add(frame.bytes.len())
-                });
-                state.queued_frames = state.queued_frames.saturating_sub(count);
-                state.queued_bytes = state.queued_bytes.saturating_sub(bytes);
-                removed = count > 0;
-            }
-            state.round_robin.retain(|candidate| candidate != &key);
+        if let Some(frames) = state.lanes.remove(&key) {
+            let count = frames.len();
+            let bytes = frames.iter().fold(0_usize, |total, frame| {
+                total.saturating_add(frame.bytes.len())
+            });
+            state.queued_frames = state.queued_frames.saturating_sub(count);
+            state.queued_bytes = state.queued_bytes.saturating_sub(bytes);
+            removed = count > 0;
+        }
+        state.round_robin.retain(|candidate| candidate != &key);
+        let pending = state.pending_responses.remove(attachment_id);
+        if pending.is_some() {
+            removed |= splice_staged_response(&mut state, attachment_id);
         }
         if removed {
-            self.mark_drained();
+            state.fire_one_ticket();
         }
+        pending
     }
 
     fn close(&self) {
         if let Ok(mut state) = self.inner.state.lock() {
             state.closed = true;
+            // Every waiter re-offers and observes the refusal.
+            while let Some(ticket) = state.tickets.pop_front() {
+                let _ = ticket.send(());
+            }
         }
         self.inner.ready.notify_waiters();
-        self.mark_drained();
     }
+
+    #[cfg(test)]
+    fn attachment_lane_count(&self) -> usize {
+        self.inner
+            .state
+            .lock()
+            .map(|state| {
+                state
+                    .lanes
+                    .keys()
+                    .filter(|key| matches!(key, LaneKey::Attachment(_)))
+                    .count()
+            })
+            .unwrap_or(usize::MAX)
+    }
+}
+
+/// Pop bookkeeping shared by the floor and the fair ring: clears the
+/// pending-response marker when a staged response leaves the queue and fires
+/// the next admission ticket for the freed frame slot.
+fn finish_pop(state: &mut OutboundState, frame: &QueuedFrame) {
+    if let Some((attachment_id, _)) = &frame.response_for {
+        state.pending_responses.remove(attachment_id);
+    }
+    state.fire_one_ticket();
+}
+
+/// Removes a still-queued staged attach response (System lane or floor) for
+/// a purged attachment, refunding its accounting.
+fn splice_staged_response(state: &mut OutboundState, attachment_id: &AttachmentId) -> bool {
+    let mut removed = false;
+    if let Some(lane) = state.lanes.get_mut(&LaneKey::System) {
+        let before = lane.len();
+        let mut refunded = 0_usize;
+        lane.retain(|frame| {
+            let matches = frame
+                .response_for
+                .as_ref()
+                .is_some_and(|(id, _)| id == attachment_id);
+            if matches {
+                refunded = refunded.saturating_add(frame.bytes.len());
+            }
+            !matches
+        });
+        state.queued_bytes = state.queued_bytes.saturating_sub(refunded);
+        let dropped = before.saturating_sub(lane.len());
+        state.queued_frames = state.queued_frames.saturating_sub(dropped);
+        removed |= dropped > 0;
+        if lane.is_empty() {
+            state.lanes.remove(&LaneKey::System);
+            state
+                .round_robin
+                .retain(|candidate| candidate != &LaneKey::System);
+        }
+    }
+    let floor_before = state.floor.len();
+    state.floor.retain(|frame| {
+        frame
+            .response_for
+            .as_ref()
+            .is_none_or(|(id, _)| id != attachment_id)
+    });
+    if state.floor.len() < floor_before {
+        state.floor_in_use = 0;
+        removed = true;
+    }
+    removed
 }
 
 struct ConnectionFrameSink {
@@ -403,7 +568,9 @@ impl FrameSink for ConnectionFrameSink {
     fn try_send(&self, frame: WireFrame) -> Result<(), FrameSendError> {
         let key = attachment_lane(&frame);
         let bytes = encode_outbound(&frame, self.outbound_limit).map_err(|_| FrameSendError)?;
-        self.lane.try_push(key, bytes).map_err(|_| FrameSendError)
+        self.lane
+            .try_push(key, QueuedFrame::ordinary(bytes))
+            .map_err(|_| FrameSendError)
     }
 
     fn try_send_for(
@@ -411,14 +578,28 @@ impl FrameSink for ConnectionFrameSink {
         attachment_id: &AttachmentId,
         frame: WireFrame,
     ) -> Result<(), FrameSendError> {
+        // The attach response rides the SYSTEM reply lane, tagged so its pop
+        // releases this attachment's event offers (response-before-event)
+        // and a purge can answer the request instead of orphaning it.
+        let WireFrame::Response { request_id, .. } = &frame else {
+            return self.try_send(frame);
+        };
+        let marker = Some((attachment_id.clone(), request_id.clone()));
         let bytes = encode_outbound(&frame, self.outbound_limit).map_err(|_| FrameSendError)?;
         self.lane
-            .try_push(LaneKey::Attachment(attachment_id.clone()), bytes)
+            .try_push(
+                LaneKey::System,
+                QueuedFrame {
+                    bytes,
+                    response_for: marker,
+                    floor: false,
+                },
+            )
             .map_err(|_| FrameSendError)
     }
 
-    fn purge_attachment(&self, attachment_id: &AttachmentId) {
-        self.lane.purge(attachment_id);
+    fn purge_attachment(&self, attachment_id: &AttachmentId) -> Option<RequestId> {
+        self.lane.purge(attachment_id)
     }
 
     fn offer(&self, attachment_id: &AttachmentId, frame: &WireFrame) -> SendAdmission {
@@ -431,16 +612,22 @@ impl FrameSink for ConnectionFrameSink {
             .offer(LaneKey::Attachment(attachment_id.clone()), bytes)
     }
 
-    fn drain_progress(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
-        Some(self.lane.drain_progress())
+    fn drain_ticket(&self) -> Option<tokio::sync::oneshot::Receiver<()>> {
+        Some(self.lane.drain_ticket())
     }
 }
 
+/// Lane routing: EVENT traffic (events and caught-up markers) is
+/// attachment-keyed; everything else — including `Lagged`, which is a
+/// CONTROL notice about an attachment that no longer exists — rides the
+/// shared System reply lane. After a detach nothing attachment-keyed is ever
+/// enqueued again, so a purged lane can never be recreated.
 fn attachment_lane(frame: &WireFrame) -> LaneKey {
     match frame {
         WireFrame::Event { attachment_id, .. }
-        | WireFrame::AttachCaughtUp { attachment_id, .. }
-        | WireFrame::Lagged { attachment_id, .. } => LaneKey::Attachment(attachment_id.clone()),
+        | WireFrame::AttachCaughtUp { attachment_id, .. } => {
+            LaneKey::Attachment(attachment_id.clone())
+        }
         _ => LaneKey::System,
     }
 }
@@ -511,6 +698,9 @@ pub(crate) async fn serve(
     let lane = OutboundLane::new(
         context.outbound_queue_capacity,
         context.outbound_queued_bytes,
+        // The reply floor carries exactly one maximum encoded reply:
+        // frame_limit body + the 4-byte UDS length prefix.
+        context.frame_limit.saturating_add(4),
     );
     // Reserved drain path (R17): one dedicated slot, outside the ordinary
     // queue and outside its byte budget, so no volume of ordinary replies can
@@ -684,7 +874,6 @@ async fn run_writer(
             queued.recv().await
         };
         if let Some(frame) = next {
-            let charged = frame.bytes.len();
             let result = if notice_written {
                 match drain_deadline {
                     Some(deadline) => {
@@ -711,8 +900,9 @@ async fn run_writer(
                 .await
             };
             // Credit after the write settles: an in-flight frame still owns
-            // its bytes, which is what makes the budget a real memory bound.
-            queued.credit(charged);
+            // its bytes (or the floor), which is what makes the budgets real
+            // memory bounds.
+            queued.credit(&frame);
             match result {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
@@ -983,7 +1173,7 @@ fn enqueue(
     outbound_limit: usize,
 ) -> Result<(), DaemonError> {
     let bytes = encode_outbound(frame, outbound_limit)?;
-    lane.try_push(LaneKey::System, bytes)
+    lane.try_push(LaneKey::System, QueuedFrame::ordinary(bytes))
 }
 
 fn encode_outbound(frame: &WireFrame, outbound_limit: usize) -> Result<Vec<u8>, DaemonError> {

@@ -39,8 +39,9 @@
 //! - **Store-backed lag and menu CAS** — overflow has two responses: internal
 //!   catch-up overflow re-registers and resumes from the store without
 //!   detaching (the client just sees a repeated `AttachCaughtUp`), while
-//!   sink-side refusal or lag-under-stall detaches with `Lagged` and the
-//!   client reattaches after its applied `RawEnvelope.seq`. Menu answers
+//!   sink-side refusal or lag-under-stall detaches with a system-lane
+//!   `Lagged` and the client reattaches after its applied
+//!   `RawEnvelope.seq`. Menu answers
 //!   append through one durable compare-and-set and every attachment learns
 //!   the winner from the event stream.
 //!

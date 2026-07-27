@@ -27,7 +27,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{Notify, mpsc, watch};
+use tokio::sync::{Notify, mpsc, oneshot};
 
 const DEADLINE: Duration = Duration::from_secs(10);
 
@@ -131,24 +131,39 @@ impl FrameSink for CollectSink {
         Ok(())
     }
 
-    fn purge_attachment(&self, attachment_id: &AttachmentId) {
+    fn purge_attachment(&self, attachment_id: &AttachmentId) -> Option<RequestId> {
+        let mut purged_response = None;
         if let Ok(mut frames) = self.frames.lock() {
-            frames.retain(|frame| {
-                !matches!(
-                    frame,
-                    WireFrame::Event {
-                        attachment_id: queued,
-                        ..
-                    } | WireFrame::AttachCaughtUp {
-                        attachment_id: queued,
-                        ..
-                    } | WireFrame::Lagged {
-                        attachment_id: queued,
-                        ..
-                    } if queued == attachment_id
-                )
+            frames.retain(|frame| match frame {
+                WireFrame::Event {
+                    attachment_id: queued,
+                    ..
+                }
+                | WireFrame::AttachCaughtUp {
+                    attachment_id: queued,
+                    ..
+                }
+                | WireFrame::Lagged {
+                    attachment_id: queued,
+                    ..
+                } => queued != attachment_id,
+                WireFrame::Response {
+                    request_id,
+                    body:
+                        ResponseBody::SessionAttach {
+                            attachment_id: queued,
+                            ..
+                        },
+                } if queued == attachment_id => {
+                    // Mirrors the real sink: an undelivered staged attach
+                    // response is removed and reported.
+                    purged_response = Some(request_id.clone());
+                    false
+                }
+                _ => true,
             });
         }
+        purged_response
     }
 }
 
@@ -183,8 +198,8 @@ impl FrameSink for LostSuccessSink {
         self.collected.try_send(frame)
     }
 
-    fn purge_attachment(&self, attachment_id: &AttachmentId) {
-        self.collected.purge_attachment(attachment_id);
+    fn purge_attachment(&self, attachment_id: &AttachmentId) -> Option<RequestId> {
+        self.collected.purge_attachment(attachment_id)
     }
 }
 
@@ -1934,7 +1949,8 @@ async fn catch_up_byte_budget_trips_long_before_the_frame_count_and_resumes_from
 struct StalledAfterCaughtUpSink {
     collected: CollectSink,
     saw_caught_up: AtomicBool,
-    progress: watch::Sender<u64>,
+    /// Admission tickets that deliberately never fire — the stuck shape.
+    parked: Mutex<Vec<oneshot::Sender<()>>>,
 }
 
 impl FrameSink for StalledAfterCaughtUpSink {
@@ -1945,8 +1961,8 @@ impl FrameSink for StalledAfterCaughtUpSink {
         self.collected.try_send(frame)
     }
 
-    fn purge_attachment(&self, attachment_id: &AttachmentId) {
-        self.collected.purge_attachment(attachment_id);
+    fn purge_attachment(&self, attachment_id: &AttachmentId) -> Option<RequestId> {
+        self.collected.purge_attachment(attachment_id)
     }
 
     fn offer(&self, _attachment_id: &AttachmentId, frame: &WireFrame) -> SendAdmission {
@@ -1959,8 +1975,10 @@ impl FrameSink for StalledAfterCaughtUpSink {
         }
     }
 
-    fn drain_progress(&self) -> Option<watch::Receiver<u64>> {
-        Some(self.progress.subscribe())
+    fn drain_ticket(&self) -> Option<oneshot::Receiver<()>> {
+        let (fire, ticket) = oneshot::channel();
+        self.parked.lock().expect("parked lock").push(fire);
+        Some(ticket)
     }
 }
 
@@ -1979,11 +1997,10 @@ async fn commit_pressure_behind_a_stalled_outbox_laggs_and_detaches() {
     let session_id = SessionId::new("stalled-outbox");
     let generation = store.worker_generation();
     append_one(&hub, &session_id, generation, "initial").await;
-    let (progress, _keep_progress_open) = watch::channel(0_u64);
     let sink = Arc::new(StalledAfterCaughtUpSink {
         collected: CollectSink::default(),
         saw_caught_up: AtomicBool::new(false),
-        progress,
+        parked: Mutex::new(Vec::new()),
     });
     let connection = hub
         .open_connection(capabilities(), sink.clone())
@@ -2194,29 +2211,18 @@ async fn cancelled_registration_refunds_its_admission_slot() {
     store.close().await.expect("store closes");
 }
 
-/// A sink that records HOW each frame was staged: `true` for attachment-keyed
-/// staging (`try_send_for` / `offer`), `false` for the shared system path.
+/// A sink whose staged attach response is never delivered: events answer
+/// `Busy` on parked tickets and the purge reports the pending request id —
+/// the shape `lag_and_detach`'s unknown-id rule must handle.
 #[derive(Default)]
-struct LaneRecordingSink {
+struct UndeliveredResponseSink {
     collected: CollectSink,
-    staged: Mutex<Vec<(bool, &'static str)>>,
+    pending: Mutex<Option<RequestId>>,
+    parked: Mutex<Vec<oneshot::Sender<()>>>,
 }
 
-impl LaneRecordingSink {
-    fn record(&self, keyed: bool, frame: &WireFrame) {
-        let kind = match frame {
-            WireFrame::Response { .. } => "response",
-            WireFrame::Event { .. } => "event",
-            WireFrame::AttachCaughtUp { .. } => "caught-up",
-            _ => "other",
-        };
-        self.staged.lock().expect("staged lock").push((keyed, kind));
-    }
-}
-
-impl FrameSink for LaneRecordingSink {
+impl FrameSink for UndeliveredResponseSink {
     fn try_send(&self, frame: WireFrame) -> Result<(), FrameSendError> {
-        self.record(false, &frame);
         self.collected.try_send(frame)
     }
 
@@ -2225,34 +2231,121 @@ impl FrameSink for LaneRecordingSink {
         _attachment_id: &AttachmentId,
         frame: WireFrame,
     ) -> Result<(), FrameSendError> {
-        self.record(true, &frame);
-        self.collected.try_send(frame)
+        let WireFrame::Response { request_id, .. } = &frame else {
+            return self.try_send(frame);
+        };
+        // Staged but never popped: the client never learns the id.
+        *self.pending.lock().expect("pending lock") = Some(request_id.clone());
+        Ok(())
     }
 
     fn offer(&self, _attachment_id: &AttachmentId, frame: &WireFrame) -> SendAdmission {
-        self.record(true, frame);
-        match self.collected.try_send(frame.clone()) {
+        if matches!(frame, WireFrame::Event { .. }) {
+            return SendAdmission::Busy;
+        }
+        match self.try_send(frame.clone()) {
             Ok(()) => SendAdmission::Sent,
             Err(FrameSendError) => SendAdmission::Refused,
         }
     }
 
-    fn purge_attachment(&self, attachment_id: &AttachmentId) {
-        self.collected.purge_attachment(attachment_id);
+    fn purge_attachment(&self, attachment_id: &AttachmentId) -> Option<RequestId> {
+        let _ = self.collected.purge_attachment(attachment_id);
+        self.pending.lock().expect("pending lock").take()
+    }
+
+    fn drain_ticket(&self) -> Option<oneshot::Receiver<()>> {
+        let (fire, ticket) = oneshot::channel();
+        self.parked.lock().expect("parked lock").push(fire);
+        Some(ticket)
     }
 }
 
-/// MUTATION CHECK: route the attach response back through the shared system
-/// lane (`self.send` instead of `try_send_for`). Expected failure: the
-/// response's staging record is not attachment-keyed, so round-robin could
-/// pop a replayed event ahead of the response that names the attachment id.
+/// MUTATION CHECK: ignore the purge report in `lag_and_detach` and always
+/// send `Lagged`. Expected failure: the client receives a `Lagged` frame for
+/// an attachment id it was never told about, and the correlated error
+/// asserted below never arrives (unknown-id rule).
 /// Verified by revert on 2026-07-27.
-#[tokio::test]
-async fn attach_response_is_staged_in_the_attachment_lane_before_its_first_event() {
-    let (_root, store, hub) = open_hub(None, 8).await;
-    let session_id = SessionId::new("response-lane");
-    append_one(&hub, &session_id, store.worker_generation(), "seed").await;
-    let sink = Arc::new(LaneRecordingSink::default());
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn undelivered_attach_response_is_answered_with_a_correlated_error_not_lagged() {
+    let config = SessionHubConfig {
+        catch_up_byte_budget: 600,
+        ..SessionHubConfig::default()
+    };
+    let (_root, store, hub) = open_hub_with_config(None, config).await;
+    let session_id = SessionId::new("undelivered-response");
+    let generation = store.worker_generation();
+    append_one(&hub, &session_id, generation, "seed").await;
+    let sink = Arc::new(UndeliveredResponseSink::default());
+    let connection = hub
+        .open_connection(capabilities(), sink.clone())
+        .expect("connection");
+    connection
+        .request(
+            RequestId::new("attach-unheard"),
+            RequestBody::SessionAttach {
+                session_id: session_id.clone(),
+                after_seq: 0,
+                mode: AttachMode::View,
+            },
+        )
+        .await
+        .expect("attach routes");
+
+    // One oversized commit trips the hard catch-up byte bound while the
+    // replay is parked on its admission ticket: lag-under-stall detaches.
+    let mut event = vec![envelope(&session_id, "pressure", generation)];
+    event[0].payload = serde_json::json!({
+        "type": "future_test_event",
+        "blob": "x".repeat(700),
+    });
+    hub.append(&mut event).await.expect("pressure commits");
+
+    match sink.collected.next().await {
+        WireFrame::Response {
+            request_id,
+            body:
+                ResponseBody::Error {
+                    code,
+                    retryable: true,
+                    ..
+                },
+        } => {
+            assert_eq!(request_id.as_str(), "attach-unheard");
+            assert_eq!(code, "overloaded");
+        }
+        frame => panic!("expected the correlated attach error, got {frame:?}"),
+    }
+    assert!(
+        sink.collected
+            .snapshot()
+            .iter()
+            .all(|frame| !matches!(frame, WireFrame::Lagged { .. } | WireFrame::Event { .. })),
+        "no frame may reference an attachment id the client never learned"
+    );
+
+    connection.close().await.expect("connection closes");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// MUTATION CHECK: remove the pending-lag `final_suffix_resume` from the
+/// live loop's closed-channel exit. Expected failure: the envelope that
+/// overflowed the catch-up buffer just before drain is never delivered and
+/// this test times out waiting for seq 3.
+/// Verified by revert on 2026-07-27.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn graceful_drain_store_resumes_a_pending_lag_suffix() {
+    let (observer, mut control) = gated_observer(vec![GateTarget::BeforeEvent(2)]);
+    let config = SessionHubConfig {
+        catch_up_byte_budget: 600,
+        ..SessionHubConfig::default()
+    };
+    let (_root, store, hub) = open_hub_with_config(Some(observer), config).await;
+    let session_id = SessionId::new("drain-pending-lag");
+    let generation = store.worker_generation();
+    append_one(&hub, &session_id, generation, "seed").await;
+    let sink = Arc::new(CollectSink::default());
     let connection = hub
         .open_connection(capabilities(), sink.clone())
         .expect("connection");
@@ -2260,36 +2353,402 @@ async fn attach_response_is_staged_in_the_attachment_lane_before_its_first_event
         .request(
             RequestId::new("attach"),
             RequestBody::SessionAttach {
-                session_id,
+                session_id: session_id.clone(),
                 after_seq: 0,
                 mode: AttachMode::View,
             },
         )
         .await
         .expect("attach routes");
-    let _ = attachment_from(sink.collected.next().await);
+    let _ = attachment_from(sink.next().await);
     assert!(matches!(
-        sink.collected.next().await,
+        sink.next().await,
         WireFrame::Event { envelope, .. } if envelope.seq == 1
     ));
     assert!(matches!(
-        sink.collected.next().await,
-        WireFrame::AttachCaughtUp { .. }
+        sink.next().await,
+        WireFrame::AttachCaughtUp {
+            high_water_seq: 1,
+            ..
+        }
     ));
 
-    let staged = sink.staged.lock().expect("staged lock").clone();
-    let response_at = staged
-        .iter()
-        .position(|(keyed, kind)| *keyed && *kind == "response")
-        .expect("attach response staged in the attachment's own lane");
-    let first_event_at = staged
-        .iter()
-        .position(|(_, kind)| *kind == "event")
-        .expect("replayed event staged");
-    assert!(
-        response_at < first_event_at,
-        "the attach response precedes the first event in its FIFO lane"
+    // Small live commit: the replay task picks it up and parks at the
+    // BeforeEvent(2) gate, leaving the catch-up channel EMPTY.
+    append_one(&hub, &session_id, generation, "small-live").await;
+    assert!(matches!(
+        control.reached().await,
+        HubObservation::BeforeEvent { seq: 2, .. }
+    ));
+    // Oversized commit while the replay is gated: trips the hard byte bound,
+    // sets REAL lag, and is never buffered.
+    let mut oversized = vec![envelope(&session_id, "oversized", generation)];
+    oversized[0].payload = serde_json::json!({
+        "type": "future_test_event",
+        "blob": "x".repeat(700),
+    });
+    hub.append(&mut oversized).await.expect("oversized commits");
+
+    // Drain begins with the lag pending and stops the actor.
+    let shutdown = tokio::spawn({
+        let hub = hub.clone();
+        async move { hub.shutdown().await }
+    });
+    control.observed_shutdown_guarded().await;
+    control.release();
+    shutdown
+        .await
+        .expect("shutdown joins")
+        .expect("graceful drain completes");
+
+    // §6.6: the committed suffix (seq 3) was store-resumed during the grace
+    // and announced with a final caught-up at the durable head.
+    let mut saw_suffix = false;
+    let mut saw_final_head = false;
+    while !saw_suffix || !saw_final_head {
+        match sink.next().await {
+            WireFrame::Event { envelope, .. } if envelope.seq == 3 => saw_suffix = true,
+            WireFrame::AttachCaughtUp {
+                high_water_seq: 3, ..
+            } => saw_final_head = true,
+            WireFrame::Event { .. } | WireFrame::AttachCaughtUp { .. } => {}
+            frame => panic!("unexpected drain-suffix frame: {frame:?}"),
+        }
+    }
+
+    connection.close().await.expect("connection closes");
+    store.close().await.expect("store closes");
+}
+
+/// MUTATION CHECK: restore the empty-channel oversized-envelope admission in
+/// `publish`. Expected failure: the giant envelope is buffered and delivered
+/// live, so the discriminating SECOND `AttachCaughtUp` at the raised head
+/// never arrives and this test times out.
+/// Verified by revert on 2026-07-27.
+#[tokio::test]
+async fn oversized_envelope_takes_the_store_resume_path_exactly_once() {
+    let config = SessionHubConfig {
+        catch_up_byte_budget: 600,
+        ..SessionHubConfig::default()
+    };
+    let (_root, store, hub) = open_hub_with_config(None, config).await;
+    let session_id = SessionId::new("oversized-envelope");
+    let generation = store.worker_generation();
+    append_one(&hub, &session_id, generation, "seed").await;
+    let sink = Arc::new(CollectSink::default());
+    let connection = hub
+        .open_connection(capabilities(), sink.clone())
+        .expect("connection");
+    connection
+        .request(
+            RequestId::new("attach"),
+            RequestBody::SessionAttach {
+                session_id: session_id.clone(),
+                after_seq: 0,
+                mode: AttachMode::View,
+            },
+        )
+        .await
+        .expect("attach routes");
+    let _ = attachment_from(sink.next().await);
+    assert!(matches!(
+        sink.next().await,
+        WireFrame::Event { envelope, .. } if envelope.seq == 1
+    ));
+    assert!(matches!(
+        sink.next().await,
+        WireFrame::AttachCaughtUp {
+            high_water_seq: 1,
+            ..
+        }
+    ));
+
+    let mut giant = vec![envelope(&session_id, "giant", generation)];
+    giant[0].payload = serde_json::json!({
+        "type": "future_test_event",
+        "blob": "x".repeat(3_000),
+    });
+    hub.append(&mut giant).await.expect("giant commits");
+
+    // The hard byte bound never buffers it: the attachment laggs internally,
+    // re-registers, and the giant arrives from the STORE — visible as a
+    // repeated caught-up at the raised head.
+    let mut delivered = Vec::new();
+    loop {
+        match sink.next().await {
+            WireFrame::Event { envelope, .. } => delivered.push(envelope.seq),
+            WireFrame::AttachCaughtUp {
+                high_water_seq: 2, ..
+            } => break,
+            frame => panic!("unexpected oversized-envelope frame: {frame:?}"),
+        }
+    }
+    assert_eq!(delivered, [2], "the giant arrived exactly once, from store");
+
+    connection.close().await.expect("connection closes");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// A faithful bounded outbox for the combined adversarial case: atomic
+/// frame+byte admission, FIFO tickets fired as the reader consumes, replies
+/// always deliverable — the [`FrameSink`] contract of the real connection
+/// outbox, driven by the test as the reading client. (Live commit pressure
+/// is unreachable over the wire in v0.1 — there is no append RPC and the
+/// menu CAS is generation-fenced across restarts — so the combined case
+/// exercises the hub seam; the per-dimension e2e tests cover the real
+/// outbox.)
+struct BoundedReaderSink {
+    state: Mutex<BoundedReaderState>,
+    changed: Notify,
+    frame_cap: usize,
+    byte_cap: usize,
+}
+
+struct BoundedReaderState {
+    queue: VecDeque<(WireFrame, usize)>,
+    queued_bytes: usize,
+    tickets: VecDeque<oneshot::Sender<()>>,
+}
+
+impl BoundedReaderSink {
+    fn new(frame_cap: usize, byte_cap: usize) -> Self {
+        Self {
+            state: Mutex::new(BoundedReaderState {
+                queue: VecDeque::new(),
+                queued_bytes: 0,
+                tickets: VecDeque::new(),
+            }),
+            changed: Notify::new(),
+            frame_cap,
+            byte_cap,
+        }
+    }
+
+    fn weight(frame: &WireFrame) -> usize {
+        match frame {
+            WireFrame::Event { envelope, .. } => serde_json::to_string(&envelope.payload)
+                .map(|payload| payload.len())
+                .unwrap_or(256)
+                .saturating_add(256),
+            _ => 128,
+        }
+    }
+
+    /// The reading client: pops one frame, credits its weight, fires the
+    /// next admission ticket in order.
+    async fn next(&self) -> WireFrame {
+        tokio::time::timeout(DEADLINE, async {
+            loop {
+                let notified = self.changed.notified();
+                {
+                    let mut state = self.state.lock().expect("reader state");
+                    if let Some((frame, weight)) = state.queue.pop_front() {
+                        state.queued_bytes = state.queued_bytes.saturating_sub(weight);
+                        while let Some(ticket) = state.tickets.pop_front() {
+                            if ticket.send(()).is_ok() {
+                                break;
+                            }
+                        }
+                        return frame;
+                    }
+                }
+                notified.await;
+            }
+        })
+        .await
+        .expect("bounded reader deadline")
+    }
+}
+
+impl FrameSink for BoundedReaderSink {
+    fn try_send(&self, frame: WireFrame) -> Result<(), FrameSendError> {
+        // Reply class: always deliverable (the reader consumes promptly).
+        let weight = Self::weight(&frame);
+        let mut state = self.state.lock().map_err(|_| FrameSendError)?;
+        state.queue.push_back((frame, weight));
+        state.queued_bytes = state.queued_bytes.saturating_add(weight);
+        drop(state);
+        self.changed.notify_waiters();
+        Ok(())
+    }
+
+    fn offer(&self, _attachment_id: &AttachmentId, frame: &WireFrame) -> SendAdmission {
+        let weight = Self::weight(frame);
+        let Ok(mut state) = self.state.lock() else {
+            return SendAdmission::Refused;
+        };
+        if state.queue.len() >= self.frame_cap
+            || state.queued_bytes.saturating_add(weight) > self.byte_cap
+        {
+            return SendAdmission::Busy;
+        }
+        state.queue.push_back((frame.clone(), weight));
+        state.queued_bytes = state.queued_bytes.saturating_add(weight);
+        drop(state);
+        self.changed.notify_waiters();
+        SendAdmission::Sent
+    }
+
+    fn drain_ticket(&self) -> Option<oneshot::Receiver<()>> {
+        let (fire, ticket) = oneshot::channel();
+        match self.state.lock() {
+            Ok(mut state) => state.tickets.push_back(fire),
+            Err(_) => {
+                let _ = fire.send(());
+            }
+        }
+        Some(ticket)
+    }
+}
+
+/// MUTATION CHECK: treat a `Busy` admission as a hard refusal inside
+/// `deliver_frame` (the rejected snapshot-era behavior). Expected failure:
+/// under combined byte + frame + live-commit pressure across five lanes, at
+/// least one reading lane is purged through `Lagged` and the zero-Lagged
+/// assertion trips (or the cold lane never completes).
+/// Verified by revert on 2026-07-27.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn combined_pressure_five_lanes_large_envelopes_and_live_commits_lag_no_reader() {
+    let config = SessionHubConfig {
+        catch_up_byte_budget: 64 * 1024,
+        ..SessionHubConfig::default()
+    };
+    let (_root, store, hub) = open_hub_with_config(None, config).await;
+    let generation = store.worker_generation();
+    let sessions = (0..5)
+        .map(|index| SessionId::new(format!("combined-{index}")))
+        .collect::<Vec<_>>();
+    for session_id in &sessions {
+        for seq in 1..=12 {
+            let mut event = vec![envelope(
+                session_id,
+                format!("{session_id}-big-{seq}"),
+                generation,
+            )];
+            event[0].payload = serde_json::json!({
+                "type": "future_test_event",
+                "blob": "x".repeat(8 * 1024),
+            });
+            hub.append(&mut event).await.expect("seed commits");
+        }
+    }
+    let cold_session = SessionId::new("combined-cold");
+    append_one(&hub, &cold_session, generation, "cold-seed").await;
+
+    // Tight bounds: ~6 large frames or ~48 KiB in flight across 6 lanes.
+    let sink = Arc::new(BoundedReaderSink::new(6, 48 * 1024));
+    let connection = Arc::new(
+        hub.open_connection(capabilities(), sink.clone())
+            .expect("connection"),
     );
+    for (index, session_id) in sessions.iter().enumerate() {
+        connection
+            .request(
+                RequestId::new(format!("attach-{index}")),
+                RequestBody::SessionAttach {
+                    session_id: session_id.clone(),
+                    after_seq: 0,
+                    mode: AttachMode::View,
+                },
+            )
+            .await
+            .expect("attach routes");
+    }
+    // Live commit pressure on two hot sessions while every replay runs.
+    let pressure = tokio::spawn({
+        let hub = hub.clone();
+        let hot = sessions[0].clone();
+        let also_hot = sessions[1].clone();
+        async move {
+            for round in 0..8 {
+                for session_id in [&hot, &also_hot] {
+                    let mut event = vec![envelope(
+                        session_id,
+                        format!("{session_id}-live-{round}"),
+                        generation,
+                    )];
+                    event[0].payload = serde_json::json!({
+                        "type": "future_test_event",
+                        "blob": "y".repeat(8 * 1024),
+                    });
+                    hub.append(&mut event).await.expect("live commit");
+                }
+            }
+        }
+    });
+    // Cold late attachment joins mid-storm.
+    connection
+        .request(
+            RequestId::new("attach-cold"),
+            RequestBody::SessionAttach {
+                session_id: cold_session.clone(),
+                after_seq: 0,
+                mode: AttachMode::View,
+            },
+        )
+        .await
+        .expect("cold attach routes");
+
+    // The reading client: dedup by seq per session (at-least-once, R11);
+    // finish once every lane is complete and the cold lane caught up.
+    let mut applied: std::collections::HashMap<SessionId, std::collections::BTreeSet<u64>> =
+        std::collections::HashMap::new();
+    let mut cold_caught_up = false;
+    loop {
+        match sink.next().await {
+            WireFrame::Response { .. } => {}
+            WireFrame::Event {
+                session_id,
+                envelope,
+                ..
+            } => {
+                applied.entry(session_id).or_default().insert(envelope.seq);
+            }
+            WireFrame::AttachCaughtUp { attachment_id, .. } => {
+                // Identify the cold lane by its completed single event.
+                let _ = attachment_id;
+                if applied
+                    .get(&cold_session)
+                    .is_some_and(|seqs| seqs.contains(&1))
+                {
+                    cold_caught_up = true;
+                }
+            }
+            WireFrame::Lagged { .. } => {
+                panic!("a continuously reading lane must never be lagged")
+            }
+            frame => panic!("unexpected combined-pressure frame: {frame:?}"),
+        }
+        let hot_done = (0..2).all(|index| {
+            applied
+                .get(&sessions[index])
+                .is_some_and(|seqs| seqs.len() == 20)
+        });
+        let warm_done = (2..5).all(|index| {
+            applied
+                .get(&sessions[index])
+                .is_some_and(|seqs| seqs.len() == 12)
+        });
+        if hot_done && warm_done && cold_caught_up {
+            break;
+        }
+    }
+    pressure.await.expect("pressure task joins");
+    for (session_id, seqs) in &applied {
+        let expected = if session_id == &cold_session {
+            1
+        } else if session_id == &sessions[0] || session_id == &sessions[1] {
+            20
+        } else {
+            12
+        };
+        assert_eq!(
+            seqs.iter().copied().collect::<Vec<_>>(),
+            (1..=expected).collect::<Vec<_>>(),
+            "lane {session_id} is contiguous and complete"
+        );
+    }
 
     connection.close().await.expect("connection closes");
     hub.shutdown().await.expect("hub stops");
