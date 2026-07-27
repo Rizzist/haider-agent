@@ -16,10 +16,12 @@
 //!   against the runtime directory's own descriptor so no path swap can
 //!   redirect it (`endpoint.rs`).
 //! - **Device+inode identity, verified where it is removed** — the socket is
-//!   created under a private name and renamed into place, so the recorded
-//!   device+inode is provably this daemon's; cleanup claims the public name
-//!   back under a private one and verifies identity there, so an old daemon
-//!   can never delete a successor's socket (`endpoint.rs`).
+//!   created under an unpredictable name and renamed into place, so the
+//!   recorded device+inode cannot have been pre-staged by anyone else; cleanup
+//!   claims the public name back under a fresh unpredictable name and verifies
+//!   identity there, so an old daemon does not delete a successor's socket. The
+//!   residual — a same-UID process that WATCHES the directory can still learn a
+//!   staging name as it appears — is scoped precisely in `endpoint.rs`.
 //! - **Reconcile before ready** — the daemon generation is durably bumped and
 //!   every dispatched-without-terminal effect is reconciled (via
 //!   `haider_core::reconcile_dispatched_effects`) before the listener binds

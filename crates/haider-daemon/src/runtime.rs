@@ -168,7 +168,7 @@ async fn run_inner(
         .map_err(|message| DaemonError::InvalidConfig { message })?;
     if !matches!(*shutdown.borrow(), ShutdownRequest::None) {
         let request = shutdown.borrow().clone();
-        return shutdown_without_store(config, states, request);
+        return shutdown_without_store(config, states, request, &shutdown);
     }
     let endpoint_path = config.endpoint_path();
     // R1: the profile lifetime lock is acquired before any socket cleanup or
@@ -186,7 +186,7 @@ async fn run_inner(
     if !matches!(*shutdown.borrow(), ShutdownRequest::None) {
         let request = shutdown.borrow().clone();
         drop(lease);
-        return shutdown_without_store(config, states, request);
+        return shutdown_without_store(config, states, request, &shutdown);
     }
 
     // R16 ready gate: open store under the lock -> durable generation bump ->
@@ -576,9 +576,11 @@ async fn finalize(
 /// What a barrier step's failure means once the barrier has been breached.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StepFailure {
-    /// Lossy by contract (R17): a store flush or close that fails after a force
-    /// or an overrun is an expected consequence of the forced path, not the
-    /// daemon's report. The outcome already says `Forced`.
+    /// Lossy by contract (R17): a store flush or close that fails BECAUSE THIS
+    /// STEP ran into the barrier — its own overrun, an expired deadline, or a
+    /// second signal — is an expected consequence of the forced path, not the
+    /// daemon's report. A force raised for an unrelated reason does not
+    /// suppress it.
     SuppressedWhenForced,
     /// Reported on every path: a rendezvous node the daemon could not remove
     /// outlives the process and confuses the next start, forced or not.
@@ -607,9 +609,15 @@ where
     let error = outcome
         .and_then(|result| result.err())
         .map(DaemonError::from);
-    *forced |= overran || barrier_breached(deadline, shutdown);
+    // Suppression keys on WHY, not on the accumulated flag: only a barrier the
+    // step itself ran into — its own overrun, an expired deadline, a second
+    // signal — makes that step's failure an expected consequence. A `forced`
+    // raised elsewhere (an undelivered drain notice, say) says nothing about
+    // this step, and must not swallow an unrelated store error.
+    let breached = overran || barrier_breached(deadline, shutdown);
+    *forced |= breached;
     match failure {
-        StepFailure::SuppressedWhenForced if *forced => None,
+        StepFailure::SuppressedWhenForced if breached => None,
         StepFailure::SuppressedWhenForced | StepFailure::AlwaysReported => error,
     }
 }
@@ -751,16 +759,24 @@ fn shutdown_without_store(
     config: &DaemonConfig,
     states: &StatePublisher,
     request: ShutdownRequest,
+    shutdown: &watch::Receiver<ShutdownRequest>,
 ) -> Result<ShutdownOutcome, DaemonError> {
-    let (reason, forced) = match request {
+    let (reason, mut forced) = match request {
         ShutdownRequest::Graceful { reason } => (reason, false),
         ShutdownRequest::Forced { reason } => (reason, true),
         ShutdownRequest::None => ("startup shutdown controller dropped".into(), true),
     };
+    let barrier_deadline = tokio::time::Instant::now() + config.drain_timeout;
     states.publish(DaemonState::Draining {
         reason,
         deadline_unix_ms: unix_time_ms().saturating_add(duration_ms(config.drain_timeout)),
     });
+    // Same arbitration as the other two tails: the caller handed us a CLONE of
+    // the request, so a second signal that landed after that clone is only
+    // visible in the CURRENT watch value. Without this recheck the caller could
+    // be told `Forced` while the daemon's own join reported `Graceful` — all
+    // three shutdown paths must agree on one answer.
+    forced |= barrier_breached(barrier_deadline, shutdown);
     states.publish(DaemonState::Stopped);
     Ok(if forced {
         ShutdownOutcome::Forced

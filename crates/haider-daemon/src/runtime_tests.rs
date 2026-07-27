@@ -127,3 +127,100 @@ async fn work_finishing_inside_the_barrier_completes_normally() {
     assert_eq!(completed, Some("done"));
     assert!(!barrier_breached(deadline, &shutdown));
 }
+
+/// The regression this pins: `forced` raised for a reason OTHER than this
+/// step's own barrier — an undelivered drain notice, counted before
+/// finalization runs — must not swallow an unrelated store failure. Before the
+/// W3b1.5 refactor the flag was checked directly, so a notice-only force hid a
+/// real flush error; the outcome said `Forced` and the error vanished.
+///
+/// MUTATION CHECK: in `barrier_step`, change the guard back to
+/// `StepFailure::SuppressedWhenForced if *forced`. Expected failure: this test
+/// gets `None` where it demands the store error.
+#[tokio::test]
+async fn a_force_raised_elsewhere_does_not_swallow_a_store_error() {
+    let (_sender, mut shutdown) = shutdown_channel();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    // The drain already decided the outcome is forced (a connection never got
+    // its ServerDraining), and the barrier itself is entirely intact.
+    let mut forced = true;
+
+    let reported = barrier_step(
+        async {
+            Err::<(), haider_protocol::error::HaiderError>(
+                haider_protocol::error::HaiderError::new(
+                    haider_protocol::error::ErrorCode::Internal,
+                    "flush failed on its own",
+                    false,
+                ),
+            )
+        },
+        StepFailure::SuppressedWhenForced,
+        deadline,
+        &mut shutdown,
+        &mut forced,
+    )
+    .await;
+
+    assert!(
+        matches!(reported, Some(DaemonError::Store(_))),
+        "a store failure unrelated to the barrier must still be reported, got {reported:?}"
+    );
+    assert!(forced, "the caller's reason for forcing still stands");
+}
+
+/// The other half of the same rule: when the step ITSELF ran into the barrier,
+/// its failure is the expected consequence of the forced path (R17) and is not
+/// the daemon's report.
+#[tokio::test]
+async fn a_step_that_ran_into_the_barrier_keeps_its_failure_to_itself() {
+    let (sender, mut shutdown) = shutdown_channel();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    sender.send_replace(ShutdownRequest::Forced {
+        reason: "second signal".into(),
+    });
+    let mut forced = false;
+
+    let reported = barrier_step(
+        async {
+            Err::<(), haider_protocol::error::HaiderError>(
+                haider_protocol::error::HaiderError::new(
+                    haider_protocol::error::ErrorCode::Internal,
+                    "flush failed under a force",
+                    false,
+                ),
+            )
+        },
+        StepFailure::SuppressedWhenForced,
+        deadline,
+        &mut shutdown,
+        &mut forced,
+    )
+    .await;
+
+    assert!(reported.is_none(), "a forced path is lossy by contract");
+    assert!(forced, "and the step's own breach raises the flag");
+}
+
+/// An always-reported step (endpoint cleanup) reports through a breach: a
+/// rendezvous node the daemon could not remove outlives the process.
+#[tokio::test]
+async fn an_always_reported_step_survives_a_breached_barrier() {
+    let (_sender, mut shutdown) = shutdown_channel();
+    let expired = tokio::time::Instant::now() - Duration::from_secs(1);
+    let mut forced = false;
+
+    let reported = barrier_step(
+        std::future::ready(Err::<(), DaemonError>(DaemonError::Endpoint {
+            message: "socket still there".into(),
+        })),
+        StepFailure::AlwaysReported,
+        expired,
+        &mut shutdown,
+        &mut forced,
+    )
+    .await;
+
+    assert!(matches!(reported, Some(DaemonError::Endpoint { .. })));
+    assert!(forced, "an expired deadline still forces the outcome");
+}

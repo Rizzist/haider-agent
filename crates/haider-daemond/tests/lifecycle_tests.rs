@@ -44,6 +44,7 @@
 //! - peer that reads NOTHING       -> `client_that_never_reads_a_byte_cannot_hold_the_barrier_open`
 //! - peer that reads ONE byte      -> `one_byte_reader_cannot_hold_the_barrier_open`
 //! - blocked writer, forced path   -> `forced_shutdown_aborts_a_blocked_writer_instead_of_detaching_it`
+//! - accepts racing the request     -> `connections_racing_the_shutdown_request_are_torn_down_completely`
 //! - deadline covers finalization  -> `drain_deadline_covers_the_finalization_tail`
 //! - second-signal termination     -> `second_signal_request_selects_immediate_forced_termination_path`
 //! - second OS signal, end to end  -> `second_os_signal_terminates_the_daemon_through_the_forced_exit_path`
@@ -57,7 +58,7 @@
 //! (`haider-daemon/src/runtime_tests.rs`).
 //!
 //! Two windows have no test, by construction rather than by omission: the
-//! bind → identity window (the socket is created under an unguessable name and
+//! bind → identity window (the socket is created under an unpredictable name and
 //! renamed into place, so no replacement can be adopted), and abort-vs-join of
 //! a child writer (indistinguishable once the daemon has reported). Both are
 //! recorded in docs/OPTIMIZATIONS.md.

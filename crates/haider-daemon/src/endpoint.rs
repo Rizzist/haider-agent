@@ -16,14 +16,15 @@
 //!
 //! The file half is closed by never verifying and acting on the *public* name:
 //!
-//! - **bind → identity**: the socket is created under an UNGUESSABLE sibling
+//! - **bind → identity**: the socket is created under an UNPREDICTABLE sibling
 //!   name (128 CSPRNG bits, [`staging_name`]), `statat`-ed there, and only then
 //!   moved onto the public name with a non-replacing rename. A racer cannot
-//!   name — and therefore cannot replace — the node whose device+inode is
-//!   recorded, so that identity is provably the one this daemon created.
+//!   PRE-STAGE anything at a name it could not predict, so the node whose
+//!   device+inode is recorded is the one this daemon created — unless an
+//!   observer learns the name as it appears (see the residual below).
 //! - **identity → unlink**: cleanup looks first (an already-replaced node is
 //!   left completely alone, with no rename at all), then *claims* the public
-//!   name by renaming it to a fresh unguessable name. Identity is verified, and
+//!   name by renaming it to a fresh unpredictable name. Identity is verified, and
 //!   the unlink performed, on that name. A replacement that lands after the
 //!   claim creates a brand-new node at the public name this daemon never
 //!   touches again.
@@ -34,18 +35,25 @@
 //!
 //! Residual, stated precisely:
 //!
-//! 1. If a same-UID process creates a node at the public name between our claim
+//! 1. What the unpredictable names buy is the removal of the PRE-KNOWLEDGE
+//!    race: nothing can be waiting at a staging name before this daemon uses
+//!    it. They do NOT make the name secret. `0700` excludes other UIDs, not the
+//!    owner — a same-UID process watching the runtime directory (kqueue,
+//!    FSEvents, or plain polling) can learn each staging name as it appears and
+//!    then race the pathname-based `statat`/`unlinkat`/`renameat` that follow.
+//!    That window is microsecond-scale and requires a deliberate observer, and
+//!    it is the precisely-scoped residual of this design.
+//! 2. If a same-UID process creates a node at the public name between our claim
 //!    and our restore, the restore is REFUSED and the claimed node stays under
-//!    its unguessable staging name until a later sweep. Nothing of anyone
-//!    else's is deleted or overwritten, but a live foreign socket claimed in
-//!    that window loses its public path until its owner rebinds.
-//! 2. Guessing is the only way to target the staging window, and it is 128 bits
-//!    wide; a brute-force attempt would also have to land inside a
-//!    microsecond-scale window.
-//! 3. All of this describes a same-UID process DELIBERATELY racing the daemon.
-//!    A normally-starting peer daemon cannot reach bind at all — the store's
-//!    profile lifetime lock is taken first and released last (R1) — so
-//!    accidental successor deletion is prevented one layer up.
+//!    its staging name until a later sweep. Nothing of anyone else's is deleted
+//!    or overwritten, but a live foreign socket claimed in that window loses
+//!    its public path until its owner rebinds.
+//! 3. Both of the above describe a same-UID process DELIBERATELY racing the
+//!    daemon — an adversary who already has the user's own privileges, which is
+//!    the calibration this lane is designed to. A normally-starting peer daemon
+//!    cannot reach bind at all: the store's profile lifetime lock is taken
+//!    first and released last (R1), so accidental successor deletion is
+//!    prevented one layer up.
 //! 4. [`rename_no_replace`] is native only on Apple/Linux; other Unix targets
 //!    fall back to check-then-rename, which keeps a replacing race in publish
 //!    and restore. That platform gap and its trigger are stated at that
@@ -123,7 +131,7 @@ struct SocketCleanup {
 }
 
 impl SocketCleanup {
-    /// Claims the public name, verifies identity on the claimed (unguessable)
+    /// Claims the public name, verifies identity on the claimed (unpredictable)
     /// name, and unlinks only there. A node that is not ours goes back exactly
     /// where it was, which is what keeps an old daemon from deleting its
     /// successor's socket (R22 named case: successor-socket-deletion).
@@ -256,8 +264,9 @@ pub(crate) async fn bind(config: &DaemonConfig) -> Result<BoundEndpoint, DaemonE
 }
 
 /// Verifies the freshly bound staging node, tightens its mode, and moves it
-/// onto the public name. The returned identity is provably this daemon's: no
-/// other process can name, replace, or even see the staging node.
+/// onto the public name. The identity returned is read from a node no other
+/// process could have pre-staged; a same-UID observer watching the directory
+/// could still see the name appear, which is the residual stated at the module.
 fn stage_and_publish(
     directory: &OwnedFd,
     staging: &str,
@@ -557,13 +566,15 @@ fn restore(directory: &OwnedFd, claim: &str, name: &str) -> Result<(), DaemonErr
 /// [`sweep_staging`] can recognise leftovers by construction.
 const STAGING_PREFIX: &str = ".haiderd-";
 
-/// An unguessable sibling name in the same directory.
+/// An unpredictable sibling name in the same directory.
 ///
-/// 128 CSPRNG bits: this is the load-bearing property of the claim discipline.
-/// A same-UID racer cannot replace a node it cannot name, so claim → verify →
-/// unlink acts on one object that only this daemon can reach. (A 32-bit name
-/// would be enumerable, which is precisely what made the earlier version
-/// raceable.)
+/// 128 CSPRNG bits: the load-bearing property of the claim discipline is that
+/// nobody can PREDICT this name, so nothing can be pre-staged at it and the
+/// claim → verify → unlink sequence has no target waiting for it. (A 32-bit
+/// name was enumerable, which is what made the earlier version raceable.) It
+/// is not a secret: `0700` keeps other UIDs out, but a same-UID process
+/// watching the directory can observe the name once it exists — the residual
+/// stated at the module.
 fn staging_name() -> Result<String, DaemonError> {
     let mut bytes = [0_u8; 16];
     getrandom::fill(&mut bytes).map_err(|error| DaemonError::Task {

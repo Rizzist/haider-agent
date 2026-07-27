@@ -95,8 +95,28 @@ fn count_tests(root: &Path) -> usize {
                     .is_some_and(|n| n.ends_with("_tests.rs"))
         })
         .filter_map(|p| fs::read_to_string(p).ok())
-        .map(|text| text.matches("#[test]").count() + text.matches("#[tokio::test]").count())
+        .map(|text| text.lines().filter(|line| is_test_marker(line)).count())
         .sum()
+}
+
+/// Test markers this counter recognises. Deliberately exact strings: widening
+/// the SET (say, to attributes carrying arguments) is a separate change from
+/// the POSITION rule below, so the two compose instead of overwriting one
+/// another.
+const TEST_MARKERS: [&str; 2] = ["#[test]", "#[tokio::test]"];
+
+/// Counting rule, stated once: a marker counts only where an attribute can
+/// actually appear — as the first token on its line. That excludes prose that
+/// merely mentions a marker (a doc comment describing the acceptance matrix is
+/// not a test) and any marker embedded mid-line, such as this counter's own
+/// source. Substring counting had exactly that bug: `lifecycle_tests.rs`'s
+/// header, which names `#[tokio::test]` in a sentence, inflated the workspace
+/// baseline by one phantom test.
+fn is_test_marker(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    TEST_MARKERS
+        .iter()
+        .any(|marker| trimmed.starts_with(marker))
 }
 
 fn test_count(update: bool) -> ExitCode {
