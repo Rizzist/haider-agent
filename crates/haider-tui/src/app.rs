@@ -550,12 +550,13 @@ impl Default for AuraModel {
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppRequest {
     /// Run a respond() turn for user text. `voice` turns skip the script's
-    /// UserMessage (the reducer already pushed the ◉ row); `title` is the
-    /// freshly-set blurb owed the 1.5 s auto-title note.
+    /// UserMessage (the reducer already pushed the ◉ row); `title` asks the
+    /// driver to schedule the 1.5 s auto-title micro-call, which names the
+    /// session INSIDE its callback (sim tui.js:1219-1227, review P2-12).
     SubmitText {
         text: String,
         voice: bool,
-        title: Option<String>,
+        title: bool,
     },
     /// Attach a sample session: replay the classic scripted demo turn.
     AttachSample(usize),
@@ -626,9 +627,12 @@ impl VoiceState {
 /// screen — or be dropped — never a different row the model drifted to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Hit {
-    AttachSample(usize),
-    /// Aura / Accounts / Peers launcher rows (UI stubs).
-    ExtraRow(u8),
+    /// The launcher row's session NAME at render time (review P2-9: an
+    /// ordinal resolved against current state could attach a different
+    /// session than the one clicked).
+    AttachSample(String),
+    /// Aura / Accounts / Peers launcher rows, by identity not ordinal.
+    ExtraRow(LauncherRow),
     /// The palette row's actual content at render time.
     PaletteRow(PaletteItem),
     /// A menu option, bound to the menu it was rendered for.
@@ -658,6 +662,14 @@ pub enum Hit {
     /// producing prompt's first row at the viewport top (sim jumpToSticky:
     /// stay AT the prompt, tui.js:2637-2645).
     StickyJump(u16),
+}
+
+/// The launcher's non-session rows (value-carrying hit payload, P2-9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LauncherRow {
+    Aura,
+    Accounts,
+    Peers,
 }
 
 /// Everything the reducer consumes.
@@ -1174,6 +1186,7 @@ impl AppModel {
                     // stays on screen. Only an idle esc walks back. The
                     // held queue drops with the turn (sim tui.js:1557).
                     self.turn_active = false;
+                    self.listening = false;
                     self.msg_queue.clear();
                     self.requests.push(AppRequest::Interrupt);
                     self.projection
@@ -1181,6 +1194,8 @@ impl AppModel {
                     self.projection
                         .push_note("· interrupted — run → cancelled · idle (i)".to_owned());
                 } else {
+                    // Leaving the session cancels a live talk hold (P1-3).
+                    self.listening = false;
                     self.screen = Screen::Launcher;
                 }
             }
@@ -1283,11 +1298,10 @@ impl AppModel {
             self.fresh_session();
             self.session_name = Some(slug_name(&text));
         }
-        let title = if self.maybe_title(&text) {
-            self.session_title.clone()
-        } else {
-            None
-        };
+        // The blurb is NOT set here: the sim's micro-call names the session
+        // inside its own 1.5 s callback, so an interrupt in that window
+        // leaves the session untitled (review P2-12).
+        let title = self.session_title.is_none();
         self.screen = Screen::Session;
         self.turn_active = true;
         self.scroll_back.set(0);
@@ -1333,11 +1347,7 @@ impl AppModel {
         self.projection.push_user_voice(text.clone());
         self.projection
             .push_note(format!("◉ heard · {}", self.voice.stt));
-        let title = if self.maybe_title(&text) {
-            self.session_title.clone()
-        } else {
-            None
-        };
+        let title = self.session_title.is_none();
         self.screen = Screen::Session;
         self.turn_active = true;
         self.scroll_back.set(0);
@@ -1351,9 +1361,23 @@ impl AppModel {
     /// The ◉ talk hold finished (driver timer): submit the canned phrase
     /// through the voice path (sim tui.js:2044-2054).
     pub fn talk_fire(&mut self) {
+        // A hold nobody is holding fires nothing: Esc (and any navigation)
+        // clears `listening`, so the 1.3 s timer can no longer land on the
+        // Launcher and yank the user into a fresh canned session
+        // (review P1-3). The timer is ALSO session-owned, so a fresh
+        // session cancels it outright.
+        if !self.listening {
+            return;
+        }
         self.listening = false;
         self.dirty = true;
-        if self.turn_active || !self.voice.enabled {
+        // The mic renders on the session AND the launcher (sim
+        // tui.js:3035-3047), so both are legal targets; every other screen
+        // means the user navigated away mid-hold.
+        if self.turn_active
+            || !self.voice.enabled
+            || !matches!(self.screen, Screen::Session | Screen::Launcher)
+        {
             return;
         }
         self.submit_voice(TALK_PHRASE.to_owned());
@@ -1370,12 +1394,22 @@ impl AppModel {
                 mode: DeliveryMode::Steer,
             });
         }
+        // The orb leaves idle NOW, not when the first async beat lands:
+        // the `idle` submit gate is what stops two rapid submits from
+        // interleaving (review P1-2; the driver additionally cancels the
+        // previous run, as the sim's `++auraRunRef` does).
+        self.aura.state = AuraState::Thinking;
         self.aura.runs += 1;
         self.requests.push(AppRequest::AuraSubmit { text, voice });
     }
 
     /// The aura talk hold finished (driver timer, tui.js:2128-2132).
     pub fn aura_talk_fire(&mut self) {
+        // Only a hold still in `listening` fires (navigation away cancels
+        // the arm; a run started meanwhile owns the orb).
+        if self.aura.state != AuraState::Listening {
+            return;
+        }
         self.dirty = true;
         self.aura_submit(crate::script::AURA_TALK_PHRASE.to_owned(), true);
     }
@@ -1511,17 +1545,6 @@ impl AppModel {
                 self.execute_slash();
             }
         }
-    }
-
-    /// Title an untitled session from its first message (sim auto-title
-    /// micro-call). True when a title was newly set — the caller owes the
-    /// transcript its `· session titled` note once the message lands.
-    fn maybe_title(&mut self, text: &str) -> bool {
-        if self.session_title.is_some() {
-            return false;
-        }
-        self.session_title = Some(auto_blurb(text));
-        true
     }
 
     fn execute_slash(&mut self) {
@@ -1745,18 +1768,24 @@ impl AppModel {
         {
             self.screen = Screen::Launcher;
         }
-        if let EventPayload::UserMessage { text, .. } = payload {
+        if let EventPayload::UserMessage { .. } = payload {
             self.screen = Screen::Session;
             self.turn_active = true;
-            // Envelope-driven turns (attach replay, queued consumption)
-            // keep the blurb law; the 1.5 s note belongs to the driver.
-            let _ = self.maybe_title(text);
+            // NB: no titling here. The sim names a session ONLY inside the
+            // 1.5 s micro-call callback (tui.js:1219-1227); titling on the
+            // user-row envelope pre-empted that callback, so its note never
+            // landed (review P2-12).
         }
         if let EventPayload::RunState(state) = payload
             && state.is_terminal()
         {
             self.turn_active = false;
             self.auto_resuming = false;
+            // The `♪ speaking` tag ends where the TURN ends. A trailing
+            // `Voice(false)` beat could not: a branch parked on a menu
+            // never reaches its own tail, so later ordinary rows kept
+            // rendering as spoken (review P2-10).
+            self.projection.set_voice_live(false);
         }
         if matches!(payload, EventPayload::MenuOpened(_)) {
             self.menu_selection = 0;
@@ -1863,6 +1892,13 @@ impl AppModel {
         self.requests.push(AppRequest::StopScripts);
     }
 
+    /// Attach a sample session by NAME (the clicked row's identity, P2-9).
+    fn attach_sample_named(&mut self, name: &str) {
+        if let Some(index) = self.samples.iter().position(|s| s.name == name) {
+            self.attach_sample(index);
+        }
+    }
+
     /// Attach a sample session (digit or click) — one turn at a time.
     fn attach_sample(&mut self, index: usize) {
         if self.turn_active {
@@ -1896,42 +1932,57 @@ impl AppModel {
             return;
         }
         match hit {
-            Hit::AttachSample(index) => self.attach_sample(index),
-            Hit::ExtraRow(which) => match which {
-                0 => self.screen = Screen::Aura,
-                1 => {
+            // Every hit below re-checks its OWNING SURFACE: the map may be
+            // one frame stale, so a rect from a screen we have since left
+            // must never act (review P1-5 — the law documented above was
+            // only honored by the palette/menu hits).
+            Hit::AttachSample(name) if self.screen == Screen::Launcher => {
+                self.attach_sample_named(&name);
+            }
+            Hit::ExtraRow(which) if self.screen == Screen::Launcher => match which {
+                LauncherRow::Aura => self.screen = Screen::Aura,
+                LauncherRow::Accounts => {
                     self.flash = Some(
                         "· /accounts — UI ready; lands with the account switchboard (W3)"
                             .to_owned(),
                     );
                 }
-                _ => {
+                LauncherRow::Peers => {
                     self.flash = Some(
                         "· /peers — UI ready; lands with the mesh wave (post-v0.1)".to_owned(),
                     );
                 }
             },
-            Hit::PaletteRow(item) => {
-                // Dismissed/replaced palettes drop the click.
-                if self.palette_open() {
-                    self.activate_palette_item(item);
-                }
-            }
+            // Dismissed/replaced palettes drop the click.
+            Hit::PaletteRow(item) if self.palette_open() => self.activate_palette_item(item),
             Hit::MenuOption { menu, index } => {
-                // Only the SAME menu the row was rendered for may answer.
-                let valid = self
+                // Only the SAME menu the row was rendered for may answer —
+                // and on the subagent screen that menu is the CHIP's card,
+                // which the session projection knows nothing about (review
+                // P2-7: chip-question clicks were silently dead).
+                if self.screen == Screen::Subagent {
+                    let card = self
+                        .viewed_chip()
+                        .and_then(ChipModel::question_menu)
+                        .filter(|m| m.id == menu && index < m.options.len())
+                        .cloned();
+                    if let Some(card) = card {
+                        self.menu_selection = index;
+                        self.answer_chip_menu(&card);
+                    }
+                } else if self
                     .projection
                     .open_menu()
-                    .is_some_and(|m| m.id == menu && index < m.options.len());
-                if valid {
+                    .is_some_and(|m| m.id == menu && index < m.options.len())
+                {
                     self.menu_selection = index;
                     self.submit_menu_answer();
                 }
             }
-            Hit::BackChip => {
-                if self.screen == Screen::Session {
-                    self.screen = Screen::Launcher;
-                }
+            Hit::BackChip if self.screen == Screen::Session => {
+                self.screen = Screen::Launcher;
+                // Leaving the session cancels a live talk hold (P1-3).
+                self.listening = false;
             }
             Hit::TalkChip => {
                 // ◉ talk (sim tui.js:2044-2054): idle-only. The hold is a
@@ -1944,7 +1995,12 @@ impl AppModel {
                 }
             }
             Hit::HelpHint => self.help_open = true,
-            Hit::ChipRow(agent) => {
+            // The SubTree panel exists only on the session/subagent screens,
+            // and its rows only while it is expanded.
+            Hit::ChipRow(agent)
+                if matches!(self.screen, Screen::Session | Screen::Subagent)
+                    && !self.subtree_collapsed =>
+            {
                 if let Some(path) = path_to_chip(&self.chips, &agent) {
                     self.view_path = path;
                     self.screen = Screen::Subagent;
@@ -1952,15 +2008,26 @@ impl AppModel {
                     self.scroll_back.set(0);
                 }
             }
-            Hit::SubTreeToggle => self.subtree_collapsed = !self.subtree_collapsed,
-            Hit::SessionHome => {
+            Hit::SubTreeToggle
+                if matches!(self.screen, Screen::Session | Screen::Subagent)
+                    && !self.chips.is_empty() =>
+            {
+                self.subtree_collapsed = !self.subtree_collapsed;
+            }
+            // The ⌂ home row and the ✕ close button belong to the subagent
+            // screen; ✕ closes only the chip actually being VIEWED.
+            Hit::SessionHome if self.screen == Screen::Subagent => {
                 self.screen = Screen::Session;
                 self.scroll_back.set(0);
             }
-            Hit::ChipCloseBtn(agent) => {
+            Hit::ChipCloseBtn(agent)
+                if self.screen == Screen::Subagent
+                    && self.view_path.last() == Some(&agent)
+                    && find_chip(&self.chips, &agent).is_some_and(|chip| !chip.closed) =>
+            {
                 self.requests.push(AppRequest::ChipClose { agent });
             }
-            Hit::ChipCrumb(path) => {
+            Hit::ChipCrumb(path) if self.screen == Screen::Subagent => {
                 if path.is_empty() {
                     self.screen = Screen::Session;
                 } else if path
@@ -1971,14 +2038,14 @@ impl AppModel {
                     self.screen = Screen::Subagent;
                 }
             }
-            Hit::AuraEngine => {
+            Hit::AuraEngine if self.screen == Screen::Aura => {
                 self.aura.realtime = !self.aura.realtime;
                 let label = self.aura.engine_label();
                 self.aura
                     .transcript
                     .push_note(format!("· engine hot-swapped → {label} · dialogue kept"));
             }
-            Hit::AuraMute => {
+            Hit::AuraMute if self.screen == Screen::Aura => {
                 self.aura.muted = !self.aura.muted;
                 self.aura.transcript.push_note(
                     if self.aura.muted {
@@ -1989,12 +2056,12 @@ impl AppModel {
                     .to_owned(),
                 );
             }
-            Hit::AuraExit => self.exit_aura(),
-            Hit::AuraTalkBtn => {
-                if self.aura.state == AuraState::Idle {
-                    self.aura.state = AuraState::Listening;
-                    self.requests.push(AppRequest::AuraTalk);
-                }
+            Hit::AuraExit if self.screen == Screen::Aura => self.exit_aura(),
+            Hit::AuraTalkBtn
+                if self.screen == Screen::Aura && self.aura.state == AuraState::Idle =>
+            {
+                self.aura.state = AuraState::Listening;
+                self.requests.push(AppRequest::AuraTalk);
             }
             Hit::StickyJump(scroll_back) => {
                 // Stay AT the producing prompt, and suppress the sticky
@@ -2004,6 +2071,8 @@ impl AppModel {
                 self.scroll_back.set(scroll_back.min(self.scroll_max.get()));
                 self.sticky_suppressed = true;
             }
+            // A hit whose owning surface is gone: dropped, never acted on.
+            _ => {}
         }
     }
 
@@ -2061,10 +2130,17 @@ impl AppModel {
                 }
             }
             Some(Hit::MenuOption { menu, index }) => {
-                let valid = self
-                    .projection
-                    .open_menu()
-                    .is_some_and(|m| m.id == menu && index < m.options.len());
+                // Hover moves the selection on BOTH card surfaces (sim
+                // `onMouseEnter` on `.imo`, tui.js:3093 — review P2-7).
+                let valid = if self.screen == Screen::Subagent {
+                    self.viewed_chip()
+                        .and_then(ChipModel::question_menu)
+                        .is_some_and(|m| m.id == menu && index < m.options.len())
+                } else {
+                    self.projection
+                        .open_menu()
+                        .is_some_and(|m| m.id == menu && index < m.options.len())
+                };
                 if valid {
                     self.menu_selection = index;
                 }

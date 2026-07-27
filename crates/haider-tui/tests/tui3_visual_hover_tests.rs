@@ -178,9 +178,11 @@ fn launcher_recent_rows_share_one_left_column_without_digits() {
     // Every row of the block starts at the SAME left column.
     let left = col_of(&rows[head_y as usize], "recent sessions");
     for needle in [
+        // TUI3.1 P2-8: liveness follows the SIM's seeds — the L1 session
+        // owns the running `web-index` chip, so it is the one live row.
         "● billing-service",
-        "◉ cellular-pool-fix",
-        "● l1-remote-projects",
+        "● cellular-pool-fix",
+        "◉ l1-remote-projects",
         "◉ Aura",
         "⚿ Accounts",
         "⇄ Peers",
@@ -303,12 +305,15 @@ fn hover_lights_launcher_rows_and_clears_off_target() {
     let (rows, hits, _) = draw(&model, 118, 34);
     let (rect, _) = hits
         .iter()
-        .find(|(_, h)| *h == Hit::AttachSample(0))
+        .find(|(_, h)| *h == Hit::AttachSample("billing-service".to_owned()))
         .expect("sample row hit");
     let row_y = rect.y;
     let (cx, cy) = rect_center(*rect);
     dispatch_input(&mut model, &hits, moved(cx, cy));
-    assert_eq!(model.hovered, Some(Hit::AttachSample(0)));
+    assert_eq!(
+        model.hovered,
+        Some(Hit::AttachSample("billing-service".to_owned()))
+    );
     assert!(model.dirty, "hover change dirties");
     let theme = model.theme.theme();
     let (_, _, terminal) = draw(&model, 118, 34);

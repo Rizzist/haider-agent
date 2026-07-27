@@ -422,8 +422,9 @@ fn typed_text_starts_a_session_and_requests_a_turn() {
     model.handle(key(KeyCode::Enter));
     assert_eq!(model.screen, Screen::Session);
     // fresh_session stops the old context first (review r3 P3-6). The
-    // freshly-set blurb rides the request — the driver owes the 1.5 s
-    // auto-title note (sim tui.js:1221-1227, TUI3b §1.0).
+    // request only ASKS for the micro-call: the driver names the session
+    // and pushes the note together 1.5 s later (sim tui.js:1219-1227,
+    // TUI3.1 P2-12).
     assert_eq!(
         model.requests,
         vec![
@@ -431,13 +432,14 @@ fn typed_text_starts_a_session_and_requests_a_turn() {
             AppRequest::SubmitText {
                 text: "refactor the parser".to_owned(),
                 voice: false,
-                title: Some("Refactor the parser".to_owned()),
+                title: true,
             }
         ]
     );
-    // Sim autoBlurb (G47) is the BLURB; the header + window title show the
-    // session's slug NAME (sim tui.js:2014-2016, TUI3b §4 step 7).
-    assert_eq!(model.session_title.as_deref(), Some("Refactor the parser"));
+    // Sim autoBlurb (G47) is the BLURB, applied by the 1.5 s callback; the
+    // header + window title show the session's slug NAME right away (sim
+    // tui.js:2014-2016, TUI3b §4 step 7).
+    assert_eq!(model.session_title, None, "not titled until the callback");
     assert_eq!(model.session_name.as_deref(), Some("refactor-the-parser"));
     assert_eq!(
         model.window_title(),
@@ -539,16 +541,17 @@ fn one_turn_at_a_time_across_digits_and_submits() {
 #[test]
 fn same_length_prompts_produce_distinct_turn_items() {
     use haider_tui::script::{Beat, respond_beats};
+    let counter = std::sync::atomic::AtomicU64::new;
     let mut projection = haider_tui::projection::SessionProjection::new();
-    let (mut generic, mut roster) = (0_u64, 3_u64);
+    let (generic, roster) = (counter(0), counter(3));
     for (text, turn) in [("aaa", 1_u64), ("bbb", 2)] {
         let beats = respond_beats(
             text,
             false,
             haider_protocol::DeliveryMode::Steer,
             turn,
-            &mut generic,
-            &mut roster,
+            &generic,
+            &roster,
         );
         for beat in beats {
             if let Beat::Emit(payload) = beat {
@@ -688,13 +691,14 @@ fn clicks_attach_sessions_and_wheel_scrolls() {
     ))));
     let (_, hits) = draw_with_hits(&model, 118, 34);
     assert!(
-        hits.iter().any(|(_, h)| *h == Hit::AttachSample(0)),
+        hits.iter()
+            .any(|(_, h)| *h == Hit::AttachSample("billing-service".to_owned())),
         "sample rows are clickable"
     );
     assert!(hits.iter().any(|(_, h)| *h == Hit::TalkChip));
     assert!(hits.iter().any(|(_, h)| *h == Hit::HelpHint));
 
-    model.handle_hit(Hit::AttachSample(2));
+    model.handle_hit(Hit::AttachSample("l1-remote-projects".to_owned()));
     assert!(model.turn_active);
     assert_eq!(model.session_head, ("Ali", "(a)"));
 

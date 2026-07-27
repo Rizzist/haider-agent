@@ -339,28 +339,34 @@ fn mid_turn_submit_flashes_and_echoes_a_note() {
 
 #[test]
 fn auto_title_uses_auto_blurb_and_notes_the_transcript() {
-    // TUI3b §1.0: the blurb is computed at submit and rides the request;
-    // the driver lands the sim's FULL note 1.5 s later (driver-timed path
-    // covered in turn_engine_tests). The header shows the slug, never the
-    // blurb.
+    // TUI3.1 P2-12: the request only ASKS for the micro-call; the driver
+    // names the session and pushes the sim's FULL note together 1.5 s later
+    // (driver-timed path covered in turn_engine_tests). The header shows
+    // the slug, never the blurb.
+    let text = "please fix the flaky boundary test suite before the release";
     let mut model = launcher_model();
-    for c in "please fix the flaky boundary test suite before the release".chars() {
+    for c in text.chars() {
         model.handle(key(KeyCode::Char(c)));
     }
     model.handle(key(KeyCode::Enter));
-    // Sim autoBlurb: first seven words, capitalized.
+    // Sim autoBlurb: first seven words, capitalized — but the micro-call
+    // NAMES the session inside its own 1.5 s callback (tui.js:1219-1227),
+    // so nothing is titled at submit (review P2-12).
     assert_eq!(
-        model.session_title.as_deref(),
-        Some("Please fix the flaky boundary test suite")
+        haider_tui::app::auto_blurb(text),
+        "Please fix the flaky boundary test suite"
+    );
+    assert_eq!(
+        model.session_title, None,
+        "titled by the callback, not at submit"
     );
     assert_eq!(model.session_name.as_deref(), Some("please-fix-the"));
     assert!(
         model.requests.iter().any(|request| matches!(
             request,
-            haider_tui::app::AppRequest::SubmitText { title: Some(blurb), .. }
-                if blurb == "Please fix the flaky boundary test suite"
+            haider_tui::app::AppRequest::SubmitText { title: true, .. }
         )),
-        "the fresh blurb rides the request for the driver's 1.5 s note"
+        "the request asks the driver to schedule the 1.5 s micro-call"
     );
     let (rows, _, _) = draw(&model, 140, 34);
     assert!(

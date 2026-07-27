@@ -163,14 +163,17 @@ fn main() {
     todos_model.handle(AppEvent::Envelope(Box::new(ready.clone())));
     submit(&mut todos_model, "plan todo the harness work");
     todos_model.requests.clear();
-    let (mut generic, mut roster) = (0, 3);
+    let (generic, roster) = (
+        std::sync::atomic::AtomicU64::new(0),
+        std::sync::atomic::AtomicU64::new(3),
+    );
     let beats = haider_tui::script::respond_beats(
         "plan todo the harness work",
         false,
         haider_protocol::DeliveryMode::Steer,
         1,
-        &mut generic,
-        &mut roster,
+        &generic,
+        &roster,
     );
     let mut tools_done = 0;
     for beat in &beats {
@@ -268,14 +271,17 @@ fn main() {
     sub_model.requests.clear();
     // Replay the parent turn's own envelopes so the transcript above the
     // panel is the real §1.1 branch (the chips below are hand-seeded).
-    let (mut sub_generic, mut sub_roster) = (0, 3);
+    let (sub_generic, sub_roster) = (
+        std::sync::atomic::AtomicU64::new(0),
+        std::sync::atomic::AtomicU64::new(3),
+    );
     for beat in &haider_tui::script::respond_beats(
         "use two subagents to split this work",
         false,
         haider_protocol::DeliveryMode::Steer,
         1,
-        &mut sub_generic,
-        &mut sub_roster,
+        &sub_generic,
+        &sub_roster,
     ) {
         if let haider_tui::script::Beat::Emit(payload) = beat {
             sub_model.handle(AppEvent::Envelope(Box::new(payload.clone())));
@@ -449,6 +455,11 @@ fn main() {
     aura_model.handle_hit(Hit::AuraEngine);
     aura_model.handle_hit(Hit::AuraMute);
     dump(&aura_model, "aura stage — engine swapped · audio muted");
+    // TUI3.1 P1-6: the aura stage joins the sacred-row ladder — chrome
+    // sheds in order and the composer's cursor row survives every size.
+    dump_at(&aura_model, "aura @ 90×10 (columns shed)", 90, 10);
+    dump_at(&aura_model, "aura @ 90×5 (orb shed, bar intact)", 90, 5);
+    dump_at(&aura_model, "aura @ 90×1 (cursor row only)", 90, 1);
 }
 
 /// Build one chip straight from a seed (the driver's `ChipAdd` path). The

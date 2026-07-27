@@ -105,16 +105,17 @@ fn menu_model() -> AppModel {
 fn launcher_row_hits_align_with_their_rendered_rows() {
     let model = launcher_model();
     let (rows, hits, _) = draw(&model, 118, 34);
-    for (index, name) in ["billing-service", "cellular-pool-fix", "l1-remote-projects"]
-        .into_iter()
-        .enumerate()
-    {
-        let rect = rect_for(&hits, Hit::AttachSample(index));
+    for name in ["billing-service", "cellular-pool-fix", "l1-remote-projects"] {
+        let rect = rect_for(&hits, Hit::AttachSample(name.to_owned()));
         assert_eq!(rect.y, row_of(&rows, name), "sample row {name} aligned");
         assert_eq!(rect.height, 1);
     }
-    for (order, name) in ["Aura", "Accounts", "Peers"].into_iter().enumerate() {
-        let rect = rect_for(&hits, Hit::ExtraRow(u8::try_from(order).expect("order")));
+    for (row, name) in [
+        (haider_tui::app::LauncherRow::Aura, "Aura"),
+        (haider_tui::app::LauncherRow::Accounts, "Accounts"),
+        (haider_tui::app::LauncherRow::Peers, "Peers"),
+    ] {
+        let rect = rect_for(&hits, Hit::ExtraRow(row));
         assert_eq!(rect.y, row_of(&rows, name), "extra row {name} aligned");
     }
 }

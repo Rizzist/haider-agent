@@ -4,7 +4,7 @@
 //! Visual authority: the `/tui` sim — typography, chips, and row shapes are
 //! copied from it deliberately.
 
-use crate::app::{AppModel, Hit, Screen};
+use crate::app::{AppModel, Hit, LauncherRow, Screen};
 use crate::boot::{boot_subline, check_rows, launcher_subline};
 use crate::commands::{HELP_TEXT, PALETTE_MAX_ROWS};
 use crate::format::{METER_CELLS_DEFAULT, fmt_tok, meter_cells};
@@ -36,25 +36,25 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
     // input — a blocking menu's options OR the composer's cursor row
     // (review r5 P2-1 + r6 P2-1) — cannot otherwise fit. Minimal need
     // with the full 4-row chrome is status(1) + chrome(4) + floor.
-    let status_height: u16 = if matches!(model.screen, Screen::Session | Screen::Subagent) {
-        let input_floor = if model.screen == Screen::Session {
-            model
-                .projection
-                .open_menu()
-                .map_or(1, |menu| menu.options.len())
-        } else {
-            model
-                .viewed_chip()
-                .and_then(crate::app::ChipModel::question_menu)
-                .map_or(1, |menu| menu.options.len())
-        };
-        if (area.height as usize) < 1 + 4 + input_floor {
-            0
-        } else {
-            1
+    let status_height: u16 = match model.screen {
+        // Aura joins the same ladder (review P1-6): its composer's cursor
+        // row is sacred, so the status row yields before the stage can
+        // squeeze it out. Minimal need = status + bar + 2 rules + floor.
+        Screen::Session | Screen::Subagent | Screen::Aura => {
+            let input_floor = match model.screen {
+                Screen::Session => model
+                    .projection
+                    .open_menu()
+                    .map_or(1, |menu| menu.options.len()),
+                Screen::Subagent => model
+                    .viewed_chip()
+                    .and_then(crate::app::ChipModel::question_menu)
+                    .map_or(1, |menu| menu.options.len()),
+                _ => 1,
+            };
+            u16::from((area.height as usize) >= 1 + 4 + input_floor)
         }
-    } else {
-        1
+        Screen::Boot | Screen::Launcher => 1,
     };
     let [body, status] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(status_height)]).areas(area);
@@ -325,8 +325,9 @@ fn render_launcher(
     // min(560px, 92%)); every line pads to it so per-line centering yields
     // one shared left edge and hover bands span the full column.
     let area_cap = (area.width as usize).saturating_sub(4).max(10);
-    // Sim `.rhead` verbatim + gold `· N running` (`.livehd`).
-    let running = model.samples.iter().filter(|s| s.running).count();
+    // Sim `.rhead` verbatim + gold `· N running` (`.livehd`). The count is
+    // `sessionBusy` = live subagents OR a busy run state (tui.js:789-792).
+    let running = model.samples.iter().filter(|s| s.busy()).count();
     let mut rhead = vec![Span::styled(
         "recent sessions — click to attach · /sessions for all",
         theme.dim_style(),
@@ -343,7 +344,8 @@ fn render_launcher(
         // Sim row anatomy (tui.js:3252-3277): dot (ok; gold running) ·
         // name BRIGHT bold · `▸ head hon` DIM (.hd) · meta DIM ellipsized.
         // No digit prefix (the 1-3 keys stay as silent bindings).
-        let (dot, dot_style) = if sample.running {
+        let busy = sample.busy();
+        let (dot, dot_style) = if busy {
             ("◉", theme.gold_style())
         } else {
             ("●", theme.ok_style())
@@ -361,7 +363,15 @@ fn render_launcher(
                 theme.dim_style(),
             ),
         ];
-        if sample.running {
+        // Sim `.live` (tui.js:3259-3266): live subagents name themselves;
+        // a busy session WITHOUT chips falls back to `running… · `.
+        if sample.live_subagents > 0 {
+            let plural = if sample.live_subagents > 1 { "s" } else { "" };
+            spans.push(Span::styled(
+                format!("  {} live subagent{plural} ·", sample.live_subagents),
+                theme.gold_style(),
+            ));
+        } else if busy {
             spans.push(Span::styled("  running… ·", theme.gold_style()));
         }
         let meta = format!(
@@ -385,28 +395,41 @@ fn render_launcher(
             ellipsize(&meta, meta_budget),
             theme.dim_style(),
         ));
-        recent.push((spans, Some(Hit::AttachSample(index))));
+        recent.push((spans, Some(Hit::AttachSample(sample.name.to_owned()))));
+        let _ = index;
     }
-    for (order, (glyph, name, blurb)) in [
+    // Sim `.aurarow` metas VERBATIM (tui.js:3278-3300) — the earlier port
+    // abbreviated all three (review P2-8). The Accounts/Peers counts come
+    // from the sim's own seed lists (4 credentials across 3 providers;
+    // 2 host-capable nodes of the 3 seeded — the shell rung is excluded).
+    for (row, glyph, name, blurb) in [
         (
+            LauncherRow::Aura,
             "◉",
             "Aura",
-            "voice session · orchestrator — spawns & steers, never codes",
+            "voice session · orchestrator — spawns & steers sessions across devices, never codes"
+                .to_owned(),
         ),
         (
+            LauncherRow::Accounts,
             "⚿",
             "Accounts",
-            "provider credentials — OAuth & API keys, harness-owned",
+            format!(
+                "provider credentials — OAuth & API keys, harness-owned · {} across {} providers",
+                crate::mock::SEED_ACCOUNTS,
+                crate::mock::SEED_ACCOUNT_PROVIDERS
+            ),
         ),
         (
+            LauncherRow::Peers,
             "⇄",
             "Peers",
-            "reachability ladder — peers · sponsored nodes · shells",
+            format!(
+                "reachability ladder — enrolled peers · sponsored SSH nodes · shell targets · {} host-capable",
+                crate::mock::SEED_HOST_CAPABLE_PEERS
+            ),
         ),
-    ]
-    .into_iter()
-    .enumerate()
-    {
+    ] {
         // Sim `.aurarow` (tui.js:4403-4413): gold glyph, gold name, dim
         // meta — its frame border-top rule is inserted in pass 2.
         let spans = vec![
@@ -420,7 +443,7 @@ fn render_launcher(
                 theme.dim_style(),
             ),
         ];
-        recent.push((spans, Some(Hit::ExtraRow(u8::try_from(order).unwrap_or(2)))));
+        recent.push((spans, Some(Hit::ExtraRow(row))));
     }
     // Pass 2: one shared column = widest row, capped by the frame.
     let column = recent
@@ -429,8 +452,8 @@ fn render_launcher(
         .max()
         .unwrap_or(10)
         .clamp(10, area_cap);
-    let mut sample_rows: Vec<(usize, usize)> = Vec::new();
-    let mut extra_rows: Vec<usize> = Vec::new();
+    let mut sample_rows: Vec<(usize, String)> = Vec::new();
+    let mut extra_rows: Vec<(usize, LauncherRow)> = Vec::new();
     for (spans, hit) in recent {
         if matches!(hit, Some(Hit::ExtraRow(_))) {
             // The `.aurarow` frame border-top, spanning the column.
@@ -441,9 +464,9 @@ fn render_launcher(
         if hit.is_some() && model.hovered == hit {
             line = line.style(theme.hover_style());
         }
-        match hit {
-            Some(Hit::AttachSample(index)) => sample_rows.push((lines.len(), index)),
-            Some(Hit::ExtraRow(_)) => extra_rows.push(lines.len()),
+        match &hit {
+            Some(Hit::AttachSample(name)) => sample_rows.push((lines.len(), name.clone())),
+            Some(Hit::ExtraRow(row)) => extra_rows.push((lines.len(), *row)),
             _ => {}
         }
         lines.push(line);
@@ -468,20 +491,17 @@ fn render_launcher(
     }
     let (middle, dropped) = centered(frame, content_area, lines);
     let visible = |row: usize| row.checked_sub(dropped);
-    for (row, index) in sample_rows {
+    for (row, name) in sample_rows {
         if let Some(row) = visible(row) {
             hits.push((
                 row_rect(content_area, middle.y, row),
-                Hit::AttachSample(index),
+                Hit::AttachSample(name),
             ));
         }
     }
-    for (order, row) in extra_rows.into_iter().enumerate() {
+    for (row, which) in extra_rows {
         if let Some(row) = visible(row) {
-            hits.push((
-                row_rect(content_area, middle.y, row),
-                Hit::ExtraRow(u8::try_from(order).unwrap_or(2)),
-            ));
+            hits.push((row_rect(content_area, middle.y, row), Hit::ExtraRow(which)));
         }
     }
     if palette_height > 0 {
@@ -1370,18 +1390,63 @@ fn render_aura(
     hits: &mut Vec<(Rect, Hit)>,
 ) {
     let aura = &model.aura;
+    // ---- Sacred-row ledger (review P1-6) ----
+    // The composer's CURSOR row is sacred here exactly as it is on the
+    // session and subagent screens: the stage may never render a composer
+    // the user cannot see while it still accepts typing. Shed order under
+    // pressure, first to go → last:
+    //
+    //   gap → columns → orb → the transcript's sacred row →
+    //   bar rule + input rule → the ◉ AURA bar → (never) the cursor row
+    //
+    // Every shed region also stops emitting hits (the bar chips and the
+    // hold-to-talk button are gated on their own area heights), so nothing
+    // stays clickable once it stops being painted.
     let left_rows = 1 + aura.roster.len().max(1);
     let right_rows = 1 + aura.log.len().min(7);
     let mut columns_h = u16::try_from(left_rows.max(right_rows)).unwrap_or(8).min(8);
     let mut orb_h: u16 = 4;
-    // Small windows: columns shed first, then the orb — the composer and
-    // transcript row survive.
-    if area.height < orb_h + columns_h + 7 {
+    let mut transcript_min: u16 = 1;
+    let mut gap: u16 = 1;
+    let mut bar_h: u16 = 1;
+    let mut bar_rule_h: u16 = 1;
+    let mut input_rule_h: u16 = 1;
+    let composer_want = composer_height(model).max(1);
+    let over =
+        |bar: u16, rules: u16, extras: u16| area.height.saturating_sub(bar + rules + extras) < 1;
+    if over(
+        bar_h,
+        bar_rule_h + input_rule_h,
+        gap + columns_h + orb_h + transcript_min,
+    ) {
+        gap = 0;
+    }
+    if over(
+        bar_h,
+        bar_rule_h + input_rule_h,
+        columns_h + orb_h + transcript_min,
+    ) {
         columns_h = 0;
     }
-    if area.height < orb_h + 7 {
+    if over(bar_h, bar_rule_h + input_rule_h, orb_h + transcript_min) {
         orb_h = 0;
     }
+    if over(bar_h, bar_rule_h + input_rule_h, transcript_min) {
+        transcript_min = 0;
+    }
+    if over(bar_h, bar_rule_h + input_rule_h, 0) {
+        bar_rule_h = 0;
+        input_rule_h = 0;
+    }
+    if over(bar_h, 0, 0) {
+        bar_h = 0;
+    }
+    let composer_h = composer_want
+        .min(area.height.saturating_sub(
+            bar_h + bar_rule_h + input_rule_h + gap + columns_h + orb_h + transcript_min,
+        ))
+        .max(1)
+        .clamp(1, area.height.max(1));
     let [
         bar_area,
         bar_rule,
@@ -1392,14 +1457,14 @@ fn render_aura(
         composer_area,
         _gap,
     ] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(1),
+        Constraint::Length(bar_h),
+        Constraint::Length(bar_rule_h),
         Constraint::Length(orb_h),
         Constraint::Length(columns_h),
-        Constraint::Min(1),
-        Constraint::Length(1),
-        Constraint::Length(composer_height(model)),
-        Constraint::Length(1),
+        Constraint::Min(transcript_min),
+        Constraint::Length(input_rule_h),
+        Constraint::Length(composer_h),
+        Constraint::Length(gap),
     ])
     .areas(area);
 
@@ -1476,7 +1541,7 @@ fn render_aura(
     );
 
     // ---- Orb block ----
-    if orb_h > 0 {
+    if orb_area.height > 0 {
         let talk_label = if aura.state == crate::script::AuraState::Listening {
             "◉ listening…"
         } else {
@@ -1523,7 +1588,7 @@ fn render_aura(
     }
 
     // ---- Two columns: controlled sessions / activity ----
-    if columns_h > 0 {
+    if columns_area.height > 0 {
         let [left_area, right_area] =
             Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
                 .areas(columns_area);

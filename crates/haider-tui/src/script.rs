@@ -31,9 +31,21 @@ pub enum DemoEvent {
     /// End-of-turn law (sim `finishTurn`, tui.js:1507-1543): queued input
     /// consumes directly (never idle) → auto-compaction check → IDLE.
     TurnEnd,
+    /// The think window closed — the driver picks the branch NOW (sim
+    /// tui.js:1259), so the generic/roster counters advance only for turns
+    /// that actually survive it (review P2-11).
+    Dispatch {
+        text: String,
+        voice: bool,
+        turn: u64,
+    },
+    /// The 1.5 s auto-title micro-call returned: the driver names the
+    /// session and pushes the note TOGETHER, inside the callback (sim
+    /// tui.js:1219-1227, review P2-12).
+    AutoTitle(String),
     /// The ◉ talk hold finished — submit the canned voice phrase.
     TalkFire,
-    // ---- Chip events (§2), tagged with the CHIP guard's generation ----
+    // ---- Chip events (§2), tagged with the owning chip's arm ----
     ChipAdd(Box<ChipSeed>),
     ChipState {
         agent: String,
@@ -114,6 +126,14 @@ pub enum Beat {
     /// Reset the token meter to exactly `n` (post-compaction: 6% of window).
     TokensReset(u64),
     Voice(bool),
+    /// Hand the branch choice back to the driver once the think window has
+    /// closed (review P2-11 — the sim evaluates `low` AFTER `await
+    /// sleep(750)`, tui.js:1254-1260).
+    Dispatch {
+        text: String,
+        voice: bool,
+        turn: u64,
+    },
     /// Park until this menu is answered; the answer's `option_index`
     /// selects the continuation arm (extra indexes clamp to the last arm).
     AwaitMenu {
@@ -175,9 +195,13 @@ pub enum Beat {
     ChipClose {
         agent: String,
     },
-    /// Play a concurrent child script (childRunTests/Docs, nested child) —
-    /// the parent beat stream continues immediately.
-    ChipScript(Vec<Beat>),
+    /// Play a concurrent child script (childRunTests/Docs, nested child) on
+    /// the named chip's OWN arm — the parent beat stream continues
+    /// immediately, and closing that chip stops exactly this script.
+    ChipScript {
+        agent: String,
+        beats: Vec<Beat>,
+    },
     /// Sim `autoResumeParent` (§2.7): a 120 ms deferred, guard-checked
     /// resume of the parked parent turn.
     AutoResume,
@@ -342,6 +366,9 @@ pub const DEFERRED_CALLBACK_MS: u64 = 2600;
 pub const RATE_RESET_MS: u64 = 3000;
 pub const COMPACT_AUTO_MS: u64 = 1400;
 pub const COMPACT_MANUAL_MS: u64 = 1200;
+/// The sim's transient `IDLE → 30 ms → COMPACTING` window before an
+/// auto-compaction (tui.js:1507-1519, review P2-13).
+pub const COMPACT_IDLE_GAP_MS: u64 = 30;
 pub const TALK_HOLD_MS: u64 = 1300;
 /// The ◉ talk canned phrase (tui.js:2050).
 pub const TALK_PHRASE: &str = "walk me through the harness entrypoints";
@@ -454,29 +481,64 @@ pub fn roster_at(index: u64) -> RosterName {
 pub const ROSTER_FIRST_CLAIM: u64 = 3;
 
 /// `claimName()` — reads the roster at the counter, then post-increments.
-pub fn claim_name(counter: &mut u64) -> RosterName {
-    let name = roster_at(*counter);
-    *counter += 1;
-    name
+/// The counter is SHARED (an `AtomicU64` on the driver) so a callsign is
+/// burned exactly when the sim burns it: at branch dispatch, never while a
+/// script is merely being built (review P2-11).
+pub fn claim_name(counter: &std::sync::atomic::AtomicU64) -> RosterName {
+    roster_at(counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
 }
 
-/// Word-boundary test matching JS `\b` (word chars = [A-Za-z0-9_]).
+/// The sim's token unit: JS `String.length` counts UTF-16 CODE UNITS, so a
+/// non-BMP emoji is 2 units (18 tokens at 9/unit), not 1 scalar (review
+/// P2-11 — the Rust port used to count Unicode scalars).
+fn js_len(text: &str) -> u64 {
+    text.encode_utf16().count() as u64
+}
+
+/// `round(len * rate)` on the sim's UTF-16 length.
+fn js_tokens(text: &str, rate: u64) -> u64 {
+    js_len(text).saturating_mul(rate)
+}
+
+/// True when `haystack[at + needle.len()..]` starts on a JS `\b` boundary
+/// (word chars = `[A-Za-z0-9_]`).
+fn trailing_boundary(haystack: &str, end: usize) -> bool {
+    end >= haystack.len()
+        || !haystack[end..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn leading_boundary(haystack: &str, at: usize) -> bool {
+    at == 0
+        || !haystack[..at]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// JS `/\bNEEDLE\b/` — boundaries on BOTH sides (`\bprod\b`, `\bpush\b`,
+/// `\b429\b`).
 fn word_match(haystack: &str, needle: &str) -> bool {
+    scan(haystack, needle, true, true)
+}
+
+/// JS `/NEEDLE\b/` — a TRAILING boundary only, so "ascii" matches `ci\b`
+/// and "the subagents" matches `subagents\b` mid-word-start (review P2-11:
+/// requiring a leading boundary routed "ascii" to the generic branch while
+/// the sim routes it to the test branch).
+fn suffix_match(haystack: &str, needle: &str) -> bool {
+    scan(haystack, needle, false, true)
+}
+
+fn scan(haystack: &str, needle: &str, lead: bool, trail: bool) -> bool {
     let mut start = 0;
     while let Some(pos) = haystack[start..].find(needle) {
         let at = start + pos;
-        let before_ok = at == 0
-            || !haystack[..at]
-                .chars()
-                .next_back()
-                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
-        let after = at + needle.len();
-        let after_ok = after >= haystack.len()
-            || !haystack[after..]
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
-        if before_ok && after_ok {
+        let end = at + needle.len();
+        if (!lead || leading_boundary(haystack, at)) && (!trail || trailing_boundary(haystack, end))
+        {
             return true;
         }
         start = at + needle.len();
@@ -595,9 +657,10 @@ impl B {
                     text: token.clone(),
                 },
             }));
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let n = ((token.chars().count() as f64) * 9.0).round() as u64;
-            self.beats.push(Beat::Tokens { n, output: true });
+            self.beats.push(Beat::Tokens {
+                n: js_tokens(&token, 9),
+                output: true,
+            });
             self.sleep(pace_ms);
         }
         self.emit(EventPayload::Item(ItemEvent::Completed {
@@ -680,23 +743,20 @@ fn split_word_tokens(text: &str) -> Vec<String> {
     tokens
 }
 
-/// Build the full respond() turn for user text (sim tui.js:1191-1546).
-/// `generic_counter` is the sim's `genRef`: the generic branch
-/// post-increments; the test branch reads without incrementing.
-/// `roster_counter` is the sim's `rosterRef` (claims post-increment).
-/// `mode` rides the UserMessage envelope (queued turns carry `Queue`).
+/// The turn PREAMBLE (sim tui.js:1254-1260): the user row, its tokens,
+/// THINKING for 750 ms, STREAMING — then `Dispatch`, which hands the branch
+/// choice back to the driver. Splitting here is what makes the sim's
+/// ordering exact: `low` is only examined after the think window, so an
+/// interrupt inside it burns neither a GENERIC intro nor a roster callsign
+/// (review P2-11).
 #[must_use]
-pub fn respond_beats(
+pub fn respond_preamble(
     user_text: &str,
     voice: bool,
     mode: haider_protocol::DeliveryMode,
     turn: u64,
-    generic_counter: &mut u64,
-    roster_counter: &mut u64,
 ) -> Vec<Beat> {
-    let low = user_text.to_lowercase();
     let mut b = B::new(turn);
-
     if voice {
         b.beats.push(Beat::Voice(true));
     } else {
@@ -707,19 +767,43 @@ pub fn respond_beats(
             mode,
         });
     }
-    // Preamble (tui.js:1254-1260): user tokens · THINKING 750 · STREAMING.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let user_tokens = ((user_text.chars().count() as f64) * 9.0).round() as u64;
     b.beats.push(Beat::Tokens {
-        n: user_tokens,
+        n: js_tokens(user_text, 9),
         output: false,
     });
     b.state(RunState::Thinking);
     b.sleep(THINK_MS);
     b.streaming();
+    b.beats.push(Beat::Dispatch {
+        text: user_text.to_owned(),
+        voice,
+        turn,
+    });
+    b.beats
+}
 
+/// Build the branch body for user text (sim tui.js:1262-1546), chosen at
+/// DISPATCH time. `generic` is the sim's `genRef` (the generic branch
+/// post-increments; the test branch reads without incrementing) and
+/// `roster` is `rosterRef` (claims post-increment) — both shared counters
+/// so they advance exactly when the sim's do.
+#[must_use]
+pub fn respond_branch(
+    user_text: &str,
+    voice: bool,
+    turn: u64,
+    generic: &std::sync::atomic::AtomicU64,
+    roster: &std::sync::atomic::AtomicU64,
+) -> Vec<Beat> {
+    use std::sync::atomic::Ordering::SeqCst;
+    let low = user_text.to_lowercase();
+    let mut b = B::new(turn);
+    // The branch body re-enters STREAMING ids after the preamble's, so
+    // start the sequence past them (the preamble emitted none).
+    // Branch 1's own gate is a BARE /subagent/ (tui.js:1262) — only the
+    // PLURAL detection carries `\b` (see `branch_subagent`).
     if low.contains("subagent") {
-        branch_subagent(&mut b, &low, roster_counter);
+        branch_subagent(&mut b, &low, roster);
     } else if ["crash", "unstable", "unreliable", "corrupt"]
         .iter()
         .any(|k| low.contains(k))
@@ -735,7 +819,7 @@ pub fn respond_beats(
         .iter()
         .any(|k| low.contains(k))
     {
-        branch_auth(&mut b, roster_counter);
+        branch_auth(&mut b, roster);
     } else if [
         "custom tool",
         "preview env",
@@ -746,31 +830,48 @@ pub fn respond_beats(
     .any(|k| low.contains(k))
     {
         branch_custom_tool(&mut b);
-    } else if ["test", "flake", "fail"].iter().any(|k| low.contains(k)) || word_match(&low, "ci") {
-        branch_test(&mut b, *generic_counter);
+    } else if ["test", "flake", "fail"].iter().any(|k| low.contains(k)) || suffix_match(&low, "ci")
+    {
+        branch_test(&mut b, generic.load(SeqCst));
     } else if rate_limit_match(&low) || word_match(&low, "429") || low.contains("quota") {
         branch_rate_limit(&mut b);
     } else if low.contains("plan todo") {
         branch_plan_todo(&mut b);
     } else {
-        let index = *generic_counter;
-        *generic_counter += 1;
-        branch_generic(&mut b, user_text, &low, index);
+        branch_generic(&mut b, user_text, &low, generic.fetch_add(1, SeqCst));
     }
-
-    if voice {
-        b.beats.push(Beat::Voice(false));
-    }
+    let _ = voice;
+    // NB: no trailing `Voice(false)` beat — a branch that parks on
+    // `AwaitMenu` never reaches it, which left later ordinary rows tagged
+    // `♪ speaking` (review P2-10). The voice tag now clears where it truly
+    // ends: on the turn's TERMINAL run state, in the reducer.
     b.beats.push(Beat::TurnEnd);
     b.beats
+}
+
+/// The full turn (preamble + branch) — kept for the beat-level tests and
+/// any caller that does not need the dispatch split.
+#[must_use]
+pub fn respond_beats(
+    user_text: &str,
+    voice: bool,
+    mode: haider_protocol::DeliveryMode,
+    turn: u64,
+    generic: &std::sync::atomic::AtomicU64,
+    roster: &std::sync::atomic::AtomicU64,
+) -> Vec<Beat> {
+    let mut beats = respond_preamble(user_text, voice, mode, turn);
+    beats.pop(); // the Dispatch marker
+    beats.extend(respond_branch(user_text, voice, turn, generic, roster));
+    beats
 }
 
 /// §1.1 `/subagent/` (tui.js:1262-1290): the parent turn spawns LIVE
 /// chips; `childRunTests`/`childRunDocs` play CONCURRENTLY while the
 /// parent keeps going — the turn ends with children still running, so the
 /// derived `◔ WAITING · N subagent(s)` badge takes over (§2.6).
-fn branch_subagent(b: &mut B, low: &str, roster_counter: &mut u64) {
-    let plural = word_match(low, "subagents");
+fn branch_subagent(b: &mut B, low: &str, roster_counter: &std::sync::atomic::AtomicU64) {
+    let plural = suffix_match(low, "subagents");
     let tests_name = claim_name(roster_counter);
     let tests_agent = format!("t{}-tests", b.turn);
     let docs_name = if plural {
@@ -810,8 +911,10 @@ fn branch_subagent(b: &mut B, low: &str, roster_counter: &mut u64) {
         tokens: 1200,
         prefill: vec![],
     })));
-    b.beats
-        .push(Beat::ChipScript(child_run_tests(&tests_agent, b.turn)));
+    b.beats.push(Beat::ChipScript {
+        agent: tests_agent.clone(),
+        beats: child_run_tests(&tests_agent, b.turn),
+    });
     if let Some(docs_name) = &docs_name {
         let docs_agent = format!("t{}-docs", b.turn);
         b.tool(
@@ -834,8 +937,10 @@ fn branch_subagent(b: &mut B, low: &str, roster_counter: &mut u64) {
             tokens: 900,
             prefill: vec![],
         })));
-        b.beats
-            .push(Beat::ChipScript(child_run_docs(&docs_agent, b.turn)));
+        b.beats.push(Beat::ChipScript {
+            agent: docs_agent.clone(),
+            beats: child_run_docs(&docs_agent, b.turn),
+        });
     }
     b.streaming();
     b.stream(
@@ -993,7 +1098,7 @@ fn branch_prod(b: &mut B) {
 /// §1.4 `/auth|deleg|split|machin|device/` (tui.js:1345-1378): the
 /// hetzner-1 chip is PRE-SEEDED (added before the spawn tool, transcript
 /// pre-filled) and stepped tool → done between the parent's beats.
-fn branch_auth(b: &mut B, roster_counter: &mut u64) {
+fn branch_auth(b: &mut B, roster_counter: &std::sync::atomic::AtomicU64) {
     let auth_name = claim_name(roster_counter);
     let auth_agent = format!("t{}-auth", b.turn);
     b.stream(&format!(
@@ -1357,8 +1462,12 @@ fn option(key: &str, label: &str) -> MenuOption {
 /// Auto-compaction beats (§5): shared by the 85% auto path (1400 ms) and
 /// `/compact` (1200 ms). `finish` re-enters the turn-end law for auto;
 /// manual ends at IDLE directly.
+/// `seq` makes the compaction item id UNIQUE per run: `/compact` twice
+/// without token growth used to reuse `compact-{before}`, and the
+/// projection — which permanently rejects closed item ids — dropped the
+/// second row (review P2-13).
 #[must_use]
-pub fn compaction_beats(before: u64, after: u64, manual: bool) -> Vec<Beat> {
+pub fn compaction_beats(before: u64, after: u64, manual: bool, seq: u64) -> Vec<Beat> {
     let mut beats = Vec::new();
     if !manual {
         beats.push(Beat::Note(
@@ -1372,7 +1481,7 @@ pub fn compaction_beats(before: u64, after: u64, manual: bool) -> Vec<Beat> {
         COMPACT_AUTO_MS
     }));
     beats.push(Beat::Emit(EventPayload::Item(ItemEvent::Completed {
-        item_id: ItemId::new(format!("compact-{before}")),
+        item_id: ItemId::new(format!("compact-{seq}")),
         item: TurnItem::ContextCompaction {
             summary_artifact: haider_protocol::ids::ArtifactRef::new("blake3:demo-compact"),
             tokens_before: Some(before),
@@ -1411,8 +1520,15 @@ pub fn from_legacy(payloads: Vec<EventPayload>) -> Vec<Beat> {
 // ---- §2 chip scripts (chipOps, tui.js:898-1074) ----
 
 /// cStream: 18 ms/word, chip tokens `round(len*8)` ONCE at stream end.
-fn chip_stream(beats: &mut Vec<Beat>, agent: &str, id: &str, text: &str) {
-    let item_id = ItemId::new(format!("{agent}-{id}"));
+///
+/// `ns` is the chip's PER-TURN id namespace (`{agent}-t{turn}`). The sim
+/// mints a fresh `nid()` per row (tui.js:900); the Rust port derived ids
+/// from the agent plus a fixed suffix, so a SECOND message to the same chip
+/// reused `…-g1`/`…-n2` — and the projection, which permanently rejects
+/// closed item ids, silently dropped every assistant and tool row of that
+/// turn (review P1-4). The namespace mirrors the main engine's `t{turn}-`.
+fn chip_stream(beats: &mut Vec<Beat>, agent: &str, ns: &str, id: &str, text: &str) {
+    let item_id = ItemId::new(format!("{ns}-{id}"));
     beats.push(Beat::ChipEmit {
         agent: agent.to_owned(),
         payload: EventPayload::Item(ItemEvent::Started {
@@ -1441,11 +1557,9 @@ fn chip_stream(beats: &mut Vec<Beat>, agent: &str, id: &str, text: &str) {
             },
         }),
     });
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let n = ((text.chars().count() as f64) * 8.0).round() as u64;
     beats.push(Beat::ChipTokens {
         agent: agent.to_owned(),
-        n,
+        n: js_tokens(text, 8),
     });
 }
 
@@ -1454,6 +1568,7 @@ fn chip_stream(beats: &mut Vec<Beat>, agent: &str, id: &str, text: &str) {
 fn chip_tool(
     beats: &mut Vec<Beat>,
     agent: &str,
+    ns: &str,
     id: &str,
     name: &str,
     desc: &str,
@@ -1461,7 +1576,7 @@ fn chip_tool(
     meta: &str,
     ok: bool,
 ) {
-    let item_id = ItemId::new(format!("{agent}-{id}"));
+    let item_id = ItemId::new(format!("{ns}-{id}"));
     beats.push(Beat::ChipEmit {
         agent: agent.to_owned(),
         payload: EventPayload::Item(ItemEvent::Started {
@@ -1529,12 +1644,10 @@ fn chip_question_menu(
     text: &str,
     options: &[&str],
 ) -> MenuId {
-    beats.push(Beat::ChipQuestion {
-        agent: agent.to_owned(),
-        recovery,
-        text: text.to_owned(),
-        options: options.iter().map(|o| (*o).to_owned()).collect(),
-    });
+    // ORDER MATTERS: the protocol card opens FIRST, then the atomic
+    // state+question patch. `ChipModel::question_menu` gates on all three,
+    // so the card becomes visible exactly once — an observer can never
+    // catch `input_required` with its question but without its menu.
     let menu_id = MenuId::new(format!("{agent}-q"));
     let kind = if recovery {
         MenuKind::Recovery {
@@ -1564,6 +1677,12 @@ fn chip_question_menu(
             timeout_option: None,
         }),
     });
+    beats.push(Beat::ChipQuestion {
+        agent: agent.to_owned(),
+        recovery,
+        text: text.to_owned(),
+        options: options.iter().map(|o| (*o).to_owned()).collect(),
+    });
     menu_id
 }
 
@@ -1571,17 +1690,20 @@ fn chip_question_menu(
 /// question; the answer arm finishes the suite and resumes the parent.
 #[must_use]
 pub fn child_run_tests(agent: &str, turn: u64) -> Vec<Beat> {
+    let ns = format!("{agent}-t{turn}");
     let mut beats = Vec::new();
     chip_state(&mut beats, agent, ChipDisplayState::Running);
     chip_stream(
         &mut beats,
         agent,
+        &ns,
         "s1",
         "Picking up the lease — scoping the billing test surface before writing anything.",
     );
     chip_tool(
         &mut beats,
         agent,
+        &ns,
         "t1",
         "fs_read",
         "cloud/tests/billing/mod.rs",
@@ -1593,6 +1715,7 @@ pub fn child_run_tests(agent: &str, turn: u64) -> Vec<Beat> {
     chip_tool(
         &mut beats,
         agent,
+        &ns,
         "t2",
         "fs_patch",
         "cloud/tests/billing/webhooks.rs",
@@ -1643,6 +1766,7 @@ pub fn child_run_tests(agent: &str, turn: u64) -> Vec<Beat> {
         chip_tool(
             &mut arm_beats,
             agent,
+            &ns,
             "t3",
             "process_exec",
             cmd,
@@ -1674,17 +1798,20 @@ pub fn child_run_tests(agent: &str, turn: u64) -> Vec<Beat> {
 /// childRunDocs (tui.js:940-958): a deliberate failure + `⌁` recovery.
 #[must_use]
 pub fn child_run_docs(agent: &str, turn: u64) -> Vec<Beat> {
+    let ns = format!("{agent}-t{turn}");
     let mut beats = Vec::new();
     chip_state(&mut beats, agent, ChipDisplayState::Running);
     chip_stream(
         &mut beats,
         agent,
+        &ns,
         "s1",
         "Drafting API docs for the new webhook endpoint from the patched source.",
     );
     chip_tool(
         &mut beats,
         agent,
+        &ns,
         "t1",
         "fs_read",
         "cloud/src/billing/webhooks.rs",
@@ -1696,6 +1823,7 @@ pub fn child_run_docs(agent: &str, turn: u64) -> Vec<Beat> {
     chip_tool(
         &mut beats,
         agent,
+        &ns,
         "t2",
         "fs_patch",
         "docs/api/billing-webhooks.md",
@@ -1706,6 +1834,7 @@ pub fn child_run_docs(agent: &str, turn: u64) -> Vec<Beat> {
     chip_tool(
         &mut beats,
         agent,
+        &ns,
         "t3",
         "process_exec",
         "cargo doc --no-deps",
@@ -1747,6 +1876,7 @@ pub fn child_run_docs(agent: &str, turn: u64) -> Vec<Beat> {
     chip_tool(
         &mut retry,
         agent,
+        &ns,
         "t4",
         "process_exec",
         "cargo doc --no-deps --features docs",
@@ -1789,9 +1919,11 @@ pub fn respond_chip_beats(
     chip_device: &str,
     text: &str,
     turn: u64,
-    roster_counter: &mut u64,
+    roster_counter: &std::sync::atomic::AtomicU64,
 ) -> Vec<Beat> {
     let low = text.to_lowercase();
+    // Per-TURN id namespace — see `chip_stream` (review P1-4).
+    let ns = format!("{agent}-t{turn}");
     let mut beats = Vec::new();
     beats.push(Beat::ChipEmit {
         agent: agent.to_owned(),
@@ -1818,6 +1950,7 @@ pub fn respond_chip_beats(
         chip_stream(
             &mut beats,
             agent,
+            &ns,
             "n1",
             "Good call — I'll delegate part of this to a child agent and wait on its result.",
         );
@@ -1841,6 +1974,7 @@ pub fn respond_chip_beats(
         chip_tool(
             &mut beats,
             agent,
+            &ns,
             "n2",
             "agent_spawn",
             &format!("{} → {chip_device} · nested", child_name.callsign),
@@ -1848,47 +1982,27 @@ pub fn respond_chip_beats(
             "lease ok",
             true,
         );
-        // INTENDED flow (see the sim-bug note above): the parent chip
-        // waits on its child — the session waits too.
-        chip_state(&mut beats, agent, ChipDisplayState::Waiting);
-        chip_state(&mut beats, &child_agent, ChipDisplayState::Thinking);
-        beats.push(Beat::Sleep(500));
-        chip_state(&mut beats, &child_agent, ChipDisplayState::Streaming);
-        chip_stream(
-            &mut beats,
-            &child_agent,
-            "s1",
-            "On it — scoped the subtask, patching now.",
-        );
-        chip_state(&mut beats, &child_agent, ChipDisplayState::Tool);
-        chip_tool(
-            &mut beats,
-            &child_agent,
-            "t1",
-            "fs_patch",
-            "src/subtask.rs",
-            1100,
-            "+40 −6",
-            true,
-        );
-        chip_state(&mut beats, &child_agent, ChipDisplayState::Done);
-        chip_state(&mut beats, agent, ChipDisplayState::Streaming);
-        chip_stream(
-            &mut beats,
-            agent,
-            "n3",
-            &format!(
-                "{} {} finished — folded its patch into my work. Done.",
-                child_name.callsign, child_name.hon
-            ),
-        );
-        chip_state(&mut beats, agent, ChipDisplayState::Done);
-        beats.push(Beat::AutoResume);
+        // ⚠ SIM BUG, PORTED AS-IS (tui.js:1137). The shipped sim wraps the
+        // spawn in `if (!(await ops.cTool(...))) return;` — but `cTool`
+        // resolves to `undefined`, so the guard ALWAYS fires and the turn
+        // dead-ends right here: the parent chip stays `streaming`, the
+        // nested child stays `running`, and because a live descendant keeps
+        // the tree live the session shows `◔ WAITING` until the chip is
+        // closed. Everything below the return in the sim is dead code.
+        //
+        // The INTENDED flow (what the beats would be if `cTool` returned
+        // true) is: parent → waiting; child thinking → 500 ms → streaming →
+        // "On it — scoped the subtask, patching now." → tool → fs_patch
+        // src/subtask.rs 1100 ms +40 −6 → child done; parent → streaming →
+        // "{callsign} {hon} finished — folded its patch into my work. Done."
+        // → parent done → autoResumeParent. TUI3b shipped that version;
+        // TUI3.1 reverts to the sim because tui.js is the authority.
     } else {
         chip_state(&mut beats, agent, ChipDisplayState::Streaming);
         chip_stream(
             &mut beats,
             agent,
+            &ns,
             "g1",
             "Acknowledged — folding that into the current step.",
         );
@@ -1896,6 +2010,7 @@ pub fn respond_chip_beats(
         chip_tool(
             &mut beats,
             agent,
+            &ns,
             "g2",
             "fs_read",
             "src/target.rs",

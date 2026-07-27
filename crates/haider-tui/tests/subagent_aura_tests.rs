@@ -74,7 +74,7 @@ fn echo_answers(driver: &DemoDriver, model: &mut AppModel) {
         driver
             .sender()
             .try_send((
-                driver.generation(),
+                driver.control_tag(),
                 DemoEvent::Envelope(EventPayload::MenuAnswered(answer)),
             ))
             .expect("echo");
@@ -203,8 +203,12 @@ fn child_scripts_are_verbatim_with_question_arms() {
 }
 
 #[test]
-fn respond_chip_nested_ports_the_intended_flow() {
-    let mut roster = 5;
+fn respond_chip_nested_dead_ends_exactly_as_the_shipped_sim_does() {
+    // TUI3.1 P2-14: tui.js is the authority. The sim wraps the nested
+    // agent_spawn in `if (!(await ops.cTool(...))) return;` and `cTool`
+    // resolves to undefined — so the turn ALWAYS returns there. TUI3b
+    // shipped the "intended" continuation; this reverts to the sim.
+    let roster = std::sync::atomic::AtomicU64::new(5);
     let beats = respond_chip_beats(
         "t1-tests",
         "Hasan",
@@ -212,7 +216,7 @@ fn respond_chip_nested_ports_the_intended_flow() {
         "local",
         "please spawn a helper",
         7,
-        &mut roster,
+        &roster,
     );
     // Nested chip added under the parent with the spawn note prefilled.
     let seed = beats
@@ -225,17 +229,37 @@ fn respond_chip_nested_ports_the_intended_flow() {
     assert_eq!(seed.parent.as_deref(), Some("t1-tests"));
     assert_eq!(seed.name, "subtask");
     assert_eq!(seed.tokens, 400);
-    // INTENDED flow beyond the sim's tui.js:1137 early-return bug: the
-    // parent waits, the child completes, the parent finishes + resumes.
-    assert!(beats.iter().any(|beat| matches!(
-        beat,
-        Beat::ChipState { agent, state: ChipDisplayState::Waiting } if agent == "t1-tests"
-    )));
-    assert!(beats.iter().any(|beat| matches!(
-        beat,
-        Beat::ChipState { agent, state: ChipDisplayState::Done } if agent != "t1-tests"
-    )));
-    assert!(matches!(beats.last(), Some(Beat::AutoResume)));
+    assert_eq!(seed.state, ChipDisplayState::Running);
+    // The LAST beat is the agent_spawn tool's token accrual: nothing after
+    // the sim's early return exists.
+    assert!(
+        matches!(beats.last(), Some(Beat::ChipTokens { agent, n: 1800 }) if agent == "t1-tests"),
+        "the script stops at the spawn tool"
+    );
+    for forbidden in ["Waiting", "Done"] {
+        assert!(
+            !beats.iter().any(|beat| matches!(
+                beat,
+                Beat::ChipState { state, .. } if format!("{state:?}") == forbidden
+            )),
+            "no {forbidden} beat survives the sim's early return"
+        );
+    }
+    assert!(
+        !beats.iter().any(|beat| matches!(beat, Beat::AutoResume)),
+        "the parent turn is never discharged — that is the sim bug"
+    );
+    // The NON-nested path is unaffected and still completes + resumes.
+    let plain = respond_chip_beats(
+        "t1-tests",
+        "Hasan",
+        "gpt-5.6",
+        "local",
+        "tighten the assertions",
+        8,
+        &roster,
+    );
+    assert!(matches!(plain.last(), Some(Beat::AutoResume)));
 }
 
 #[test]
@@ -464,10 +488,12 @@ async fn respond_chip_steers_queue_when_blocked_and_delegates_nested_when_asked(
         agent: "t1-tests".to_owned(),
         text: "delegate part of this".to_owned(),
     });
-    pump_until(&mut driver, &mut rx, &mut model, "nested done", |m| {
+    // The sim's nested flow DEAD-ENDS at tui.js:1137 (P2-14): the parent
+    // chip is left `streaming`, the nested child `running`, and the live
+    // descendant keeps the whole session in the derived WAITING badge.
+    pump_until(&mut driver, &mut rx, &mut model, "nested parked", |m| {
         haider_tui::app::find_chip(&m.chips, "t1-tests")
-            .is_some_and(|chip| chip.state == ChipDisplayState::Done && !chip.children.is_empty())
-            && tree_live_count(&m.chips) == 0
+            .is_some_and(|chip| !chip.children.is_empty())
     })
     .await;
     let tests_chip = haider_tui::app::find_chip(&model.chips, "t1-tests").expect("tests");
@@ -477,15 +503,47 @@ async fn respond_chip_steers_queue_when_blocked_and_delegates_nested_when_asked(
         entry,
         TranscriptEntry::Note { text } if text == "· spawned by Hasan — nested delegation"
     )));
-    assert!(tests_chip.transcript.entries().iter().any(|entry| matches!(
-        entry,
-        TranscriptEntry::Item(block)
-            if matches!(
-                &block.item,
-                haider_protocol::item::TurnItem::AgentMessage { text }
-                    if text.ends_with("finished — folded its patch into my work. Done.")
-            )
-    )));
+    assert_eq!(
+        nested.state,
+        ChipDisplayState::Running,
+        "child never finishes"
+    );
+    assert_eq!(
+        tests_chip.state,
+        ChipDisplayState::Streaming,
+        "parent is stranded mid-stream, exactly as the sim strands it"
+    );
+    assert!(tree_live_count(&model.chips) > 0);
+    let (badge, _) = model.status_badge();
+    assert!(
+        badge.starts_with("◔ WAITING · "),
+        "session waits, got {badge}"
+    );
+    // Closing the stranded parent takes its subtree with it and discharges
+    // the wait — the only way out, as in the sim.
+    model.view_path = vec!["t1-tests".to_owned()];
+    model.screen = Screen::Subagent;
+    model.handle_hit(Hit::ChipCloseBtn("t1-tests".to_owned()));
+    pump_until(&mut driver, &mut rx, &mut model, "closed", |m| {
+        haider_tui::app::find_chip(&m.chips, "t1-tests").is_some_and(|chip| chip.closed)
+    })
+    .await;
+    // Sim-true: the nested child is not itself `closed`, so it keeps the
+    // tree live until the 5 s removal takes the whole subtree out.
+    assert_eq!(
+        tree_live_count(&model.chips),
+        1,
+        "the child leaves with the subtree"
+    );
+    pump_until(&mut driver, &mut rx, &mut model, "subtree gone", |m| {
+        haider_tui::app::find_chip(&m.chips, "t1-tests").is_none()
+    })
+    .await;
+    assert_eq!(
+        tree_live_count(&model.chips),
+        0,
+        "the wait discharges with the subtree"
+    );
 }
 
 #[tokio::test(start_paused = true)]

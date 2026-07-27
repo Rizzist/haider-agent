@@ -7,8 +7,8 @@ use crate::app::{AppEvent, AppModel, AppRequest};
 use crate::mock::demo_script;
 use crate::render::render;
 use crate::script::{
-    AUTO_TITLE_MS, Beat, DemoEvent, TALK_HOLD_MS, compaction_beats, from_legacy, respond_beats,
-    title_note,
+    AUTO_TITLE_MS, Beat, COMPACT_IDLE_GAP_MS, DemoEvent, TALK_HOLD_MS, compaction_beats,
+    from_legacy, respond_preamble, title_note,
 };
 use crate::theme::{Rgb, ThemeKey};
 use haider_protocol::EventPayload;
@@ -293,9 +293,8 @@ pub async fn run_demo(mut model: AppModel) -> std::io::Result<()> {
         // pending envelopes, so the loop WILL wake and retry. Awaiting the
         // send here instead would deadlock: this loop is the only consumer.
         while let Some(answer) = model.outbox.first().cloned() {
-            let generation = driver.generation();
             match answer_echo.try_send((
-                generation,
+                driver.control_tag(),
                 DemoEvent::Envelope(EventPayload::MenuAnswered(answer)),
             )) {
                 Ok(()) => {
@@ -369,40 +368,142 @@ pub fn dispatch_input(
 /// respond() port), owns the token meter (cumulative `Usage` frames), the
 /// GENERIC/roster rotation counters, parked `AwaitMenu` arms, and the
 /// turn-end law (`finish_turn`).
-/// Generation number spaces: three guard domains share one tagged channel
-/// — session turns (bumped by interrupt + fresh session), chip scripts
-/// (bumped by fresh session ONLY — the sim's children survive a parent
-/// interrupt), and aura runs (bumped by /reset only). Disjoint bases keep
-/// the spaces collision-free, so consumption accepts a tag iff it equals
-/// its own domain's live value.
-pub const CHIP_GEN_BASE: u64 = 1 << 40;
-pub const AURA_GEN_BASE: u64 = 1 << 41;
+/// TUI3.1 (review P1-1/2/3) replaced three per-domain generation counters
+/// with a live-ARM REGISTRY. Every spawned script and timer holds an id
+/// allocated ONCE — atomically, against a still-live parent — and
+/// consumption drops any event whose id is no longer registered.
+/// Cancellation is OWNER-scoped, so closing one chip stops exactly that
+/// chip's beats while its siblings keep running, and no arm can adopt a
+/// newer generation at fire time (the teardown race the old `ChipScript`
+/// beat had).
+///
+/// The always-live control tag: model→driver echoes (menu answers) and the
+/// boot script ride it. It is never cancelled — a user's answer is not
+/// stale work, and boot belongs to the harness, not to any turn.
+pub const CONTROL_ARM: u64 = 0;
 
-type Guard = std::sync::Arc<std::sync::atomic::AtomicU64>;
+/// Who owns a spawned arm — the surface whose teardown cancels it.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum ArmOwner {
+    /// The attached session's turn engine: interrupt and fresh-session
+    /// cancel it (sim per-session `runTokensRef`, tui.js:1551-1567).
+    Session,
+    /// One subagent chip's script. Its own close/removal cancels it, and a
+    /// fresh session cancels every chip — but a session INTERRUPT does
+    /// NOT: the sim's `interrupt` touches only the run token, the queue and
+    /// the note (tui.js:1551-1567), so children outlive their parent's
+    /// cancelled turn. Because the chip's PARKED arms survive with them,
+    /// answering such a child's card still resolves cleanly — that is what
+    /// closes the review's "permanently blocked chip" hole.
+    Chip(String),
+    /// An aura orchestrate run or its talk timer. The next submit cancels
+    /// the previous run (sim `++auraRunRef`, tui.js:2060); `/clear`,
+    /// `/reset` and a fresh session cancel it outright.
+    Aura,
+}
+
+type Counter = std::sync::Arc<std::sync::atomic::AtomicU64>;
+
+/// The live-arm table. A poisoned lock degrades to "nothing is live" — it
+/// can never resurrect cancelled work.
+#[derive(Clone)]
+struct ArmTable {
+    inner: std::sync::Arc<std::sync::Mutex<(u64, std::collections::HashMap<u64, ArmOwner>)>>,
+}
+
+impl ArmTable {
+    fn new() -> Self {
+        Self {
+            inner: std::sync::Arc::new(std::sync::Mutex::new((
+                CONTROL_ARM,
+                std::collections::HashMap::new(),
+            ))),
+        }
+    }
+
+    /// Register a new arm. Returns `CONTROL_ARM` only if the lock is
+    /// poisoned, in which case the caller's work rides the never-cancelled
+    /// tag rather than being silently dropped.
+    ///
+    /// Arms are deliberately NOT deregistered when their script ends: a
+    /// finished arm is still the parent of any in-flight continuation (the
+    /// `Dispatch` hand-off, a parked menu, an auto-resume timer), and
+    /// events it already sent may still be buffered in the channel. The
+    /// table only ever shrinks on an explicit teardown, and each entry is
+    /// one u64 plus a small enum.
+    fn alloc(&self, owner: ArmOwner) -> u64 {
+        let Ok(mut table) = self.inner.lock() else {
+            return CONTROL_ARM;
+        };
+        table.0 += 1;
+        let id = table.0;
+        table.1.insert(id, owner);
+        id
+    }
+
+    /// Register a child arm ONLY while `parent` is still live — one lock
+    /// covers the check and the insert, so a teardown between them is
+    /// impossible (the `ChipScript` adoption race, review P1-1).
+    fn alloc_child(&self, parent: u64, owner: ArmOwner) -> Option<u64> {
+        let mut table = self.inner.lock().ok()?;
+        if parent != CONTROL_ARM && !table.1.contains_key(&parent) {
+            return None;
+        }
+        table.0 += 1;
+        let id = table.0;
+        table.1.insert(id, owner);
+        Some(id)
+    }
+
+    fn is_live(&self, id: u64) -> bool {
+        id == CONTROL_ARM
+            || self
+                .inner
+                .lock()
+                .is_ok_and(|table| table.1.contains_key(&id))
+    }
+
+    fn owner(&self, id: u64) -> Option<ArmOwner> {
+        self.inner.lock().ok()?.1.get(&id).cloned()
+    }
+
+    /// Cancel every arm whose owner matches, and report which ids died so
+    /// parked continuations can be dropped with them.
+    fn cancel(&self, matches: &dyn Fn(&ArmOwner) -> bool) {
+        if let Ok(mut table) = self.inner.lock() {
+            table.1.retain(|_, owner| !matches(owner));
+        }
+    }
+}
+
 #[allow(clippy::type_complexity)]
-type PendingArms =
-    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, (u64, Vec<Vec<Beat>>)>>>;
+type PendingArms = std::sync::Arc<
+    std::sync::Mutex<std::collections::HashMap<String, (u64, ArmOwner, Vec<Vec<Beat>>)>>,
+>;
 
 pub struct DemoDriver {
     tx: mpsc::Sender<(u64, DemoEvent)>,
-    script_gen: Guard,
-    /// The chip guard (chip scripts + removal/resume timers).
-    chip_gen: Guard,
-    /// The aura guard (orchestrate runs + the talk timer).
-    aura_gen: Guard,
+    /// Every live script/timer arm (review P1-1/2/3).
+    table: ArmTable,
     turn_counter: u64,
+    /// Unique suffix for compaction item ids (review P2-13: `/compact`
+    /// twice without token growth reused `compact-{before}` and the
+    /// projection dropped the second row).
+    compact_counter: u64,
     /// Sim `genRef` (tui.js:1488): generic-branch post-increment rotation.
-    generic_counter: u64,
+    /// Read at DISPATCH time, not while building beats (review P2-11).
+    generic_counter: Counter,
     /// Sim `rosterRef` (tui.js:681): starts at 3 (seed heads claim 0-2).
-    roster_counter: u64,
-    /// Demo token meter, input bucket (user text 9/char + tools 2400).
-    tokens_input: Guard,
-    /// Demo token meter, output bucket (streamed words 9/char).
-    tokens_output: Guard,
-    /// Menus a script parked on: menu id → (generation, continuation arms).
+    roster_counter: Counter,
+    /// Demo token meter, input bucket (user text 9/unit + tools 2400).
+    tokens_input: Counter,
+    /// Demo token meter, output bucket (streamed words 9/unit).
+    tokens_output: Counter,
+    /// Menus a script parked on: menu id → (arm, owner, continuation arms).
     /// `MenuAnswered` at consume selects `arms[option_index]` (clamped) and
-    /// plays it under the SAME generation; a bump while parked cancels the
-    /// continuation (sim `alive()` guard killing a turn parked on askMenu).
+    /// plays it under a FRESH arm owned by the same surface; a cancelled
+    /// owner drops the continuation (sim `alive()` killing a turn parked on
+    /// askMenu).
     pending_arms: PendingArms,
 }
 
@@ -411,17 +512,19 @@ impl DemoDriver {
     #[must_use]
     pub fn new(capacity: usize) -> (Self, mpsc::Receiver<(u64, DemoEvent)>) {
         let (tx, rx) = mpsc::channel(capacity);
+        let counter = || std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         (
             Self {
                 tx,
-                script_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-                chip_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(CHIP_GEN_BASE)),
-                aura_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(AURA_GEN_BASE)),
+                table: ArmTable::new(),
                 turn_counter: 0,
-                generic_counter: 0,
-                roster_counter: crate::script::ROSTER_FIRST_CLAIM,
-                tokens_input: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-                tokens_output: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                compact_counter: 0,
+                generic_counter: counter(),
+                roster_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                    crate::script::ROSTER_FIRST_CLAIM,
+                )),
+                tokens_input: counter(),
+                tokens_output: counter(),
                 pending_arms: std::sync::Arc::new(std::sync::Mutex::new(
                     std::collections::HashMap::new(),
                 )),
@@ -430,39 +533,25 @@ impl DemoDriver {
         )
     }
 
-    /// The current script generation.
+    /// The never-cancelled tag for model→driver echoes (menu answers).
     #[must_use]
-    pub fn generation(&self) -> u64 {
-        self.script_gen.load(std::sync::atomic::Ordering::SeqCst)
+    pub const fn control_tag(&self) -> u64 {
+        CONTROL_ARM
     }
 
-    /// The current chip-domain generation.
+    /// True iff this arm is still registered (tests assert cancellation
+    /// through this, not through counter arithmetic).
     #[must_use]
-    pub fn chip_generation(&self) -> u64 {
-        self.chip_gen.load(std::sync::atomic::Ordering::SeqCst)
+    pub fn is_arm_live(&self, arm: u64) -> bool {
+        self.table.is_live(arm)
     }
 
-    /// The current aura-domain generation.
-    #[must_use]
-    pub fn aura_generation(&self) -> u64 {
-        self.aura_gen.load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    /// True iff `generation` is the LIVE value of its own domain.
-    fn is_live(&self, generation: u64) -> bool {
-        generation == self.generation()
-            || generation == self.chip_generation()
-            || generation == self.aura_generation()
-    }
-
-    /// The guard a generation value belongs to (disjoint number spaces).
-    fn guard_for(&self, generation: u64) -> Guard {
-        if generation >= AURA_GEN_BASE {
-            std::sync::Arc::clone(&self.aura_gen)
-        } else if generation >= CHIP_GEN_BASE {
-            std::sync::Arc::clone(&self.chip_gen)
-        } else {
-            std::sync::Arc::clone(&self.script_gen)
+    /// Cancel every arm of the matching owners, dropping their parked
+    /// continuations with them.
+    fn cancel_arms(&self, matches: &dyn Fn(&ArmOwner) -> bool) {
+        self.table.cancel(matches);
+        if let Ok(mut pending) = self.pending_arms.lock() {
+            pending.retain(|_, (_, owner, _)| !matches(owner));
         }
     }
 
@@ -471,8 +560,8 @@ impl DemoDriver {
             tx: self.tx.clone(),
             input: std::sync::Arc::clone(&self.tokens_input),
             output: std::sync::Arc::clone(&self.tokens_output),
-            arms: std::sync::Arc::clone(&self.pending_arms),
-            chip_gen: std::sync::Arc::clone(&self.chip_gen),
+            parked: std::sync::Arc::clone(&self.pending_arms),
+            table: self.table.clone(),
         }
     }
 
@@ -490,17 +579,15 @@ impl DemoDriver {
         self.tx.clone()
     }
 
-    /// Spawn the boot beats. They tag with the CURRENT generation at each
-    /// send: they belong to the harness, not any turn, and survive bumps.
+    /// Spawn the boot beats on the control tag: they belong to the harness,
+    /// not to any turn, so no teardown may silence them.
     pub fn spawn_boot(&self) {
         let tx = self.tx.clone();
-        let gen_ref = std::sync::Arc::clone(&self.script_gen);
         tokio::spawn(async move {
             for payload in crate::mock::boot_script() {
                 tokio::time::sleep(demo_pace(&payload)).await;
-                let generation = gen_ref.load(std::sync::atomic::Ordering::SeqCst);
                 if tx
-                    .send((generation, DemoEvent::Envelope(payload)))
+                    .send((CONTROL_ARM, DemoEvent::Envelope(payload)))
                     .await
                     .is_err()
                 {
@@ -510,17 +597,30 @@ impl DemoDriver {
         });
     }
 
-    /// Play one beat script under the SESSION guard, generation-captured:
-    /// bumps at EITHER end of the channel silence it (send-side check +
-    /// consumption guard).
-    pub fn play_beats(&self, beats: Vec<Beat>, generation: u64) {
-        self.player()
-            .spawn(beats, std::sync::Arc::clone(&self.script_gen), generation);
+    /// Play a script on a FRESH arm owned by `owner`, returning its id.
+    fn play_owned(&self, beats: Vec<Beat>, owner: ArmOwner) -> u64 {
+        let arm = self.table.alloc(owner);
+        self.player().spawn(beats, arm);
+        arm
     }
 
-    /// Play a script under an explicit guard domain (chip/aura scripts).
-    fn play_guarded(&self, beats: Vec<Beat>, guard: Guard, generation: u64) {
-        self.player().spawn(beats, guard, generation);
+    /// Play a session script (the turn engine's own arm).
+    pub fn play_beats(&self, beats: Vec<Beat>) -> u64 {
+        self.play_owned(beats, ArmOwner::Session)
+    }
+
+    /// Spawn a guarded timer: it fires `event` after `delay` only while
+    /// `parent` is still live, on a fresh arm of its own so a later
+    /// teardown drops the event even once it is buffered in the channel.
+    fn spawn_timer(&self, parent: u64, owner: ArmOwner, delay: Duration, event: DemoEvent) {
+        let Some(arm) = self.table.alloc_child(parent, owner) else {
+            return;
+        };
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let _ = tx.send((arm, event)).await;
+        });
     }
 
     /// Drain one reducer request — scripts play generation-captured,
@@ -532,88 +632,84 @@ impl DemoDriver {
         match request {
             AppRequest::SubmitText { text, voice, title } => {
                 self.turn_counter += 1;
-                let generation = self.generation();
-                let beats = respond_beats(
+                // The branch is chosen — and the generic/roster counters
+                // advance — at DISPATCH, after the 750 ms think window, so
+                // an interrupt inside it skips no intro and burns no
+                // callsign (review P2-11, sim tui.js:1259).
+                let arm = self.play_beats(respond_preamble(
                     &text,
                     voice,
                     haider_protocol::DeliveryMode::Steer,
                     self.turn_counter,
-                    &mut self.generic_counter,
-                    &mut self.roster_counter,
-                );
-                self.play_beats(beats, generation);
-                // Auto-title (sim tui.js:1221-1227): scheduled at turn
-                // start, the note lands 1.5 s later wherever the transcript
-                // is; an interrupt inside the window drops it (gen guard).
-                if let Some(blurb) = title {
-                    self.play_beats(
-                        vec![Beat::Sleep(AUTO_TITLE_MS), Beat::Note(title_note(&blurb))],
-                        generation,
+                ));
+                // Auto-title (sim tui.js:1219-1227): the micro-call names
+                // the session INSIDE the 1.5 s callback — the title and the
+                // note land together, and an interrupt in the window drops
+                // both (review P2-12).
+                if title {
+                    self.spawn_timer(
+                        arm,
+                        ArmOwner::Session,
+                        Duration::from_millis(AUTO_TITLE_MS),
+                        DemoEvent::AutoTitle(text),
                     );
                 }
             }
             AppRequest::AttachSample(_) => {
                 self.turn_counter += 1;
-                self.play_beats(
-                    from_legacy(crate::mock::turn_script(self.turn_counter)),
-                    self.generation(),
-                );
+                self.play_beats(from_legacy(crate::mock::turn_script(self.turn_counter)));
             }
             AppRequest::StopScripts => {
-                self.script_gen
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                // A fresh session kills its chips' scripts too (the chip
-                // domain survives interrupts, not session teardown).
-                self.chip_gen
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                // A fresh session starts from a zero meter and no parked
-                // continuations (stale arms are also gen-guarded; clearing
-                // is hygiene, not correctness).
+                // Session teardown (`/clear`, `/reset`, a fresh session):
+                // EVERY arm dies — session, every chip, and any hidden aura
+                // run (review P1-1/P1-2: aura used to survive navigation
+                // and keep mutating roster/log/transcript).
+                self.cancel_arms(&|_| true);
+                self.reset_aura_state(model);
                 self.tokens_input
                     .store(0, std::sync::atomic::Ordering::SeqCst);
                 self.tokens_output
                     .store(0, std::sync::atomic::Ordering::SeqCst);
-                if let Ok(mut pending) = self.pending_arms.lock() {
-                    pending.clear();
-                }
             }
             AppRequest::Interrupt => {
-                let decay_gen = self
-                    .script_gen
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                    + 1;
-                if let Ok(mut pending) = self.pending_arms.lock() {
-                    pending.clear();
-                }
-                let tx = self.tx.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(IDLE_DECAY).await;
-                    let _ = tx
-                        .send((decay_gen, DemoEvent::Envelope(EventPayload::IdleDecayed)))
-                        .await;
-                });
+                // Esc mid-turn cancels THIS session's turn (sim
+                // tui.js:1551-1567 touches only the run token, the queue and
+                // the note). Chip arms — and their PARKED continuations —
+                // deliberately survive, exactly as the sim's children do, so
+                // a chip card answered after an interrupt still resolves
+                // instead of blocking forever. Any hidden aura run dies with
+                // the session (review P1-2).
+                self.cancel_arms(&|owner| matches!(owner, ArmOwner::Session | ArmOwner::Aura));
+                self.reset_aura_state(model);
+                self.spawn_timer(
+                    CONTROL_ARM,
+                    ArmOwner::Session,
+                    IDLE_DECAY,
+                    DemoEvent::Envelope(EventPayload::IdleDecayed),
+                );
             }
             AppRequest::Compact => {
                 // Manual /compact (sim tui.js:1791-1806): before = current
                 // meter, after = 6% of the window — 1200 ms, then IDLE.
                 let before = self.tokens_total();
                 let after = model.identity.context_window * 6 / 100;
-                self.play_beats(compaction_beats(before, after, true), self.generation());
+                self.compact_counter += 1;
+                self.play_beats(compaction_beats(before, after, true, self.compact_counter));
             }
             AppRequest::Talk => {
                 // ◉ talk hold (sim tui.js:2044-2054): 1300 ms of
                 // `◉ listening…`, then the canned phrase fires through the
-                // voice path. Generation-captured like every timer.
-                let generation = self.generation();
-                let tx = self.tx.clone();
-                let gen_ref = std::sync::Arc::clone(&self.script_gen);
-                tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_millis(TALK_HOLD_MS)).await;
-                    if gen_ref.load(std::sync::atomic::Ordering::SeqCst) != generation {
-                        return;
-                    }
-                    let _ = tx.send((generation, DemoEvent::TalkFire)).await;
-                });
+                // voice path. Owned by the SESSION, so a fresh session kills
+                // it; Esc additionally clears `listening`, and `talk_fire`
+                // refuses a hold nobody is holding (review P1-3 — the timer
+                // used to fire from the Launcher and yank the user into a
+                // brand-new canned session).
+                self.spawn_timer(
+                    CONTROL_ARM,
+                    ArmOwner::Session,
+                    Duration::from_millis(TALK_HOLD_MS),
+                    DemoEvent::TalkFire,
+                );
             }
             AppRequest::ChipSubmit { agent, text } => {
                 // respondChip (§2.4): a full turn on the CHIP's state
@@ -643,7 +739,7 @@ impl DemoDriver {
                             },
                         },
                         Beat::ChipNote {
-                            agent,
+                            agent: agent.clone(),
                             text: "· steer queued — delivered when the pending question resolves"
                                 .to_owned(),
                         },
@@ -657,19 +753,19 @@ impl DemoDriver {
                         &chip.device,
                         &text,
                         self.turn_counter,
-                        &mut self.roster_counter,
+                        &self.roster_counter,
                     )
                 };
-                self.play_guarded(
-                    beats,
-                    std::sync::Arc::clone(&self.chip_gen),
-                    self.chip_generation(),
-                );
+                self.play_owned(beats, ArmOwner::Chip(agent));
             }
             AppRequest::ChipClose { agent } => self.close_chip(model, &agent),
             AppRequest::AuraSubmit { text, voice: _ } => {
                 // Sim: spoken = !muted at turn start; `voice` only shaped
                 // the user row's ◉ sigil (already pushed by the reducer).
+                // Sim `orchestrate` opens with `++auraRunRef` (tui.js:2060):
+                // a new run CANCELS the previous one — two rapid submits can
+                // never interleave (review P1-2).
+                self.cancel_arms(&|owner| matches!(owner, ArmOwner::Aura));
                 let low = text.to_lowercase();
                 let spoken = !model.aura.muted;
                 let runs = model.aura.runs;
@@ -690,103 +786,145 @@ impl DemoDriver {
                     let (name, device) = crate::script::aura_target(&low);
                     crate::script::aura_spawn_beats(spoken, &name, &device, runs)
                 };
-                self.play_guarded(
-                    beats,
-                    std::sync::Arc::clone(&self.aura_gen),
-                    self.aura_generation(),
-                );
+                self.play_owned(beats, ArmOwner::Aura);
             }
             AppRequest::AuraTalk => {
                 // auraTalk (tui.js:2128-2132): 1100 ms listening, then the
                 // canned phrase orchestrates as a voice run.
-                let generation = self.aura_generation();
-                let tx = self.tx.clone();
-                let gen_ref = std::sync::Arc::clone(&self.aura_gen);
-                tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_millis(crate::script::AURA_TALK_MS)).await;
-                    if gen_ref.load(std::sync::atomic::Ordering::SeqCst) != generation {
-                        return;
-                    }
-                    let _ = tx.send((generation, DemoEvent::AuraTalkFire)).await;
-                });
+                self.spawn_timer(
+                    CONTROL_ARM,
+                    ArmOwner::Aura,
+                    Duration::from_millis(crate::script::AURA_TALK_MS),
+                    DemoEvent::AuraTalkFire,
+                );
             }
             AppRequest::ResetAura => {
-                self.aura_gen
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.cancel_arms(&|owner| matches!(owner, ArmOwner::Aura));
             }
             AppRequest::Quit => model.should_quit = true,
         }
     }
 
+    /// A cancelled aura run leaves the orb wherever it stopped; the model
+    /// must return to a state the user can act on (the `idle` submit gate)
+    /// and stop tagging later rows as spoken (review P1-2 + P2-10).
+    fn reset_aura_state(&self, model: &mut AppModel) {
+        if model.aura.state != crate::script::AuraState::Idle {
+            model.aura.state = crate::script::AuraState::Idle;
+            model.dirty = true;
+        }
+        model.aura.transcript.set_voice_live(false);
+    }
+
     /// The chip close lifecycle (§2.5): reducer flags + parent note, then
     /// the driver's 5 s removal timer; closing the last LIVE child arms
     /// the auto-resume check (closing a done chip discharges nothing).
+    ///
+    /// Closing KILLS that chip's arms first (review P1-1: a closed chip
+    /// used to keep streaming into its own transcript), subtree included —
+    /// a closed parent's children leave the tree with it. The removal timer
+    /// is allocated AFTER the cancellation so it is not swept up by it.
     fn close_chip(&mut self, model: &mut AppModel, agent: &str) {
+        let doomed = crate::app::find_chip(&model.chips, agent)
+            .map(|chip| {
+                let mut ids = vec![chip.agent.clone()];
+                ids.extend(
+                    crate::app::flatten_chips(&chip.children)
+                        .into_iter()
+                        .map(|(_, child)| child.agent.clone()),
+                );
+                ids
+            })
+            .unwrap_or_default();
         let Some(was_live) = model.close_chip_state(agent) else {
             return;
         };
-        let generation = self.chip_generation();
-        let tx = self.tx.clone();
-        let gen_ref = std::sync::Arc::clone(&self.chip_gen);
-        let removed = agent.to_owned();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(crate::script::CHIP_REMOVE_MS)).await;
-            if gen_ref.load(std::sync::atomic::Ordering::SeqCst) != generation {
-                return;
-            }
-            let _ = tx
-                .send((generation, DemoEvent::ChipRemove { agent: removed }))
-                .await;
+        self.cancel_arms(&|owner| match owner {
+            ArmOwner::Chip(id) => doomed.iter().any(|dead| dead == id),
+            _ => false,
         });
+        self.spawn_timer(
+            CONTROL_ARM,
+            ArmOwner::Chip(agent.to_owned()),
+            Duration::from_millis(crate::script::CHIP_REMOVE_MS),
+            DemoEvent::ChipRemove {
+                agent: agent.to_owned(),
+            },
+        );
         if was_live {
-            self.arm_auto_resume();
+            self.arm_auto_resume(CONTROL_ARM);
         }
     }
 
-    /// Spawn the 120 ms autoResumeParent defer (§2.7) under the chip guard.
-    fn arm_auto_resume(&self) {
-        let generation = self.chip_generation();
-        let tx = self.tx.clone();
-        let gen_ref = std::sync::Arc::clone(&self.chip_gen);
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(crate::script::AUTO_RESUME_DEFER_MS)).await;
-            if gen_ref.load(std::sync::atomic::Ordering::SeqCst) != generation {
-                return;
-            }
-            let _ = tx.send((generation, DemoEvent::AutoResume)).await;
-        });
+    /// Spawn the 120 ms autoResumeParent defer (§2.7). It resumes the
+    /// SESSION's parked turn, so the arm is session-owned: an interrupt
+    /// drops it, and the §2.7 guards re-check the world at consumption.
+    fn arm_auto_resume(&self, parent: u64) {
+        self.spawn_timer(
+            parent,
+            ArmOwner::Session,
+            Duration::from_millis(crate::script::AUTO_RESUME_DEFER_MS),
+            DemoEvent::AutoResume,
+        );
     }
 
-    /// Consume one generation-tagged demo event. Stale generations are
-    /// dropped whole — the P1-1 law: a bump invalidates events already
-    /// buffered in the channel, not only future sends. A tag is live iff
-    /// it equals its OWN domain's current value (disjoint number spaces).
+    /// Consume one arm-tagged demo event. Cancelled arms are dropped whole
+    /// — the P1-1 law: a teardown invalidates events already buffered in
+    /// the channel, not only future sends.
     pub fn consume(&mut self, model: &mut AppModel, generation: u64, event: DemoEvent) {
-        if !self.is_live(generation) {
+        if !self.table.is_live(generation) {
             return;
         }
         match event {
             DemoEvent::Envelope(payload) => {
                 // A parked script's menu was answered: the option index
                 // selects the continuation arm (clamped to the last arm),
-                // played under the SAME (still-live) generation.
+                // which plays on a FRESH arm owned by the same surface.
+                // `alloc_child` re-checks the parked arm under one lock, so
+                // a continuation can never outlive its owner's teardown.
                 if let EventPayload::MenuAnswered(answer) = &payload {
                     let parked = self
                         .pending_arms
                         .lock()
                         .ok()
                         .and_then(|mut pending| pending.remove(answer.menu.as_str()));
-                    if let Some((arm_gen, mut arms)) = parked
-                        && self.is_live(arm_gen)
+                    if let Some((parked_arm, owner, mut arms)) = parked
                         && !arms.is_empty()
+                        && let Some(arm) = self.table.alloc_child(parked_arm, owner)
                     {
                         let index = (answer.option_index as usize).min(arms.len() - 1);
                         let beats = arms.swap_remove(index);
-                        let guard = self.guard_for(arm_gen);
-                        self.play_guarded(beats, guard, arm_gen);
+                        self.player().spawn(beats, arm);
                     }
                 }
                 consume_scripted(model, generation, generation, payload);
+            }
+            DemoEvent::Dispatch { text, voice, turn } => {
+                // The sim picks its branch AFTER the think window
+                // (tui.js:1259) — build it now, on this same live arm, so
+                // the generic/roster counters advance only for turns that
+                // actually reach dispatch (review P2-11).
+                let beats = crate::script::respond_branch(
+                    &text,
+                    voice,
+                    turn,
+                    &self.generic_counter,
+                    &self.roster_counter,
+                );
+                if let Some(arm) = self.table.alloc_child(generation, ArmOwner::Session) {
+                    self.player().spawn(beats, arm);
+                }
+            }
+            DemoEvent::AutoTitle(text) => {
+                // Sim tui.js:1219-1227: the callback itself checks the
+                // session is still untitled, sets the blurb and pushes the
+                // note — both inside the 1.5 s window.
+                if model.session_title.is_none() {
+                    let blurb = crate::app::auto_blurb(&text);
+                    model.projection.push_note(title_note(&blurb));
+                    model.session_title = Some(blurb);
+                    model.dirty = true;
+                }
             }
             DemoEvent::Note(text) => {
                 model.projection.push_note(text);
@@ -900,9 +1038,7 @@ impl DemoDriver {
                     model.turn_active = true;
                     model.dirty = true;
                     self.turn_counter += 1;
-                    let beats = crate::script::auto_resume_beats(reports, self.turn_counter);
-                    let generation = self.generation();
-                    self.play_beats(beats, generation);
+                    self.play_beats(crate::script::auto_resume_beats(reports, self.turn_counter));
                 }
             }
             // ---- Aura events (§3) ----
@@ -960,11 +1096,9 @@ impl DemoDriver {
 
     /// The sim's `finishTurn` + auto-compaction law (tui.js:1507-1543):
     /// queued input consumes directly — the session never passes through
-    /// idle; else the 85% auto-compaction check (checked BEFORE emitting
-    /// Done — the sim's 30 ms transient-IDLE flicker is a known sim wart
-    /// the spec says not to port); else IDLE.
+    /// idle; else IDLE, then (review P2-13) the sim's own transient
+    /// `IDLE → 30 ms → COMPACTING` transition when the window is hot.
     pub fn finish_turn(&mut self, model: &mut AppModel) {
-        let generation = self.generation();
         if !model.msg_queue.is_empty() {
             let text = model.msg_queue.remove(0);
             model.dirty = true;
@@ -972,27 +1106,31 @@ impl DemoDriver {
             let mut beats = vec![Beat::Note(
                 "· turn ended with queued input — consuming it directly, no idle".to_owned(),
             )];
-            beats.extend(respond_beats(
+            beats.extend(respond_preamble(
                 &text,
                 false,
                 haider_protocol::DeliveryMode::Queue,
                 self.turn_counter,
-                &mut self.generic_counter,
-                &mut self.roster_counter,
             ));
-            self.play_beats(beats, generation);
+            self.play_beats(beats);
             return;
         }
+        // `hot` is sampled BEFORE the 30 ms window, exactly as the sim
+        // samples `b.tokens` before its `await sleep(30)` (tui.js:1510-1518).
         let window = model.identity.context_window;
         let total = self.tokens_total();
+        let mut beats = vec![Beat::Emit(EventPayload::RunState(RunState::Done))];
         if window > 0 && total.saturating_mul(100) >= window.saturating_mul(85) {
-            self.play_beats(compaction_beats(total, window * 6 / 100, false), generation);
-            return;
+            beats.push(Beat::Sleep(COMPACT_IDLE_GAP_MS));
+            self.compact_counter += 1;
+            beats.extend(compaction_beats(
+                total,
+                window * 6 / 100,
+                false,
+                self.compact_counter,
+            ));
         }
-        self.play_beats(
-            vec![Beat::Emit(EventPayload::RunState(RunState::Done))],
-            generation,
-        );
+        self.play_beats(beats);
     }
 }
 
@@ -1007,30 +1145,30 @@ fn count_done_reports(chips: &[crate::app::ChipModel]) -> usize {
         .sum()
 }
 
-/// The beat player: one spawned task per script, guard-captured. Cloned
-/// into child tasks so `ChipScript` beats can spawn concurrently (the
-/// future is boxed at each spawn to break the recursive type).
+/// The beat player: one spawned task per script, ARM-captured. Cloned into
+/// child tasks so `ChipScript` beats can spawn concurrently (the future is
+/// boxed at each spawn to break the recursive type).
 #[derive(Clone)]
 struct Player {
     tx: mpsc::Sender<(u64, DemoEvent)>,
-    input: Guard,
-    output: Guard,
-    arms: PendingArms,
-    chip_gen: Guard,
+    input: Counter,
+    output: Counter,
+    parked: PendingArms,
+    table: ArmTable,
 }
 
 impl Player {
-    fn spawn(&self, beats: Vec<Beat>, guard: Guard, generation: u64) {
+    fn spawn(&self, beats: Vec<Beat>, arm: u64) {
         let player = self.clone();
         let future: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
             Box::pin(async move {
-                player.run(beats, guard, generation).await;
+                player.run(beats, arm).await;
             });
         tokio::spawn(future);
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn run(&self, beats: Vec<Beat>, guard: Guard, generation: u64) {
+    async fn run(&self, beats: Vec<Beat>, arm: u64) {
         use std::sync::atomic::Ordering::SeqCst;
         let usage_event = |player: &Self| {
             DemoEvent::Envelope(EventPayload::Usage(Usage {
@@ -1043,7 +1181,7 @@ impl Player {
             }))
         };
         for beat in beats {
-            if guard.load(SeqCst) != generation {
+            if !self.table.is_live(arm) {
                 return;
             }
             let event = match beat {
@@ -1067,17 +1205,21 @@ impl Player {
                     self.output.store(0, SeqCst);
                     usage_event(self)
                 }
+                Beat::Dispatch { text, voice, turn } => {
+                    // Park the branch choice for the driver: the counters
+                    // must advance at dispatch, not while building beats.
+                    DemoEvent::Dispatch { text, voice, turn }
+                }
                 Beat::AwaitMenu { menu, arms } => {
-                    if let Ok(mut pending) = self.arms.lock() {
-                        pending.insert(menu.as_str().to_owned(), (generation, arms));
+                    let owner = self.table.owner(arm).unwrap_or(ArmOwner::Session);
+                    if let Ok(mut pending) = self.parked.lock() {
+                        pending.insert(menu.as_str().to_owned(), (arm, owner, arms));
                     }
                     return;
                 }
                 Beat::TurnEnd => DemoEvent::TurnEnd,
                 // Chip/aura beats map 1:1 onto their DemoEvents, tagged
-                // with THIS script's generation (a chip script tags chip-
-                // domain; its parent-transcript beats ride the same tag
-                // and stay live across a session interrupt).
+                // with THIS script's arm.
                 Beat::ChipAdd(seed) => DemoEvent::ChipAdd(seed),
                 Beat::ChipState { agent, state } => DemoEvent::ChipState { agent, state },
                 Beat::ChipEmit { agent, payload } => DemoEvent::ChipEmit { agent, payload },
@@ -1099,28 +1241,30 @@ impl Player {
                     DemoEvent::ChipQuestionClear { agent, state }
                 }
                 Beat::ChipClose { agent } => DemoEvent::ChipCloseReq { agent },
-                Beat::ChipScript(child) => {
-                    // Concurrent child script under the CHIP guard.
-                    let chip_now = self.chip_gen.load(SeqCst);
-                    self.spawn(child, std::sync::Arc::clone(&self.chip_gen), chip_now);
+                Beat::ChipScript { agent, beats } => {
+                    // A concurrent child script on its OWN chip-owned arm,
+                    // allocated against THIS arm under one lock — a
+                    // teardown between the check and the spawn can no
+                    // longer be adopted (review P1-1).
+                    if let Some(child) = self.table.alloc_child(arm, ArmOwner::Chip(agent)) {
+                        self.spawn(beats, child);
+                    }
                     continue;
                 }
                 Beat::AutoResume => {
-                    // The 120 ms defer runs under the CHIP guard; the §2.7
-                    // state guards are checked at consumption.
-                    let chip_now = self.chip_gen.load(SeqCst);
-                    let tx = self.tx.clone();
-                    let gen_ref = std::sync::Arc::clone(&self.chip_gen);
-                    tokio::spawn(async move {
-                        tokio::time::sleep(Duration::from_millis(
-                            crate::script::AUTO_RESUME_DEFER_MS,
-                        ))
-                        .await;
-                        if gen_ref.load(SeqCst) != chip_now {
-                            return;
-                        }
-                        let _ = tx.send((chip_now, DemoEvent::AutoResume)).await;
-                    });
+                    // The 120 ms defer resumes the SESSION's parked turn,
+                    // so its arm is session-owned; the §2.7 state guards
+                    // are re-checked at consumption.
+                    if let Some(timer) = self.table.alloc_child(arm, ArmOwner::Session) {
+                        let tx = self.tx.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(Duration::from_millis(
+                                crate::script::AUTO_RESUME_DEFER_MS,
+                            ))
+                            .await;
+                            let _ = tx.send((timer, DemoEvent::AutoResume)).await;
+                        });
+                    }
                     continue;
                 }
                 Beat::AuraState(state) => DemoEvent::AuraState(state),
@@ -1139,10 +1283,10 @@ impl Player {
                 },
                 Beat::AuraLog(text) => DemoEvent::AuraLog(text),
             };
-            if guard.load(SeqCst) != generation {
+            if !self.table.is_live(arm) {
                 return;
             }
-            if self.tx.send((generation, event)).await.is_err() {
+            if self.tx.send((arm, event)).await.is_err() {
                 return;
             }
         }

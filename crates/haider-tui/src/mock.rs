@@ -253,7 +253,32 @@ pub struct SampleSession {
     pub model: &'static str,
     pub device: &'static str,
     pub ago: &'static str,
+    /// The session's own run state is busy (sim `runStates[s.id] !== IDLE`).
     pub running: bool,
+    /// Live subagent chips this session owns (sim `sessionLive`,
+    /// tui.js:789-792). The L1 seed owns the running `web-index` chip
+    /// (tui.js:556-572), which is what makes it the launcher's one live row
+    /// — the Rust port used to mark `cellular-pool-fix` busy instead
+    /// (review P2-8). `sessionBusy` = `live > 0 || running`.
+    pub live_subagents: usize,
+}
+
+/// The sim's seeded credential list (tui.js:146-154): 7 accounts across 5
+/// providers (openai ×2, anthropic ×2, google, local, huggingface) — the
+/// launcher's Accounts meta quotes both counts verbatim.
+pub const SEED_ACCOUNTS: usize = 7;
+pub const SEED_ACCOUNT_PROVIDERS: usize = 5;
+/// The sim's seeded peer list minus the `shell` rung (tui.js:169-174):
+/// this-mac + workstation (peer) and hetzner-1 (attached) host sessions;
+/// ci-runner-7 is exec-only. The launcher's Peers meta quotes this count.
+pub const SEED_HOST_CAPABLE_PEERS: usize = 3;
+
+impl SampleSession {
+    /// Sim `sessionBusy` (tui.js:789-792): live subagents OR a busy run.
+    #[must_use]
+    pub const fn busy(&self) -> bool {
+        self.live_subagents > 0 || self.running
+    }
 }
 
 /// The sim's seed sessions, verbatim identity (owner default roster).
@@ -272,6 +297,7 @@ pub fn sample_sessions() -> Vec<SampleSession> {
             device: "this-mac",
             ago: "12m",
             running: false,
+            live_subagents: 0,
         },
         SampleSession {
             name: "cellular-pool-fix",
@@ -284,7 +310,8 @@ pub fn sample_sessions() -> Vec<SampleSession> {
             model: "gpt-5.6",
             device: "hetzner-1",
             ago: "2h",
-            running: true,
+            running: false,
+            live_subagents: 0,
         },
         SampleSession {
             name: "l1-remote-projects",
@@ -298,6 +325,7 @@ pub fn sample_sessions() -> Vec<SampleSession> {
             device: "mac-studio",
             ago: "1d",
             running: false,
+            live_subagents: 1,
         },
     ]
 }

@@ -15,6 +15,11 @@ use haider_tui::script::{
 };
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+/// A shared sim counter (`genRef` / `rosterRef`) for beat-level builders.
+fn counter(start: u64) -> std::sync::atomic::AtomicU64 {
+    std::sync::atomic::AtomicU64::new(start)
+}
+
 fn key(code: KeyCode) -> AppEvent {
     AppEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))
 }
@@ -29,15 +34,8 @@ fn launcher_model() -> AppModel {
 
 /// Build a turn's beats with fresh sim counters (genRef 0, rosterRef 3).
 fn beats_for(text: &str) -> Vec<Beat> {
-    let (mut generic, mut roster) = (0, 3);
-    respond_beats(
-        text,
-        false,
-        DeliveryMode::Steer,
-        1,
-        &mut generic,
-        &mut roster,
-    )
+    let (generic, roster) = (counter(0), counter(3));
+    respond_beats(text, false, DeliveryMode::Steer, 1, &generic, &roster)
 }
 
 /// Every emitted payload, in order (arms excluded).
@@ -158,15 +156,8 @@ fn preamble_is_user_tokens_thinking_750_streaming_and_ends_with_turn_end() {
 
 #[test]
 fn voice_turns_wrap_in_voice_tags_and_skip_the_user_row() {
-    let (mut generic, mut roster) = (0, 3);
-    let beats = respond_beats(
-        "hello",
-        true,
-        DeliveryMode::Steer,
-        1,
-        &mut generic,
-        &mut roster,
-    );
+    let (generic, roster) = (counter(0), counter(3));
+    let beats = respond_beats("hello", true, DeliveryMode::Steer, 1, &generic, &roster);
     assert!(matches!(beats[0], Beat::Voice(true)));
     assert!(
         !emits(&beats)
@@ -174,14 +165,17 @@ fn voice_turns_wrap_in_voice_tags_and_skip_the_user_row() {
             .any(|payload| matches!(payload, EventPayload::UserMessage { .. })),
         "the reducer already pushed the ◉ row"
     );
-    let voice_off = beats
-        .iter()
-        .position(|beat| matches!(beat, Beat::Voice(false)))
-        .expect("voice tag closes");
+    // TUI3.1 P2-10: there is NO trailing `Voice(false)` beat. A branch that
+    // parks on a menu never reaches its own tail, so the tag would leak
+    // into later ordinary rows; it now closes where the turn truly ends —
+    // on the terminal run state, in the reducer (asserted end-to-end in
+    // `talk_hold_fires_the_canned_phrase_through_the_voice_path` and
+    // `voice_tag_clears_even_when_the_branch_parks_on_a_menu`).
     assert!(
-        matches!(beats[voice_off + 1], Beat::TurnEnd),
-        "Voice(false) lands right before TurnEnd"
+        !beats.iter().any(|beat| matches!(beat, Beat::Voice(false))),
+        "no tail-only voice beat survives a parked branch"
     );
+    assert!(matches!(beats.last(), Some(Beat::TurnEnd)));
 }
 
 #[test]
@@ -258,16 +252,9 @@ fn routing_follows_the_sim_order_and_word_boundaries() {
 
 #[test]
 fn generic_rotation_post_increments_and_test_branch_reads_without_increment() {
-    let (mut generic, mut roster) = (0, 3);
-    let mut turn = |text: &str| {
-        let beats = respond_beats(
-            text,
-            false,
-            DeliveryMode::Steer,
-            1,
-            &mut generic,
-            &mut roster,
-        );
+    let (generic, roster) = (counter(0), counter(3));
+    let turn = |text: &str| {
+        let beats = respond_beats(text, false, DeliveryMode::Steer, 1, &generic, &roster);
         agent_texts(&beats)
     };
     let first = turn("hello");
@@ -594,22 +581,22 @@ fn roster_claims_draw_in_order_from_index_three_and_wrap_with_roman() {
     assert_eq!(tool_rows(&beats)[0].1, "Hasan · tests → local · gpt-5.6");
     assert_eq!(tool_rows(&beats)[1].1, "Husayn · docs → local · gemini-3");
     // §1.4 claims the NEXT name.
-    let (mut generic, mut roster) = (0, 3);
+    let (generic, roster) = (counter(0), counter(3));
     let _ = respond_beats(
         "use a subagent here",
         false,
         DeliveryMode::Steer,
         1,
-        &mut generic,
-        &mut roster,
+        &generic,
+        &roster,
     );
     let auth = respond_beats(
         "split the auth work",
         false,
         DeliveryMode::Steer,
         2,
-        &mut generic,
-        &mut roster,
+        &generic,
+        &roster,
     );
     assert!(
         agent_texts(&auth)[0]
@@ -622,7 +609,7 @@ fn roster_claims_draw_in_order_from_index_three_and_wrap_with_roman() {
 
 #[test]
 fn compaction_beats_carry_the_numbers_and_reenter_the_turn_end_law() {
-    let auto = compaction_beats(170_000, 12_000, false);
+    let auto = compaction_beats(170_000, 12_000, false, 1);
     assert!(matches!(
         &auto[0],
         Beat::Note(text)
@@ -654,7 +641,7 @@ fn compaction_beats_carry_the_numbers_and_reenter_the_turn_end_law() {
         matches!(auto.last(), Some(Beat::TurnEnd)),
         "auto path re-runs finishTurn (queued input may consume here too)"
     );
-    let manual = compaction_beats(30_000, 12_000, true);
+    let manual = compaction_beats(30_000, 12_000, true, 2);
     assert!(
         !manual.iter().any(|beat| matches!(beat, Beat::Note(_))),
         "manual /compact has no 85% note"
@@ -691,7 +678,7 @@ fn echo_answers(driver: &DemoDriver, model: &mut AppModel) {
         driver
             .sender()
             .try_send((
-                driver.generation(),
+                driver.control_tag(),
                 DemoEvent::Envelope(EventPayload::MenuAnswered(answer)),
             ))
             .expect("echo");
@@ -1028,7 +1015,7 @@ async fn talk_hold_fires_the_canned_phrase_through_the_voice_path() {
     )));
     assert!(
         !model.projection.voice_live(),
-        "Voice(false) closed the tag"
+        "the terminal run state closed the tag"
     );
 }
 
@@ -1047,7 +1034,7 @@ async fn stop_scripts_cancels_parked_menu_arms() {
     driver
         .sender()
         .try_send((
-            driver.generation(),
+            driver.control_tag(),
             DemoEvent::Envelope(EventPayload::MenuAnswered(
                 haider_protocol::menu::MenuAnswer {
                     menu: menu_id,

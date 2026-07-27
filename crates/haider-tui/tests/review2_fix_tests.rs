@@ -122,7 +122,10 @@ async fn stale_generation_envelopes_are_dropped_at_consumption() {
     drain(&mut driver, &mut model);
     assert!(!model.turn_active);
     assert!(model.projection.interrupted());
-    assert!(stale_generation < driver.generation(), "bump happened");
+    assert!(
+        !driver.is_arm_live(stale_generation),
+        "the interrupt cancelled that arm"
+    );
     let entries_before = model.projection.entries().len();
 
     // The buffered stale beat is consumed AFTER the bump: dropped whole.
@@ -190,7 +193,7 @@ async fn stale_idle_decay_never_lands_in_a_fresh_session() {
     loop {
         let (generation, payload) = rx.recv().await.expect("beat");
         let is_decay = matches!(payload, DemoEvent::Envelope(EventPayload::IdleDecayed));
-        let current = generation == driver.generation();
+        let current = driver.is_arm_live(generation);
         driver.consume(&mut model, generation, payload);
         if is_decay {
             decays_seen += 1;
@@ -308,7 +311,7 @@ fn alt_and_shift_enter_insert_newlines_and_enter_submits() {
             AppRequest::SubmitText {
                 text: "line one\nline two\nline three".to_owned(),
                 voice: false,
-                title: Some("Line one line two line three".to_owned()),
+                title: true,
             }
         ]
     );
