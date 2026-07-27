@@ -32,6 +32,10 @@
 //! ([`shutdown_without_store`], [`shutdown_before_listener`]) run the same
 //! tail ordering with whatever resources exist so far.
 
+#[cfg(test)]
+#[path = "runtime_tests.rs"]
+mod runtime_tests;
+
 use crate::connection::{ConnectionContext, ConnectionExit, DrainNotice, reject_over_limit, serve};
 use crate::endpoint;
 use crate::lifecycle::{ShutdownObserver, ShutdownRequest, StatePublisher};
@@ -234,6 +238,10 @@ async fn run_inner(
         }
     };
     let (drain_sender, drain_receiver) = watch::channel(Option::<DrainNotice>::None);
+    // Every connection hands its writer task here; the barrier below owns
+    // aborting and JOINING them, so no child outlives teardown (R17).
+    let (writer_sender, mut writer_receiver) = tokio::sync::mpsc::unbounded_channel();
+    let mut writers = Vec::new();
     let context = ConnectionContext {
         profile_id: config.profile_id.clone(),
         instance_id: instance_id.clone(),
@@ -243,6 +251,7 @@ async fn run_inner(
         outbound_queued_bytes: config.outbound_queued_bytes,
         max_connections: config.max_connections,
         handshake_timeout: config.handshake_timeout,
+        writers: writer_sender,
         owner_uid: endpoint.owner_uid,
         endpoint_path: endpoint.path().to_path_buf(),
     };
@@ -303,6 +312,14 @@ async fn run_inner(
                             reason: "listener failure".into(),
                         };
                     }
+                }
+            }
+            registered = writer_receiver.recv() => {
+                if let Some(handle) = registered {
+                    // Opportunistic pruning keeps the registry proportional to
+                    // live connections, not to connections ever served.
+                    writers.retain(|writer: &JoinHandle<()>| !writer.is_finished());
+                    writers.push(handle);
                 }
             }
             completed = connections.join_next(), if !connections.is_empty() => {
@@ -366,49 +383,67 @@ async fn run_inner(
             }
         }
     }
-    if !forced {
-        forced = matches!(*shutdown.borrow(), ShutdownRequest::Forced { .. });
+    forced |= barrier_breached(barrier_deadline, &shutdown);
+    // Collect writers registered since the accept loop's last turn, then take
+    // ownership of their completion: abort first so every connection parked on
+    // its writer can finish, and JOIN below so no writer future — with its
+    // socket half and payload — can still exist when the endpoint and store go.
+    while let Ok(handle) = writer_receiver.try_recv() {
+        writers.push(handle);
     }
     if forced {
+        for writer in &writers {
+            writer.abort();
+        }
         connections.abort_all();
     }
     while let Some(completed) = connections.join_next().await {
         note_connection_exit(&mut undelivered_notices, Some(completed));
     }
+    let joined_writers = bounded_finalization(
+        async {
+            for writer in writers {
+                let _ = writer.await;
+            }
+        },
+        barrier_deadline,
+        &mut shutdown,
+    )
+    .await;
+    // An unjoined writer is exactly what P1-1 forbids: report it, never
+    // pretend the barrier completed cleanly.
+    forced |= joined_writers.is_none() || barrier_breached(barrier_deadline, &shutdown);
 
     // Finalization is part of the barrier: flush, socket removal, and the
     // store close each run under the same deadline and the same second-signal
-    // escape. Store work that overruns keeps running on the blocking pool and
-    // releases the lock as soon as it physically can, but this task stops
-    // waiting and reports the forced outcome honestly.
-    let flush_error =
-        match bounded_finalization(store.flush(), barrier_deadline, &mut shutdown).await {
-            Some(result) => {
-                let error = result.err().map(DaemonError::from);
-                if forced { None } else { error }
-            }
-            None => {
-                forced = true;
-                None
-            }
-        };
+    // escape, and EVERY step is arbitrated afterwards — a step that completed
+    // is not evidence that the barrier held. Store work that overruns keeps
+    // running on the blocking pool and releases the lock as soon as it
+    // physically can, but this task stops waiting and reports forced honestly.
+    let flush = bounded_finalization(store.flush(), barrier_deadline, &mut shutdown).await;
+    let flush_overran = flush.is_none();
+    let flush_result = flush.and_then(|result| result.err()).map(DaemonError::from);
+    forced |= flush_overran || barrier_breached(barrier_deadline, &shutdown);
+    let flush_error = if forced { None } else { flush_result };
+
     // Socket removal happens even when the flush overran: an abandoned
-    // rendezvous node is worse than a large WAL.
+    // rendezvous node is worse than a large WAL. It is synchronous, so its
+    // arbitration is the recheck that follows it.
     let cleanup_error = endpoint.cleanup().err();
-    let close_error =
-        match bounded_finalization(store.close(), barrier_deadline, &mut shutdown).await {
-            Some(result) => {
-                let error = result.err().map(DaemonError::from);
-                if forced { None } else { error }
-            }
-            None => {
-                forced = true;
-                None
-            }
-        };
+    forced |= barrier_breached(barrier_deadline, &shutdown);
+
+    let close = bounded_finalization(store.close(), barrier_deadline, &mut shutdown).await;
+    let close_overran = close.is_none();
+    let close_result = close.and_then(|result| result.err()).map(DaemonError::from);
+    forced |= close_overran || barrier_breached(barrier_deadline, &shutdown);
+    let close_error = if forced { None } else { close_result };
+
     if undelivered_notices > 0 {
         forced = true;
     }
+    // Final arbitration: a second signal that arrived during any synchronous
+    // step above still decides the outcome.
+    forced |= barrier_breached(barrier_deadline, &shutdown);
 
     if let Some(error) = listener_error
         .or(flush_error)
@@ -458,14 +493,19 @@ async fn bounded_finalization<T>(
     // for the step to finish and hide an already-expired deadline.
     let started = std::future::poll_fn(|context| Poll::Ready(work.as_mut().poll(context))).await;
     if let Poll::Ready(output) = started {
+        // Completing is not evidence the barrier held; the caller arbitrates
+        // the deadline and the force AFTER every step.
         return Some(output);
     }
-    if tokio::time::Instant::now() >= deadline {
+    if barrier_breached(deadline, shutdown) {
         return None;
     }
     loop {
         tokio::select! {
-            output = &mut work => return Some(output),
+            // Biased: the barrier's own signals are inspected before the work,
+            // so a step that becomes ready at the same instant as the deadline
+            // or a force can never mask them.
+            biased;
             () = tokio::time::sleep_until(deadline) => return None,
             changed = shutdown.changed() => {
                 match changed {
@@ -480,8 +520,21 @@ async fn bounded_finalization<T>(
                     Err(_) => return tokio::time::timeout_at(deadline, &mut work).await.ok(),
                 }
             }
+            output = &mut work => return Some(output),
         }
     }
+}
+
+/// Has the drain barrier been breached — deadline gone, or a force arrived?
+///
+/// Read from the watch value rather than from `changed()`, so a second signal
+/// delivered while a SYNCHRONOUS step ran is still observed (R17 honesty).
+pub(crate) fn barrier_breached(
+    deadline: tokio::time::Instant,
+    shutdown: &watch::Receiver<ShutdownRequest>,
+) -> bool {
+    tokio::time::Instant::now() >= deadline
+        || matches!(*shutdown.borrow(), ShutdownRequest::Forced { .. })
 }
 
 /// Drain tail for shutdown observed after store open but before the listener
@@ -508,20 +561,18 @@ async fn shutdown_before_listener(
         reason,
         deadline_unix_ms: unix_time_ms().saturating_add(duration_ms(config.drain_timeout)),
     });
-    let flush_error = match bounded_finalization(store.flush(), barrier_deadline, shutdown).await {
-        Some(result) => result.err().map(DaemonError::from),
-        None => {
-            forced = true;
-            None
-        }
-    };
-    let close_error = match bounded_finalization(store.close(), barrier_deadline, shutdown).await {
-        Some(result) => result.err().map(DaemonError::from),
-        None => {
-            forced = true;
-            None
-        }
-    };
+    // Same discipline as the full barrier: bound each step, then arbitrate the
+    // deadline and any force AFTER it, and once more before reporting.
+    let flush = bounded_finalization(store.flush(), barrier_deadline, shutdown).await;
+    let flush_overran = flush.is_none();
+    let flush_error = flush.and_then(|result| result.err()).map(DaemonError::from);
+    forced |= flush_overran || barrier_breached(barrier_deadline, shutdown);
+
+    let close = bounded_finalization(store.close(), barrier_deadline, shutdown).await;
+    let close_overran = close.is_none();
+    let close_error = close.and_then(|result| result.err()).map(DaemonError::from);
+    forced |= close_overran || barrier_breached(barrier_deadline, shutdown);
+
     if !forced && let Some(error) = flush_error.or(close_error) {
         return Err(error);
     }

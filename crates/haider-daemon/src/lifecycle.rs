@@ -7,6 +7,11 @@
 
 use haider_rpc::LifecyclePhase;
 use std::sync::Arc;
+
+#[cfg(test)]
+#[path = "lifecycle_tests.rs"]
+mod lifecycle_tests;
+
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use tokio::sync::watch;
@@ -127,7 +132,9 @@ impl StatePublisher {
     pub(crate) fn publish(&self, state: DaemonState) {
         let prior = self.sender.borrow().clone();
         if !prior.can_transition_to(&state) {
-            debug_assert!(false, "illegal lifecycle transition {prior:?} -> {state:?}");
+            // Refusal, not an abort: the behaviour must be identical in every
+            // build (a debug-only panic would make dev and release disagree
+            // about a contract clients read), and it must be testable.
             eprintln!(
                 "haider-daemon: refusing illegal lifecycle transition {prior:?} -> {state:?}"
             );

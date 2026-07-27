@@ -41,38 +41,44 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::net::unix::OwnedWriteHalf;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 
-/// Owns the socket write half; aborted on drop so a peer that never reads
-/// cannot leak a writer task past its connection.
-struct WriterTask(Option<tokio::task::JoinHandle<std::io::Result<bool>>>);
+/// Registry of writer tasks, owned by the daemon runtime.
+///
+/// Load-bearing for R17: the connection task cannot own its writer's
+/// completion, because a cancelled connection is dropped and `Drop` cannot
+/// await. So the `JoinHandle` of every writer goes to `runtime.rs`, which
+/// aborts AND JOINS them inside the drain barrier — no writer future, socket
+/// half, or payload can be alive when endpoint cleanup and the store close run.
+/// The connection keeps only an [`tokio::task::AbortHandle`] (to stop its own
+/// writer when it ends early) and a one-shot for the writer's result.
+pub(crate) type WriterRegistry = mpsc::UnboundedSender<tokio::task::JoinHandle<()>>;
 
-impl WriterTask {
-    /// Awaits the writer WITHOUT taking its handle out of the guard.
-    ///
-    /// Load-bearing for R17: if this future is cancelled mid-await (the drain
-    /// barrier aborting a connection at its deadline), [`Drop`] still finds the
-    /// handle and aborts the writer. Taking the handle first would detach the
-    /// writer instead, letting a task, a socket, and its payload outlive
-    /// endpoint cleanup and the profile-lock release.
-    async fn finish(&mut self) -> Result<std::io::Result<bool>, tokio::task::JoinError> {
-        match self.0.as_mut() {
-            Some(task) => {
-                let result = task.await;
-                self.0 = None;
-                result
-            }
-            None => Ok(Ok(false)),
+/// Connection-side handle to the writer: abort authority without join
+/// authority (the runtime owns the join).
+struct WriterGuard {
+    abort: tokio::task::AbortHandle,
+    finished: Option<oneshot::Receiver<std::io::Result<bool>>>,
+}
+
+impl WriterGuard {
+    /// Waits for the writer's own report. An aborted writer reports nothing,
+    /// which is exactly "no notice reached the wire".
+    async fn finish(&mut self) -> std::io::Result<bool> {
+        match self.finished.take() {
+            Some(finished) => finished.await.unwrap_or(Ok(false)),
+            None => Ok(false),
         }
     }
 }
 
-impl Drop for WriterTask {
+impl Drop for WriterGuard {
     fn drop(&mut self) {
-        if let Some(task) = self.0.take() {
-            task.abort();
-        }
+        // Best effort, and a no-op once the writer has finished: a connection
+        // that ends early must not leave its writer parked on a peer that
+        // never reads. The runtime still joins the task.
+        self.abort.abort();
     }
 }
 
@@ -199,6 +205,9 @@ pub(crate) struct ConnectionContext {
     /// How long a peer may hold a connection slot without completing its
     /// handshake before it is closed.
     pub(crate) handshake_timeout: std::time::Duration,
+    /// Where each connection hands its writer task for the runtime to abort
+    /// and join at teardown (R17: teardown owns child completion).
+    pub(crate) writers: WriterRegistry,
     /// UID that owns the endpoint; every peer must match it (R2).
     pub(crate) owner_uid: u32,
     /// For error context only; the stream is already accepted.
@@ -238,9 +247,21 @@ pub(crate) async fn serve(
     // consume what the last frame needs.
     let (reserve, reserved) = mpsc::channel::<ReservedNotice>(1);
     let ledger = Arc::clone(&lane.queued_bytes);
-    let mut writer_task = WriterTask(Some(tokio::spawn(run_writer(
-        writer, queued, reserved, ledger,
-    ))));
+    let (report, reported) = oneshot::channel::<std::io::Result<bool>>();
+    let writer_handle = tokio::spawn(async move {
+        let outcome = run_writer(writer, queued, reserved, ledger).await;
+        // The result travels the one-shot; the JoinHandle belongs to the
+        // runtime, which owns abort-and-join at teardown.
+        let _ = report.send(outcome);
+    });
+    let mut writer_task = WriterGuard {
+        abort: writer_handle.abort_handle(),
+        finished: Some(reported),
+    };
+    if let Err(unowned) = context.writers.send(writer_handle) {
+        // The runtime is already gone; nothing would ever join this writer.
+        unowned.0.abort();
+    }
 
     let mut decoder = uds_codec::Decoder::new(context.frame_limit);
     let mut buffer = [0_u8; 16 * 1024];
@@ -330,9 +351,6 @@ pub(crate) async fn serve(
     let written = writer_task
         .finish()
         .await
-        .map_err(|error| DaemonError::Task {
-            message: format!("connection writer task failed: {error}"),
-        })?
         .map_err(|error| DaemonError::io("write Unix connection", &context.endpoint_path, error))?;
     Ok(match (notice_reserved || notice_refused, written) {
         (false, _) => ConnectionExit::ClosedBeforeDrain,

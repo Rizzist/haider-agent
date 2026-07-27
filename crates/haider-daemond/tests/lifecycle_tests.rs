@@ -67,6 +67,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::os::unix::net::UnixListener as StdUnixListener;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Barrier};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1029,6 +1030,108 @@ async fn never_reading_client_is_cut_at_the_drain_deadline_and_releases_everythi
     );
 }
 
+/// The strict form of the same law with a peer that reads NOTHING — not one
+/// byte, ever. The daemon's reply is parked in `write_all` from the first
+/// moment, so the barrier is the only thing that can end this connection, and
+/// the writer must be gone (aborted AND joined) before the daemon reports.
+#[tokio::test]
+async fn client_that_never_reads_a_byte_cannot_hold_the_barrier_open() {
+    let root = test_root();
+    let profile = format!("never-reads-strict-{}", "p".repeat(512 * 1024));
+    let mut config = test_config(&root, &profile);
+    config.frame_limit = config.profile_id.len() + 1_024;
+    config.outbound_queued_bytes = config.frame_limit;
+    config.drain_timeout = Duration::from_millis(250);
+    let task = spawn(config.clone());
+    wait_for_state(task.readiness(), |state| *state == DaemonState::Ready).await;
+
+    let mut client = TestClient::connect(&config.endpoint_path(), config.frame_limit)
+        .await
+        .expect("connect");
+    client
+        .send(
+            &hello(
+                WIRE_PROTOCOL_VERSION,
+                WIRE_PROTOCOL_VERSION,
+                u32::try_from(config.frame_limit).expect("frame limit fits"),
+            ),
+            config.frame_limit,
+        )
+        .await;
+    // Synchronise WITHOUT consuming: readable() proves the daemon's reply has
+    // started arriving, and the client still has not read a single byte.
+    tokio::time::timeout(DEADLINE, client.stream.readable())
+        .await
+        .expect("reply deadline")
+        .expect("readable");
+
+    task.shutdown_handle().request("strict deadline");
+    assert_eq!(
+        task.join().await.expect("daemon joins"),
+        ShutdownOutcome::Forced
+    );
+    assert!(!config.endpoint_path().exists());
+    poll_store_release(&config).await;
+
+    // Nothing is feeding this socket any more: the reply is a truncated prefix
+    // followed by EOF, reached promptly because the writer was joined, not left
+    // to finish its half-megabyte frame.
+    let delivered = tokio::time::timeout(Duration::from_secs(2), client.frames_until_eof())
+        .await
+        .expect("EOF must follow the barrier promptly");
+    assert_eq!(
+        delivered, 0,
+        "a writer that outlived teardown completed its frame"
+    );
+}
+
+/// A peer that reads exactly one byte and then stops is the same hazard with a
+/// different shape: the write is in flight, the socket buffer never drains, and
+/// the barrier still has to end everything on time.
+#[tokio::test]
+async fn one_byte_reader_cannot_hold_the_barrier_open() {
+    let root = test_root();
+    let profile = format!("one-byte-reader-{}", "p".repeat(512 * 1024));
+    let mut config = test_config(&root, &profile);
+    config.frame_limit = config.profile_id.len() + 1_024;
+    config.outbound_queued_bytes = config.frame_limit;
+    config.drain_timeout = Duration::from_millis(250);
+    let task = spawn(config.clone());
+    wait_for_state(task.readiness(), |state| *state == DaemonState::Ready).await;
+
+    let mut client = TestClient::connect(&config.endpoint_path(), config.frame_limit)
+        .await
+        .expect("connect");
+    client
+        .send(
+            &hello(
+                WIRE_PROTOCOL_VERSION,
+                WIRE_PROTOCOL_VERSION,
+                u32::try_from(config.frame_limit).expect("frame limit fits"),
+            ),
+            config.frame_limit,
+        )
+        .await;
+    let mut byte = [0_u8; 1];
+    let read = tokio::time::timeout(DEADLINE, client.stream.read(&mut byte))
+        .await
+        .expect("first byte deadline")
+        .expect("first byte");
+    assert_eq!(read, 1);
+
+    task.shutdown_handle().request("one byte and no more");
+    assert_eq!(
+        task.join().await.expect("daemon joins"),
+        ShutdownOutcome::Forced
+    );
+    assert!(!config.endpoint_path().exists());
+    poll_store_release(&config).await;
+    let delivered = tokio::time::timeout(Duration::from_secs(2), client.frames_until_eof())
+        .await
+        .expect("EOF must follow the barrier promptly");
+    assert_eq!(delivered, 0);
+}
+
 /// The forced path aborts connection tasks outright. The writer must die with
 /// its connection: joining it may not hand its handle away, or the abort finds
 /// nothing to cancel and the writer (plus its socket and payload) survives
@@ -1108,27 +1211,20 @@ async fn drain_deadline_covers_the_finalization_tail() {
     poll_store_release(&config).await;
 }
 
-/// R3/R22: a node that appears at the endpoint path around cleanup is never
-/// this daemon's to delete, whichever side of the claim it lands on. The
-/// bind → identity window is closed by construction (the socket is created
-/// under a private name and renamed into place), so only this side needs a
-/// racing test.
+/// R3/R22, quiet ordering: a replacement that is already in place when cleanup
+/// runs is left completely alone.
 #[tokio::test]
-async fn endpoint_replacement_around_cleanup_is_never_deleted() {
+async fn endpoint_replacement_before_cleanup_is_never_deleted() {
     let root = test_root();
     let config = test_config(&root, "cleanup-replacement");
     let task = spawn(config.clone());
     wait_for_state(task.readiness(), |state| *state == DaemonState::Ready).await;
 
     let socket_path = config.endpoint_path();
-    task.shutdown_handle().request("handover");
-    // Racing the cleanup deliberately: if we win, the daemon claims a node
-    // that is not its own and must restore it; if we lose, we create a node
-    // the daemon has already stopped caring about. Both orderings must leave
-    // this node in place.
     let _ = fs::remove_file(&socket_path);
     let replacement = StdUnixListener::bind(&socket_path).expect("bind replacement node");
     let replacement_metadata = fs::symlink_metadata(&socket_path).expect("replacement metadata");
+    task.shutdown_handle().request("handover");
     assert_eq!(
         task.join().await.expect("daemon joins"),
         ShutdownOutcome::Graceful
@@ -1140,6 +1236,215 @@ async fn endpoint_replacement_around_cleanup_is_never_deleted() {
     );
     drop(replacement);
     fs::remove_file(socket_path).expect("remove replacement");
+}
+
+/// R3/R22, real race: another same-UID process replaces the endpoint node in a
+/// tight loop across the whole drain, so its swaps genuinely interleave with
+/// the daemon's cleanup on another thread. The invariant is absolute — the
+/// daemon may unlink only a node whose identity it recorded — so a node the
+/// racer created must NEVER disappear under it.
+#[tokio::test]
+async fn endpoint_replacement_racing_cleanup_is_never_deleted() {
+    let root = test_root();
+    let config = test_config(&root, "cleanup-race");
+    let task = spawn(config.clone());
+    wait_for_state(task.readiness(), |state| *state == DaemonState::Ready).await;
+
+    let socket_path = config.endpoint_path();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stolen = Arc::new(AtomicUsize::new(0));
+    let racer = std::thread::spawn({
+        let path = socket_path.clone();
+        let stop = Arc::clone(&stop);
+        let stolen = Arc::clone(&stolen);
+        move || {
+            while !stop.load(AtomicOrdering::Relaxed) {
+                let _ = fs::remove_file(&path);
+                let Ok(listener) = StdUnixListener::bind(&path) else {
+                    continue;
+                };
+                let Ok(metadata) = fs::symlink_metadata(&path) else {
+                    continue;
+                };
+                let mine = (metadata.dev(), metadata.ino());
+                // Watch my own node for a while: anything that removes or
+                // replaces it in this window is not me.
+                for _ in 0..256 {
+                    match fs::symlink_metadata(&path) {
+                        Ok(found) if (found.dev(), found.ino()) == mine => {}
+                        _ => {
+                            stolen.fetch_add(1, AtomicOrdering::Relaxed);
+                            break;
+                        }
+                    }
+                    std::thread::yield_now();
+                }
+                drop(listener);
+            }
+        }
+    });
+
+    task.shutdown_handle().request("racing handover");
+    assert_eq!(
+        task.join().await.expect("daemon joins"),
+        ShutdownOutcome::Graceful
+    );
+    stop.store(true, AtomicOrdering::Relaxed);
+    racer.join().expect("racer thread");
+    assert_eq!(
+        stolen.load(AtomicOrdering::Relaxed),
+        0,
+        "the daemon removed an endpoint node it never created"
+    );
+    let _ = fs::remove_file(&socket_path);
+}
+
+/// Does any entry in `directory` still refer to this exact inode? Used to tell
+/// "the node was moved" (legal, and the documented claim residual) from "the
+/// node was unlinked" (never legal for a node this daemon did not create).
+fn inode_exists_in(directory: &Path, identity: (u64, u64)) -> bool {
+    // A rename is atomic, but a directory scan is not, so a node caught
+    // mid-claim can be missed once; retry before believing it is gone.
+    for _ in 0..8 {
+        let Ok(entries) = fs::read_dir(directory) else {
+            return true;
+        };
+        for entry in entries.flatten() {
+            if let Ok(metadata) = fs::symlink_metadata(entry.path())
+                && (metadata.dev(), metadata.ino()) == identity
+            {
+                return true;
+            }
+        }
+        std::thread::yield_now();
+    }
+    false
+}
+
+/// R3's widest window: the stale-cleanup decision is made by a connect probe,
+/// and a node can go LIVE between that probe and the removal. Cleanup must
+/// therefore re-probe the node it actually holds — under its claimed name —
+/// so a listener that came up in the gap is restored, never unlinked.
+///
+/// The racer flips the endpoint between live and stale continuously while the
+/// daemon repeatedly tries to start, so the gap is genuinely exercised; the
+/// daemon may legitimately refuse (live at probe) or start (stale at probe),
+/// and either way a LIVE node of the racer's must never be removed.
+#[tokio::test]
+async fn stale_cleanup_never_removes_a_node_that_went_live() {
+    let root = test_root();
+    let config = test_config(&root, "stale-flip");
+    fs::create_dir_all(&config.runtime_dir).expect("runtime directory");
+    let socket_path = config.endpoint_path();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stolen = Arc::new(AtomicUsize::new(0));
+    let racer = std::thread::spawn({
+        let path = socket_path.clone();
+        let runtime_dir = config.runtime_dir.clone();
+        let stop = Arc::clone(&stop);
+        let stolen = Arc::clone(&stolen);
+        move || {
+            while !stop.load(AtomicOrdering::Relaxed) {
+                let _ = fs::remove_file(&path);
+                let Ok(listener) = StdUnixListener::bind(&path) else {
+                    continue;
+                };
+                let Ok(metadata) = fs::symlink_metadata(&path) else {
+                    continue;
+                };
+                let mine = (metadata.dev(), metadata.ino());
+                // While this listener is LIVE, its inode may never be UNLINKED.
+                // A claim that moves it under a staging name and restores it
+                // (or strands it there) is the documented residual — the law
+                // being pinned is that the node still exists somewhere.
+                for _ in 0..64 {
+                    match fs::symlink_metadata(&path) {
+                        Ok(found) if (found.dev(), found.ino()) == mine => {}
+                        _ if !inode_exists_in(&runtime_dir, mine) => {
+                            stolen.fetch_add(1, AtomicOrdering::Relaxed);
+                            break;
+                        }
+                        _ => {}
+                    }
+                    std::thread::yield_now();
+                }
+                // Now the node is stale: exactly what the daemon's preflight
+                // probe is allowed to remove — but only if it is still stale
+                // when the removal happens.
+                drop(listener);
+                for _ in 0..64 {
+                    std::thread::yield_now();
+                }
+            }
+        }
+    });
+
+    for _ in 0..32 {
+        let task = spawn(config.clone());
+        // A start may legitimately succeed (the node was stale all the way
+        // through) or be refused (it was live at the probe); either way the
+        // daemon must stop on request rather than be waited on forever.
+        wait_for_state(task.readiness(), |state| {
+            matches!(state, DaemonState::Ready | DaemonState::Failed { .. })
+        })
+        .await;
+        task.shutdown_handle().request("flip round");
+        match task.join().await {
+            Ok(_) | Err(DaemonError::Endpoint { .. }) => {}
+            other => panic!("unexpected startup outcome: {other:?}"),
+        }
+        poll_store_release(&config).await;
+    }
+    stop.store(true, AtomicOrdering::Relaxed);
+    racer.join().expect("racer thread");
+    assert_eq!(
+        stolen.load(AtomicOrdering::Relaxed),
+        0,
+        "startup cleanup unlinked a node that was live when it was removed"
+    );
+    let _ = fs::remove_file(&socket_path);
+}
+
+/// A daemon that died between claim and restore leaves a staging node behind.
+/// The next start sweeps its own leftovers — and only those: a staging name
+/// that is still LIVE belongs to someone else's in-flight bind and is left.
+#[tokio::test]
+async fn stranded_staging_nodes_are_swept_but_live_ones_are_left() {
+    let root = test_root();
+    let config = test_config(&root, "staging-sweep");
+    fs::create_dir_all(&config.runtime_dir).expect("runtime directory");
+    let stranded = config
+        .runtime_dir
+        .join(".haiderd-00112233445566778899aabbccddeeff");
+    let live = config
+        .runtime_dir
+        .join(".haiderd-ffeeddccbbaa99887766554433221100");
+    let unrelated = config.runtime_dir.join("keep-me.sock");
+    drop(StdUnixListener::bind(&stranded).expect("stranded staging node"));
+    let live_listener = StdUnixListener::bind(&live).expect("live staging node");
+    drop(StdUnixListener::bind(&unrelated).expect("unrelated node"));
+
+    let task = spawn(config.clone());
+    wait_for_state(task.readiness(), |state| *state == DaemonState::Ready).await;
+    assert!(
+        !stranded.exists(),
+        "a stale staging leftover must be swept at startup"
+    );
+    assert!(
+        live.exists(),
+        "a live staging node is somebody's in-flight bind, not garbage"
+    );
+    assert!(
+        unrelated.exists(),
+        "the sweep must only ever consider its own staging prefix"
+    );
+
+    drop(live_listener);
+    task.shutdown_handle().request("test complete");
+    assert_eq!(
+        task.join().await.expect("daemon joins"),
+        ShutdownOutcome::Graceful
+    );
 }
 
 /// The conservative half of R3: a LIVE endpoint owned by someone else is
