@@ -613,6 +613,11 @@ fn token_scan(text: &str, prefix: &str, suffix: &str) -> Option<String> {
 }
 
 /// The script builder: shared beat vocabulary for every branch.
+/// Beat builder. `seq` numbers item ids within one turn's namespace
+/// (`t{turn}-{seq}`); continuation ARMS resume numbering from hand-picked
+/// bases (90/95/80/85/89/70 at their park sites) chosen to stay clear of
+/// the parent script's low sequence range — a new arm must pick a base
+/// that cannot collide with ids the same turn already emitted.
 struct B {
     beats: Vec<Beat>,
     turn: u64,
@@ -1920,11 +1925,13 @@ pub fn child_run_docs(agent: &str, turn: u64) -> Vec<Beat> {
 }
 
 /// respondChip (tui.js:1097-1161): a full turn on the CHIP's state
-/// machine. The nested-delegation path ports the INTENDED flow — the
-/// shipped sim early-returns at tui.js:1137 (`if (!(await ops.cTool(...)))`
-/// where cTool returns undefined), leaving parent `streaming` and child
-/// `running` forever; that dead-code path is a documented sim bug the
-/// spec says NOT to port as-is.
+/// machine. The nested-delegation path ports the sim AS SHIPPED (review
+/// r2 P2-14 adjudication: tui.js wins over the spec): the sim
+/// early-returns at tui.js:1137 (`if (!(await ops.cTool(...)))` where
+/// cTool returns undefined), leaving parent `streaming` and child
+/// `running` forever. We reproduce that dead-end exactly; the INTENDED
+/// flow (spawn → collect → integrate) is described at the early-return
+/// site below and must NOT be "fixed" here unless the sim changes first.
 #[must_use]
 pub fn respond_chip_beats(
     agent: &str,

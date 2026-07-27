@@ -400,8 +400,10 @@ pub enum ArmOwner {
     /// closes the review's "permanently blocked chip" hole.
     Chip(String),
     /// An aura orchestrate run or its talk timer. The next submit cancels
-    /// the previous run (sim `++auraRunRef`, tui.js:2060); `/clear`,
-    /// `/reset` and a fresh session cancel it outright.
+    /// the previous run (sim `++auraRunRef`, tui.js:2060) and `/reset`
+    /// cancels it outright; `/clear`, a session interrupt, and a fresh
+    /// session deliberately do NOT cancel it (sim tui.js:1913/1950 — a
+    /// background orchestration finishes; review r2 P2-5).
     Aura,
 }
 
@@ -657,10 +659,11 @@ impl DemoDriver {
         });
     }
 
-    /// Drain one reducer request — scripts play generation-captured,
-    /// stop/interrupt bump the generation (so buffered envelopes AND
-    /// pending timers of the old context drop at consumption — review r2
-    /// P1-1, r3 P3-6), and an interrupt schedules the sim's 30s idle(i)
+    /// Drain one reducer request — scripts play under an ArmTable arm id
+    /// captured at spawn; stop/interrupt CANCEL the owning arms (Session,
+    /// and Chip only for StopScripts — see `ArmOwner`) so buffered
+    /// envelopes AND pending timers of a cancelled arm drop at
+    /// consumption, and an interrupt schedules the sim's 30s idle(i)
     /// decay (tui.js:1561-1564).
     pub fn handle_request(&mut self, model: &mut AppModel, request: AppRequest) {
         match request {
@@ -678,8 +681,9 @@ impl DemoDriver {
                 ));
                 // Auto-title (sim tui.js:1219-1227): the micro-call names
                 // the session INSIDE the 1.5 s callback — the title and the
-                // note land together, and an interrupt in the window drops
-                // both (review P2-12).
+                // note land together. It SURVIVES an interrupt (the sim's
+                // timeout is bare) and is voided only by a session
+                // replacement via the origin epoch (review r2 P2-6).
                 if title {
                     // The sim's micro-call is a bare setTimeout: it lands
                     // even if the turn is interrupted (review r2 P2-6), so
@@ -925,7 +929,7 @@ impl DemoDriver {
                 if let EventPayload::MenuAnswered(answer) = &payload {
                     self.resume_parked(answer);
                 }
-                consume_scripted(model, generation, generation, payload);
+                model.handle(AppEvent::Envelope(Box::new(payload)));
             }
             DemoEvent::Answer { origin, answer } => {
                 // IDENTITY GATE (review r2 P1-1): the control tag guarantees
@@ -937,12 +941,9 @@ impl DemoDriver {
                     return;
                 }
                 self.resume_parked(&answer);
-                consume_scripted(
-                    model,
-                    generation,
-                    generation,
-                    EventPayload::MenuAnswered(answer),
-                );
+                model.handle(AppEvent::Envelope(Box::new(EventPayload::MenuAnswered(
+                    answer,
+                ))));
             }
             DemoEvent::Dispatch { text, voice, turn } => {
                 // The sim picks its branch AFTER the think window
@@ -1337,20 +1338,6 @@ impl Player {
                 return;
             }
         }
-    }
-}
-
-/// Consume one generation-tagged script envelope against `current`. Kept
-/// public as the driver's inner law (tests may exercise it directly, but
-/// the production path is [`DemoDriver::consume`]).
-pub fn consume_scripted(
-    model: &mut AppModel,
-    generation: u64,
-    current: u64,
-    payload: EventPayload,
-) {
-    if generation == current {
-        model.handle(AppEvent::Envelope(Box::new(payload)));
     }
 }
 

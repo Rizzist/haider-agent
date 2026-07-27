@@ -44,3 +44,15 @@ Deliberate gaps against the `/tui` sim, each with its landing wave:
 |---|---|---|
 | crates/haider-store | Persistent connection + cached prepared statements (highest ROI per rider) | adopted — W1/M1 |
 | crates/haider-tui/runtime.rs | Loss-free theme detection: parse the OSC-11 reply inside the sole input reader instead of termbg's owning probe (TUI1 review P2 — an 80ms pre-UI window can consume one keystroke) | Needs the unified input stack; termbg window shrunk + documented meanwhile | planned → daemon-era input stack |
+
+## Fable design review — TUI3 arc (2026-07-27, verdict FIX_IN_MERGE; D2-1/2/3 + quick D3s folded)
+
+| Where | Item | Trigger |
+|---|---|---|
+| crates/haider-tui/tests | D2-4: paused-time driver harness triplicated (~130 lines × turn_engine/tui31_lifecycle/subagent_aura) — extract to tests/common/mod.rs | MUST land before the next TUI test file is created (sessions/tree/accounts wave) |
+| crates/haider-tui/src/render.rs | D3-5: four hand-rolled shed-ladder dialects (session/subagent/aura/launcher); split render.rs (2730 lines) per-screen | before the NEXT-ROUND screens land on it |
+| crates/haider-tui/src/runtime.rs | D3-6: channel tag is an ARM id but still named `generation` in consume/dispatch_input signatures + docs — one vocabulary | next runtime-touching round |
+| crates/haider-tui/src/script.rs | D3-8: `respond_branch`'s `voice` param consumed by `let _ = voice;` — drop or justify | next script-touching round |
+| crates/haider-tui/src/render.rs | D3-9: aura streaming cursor wraps `{text}▮` in text ink while item_lines splits it back out gold — aura stream reads deader than session | next aura polish |
+| crates/haider-tui/src/render.rs | D3-10: status bar has no horizontal shed order — at 90 cols the voice chip clips mid-chip (dangling `[ ◉`); ellipsize-or-drop-segments rule | next status-bar touch |
+| crates/haider-tui/src/render.rs | D3-11: session @ 90×5 w/ menu renders header-rule + input-rule adjacent with all content shed — collapse to one rule (taste; behavior pinned) | next ledger touch |

@@ -685,14 +685,15 @@ async fn settle() {
 /// These tests cancel a child that installs `trap '' TERM`, so it can only
 /// die to SIGKILL after the grace window. That escalation path runs real
 /// syscalls (`killpg` probe, `killpg(SIGKILL)`, reap) against a process
-/// that is concurrently being torn down by the kernel, and any of them may
-/// legitimately observe the group mid-teardown — ESRCH on the probe, the
-/// leader reaped as a zombie, and so on. Each such observation is recorded
-/// as a durable escalation note, which turns the outcome into
-/// `CancelledEscalated` instead of `Cancelled` (process.rs:689-694). BOTH
-/// mean "cancellation won"; which one appears depends on kill-vs-exit
-/// ordering the test cannot pin down, and that is the nondeterminism the
-/// round-2 review caught.
+/// that is concurrently being torn down by the kernel. SOME mid-teardown
+/// observations record a durable escalation note, which turns the outcome
+/// into `CancelledEscalated` (process.rs:689-694); others are normalized
+/// to plain completion with NO note — sweep-time ESRCH and the
+/// zombie-leader EPERM case are treated as "sweep already complete"
+/// (`signal_group_for_sweep`, process.rs:1284-1291). So the race decides
+/// WHICH path runs, and thereby whether the outcome is `Cancelled` or
+/// `CancelledEscalated`. BOTH mean "cancellation won"; the ordering is the
+/// nondeterminism the round-2 review caught.
 ///
 /// The set deliberately EXCLUDES `Ok` and `Failed`: if cancellation stops
 /// working the process runs to completion or dies some other way, and this

@@ -1,8 +1,9 @@
 //! TUI3b commit 2: the subagent chip system (§2) and aura mode (§3) —
 //! beat-level verbatim tests plus paused-time driver lifecycles (question
 //! → answer → collect → auto-resume, recovery, close/removal, nested
-//! delegation's INTENDED flow) and the render surfaces (SubTree panel,
-//! subagent view, aura stage).
+//! delegation's sim-exact DEAD-END — tui.js:1137's cTool bug ported as
+//! shipped, per the r2 adjudication) and the render surfaces (SubTree
+//! panel, subagent view, aura stage).
 #![allow(clippy::expect_used)]
 
 use haider_protocol::EventPayload;

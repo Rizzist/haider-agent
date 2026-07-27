@@ -1329,8 +1329,9 @@ impl AppModel {
             self.session_name = Some(slug_name(&text));
         }
         // The blurb is NOT set here: the sim's micro-call names the session
-        // inside its own 1.5 s callback, so an interrupt in that window
-        // leaves the session untitled (review P2-12).
+        // inside its own 1.5 s callback. The callback SURVIVES an interrupt
+        // (bare setTimeout in the sim) — only a session replacement voids it,
+        // via the origin epoch (review r2 P2-6).
         let title = self.session_title.is_none();
         self.screen = Screen::Session;
         self.turn_active = true;
@@ -1904,9 +1905,10 @@ impl AppModel {
 
     /// Start-fresh semantics (review r1 P2): a new session begins from an
     /// empty projection; the previous demo transcript does not leak in —
-    /// including its scroll ceiling and any pending timers (review r3
-    /// P2-2/P3-6: StopScripts bumps the generation, so a stale idle-decay
-    /// or script beat from the OLD session drops at consumption).
+    /// including its scroll ceiling and any pending timers (StopScripts
+    /// cancels the Session and Chip ARMS in the ArmTable — Aura
+    /// deliberately survives, see `ArmOwner` — so a stale idle-decay or
+    /// script beat from the OLD session drops at consumption).
     fn fresh_session(&mut self) {
         // A NEW session identity: answers and micro-calls born under the old
         // one are now stale, and any that never left the outbox are dropped
@@ -2112,11 +2114,14 @@ impl AppModel {
                 self.aura.state = AuraState::Listening;
                 self.requests.push(AppRequest::AuraTalk);
             }
-            Hit::StickyJump(scroll_back) => {
+            Hit::StickyJump(scroll_back)
+                if matches!(self.screen, Screen::Session | Screen::Subagent) =>
+            {
                 // Stay AT the producing prompt, and suppress the sticky
                 // until the next REAL wheel (sim jumpToSticky: "the bar is
                 // suppressed … so it never covers the row it just
-                // revealed", tui.js:2637-2657).
+                // revealed", tui.js:2637-2657). Surface-guarded like every
+                // other hit arm (Fable review D3-12).
                 self.scroll_back.set(scroll_back.min(self.scroll_max.get()));
                 self.sticky_suppressed = true;
             }
