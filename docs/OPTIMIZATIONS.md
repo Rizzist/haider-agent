@@ -124,11 +124,21 @@ phase functions in call order (D2-4); exhaustive test-matrix header (D2-5); re-r
 frame_limit` validated with the aggregate worst case documented (D3-9); the drain-boundary
 `yield_now` now says what it buys (D3-12).
 
+W3b2 completion (2026-07-27): both triggered rows below were resolved deliberately. `OutboundLane`
+is now an explicit-close, clonable, attachment-keyed fair outbox with one aggregate frame/byte
+bound; session actors and replay tasks remain a separate owned task stratum because their
+cancellation/checkpoint semantics differ from socket writers. The R17 scope is now
+`ServerDraining` at the next complete-frame boundary, followed only by already-queued checkpoint
+traffic under the SAME deadline. The uncharged reserve, mid-frame deadline adoption, and
+runtime-owned writer join are unchanged. Private mutation-checked writer tests pin notice-before-
+checkpoint ordering, round-robin fairness, and detach-budget refunds. `tracing` was also selected
+at this trigger and connection task failures are no longer silently discarded. Final independent
+verification additionally pinned ownership-locked detach/purge, synchronous hub drain rejection,
+abort-on-drop guards installed before the first await, replay-handle reaping, internal catch-up
+overflow recovery through the store, and the committed-event wake from the hub into a registered
+harness (without a second `MenuAnswered` append).
+
 | Where | Idea | Why deferred |
 |---|---|---|
-| crates/haider-daemon/src/connection.rs (`OutboundLane`) | W3b2 fan-out needs a clonable outbound handle that carries its own limit, so the session hub can enqueue without threading `outbound_limit` through every call | Today exactly one task writes to the lane and the limit is a local; a handle type before the fan-out exists would be shaped by guesswork. Trigger: the first W3b2 caller outside `connection.rs`. |
-| crates/haider-daemon/src/runtime.rs (`ConnectionRuntime`) | Barrier task ownership is bespoke per class — connections in a `JoinSet`, writers in a channel-fed `Vec`. Either generalize into one owned-task stratum or keep the split deliberately | The shapes differ for a reason (a JoinSet cannot adopt a handle a child task created), and W3b2 adds a third class (session actors). Decide once all three exist, not twice. |
 | crates/haider-daemon/src/endpoint.rs | `remove_owned` and `remove_verified_stale` share a claim → verify → act skeleton with different verification steps | Two flows do not justify the abstraction, and the verifications are what the laws are about. Trigger: a third claim-based flow. |
-| crates/haider-daemon (whole crate) | Adopt `tracing` — the accept loop discards connection exits (`let _ = completed;`) and refused transitions only reach stderr | No observability dependency has been chosen for the workspace yet, and W3b1 has no real clients. DO THIS before real clients attach: W3b2's session hub is where per-connection faults stop being invisible. |
-| crates/haider-daemon/src/connection.rs (R17 scope) | W3b2 must relax "one `ServerDraining` is the last frame" to "notice, then keep streaming until checkpoint or deadline" (d1 report §6.6 step 10 closes transports only after final envelopes are broadcast) | Deliberate relaxation, not a regression — and it must keep the deadline discipline: the reserve, the mid-frame deadline adoption, and teardown's ownership of writer completion all stay. |
 | crates/haider-daemond/tests/lifecycle_tests.rs | The writer-registry re-drain (D1-1) has no discriminating test: removing it left all 34 cases green across 6 runs. `connections_racing_the_shutdown_request_are_torn_down_completely` exercises the shape (accepts racing the request) but cannot force a registration to land after the first collection | The window is a scheduling coincidence between a connection's first poll on another worker and the barrier's collection. Correct by construction instead: only connection tasks send on that channel, all of them are joined before the second collection, and the runtime's own sender never sends. |

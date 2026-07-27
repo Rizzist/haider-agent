@@ -26,6 +26,7 @@ pub use actor::{
     CancelToken, HarnessActor, HarnessConfig, HarnessHandle, SubmitTurn, TurnHandle, TurnOutcome,
 };
 pub use fake_store::MemoryStore;
+pub use haider_store::{MenuResolutionCommand, MenuResolutionOutcome};
 pub use recovery::{RecoveryReport, reconcile_dispatched_effects};
 pub use sqlite_store::SqliteStoreHandle;
 

@@ -12,41 +12,41 @@
 //!   the daemon on a slow client (R12's mechanism): exceeding either bound is
 //!   a connection error, and the store — not the socket — is the lag buffer in
 //!   later lanes;
-//! - one `ServerDraining` is the last frame of THIS LANE's traffic on a
-//!   draining connection (R17), and it travels a reserved path so ordinary
-//!   replies can never spend the queue slot or the bytes that last frame
-//!   needs. Once the notice is reserved, EVERY write is bounded by the drain
-//!   deadline, so the last frame can neither be starved behind an in-flight
-//!   ordinary write nor outlive the barrier. SCOPE, for W3b2: the binding
-//!   spec closes transports only AFTER the final committed envelopes are
-//!   broadcast during the grace period (d1 report §6.6 step 10), so once
-//!   attachments stream through this barrier the rule becomes "notice, then
-//!   keep streaming until checkpoint or deadline" — a deliberate relaxation,
-//!   not a regression, and it must keep the deadline discipline intact;
+//! - `ServerDraining` travels a reserved path outside ordinary frame/byte
+//!   capacity. W3b2 deliberately relaxes W3b1's scoped "last frame of this
+//!   lane" law: at the next complete-frame boundary the notice is written,
+//!   then queued checkpoint envelopes may follow until close or the same
+//!   drain deadline (report §6.6 step 10; OPTIMIZATIONS ledger);
 //! - a peer that never finishes its handshake is closed at
 //!   `handshake_timeout`, so silent peers cannot hold connection slots;
 //! - a peer accepted beyond the daemon's connection cap is answered with a
 //!   fatal `overloaded` error and closed without ever entering this layer's
 //!   task/queue accounting (report §2.5).
 //!
-//! W3b2 seams: `Request` bodies and `MenuAnswer` are answered with typed
-//! `draining` / `not_found` stubs (see [`handle_frame`] / [`enqueue_stub`]);
-//! session hub, attach/replay, and menu arbitration replace them in W3b2. The
-//! negotiated grant ([`ConnectionGrant`]) is retained for that authorization.
+//! Session requests and `MenuAnswer` route through the session hub. The
+//! negotiated grant ([`ConnectionGrant`]) is retained and every method is
+//! authorized centrally there.
+
+// Crate-internal by necessity: these tests exercise the private fair queue and
+// writer's reserved drain lane directly. The externally visible session laws
+// live in `tests/session_hub_tests.rs` and haider-daemond's UDS tests.
+#[cfg(test)]
+#[path = "connection_tests.rs"]
+mod connection_tests;
 
 use crate::DaemonError;
+use crate::session_hub::{FrameSendError, FrameSink, HubConnection, SessionHub};
 use haider_rpc::{
-    Capability, CapabilitySet, ERROR_CODE_CAPABILITY_DENIED, ERROR_CODE_DRAINING,
-    ERROR_CODE_NOT_FOUND, ERROR_CODE_OVERLOADED, ErrorData, Hello, LifecyclePhase, ProtocolError,
-    RequestId, ResponseBody, ServerRange, Welcome, WireFrame, negotiate, uds_codec,
+    AttachmentId, Capability, CapabilitySet, ERROR_CODE_OVERLOADED, Hello, LifecyclePhase,
+    ProtocolError, ServerRange, Welcome, WireFrame, negotiate, uds_codec,
 };
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::net::unix::OwnedWriteHalf;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::time::Instant;
 
 /// Registry of writer tasks, owned by the daemon runtime.
@@ -76,6 +76,10 @@ impl WriterGuard {
             None => Ok(false),
         }
     }
+
+    fn abort(&self) {
+        self.abort.abort();
+    }
 }
 
 impl Drop for WriterGuard {
@@ -87,8 +91,8 @@ impl Drop for WriterGuard {
     }
 }
 
-/// The reserved last frame plus the barrier deadline that bounds every write
-/// from the moment it exists (R17).
+/// The reserved drain notice plus the deadline that bounds it and every
+/// checkpoint write that follows (R17/W3b2 relaxation).
 #[derive(Debug)]
 struct ReservedNotice {
     bytes: Vec<u8>,
@@ -123,62 +127,190 @@ pub(crate) struct ConnectionGrant {
     pub(crate) capabilities: CapabilitySet,
 }
 
-impl ConnectionGrant {
-    fn grants(&self, capability: Capability) -> bool {
-        self.capabilities.contains(&capability)
-    }
+/// One fair scheduling lane. System replies share one lane; each attachment
+/// owns another. The writer visits active lanes round-robin.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum LaneKey {
+    System,
+    Attachment(AttachmentId),
 }
 
-/// Per-connection ledger of encoded bytes queued but not yet written.
+#[derive(Debug)]
+struct QueuedFrame {
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct OutboundState {
+    lanes: HashMap<LaneKey, VecDeque<QueuedFrame>>,
+    round_robin: VecDeque<LaneKey>,
+    queued_frames: usize,
+    /// Includes the frame currently being written; credited only when that
+    /// write settles, preserving W3b1's real allocation bound.
+    queued_bytes: usize,
+    closed: bool,
+}
+
+/// Explicit-close, bounded, fair per-connection outbox.
 ///
-/// The frame-count queue bounds how MANY replies may be pending; this bounds
-/// how much memory those replies may hold, so `outbound_queue_capacity ×
-/// frame_limit` never becomes the real bound. Bytes are charged before enqueue
-/// and credited only once the write completes — an in-flight frame still owns
-/// its allocation.
-struct QueuedBytes {
-    queued: AtomicUsize,
-    budget: usize,
+/// Clones carry enqueue authority but cannot keep the writer alive after the
+/// connection owner calls [`Self::close`]. One hot attachment is capped at
+/// half the global frame bound, leaving admission room for another lane.
+#[derive(Clone)]
+struct OutboundLane {
+    inner: Arc<OutboundQueue>,
 }
 
-impl QueuedBytes {
-    fn new(budget: usize) -> Self {
+struct OutboundQueue {
+    state: Mutex<OutboundState>,
+    ready: Notify,
+    frame_capacity: usize,
+    byte_budget: usize,
+    per_lane_capacity: usize,
+}
+
+impl OutboundLane {
+    fn new(frame_capacity: usize, byte_budget: usize) -> Self {
         Self {
-            queued: AtomicUsize::new(0),
-            budget,
+            inner: Arc::new(OutboundQueue {
+                state: Mutex::new(OutboundState {
+                    lanes: HashMap::new(),
+                    round_robin: VecDeque::new(),
+                    queued_frames: 0,
+                    queued_bytes: 0,
+                    closed: false,
+                }),
+                ready: Notify::new(),
+                frame_capacity,
+                byte_budget,
+                per_lane_capacity: frame_capacity.saturating_add(1).saturating_div(2).max(1),
+            }),
         }
     }
 
-    /// Reserves `bytes`, or reports the currently queued total without
-    /// reserving anything. Never partially charges.
-    fn charge(&self, bytes: usize) -> Result<(), usize> {
-        self.queued
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
-                queued
-                    .checked_add(bytes)
-                    .filter(|total| *total <= self.budget)
-            })
-            .map(|_| ())
+    fn try_push(&self, key: LaneKey, bytes: Vec<u8>) -> Result<(), DaemonError> {
+        let charged = bytes.len();
+        let mut state = self.inner.state.lock().map_err(|_| DaemonError::Task {
+            message: "connection outbox mutex is poisoned".into(),
+        })?;
+        let lane_len = state.lanes.get(&key).map_or(0, VecDeque::len);
+        let next_bytes = state.queued_bytes.checked_add(charged);
+        if state.closed
+            || state.queued_frames >= self.inner.frame_capacity
+            || lane_len >= self.inner.per_lane_capacity
+            || next_bytes.is_none_or(|total| total > self.inner.byte_budget)
+        {
+            return Err(DaemonError::Protocol {
+                message: format!(
+                    "bounded fair connection outbox unavailable: {charged} more bytes with {} frames and {} bytes queued",
+                    state.queued_frames, state.queued_bytes
+                ),
+            });
+        }
+        let activate = lane_len == 0;
+        state
+            .lanes
+            .entry(key.clone())
+            .or_default()
+            .push_back(QueuedFrame { bytes });
+        if activate {
+            state.round_robin.push_back(key);
+        }
+        state.queued_frames = state.queued_frames.saturating_add(1);
+        state.queued_bytes = next_bytes.unwrap_or(state.queued_bytes);
+        drop(state);
+        self.inner.ready.notify_one();
+        Ok(())
     }
 
-    /// Returns `bytes` to the budget. Saturating by construction: a credit may
-    /// never invent capacity by wrapping below zero.
+    async fn recv(&self) -> Option<QueuedFrame> {
+        loop {
+            let notified = self.inner.ready.notified();
+            {
+                let mut state = match self.inner.state.lock() {
+                    Ok(state) => state,
+                    Err(_) => return None,
+                };
+                while let Some(key) = state.round_robin.pop_front() {
+                    let (frame, still_active) = match state.lanes.get_mut(&key) {
+                        Some(lane) => {
+                            let frame = lane.pop_front();
+                            (frame, !lane.is_empty())
+                        }
+                        None => (None, false),
+                    };
+                    if still_active {
+                        state.round_robin.push_back(key.clone());
+                    } else {
+                        state.lanes.remove(&key);
+                    }
+                    if let Some(frame) = frame {
+                        state.queued_frames = state.queued_frames.saturating_sub(1);
+                        return Some(frame);
+                    }
+                }
+                if state.closed {
+                    return None;
+                }
+            }
+            notified.await;
+        }
+    }
+
     fn credit(&self, bytes: usize) {
-        let _ = self
-            .queued
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
-                Some(queued.saturating_sub(bytes))
+        if let Ok(mut state) = self.inner.state.lock() {
+            state.queued_bytes = state.queued_bytes.saturating_sub(bytes);
+        }
+    }
+
+    fn purge(&self, attachment_id: &AttachmentId) {
+        let Ok(mut state) = self.inner.state.lock() else {
+            return;
+        };
+        let key = LaneKey::Attachment(attachment_id.clone());
+        if let Some(frames) = state.lanes.remove(&key) {
+            let count = frames.len();
+            let bytes = frames.iter().fold(0_usize, |total, frame| {
+                total.saturating_add(frame.bytes.len())
             });
+            state.queued_frames = state.queued_frames.saturating_sub(count);
+            state.queued_bytes = state.queued_bytes.saturating_sub(bytes);
+        }
+        state.round_robin.retain(|candidate| candidate != &key);
+    }
+
+    fn close(&self) {
+        if let Ok(mut state) = self.inner.state.lock() {
+            state.closed = true;
+        }
+        self.inner.ready.notify_waiters();
     }
 }
 
-/// The ordinary outbound lane: the bounded frame queue plus its byte ledger.
-///
-/// The final `ServerDraining` frame deliberately does NOT travel here; see the
-/// reserved drain path in [`serve`].
-struct OutboundLane {
-    frames: mpsc::Sender<Vec<u8>>,
-    queued_bytes: Arc<QueuedBytes>,
+struct ConnectionFrameSink {
+    lane: OutboundLane,
+    outbound_limit: usize,
+}
+
+impl FrameSink for ConnectionFrameSink {
+    fn try_send(&self, frame: WireFrame) -> Result<(), FrameSendError> {
+        let key = attachment_lane(&frame);
+        let bytes = encode_outbound(&frame, self.outbound_limit).map_err(|_| FrameSendError)?;
+        self.lane.try_push(key, bytes).map_err(|_| FrameSendError)
+    }
+
+    fn purge_attachment(&self, attachment_id: &AttachmentId) {
+        self.lane.purge(attachment_id);
+    }
+}
+
+fn attachment_lane(frame: &WireFrame) -> LaneKey {
+    match frame {
+        WireFrame::Event { attachment_id, .. }
+        | WireFrame::AttachCaughtUp { attachment_id, .. }
+        | WireFrame::Lagged { attachment_id, .. } => LaneKey::Attachment(attachment_id.clone()),
+        _ => LaneKey::System,
+    }
 }
 
 /// Payload of the one-shot drain broadcast; becomes the `ServerDraining`
@@ -196,7 +328,7 @@ pub(crate) struct DrainNotice {
 }
 
 /// Immutable per-daemon facts shared by every connection task.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct ConnectionContext {
     pub(crate) profile_id: String,
     pub(crate) instance_id: String,
@@ -215,6 +347,8 @@ pub(crate) struct ConnectionContext {
     pub(crate) writers: WriterRegistry,
     /// UID that owns the endpoint; every peer must match it (R2).
     pub(crate) owner_uid: u32,
+    /// Profile session hub shared by all negotiated connections.
+    pub(crate) hub: SessionHub,
     /// For error context only; the stream is already accepted.
     pub(crate) endpoint_path: PathBuf,
 }
@@ -242,19 +376,18 @@ pub(crate) async fn serve(
     }
 
     let (mut reader, writer) = stream.into_split();
-    let (outbound, queued) = mpsc::channel::<Vec<u8>>(context.outbound_queue_capacity);
-    let lane = OutboundLane {
-        frames: outbound,
-        queued_bytes: Arc::new(QueuedBytes::new(context.outbound_queued_bytes)),
-    };
+    let lane = OutboundLane::new(
+        context.outbound_queue_capacity,
+        context.outbound_queued_bytes,
+    );
     // Reserved drain path (R17): one dedicated slot, outside the ordinary
     // queue and outside its byte budget, so no volume of ordinary replies can
     // consume what the last frame needs.
     let (reserve, reserved) = mpsc::channel::<ReservedNotice>(1);
-    let ledger = Arc::clone(&lane.queued_bytes);
+    let writer_lane = lane.clone();
     let (report, reported) = oneshot::channel::<std::io::Result<bool>>();
     let writer_handle = tokio::spawn(async move {
-        let outcome = run_writer(writer, queued, reserved, ledger).await;
+        let outcome = run_writer(writer, writer_lane, reserved).await;
         // The result travels the one-shot; the JoinHandle belongs to the
         // runtime, which owns abort-and-join at teardown.
         let _ = report.send(outcome);
@@ -270,7 +403,13 @@ pub(crate) async fn serve(
 
     let mut decoder = uds_codec::Decoder::new(context.frame_limit);
     let mut buffer = [0_u8; 16 * 1024];
+    // Inbound capacity is deliberately one handler: bytes enter through this
+    // fixed read buffer and bounded decoder, and every decoded command is
+    // completed serially in this connection task. No detached handler set or
+    // unbounded inbound command queue exists; cancelling/joining this owned
+    // connection task cancels its sole in-flight handler.
     let mut grant = Option::<ConnectionGrant>::None;
+    let mut hub_connection = Option::<HubConnection>::None;
     let mut outbound_limit = context.frame_limit;
     let mut close = false;
     let mut notice_reserved = false;
@@ -279,84 +418,98 @@ pub(crate) async fn serve(
     let handshake_deadline = tokio::time::sleep(context.handshake_timeout);
     tokio::pin!(handshake_deadline);
 
-    while !close {
-        tokio::select! {
-            changed = drain.changed() => {
-                let notice = changed.is_ok().then(|| drain.borrow().clone()).flatten();
-                if let Some(notice) = notice {
-                    match encode_drain_notice(&notice, outbound_limit) {
-                        Ok(bytes) => {
-                            // Never blocks and never charged: the reserve exists
-                            // precisely so queue pressure cannot lose this frame.
-                            notice_reserved = reserve
-                                .try_send(ReservedNotice { bytes, deadline: notice.deadline })
-                                .is_ok();
+    let processing = async {
+        while !close {
+            tokio::select! {
+                changed = drain.changed() => {
+                    let notice = changed.is_ok().then(|| drain.borrow().clone()).flatten();
+                    if let Some(notice) = notice {
+                        match encode_drain_notice(&notice, outbound_limit) {
+                            Ok(bytes) => {
+                                // Never blocks and never charged: the reserve exists
+                                // precisely so queue pressure cannot lose this frame.
+                                notice_reserved = reserve
+                                    .try_send(ReservedNotice { bytes, deadline: notice.deadline })
+                                    .is_ok();
+                            }
+                            // Even an empty reason does not fit what this client
+                            // said it can receive: the barrier must report that
+                            // honestly instead of claiming a clean drain.
+                            Err(_) => notice_refused = true,
                         }
-                        // Even an empty reason does not fit what this client
-                        // said it can receive: the barrier must report that
-                        // honestly instead of claiming a clean drain.
-                        Err(_) => notice_refused = true,
                     }
-                }
-                break;
-            }
-            () = &mut handshake_deadline, if grant.is_none() => {
-                let _ = enqueue_fatal(
-                    &lane,
-                    "handshake_timeout",
-                    "Hello did not arrive before the handshake deadline",
-                    outbound_limit,
-                );
-                close = true;
-            }
-            read = reader.read(&mut buffer) => {
-                let read = read.map_err(|error| {
-                    DaemonError::io("read Unix connection", &context.endpoint_path, error)
-                })?;
-                if read == 0 {
                     break;
                 }
-                let batch = decoder.push(&buffer[..read]);
-                for frame in batch.frames {
-                    close = handle_frame(
-                        frame,
-                        &context,
-                        &drain,
+                () = &mut handshake_deadline, if grant.is_none() => {
+                    let _ = enqueue_fatal(
                         &lane,
-                        &mut grant,
-                        &mut outbound_limit,
-                    )?;
-                    if close {
-                        break;
-                    }
-                }
-                if !close
-                    && let Some(error) = batch.error
-                {
-                    let protocol_error = ProtocolError {
-                        code: "invalid_frame".into(),
-                        message: error.to_string(),
-                        fatal: true,
-                    };
-                    let _ = enqueue(
-                        &lane,
-                        &WireFrame::ProtocolError(protocol_error),
+                        "handshake_timeout",
+                        "Hello did not arrive before the handshake deadline",
                         outbound_limit,
                     );
                     close = true;
                 }
+                read = reader.read(&mut buffer) => {
+                    let read = read.map_err(|error| {
+                        DaemonError::io("read Unix connection", &context.endpoint_path, error)
+                    })?;
+                    if read == 0 {
+                        break;
+                    }
+                    let batch = decoder.push(&buffer[..read]);
+                    for frame in batch.frames {
+                        close = handle_frame(
+                            frame,
+                            &context,
+                            &drain,
+                            &lane,
+                            &mut grant,
+                            &mut hub_connection,
+                            &mut outbound_limit,
+                        ).await?;
+                        if close {
+                            break;
+                        }
+                    }
+                    if !close
+                        && let Some(error) = batch.error
+                    {
+                        let protocol_error = ProtocolError {
+                            code: "invalid_frame".into(),
+                            message: error.to_string(),
+                            fatal: true,
+                        };
+                        let _ = enqueue(
+                            &lane,
+                            &WireFrame::ProtocolError(protocol_error),
+                            outbound_limit,
+                        );
+                        close = true;
+                    }
+                }
             }
         }
+        Ok::<(), DaemonError>(())
     }
+    .await;
 
-    // Closing both lanes lets the writer flush what is already queued and then
-    // stop; the reserve close is what releases its wait when no notice exists.
-    drop(lane);
+    if let Some(connection) = hub_connection.as_ref() {
+        let _ = connection.close().await;
+    }
+    // Explicit close means cloned attachment senders cannot keep the writer
+    // alive. Queued checkpoint traffic drains before socket shutdown.
+    lane.close();
     drop(reserve);
+    if processing.is_err() {
+        // A connection-fatal queue/protocol failure must discard its pending
+        // traffic and close, not wait for the very client that overflowed it.
+        writer_task.abort();
+    }
     let written = writer_task
         .finish()
         .await
         .map_err(|error| DaemonError::io("write Unix connection", &context.endpoint_path, error))?;
+    processing?;
     Ok(match (notice_reserved || notice_refused, written) {
         (false, _) => ConnectionExit::ClosedBeforeDrain,
         (true, true) => ConnectionExit::NoticeDelivered,
@@ -366,67 +519,110 @@ pub(crate) async fn serve(
 
 /// Writer half of one connection.
 ///
-/// Ordinary frames are written in queue order and their bytes credited back to
-/// the connection's budget as each write completes. The reserved drain notice
-/// is accepted at any time — including while an ordinary frame is mid-write —
-/// and from that moment every write is bounded by the barrier deadline, so the
-/// last frame is neither starved behind ordinary work nor able to outlive the
-/// drain. A deadline hit ends the connection rather than splicing the notice
-/// into a truncated frame. Returns whether `ServerDraining` reached the wire.
+/// Ordinary frames are selected fairly and credited after each write. A drain
+/// notice arriving mid-frame adopts the deadline without splicing that frame;
+/// at its boundary the notice is written, then queued checkpoint traffic may
+/// follow under the same deadline. Returns whether `ServerDraining` reached
+/// the wire.
 async fn run_writer(
     mut writer: OwnedWriteHalf,
-    mut queued: mpsc::Receiver<Vec<u8>>,
+    queued: OutboundLane,
     mut reserved: mpsc::Receiver<ReservedNotice>,
-    queued_bytes: Arc<QueuedBytes>,
 ) -> std::io::Result<bool> {
     let mut notice = Option::<ReservedNotice>::None;
     let mut reserve_open = true;
+    let mut notice_written = false;
+    let mut drain_deadline = Option::<Instant>::None;
     loop {
-        let next = if reserve_open {
+        let next = if reserve_open && !notice_written {
             tokio::select! {
-                frame = queued.recv() => frame,
+                biased;
                 received = reserved.recv() => {
                     reserve_open = false;
                     notice = received;
-                    continue;
+                    if notice.is_some() {
+                        None
+                    } else {
+                        queued.recv().await
+                    }
                 }
+                frame = queued.recv() => frame,
             }
         } else {
             queued.recv().await
         };
-        let Some(bytes) = next else { break };
-        let charged = bytes.len();
-        let result = write_ordinary(
-            &mut writer,
-            &bytes,
-            &mut notice,
-            &mut reserve_open,
-            &mut reserved,
-        )
-        .await;
-        // Credit after the write settles: an in-flight frame still owns its
-        // bytes, which is what makes the budget a real memory bound.
-        queued_bytes.credit(charged);
-        match result {
-            Ok(()) => {}
-            // The barrier expired mid-frame: stop, and report the notice as
-            // undelivered rather than corrupt the stream with a partial frame.
-            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => return Ok(false),
-            Err(error) => return Err(error),
+        if let Some(frame) = next {
+            let charged = frame.bytes.len();
+            let result = if notice_written {
+                match drain_deadline {
+                    Some(deadline) => {
+                        match tokio::time::timeout_at(deadline, writer.write_all(&frame.bytes))
+                            .await
+                        {
+                            Ok(result) => result,
+                            Err(_) => Err(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "drain deadline expired while writing checkpoint traffic",
+                            )),
+                        }
+                    }
+                    None => writer.write_all(&frame.bytes).await,
+                }
+            } else {
+                write_ordinary(
+                    &mut writer,
+                    &frame.bytes,
+                    &mut notice,
+                    &mut reserve_open,
+                    &mut reserved,
+                )
+                .await
+            };
+            // Credit after the write settles: an in-flight frame still owns
+            // its bytes, which is what makes the budget a real memory bound.
+            queued.credit(charged);
+            match result {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                    return Ok(notice_written);
+                }
+                Err(error) => return Err(error),
+            }
+        } else if notice.is_none() {
+            break;
+        }
+        if !notice_written && let Some(reserved_notice) = notice.take() {
+            drain_deadline = Some(reserved_notice.deadline);
+            match tokio::time::timeout_at(
+                reserved_notice.deadline,
+                writer.write_all(&reserved_notice.bytes),
+            )
+            .await
+            {
+                Ok(Ok(())) => notice_written = true,
+                Ok(Err(error)) => return Err(error),
+                Err(_) => return Ok(false),
+            }
         }
     }
-    let Some(notice) = notice.take().or(reserved.recv().await) else {
-        writer.shutdown().await?;
-        return Ok(false);
-    };
-    match tokio::time::timeout_at(notice.deadline, writer.write_all(&notice.bytes)).await {
-        Ok(Ok(())) => {
+    if !notice_written {
+        let Some(reserved_notice) = notice.take().or(reserved.recv().await) else {
             writer.shutdown().await?;
-            Ok(true)
+            return Ok(false);
+        };
+        match tokio::time::timeout_at(
+            reserved_notice.deadline,
+            writer.write_all(&reserved_notice.bytes),
+        )
+        .await
+        {
+            Ok(Ok(())) => notice_written = true,
+            Ok(Err(error)) => return Err(error),
+            Err(_) => return Ok(false),
         }
-        Ok(Err(error)) => Err(error),
-        Err(_) => Ok(false),
     }
+    writer.shutdown().await?;
+    Ok(notice_written)
 }
 
 /// Writes one ordinary frame, adopting the drain deadline the moment the
@@ -467,15 +663,16 @@ async fn write_ordinary(
 
 /// Dispatches one decoded frame. Returns `Ok(true)` when the connection must
 /// close (fatal protocol error or rejected handshake).
-fn handle_frame(
+async fn handle_frame(
     frame: WireFrame,
     context: &ConnectionContext,
     drain: &watch::Receiver<Option<DrainNotice>>,
     lane: &OutboundLane,
     grant: &mut Option<ConnectionGrant>,
+    hub_connection: &mut Option<HubConnection>,
     outbound_limit: &mut usize,
 ) -> Result<bool, DaemonError> {
-    let Some(granted) = grant.as_ref() else {
+    let Some(_) = grant.as_ref() else {
         let WireFrame::Hello(hello) = frame else {
             enqueue_fatal(
                 lane,
@@ -488,7 +685,20 @@ fn handle_frame(
         // From here on the client's max_receive_frame caps everything we
         // send, including the Welcome itself and any rejection.
         *outbound_limit = context.frame_limit.min(hello.max_receive_frame as usize);
-        return negotiate_hello(hello, context, drain, lane, grant, *outbound_limit);
+        let close = negotiate_hello(hello, context, drain, lane, grant, *outbound_limit)?;
+        if !close && let Some(granted) = grant.as_ref() {
+            let sink: Arc<dyn FrameSink> = Arc::new(ConnectionFrameSink {
+                lane: lane.clone(),
+                outbound_limit: *outbound_limit,
+            });
+            *hub_connection = Some(
+                context
+                    .hub
+                    .open_connection(granted.capabilities.clone(), sink)
+                    .map_err(DaemonError::from)?,
+            );
+        }
+        return Ok(close);
     };
 
     match frame {
@@ -496,49 +706,44 @@ fn handle_frame(
             enqueue(lane, &WireFrame::Pong { nonce }, *outbound_limit)?;
             Ok(false)
         }
-        // W3b2 seam: the session hub will route Request bodies; until then
-        // every request gets the typed draining/not_found stub.
-        WireFrame::Request { request_id, .. } => {
-            enqueue_stub(request_id, drain, lane, *outbound_limit)?;
+        WireFrame::Request { request_id, body } => {
+            let connection = hub_connection.as_ref().ok_or_else(|| DaemonError::Task {
+                message: "negotiated connection has no session-hub registration".into(),
+            })?;
+            connection
+                .request(request_id, body)
+                .await
+                .map_err(DaemonError::from)?;
             Ok(false)
         }
-        // Authorization is already real: `MenuAnswer` is the one control frame
-        // this lane accepts, so a connection granted only `view` is refused
-        // here rather than in W3b2. Arbitration (durable compare-and-set
-        // answers) is what replaces the stub below.
-        WireFrame::MenuAnswer { request_id, .. } => {
-            let (code, message) = if !granted.grants(Capability::Control) {
-                (
-                    ERROR_CODE_CAPABILITY_DENIED,
-                    "this connection was not granted the control capability",
-                )
-            } else if drain.borrow().is_some() {
-                (ERROR_CODE_DRAINING, "daemon is draining")
-            } else {
-                (
-                    ERROR_CODE_NOT_FOUND,
-                    "menu routing is not available until W3b2",
-                )
-            };
-            // A client that correlated its answer gets a correlated reply; one
-            // that did not still gets the uncorrelated connection-level form.
-            let frame = match request_id {
-                Some(request_id) => WireFrame::Response {
+        WireFrame::MenuAnswer {
+            request_id,
+            command_id,
+            session_id,
+            menu_id,
+            request_seq,
+            worker_generation,
+            option_key,
+            option_index,
+            input,
+        } => {
+            let connection = hub_connection.as_ref().ok_or_else(|| DaemonError::Task {
+                message: "negotiated connection has no session-hub registration".into(),
+            })?;
+            connection
+                .menu_answer(
                     request_id,
-                    body: ResponseBody::Error {
-                        code: code.into(),
-                        message: message.into(),
-                        retryable: code == ERROR_CODE_DRAINING,
-                        data: Option::<ErrorData>::None,
-                    },
-                },
-                None => WireFrame::ProtocolError(ProtocolError {
-                    code: code.into(),
-                    message: message.into(),
-                    fatal: false,
-                }),
-            };
-            enqueue(lane, &frame, *outbound_limit)?;
+                    command_id,
+                    session_id,
+                    menu_id,
+                    request_seq,
+                    worker_generation,
+                    option_key,
+                    option_index,
+                    input,
+                )
+                .await
+                .map_err(DaemonError::from)?;
             Ok(false)
         }
         WireFrame::Unknown => {
@@ -620,39 +825,6 @@ fn negotiate_hello(
     Ok(false)
 }
 
-/// W3b2 seam: typed `Response::Error` stub for every session RPC.
-/// `draining` (retryable — try the next generation) once shutdown started,
-/// `not_found` (not retryable) otherwise.
-fn enqueue_stub(
-    request_id: RequestId,
-    drain: &watch::Receiver<Option<DrainNotice>>,
-    lane: &OutboundLane,
-    outbound_limit: usize,
-) -> Result<(), DaemonError> {
-    let (code, message, retryable) = if drain.borrow().is_some() {
-        (ERROR_CODE_DRAINING, "daemon is draining", true)
-    } else {
-        (
-            ERROR_CODE_NOT_FOUND,
-            "session RPC is not available until W3b2",
-            false,
-        )
-    };
-    enqueue(
-        lane,
-        &WireFrame::Response {
-            request_id,
-            body: ResponseBody::Error {
-                code: code.into(),
-                message: message.into(),
-                retryable,
-                data: Option::<ErrorData>::None,
-            },
-        },
-        outbound_limit,
-    )
-}
-
 fn enqueue_fatal(
     lane: &OutboundLane,
     code: &str,
@@ -679,22 +851,7 @@ fn enqueue(
     outbound_limit: usize,
 ) -> Result<(), DaemonError> {
     let bytes = encode_outbound(frame, outbound_limit)?;
-    let charged = bytes.len();
-    lane.queued_bytes
-        .charge(charged)
-        .map_err(|queued| DaemonError::Protocol {
-            message: format!(
-                "connection queued-byte budget exhausted: {charged} more bytes with {queued} of {} queued",
-                lane.queued_bytes.budget
-            ),
-        })?;
-    lane.frames.try_send(bytes).map_err(|error| {
-        // A refused frame must not leave its charge behind.
-        lane.queued_bytes.credit(charged);
-        DaemonError::Protocol {
-            message: format!("bounded connection queue unavailable: {error}"),
-        }
-    })
+    lane.try_push(LaneKey::System, bytes)
 }
 
 fn encode_outbound(frame: &WireFrame, outbound_limit: usize) -> Result<Vec<u8>, DaemonError> {

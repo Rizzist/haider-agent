@@ -143,6 +143,10 @@ pub fn transcript() -> Vec<WireFrame> {
             },
         },
         WireFrame::Response {
+            request_id: RequestId::new("request-menu-success"),
+            body: ResponseBody::MenuAnswer { resolution_seq: 10 },
+        },
+        WireFrame::Response {
             request_id: RequestId::new("request-control"),
             body: ResponseBody::Error {
                 code: ERROR_CODE_CAPABILITY_DENIED.into(),

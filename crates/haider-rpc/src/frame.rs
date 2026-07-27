@@ -78,6 +78,12 @@ pub const ERROR_CODE_DRAINING: &str = "draining";
 /// reached — the connection admission cap is the first user (report §2.5).
 /// Retrying later, after other work finishes, is the intended recovery.
 pub const ERROR_CODE_OVERLOADED: &str = "overloaded";
+/// Stable code for an opaque pagination cursor that cannot be decoded.
+pub const ERROR_CODE_INVALID_CURSOR: &str = "invalid_cursor";
+/// Stable code for a request whose durable version coordinates are invalid.
+pub const ERROR_CODE_INVALID_ARGUMENT: &str = "invalid_argument";
+/// Stable code for a control command fenced by a newer worker generation.
+pub const ERROR_CODE_STALE_GENERATION: &str = "stale_generation";
 
 /// Kind of client taking part in the handshake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -316,6 +322,11 @@ pub enum ResponseBody {
     },
     #[serde(rename = "session.detach")]
     SessionDetach { attachment_id: AttachmentId },
+    /// Successful durable menu resolution. The same-command retry receives
+    /// the original sequence; a different command receives
+    /// [`ERROR_CODE_ALREADY_RESOLVED`] instead.
+    #[serde(rename = "menu.answer")]
+    MenuAnswer { resolution_seq: u64 },
     /// A request-correlated operation failure.
     ///
     /// Stable v0.1 codes include [`ERROR_CODE_CURSOR_AHEAD`],

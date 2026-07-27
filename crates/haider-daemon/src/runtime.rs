@@ -47,8 +47,8 @@ use crate::connection::{ConnectionContext, ConnectionExit, DrainNotice, reject_o
 use crate::endpoint;
 use crate::lifecycle::{ShutdownObserver, ShutdownRequest, StatePublisher};
 use crate::{
-    DaemonConfig, DaemonError, DaemonState, IncumbentDiagnostics, Readiness, ShutdownHandle,
-    ShutdownOutcome,
+    DaemonConfig, DaemonError, DaemonState, IncumbentDiagnostics, Readiness, SessionHub,
+    SessionHubConfig, ShutdownHandle, ShutdownOutcome,
 };
 use haider_core::{SqliteStoreHandle, reconcile_dispatched_effects};
 use haider_protocol::error::ErrorCode;
@@ -219,6 +219,8 @@ async fn run_inner(
         return shutdown_before_listener(config, states, store, request, &mut shutdown).await;
     }
 
+    let hub =
+        SessionHub::new(store.clone(), SessionHubConfig::default()).map_err(DaemonError::from)?;
     let mut endpoint = match endpoint::bind(config).await {
         Ok(endpoint) => endpoint,
         Err(error) => {
@@ -242,6 +244,7 @@ async fn run_inner(
         handshake_timeout: config.handshake_timeout,
         writers: writer_sender,
         owner_uid: endpoint.owner_uid,
+        hub: hub.clone(),
         endpoint_path: endpoint.path().to_path_buf(),
     };
     // Ready is published under the shutdown transition mutex, so a first
@@ -269,6 +272,9 @@ async fn run_inner(
     };
     let barrier_deadline = tokio::time::Instant::now() + config.drain_timeout;
     let deadline_unix_ms = unix_time_ms().saturating_add(duration_ms(config.drain_timeout));
+    // Reject new hub work before Draining becomes externally observable. The
+    // watch broadcast wakes connection tasks on other executor workers.
+    hub.begin_draining();
     states.publish(DaemonState::Draining {
         reason: reason.clone(),
         deadline_unix_ms,
@@ -281,6 +287,16 @@ async fn run_inner(
         deadline: barrier_deadline,
     }));
 
+    // W3b2 deliberate relaxation of W3b1's "notice is last" law: the writer
+    // prioritizes the reserved notice at the next frame boundary, then drains
+    // already-queued checkpoint envelopes under the same deadline. Replays
+    // are cancelled and joined before the store finalization tail.
+    let hub_shutdown = bounded_finalization(hub.shutdown(), barrier_deadline, &mut shutdown).await;
+    match hub_shutdown {
+        Some(Ok(())) => {}
+        Some(Err(error)) => return Err(DaemonError::from(error)),
+        None => forced = true,
+    }
     let undelivered_notices = runtime
         .drain(&mut forced, barrier_deadline, &mut shutdown)
         .await;
@@ -432,10 +448,18 @@ impl ConnectionRuntime {
                     }
                 }
                 completed = self.connections.join_next(), if !self.connections.is_empty() => {
-                    // W3b1 has nothing to do with a connection's exit before the
-                    // barrier; W3b2's session hub is where per-connection faults
-                    // become observable (ledgered: adopt tracing before then).
-                    let _ = completed;
+                    match completed {
+                        Some(Ok(Ok(exit))) => {
+                            tracing::debug!(?exit, "daemon connection closed");
+                        }
+                        Some(Ok(Err(error))) => {
+                            tracing::warn!(%error, "daemon connection failed");
+                        }
+                        Some(Err(error)) => {
+                            tracing::warn!(%error, "daemon connection task failed");
+                        }
+                        None => {}
+                    }
                 }
             }
         };

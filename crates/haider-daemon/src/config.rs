@@ -18,8 +18,9 @@ pub struct DaemonConfig {
     /// Maximum inbound frame size; also advertised in `Welcome.frame_limit`,
     /// so it must fit `u32`.
     pub frame_limit: usize,
-    /// Depth of each connection's bounded outbound queue (R12 mechanism);
-    /// an unwritable full queue is a connection-fatal error, never a stall.
+    /// Aggregate depth of each connection's fair, attachment-keyed outbound
+    /// queue (R12); an unwritable session lane lags/detaches that attachment,
+    /// while a refused system reply closes the connection.
     pub outbound_queue_capacity: usize,
     /// Ceiling on encoded bytes a connection may hold queued-but-unwritten
     /// (R12 mechanism). The frame-count bound alone permits

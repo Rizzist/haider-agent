@@ -7,6 +7,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+async-trait.workspace = true
 blake3.workspace = true
 getrandom.workspace = true
 haider-core = { path = "../haider-core" }
@@ -14,8 +15,10 @@ haider-protocol = { path = "../haider-protocol" }
 haider-rpc = { path = "../haider-rpc" }
 rustix.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
+haider-provider = { path = "../haider-provider" }
 haider-store = { path = "../haider-store" }
 serde_json.workspace = true
 tempfile.workspace = true

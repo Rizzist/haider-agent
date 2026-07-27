@@ -1,0 +1,1790 @@
+//! Session-scoped actors, attachment replay, and durable menu arbitration.
+//!
+//! One actor owns the serialized command order for each live session. That
+//! order is the proof boundary for both §5.5 invariants:
+//!
+//! - an append returns from the store before the actor publishes it;
+//! - attachment receiver registration and committed-head capture happen in
+//!   one command-loop turn with no await or yield between them.
+//!
+//! Replays are separate cancellable tasks. They page `(after_seq, H]`, emit
+//! `AttachCaughtUp(H)`, drain the already-registered bounded receiver for
+//! `seq > H`, then stay live. If that receiver fills, the task registers a new
+//! receiver and resumes from the store after its last delivered sequence. The
+//! store is therefore the lag buffer; no unbounded attachment history exists.
+
+use crate::DaemonError;
+use async_trait::async_trait;
+use haider_core::{
+    HarnessHandle, MenuResolutionCommand, MenuResolutionOutcome, SqliteStoreHandle, StoreHandle,
+};
+use haider_protocol::envelope::RawEnvelope;
+use haider_protocol::error::{ErrorCode, HaiderError};
+use haider_protocol::ids::{DeviceId, SessionId};
+use haider_protocol::menu::{AnswerVia, MenuAnswer as DurableMenuAnswer};
+use haider_rpc::{
+    AttachMode, AttachState, AttachmentId, Capability, CapabilitySet, CommandId,
+    ERROR_CODE_ALREADY_RESOLVED, ERROR_CODE_CAPABILITY_DENIED, ERROR_CODE_CURSOR_AHEAD,
+    ERROR_CODE_DRAINING, ERROR_CODE_INVALID_ARGUMENT, ERROR_CODE_INVALID_CURSOR,
+    ERROR_CODE_NOT_FOUND, ERROR_CODE_STALE_GENERATION, ErrorData, MenuInput, ProtocolError,
+    RequestBody, RequestId, ResponseBody, SeqRange, SessionReadResult, SessionSummary, WireFrame,
+};
+use std::collections::HashMap;
+use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use tokio::sync::{mpsc, oneshot, watch};
+use tokio::task::JoinHandle;
+
+const REPLAY_PAGE_SIZE: usize = 256;
+const MAX_LIST_PAGE: usize = 100;
+const MAX_READ_ENVELOPES: usize = 1_024;
+
+/// Bounds for session-actor and catch-up traffic.
+#[derive(Debug, Clone, Copy)]
+pub struct SessionHubConfig {
+    /// Commands waiting at one live session actor.
+    pub actor_command_capacity: usize,
+    /// Commits after `H` retained while one attachment replays.
+    pub catch_up_capacity: usize,
+}
+
+impl Default for SessionHubConfig {
+    fn default() -> Self {
+        Self {
+            actor_command_capacity: 64,
+            catch_up_capacity: 64,
+        }
+    }
+}
+
+/// A nonblocking destination for frames produced by one hub connection.
+///
+/// The production implementation is the connection's bounded fair outbox.
+/// Tests may use a deterministic sink to stop at replay boundaries.
+pub trait FrameSink: Send + Sync {
+    /// Admits one complete frame without waiting on a socket.
+    fn try_send(&self, frame: WireFrame) -> Result<(), FrameSendError>;
+
+    /// Purges queued traffic for a detached attachment when the sink supports
+    /// keyed lanes. The default is suitable for sinks without staging queues.
+    fn purge_attachment(&self, _attachment_id: &AttachmentId) {}
+}
+
+/// A bounded sink refused a frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameSendError;
+
+impl fmt::Display for FrameSendError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("bounded connection outbox refused a frame")
+    }
+}
+
+impl std::error::Error for FrameSendError {}
+
+/// Semantic boundary emitted by the hub's optional observer.
+///
+/// Production uses the no-op observer. The observer contract is nonblocking;
+/// deterministic tests may deliberately gate a replay task or actor turn to
+/// force every §5.5 interleaving.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum HubObservation {
+    AppendEnqueued {
+        session_id: SessionId,
+    },
+    ShutdownGuarded,
+    ReceiverRegistered {
+        attachment_id: AttachmentId,
+    },
+    HeadCaptured {
+        attachment_id: AttachmentId,
+        head: u64,
+    },
+    Persisted {
+        session_id: SessionId,
+        through_seq: u64,
+    },
+    Published {
+        session_id: SessionId,
+        through_seq: u64,
+    },
+    ReplayEvent {
+        attachment_id: AttachmentId,
+        seq: u64,
+    },
+    BeforeCaughtUp {
+        attachment_id: AttachmentId,
+        through_seq: u64,
+    },
+    CaughtUp {
+        attachment_id: AttachmentId,
+        through_seq: u64,
+    },
+    BufferedEvent {
+        attachment_id: AttachmentId,
+        seq: u64,
+    },
+    LiveEvent {
+        attachment_id: AttachmentId,
+        seq: u64,
+    },
+    BeforeEvent {
+        attachment_id: AttachmentId,
+        seq: u64,
+    },
+}
+
+/// Optional boundary observer. Implementations must return promptly outside
+/// deterministic tests.
+pub trait SessionHubObserver: Send + Sync {
+    fn observe(&self, observation: HubObservation);
+}
+
+#[derive(Debug)]
+struct NoopObserver;
+
+impl SessionHubObserver for NoopObserver {
+    fn observe(&self, _observation: HubObservation) {}
+}
+
+/// Cloneable owner of every live session actor and replay task.
+#[derive(Clone)]
+pub struct SessionHub {
+    inner: Arc<HubInner>,
+}
+
+struct HubInner {
+    store: SqliteStoreHandle,
+    config: SessionHubConfig,
+    observer: Arc<dyn SessionHubObserver>,
+    actors: Mutex<HashMap<SessionId, SessionActorHandle>>,
+    actor_tasks: Mutex<Vec<JoinHandle<()>>>,
+    replay_tasks: Mutex<Vec<JoinHandle<()>>>,
+    attachments: Mutex<HashMap<AttachmentId, AttachmentOwner>>,
+    draining: AtomicBool,
+    device_id: DeviceId,
+}
+
+/// Join handles that abort every still-owned task if the enclosing shutdown
+/// future is itself cancelled at the global drain deadline.
+struct OwnedTasks {
+    handles: Vec<JoinHandle<()>>,
+}
+
+impl OwnedTasks {
+    fn new(handles: Vec<JoinHandle<()>>) -> Self {
+        Self { handles }
+    }
+
+    fn abort_all(&self) {
+        for handle in &self.handles {
+            handle.abort();
+        }
+    }
+
+    async fn join_all(&mut self) {
+        while let Some(handle) = self.handles.last_mut() {
+            let _ = handle.await;
+            self.handles.pop();
+        }
+    }
+}
+
+impl Drop for OwnedTasks {
+    fn drop(&mut self) {
+        self.abort_all();
+    }
+}
+
+#[derive(Clone)]
+struct SessionActorHandle {
+    commands: mpsc::Sender<ActorCommand>,
+    stopping: Arc<AtomicBool>,
+}
+
+struct AttachmentOwner {
+    connection_id: String,
+    session_id: SessionId,
+    mode: AttachMode,
+    actor: SessionActorHandle,
+    cancel: watch::Sender<bool>,
+}
+
+struct ActorAttachment {
+    connection_id: String,
+    mode: AttachMode,
+    events: mpsc::Sender<RawEnvelope>,
+    lagged: watch::Sender<Option<u64>>,
+    last_buffered_seq: u64,
+    active: bool,
+}
+
+struct Registration {
+    attachment_id: AttachmentId,
+    attach_state: AttachState,
+    actor: SessionActorHandle,
+    events: mpsc::Receiver<RawEnvelope>,
+    lagged: watch::Receiver<Option<u64>>,
+}
+
+enum RegisterResult {
+    Registered(Registration),
+    CursorAhead { requested: u64, head: u64 },
+}
+
+enum ActorRegisterResult {
+    Registered(AttachState),
+    CursorAhead { requested: u64, head: u64 },
+}
+
+enum ActorCommand {
+    Append {
+        envelopes: Vec<RawEnvelope>,
+        completed: oneshot::Sender<Result<Vec<RawEnvelope>, HaiderError>>,
+    },
+    Register {
+        attachment_id: AttachmentId,
+        connection_id: String,
+        after_seq: u64,
+        mode: AttachMode,
+        events: mpsc::Sender<RawEnvelope>,
+        lagged: watch::Sender<Option<u64>>,
+        completed: oneshot::Sender<ActorRegisterResult>,
+    },
+    Reregister {
+        attachment_id: AttachmentId,
+        events: mpsc::Sender<RawEnvelope>,
+        lagged: watch::Sender<Option<u64>>,
+        completed: oneshot::Sender<Option<u64>>,
+    },
+    Detach {
+        attachment_id: AttachmentId,
+    },
+    MenuAnswer {
+        command: MenuResolutionCommand,
+        completed: oneshot::Sender<Result<MenuResolutionOutcome, HaiderError>>,
+    },
+    RegisterHarness {
+        harness: HarnessHandle,
+    },
+    Stop,
+}
+
+/// One negotiated connection's authorization and attachment ownership.
+pub struct HubConnection {
+    hub: SessionHub,
+    connection_id: String,
+    capabilities: CapabilitySet,
+    sink: Arc<dyn FrameSink>,
+    closed: AtomicBool,
+}
+
+/// Infrastructure failure while routing a frame.
+#[derive(Debug)]
+pub enum SessionHubError {
+    Closed,
+    Store(HaiderError),
+    Delivery,
+    Task(String),
+    InvalidConfig(String),
+}
+
+impl fmt::Display for SessionHubError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Closed => formatter.write_str("session hub is draining or closed"),
+            Self::Store(error) => write!(formatter, "session store failed: {error:?}"),
+            Self::Delivery => formatter.write_str("connection outbox refused a frame"),
+            Self::Task(message) | Self::InvalidConfig(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for SessionHubError {}
+
+impl From<HaiderError> for SessionHubError {
+    fn from(error: HaiderError) -> Self {
+        Self::Store(error)
+    }
+}
+
+impl From<SessionHubError> for DaemonError {
+    fn from(error: SessionHubError) -> Self {
+        match error {
+            SessionHubError::Store(error) => Self::Store(error),
+            other => Self::Task {
+                message: other.to_string(),
+            },
+        }
+    }
+}
+
+impl SessionHub {
+    /// Creates a hub with production's no-op boundary observer.
+    pub fn new(
+        store: SqliteStoreHandle,
+        config: SessionHubConfig,
+    ) -> Result<Self, SessionHubError> {
+        Self::with_observer(store, config, Arc::new(NoopObserver))
+    }
+
+    /// Creates a hub with a semantic-boundary observer.
+    pub fn with_observer(
+        store: SqliteStoreHandle,
+        config: SessionHubConfig,
+        observer: Arc<dyn SessionHubObserver>,
+    ) -> Result<Self, SessionHubError> {
+        if config.actor_command_capacity == 0 || config.catch_up_capacity == 0 {
+            return Err(SessionHubError::InvalidConfig(
+                "session hub queue capacities must be greater than zero".into(),
+            ));
+        }
+        let device_id = DeviceId::new(format!("daemon-session-hub-{}", store.worker_generation()));
+        Ok(Self {
+            inner: Arc::new(HubInner {
+                store,
+                config,
+                observer,
+                actors: Mutex::new(HashMap::new()),
+                actor_tasks: Mutex::new(Vec::new()),
+                replay_tasks: Mutex::new(Vec::new()),
+                attachments: Mutex::new(HashMap::new()),
+                draining: AtomicBool::new(false),
+                device_id,
+            }),
+        })
+    }
+
+    /// Opens one logical connection after handshake negotiation.
+    pub fn open_connection(
+        &self,
+        capabilities: CapabilitySet,
+        sink: Arc<dyn FrameSink>,
+    ) -> Result<HubConnection, SessionHubError> {
+        if self.inner.draining.load(Ordering::Acquire) {
+            return Err(SessionHubError::Closed);
+        }
+        Ok(HubConnection {
+            hub: self.clone(),
+            connection_id: random_id("connection")?,
+            capabilities,
+            sink,
+            closed: AtomicBool::new(false),
+        })
+    }
+
+    /// Routes a worker append through the owning session actor.
+    ///
+    /// This is the only live-daemon append seam: bypassing it would escape the
+    /// actor order that closes the replay/live race.
+    pub async fn append(
+        &self,
+        envelopes: &mut [RawEnvelope],
+    ) -> Result<haider_core::CommittedRange, HaiderError> {
+        let Some(first) = envelopes.first() else {
+            return Err(HaiderError::new(
+                ErrorCode::InvalidArgument,
+                "cannot append an empty envelope batch",
+                false,
+            ));
+        };
+        let actor = self
+            .actor_for(first.session_id.clone())
+            .await
+            .map_err(hub_error_as_store)?;
+        let (completed, result) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::Append {
+                envelopes: envelopes.to_vec(),
+                completed,
+            })
+            .await
+            .map_err(|_| hub_closed_store_error())?;
+        self.inner.observer.observe(HubObservation::AppendEnqueued {
+            session_id: first.session_id.clone(),
+        });
+        let committed = result.await.map_err(|_| hub_closed_store_error())??;
+        envelopes.clone_from_slice(&committed);
+        let first_seq = committed.first().map_or(0, |envelope| envelope.seq);
+        let last_seq = committed.last().map_or(0, |envelope| envelope.seq);
+        Ok(haider_core::CommittedRange {
+            first_seq,
+            last_seq,
+        })
+    }
+
+    /// Registers the live harness that consumes already-committed menu events.
+    ///
+    /// Harness persistence should use this hub as its [`StoreHandle`], keeping
+    /// every worker append inside the same session-actor order as attachment
+    /// registration and publication.
+    pub async fn register_harness(
+        &self,
+        session_id: SessionId,
+        harness: HarnessHandle,
+    ) -> Result<(), SessionHubError> {
+        let actor = self.actor_for(session_id).await?;
+        actor
+            .commands
+            .send(ActorCommand::RegisterHarness { harness })
+            .await
+            .map_err(|_| SessionHubError::Closed)
+    }
+
+    async fn actor_for(
+        &self,
+        session_id: SessionId,
+    ) -> Result<SessionActorHandle, SessionHubError> {
+        if self.inner.draining.load(Ordering::Acquire) {
+            return Err(SessionHubError::Closed);
+        }
+        {
+            let actors = lock(&self.inner.actors)?;
+            if let Some(actor) = actors.get(&session_id) {
+                return Ok(actor.clone());
+            }
+        }
+        let head = self.inner.store.latest_seq(&session_id).await?;
+        let last = if head == 0 {
+            None
+        } else {
+            self.inner
+                .store
+                .read(&session_id, head.saturating_sub(1), 1)
+                .await?
+                .into_iter()
+                .next()
+        };
+        let mut actors = lock(&self.inner.actors)?;
+        if self.inner.draining.load(Ordering::Acquire) {
+            return Err(SessionHubError::Closed);
+        }
+        if let Some(actor) = actors.get(&session_id) {
+            return Ok(actor.clone());
+        }
+        let authority_epoch = last.as_ref().map_or(0, |envelope| envelope.authority_epoch);
+        let (commands, receiver) = mpsc::channel(self.inner.config.actor_command_capacity);
+        let stopping = Arc::new(AtomicBool::new(false));
+        let actor = SessionActorHandle {
+            commands,
+            stopping: Arc::clone(&stopping),
+        };
+        let mut actor_tasks = lock(&self.inner.actor_tasks)?;
+        let task = tokio::spawn(run_session_actor(
+            session_id.clone(),
+            head,
+            authority_epoch,
+            self.inner.store.worker_generation(),
+            self.inner.store.clone(),
+            Arc::clone(&self.inner.observer),
+            stopping,
+            receiver,
+        ));
+        actor_tasks.push(task);
+        actors.insert(session_id, actor.clone());
+        Ok(actor)
+    }
+
+    async fn register(
+        &self,
+        connection_id: &str,
+        session_id: SessionId,
+        after_seq: u64,
+        mode: AttachMode,
+    ) -> Result<RegisterResult, SessionHubError> {
+        let actor = self.actor_for(session_id.clone()).await?;
+        let attachment_id = AttachmentId::new(random_id("attachment")?);
+        let (events, event_receiver) = mpsc::channel(self.inner.config.catch_up_capacity);
+        let (lagged, lag_receiver) = watch::channel(Option::<u64>::None);
+        let (completed, result) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::Register {
+                attachment_id: attachment_id.clone(),
+                connection_id: connection_id.to_owned(),
+                after_seq,
+                mode,
+                events,
+                lagged,
+                completed,
+            })
+            .await
+            .map_err(|_| SessionHubError::Closed)?;
+        let registered = result.await.map_err(|_| SessionHubError::Closed)?;
+        let ActorRegisterResult::Registered(attach_state) = registered else {
+            let ActorRegisterResult::CursorAhead { requested, head } = registered else {
+                return Err(SessionHubError::Task(
+                    "actor registration changed variants unexpectedly".into(),
+                ));
+            };
+            return Ok(RegisterResult::CursorAhead { requested, head });
+        };
+        let registration = Registration {
+            attachment_id: attachment_id.clone(),
+            attach_state,
+            actor: actor.clone(),
+            events: event_receiver,
+            lagged: lag_receiver,
+        };
+        let (cancel, _) = watch::channel(false);
+        lock(&self.inner.attachments)?.insert(
+            attachment_id,
+            AttachmentOwner {
+                connection_id: connection_id.to_owned(),
+                session_id,
+                mode,
+                actor,
+                cancel,
+            },
+        );
+        Ok(RegisterResult::Registered(registration))
+    }
+
+    fn spawn_replay(
+        &self,
+        registration: Registration,
+        after_seq: u64,
+        sink: Arc<dyn FrameSink>,
+    ) -> Result<(), SessionHubError> {
+        if self.inner.draining.load(Ordering::Acquire) {
+            return Err(SessionHubError::Closed);
+        }
+        let cancel = lock(&self.inner.attachments)?
+            .get(&registration.attachment_id)
+            .map(|owner| owner.cancel.subscribe())
+            .ok_or(SessionHubError::Closed)?;
+        let mut replay_tasks = lock(&self.inner.replay_tasks)?;
+        if self.inner.draining.load(Ordering::Acquire) {
+            return Err(SessionHubError::Closed);
+        }
+        // Finished handles carry no live task ownership. Reap them on each
+        // admission so repeated attach/detach cannot grow this registry.
+        replay_tasks.retain(|handle| !handle.is_finished());
+        let hub = self.clone();
+        let task = tokio::spawn(async move {
+            run_replay(hub, registration, after_seq, sink, cancel).await;
+        });
+        // The lock stays held from the drain recheck through spawn+push, so
+        // shutdown's registry take either owns this task or rejects it before
+        // it exists. No aborted-but-unjoined admission gap is possible.
+        replay_tasks.push(task);
+        Ok(())
+    }
+
+    fn take_attachment(
+        &self,
+        attachment_id: &AttachmentId,
+        connection_id: Option<&str>,
+    ) -> Result<Option<AttachmentOwner>, SessionHubError> {
+        let mut attachments = lock(&self.inner.attachments)?;
+        let owned = attachments
+            .get(attachment_id)
+            .is_some_and(|owner| connection_id.is_none_or(|id| owner.connection_id == id));
+        if !owned {
+            return Ok(None);
+        }
+        let owner = attachments.remove(attachment_id);
+        if let Some(owner) = owner.as_ref() {
+            let _ = owner.cancel.send(true);
+        }
+        Ok(owner)
+    }
+
+    async fn finish_detach(
+        attachment_id: &AttachmentId,
+        owner: AttachmentOwner,
+    ) -> Result<(), SessionHubError> {
+        owner
+            .actor
+            .commands
+            .send(ActorCommand::Detach {
+                attachment_id: attachment_id.clone(),
+            })
+            .await
+            .map_err(|_| SessionHubError::Closed)
+    }
+
+    async fn detach(&self, attachment_id: &AttachmentId) -> Result<bool, SessionHubError> {
+        let owner = self.take_attachment(attachment_id, None)?;
+        let Some(owner) = owner else {
+            return Ok(false);
+        };
+        Self::finish_detach(attachment_id, owner).await?;
+        Ok(true)
+    }
+
+    async fn detach_connection(&self, connection_id: &str) -> Result<(), SessionHubError> {
+        let attachments = {
+            let owners = lock(&self.inner.attachments)?;
+            owners
+                .iter()
+                .filter(|(_, owner)| owner.connection_id == connection_id)
+                .map(|(attachment_id, _)| attachment_id.clone())
+                .collect::<Vec<_>>()
+        };
+        for attachment_id in attachments {
+            let _ = self.detach(&attachment_id).await?;
+        }
+        Ok(())
+    }
+
+    fn attachment_for_menu(
+        &self,
+        connection_id: &str,
+        session_id: &SessionId,
+    ) -> Result<bool, SessionHubError> {
+        Ok(lock(&self.inner.attachments)?.values().any(|owner| {
+            owner.connection_id == connection_id
+                && owner.session_id == *session_id
+                && matches!(owner.mode, AttachMode::Control)
+        }))
+    }
+
+    fn try_send_attachment(
+        &self,
+        attachment_id: &AttachmentId,
+        sink: &Arc<dyn FrameSink>,
+        frame: WireFrame,
+    ) -> Result<(), FrameSendError> {
+        let attachments = lock(&self.inner.attachments).map_err(|_| FrameSendError)?;
+        if !attachments.contains_key(attachment_id) {
+            return Err(FrameSendError);
+        }
+        // The ownership lock makes send-vs-detach atomic: detach removes the
+        // owner before purging its lane, so no frame can appear after purge.
+        sink.try_send(frame)
+    }
+
+    /// Rejects new hub work synchronously before the runtime announces drain.
+    pub fn begin_draining(&self) {
+        self.inner.draining.store(true, Ordering::Release);
+    }
+
+    /// Begins drain, cancels and joins every replay, then stops and joins every
+    /// session actor. No task retaining the store survives this method.
+    pub async fn shutdown(&self) -> Result<(), SessionHubError> {
+        self.begin_draining();
+        // Install both abort-on-drop guards before the first await. If the
+        // global drain deadline cancels this future, no hub task is detached.
+        let replay_tasks = std::mem::take(&mut *lock(&self.inner.replay_tasks)?);
+        let mut replay_tasks = OwnedTasks::new(replay_tasks);
+        let actors = {
+            let mut actors = lock(&self.inner.actors)?;
+            actors.drain().map(|(_, actor)| actor).collect::<Vec<_>>()
+        };
+        let actor_tasks = std::mem::take(&mut *lock(&self.inner.actor_tasks)?);
+        let mut actor_tasks = OwnedTasks::new(actor_tasks);
+        for actor in &actors {
+            actor.stopping.store(true, Ordering::Release);
+        }
+        self.inner.observer.observe(HubObservation::ShutdownGuarded);
+        let owners = {
+            let mut owners = lock(&self.inner.attachments)?;
+            owners.drain().collect::<Vec<_>>()
+        };
+        for (_, owner) in &owners {
+            let _ = owner.cancel.send(true);
+        }
+        replay_tasks.abort_all();
+        replay_tasks.join_all().await;
+        for actor in actors {
+            let _ = actor.commands.send(ActorCommand::Stop).await;
+        }
+        actor_tasks.join_all().await;
+        Ok(())
+    }
+}
+
+impl HubConnection {
+    /// Handles one request and enqueues its correlated response.
+    pub async fn request(
+        &self,
+        request_id: RequestId,
+        body: RequestBody,
+    ) -> Result<(), SessionHubError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(SessionHubError::Closed);
+        }
+        if self.hub.inner.draining.load(Ordering::Acquire) {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_DRAINING,
+                "daemon is draining",
+                true,
+                None,
+            );
+        }
+        match body {
+            RequestBody::SessionList { cursor, limit } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::View) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.session_list(request_id, cursor, limit).await
+            }
+            RequestBody::SessionRead { session_id, range } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::View) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.session_read(request_id, session_id, range).await
+            }
+            RequestBody::SessionAttach {
+                session_id,
+                after_seq,
+                mode,
+            } => {
+                let operation = match mode {
+                    AttachMode::View => Operation::View,
+                    AttachMode::Control => Operation::Control,
+                    AttachMode::Unknown => {
+                        return self.respond_error(
+                            request_id,
+                            ERROR_CODE_INVALID_ARGUMENT,
+                            "unknown attachment mode",
+                            false,
+                            None,
+                        );
+                    }
+                    _ => {
+                        return self.respond_error(
+                            request_id,
+                            ERROR_CODE_INVALID_ARGUMENT,
+                            "unknown attachment mode",
+                            false,
+                            None,
+                        );
+                    }
+                };
+                if let Err(message) = authorize(&self.capabilities, operation) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.session_attach(request_id, session_id, after_seq, mode)
+                    .await
+            }
+            RequestBody::SessionDetach { attachment_id } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::View) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.session_detach(request_id, attachment_id).await
+            }
+            RequestBody::Unknown => self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "unknown session method",
+                false,
+                None,
+            ),
+            _ => self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "unknown session method",
+                false,
+                None,
+            ),
+        }
+    }
+
+    async fn session_list(
+        &self,
+        request_id: RequestId,
+        cursor: Option<String>,
+        limit: u32,
+    ) -> Result<(), SessionHubError> {
+        let after = match cursor.as_deref().map(decode_cursor).transpose() {
+            Ok(after) => after,
+            Err(()) => {
+                return self.respond_error(
+                    request_id,
+                    ERROR_CODE_INVALID_CURSOR,
+                    "session-list cursor is invalid",
+                    false,
+                    None,
+                );
+            }
+        };
+        let limit = usize::try_from(limit)
+            .unwrap_or(usize::MAX)
+            .min(MAX_LIST_PAGE);
+        if limit == 0 {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "session-list limit must be greater than zero",
+                false,
+                None,
+            );
+        }
+        let ids = self.hub.inner.store.session_ids().await?;
+        let mut selected = ids
+            .into_iter()
+            .filter(|session_id| {
+                after
+                    .as_ref()
+                    .is_none_or(|after| session_id.as_str() > after.as_str())
+            })
+            .take(limit.saturating_add(1))
+            .collect::<Vec<_>>();
+        let has_more = selected.len() > limit;
+        if has_more {
+            selected.truncate(limit);
+        }
+        let mut sessions = Vec::with_capacity(selected.len());
+        for session_id in &selected {
+            sessions.push(SessionSummary {
+                session_id: session_id.clone(),
+                head_seq: self.hub.inner.store.latest_seq(session_id).await?,
+                worker_generation: self.hub.inner.store.worker_generation(),
+            });
+        }
+        let next_cursor = has_more
+            .then(|| selected.last().map(encode_cursor))
+            .flatten();
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::SessionList {
+                sessions,
+                next_cursor,
+            },
+        })
+    }
+
+    async fn session_read(
+        &self,
+        request_id: RequestId,
+        session_id: SessionId,
+        range: SeqRange,
+    ) -> Result<(), SessionHubError> {
+        let head = self.hub.inner.store.latest_seq(&session_id).await?;
+        if head == 0 {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_NOT_FOUND,
+                "session was not found",
+                false,
+                None,
+            );
+        }
+        if range.start_seq == 0 || range.end_seq < range.start_seq {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "session-read range must be non-empty and start at sequence one or later",
+                false,
+                None,
+            );
+        }
+        let count = range
+            .end_seq
+            .saturating_sub(range.start_seq)
+            .saturating_add(1);
+        let limit = usize::try_from(count).unwrap_or(usize::MAX);
+        if limit > MAX_READ_ENVELOPES {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "session-read range exceeds the maximum of 1024 envelopes",
+                false,
+                None,
+            );
+        }
+        let envelopes = self
+            .hub
+            .inner
+            .store
+            .read(&session_id, range.start_seq.saturating_sub(1), limit)
+            .await?
+            .into_iter()
+            .take_while(|envelope| envelope.seq <= range.end_seq)
+            .collect::<Vec<_>>();
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::SessionRead {
+                result: SessionReadResult {
+                    session_id,
+                    range,
+                    head_seq: head,
+                    envelopes,
+                },
+            },
+        })
+    }
+
+    async fn session_attach(
+        &self,
+        request_id: RequestId,
+        session_id: SessionId,
+        after_seq: u64,
+        mode: AttachMode,
+    ) -> Result<(), SessionHubError> {
+        if self.hub.inner.store.latest_seq(&session_id).await? == 0 {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_NOT_FOUND,
+                "session was not found",
+                false,
+                None,
+            );
+        }
+        let registered = self
+            .hub
+            .register(&self.connection_id, session_id, after_seq, mode)
+            .await?;
+        let RegisterResult::Registered(registration) = registered else {
+            let RegisterResult::CursorAhead { requested, head } = registered else {
+                return Err(SessionHubError::Task(
+                    "attachment registration changed variants unexpectedly".into(),
+                ));
+            };
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_CURSOR_AHEAD,
+                "replay cursor is beyond the committed session head",
+                false,
+                Some(ErrorData::CursorAhead { requested, head }),
+            );
+        };
+        let attachment_id = registration.attachment_id.clone();
+        let attach_state = registration.attach_state.clone();
+        if let Err(error) = self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::SessionAttach {
+                attachment_id: attachment_id.clone(),
+                attach_state,
+            },
+        }) {
+            let _ = self.hub.detach(&attachment_id).await;
+            return Err(error);
+        }
+        self.hub
+            .spawn_replay(registration, after_seq, Arc::clone(&self.sink))
+    }
+
+    async fn session_detach(
+        &self,
+        request_id: RequestId,
+        attachment_id: AttachmentId,
+    ) -> Result<(), SessionHubError> {
+        let owner = self
+            .hub
+            .take_attachment(&attachment_id, Some(&self.connection_id))?;
+        let Some(owner) = owner else {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_NOT_FOUND,
+                "attachment was not found on this connection",
+                false,
+                None,
+            );
+        };
+        // Removal/cancellation happened under the same ownership lock used by
+        // replay delivery. Purging now is therefore a terminal lane barrier.
+        self.sink.purge_attachment(&attachment_id);
+        SessionHub::finish_detach(&attachment_id, owner).await?;
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::SessionDetach { attachment_id },
+        })
+    }
+
+    /// Handles the durable top-level `MenuAnswer` command.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn menu_answer(
+        &self,
+        request_id: Option<RequestId>,
+        command_id: CommandId,
+        session_id: SessionId,
+        menu_id: haider_protocol::ids::MenuId,
+        request_seq: u64,
+        worker_generation: u64,
+        option_key: String,
+        option_index: u32,
+        input: Option<MenuInput>,
+    ) -> Result<(), SessionHubError> {
+        if self.hub.inner.draining.load(Ordering::Acquire) {
+            return self.menu_error(
+                request_id,
+                ERROR_CODE_DRAINING,
+                "daemon is draining",
+                true,
+                None,
+            );
+        }
+        if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+            return self.menu_error(
+                request_id,
+                ERROR_CODE_CAPABILITY_DENIED,
+                message,
+                false,
+                None,
+            );
+        }
+        if !self
+            .hub
+            .attachment_for_menu(&self.connection_id, &session_id)?
+        {
+            return self.menu_error(
+                request_id,
+                ERROR_CODE_CAPABILITY_DENIED,
+                "menu answers require a control attachment to this session",
+                false,
+                None,
+            );
+        }
+        let (value, secret_reference) = match input {
+            Some(MenuInput::Text { text }) => (Some(text), false),
+            Some(MenuInput::SecretVaultReference { vault_reference }) => {
+                (Some(vault_reference), true)
+            }
+            None => (None, false),
+            Some(_) => {
+                return self.menu_error(
+                    request_id,
+                    ERROR_CODE_INVALID_ARGUMENT,
+                    "unknown menu input kind",
+                    false,
+                    None,
+                );
+            }
+        };
+        let answer = DurableMenuAnswer {
+            menu: menu_id,
+            option_key: (!option_key.is_empty()).then_some(option_key),
+            option_index,
+            value,
+            via: AnswerVia::Rpc,
+        };
+        let actor = self.hub.actor_for(session_id.clone()).await?;
+        let command = MenuResolutionCommand {
+            command_id: command_id.0,
+            session_id,
+            request_seq,
+            worker_generation,
+            answer,
+            device_id: self.hub.inner.device_id.clone(),
+            input_is_secret_reference: secret_reference,
+        };
+        let (completed, result) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::MenuAnswer { command, completed })
+            .await
+            .map_err(|_| SessionHubError::Closed)?;
+        match result.await.map_err(|_| SessionHubError::Closed)? {
+            Ok(MenuResolutionOutcome::Committed { ref envelope }) => {
+                self.menu_success(request_id, envelope.seq)
+            }
+            Ok(MenuResolutionOutcome::IdempotentReplay { resolution_seq }) => {
+                self.menu_success(request_id, resolution_seq)
+            }
+            Ok(MenuResolutionOutcome::AlreadyResolved { resolution_seq }) => self.menu_error(
+                request_id,
+                ERROR_CODE_ALREADY_RESOLVED,
+                "menu was already resolved",
+                false,
+                Some(ErrorData::AlreadyResolved { resolution_seq }),
+            ),
+            Err(error) => {
+                let code = match error.code {
+                    ErrorCode::SingleWriterViolation => ERROR_CODE_STALE_GENERATION,
+                    ErrorCode::MenuAlreadyAnswered => ERROR_CODE_ALREADY_RESOLVED,
+                    ErrorCode::MenuNotFound | ErrorCode::SessionNotFound => ERROR_CODE_NOT_FOUND,
+                    _ => ERROR_CODE_INVALID_ARGUMENT,
+                };
+                self.menu_error(request_id, code, &error.message, error.retryable, None)
+            }
+        }
+    }
+
+    fn menu_success(
+        &self,
+        request_id: Option<RequestId>,
+        resolution_seq: u64,
+    ) -> Result<(), SessionHubError> {
+        match request_id {
+            Some(request_id) => self.send(WireFrame::Response {
+                request_id,
+                body: ResponseBody::MenuAnswer { resolution_seq },
+            }),
+            None => Ok(()),
+        }
+    }
+
+    fn menu_error(
+        &self,
+        request_id: Option<RequestId>,
+        code: &str,
+        message: &str,
+        retryable: bool,
+        data: Option<ErrorData>,
+    ) -> Result<(), SessionHubError> {
+        match request_id {
+            Some(request_id) => self.respond_error(request_id, code, message, retryable, data),
+            None => self.send(WireFrame::ProtocolError(ProtocolError {
+                code: code.into(),
+                message: message.into(),
+                fatal: false,
+            })),
+        }
+    }
+
+    fn respond_error(
+        &self,
+        request_id: RequestId,
+        code: &str,
+        message: &str,
+        retryable: bool,
+        data: Option<ErrorData>,
+    ) -> Result<(), SessionHubError> {
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::Error {
+                code: code.into(),
+                message: message.into(),
+                retryable,
+                data,
+            },
+        })
+    }
+
+    fn send(&self, frame: WireFrame) -> Result<(), SessionHubError> {
+        self.sink
+            .try_send(frame)
+            .map_err(|_| SessionHubError::Delivery)
+    }
+
+    /// Detaches every attachment owned by this connection.
+    pub async fn close(&self) -> Result<(), SessionHubError> {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        self.hub.detach_connection(&self.connection_id).await
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Operation {
+    View,
+    Control,
+}
+
+fn authorize(capabilities: &CapabilitySet, operation: Operation) -> Result<(), &'static str> {
+    let allowed = match operation {
+        Operation::View => {
+            capabilities.contains(&Capability::View) || capabilities.contains(&Capability::Control)
+        }
+        Operation::Control => capabilities.contains(&Capability::Control),
+    };
+    allowed.then_some(()).ok_or(match operation {
+        Operation::View => "this method requires the view capability",
+        Operation::Control => "this method requires the control capability",
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_session_actor(
+    session_id: SessionId,
+    mut head: u64,
+    mut authority_epoch: u64,
+    worker_generation: u64,
+    store: SqliteStoreHandle,
+    observer: Arc<dyn SessionHubObserver>,
+    stopping: Arc<AtomicBool>,
+    mut commands: mpsc::Receiver<ActorCommand>,
+) {
+    let mut attachments = HashMap::<AttachmentId, ActorAttachment>::new();
+    let mut harness = Option::<HarnessHandle>::None;
+    while let Some(command) = commands.recv().await {
+        if stopping.load(Ordering::Acquire) {
+            break;
+        }
+        match command {
+            ActorCommand::Append {
+                mut envelopes,
+                completed,
+            } => {
+                let result = store.append(&mut envelopes).await;
+                match result {
+                    Ok(range) => {
+                        head = range.last_seq;
+                        if let Some(last) = envelopes.last() {
+                            authority_epoch = last.authority_epoch;
+                        }
+                        observer.observe(HubObservation::Persisted {
+                            session_id: session_id.clone(),
+                            through_seq: head,
+                        });
+                        publish(&mut attachments, &envelopes, &observer, &session_id);
+                        observer.observe(HubObservation::Published {
+                            session_id: session_id.clone(),
+                            through_seq: head,
+                        });
+                        let _ = completed.send(Ok(envelopes));
+                    }
+                    Err(error) => {
+                        let _ = completed.send(Err(error));
+                    }
+                }
+            }
+            ActorCommand::Register {
+                attachment_id,
+                connection_id,
+                after_seq,
+                mode,
+                events,
+                lagged,
+                completed,
+            } => {
+                if after_seq > head {
+                    let _ = completed.send(ActorRegisterResult::CursorAhead {
+                        requested: after_seq,
+                        head,
+                    });
+                    continue;
+                }
+                attachments.insert(
+                    attachment_id.clone(),
+                    ActorAttachment {
+                        connection_id,
+                        mode,
+                        events,
+                        lagged,
+                        last_buffered_seq: head,
+                        active: true,
+                    },
+                );
+                observer.observe(HubObservation::ReceiverRegistered {
+                    attachment_id: attachment_id.clone(),
+                });
+                // Load-bearing §5.5 invariant: receiver insertion and this
+                // head read are adjacent synchronous operations in one actor
+                // turn. There is no await or yield between them.
+                let high_water = head;
+                observer.observe(HubObservation::HeadCaptured {
+                    attachment_id: attachment_id.clone(),
+                    head: high_water,
+                });
+                let _ = completed.send(ActorRegisterResult::Registered(AttachState {
+                    session_id: session_id.clone(),
+                    requested_after_seq: after_seq,
+                    replay_through_seq: high_water,
+                    worker_generation,
+                    authority_epoch,
+                }));
+            }
+            ActorCommand::Reregister {
+                attachment_id,
+                events,
+                lagged,
+                completed,
+            } => {
+                let registered = attachments.get_mut(&attachment_id).map(|attachment| {
+                    attachment.events = events;
+                    attachment.lagged = lagged;
+                    attachment.last_buffered_seq = head;
+                    attachment.active = true;
+                    head
+                });
+                let _ = completed.send(registered);
+            }
+            ActorCommand::Detach { attachment_id } => {
+                attachments.remove(&attachment_id);
+            }
+            ActorCommand::MenuAnswer { command, completed } => {
+                let outcome = store.resolve_menu(command).await;
+                if let Ok(MenuResolutionOutcome::Committed { ref envelope }) = outcome {
+                    head = envelope.seq;
+                    authority_epoch = envelope.authority_epoch;
+                    observer.observe(HubObservation::Persisted {
+                        session_id: session_id.clone(),
+                        through_seq: head,
+                    });
+                    publish(
+                        &mut attachments,
+                        std::slice::from_ref(envelope.as_ref()),
+                        &observer,
+                        &session_id,
+                    );
+                    observer.observe(HubObservation::Published {
+                        session_id: session_id.clone(),
+                        through_seq: head,
+                    });
+                    if let Some(harness) = harness.as_ref()
+                        && let Err(error) =
+                            harness.apply_committed_menu_event(envelope.as_ref().clone())
+                    {
+                        tracing::warn!(
+                            session_id = %session_id,
+                            error = ?error,
+                            "committed menu event could not wake the live harness"
+                        );
+                    }
+                }
+                let _ = completed.send(outcome);
+            }
+            ActorCommand::RegisterHarness {
+                harness: registered,
+            } => harness = Some(registered),
+            ActorCommand::Stop => break,
+        }
+    }
+}
+
+#[async_trait]
+impl StoreHandle for SessionHub {
+    async fn append(
+        &self,
+        envelopes: &mut [RawEnvelope],
+    ) -> Result<haider_core::CommittedRange, HaiderError> {
+        SessionHub::append(self, envelopes).await
+    }
+
+    async fn read(
+        &self,
+        session_id: &SessionId,
+        since_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<RawEnvelope>, HaiderError> {
+        self.inner.store.read(session_id, since_seq, limit).await
+    }
+
+    async fn latest_seq(&self, session_id: &SessionId) -> Result<u64, HaiderError> {
+        self.inner.store.latest_seq(session_id).await
+    }
+}
+
+fn publish(
+    attachments: &mut HashMap<AttachmentId, ActorAttachment>,
+    envelopes: &[RawEnvelope],
+    _observer: &Arc<dyn SessionHubObserver>,
+    _session_id: &SessionId,
+) {
+    for attachment in attachments.values_mut() {
+        if !attachment.active {
+            continue;
+        }
+        let _metadata = (&attachment.connection_id, attachment.mode);
+        for envelope in envelopes {
+            match attachment.events.try_send(envelope.clone()) {
+                Ok(()) => attachment.last_buffered_seq = envelope.seq,
+                Err(_) => {
+                    let _ = attachment.lagged.send(Some(attachment.last_buffered_seq));
+                    attachment.active = false;
+                    break;
+                }
+            }
+        }
+    }
+}
+
+async fn run_replay(
+    hub: SessionHub,
+    mut registration: Registration,
+    mut last_sent_seq: u64,
+    sink: Arc<dyn FrameSink>,
+    mut cancel: watch::Receiver<bool>,
+) {
+    let attachment_id = registration.attachment_id.clone();
+    let session_id = registration.attach_state.session_id.clone();
+    let mut high_water = registration.attach_state.replay_through_seq;
+    loop {
+        let replayed = replay_range(
+            &hub,
+            &sink,
+            &attachment_id,
+            &session_id,
+            &mut last_sent_seq,
+            high_water,
+            &mut registration.lagged,
+            &mut cancel,
+        )
+        .await;
+        match replayed {
+            ReplayStep::Continue => {}
+            ReplayStep::ReceiverLagged => {
+                match reregister(&hub, &registration.actor, &attachment_id).await {
+                    Some((events, lagged, next_head)) => {
+                        registration.events = events;
+                        registration.lagged = lagged;
+                        high_water = next_head;
+                        continue;
+                    }
+                    None => break,
+                }
+            }
+            ReplayStep::Cancelled => break,
+            ReplayStep::OutboxFull => {
+                lag_and_detach(&hub, &sink, &attachment_id, last_sent_seq).await;
+                return;
+            }
+        }
+
+        hub.inner.observer.observe(HubObservation::BeforeCaughtUp {
+            attachment_id: attachment_id.clone(),
+            through_seq: high_water,
+        });
+        if hub
+            .try_send_attachment(
+                &attachment_id,
+                &sink,
+                WireFrame::AttachCaughtUp {
+                    attachment_id: attachment_id.clone(),
+                    high_water_seq: high_water,
+                },
+            )
+            .is_err()
+        {
+            lag_and_detach(&hub, &sink, &attachment_id, last_sent_seq).await;
+            return;
+        }
+        hub.inner.observer.observe(HubObservation::CaughtUp {
+            attachment_id: attachment_id.clone(),
+            through_seq: high_water,
+        });
+
+        loop {
+            if *cancel.borrow() {
+                return;
+            }
+            match registration.events.try_recv() {
+                Ok(envelope) => {
+                    if envelope.seq <= last_sent_seq || envelope.seq <= high_water {
+                        continue;
+                    }
+                    if deliver_event(
+                        &hub,
+                        &sink,
+                        &attachment_id,
+                        &session_id,
+                        envelope,
+                        &mut last_sent_seq,
+                        DeliveryPhase::Buffered,
+                    )
+                    .is_err()
+                    {
+                        lag_and_detach(&hub, &sink, &attachment_id, last_sent_seq).await;
+                        return;
+                    }
+                }
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    if registration.lagged.borrow().is_some() {
+                        match reregister(&hub, &registration.actor, &attachment_id).await {
+                            Some((events, lagged, next_head)) => {
+                                registration.events = events;
+                                registration.lagged = lagged;
+                                high_water = next_head;
+                                break;
+                            }
+                            None => return,
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+        if high_water > last_sent_seq {
+            continue;
+        }
+
+        loop {
+            tokio::select! {
+                biased;
+                changed = cancel.changed() => {
+                    if changed.is_err() || *cancel.borrow() {
+                        return;
+                    }
+                }
+                changed = registration.lagged.changed() => {
+                    if changed.is_err() || registration.lagged.borrow().is_some() {
+                        match reregister(&hub, &registration.actor, &attachment_id).await {
+                            Some((events, lagged, next_head)) => {
+                                registration.events = events;
+                                registration.lagged = lagged;
+                                high_water = next_head;
+                                break;
+                            }
+                            None => return,
+                        }
+                    }
+                }
+                envelope = registration.events.recv() => {
+                    let Some(envelope) = envelope else {
+                        return;
+                    };
+                    if envelope.seq <= last_sent_seq {
+                        continue;
+                    }
+                    if deliver_event(
+                        &hub,
+                        &sink,
+                        &attachment_id,
+                        &session_id,
+                        envelope,
+                        &mut last_sent_seq,
+                        DeliveryPhase::Live,
+                    ).is_err() {
+                        lag_and_detach(&hub, &sink, &attachment_id, last_sent_seq).await;
+                        return;
+                    }
+                }
+            }
+        }
+    }
+    let _ = hub.detach(&attachment_id).await;
+}
+
+enum ReplayStep {
+    Continue,
+    ReceiverLagged,
+    Cancelled,
+    OutboxFull,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn replay_range(
+    hub: &SessionHub,
+    sink: &Arc<dyn FrameSink>,
+    attachment_id: &AttachmentId,
+    session_id: &SessionId,
+    last_sent_seq: &mut u64,
+    high_water: u64,
+    lagged: &mut watch::Receiver<Option<u64>>,
+    cancel: &mut watch::Receiver<bool>,
+) -> ReplayStep {
+    while *last_sent_seq < high_water {
+        let read = hub
+            .inner
+            .store
+            .read(session_id, *last_sent_seq, REPLAY_PAGE_SIZE);
+        let page = tokio::select! {
+            biased;
+            changed = cancel.changed() => {
+                if changed.is_err() || *cancel.borrow() {
+                    return ReplayStep::Cancelled;
+                }
+                continue;
+            }
+            changed = lagged.changed() => {
+                if changed.is_err() || lagged.borrow().is_some() {
+                    return ReplayStep::ReceiverLagged;
+                }
+                continue;
+            }
+            result = read => match result {
+                Ok(page) => page,
+                Err(error) => {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        attachment_id = %attachment_id,
+                        error = ?error,
+                        "attachment replay store read failed"
+                    );
+                    return ReplayStep::Cancelled;
+                }
+            }
+        };
+        if page.is_empty() {
+            return ReplayStep::Cancelled;
+        }
+        for envelope in page
+            .into_iter()
+            .take_while(|envelope| envelope.seq <= high_water)
+        {
+            if *cancel.borrow() {
+                return ReplayStep::Cancelled;
+            }
+            if envelope.seq <= *last_sent_seq {
+                continue;
+            }
+            if deliver_event(
+                hub,
+                sink,
+                attachment_id,
+                session_id,
+                envelope,
+                last_sent_seq,
+                DeliveryPhase::Replay,
+            )
+            .is_err()
+            {
+                return ReplayStep::OutboxFull;
+            }
+        }
+    }
+    ReplayStep::Continue
+}
+
+fn deliver_event(
+    hub: &SessionHub,
+    sink: &Arc<dyn FrameSink>,
+    attachment_id: &AttachmentId,
+    session_id: &SessionId,
+    envelope: RawEnvelope,
+    last_sent_seq: &mut u64,
+    phase: DeliveryPhase,
+) -> Result<(), FrameSendError> {
+    let seq = envelope.seq;
+    hub.inner.observer.observe(HubObservation::BeforeEvent {
+        attachment_id: attachment_id.clone(),
+        seq,
+    });
+    hub.try_send_attachment(
+        attachment_id,
+        sink,
+        WireFrame::Event {
+            attachment_id: attachment_id.clone(),
+            session_id: session_id.clone(),
+            envelope,
+        },
+    )?;
+    *last_sent_seq = seq;
+    hub.inner.observer.observe(match phase {
+        DeliveryPhase::Buffered => HubObservation::BufferedEvent {
+            attachment_id: attachment_id.clone(),
+            seq,
+        },
+        DeliveryPhase::Replay => HubObservation::ReplayEvent {
+            attachment_id: attachment_id.clone(),
+            seq,
+        },
+        DeliveryPhase::Live => HubObservation::LiveEvent {
+            attachment_id: attachment_id.clone(),
+            seq,
+        },
+    });
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DeliveryPhase {
+    Replay,
+    Buffered,
+    Live,
+}
+
+async fn reregister(
+    hub: &SessionHub,
+    actor: &SessionActorHandle,
+    attachment_id: &AttachmentId,
+) -> Option<(
+    mpsc::Receiver<RawEnvelope>,
+    watch::Receiver<Option<u64>>,
+    u64,
+)> {
+    let (events, event_receiver) = mpsc::channel(hub.inner.config.catch_up_capacity);
+    let (lagged, lag_receiver) = watch::channel(None);
+    let (completed, result) = oneshot::channel();
+    actor
+        .commands
+        .send(ActorCommand::Reregister {
+            attachment_id: attachment_id.clone(),
+            events,
+            lagged,
+            completed,
+        })
+        .await
+        .ok()?;
+    let head = result.await.ok().flatten()?;
+    Some((event_receiver, lag_receiver, head))
+}
+
+async fn lag_and_detach(
+    hub: &SessionHub,
+    sink: &Arc<dyn FrameSink>,
+    attachment_id: &AttachmentId,
+    last_queued_seq: u64,
+) {
+    let Ok(Some(owner)) = hub.take_attachment(attachment_id, None) else {
+        return;
+    };
+    sink.purge_attachment(attachment_id);
+    let _ = sink.try_send(WireFrame::Lagged {
+        attachment_id: attachment_id.clone(),
+        last_queued_seq,
+    });
+    let _ = SessionHub::finish_detach(attachment_id, owner).await;
+}
+
+fn encode_cursor(session_id: &SessionId) -> String {
+    let mut cursor = String::from("hs1.");
+    for byte in session_id.as_str().as_bytes() {
+        use std::fmt::Write as _;
+        let _ = write!(&mut cursor, "{byte:02x}");
+    }
+    cursor
+}
+
+fn decode_cursor(cursor: &str) -> Result<SessionId, ()> {
+    let encoded = cursor.strip_prefix("hs1.").ok_or(())?;
+    if encoded.len() % 2 != 0 {
+        return Err(());
+    }
+    let mut bytes = Vec::with_capacity(encoded.len() / 2);
+    for pair in encoded.as_bytes().chunks_exact(2) {
+        let pair = std::str::from_utf8(pair).map_err(|_| ())?;
+        bytes.push(u8::from_str_radix(pair, 16).map_err(|_| ())?);
+    }
+    String::from_utf8(bytes).map(SessionId::new).map_err(|_| ())
+}
+
+fn random_id(prefix: &str) -> Result<String, SessionHubError> {
+    let mut bytes = [0_u8; 16];
+    getrandom::fill(&mut bytes).map_err(|error| {
+        SessionHubError::Task(format!("cannot generate {prefix} identity: {error}"))
+    })?;
+    let mut id = String::with_capacity(prefix.len().saturating_add(33));
+    id.push_str(prefix);
+    id.push('-');
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut id, "{byte:02x}");
+    }
+    Ok(id)
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> Result<std::sync::MutexGuard<'_, T>, SessionHubError> {
+    mutex
+        .lock()
+        .map_err(|_| SessionHubError::Task("session hub mutex is poisoned".into()))
+}
+
+fn hub_error_as_store(error: SessionHubError) -> HaiderError {
+    match error {
+        SessionHubError::Store(error) => error,
+        other => HaiderError::new(ErrorCode::Internal, other.to_string(), false),
+    }
+}
+
+fn hub_closed_store_error() -> HaiderError {
+    HaiderError::new(
+        ErrorCode::Internal,
+        "session actor stopped before completing append",
+        false,
+    )
+}

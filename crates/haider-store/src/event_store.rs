@@ -16,11 +16,16 @@ use crate::cas::FileCas;
 use crate::migrations;
 use crate::profile_lock::ProfileLock;
 use crate::{Cas, StoreResult, now_ms, store_error, to_sqlite_integer};
-use haider_protocol::envelope::RawEnvelope;
+use haider_protocol::EventPayload;
+use haider_protocol::envelope::{
+    EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
+};
 use haider_protocol::error::{ErrorCode, HaiderError};
-use haider_protocol::ids::{ArtifactRef, SessionId};
+use haider_protocol::ids::{ArtifactRef, DeviceId, EventId, MenuId, SessionId};
+use haider_protocol::menu::{Menu, MenuAnswer, MenuKind};
 use rusqlite::{
-    Connection, Error as SqliteError, ErrorCode as SqliteErrorCode, TransactionBehavior, params,
+    Connection, Error as SqliteError, ErrorCode as SqliteErrorCode, OptionalExtension, Transaction,
+    TransactionBehavior, params,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -39,6 +44,36 @@ pub struct CommittedSeqRange {
     pub session_id: SessionId,
     pub first_seq: u64,
     pub last_seq: u64,
+}
+
+/// Durable coordinates for one menu-resolution compare-and-set.
+///
+/// `command_id` is the cross-connection idempotency key. The selected answer
+/// stays in the ordinary protocol payload; this side structure supplies only
+/// the version and fencing coordinates the transaction must validate.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MenuResolutionCommand {
+    pub command_id: String,
+    pub session_id: SessionId,
+    pub request_seq: u64,
+    pub worker_generation: u64,
+    pub answer: MenuAnswer,
+    pub device_id: DeviceId,
+    /// Preserves the wire distinction between ordinary text and a vault
+    /// reference after both normalize into `MenuAnswer.value`.
+    pub input_is_secret_reference: bool,
+}
+
+/// Result of the durable menu compare-and-set.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MenuResolutionOutcome {
+    /// This call appended the authoritative event. Publish this envelope only
+    /// after the transaction has returned successfully.
+    Committed { envelope: Box<RawEnvelope> },
+    /// The same durable command was retried after its response was lost.
+    IdempotentReplay { resolution_seq: u64 },
+    /// A different command already resolved the menu.
+    AlreadyResolved { resolution_seq: u64 },
 }
 
 impl CommittedSeqRange {
@@ -227,6 +262,32 @@ impl Store {
         Ok(version)
     }
 
+    /// Atomically resolves one durable menu and appends its authoritative
+    /// `MenuAnswered` envelope.
+    ///
+    /// The journal remains the source of truth. `menu_resolutions` is only a
+    /// uniqueness/idempotency index, and historical journals are scanned so a
+    /// pre-index `MenuAnswered` still fences a later answer.
+    pub fn resolve_menu(
+        &self,
+        command: &MenuResolutionCommand,
+    ) -> StoreResult<MenuResolutionOutcome> {
+        if command.command_id.is_empty() {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "menu command id must not be empty",
+                false,
+            ));
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        let outcome = resolve_menu_transaction(&transaction, command, self.worker_generation)?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(outcome)
+    }
+
     /// Replays a session's complete journal in committed sequence order.
     pub fn journal_replay(&self, session: &SessionId) -> StoreResult<Vec<RawEnvelope>> {
         let mut replay = Vec::new();
@@ -250,6 +311,394 @@ impl Store {
             )
         })
     }
+}
+
+#[derive(Debug)]
+struct ResolutionRow {
+    session_id: String,
+    menu_id: String,
+    request_seq: u64,
+    worker_generation: u64,
+    answer_json: String,
+    input_is_secret_reference: bool,
+    resolution_seq: u64,
+}
+
+fn resolve_menu_transaction(
+    transaction: &Transaction<'_>,
+    command: &MenuResolutionCommand,
+    current_worker_generation: u64,
+) -> StoreResult<MenuResolutionOutcome> {
+    let answer_json = serde_json::to_string(&command.answer).map_err(|error| {
+        store_error(
+            ErrorCode::InvalidArgument,
+            format!("cannot serialize menu answer: {error}"),
+            false,
+        )
+    })?;
+    if let Some(existing) = resolution_by_command(transaction, &command.command_id)? {
+        let same_command = existing.session_id == command.session_id.as_str()
+            && existing.menu_id == command.answer.menu.as_str()
+            && existing.request_seq == command.request_seq
+            && existing.worker_generation == command.worker_generation
+            && existing.answer_json == answer_json
+            && existing.input_is_secret_reference == command.input_is_secret_reference;
+        return if same_command {
+            Ok(MenuResolutionOutcome::IdempotentReplay {
+                resolution_seq: existing.resolution_seq,
+            })
+        } else {
+            Err(store_error(
+                ErrorCode::InvalidArgument,
+                "menu command id was already used with different coordinates or answer",
+                false,
+            ))
+        };
+    }
+    if command.worker_generation != current_worker_generation {
+        return Err(store_error(
+            ErrorCode::SingleWriterViolation,
+            format!(
+                "stale worker generation {}; current generation is {}",
+                command.worker_generation, current_worker_generation
+            ),
+            false,
+        ));
+    }
+
+    let opening = load_envelope(transaction, &command.session_id, command.request_seq)?
+        .ok_or_else(|| {
+            store_error(
+                ErrorCode::MenuNotFound,
+                format!(
+                    "menu request event {} does not exist in session {}",
+                    command.request_seq, command.session_id
+                ),
+                false,
+            )
+        })?;
+    let menu = opened_menu(&opening, &command.answer.menu)?;
+    if opening.worker_generation != command.worker_generation {
+        return Err(store_error(
+            ErrorCode::SingleWriterViolation,
+            format!(
+                "menu {} belongs to worker generation {}, not {}",
+                command.answer.menu, opening.worker_generation, command.worker_generation
+            ),
+            false,
+        ));
+    }
+    validate_answer(&menu, &command.answer, command.input_is_secret_reference)?;
+    if let Some(resolution_seq) =
+        resolution_by_menu(transaction, &command.session_id, &command.answer.menu)?
+    {
+        return Ok(MenuResolutionOutcome::AlreadyResolved { resolution_seq });
+    }
+    if let Some(resolution_seq) = historical_resolution(transaction, command, command.request_seq)?
+    {
+        return Ok(MenuResolutionOutcome::AlreadyResolved { resolution_seq });
+    }
+
+    let latest: i64 = transaction
+        .prepare_cached("SELECT COALESCE(MAX(seq), 0) FROM events WHERE session_id = ?1")
+        .and_then(|mut statement| {
+            statement.query_row([command.session_id.as_str()], |row| row.get(0))
+        })
+        .map_err(map_sqlite_error)?;
+    let resolution_seq = u64::try_from(latest)
+        .map_err(|_| corrupt("database contains a negative event sequence"))?
+        .checked_add(1)
+        .ok_or_else(|| corrupt("event sequence space is exhausted"))?;
+    let committed_at_ms = now_ms()?;
+    let event_id = menu_resolution_event_id(command);
+    let payload = serde_json::to_value(EventPayload::MenuAnswered(command.answer.clone()))
+        .map_err(|error| {
+            store_error(
+                ErrorCode::InvalidArgument,
+                format!("cannot serialize menu resolution payload: {error}"),
+                false,
+            )
+        })?;
+    let envelope = EventEnvelope {
+        schema_version: SCHEMA_VERSION,
+        event_id: event_id.clone(),
+        seq: resolution_seq,
+        session_id: command.session_id.clone(),
+        branch_id: opening.branch_id.clone(),
+        run_id: opening.run_id.clone(),
+        agent_id: opening.agent_id.clone(),
+        device_id: command.device_id.clone(),
+        authority_epoch: opening.authority_epoch,
+        worker_generation: command.worker_generation,
+        causation_id: Some(opening.event_id.clone()),
+        correlation_id: opening.correlation_id.clone(),
+        committed_at_ms,
+        render: RenderTargets {
+            ui: true,
+            durable: true,
+            prompt: PromptRender::Omit,
+        },
+        payload,
+    };
+    let envelope_json = serde_json::to_string(&envelope).map_err(|error| {
+        store_error(
+            ErrorCode::InvalidArgument,
+            format!("cannot serialize menu resolution envelope: {error}"),
+            false,
+        )
+    })?;
+    transaction
+        .execute(
+            "INSERT INTO events(
+                session_id, seq, envelope_json, event_id, committed_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                command.session_id.as_str(),
+                to_sqlite_integer(resolution_seq)?,
+                envelope_json,
+                event_id.as_str(),
+                to_sqlite_integer(committed_at_ms)?,
+            ],
+        )
+        .map_err(map_sqlite_error)?;
+    transaction
+        .execute(
+            "INSERT INTO menu_resolutions(
+                session_id, menu_id, request_seq, worker_generation,
+                command_id, answer_json, input_is_secret_reference, resolution_seq
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                command.session_id.as_str(),
+                command.answer.menu.as_str(),
+                to_sqlite_integer(command.request_seq)?,
+                to_sqlite_integer(command.worker_generation)?,
+                &command.command_id,
+                answer_json,
+                command.input_is_secret_reference,
+                to_sqlite_integer(resolution_seq)?,
+            ],
+        )
+        .map_err(map_sqlite_error)?;
+    Ok(MenuResolutionOutcome::Committed {
+        envelope: Box::new(envelope),
+    })
+}
+
+fn resolution_by_command(
+    transaction: &Transaction<'_>,
+    command_id: &str,
+) -> StoreResult<Option<ResolutionRow>> {
+    transaction
+        .query_row(
+            "SELECT session_id, menu_id, request_seq, worker_generation,
+                    answer_json, input_is_secret_reference, resolution_seq
+             FROM menu_resolutions
+             WHERE command_id = ?1",
+            [command_id],
+            |row| {
+                Ok(ResolutionRow {
+                    session_id: row.get(0)?,
+                    menu_id: row.get(1)?,
+                    request_seq: sql_u64(row.get(2)?)?,
+                    worker_generation: sql_u64(row.get(3)?)?,
+                    answer_json: row.get(4)?,
+                    input_is_secret_reference: row.get(5)?,
+                    resolution_seq: sql_u64(row.get(6)?)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(map_sqlite_error)
+}
+
+fn resolution_by_menu(
+    transaction: &Transaction<'_>,
+    session_id: &SessionId,
+    menu_id: &MenuId,
+) -> StoreResult<Option<u64>> {
+    transaction
+        .query_row(
+            "SELECT resolution_seq
+             FROM menu_resolutions
+             WHERE session_id = ?1 AND menu_id = ?2",
+            params![session_id.as_str(), menu_id.as_str()],
+            |row| sql_u64(row.get(0)?),
+        )
+        .optional()
+        .map_err(map_sqlite_error)
+}
+
+fn load_envelope(
+    transaction: &Transaction<'_>,
+    session_id: &SessionId,
+    seq: u64,
+) -> StoreResult<Option<RawEnvelope>> {
+    let envelope_json = transaction
+        .query_row(
+            "SELECT envelope_json FROM events WHERE session_id = ?1 AND seq = ?2",
+            params![session_id.as_str(), to_sqlite_integer(seq)?],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(map_sqlite_error)?;
+    envelope_json
+        .map(|json| {
+            serde_json::from_str(&json).map_err(|error| {
+                corrupt(format!(
+                    "invalid envelope JSON for session {session_id}, seq {seq}: {error}"
+                ))
+            })
+        })
+        .transpose()
+}
+
+fn opened_menu(opening: &RawEnvelope, menu_id: &MenuId) -> StoreResult<Menu> {
+    let payload =
+        serde_json::from_value::<EventPayload>(opening.payload.clone()).map_err(|_| {
+            store_error(
+                ErrorCode::MenuNotFound,
+                format!("event {} is not a recognized menu request", opening.seq),
+                false,
+            )
+        })?;
+    match payload {
+        EventPayload::MenuOpened(menu) if menu.id == *menu_id => Ok(menu),
+        _ => Err(store_error(
+            ErrorCode::MenuNotFound,
+            format!("event {} does not open menu {}", opening.seq, menu_id),
+            false,
+        )),
+    }
+}
+
+fn validate_answer(
+    menu: &Menu,
+    answer: &MenuAnswer,
+    input_is_secret_reference: bool,
+) -> StoreResult<()> {
+    if matches!(menu.kind, MenuKind::Secret) {
+        if !input_is_secret_reference || answer.value.as_deref().is_none_or(str::is_empty) {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "secret menus require a non-empty vault reference",
+                false,
+            ));
+        }
+    } else if input_is_secret_reference {
+        return Err(store_error(
+            ErrorCode::InvalidArgument,
+            "vault references are accepted only by secret menus",
+            false,
+        ));
+    }
+    if menu.options.is_empty() {
+        if !matches!(
+            menu.kind,
+            MenuKind::Question | MenuKind::Secret | MenuKind::File
+        ) || answer.option_index != 0
+            || answer
+                .option_key
+                .as_deref()
+                .is_some_and(|key| !key.is_empty())
+        {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "menu answer does not match the committed option version",
+                false,
+            ));
+        }
+        return Ok(());
+    }
+    let option = usize::try_from(answer.option_index)
+        .ok()
+        .and_then(|index| menu.options.get(index))
+        .ok_or_else(|| {
+            store_error(
+                ErrorCode::InvalidArgument,
+                "menu answer option index is outside the committed menu",
+                false,
+            )
+        })?;
+    if answer.option_key.as_deref() != Some(option.key.as_str()) {
+        return Err(store_error(
+            ErrorCode::InvalidArgument,
+            "menu answer key and index do not match the committed menu version",
+            false,
+        ));
+    }
+    Ok(())
+}
+
+fn historical_resolution(
+    transaction: &Transaction<'_>,
+    command: &MenuResolutionCommand,
+    after_seq: u64,
+) -> StoreResult<Option<u64>> {
+    let mut statement = transaction
+        .prepare_cached(
+            "SELECT seq, envelope_json
+             FROM events
+             WHERE session_id = ?1 AND seq > ?2
+             ORDER BY seq ASC",
+        )
+        .map_err(map_sqlite_error)?;
+    let mut rows = statement
+        .query(params![
+            command.session_id.as_str(),
+            to_sqlite_integer(after_seq)?
+        ])
+        .map_err(map_sqlite_error)?;
+    while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+        let seq = sql_u64(row.get(0).map_err(map_sqlite_error)?).map_err(map_sqlite_error)?;
+        let json: String = row.get(1).map_err(map_sqlite_error)?;
+        let envelope: RawEnvelope = serde_json::from_str(&json).map_err(|error| {
+            corrupt(format!(
+                "invalid envelope JSON for session {}, seq {seq}: {error}",
+                command.session_id
+            ))
+        })?;
+        let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload) else {
+            continue;
+        };
+        match payload {
+            EventPayload::MenuAnswered(answer) if answer.menu == command.answer.menu => {
+                return Ok(Some(seq));
+            }
+            EventPayload::MenuClosed { menu, .. } if menu == command.answer.menu => {
+                return Err(store_error(
+                    ErrorCode::MenuNotFound,
+                    format!("menu {} is no longer pending", command.answer.menu),
+                    false,
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(None)
+}
+
+fn menu_resolution_event_id(command: &MenuResolutionCommand) -> EventId {
+    let mut hasher = blake3::Hasher::new();
+    for part in [
+        command.session_id.as_str(),
+        command.answer.menu.as_str(),
+        &command.command_id,
+    ] {
+        let length = u64::try_from(part.len()).unwrap_or(u64::MAX);
+        hasher.update(&length.to_be_bytes());
+        hasher.update(part.as_bytes());
+    }
+    EventId::new(format!("menu-resolution-{}", hasher.finalize().to_hex()))
+}
+
+fn sql_u64(value: i64) -> rusqlite::Result<u64> {
+    u64::try_from(value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Integer,
+            Box::new(error),
+        )
+    })
 }
 
 /// Advances and returns the profile-owned fencing generation.

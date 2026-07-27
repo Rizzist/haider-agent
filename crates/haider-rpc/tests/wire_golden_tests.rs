@@ -9,9 +9,10 @@ use std::path::PathBuf;
 use common::{TEST_FRAME_LIMIT, transcript};
 use haider_rpc::{
     DEFAULT_FRAME_LIMIT, ERROR_CODE_ALREADY_RESOLVED, ERROR_CODE_CAPABILITY_DENIED,
-    ERROR_CODE_CURSOR_AHEAD, ERROR_CODE_DRAINING, ERROR_CODE_NOT_FOUND, ERROR_CODE_OVERLOADED,
-    Hello, RequestBody, ResponseBody, WIRE_PROTOCOL_VERSION, Welcome, WireFrame, uds_codec,
-    ws_codec,
+    ERROR_CODE_CURSOR_AHEAD, ERROR_CODE_DRAINING, ERROR_CODE_INVALID_ARGUMENT,
+    ERROR_CODE_INVALID_CURSOR, ERROR_CODE_NOT_FOUND, ERROR_CODE_OVERLOADED,
+    ERROR_CODE_STALE_GENERATION, Hello, RequestBody, ResponseBody, WIRE_PROTOCOL_VERSION, Welcome,
+    WireFrame, uds_codec, ws_codec,
 };
 use serde::{Deserialize, Serialize};
 
@@ -161,6 +162,9 @@ fn correlated_errors_pin_the_named_stable_codes() {
             ERROR_CODE_NOT_FOUND,
             ERROR_CODE_DRAINING,
             ERROR_CODE_OVERLOADED,
+            ERROR_CODE_INVALID_CURSOR,
+            ERROR_CODE_INVALID_ARGUMENT,
+            ERROR_CODE_STALE_GENERATION,
         ],
         [
             "cursor_ahead",
@@ -169,6 +173,9 @@ fn correlated_errors_pin_the_named_stable_codes() {
             "not_found",
             "draining",
             "overloaded",
+            "invalid_cursor",
+            "invalid_argument",
+            "stale_generation",
         ]
     );
 
@@ -191,6 +198,24 @@ fn correlated_errors_pin_the_named_stable_codes() {
     assert_eq!(
         value["body"]["code"],
         serde_json::Value::String(ERROR_CODE_CAPABILITY_DENIED.into())
+    );
+}
+
+/// MUTATION CHECK: remove the additive `ResponseBody::MenuAnswer` variant or
+/// rename its method/coordinate. Expected failure: the exact success shape
+/// below no longer round-trips.
+#[test]
+fn menu_answer_success_is_correlated_by_request_and_resolution_sequence() {
+    let frame = WireFrame::Response {
+        request_id: haider_rpc::RequestId::new("menu-success"),
+        body: ResponseBody::MenuAnswer { resolution_seq: 42 },
+    };
+    let json = serde_json::to_value(&frame).expect("encode success");
+    assert_eq!(json["body"]["method"], "menu.answer");
+    assert_eq!(json["body"]["resolution_seq"], 42);
+    assert_eq!(
+        serde_json::from_value::<WireFrame>(json).expect("decode success"),
+        frame
     );
 }
 

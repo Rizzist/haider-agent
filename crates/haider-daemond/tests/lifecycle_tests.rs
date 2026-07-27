@@ -8,7 +8,7 @@
 //! - simultaneous-start            -> `simultaneous_start_n_processes_has_one_winner_and_clean_losers`
 //! - loser diagnostics             -> `already_running_error_carries_incumbent_diagnostics`
 //! - stale-PID-reuse               -> `stale_pid_reuse_is_diagnostic_only_and_does_not_block_start`
-//! - cold-start socket-missing     -> `cold_start_socket_missing_serves_handshake_ping_and_stub_with_private_modes`
+//! - cold-start socket-missing     -> `cold_start_socket_missing_serves_handshake_ping_and_session_list`
 //! - failed-listener startup       -> `failed_listener_startup_publishes_failed_and_releases_profile_lock`
 //! - abrupt-death (kill -9)        -> `abrupt_death_kill_9_leaves_recoverable_socket_and_next_start_serves`
 //! - reconcile-before-ready        -> `reconcile_before_ready_marks_unknown_exactly_once_and_never_retries_effect`
@@ -491,7 +491,7 @@ fn unknown_outcomes(events: &[RawEnvelope], effect: &EffectId) -> usize {
 }
 
 #[tokio::test]
-async fn cold_start_socket_missing_serves_handshake_ping_and_stub_with_private_modes() {
+async fn cold_start_socket_missing_serves_handshake_ping_and_session_list() {
     let root = test_root();
     let config = test_config(&root, "cold-start");
     assert!(!config.endpoint_path().exists());
@@ -522,7 +522,7 @@ async fn cold_start_socket_missing_serves_handshake_ping_and_stub_with_private_m
     client
         .send(
             &WireFrame::Request {
-                request_id: RequestId::new("stub"),
+                request_id: RequestId::new("list"),
                 body: RequestBody::SessionList {
                     cursor: None,
                     limit: 10,
@@ -534,9 +534,13 @@ async fn cold_start_socket_missing_serves_handshake_ping_and_stub_with_private_m
     assert!(matches!(
         client.receive().await,
         WireFrame::Response {
-            body: ResponseBody::Error { ref code, .. },
+            request_id,
+            body: ResponseBody::SessionList {
+                ref sessions,
+                next_cursor: None,
+            },
             ..
-        } if code == "not_found"
+        } if request_id.as_str() == "list" && sessions.is_empty()
     ));
 
     task.shutdown_handle().request("test complete");
@@ -1689,8 +1693,8 @@ async fn view_only_connection_is_denied_the_control_frame() {
         "a view-only connection must be denied the control frame, correlated to its request"
     );
 
-    // A control connection gets the W3b2 stub instead, and an uncorrelated
-    // answer still gets the connection-level form.
+    // Capability alone does not authorize a controller without a viewport:
+    // policy requires a control attachment to the target session.
     let mut controller = handshake(&config.endpoint_path(), config.frame_limit).await;
     controller
         .send(&menu_answer(None), config.frame_limit)
@@ -1698,7 +1702,7 @@ async fn view_only_connection_is_denied_the_control_frame() {
     assert!(matches!(
         controller.receive().await,
         WireFrame::ProtocolError(ProtocolError { ref code, fatal: false, .. })
-            if code == "not_found"
+            if code == "capability_denied"
     ));
 
     task.shutdown_handle().request("test complete");

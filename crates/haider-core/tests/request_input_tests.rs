@@ -1,9 +1,9 @@
 #![allow(clippy::expect_used)]
 
-use haider_core::{HarnessActor, HarnessConfig, MemoryStore, SubmitTurn};
+use haider_core::{HarnessActor, HarnessConfig, MemoryStore, StoreHandle, SubmitTurn};
 use haider_protocol::EventPayload;
 use haider_protocol::error::ErrorCode;
-use haider_protocol::ids::{DeviceId, SessionId};
+use haider_protocol::ids::{DeviceId, EventId, SessionId};
 use haider_protocol::item::{ItemEvent, ToolStatus, TurnItem};
 use haider_protocol::menu::{AnswerVia, MenuAnswer, MenuKind};
 use haider_protocol::provider::FinishReason;
@@ -191,6 +191,97 @@ async fn request_input_journals_menu_round_trip_and_returns_answer_as_tool_resul
             if serde_json::from_str::<serde_json::Value>(preview).expect("answer JSON")
                 == serde_json::json!({"value":"Binary","option_key":"binary"})
     ));
+}
+
+/// MUTATION CHECK: route an externally committed answer back through
+/// `answer_menu`, causing the harness to append a second `MenuAnswered`, or
+/// omit the committed-event wake. Expected failure: the turn hangs or the
+/// durable history contains two resolutions.
+#[tokio::test]
+async fn committed_menu_event_wakes_waiter_without_reappending_resolution() {
+    let (handle, store, _provider) = actor(vec![
+        FakeStep::EmitRequestInput {
+            call_id: "durable-question".into(),
+            kind: FakeInputKind::Choice,
+            title: "Continue?".into(),
+            body: Vec::new(),
+            options: vec![FakeInputOption {
+                key: "yes".into(),
+                label: "Yes".into(),
+                detail: None,
+            }],
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "durable-question".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]);
+    let turn = handle
+        .submit_turn(SubmitTurn::new("ask durably"))
+        .await
+        .expect("turn accepted");
+    let mut state = handle.state_receiver();
+    let parked = state
+        .wait_for(|state| matches!(state, Some(RunState::InputRequired { .. })))
+        .await
+        .expect("actor parks")
+        .clone();
+    let Some(RunState::InputRequired { menu }) = parked else {
+        panic!("wait predicate guarantees InputRequired");
+    };
+
+    let opening = store
+        .events(&SessionId::new(SESSION))
+        .await
+        .into_iter()
+        .find(|envelope| {
+            serde_json::from_value::<EventPayload>(envelope.payload.clone())
+                .is_ok_and(|payload| matches!(payload, EventPayload::MenuOpened(_)))
+        })
+        .expect("menu opening is durable");
+    let mut resolutions = [haider_protocol::envelope::EventEnvelope {
+        event_id: EventId::new("external-menu-resolution"),
+        seq: 0,
+        committed_at_ms: 0,
+        causation_id: Some(opening.event_id.clone()),
+        payload: serde_json::to_value(EventPayload::MenuAnswered(MenuAnswer {
+            menu,
+            option_key: Some("yes".into()),
+            option_index: 0,
+            value: None,
+            via: AnswerVia::Rpc,
+        }))
+        .expect("answer serializes"),
+        ..opening
+    }];
+    store
+        .append(&mut resolutions)
+        .await
+        .expect("external authority commits");
+    handle
+        .apply_committed_menu_event(resolutions[0].clone())
+        .expect("committed event wakes waiter");
+
+    assert_eq!(
+        turn.wait().await.expect("turn completes").state,
+        RunState::Done
+    );
+    let history = store.events(&SessionId::new(SESSION)).await;
+    assert_eq!(
+        history
+            .iter()
+            .filter(|envelope| {
+                serde_json::from_value::<EventPayload>(envelope.payload.clone())
+                    .is_ok_and(|payload| matches!(payload, EventPayload::MenuAnswered(_)))
+            })
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]

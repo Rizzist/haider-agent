@@ -1,8 +1,8 @@
 //! Lifecycle owner for the long-running Haider profile daemon.
 //!
-//! This crate deliberately stops at handshake, ping, recovery, and shutdown.
-//! Session routing, attachment replay, and menu arbitration are W3b2 seams
-//! (their stubs live in `connection.rs` and answer `draining` / `not_found`).
+//! In addition to singleton/recovery/shutdown ownership, this crate owns the
+//! W3b2 per-session actor hub: list/read/attach/detach, snapshot-free replay
+//! and its live barrier, bounded fair delivery, and durable menu arbitration.
 //!
 //! Laws enforced here (d1 report R1/R2/R3/R16/R17):
 //!
@@ -33,6 +33,12 @@
 //!   termination at any point in it; an overrun, a force, or a connection that
 //!   never received its notice is reported as `Forced`, never `Graceful`.
 //!   Recovery is the next generation's job (`runtime.rs`).
+//! - **Snapshot-free attachment** — one actor serializes each live session.
+//!   Receiver registration and head capture are one actor turn, appends are
+//!   persisted before publication, and replay tasks are cancellable/owned.
+//! - **Store-backed lag and menu CAS** — slow attachments detach and resume by
+//!   `RawEnvelope.seq`; menu answers append through one durable compare-and-set
+//!   and every attachment learns the winner from the event stream.
 //!
 //! The phase machine itself lives in `lifecycle.rs`; its legal transitions are
 //! documented on [`DaemonState`] and enforced by the state publisher.
@@ -43,11 +49,16 @@ mod endpoint;
 mod error;
 mod lifecycle;
 mod runtime;
+mod session_hub;
 
 pub use config::DaemonConfig;
 pub use error::{DaemonError, IncumbentDiagnostics};
 pub use lifecycle::{DaemonState, Readiness, ShutdownDisposition, ShutdownHandle, ShutdownOutcome};
 pub use runtime::{DaemonTask, run_with_signals, spawn};
+pub use session_hub::{
+    FrameSendError, FrameSink, HubConnection, HubObservation, SessionHub, SessionHubConfig,
+    SessionHubError, SessionHubObserver,
+};
 
 /// Crate marker used by the workspace self-test.
 pub const CRATE_NAME: &str = "haider-daemon";
