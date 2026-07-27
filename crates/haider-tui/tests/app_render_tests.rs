@@ -185,15 +185,15 @@ fn reducer_handles_quit_composer_and_navigation() {
     assert!(model.projection.interrupted(), "idle (i) marker set");
     model.handle(key(KeyCode::Esc));
     assert_eq!(model.screen, Screen::Launcher);
+    // TUI4c (directed): this transcript came from RAW envelopes — a
+    // scratch surface with no session id — so leaving discarded it and
+    // empty ⏎ has nothing to re-attach (the law now works by id:
+    // `tui4c_session_map_tests` pins it for real typed sessions).
     model.handle(key(KeyCode::Enter));
-    assert_eq!(model.screen, Screen::Session, "enter re-attaches");
+    assert_eq!(model.screen, Screen::Launcher, "no scratch to re-attach");
 
-    // TUI4b item 10 (DIRECTED parity change): ⌃C is NAVIGATION from any
-    // non-launcher surface — this used to pin quit-from-anywhere. Quit now
-    // requires ⌃C at the launcher (or boot).
-    assert!(!model.should_quit);
-    model.handle(ctrl('c'));
-    assert_eq!(model.screen, Screen::Launcher, "session ⌃C navigates");
+    // TUI4b item 10 (directed): ⌃C at the launcher quits; the
+    // session-side navigation half lives in tui4b_interaction_tests.
     assert!(!model.should_quit);
     model.handle(ctrl('c'));
     assert!(model.should_quit, "launcher ⌃C quits");
@@ -440,20 +440,16 @@ fn typed_text_starts_a_session_and_requests_a_turn() {
     }
     model.handle(key(KeyCode::Enter));
     assert_eq!(model.screen, Screen::Session);
-    // fresh_session stops the old context first (review r3 P3-6). The
-    // request only ASKS for the micro-call: the driver names the session
-    // and pushes the note together 1.5 s later (sim tui.js:1219-1227,
-    // TUI3.1 P2-12).
+    // TUI4c (directed): `new_session` cancels NOTHING — the session left
+    // behind keeps running (sim tui.js:1617-1650); only the submit itself
+    // is requested. The micro-call still names the session 1.5 s later.
     assert_eq!(
         model.requests,
-        vec![
-            AppRequest::StopScripts,
-            AppRequest::SubmitText {
-                text: "refactor the parser".to_owned(),
-                voice: false,
-                title: true,
-            }
-        ]
+        vec![AppRequest::SubmitText {
+            text: "refactor the parser".to_owned(),
+            voice: false,
+            title: true,
+        }]
     );
     // Sim autoBlurb (G47) is the BLURB, applied by the 1.5 s callback; the
     // header + window title show the session's slug NAME right away (sim
@@ -474,11 +470,12 @@ fn digit_attaches_a_sample_and_autoplay_is_one_shot() {
         HarnessStatus::Ready,
     ))));
     model.handle(key(KeyCode::Char('2')));
-    // fresh_session stops the old context first (review r3 P3-6); attaching
-    // asks for NOTHING else — TUI4 item 1: opening a session must not start
-    // a canned turn (sim `openSession`, tui.js:1606-1615).
-    assert_eq!(model.requests, vec![AppRequest::StopScripts]);
-    assert_eq!(model.session_head, ("Fatima", "(a)"));
+    // TUI4c (directed): attaching asks for NOTHING — no canned turn (item
+    // 1) and no teardown either: the sim's `openSession` (tui.js:1606)
+    // never cancels; the previous session keeps running in its slot.
+    assert_eq!(model.requests, vec![]);
+    let _ = AppRequest::Quit;
+    assert_eq!(model.session_head, ("Fatima".to_owned(), "(a)".to_owned()));
     assert!(!model.turn_active, "no turn was started");
     assert_eq!(model.screen, Screen::Session);
 }
@@ -528,8 +525,8 @@ fn one_turn_at_a_time_across_digits_and_submits() {
         HarnessStatus::Ready,
     ))));
     model.handle(key(KeyCode::Char('1')));
-    // TUI4 item 1: attaching only tears down — it starts no turn.
-    assert_eq!(model.requests.len(), 1);
+    // TUI4c (directed): attaching requests nothing and starts no turn.
+    assert_eq!(model.requests.len(), 0);
     assert!(!model.turn_active, "attach starts no turn");
     // A second digit attaches the OTHER seeded session — there is no turn to
     // conflict with any more (TUI4 item 1).
@@ -704,7 +701,7 @@ fn clicks_attach_sessions_and_wheel_scrolls() {
     // TUI4 item 1: attaching opens the SEEDED session and starts no turn.
     assert!(!model.turn_active);
     assert_eq!(model.screen, Screen::Session);
-    assert_eq!(model.session_head, ("Ali", "(a)"));
+    assert_eq!(model.session_head, ("Ali".to_owned(), "(a)".to_owned()));
 
     // The script's UserMessage envelope flips to the session view.
     model.handle(AppEvent::Envelope(Box::new(EventPayload::UserMessage {

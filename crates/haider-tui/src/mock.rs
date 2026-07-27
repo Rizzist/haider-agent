@@ -472,3 +472,51 @@ pub fn sample_seed_chip(index: usize) -> Option<crate::script::ChipSeed> {
 pub fn seed_item_id(seq: u64) -> haider_protocol::ids::ItemId {
     haider_protocol::ids::ItemId::new(format!("seed-{seq}"))
 }
+
+/// Materialize the three seed sessions as full [`SessionState`]s (sim
+/// seeds, tui.js:497-579) — ids 1-3, roster heads 0-2, seed transcripts
+/// applied verbatim, the L1 seed's live `web-index` chip attached, and the
+/// token meter Usage-seeded. `turns_offset` keeps each seed's advertised
+/// turn count while real turns still move the number.
+#[must_use]
+pub fn seed_session_states() -> Vec<crate::session::SessionState> {
+    sample_sessions()
+        .iter()
+        .enumerate()
+        .map(|(index, sample)| {
+            let mut entry =
+                crate::session::SessionState::neutral(u64::try_from(index).unwrap_or(0) + 1);
+            entry.name = Some(sample.name.to_owned());
+            entry.title = Some(sample.blurb.to_owned());
+            entry.head = (sample.head.to_owned(), sample.honorific.to_owned());
+            entry.head_ros = Some(u64::try_from(index).unwrap_or(0));
+            entry.dir = sample.dir.to_owned();
+            entry.model_short = sample.model.to_owned();
+            entry.device = sample.device.to_owned();
+            entry.ago = sample.ago.to_owned();
+            entry.branches = sample.branches;
+            for row in sample_seed(index) {
+                entry.projection.apply_seed_row(row);
+            }
+            entry
+                .projection
+                .apply(&haider_protocol::EventPayload::Usage(
+                    haider_protocol::provider::Usage {
+                        input: sample.tokens,
+                        output: 0,
+                        reasoning: 0,
+                        cached: 0,
+                        source: haider_protocol::provider::UsageSource::Estimated,
+                        account: None,
+                    },
+                ));
+            if let Some(seed) = sample_seed_chip(index) {
+                entry.chips.push(crate::app::ChipModel::from_seed(seed));
+            }
+            entry.turns_offset = sample
+                .turns
+                .saturating_sub(entry.projection.user_row_count());
+            entry
+        })
+        .collect()
+}

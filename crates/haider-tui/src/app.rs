@@ -3,7 +3,7 @@
 //! mutates it. The reducer is pure enough to test headlessly.
 
 use crate::commands::{PALETTE_MAX_ROWS, PaletteItem, has_arg_slots, palette_items};
-use crate::mock::{SampleSession, sample_sessions};
+use crate::mock::seed_session_states;
 use crate::projection::SessionProjection;
 use crate::sanctum::SanctumTier;
 use crate::script::{AuraState, ChipDisplayState, ChipPrefill, ChipSeed, TALK_PHRASE};
@@ -388,6 +388,32 @@ fn truncate_activity(text: &str) -> String {
 
 /// `treeLiveCount` (tui.js:286-329): live chips, recursively.
 #[must_use]
+/// The chips-level half of the close lifecycle (§2.5): flags + the parent
+/// transcript note — shared by the attached surface (`close_chip_state`)
+/// and background routing, so both speak one law. Returns `was_live`, or
+/// `None` when the chip is unknown or already closed.
+pub fn close_chip_core(
+    chips: &mut [ChipModel],
+    projection: &mut SessionProjection,
+    agent: &str,
+) -> Option<bool> {
+    let chip = find_chip_mut(chips, agent)?;
+    if chip.closed {
+        return None;
+    }
+    let was_live = chip.is_live();
+    chip.closed = true;
+    chip.removing = true;
+    if let Some(question) = &mut chip.question {
+        question.resolved = true;
+    }
+    projection.push_note(format!(
+        "· subagent {} {} closed — leaving the tree in 5s",
+        chip.callsign, chip.hon
+    ));
+    Some(was_live)
+}
+
 pub fn tree_live_count(chips: &[ChipModel]) -> usize {
     chips
         .iter()
@@ -558,8 +584,6 @@ pub enum AppRequest {
         voice: bool,
         title: bool,
     },
-    /// Attach a sample session: replay the classic scripted demo turn.
-    AttachSample(usize),
     /// Stop any playing script (fresh session / reset).
     StopScripts,
     /// Esc mid-turn: stop the playing script; the reducer already settled
@@ -754,8 +778,9 @@ pub struct AppModel {
     pub session_title: Option<String>,
     /// Session slug name (sim tui.js:2014-2016) — header + window title.
     pub session_name: Option<String>,
-    /// Head callsign for the live demo session (sim: claimed from roster).
-    pub session_head: (&'static str, &'static str),
+    /// Head callsign for the live demo session (sim: claimed from the
+    /// roster at `newSession`, tui.js:1631 — TUI4c makes the claim real).
+    pub session_head: (String, String),
     /// Mid-turn input held for turn end (sim queue mode, §4.4): the ⧗
     /// panel's rows; consumed by the driver's `finish_turn` with no idle.
     pub msg_queue: Vec<String>,
@@ -791,8 +816,21 @@ pub struct AppModel {
     pub auto_resuming: bool,
     /// The aura orchestrator surface (persists across screen exits).
     pub aura: AuraModel,
-    /// Launcher sample rows (sim seeds; display-only until the daemon).
-    pub samples: Vec<SampleSession>,
+    /// EVERY session, fully materialized (sim `sessions`, tui.js:497) —
+    /// seeds and user-created alike; newest user session first, then the
+    /// seeds. The ATTACHED session's state is checked OUT of its slot into
+    /// this model's live fields (see `crate::session`).
+    pub sessions: Vec<crate::session::SessionState>,
+    /// The checked-out session's id (sim `activeId`; `None` = launcher's
+    /// no-session state, exactly the sim's `setActiveId(null)`).
+    pub active_session: Option<u64>,
+    /// The most recently detached session — the empty-⏎ re-attach target.
+    pub last_detached: Option<u64>,
+    /// Session id allocator (seeds take 1-3; sim uses `Date.now()`).
+    pub next_session_id: u64,
+    /// The roster claim counter (sim `rosterRef`, tui.js:681) — shared
+    /// with the driver so heads and chips draw from ONE honour roll.
+    pub roster: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Selected option index while a blocking menu replaces the composer.
     pub menu_selection: usize,
     /// Selected row in the slash palette (open while composer starts with /).
@@ -867,7 +905,9 @@ impl Default for AppModel {
             composer: String::new(),
             session_title: None,
             session_name: None,
-            session_head: ("Hasan", "(a)"),
+            // The scratch surface's canonical head (the demo script's
+            // voice); real sessions claim theirs from the roster.
+            session_head: ("Hasan".to_owned(), "(a)".to_owned()),
             msg_queue: Vec::new(),
             queue_mode: false,
             voice: VoiceState::default(),
@@ -883,7 +923,13 @@ impl Default for AppModel {
             todos_collapsed: false,
             auto_resuming: false,
             aura: AuraModel::seed(),
-            samples: sample_sessions(),
+            sessions: seed_session_states(),
+            active_session: None,
+            last_detached: None,
+            next_session_id: 4,
+            roster: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::script::ROSTER_FIRST_CLAIM,
+            )),
             menu_selection: 0,
             palette_selection: 0,
             palette_scroll: 0,
@@ -1293,8 +1339,12 @@ impl AppModel {
         self.palette_scroll = 0;
         self.palette_dismissed = false;
         if text.is_empty() {
-            if self.screen == Screen::Launcher && !self.projection.entries().is_empty() {
-                self.screen = Screen::Session;
+            // Empty ⏎ on the launcher re-attaches the most recently left
+            // session (a port law; the detach model keeps it honest by id).
+            if self.screen == Screen::Launcher
+                && let Some(id) = self.last_detached
+            {
+                self.open_session(id);
             }
             return;
         }
@@ -1348,11 +1398,11 @@ impl AppModel {
             }
             return;
         }
-        // Typing on the LAUNCHER starts a FRESH session (sim promise);
-        // typing inside a session continues it.
+        // Typing on the LAUNCHER starts a FRESH session (sim promise,
+        // tui.js:2013-2016 `newSession`) — the one left behind keeps
+        // running and shows as busy in its launcher row.
         if self.screen == Screen::Launcher {
-            self.fresh_session();
-            self.session_name = Some(slug_name(&text));
+            self.new_session(&text);
         }
         // The blurb is NOT set here: the sim's micro-call names the session
         // inside its own 1.5 s callback. The callback SURVIVES an interrupt
@@ -1398,8 +1448,7 @@ impl AppModel {
     /// own UserMessage and tags streamed rows `♪ speaking`.
     fn submit_voice(&mut self, text: String) {
         if self.screen == Screen::Launcher {
-            self.fresh_session();
-            self.session_name = Some(slug_name(&text));
+            self.new_session(&text);
         }
         self.projection.push_user_voice(text.clone());
         self.projection
@@ -1470,10 +1519,16 @@ impl AppModel {
     /// Esc from the aura stage: back to the session if one is attached,
     /// else the launcher — aura state persists either way.
     fn exit_aura(&mut self) {
-        self.screen = if self.projection.entries().is_empty() && self.session_name.is_none() {
-            Screen::Launcher
-        } else {
+        // TUI4c: attachment is the map's word now — a checked-out session
+        // (or a content-bearing scratch) takes esc back to the session;
+        // an aura entered from the menu returns to the menu.
+        self.screen = if self.active_session.is_some()
+            || !self.projection.entries().is_empty()
+            || self.session_name.is_some()
+        {
             Screen::Session
+        } else {
+            Screen::Launcher
         };
     }
 
@@ -1481,21 +1536,7 @@ impl AppModel {
     /// timer and the resume check; returns whether the chip WAS live
     /// (closing the last live child discharges the wait).
     pub fn close_chip_state(&mut self, agent: &str) -> Option<bool> {
-        let chip = find_chip_mut(&mut self.chips, agent)?;
-        if chip.closed {
-            return None;
-        }
-        let was_live = chip.is_live();
-        chip.closed = true;
-        chip.removing = true;
-        if let Some(question) = &mut chip.question {
-            question.resolved = true;
-        }
-        let note = format!(
-            "· subagent {} {} closed — leaving the tree in 5s",
-            chip.callsign, chip.hon
-        );
-        self.projection.push_note(note);
+        let was_live = close_chip_core(&mut self.chips, &mut self.projection, agent)?;
         // Sim closeChip (tui.js:1176-1178): the screen ALWAYS returns to the
         // session, but the remembered view path only clears when the CLOSED
         // chip is the one being viewed (`viewChipId === chipId ? null : v`).
@@ -1641,14 +1682,23 @@ impl AppModel {
                 }
             },
             "clear" | "back" => {
-                // /clear promises a fresh start (review r1 P2);
-                // fresh_session itself stops scripts + stale timers.
-                self.fresh_session();
-                self.screen = Screen::Launcher;
+                // Sim tui.js:1950-1958: /clear DETACHES (activeId = null)
+                // and nothing more — the session keeps running and shows
+                // as busy in its row. The /clear fresh-start promise
+                // (review r1 P2) is kept by `new_session`: the next typed
+                // message starts a brand-new session, never this one.
+                self.back_to_launcher();
             }
             "reset" => {
                 self.fresh_session();
-                self.samples = sample_sessions();
+                self.sessions = seed_session_states();
+                self.active_session = None;
+                self.last_detached = None;
+                self.next_session_id = 4;
+                self.roster.store(
+                    crate::script::ROSTER_FIRST_CLAIM,
+                    std::sync::atomic::Ordering::SeqCst,
+                );
                 self.aura = AuraModel::seed();
                 self.requests.push(AppRequest::ResetAura);
                 self.screen = Screen::Launcher;
@@ -1939,7 +1989,10 @@ impl AppModel {
         // A NEW session identity: answers and micro-calls born under the old
         // one are now stale, and any that never left the outbox are dropped
         // outright (review r2 P1-1).
-        self.session_epoch = self.session_epoch.wrapping_add(1);
+        // TUI4c: the epoch IS the active session id; a reset surface has
+        // none, so stale answers/titles fail their identity check against
+        // 0 exactly as they failed the old bumped epoch.
+        self.session_epoch = 0;
         self.outbox.clear();
         self.projection = SessionProjection::new();
         self.session_title = None;
@@ -1963,48 +2016,129 @@ impl AppModel {
 
     /// Attach a sample session by NAME (the clicked row's identity, P2-9).
     fn attach_sample_named(&mut self, name: &str) {
-        if let Some(index) = self.samples.iter().position(|s| s.name == name) {
-            self.attach_sample(index);
+        if let Some(id) = self
+            .sessions
+            .iter()
+            .find(|entry| entry.name.as_deref() == Some(name))
+            .map(|entry| entry.id)
+        {
+            self.open_session(id);
         }
     }
 
-    /// Attach a sample session (digit or click) — one turn at a time.
+    /// Attach the launcher's nth row (digit binding). TUI4c: switching is
+    /// FREE — the sim's `openSession` never blocks on a running turn
+    /// (tui.js:1606: "attaching never cancels a turn"); the old
+    /// one-turn-at-a-time flash guarded a single shared projection that no
+    /// longer exists.
     fn attach_sample(&mut self, index: usize) {
-        if self.turn_active {
-            self.flash = Some("· a turn is already running".to_owned());
+        if let Some(id) = self.sessions.get(index).map(|entry| entry.id) {
+            self.open_session(id);
+        }
+    }
+
+    /// Sim `openSession` (tui.js:1606-1615): sweep closed chips whose 5 s
+    /// removal never fired, attach, and NOTHING else — no turn starts
+    /// (owner item 1), and the one left behind keeps running.
+    pub fn open_session(&mut self, id: u64) {
+        if self.active_session == Some(id) {
+            self.screen = Screen::Session;
             return;
         }
-        let Some(sample) = self.samples.get(index).copied() else {
+        self.checkin();
+        let Some(index) = self.sessions.iter().position(|entry| entry.id == id) else {
             return;
         };
-        self.fresh_session();
-        self.session_title = Some(sample.blurb.to_owned());
-        self.session_name = Some(sample.name.to_owned());
-        self.session_head = (sample.head, sample.honorific);
-        self.session_dir = sample.dir.to_owned();
-        // Sim `openSession` (tui.js:1606-1615) attaches and NOTHING else —
-        // no turn is started. The session opens showing the transcript it
-        // already has (owner item 1: opening a session must not kick off a
-        // canned sequence).
-        for row in crate::mock::sample_seed(index) {
-            self.projection.apply_seed_row(row);
-        }
-        // The launcher row advertises this session's context; the meter is
-        // Usage-authoritative, so seed it rather than showing 0 tok.
-        self.projection
-            .apply(&EventPayload::Usage(haider_protocol::provider::Usage {
-                input: sample.tokens,
-                output: 0,
-                reasoning: 0,
-                cached: 0,
-                source: haider_protocol::provider::UsageSource::Estimated,
-                account: None,
-            }));
-        if let Some(seed) = crate::mock::sample_seed_chip(index) {
-            self.chips.push(ChipModel::from_seed(seed));
-        }
+        // Move the slot out so its fields can swap with `self`'s without
+        // aliasing; the slot keeps a neutral placeholder meanwhile.
+        let mut slot = std::mem::replace(
+            &mut self.sessions[index],
+            crate::session::SessionState::neutral(id),
+        );
+        crate::session::sweep_closed_chips(&mut slot.chips);
+        self.projection = std::mem::replace(&mut slot.projection, SessionProjection::new());
+        self.chips = std::mem::take(&mut slot.chips);
+        self.msg_queue = std::mem::take(&mut slot.msg_queue);
+        self.queue_mode = slot.queue_mode;
+        self.turn_active = slot.turn_active;
+        self.auto_resuming = slot.auto_resuming;
+        self.subtree_collapsed = slot.subtree_collapsed;
+        self.todos_collapsed = slot.todos_collapsed;
+        self.session_title = slot.title.take();
+        self.session_name = slot.name.take();
+        self.session_head = std::mem::take(&mut slot.head);
+        self.session_dir = std::mem::take(&mut slot.dir);
+        self.sessions[index] = slot;
+        self.active_session = Some(id);
+        self.session_epoch = id;
+        self.menu_selection = 0;
+        self.view_path.clear();
         self.screen = Screen::Session;
         self.scroll_back.set(0);
+        self.scroll_max.set(0);
+        self.sticky_suppressed = false;
+    }
+
+    /// Detach: write the live fields back into the session's slot (sim
+    /// `setActiveId(null)` — the state lives on and its scripts keep
+    /// running). The surface then returns to the neutral no-session state
+    /// item 12 requires of the launcher.
+    pub fn checkin(&mut self) {
+        let Some(active) = self.active_session.take() else {
+            self.session_epoch = 0;
+            return;
+        };
+        if let Some(index) = self.sessions.iter().position(|entry| entry.id == active) {
+            let slot = &mut self.sessions[index];
+            slot.projection = std::mem::replace(&mut self.projection, SessionProjection::new());
+            slot.chips = std::mem::take(&mut self.chips);
+            slot.msg_queue = std::mem::take(&mut self.msg_queue);
+            slot.queue_mode = std::mem::take(&mut self.queue_mode);
+            slot.turn_active = std::mem::take(&mut self.turn_active);
+            slot.auto_resuming = std::mem::take(&mut self.auto_resuming);
+            slot.subtree_collapsed = std::mem::take(&mut self.subtree_collapsed);
+            slot.todos_collapsed = std::mem::take(&mut self.todos_collapsed);
+            slot.title = self.session_title.take();
+            slot.name = self.session_name.take();
+            slot.head = std::mem::replace(
+                &mut self.session_head,
+                ("Hasan".to_owned(), "(a)".to_owned()),
+            );
+            slot.dir = std::mem::replace(&mut self.session_dir, self.launcher_dir.clone());
+        }
+        self.last_detached = Some(active);
+        self.session_epoch = 0;
+        self.msg_queue.clear();
+        self.queue_mode = false;
+        self.view_path.clear();
+        self.menu_selection = 0;
+        self.scroll_back.set(0);
+        self.scroll_max.set(0);
+        self.sticky_suppressed = false;
+    }
+
+    /// Sim `newSession` (tui.js:1617-1650): a fresh id, a head claimed
+    /// from the roster (the seeds hold 0-2, so the first user session
+    /// claims Hasan), the launcher dir, newest-first in the list. The
+    /// session left behind is checked in, never cancelled.
+    fn new_session(&mut self, text: &str) {
+        self.checkin();
+        let id = self.next_session_id;
+        self.next_session_id += 1;
+        let ros = self
+            .roster
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let head = crate::script::roster_at(ros);
+        let mut entry = crate::session::SessionState::neutral(id);
+        entry.name = Some(slug_name(text));
+        entry.head = (head.callsign, head.hon.to_owned());
+        entry.head_ros = Some(ros);
+        entry.dir = self.launcher_dir.clone();
+        entry.model_short = self.identity.model_short.clone();
+        entry.device = self.identity.device.clone();
+        entry.ago = "now".to_owned();
+        self.sessions.insert(0, entry);
+        self.open_session(id);
     }
 
     /// Walk back to the launcher — the ONE teardown every back path shares
@@ -2014,10 +2148,32 @@ impl AppModel {
     /// running turn are untouched, so the session resumes exactly where it
     /// was left.
     pub fn back_to_launcher(&mut self) {
+        // TUI4c: leaving DETACHES (sim `setActiveId(null)`, tui.js:1956) —
+        // the session's state checks into its slot, its scripts keep
+        // running, and the launcher's surface derives from NO session
+        // (item 12: a background turn never reaches the main menu's badge).
+        if self.active_session.is_some() {
+            self.checkin();
+        } else if !self.projection.entries().is_empty() || self.turn_active {
+            // A content-bearing SCRATCH (envelope-driven flows with no
+            // session id — the headless harness, the plain oracle): there
+            // is no slot to keep it in, so /clear's fresh-start promise
+            // applies literally — reset and stop its scripts. Real UI
+            // flows always mint a session id first (`new_session`).
+            self.fresh_session();
+        }
         self.screen = Screen::Launcher;
         self.listening = false;
         self.view_path.clear();
         self.help_open = false;
+    }
+
+    /// A NON-attached session's slot (background event routing).
+    pub fn session_entry_mut(&mut self, id: u64) -> Option<&mut crate::session::SessionState> {
+        if self.active_session == Some(id) {
+            return None;
+        }
+        self.sessions.iter_mut().find(|entry| entry.id == id)
     }
 
     /// A left-click resolved through the frame's hit map. The map may be

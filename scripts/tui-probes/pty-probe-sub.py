@@ -53,8 +53,9 @@ pump(9.0)  # parent turn + both child scripts up to their cards
 sub_paint = since(0)
 # The tests chip is holding its amber ? — the parent turn is idle by now.
 pre = mark()
-os.write(fd, b"\x1b")  # esc: idle session -> launcher? (no: still session)
-pump(0.6)
+# TUI4c: an idle esc now really DETACHES (the session checks into its
+# slot), so /aura is typed from the SESSION — entered that way, esc from
+# the aura returns to it (sim: exit goes back to where you came from).
 os.write(fd, b"/aura\r")
 pump(1.2)
 aura_paint = since(pre)

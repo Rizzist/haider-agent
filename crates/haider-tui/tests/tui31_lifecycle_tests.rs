@@ -897,8 +897,10 @@ fn launcher_liveness_and_metas_follow_the_sim_seeds() {
 fn an_attach_hit_follows_its_session_when_the_list_reorders() {
     // The value-carrying law: a one-frame-stale rect must attach exactly the
     // row that was clicked, or nothing.
+    // TUI4c (directed): rows live in the SESSION MAP now — same law,
+    // exercised against `model.sessions`.
     let mut model = launcher_model();
-    model.samples.reverse();
+    model.sessions.reverse();
     model.handle_hit(Hit::AttachSample("billing-service".to_owned()));
     assert_eq!(
         model.session_name.as_deref(),
@@ -906,7 +908,7 @@ fn an_attach_hit_follows_its_session_when_the_list_reorders() {
         "identity, not ordinal"
     );
     let mut model = launcher_model();
-    model.samples.clear();
+    model.sessions.clear();
     model.handle_hit(Hit::AttachSample("billing-service".to_owned()));
     assert_eq!(model.session_name, None, "a vanished row attaches nothing");
     assert_eq!(tree_live_count(&model.chips), 0);
@@ -1065,19 +1067,37 @@ async fn a_menu_option_hit_is_inert_once_its_surface_is_gone() {
         .find(|(_, hit)| matches!(hit, Hit::MenuOption { .. }))
         .map(|(_, hit)| hit.clone())
         .expect("an option row");
-    // Back to the launcher: the projection (and its card) survive, but the
-    // surface is gone, so a queued click must not answer it.
+    // Back to the launcher: TUI4c (directed) — the projection (and its
+    // card) check into the session's SLOT; the live surface is neutral,
+    // so a queued click must not answer it.
     model.handle_hit(Hit::BackChip);
     assert_eq!(model.screen, Screen::Launcher);
-    assert!(model.projection.open_menu().is_some(), "card still parked");
+    let sid = model.last_detached.expect("detached id");
+    let slot_menu = |m: &haider_tui::app::AppModel| {
+        m.sessions
+            .iter()
+            .find(|entry| entry.id == sid)
+            .and_then(|entry| entry.projection.open_menu().cloned())
+    };
+    assert!(slot_menu(&model).is_some(), "card still parked in the slot");
     model.handle_hit(option.clone());
     assert!(model.outbox.is_empty(), "no answer from an invisible card");
     model.handle_hover(Some(option.clone()));
     assert_eq!(model.menu_selection, 0, "hover is inert too");
-    let entries = model.projection.entries().len();
+    let entries = model
+        .sessions
+        .iter()
+        .find(|entry| entry.id == sid)
+        .map(|entry| entry.projection.entries().len())
+        .expect("slot");
     pump_quiet(&mut driver, &mut rx, &mut model, 2_000).await;
     assert_eq!(
-        model.projection.entries().len(),
+        model
+            .sessions
+            .iter()
+            .find(|entry| entry.id == sid)
+            .map(|entry| entry.projection.entries().len())
+            .expect("slot"),
         entries,
         "no parked continuation started"
     );

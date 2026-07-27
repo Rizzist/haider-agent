@@ -193,26 +193,35 @@ async fn stale_idle_decay_never_lands_in_a_fresh_session() {
     drain(&mut driver, &mut model);
     assert!(model.projection.interrupted(), "B is idle(i)");
 
-    // Consume everything on virtual time. A's decay carries a stale
-    // generation → dropped, B stays idle(i); B's decay is current → lands.
+    // Consume everything on virtual time. TUI4c (directed — the law got
+    // STRONGER): A's decay is no longer a stale-generation drop; it ROUTES
+    // to A's slot by session id (the sim's timeout writes `runStates[A]`
+    // wherever A lives, tui.js:1561-1564). B's idle(i) is untouched by it
+    // and only B's OWN decay clears B.
     let mut decays_seen = 0;
-    loop {
+    while decays_seen < 2 {
         let (generation, payload) = rx.recv().await.expect("beat");
         let is_decay = matches!(payload, DemoEvent::Envelope(EventPayload::IdleDecayed));
-        let current = driver.is_arm_live(generation);
         driver.consume(&mut model, generation, payload);
         if is_decay {
             decays_seen += 1;
-            if current {
-                break;
+            if decays_seen == 1 {
+                assert!(
+                    model.projection.interrupted(),
+                    "A's decay left B's idle(i) alone"
+                );
+                let slot_a = model
+                    .sessions
+                    .iter()
+                    .find(|entry| entry.name.as_deref() == Some("walk-me-through"))
+                    .expect("A's slot");
+                assert!(
+                    !slot_a.projection.interrupted(),
+                    "A's own idle(i) decayed IN ITS SLOT"
+                );
             }
-            assert!(
-                model.projection.interrupted(),
-                "A's stale decay left B's idle(i) alone"
-            );
         }
     }
-    assert_eq!(decays_seen, 2, "both decays travelled the channel");
     assert!(!model.projection.interrupted(), "B's own decay cleared it");
 }
 
@@ -308,18 +317,15 @@ fn alt_and_shift_enter_insert_newlines_and_enter_submits() {
     assert_eq!(model.composer, "line one\nline two\nline three");
     model.handle(key(KeyCode::Enter));
     assert_eq!(model.composer, "", "plain ⏎ still submits");
-    // fresh_session stops the old context first (review r3 P3-6); the
-    // fresh blurb rides the request for the driver's 1.5 s title note.
+    // TUI4c (directed): `new_session` cancels nothing — the previous
+    // session keeps running in its slot; only the submit is requested.
     assert_eq!(
         model.requests,
-        vec![
-            AppRequest::StopScripts,
-            AppRequest::SubmitText {
-                text: "line one\nline two\nline three".to_owned(),
-                voice: false,
-                title: true,
-            }
-        ]
+        vec![AppRequest::SubmitText {
+            text: "line one\nline two\nline three".to_owned(),
+            voice: false,
+            title: true,
+        }]
     );
 }
 

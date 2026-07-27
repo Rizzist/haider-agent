@@ -553,6 +553,19 @@ impl SessionProjection {
         &self.entries
     }
 
+    /// User prompt rows — the launcher row's turn count (sim tui.js:3248:
+    /// `entries.filter((e) => e.kind === "user").length`).
+    #[must_use]
+    pub fn user_row_count(&self) -> u32 {
+        u32::try_from(
+            self.entries
+                .iter()
+                .filter(|entry| matches!(entry, TranscriptEntry::User { .. }))
+                .count(),
+        )
+        .unwrap_or(u32::MAX)
+    }
+
     #[must_use]
     pub fn open_menu(&self) -> Option<&Menu> {
         self.menu.as_ref()

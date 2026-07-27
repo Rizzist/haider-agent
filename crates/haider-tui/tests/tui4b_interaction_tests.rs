@@ -371,17 +371,29 @@ fn ctrl_c_walks_a_session_back_to_the_launcher_and_touches_no_turn() {
     model.handle(ctrl('c'));
     assert_eq!(model.screen, Screen::Launcher, "⌃C navigates");
     assert!(!model.should_quit, "…and does NOT quit from a session");
+    // TUI4c (directed): the session's state now checks into its SLOT on
+    // leave — the running turn keeps its lifecycle THERE, and the neutral
+    // launcher surface is exactly item 12's law.
+    let slot = model
+        .sessions
+        .iter()
+        .find(|entry| Some(entry.id) == model.last_detached)
+        .expect("the left session's slot");
     assert!(
-        model.turn_active,
-        "navigation only — the running turn keeps its lifecycle"
+        slot.turn_active,
+        "navigation only — the running turn keeps its lifecycle in its slot"
+    );
+    assert!(
+        !slot.projection.entries().is_empty(),
+        "the session transcript survives: still resumable"
     );
     assert!(
         model.requests.is_empty(),
         "no Interrupt request — esc owns interrupt"
     );
     assert!(
-        !model.projection.entries().is_empty(),
-        "the session transcript survives: still resumable"
+        model.projection.entries().is_empty() && !model.turn_active,
+        "the launcher surface is neutral (item 12)"
     );
 }
 

@@ -86,11 +86,10 @@ fn attaching_a_session_replays_its_seed_and_starts_no_turn() {
     model.handle_hit(Hit::AttachSample("billing-service".to_owned()));
     assert_eq!(model.screen, Screen::Session);
     assert!(!model.turn_active, "attach must not start a turn");
-    assert_eq!(
-        model.requests,
-        vec![haider_tui::app::AppRequest::StopScripts],
-        "attach only tears the previous session down — it starts nothing"
-    );
+    // TUI4c (directed): attach requests NOTHING at all — no teardown
+    // either, because the previous session keeps running in its slot
+    // (sim `openSession`, tui.js:1606: "attaching never cancels a turn").
+    assert_eq!(model.requests, vec![]);
     // The SEEDED transcript is what the session opens with (sim tui.js:474).
     assert!(model.projection.entries().iter().any(|entry| matches!(
         entry,

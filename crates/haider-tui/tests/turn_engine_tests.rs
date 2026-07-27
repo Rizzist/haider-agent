@@ -774,7 +774,10 @@ async fn generic_turn_plays_end_to_end_with_the_delayed_title_note() {
     )));
     // The meter is Usage-authoritative and matches the driver's counters.
     assert!(model.projection.context_tokens() > 0);
-    assert_eq!(model.projection.context_tokens(), driver.tokens_total());
+    assert_eq!(
+        model.projection.context_tokens(),
+        driver.tokens_total(model.active_session.unwrap_or(0))
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -941,7 +944,11 @@ async fn auto_compaction_fires_at_85_percent_and_drops_the_meter_to_6_percent() 
     assert!(before.expect("before") * 100 >= 2_000 * 85, "trigger math");
     assert_eq!(after, Some(120), "6% of the 2k window");
     assert_eq!(model.projection.context_tokens(), 120, "the meter dropped");
-    assert_eq!(driver.tokens_total(), 120, "driver counters reset too");
+    assert_eq!(
+        driver.tokens_total(model.active_session.unwrap_or(0)),
+        120,
+        "driver counters reset too"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -953,7 +960,7 @@ async fn manual_compact_runs_1200ms_and_lands_the_numbers() {
         !m.turn_active && m.projection.badge() == "IDLE"
     })
     .await;
-    let before_tokens = driver.tokens_total();
+    let before_tokens = driver.tokens_total(model.active_session.unwrap_or(0));
     submit(&mut model, "/compact");
     pump_until(&mut driver, &mut rx, &mut model, "compacted", |m| {
         !m.turn_active
@@ -1066,5 +1073,9 @@ async fn stop_scripts_cancels_parked_menu_arms() {
         rx.try_recv().is_err(),
         "no arm beats after StopScripts — the park was cancelled"
     );
-    assert_eq!(driver.tokens_total(), 0, "fresh session, fresh meter");
+    assert_eq!(
+        driver.tokens_total(model.active_session.unwrap_or(0)),
+        0,
+        "fresh session, fresh meter"
+    );
 }

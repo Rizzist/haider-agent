@@ -314,6 +314,16 @@ fn main() {
     submit(&mut shell_launcher, "ls");
     dump(&shell_launcher, "launcher + shellout");
 
+    // TUI4c items 12+13a: a USER session left mid-turn — the launcher
+    // badge stays IDLE and the meter reads 0; the busy-ness lives in the
+    // row (gold ◉ + `running… ·` + the gold running count).
+    let mut left_running = AppModel::new();
+    left_running.handle(AppEvent::Envelope(Box::new(ready.clone())));
+    submit(&mut left_running, "migrate the billing store to sqlite");
+    left_running.requests.clear();
+    submit(&mut left_running, "/clear");
+    dump(&left_running, "launcher + user session left running");
+
     // ---- TUI3b commit 2: subagent chips (§2) + aura mode (§3) ----
     let mut sub_model = AppModel::new();
     sub_model.handle(AppEvent::Envelope(Box::new(ready)));

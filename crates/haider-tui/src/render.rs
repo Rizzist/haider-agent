@@ -427,7 +427,10 @@ fn render_launcher(
         .clamp(10, LAUNCHER_COLS);
     // Sim `.rhead` verbatim + gold `· N running` (`.livehd`). The count is
     // `sessionBusy` = live subagents OR a busy run state (tui.js:789-792).
-    let running = model.samples.iter().filter(|s| s.busy()).count();
+    // TUI4c: rows derive from the LIVE session map — seeds and user
+    // sessions alike; a busy background session shows its liveness HERE
+    // (gold pulsing-dot semantics), never in the global badge (item 12).
+    let running = model.sessions.iter().filter(|s| s.busy()).count();
     let mut rhead = vec![Span::styled(
         "recent sessions — click to attach · /sessions for all",
         theme.dim_style(),
@@ -439,55 +442,65 @@ fn render_launcher(
         ));
     }
     // Pass 1: build every row's spans, metas ellipsized to the frame cap.
+    // Sim shows the first THREE sessions (tui.js:3246 `slice(0, 3)`).
     let mut recent: Vec<(Vec<Span<'_>>, Option<Hit>)> = vec![(rhead, None)];
-    for (index, sample) in model.samples.iter().enumerate() {
+    for entry in model.sessions.iter().take(3) {
         // Sim row anatomy (tui.js:3252-3277): dot (ok; gold running) ·
         // name BRIGHT bold · `▸ head hon` DIM (.hd) · meta DIM ellipsized.
         // No digit prefix (the 1-3 keys stay as silent bindings).
-        let busy = sample.busy();
+        let busy = entry.busy();
+        let live = entry.live();
         let (dot, dot_style) = if busy {
             ("◉", theme.gold_style())
         } else {
             ("●", theme.ok_style())
         };
+        let name = entry.name.clone().unwrap_or_else(|| "session".to_owned());
         let mut spans = vec![
             Span::styled(format!("{dot} "), dot_style),
             Span::styled(
-                sample.name,
+                name.clone(),
                 theme
                     .bright_style()
                     .add_modifier(ratatui::style::Modifier::BOLD),
             ),
             Span::styled(
-                format!(" ▸ {} {}", sample.head, sample.honorific),
+                format!(" ▸ {} {}", entry.head.0, entry.head.1),
                 theme.dim_style(),
             ),
         ];
         // Sim `.live` (tui.js:3259-3266): live subagents name themselves;
         // a busy session WITHOUT chips falls back to `running… · `.
-        if sample.live_subagents > 0 {
-            let plural = if sample.live_subagents > 1 { "s" } else { "" };
+        if live > 0 {
+            let plural = if live > 1 { "s" } else { "" };
             spans.push(Span::styled(
-                format!("  {} live subagent{plural} ·", sample.live_subagents),
+                format!("  {live} live subagent{plural} ·"),
                 theme.gold_style(),
             ));
         } else if busy {
             spans.push(Span::styled("  running… ·", theme.gold_style()));
         }
+        let turns = entry.turns();
+        // Sim renders the blurb segment only when a blurb exists
+        // (tui.js:3267 `s.blurb ? … : null`).
+        let blurb = entry
+            .title
+            .as_ref()
+            .map(|title| format!(" “{title}” ·"))
+            .unwrap_or_default();
         let meta = format!(
-            " “{}” · {} · {} {} · {} tok · {} · {} · {}",
-            sample.blurb,
-            if sample.branches > 1 {
-                format!("{} branches", sample.branches)
+            "{blurb} {} · {} {} · {} tok · {} · {} · {}",
+            if entry.branches > 1 {
+                format!("{} branches", entry.branches)
             } else {
                 "1 branch".to_owned()
             },
-            sample.turns,
-            if sample.turns == 1 { "turn" } else { "turns" },
-            fmt_tok(sample.tokens),
-            sample.model,
-            sample.device,
-            sample.ago
+            turns,
+            if turns == 1 { "turn" } else { "turns" },
+            fmt_tok(entry.projection.context_tokens()),
+            entry.model_short,
+            entry.device,
+            entry.ago
         );
         // Sim `.meta`: ellipsized into the column, never clipped.
         let meta_budget = area_cap.saturating_sub(Line::from(spans.clone()).width());
@@ -495,8 +508,7 @@ fn render_launcher(
             ellipsize(&meta, meta_budget),
             theme.dim_style(),
         ));
-        recent.push((spans, Some(Hit::AttachSample(sample.name.to_owned()))));
-        let _ = index;
+        recent.push((spans, Some(Hit::AttachSample(name))));
     }
     // Sim `.aurarow` metas VERBATIM (tui.js:3278-3300) — the earlier port
     // abbreviated all three (review P2-8). The Accounts/Peers counts come
@@ -856,7 +868,7 @@ fn render_session(
     // The header shows the session's slug NAME (sim `session.name`); the
     // auto-title blurb lives in the `· session titled` note only.
     let title = model.display_name();
-    let (head, honorific) = model.session_head;
+    let (head, honorific) = (&model.session_head.0, &model.session_head.1);
     // Sim `.backbtn` (tui.js:5190-5205): FRAME border, dim label; hover
     // turns text and border gold.
     let back_hovered = model.hovered == Some(Hit::BackChip);
