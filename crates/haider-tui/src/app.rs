@@ -838,8 +838,20 @@ impl LoginCard {
 /// | mid-turn composer submit | local queue / steer row | `SubmitText` |
 /// | launcher composer submit | `new_session` | `CreateSession` |
 /// | voice submit (`submit_voice`) | local ◉ row + note | `CreateSession` / `SubmitText` |
+/// | Esc mid-turn | local `Cancelled` + note | `Interrupt`; the committed `RunState` paints it |
 /// | `/reset` | reseeds the demo world | honest flash |
 /// | `/voice`, `/tools`, `/say` | local card | honest flash |
+/// | `/compact` | local `turn_active` + demo beat | honest flash |
+/// | `enter_aura` (`/aura`, ◉ Aura row) | the aura stage | honest flash |
+/// | ◉ talk hold | local `listening` + demo timer | honest flash |
+/// | subagent submit / close | `ChipSubmit` / `ChipClose` | honest flash |
+/// | shell builtins (`ls` · `cd` …) | the demo VFS | honest flash |
+/// | `/sessions` | honest stub (the sim's screen is unbuilt) | real listing + open |
+///
+/// The last row is the one INVERSION: demo refuses and live acts, because
+/// what demo refuses there is a sim surface this port has not built, not a
+/// fabrication. Every row above it is the same shape — demo may invent
+/// local state, live may not.
 ///
 /// Menu ANSWER coordinates are deliberately absent: they are not a reducer
 /// decision. The reducer emits one source-neutral [`OutboundAnswer`] and
@@ -861,9 +873,16 @@ impl RuntimeMode {
     ///
     /// This is the ONE question behind every mode branch in the reducer.
     /// It is expressed as a predicate rather than an identity check so
-    /// "did we cover every site?" is answerable by grep — every branch in
-    /// the table above reads `!self.mode.fabricates_locally()`, and
-    /// nothing in the reducer compares `RuntimeMode` any other way.
+    /// "did we cover every site?" is answerable by grep: every fabrication
+    /// branch reads `!self.mode.fabricates_locally()`, and
+    /// `grep -c fabricates_locally` counts the table above.
+    ///
+    /// ONE site reads the mode and is NOT about fabrication:
+    /// [`AppModel::launcher_rows`], which is a DISPLAY policy (the sim's
+    /// three rows in demo, the reachable digit span live). It is named
+    /// here so the enumeration stays total — the previous charter's claim
+    /// that nothing else compared `RuntimeMode` was falsified by the same
+    /// round that wrote it (W3c3.1 r2, P2-C).
     #[must_use]
     pub const fn fabricates_locally(self) -> bool {
         matches!(self, Self::Demo)
@@ -2037,10 +2056,19 @@ impl AppModel {
                     self.listening = false;
                     self.msg_queue.clear();
                     self.requests.push(AppRequest::Interrupt);
-                    self.projection
-                        .apply(&EventPayload::RunState(RunState::Cancelled));
-                    self.projection
-                        .push_note("· interrupted — run → cancelled · idle (i)".to_owned());
+                    // LIVE (W3c3.1 r2): the cancellation is the DAEMON's to
+                    // commit. Painting `Cancelled` + the note here says the
+                    // run ended before `turn.cancel` has even been sent —
+                    // and if the daemon rejects it (a run that already
+                    // terminalized, a stale generation) the screen is
+                    // simply lying. The committed `RunState` envelope
+                    // paints it, exactly as it paints every other state.
+                    if self.mode.fabricates_locally() {
+                        self.projection
+                            .apply(&EventPayload::RunState(RunState::Cancelled));
+                        self.projection
+                            .push_note("· interrupted — run → cancelled · idle (i)".to_owned());
+                    }
                 } else {
                     self.back_to_launcher();
                 }
@@ -2226,11 +2254,30 @@ impl AppModel {
         if self.screen != Screen::Subagent
             && SHELL_CMDS.contains(&first_word.to_ascii_lowercase().as_str())
         {
+            if !self.mode.fabricates_locally() {
+                // The VFS is the demo's FAKE filesystem (`vfs_seed`). In
+                // live mode an intercepted `ls` would paint invented files
+                // as the user's real cwd, and `cd` would retarget the dir
+                // shown on real session rows — fabricated state presented
+                // as truth, the exact class the P1-A sweep closes. Refuse;
+                // the agent itself is how live mode runs real commands
+                // (W3c3.1 r2 sibling sweep).
+                self.refuse_demo_only("shell builtins");
+                return;
+            }
             self.run_shell_line(&text);
             return;
         }
         // §4 step 6: the subagent screen steers ITS chip (respondChip).
         if self.screen == Screen::Subagent {
+            if !self.mode.fabricates_locally() {
+                // Steering a subagent is the demo driver's scripted beat.
+                // Live chips come from committed `AgentSpawned` envelopes
+                // and there is no `agent.steer` RPC yet, so this text was
+                // silently destroyed (W3c3.1 r2, P1-A).
+                self.refuse_demo_only("steering a subagent");
+                return;
+            }
             if let Some(agent) = self.view_path.last().cloned() {
                 self.requests.push(AppRequest::ChipSubmit { agent, text });
             }
@@ -2482,6 +2529,15 @@ impl AppModel {
     /// own comes live (TUI5 item 9 — Aura has its own composer instance).
     fn enter_aura(&mut self) {
         if self.screen == Screen::Aura {
+            return;
+        }
+        if !self.mode.fabricates_locally() {
+            // THE ONE DOOR into the aura stage (`/aura` and the launcher's
+            // ◉ Aura row both come through here). Everything behind it —
+            // `AuraSubmit`, `AuraTalk`, `ResetAura` — is demo-driver
+            // vocabulary the live driver discards, so the stage would take
+            // a hold and sit in `Listening` forever (W3c3.1 r2, P1-A).
+            self.refuse_demo_only("Aura Mode");
             return;
         }
         self.stash_draft();
@@ -2787,7 +2843,13 @@ impl AppModel {
                 // the sim's single-threaded state writes tolerate /compact
                 // mid-turn; the envelope demo refuses honestly instead of
                 // clobbering a live turn's run state.
-                if self.screen != Screen::Session {
+                if !self.mode.fabricates_locally() {
+                    // The compaction beat is the DEMO driver's; live mode
+                    // has no `context.compact` RPC yet, so setting
+                    // `turn_active` here parked the session mid-turn with
+                    // nothing able to clear it (W3c3.1 r2, P1-A).
+                    self.refuse_demo_only("/compact");
+                } else if self.screen != Screen::Session {
                     self.flash = Some("· /compact — session only".to_owned());
                 } else if self.turn_active {
                     self.flash = Some("· /compact — wait for the turn to end".to_owned());
@@ -2868,9 +2930,34 @@ impl AppModel {
             }
             // `/sessions for all` is what the launcher's own header
             // promises, and with more rows than the launcher paints it is
-            // the ONLY way to see the rest (review P1-6: the cold list the
-            // driver already tracks had no surface at all).
-            "sessions" => self.list_sessions(),
+            // the ONLY way to see — and OPEN — the rest (review P1-6: the
+            // cold list the driver already tracks had no surface at all).
+            //
+            // DEMO keeps the honest stub: the sim implements `/sessions` as
+            // a full screen with selection (tui.js:1753-1755, :3485-3492),
+            // which this port has not built, and the demo world has three
+            // sessions the launcher already paints. Inventing a text
+            // listing there would be a divergence from the sim for no gain
+            // (W3c3.1 r2, P3-H).
+            "sessions" if !self.mode.fabricates_locally() => {
+                if remainder.is_empty() {
+                    self.list_sessions();
+                } else {
+                    self.open_listed_session(&remainder);
+                }
+            }
+            "sessions" => {
+                // The demo stub must stay a KNOWN command: without this arm
+                // it fell to the typo catch-all, which called a command
+                // `/help` itself lists "unknown" (W3c3.1 r2 completion —
+                // the first cut of P3-H removed the listing arm without
+                // re-homing the stub).
+                self.flash = Some(
+                    "· /sessions — demo stub; the sim's sessions screen is unbuilt \
+                     (live mode lists and opens)"
+                        .to_owned(),
+                );
+            }
             "" => {}
             other => {
                 // Known stubs name their wave; typos say so (review r1 P2).
@@ -3163,6 +3250,26 @@ impl AppModel {
         self.requests.push(AppRequest::ResetAllSessions);
     }
 
+    /// Refuse a DEMO-ONLY surface in live mode, honestly and in one voice
+    /// (W3c3.1 r2, P1-A).
+    ///
+    /// The rule this enforces is [`RuntimeMode::fabricates_locally`]'s:
+    /// live mode must not mint local state the daemon will never resolve.
+    /// The first pass of this fix swept only the three commands the review
+    /// named, and `/compact` kept the class alive — it set `turn_active`
+    /// and handed `AppRequest::Compact` to a driver that discarded it, so
+    /// the session sat mid-turn forever with `/compact` itself answering
+    /// "wait for the turn to end".
+    ///
+    /// Refusing HERE, not in the driver, is the whole point: nothing local
+    /// is fabricated, so nothing has to be undone.
+    fn refuse_demo_only(&mut self, what: &str) {
+        self.flash = Some(format!(
+            "· {what} — demo only; no daemon behavior stands behind it yet"
+        ));
+        self.dirty = true;
+    }
+
     /// `/sessions` — EVERY session the model knows, not just the rows the
     /// launcher has room to paint (review P1-6).
     ///
@@ -3180,10 +3287,13 @@ impl AppModel {
                 .iter()
                 .enumerate()
                 .map(|(index, entry)| {
+                    // The number is the ROW's coordinate either way: a
+                    // digit for the rows the launcher paints, and the
+                    // `/sessions <n>` argument for the rest.
                     let reach = if index < rows {
-                        format!("{}", index + 1)
+                        format!("{:>2}", index + 1)
                     } else {
-                        "·".to_owned()
+                        format!("/{}", index + 1)
                     };
                     let status = if entry.busy() { "running" } else { "idle" };
                     let name = entry.name.as_deref().unwrap_or("—");
@@ -3202,6 +3312,38 @@ impl AppModel {
             self.launcher_shellout = Some(("sessions".to_owned(), out));
         }
         self.dirty = true;
+    }
+
+    /// `/sessions <n|id>` — open ANY listed session, including the ones
+    /// past the launcher's painted rows (W3c3.1 r2, P2-D).
+    ///
+    /// Without this, R11's "cold sessions … listable and READABLE" held
+    /// only for the first nine: rows past the digit span had no hit target
+    /// and no key, so raising the bound from three to nine moved the
+    /// defect rather than closing it. The read itself is the attach's own
+    /// replay, so opening is all that was missing.
+    fn open_listed_session(&mut self, arg: &str) {
+        let by_ordinal = arg
+            .parse::<usize>()
+            .ok()
+            .filter(|n| *n >= 1)
+            .and_then(|n| self.sessions.get(n - 1))
+            .map(|entry| entry.id.clone());
+        let target = by_ordinal.or_else(|| {
+            self.sessions
+                .iter()
+                .find(|entry| entry.id.as_str() == arg)
+                .map(|entry| entry.id.clone())
+        });
+        match target {
+            Some(id) => self.open_session(&id),
+            None => {
+                self.flash = Some(format!(
+                    "· /sessions {arg} — no such row; /sessions lists them by number and id"
+                ));
+                self.dirty = true;
+            }
+        }
     }
 
     /// How many session rows the launcher shows — and therefore how many
@@ -3442,6 +3584,12 @@ impl AppModel {
                 .find(|entry| &entry.id == session)
                 .map(|entry| &mut entry.projection)
         };
+        debug_assert!(
+            projection.is_some(),
+            "seed_cursor for a session with no row: every `ensure_attached` \
+             caller upserts the row first, and a silent no-op here hands the \
+             strict gap law back its blind spot"
+        );
         if let Some(projection) = projection
             && projection
                 .last_applied()
@@ -3551,7 +3699,11 @@ impl AppModel {
             // screen gate is also the owning-surface guard the other hits
             // already carry (review r2 P2-4).
             Hit::TalkChip if self.screen == Screen::Session => {
-                if !self.voice.enabled {
+                if !self.mode.fabricates_locally() {
+                    // The hold's 1.3 s timer lives in the DEMO driver;
+                    // live mode would set `listening` and never clear it.
+                    self.refuse_demo_only("push-to-talk");
+                } else if !self.voice.enabled {
                     self.flash = Some("· enable voice first with /voice".to_owned());
                 } else if !self.turn_active && !self.listening {
                     self.listening = true;
@@ -3594,7 +3746,12 @@ impl AppModel {
                     && self.view_path.last() == Some(&agent)
                     && find_chip(&self.chips, &agent).is_some_and(|chip| !chip.closed) =>
             {
-                self.requests.push(AppRequest::ChipClose { agent });
+                if self.mode.fabricates_locally() {
+                    self.requests.push(AppRequest::ChipClose { agent });
+                } else {
+                    // A live chip closes when its `AgentChipState` says so.
+                    self.refuse_demo_only("closing a subagent");
+                }
             }
             Hit::ChipCrumb(path) if self.screen == Screen::Subagent => {
                 if path.is_empty() {

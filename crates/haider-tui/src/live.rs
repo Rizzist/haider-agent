@@ -466,6 +466,33 @@ impl LiveDriver {
         self.outbox.len()
     }
 
+    /// Working-set members that are neither attached nor waiting for an
+    /// attach — the state that must not exist while connected (W3c3.1 r2,
+    /// P1-B).
+    ///
+    /// A ghost holds a slot nothing will ever fill, and at the cap it is
+    /// chosen as the eviction victim forever: `ensure_attached` finds no
+    /// attachment to detach and refuses every later attach, so the
+    /// ATTACHED surface stops loading with nothing on screen to say why.
+    /// Exposed so the invariant is assertable rather than argued.
+    ///
+    /// A DISCONNECT is the documented exception: attachments die with the
+    /// socket while the working set — which sessions to restore — survives
+    /// on purpose, and `resume` re-attaches every member.
+    #[must_use]
+    pub fn ghost_slots(&self) -> Vec<SessionId> {
+        if !self.connected {
+            return Vec::new();
+        }
+        self.lru
+            .iter()
+            .filter(|session| {
+                !self.attachments.contains_key(*session) && !self.attaching.contains_key(*session)
+            })
+            .cloned()
+            .collect()
+    }
+
     /// The committed coordinates of an open menu, if this connection saw it
     /// open.
     #[must_use]
@@ -577,11 +604,10 @@ impl LiveDriver {
             commands.push(LiveCommand::Detach { attachment });
         }
         let after_seq = cursor_of(model, session).unwrap_or(0);
-        self.attaching.insert(session.clone(), after_seq);
         // The working set WANTS it from the moment we ask, not from the
         // moment the daemon answers: a disconnect in between must still
-        // restore it.
-        self.touch(session);
+        // restore it. Slot and latch move together — see `claim_slot`.
+        self.claim_slot(session, after_seq);
         commands.push(LiveCommand::Attach {
             session: session.clone(),
             after_seq,
@@ -611,6 +637,29 @@ impl LiveDriver {
     fn touch(&mut self, session: &SessionId) {
         self.lru.retain(|held| held != session);
         self.lru.push(session.clone());
+    }
+
+    /// CLAIM a working-set slot and the in-flight latch TOGETHER — the only
+    /// place either is set for a session we do not yet hold.
+    ///
+    /// They are inseparable on purpose (W3c3.1 r2, P1-B). Setting the LRU
+    /// entry without the latch produces a GHOST: a slot nothing will ever
+    /// fill, which at the cap is chosen as the eviction victim on every
+    /// pass, whereupon `ensure_attached` finds no attachment to detach and
+    /// refuses every later attach — the attached surface stops loading
+    /// with nothing on screen to say why. Setting the latch without the
+    /// slot is the mirror: an attach whose response has no reserved place
+    /// in the working set.
+    fn claim_slot(&mut self, session: &SessionId, after_seq: u64) {
+        self.attaching.insert(session.clone(), after_seq);
+        self.touch(session);
+    }
+
+    /// RELEASE both, for a session that now holds neither an attachment nor
+    /// a pending attach. See [`Self::claim_slot`].
+    fn release_slot(&mut self, session: &SessionId) {
+        self.attaching.remove(session);
+        self.lru.retain(|held| held != session);
     }
 
     fn drop_attachment(&mut self, attachment: &AttachmentId) {
@@ -836,19 +885,52 @@ impl LiveDriver {
                 message,
                 retryable,
             } => {
-                self.attaching.remove(&session);
+                // THE WORKING SET HOLDS NO GHOSTS (W3c3.1 r2, P1-B). While
+                // connected, every `lru` member is either attached or has
+                // an attach in flight — `ensure_attached` now claims the
+                // slot at REQUEST time, so a failure that released only the
+                // latch left a member that was neither. Nothing retried it,
+                // and worse: at cap it became `evictable`, whereupon
+                // `ensure_attached` found no attachment to detach and
+                // silently refused EVERY later attach. One background
+                // `overloaded` during a reconnect could make the attached
+                // surface permanently unattachable, with nothing on screen
+                // to say why. The slot is released either way; a retry
+                // re-claims it.
+                self.release_slot(&session);
+                self.cold.insert(
+                    session.clone(),
+                    Cold {
+                        head_seq: cursor_of(model, &session).unwrap_or(0),
+                    },
+                );
                 // Retryable classes (overloaded, a transient cap) are worth
                 // one more try on the next loop pass; a permanent one is
                 // reported and the row stays cold rather than pretending.
                 model.flash = Some(format!("· attach {code} — {message}"));
                 model.dirty = true;
+                // Only the ATTACHED SURFACE retries here. A background
+                // session that took a transient `overloaded` goes cold and
+                // is re-attached by the next selection, which is reachable
+                // and visible; retrying every member of a 16-session
+                // working set against a daemon that just said "overloaded"
+                // would be a client-side amplification of its overload.
                 if retryable && model.active_session.as_ref() == Some(&session) {
-                    return self.sync_selection(model);
+                    return self.ensure_attached(model, &session);
                 }
-                if !retryable {
-                    // A permanently unattachable session must not hold a
-                    // working-set slot for the life of the connection.
-                    self.lru.retain(|held| held != &session);
+                // A PERMANENT refusal of the attached surface DESELECTS it
+                // (W3c3.2). The daemon said retrying is futile, but the
+                // loop tail's `sync_selection` re-attaches whatever is
+                // selected — so leaving the row selected turns every
+                // failure reply into the next attach, an infinite
+                // attach/fail ping-pong at wire speed (reachable with a
+                // stale roster: a session another store knew, attached
+                // after a reconnect). Deselecting keeps the arm's own
+                // promise — the row stays COLD, the flash names the code,
+                // and every later retry is the user's own selection, which
+                // the released latch accepts cleanly.
+                if !retryable && model.active_session.as_ref() == Some(&session) {
+                    model.back_to_launcher();
                 }
                 Vec::new()
             }
@@ -965,6 +1047,21 @@ impl LiveDriver {
                 why.to_owned(),
             )));
         }
+    }
+
+    /// The next instant this driver has something to do with no inbound
+    /// reply to trigger it — the shell's wakeup, so a deadline is BOUNDED
+    /// rather than dependent on unrelated traffic (W3c3.1 r2, P2-B).
+    ///
+    /// `expire_login` used to run only when `live_pass` happened to run,
+    /// and `live_pass` runs only when the select loop wakes: a keypress, a
+    /// reply, or a tick gated on `model.dirty`/`model.animated()` — none of
+    /// which a quiet terminal with a wedged daemon produces. The card sat
+    /// at "validating…", closed to input, until the user pressed a key.
+    #[must_use]
+    pub fn next_deadline(&self) -> Option<std::time::Instant> {
+        self.login_started
+            .map(|started| started + LOGIN_STAGE_TIMEOUT)
     }
 
     /// The pass's deadline sweep — see [`LOGIN_STAGE_TIMEOUT`]. Driven by
@@ -1128,6 +1225,7 @@ impl LiveDriver {
         model: &mut AppModel,
         request: AppRequest,
     ) -> Vec<LiveCommand> {
+        let label = demo_only_label(&request);
         match request {
             AppRequest::CreateSession { text } => {
                 let command_id = self.mint();
@@ -1200,20 +1298,41 @@ impl LiveDriver {
                     run_id,
                 })]
             }
-            // Demo-only vocabulary and runtime-owned effects. The catch-all
-            // is deliberate: `run_live` must never grow a demo behavior by
-            // forgetting to exclude one.
-            AppRequest::ResetAllSessions
-            | AppRequest::Compact
-            | AppRequest::CopySelection
-            | AppRequest::CopyText(_)
+            // Runtime-owned effects: `live_pass` hands these BACK to the
+            // shell (they need the terminal or the process), so reaching
+            // here at all would be a routing bug, not a discard.
+            AppRequest::CopySelection | AppRequest::CopyText(_) | AppRequest::Quit => Vec::new(),
+            // DEMO-ONLY VOCABULARY. The reducer refuses every one of these
+            // upstream in live mode (`AppModel::refuse_demo_only`), so this
+            // arm is unreachable by design — but it must never be a SILENT
+            // discard. Returning an empty vector quietly is exactly how
+            // `/compact` fabricated `turn_active = true` and then wedged
+            // the session forever (W3c3.1 r2, P1-A): the request vanished
+            // and no surface said so. If a future reducer path forgets its
+            // gate, the user sees a flash instead of a dead UI, and the
+            // pinned test sees a failure instead of silence.
+            AppRequest::Compact
             | AppRequest::Talk
             | AppRequest::ChipSubmit { .. }
             | AppRequest::ChipClose { .. }
             | AppRequest::AuraSubmit { .. }
             | AppRequest::AuraTalk
-            | AppRequest::ResetAura
-            | AppRequest::Quit => Vec::new(),
+            | AppRequest::ResetAura => {
+                // Undo the optimistic local state the reducer's gate should
+                // have prevented, so a missed gate costs a flash rather
+                // than a session that is mid-turn or listening forever.
+                model.turn_active = false;
+                model.listening = false;
+                model.flash = Some(format!(
+                    "· {label} — demo only; the live runtime has no behavior for it"
+                ));
+                model.dirty = true;
+                Vec::new()
+            }
+            // A genuine NO-OP, not a discard: `ResetAllSessions` cancels the
+            // demo driver's arms and clears its token meters. Live mode has
+            // neither, so there is nothing to do and nothing to say.
+            AppRequest::ResetAllSessions => Vec::new(),
         }
     }
 
@@ -1293,6 +1412,23 @@ impl LiveDriver {
                 .clone()
                 .map(|text| MenuInput::Text { text }),
         })
+    }
+}
+
+/// What to CALL a demo-only request when live mode has to refuse it — the
+/// user's word for the thing, not the variant's.
+///
+/// Every request gets one, so the refusal arm can never be reached with
+/// nothing to say (W3c3.1 r2, P1-A: the silent discard is what let
+/// `/compact` wedge a live session).
+const fn demo_only_label(request: &AppRequest) -> &'static str {
+    match request {
+        AppRequest::Compact => "/compact",
+        AppRequest::Talk => "push-to-talk",
+        AppRequest::ChipSubmit { .. } => "steering a subagent",
+        AppRequest::ChipClose { .. } => "closing a subagent",
+        AppRequest::AuraSubmit { .. } | AppRequest::AuraTalk | AppRequest::ResetAura => "Aura Mode",
+        _ => "that",
     }
 }
 

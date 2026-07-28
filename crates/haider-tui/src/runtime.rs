@@ -2055,6 +2055,17 @@ pub fn run_demo_plain(mut model: AppModel) -> String {
     crate::plain::render_plain(&model.projection, model.identity.context_window)
 }
 
+/// Sleep until `deadline`, or forever when there is none.
+///
+/// A `select!` arm needs a future either way; `pending()` is the honest
+/// "this driver has no deadline right now" (W3c3.1 r2, P2-B).
+async fn wait_until(deadline: Option<std::time::Instant>) {
+    match deadline {
+        Some(at) => tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await,
+        None => std::future::pending().await,
+    }
+}
+
 /// What one [`live_pass`] produced.
 #[derive(Debug, Default)]
 pub struct LivePass {
@@ -2210,6 +2221,10 @@ pub async fn run_live(
             }
         }
         let mut inbound: Option<crate::live::LiveReply> = None;
+        // The driver's own wakeup. Without it a deadline fires only when
+        // something ELSE wakes the loop, which a quiet terminal facing a
+        // wedged daemon never does (W3c3.1 r2, P2-B).
+        let deadline = driver.next_deadline();
         tokio::select! {
             input = input_rx.recv() => match input {
                 Some(event) => dispatch_input(&mut model, &hit_map, event),
@@ -2223,6 +2238,7 @@ pub async fn run_live(
                 model.anim_phase = model.anim_phase.wrapping_add(1);
                 model.dirty = true;
             }
+            () = wait_until(deadline) => {}
             _ = frame_tick.tick(), if model.dirty => {
                 hit_map = draw(&mut terminal, &model)?;
                 model.dirty = false;

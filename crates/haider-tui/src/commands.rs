@@ -252,7 +252,7 @@ pub const HELP_TEXT: &[&str] = &[
     "  /tree              session tree — main-line view, ⏎ opens forks, f forks at a node",
     "  /fork              fork the session at the current point",
     "  /sessions          list + switch sessions",
-    "  /aura              Aura Mode — a voice/orchestrator session (spawns sessions, never codes)",
+    "  /aura              Aura Mode — a voice/orchestrator session (spawns sessions, never codes) — demo only",
     "  /peers             reachability ladder — enrolled peers · sponsored SSH nodes · shell targets",
     "  /accounts          provider credentials — OAuth / API / HuggingFace / custom, pick the active",
     "  /account <alias>   switch the active account for its provider (tab-completes aliases)",

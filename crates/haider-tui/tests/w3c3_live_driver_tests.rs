@@ -868,8 +868,12 @@ fn a_failed_attach_releases_its_latch_so_the_session_is_not_wedged() {
         "a retryable attach failure retries rather than wedging"
     );
 
-    // A PERMANENT one reports and leaves the row cold — but still releases
-    // the latch, so a later selection is not poisoned by this one.
+    // A PERMANENT one reports, leaves the row cold, and DESELECTS the
+    // surface (W3c3.2): the daemon said retrying is futile, and a
+    // still-selected row would make the loop tail's `sync_selection`
+    // re-attach on every pass — an infinite attach/fail ping-pong. The
+    // latch is still released, so a LATER selection — the user's own —
+    // is not poisoned by this one.
     driver.apply(
         &mut model,
         LiveReply::AttachFailed {
@@ -886,10 +890,19 @@ fn a_failed_attach_releases_its_latch_so_the_session_is_not_wedged() {
             .is_some_and(|flash| flash.contains("not_found")),
         "the failure is reported, not swallowed"
     );
+    assert!(
+        model.active_session.is_none(),
+        "the permanently refused surface is deselected, not ping-ponged"
+    );
+    assert!(
+        driver.sync_selection(&model).is_empty(),
+        "…so the loop tail re-attaches nothing"
+    );
+    model.open_session(&sid(3));
     assert_eq!(
         driver.sync_selection(&model).len(),
         1,
-        "the latch is released either way"
+        "a fresh selection attaches cleanly — the latch was released"
     );
 }
 
