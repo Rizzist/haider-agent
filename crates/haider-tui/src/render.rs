@@ -892,12 +892,16 @@ fn render_session(
     // The composer band closes with a frame rule — the sim draws it as the
     // border-top of whatever follows the InputBar (SubTree tui.js:4764 /
     // StatusBar tui.js:5497), which is the "bottom line" the owner's
-    // screenshot was missing (item 2).
-    let band_pad = u16::from(budget > 0 && input_rule_h > 0);
-    if band_pad > 0 {
-        budget -= band_pad;
-    }
+    // screenshot was missing (item 2). TUI6 item 6 flipped the claim
+    // order: the RULE outranks the pad, so at exactly one spare row the
+    // band still closes (the rule IS the anatomy; the pad is the
+    // InputBar's bottom padding) — the TUI5 order kept the pad and
+    // dropped the rule there.
     let band_rule_h = u16::from(budget > 0 && input_rule_h > 0);
+    if band_rule_h > 0 {
+        budget -= band_rule_h;
+    }
+    let band_pad = u16::from(budget > 0 && input_rule_h > 0);
     let [
         header_area,
         header_rule,
@@ -1623,12 +1627,28 @@ fn render_subagent(
         .min(input_avail)
         .max(floor_input.min(area.height.saturating_sub(chrome)))
         .clamp(1, area.height.max(1));
+    // TUI6 item 6 (the band-anatomy sweep — the owner's screenshot was
+    // THIS surface: `❯ message …` straight into `▼ subagents`): the input
+    // band closes under the composer exactly as on the session — an
+    // inputBg pad row plus the frame rule the sim draws as the SubTree's
+    // border-top (tui.js:4764). The RULE outranks the pad (the rule IS
+    // the anatomy; the pad is the InputBar's bottom padding), and both
+    // claim rows the transcript's Min would otherwise absorb — never a
+    // sacred row.
+    let mut spare = area
+        .height
+        .saturating_sub(chrome + gap + transcript_min + subtree_height + input_height);
+    let band_rule_h = u16::from(spare > 0 && input_rule_h > 0);
+    spare = spare.saturating_sub(band_rule_h);
+    let band_pad = u16::from(spare > 0 && input_rule_h > 0);
     let [
         header_area,
         header_rule,
         transcript_area,
         rule_area,
         composer_area,
+        band_pad_area,
+        band_rule_area,
         subtree_area,
         _gap,
     ] = Layout::vertical([
@@ -1637,6 +1657,8 @@ fn render_subagent(
         Constraint::Min(transcript_min),
         Constraint::Length(input_rule_h),
         Constraint::Length(input_height),
+        Constraint::Length(band_pad),
+        Constraint::Length(band_rule_h),
         Constraint::Length(subtree_height),
         Constraint::Length(gap),
     ])
@@ -1830,6 +1852,22 @@ fn render_subagent(
     } else {
         render_composer(model, theme, frame, rule_area, composer_area, hits);
     }
+    // The band's closing anatomy (TUI6 item 6): inputBg pad, then the
+    // frame rule — rendered on BOTH the composer and question-card forms,
+    // exactly as the session band does.
+    if band_pad > 0 {
+        frame.render_widget(Block::default().style(theme.input_style()), band_pad_area);
+    }
+    if band_rule_h > 0 {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                "─".repeat(band_rule_area.width as usize),
+                theme.frame_style(),
+            ))
+            .style(theme.text_style()),
+            band_rule_area,
+        );
+    }
     if subtree_height > 0 {
         render_subtree(model, theme, frame, subtree_area, true, hits);
     }
@@ -1904,6 +1942,12 @@ fn render_aura(
         ))
         .max(1)
         .clamp(1, area.height.max(1));
+    // TUI6 item 6 (band sweep): the aura band CLOSES — the launcher's
+    // net-zero trick verbatim (TUI5 item 1b): the blank gap row under the
+    // composer becomes the frame rule the sim draws as the StatusBar's
+    // border-top (tui.js:5497); it sheds under pressure exactly as the
+    // gap did.
+    let band_rule_h = gap;
     let [
         bar_area,
         bar_rule,
@@ -1912,7 +1956,7 @@ fn render_aura(
         transcript_area,
         rule_area,
         composer_area,
-        _gap,
+        band_rule_area,
     ] = Layout::vertical([
         Constraint::Length(bar_h),
         Constraint::Length(bar_rule_h),
@@ -1921,7 +1965,7 @@ fn render_aura(
         Constraint::Min(transcript_min),
         Constraint::Length(input_rule_h),
         Constraint::Length(composer_h),
-        Constraint::Length(gap),
+        Constraint::Length(band_rule_h),
     ])
     .areas(area);
 
@@ -2163,6 +2207,16 @@ fn render_aura(
     );
 
     render_composer(model, theme, frame, rule_area, composer_area, hits);
+    if band_rule_h > 0 {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                "─".repeat(band_rule_area.width as usize),
+                theme.frame_style(),
+            ))
+            .style(theme.text_style()),
+            band_rule_area,
+        );
+    }
 }
 
 /// The menu's body lines pre-wrapped by display cells into the menu's
@@ -2321,6 +2375,23 @@ fn composer_height(model: &AppModel, width: u16) -> u16 {
 /// The gold rule + composer rows on the input ground (sim InputBar,
 /// tui.js:5395: `border-top: gold`, `background: inputBg`). Pushes the
 /// talk-chip hit region so the click lands exactly on the chip.
+///
+/// BAND ANATOMY (TUI6 item 6, per Claude Code's own TUI): every surface
+/// that draws an input band closes it with a rule BELOW as well as the
+/// rule above. The sweep's enumeration of input-band render paths and
+/// where each closing rule lives:
+///   - `render_launcher`  — `band_rule_area` (TUI5 item 1b, gap→rule);
+///   - `render_session`   — `band_pad` + `band_rule_area`, on BOTH the
+///     composer and blocking-menu forms (the rule renders outside the
+///     menu if/else);
+///   - `render_subagent`  — `band_pad` + `band_rule_area` (TUI6 — the
+///     owner's screenshot), composer and question-card forms alike;
+///   - `render_aura`      — `band_rule_area` (TUI6, gap→rule);
+///   - the login card and the arg-slot/palette state REPLACE the
+///     composer's CONTENT inside the same band, so they inherit the
+///     hosting surface's two rules — no separate path exists.
+///
+/// Each surface's pair is pinned by a test in `tui6_softwrap_tests`.
 fn render_composer(
     model: &AppModel,
     theme: &Theme,

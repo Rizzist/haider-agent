@@ -12,11 +12,13 @@
 //! one owner wave, one suite.
 #![allow(clippy::expect_used)]
 
-use haider_tui::app::{AppEvent, AppModel, Hit, Screen};
+use haider_protocol::EventPayload;
+use haider_tui::app::{AppEvent, AppModel, ChipModel, ChipQuestion, Hit, RuntimeMode, Screen};
 use haider_tui::composer::{Composer, wrap_rows};
 use haider_tui::mock::demo_script;
 use haider_tui::render::render;
 use haider_tui::runtime::dispatch_input;
+use haider_tui::script::{ChipDisplayState, ChipSeed};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::{
@@ -60,6 +62,15 @@ fn draw(
         })
         .collect();
     (rows, hits, terminal)
+}
+
+fn row_of(rows: &[String], needle: &str) -> u16 {
+    u16::try_from(
+        rows.iter()
+            .position(|row| row.contains(needle))
+            .unwrap_or_else(|| panic!("row containing {needle:?} not rendered")),
+    )
+    .expect("row fits u16")
 }
 
 fn mouse(kind: MouseEventKind, column: u16, row: u16) -> Event {
@@ -418,6 +429,221 @@ fn every_composer_surface_soft_wraps() {
     );
     // Session (the owner's screenshot surface) is pinned throughout this
     // suite; the subagent band is covered by the item-6 sweep below.
+}
+
+// ---- Item 6: the band-anatomy sweep — two rules on EVERY input band ----
+
+/// A screen row that reads as a horizontal rule.
+fn is_rule(row: &str) -> bool {
+    row.chars().filter(|c| *c == '─').count() >= 20
+}
+
+/// TUI6 item 6 (per Claude Code's own TUI): the input band carries a rule
+/// ABOVE and a rule BELOW on every surface with an input. `first` finds
+/// the band's first rendered row, `last` its last (the same needle for a
+/// one-row band); the closing rule must land within the pad rows beneath.
+fn assert_two_rules(rows: &[String], first: &str, last: &str, surface: &str) -> usize {
+    let top = row_of(rows, first) as usize;
+    let bottom = row_of(rows, last) as usize;
+    assert!(
+        is_rule(&rows[top - 1]),
+        "{surface}: rule ABOVE the band, got {:?}",
+        rows[top - 1]
+    );
+    let below = (1..=3)
+        .map(|d| bottom + d)
+        .find(|y| *y < rows.len() && is_rule(&rows[*y]));
+    below.unwrap_or_else(|| {
+        panic!(
+            "{surface}: closing rule BELOW the band, got {:?}",
+            &rows[(bottom + 1).min(rows.len())..(bottom + 4).min(rows.len())]
+        )
+    })
+}
+
+/// A session model viewing one live chip — the owner's screenshot surface.
+fn subagent_model() -> AppModel {
+    let mut model = session_model();
+    model.chips = vec![ChipModel::from_seed(ChipSeed {
+        agent: "t1-docs".to_owned(),
+        parent: None,
+        ros: None,
+        callsign: "Husayn".to_owned(),
+        hon: "(r)",
+        full: "Husayn ibn Ali".to_owned(),
+        name: "docs".to_owned(),
+        model: "fable-5".to_owned(),
+        device: "macbook".to_owned(),
+        state: ChipDisplayState::Running,
+        tokens: 100,
+        prefill: Vec::new(),
+    })];
+    model.screen = Screen::Subagent;
+    model.view_path = vec!["t1-docs".to_owned()];
+    model
+}
+
+#[test]
+fn subagent_band_closes_with_a_rule_above_the_subtree() {
+    // MUTATION CHECK (band-rule): delete the `if band_rule_h > 0` render
+    // block from `render_subagent` and this fails — the owner's second
+    // screenshot exactly (`❯ message Husayn…` straight into
+    // `▼ subagents`). Verified by revert.
+    let model = subagent_model();
+    let (rows, _, terminal) = draw(&model, 100, 30);
+    let below = assert_two_rules(&rows, "message Husayn", "message Husayn", "subagent");
+    // The closing rule separates the band from the SubTree map — the
+    // precise gap the owner's screenshot showed missing.
+    let subtree_y = row_of(&rows, "subagents") as usize;
+    assert!(
+        below < subtree_y,
+        "the closing rule sits BETWEEN the band and ▼ subagents"
+    );
+    // Frame ink, like every closing rule (sim border-top: frame).
+    let theme = model.theme.theme();
+    let buffer = terminal.backend().buffer();
+    assert_eq!(
+        buffer[(0, u16::try_from(below).expect("fits"))].fg,
+        Color::from(theme.frame),
+        "closing rule wears the frame ink"
+    );
+}
+
+#[test]
+fn subagent_question_card_band_closes_too() {
+    // The question card REPLACES the chip composer inside the same band —
+    // the anatomy holds on both forms.
+    let mut model = subagent_model();
+    let text = "Run the suite against testcontainers or mocks?";
+    let options = ["testcontainers", "mocks"];
+    model.chips[0].state = ChipDisplayState::InputRequired;
+    model.chips[0].question = Some(ChipQuestion {
+        recovery: false,
+        text: text.to_owned(),
+        options: options.iter().map(|o| (*o).to_owned()).collect(),
+        resolved: false,
+    });
+    // The card renders from the chip transcript's open menu (the same
+    // wiring the driver's ChipQuestion beat performs).
+    model.chips[0]
+        .transcript
+        .apply(&EventPayload::MenuOpened(haider_protocol::menu::Menu {
+            id: haider_protocol::ids::MenuId::new("t1-docs-q"),
+            kind: haider_protocol::menu::MenuKind::Choice,
+            title: text.to_owned(),
+            body: vec![],
+            options: options
+                .iter()
+                .enumerate()
+                .map(|(index, label)| haider_protocol::menu::MenuOption {
+                    key: format!("o{index}"),
+                    label: (*label).to_owned(),
+                    detail: None,
+                    decision: None,
+                })
+                .collect(),
+            blocking: false,
+            scope: haider_protocol::menu::MenuScope::Subagent {
+                agent: haider_protocol::ids::AgentId::new("t1-docs"),
+            },
+            origin: "subagent".to_owned(),
+            ttl_ms: None,
+            timeout_option: None,
+        }));
+    let (rows, _, _) = draw(&model, 100, 30);
+    assert_two_rules(
+        &rows,
+        "Run the suite against",
+        "↑↓ select",
+        "subagent question card",
+    );
+}
+
+#[test]
+fn session_band_carries_both_rules() {
+    let mut model = session_model();
+    for c in "draft".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    let (rows, _, _) = draw(&model, 100, 30);
+    assert_two_rules(&rows, "❯ draft", "❯ draft", "session");
+}
+
+#[test]
+fn session_menu_band_carries_both_rules() {
+    // A blocking menu replaces the composer (sim §3 law); the band's two
+    // rules survive the swap — warn above, frame below.
+    let mut model = AppModel::new();
+    for payload in demo_script() {
+        if matches!(payload, EventPayload::MenuAnswered(_)) {
+            break;
+        }
+        model.handle(AppEvent::Envelope(Box::new(payload)));
+    }
+    let menu_title = model
+        .projection
+        .open_menu()
+        .expect("demo menu open")
+        .title
+        .clone();
+    let anchor: String = menu_title.chars().take(20).collect();
+    let (rows, _, _) = draw(&model, 118, 34);
+    assert_two_rules(&rows, &anchor, "↑↓ select", "session menu");
+}
+
+#[test]
+fn launcher_band_carries_both_rules() {
+    // TUI5 item 1b fixed this surface; the sweep pins it alongside its
+    // siblings so the pair can never regress apart again.
+    let model = launcher_model();
+    let (rows, _, _) = draw(&model, 100, 30);
+    assert_two_rules(&rows, "start a session", "start a session", "launcher");
+}
+
+#[test]
+fn aura_band_carries_both_rules() {
+    let mut model = launcher_model();
+    for c in "/aura".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Enter));
+    assert_eq!(model.screen, Screen::Aura);
+    let (rows, _, _) = draw(&model, 100, 30);
+    assert_two_rules(&rows, "speak or type", "speak or type", "aura");
+}
+
+#[test]
+fn arg_slot_band_carries_both_rules() {
+    // The arg-slot is the SAME band with staged text + the palette above
+    // it (palette_area sits above rule_area, so the gold rule still
+    // closes the palette against the band's first row).
+    let mut model = session_model();
+    for c in "/theme ".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    assert!(model.palette_open());
+    let (rows, _, _) = draw(&model, 118, 34);
+    assert_two_rules(&rows, "❯ /theme", "❯ /theme", "arg-slot");
+}
+
+#[test]
+fn login_card_band_carries_both_rules() {
+    // The masked login card replaces the composer CONTENT inside the same
+    // band — it inherits the hosting surface's two rules.
+    let mut model = launcher_model();
+    model.mode = RuntimeMode::Live;
+    for c in "/login anthropic api".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Esc));
+    model.handle(key(KeyCode::Enter));
+    assert!(
+        model.login.is_some(),
+        "card open (flash: {:?})",
+        model.flash
+    );
+    let (rows, _, _) = draw(&model, 100, 30);
+    assert_two_rules(&rows, "API key", "esc cancel", "login card");
 }
 
 // ---- Multi-line + wrap compose: logical lines wrap independently ----

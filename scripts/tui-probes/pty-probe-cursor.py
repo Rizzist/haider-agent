@@ -80,6 +80,18 @@ def row_segment(frame, needle):
 
 
 pump(4.5)  # boot -> launcher (cold-build tolerant)
+# TUI6 item 6: the LAUNCHER band's two-rule anatomy off a full repaint
+# (this probe's session frames carry the session band; ml/sub carry the
+# session and aura bands — the launcher rides here).
+frame_l = snap()
+grid_l = probelib.screen_rows(frame_l)
+launcher_rows = sorted(r for r, t in grid_l.items() if "start a session" in t)
+launcher_band = bool(launcher_rows) and (
+    (launcher_rows[0] - 1) in grid_l
+    and grid_l[launcher_rows[0] - 1].count("\u2500") >= 20
+    and (launcher_rows[-1] + 1) in grid_l
+    and grid_l[launcher_rows[-1] + 1].count("\u2500") >= 20
+)
 send(b"hi\r", 1.5)  # start a session
 
 # Stage A — type-in-middle. "helo", ← (CSI D), "l" → "hello"; the caret
@@ -160,5 +172,7 @@ probelib.verdict(
         ("ctrl_c_copy_flash", c_flash),
         ("ctrl_c_with_selection_stayed_in_session", c_stayed),
         ("history_recall_editable", d_recall),
+        # TUI6 item 6: rule above AND below the launcher band.
+        ("launcher_band_two_rules", launcher_band),
     ],
 )

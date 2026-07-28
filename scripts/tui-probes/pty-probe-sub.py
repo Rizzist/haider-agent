@@ -40,6 +40,14 @@ pre = mark()
 os.write(fd, b"/aura\r")
 pump(1.2)
 aura_paint = since(pre)
+# TUI6 item 6: the aura band's two-rule anatomy, read off a resize-forced
+# FULL repaint of the aura stage (the composer is still empty here, so
+# the band's row is the placeholder).
+pre_band = mark()
+probelib.set_size(fd, cols + 1, rows)
+os.kill(pid, signal.SIGWINCH)
+pump(1.2)
+aura_grid = probelib.screen_rows(sink[0][pre_band:])
 os.write(fd, b"spin up billing on workstation and run its tests\r")
 pump(4.5)
 pre2 = mark()
@@ -65,6 +73,7 @@ probelib.set_size(fd, cols + 2, rows)
 os.kill(pid, signal.SIGWINCH)
 pump(1.5)
 final = since(pre3)
+final_bytes = sink[0][pre3:]
 try:
     # TUI4b item 10: ctrl-C is NAVIGATION from a session (back to the
     # launcher); only the second ctrl-C, now at the launcher, quits.
@@ -87,6 +96,25 @@ print(
 # Which checks this SIZE can show: short frames shed the chip rows and the
 # activity column; tall frames fit the whole turn so no sticky band pins.
 tall = rows >= 30
+
+
+# ---- TUI6 item 6: two-rule band anatomy on the captured frames ----
+def rule_in(grid, r):
+    return r in grid and grid[r].count("\u2500") >= 20
+
+
+def band_rules(grid, needle, below_span=3):
+    band = sorted(r for r, t in grid.items() if needle in t)
+    if not band:
+        return False
+    above = rule_in(grid, band[0] - 1)
+    below = any(rule_in(grid, band[-1] + d) for d in range(1, below_span + 1))
+    return above and below
+
+
+final_grid = probelib.screen_rows(final_bytes)
+aura_band = band_rules(aura_grid, "speak or type")
+session_band = band_rules(final_grid, "message haider")
 detail = "SKIP" if not tall else None
 sticky = "SKIP" if tall else None
 probelib.verdict(
@@ -107,5 +135,10 @@ probelib.verdict(
         ("final_has_subtree", "subagents" in final),
         ("sticky_prompt_pinned", sticky or ("use two subagents" in scrolled)),
         ("sticky_band_ground", sticky or ("48;2;237;225;207" in scrolled)),
+        # TUI6 item 6: both band rules on the aura stage and the session
+        # (the closing rule sheds by the ledger at short frames — tall
+        # runs enforce, short runs SKIP loudly).
+        ("aura_band_two_rules", aura_band if tall else "SKIP"),
+        ("session_band_two_rules", session_band if tall else "SKIP"),
     ],
 )
