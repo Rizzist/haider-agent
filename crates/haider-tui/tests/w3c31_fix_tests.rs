@@ -696,6 +696,7 @@ fn a_login_retry_restages_under_the_original_command_id() {
             vault_reference: "vault-1".to_owned(),
             provider: "anthropic".to_owned(),
             alias: None,
+            attempt: 1,
         }),
     );
     let original: CommandId = first
@@ -728,6 +729,7 @@ fn a_login_retry_restages_under_the_original_command_id() {
             vault_reference: "vault-2".to_owned(),
             provider: "anthropic".to_owned(),
             alias: None,
+            attempt: 1,
         }),
     );
     assert_eq!(
@@ -813,6 +815,7 @@ fn a_disconnect_mid_validation_recovers_the_card_and_retires_the_dead_login() {
             vault_reference: "vault-1".to_owned(),
             provider: "anthropic".to_owned(),
             alias: None,
+            attempt: 1,
         }),
     );
     assert_eq!(driver.outbox_len(), 1);

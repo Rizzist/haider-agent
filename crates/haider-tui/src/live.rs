@@ -110,6 +110,15 @@ pub enum LiveCommand {
         secret: haider_rpc::SecretWire,
         provider: String,
         alias: Option<String>,
+        /// The login ATTEMPT this stage serves (TUI6.4, review r4
+        /// finding 1). CLIENT-SIDE identity only — `request_body` never
+        /// sends it; the link's `CommandContext` carries it back into
+        /// the decoded reply, so stage correlation is by IDENTITY, never
+        /// by queue position (r4's lesson: position-based popping on a
+        /// wire that also delivers uncorrelated no-id frames is how a
+        /// cancelled attempt's vault reference cross-bound to a live
+        /// card).
+        attempt: u64,
     },
     /// Commit an API login against an already-staged reference. DURABLE:
     /// its command identity deliberately EXCLUDES the ephemeral
@@ -128,6 +137,9 @@ pub enum LiveCommand {
         provider: String,
         alias: Option<String>,
         vault_reference: String,
+        /// The attempt identity, uniform with [`Self::Stage`] (TUI6.4) —
+        /// client-side only, never on the wire.
+        attempt: u64,
     },
     /// A menu answer at its EXACT committed opening coordinates.
     Answer {
@@ -198,11 +210,26 @@ pub enum LiveReply {
     Answered {
         command_id: CommandId,
     },
-    /// `vault.stage` answered with an opaque single-use reference.
+    /// `vault.stage` answered with an opaque single-use reference. The
+    /// `attempt` is the CLIENT-side identity the link's request context
+    /// carried through (TUI6.4): the driver gates on it — a reply whose
+    /// attempt is retired, or is not the live one, mints nothing and
+    /// emits no vault reference.
     Staged {
         vault_reference: String,
         provider: String,
         alias: Option<String>,
+        attempt: u64,
+    },
+    /// `vault.stage` answered with a wire-level ERROR (TUI6.4): identity-
+    /// carried like [`Self::Staged`] — stage requests hold no durable
+    /// command id, but the link's context knows which attempt asked, so
+    /// the failure reaches the RIGHT card (or a ghost dies silently)
+    /// instead of being guessed from queue position (the 6.3b bug).
+    StageFailed {
+        attempt: u64,
+        code: String,
+        message: String,
     },
     /// `account.login_api` committed; `identity` is the descriptor's
     /// display identity (never a secret).
@@ -354,14 +381,19 @@ pub struct LiveDriver {
     /// retire, an abandon, or completion. Reply gates compare against it
     /// AND against the open card's own attempt — both must agree or the
     /// reply is a ghost from a cancelled attempt and is ignored whole.
+    /// Since TUI6.4 the stage leg carries the attempt in the REPLY
+    /// itself (the link's request context), so there is no positional
+    /// correlation state at all — r4 proved a FIFO tag queue lets an
+    /// uncorrelated no-id frame shift the alignment and cross-bind a
+    /// cancelled vault reference.
     login_attempt: Option<u64>,
-    /// Attempts with a `Stage` command in flight, in ISSUE order — the
-    /// RPC socket answers a connection's commands in order, so each
-    /// `Staged` reply pops the front: that is the attempt it answers.
-    /// (Belt and braces: the `Staged` gate also requires the popped
-    /// attempt to BE the live one, so even an ordering violation cannot
-    /// cross-bind a cancelled attempt's vault reference to a new card.)
-    staged_attempts: std::collections::VecDeque<u64>,
+    /// Login command ids retired BEFORE their reply arrived (a close or
+    /// abandon raced the daemon). Their late replies — success or
+    /// failure — are consumed SILENTLY: the user already saw the cancel,
+    /// and r4's P2 was exactly a retired failure painting a misleading
+    /// global flash. Entries are consumed on their (single) reply and
+    /// the set dies with the connection (no reply can cross a socket).
+    retired_logins: std::collections::HashSet<CommandId>,
     /// When the card's non-durable `vault.stage` was issued. A Stage
     /// swallowed by a disconnect or a wedged daemon would otherwise park
     /// the card at "validating…" with `accepts_input() == false` forever
@@ -423,7 +455,7 @@ impl LiveDriver {
             attaching: HashMap::new(),
             login_command: None,
             login_attempt: None,
-            staged_attempts: std::collections::VecDeque::new(),
+            retired_logins: std::collections::HashSet::new(),
             login_started: None,
             outbox: Vec::new(),
             menus: HashMap::new(),
@@ -806,19 +838,20 @@ impl LiveDriver {
                 vault_reference,
                 provider,
                 alias,
+                attempt,
             } => {
-                // TUI6.3 fix 1(c): correlate the reply to the attempt it
-                // answers — the front of the issue-ordered queue — and
-                // require that attempt to be the LIVE one on both sides
-                // (driver binding AND the open card). The r3 probe showed
-                // abort→re-/login letting an old and a new Staged reuse
-                // one login command id: a credential could commit after
-                // the UI said cancelled. A ghost reply is dropped whole —
-                // no mint, no enqueue, no flash (the user saw the cancel).
-                let answered = self.staged_attempts.pop_front();
-                let live = answered.is_some()
-                    && answered == self.login_attempt
-                    && model.login.as_ref().map(|card| card.attempt) == answered;
+                // TUI6.4 (review r4 finding 1): correlation is by the
+                // reply's OWN attempt identity — carried through the
+                // link's request context, never guessed from queue
+                // position (r4's probe shifted a FIFO queue with an
+                // uncorrelated no-id frame and cross-bound a CANCELLED
+                // vault reference to the live card). The attempt must be
+                // the live one on both sides — driver binding AND the
+                // open card — or the reply is a ghost: dropped whole, no
+                // mint, no vault reference emitted, no flash (the user
+                // saw the cancel).
+                let live = self.login_attempt == Some(attempt)
+                    && model.login.as_ref().map(|card| card.attempt) == Some(attempt);
                 if !live {
                     return Vec::new();
                 }
@@ -843,6 +876,7 @@ impl LiveDriver {
                     provider,
                     alias,
                     vault_reference,
+                    attempt,
                 })]
             }
             LiveReply::LoggedIn {
@@ -850,6 +884,9 @@ impl LiveDriver {
                 identity,
             } => {
                 self.retire(&command_id);
+                // A retired attempt's late SUCCESS is as silent as its
+                // failure (TUI6.4): consume the remembered id and move on.
+                self.retired_logins.remove(&command_id);
                 // TUI6.3 fix 1(c): the result lands only on the card that
                 // ASKED — the command must be the live login command and
                 // the open card must be the live attempt. A stale
@@ -976,39 +1013,54 @@ impl LiveDriver {
                 }
                 Vec::new()
             }
+            LiveReply::StageFailed {
+                attempt,
+                code,
+                message,
+            } => {
+                // TUI6.4: the stage-level error arrives identity-tagged
+                // (the link's context knows which attempt staged), so the
+                // LIVE attempt's card takes the recovery immediately —
+                // the 6.3b liveness case, now solved by identity instead
+                // of the positional pop r4 proved unsound. A ghost
+                // attempt's error dies silently: no card paint, no flash
+                // (the user already saw the cancel).
+                let live = self.login_attempt == Some(attempt)
+                    && model.login.as_ref().map(|card| card.attempt) == Some(attempt);
+                if live {
+                    self.login_started = None;
+                    self.login_attempt = None;
+                    model.login_result(Err((code, message)));
+                    model.dirty = true;
+                }
+                Vec::new()
+            }
             LiveReply::Failed {
                 command_id,
                 code,
                 message,
                 retryable,
             } => {
-                // TUI6.3b (verification P3, path a): a STAGE-level error
-                // answers a stage the correlation queue still holds a tag
-                // for — the Staged reply it replaces will never arrive, so
-                // the tag must pop here or it desyncs the NEXT attempt's
-                // correlation (a 30s-bounded wedge until the deadline
-                // cleared it). Stage commands carry no durable id by
-                // charter, so their errors arrive as `command_id: None`;
-                // a None while stages are in flight is consumed as the
-                // FRONT stage's answer (socket order — the same FIFO the
-                // Staged arm pops). If it was the LIVE attempt's stage,
-                // the card takes the recovery NOW instead of waiting out
-                // the deadline; a ghost attempt's error is swallowed —
-                // the user already saw the cancel. (A no-id error from a
-                // non-stage command while a stage is in flight would
-                // mis-pop — indistinguishable without wire identity, and
-                // strictly no worse than the wedge this fixes: the same
-                // deadline bounds it.)
-                if command_id.is_none() && !self.staged_attempts.is_empty() {
-                    let answered = self.staged_attempts.pop_front();
-                    let live = answered == self.login_attempt
-                        && model.login.as_ref().map(|card| card.attempt) == answered
-                        && answered.is_some();
-                    if live {
-                        self.login_started = None;
-                        self.login_attempt = None;
-                        model.login_result(Err((code, message)));
-                    }
+                // TUI6.4 (review r4): no-id failures NEVER touch login
+                // state — 6.3b's positional consumption is REMOVED, and
+                // stage-level errors arrive as the identity-tagged
+                // `StageFailed` instead. The honest residual: an
+                // uncorrelated ProtocolError that kills a stage leaves no
+                // reply to correlate at all — the stage's answer simply
+                // never arrives and the 30s deadline abandons with the
+                // retype recovery. Fail-closed (nothing ever mints on
+                // ambiguity), deadline-bounded, and no longer guessable
+                // into the wrong attempt.
+                //
+                // r4's P2: a late reply for a RETIRED login command is
+                // consumed SILENTLY — no card paint, no flash. The retire
+                // remembered the id precisely so this reply could be told
+                // apart from a genuinely unrelated failure (which still
+                // deserves its flash below).
+                if let Some(id) = &command_id
+                    && self.retired_logins.remove(id)
+                {
+                    self.retire(id);
                     model.dirty = true;
                     return Vec::new();
                 }
@@ -1075,6 +1127,9 @@ impl LiveDriver {
                 // at "validating…" refuses input until Esc, which is a dead
                 // end the user has no way to read (review W3c3 D2-5).
                 self.abandon_login(model, "the connection dropped mid-validation");
+                // No reply crosses a socket: retired ids awaiting silent
+                // consumption die with the connection (TUI6.4).
+                self.retired_logins.clear();
                 model.flash = Some(format!("· reconnecting — {reason}"));
                 model.dirty = true;
                 Vec::new()
@@ -1109,14 +1164,11 @@ impl LiveDriver {
     /// nothing to resend: the only recovery is a retype, and saying so is
     /// the whole job.
     fn abandon_login(&mut self, model: &mut AppModel, why: &str) {
-        // TUI6.3b (verification P3, path b): the correlation queue is
-        // connection-scoped and dies on EVERY abandon path — the
-        // early-return below fires when a retire already cleared the
-        // command and deadline, and clearing after it stranded the tags:
-        // the NEXT attempt's genuine Staged reply then popped a stale tag
-        // and was dropped (a 30s-bounded wedge). The attempt binding dies
-        // with the connection for the same reason.
-        self.staged_attempts.clear();
+        // TUI6.3b lesson, restated for the identity mechanism (TUI6.4):
+        // the attempt binding dies on EVERY abandon path, BEFORE the
+        // early-return — there is no positional queue left to strand,
+        // and a stage reply that arrives after an abandon fails the
+        // identity gate on the dead binding.
         self.login_attempt = None;
         if self.login_started.is_none() && self.login_command.is_none() {
             return;
@@ -1124,6 +1176,9 @@ impl LiveDriver {
         self.login_started = None;
         if let Some(id) = self.login_command.take() {
             self.retire(&id);
+            // Its reply may still arrive on a LIVE connection (timeout
+            // abandon): consume it silently when it does.
+            self.retired_logins.insert(id);
         }
         if model.login.is_some() {
             model.login_result(Err((
@@ -1340,9 +1395,10 @@ impl LiveDriver {
                 // connection-scoped.
                 self.next_command += 1;
                 // TUI6.3 fix 1: bind the driver to THIS attempt — every
-                // later reply must correlate to it or die.
+                // later reply must correlate to it or die. TUI6.4: the
+                // stage COMMAND carries the attempt too, so its reply
+                // comes back identity-tagged by the link's context.
                 self.login_attempt = Some(attempt);
-                self.staged_attempts.push_back(attempt);
                 // The card is now UNANSWERABLE-BY-ITSELF until a response
                 // lands: arm the deadline that covers BOTH transactions.
                 self.login_started = Some(self.now);
@@ -1351,6 +1407,7 @@ impl LiveDriver {
                     secret,
                     provider,
                     alias,
+                    attempt,
                 }]
             }
             AppRequest::LoginRetired { attempt } => {
@@ -1358,14 +1415,16 @@ impl LiveDriver {
                 // Whatever the transaction had in flight (a stage awaiting
                 // its reference, the login command awaiting commit, the
                 // deadline) is invalidated; the reply gates then drop the
-                // ghosts silently. The staged_attempts queue keeps its
-                // entries — each in-flight `Staged` reply still POPS its
-                // tag on arrival and fails the liveness gate.
+                // ghosts silently — stage replies by their own carried
+                // attempt (TUI6.4), login replies by the retired command
+                // id remembered below (r4's P2: a late Failed for a
+                // retired id must not even flash).
                 if self.login_attempt == Some(attempt) {
                     self.login_attempt = None;
                     self.login_started = None;
                     if let Some(id) = self.login_command.take() {
                         self.retire(&id);
+                        self.retired_logins.insert(id);
                     }
                 }
                 Vec::new()

@@ -545,7 +545,8 @@ fn cancelled_attempt_never_mints_and_a_stale_result_never_lands() {
             .any(|command| matches!(command, LiveCommand::Stage { .. })),
         "attempt 2 staged"
     );
-    // The OLD Staged reply lands first (socket order): it must die whole.
+    // The OLD Staged reply lands first, carrying ITS OWN attempt (the
+    // link's context tags every stage reply — TUI6.4): it must die whole.
     let pass = live_pass(
         &mut driver,
         &mut model,
@@ -553,6 +554,7 @@ fn cancelled_attempt_never_mints_and_a_stale_result_never_lands() {
             vault_reference: "old-cancelled-ref".to_owned(),
             provider: "anthropic".to_owned(),
             alias: None,
+            attempt: first,
         }),
         start,
     );
@@ -569,6 +571,7 @@ fn cancelled_attempt_never_mints_and_a_stale_result_never_lands() {
             vault_reference: "new-live-ref".to_owned(),
             provider: "anthropic".to_owned(),
             alias: None,
+            attempt: second,
         }),
         start,
     );
@@ -628,7 +631,7 @@ fn switch_abort_retires_the_inflight_attempt_too() {
     let mut model = live_model();
     let mut driver = LiveDriver::new("test");
     let start = std::time::Instant::now();
-    submit_login(&mut model, SENTINEL);
+    let aborted = submit_login(&mut model, SENTINEL);
     let pass = live_pass(&mut driver, &mut model, None, start);
     assert_eq!(pass.commands.len(), 1, "stage in flight");
     // The daemon's Created reply forces open_session — the switch aborts
@@ -643,6 +646,7 @@ fn switch_abort_retires_the_inflight_attempt_too() {
             vault_reference: "post-abort-ref".to_owned(),
             provider: "anthropic".to_owned(),
             alias: None,
+            attempt: aborted,
         }),
         start,
     );
@@ -695,31 +699,33 @@ fn pasted_buffer_is_zeroizing_by_type() {
 
 #[test]
 fn stage_error_pops_its_tag_and_the_next_attempt_is_not_wedged() {
-    // Verification P3 path (a): a stage answered by a wire-level error
-    // (`Failed { command_id: None }` — stages carry no durable id) never
-    // popped its correlation tag, so the NEXT attempt's genuine Staged
-    // reply popped the stale tag and was dropped: a 30s wedge until the
-    // deadline cleared it. The error now consumes the tag; the live
-    // card takes the recovery immediately.
+    // TUI6.4 re-scope (directed, review r4): this pin was born on 6.3b's
+    // positional no-id consumption, which r4 proved unsound (an
+    // unrelated no-id frame could shift the FIFO and cross-bind a
+    // cancelled vault reference). The LIVENESS LAW it pinned is
+    // unchanged — a stage-level error must reach the live card
+    // immediately and must not wedge the next attempt — but the stage
+    // error now arrives IDENTITY-TAGGED (`StageFailed { attempt }`, the
+    // link's request context) instead of being guessed from queue
+    // position.
     //
-    // MUTATION CHECK (stage-error-pops): remove the `command_id.is_none()`
-    // consumption branch from the Failed arm and this fails — attempt 2
-    // mints nothing. Verified by revert.
+    // MUTATION CHECK (stage-error-identity): remove the StageFailed
+    // arm's live delivery and this fails — the card never leaves
+    // Submitting. Verified by revert.
     let mut model = live_model();
     let mut driver = LiveDriver::new("test");
     let start = std::time::Instant::now();
-    submit_login(&mut model, SENTINEL);
+    let first = submit_login(&mut model, SENTINEL);
     let pass = live_pass(&mut driver, &mut model, None, start);
     assert_eq!(pass.commands.len(), 1, "attempt 1 staged");
-    // The stage fails at the wire.
+    // The stage fails at the wire — identity-tagged by the link.
     let _ = live_pass(
         &mut driver,
         &mut model,
-        Some(LiveReply::Failed {
-            command_id: None,
+        Some(LiveReply::StageFailed {
+            attempt: first,
             code: "vault_unavailable".to_owned(),
             message: "the vault is sealed".to_owned(),
-            retryable: true,
         }),
         start,
     );
@@ -747,6 +753,7 @@ fn stage_error_pops_its_tag_and_the_next_attempt_is_not_wedged() {
             vault_reference: "second-ref".to_owned(),
             provider: "anthropic".to_owned(),
             alias: None,
+            attempt: second,
         }),
         start,
     );
@@ -754,23 +761,25 @@ fn stage_error_pops_its_tag_and_the_next_attempt_is_not_wedged() {
         pass.commands
             .iter()
             .any(|command| matches!(command, LiveCommand::LoginApi { .. })),
-        "attempt 2's genuine Staged mints — the queue was not wedged: {:?}",
+        "attempt 2's genuine Staged mints — nothing wedged: {:?}",
         pass.commands
     );
 }
 
 #[test]
 fn retire_then_disconnect_clears_the_tags_and_the_next_attempt_works() {
-    // Verification P3 path (b): Esc retired the attempt (command and
-    // deadline both cleared), then the disconnect's abandon early-returned
-    // BEFORE clearing the correlation queue — stranding the tag for the
-    // reconnected world, where the next attempt's Staged popped it and
-    // was dropped.
+    // TUI6.4 re-scope (directed, review r4): born as 6.3b's
+    // clear-before-early-return pin for the positional queue; the queue
+    // is gone, but the LAW stands — retire-then-disconnect must leave
+    // NOTHING that eats the next attempt's correlation. Under the
+    // identity mechanism the pin asserts the same end-to-end outcome:
+    // the post-reconnect attempt stages and mints cleanly.
     //
-    // MUTATION CHECK (abandon-clears-first): move the
-    // `staged_attempts.clear()` back below abandon_login's early-return
-    // and this fails — attempt 2 mints nothing after the reconnect.
-    // Verified by revert.
+    // MUTATION CHECK (abandon-clears-binding): move abandon_login's
+    // `login_attempt = None` below its early-return and the SIBLING law
+    // (a ghost reply gated on a dead binding) weakens; this pin holds
+    // the liveness half — attempt 2 mints after the reconnect. Verified
+    // by revert (executed on the 6.4 identity gate below).
     let mut model = live_model();
     let mut driver = LiveDriver::new("test");
     let start = std::time::Instant::now();
@@ -789,7 +798,7 @@ fn retire_then_disconnect_clears_the_tags_and_the_next_attempt_works() {
     );
     let _ = live_pass(&mut driver, &mut model, Some(LiveReply::Reconnected), start);
     // Attempt 2 on the fresh connection.
-    submit_login(&mut model, "sk-ant-SECOND-after-reconnect");
+    let second = submit_login(&mut model, "sk-ant-SECOND-after-reconnect");
     let pass = live_pass(&mut driver, &mut model, None, start);
     assert!(
         pass.commands
@@ -804,6 +813,7 @@ fn retire_then_disconnect_clears_the_tags_and_the_next_attempt_works() {
             vault_reference: "fresh-connection-ref".to_owned(),
             provider: "anthropic".to_owned(),
             alias: None,
+            attempt: second,
         }),
         start,
     );
@@ -811,7 +821,165 @@ fn retire_then_disconnect_clears_the_tags_and_the_next_attempt_works() {
         pass.commands
             .iter()
             .any(|command| matches!(command, LiveCommand::LoginApi { .. })),
-        "no stale tag survived the disconnect: {:?}",
+        "nothing stale survived the disconnect: {:?}",
         pass.commands
+    );
+}
+
+// ---- TUI6.4: identity-matched stage correlation (review r4) ----
+
+#[test]
+fn non_stage_noid_failure_never_shifts_stage_correlation() {
+    // The r4 reviewer's exact probe: after abort→re-login, 6.3b's FIFO
+    // queue was [retired N, live N+1]; a NON-stage no-id failure (a
+    // List/Detach error, an uncorrelated ProtocolError) consumed N, the
+    // OLD attempt's Staged then consumed N+1, passed both live gates,
+    // and minted LoginApi with the CANCELLED vault reference. Under
+    // identity correlation there is no position to shift: the old reply
+    // carries its own retired attempt and dies, whatever arrives around
+    // it.
+    //
+    // MUTATION CHECK (staged-identity-gate): weaken the Staged arm's
+    // gate to `let live = true;` and this fails — the cancelled
+    // reference mints LoginApi. Verified by revert.
+    let mut model = live_model();
+    let mut driver = LiveDriver::new("test");
+    let start = std::time::Instant::now();
+    let first = submit_login(&mut model, SENTINEL);
+    let pass = live_pass(&mut driver, &mut model, None, start);
+    assert_eq!(pass.commands.len(), 1, "attempt 1 staged");
+    model.handle(key(KeyCode::Esc)); // abort — attempt 1 retired
+    let second = submit_login(&mut model, "sk-ant-SECOND-live-key");
+    let pass = live_pass(&mut driver, &mut model, None, start);
+    assert!(
+        pass.commands
+            .iter()
+            .any(|command| matches!(command, LiveCommand::Stage { .. })),
+        "attempt 2 staged"
+    );
+    // The unrelated no-id failure lands between them — exactly what
+    // shifted 6.3b's queue. It must touch no login state.
+    let _ = live_pass(
+        &mut driver,
+        &mut model,
+        Some(LiveReply::Failed {
+            command_id: None,
+            code: "list_failed".to_owned(),
+            message: "roster unavailable".to_owned(),
+            retryable: true,
+        }),
+        start,
+    );
+    // The OLD attempt's Staged, identity-tagged with the retired attempt.
+    let pass = live_pass(
+        &mut driver,
+        &mut model,
+        Some(LiveReply::Staged {
+            vault_reference: "OLD-CANCELLED-VAULT-REFERENCE".to_owned(),
+            provider: "anthropic".to_owned(),
+            alias: None,
+            attempt: first,
+        }),
+        start,
+    );
+    assert!(
+        pass.commands.is_empty(),
+        "the cancelled attempt's reply minted something: {:?}",
+        pass.commands
+    );
+    // The TUI-side guarantee stands alone (no daemon backstop assumed):
+    // the cancelled single-use reference is never emitted in ANY command.
+    let pass = live_pass(
+        &mut driver,
+        &mut model,
+        Some(LiveReply::Staged {
+            vault_reference: "new-live-ref".to_owned(),
+            provider: "anthropic".to_owned(),
+            alias: None,
+            attempt: second,
+        }),
+        start,
+    );
+    let minted = pass
+        .commands
+        .iter()
+        .find_map(|command| match command {
+            LiveCommand::LoginApi {
+                vault_reference, ..
+            } => Some(vault_reference.clone()),
+            _ => None,
+        })
+        .expect("the live attempt mints");
+    assert_eq!(minted, "new-live-ref");
+    assert!(
+        !format!("{pass:?}").contains("OLD-CANCELLED-VAULT-REFERENCE"),
+        "the cancelled reference never leaves the driver"
+    );
+}
+
+#[test]
+fn retired_failed_reply_is_silent_no_flash() {
+    // Review r4 finding 2 (P2): a late `Failed(Some(old_login_id))` for
+    // a RETIRED attempt left the card untouched but painted
+    // `model.flash = "· provider_rejected — …"` — a misleading global
+    // flash for an attempt the user already cancelled. Retired replies
+    // are now consumed SILENTLY: the retire remembers the command id
+    // precisely so its late reply can be told apart from a genuinely
+    // unrelated failure (which still deserves its flash).
+    //
+    // MUTATION CHECK (retired-silence): remove the
+    // `retired_logins.remove(id)` consumption from the Failed arm and
+    // this fails — the ghost failure paints the flash. Verified by
+    // revert.
+    let mut model = live_model();
+    let mut driver = LiveDriver::new("test");
+    let start = std::time::Instant::now();
+    let first = submit_login(&mut model, SENTINEL);
+    let _ = live_pass(&mut driver, &mut model, None, start);
+    // The stage answers; the login command mints.
+    let pass = live_pass(
+        &mut driver,
+        &mut model,
+        Some(LiveReply::Staged {
+            vault_reference: "ref-1".to_owned(),
+            provider: "anthropic".to_owned(),
+            alias: None,
+            attempt: first,
+        }),
+        start,
+    );
+    let old_login_id = pass
+        .commands
+        .iter()
+        .find_map(|command| match command {
+            LiveCommand::LoginApi { command_id, .. } => Some(command_id.clone()),
+            _ => None,
+        })
+        .expect("login command in flight");
+    // Abort while the login is in flight, then open a NEW card (the r4
+    // shape: the ghost must not touch it OR the global flash).
+    model.handle(key(KeyCode::Esc));
+    run_slash(&mut model, "/login anthropic api");
+    let _ = live_pass(&mut driver, &mut model, None, start);
+    model.flash = None;
+    let _ = live_pass(
+        &mut driver,
+        &mut model,
+        Some(LiveReply::Failed {
+            command_id: Some(old_login_id),
+            code: "provider_rejected".to_owned(),
+            message: "old attempt failed".to_owned(),
+            retryable: false,
+        }),
+        start,
+    );
+    assert_eq!(
+        model.flash, None,
+        "a retired attempt's late failure paints NOTHING"
+    );
+    assert_eq!(
+        model.login.as_ref().expect("new card open").stage,
+        LoginStage::Entry,
+        "and the new card is untouched"
     );
 }
