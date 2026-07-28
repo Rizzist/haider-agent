@@ -825,3 +825,105 @@ async fn menu_answers_reach_the_wire_uncorrelated() {
         other => panic!("expected a MenuAnswer, got {other:?}"),
     }
 }
+
+// ------------------------------------------------- 4. barrier overflow --
+
+/// THE LAW (review r2 NF-1): loss the barrier swallows while an attach is
+/// OUTSTANDING is deferred — never published mid-barrier. An `EventsLost`
+/// published before the attach outcome installs reaches a driver with no
+/// attachment to repair; the later `Attached` then paints a surface whose
+/// replay and catch-up boundary were silently thrown away, and a quiescent
+/// session never exposes the hole.
+///
+/// This is a SEAM test on `link::deliver` itself: a socket-driven flood
+/// cannot deterministically overflow the barrier because the client's own
+/// bounded event channel drops first (a different loss class). The flush
+/// half — deferred loss published only after the barrier drains — is pinned
+/// by the source guard below it.
+///
+/// MUTATION CHECK: revert `deliver` to `held.clear()` +
+/// `replies.send(LiveReply::EventsLost { .. })` inline on overflow (the
+/// pre-NF-1 body). Expected failure: `try_recv` observes an `EventsLost`
+/// mid-barrier and the "nothing published" assertion fails.
+#[tokio::test]
+async fn barrier_overflow_defers_loss_instead_of_publishing_mid_barrier() {
+    use haider_tui::link::{HELD_REPLY_CAP, deliver};
+    use std::collections::VecDeque;
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<LiveReply>(HELD_REPLY_CAP * 2 + 8);
+    let mut held: VecDeque<LiveReply> = VecDeque::new();
+    let mut deferred: u64 = 0;
+    let event = |seq: u64| LiveReply::Event {
+        session: session(1),
+        attachment: attachment(1),
+        envelope: Box::new(envelope(&session(1), seq)),
+    };
+    // Fill to the cap, then two more: the cap+1th clears-and-defers, the
+    // cap+2th re-accumulates in the (now empty) queue.
+    let flood = u64::try_from(HELD_REPLY_CAP).expect("cap fits") + 2;
+    for seq in 1..=flood {
+        assert!(deliver(event(seq), 1, &mut held, &mut deferred, &tx).await);
+    }
+    assert!(
+        rx.try_recv().is_err(),
+        "nothing may publish while the attach is outstanding — loss defers"
+    );
+    assert_eq!(
+        deferred,
+        u64::try_from(HELD_REPLY_CAP).expect("cap fits") + 1,
+        "the deferral coalesces the cleared queue plus the overflowing reply"
+    );
+    assert_eq!(held.len(), 1, "the queue re-accumulates after the clear");
+
+    // With the barrier down, delivery is direct and the deferral untouched.
+    assert!(deliver(event(flood + 1), 0, &mut held, &mut deferred, &tx).await);
+    assert!(matches!(rx.try_recv(), Ok(LiveReply::Event { .. })));
+    assert_eq!(
+        deferred,
+        u64::try_from(HELD_REPLY_CAP).expect("cap fits") + 1
+    );
+}
+
+/// The flush half of NF-1, pinned at the source: the deferred-loss publish
+/// lives INSIDE the barrier-drain block (`outstanding_attaches == 0`),
+/// AFTER the held flush — so the loss report always follows the attach
+/// outcomes and the surviving held tail it refers to.
+///
+/// MUTATION CHECK: move the `deferred_loss > 0` publish above the held
+/// flush (or out of the drain block). Expected failure: the position
+/// assertions below invert.
+#[test]
+fn deferred_loss_publishes_only_after_the_barrier_drains() {
+    let source = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/link.rs"),
+    )
+    .expect("link source");
+    let drain = source
+        .find("if outstanding_attaches == 0 {")
+        .expect("the barrier-drain block");
+    let flush = source[drain..]
+        .find("while let Some(reply) = held.pop_front()")
+        .expect("the held flush inside the drain block")
+        + drain;
+    let publish = source[drain..]
+        .find("if deferred_loss > 0 {")
+        .expect("the deferred publish inside the drain block")
+        + drain;
+    assert!(
+        flush < publish,
+        "the deferred loss must publish AFTER the held tail it refers to"
+    );
+    // And the deferral itself must not publish inline: the overflow arm of
+    // `deliver` contains no send.
+    let overflow = source
+        .find("held.len() >= HELD_REPLY_CAP")
+        .expect("the overflow arm");
+    let arm_end = source[overflow..]
+        .find("held.push_back(reply);")
+        .expect("the hold arm follows")
+        + overflow;
+    assert!(
+        !source[overflow..arm_end].contains("replies.send"),
+        "the overflow arm defers; it must not publish mid-barrier"
+    );
+}

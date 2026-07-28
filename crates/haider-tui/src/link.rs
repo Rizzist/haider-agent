@@ -63,7 +63,8 @@ const LINK_CAPACITY: usize = 256;
 /// [`LiveReply::EventsLost`] and drops the queue, because a drop the driver
 /// can see costs one reattach, and a drop it cannot see costs a transcript
 /// that is silently wrong.
-const HELD_REPLY_CAP: usize = 512;
+#[doc(hidden)]
+pub const HELD_REPLY_CAP: usize = 512;
 
 /// A live link: send [`LiveCommand`]s, receive [`LiveReply`]s.
 pub struct Link {
@@ -117,6 +118,9 @@ async fn run_link(
     let (mut attaches_tx, mut attaches_rx) = mpsc::channel::<Vec<LiveReply>>(LINK_CAPACITY);
     let mut outstanding_attaches: usize = 0;
     let mut held: VecDeque<LiveReply> = VecDeque::new();
+    // Loss the barrier swallowed while an attach was outstanding; published
+    // only when the barrier drains (review r2 NF-1).
+    let mut deferred_loss: u64 = 0;
     // The client drops uncorrelated frames when its event channel is full
     // and counts them. Nothing used to read that counter, so a dropped final
     // envelope — the one with no later sequence to expose its hole — was
@@ -129,7 +133,15 @@ async fn run_link(
                 count: lost - lost_baseline,
             };
             lost_baseline = lost;
-            if !deliver(reply, outstanding_attaches, &mut held, &replies).await {
+            if !deliver(
+                reply,
+                outstanding_attaches,
+                &mut held,
+                &mut deferred_loss,
+                &replies,
+            )
+            .await
+            {
                 return;
             }
         }
@@ -156,13 +168,32 @@ async fn run_link(
                             return;
                         }
                     }
+                    // The barrier is drained and every attach outcome above
+                    // is installed — NOW the swallowed loss is repairable:
+                    // the driver's reattach walk includes the attachments
+                    // those attaches just installed (review r2 NF-1).
+                    if deferred_loss > 0 {
+                        let count = deferred_loss;
+                        deferred_loss = 0;
+                        if replies.send(LiveReply::EventsLost { count }).await.is_err() {
+                            return;
+                        }
+                    }
                 }
                 None
             }
             frame = events.recv() => match frame {
                 Some(frame) => {
                     for reply in map_frame(frame) {
-                        if !deliver(reply, outstanding_attaches, &mut held, &replies).await {
+                        if !deliver(
+                            reply,
+                            outstanding_attaches,
+                            &mut held,
+                            &mut deferred_loss,
+                            &replies,
+                        )
+                        .await
+                        {
                             return;
                         }
                     }
@@ -181,6 +212,9 @@ async fn run_link(
         // orphans the tasks still waiting on the old one.
         held.clear();
         outstanding_attaches = 0;
+        // The disconnect reattach replays everything from applied cursors;
+        // deferred loss is subsumed by it.
+        deferred_loss = 0;
         let (fresh_tx, fresh_rx) = mpsc::channel::<Vec<LiveReply>>(LINK_CAPACITY);
         attaches_tx = fresh_tx;
         attaches_rx = fresh_rx;
@@ -247,24 +281,38 @@ const fn attachment_scoped(reply: &LiveReply) -> bool {
 /// Publish one inbound reply, or hold it behind an outstanding attach.
 ///
 /// Returns `false` once the reply consumer is gone (the link is finished).
-async fn deliver(
+///
+/// Public only so `tests/` can pin the overflow-deferral law at this seam
+/// (the same precedent as [`CommandContext`]): a socket-driven flood cannot
+/// deterministically overflow the barrier, because the client's own bounded
+/// event channel drops first — a DIFFERENT loss class with its own report.
+#[doc(hidden)]
+pub async fn deliver(
     reply: LiveReply,
     outstanding_attaches: usize,
     held: &mut VecDeque<LiveReply>,
+    deferred_loss: &mut u64,
     replies: &mpsc::Sender<LiveReply>,
 ) -> bool {
     if outstanding_attaches == 0 || !attachment_scoped(&reply) {
         return replies.send(reply).await.is_ok();
     }
     if held.len() >= HELD_REPLY_CAP {
-        // The queue and the reply that overflowed it are both gone. Say so:
-        // the driver reattaches every held attachment from its own cursor
-        // and the daemon replays what we just threw away.
-        let count = u64::try_from(held.len())
-            .unwrap_or(u64::MAX)
-            .saturating_add(1);
+        // The queue and the reply that overflowed it are both gone — but the
+        // loss must NOT be published yet. An `EventsLost` sent while the
+        // attach is still outstanding reaches a driver with no installed
+        // attachment to repair, and the later `Attached` then paints a
+        // surface whose replay and catch-up boundary were silently thrown
+        // away (review r2 NF-1). Defer the count until the barrier drains:
+        // the flush publishes it AFTER the attach outcome installs, so the
+        // driver's reattach walk covers the fresh attachment too.
+        *deferred_loss = deferred_loss.saturating_add(
+            u64::try_from(held.len())
+                .unwrap_or(u64::MAX)
+                .saturating_add(1),
+        );
         held.clear();
-        return replies.send(LiveReply::EventsLost { count }).await.is_ok();
+        return true;
     }
     held.push_back(reply);
     true
@@ -323,14 +371,26 @@ async fn issue(
         // reissued by the resume path.
         Err(ClientError::Disconnected(_)) => return false,
         Err(error) => {
-            let _ = replies
-                .send(LiveReply::Failed {
+            // An attach carries no command id, so the generic `Failed` can
+            // never release the slot the driver claimed for it — a permanent
+            // false in-flight latch (review r2 NF-2). The link knows which
+            // session the attach was for; say so, permanently.
+            let reply = if let Some(session) = context.attach.clone() {
+                LiveReply::AttachFailed {
+                    session,
+                    code: "encode_failed".to_owned(),
+                    message: error.to_string(),
+                    retryable: false,
+                }
+            } else {
+                LiveReply::Failed {
                     command_id: context.command_id.clone(),
                     code: "encode_failed".to_owned(),
                     message: error.to_string(),
                     retryable: false,
-                })
-                .await;
+                }
+            };
+            let _ = replies.send(reply).await;
             return false;
         }
     };

@@ -873,9 +873,12 @@ impl RuntimeMode {
     ///
     /// This is the ONE question behind every mode branch in the reducer.
     /// It is expressed as a predicate rather than an identity check so
-    /// "did we cover every site?" is answerable by grep: every fabrication
-    /// branch reads `!self.mode.fabricates_locally()`, and
-    /// `grep -c fabricates_locally` counts the table above.
+    /// every site asks the same question. Call sites use BOTH polarities
+    /// (a demo-only path guards with the positive form; a live refusal
+    /// guards with the negative), so a bare grep count is NOT an audit —
+    /// the audit is the exhaustive `AppRequest` match in the live driver's
+    /// `handle_request`, where a new variant is a compile error, plus the
+    /// per-surface gate tests in `w3c31_r2_tests` (review r2 NF-4).
     ///
     /// ONE site reads the mode and is NOT about fabrication:
     /// [`AppModel::launcher_rows`], which is a DISPLAY policy (the sim's

@@ -246,8 +246,14 @@ async fn pending_response_wait_reports_the_typed_disconnect() {
         .await
         .expect("wait resolves instead of hanging");
     match outcome {
-        Err(haider_client::ClientError::Disconnected(DisconnectReason::PeerClosed)) => {}
-        Err(other) => panic!("expected the typed peer-closed disconnect, got {other:?}"),
+        // Reader EOF (PeerClosed) and the writer's failed flush (Io) race
+        // legitimately under the client's documented first-reason-wins rule;
+        // either typed disconnect satisfies the law under test — the pending
+        // wait resolves with a TYPED reason instead of hanging (r2 NF-3).
+        Err(haider_client::ClientError::Disconnected(
+            DisconnectReason::PeerClosed | DisconnectReason::Io(_),
+        )) => {}
+        Err(other) => panic!("expected a typed disconnect, got {other:?}"),
         Ok(body) => panic!("expected a disconnect, got Ok({body:?})"),
     }
 }
