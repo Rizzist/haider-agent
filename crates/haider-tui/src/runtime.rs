@@ -426,7 +426,21 @@ pub fn dispatch_input(
             model.handle(AppEvent::Key(key));
         }
         Event::Paste(text) => model.handle(AppEvent::Paste(text)),
-        Event::Resize(..) => model.handle_resize(),
+        Event::Resize(cols, _) => {
+            // TUI6.1 fix 1 (reflow-before-input): the next frame's wrap
+            // budget is a pure function of the NEW width, so apply it
+            // here — before any queued key can walk the previous width's
+            // visual rows (review r1 finding 1: a Down racing the redraw
+            // landed on the old wrap geometry). The reducer stays
+            // wrap-ignorant: this is the dispatch seam, the same layer
+            // that owns the hit map. handle_resize bumps the geometry
+            // epoch, which retires every composer hit the old frames
+            // stamped.
+            model
+                .composer
+                .set_wrap_budget(crate::render::composer_text_budget(cols));
+            model.handle_resize();
+        }
         Event::Mouse(mouse) => {
             let hit_at = |column: u16, row: u16| {
                 hit_map
@@ -460,11 +474,12 @@ pub fn dispatch_input(
                             content,
                             surface,
                             revision,
+                            epoch,
                         },
                     )) = hit_rect_at(hit_map, mouse.column, mouse.row)
                     {
                         let col = usize::from(mouse.column.saturating_sub(rect.x));
-                        model.composer_press(start, &content, col, surface, revision);
+                        model.composer_press(start, &content, col, surface, revision, epoch);
                         return;
                     }
                     model.mouse_down = Some((mouse.column, mouse.row));
@@ -583,13 +598,20 @@ fn composer_byte_at(
             content,
             surface,
             revision,
+            epoch,
         } = hit
         else {
             continue;
         };
         // TUI5.1 fix 2: drag rows bind to surface + revision exactly as
-        // the press does — a stale row is no row.
-        if *surface != model.surface_key() || *revision != model.composer.revision() {
+        // the press does — a stale row is no row. TUI6.1 fix 1: and to
+        // the geometry epoch, so a drag armed before a resize maps
+        // through NOTHING (the caret stays put) instead of the previous
+        // frame's rows.
+        if *surface != model.surface_key()
+            || *revision != model.composer.revision()
+            || *epoch != model.geometry_epoch.get()
+        {
             continue;
         }
         let (top, bottom) = band.get_or_insert((rect.y, rect.y));

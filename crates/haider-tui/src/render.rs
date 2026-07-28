@@ -26,6 +26,14 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Render the whole frame for the current screen. Returns the frame's
 /// clickable regions (hit map) for the runtime's mouse dispatch.
 pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
+    // TUI6.1 fix 1: every frame advances the geometry epoch and stamps
+    // its composer hits with the NEW value — only hits from the LATEST
+    // frame with no intervening resize are consumable (handle_resize
+    // bumps the same counter). The Cell is the scroll_max discipline:
+    // frame feedback through a shared borrow, never reducer state.
+    model
+        .geometry_epoch
+        .set(model.geometry_epoch.get().wrapping_add(1));
     let theme = model.theme.theme();
     let area = frame.area();
     // Ground the whole frame in the theme bg.
@@ -324,25 +332,33 @@ fn render_launcher(
     // Sacred-input ledger (review r3 P2-1a, launcher form; r6 P2-1: same
     // shed ladder as the session): the composer grows up to its need but
     // tail-windows to whatever the height allows — the cursor row is never
-    // hidden. Under pressure the gap yields, then the content's sacred
-    // row, then the rule, before the composer loses its row.
+    // hidden. TUI6.1 fix 2 reordered the rungs to `band_rule_reserve`'s
+    // law (review r1: launcher 90×4 kept the OPTIONAL content column and
+    // lost the closing rule): under pressure the content yields, THEN the
+    // closing-rule row (the gap), then the top rule, before the composer
+    // loses its row.
     let needed = composer_height(model, area.width);
     let mut gap: u16 = 1;
     let mut content_min: u16 = 1;
     let mut rule_h: u16 = 1;
     let mut input_avail = area.height.saturating_sub(content_min + rule_h + gap);
     if input_avail < 1 {
-        gap = 0;
-        input_avail = area.height.saturating_sub(content_min + rule_h);
+        content_min = 0;
+        input_avail = area.height.saturating_sub(rule_h + gap);
     }
     if input_avail < 1 {
-        content_min = 0;
+        gap = 0;
         input_avail = area.height.saturating_sub(rule_h);
     }
     if input_avail < 1 {
         rule_h = 0;
         input_avail = area.height;
     }
+    debug_assert_eq!(
+        u16::from(gap > 0),
+        band_rule_reserve(area.height, content_min + rule_h + 1, rule_h),
+        "the launcher ladder implements band_rule_reserve exactly"
+    );
     let composer_rows = needed.min(input_avail).clamp(1, area.height.max(1));
     let fixed = content_min + rule_h + composer_rows + gap;
     if palette_height > area.height.saturating_sub(fixed) {
@@ -848,6 +864,24 @@ fn render_session(
     };
     let mut palette_height = u16::try_from(palette.len()).unwrap_or(0);
     let mut budget = area.height.saturating_sub(fixed + transcript_min);
+    // TUI6.1 fix 2: the closing rule claims FIRST — before EVERY optional
+    // panel — per `band_rule_reserve`'s law: reserved whenever chrome +
+    // input + the transcript's sacred row leave it a row. It takes a
+    // budget row when one exists, else the spacer gap row (review r1:
+    // session menu 90×10 kept a blank gap where the rule fit; session
+    // with chip 90×11 funded the SubTree and left the band open).
+    let band_rule_h = band_rule_reserve(
+        area.height,
+        chrome + input_height + transcript_min,
+        input_rule_h,
+    );
+    if band_rule_h > 0 {
+        if budget > 0 {
+            budget -= 1;
+        } else {
+            gap = 0;
+        }
+    }
     if palette_height > budget {
         palette_height = 0;
     } else {
@@ -873,21 +907,11 @@ fn render_session(
     } else {
         budget -= todos_height;
     }
-    // The composer band closes with a frame rule — the sim draws it as the
-    // border-top of whatever follows the InputBar (SubTree tui.js:4764 /
-    // StatusBar tui.js:5497), which is the "bottom line" the owner's
-    // screenshot was missing (item 2). TUI6 item 6 fixed the claim order
-    // twice over: the RULE outranks the pad (at exactly one spare row the
-    // band still closes — the rule IS the anatomy, the pad is the
-    // InputBar's bottom padding), and BOTH outrank the breathing rows
-    // below, which the local comment always declared "the FIRST thing to
-    // shed" — the TUI5 arithmetic let a blank breathing row survive a
-    // starved closing rule, recreating the owner's missing-line defect
-    // with a blank in its place (TUI6 review, MINOR 1).
-    let band_rule_h = u16::from(budget > 0 && input_rule_h > 0);
-    if band_rule_h > 0 {
-        budget -= band_rule_h;
-    }
+    // The closing rule was reserved ABOVE, before the panels (TUI6.1
+    // fix 2 — sim anatomy: the border-top of whatever follows the
+    // InputBar, SubTree tui.js:4764 / StatusBar tui.js:5497). The PAD is
+    // the InputBar's bottom padding and stays behind every panel but
+    // ahead of the breathing rows (TUI6 item 6 / TUI6d).
     let band_pad = u16::from(budget > 0 && input_rule_h > 0);
     if band_pad > 0 {
         budget -= band_pad;
@@ -1584,9 +1608,14 @@ fn render_subagent(
         },
     );
     let floor_input = menu.map_or(1, |m| u16::try_from(m.options.len().max(1)).unwrap_or(1));
-    // Compact ledger (the session screen's shed order, condensed): gap →
-    // subtree → transcript row → header line 2 → rules → header line 1;
-    // the input floor never yields.
+    // Compact ledger (the session screen's shed order, condensed).
+    // TUI6.1 fix 2: the closing rule joined it AHEAD of the SubTree and
+    // the gap (review r1: subagent 90×11 / question 90×14 funded the
+    // SubTree while the band stayed open) — shed order is now subtree →
+    // gap → closing rule → transcript row → header line 2 → rules →
+    // header line 1; the input floor never yields. The subtree and gap
+    // rungs carry the rule's provisional row in their extras, so they
+    // shed in its favor per `band_rule_reserve`'s law.
     let mut gap: u16 = 1;
     let mut transcript_min: u16 = 1;
     let mut header_h: u16 = 2;
@@ -1596,10 +1625,11 @@ fn render_subagent(
     let over = |header_h: u16, rules: u16, extras: u16, area: Rect| {
         area.height.saturating_sub(header_h + rules + extras) < floor_input
     };
+    let rule_demand = u16::from(input_rule_h > 0);
     if over(
         header_h,
         header_rule_h + input_rule_h,
-        gap + transcript_min + subtree_height,
+        gap + transcript_min + subtree_height + rule_demand,
         area,
     ) {
         subtree_height = 0;
@@ -1607,11 +1637,26 @@ fn render_subagent(
     if over(
         header_h,
         header_rule_h + input_rule_h,
-        gap + transcript_min,
+        gap + transcript_min + rule_demand,
         area,
     ) {
         gap = 0;
     }
+    // The rule's own claim, through the shared law: reserved whenever the
+    // surviving chrome + the transcript's sacred row + the input floor
+    // leave it a row; it yields to the transcript's sacred row (session
+    // parity), never to the optional panels above.
+    let band_rule_h = band_rule_reserve(
+        area.height,
+        header_h
+            + header_rule_h
+            + input_rule_h
+            + gap
+            + transcript_min
+            + subtree_height
+            + floor_input,
+        input_rule_h,
+    );
     if over(header_h, header_rule_h + input_rule_h, transcript_min, area) {
         transcript_min = 0;
     }
@@ -1628,24 +1673,19 @@ fn render_subagent(
     let chrome = header_h + header_rule_h + input_rule_h;
     let input_avail = area
         .height
-        .saturating_sub(chrome + gap + transcript_min + subtree_height);
+        .saturating_sub(chrome + gap + transcript_min + subtree_height + band_rule_h);
     let input_height = needed_input
         .min(input_avail)
         .max(floor_input.min(area.height.saturating_sub(chrome)))
         .clamp(1, area.height.max(1));
     // TUI6 item 6 (the band-anatomy sweep — the owner's screenshot was
-    // THIS surface: `❯ message …` straight into `▼ subagents`): the input
-    // band closes under the composer exactly as on the session — an
-    // inputBg pad row plus the frame rule the sim draws as the SubTree's
-    // border-top (tui.js:4764). The RULE outranks the pad (the rule IS
-    // the anatomy; the pad is the InputBar's bottom padding), and both
-    // claim rows the transcript's Min would otherwise absorb — never a
-    // sacred row.
-    let mut spare = area
-        .height
-        .saturating_sub(chrome + gap + transcript_min + subtree_height + input_height);
-    let band_rule_h = u16::from(spare > 0 && input_rule_h > 0);
-    spare = spare.saturating_sub(band_rule_h);
+    // THIS surface: `❯ message …` straight into `▼ subagents`): the band
+    // closes with the rule reserved above plus an inputBg pad row when a
+    // row remains (the pad is the InputBar's bottom padding and stays
+    // OPTIONAL — behind the rule, per the law).
+    let spare = area.height.saturating_sub(
+        chrome + gap + transcript_min + subtree_height + input_height + band_rule_h,
+    );
     let band_pad = u16::from(spare > 0 && input_rule_h > 0);
     let [
         header_area,
@@ -1915,22 +1955,28 @@ fn render_aura(
     let composer_want = composer_height(model, area.width).max(1);
     let over =
         |bar: u16, rules: u16, extras: u16| area.height.saturating_sub(bar + rules + extras) < 1;
+    // TUI6.1 fix 2 (review r1: aura 90×10 kept orb/columns while the
+    // closing rule shed): the rule row (the gap, TUI5's net-zero trick)
+    // outranks the OPTIONAL columns and orb per `band_rule_reserve`'s
+    // law, and yields to the transcript's sacred row (session parity) —
+    // shed order is now columns → orb → closing rule → transcript row →
+    // rules → bar.
     if over(
         bar_h,
         bar_rule_h + input_rule_h,
         gap + columns_h + orb_h + transcript_min,
     ) {
-        gap = 0;
+        columns_h = 0;
     }
     if over(
         bar_h,
         bar_rule_h + input_rule_h,
-        columns_h + orb_h + transcript_min,
+        gap + orb_h + transcript_min,
     ) {
-        columns_h = 0;
-    }
-    if over(bar_h, bar_rule_h + input_rule_h, orb_h + transcript_min) {
         orb_h = 0;
+    }
+    if over(bar_h, bar_rule_h + input_rule_h, gap + transcript_min) {
+        gap = 0;
     }
     if over(bar_h, bar_rule_h + input_rule_h, transcript_min) {
         transcript_min = 0;
@@ -1942,6 +1988,15 @@ fn render_aura(
     if over(bar_h, 0, 0) {
         bar_h = 0;
     }
+    debug_assert_eq!(
+        u16::from(gap > 0),
+        band_rule_reserve(
+            area.height,
+            bar_h + bar_rule_h + input_rule_h + columns_h + orb_h + transcript_min + 1,
+            input_rule_h,
+        ),
+        "the aura ladder implements band_rule_reserve exactly"
+    );
     let composer_h = composer_want
         .min(area.height.saturating_sub(
             bar_h + bar_rule_h + input_rule_h + gap + columns_h + orb_h + transcript_min,
@@ -2356,7 +2411,24 @@ fn menu_glyph(menu: &haider_protocol::menu::Menu) -> &'static str {
 /// row — not just the cursor row — so wrap points depend on the width
 /// alone: moving the caret can never move a wrap point (item 5's
 /// derive-from-width law).
-fn composer_text_budget(width: u16) -> usize {
+/// TUI6.1 fix 2 — the closing-rule reservation law (review r1 finding 2),
+/// stated ONCE and applied by EVERY surface ledger: the band's lower rule
+/// is RESERVED whenever the rows that outrank it — the surface's
+/// surviving chrome, the top input rule, the sacred input floor, and the
+/// transcript's sacred row where the surface has one — still leave it a
+/// row (`area_h > outranking`). The rule outranks every OPTIONAL row:
+/// panels (palette, ⧗ queue, SubTree, todos, the waiting line), the band
+/// pad, breathing rows, the launcher's content column and aura's
+/// orb/columns. It sheds only when the top-rule + input + lower-rule
+/// triple itself cannot fit (and dies with the top rule, `top_rule_h`).
+/// The reviewer's five failing frames — launcher 90×4, session+chip
+/// 90×11, session menu 90×10, subagent 90×11 / question 90×14, aura
+/// 90×10 — are the height-sweep pins in `tui6_softwrap_tests`.
+fn band_rule_reserve(area_h: u16, outranking: u16, top_rule_h: u16) -> u16 {
+    u16::from(top_rule_h > 0 && area_h > outranking)
+}
+
+pub(crate) fn composer_text_budget(width: u16) -> usize {
     (width as usize).saturating_sub(COMPOSER_PAD + 2 + 1).max(1)
 }
 
@@ -2461,6 +2533,7 @@ fn render_composer(
                 content: window.content,
                 surface: model.surface_key(),
                 revision: model.composer.revision(),
+                epoch: model.geometry_epoch.get(),
             },
         ));
     }
@@ -2747,6 +2820,7 @@ fn composer_row_spans<'s>(
     theme: &Theme,
 ) {
     use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
     let visible = &text[row.start..row.end];
     let mut run = String::new();
     let mut run_style = theme.bright_style();
@@ -2763,6 +2837,17 @@ fn composer_row_spans<'s>(
             spans.push(Span::styled(std::mem::take(&mut run), run_style));
         }
         run_style = style;
+        // TUI6.1 fix 3: a ZERO-WIDTH cluster (a combining mark or ZWJ
+        // standing alone at a line start, reachable by paste) gets a
+        // SPACE BASE — one real cell, the terminal convention for a bare
+        // mark. This is the render half of `composer::cluster_cells`'s
+        // one-cell price: wrap, click and navigation already charge the
+        // cluster one cell, so painting it at zero cells hid the caret
+        // and skewed every column right of it by one (review r1
+        // finding 3).
+        if grapheme.width() == 0 {
+            run.push(' ');
+        }
         run.push_str(grapheme);
     }
     if !run.is_empty() {

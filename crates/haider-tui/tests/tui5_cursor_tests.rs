@@ -753,7 +753,14 @@ fn stale_composer_hit_is_dropped_not_misapplied() {
     // defense-in-depth guard.)
     let surface = model.surface_key();
     let revision = model.composer.revision();
-    model.composer_press(50, "stale content", 3, surface, revision);
+    model.composer_press(
+        50,
+        "stale content",
+        3,
+        surface,
+        revision,
+        model.geometry_epoch.get(),
+    );
     assert_eq!(model.composer.cursor(), 2, "cursor untouched");
     assert!(!model.composer_drag, "no drag armed from a dropped press");
 }
@@ -1253,11 +1260,25 @@ fn stale_hit_with_old_content_never_moves_the_caret() {
     model.composer.set_text("fresh text");
     assert_ne!(model.composer.revision(), stale_revision);
     assert_eq!(model.composer.cursor(), 10);
-    model.composer_press(0, "stale text", 3, surface, stale_revision);
+    model.composer_press(
+        0,
+        "stale text",
+        3,
+        surface,
+        stale_revision,
+        model.geometry_epoch.get(),
+    );
     assert_eq!(model.composer.cursor(), 10, "stale press dropped whole");
     assert!(!model.composer_drag, "no drag armed from a stale press");
     // The same press wearing the CURRENT revision lands.
-    model.composer_press(0, "fresh text", 3, surface, model.composer.revision());
+    model.composer_press(
+        0,
+        "fresh text",
+        3,
+        surface,
+        model.composer.revision(),
+        model.geometry_epoch.get(),
+    );
     assert_eq!(model.composer.cursor(), 3);
     assert!(model.composer_drag);
     model.composer_release();
@@ -1278,6 +1299,7 @@ fn held_drag_dies_with_the_surface_it_started_on() {
         2,
         model.surface_key(),
         model.composer.revision(),
+        model.geometry_epoch.get(),
     );
     assert!(model.composer_drag, "armed on the session surface");
     model.back_to_launcher();

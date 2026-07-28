@@ -431,6 +431,289 @@ fn every_composer_surface_soft_wraps() {
     // suite; the subagent band is covered by the item-6 sweep below.
 }
 
+// ---- TUI6.1 fix 3: the zero-width cluster costs one cell EVERYWHERE ----
+
+#[test]
+fn zero_width_leading_cluster_gets_one_cell_everywhere() {
+    // Review r1 finding 3 (P2): draft "\u{301}a" (a combining acute
+    // standing alone at the buffer start — reachable through paste) with
+    // the caret at byte 0 painted NO caret cell (the cursor-styled
+    // cluster occupied zero cells) while click mapping charged it one
+    // invented cell, skewing the visible 'a'. The one policy
+    // (composer::cluster_cells): the cluster costs ONE cell everywhere,
+    // and the renderer gives it a space base.
+    //
+    // MUTATION CHECK (zero-width-cell render): drop the space-base
+    // `run.push(' ')` from composer_row_spans and the caret-cell
+    // assertion fails (no gold cell at the cluster's column). Verified
+    // by revert.
+    let mut model = session_model();
+    model.handle(AppEvent::Paste("\u{301}a".to_owned()));
+    model.handle(key(KeyCode::Home));
+    assert_eq!(model.composer.cursor(), 0);
+    let theme = model.theme.theme();
+    let (_, hits, terminal) = draw(&model, 90, 34);
+    // Anchor on the composer's OWN row via its hit window (the transcript
+    // also draws ❯ prompt rows above the band).
+    let windows = composer_windows(&hits);
+    let rect = windows[0].0;
+    let buffer = terminal.backend().buffer();
+    // The caret is PAINTED: one real cell, gold ground, at the band's
+    // first content column.
+    assert_eq!(
+        buffer[(rect.x, rect.y)].bg,
+        Color::from(theme.gold),
+        "caret cell painted on the zero-width cluster"
+    );
+    assert_eq!(
+        buffer[(rect.x + 1, rect.y)].symbol(),
+        "a",
+        "the 'a' sits one cell right"
+    );
+    dispatch_input(
+        &mut model,
+        &hits,
+        mouse(MouseEventKind::Down(MouseButton::Left), rect.x + 1, rect.y),
+    );
+    assert_eq!(
+        model.composer.cursor(),
+        "\u{301}".len(),
+        "clicking the 'a' cell lands AFTER the one-cell cluster"
+    );
+    dispatch_input(
+        &mut model,
+        &hits,
+        mouse(MouseEventKind::Up(MouseButton::Left), rect.x + 1, rect.y),
+    );
+    let (_, hits, _) = draw(&model, 90, 34);
+    let rect = composer_windows(&hits)[0].0;
+    dispatch_input(
+        &mut model,
+        &hits,
+        mouse(MouseEventKind::Down(MouseButton::Left), rect.x, rect.y),
+    );
+    assert_eq!(
+        model.composer.cursor(),
+        0,
+        "clicking the cluster cell lands at 0"
+    );
+    dispatch_input(
+        &mut model,
+        &hits,
+        mouse(MouseEventKind::Up(MouseButton::Left), rect.x, rect.y),
+    );
+}
+
+#[test]
+fn cluster_families_price_and_wrap_consistently() {
+    // The reviewer's unexercised families (decomposed marks, flags, skin
+    // tones, standalone marks after a newline), headless over wrapped
+    // rows, all priced through the ONE policy.
+    //
+    // MUTATION CHECK (one-price law): drop the `.max(1)` from
+    // `cluster_cells` and the standalone-mark wrap pin fails (the wrap
+    // walk would charge the mark zero cells while click mapping charges
+    // one — the exact disagreement of review r1 finding 3). Verified by
+    // revert.
+    use haider_tui::composer::{byte_at_col, cluster_cells, cluster_cols, visual_row_of};
+    use unicode_segmentation::UnicodeSegmentation;
+    assert_eq!(cluster_cells("\u{301}"), 1, "standalone mark: one cell");
+    assert_eq!(cluster_cells("e\u{301}"), 1, "decomposed é: one cell");
+    assert_eq!(cluster_cells("\u{1F1E6}\u{1F1E7}"), 2, "flag pair");
+    assert_eq!(cluster_cells("👍\u{1F3FD}"), 2, "skin-tone thumbs-up");
+    // The standalone-mark wrap pin: budget 3 packs mark+a+b on row 0.
+    let text = "\u{301}abcde";
+    let rows = wrap_rows(text, 3);
+    assert_eq!(
+        rows[0].end, 4,
+        "row 0 = mark(1 cell) + ab, ending at byte 4"
+    );
+    // byte_at_col agrees with the wrap pricing on the same content.
+    assert_eq!(byte_at_col(&text[rows[0].start..rows[0].end], 0), 0);
+    assert_eq!(byte_at_col(&text[rows[0].start..rows[0].end], 1), 2);
+    // Families over wrapped rows: partition + boundary law at every
+    // budget, standalone marks after newlines included.
+    for text in [
+        format!("{}tail", "e\u{301}".repeat(20)),
+        format!("{}x", "\u{1F1E6}\u{1F1E7}".repeat(12)),
+        format!("{}y", "👍\u{1F3FD}".repeat(12)),
+        format!("head\n\u{301}{}", "e\u{301}".repeat(15)),
+    ] {
+        for budget in 2..12 {
+            let rows = wrap_rows(&text, budget);
+            for row in &rows {
+                assert!(
+                    text.grapheme_indices(true).any(|(i, _)| i == row.start)
+                        || row.start == text.len(),
+                    "mid-cluster row start {} in {text:?} at budget {budget}",
+                    row.start
+                );
+                assert!(
+                    cluster_cols(&text[row.start..row.end]) <= budget.max(2),
+                    "row over budget at {budget}"
+                );
+            }
+            // Sticky navigation lands on cluster boundaries at this
+            // budget too.
+            let mut c = Composer::new();
+            c.set_wrap_budget(budget);
+            c.insert_str(&text);
+            let rows_now = c.visual_rows();
+            let last = visual_row_of(&rows_now, c.cursor());
+            if last > 0 {
+                assert!(c.line_up(false));
+                assert!(
+                    text.grapheme_indices(true).any(|(i, _)| i == c.cursor())
+                        || c.cursor() == text.len(),
+                    "↑ landed mid-cluster at budget {budget}"
+                );
+            }
+        }
+    }
+}
+
+// ---- TUI6.1 fix 1: resize can never serve the previous frame's layout ----
+
+#[test]
+fn resize_reflows_navigation_before_any_queued_key() {
+    // Review r1 finding 1 (P1), the reviewer's exact repro: render at 20
+    // cols (budget 15) with the caret at byte 4, dispatch a resize to 10
+    // cols, then a Down that RACES the redraw. Pre-fix the Down walked
+    // the 15-cell rows and landed at byte 19; the law lands it at byte 9
+    // (10-col geometry, budget 5). Reflow-before-input: the dispatch
+    // seam applies the new width's budget on the Resize event itself.
+    //
+    // MUTATION CHECK (reflow-before-input): delete the
+    // `set_wrap_budget(composer_text_budget(cols))` line from
+    // dispatch_input's Resize arm and this fails with cursor 19.
+    // Verified by revert.
+    let mut model = session_model();
+    for c in "abcdefghijklmnopqrst".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    let (_, hits, _) = draw(&model, 20, 30);
+    model.handle(key(KeyCode::Home));
+    for _ in 0..4 {
+        model.handle(key(KeyCode::Right));
+    }
+    assert_eq!(model.composer.cursor(), 4);
+    dispatch_input(&mut model, &hits, Event::Resize(10, 30));
+    // The Down is queued BEFORE any redraw at the new size.
+    dispatch_input(
+        &mut model,
+        &hits,
+        Event::Key(ratatui::crossterm::event::KeyEvent::new(
+            KeyCode::Down,
+            KeyModifiers::NONE,
+        )),
+    );
+    assert_eq!(
+        model.composer.cursor(),
+        9,
+        "Down after resize walks the CURRENT width's rows (budget 5), \
+         never the stale 20-col geometry (which lands 19)"
+    );
+}
+
+#[test]
+fn resize_retires_the_previous_frames_composer_hits() {
+    // Review r1 finding 1 (P1), click half: resize bumps no text
+    // revision, so the TUI5 stale-hit guard ACCEPTED clicks stamped by
+    // pre-resize frames and mapped them through the old wrap windows.
+    // The geometry epoch retires them whole: a stale click moves
+    // nothing; the next frame's map works.
+    //
+    // MUTATION CHECK (geometry-epoch gate): drop the
+    // `epoch != self.geometry_epoch.get()` clause from composer_press
+    // (and composer_byte_at) and this fails — the stale click lands at
+    // byte 89. Verified by revert.
+    let mut model = session_model();
+    for _ in 0..200 {
+        model.handle(key(KeyCode::Char('x')));
+    }
+    let (_, stale_hits, _) = draw(&model, 90, 34);
+    let stale = composer_windows(&stale_hits);
+    let (stale_rect, _, _) = stale[1];
+    let before = model.composer.cursor();
+    dispatch_input(&mut model, &stale_hits, Event::Resize(60, 34));
+    // The old frame's second-row click races the redraw: DROPPED whole.
+    dispatch_input(
+        &mut model,
+        &stale_hits,
+        mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            stale_rect.x + 4,
+            stale_rect.y,
+        ),
+    );
+    assert_eq!(
+        model.composer.cursor(),
+        before,
+        "a click stamped by pre-resize geometry never places a caret"
+    );
+    assert!(!model.composer_drag, "and never arms a drag");
+    // A drag armed BEFORE the resize maps through nothing after it.
+    let (_, hits, _) = draw(&model, 90, 34);
+    let rows = composer_windows(&hits);
+    dispatch_input(
+        &mut model,
+        &hits,
+        mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            rows[1].0.x + 4,
+            rows[1].0.y,
+        ),
+    );
+    assert_eq!(model.composer.cursor(), 89, "fresh press lands");
+    dispatch_input(&mut model, &hits, Event::Resize(60, 34));
+    dispatch_input(
+        &mut model,
+        &hits,
+        mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            rows[0].0.x + 2,
+            rows[0].0.y,
+        ),
+    );
+    assert_eq!(
+        model.composer.cursor(),
+        89,
+        "a drag across a resize maps through NO stale row — the caret stays"
+    );
+    dispatch_input(
+        &mut model,
+        &hits,
+        mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            rows[0].0.x + 2,
+            rows[0].0.y,
+        ),
+    );
+    // After a REDRAW at the new size, the fresh map works end to end.
+    let (_, hits, _) = draw(&model, 60, 34);
+    let rows = composer_windows(&hits);
+    assert_eq!(rows[1].1, 55, "60-col wrap point (budget 55)");
+    dispatch_input(
+        &mut model,
+        &hits,
+        mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            rows[1].0.x + 4,
+            rows[1].0.y,
+        ),
+    );
+    assert_eq!(model.composer.cursor(), 59, "post-redraw click lands");
+    dispatch_input(
+        &mut model,
+        &hits,
+        mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            rows[1].0.x + 4,
+            rows[1].0.y,
+        ),
+    );
+}
+
 // ---- Item 6: the band-anatomy sweep — two rules on EVERY input band ----
 
 /// A screen row that reads as a horizontal rule.
@@ -694,6 +977,241 @@ fn closing_rule_outranks_breathing_rows_under_pressure() {
             &rows[band_y..=subtree_y]
         );
     }
+}
+
+// ---- TUI6.1 fix 2: the reserved closing rule, height-swept ----
+
+/// The sweep law (review r1 finding 2), one assertion for every surface:
+/// at ANY height, if `optional` content renders, BOTH band rules render —
+/// an optional row must never outlive the closing rule. `band` finds the
+/// input band's row; heights where the band itself is shed are skipped
+/// (nothing to close).
+fn sweep_two_rules(
+    model: &AppModel,
+    width: u16,
+    band_top: &str,
+    band_bottom: &str,
+    optional: &[&str],
+    surface: &str,
+) {
+    for height in 1..=16 {
+        let (rows, _, _) = draw(model, width, height);
+        let optional_shown = optional
+            .iter()
+            .any(|needle| rows.iter().any(|row| row.contains(needle)));
+        if !optional_shown {
+            continue;
+        }
+        let Some(top) = rows.iter().position(|row| row.contains(band_top)) else {
+            continue;
+        };
+        let bottom = rows
+            .iter()
+            .rposition(|row| row.contains(band_bottom))
+            .unwrap_or(top)
+            .max(top);
+        assert!(
+            top > 0 && is_rule(&rows[top - 1]),
+            "{surface} at {width}x{height}: optional content renders but the \
+             TOP rule is missing: {rows:?}"
+        );
+        assert!(
+            (1..=3).any(|d| bottom + d < rows.len() && is_rule(&rows[bottom + d])),
+            "{surface} at {width}x{height}: optional content renders but the \
+             CLOSING rule is missing: {rows:?}"
+        );
+    }
+}
+
+#[test]
+fn reserved_rule_sweeps_launcher() {
+    // MUTATION CHECK (band-rule-reserve law): make `band_rule_reserve`
+    // return 0 and every surface breaks at once — this sweep's 90×4 pin,
+    // the session/subagent/aura pins below, and the launcher/aura
+    // ladders' debug_asserts (all five ledgers route through the ONE law
+    // function). Verified by revert.
+    let model = launcher_model();
+    sweep_two_rules(
+        &model,
+        90,
+        "start a session",
+        "start a session",
+        &["recent sessions"],
+        "launcher",
+    );
+    // Reviewer point pin — launcher 90×4: the OPTIONAL content column
+    // yields and the triple (top rule · composer · closing rule) renders.
+    let (rows, _, _) = draw(&model, 90, 4);
+    assert_two_rules(&rows, "start a session", "start a session", "launcher@90x4");
+    assert!(
+        !rows.iter().any(|row| row.contains("recent sessions")),
+        "the content column yielded to the closing rule at 90×4"
+    );
+}
+
+#[test]
+fn reserved_rule_sweeps_session_with_chip() {
+    let mut model = session_model();
+    model.chips = vec![ChipModel::from_seed(ChipSeed {
+        agent: "t1-docs".to_owned(),
+        parent: None,
+        ros: None,
+        callsign: "Husayn".to_owned(),
+        hon: "(r)",
+        full: "Husayn ibn Ali".to_owned(),
+        name: "docs".to_owned(),
+        model: "fable-5".to_owned(),
+        device: "macbook".to_owned(),
+        state: ChipDisplayState::Running,
+        tokens: 100,
+        prefill: Vec::new(),
+    })];
+    sweep_two_rules(
+        &model,
+        90,
+        "message haider",
+        "message haider",
+        &["subagents", "✳ Waiting"],
+        "session+chip",
+    );
+    // Reviewer point pin — session with chip 90×11: the SubTree must not
+    // outbid the closing rule.
+    let (rows, _, _) = draw(&model, 90, 11);
+    assert_two_rules(
+        &rows,
+        "message haider",
+        "message haider",
+        "session+chip@90x11",
+    );
+}
+
+#[test]
+fn reserved_rule_holds_on_the_session_menu() {
+    // Reviewer point pin — session menu 90×10: a blank spacer row
+    // survived where the closing rule fit; the reserve now takes the gap
+    // row itself when the budget is dry.
+    let mut model = AppModel::new();
+    for payload in demo_script() {
+        if matches!(payload, EventPayload::MenuAnswered(_)) {
+            break;
+        }
+        model.handle(AppEvent::Envelope(Box::new(payload)));
+    }
+    assert!(model.projection.open_menu().is_some(), "demo menu open");
+    // Band bottom = the LAST OPTION row ("2. Deny") — the footer hint is
+    // the card's first shed under pressure, and the options are the
+    // sacred floor the rule must close beneath.
+    let (rows, _, _) = draw(&model, 90, 10);
+    assert_two_rules(&rows, "Allow fs_patch", "2. Deny", "session-menu@90x10");
+    // And across 8..=16 the same law holds wherever ANY row exists
+    // between the last option and the status row — a lower row (pad,
+    // gap, panel) must never outlive the closing rule. At the
+    // exactly-full heights (e.g. 90×8: header + rules + the transcript's
+    // sacred row + both options fill the frame to the brim) there is
+    // nothing below the options and no rule is owed: the transcript's
+    // sacred row OUTRANKS the closing rule (session parity), so the
+    // triple no longer physically fits — the law's own shed case.
+    for height in 8..=16 {
+        let (rows, _, _) = draw(&model, 90, height);
+        let Some(last_option) = rows.iter().rposition(|row| row.contains("2. Deny")) else {
+            continue;
+        };
+        if last_option + 2 >= rows.len() {
+            continue; // nothing between the options and the status row
+        }
+        assert!(
+            (1..=3).any(|d| last_option + d < rows.len() && is_rule(&rows[last_option + d])),
+            "menu band closes at 90×{height}: {rows:?}"
+        );
+    }
+}
+
+#[test]
+fn reserved_rule_sweeps_subagent_and_question_card() {
+    let model = subagent_model();
+    sweep_two_rules(
+        &model,
+        90,
+        "message Husayn",
+        "message Husayn",
+        &["subagents"],
+        "subagent",
+    );
+    // Reviewer point pin — subagent composer 90×11.
+    let (rows, _, _) = draw(&model, 90, 11);
+    assert_two_rules(&rows, "message Husayn", "message Husayn", "subagent@90x11");
+    // Question-card form, reviewer point pin — 90×14.
+    let mut model = subagent_model();
+    let text = "Run the suite against testcontainers or mocks?";
+    let options = ["testcontainers", "mocks"];
+    model.chips[0].state = ChipDisplayState::InputRequired;
+    model.chips[0].question = Some(ChipQuestion {
+        recovery: false,
+        text: text.to_owned(),
+        options: options.iter().map(|o| (*o).to_owned()).collect(),
+        resolved: false,
+    });
+    model.chips[0]
+        .transcript
+        .apply(&EventPayload::MenuOpened(haider_protocol::menu::Menu {
+            id: haider_protocol::ids::MenuId::new("t1-docs-q"),
+            kind: haider_protocol::menu::MenuKind::Choice,
+            title: text.to_owned(),
+            body: vec![],
+            options: options
+                .iter()
+                .enumerate()
+                .map(|(index, label)| haider_protocol::menu::MenuOption {
+                    key: format!("o{index}"),
+                    label: (*label).to_owned(),
+                    detail: None,
+                    decision: None,
+                })
+                .collect(),
+            blocking: false,
+            scope: haider_protocol::menu::MenuScope::Subagent {
+                agent: haider_protocol::ids::AgentId::new("t1-docs"),
+            },
+            origin: "subagent".to_owned(),
+            ttl_ms: None,
+            timeout_option: None,
+        }));
+    // Band top = the card TITLE (the warn rule sits above it); band
+    // bottom = the last OPTION row (the footer is the card's first shed).
+    sweep_two_rules(
+        &model,
+        90,
+        "Run the suite against",
+        "2. mocks",
+        &["subagents"],
+        "subagent-question",
+    );
+    // Bottom anchor = the last OPTION ("2. mocks") — the footer hint is
+    // the card's first shed and is already gone at this height.
+    let (rows, _, _) = draw(&model, 90, 14);
+    assert_two_rules(&rows, "Run the suite against", "2. mocks", "question@90x14");
+}
+
+#[test]
+fn reserved_rule_sweeps_aura() {
+    let mut model = launcher_model();
+    for c in "/aura".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Enter));
+    assert_eq!(model.screen, Screen::Aura);
+    sweep_two_rules(
+        &model,
+        90,
+        "speak or type",
+        "speak or type",
+        &["hold to talk", "controlled sessions"],
+        "aura",
+    );
+    // Reviewer point pin — aura 90×10: orb/columns must not outbid the
+    // closing rule.
+    let (rows, _, _) = draw(&model, 90, 10);
+    assert_two_rules(&rows, "speak or type", "speak or type", "aura@90x10");
 }
 
 // ---- Item 7: the thinner header mark ----

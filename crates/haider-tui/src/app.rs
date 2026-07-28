@@ -1096,11 +1096,20 @@ pub enum Hit {
     /// mismatch. One authority, no per-callsite length heuristics: a
     /// stale frame's hit can never move the caret into fresh text or
     /// another surface's draft.
+    ///
+    /// TUI6.1 fix 1: it also carries the GEOMETRY EPOCH the frame was
+    /// drawn at ([`AppModel::geometry_epoch`]) — a resize between the
+    /// frame and the click re-lays the band (wrap points AND row
+    /// positions), which the text revision cannot see (resize mutates no
+    /// text, so the TUI5 guard ACCEPTED pre-resize hits). Press and drag
+    /// validate the epoch exactly like the revision: a hit from stale
+    /// geometry is dropped whole, never remapped.
     ComposerText {
         start: usize,
         content: String,
         surface: DraftKey,
         revision: u64,
+        epoch: u64,
     },
 }
 
@@ -1323,6 +1332,15 @@ pub struct AppModel {
     /// (reconcile-then-apply, review r5 P2-2). Starts at 0 (review r2
     /// P2-6).
     pub scroll_max: std::cell::Cell<u16>,
+    /// The frame-geometry epoch (TUI6.1 fix 1). Bumped by every RESIZE
+    /// (the reducer's only involvement — it versions the frame, it learns
+    /// nothing about wrapping) and by every RENDER (`Cell`: the renderer
+    /// holds `&AppModel`, the `scroll_max` discipline). Composer hits are
+    /// stamped with the epoch of the frame that drew them and press/drag
+    /// validate it, so consuming a layout that a resize (or a newer
+    /// frame) has replaced is unrepresentable — the geometry twin of the
+    /// text-revision guard.
+    pub geometry_epoch: std::cell::Cell<u64>,
     /// The sticky origin line is suppressed after a sticky jump until the
     /// next REAL wheel event (sim jumpToSticky, tui.js:2637-2657: the bar
     /// must never cover the row it just revealed).
@@ -1415,6 +1433,7 @@ impl Default for AppModel {
             turn_active: false,
             scroll_back: std::cell::Cell::new(0),
             scroll_max: std::cell::Cell::new(0),
+            geometry_epoch: std::cell::Cell::new(0),
             sticky_suppressed: false,
             hovered: None,
             selection: None,
@@ -1836,8 +1855,15 @@ impl AppModel {
         col: usize,
         surface: DraftKey,
         revision: u64,
+        epoch: u64,
     ) {
-        if surface != self.surface_key() || revision != self.composer.revision() {
+        // TUI6.1 fix 1: the epoch gate joins the surface/revision gates —
+        // a hit stamped before a resize (or an older frame) is stale
+        // GEOMETRY even when the text never changed.
+        if surface != self.surface_key()
+            || revision != self.composer.revision()
+            || epoch != self.geometry_epoch.get()
+        {
             return;
         }
         // Defense in depth (the revision check subsumes this, but a
@@ -3838,7 +3864,19 @@ impl AppModel {
     /// Terminal resize: force a redraw. The frame itself reconciles the
     /// scroll offset against the new true range (review r3 P2-2 — render
     /// is the single scroll authority, so no resize-ordering bug exists).
+    ///
+    /// TUI6.1 fix 1: it also advances the GEOMETRY EPOCH, killing every
+    /// composer hit stamped by pre-resize frames — a queued click can win
+    /// the event race against the redraw, and resize bumps no text
+    /// revision, so the TUI5 guard alone accepted stale-layout clicks
+    /// (review r1 finding 1). The wrap-budget half of the same fix lives
+    /// at the dispatch seam (`runtime::dispatch_input`), which reflows
+    /// the composer's budget from the new width BEFORE any queued key can
+    /// navigate the old geometry — the reducer itself stays
+    /// wrap-ignorant.
     pub fn handle_resize(&mut self) {
+        self.geometry_epoch
+            .set(self.geometry_epoch.get().wrapping_add(1));
         self.dirty = true;
     }
 

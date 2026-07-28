@@ -455,7 +455,7 @@ impl Composer {
         }
         let target = *self
             .sticky_col
-            .get_or_insert_with(|| self.text[rows[at].start..self.cursor].width());
+            .get_or_insert_with(|| cluster_cols(&self.text[rows[at].start..self.cursor]));
         self.cursor = seek_col_in_row(&self.text, rows[at - 1], target);
         true
     }
@@ -490,7 +490,7 @@ impl Composer {
         }
         let target = *self
             .sticky_col
-            .get_or_insert_with(|| self.text[rows[at].start..self.cursor].width());
+            .get_or_insert_with(|| cluster_cols(&self.text[rows[at].start..self.cursor]));
         self.cursor = seek_col_in_row(&self.text, rows[at + 1], target);
         true
     }
@@ -685,6 +685,29 @@ pub struct WrapRow {
     pub line_last: bool,
 }
 
+/// THE cluster width policy (TUI6.1 fix 3, review r1 finding 3): a
+/// grapheme cluster costs its display width, and a ZERO-WIDTH cluster —
+/// a combining mark or ZWJ standing alone at a line start, reachable by
+/// paste — costs ONE real cell (the renderer gives it a space base, the
+/// way terminals conventionally present a bare combining mark). Every
+/// consumer of composer geometry MUST price clusters through this one
+/// function: `wrap_rows`, `seek_col`, the sticky-column math, click
+/// mapping ([`byte_at_col`]) and the renderer's span builder — render,
+/// click and navigation can then never disagree about which cell a byte
+/// lives in.
+#[must_use]
+pub fn cluster_cells(grapheme: &str) -> usize {
+    grapheme.width().max(1)
+}
+
+/// Display cells of a whole slice under the SAME policy — grapheme-wise,
+/// never `str::width` (which prices a standalone zero-width cluster at 0
+/// and would skew every column right of it by one).
+#[must_use]
+pub fn cluster_cols(text: &str) -> usize {
+    text.graphemes(true).map(cluster_cells).sum()
+}
+
 /// Wrap `text` into visual rows of at most `budget` display cells,
 /// breaking ONLY at grapheme boundaries — the `nearest_boundary`/
 /// `after_edit` discipline extended to wrap points (a wrap point and a
@@ -702,7 +725,7 @@ pub fn wrap_rows(text: &str, budget: usize) -> Vec<WrapRow> {
     let mut rows = Vec::new();
     let mut line_offset = 0;
     for line in text.split('\n') {
-        if budget == 0 || line.width() <= budget {
+        if budget == 0 || cluster_cols(line) <= budget {
             rows.push(WrapRow {
                 start: line_offset,
                 end: line_offset + line.len(),
@@ -712,7 +735,7 @@ pub fn wrap_rows(text: &str, budget: usize) -> Vec<WrapRow> {
             let mut row_start = 0;
             let mut col = 0;
             for (offset, grapheme) in line.grapheme_indices(true) {
-                let width = grapheme.width();
+                let width = cluster_cells(grapheme);
                 if offset > row_start && col + width > budget {
                     rows.push(WrapRow {
                         start: line_offset + row_start,
@@ -779,7 +802,7 @@ pub fn line_end(text: &str, at: usize) -> usize {
 fn seek_col(text: &str, start: usize, end: usize, target: usize) -> usize {
     let mut col = 0;
     for (offset, g) in text[start..end].grapheme_indices(true) {
-        let w = g.width();
+        let w = cluster_cells(g);
         if col + w > target {
             return start + offset;
         }
@@ -798,7 +821,7 @@ fn seek_col(text: &str, start: usize, end: usize, target: usize) -> usize {
 pub fn byte_at_col(content: &str, col: usize) -> usize {
     let mut acc = 0;
     for (offset, grapheme) in content.grapheme_indices(true) {
-        let w = grapheme.width().max(1);
+        let w = cluster_cells(grapheme);
         if acc + w > col {
             if col - acc >= w.div_ceil(2).max(1) {
                 return offset + grapheme.len();

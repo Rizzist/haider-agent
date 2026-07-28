@@ -284,18 +284,27 @@ fn queue_panel_renders_between_todos_and_composer_with_the_verbatim_header() {
 
 #[test]
 fn queue_panel_joins_the_sacred_ledger_at_90x10() {
-    // Ledger at 90×10 (status 1 + header 2 + rule 1 + transcript 1 +
-    // input rule 1 + composer 1 + gap 1): the leftover budget is 2 rows —
-    // a 1-message panel (2 rows) fits; a 2-message panel (3 rows) SHEDS
-    // whole, before the composer or the transcript's sacred row yields.
+    // Ledger at 90×11 (status 1 + header 2 + rule 1 + transcript 1 +
+    // input rule 1 + composer 1 + gap 1 + the RESERVED closing rule): the
+    // leftover budget is 2 rows — a 1-message panel (2 rows) fits; a
+    // 2-message panel (3 rows) SHEDS whole, before the composer or the
+    // transcript's sacred row yields.
+    //
+    // Directed (TUI6.1 fix 2, review r1 finding 2): this pin sat at
+    // 90×10 when the ⧗ panel could outbid the band's closing rule. The
+    // reservation law ranks the rule ahead of EVERY optional panel — the
+    // queue included — so at 90×10 the rule takes the first budget row
+    // and the 2-row panel no longer fits; the fits-case moves up exactly
+    // one row. The panel's own law (sheds WHOLE, never the composer) is
+    // unchanged and re-asserted at both heights.
     let mut model = session_model();
     model.turn_active = true;
     model.queue_mode = true;
     submit(&mut model, "only queued line");
-    let rows = draw(&model, 90, 10);
+    let rows = draw(&model, 90, 11);
     assert!(
         rows.iter().any(|row| row.contains("⧗ queued — 1 message")),
-        "a 1-message panel fits the 90×10 budget"
+        "a 1-message panel fits the 90×11 budget (post-rule reserve)"
     );
     assert!(
         // Directed (TUI5 item 1): the empty composer's appended ▮ became a styled
@@ -303,8 +312,17 @@ fn queue_panel_joins_the_sacred_ledger_at_90x10() {
         rows.iter().any(|row| row.contains("❯  ")),
         "composer intact"
     );
+    let rows_ten = draw(&model, 90, 10);
+    assert!(
+        !rows_ten.iter().any(|row| row.contains("⧗ queued")),
+        "at 90×10 the RESERVED closing rule outbids the panel (TUI6.1)"
+    );
+    assert!(
+        rows_ten.iter().any(|row| row.contains("❯  ")),
+        "composer intact at 90×10 too"
+    );
     submit(&mut model, "second line");
-    let rows = draw(&model, 90, 10);
+    let rows = draw(&model, 90, 11);
     assert!(
         !rows.iter().any(|row| row.contains("⧗ queued")),
         "over budget the panel sheds WHOLE — never the composer"
@@ -331,7 +349,9 @@ fn queue_panel_joins_the_sacred_ledger_at_90x10() {
             },
         },
     ));
-    let rows = draw(&model, 90, 10);
+    // (90×11 for the same one-row shift: the reserved closing rule holds
+    // the first budget row at 90×10 — TUI6.1 fix 2.)
+    let rows = draw(&model, 90, 11);
     assert!(
         rows.iter().any(|row| row.contains("⧗ queued — 1 message")),
         "the queue panel outranks the todos"
