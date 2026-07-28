@@ -106,7 +106,7 @@ async fn pump_quiet(
 
 fn answer_menu(model: &mut AppModel, menu: &str, index: u32) {
     model.outbox.push(haider_tui::app::OutboundAnswer {
-        origin: model.session_identity(),
+        origin: model.ui_generation(),
         answer: MenuAnswer {
             menu: haider_protocol::ids::MenuId::new(menu),
             option_key: None,
@@ -496,7 +496,7 @@ fn stale_hits_from_another_surface_are_dropped() {
     // Aura: the launcher's own rows are inert.
     submit(&mut model, "/aura");
     model.requests.clear();
-    model.handle_hit(Hit::AttachSample("billing-service".to_owned()));
+    common::hit_session_named(&mut model, "billing-service");
     assert_eq!(model.screen, Screen::Aura, "no attach from a stale rect");
     assert!(model.requests.is_empty());
     model.handle_hit(Hit::ExtraRow(LauncherRow::Accounts));
@@ -862,9 +862,10 @@ fn launcher_liveness_and_metas_follow_the_sim_seeds() {
     assert!(row_with("⚿ Accounts").contains("provider credentials — OAuth & API keys, har"));
     assert!(row_with("⇄ Peers").contains("reachability ladder — enrolled peers · sponsored"));
     // P2-9: hits carry identity, never a mutable ordinal.
+    let l1 = common::session_named(&model, "l1-remote-projects");
     assert!(hits.iter().any(|(_, hit)| matches!(
         hit,
-        Hit::AttachSample(name) if name == "l1-remote-projects"
+        Hit::AttachSession(id) if *id == l1
     )));
     assert!(
         hits.iter()
@@ -880,15 +881,18 @@ fn an_attach_hit_follows_its_session_when_the_list_reorders() {
     // exercised against `model.sessions`.
     let mut model = launcher_model();
     model.sessions.reverse();
-    model.handle_hit(Hit::AttachSample("billing-service".to_owned()));
+    common::hit_session_named(&mut model, "billing-service");
     assert_eq!(
         model.session_name.as_deref(),
         Some("billing-service"),
         "identity, not ordinal"
     );
     let mut model = launcher_model();
+    // The hit was built from the frame that HAD the row; the row is gone by
+    // the time the click resolves.
+    let vanished = common::session_named(&model, "billing-service");
     model.sessions.clear();
-    model.handle_hit(Hit::AttachSample("billing-service".to_owned()));
+    model.handle_hit(Hit::AttachSession(vanished));
     assert_eq!(model.session_name, None, "a vanished row attaches nothing");
     assert_eq!(tree_live_count(&model.chips), 0);
 }
@@ -919,7 +923,7 @@ async fn a_stale_card_answer_cannot_reconfigure_a_replacement_session() {
     model.handle(key(KeyCode::Down));
     model.handle(key(KeyCode::Enter));
     let pending = model.outbox.remove(0);
-    assert_eq!(pending.origin, model.session_identity());
+    assert_eq!(pending.origin, model.ui_generation());
     let pending_origin = pending.origin;
     driver
         .sender()
@@ -939,14 +943,14 @@ async fn a_stale_card_answer_cannot_reconfigure_a_replacement_session() {
     submit(&mut model, "a different task entirely");
     drain(&mut driver, &mut model);
     assert_ne!(
-        model.session_identity(),
+        model.ui_generation(),
         pending_origin,
-        "a new session identity"
+        "a new surface generation"
     );
-    let epoch = model.session_identity();
+    let epoch = model.ui_generation();
     let voice_before = model.voice.clone();
     pump_quiet(&mut driver, &mut rx, &mut model, 6_000).await;
-    assert_eq!(model.session_identity(), epoch);
+    assert_eq!(model.ui_generation(), epoch);
     assert_eq!(
         model.voice, voice_before,
         "the stale answer must not reconfigure the replacement session"
@@ -1052,7 +1056,7 @@ async fn a_menu_option_hit_is_inert_once_its_surface_is_gone() {
     // so a queued click must not answer it.
     model.handle_hit(Hit::BackChip);
     assert_eq!(model.screen, Screen::Launcher);
-    let sid = model.last_detached.expect("detached id");
+    let sid = model.last_detached.clone().expect("detached id");
     let slot_menu = |m: &haider_tui::app::AppModel| {
         m.sessions
             .iter()

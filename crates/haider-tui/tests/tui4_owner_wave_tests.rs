@@ -64,7 +64,7 @@ fn attaching_a_session_replays_its_seed_and_starts_no_turn() {
     // `turn_active` / `requests` — the assertions below are not satisfiable
     // by an empty transcript either, because the seed rows must be present.
     let mut model = launcher_model();
-    model.handle_hit(Hit::AttachSample("billing-service".to_owned()));
+    common::hit_session_named(&mut model, "billing-service");
     assert_eq!(model.screen, Screen::Session);
     assert!(!model.turn_active, "attach must not start a turn");
     // TUI4c (directed): attach requests NOTHING at all — no teardown
@@ -91,7 +91,7 @@ fn attaching_a_session_replays_its_seed_and_starts_no_turn() {
     // The l1 seed owns the sim's running web-index chip; attaching it shows
     // that chip without starting a parent turn.
     let mut model = launcher_model();
-    model.handle_hit(Hit::AttachSample("l1-remote-projects".to_owned()));
+    common::hit_session_named(&mut model, "l1-remote-projects");
     assert!(!model.turn_active);
     assert_eq!(model.chips.len(), 1, "the seeded chip came with it");
     assert_eq!(model.chips[0].name, "web-index");

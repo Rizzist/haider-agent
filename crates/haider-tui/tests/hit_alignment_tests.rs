@@ -96,7 +96,10 @@ fn launcher_row_hits_align_with_their_rendered_rows() {
     let model = launcher_model();
     let (rows, hits, _) = draw(&model, 118, 34);
     for name in ["billing-service", "cellular-pool-fix", "l1-remote-projects"] {
-        let rect = rect_for(&hits, Hit::AttachSample(name.to_owned()));
+        let rect = rect_for(
+            &hits,
+            Hit::AttachSession(common::session_named(&model, name)),
+        );
         assert_eq!(rect.y, row_of(&rows, name), "sample row {name} aligned");
         assert_eq!(rect.height, 1);
     }

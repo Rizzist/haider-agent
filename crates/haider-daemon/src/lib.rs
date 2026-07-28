@@ -66,7 +66,9 @@ pub use accounts::{
 pub use config::DaemonConfig;
 pub use error::{DaemonError, IncumbentDiagnostics};
 pub use lifecycle::{DaemonState, Readiness, ShutdownDisposition, ShutdownHandle, ShutdownOutcome};
-pub use runtime::{DaemonTask, run_with_signals, spawn, spawn_with_dependencies};
+pub use runtime::{
+    DaemonTask, run_with_signals, run_with_signals_and_dependencies, spawn, spawn_with_dependencies,
+};
 pub use session_hub::{
     AdmissionTicket, FrameSendError, FrameSink, HubConnection, HubObservation, HubStoreHandle,
     SendAdmission, SessionHub, SessionHubConfig, SessionHubError, SessionHubMetrics,

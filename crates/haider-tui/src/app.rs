@@ -3,12 +3,14 @@
 //! mutates it. The reducer is pure enough to test headlessly.
 
 use crate::commands::{PALETTE_MAX_ROWS, PaletteItem, has_arg_slots, palette_items};
+use crate::identity::UiGeneration;
 use crate::mock::seed_session_states;
 use crate::projection::SessionProjection;
 use crate::sanctum::SanctumTier;
 use crate::script::{AuraState, ChipDisplayState, ChipPrefill, ChipSeed, TALK_PHRASE};
 use crate::theme::ThemeKey;
-use haider_protocol::ids::MenuId;
+use haider_protocol::envelope::RawEnvelope;
+use haider_protocol::ids::{MenuId, SessionId};
 use haider_protocol::menu::{
     AnswerVia, Menu, MenuAnswer, MenuCloseReason, MenuKind, MenuOption, MenuScope,
 };
@@ -290,6 +292,44 @@ impl ChipModel {
         }
     }
 
+    /// A chip built from a live `AgentSpawned` manifest (W3c3, report R11
+    /// cut 2). The manifest is the ONLY source: `callsign` is display-only
+    /// identity (§5.1 — never an address), `model_profile` is the model
+    /// line, and `placement` names the device. The chip starts IDLE because
+    /// `AgentChipState` is the sole chip-state authority; nothing here
+    /// guesses at a running state the stream has not reported.
+    #[must_use]
+    pub fn from_manifest(manifest: &haider_protocol::agent::AgentManifest) -> Self {
+        let callsign = manifest.callsign.clone().unwrap_or_default();
+        // The honorific/full name are roster facts, not wire fields: when a
+        // callsign is one we minted, re-derive its pair; otherwise carry the
+        // bare callsign with no honorific rather than inventing one.
+        let roster = crate::script::ROSTER
+            .iter()
+            .find(|(name, _, _)| *name == callsign);
+        let device = match &manifest.placement {
+            haider_protocol::agent::Placement::Local => "this-mac".to_owned(),
+            haider_protocol::agent::Placement::Device { device } => device.as_str().to_owned(),
+        };
+        Self {
+            agent: manifest.agent.as_str().to_owned(),
+            ros: None,
+            callsign: callsign.clone(),
+            hon: roster.map_or("", |(_, hon, _)| *hon),
+            full: roster.map_or(callsign, |(_, _, full)| (*full).to_owned()),
+            name: String::new(),
+            model: manifest.model_profile.clone(),
+            device,
+            state: ChipDisplayState::Idle,
+            tokens: 0,
+            question: None,
+            closed: false,
+            removing: false,
+            children: Vec::new(),
+            transcript: SessionProjection::new(),
+        }
+    }
+
     /// The chip's question card, per the sim's `chipMenu` gate
     /// (tui.js:2360-2364): open only while the chip is `input_required`/
     /// `error` AND holds an UNRESOLVED question. A closed chip has its
@@ -472,6 +512,63 @@ pub fn find_chip<'t>(chips: &'t [ChipModel], agent: &str) -> Option<&'t ChipMode
     None
 }
 
+/// Recovery text for a typed login failure (W3c3 M3, report §6.3: "typed
+/// `restage_required`/`busy` result handling").
+///
+/// The daemon's STABLE CODE decides what to say; `message` is human detail
+/// and is never load-bearing. Every one of these leaves the card in Entry
+/// with an EMPTY buffer, so the user's next act is a retype — the key is
+/// never held across a retry.
+#[must_use]
+pub fn login_recovery(code: &str, message: &str) -> String {
+    match code {
+        // The staged secret expired (or was already claimed) before the
+        // login committed: stage a FRESH one — there is nothing to resend.
+        haider_rpc::ERROR_CODE_RESTAGE_REQUIRED => {
+            "the staged key expired before it was committed — type it again".to_owned()
+        }
+        // Retryable: the account actor is mid-transaction.
+        haider_rpc::ERROR_CODE_BUSY | haider_rpc::ERROR_CODE_OVERLOADED => {
+            "the daemon is busy — press ⏎ to try again".to_owned()
+        }
+        // The provider rejected the key itself.
+        haider_rpc::ERROR_CODE_UNAUTHORIZED => {
+            "the provider rejected this key — check it and type it again".to_owned()
+        }
+        // This connection may not stage secrets (not same-UID / no Control).
+        haider_rpc::ERROR_CODE_PERMISSION_DENIED => {
+            "this connection may not stage secrets — run haider as the profile owner".to_owned()
+        }
+        // No vault on this platform (W3c's vault gate is macOS).
+        haider_rpc::ERROR_CODE_VAULT_UNSUPPORTED => {
+            "no credential vault on this platform — API login lands with the file vault".to_owned()
+        }
+        // Committed a descriptor whose secret cannot be found.
+        haider_rpc::ERROR_CODE_CREDENTIAL_MISSING => {
+            "the stored credential is gone — type the key again to re-commit".to_owned()
+        }
+        _ if message.is_empty() => format!("login failed ({code})"),
+        _ => format!("login failed ({code}) — {message}"),
+    }
+}
+
+/// The transcript note one `AgentReport` becomes (W3c3, report R11 cut 2:
+/// "maps `AgentReport` only to report summary/verification content" —
+/// never to chip STATE, which stays `AgentChipState`'s alone). The
+/// vocabulary matches the `ChildResult` row the transcript already renders
+/// (`render.rs`: `└ subagent report — {summary}`).
+#[must_use]
+pub fn report_note(report: &haider_protocol::agent::ChildReport) -> String {
+    use haider_protocol::agent::ReportVerification;
+    let verdict = match report.verified {
+        ReportVerification::Verified => "verified",
+        ReportVerification::Red => "red",
+        ReportVerification::Waived => "waived",
+        ReportVerification::Unverified => "unverified",
+    };
+    format!("└ subagent report ({verdict}) — {}", report.summary)
+}
+
 pub fn find_chip_mut<'t>(chips: &'t mut [ChipModel], agent: &str) -> Option<&'t mut ChipModel> {
     for chip in chips {
         if chip.agent == agent {
@@ -608,6 +705,193 @@ impl Default for AuraModel {
     }
 }
 
+/// The `/login <provider> api` masked key card (W3c3 M3 — report R10).
+///
+/// SECRET HYGIENE is the whole point of this type existing instead of
+/// reusing the composer:
+///
+/// * the key lives in a [`Zeroizing`] buffer that wipes on drop, on
+///   submit, and on cancel;
+/// * `Debug` is REDACTED, so `{:?}` on the whole `AppModel` (panic
+///   teardown, a stray log) cannot print it;
+/// * the renderer is given the LENGTH, never the text, so no frame — and
+///   therefore no snapshot, no scrollback, no selection copy — can carry
+///   it;
+/// * nothing in it reaches the composer's input ring, the per-surface
+///   drafts, or the demo store's DTO.
+pub struct LoginCard {
+    /// Provider being logged into (`anthropic`).
+    pub provider: String,
+    /// Optional display alias for the credential.
+    pub alias: Option<String>,
+    /// The typed key. Never rendered, never persisted, never logged.
+    secret: zeroize::Zeroizing<String>,
+    pub stage: LoginStage,
+}
+
+/// Where the login card is in its two-transaction flow (stage → login).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoginStage {
+    /// Typing the key.
+    Entry,
+    /// `vault.stage` + `account.login_api` are in flight; the local copy of
+    /// the key is ALREADY wiped (it lives only in the staged frame).
+    Submitting,
+    /// A typed failure, carrying its recovery text.
+    Failed(String),
+    /// Committed: the descriptor's identity, for the confirmation row.
+    Done(String),
+}
+
+impl std::fmt::Debug for LoginCard {
+    /// Redacted by construction (the W3c2 precedent: `SecretWire`'s Debug
+    /// was mutation-killed TWICE for exactly this). The length is omitted
+    /// too — a key's length is itself a hint.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LoginCard")
+            .field("provider", &self.provider)
+            .field("alias", &self.alias)
+            .field("secret", &"<redacted>")
+            .field("stage", &self.stage)
+            .finish()
+    }
+}
+
+impl LoginCard {
+    #[must_use]
+    pub fn new(provider: String, alias: Option<String>) -> Self {
+        Self {
+            provider,
+            alias,
+            secret: zeroize::Zeroizing::new(String::new()),
+            stage: LoginStage::Entry,
+        }
+    }
+
+    /// How many MASK GLYPHS to draw — the only thing the renderer learns.
+    #[must_use]
+    pub fn masked_len(&self) -> usize {
+        self.secret.chars().count()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.secret.is_empty()
+    }
+
+    /// True while the card accepts typing — entry, and after a FAILURE
+    /// (the recovery text says "type it again" / "press ⏎ to try again",
+    /// and a card that refused the retry it advertises is a dead end —
+    /// review P2-1). `Submitting` and `Done` are closed to input.
+    #[must_use]
+    pub const fn accepts_input(&self) -> bool {
+        matches!(self.stage, LoginStage::Entry | LoginStage::Failed(_))
+    }
+
+    /// Append one typed character. Non-printing keys never reach here.
+    pub fn push(&mut self, c: char) {
+        if self.accepts_input() {
+            self.secret.push(c);
+        }
+    }
+
+    /// Bracketed paste — the whole clipboard at once (keys are pasted far
+    /// more often than typed).
+    pub fn push_str(&mut self, text: &str) {
+        if self.accepts_input() {
+            self.secret.push_str(text.trim());
+        }
+    }
+
+    pub fn backspace(&mut self) {
+        if self.accepts_input() {
+            self.secret.pop();
+        }
+    }
+
+    /// TAKE the key for staging: the card's copy is emptied in the same
+    /// move, so between here and the wire there is exactly one live copy.
+    fn take_secret(&mut self) -> haider_rpc::SecretWire {
+        let taken = std::mem::replace(&mut self.secret, zeroize::Zeroizing::new(String::new()));
+        haider_rpc::SecretWire::new(taken.as_str())
+    }
+}
+
+/// Which runtime is driving this model (W3c3 M2).
+///
+/// The reducer is source-agnostic by design. What is NOT source-agnostic
+/// is ONE question, asked at every site where the reducer would otherwise
+/// invent session state: **may this model fabricate locally?** See
+/// [`Self::fabricates_locally`] — in live mode the daemon owns the
+/// sessions, their rows, their transcripts and their cards, so anything
+/// minted here would have to be reconciled with the truth that follows,
+/// and reconciliation is where duplicate rows and un-closable cards come
+/// from.
+///
+/// Every branch in the reducer, exhaustively (W3c3.1, review D2-1 — the
+/// previous charter named three, there were four, and one of the three it
+/// named was not a reducer branch at all):
+///
+/// | Site | Demo | Live |
+/// |---|---|---|
+/// | mid-turn composer submit | local queue / steer row | `SubmitText` |
+/// | launcher composer submit | `new_session` | `CreateSession` |
+/// | voice submit (`submit_voice`) | local ◉ row + note | `CreateSession` / `SubmitText` |
+/// | Esc mid-turn | local `Cancelled` + note | `Interrupt`; the committed `RunState` paints it |
+/// | `/reset` | reseeds the demo world | honest flash |
+/// | `/voice`, `/tools`, `/say` | local card | honest flash |
+/// | `/compact` | local `turn_active` + demo beat | honest flash |
+/// | `enter_aura` (`/aura`, ◉ Aura row) | the aura stage | honest flash |
+/// | ◉ talk hold | local `listening` + demo timer | honest flash |
+/// | subagent submit / close | `ChipSubmit` / `ChipClose` | honest flash |
+/// | shell builtins (`ls` · `cd` …) | the demo VFS | honest flash |
+/// | `/sessions` | honest stub (the sim's screen is unbuilt) | real listing + open |
+///
+/// The last row is the one INVERSION: demo refuses and live acts, because
+/// what demo refuses there is a sim surface this port has not built, not a
+/// fabrication. Every row above it is the same shape — demo may invent
+/// local state, live may not.
+///
+/// Menu ANSWER coordinates are deliberately absent: they are not a reducer
+/// decision. The reducer emits one source-neutral [`OutboundAnswer`] and
+/// `LiveDriver::drain_answers` / `DemoDriver` supply their own
+/// coordinates.
+///
+/// The default is [`Self::Demo`] so the entire pre-W3c3 corpus keeps its
+/// exact meaning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RuntimeMode {
+    #[default]
+    Demo,
+    Live,
+}
+
+impl RuntimeMode {
+    /// May the reducer invent session state — a row, a transcript line, a
+    /// card — that no committed envelope carries?
+    ///
+    /// This is the ONE question behind every mode branch in the reducer.
+    /// It is expressed as a predicate rather than an identity check so
+    /// every site asks the same question. Call sites use BOTH polarities
+    /// (a demo-only path guards with the positive form; a live refusal
+    /// guards with the negative), so a bare grep count is NOT an audit —
+    /// the audit is the exhaustive `AppRequest` match in the live driver's
+    /// `handle_request`, where a new variant is a compile error, plus the
+    /// per-surface gate tests in `w3c31_r2_tests` (review r2 NF-4).
+    ///
+    /// ONE site reads the mode and is NOT about fabrication:
+    /// [`AppModel::launcher_rows`], which is a DISPLAY policy (the sim's
+    /// three rows in demo, the reachable digit span live). It is named
+    /// here so the enumeration stays total — the previous charter's claim
+    /// that nothing else compared `RuntimeMode` was falsified by the same
+    /// round that wrote it (W3c3.1 r2, P2-C).
+    #[must_use]
+    pub const fn fabricates_locally(self) -> bool {
+        matches!(self, Self::Demo)
+    }
+}
+
 /// Side effects the reducer requests from the runtime (the reducer itself
 /// never performs IO).
 #[derive(Debug, Clone, PartialEq)]
@@ -659,13 +943,54 @@ pub enum AppRequest {
     AuraTalk,
     /// `/reset` reseeded the aura — bump its script guard.
     ResetAura,
-    /// `/reset` also purges the demo state file (sim tui.js:1918:
-    /// `localStorage.removeItem("haider-tui-v1")`). Runtime-owned like
-    /// `CopySelection`: only the interactive loop knows the store path, so
-    /// it intercepts this; the driver treats it as a no-op.
-    PurgeDemoStore,
+    /// The masked login card was submitted (W3c3 M3, report R10): stage
+    /// the secret over the non-journaled vault RPC, then commit the login.
+    /// The raw key rides HERE and nowhere else — it never enters the
+    /// composer, a draft, the input ring, a transcript row or the store.
+    LoginApi {
+        provider: String,
+        alias: Option<String>,
+        /// The wire's own secret carrier: zeroized on drop and REDACTED in
+        /// `Debug`, so `AppRequest`'s derived `Debug` — and any panic
+        /// teardown that prints it — cannot leak the key. (W3c2's review
+        /// mutation-killed an un-redacted `SecretWire` Debug TWICE; reusing
+        /// that type is how this lane inherits the guarantee instead of
+        /// re-earning it.)
+        secret: haider_rpc::SecretWire,
+    },
+    /// LIVE launcher submit (W3c3, report R11 cut 4): ask the daemon to
+    /// create a session for `text`. Deliberately NOT accompanied by a row,
+    /// a session id, a screen flip or a turn: in live mode there is no
+    /// local truth to fabricate, so the launcher shows nothing new until
+    /// `session.create` answers. The demo path (`new_session`) is the
+    /// opposite by design — its world IS local.
+    CreateSession { text: String },
+    /// The strict gap law fired (W3c3, report R11 cut 2): reduction STOPPED
+    /// for `session` with its cursor still at `after_seq`, and NOTHING later
+    /// may be applied until the driver reattaches from there. The demo
+    /// driver never produces gaps and ignores this; `LiveDriver` reattaches.
+    Reattach {
+        session: haider_protocol::ids::SessionId,
+        after_seq: u64,
+    },
     /// Quit the app.
     Quit,
+}
+
+/// Side effects only the DEMO runtime can perform (W3c3, report R11 cut 3).
+///
+/// Deliberately NOT an [`AppRequest`]: the common request vocabulary must
+/// carry no demo concepts, so `run_live` cannot even name these. They ride
+/// their own [`AppModel::demo_requests`] queue, which only `run_demo`
+/// drains — a live reset therefore can never delete demo persistence, and a
+/// demo reset can never reach a profile mutation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DemoRequest {
+    /// `/reset` reseeded the demo world; the state file dies with it (sim
+    /// tui.js:1918: `localStorage.removeItem("haider-tui-v1")`). Runtime-
+    /// owned like `CopySelection`: only the interactive loop knows the
+    /// store path.
+    PurgeStore,
 }
 
 /// Per-session voice pipeline (sim `DEFAULT_VOICE`, tui.js:110 — voice
@@ -710,10 +1035,18 @@ impl VoiceState {
 /// screen — or be dropped — never a different row the model drifted to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Hit {
-    /// The launcher row's session NAME at render time (review P2-9: an
+    /// The launcher row's SESSION ID at render time (review P2-9: an
     /// ordinal resolved against current state could attach a different
     /// session than the one clicked).
-    AttachSample(String),
+    ///
+    /// W3c3.1 (review P1-6): this used to carry the row's display NAME,
+    /// which live rows do not have — render substituted the literal
+    /// `"session"` and the click handler then searched for a row actually
+    /// named that, so every live row was unclickable. The session id is
+    /// the coordinate the row is *made of*: it exists in both modes, it is
+    /// what `open_session` takes, and it cannot collide the way a name
+    /// can.
+    AttachSession(SessionId),
     /// Aura / Accounts / Peers launcher rows, by identity not ordinal.
     ExtraRow(LauncherRow),
     /// The palette row's actual content at render time.
@@ -771,16 +1104,22 @@ pub enum Hit {
     },
 }
 
-/// One answer on its way to the client, tagged with the session identity that
-/// RENDERED the card (review r2 P1-1). Answers ride the never-cancelled
+/// One answer on its way to the client, tagged with the SURFACE GENERATION
+/// that RENDERED the card (review r2 P1-1). Answers ride the never-cancelled
 /// control tag so delivery is guaranteed, but CONSUMPTION checks the
 /// origin: an answer to a card the user has since replaced must never
 /// reconfigure the session that took its place. The sim gets this for free
 /// — its `askMenu` promise closes over the originating session/branch ids
 /// and its menu ids are per-open `nid()`s (tui.js:849-878).
+///
+/// W3c3 (report R11 cut 1): the origin is a [`UiGeneration`], not the
+/// protocol [`SessionId`]. This is an ASYNCHRONOUS RESPONSE GUARD — the
+/// exact role the report forbids a session id from playing — and the
+/// generation carries the old numeric id's semantics unchanged (monotonic,
+/// never reused, `SCRATCH` for the no-session surface).
 #[derive(Debug, Clone, PartialEq)]
 pub struct OutboundAnswer {
-    pub origin: u64,
+    pub origin: UiGeneration,
     pub answer: MenuAnswer,
 }
 
@@ -800,15 +1139,22 @@ pub enum LauncherRow {
 }
 
 /// A composer surface's identity (TUI5 item 9): the launcher, one session
-/// (by id — the monotonic-identity law means a key can never be reworn),
-/// or the aura. The SUBAGENT screen shares its session's key (the
-/// amendment's key list is exactly launcher | session id | aura), and the
-/// scratch surface (screen=Session, no id) shares the launcher's —
+/// (by its LOCAL generation — the monotonic-identity law means a key can
+/// never be reworn), or the aura. The SUBAGENT screen shares its session's
+/// key (the amendment's key list is exactly launcher | session | aura), and
+/// the scratch surface (screen=Session, no session) shares the launcher's —
 /// documented: scratch is the launcher's envelope-driven lineage.
+///
+/// W3c3: keyed by [`UiGeneration`], not [`SessionId`]. A draft key is a
+/// LOCAL SURFACE identity in the same family as the demo driver's arms and
+/// meters — report R11 cut 1's assignment for the generation — and keeping
+/// it `Copy` keeps the per-frame hit map and the stash/restore round trip
+/// allocation-free. The law it must satisfy is "never reworn", which the
+/// generation satisfies exactly as the old id did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DraftKey {
     Launcher,
-    Session(u64),
+    Session(UiGeneration),
     Aura,
 }
 
@@ -881,8 +1227,14 @@ pub struct AppModel {
     pub voice: VoiceState,
     /// The ◉ talk hold is live (`◉ listening…` chip + status segment).
     pub listening: bool,
-    /// The launcher's working dir for shell builtins (sim `~/dev/enterprise-suite`).
+    /// The launcher's working dir for shell builtins, in DISPLAY form
+    /// (`~`-abbreviated, sim `~/dev/enterprise-suite`).
     pub launcher_dir: String,
+    /// The process working directory, ABSOLUTE (W3c3 M2). `session.create`
+    /// carries this, never [`Self::launcher_dir`]: the daemon rejects a
+    /// non-absolute cwd, and `~` is a display convention the wire has never
+    /// heard of.
+    pub cwd: String,
     /// The session's working dir — shown in the header; `cd` retargets it.
     pub session_dir: String,
     /// Per-open card counter: `/voice` and `/tools` mint a FRESH menu id
@@ -912,19 +1264,30 @@ pub struct AppModel {
     /// seeds. The ATTACHED session's state is checked OUT of its slot into
     /// this model's live fields (see `crate::session`).
     pub sessions: Vec<crate::session::SessionState>,
-    /// The checked-out session's id (sim `activeId`; `None` = launcher's
-    /// no-session state, exactly the sim's `setActiveId(null)`).
-    pub active_session: Option<u64>,
+    /// Which runtime drives this model (W3c3 M2). Demo by default.
+    pub mode: RuntimeMode,
+    /// The masked `/login … api` card, while it is open (W3c3 M3).
+    pub login: Option<LoginCard>,
+    /// The checked-out session's PROTOCOL id (sim `activeId`; `None` =
+    /// launcher's no-session state, exactly the sim's `setActiveId(null)`).
+    pub active_session: Option<SessionId>,
     /// The most recently detached session — the empty-⏎ re-attach target.
-    pub last_detached: Option<u64>,
-    /// Session id allocator (seeds take 1-3; sim uses `Date.now()`).
-    /// MONOTONIC for the process lifetime — never reset, not even by
-    /// `/reset` (review TUI4.1 P1-2): an id-keyed control callback must
-    /// never find a replacement session wearing a dead session's id.
-    pub next_session_id: u64,
+    pub last_detached: Option<SessionId>,
+    /// Local generation allocator (seeds take 1-3; `0` is the scratch
+    /// sentinel). MONOTONIC for the process lifetime — never reset, not
+    /// even by `/reset` (review TUI4.1 P1-2): a generation-keyed control
+    /// callback must never find a replacement session wearing a dead
+    /// session's generation. W3c3 renamed it from `next_session_id`: the
+    /// PROTOCOL id is no longer minted by arithmetic (report R11 cut 1),
+    /// only the local generation is.
+    pub next_ui_generation: u64,
     /// The roster claim counter (sim `rosterRef`, tui.js:681) — shared
     /// with the driver so heads and chips draw from ONE honour roll.
     pub roster: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Demo-runtime side effects (W3c3, report R11 cut 3) — a channel
+    /// SEPARATE from `requests` so `run_live` never even sees demo
+    /// vocabulary. Only `run_demo` drains it.
+    pub demo_requests: Vec<DemoRequest>,
     /// Selected option index while a blocking menu replaces the composer.
     pub menu_selection: usize,
     /// Selected row in the slash palette (open while composer starts with /).
@@ -1017,6 +1380,7 @@ impl Default for AppModel {
             voice: VoiceState::default(),
             listening: false,
             launcher_dir: "~/dev/enterprise-suite".to_owned(),
+            cwd: "/".to_owned(),
             session_dir: "~/dev/enterprise-suite".to_owned(),
             card_seq: 0,
             vfs: vfs_seed(),
@@ -1027,13 +1391,19 @@ impl Default for AppModel {
             todos_collapsed: false,
             auto_resuming: false,
             aura: AuraModel::seed(),
-            sessions: seed_session_states(),
+            mode: RuntimeMode::Demo,
+            login: None,
+            // The first three generations the allocator can hand out, so a
+            // fresh process's seeds are 1-3 exactly as before and
+            // `next_ui_generation` continues at 4.
+            sessions: seed_session_states(UiGeneration::FIRST.get()),
             active_session: None,
             last_detached: None,
-            next_session_id: 4,
+            next_ui_generation: UiGeneration::FIRST.get() + SEED_SESSION_COUNT,
             roster: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
                 crate::script::ROSTER_FIRST_CLAIM,
             )),
+            demo_requests: Vec::new(),
             menu_selection: 0,
             palette_selection: 0,
             palette_scroll: 0,
@@ -1063,18 +1433,33 @@ impl AppModel {
         Self::default()
     }
 
-    /// The identity that outbound answers and the auto-title micro-call
+    /// The generation that outbound answers and the auto-title micro-call
     /// carry as their `origin`, and that the driver's consumption gates
-    /// check (review r2 P1-1): the ATTACHED session's id, or 0 for the
-    /// no-session scratch surface. DERIVED, never stored (review TUI4.1,
-    /// Fable D2-1 — the old `session_epoch` field was a hand-maintained
-    /// twin of `active_session` with a stale monotonicity doc). Identities
-    /// themselves never recur: `next_session_id` is monotonic for the
-    /// process lifetime (the sim's `s-${Date.now()}` law), so an id-keyed
-    /// callback can never find a replacement wearing an old id.
+    /// check (review r2 P1-1): the ATTACHED session's generation, or
+    /// [`UiGeneration::SCRATCH`] for the no-session scratch surface.
+    /// DERIVED from the attached row, never stored (review TUI4.1, Fable
+    /// D2-1 — the old `session_epoch` field was a hand-maintained twin of
+    /// `active_session` with a stale monotonicity doc). Generations never
+    /// recur: `next_ui_generation` is monotonic for the process lifetime
+    /// (the sim's `s-${Date.now()}` law), so a generation-keyed callback
+    /// can never find a replacement wearing a dead one.
+    ///
+    /// W3c3 renamed this from `session_identity`: the value is no longer
+    /// the session's identity, it is the SURFACE's generation (report R11
+    /// cut 1 — a session id must not double as a stale-timer epoch).
     #[must_use]
-    pub fn session_identity(&self) -> u64 {
-        self.active_session.unwrap_or(0)
+    pub fn ui_generation(&self) -> UiGeneration {
+        self.active_session
+            .as_ref()
+            .and_then(|id| self.sessions.iter().find(|entry| &entry.id == id))
+            .map_or(UiGeneration::SCRATCH, |entry| entry.ui_gen)
+    }
+
+    /// The attached session's protocol id, if any — the coordinate every
+    /// live RPC (`turn.submit`, `turn.cancel`, `MenuAnswer`) carries.
+    #[must_use]
+    pub fn active_session_id(&self) -> Option<&SessionId> {
+        self.active_session.as_ref()
     }
 
     /// The composer surface currently on screen (TUI5 item 9). Boot maps
@@ -1084,9 +1469,16 @@ impl AppModel {
     pub fn surface_key(&self) -> DraftKey {
         match self.screen {
             Screen::Aura => DraftKey::Aura,
-            _ => self
-                .active_session
-                .map_or(DraftKey::Launcher, DraftKey::Session),
+            _ => self.session_draft_key(),
+        }
+    }
+
+    /// The draft key of the attached session (the launcher's when nothing
+    /// is attached) — the ONE place a generation becomes a surface key.
+    fn session_draft_key(&self) -> DraftKey {
+        match self.active_session {
+            Some(_) => DraftKey::Session(self.ui_generation()),
+            None => DraftKey::Launcher,
         }
     }
 
@@ -1120,9 +1512,7 @@ impl AppModel {
     /// one-stash-one-restore discipline literal.
     fn goto_session_screen(&mut self) {
         let from = self.surface_key();
-        let to = self
-            .active_session
-            .map_or(DraftKey::Launcher, DraftKey::Session);
+        let to = self.session_draft_key();
         if from == to {
             self.screen = Screen::Session;
             return;
@@ -1335,6 +1725,14 @@ impl AppModel {
             AppEvent::Key(key) => {
                 self.dirty = true;
                 self.flash = None;
+                // The masked login card OWNS the keyboard while it is open
+                // (W3c3 M3): a key must never reach the composer, the
+                // palette, the input ring or a selection gate, because
+                // every one of those would keep a copy of it.
+                if self.login.is_some() {
+                    self.login_key(&key);
+                    return;
+                }
                 // TUI5 item 4 — the selection gates run BEFORE the
                 // clear-on-keypress law, or ⌃C/Esc could never see the
                 // selection they govern.
@@ -1348,6 +1746,13 @@ impl AppModel {
             }
             AppEvent::Paste(text) => {
                 self.dirty = true;
+                // Keys are pasted more often than typed; the paste lands in
+                // the masked buffer and NOWHERE else (no pill token, no
+                // draft, no ring).
+                if let Some(card) = self.login.as_mut() {
+                    card.push_str(&text);
+                    return;
+                }
                 // While a blocking menu replaces the composer, paste has no
                 // target (r2 P2).
                 if self.projection.open_menu().is_some() && self.screen == Screen::Session {
@@ -1654,10 +2059,19 @@ impl AppModel {
                     self.listening = false;
                     self.msg_queue.clear();
                     self.requests.push(AppRequest::Interrupt);
-                    self.projection
-                        .apply(&EventPayload::RunState(RunState::Cancelled));
-                    self.projection
-                        .push_note("· interrupted — run → cancelled · idle (i)".to_owned());
+                    // LIVE (W3c3.1 r2): the cancellation is the DAEMON's to
+                    // commit. Painting `Cancelled` + the note here says the
+                    // run ended before `turn.cancel` has even been sent —
+                    // and if the daemon rejects it (a run that already
+                    // terminalized, a stale generation) the screen is
+                    // simply lying. The committed `RunState` envelope
+                    // paints it, exactly as it paints every other state.
+                    if self.mode.fabricates_locally() {
+                        self.projection
+                            .apply(&EventPayload::RunState(RunState::Cancelled));
+                        self.projection
+                            .push_note("· interrupted — run → cancelled · idle (i)".to_owned());
+                    }
                 } else {
                     self.back_to_launcher();
                 }
@@ -1732,8 +2146,13 @@ impl AppModel {
                 self.composer
                     .line_end_key(key.modifiers.contains(KeyModifiers::SHIFT));
             }
-            KeyCode::Char(c @ '1'..='3')
-                if self.screen == Screen::Launcher && self.composer.is_empty() =>
+            // The digit span matches what the launcher PAINTS
+            // (`launcher_rows`): three in demo (the sim's world), nine
+            // live. A digit past the last row attaches nothing.
+            KeyCode::Char(c @ '1'..='9')
+                if self.screen == Screen::Launcher
+                    && self.composer.is_empty()
+                    && ((c as usize) - ('1' as usize)) < self.launcher_rows() =>
             {
                 let index = (c as usize) - ('1' as usize);
                 self.attach_sample(index);
@@ -1812,9 +2231,9 @@ impl AppModel {
             // Empty ⏎ on the launcher re-attaches the most recently left
             // session (a port law; the detach model keeps it honest by id).
             if self.screen == Screen::Launcher
-                && let Some(id) = self.last_detached
+                && let Some(id) = self.last_detached.clone()
             {
-                self.open_session(id);
+                self.open_session(&id);
             }
             return;
         }
@@ -1838,11 +2257,30 @@ impl AppModel {
         if self.screen != Screen::Subagent
             && SHELL_CMDS.contains(&first_word.to_ascii_lowercase().as_str())
         {
+            if !self.mode.fabricates_locally() {
+                // The VFS is the demo's FAKE filesystem (`vfs_seed`). In
+                // live mode an intercepted `ls` would paint invented files
+                // as the user's real cwd, and `cd` would retarget the dir
+                // shown on real session rows — fabricated state presented
+                // as truth, the exact class the P1-A sweep closes. Refuse;
+                // the agent itself is how live mode runs real commands
+                // (W3c3.1 r2 sibling sweep).
+                self.refuse_demo_only("shell builtins");
+                return;
+            }
             self.run_shell_line(&text);
             return;
         }
         // §4 step 6: the subagent screen steers ITS chip (respondChip).
         if self.screen == Screen::Subagent {
+            if !self.mode.fabricates_locally() {
+                // Steering a subagent is the demo driver's scripted beat.
+                // Live chips come from committed `AgentSpawned` envelopes
+                // and there is no `agent.steer` RPC yet, so this text was
+                // silently destroyed (W3c3.1 r2, P1-A).
+                self.refuse_demo_only("steering a subagent");
+                return;
+            }
             if let Some(agent) = self.view_path.last().cloned() {
                 self.requests.push(AppRequest::ChipSubmit { agent, text });
             }
@@ -1853,6 +2291,22 @@ impl AppModel {
         // row now with the sim's note (display-only — the running script
         // is not altered, same as the sim).
         if self.screen == Screen::Session && self.turn_active {
+            // LIVE (review P1-1): mid-turn input is a REAL delivery. The
+            // demo parks it in `msg_queue` (drained by `DemoDriver::
+            // finish_turn`) or paints a steer row locally — neither of
+            // which exists live, so both silently destroyed the user's
+            // text. The wire has carried `DeliveryMode` all along: steer
+            // delivers at the next safe boundary, queue holds to turn end,
+            // and the AUTHORITATIVE `UserMessage` envelope paints the row.
+            // Nothing is fabricated here (R11 cut 4).
+            if !self.mode.fabricates_locally() {
+                self.requests.push(AppRequest::SubmitText {
+                    text,
+                    voice: false,
+                    title: false,
+                });
+                return;
+            }
             if self.queue_mode {
                 self.msg_queue.push(text);
             } else {
@@ -1871,7 +2325,16 @@ impl AppModel {
         // Typing on the LAUNCHER starts a FRESH session (sim promise,
         // tui.js:2013-2016 `newSession`) — the one left behind keeps
         // running and shows as busy in its launcher row.
+        //
+        // LIVE (W3c3, report R11 cut 4): nothing local happens. The daemon
+        // mints the session; the row, the attachment and the first turn all
+        // follow its responses, so no fabricated row or session can ever
+        // need reconciling with the truth that arrives.
         if self.screen == Screen::Launcher {
+            if !self.mode.fabricates_locally() {
+                self.requests.push(AppRequest::CreateSession { text });
+                return;
+            }
             self.new_session(&text);
         }
         // The blurb is NOT set here: the sim's micro-call names the session
@@ -1887,6 +2350,66 @@ impl AppModel {
             voice: false,
             title,
         });
+    }
+
+    /// The masked card's keyboard (W3c3 M3). Printable characters extend
+    /// the key, ⌫ shortens it, ⏎ submits, Esc cancels — and every exit
+    /// path wipes the buffer, because a card left open is a key left in
+    /// memory.
+    fn login_key(&mut self, key: &KeyEvent) {
+        let Some(card) = self.login.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                // Drop wipes: `Zeroizing` on the way out.
+                self.login = None;
+            }
+            KeyCode::Enter => {
+                if !card.accepts_input() || card.is_empty() {
+                    return;
+                }
+                let provider = card.provider.clone();
+                let alias = card.alias.clone();
+                let secret = card.take_secret();
+                card.stage = LoginStage::Submitting;
+                self.requests.push(AppRequest::LoginApi {
+                    provider,
+                    alias,
+                    secret,
+                });
+            }
+            KeyCode::Backspace => card.backspace(),
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => card.push(c),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.login = None;
+            }
+            _ => {}
+        }
+    }
+
+    /// The login card's outcome, from the driver (W3c3 M3). Every failure
+    /// returns the card to ENTRY with an empty buffer: the key is never
+    /// retained across a retry, so a `busy` retry costs a retype and a
+    /// `restage_required` cannot resend an expired stage.
+    pub fn login_result(&mut self, outcome: Result<String, (String, String)>) {
+        let Some(card) = self.login.as_mut() else {
+            return;
+        };
+        self.dirty = true;
+        match outcome {
+            Ok(identity) => card.stage = LoginStage::Done(identity),
+            Err((code, message)) => {
+                card.stage = LoginStage::Failed(login_recovery(&code, &message))
+            }
+        }
+    }
+
+    /// Open the masked card for `/login <provider> api`.
+    fn open_login_card(&mut self, provider: &str, alias: Option<String>) {
+        self.stash_draft();
+        self.login = Some(LoginCard::new(provider.to_owned(), alias));
+        self.dirty = true;
     }
 
     /// One shell-builtin line against the VFS: a session gets a transcript
@@ -1917,6 +2440,24 @@ impl AppModel {
     /// ◉ user row + `◉ heard` note ride the reducer; the script skips its
     /// own UserMessage and tags streamed rows `♪ speaking`.
     fn submit_voice(&mut self, text: String) {
+        // LIVE (W3c3.1, review D2-2): the launcher branch returned early,
+        // but the SESSION branch fell through and painted a local ◉ user
+        // row plus a `◉ heard` note — the authoritative `UserMessage`
+        // envelope then paints the same row again. This is P1-1's exact
+        // shape, left un-swept because `/say` sits behind `/voice`, which
+        // live mode now refuses outright (D1-2). Both halves are closed
+        // here so no path can reach the fabrication.
+        if !self.mode.fabricates_locally() {
+            match self.screen {
+                Screen::Launcher => self.requests.push(AppRequest::CreateSession { text }),
+                _ => self.requests.push(AppRequest::SubmitText {
+                    text,
+                    voice: true,
+                    title: self.session_title.is_none(),
+                }),
+            }
+            return;
+        }
         if self.screen == Screen::Launcher {
             self.new_session(&text);
         }
@@ -1991,6 +2532,15 @@ impl AppModel {
     /// own comes live (TUI5 item 9 — Aura has its own composer instance).
     fn enter_aura(&mut self) {
         if self.screen == Screen::Aura {
+            return;
+        }
+        if !self.mode.fabricates_locally() {
+            // THE ONE DOOR into the aura stage (`/aura` and the launcher's
+            // ◉ Aura row both come through here). Everything behind it —
+            // `AuraSubmit`, `AuraTalk`, `ResetAura` — is demo-driver
+            // vocabulary the live driver discards, so the stage would take
+            // a hold and sit in `Listening` forever (W3c3.1 r2, P1-A).
+            self.refuse_demo_only("Aura Mode");
             return;
         }
         self.stash_draft();
@@ -2070,7 +2620,7 @@ impl AppModel {
             return;
         };
         self.outbox.push(OutboundAnswer {
-            origin: self.session_identity(),
+            origin: self.ui_generation(),
             answer: MenuAnswer {
                 menu: menu.id.clone(),
                 option_key: Some(option.key.clone()),
@@ -2158,6 +2708,21 @@ impl AppModel {
             .map(str::to_ascii_lowercase);
         match name.as_str() {
             "help" => self.help_open = true,
+            // THE REDUCER MAY NOT OPEN A CARD IT CANNOT CLOSE (W3c3.1,
+            // review D1-2). `/voice` and `/tools` mint a LOCAL `MenuOpened`
+            // with no committed opening envelope, so live mode has no
+            // `request_seq`/`worker_generation` to answer at:
+            // `LiveDriver::answer_command` finds no coordinates, drops the
+            // answer, and the card stays open FOREVER — blocking every
+            // later card, including the daemon's own `request_input`. The
+            // whole voice surface is local (engine names, a `/say` that
+            // plays a canned turn), so live mode says so, exactly as
+            // `/reset` does, rather than promising an RPC it never sends.
+            "voice" | "tools" | "say" if !self.mode.fabricates_locally() => {
+                self.flash = Some(format!(
+                    "· /{name} — demo only; the live voice/tool surface lands after v0.0.12"
+                ));
+            }
             "theme" => match arg.as_deref() {
                 Some(name) => match ThemeKey::parse(name) {
                     Some(key) => {
@@ -2188,6 +2753,45 @@ impl AppModel {
                 // message starts a brand-new session, never this one.
                 self.back_to_launcher();
             }
+            // W3c3 M3 (report R10 + §6.3's `/login` argument slots): the
+            // ONE account command this release makes executable.
+            "login" => {
+                let mut words = remainder.split_whitespace();
+                let provider = words.next().unwrap_or("");
+                let method = words.next().unwrap_or("");
+                let alias = words.next().map(str::to_owned);
+                match (provider, method) {
+                    ("", _) => {
+                        self.flash = Some(
+                            "· /login <provider> <oauth|api> — e.g. /login anthropic api"
+                                .to_owned(),
+                        );
+                    }
+                    (provider, "api") => self.open_login_card(provider, alias),
+                    (_, "oauth") => {
+                        self.flash = Some(
+                            "· /login … oauth — UI ready; the loopback flow lands after v0.0.12"
+                                .to_owned(),
+                        );
+                    }
+                    (provider, _) => {
+                        self.flash =
+                            Some(format!("· /login {provider} <oauth|api> — pick a method"));
+                    }
+                }
+            }
+            // `/reset` reseeds the DEMO world. In live mode the sessions
+            // are the daemon's, so reseeding would replace real rows with
+            // three fabricated ones and strand every attachment the driver
+            // holds — the live stream would then be discarded as
+            // `WrongSession` in silence (review P1-2). `RuntimeMode`'s
+            // charter always named this as one of the three source-
+            // dependent decisions; this is that branch.
+            "reset" if !self.mode.fabricates_locally() => {
+                self.flash = Some(
+                    "· /reset — demo only; live sessions live in the daemon's store".to_owned(),
+                );
+            }
             "reset" => {
                 // TUI5 item 9: park the departing surface first; session
                 // drafts die with the reseed (the identity law — a
@@ -2198,16 +2802,28 @@ impl AppModel {
                 // rules govern session ids only.
                 self.stash_draft();
                 self.fresh_session();
-                self.sessions = seed_session_states();
+                // IDENTITY NEVER RECURS (W3c3.1, review P1-5). The
+                // replacement seeds DRAW from the monotonic allocator —
+                // they used to be minted with a hardcoded 1-3, so every
+                // `/reset` reissued three dead generations and a
+                // generation-keyed callback (the auto-title micro-call,
+                // the answer outbox's `origin`, a `DraftKey::Session`)
+                // could land on a replacement wearing its predecessor's
+                // identity. Their SESSION IDS stay `demo-session-1..3`:
+                // the reseeded world is the same world, and the demo
+                // store's upcaster maps a legacy `id: 2` onto exactly that
+                // string (report R11 cut 1 — a session id is not a
+                // generation).
+                self.sessions = seed_session_states(self.next_ui_generation);
+                self.next_ui_generation += SEED_SESSION_COUNT;
                 self.active_session = None;
                 self.last_detached = None;
-                // `next_session_id` is deliberately NOT reset (review
+                // The allocator itself is deliberately NOT rewound (review
                 // TUI4.1 P1-2): the control-tagged auto-title callback is
-                // keyed by session id and survives /reset by design (sim:
-                // a bare setTimeout); resetting the allocator let a
-                // replacement session reuse the old id and receive the old
-                // title. The sim's `s-${Date.now()}` ids never recur —
-                // monotonicity ports that law, killing the whole class.
+                // keyed by generation and survives /reset by design (sim:
+                // a bare setTimeout). The sim's `s-${Date.now()}` ids
+                // never recur — monotonicity ports that law, killing the
+                // class.
                 self.roster.store(
                     crate::script::ROSTER_FIRST_CLAIM,
                     std::sync::atomic::Ordering::SeqCst,
@@ -2217,7 +2833,7 @@ impl AppModel {
                 // Sim tui.js:1918: the state file dies with the reset; the
                 // seeds re-save on the next change exactly as the sim's
                 // save effect refills localStorage after removeItem.
-                self.requests.push(AppRequest::PurgeDemoStore);
+                self.demo_requests.push(DemoRequest::PurgeStore);
                 self.screen = Screen::Launcher;
                 self.drafts.retain(|key, _| *key == DraftKey::Launcher);
                 self.restore_draft();
@@ -2230,7 +2846,13 @@ impl AppModel {
                 // the sim's single-threaded state writes tolerate /compact
                 // mid-turn; the envelope demo refuses honestly instead of
                 // clobbering a live turn's run state.
-                if self.screen != Screen::Session {
+                if !self.mode.fabricates_locally() {
+                    // The compaction beat is the DEMO driver's; live mode
+                    // has no `context.compact` RPC yet, so setting
+                    // `turn_active` here parked the session mid-turn with
+                    // nothing able to clear it (W3c3.1 r2, P1-A).
+                    self.refuse_demo_only("/compact");
+                } else if self.screen != Screen::Session {
                     self.flash = Some("· /compact — session only".to_owned());
                 } else if self.turn_active {
                     self.flash = Some("· /compact — wait for the turn to end".to_owned());
@@ -2309,16 +2931,44 @@ impl AppModel {
                     self.flash = Some("· /tools — session only".to_owned());
                 }
             }
+            // `/sessions for all` is what the launcher's own header
+            // promises, and with more rows than the launcher paints it is
+            // the ONLY way to see — and OPEN — the rest (review P1-6: the
+            // cold list the driver already tracks had no surface at all).
+            //
+            // DEMO keeps the honest stub: the sim implements `/sessions` as
+            // a full screen with selection (tui.js:1753-1755, :3485-3492),
+            // which this port has not built, and the demo world has three
+            // sessions the launcher already paints. Inventing a text
+            // listing there would be a divergence from the sim for no gain
+            // (W3c3.1 r2, P3-H).
+            "sessions" if !self.mode.fabricates_locally() => {
+                if remainder.is_empty() {
+                    self.list_sessions();
+                } else {
+                    self.open_listed_session(&remainder);
+                }
+            }
+            "sessions" => {
+                // The demo stub must stay a KNOWN command: without this arm
+                // it fell to the typo catch-all, which called a command
+                // `/help` itself lists "unknown" (W3c3.1 r2 completion —
+                // the first cut of P3-H removed the listing arm without
+                // re-homing the stub).
+                self.flash = Some(
+                    "· /sessions — demo stub; the sim's sessions screen is unbuilt \
+                     (live mode lists and opens)"
+                        .to_owned(),
+                );
+            }
             "" => {}
             other => {
                 // Known stubs name their wave; typos say so (review r1 P2).
                 let wave = match other {
-                    "model" | "provider" | "login" | "account" | "accounts" => {
+                    "model" | "provider" | "account" | "accounts" => {
                         Some("the account switchboard (W3)")
                     }
-                    "sessions" | "tree" | "fork" | "rename" | "tokens" => {
-                        Some("the daemon wave (W3)")
-                    }
+                    "tree" | "fork" | "rename" | "tokens" => Some("the daemon wave (W3)"),
                     "peers" => Some("the mesh wave (post-v0.1)"),
                     "hooks" | "update" => Some("the gates wave (W4)"),
                     _ => None,
@@ -2384,10 +3034,82 @@ impl AppModel {
             via: AnswerVia::Tui,
         };
         self.outbox.push(OutboundAnswer {
-            origin: self.session_identity(),
+            origin: self.ui_generation(),
             answer,
         });
         self.menu_selection = 0;
+    }
+
+    /// Route one RAW envelope to whichever session owns it (W3c3, report
+    /// R11 cut 2) — the single live entry point for the event stream.
+    ///
+    /// The attached session reduces through the model's checked-out live
+    /// fields; every other session reduces in its own slot. A gap STOPS
+    /// reduction with the cursor unmoved and emits
+    /// [`AppRequest::Reattach`] BEFORE any later state can mutate — the
+    /// store is the lag buffer (R9), so the client never papers over a
+    /// hole. An envelope for a session this model does not know is
+    /// rejected, not invented.
+    pub fn route_raw(&mut self, envelope: &RawEnvelope) -> crate::projection::RawOutcome {
+        use crate::projection::RawOutcome;
+        let outcome = if self.active_session.as_ref() == Some(&envelope.session_id) {
+            self.absorb_raw_active(envelope)
+        } else if let Some(entry) = self
+            .sessions
+            .iter_mut()
+            .find(|entry| entry.id == envelope.session_id)
+        {
+            entry.absorb_raw(envelope)
+        } else {
+            RawOutcome::WrongSession
+        };
+        match outcome {
+            RawOutcome::Applied => self.dirty = true,
+            RawOutcome::Gap { after_seq } => self.requests.push(AppRequest::Reattach {
+                session: envelope.session_id.clone(),
+                after_seq,
+            }),
+            RawOutcome::Duplicate | RawOutcome::WrongSession => {}
+        }
+        outcome
+    }
+
+    /// The ATTACHED session's half of [`Self::route_raw`]: the cursor lives
+    /// on the checked-out projection, so it travels with checkout/checkin
+    /// and no second cursor authority exists.
+    fn absorb_raw_active(&mut self, envelope: &RawEnvelope) -> crate::projection::RawOutcome {
+        use crate::projection::{Admission, RawOutcome};
+        match self.projection.admit(envelope) {
+            Admission::Duplicate => RawOutcome::Duplicate,
+            Admission::Gap { after_seq } => RawOutcome::Gap { after_seq },
+            Admission::Skip => RawOutcome::Applied,
+            Admission::Apply => {
+                match serde_json::from_value::<EventPayload>(envelope.payload.clone()) {
+                    Ok(payload) => self.absorb_scoped(&payload, envelope.agent_id.as_ref()),
+                    Err(_) => self.projection.count_unknown_payload(),
+                }
+                RawOutcome::Applied
+            }
+        }
+    }
+
+    /// The attached path's scope router — the same [`crate::session::classify`]
+    /// decision the background path takes, applied to the live fields.
+    fn absorb_scoped(
+        &mut self,
+        payload: &EventPayload,
+        agent: Option<&haider_protocol::ids::AgentId>,
+    ) {
+        use crate::session::Destination;
+        match crate::session::classify(&mut self.projection, &self.chips, payload, agent) {
+            Destination::Agent => crate::session::apply_agent_payload(&mut self.chips, payload),
+            Destination::Chip(target) => {
+                if let Some(chip) = find_chip_mut(&mut self.chips, &target) {
+                    chip.transcript.apply(payload);
+                }
+            }
+            Destination::Session => self.handle_envelope(payload),
+        }
     }
 
     fn handle_envelope(&mut self, payload: &EventPayload) {
@@ -2531,14 +3253,125 @@ impl AppModel {
         self.requests.push(AppRequest::ResetAllSessions);
     }
 
-    /// Attach a sample session by NAME (the clicked row's identity, P2-9).
-    fn attach_sample_named(&mut self, name: &str) {
-        if let Some(id) = self
-            .sessions
-            .iter()
-            .find(|entry| entry.name.as_deref() == Some(name))
-            .map(|entry| entry.id)
-        {
+    /// Refuse a DEMO-ONLY surface in live mode, honestly and in one voice
+    /// (W3c3.1 r2, P1-A).
+    ///
+    /// The rule this enforces is [`RuntimeMode::fabricates_locally`]'s:
+    /// live mode must not mint local state the daemon will never resolve.
+    /// The first pass of this fix swept only the three commands the review
+    /// named, and `/compact` kept the class alive — it set `turn_active`
+    /// and handed `AppRequest::Compact` to a driver that discarded it, so
+    /// the session sat mid-turn forever with `/compact` itself answering
+    /// "wait for the turn to end".
+    ///
+    /// Refusing HERE, not in the driver, is the whole point: nothing local
+    /// is fabricated, so nothing has to be undone.
+    fn refuse_demo_only(&mut self, what: &str) {
+        self.flash = Some(format!(
+            "· {what} — demo only; no daemon behavior stands behind it yet"
+        ));
+        self.dirty = true;
+    }
+
+    /// `/sessions` — EVERY session the model knows, not just the rows the
+    /// launcher has room to paint (review P1-6).
+    ///
+    /// The listing is a read of state already held: `session.list` has
+    /// already populated the row for every session the daemon has, hot or
+    /// cold. Each line names the row's digit when it has one, its id, its
+    /// status and its head — the id because that is the coordinate, and
+    /// the digit because that is how the user reaches it.
+    fn list_sessions(&mut self) {
+        let rows = self.launcher_rows();
+        let lines: Vec<String> = if self.sessions.is_empty() {
+            vec!["no sessions yet — type to start one".to_owned()]
+        } else {
+            self.sessions
+                .iter()
+                .enumerate()
+                .map(|(index, entry)| {
+                    // The number is the ROW's coordinate either way: a
+                    // digit for the rows the launcher paints, and the
+                    // `/sessions <n>` argument for the rest.
+                    let reach = if index < rows {
+                        format!("{:>2}", index + 1)
+                    } else {
+                        format!("/{}", index + 1)
+                    };
+                    let status = if entry.busy() { "running" } else { "idle" };
+                    let name = entry.name.as_deref().unwrap_or("—");
+                    format!(
+                        "{reach}  {}  {name}  {status}  {} turns",
+                        entry.id.as_str(),
+                        entry.turns()
+                    )
+                })
+                .collect()
+        };
+        let out = lines.join("\n");
+        if self.screen == Screen::Session {
+            self.projection.push_shell("sessions".to_owned(), out);
+        } else {
+            self.launcher_shellout = Some(("sessions".to_owned(), out));
+        }
+        self.dirty = true;
+    }
+
+    /// `/sessions <n|id>` — open ANY listed session, including the ones
+    /// past the launcher's painted rows (W3c3.1 r2, P2-D).
+    ///
+    /// Without this, R11's "cold sessions … listable and READABLE" held
+    /// only for the first nine: rows past the digit span had no hit target
+    /// and no key, so raising the bound from three to nine moved the
+    /// defect rather than closing it. The read itself is the attach's own
+    /// replay, so opening is all that was missing.
+    fn open_listed_session(&mut self, arg: &str) {
+        let by_ordinal = arg
+            .parse::<usize>()
+            .ok()
+            .filter(|n| *n >= 1)
+            .and_then(|n| self.sessions.get(n - 1))
+            .map(|entry| entry.id.clone());
+        let target = by_ordinal.or_else(|| {
+            self.sessions
+                .iter()
+                .find(|entry| entry.id.as_str() == arg)
+                .map(|entry| entry.id.clone())
+        });
+        match target {
+            Some(id) => self.open_session(&id),
+            None => {
+                self.flash = Some(format!(
+                    "· /sessions {arg} — no such row; /sessions lists them by number and id"
+                ));
+                self.dirty = true;
+            }
+        }
+    }
+
+    /// How many session rows the launcher shows — and therefore how many
+    /// are clickable and digit-bindable.
+    ///
+    /// DEMO keeps the sim's three (`tui.js:3246 slice(0, 3)`): the sim is
+    /// read-only law for demo behavior and its world only ever has three.
+    /// LIVE shows the full digit span, because the daemon's list is
+    /// whatever the user has actually got — with three rows, session four
+    /// onward was listed by `session.list`, held cold by the driver, and
+    /// reachable by nothing at all (review P1-6). `/sessions` lists the
+    /// remainder for the rare profile with more than nine.
+    #[must_use]
+    pub const fn launcher_rows(&self) -> usize {
+        match self.mode {
+            RuntimeMode::Demo => SEED_SESSION_COUNT as usize,
+            RuntimeMode::Live => LIVE_LAUNCHER_ROWS,
+        }
+    }
+
+    /// Attach the session a launcher row was rendered FOR (the clicked
+    /// row's identity, P2-9). A row the model no longer holds — the frame's
+    /// hit map may be one frame stale — activates nothing.
+    fn attach_session_id(&mut self, id: &SessionId) {
+        if self.sessions.iter().any(|entry| &entry.id == id) {
             self.open_session(id);
         }
     }
@@ -2549,16 +3382,16 @@ impl AppModel {
     /// one-turn-at-a-time flash guarded a single shared projection that no
     /// longer exists.
     fn attach_sample(&mut self, index: usize) {
-        if let Some(id) = self.sessions.get(index).map(|entry| entry.id) {
-            self.open_session(id);
+        if let Some(id) = self.sessions.get(index).map(|entry| entry.id.clone()) {
+            self.open_session(&id);
         }
     }
 
     /// Sim `openSession` (tui.js:1606-1615): sweep closed chips whose 5 s
     /// removal never fired, attach, and NOTHING else — no turn starts
     /// (owner item 1), and the one left behind keeps running.
-    pub fn open_session(&mut self, id: u64) {
-        if self.active_session == Some(id) {
+    pub fn open_session(&mut self, id: &SessionId) {
+        if self.active_session.as_ref() == Some(id) {
             self.screen = Screen::Session;
             return;
         }
@@ -2567,7 +3400,7 @@ impl AppModel {
         // one restore per transition).
         self.stash_draft();
         self.checkin();
-        let Some(index) = self.sessions.iter().position(|entry| entry.id == id) else {
+        let Some(index) = self.sessions.iter().position(|entry| &entry.id == id) else {
             // Unknown id: the checkin left us on the no-session surface —
             // bring ITS (the launcher's) draft live, stranding nothing.
             self.restore_draft();
@@ -2575,9 +3408,10 @@ impl AppModel {
         };
         // Move the slot out so its fields can swap with `self`'s without
         // aliasing; the slot keeps a neutral placeholder meanwhile.
+        let ui_gen = self.sessions[index].ui_gen;
         let mut slot = std::mem::replace(
             &mut self.sessions[index],
-            crate::session::SessionState::neutral(id),
+            crate::session::SessionState::neutral(id.clone(), ui_gen),
         );
         crate::session::sweep_closed_chips(&mut slot.chips);
         self.projection = std::mem::replace(&mut slot.projection, SessionProjection::new());
@@ -2593,7 +3427,7 @@ impl AppModel {
         self.session_head = std::mem::take(&mut slot.head);
         self.session_dir = std::mem::take(&mut slot.dir);
         self.sessions[index] = slot;
-        self.active_session = Some(id);
+        self.active_session = Some(id.clone());
         self.menu_selection = 0;
         self.view_path.clear();
         self.screen = Screen::Session;
@@ -2614,6 +3448,7 @@ impl AppModel {
             return;
         };
         if let Some(index) = self.sessions.iter().position(|entry| entry.id == active) {
+            // (identity is the protocol id; the row's generation stays put)
             let slot = &mut self.sessions[index];
             slot.projection = std::mem::replace(&mut self.projection, SessionProjection::new());
             slot.chips = std::mem::take(&mut self.chips);
@@ -2647,13 +3482,17 @@ impl AppModel {
     /// session left behind is checked in, never cancelled.
     fn new_session(&mut self, text: &str) {
         self.checkin();
-        let id = self.next_session_id;
-        self.next_session_id += 1;
+        let ui_gen = UiGeneration::new(self.next_ui_generation);
+        self.next_ui_generation += 1;
+        // The DEMO mints its own protocol id from the generation (report
+        // R11 cut 1). `run_live` never reaches here: a live session exists
+        // only once `session.create` answers with the daemon's id.
+        let id = crate::identity::demo_session_id(ui_gen);
         let ros = self
             .roster
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let head = crate::script::roster_at(ros);
-        let mut entry = crate::session::SessionState::neutral(id);
+        let mut entry = crate::session::SessionState::neutral(id.clone(), ui_gen);
         entry.name = Some(slug_name(text));
         entry.head = (head.callsign, head.hon.to_owned());
         entry.head_ros = Some(ros);
@@ -2662,7 +3501,7 @@ impl AppModel {
         entry.device = self.identity.device.clone();
         entry.ago = "now".to_owned();
         self.sessions.insert(0, entry);
-        self.open_session(id);
+        self.open_session(&id);
         // Review P3-8: the founding message recalls IN the new session
         // (Claude Code recalls in-conversation); the launcher's own ring
         // kept its copy via take_for_submit before the surface swap.
@@ -2702,12 +3541,90 @@ impl AppModel {
         self.restore_draft();
     }
 
+    /// Learn (or re-learn) a LIVE session row (W3c3 M2). Idempotent: a
+    /// session the model already holds keeps its row, its transcript and
+    /// its generation, so a `session.list` after every reconnect neither
+    /// duplicates rows nor resets the drafts/arms keyed by generation.
+    ///
+    /// A NEW row is minted with the next local generation and NO content:
+    /// the launcher shows the daemon's session, and its transcript arrives
+    /// by attach, never by guess.
+    pub fn upsert_live_session(&mut self, id: &SessionId) -> UiGeneration {
+        if let Some(existing) = self.sessions.iter().find(|row| &row.id == id) {
+            return existing.ui_gen;
+        }
+        let ui_gen = UiGeneration::new(self.next_ui_generation);
+        self.next_ui_generation += 1;
+        let mut entry = crate::session::SessionState::neutral(id.clone(), ui_gen);
+        entry.dir = self.launcher_dir.clone();
+        entry.model_short = self.identity.model_short.clone();
+        entry.device = self.identity.device.clone();
+        entry.ago = "now".to_owned();
+        // Newest first, exactly like `new_session` — the launcher's order
+        // is a display law, not a source law.
+        self.sessions.insert(0, entry);
+        self.dirty = true;
+        ui_gen
+    }
+
+    /// Seed a session's cursor with the sequence its attach asked FROM, so
+    /// the strict gap law covers the FIRST delivered envelope too (W3c3.1,
+    /// review P1-1).
+    ///
+    /// Without this, continuity was only checked once `last_seq` was set:
+    /// a fresh attach at cursor 0 answered with seq 2 applied seq 2 as its
+    /// first event and painted a hole as history — and a hole with no
+    /// later sequence behind it can never be discovered. Seeding is
+    /// MONOTONE (it never rewinds a cursor): the attach's `after_seq` is
+    /// read from this same authority, so the only case that moves is the
+    /// one that was never set.
+    pub fn seed_cursor(&mut self, session: &SessionId, after_seq: u64) {
+        let projection = if self.active_session.as_ref() == Some(session) {
+            Some(&mut self.projection)
+        } else {
+            self.sessions
+                .iter_mut()
+                .find(|entry| &entry.id == session)
+                .map(|entry| &mut entry.projection)
+        };
+        debug_assert!(
+            projection.is_some(),
+            "seed_cursor for a session with no row: every `ensure_attached` \
+             caller upserts the row first, and a silent no-op here hands the \
+             strict gap law back its blind spot"
+        );
+        if let Some(projection) = projection
+            && projection
+                .last_applied()
+                .is_none_or(|last| last < after_seq)
+        {
+            projection.set_last_applied(after_seq);
+        }
+    }
+
     /// A NON-attached session's slot (background event routing).
-    pub fn session_entry_mut(&mut self, id: u64) -> Option<&mut crate::session::SessionState> {
-        if self.active_session == Some(id) {
+    pub fn session_entry_mut(
+        &mut self,
+        id: &SessionId,
+    ) -> Option<&mut crate::session::SessionState> {
+        if self.active_session.as_ref() == Some(id) {
             return None;
         }
-        self.sessions.iter_mut().find(|entry| entry.id == id)
+        self.sessions.iter_mut().find(|entry| &entry.id == id)
+    }
+
+    /// A non-attached session's slot BY GENERATION — the demo driver's
+    /// lookup, whose arms are generation-keyed (report R11 cut 1).
+    pub fn session_entry_by_generation(
+        &mut self,
+        generation: UiGeneration,
+    ) -> Option<&mut crate::session::SessionState> {
+        if self.ui_generation() == generation && self.active_session.is_some() {
+            return None;
+        }
+        self.sessions
+            .iter_mut()
+            .find(|entry| entry.ui_gen == generation)
     }
 
     /// A left-click resolved through the frame's hit map. The map may be
@@ -2727,8 +3644,8 @@ impl AppModel {
             // one frame stale, so a rect from a screen we have since left
             // must never act (review P1-5 — the law documented above was
             // only honored by the palette/menu hits).
-            Hit::AttachSample(name) if self.screen == Screen::Launcher => {
-                self.attach_sample_named(&name);
+            Hit::AttachSession(id) if self.screen == Screen::Launcher => {
+                self.attach_session_id(&id);
             }
             Hit::ExtraRow(which) if self.screen == Screen::Launcher => match which {
                 LauncherRow::Aura => self.enter_aura(),
@@ -2785,7 +3702,11 @@ impl AppModel {
             // screen gate is also the owning-surface guard the other hits
             // already carry (review r2 P2-4).
             Hit::TalkChip if self.screen == Screen::Session => {
-                if !self.voice.enabled {
+                if !self.mode.fabricates_locally() {
+                    // The hold's 1.3 s timer lives in the DEMO driver;
+                    // live mode would set `listening` and never clear it.
+                    self.refuse_demo_only("push-to-talk");
+                } else if !self.voice.enabled {
                     self.flash = Some("· enable voice first with /voice".to_owned());
                 } else if !self.turn_active && !self.listening {
                     self.listening = true;
@@ -2828,7 +3749,12 @@ impl AppModel {
                     && self.view_path.last() == Some(&agent)
                     && find_chip(&self.chips, &agent).is_some_and(|chip| !chip.closed) =>
             {
-                self.requests.push(AppRequest::ChipClose { agent });
+                if self.mode.fabricates_locally() {
+                    self.requests.push(AppRequest::ChipClose { agent });
+                } else {
+                    // A live chip closes when its `AgentChipState` says so.
+                    self.refuse_demo_only("closing a subagent");
+                }
             }
             Hit::ChipCrumb(path) if self.screen == Screen::Subagent => {
                 if path.is_empty() {
@@ -2970,6 +3896,14 @@ impl AppModel {
 
 /// Command-card id prefixes — each open mints `{prefix}{seq}` so a stale
 /// answer can never drive a later card's consequences (review r2 P1-1).
+/// How many sessions the demo world seeds (sim tui.js:497-579). The
+/// generation allocator advances by exactly this on every reseed.
+pub const SEED_SESSION_COUNT: u64 = 3;
+
+/// How many launcher rows LIVE mode shows: the whole `1`-`9` digit span,
+/// so every row the launcher paints is also reachable from the keyboard.
+pub const LIVE_LAUNCHER_ROWS: usize = 9;
+
 pub const VOICE_CARD_PREFIX: &str = "voice-card-";
 pub const TOOLS_CARD_PREFIX: &str = "tools-card-";
 

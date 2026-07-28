@@ -753,7 +753,7 @@ async fn generic_turn_plays_end_to_end_with_the_delayed_title_note() {
     assert!(model.projection.context_tokens() > 0);
     assert_eq!(
         model.projection.context_tokens(),
-        driver.tokens_total(model.active_session.unwrap_or(0))
+        driver.tokens_total(model.ui_generation())
     );
 }
 
@@ -922,7 +922,7 @@ async fn auto_compaction_fires_at_85_percent_and_drops_the_meter_to_6_percent() 
     assert_eq!(after, Some(120), "6% of the 2k window");
     assert_eq!(model.projection.context_tokens(), 120, "the meter dropped");
     assert_eq!(
-        driver.tokens_total(model.active_session.unwrap_or(0)),
+        driver.tokens_total(model.ui_generation()),
         120,
         "driver counters reset too"
     );
@@ -937,7 +937,7 @@ async fn manual_compact_runs_1200ms_and_lands_the_numbers() {
         !m.turn_active && m.projection.badge() == "IDLE"
     })
     .await;
-    let before_tokens = driver.tokens_total(model.active_session.unwrap_or(0));
+    let before_tokens = driver.tokens_total(model.ui_generation());
     submit(&mut model, "/compact");
     pump_until(&mut driver, &mut rx, &mut model, "compacted", |m| {
         !m.turn_active
@@ -1051,7 +1051,7 @@ async fn stop_scripts_cancels_parked_menu_arms() {
         "no arm beats after ResetAllSessions — the park was cancelled"
     );
     assert_eq!(
-        driver.tokens_total(model.active_session.unwrap_or(0)),
+        driver.tokens_total(model.ui_generation()),
         0,
         "fresh session, fresh meter"
     );

@@ -13,7 +13,7 @@ use haider_protocol::menu::{
 };
 use haider_protocol::provider::{Usage, UsageSource};
 use haider_protocol::state::{HarnessStatus, ReadinessCheck, RunState, VerifyStep, WaitReason};
-use haider_tui::projection::{OUTPUT_TAIL_MAX, SessionProjection, TranscriptEntry};
+use haider_tui::projection::{OUTPUT_TAIL_MAX, RawOutcome, SessionProjection, TranscriptEntry};
 
 fn item_id(n: u32) -> ItemId {
     ItemId::new(format!("item-{n}"))
@@ -472,10 +472,81 @@ fn raw_stream_tracks_gaps_duplicates_and_unknown_payloads() {
     ));
     assert_eq!(projection.unknown_payloads(), 1);
 
-    // Gap: recorded, event still applied.
-    projection.apply_raw(&envelope(5, streaming));
+    // Gap: recorded AND reduction STOPS. W3c3 (report R11 cut 2) outlaws
+    // the pre-existing "record it and keep going" behavior: continuing
+    // projects a hole in history as if it were the truth. The cursor stays
+    // where it was so the caller can reattach after the last FULLY APPLIED
+    // sequence, and nothing later paints.
+    //
+    // MUTATION CHECK: make the gap arm in `SessionProjection::admit` fall
+    // through to the cursor advance (i.e. restore the pre-W3c3 behavior)
+    // and the outcome, badge and cursor assertions below all fail.
+    assert_eq!(
+        projection.apply_raw(&envelope(5, streaming)),
+        RawOutcome::Gap { after_seq: 2 },
+        "a hole must be reported with the last applied sequence"
+    );
     assert!(projection.gap_seen());
-    assert_eq!(projection.badge(), "▮ STREAMING");
+    assert_eq!(
+        projection.badge(),
+        "● THINKING",
+        "nothing after a gap may paint"
+    );
+    assert_eq!(
+        projection.last_applied(),
+        Some(2),
+        "…and the cursor did NOT move past the hole"
+    );
+}
+
+#[test]
+fn duplicate_envelopes_are_a_no_op_and_the_cursor_survives() {
+    // Report §6.3: "reducer duplicate is a no-op". Delivery is
+    // at-least-once, so the SAME envelope arriving twice must change
+    // nothing — not the display, not the cursor.
+    //
+    // MUTATION CHECK: change `envelope.seq <= last` to `envelope.seq < last`
+    // in `SessionProjection::admit` and the re-delivered seq 1 applies,
+    // pushing a second user row.
+    let mut projection = SessionProjection::new();
+    let user = serde_json::to_value(EventPayload::UserMessage {
+        text: "once".to_owned(),
+        attachments: vec![],
+        mode: haider_protocol::DeliveryMode::Steer,
+    })
+    .expect("payload serializes");
+    assert_eq!(
+        projection.apply_raw(&envelope(1, user.clone())),
+        RawOutcome::Applied
+    );
+    assert_eq!(projection.entries().len(), 1);
+    assert_eq!(
+        projection.apply_raw(&envelope(1, user)),
+        RawOutcome::Duplicate,
+        "a re-delivered sequence is a no-op"
+    );
+    assert_eq!(projection.entries().len(), 1, "no duplicate row");
+    assert_eq!(projection.last_applied(), Some(1));
+}
+
+#[test]
+fn an_attach_cursor_gap_checks_the_very_first_delivered_envelope() {
+    // A client that attached `after_seq = 10` and receives 13 has lost
+    // 11-12. Without seeding the cursor at attach the first envelope is
+    // unconditionally applied and the loss is invisible.
+    //
+    // MUTATION CHECK: delete the `set_last_applied(10)` call below (i.e.
+    // do not seed the cursor at attach) and the first envelope is Applied.
+    let mut projection = SessionProjection::new();
+    projection.set_last_applied(10);
+    let streaming = serde_json::to_value(EventPayload::RunState(RunState::Streaming))
+        .expect("payload serializes");
+    assert_eq!(
+        projection.apply_raw(&envelope(13, streaming)),
+        RawOutcome::Gap { after_seq: 10 },
+        "the first post-attach envelope is gap-checked like any other"
+    );
+    assert_eq!(projection.badge(), "IDLE");
 }
 
 #[test]

@@ -147,9 +147,36 @@ impl PaletteItem {
 pub const PALETTE_MAX_ROWS: usize = 8;
 
 /// Commands whose argument slot the palette can complete today.
+///
+/// W3c3 M3 adds `/login` (report §6.3: "`/login` argument slots") — the
+/// one account command this release makes executable.
 #[must_use]
 pub fn has_arg_slots(name: &str) -> bool {
-    name == "theme"
+    matches!(name, "theme" | "login")
+}
+
+/// `/login`'s two argument slots: provider, then method. The provider list
+/// is the set the daemon can actually validate against today; the method
+/// list is the wire's own (`api` executes, `oauth` is honest about landing
+/// later).
+fn login_args(slot: usize, fragment: &str) -> Vec<PaletteItem> {
+    let candidates: &[(&'static str, &'static str)] = match slot {
+        0 => &[("anthropic", "Anthropic — Claude models")],
+        1 => &[
+            ("api", "paste an API key (masked, stored in the OS vault)"),
+            ("oauth", "browser sign-in — lands after v0.0.12"),
+        ],
+        _ => &[],
+    };
+    candidates
+        .iter()
+        .filter(|(value, _)| value.starts_with(fragment))
+        .map(|(value, desc)| PaletteItem::Arg {
+            cmd: "login",
+            value,
+            desc,
+        })
+        .collect()
 }
 
 /// `/theme`'s argument candidates, derived from the theme registry (sim
@@ -189,27 +216,30 @@ pub fn palette_items(query: &str, in_session: bool) -> Vec<PaletteItem> {
             && has_arg_slots(&first)
             && matches!(matches[0], PaletteItem::Cmd(spec) if spec.name == first)
         {
-            return theme_args("");
+            return match first.as_str() {
+                "login" => login_args(0, ""),
+                _ => theme_args(""),
+            };
         }
         return matches;
     }
-    // Argument position. /theme has one slot; further args offer nothing.
-    if first == "theme" {
-        let done_args = if ends_space {
-            rest.len()
-        } else {
-            rest.len().saturating_sub(1)
-        };
-        if done_args == 0 {
-            let fragment = if ends_space {
-                String::new()
-            } else {
-                rest.last().copied().unwrap_or("").to_ascii_lowercase()
-            };
-            return theme_args(&fragment);
-        }
+    // Argument position. /theme has ONE slot; /login has two (provider,
+    // then method); further args offer nothing.
+    let done_args = if ends_space {
+        rest.len()
+    } else {
+        rest.len().saturating_sub(1)
+    };
+    let fragment = if ends_space {
+        String::new()
+    } else {
+        rest.last().copied().unwrap_or("").to_ascii_lowercase()
+    };
+    match first.as_str() {
+        "theme" if done_args == 0 => theme_args(&fragment),
+        "login" if done_args < 2 => login_args(done_args, &fragment),
+        _ => Vec::new(),
     }
-    Vec::new()
 }
 
 /// The `/help` panel body — the sim's `HELP_TEXT` verbatim (tui.js:587-614),
@@ -222,7 +252,7 @@ pub const HELP_TEXT: &[&str] = &[
     "  /tree              session tree — main-line view, ⏎ opens forks, f forks at a node",
     "  /fork              fork the session at the current point",
     "  /sessions          list + switch sessions",
-    "  /aura              Aura Mode — a voice/orchestrator session (spawns sessions, never codes)",
+    "  /aura              Aura Mode — a voice/orchestrator session (spawns sessions, never codes) — demo only",
     "  /peers             reachability ladder — enrolled peers · sponsored SSH nodes · shell targets",
     "  /accounts          provider credentials — OAuth / API / HuggingFace / custom, pick the active",
     "  /account <alias>   switch the active account for its provider (tab-completes aliases)",
@@ -231,9 +261,9 @@ pub const HELP_TEXT: &[&str] = &[
     "  /compact           compact context now",
     "  /tokens            token panel — context by model (also ⌃G)",
     "  /hooks             trust third-party hooks — FULL-SCREEN startup gate (not a session card)",
-    "  /voice             enable voice · pick STT / TTS providers (menu card)",
-    "  /say <words>       speak a turn once voice is on (simulated STT)",
-    "  /tools             core + custom tools · register with a dispatch mode (menu card)",
+    "  /voice             enable voice · pick STT / TTS providers (menu card) — demo only",
+    "  /say <words>       speak a turn once voice is on (simulated STT) — demo only",
+    "  /tools             core + custom tools · register with a dispatch mode (menu card) — demo only",
     "  /queue <steer|turn> mid-turn input mode — steer at safe boundary, or hold until turn end",
     "  /update            check for updates — FULL-SCREEN startup gate (harness-level)",
     "  /rename <name>     rename this session",

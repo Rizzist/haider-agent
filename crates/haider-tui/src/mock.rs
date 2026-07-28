@@ -475,18 +475,37 @@ pub fn seed_item_id(seq: u64) -> haider_protocol::ids::ItemId {
 }
 
 /// Materialize the three seed sessions as full [`SessionState`]s (sim
-/// seeds, tui.js:497-579) — ids 1-3, roster heads 0-2, seed transcripts
-/// applied verbatim, the L1 seed's live `web-index` chip attached, and the
-/// token meter Usage-seeded. `turns_offset` keeps each seed's advertised
-/// turn count while real turns still move the number.
+/// seeds, tui.js:497-579) — stable ids `demo-session-1..3`, roster heads
+/// 0-2, seed transcripts applied verbatim, the L1 seed's live `web-index`
+/// chip attached, and the token meter Usage-seeded. `turns_offset` keeps
+/// each seed's advertised turn count while real turns still move the
+/// number.
+///
+/// `first_generation` is where the caller's monotonic allocator stands;
+/// the three rows take it and the next two. IDENTITY NEVER RECURS (W3c3.1,
+/// review P1-5): `/reset` reseeds this same world, and hardcoding
+/// generations 1-3 let a REPLACEMENT surface wear a dead one — defeating,
+/// at the only site that matters, the very law `next_ui_generation`'s
+/// monotonicity exists to keep.
+///
+/// The SESSION IDS stay `demo-session-1..3` regardless. They are the
+/// demo's stable persistence identities — what the v1→v2 upcaster maps a
+/// legacy numeric `id: 2` onto — and a session id is not a generation
+/// (report R11 cut 1).
 #[must_use]
-pub fn seed_session_states() -> Vec<crate::session::SessionState> {
+pub fn seed_session_states(first_generation: u64) -> Vec<crate::session::SessionState> {
     sample_sessions()
         .iter()
         .enumerate()
         .map(|(index, sample)| {
-            let mut entry =
-                crate::session::SessionState::neutral(u64::try_from(index).unwrap_or(0) + 1);
+            let ordinal = u64::try_from(index).unwrap_or(0);
+            // The stable demo id (the old numeric ids verbatim; `+ 1`
+            // skips `UiGeneration::SCRATCH`) and a FRESH generation.
+            let id =
+                crate::identity::demo_session_id(crate::identity::UiGeneration::new(ordinal + 1));
+            let ui_gen =
+                crate::identity::UiGeneration::new(first_generation.saturating_add(ordinal));
+            let mut entry = crate::session::SessionState::neutral(id, ui_gen);
             entry.name = Some(sample.name.to_owned());
             entry.title = Some(sample.blurb.to_owned());
             entry.head = (sample.head.to_owned(), sample.honorific.to_owned());

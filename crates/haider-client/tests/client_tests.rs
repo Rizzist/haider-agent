@@ -494,8 +494,8 @@ async fn fatal_protocol_error_frame_fails_pending_requests() {
     }
 }
 
-/// W3c2 review finding 1: a `request()` racing `Shared::fail` must never
-/// orphan its pending sender. The fix places the disconnect check INSIDE the
+/// W3c2 review finding 1: a request racing `Shared::fail` must never orphan
+/// its pending sender. The fix places the disconnect check INSIDE the
 /// pending lock, so either the flip is visible before insert (typed error,
 /// nothing inserted) or the sender lands before fail's one-time clear and the
 /// clear drops it (the receiver resolves with the typed disconnect). The
@@ -503,8 +503,12 @@ async fn fatal_protocol_error_frame_fails_pending_requests() {
 /// r2-precedented executing source guard on the ordering, beside the
 /// behavioral request-after-disconnect pin below.
 ///
+/// The correlation now lives in `begin_request` (W3c3 P1-3 split the ordered
+/// send from the concurrent wait); `request` is its one-line composition, so
+/// there is still exactly ONE copy of this ordering to guard.
+///
 /// MUTATION CHECK: move the `ConnectionState::Disconnected` early-return in
-/// `RpcClient::request` back above the `pending.lock()` acquisition.
+/// `RpcClient::begin_request` back above the `pending.lock()` acquisition.
 /// Expected failure: the position assertions below invert.
 #[test]
 fn request_disconnect_check_sits_inside_the_pending_lock() {
@@ -512,7 +516,9 @@ fn request_disconnect_check_sits_inside_the_pending_lock() {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/client.rs"),
     )
     .expect("client source");
-    let body_start = source.find("pub async fn request").expect("request fn");
+    let body_start = source
+        .find("pub async fn begin_request")
+        .expect("begin_request fn");
     let body = &source[body_start..body_start + 2_500];
     let lock = body
         .find("self.shared.pending.lock()")

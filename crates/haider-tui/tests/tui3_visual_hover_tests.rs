@@ -300,17 +300,15 @@ fn rect_center(rect: Rect) -> (u16, u16) {
 fn hover_lights_launcher_rows_and_clears_off_target() {
     let mut model = launcher_model();
     let (rows, hits, _) = draw(&model, 118, 34);
+    let billing = common::session_named(&model, "billing-service");
     let (rect, _) = hits
         .iter()
-        .find(|(_, h)| *h == Hit::AttachSample("billing-service".to_owned()))
+        .find(|(_, h)| *h == Hit::AttachSession(billing.clone()))
         .expect("sample row hit");
     let row_y = rect.y;
     let (cx, cy) = rect_center(*rect);
     dispatch_input(&mut model, &hits, moved(cx, cy));
-    assert_eq!(
-        model.hovered,
-        Some(Hit::AttachSample("billing-service".to_owned()))
-    );
+    assert_eq!(model.hovered, Some(Hit::AttachSession(billing)));
     assert!(model.dirty, "hover change dirties");
     let theme = model.theme.theme();
     let (_, _, terminal) = draw(&model, 118, 34);

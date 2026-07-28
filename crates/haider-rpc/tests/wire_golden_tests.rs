@@ -9,12 +9,13 @@ use std::path::PathBuf;
 use common::{TEST_FRAME_LIMIT, transcript};
 use haider_rpc::{
     CancelStatus, DEFAULT_FRAME_LIMIT, ERROR_CODE_ALREADY_RESOLVED, ERROR_CODE_BUSY,
-    ERROR_CODE_CAPABILITY_DENIED, ERROR_CODE_CURSOR_AHEAD, ERROR_CODE_DRAINING,
-    ERROR_CODE_INVALID_ARGUMENT, ERROR_CODE_INVALID_CURSOR, ERROR_CODE_NOT_FOUND,
-    ERROR_CODE_OVERLOADED, ERROR_CODE_PROVIDER_ERROR, ERROR_CODE_RUN_NOT_ACTIVE,
-    ERROR_CODE_STALE_GENERATION, FEATURE_SESSION_MUTATION_V1, FEATURE_TURN_CONTROL_V1, Hello,
-    RequestBody, ResponseBody, SubmitDisposition, WIRE_PROTOCOL_VERSION, Welcome, WireFrame,
-    uds_codec, ws_codec,
+    ERROR_CODE_CAPABILITY_DENIED, ERROR_CODE_CREDENTIAL_MISSING, ERROR_CODE_CURSOR_AHEAD,
+    ERROR_CODE_DRAINING, ERROR_CODE_INVALID_ARGUMENT, ERROR_CODE_INVALID_CURSOR,
+    ERROR_CODE_NOT_FOUND, ERROR_CODE_OVERLOADED, ERROR_CODE_PERMISSION_DENIED,
+    ERROR_CODE_PROVIDER_ERROR, ERROR_CODE_RESTAGE_REQUIRED, ERROR_CODE_RUN_NOT_ACTIVE,
+    ERROR_CODE_STALE_GENERATION, ERROR_CODE_UNAUTHORIZED, ERROR_CODE_VAULT_UNSUPPORTED,
+    FEATURE_SESSION_MUTATION_V1, FEATURE_TURN_CONTROL_V1, Hello, RequestBody, ResponseBody,
+    SubmitDisposition, WIRE_PROTOCOL_VERSION, Welcome, WireFrame, uds_codec, ws_codec,
 };
 use serde::{Deserialize, Serialize};
 
@@ -209,6 +210,74 @@ fn correlated_errors_pin_the_named_stable_codes() {
         value["body"]["code"],
         serde_json::Value::String(ERROR_CODE_CAPABILITY_DENIED.into())
     );
+}
+
+/// The five W3c2 account/vault codes pinned as WIRE LITERALS: a client
+/// matching on `"restage_required"` must keep matching, so the constant's
+/// value and the encoded frame's bytes are both asserted against the string
+/// (asserting the constant against itself would pin nothing).
+///
+/// MUTATION CHECK: change any of the five constants' values in `frame.rs`
+/// (e.g. `ERROR_CODE_RESTAGE_REQUIRED` to `"restage_needed"`). Expected
+/// failure: the literal array below mismatches AND the encoded WS body no
+/// longer contains `"code":"restage_required"`.
+#[test]
+fn account_and_vault_stable_codes_pin_their_wire_literals() {
+    assert_eq!(
+        [
+            ERROR_CODE_UNAUTHORIZED,
+            ERROR_CODE_PERMISSION_DENIED,
+            ERROR_CODE_RESTAGE_REQUIRED,
+            ERROR_CODE_VAULT_UNSUPPORTED,
+            ERROR_CODE_CREDENTIAL_MISSING,
+        ],
+        [
+            "unauthorized",
+            "permission_denied",
+            "restage_required",
+            "vault_unsupported",
+            "credential_missing",
+        ]
+    );
+
+    // Each code also travels as that literal inside a correlated error frame
+    // (and an older client carries the bytes back unchanged).
+    for (code, literal, retryable) in [
+        (ERROR_CODE_UNAUTHORIZED, "unauthorized", false),
+        (ERROR_CODE_PERMISSION_DENIED, "permission_denied", false),
+        (ERROR_CODE_RESTAGE_REQUIRED, "restage_required", true),
+        (ERROR_CODE_VAULT_UNSUPPORTED, "vault_unsupported", false),
+        (ERROR_CODE_CREDENTIAL_MISSING, "credential_missing", false),
+    ] {
+        let frame = WireFrame::Response {
+            request_id: haider_rpc::RequestId::new("request-login"),
+            body: ResponseBody::Error {
+                code: code.into(),
+                message: "pinned code".into(),
+                retryable,
+                data: None,
+            },
+        };
+        let ws_body = ws_codec::encode(&frame, TEST_FRAME_LIMIT).expect("WS encode");
+        assert!(
+            ws_body.contains(&format!(r#""code":"{literal}""#)),
+            "wire body must carry the literal code {literal}: {ws_body}"
+        );
+        let value = serde_json::to_value(&frame).expect("error JSON");
+        assert_eq!(value["body"]["method"], "error");
+        assert_eq!(
+            value["body"]["code"],
+            serde_json::Value::String(literal.into())
+        );
+        assert_eq!(
+            value["body"]["retryable"],
+            serde_json::Value::Bool(retryable)
+        );
+        assert_eq!(
+            ws_codec::decode(&ws_body, TEST_FRAME_LIMIT).expect("decode pinned error"),
+            frame
+        );
+    }
 }
 
 /// MUTATION CHECK: remove `Welcome.features`' default/skip-empty attributes.

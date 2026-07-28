@@ -104,6 +104,47 @@ impl ItemBlock {
     }
 }
 
+/// What one raw envelope did to the reducer (W3c3, report R11 cut 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RawOutcome {
+    /// Reduced (or deliberately invisible); the cursor advanced to this seq.
+    Applied,
+    /// `seq <= last_applied` — an at-least-once redelivery. Nothing moved.
+    Duplicate,
+    /// `seq > last_applied + 1`. Reduction STOPPED: nothing was applied and
+    /// the cursor did not move. The caller must request a reattach after
+    /// `after_seq` before any later envelope may mutate state.
+    Gap { after_seq: u64 },
+    /// The frame named a different session than the one it was routed to —
+    /// rejected without touching anything (report R11 cut 2: "validates
+    /// frame session ID").
+    WrongSession,
+}
+
+/// Who owns an open menu, recorded at `MenuOpened` and consulted when its
+/// `MenuAnswered`/`MenuClosed` arrives (report R11 cut 2). Without the map
+/// a subagent's answer would land on the session's blocking card.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MenuScopeOwner {
+    Session,
+    Agent(haider_protocol::ids::AgentId),
+}
+
+/// What [`SessionProjection::admit`] decided about one raw envelope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admission {
+    /// In order and `render.ui` — the cursor advanced; apply the payload.
+    Apply,
+    /// In order but `render.ui == false` — the cursor advanced; the payload
+    /// must NOT paint (§6.1).
+    Skip,
+    /// At-least-once redelivery; the cursor did not move.
+    Duplicate,
+    /// A hole in the stream; the cursor did not move and nothing may be
+    /// applied until the caller reattaches after `after_seq`.
+    Gap { after_seq: u64 },
+}
+
 /// The live todo plan pinned above the composer; unpins into the transcript
 /// when every item completes (sim behavior).
 #[derive(Debug, Clone, PartialEq)]
@@ -144,6 +185,10 @@ pub struct SessionProjection {
     /// semantics: one item, one block, ever).
     finished_items: std::collections::HashSet<ItemId>,
     menu: Option<Menu>,
+    /// Menu-id → opening scope (report R11 cut 2). Stream-scoped: hydration
+    /// starts it empty, and a menu with no recorded opening falls back to
+    /// the pre-W3c3 broadcast.
+    menu_owner: std::collections::HashMap<haider_protocol::ids::MenuId, MenuScopeOwner>,
     todos: Option<TodoPanel>,
     usage: Option<Usage>,
     /// A voice turn is live: blocks started now render ` · ♪ speaking`
@@ -192,28 +237,94 @@ impl SessionProjection {
         }
     }
 
-    /// Consume one raw envelope in stream order. Duplicate seqs are skipped;
-    /// gaps are recorded (attach/replay honesty) and processing continues.
-    /// Unknown payloads are counted and ignored (forward-compat law).
-    /// Envelopes marked `render.ui == false` advance sequence accounting but
-    /// never mutate display state (§6.1: three surfaces, never conflated).
-    pub fn apply_raw(&mut self, envelope: &RawEnvelope) {
+    /// Consume one raw envelope in stream order — the SOLE cursor authority
+    /// (W3c3, report R11 cut 2).
+    ///
+    /// STRICT gap law: `seq > last_applied + 1` applies NOTHING and leaves
+    /// the cursor where it was, so the caller can reattach after the last
+    /// FULLY APPLIED sequence before any later envelope mutates state. The
+    /// pre-W3c3 reducer recorded the gap and kept going, which silently
+    /// projected a hole in history; the store is the lag buffer (R9), so
+    /// papering over a gap is never the client's job.
+    ///
+    /// Duplicate seqs are skipped (delivery is at-least-once). Unknown
+    /// payloads are counted and ignored (forward-compat law). Envelopes
+    /// marked `render.ui == false` advance the cursor but never mutate
+    /// display state (§6.1: three surfaces, never conflated).
+    pub fn apply_raw(&mut self, envelope: &RawEnvelope) -> RawOutcome {
+        match self.admit(envelope) {
+            Admission::Apply => {
+                self.apply_payload_json(&envelope.payload);
+                RawOutcome::Applied
+            }
+            Admission::Skip => RawOutcome::Applied,
+            Admission::Duplicate => RawOutcome::Duplicate,
+            Admission::Gap { after_seq } => RawOutcome::Gap { after_seq },
+        }
+    }
+
+    /// The cursor gate ALONE — the strict half of [`Self::apply_raw`],
+    /// separated so a router can decide WHERE the payload lands (a session's
+    /// own projection, or a subagent chip's transcript) while the cursor
+    /// stays single-authority here. The cursor advances on `Apply`/`Skip`
+    /// and never on `Duplicate`/`Gap`.
+    pub fn admit(&mut self, envelope: &RawEnvelope) -> Admission {
         if let Some(last) = self.last_seq {
             if envelope.seq <= last {
-                return;
+                return Admission::Duplicate;
             }
             if envelope.seq != last + 1 {
                 self.gap_seen = true;
+                return Admission::Gap { after_seq: last };
             }
         }
         self.last_seq = Some(envelope.seq);
-        if !envelope.render.ui {
-            return;
+        if envelope.render.ui {
+            Admission::Apply
+        } else {
+            Admission::Skip
         }
-        match serde_json::from_value::<EventPayload>(envelope.payload.clone()) {
+    }
+
+    /// Decode one admitted payload into this projection; an undecodable kind
+    /// is counted, never fatal (forward-compat law).
+    pub fn apply_payload_json(&mut self, payload: &serde_json::Value) {
+        match serde_json::from_value::<EventPayload>(payload.clone()) {
             Ok(payload) => self.apply(&payload),
             Err(_) => self.unknown_payloads += 1,
         }
+    }
+
+    /// Count one payload this build cannot decode (forward-compat law) —
+    /// the router's hook when IT owns the decode.
+    pub fn count_unknown_payload(&mut self) {
+        self.unknown_payloads += 1;
+    }
+
+    /// Record which scope opened a menu (report R11 cut 2).
+    pub fn note_menu_owner(&mut self, menu: haider_protocol::ids::MenuId, owner: MenuScopeOwner) {
+        self.menu_owner.insert(menu, owner);
+    }
+
+    /// The recorded opening scope of a menu, if this stream carried it.
+    #[must_use]
+    pub fn menu_owner(&self, menu: &haider_protocol::ids::MenuId) -> Option<&MenuScopeOwner> {
+        self.menu_owner.get(menu)
+    }
+
+    /// The greatest FULLY APPLIED sequence — the only reattach cursor there
+    /// is (R9's cursor law: server telemetry like `last_queued_seq` is never
+    /// resume authority). `None` before the first envelope.
+    #[must_use]
+    pub const fn last_applied(&self) -> Option<u64> {
+        self.last_seq
+    }
+
+    /// Seed the cursor at attach time so the FIRST delivered envelope is
+    /// gap-checked too: a client that attached `after_seq = N` and receives
+    /// `N + 3` has lost `N+1..=N+2` and must reattach, not paint.
+    pub fn set_last_applied(&mut self, after_seq: u64) {
+        self.last_seq = Some(after_seq);
     }
 
     /// Consume one typed payload (used by tests and the mock client).

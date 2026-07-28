@@ -688,15 +688,16 @@ fn clicks_attach_sessions_and_wheel_scrolls() {
         HarnessStatus::Ready,
     ))));
     let (_, hits) = draw_with_hits(&model, 118, 34);
+    let billing = common::session_named(&model, "billing-service");
     assert!(
         hits.iter()
-            .any(|(_, h)| *h == Hit::AttachSample("billing-service".to_owned())),
+            .any(|(_, h)| *h == Hit::AttachSession(billing.clone())),
         "sample rows are clickable"
     );
     assert!(hits.iter().any(|(_, h)| *h == Hit::TalkChip));
     assert!(hits.iter().any(|(_, h)| *h == Hit::HelpHint));
 
-    model.handle_hit(Hit::AttachSample("l1-remote-projects".to_owned()));
+    common::hit_session_named(&mut model, "l1-remote-projects");
     // TUI4 item 1: attaching opens the SEEDED session and starts no turn.
     assert!(!model.turn_active);
     assert_eq!(model.screen, Screen::Session);

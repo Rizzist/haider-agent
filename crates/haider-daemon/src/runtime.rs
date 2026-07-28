@@ -138,6 +138,20 @@ pub fn spawn_with_dependencies(
 /// The first SIGINT/SIGTERM starts the drain barrier; the second selects the
 /// forced path. Crash/forced recovery belongs to the next daemon generation.
 pub async fn run_with_signals(config: DaemonConfig) -> Result<ShutdownOutcome, DaemonError> {
+    run_with_signals_and_dependencies(config, DaemonDependencies::default()).await
+}
+
+/// [`run_with_signals`] with injectable provider/tool factories — the
+/// binary-level twin of [`spawn_with_dependencies`].
+///
+/// The only production caller passes [`DaemonDependencies::default`]; the
+/// injectable form exists so an END-TO-END probe can drive the REAL daemon
+/// binary (real socket, real store, real hub) against a deterministic
+/// provider, with no network and no credentials.
+pub async fn run_with_signals_and_dependencies(
+    config: DaemonConfig,
+    dependencies: DaemonDependencies,
+) -> Result<ShutdownOutcome, DaemonError> {
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|error| DaemonError::Task {
         message: format!("cannot install SIGTERM handler: {error}"),
@@ -146,7 +160,7 @@ pub async fn run_with_signals(config: DaemonConfig) -> Result<ShutdownOutcome, D
         .map_err(|error| DaemonError::Task {
         message: format!("cannot install SIGINT handler: {error}"),
     })?;
-    let task = spawn(config);
+    let task = spawn_with_dependencies(config, dependencies);
     let shutdown = task.shutdown_handle();
     let mut joined: Pin<Box<dyn Future<Output = Result<ShutdownOutcome, DaemonError>> + Send>> =
         Box::pin(task.join());

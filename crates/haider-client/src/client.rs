@@ -278,6 +278,16 @@ struct Shared {
 }
 
 impl Shared {
+    /// The recorded death reason. A correlation that was dropped while the
+    /// connection still reads as live is a local close — never a hang and
+    /// never an untyped error.
+    fn disconnect_reason(&self) -> DisconnectReason {
+        match &*self.state.borrow() {
+            ConnectionState::Disconnected(reason) => reason.clone(),
+            ConnectionState::Connected => DisconnectReason::Closed,
+        }
+    }
+
     /// First disconnect reason wins; pending requests observe it by drop.
     fn fail(&self, reason: DisconnectReason) {
         let mut first = false;
@@ -387,7 +397,26 @@ impl RpcClient {
     }
 
     /// Sends one correlated request and awaits its response body.
+    ///
+    /// Exactly [`Self::begin_request`] followed by [`PendingResponse::wait`]:
+    /// there is ONE piece of correlation logic in this file, because a second
+    /// copy is how the pending-lock ordering below silently drifts back to
+    /// the orphaning shape it was fixed out of.
     pub async fn request(&self, body: RequestBody) -> Result<ResponseBody, ClientError> {
+        self.begin_request(body).await?.wait().await
+    }
+
+    /// Registers the correlation, writes the frame, and hands back the
+    /// handle that resolves when the response lands.
+    ///
+    /// THE SEND HALF IS THE ORDERED HALF. A caller that must put two frames
+    /// on the wire in a fixed order — `session.detach` before the
+    /// `session.attach` that reuses its slot — awaits `begin_request` inline
+    /// and moves only the returned [`PendingResponse`] onto a task. Awaiting
+    /// the whole of [`Self::request`] on a task instead lets two requests
+    /// race to `outbound.send`, and the daemon then sees the attach first and
+    /// rejects it at `max_attachments_per_connection` (review W3c3 P1-3).
+    pub async fn begin_request(&self, body: RequestBody) -> Result<PendingResponse, ClientError> {
         let id = format!(
             "req-{}",
             self.shared.next_request.fetch_add(1, Ordering::Relaxed)
@@ -426,10 +455,10 @@ impl RpcClient {
             }
             return Err(ClientError::Disconnected(self.disconnect_reason()));
         }
-        match receiver.await {
-            Ok(body) => Ok(body),
-            Err(_) => Err(ClientError::Disconnected(self.disconnect_reason())),
-        }
+        Ok(PendingResponse {
+            receiver,
+            shared: Arc::clone(&self.shared),
+        })
     }
 
     /// Sends one uncorrelated frame (`MenuAnswer` is the intended user).
@@ -449,9 +478,33 @@ impl RpcClient {
     }
 
     fn disconnect_reason(&self) -> DisconnectReason {
-        match self.state() {
-            ConnectionState::Disconnected(reason) => reason,
-            ConnectionState::Connected => DisconnectReason::Closed,
+        self.shared.disconnect_reason()
+    }
+}
+
+/// A correlated request whose frame is ALREADY on the wire, waiting only for
+/// its response.
+///
+/// This is the half of a request that may be moved onto a task. Holding it
+/// keeps the correlation registered, so the response cannot be lost by the
+/// caller deferring its wait; dropping it abandons the wait, and the reply
+/// is then discarded when it arrives (the pending entry is removed either
+/// way, by the reader or by the connection's one-time clear).
+pub struct PendingResponse {
+    receiver: oneshot::Receiver<ResponseBody>,
+    shared: Arc<Shared>,
+}
+
+impl PendingResponse {
+    /// Awaits the daemon's answer.
+    ///
+    /// A correlation dropped by a dying connection resolves as the typed
+    /// [`DisconnectReason`] — the caller's reconnect cue — never as a hang.
+    pub async fn wait(self) -> Result<ResponseBody, ClientError> {
+        let Self { receiver, shared } = self;
+        match receiver.await {
+            Ok(body) => Ok(body),
+            Err(_) => Err(ClientError::Disconnected(shared.disconnect_reason())),
         }
     }
 }

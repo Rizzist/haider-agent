@@ -491,9 +491,11 @@ fn render_launcher(
         ));
     }
     // Pass 1: build every row's spans, metas ellipsized to the frame cap.
-    // Sim shows the first THREE sessions (tui.js:3246 `slice(0, 3)`).
+    // HOW MANY rows is the MODEL's policy, not the renderer's — the sim's
+    // three in demo, the reachable digit span live (see
+    // `AppModel::launcher_rows`). Render stays source-agnostic: it asks.
     let mut recent: Vec<(Vec<Span<'_>>, Option<Hit>)> = vec![(rhead, None)];
-    for entry in model.sessions.iter().take(3) {
+    for entry in model.sessions.iter().take(model.launcher_rows()) {
         // Sim row anatomy (tui.js:3252-3277): rail · dot (ok; gold
         // PULSING when running, tui.js:4392-4394) · name BRIGHT bold ·
         // `▸ head hon` DIM (.hd) · meta DIM ellipsized. No digit prefix
@@ -565,7 +567,7 @@ fn render_launcher(
             ellipsize(&meta, meta_budget),
             theme.dim_style(),
         ));
-        recent.push((spans, Some(Hit::AttachSample(name))));
+        recent.push((spans, Some(Hit::AttachSession(entry.id.clone()))));
     }
     // Sim `.aurarow` metas VERBATIM (tui.js:3278-3300) — the earlier port
     // abbreviated all three (review P2-8). The Accounts/Peers counts come
@@ -625,7 +627,7 @@ fn render_launcher(
         .max()
         .unwrap_or(10)
         .clamp(10, area_cap);
-    let mut sample_rows: Vec<(usize, String)> = Vec::new();
+    let mut sample_rows: Vec<(usize, haider_protocol::ids::SessionId)> = Vec::new();
     let mut extra_rows: Vec<(usize, LauncherRow)> = Vec::new();
     for (spans, hit) in recent {
         if matches!(hit, Some(Hit::ExtraRow(_))) {
@@ -638,7 +640,7 @@ fn render_launcher(
             line = line.style(theme.hover_style());
         }
         match &hit {
-            Some(Hit::AttachSample(name)) => sample_rows.push((lines.len(), name.clone())),
+            Some(Hit::AttachSession(id)) => sample_rows.push((lines.len(), id.clone())),
             Some(Hit::ExtraRow(row)) => extra_rows.push((lines.len(), *row)),
             _ => {}
         }
@@ -679,11 +681,11 @@ fn render_launcher(
     };
     let (middle, dropped) = centered(frame, content_area, lines);
     let visible = |row: usize| row.checked_sub(dropped);
-    for (row, name) in sample_rows {
+    for (row, id) in sample_rows {
         if let Some(row) = visible(row) {
             hits.push((
                 row_rect(content_area, middle.y, row),
-                Hit::AttachSample(name),
+                Hit::AttachSession(id),
             ));
         }
     }
@@ -2292,6 +2294,11 @@ fn menu_glyph(menu: &haider_protocol::menu::Menu) -> &'static str {
 /// [`COMPOSER_MAX_ROWS`] (sim textarea autoGrow, tui.js:2799-2803); beyond
 /// the cap the composer scrolls to its tail.
 fn composer_height(model: &AppModel) -> u16 {
+    // The masked login card REPLACES the composer while it is open
+    // (W3c3 M3): title, masked field, hint.
+    if model.login.is_some() {
+        return LOGIN_CARD_ROWS;
+    }
     let rows = model
         .composer
         .text()
@@ -2413,6 +2420,60 @@ struct ComposerRowWindow {
     content: String,
 }
 
+/// Rows the masked login card claims: title · field · hint.
+const LOGIN_CARD_ROWS: u16 = 3;
+
+/// The masked `/login … api` card (W3c3 M3 — report R10).
+///
+/// The renderer is handed a LENGTH, never the key. That is the whole
+/// design: no frame can carry the secret, so no snapshot, no scrollback,
+/// no drag-selection copy and no `⌃C` can either. The mask is also CAPPED,
+/// so a long key does not advertise its length across the terminal.
+fn login_lines(card: &crate::app::LoginCard, theme: &Theme, width: u16) -> Vec<Line<'static>> {
+    use crate::app::LoginStage;
+    const MASK_CAP: usize = 32;
+    let inner = usize::from(width).saturating_sub(4).max(1);
+    let title = format!(
+        "  ⚿ {} · API key{}",
+        card.provider,
+        card.alias
+            .as_ref()
+            .map_or_else(String::new, |alias| format!(" · {alias}"))
+    );
+    let field = match &card.stage {
+        // A failed card still shows its mask: it accepts the retype the
+        // recovery text asks for (review P2-1).
+        LoginStage::Entry | LoginStage::Failed(_) if !card.is_empty() => {
+            let shown = card.masked_len().min(MASK_CAP);
+            let mask = "•".repeat(shown);
+            let more = if card.masked_len() > MASK_CAP {
+                "…"
+            } else {
+                ""
+            };
+            format!("  ❯ {mask}{more}▏")
+        }
+        LoginStage::Submitting => "  ❯ validating…".to_owned(),
+        LoginStage::Failed(text) => format!("  ✗ {text}"),
+        LoginStage::Entry => "  ❯ ▏".to_owned(),
+        LoginStage::Done(identity) => format!("  ✓ signed in · {identity}"),
+    };
+    let hint = match &card.stage {
+        LoginStage::Entry => {
+            "    the key is masked and never stored locally · ⏎ commit · esc cancel"
+        }
+        LoginStage::Submitting => "    staging and validating with the provider…",
+        LoginStage::Failed(_) => "    ⏎ try again · esc cancel",
+        LoginStage::Done(_) => "    esc closes",
+    };
+    let clip = |text: String| -> String { text.chars().take(inner + 2).collect() };
+    vec![
+        Line::styled(clip(title), theme.gold_style()),
+        Line::styled(clip(field), theme.text_style()),
+        Line::styled(clip(hint.to_owned()), theme.dim_style()),
+    ]
+}
+
 /// The composer rows (sim InputBar textarea): padded off the frame edge,
 /// bold gold ❯ sigil, REAL newlines on their own rows, a horizontal
 /// tail-window on any overlong line so the editable end stays visible,
@@ -2425,6 +2486,11 @@ struct ComposerRowWindow {
 /// sacred at any size, review r3 P2-1a), with a faint ⋮ gutter marker when
 /// rows are hidden above. Returns the rows plus the chip's column offset +
 /// width.
+///
+/// (W3c3.1, review D3-7: the M3 login card was inserted BETWEEN this doc
+/// comment and the function it documents, orphaning both it and the
+/// `type_complexity` allow onto a `u16` constant. Both are back where they
+/// belong.)
 #[allow(clippy::type_complexity)]
 fn composer_lines<'a>(
     model: &'a AppModel,
@@ -2432,6 +2498,15 @@ fn composer_lines<'a>(
     width: u16,
     allocated: u16,
 ) -> (Vec<Line<'a>>, Option<(u16, u16)>, Vec<ComposerRowWindow>) {
+    // The masked login card owns the input band while it is open. It emits
+    // NO click/drag windows and NO talk chip: a composer text window
+    // carries its CONTENT for caret mapping, which is precisely the thing
+    // that must not exist for a secret.
+    if let Some(card) = model.login.as_ref() {
+        let mut lines = login_lines(card, theme, width);
+        lines.truncate(usize::from(allocated).max(1));
+        return (lines, None, Vec::new());
+    }
     let sigil = Span::styled(
         "❯ ",
         theme

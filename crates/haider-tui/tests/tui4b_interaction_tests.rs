@@ -367,7 +367,7 @@ fn ctrl_c_walks_a_session_back_to_the_launcher_and_touches_no_turn() {
     let slot = model
         .sessions
         .iter()
-        .find(|entry| Some(entry.id) == model.last_detached)
+        .find(|entry| model.last_detached.as_ref() == Some(&entry.id))
         .expect("the left session's slot");
     assert!(
         slot.turn_active,
