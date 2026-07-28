@@ -820,17 +820,54 @@ impl LoginCard {
 
 /// Which runtime is driving this model (W3c3 M2).
 ///
-/// The reducer is source-agnostic by design, but three decisions are NOT:
-/// a launcher submit either mints a local demo session or asks the daemon
-/// to create one; `/reset` reseeds a demo world that a live profile does
-/// not have; and menu answers carry demo epochs or live coordinates. Every
-/// other behavior is identical, and the default is [`Self::Demo`] so the
-/// entire pre-W3c3 corpus keeps its exact meaning.
+/// The reducer is source-agnostic by design. What is NOT source-agnostic
+/// is ONE question, asked at every site where the reducer would otherwise
+/// invent session state: **may this model fabricate locally?** See
+/// [`Self::fabricates_locally`] — in live mode the daemon owns the
+/// sessions, their rows, their transcripts and their cards, so anything
+/// minted here would have to be reconciled with the truth that follows,
+/// and reconciliation is where duplicate rows and un-closable cards come
+/// from.
+///
+/// Every branch in the reducer, exhaustively (W3c3.1, review D2-1 — the
+/// previous charter named three, there were four, and one of the three it
+/// named was not a reducer branch at all):
+///
+/// | Site | Demo | Live |
+/// |---|---|---|
+/// | mid-turn composer submit | local queue / steer row | `SubmitText` |
+/// | launcher composer submit | `new_session` | `CreateSession` |
+/// | voice submit (`submit_voice`) | local ◉ row + note | `CreateSession` / `SubmitText` |
+/// | `/reset` | reseeds the demo world | honest flash |
+/// | `/voice`, `/tools`, `/say` | local card | honest flash |
+///
+/// Menu ANSWER coordinates are deliberately absent: they are not a reducer
+/// decision. The reducer emits one source-neutral [`OutboundAnswer`] and
+/// `LiveDriver::drain_answers` / `DemoDriver` supply their own
+/// coordinates.
+///
+/// The default is [`Self::Demo`] so the entire pre-W3c3 corpus keeps its
+/// exact meaning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RuntimeMode {
     #[default]
     Demo,
     Live,
+}
+
+impl RuntimeMode {
+    /// May the reducer invent session state — a row, a transcript line, a
+    /// card — that no committed envelope carries?
+    ///
+    /// This is the ONE question behind every mode branch in the reducer.
+    /// It is expressed as a predicate rather than an identity check so
+    /// "did we cover every site?" is answerable by grep — every branch in
+    /// the table above reads `!self.mode.fabricates_locally()`, and
+    /// nothing in the reducer compares `RuntimeMode` any other way.
+    #[must_use]
+    pub const fn fabricates_locally(self) -> bool {
+        matches!(self, Self::Demo)
+    }
 }
 
 /// Side effects the reducer requests from the runtime (the reducer itself
@@ -976,10 +1013,18 @@ impl VoiceState {
 /// screen — or be dropped — never a different row the model drifted to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Hit {
-    /// The launcher row's session NAME at render time (review P2-9: an
+    /// The launcher row's SESSION ID at render time (review P2-9: an
     /// ordinal resolved against current state could attach a different
     /// session than the one clicked).
-    AttachSample(String),
+    ///
+    /// W3c3.1 (review P1-6): this used to carry the row's display NAME,
+    /// which live rows do not have — render substituted the literal
+    /// `"session"` and the click handler then searched for a row actually
+    /// named that, so every live row was unclickable. The session id is
+    /// the coordinate the row is *made of*: it exists in both modes, it is
+    /// what `open_session` takes, and it cannot collide the way a name
+    /// can.
+    AttachSession(SessionId),
     /// Aura / Accounts / Peers launcher rows, by identity not ordinal.
     ExtraRow(LauncherRow),
     /// The palette row's actual content at render time.
@@ -1326,10 +1371,13 @@ impl Default for AppModel {
             aura: AuraModel::seed(),
             mode: RuntimeMode::Demo,
             login: None,
-            sessions: seed_session_states(),
+            // The first three generations the allocator can hand out, so a
+            // fresh process's seeds are 1-3 exactly as before and
+            // `next_ui_generation` continues at 4.
+            sessions: seed_session_states(UiGeneration::FIRST.get()),
             active_session: None,
             last_detached: None,
-            next_ui_generation: 4,
+            next_ui_generation: UiGeneration::FIRST.get() + SEED_SESSION_COUNT,
             roster: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
                 crate::script::ROSTER_FIRST_CLAIM,
             )),
@@ -2067,8 +2115,13 @@ impl AppModel {
                 self.composer
                     .line_end_key(key.modifiers.contains(KeyModifiers::SHIFT));
             }
-            KeyCode::Char(c @ '1'..='3')
-                if self.screen == Screen::Launcher && self.composer.is_empty() =>
+            // The digit span matches what the launcher PAINTS
+            // (`launcher_rows`): three in demo (the sim's world), nine
+            // live. A digit past the last row attaches nothing.
+            KeyCode::Char(c @ '1'..='9')
+                if self.screen == Screen::Launcher
+                    && self.composer.is_empty()
+                    && ((c as usize) - ('1' as usize)) < self.launcher_rows() =>
             {
                 let index = (c as usize) - ('1' as usize);
                 self.attach_sample(index);
@@ -2196,7 +2249,7 @@ impl AppModel {
             // delivers at the next safe boundary, queue holds to turn end,
             // and the AUTHORITATIVE `UserMessage` envelope paints the row.
             // Nothing is fabricated here (R11 cut 4).
-            if self.mode == RuntimeMode::Live {
+            if !self.mode.fabricates_locally() {
                 self.requests.push(AppRequest::SubmitText {
                     text,
                     voice: false,
@@ -2228,7 +2281,7 @@ impl AppModel {
         // follow its responses, so no fabricated row or session can ever
         // need reconciling with the truth that arrives.
         if self.screen == Screen::Launcher {
-            if self.mode == RuntimeMode::Live {
+            if !self.mode.fabricates_locally() {
                 self.requests.push(AppRequest::CreateSession { text });
                 return;
             }
@@ -2337,11 +2390,25 @@ impl AppModel {
     /// ◉ user row + `◉ heard` note ride the reducer; the script skips its
     /// own UserMessage and tags streamed rows `♪ speaking`.
     fn submit_voice(&mut self, text: String) {
-        if self.screen == Screen::Launcher {
-            if self.mode == RuntimeMode::Live {
-                self.requests.push(AppRequest::CreateSession { text });
-                return;
+        // LIVE (W3c3.1, review D2-2): the launcher branch returned early,
+        // but the SESSION branch fell through and painted a local ◉ user
+        // row plus a `◉ heard` note — the authoritative `UserMessage`
+        // envelope then paints the same row again. This is P1-1's exact
+        // shape, left un-swept because `/say` sits behind `/voice`, which
+        // live mode now refuses outright (D1-2). Both halves are closed
+        // here so no path can reach the fabrication.
+        if !self.mode.fabricates_locally() {
+            match self.screen {
+                Screen::Launcher => self.requests.push(AppRequest::CreateSession { text }),
+                _ => self.requests.push(AppRequest::SubmitText {
+                    text,
+                    voice: true,
+                    title: self.session_title.is_none(),
+                }),
             }
+            return;
+        }
+        if self.screen == Screen::Launcher {
             self.new_session(&text);
         }
         self.projection.push_user_voice(text.clone());
@@ -2582,6 +2649,21 @@ impl AppModel {
             .map(str::to_ascii_lowercase);
         match name.as_str() {
             "help" => self.help_open = true,
+            // THE REDUCER MAY NOT OPEN A CARD IT CANNOT CLOSE (W3c3.1,
+            // review D1-2). `/voice` and `/tools` mint a LOCAL `MenuOpened`
+            // with no committed opening envelope, so live mode has no
+            // `request_seq`/`worker_generation` to answer at:
+            // `LiveDriver::answer_command` finds no coordinates, drops the
+            // answer, and the card stays open FOREVER — blocking every
+            // later card, including the daemon's own `request_input`. The
+            // whole voice surface is local (engine names, a `/say` that
+            // plays a canned turn), so live mode says so, exactly as
+            // `/reset` does, rather than promising an RPC it never sends.
+            "voice" | "tools" | "say" if !self.mode.fabricates_locally() => {
+                self.flash = Some(format!(
+                    "· /{name} — demo only; the live voice/tool surface lands after v0.0.12"
+                ));
+            }
             "theme" => match arg.as_deref() {
                 Some(name) => match ThemeKey::parse(name) {
                     Some(key) => {
@@ -2646,7 +2728,7 @@ impl AppModel {
             // `WrongSession` in silence (review P1-2). `RuntimeMode`'s
             // charter always named this as one of the three source-
             // dependent decisions; this is that branch.
-            "reset" if self.mode == RuntimeMode::Live => {
+            "reset" if !self.mode.fabricates_locally() => {
                 self.flash = Some(
                     "· /reset — demo only; live sessions live in the daemon's store".to_owned(),
                 );
@@ -2661,16 +2743,28 @@ impl AppModel {
                 // rules govern session ids only.
                 self.stash_draft();
                 self.fresh_session();
-                self.sessions = seed_session_states();
+                // IDENTITY NEVER RECURS (W3c3.1, review P1-5). The
+                // replacement seeds DRAW from the monotonic allocator —
+                // they used to be minted with a hardcoded 1-3, so every
+                // `/reset` reissued three dead generations and a
+                // generation-keyed callback (the auto-title micro-call,
+                // the answer outbox's `origin`, a `DraftKey::Session`)
+                // could land on a replacement wearing its predecessor's
+                // identity. Their SESSION IDS stay `demo-session-1..3`:
+                // the reseeded world is the same world, and the demo
+                // store's upcaster maps a legacy `id: 2` onto exactly that
+                // string (report R11 cut 1 — a session id is not a
+                // generation).
+                self.sessions = seed_session_states(self.next_ui_generation);
+                self.next_ui_generation += SEED_SESSION_COUNT;
                 self.active_session = None;
                 self.last_detached = None;
-                // `next_ui_generation` is deliberately NOT reset (review
+                // The allocator itself is deliberately NOT rewound (review
                 // TUI4.1 P1-2): the control-tagged auto-title callback is
                 // keyed by generation and survives /reset by design (sim:
-                // a bare setTimeout); resetting the allocator let a
-                // replacement session reuse the old generation and receive
-                // the old title. The sim's `s-${Date.now()}` ids never
-                // recur — monotonicity ports that law, killing the class.
+                // a bare setTimeout). The sim's `s-${Date.now()}` ids
+                // never recur — monotonicity ports that law, killing the
+                // class.
                 self.roster.store(
                     crate::script::ROSTER_FIRST_CLAIM,
                     std::sync::atomic::Ordering::SeqCst,
@@ -2772,6 +2866,11 @@ impl AppModel {
                     self.flash = Some("· /tools — session only".to_owned());
                 }
             }
+            // `/sessions for all` is what the launcher's own header
+            // promises, and with more rows than the launcher paints it is
+            // the ONLY way to see the rest (review P1-6: the cold list the
+            // driver already tracks had no surface at all).
+            "sessions" => self.list_sessions(),
             "" => {}
             other => {
                 // Known stubs name their wave; typos say so (review r1 P2).
@@ -2779,9 +2878,7 @@ impl AppModel {
                     "model" | "provider" | "account" | "accounts" => {
                         Some("the account switchboard (W3)")
                     }
-                    "sessions" | "tree" | "fork" | "rename" | "tokens" => {
-                        Some("the daemon wave (W3)")
-                    }
+                    "tree" | "fork" | "rename" | "tokens" => Some("the daemon wave (W3)"),
                     "peers" => Some("the mesh wave (post-v0.1)"),
                     "hooks" | "update" => Some("the gates wave (W4)"),
                     _ => None,
@@ -3066,15 +3163,71 @@ impl AppModel {
         self.requests.push(AppRequest::ResetAllSessions);
     }
 
-    /// Attach a sample session by NAME (the clicked row's identity, P2-9).
-    fn attach_sample_named(&mut self, name: &str) {
-        if let Some(id) = self
-            .sessions
-            .iter()
-            .find(|entry| entry.name.as_deref() == Some(name))
-            .map(|entry| entry.id.clone())
-        {
-            self.open_session(&id);
+    /// `/sessions` — EVERY session the model knows, not just the rows the
+    /// launcher has room to paint (review P1-6).
+    ///
+    /// The listing is a read of state already held: `session.list` has
+    /// already populated the row for every session the daemon has, hot or
+    /// cold. Each line names the row's digit when it has one, its id, its
+    /// status and its head — the id because that is the coordinate, and
+    /// the digit because that is how the user reaches it.
+    fn list_sessions(&mut self) {
+        let rows = self.launcher_rows();
+        let lines: Vec<String> = if self.sessions.is_empty() {
+            vec!["no sessions yet — type to start one".to_owned()]
+        } else {
+            self.sessions
+                .iter()
+                .enumerate()
+                .map(|(index, entry)| {
+                    let reach = if index < rows {
+                        format!("{}", index + 1)
+                    } else {
+                        "·".to_owned()
+                    };
+                    let status = if entry.busy() { "running" } else { "idle" };
+                    let name = entry.name.as_deref().unwrap_or("—");
+                    format!(
+                        "{reach}  {}  {name}  {status}  {} turns",
+                        entry.id.as_str(),
+                        entry.turns()
+                    )
+                })
+                .collect()
+        };
+        let out = lines.join("\n");
+        if self.screen == Screen::Session {
+            self.projection.push_shell("sessions".to_owned(), out);
+        } else {
+            self.launcher_shellout = Some(("sessions".to_owned(), out));
+        }
+        self.dirty = true;
+    }
+
+    /// How many session rows the launcher shows — and therefore how many
+    /// are clickable and digit-bindable.
+    ///
+    /// DEMO keeps the sim's three (`tui.js:3246 slice(0, 3)`): the sim is
+    /// read-only law for demo behavior and its world only ever has three.
+    /// LIVE shows the full digit span, because the daemon's list is
+    /// whatever the user has actually got — with three rows, session four
+    /// onward was listed by `session.list`, held cold by the driver, and
+    /// reachable by nothing at all (review P1-6). `/sessions` lists the
+    /// remainder for the rare profile with more than nine.
+    #[must_use]
+    pub const fn launcher_rows(&self) -> usize {
+        match self.mode {
+            RuntimeMode::Demo => SEED_SESSION_COUNT as usize,
+            RuntimeMode::Live => LIVE_LAUNCHER_ROWS,
+        }
+    }
+
+    /// Attach the session a launcher row was rendered FOR (the clicked
+    /// row's identity, P2-9). A row the model no longer holds — the frame's
+    /// hit map may be one frame stale — activates nothing.
+    fn attach_session_id(&mut self, id: &SessionId) {
+        if self.sessions.iter().any(|entry| &entry.id == id) {
+            self.open_session(id);
         }
     }
 
@@ -3269,6 +3422,35 @@ impl AppModel {
         ui_gen
     }
 
+    /// Seed a session's cursor with the sequence its attach asked FROM, so
+    /// the strict gap law covers the FIRST delivered envelope too (W3c3.1,
+    /// review P1-1).
+    ///
+    /// Without this, continuity was only checked once `last_seq` was set:
+    /// a fresh attach at cursor 0 answered with seq 2 applied seq 2 as its
+    /// first event and painted a hole as history — and a hole with no
+    /// later sequence behind it can never be discovered. Seeding is
+    /// MONOTONE (it never rewinds a cursor): the attach's `after_seq` is
+    /// read from this same authority, so the only case that moves is the
+    /// one that was never set.
+    pub fn seed_cursor(&mut self, session: &SessionId, after_seq: u64) {
+        let projection = if self.active_session.as_ref() == Some(session) {
+            Some(&mut self.projection)
+        } else {
+            self.sessions
+                .iter_mut()
+                .find(|entry| &entry.id == session)
+                .map(|entry| &mut entry.projection)
+        };
+        if let Some(projection) = projection
+            && projection
+                .last_applied()
+                .is_none_or(|last| last < after_seq)
+        {
+            projection.set_last_applied(after_seq);
+        }
+    }
+
     /// A NON-attached session's slot (background event routing).
     pub fn session_entry_mut(
         &mut self,
@@ -3311,8 +3493,8 @@ impl AppModel {
             // one frame stale, so a rect from a screen we have since left
             // must never act (review P1-5 — the law documented above was
             // only honored by the palette/menu hits).
-            Hit::AttachSample(name) if self.screen == Screen::Launcher => {
-                self.attach_sample_named(&name);
+            Hit::AttachSession(id) if self.screen == Screen::Launcher => {
+                self.attach_session_id(&id);
             }
             Hit::ExtraRow(which) if self.screen == Screen::Launcher => match which {
                 LauncherRow::Aura => self.enter_aura(),
@@ -3554,6 +3736,14 @@ impl AppModel {
 
 /// Command-card id prefixes — each open mints `{prefix}{seq}` so a stale
 /// answer can never drive a later card's consequences (review r2 P1-1).
+/// How many sessions the demo world seeds (sim tui.js:497-579). The
+/// generation allocator advances by exactly this on every reseed.
+pub const SEED_SESSION_COUNT: u64 = 3;
+
+/// How many launcher rows LIVE mode shows: the whole `1`-`9` digit span,
+/// so every row the launcher paints is also reachable from the keyboard.
+pub const LIVE_LAUNCHER_ROWS: usize = 9;
+
 pub const VOICE_CARD_PREFIX: &str = "voice-card-";
 pub const TOOLS_CARD_PREFIX: &str = "tools-card-";
 

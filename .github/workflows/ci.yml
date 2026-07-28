@@ -32,9 +32,25 @@ jobs:
       # The PTY ladder is the only gate that exercises the real terminal
       # surface, and its live rows are the only proof that bare `haider`
       # reaches live mode on a real daemon (the v0.0.12 keystone). The
-      # headless suite cannot see either: every live-only defect this lane
-      # shipped was first caught here, not by cargo test.
+      # headless suite cannot see either, and the ladder has already caught
+      # three live-only bugs it could not: the display cwd sent to
+      # session.create, the first turn racing attach into capability_denied,
+      # and selection never attaching.
+      #
+      # What it does NOT do is replace reading the code. W3c3's six P1s were
+      # all found by an adversarial review (e39dc0f), with this ladder green
+      # through every one of them. It pins the surface cargo test cannot
+      # reach; a green ladder is not evidence that a change was reviewed.
       - name: probe ladder (demo + live)
         run: |
           cargo build --release -p haider-cli -p haider-daemond --locked
           NO_COLOR=1 CLICOLOR=0 scripts/tui-probes/ladder.sh
+      # Ledger row 17's threshold ("p95 render >8-10ms") describes the
+      # SHIPPED binary, so the debug `cargo test` above deliberately skips
+      # the measurement half and only checks that the ledger carries a
+      # recorded figure. THIS is where the row's two-way gate is actually
+      # enforced — without it the ledger and the measurement could drift
+      # apart and CI would never notice (review W3c3 P2-7). The release
+      # profile is already warm from the ladder build above.
+      - name: render benchmark (release — ledger row 17's two-way gate)
+        run: cargo test --release -p haider-tui --test w3c3_render_bench_tests --locked

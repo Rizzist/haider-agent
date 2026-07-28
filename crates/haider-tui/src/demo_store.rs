@@ -3,8 +3,24 @@
 //! This is **NOT the real session store**. It is the across-restart state of
 //! `haider tui --demo` and nothing else: one JSON file, deliberately named
 //! `demo-tui-state.json` so nobody mistakes it for harness data. The REAL
-//! daemon-backed store replaces this wholesale at W3c; when that lands, this
-//! module is deleted, not evolved.
+//! daemon-backed store is now live and does NOT replace this: `run_live`
+//! never touches this file, `run_demo` still owns it, and the two never
+//! meet (the demo request vocabulary is unreachable from live).
+//!
+//! ⚠ CHARTER CORRECTED (W3c3.1, review D2-6). This module used to say the
+//! daemon store "replaces this wholesale at W3c; when that lands, this
+//! module is deleted, not evolved." Both halves were wrong, and the seam
+//! touch-list in `docs/OPTIMIZATIONS.md` copied them. W3c3 landed the
+//! daemon swap and KEPT this module (report R11 cut 3), because
+//! `haider tui --demo` is a §6.4 acceptance row in its own right — a
+//! byte-deterministic, network-free regression pin on the whole TUI. So the
+//! rule is the opposite of what was written here: **this module IS evolved,
+//! and its on-disk format is versioned for it.** W3c3 already did so once,
+//! upcasting v1's numeric session ids to v2's opaque strings
+//! ([`DEMO_STORE_VERSION`], [`SessionIdDto`]). Evolve it the same way — a
+//! new version constant, a total one-way upcast, a v1 fixture that still
+//! loads — and never by widening a DTO in place: `deny_unknown_fields`
+//! within a version is what keeps a demo-state file honest.
 //!
 //! Sim parity source (`next-diffforge/src/pages/tui.js`):
 //! - **Save** (tui.js:765-772, key `haider-tui-v1`): `{ sessions, themeName,
@@ -33,7 +49,7 @@
 //!   menu RESOLVERS (a persisted card answered after reload lands the sim's
 //!   stale-menu note — see the driver's `Answer` arm), timers.
 //! - **/reset** (tui.js:1913-1943): `removeItem` + reseed — ported as
-//!   [`crate::app::AppRequest::PurgeDemoStore`] + the reducer's reseed; the
+//!   [`crate::app::DemoRequest::PurgeStore`] + the reducer's reseed; the
 //!   next save refills the file with seeds exactly as the sim's save effect
 //!   refills `localStorage`.
 //!

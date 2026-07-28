@@ -113,9 +113,16 @@ pub enum LiveCommand {
     },
     /// Commit an API login against an already-staged reference. DURABLE:
     /// its command identity deliberately EXCLUDES the ephemeral
-    /// `vault_reference`, so a lost-response retry may supply a freshly
-    /// staged reference under the same command id and still recover the
-    /// original committed result.
+    /// `vault_reference`, so a retry supplies a freshly staged reference
+    /// UNDER THE SAME COMMAND ID and still recovers the original committed
+    /// result — see the `Staged` arm of [`LiveDriver::apply`], which
+    /// re-stages under `login_command` and replaces the outbox entry
+    /// instead of minting a second.
+    ///
+    /// A RECONNECT IS NOT A RETRY. Staging is connection-scoped and the
+    /// card wipes its copy of the key on submit, so a fresh socket has
+    /// neither the reference nor anything to re-stage: the pending entry is
+    /// retired and the card asks for a retype (`LiveDriver::abandon_login`).
     LoginApi {
         command_id: CommandId,
         provider: String,
@@ -219,6 +226,24 @@ pub enum LiveReply {
     Lagged {
         attachment: AttachmentId,
     },
+    /// The daemon finished replaying `(after_seq, high_water_seq]` for this
+    /// attachment. It is the CATCH-UP BOUNDARY, and the only thing that can
+    /// expose a replay whose LAST envelopes were lost: a hole in the middle
+    /// is caught by the next sequence, a hole at the end has no next
+    /// sequence at all (review W3c3 P1-2 — this marker used to be
+    /// discarded at the link).
+    CaughtUp {
+        attachment: AttachmentId,
+        high_water_seq: u64,
+    },
+    /// The client's inbound frame channel overflowed and DROPPED
+    /// uncorrelated frames. A drop must become a gap, never silence: we do
+    /// not know which attachment lost what, so every held attachment
+    /// reattaches from its own cursor (review W3c3 P1-2 — `lost_events()`
+    /// had no production caller).
+    EventsLost {
+        count: u64,
+    },
     /// An `session.attach` failed. Carried separately from `Failed`
     /// because an attach has no durable command id to correlate by, and a
     /// silent failure would leave the session un-attachable for the life
@@ -306,11 +331,29 @@ pub struct LiveDriver {
     lru: Vec<SessionId>,
     /// Sessions the daemon listed that we hold no attachment for.
     cold: HashMap<SessionId, Cold>,
-    /// Attaches issued and not yet answered — see `sync_selection`.
-    attaching: std::collections::HashSet<SessionId>,
-    /// Durable commands belonging to the OPEN login card, so a failure can
-    /// be correlated to it instead of merely coinciding with it (P2-2).
-    login_commands: std::collections::HashSet<CommandId>,
+    /// Attaches issued and not yet answered, each remembering the CURSOR it
+    /// asked from. Two laws ride this one map:
+    ///
+    /// * **one attach in flight per session** — the latch lives with
+    ///   [`Self::ensure_attached`], the single `Attach` emitter, so no
+    ///   caller can open a second attachment by forgetting to check
+    ///   (review W3c3 P1-3 / D1-1: the latch used to live in the CALLER
+    ///   while four sites emitted, and `run_live`'s loop tail attached
+    ///   again on every gap, `Lagged` and reconnect);
+    /// * **the strict gap covers the FIRST envelope** — the remembered
+    ///   `after_seq` seeds the projection's cursor when the attach is
+    ///   answered, so a replay that starts at `after_seq + 2` stops and
+    ///   reattaches instead of painting (review W3c3 P1-1).
+    attaching: HashMap<SessionId, u64>,
+    /// The ONE durable command of the open login card, so a failure can be
+    /// correlated to it instead of merely coinciding with it (P2-2) and a
+    /// retry re-stages UNDER IT rather than minting a second (P1-4).
+    login_command: Option<CommandId>,
+    /// When the card's non-durable `vault.stage` was issued. A Stage
+    /// swallowed by a disconnect or a wedged daemon would otherwise park
+    /// the card at "validating…" with `accepts_input() == false` forever
+    /// (review W3c3 D2-5).
+    login_started: Option<std::time::Instant>,
     /// Durable mutations awaiting a response, in issue order.
     outbox: Vec<Pending>,
     /// Committed menu coordinates, by menu id.
@@ -337,7 +380,22 @@ pub struct LiveDriver {
     /// Text handed to `session.create`, held until the daemon names the
     /// session it created.
     creating: HashMap<CommandId, String>,
+    /// The pass clock. `live_pass` stamps it once per pass so the driver's
+    /// deadlines are a pure function of the value it was handed — a test
+    /// moves time by calling [`Self::set_now`], never by sleeping.
+    now: std::time::Instant,
 }
+
+/// How long the login card may sit in `Submitting` before it says so —
+/// the deadline covers BOTH transactions (`vault.stage` then
+/// `account.login_api`).
+///
+/// `vault.stage` is deliberately NOT durable (no receipt may contain a
+/// secret), so nothing retries it: a stage swallowed by a dead socket has
+/// no later response to arrive. The card must therefore time itself out
+/// and ask for the key again rather than advertise "validating…" forever
+/// behind `accepts_input() == false`.
+pub const LOGIN_STAGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl LiveDriver {
     /// A driver for one client instance. `instance` must be unique per
@@ -349,8 +407,9 @@ impl LiveDriver {
             routes: HashMap::new(),
             lru: Vec::new(),
             cold: HashMap::new(),
-            attaching: std::collections::HashSet::new(),
-            login_commands: std::collections::HashSet::new(),
+            attaching: HashMap::new(),
+            login_command: None,
+            login_started: None,
             outbox: Vec::new(),
             menus: HashMap::new(),
             generations: HashMap::new(),
@@ -360,7 +419,15 @@ impl LiveDriver {
             connected: true,
             pending_first_turn: HashMap::new(),
             creating: HashMap::new(),
+            now: std::time::Instant::now(),
         }
+    }
+
+    /// Stamp the pass clock. [`crate::runtime::live_pass`] calls this once
+    /// per pass with `Instant::now()`; a test calls it with
+    /// `base + Duration` to move time deterministically.
+    pub const fn set_now(&mut self, now: std::time::Instant) {
+        self.now = now;
     }
 
     /// The WORKING SET: which sessions we want attached, coldest first.
@@ -450,36 +517,56 @@ impl LiveDriver {
         let Some(active) = model.active_session.clone() else {
             return Vec::new();
         };
-        if self.attachments.contains_key(&active) {
-            self.touch(&active);
-            return Vec::new();
-        }
-        // One attach per selection: without this an idle loop pass would
-        // re-issue the attach every frame until the response landed.
-        if !self.attaching.insert(active.clone()) {
-            return Vec::new();
-        }
         self.ensure_attached(model, &active)
     }
 
-    /// Ensure `session` is attached, evicting the coldest EVICTABLE session
-    /// first when the cap is already full (report §6.3: "LRU-detaches
-    /// before the 17th attach").
+    /// THE ONE PLACE AN `Attach` IS EMITTED, evicting the coldest EVICTABLE
+    /// session first when the cap is already full (report §6.3:
+    /// "LRU-detaches before the 17th attach").
     ///
     /// Priority (R11 cut 4): the ACTIVE session is never evicted, and a
     /// session that is running or holds an unanswered menu is only evicted
     /// when nothing colder is available — losing its attachment would mean
     /// missing the very events the user is waiting on.
+    ///
+    /// The in-flight latch lives HERE, with the emitter, and every caller
+    /// (`sync_selection`, `Lagged`, `AppRequest::Reattach`, `resume`, the
+    /// create response) goes through it. "One attach in flight per
+    /// session" is then unrepresentable to break rather than a rule five
+    /// call sites have to remember — which is exactly how the double
+    /// attach survived M3.2's fix (review W3c3 P1-3 / D1-1).
     pub fn ensure_attached(&mut self, model: &AppModel, session: &SessionId) -> Vec<LiveCommand> {
         if self.attachments.contains_key(session) {
             self.touch(session);
             return Vec::new();
         }
+        if self.attaching.contains_key(session) {
+            return Vec::new();
+        }
+        // A DEAD SOCKET TAKES NO ATTACH. The link drops commands issued
+        // while disconnected (there is nothing to write them to), so an
+        // attach latched here would never be answered and never released:
+        // the session would be unattachable for the rest of the process.
+        // `resume` is what restores the working set, and it runs with the
+        // fresh connection in hand.
+        if !self.connected {
+            return Vec::new();
+        }
         let mut commands = Vec::new();
-        if self.lru.len() >= ATTACHMENT_CAP
-            && let Some(victim) = self.evictable(model)
-            && let Some(attachment) = self.attachments.get(&victim).cloned()
-        {
+        // A session ALREADY in the working set needs no new slot: that is
+        // what makes `resume` — which rebuilds `lru` wholesale and then
+        // attaches each member — reattach its own set instead of evicting
+        // it one member at a time.
+        if !self.lru.iter().any(|held| held == session) && self.lru.len() >= ATTACHMENT_CAP {
+            let Some(victim) = self.evictable(model) else {
+                return Vec::new();
+            };
+            let Some(attachment) = self.attachments.get(&victim).cloned() else {
+                // Every slot is an attach we have already asked for.
+                // Asking for a 17th would earn `overloaded`; the loop
+                // calls this again next pass, when a response has landed.
+                return Vec::new();
+            };
             self.drop_attachment(&attachment);
             self.cold.insert(
                 victim.clone(),
@@ -489,9 +576,15 @@ impl LiveDriver {
             );
             commands.push(LiveCommand::Detach { attachment });
         }
+        let after_seq = cursor_of(model, session).unwrap_or(0);
+        self.attaching.insert(session.clone(), after_seq);
+        // The working set WANTS it from the moment we ask, not from the
+        // moment the daemon answers: a disconnect in between must still
+        // restore it.
+        self.touch(session);
         commands.push(LiveCommand::Attach {
             session: session.clone(),
-            after_seq: cursor_of(model, session).unwrap_or(0),
+            after_seq,
         });
         commands
     }
@@ -565,7 +658,17 @@ impl LiveDriver {
                 ..
             } => {
                 self.cold.remove(&session);
-                self.attaching.remove(&session);
+                // THE STRICT GAP LAW COVERS THE FIRST ENVELOPE (review
+                // W3c3 P1-1). Continuity used to be checked only once
+                // `last_seq` was set, so a fresh attach at cursor 0 that
+                // was answered with seq 2 APPLIED seq 2 as its first event
+                // — a hole painted as history, with no later sequence able
+                // to expose it. Seeding the reducer with the cursor we
+                // asked from makes the first admitted envelope checked
+                // like every other one.
+                if let Some(after_seq) = self.attaching.remove(&session) {
+                    model.seed_cursor(&session, after_seq);
+                }
                 self.generations.insert(session.clone(), worker_generation);
                 self.routes.insert(attachment.clone(), session.clone());
                 self.attachments.insert(session.clone(), attachment);
@@ -642,8 +745,20 @@ impl LiveDriver {
             } => {
                 // Transaction two. The staged reference is single-use and
                 // expiring, so the login follows immediately.
-                let command_id = self.mint();
-                self.login_commands.insert(command_id.clone());
+                //
+                // A RETRY RE-STAGES UNDER THE ORIGINAL COMMAND ID (review
+                // W3c3 P1-4 / D2-5), which is exactly what this command's
+                // charter has always claimed: `LoginApi`'s durable identity
+                // EXCLUDES the ephemeral `vault_reference` precisely so a
+                // fresh reference can recover the original committed
+                // result. Minting a second id made the daemon see a second
+                // login while the first stayed pending forever.
+                let command_id = self.login_command.clone().unwrap_or_else(|| self.mint());
+                self.login_command = Some(command_id.clone());
+                // One pending entry per card: the re-stage REPLACES the
+                // stale reference under the same id rather than queueing a
+                // second unanswerable command.
+                self.retire(&command_id);
                 vec![self.enqueue(LiveCommand::LoginApi {
                     command_id,
                     provider,
@@ -656,7 +771,7 @@ impl LiveDriver {
                 identity,
             } => {
                 self.retire(&command_id);
-                self.login_commands.remove(&command_id);
+                self.close_login(&command_id);
                 model.login_result(Ok(identity));
                 Vec::new()
             }
@@ -674,6 +789,47 @@ impl LiveDriver {
                 self.drop_attachment(&attachment);
                 self.ensure_attached(model, &session)
             }
+            LiveReply::CaughtUp {
+                attachment,
+                high_water_seq,
+            } => {
+                let Some(session) = self.routes.get(&attachment).cloned() else {
+                    return Vec::new();
+                };
+                // The replay announced `H`; if the reducer never applied
+                // that far, envelopes were lost between the daemon's sink
+                // and our reducer, and the LAST ones leave no trace of
+                // their own absence. Reattach from what we really applied.
+                if cursor_of(model, &session).unwrap_or(0) >= high_water_seq {
+                    return Vec::new();
+                }
+                self.drop_attachment(&attachment);
+                let mut commands = vec![LiveCommand::Detach { attachment }];
+                commands.extend(self.ensure_attached(model, &session));
+                commands
+            }
+            LiveReply::EventsLost { count } => {
+                model.flash = Some(format!("· resynchronizing — {count} frames dropped"));
+                model.dirty = true;
+                // Working-set order, so the command stream is deterministic
+                // (a `HashMap` walk is not).
+                let held: Vec<(SessionId, AttachmentId)> = self
+                    .lru
+                    .iter()
+                    .filter_map(|session| {
+                        self.attachments
+                            .get(session)
+                            .map(|attachment| (session.clone(), attachment.clone()))
+                    })
+                    .collect();
+                let mut commands = Vec::new();
+                for (session, attachment) in held {
+                    self.drop_attachment(&attachment);
+                    commands.push(LiveCommand::Detach { attachment });
+                    commands.extend(self.ensure_attached(model, &session));
+                }
+                commands
+            }
             LiveReply::AttachFailed {
                 session,
                 code,
@@ -688,6 +844,11 @@ impl LiveDriver {
                 model.dirty = true;
                 if retryable && model.active_session.as_ref() == Some(&session) {
                     return self.sync_selection(model);
+                }
+                if !retryable {
+                    // A permanently unattachable session must not hold a
+                    // working-set slot for the life of the connection.
+                    self.lru.retain(|held| held != &session);
                 }
                 Vec::new()
             }
@@ -718,16 +879,22 @@ impl LiveDriver {
                 // open" is not correlation: an unrelated `capability_denied`
                 // would otherwise show a login recovery message for a
                 // failure that had nothing to do with the login (P2-2).
-                let owns = command_id
-                    .as_ref()
-                    .is_some_and(|id| self.login_commands.contains(id));
+                let owns = command_id.as_ref() == self.login_command.as_ref()
+                    && self.login_command.is_some();
                 if owns && model.login.is_some() {
                     model.login_result(Err((code, message)));
                 } else {
                     model.flash = Some(format!("· {code} — {message}"));
                 }
-                if let Some(id) = &command_id {
-                    self.login_commands.remove(id);
+                if let Some(id) = &command_id
+                    && !retryable
+                {
+                    // A permanent failure ends the transaction; a retryable
+                    // one keeps the id so the retype re-stages UNDER IT.
+                    self.close_login(id);
+                }
+                if owns {
+                    self.login_started = None;
                 }
                 model.dirty = true;
                 Vec::new()
@@ -746,6 +913,12 @@ impl LiveDriver {
                 // session.
                 self.attachments.clear();
                 self.routes.clear();
+                // The login's staged secret died with the socket: staging is
+                // connection-scoped and deliberately non-durable, so nothing
+                // can retry it and no response will ever arrive. A card left
+                // at "validating…" refuses input until Esc, which is a dead
+                // end the user has no way to read (review W3c3 D2-5).
+                self.abandon_login(model, "the connection dropped mid-validation");
                 model.flash = Some(format!("· reconnecting — {reason}"));
                 model.dirty = true;
                 Vec::new()
@@ -761,6 +934,47 @@ impl LiveDriver {
                 model.dirty = true;
                 Vec::new()
             }
+        }
+    }
+
+    /// End the open login transaction, if `command_id` is the one it owns.
+    fn close_login(&mut self, command_id: &CommandId) {
+        if self.login_command.as_ref() == Some(command_id) {
+            self.login_command = None;
+            self.login_started = None;
+        }
+    }
+
+    /// Give up on an in-flight login and hand the card an honest recovery.
+    ///
+    /// The staged reference is single-use, connection-scoped and holds the
+    /// only copy of the key (the card wiped its own on submit), so there is
+    /// nothing to resend: the only recovery is a retype, and saying so is
+    /// the whole job.
+    fn abandon_login(&mut self, model: &mut AppModel, why: &str) {
+        if self.login_started.is_none() && self.login_command.is_none() {
+            return;
+        }
+        self.login_started = None;
+        if let Some(id) = self.login_command.take() {
+            self.retire(&id);
+        }
+        if model.login.is_some() {
+            model.login_result(Err((
+                haider_rpc::ERROR_CODE_RESTAGE_REQUIRED.to_owned(),
+                why.to_owned(),
+            )));
+        }
+    }
+
+    /// The pass's deadline sweep — see [`LOGIN_STAGE_TIMEOUT`]. Driven by
+    /// [`crate::runtime::live_pass`], which stamps [`Self::set_now`] first.
+    pub(crate) fn expire_login(&mut self, model: &mut AppModel) {
+        if self
+            .login_started
+            .is_some_and(|started| self.now.duration_since(started) >= LOGIN_STAGE_TIMEOUT)
+        {
+            self.abandon_login(model, "validation timed out");
         }
     }
 
@@ -876,18 +1090,26 @@ impl LiveDriver {
         // before these attaches are acknowledged must not collapse it to
         // the active session alone (review P2-3).
         self.lru = wanted.iter().take(ATTACHMENT_CAP).cloned().collect();
+        // Through the SINGLE emitter, so a reconnect races nothing: the
+        // loop tail's `sync_selection` finds the active session already
+        // latched and adds no second attach (review W3c3 D1-1 case C).
         for session in self.lru.clone() {
-            commands.push(LiveCommand::Attach {
-                after_seq: cursor_of(model, &session).unwrap_or(0),
-                session,
-            });
+            commands.extend(self.ensure_attached(model, &session));
         }
+        // A pending `LoginApi` CANNOT ride the reconnect: its
+        // `vault_reference` is single-use and connection-scoped, so the
+        // fresh socket's daemon has never heard of it, and the card wiped
+        // the key on submit so nothing can re-stage it either. Resending it
+        // verbatim on every reconnect — which is what used to happen — buys
+        // a guaranteed `restage_required` and leaves the entry pending
+        // forever (review W3c3 D2-5).
+        self.abandon_login(model, "the connection dropped mid-validation");
         // Session-scoped mutations WAIT for their attachment: `turn.submit`,
         // `turn.cancel` and `MenuAnswer` all require an established control
         // attachment, and a resend issued alongside the attach races it into
         // a non-retryable `capability_denied` (review P1-4 — the same race
         // the create→attach→submit path already fixed). Unscoped commands
-        // (a login) have no such dependency and go now.
+        // have no such dependency and go now.
         commands.extend(
             self.outbox
                 .iter()
@@ -934,6 +1156,9 @@ impl LiveDriver {
                 // afresh because the daemon's staged memory is
                 // connection-scoped.
                 self.next_command += 1;
+                // The card is now UNANSWERABLE-BY-ITSELF until a response
+                // lands: arm the deadline that covers BOTH transactions.
+                self.login_started = Some(self.now);
                 vec![LiveCommand::Stage {
                     stage_id: format!("{}-stage-{}", self.instance, self.next_command),
                     secret,
@@ -941,15 +1166,19 @@ impl LiveDriver {
                     alias,
                 }]
             }
-            AppRequest::Reattach { session, after_seq } => {
+            // The request's `after_seq` is the reducer's own last fully
+            // applied sequence — the same value [`cursor_of`] reads, from
+            // the same authority. `ensure_attached` re-reads it rather
+            // than carrying a copy, because a second cursor is how a
+            // reattach asks for history the reducer already applied.
+            AppRequest::Reattach { session, .. } => {
+                let mut commands = Vec::new();
                 if let Some(attachment) = self.attachments.get(&session).cloned() {
                     self.drop_attachment(&attachment);
-                    return vec![
-                        LiveCommand::Detach { attachment },
-                        LiveCommand::Attach { session, after_seq },
-                    ];
+                    commands.push(LiveCommand::Detach { attachment });
                 }
-                vec![LiveCommand::Attach { session, after_seq }]
+                commands.extend(self.ensure_attached(model, &session));
+                commands
             }
             AppRequest::Interrupt => {
                 // Esc cancels the run the COMMITTED stream says is running.

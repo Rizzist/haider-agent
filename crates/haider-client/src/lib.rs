@@ -22,7 +22,7 @@ pub mod spawn;
 
 pub use client::{
     ClientConfig, ClientError, ConnectError, Connected, ConnectionState, DisconnectReason,
-    PING_INTERVAL, PONG_DEADLINE, RpcClient, connect,
+    PING_INTERVAL, PONG_DEADLINE, PendingResponse, RpcClient, connect,
 };
 pub use profile::{
     DEFAULT_MAX_TOKENS, DEFAULT_PROVIDER, MODEL_ENV, PACKAGED_DEFAULT_MODEL, PROFILE_CONFIG_FILE,

@@ -5,7 +5,7 @@
 //! `DemoDriver` seams the interactive loop uses) wherever a turn is needed.
 #![allow(clippy::expect_used)]
 
-use haider_tui::app::{AppModel, AppRequest, ChipModel, DemoRequest, Hit, Screen};
+use haider_tui::app::{AppModel, AppRequest, ChipModel, DemoRequest, Screen};
 use haider_tui::demo_store::{
     ChipDto, DEMO_STORE_VERSION, DemoStore, HeadDto, ProjectionDto, SessionDto, SessionIdDto,
     StateDto, hydrate, snapshot,
@@ -492,7 +492,7 @@ fn a_persisted_idle_i_survives_hydration_verbatim() {
     let dto: StateDto = serde_json::from_str(&dto_json).expect("parse");
     let mut hydrated = launcher_model();
     hydrate(&mut hydrated, dto);
-    hydrated.handle_hit(Hit::AttachSample("interrupt-me-please".to_owned()));
+    common::hit_session_named(&mut hydrated, "interrupt-me-please");
     assert_eq!(hydrated.screen, Screen::Session);
     assert!(
         !hydrated.turn_active,

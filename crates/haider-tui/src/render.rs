@@ -491,9 +491,11 @@ fn render_launcher(
         ));
     }
     // Pass 1: build every row's spans, metas ellipsized to the frame cap.
-    // Sim shows the first THREE sessions (tui.js:3246 `slice(0, 3)`).
+    // HOW MANY rows is the MODEL's policy, not the renderer's — the sim's
+    // three in demo, the reachable digit span live (see
+    // `AppModel::launcher_rows`). Render stays source-agnostic: it asks.
     let mut recent: Vec<(Vec<Span<'_>>, Option<Hit>)> = vec![(rhead, None)];
-    for entry in model.sessions.iter().take(3) {
+    for entry in model.sessions.iter().take(model.launcher_rows()) {
         // Sim row anatomy (tui.js:3252-3277): rail · dot (ok; gold
         // PULSING when running, tui.js:4392-4394) · name BRIGHT bold ·
         // `▸ head hon` DIM (.hd) · meta DIM ellipsized. No digit prefix
@@ -565,7 +567,7 @@ fn render_launcher(
             ellipsize(&meta, meta_budget),
             theme.dim_style(),
         ));
-        recent.push((spans, Some(Hit::AttachSample(name))));
+        recent.push((spans, Some(Hit::AttachSession(entry.id.clone()))));
     }
     // Sim `.aurarow` metas VERBATIM (tui.js:3278-3300) — the earlier port
     // abbreviated all three (review P2-8). The Accounts/Peers counts come
@@ -625,7 +627,7 @@ fn render_launcher(
         .max()
         .unwrap_or(10)
         .clamp(10, area_cap);
-    let mut sample_rows: Vec<(usize, String)> = Vec::new();
+    let mut sample_rows: Vec<(usize, haider_protocol::ids::SessionId)> = Vec::new();
     let mut extra_rows: Vec<(usize, LauncherRow)> = Vec::new();
     for (spans, hit) in recent {
         if matches!(hit, Some(Hit::ExtraRow(_))) {
@@ -638,7 +640,7 @@ fn render_launcher(
             line = line.style(theme.hover_style());
         }
         match &hit {
-            Some(Hit::AttachSample(name)) => sample_rows.push((lines.len(), name.clone())),
+            Some(Hit::AttachSession(id)) => sample_rows.push((lines.len(), id.clone())),
             Some(Hit::ExtraRow(row)) => extra_rows.push((lines.len(), *row)),
             _ => {}
         }
@@ -679,11 +681,11 @@ fn render_launcher(
     };
     let (middle, dropped) = centered(frame, content_area, lines);
     let visible = |row: usize| row.checked_sub(dropped);
-    for (row, name) in sample_rows {
+    for (row, id) in sample_rows {
         if let Some(row) = visible(row) {
             hits.push((
                 row_rect(content_area, middle.y, row),
-                Hit::AttachSample(name),
+                Hit::AttachSession(id),
             ));
         }
     }
@@ -2418,19 +2420,6 @@ struct ComposerRowWindow {
     content: String,
 }
 
-/// The composer rows (sim InputBar textarea): padded off the frame edge,
-/// bold gold ❯ sigil, REAL newlines on their own rows, a horizontal
-/// tail-window on any overlong line so the editable end stays visible,
-/// typed text bright with a gold block cursor (or the dim placeholder +
-/// ghost completion), and the right-aligned `[ ◉ talk ]` chip on the first
-/// row.
-///
-/// `allocated` is the height the layout actually granted: the composer
-/// VERTICALLY tail-windows to it (last lines win — the cursor row is
-/// sacred at any size, review r3 P2-1a), with a faint ⋮ gutter marker when
-/// rows are hidden above. Returns the rows plus the chip's column offset +
-/// width.
-#[allow(clippy::type_complexity)]
 /// Rows the masked login card claims: title · field · hint.
 const LOGIN_CARD_ROWS: u16 = 3;
 
@@ -2485,6 +2474,23 @@ fn login_lines(card: &crate::app::LoginCard, theme: &Theme, width: u16) -> Vec<L
     ]
 }
 
+/// The composer rows (sim InputBar textarea): padded off the frame edge,
+/// bold gold ❯ sigil, REAL newlines on their own rows, a horizontal
+/// tail-window on any overlong line so the editable end stays visible,
+/// typed text bright with a gold block cursor (or the dim placeholder +
+/// ghost completion), and the right-aligned `[ ◉ talk ]` chip on the first
+/// row.
+///
+/// `allocated` is the height the layout actually granted: the composer
+/// VERTICALLY tail-windows to it (last lines win — the cursor row is
+/// sacred at any size, review r3 P2-1a), with a faint ⋮ gutter marker when
+/// rows are hidden above. Returns the rows plus the chip's column offset +
+/// width.
+///
+/// (W3c3.1, review D3-7: the M3 login card was inserted BETWEEN this doc
+/// comment and the function it documents, orphaning both it and the
+/// `type_complexity` allow onto a `u16` constant. Both are back where they
+/// belong.)
 #[allow(clippy::type_complexity)]
 fn composer_lines<'a>(
     model: &'a AppModel,

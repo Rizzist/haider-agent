@@ -2055,6 +2055,71 @@ pub fn run_demo_plain(mut model: AppModel) -> String {
     crate::plain::render_plain(&model.projection, model.identity.context_window)
 }
 
+/// What one [`live_pass`] produced.
+#[derive(Debug, Default)]
+pub struct LivePass {
+    /// RPCs the IO shell must issue, in order.
+    pub commands: Vec<crate::live::LiveCommand>,
+    /// The requests only the SHELL can perform — they need the terminal
+    /// (a rendered selection) or the process (quit). Handed BACK rather
+    /// than swallowed, so the pass stays free of IO and every other
+    /// request is provably translated into a command.
+    pub shell: Vec<AppRequest>,
+}
+
+/// ONE PASS of the live loop's tail — the ordering that makes live mode
+/// correct, in one function that `run_live` and the tests both call.
+///
+/// This exists because of what its absence cost. The loop tail used to be
+/// inline in [`run_live`], so nothing executed it: the driver tests
+/// re-typed the tail by hand, the re-typed copy omitted `sync_selection`,
+/// and a double attach on every gap / `Lagged` / reconnect stayed green
+/// through an adversarial review (W3c3 review r1, P1-3 == D1-1). A test
+/// that copies the loop cannot pin the loop.
+///
+/// The order is the law:
+///
+/// 1. **stamp the clock**, so every deadline in this pass is a pure
+///    function of the value handed in (tests move time, never sleep);
+/// 2. **reduce the inbound reply** — model mutations first, because the
+///    requests they raise are drained in step 4;
+/// 3. **expire deadlines** the reply may have satisfied;
+/// 4. **drain the reducer's requests** into commands, handing back the
+///    shell-owned ones;
+/// 5. **`sync_selection`** — attach-on-selection (R11 cut 4): the launcher
+///    lists cold sessions, and opening one is when its history is wanted;
+/// 6. **`drain_answers`** — menu answers at their committed coordinates.
+pub fn live_pass(
+    driver: &mut crate::live::LiveDriver,
+    model: &mut AppModel,
+    reply: Option<crate::live::LiveReply>,
+    now: std::time::Instant,
+) -> LivePass {
+    driver.set_now(now);
+    let mut commands = Vec::new();
+    if let Some(reply) = reply {
+        commands.extend(driver.apply(model, reply));
+    }
+    driver.expire_login(model);
+    let mut shell = Vec::new();
+    let requests: Vec<AppRequest> = model.requests.drain(..).collect();
+    for request in requests {
+        match request {
+            AppRequest::CopySelection | AppRequest::CopyText(_) | AppRequest::Quit => {
+                shell.push(request);
+            }
+            request => commands.extend(driver.handle_request(model, request)),
+        }
+    }
+    // Demo requests are structurally unreachable here (report R11 cut 3):
+    // `/reset` takes its live branch and emits none. Clearing is
+    // belt-and-braces, never an execution.
+    model.demo_requests.clear();
+    commands.extend(driver.sync_selection(model));
+    commands.extend(driver.drain_answers(model));
+    LivePass { commands, shell }
+}
+
 /// Run the LIVE TUI against a real daemon (W3c3 M2 — the swap).
 ///
 /// Structurally the twin of [`run_demo`]: same terminal guard, same input
@@ -2064,9 +2129,14 @@ pub fn run_demo_plain(mut model: AppModel) -> String {
 /// [`DemoDriver`]) and the absence of demo persistence — the daemon's store
 /// is the real one, and `run_live` never touches the demo state file.
 ///
-/// The model enters in [`crate::app::RuntimeMode::Live`], so the reducer's
-/// three source-dependent decisions (launcher create, `/reset`, menu
-/// coordinates) take their live branches.
+/// The model enters in [`crate::app::RuntimeMode::Live`], so every reducer
+/// branch that would otherwise FABRICATE local session state takes its live
+/// side instead — [`crate::app::RuntimeMode`] enumerates them exhaustively,
+/// and they all read the one predicate `fabricates_locally`.
+///
+/// The loop TAIL — the ordering that makes live mode correct — lives in
+/// [`live_pass`], which this function and the tests both call. See its
+/// charter for why.
 pub async fn run_live(
     mut model: AppModel,
     client: haider_client::RpcClient,
@@ -2139,13 +2209,14 @@ pub async fn run_live(
                 }
             }
         }
+        let mut inbound: Option<crate::live::LiveReply> = None;
         tokio::select! {
             input = input_rx.recv() => match input {
                 Some(event) => dispatch_input(&mut model, &hit_map, event),
                 None => break,
             },
             reply = link.replies.recv() => match reply {
-                Some(reply) => pending.extend(driver.apply(&mut model, reply)),
+                Some(reply) => inbound = Some(reply),
                 None => break,
             },
             _ = anim_tick.tick(), if model.animated() => {
@@ -2164,8 +2235,9 @@ pub async fn run_live(
                 }
             }
         }
-        let requests: Vec<AppRequest> = model.requests.drain(..).collect();
-        for request in requests {
+        let pass = live_pass(&mut driver, &mut model, inbound, std::time::Instant::now());
+        pending.extend(pass.commands);
+        for request in pass.shell {
             match request {
                 AppRequest::CopySelection => {
                     if let Some(selection) = model.selection {
@@ -2176,17 +2248,11 @@ pub async fn run_live(
                 }
                 AppRequest::CopyText(text) => copy_selection_effects(&mut model, &text),
                 AppRequest::Quit => model.should_quit = true,
-                request => pending.extend(driver.handle_request(&mut model, request)),
+                // `live_pass` hands back exactly the shell-owned arms; any
+                // other request was already translated into a command.
+                _ => {}
             }
         }
-        // Demo requests are structurally unreachable here (report R11 cut
-        // 3): `/reset` takes its live branch and emits none. Clearing is
-        // belt-and-braces, never an execution.
-        model.demo_requests.clear();
-        // Attach-on-selection (R11 cut 4): the launcher lists cold
-        // sessions; opening one is when its history is wanted.
-        pending.extend(driver.sync_selection(&model));
-        pending.extend(driver.drain_answers(&mut model));
         if model.theme != active_theme {
             active_theme = model.theme;
             sync_terminal_bg(active_theme);

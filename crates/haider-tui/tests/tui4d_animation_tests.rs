@@ -11,7 +11,7 @@ use haider_protocol::history::{TodoItem, TodoState};
 use haider_protocol::ids::ItemId;
 use haider_protocol::item::{ItemEvent, ToolStatus, TurnItem};
 use haider_protocol::state::RunState;
-use haider_tui::app::{AppEvent, AppModel, Hit, Screen};
+use haider_tui::app::{AppEvent, AppModel, Screen};
 use haider_tui::projection::badge_pulses;
 use haider_tui::render::render;
 use haider_tui::script::{AuraState, ChipDisplayState, ChipSeed};
@@ -91,7 +91,7 @@ fn phase_toggle_alternates_the_thinking_line() {
     // both the glyph swap and the ink dip below vanish — either assert
     // fails.
     let mut model = launcher_model();
-    model.handle_hit(Hit::AttachSample("billing-service".to_owned()));
+    common::hit_session_named(&mut model, "billing-service");
     model.handle(AppEvent::Envelope(Box::new(EventPayload::RunState(
         RunState::Thinking,
     ))));
@@ -139,7 +139,7 @@ fn the_phase_clock_is_armed_iff_an_animated_state_exists() {
     assert!(!model.animated(), "idle launcher is still");
 
     // An idle session (no thinking, no tools, no todos, no chips): still.
-    model.handle_hit(Hit::AttachSample("billing-service".to_owned()));
+    common::hit_session_named(&mut model, "billing-service");
     assert_eq!(model.screen, Screen::Session);
     assert!(!model.animated(), "idle session is still");
 
@@ -369,7 +369,7 @@ fn the_launcher_rail_shimmers_and_the_running_dot_pulses() {
 #[test]
 fn chip_glyphs_pulse_running_maroon_and_input_required_warn() {
     let mut model = launcher_model();
-    model.handle_hit(Hit::AttachSample("billing-service".to_owned()));
+    common::hit_session_named(&mut model, "billing-service");
     model.chips.push(seed_chip(ChipDisplayState::Running));
     let theme = model.theme.theme();
 

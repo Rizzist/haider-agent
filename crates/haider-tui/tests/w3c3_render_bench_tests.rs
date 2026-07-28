@@ -131,26 +131,43 @@ fn render_p95_on_1k_3k_and_5k_row_replays_is_recorded_against_the_ledger() {
     // (This is a coarse REGRESSION guard, not a claim of sublinearity: the
     // measured curve today is roughly linear in history, which is exactly
     // why row 17 exists. What must never happen is a super-linear blow-up.)
-    // Generous constants on purpose: the two sizes are measured minutes
-    // apart on a machine that may be building something else, so a tight
-    // ratio would be a flake, not a gate. What must never happen is a
-    // super-linear blow-up (5x the history costing far more than 5x).
+    //
+    // W3c3.1 (review P3-8): M3.2 widened this from `8x + 4ms` to
+    // `12x + 50ms` for flake headroom without recording that cases the old
+    // guard rejected now pass. Re-measured over five release runs on the
+    // reference machine, the WITHIN-RUN 5k:1k ratio was 5.11 · 6.17 · 6.41 ·
+    // 6.68 · 6.77 (1k p95 9.5-15.7ms, 5k p95 50.9-96.9ms). `8x + 20ms`
+    // clears every run with ≥28% headroom while rejecting a 7x blow-up —
+    // the original ratio restored, with a small absolute cushion for the
+    // fact that the two sizes are measured minutes apart on a machine that
+    // may be building something else.
     assert!(
-        p95_5k < p95_1k * 12 + Duration::from_millis(50),
+        p95_5k < p95_1k * 8 + Duration::from_millis(20),
         "render cost must not blow up super-linearly with history: \
          1k={p95_1k:?} 5k={p95_5k:?}"
     );
 
     // 2. THE LEDGER GATE, both directions. Row 17's trigger is ">~2-3k
-    //    logical rows or p95 render >8-10ms". The row-count half is true at
-    //    3k/5k by construction, so the p95 is what decides.
+    //    logical rows OR p95 render >8-10ms" — either half fires it.
+    //
+    //    This used to be spelled `&&` (review W3c3 P2-7): a machine fast
+    //    enough to render 3k rows under 10 ms would have reported
+    //    `fired = false` and demanded the marker be REMOVED, retiring a
+    //    trigger whose row-count half had plainly fired. The operator now
+    //    matches the row it gates. Note the consequence, deliberately: the
+    //    row-count half is true by construction at these sizes, so this
+    //    benchmark can no longer authorize removing the marker — only a
+    //    benchmark that stops replaying ≥2k rows could, and the rewrite
+    //    itself is pinned separately by the cache-absence check below.
     //
     //    MUTATION CHECK: flip `TRIGGER_MARKER` out of docs/OPTIMIZATIONS.md
     //    (or change row 17's status back to `planned`) and this fails with
-    //    the measured numbers in hand.
-    let fired = table
-        .iter()
-        .any(|(rows, p95)| *rows >= ROWS_TRIGGER && *p95 >= P95_TRIGGER);
+    //    the measured numbers in hand. Second MUTATION CHECK: change the
+    //    `||` back to `&&` and a sub-10ms 3k render passes the gate with
+    //    the marker removed.
+    let rows_fired = table.iter().any(|(rows, _)| *rows >= ROWS_TRIGGER);
+    let p95_fired = table.iter().any(|(_, p95)| *p95 >= P95_TRIGGER);
+    let fired = rows_fired || p95_fired;
     let ledger = std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/OPTIMIZATIONS.md"),
     )
@@ -171,7 +188,8 @@ fn render_p95_on_1k_3k_and_5k_row_replays_is_recorded_against_the_ledger() {
     assert_eq!(
         fired, recorded,
         "the ledger and the measurement must agree. measured p95s: {table:?}; \
-         trigger fired = {fired}; ledger records `{TRIGGER_MARKER}` = {recorded}. \
+         row-count half fired = {rows_fired}; p95 half fired = {p95_fired}; \
+         ledger records `{TRIGGER_MARKER}` = {recorded}. \
          If it fired, record it (the wrapped-segment/height cache is now REQUIRED \
          work, not planned work — and per R12 it is the NEXT lane's, never the \
          seam's). If it stopped firing, remove the marker."
@@ -195,8 +213,12 @@ fn render_p95_on_1k_3k_and_5k_row_replays_is_recorded_against_the_ledger() {
         start.elapsed()
     };
     println!("render cold-frame @ 5000 rows = {first:?}");
+    // W3c3.1 (review P3-8): M3.2 widened this ceiling from 250ms to 400ms.
+    // Five release runs on the reference machine measured 46.0 · 50.7 ·
+    // 51.2 · 56.8 · 61.1 ms — 4x under the original 250ms — so the
+    // widening is retired rather than merely explained.
     assert!(
-        first < Duration::from_millis(400),
+        first < Duration::from_millis(250),
         "even a cold 5k-row frame must stay far under a human frame budget"
     );
     // The stated test: a memoizing cache would make every frame AFTER the

@@ -181,7 +181,7 @@ fn interrupt_marks_only_its_own_session_and_survives_a_round_trip() {
 
     // Reopen the first: its idle(i) marker survived the round trip.
     model.handle_hit(Hit::BackChip);
-    model.handle_hit(Hit::AttachSample("first-task-here".to_owned()));
+    common::hit_session_named(&mut model, "first-task-here");
     assert_eq!(model.active_session.as_ref(), Some(&first));
     assert!(
         model.projection.interrupted(),
@@ -194,7 +194,7 @@ fn seeded_sessions_round_trip_through_the_map_like_user_ones() {
     // The seeds are REAL sessions now (item 13a): attach, leave, reattach
     // — the seeded transcript, chips and meter ride the same slot laws.
     let mut model = launcher_model();
-    model.handle_hit(Hit::AttachSample("l1-remote-projects".to_owned()));
+    common::hit_session_named(&mut model, "l1-remote-projects");
     assert_eq!(model.screen, Screen::Session);
     let tokens = model.projection.context_tokens();
     assert!(tokens > 0, "usage-seeded meter");
@@ -204,7 +204,7 @@ fn seeded_sessions_round_trip_through_the_map_like_user_ones() {
 
     model.handle_hit(Hit::BackChip);
     assert!(model.chips.is_empty(), "neutral surface after leave");
-    model.handle_hit(Hit::AttachSample("l1-remote-projects".to_owned()));
+    common::hit_session_named(&mut model, "l1-remote-projects");
     assert_eq!(model.projection.entries().len(), entries);
     assert_eq!(model.projection.context_tokens(), tokens);
     assert_eq!(model.chips.len(), 1);

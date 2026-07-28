@@ -496,7 +496,7 @@ fn stale_hits_from_another_surface_are_dropped() {
     // Aura: the launcher's own rows are inert.
     submit(&mut model, "/aura");
     model.requests.clear();
-    model.handle_hit(Hit::AttachSample("billing-service".to_owned()));
+    common::hit_session_named(&mut model, "billing-service");
     assert_eq!(model.screen, Screen::Aura, "no attach from a stale rect");
     assert!(model.requests.is_empty());
     model.handle_hit(Hit::ExtraRow(LauncherRow::Accounts));
@@ -862,9 +862,10 @@ fn launcher_liveness_and_metas_follow_the_sim_seeds() {
     assert!(row_with("⚿ Accounts").contains("provider credentials — OAuth & API keys, har"));
     assert!(row_with("⇄ Peers").contains("reachability ladder — enrolled peers · sponsored"));
     // P2-9: hits carry identity, never a mutable ordinal.
+    let l1 = common::session_named(&model, "l1-remote-projects");
     assert!(hits.iter().any(|(_, hit)| matches!(
         hit,
-        Hit::AttachSample(name) if name == "l1-remote-projects"
+        Hit::AttachSession(id) if *id == l1
     )));
     assert!(
         hits.iter()
@@ -880,15 +881,18 @@ fn an_attach_hit_follows_its_session_when_the_list_reorders() {
     // exercised against `model.sessions`.
     let mut model = launcher_model();
     model.sessions.reverse();
-    model.handle_hit(Hit::AttachSample("billing-service".to_owned()));
+    common::hit_session_named(&mut model, "billing-service");
     assert_eq!(
         model.session_name.as_deref(),
         Some("billing-service"),
         "identity, not ordinal"
     );
     let mut model = launcher_model();
+    // The hit was built from the frame that HAD the row; the row is gone by
+    // the time the click resolves.
+    let vanished = common::session_named(&model, "billing-service");
     model.sessions.clear();
-    model.handle_hit(Hit::AttachSample("billing-service".to_owned()));
+    model.handle_hit(Hit::AttachSession(vanished));
     assert_eq!(model.session_name, None, "a vanished row attaches nothing");
     assert_eq!(tree_live_count(&model.chips), 0);
 }

@@ -15,10 +15,28 @@
 //! `Reconnected`) to the UI loop as ordinary replies — so the driver's
 //! resume path is exercised by the same code in tests and in production.
 //!
-//! Requests are performed on SPAWNED tasks with a cloned client handle: a
-//! slow response must never stall event forwarding, because events are how
-//! the transcript stays live while a mutation is in flight.
+//! ## The two orderings this task exists to preserve
+//!
+//! A request has a SEND half and a WAIT half, and they have opposite needs.
+//! The wait must be concurrent — a slow response must never stall event
+//! forwarding, because events are how the transcript stays live while a
+//! mutation is in flight. The send must be SEQUENTIAL, because the driver
+//! emits `[Detach, Attach]` as one ordered vector for a 17th-slot eviction
+//! and the daemon rejects the attach at `max_attachments_per_connection` if
+//! it arrives first. So [`issue`] awaits `begin_request` INLINE (the frame
+//! is on the wire before the next command is looked at) and spawns only
+//! `PendingResponse::wait` (review W3c3 P1-3).
+//!
+//! The second ordering is in the REPLY stream: the attach response must
+//! reach the driver before the first event for the attachment it names, or
+//! the driver rejects that event as an unknown attachment id and it is lost
+//! forever. The daemon's own register→replay seam gets this right on the
+//! wire, but the response travelled through a spawned task while events
+//! travelled through the select loop, so the two raced here. The link now
+//! HOLDS attachment-scoped replies while any attach response is outstanding
+//! and flushes them in order once none is (review W3c3 P1-2).
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -35,6 +53,17 @@ const REDIAL_MAX: Duration = Duration::from_secs(5);
 
 /// Channel depth for commands and replies. Both are UI-paced.
 const LINK_CAPACITY: usize = 256;
+
+/// How many attachment-scoped replies the link will hold behind an
+/// outstanding attach response before it gives up and reports a gap.
+///
+/// The barrier exists to fix an ordering race, not to become a second
+/// unbounded buffer: an attach response that never lands (a wedged daemon)
+/// must not grow this queue without limit. Overflowing it publishes
+/// [`LiveReply::EventsLost`] and drops the queue, because a drop the driver
+/// can see costs one reattach, and a drop it cannot see costs a transcript
+/// that is silently wrong.
+const HELD_REPLY_CAP: usize = 512;
 
 /// A live link: send [`LiveCommand`]s, receive [`LiveReply`]s.
 pub struct Link {
@@ -80,17 +109,60 @@ async fn run_link(
     let Some(mut events) = client.take_events() else {
         return;
     };
+    // THE ATTACH BARRIER. Attach responses come back on their own channel so
+    // the LINK publishes them, not the spawned task that waited for them:
+    // that is the only place with a total order over both the response and
+    // the events, and therefore the only place that can guarantee the
+    // response goes first.
+    let (mut attaches_tx, mut attaches_rx) = mpsc::channel::<Vec<LiveReply>>(LINK_CAPACITY);
+    let mut outstanding_attaches: usize = 0;
+    let mut held: VecDeque<LiveReply> = VecDeque::new();
+    // The client drops uncorrelated frames when its event channel is full
+    // and counts them. Nothing used to read that counter, so a dropped final
+    // envelope — the one with no later sequence to expose its hole — was
+    // pure silence (review W3c3 P1-2).
+    let mut lost_baseline = client.lost_events();
     loop {
+        let lost = client.lost_events();
+        if lost > lost_baseline {
+            let reply = LiveReply::EventsLost {
+                count: lost - lost_baseline,
+            };
+            lost_baseline = lost;
+            if !deliver(reply, outstanding_attaches, &mut held, &replies).await {
+                return;
+            }
+        }
         let dead = tokio::select! {
             command = commands.recv() => {
                 let Some(command) = command else { return };
-                issue(&client, command, &replies);
+                if issue(&client, command, &replies, &attaches_tx).await {
+                    outstanding_attaches += 1;
+                }
+                None
+            }
+            settled = attaches_rx.recv() => {
+                // `attaches_tx` is held right here, so the channel cannot
+                // close; `None` is unreachable and harmless.
+                for reply in settled.unwrap_or_default() {
+                    if replies.send(reply).await.is_err() {
+                        return;
+                    }
+                }
+                outstanding_attaches = outstanding_attaches.saturating_sub(1);
+                if outstanding_attaches == 0 {
+                    while let Some(reply) = held.pop_front() {
+                        if replies.send(reply).await.is_err() {
+                            return;
+                        }
+                    }
+                }
                 None
             }
             frame = events.recv() => match frame {
                 Some(frame) => {
                     for reply in map_frame(frame) {
-                        if replies.send(reply).await.is_err() {
+                        if !deliver(reply, outstanding_attaches, &mut held, &replies).await {
                             return;
                         }
                     }
@@ -102,6 +174,16 @@ async fn run_link(
             reason = client.disconnected() => Some(reason),
         };
         let Some(reason) = dead else { continue };
+        // A disconnect voids the barrier outright: every attachment died
+        // with the socket, the reattach replays whatever the held replies
+        // carried, and a stale attach response for the dead connection must
+        // never be published as a live attachment. Replacing the channel
+        // orphans the tasks still waiting on the old one.
+        held.clear();
+        outstanding_attaches = 0;
+        let (fresh_tx, fresh_rx) = mpsc::channel::<Vec<LiveReply>>(LINK_CAPACITY);
+        attaches_tx = fresh_tx;
+        attaches_rx = fresh_rx;
         if matches!(reason, DisconnectReason::Closed) {
             return;
         }
@@ -127,6 +209,8 @@ async fn run_link(
                     };
                     client = fresh;
                     events = fresh_events;
+                    // A fresh client owns a fresh loss counter.
+                    lost_baseline = client.lost_events();
                     if replies.send(LiveReply::Reconnected).await.is_err() {
                         return;
                     }
@@ -141,70 +225,149 @@ async fn run_link(
     }
 }
 
-/// Perform one command on a spawned task so the link keeps forwarding
-/// events while it is in flight.
-fn issue(client: &Arc<RpcClient>, command: LiveCommand, replies: &mpsc::Sender<LiveReply>) {
-    let client = Arc::clone(client);
-    let replies = replies.clone();
-    tokio::spawn(async move {
-        // A menu answer is an UNCORRELATED frame by wire design (the
-        // durable identity is its `command_id`). Its outcome arrives as the
-        // committed `MenuAnswered` envelope, which is also what retires it
-        // from the outbox — a correlated echo would be a second authority.
-        if let LiveCommand::Answer {
+/// Whether a reply describes a specific ATTACHMENT and is therefore subject
+/// to the attach barrier.
+///
+/// Connection-scoped news (`Draining`, a `ProtocolError` turned `Failed`)
+/// is not: it names no attachment, so holding it behind one would delay a
+/// drain notice for nothing. `EventsLost` IS attachment-scoped in effect —
+/// it makes every held attachment reattach — so releasing it early would
+/// make the driver drop the very attachments whose held events are about to
+/// be flushed.
+const fn attachment_scoped(reply: &LiveReply) -> bool {
+    matches!(
+        reply,
+        LiveReply::Event { .. }
+            | LiveReply::Lagged { .. }
+            | LiveReply::CaughtUp { .. }
+            | LiveReply::EventsLost { .. }
+    )
+}
+
+/// Publish one inbound reply, or hold it behind an outstanding attach.
+///
+/// Returns `false` once the reply consumer is gone (the link is finished).
+async fn deliver(
+    reply: LiveReply,
+    outstanding_attaches: usize,
+    held: &mut VecDeque<LiveReply>,
+    replies: &mpsc::Sender<LiveReply>,
+) -> bool {
+    if outstanding_attaches == 0 || !attachment_scoped(&reply) {
+        return replies.send(reply).await.is_ok();
+    }
+    if held.len() >= HELD_REPLY_CAP {
+        // The queue and the reply that overflowed it are both gone. Say so:
+        // the driver reattaches every held attachment from its own cursor
+        // and the daemon replays what we just threw away.
+        let count = u64::try_from(held.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        held.clear();
+        return replies.send(LiveReply::EventsLost { count }).await.is_ok();
+    }
+    held.push_back(reply);
+    true
+}
+
+/// Perform one command, returning whether an ATTACH response is now
+/// outstanding.
+///
+/// The write is awaited INLINE so commands reach the wire in the order the
+/// driver emitted them; only the response wait is spawned, so a slow answer
+/// still cannot stall event forwarding. An attach's replies are routed to
+/// `attaches` instead of straight to `replies` so the link — the one place
+/// with a total order over responses and events — publishes them itself.
+async fn issue(
+    client: &Arc<RpcClient>,
+    command: LiveCommand,
+    replies: &mpsc::Sender<LiveReply>,
+    attaches: &mpsc::Sender<Vec<LiveReply>>,
+) -> bool {
+    // A menu answer is an UNCORRELATED frame by wire design (the durable
+    // identity is its `command_id`). Its outcome arrives as the committed
+    // `MenuAnswered` envelope, which is also what retires it from the
+    // outbox — a correlated echo would be a second authority.
+    if let LiveCommand::Answer {
+        command_id,
+        session,
+        menu,
+        request_seq,
+        worker_generation,
+        option_key,
+        option_index,
+        input,
+    } = command
+    {
+        let frame = WireFrame::MenuAnswer {
+            request_id: None,
             command_id,
-            session,
-            menu,
+            session_id: session,
+            menu_id: menu,
             request_seq,
             worker_generation,
             option_key,
             option_index,
             input,
-        } = command
-        {
-            let frame = WireFrame::MenuAnswer {
-                request_id: None,
-                command_id,
-                session_id: session,
-                menu_id: menu,
-                request_seq,
-                worker_generation,
-                option_key,
-                option_index,
-                input,
-            };
-            let _ = client.send_frame(frame).await;
-            return;
+        };
+        let _ = client.send_frame(frame).await;
+        return false;
+    }
+    let context = CommandContext::of(&command);
+    let is_attach = context.attach.is_some();
+    let body = request_body(command);
+    let pending = match client.begin_request(body).await {
+        Ok(pending) => pending,
+        // Nothing reached the wire, so nothing is outstanding. The outbox
+        // resends under the same durable id on reconnect; reads are
+        // reissued by the resume path.
+        Err(ClientError::Disconnected(_)) => return false,
+        Err(error) => {
+            let _ = replies
+                .send(LiveReply::Failed {
+                    command_id: context.command_id.clone(),
+                    code: "encode_failed".to_owned(),
+                    message: error.to_string(),
+                    retryable: false,
+                })
+                .await;
+            return false;
         }
-        let context = CommandContext::of(&command);
-        let body = request_body(command);
-        match client.request(body).await {
-            Ok(response) => {
-                for reply in map_response(&context, response) {
-                    let _ = replies.send(reply).await;
-                }
-            }
-            Err(ClientError::Disconnected(_)) => {
-                // The outbox resends under the same durable id on reconnect;
-                // reads are reissued by the resume path.
-            }
-            Err(error) => {
-                let _ = replies
-                    .send(LiveReply::Failed {
-                        command_id: context.command_id.clone(),
-                        code: "encode_failed".to_owned(),
-                        message: error.to_string(),
-                        retryable: false,
-                    })
-                    .await;
+    };
+    let replies = replies.clone();
+    let attaches = attaches.clone();
+    tokio::spawn(async move {
+        let mapped = match pending.wait().await {
+            Ok(response) => map_response(&context, response),
+            // The disconnect edge is reported by the link itself.
+            Err(ClientError::Disconnected(_)) => Vec::new(),
+            Err(error) => vec![LiveReply::Failed {
+                command_id: context.command_id.clone(),
+                code: "encode_failed".to_owned(),
+                message: error.to_string(),
+                retryable: false,
+            }],
+        };
+        if is_attach {
+            // Even an EMPTY vector must be delivered: it is what retires
+            // the barrier for a failed or disconnected attach.
+            let _ = attaches.send(mapped).await;
+        } else {
+            for reply in mapped {
+                let _ = replies.send(reply).await;
             }
         }
     });
+    is_attach
 }
 
 /// What a response needs from its request to be interpretable (the wire
 /// deliberately does not echo, e.g., which session an attach was for).
-struct CommandContext {
+///
+/// Public only so `tests/` can pin the request/response mapping without a
+/// daemon — the workspace forbids inline test modules, and an unmapped
+/// response body is a silently swallowed reply.
+pub struct CommandContext {
     command_id: Option<haider_rpc::CommandId>,
     cwd: String,
     model: String,
@@ -218,7 +381,9 @@ struct CommandContext {
 }
 
 impl CommandContext {
-    fn of(command: &LiveCommand) -> Self {
+    /// Capture everything the response will not carry back.
+    #[must_use]
+    pub fn of(command: &LiveCommand) -> Self {
         let (cwd, model) = match command {
             LiveCommand::Create { cwd, model, .. } => (cwd.clone(), model.clone()),
             _ => (String::new(), String::new()),
@@ -244,7 +409,9 @@ impl CommandContext {
     }
 }
 
-fn request_body(command: LiveCommand) -> RequestBody {
+/// The wire request one driver command becomes.
+#[must_use]
+pub fn request_body(command: LiveCommand) -> RequestBody {
     match command {
         LiveCommand::List { cursor } => RequestBody::SessionList {
             cursor,
@@ -322,7 +489,9 @@ fn request_body(command: LiveCommand) -> RequestBody {
     }
 }
 
-fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveReply> {
+/// The driver facts one response body carries, given what its request knew.
+#[must_use]
+pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveReply> {
     match body {
         ResponseBody::SessionList {
             sessions,
@@ -422,7 +591,12 @@ fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveReply> 
     }
 }
 
-fn map_frame(frame: WireFrame) -> Vec<LiveReply> {
+/// The driver facts one uncorrelated frame carries.
+///
+/// Unknown frames map to nothing (forward-compat law); frames that carry
+/// cursor authority must NEVER take that path.
+#[must_use]
+pub fn map_frame(frame: WireFrame) -> Vec<LiveReply> {
     match frame {
         WireFrame::Event {
             attachment_id,
@@ -436,6 +610,19 @@ fn map_frame(frame: WireFrame) -> Vec<LiveReply> {
         WireFrame::Lagged { attachment_id, .. } => vec![LiveReply::Lagged {
             attachment: attachment_id,
         }],
+        // THE CATCH-UP BOUNDARY. This used to be dropped by the catch-all
+        // below, on the claim that it "carries no state the cursor law
+        // needs". It is the opposite: a hole in the MIDDLE of a replay is
+        // caught by the next sequence, but a hole at its END has no next
+        // sequence at all, and this marker is the only thing that says how
+        // far the replay was supposed to reach (review W3c3 P1-2).
+        WireFrame::AttachCaughtUp {
+            attachment_id,
+            high_water_seq,
+        } => vec![LiveReply::CaughtUp {
+            attachment: attachment_id,
+            high_water_seq,
+        }],
         WireFrame::ServerDraining { reason, .. } => vec![LiveReply::Draining { reason }],
         WireFrame::ProtocolError(error) => vec![LiveReply::Failed {
             command_id: None,
@@ -443,8 +630,8 @@ fn map_frame(frame: WireFrame) -> Vec<LiveReply> {
             message: error.message.clone(),
             retryable: !error.fatal,
         }],
-        // AttachCaughtUp carries no state the cursor law needs: events
-        // deduplicate by seq alone, and the marker may repeat.
+        // Handshake, correlated, and heartbeat frames never reach here; an
+        // unknown frame from a newer daemon is tolerated, never fatal.
         _ => Vec::new(),
     }
 }

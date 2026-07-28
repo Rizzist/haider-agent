@@ -64,3 +64,34 @@ pub async fn pump_until(
 pub fn driver_for(model: &AppModel) -> (DemoDriver, tokio::sync::mpsc::Receiver<(u64, DemoEvent)>) {
     DemoDriver::new(64, std::sync::Arc::clone(&model.roster))
 }
+
+/// The session id of the launcher row NAMED `name` (W3c3.1): `Hit::
+/// AttachSession` carries the wire coordinate, not a display name, because
+/// live rows have no name at all. A test that means "click the row called
+/// billing-service" resolves that row's id here — which is exactly what
+/// the renderer does when it builds the hit.
+pub fn session_named(model: &AppModel, name: &str) -> haider_protocol::ids::SessionId {
+    model
+        .sessions
+        .iter()
+        .find(|entry| entry.name.as_deref() == Some(name))
+        .unwrap_or_else(|| panic!("no launcher row named {name}"))
+        .id
+        .clone()
+}
+
+/// A click on the launcher row named `name`.
+pub fn hit_session_named(model: &mut AppModel, name: &str) {
+    let id = session_named(model, name);
+    model.handle_hit(haider_tui::app::Hit::AttachSession(id));
+}
+
+/// Type and execute one slash command. The Esc dismisses the palette that
+/// opens on `/` so ⏎ executes the line instead of activating a row.
+pub fn run_slash(model: &mut AppModel, line: &str) {
+    for c in line.chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Esc));
+    model.handle(key(KeyCode::Enter));
+}

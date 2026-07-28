@@ -464,7 +464,11 @@ fn a_gap_reattaches_exactly_once_through_the_single_authority() {
         "the driver observes the gap; it does not act on it independently"
     );
 
-    // Now drain the reducer's request exactly as `run_live` does.
+    // Now drain the reducer's request. NOTE (W3c3.1): this hand-drains the
+    // request to isolate `handle_request`; hand-copying the loop is exactly
+    // how the SECOND attach authority hid, so the composed law now lives in
+    // `w3c31_fix_tests`, which calls `runtime::live_pass` — the function the
+    // shipping loop calls.
     let requests: Vec<AppRequest> = model.requests.drain(..).collect();
     assert_eq!(
         requests,
@@ -637,9 +641,10 @@ fn a_cold_session_attaches_only_when_it_is_selected_and_only_once() {
     // not attach (found by pty-probe-live's §6.4 second-terminal row: the
     // row opened to an empty transcript).
     //
-    // MUTATION CHECK: delete the `driver.sync_selection(&model)` call in
-    // `runtime::run_live` — headlessly, make `sync_selection` return
-    // `Vec::new()` — and the attach below never happens.
+    // MUTATION CHECK: make `sync_selection` return `Vec::new()` and the
+    // attach below never happens. (The call site itself is
+    // `runtime::live_pass`, and `w3c31_fix_tests` drives THAT — this test
+    // pins the driver half in isolation.)
     let mut model = live_model();
     let mut driver = LiveDriver::new("test");
     driver.apply(
