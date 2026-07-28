@@ -982,6 +982,36 @@ impl LiveDriver {
                 message,
                 retryable,
             } => {
+                // TUI6.3b (verification P3, path a): a STAGE-level error
+                // answers a stage the correlation queue still holds a tag
+                // for — the Staged reply it replaces will never arrive, so
+                // the tag must pop here or it desyncs the NEXT attempt's
+                // correlation (a 30s-bounded wedge until the deadline
+                // cleared it). Stage commands carry no durable id by
+                // charter, so their errors arrive as `command_id: None`;
+                // a None while stages are in flight is consumed as the
+                // FRONT stage's answer (socket order — the same FIFO the
+                // Staged arm pops). If it was the LIVE attempt's stage,
+                // the card takes the recovery NOW instead of waiting out
+                // the deadline; a ghost attempt's error is swallowed —
+                // the user already saw the cancel. (A no-id error from a
+                // non-stage command while a stage is in flight would
+                // mis-pop — indistinguishable without wire identity, and
+                // strictly no worse than the wedge this fixes: the same
+                // deadline bounds it.)
+                if command_id.is_none() && !self.staged_attempts.is_empty() {
+                    let answered = self.staged_attempts.pop_front();
+                    let live = answered == self.login_attempt
+                        && model.login.as_ref().map(|card| card.attempt) == answered
+                        && answered.is_some();
+                    if live {
+                        self.login_started = None;
+                        self.login_attempt = None;
+                        model.login_result(Err((code, message)));
+                    }
+                    model.dirty = true;
+                    return Vec::new();
+                }
                 // A rejected TURN must release the optimistic mid-turn UI,
                 // or the session sits in "running" forever with no envelope
                 // ever coming to clear it — and Esc, which now cancels only
@@ -1079,14 +1109,19 @@ impl LiveDriver {
     /// nothing to resend: the only recovery is a retype, and saying so is
     /// the whole job.
     fn abandon_login(&mut self, model: &mut AppModel, why: &str) {
+        // TUI6.3b (verification P3, path b): the correlation queue is
+        // connection-scoped and dies on EVERY abandon path — the
+        // early-return below fires when a retire already cleared the
+        // command and deadline, and clearing after it stranded the tags:
+        // the NEXT attempt's genuine Staged reply then popped a stale tag
+        // and was dropped (a 30s-bounded wedge). The attempt binding dies
+        // with the connection for the same reason.
+        self.staged_attempts.clear();
+        self.login_attempt = None;
         if self.login_started.is_none() && self.login_command.is_none() {
             return;
         }
         self.login_started = None;
-        self.login_attempt = None;
-        // Staging is connection-scoped: no reply will ever arrive for
-        // these, so the correlation queue dies with the transaction.
-        self.staged_attempts.clear();
         if let Some(id) = self.login_command.take() {
             self.retire(&id);
         }

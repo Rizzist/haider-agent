@@ -690,3 +690,128 @@ fn pasted_buffer_is_zeroizing_by_type() {
     assert_eq!(zeroizing.as_str(), "sk-wipe-me");
     assert_eq!(pasted.as_str(), "sk-wipe-me");
 }
+
+// ---- TUI6.3b: the correlation queue survives every failure path ----
+
+#[test]
+fn stage_error_pops_its_tag_and_the_next_attempt_is_not_wedged() {
+    // Verification P3 path (a): a stage answered by a wire-level error
+    // (`Failed { command_id: None }` — stages carry no durable id) never
+    // popped its correlation tag, so the NEXT attempt's genuine Staged
+    // reply popped the stale tag and was dropped: a 30s wedge until the
+    // deadline cleared it. The error now consumes the tag; the live
+    // card takes the recovery immediately.
+    //
+    // MUTATION CHECK (stage-error-pops): remove the `command_id.is_none()`
+    // consumption branch from the Failed arm and this fails — attempt 2
+    // mints nothing. Verified by revert.
+    let mut model = live_model();
+    let mut driver = LiveDriver::new("test");
+    let start = std::time::Instant::now();
+    submit_login(&mut model, SENTINEL);
+    let pass = live_pass(&mut driver, &mut model, None, start);
+    assert_eq!(pass.commands.len(), 1, "attempt 1 staged");
+    // The stage fails at the wire.
+    let _ = live_pass(
+        &mut driver,
+        &mut model,
+        Some(LiveReply::Failed {
+            command_id: None,
+            code: "vault_unavailable".to_owned(),
+            message: "the vault is sealed".to_owned(),
+            retryable: true,
+        }),
+        start,
+    );
+    assert!(
+        matches!(
+            model.login.as_ref().expect("card open").stage,
+            LoginStage::Failed(_)
+        ),
+        "the live card takes the recovery immediately, not at the deadline"
+    );
+    // Attempt 2 must correlate cleanly — no stale tag in front.
+    model.handle(key(KeyCode::Esc));
+    let second = submit_login(&mut model, "sk-ant-SECOND-key-after-error");
+    let pass = live_pass(&mut driver, &mut model, None, start);
+    assert!(
+        pass.commands
+            .iter()
+            .any(|command| matches!(command, LiveCommand::Stage { .. })),
+        "attempt {second} staged"
+    );
+    let pass = live_pass(
+        &mut driver,
+        &mut model,
+        Some(LiveReply::Staged {
+            vault_reference: "second-ref".to_owned(),
+            provider: "anthropic".to_owned(),
+            alias: None,
+        }),
+        start,
+    );
+    assert!(
+        pass.commands
+            .iter()
+            .any(|command| matches!(command, LiveCommand::LoginApi { .. })),
+        "attempt 2's genuine Staged mints — the queue was not wedged: {:?}",
+        pass.commands
+    );
+}
+
+#[test]
+fn retire_then_disconnect_clears_the_tags_and_the_next_attempt_works() {
+    // Verification P3 path (b): Esc retired the attempt (command and
+    // deadline both cleared), then the disconnect's abandon early-returned
+    // BEFORE clearing the correlation queue — stranding the tag for the
+    // reconnected world, where the next attempt's Staged popped it and
+    // was dropped.
+    //
+    // MUTATION CHECK (abandon-clears-first): move the
+    // `staged_attempts.clear()` back below abandon_login's early-return
+    // and this fails — attempt 2 mints nothing after the reconnect.
+    // Verified by revert.
+    let mut model = live_model();
+    let mut driver = LiveDriver::new("test");
+    let start = std::time::Instant::now();
+    submit_login(&mut model, SENTINEL);
+    let pass = live_pass(&mut driver, &mut model, None, start);
+    assert_eq!(pass.commands.len(), 1, "attempt 1 staged");
+    model.handle(key(KeyCode::Esc)); // retire: command + deadline cleared
+    let _ = live_pass(&mut driver, &mut model, None, start); // drain the retire
+    let _ = live_pass(
+        &mut driver,
+        &mut model,
+        Some(LiveReply::Disconnected {
+            reason: "socket died".to_owned(),
+        }),
+        start,
+    );
+    let _ = live_pass(&mut driver, &mut model, Some(LiveReply::Reconnected), start);
+    // Attempt 2 on the fresh connection.
+    submit_login(&mut model, "sk-ant-SECOND-after-reconnect");
+    let pass = live_pass(&mut driver, &mut model, None, start);
+    assert!(
+        pass.commands
+            .iter()
+            .any(|command| matches!(command, LiveCommand::Stage { .. })),
+        "attempt 2 staged post-reconnect"
+    );
+    let pass = live_pass(
+        &mut driver,
+        &mut model,
+        Some(LiveReply::Staged {
+            vault_reference: "fresh-connection-ref".to_owned(),
+            provider: "anthropic".to_owned(),
+            alias: None,
+        }),
+        start,
+    );
+    assert!(
+        pass.commands
+            .iter()
+            .any(|command| matches!(command, LiveCommand::LoginApi { .. })),
+        "no stale tag survived the disconnect: {:?}",
+        pass.commands
+    );
+}
