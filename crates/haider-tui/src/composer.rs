@@ -49,9 +49,15 @@ pub struct Composer {
     /// ACTIVE selection; `a == cursor` is a parked anchor (mouse press
     /// before any drag) and renders as no selection.
     anchor: Option<usize>,
-    /// Preferred display column for a run of ↑/↓ (column-sticky like every
-    /// editor). Any horizontal movement or edit clears it.
-    sticky_col: Option<usize>,
+    /// Preferred display column for a run of ↑/↓ (column-sticky like
+    /// every editor), TAGGED with the wrap budget that MINTED it
+    /// (TUI6.2 fix 1, review r2 finding 1): the column is wrap-ROW
+    ///-relative, so it is geometry state — a budget change (resize,
+    /// draft swap, restore) makes it meaningless. Consumption validates
+    /// the mint tag and re-derives on mismatch, so a stale column is
+    /// unrepresentable at the only sites that read it. Any horizontal
+    /// movement or edit still clears it outright.
+    sticky_col: Option<(usize, usize)>,
     /// Submitted inputs, oldest first (item 6). Transient by law.
     history: Vec<String>,
     /// `Some(i)` while browsing `history[i]`; `None` while editing the
@@ -461,9 +467,7 @@ impl Composer {
         if !extend {
             self.anchor = None;
         }
-        let target = *self
-            .sticky_col
-            .get_or_insert_with(|| cluster_cols(&self.text[rows[at].start..self.cursor]));
+        let target = self.sticky_col_for(rows[at]);
         self.cursor = seek_col_in_row(&self.text, rows[at - 1], target);
         true
     }
@@ -496,9 +500,7 @@ impl Composer {
         if !extend {
             self.anchor = None;
         }
-        let target = *self
-            .sticky_col
-            .get_or_insert_with(|| cluster_cols(&self.text[rows[at].start..self.cursor]));
+        let target = self.sticky_col_for(rows[at]);
         self.cursor = seek_col_in_row(&self.text, rows[at + 1], target);
         true
     }
@@ -576,6 +578,26 @@ impl Composer {
         self.anchor = None;
         self.sticky_col = None;
         true
+    }
+
+    /// The sticky column for a ↑/↓ step from the visual row `at` — THE
+    /// one consumption seam of the mint-tagged cache (TUI6.2 fix 1,
+    /// review r2 finding 1: budget 13's cached col 4 walked budget 5's
+    /// rows to byte 24 where the current-geometry col 2 lands 22; the
+    /// parked-draft path preserved the same stale column, and
+    /// ⇧-extension shares this path). A cached column minted under any
+    /// OTHER budget is re-derived from the caret's position in the
+    /// CURRENT row and re-minted — stale reads are unrepresentable.
+    fn sticky_col_for(&mut self, row: WrapRow) -> usize {
+        let budget = self.wrap_budget.get();
+        match self.sticky_col {
+            Some((minted, col)) if minted == budget => col,
+            _ => {
+                let col = cluster_cols(&self.text[row.start..self.cursor]);
+                self.sticky_col = Some((budget, col));
+                col
+            }
+        }
     }
 
     // ---- Internals ----

@@ -54,10 +54,12 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
                     .projection
                     .open_menu()
                     .map_or(1, |menu| menu.options.len()),
+                // Title + options since TUI6.2 fix 4 (matches the
+                // subagent ledger's floor_input).
                 Screen::Subagent => model
                     .viewed_chip()
                     .and_then(crate::app::ChipModel::question_menu)
-                    .map_or(1, |menu| menu.options.len()),
+                    .map_or(1, |menu| menu.options.len() + 1),
                 _ => 1,
             };
             u16::from((area.height as usize) >= 1 + 4 + input_floor)
@@ -338,27 +340,22 @@ fn render_launcher(
     // closing-rule row (the gap), then the top rule, before the composer
     // loses its row.
     let needed = composer_height(model, area.width);
-    let mut gap: u16 = 1;
     let mut content_min: u16 = 1;
     let mut rule_h: u16 = 1;
-    let mut input_avail = area.height.saturating_sub(content_min + rule_h + gap);
-    if input_avail < 1 {
+    // TUI6.2 fix 6 (review r2 finding 6): the closing-rule row (the gap,
+    // TUI5's net-zero trick) is DERIVED from `band_rule_reserve` — the
+    // function is the runtime authority here, not a debug-only tie. The
+    // content column yields first when keeping it would starve the
+    // reserved rule (r1's launcher 90×4).
+    if band_rule_reserve(area.height, content_min + rule_h + 1, rule_h) == 0 {
         content_min = 0;
-        input_avail = area.height.saturating_sub(rule_h + gap);
     }
-    if input_avail < 1 {
-        gap = 0;
-        input_avail = area.height.saturating_sub(rule_h);
-    }
+    let gap = band_rule_reserve(area.height, content_min + rule_h + 1, rule_h);
+    let mut input_avail = area.height.saturating_sub(content_min + rule_h + gap);
     if input_avail < 1 {
         rule_h = 0;
         input_avail = area.height;
     }
-    debug_assert_eq!(
-        u16::from(gap > 0),
-        band_rule_reserve(area.height, content_min + rule_h + 1, rule_h),
-        "the launcher ladder implements band_rule_reserve exactly"
-    );
     let composer_rows = needed.min(input_avail).clamp(1, area.height.max(1));
     let fixed = content_min + rule_h + composer_rows + gap;
     if palette_height > area.height.saturating_sub(fixed) {
@@ -1607,7 +1604,15 @@ fn render_subagent(
                 .unwrap_or(u16::MAX)
         },
     );
-    let floor_input = menu.map_or(1, |m| u16::try_from(m.options.len().max(1)).unwrap_or(1));
+    // TUI6.2 fix 4 (review r2 finding 4, overruling the r1 trade): the
+    // card's sacred floor is TITLE + options — options without their
+    // question is a dignity regression (the 90×12 four-option card shed
+    // its title while a blank optional gap survived). Session parity:
+    // the session ledger funds the full card before any panel; the
+    // subagent floor now does too.
+    let floor_input = menu.map_or(1, |m| {
+        u16::try_from(m.options.len().max(1) + 1).unwrap_or(u16::MAX)
+    });
     // Compact ledger (the session screen's shed order, condensed).
     // TUI6.1 fix 2: the closing rule joined it AHEAD of the SubTree and
     // the gap (review r1: subagent 90×11 / question 90×14 funded the
@@ -1957,10 +1962,14 @@ fn render_aura(
         |bar: u16, rules: u16, extras: u16| area.height.saturating_sub(bar + rules + extras) < 1;
     // TUI6.1 fix 2 (review r1: aura 90×10 kept orb/columns while the
     // closing rule shed): the rule row (the gap, TUI5's net-zero trick)
-    // outranks the OPTIONAL columns and orb per `band_rule_reserve`'s
-    // law, and yields to the transcript's sacred row (session parity) —
-    // shed order is now columns → orb → closing rule → transcript row →
-    // rules → bar.
+    // outranks the OPTIONAL columns and orb, and yields to the
+    // transcript's sacred row (session parity) — shed order is columns →
+    // orb → closing rule → transcript row → rules → bar. The
+    // columns/orb rungs carry the rule's provisional row (`gap`, still 1
+    // here) in their extras so they shed in its favor; TUI6.2 fix 6
+    // (review r2 finding 6) then DERIVES the rule row from
+    // `band_rule_reserve` over the survivors — the function is the
+    // runtime authority, not a debug-only tie.
     if over(
         bar_h,
         bar_rule_h + input_rule_h,
@@ -1975,9 +1984,11 @@ fn render_aura(
     ) {
         orb_h = 0;
     }
-    if over(bar_h, bar_rule_h + input_rule_h, gap + transcript_min) {
-        gap = 0;
-    }
+    gap = band_rule_reserve(
+        area.height,
+        bar_h + bar_rule_h + input_rule_h + columns_h + orb_h + transcript_min + 1,
+        input_rule_h,
+    );
     if over(bar_h, bar_rule_h + input_rule_h, transcript_min) {
         transcript_min = 0;
     }
@@ -1988,15 +1999,6 @@ fn render_aura(
     if over(bar_h, 0, 0) {
         bar_h = 0;
     }
-    debug_assert_eq!(
-        u16::from(gap > 0),
-        band_rule_reserve(
-            area.height,
-            bar_h + bar_rule_h + input_rule_h + columns_h + orb_h + transcript_min + 1,
-            input_rule_h,
-        ),
-        "the aura ladder implements band_rule_reserve exactly"
-    );
     let composer_h = composer_want
         .min(area.height.saturating_sub(
             bar_h + bar_rule_h + input_rule_h + gap + columns_h + orb_h + transcript_min,
@@ -2412,7 +2414,10 @@ fn menu_glyph(menu: &haider_protocol::menu::Menu) -> &'static str {
 /// alone: moving the caret can never move a wrap point (item 5's
 /// derive-from-width law).
 /// TUI6.1 fix 2 — the closing-rule reservation law (review r1 finding 2),
-/// stated ONCE and applied by EVERY surface ledger: the band's lower rule
+/// stated ONCE and, since TUI6.2 fix 6, the RUNTIME authority on every
+/// surface ledger (r2 finding 6: launcher/aura had duplicated arithmetic
+/// tied to this function only by debug_asserts, which compile out —
+/// their rule rows are now DERIVED from it): the band's lower rule
 /// is RESERVED whenever the rows that outrank it — the surface's
 /// surviving chrome, the top input rule, the sacred input floor, and the
 /// transcript's sacred row where the surface has one — still leave it a
@@ -2638,6 +2643,15 @@ fn composer_lines<'a>(
     width: u16,
     allocated: u16,
 ) -> (Vec<Line<'a>>, Option<(u16, u16)>, Vec<ComposerRowWindow>) {
+    // TUI6.2 fix 2 (review r2 finding 2): the frame's wrap budget is
+    // published for EVERY branch — the empty-composer return kept a
+    // fresh surface at budget 0, so type-then-queued-navigation before
+    // the next redraw walked LOGICAL lines (cursor 4 where budget 13's
+    // wrapped rows land 17). The budget is a function of the width
+    // alone; an empty draft and the login card still occupy a band of
+    // this width, so their frames publish it too.
+    let budget = composer_text_budget(width);
+    model.composer.set_wrap_budget(budget);
     // The masked login card owns the input band while it is open. It emits
     // NO click/drag windows and NO talk chip: a composer text window
     // carries its CONTENT for caret mapping, which is precisely the thing
@@ -2737,12 +2751,10 @@ fn composer_lines<'a>(
     let cursor = model.composer.cursor();
     let selection = model.composer.selection_range();
     // Visual rows: the draft wrapped at grapheme boundaries into the
-    // frame's budget (TUI6 item 1). The budget is fed back to the
-    // composer so ↑/↓ walk the SAME rows this frame paints (the
-    // scroll_max Cell pattern — geometry feedback, never stored wrap
-    // points; the reducer stays put).
-    let budget = composer_text_budget(width);
-    model.composer.set_wrap_budget(budget);
+    // frame's budget (TUI6 item 1), published above for every branch so
+    // ↑/↓ walk the SAME rows this frame paints (the scroll_max Cell
+    // pattern — geometry feedback, never stored wrap points; the
+    // reducer stays put).
     let row_bounds = crate::composer::wrap_rows(text, budget);
     let cursor_row_index = crate::composer::visual_row_of(&row_bounds, cursor);
     let total = row_bounds.len();

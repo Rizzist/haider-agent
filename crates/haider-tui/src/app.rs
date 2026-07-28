@@ -1205,6 +1205,18 @@ impl Default for IdentityLine {
 /// The single mutable application state (research rec 3).
 #[derive(Debug)]
 pub struct AppModel {
+    /// WRITE LAW (TUI6.2 fix 3, review r2 finding 3): inside `AppModel`,
+    /// assign this ONLY through [`Self::switch_surface`] — it owns the
+    /// draft swap that keeps a surface change from leaking one surface's
+    /// draft onto another (the r2 Aura→Session chip-close bug). The
+    /// four named exceptions, each documented at its site: the founding
+    /// donation in the launcher submit (the ring travels by design), the
+    /// two identity-flip split seams (open_session's checkout,
+    /// back_to_launcher) whose stash/restore halves bracket an
+    /// `active_session` flip the atomic authority cannot span, and the
+    /// /reset purge flow (purge-then-restore replaces the swap). Test
+    /// fixtures set the field directly on purpose — they construct
+    /// states, they do not transition.
     pub screen: Screen,
     pub theme: ThemeKey,
     pub sanctum_tier: SanctumTier,
@@ -1547,14 +1559,30 @@ impl AppModel {
     /// nothing — an empty round-trip would be harmless but this keeps the
     /// one-stash-one-restore discipline literal.
     fn goto_session_screen(&mut self) {
-        let from = self.surface_key();
-        let to = self.session_draft_key();
-        if from == to {
-            self.screen = Screen::Session;
+        self.switch_surface(Screen::Session);
+    }
+
+    /// THE surface-switch authority (TUI6.2 fix 3, review r2 finding 3):
+    /// every atomic Screen write goes through here, and when the surface
+    /// KEY changes the draft swap happens as one atom — stash under the
+    /// departing key, restore under the arriving one. The r2 reviewer's
+    /// leak was `close_chip_state` assigning `Screen::Session` directly
+    /// while the user sat in AURA: the aura draft crossed keys unswapped
+    /// and could be SUBMITTED on the session surface. Direct
+    /// `self.screen =` assignment is that bug waiting to recur; the only
+    /// sites outside this function are enumerated on the `screen` field's
+    /// doc (the founding donation and the two identity-flip split seams).
+    fn switch_surface(&mut self, to: Screen) {
+        let from = self.screen;
+        let from_key = self.surface_key();
+        self.screen = to;
+        if self.surface_key() == from_key {
             return;
         }
+        // Keys differ: rewind, then swap with the REAL key on each side.
+        self.screen = from;
         self.stash_draft();
-        self.screen = Screen::Session;
+        self.screen = to;
         self.restore_draft();
     }
 
@@ -1984,7 +2012,7 @@ impl AppModel {
         // chip view's composer.
         if self.screen == Screen::Subagent {
             if key.code == KeyCode::Esc {
-                self.screen = Screen::Session;
+                self.switch_surface(Screen::Session);
                 return;
             }
             if self
@@ -2385,6 +2413,13 @@ impl AppModel {
         // (bare setTimeout in the sim) — only a session replacement voids it,
         // via the origin identity (review r2 P2-6).
         let title = self.session_title.is_none();
+        // FOUNDING DONATION (TUI6.2 fix 3's named exception 1 of 3): the
+        // submit just consumed the launcher draft, and its input RING
+        // deliberately travels with the composer onto the new session
+        // surface (pinned by `founding_message_recalls_in_the_new_session`)
+        // — a switch_surface swap would park the ring under the launcher
+        // key and wake an empty one. The destination key is freshly
+        // minted (new generation), so no parked draft can be clobbered.
         self.screen = Screen::Session;
         self.turn_active = true;
         self.scroll_back.set(0);
@@ -2405,8 +2440,14 @@ impl AppModel {
         };
         match key.code {
             KeyCode::Esc => {
-                // Drop wipes: `Zeroizing` on the way out.
+                // Drop wipes: `Zeroizing` on the way out. TUI6.2 fix 5
+                // (review r2 finding 5): the close RESTORES the draft the
+                // open parked — the r1-era adjudication covered draft
+                // TEXT only, but the parked composer carries the input
+                // HISTORY ring too, and an unpaired stash stranded both
+                // (overwritable by the next stash under the same key).
                 self.login = None;
+                self.restore_draft();
             }
             KeyCode::Enter => {
                 if !card.accepts_input() || card.is_empty() {
@@ -2425,7 +2466,9 @@ impl AppModel {
             KeyCode::Backspace => card.backspace(),
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => card.push(c),
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                // Same pairing as Esc (TUI6.2 fix 5).
                 self.login = None;
+                self.restore_draft();
             }
             _ => {}
         }
@@ -2448,7 +2491,12 @@ impl AppModel {
         }
     }
 
-    /// Open the masked card for `/login <provider> api`.
+    /// Open the masked card for `/login <provider> api`. The stash here
+    /// pairs with the `restore_draft` on BOTH close paths in `login_key`
+    /// (TUI6.2 fix 5) — the card borrows the band; the surface's draft
+    /// and its history ring come back when it leaves. The draft TEXT is
+    /// empty by construction at this point (the `/login…` submit consumed
+    /// it), but the RING is not — pinned in the login suite.
     fn open_login_card(&mut self, provider: &str, alias: Option<String>) {
         self.stash_draft();
         self.login = Some(LoginCard::new(provider.to_owned(), alias));
@@ -2586,21 +2634,17 @@ impl AppModel {
             self.refuse_demo_only("Aura Mode");
             return;
         }
-        self.stash_draft();
-        self.screen = Screen::Aura;
-        self.restore_draft();
+        self.switch_surface(Screen::Aura);
     }
 
     /// Esc from the aura stage: back to the session if one is attached,
     /// else the launcher — aura state persists either way.
     fn exit_aura(&mut self) {
-        // TUI5 item 9: the aura's draft parks under its own key; the
-        // return surface's draft comes live below.
-        self.stash_draft();
         // TUI4c: attachment is the map's word now — a checked-out session
         // (or a content-bearing scratch) takes esc back to the session;
-        // an aura entered from the menu returns to the menu.
-        self.screen = if self.active_session.is_some()
+        // an aura entered from the menu returns to the menu. TUI5 item 9
+        // (the draft swap) rides the switch authority.
+        let target = if self.active_session.is_some()
             || !self.projection.entries().is_empty()
             || self.session_name.is_some()
         {
@@ -2608,7 +2652,7 @@ impl AppModel {
         } else {
             Screen::Launcher
         };
-        self.restore_draft();
+        self.switch_surface(target);
     }
 
     /// Chip close lifecycle flags (§2.5) — the DRIVER owns the 5 s removal
@@ -2619,7 +2663,11 @@ impl AppModel {
         // Sim closeChip (tui.js:1176-1178): the screen ALWAYS returns to the
         // session, but the remembered view path only clears when the CLOSED
         // chip is the one being viewed (`viewChipId === chipId ? null : v`).
-        self.screen = Screen::Session;
+        // TUI6.2 fix 3 (review r2 finding 3): through the switch authority
+        // — this ran while the user sat in AURA (a background chip close),
+        // and the direct assignment leaked the aura draft onto the
+        // session surface, submittable there.
+        self.switch_surface(Screen::Session);
         if self.view_path.last().is_some_and(|last| last == agent) {
             self.view_path.clear();
         }
@@ -2877,6 +2925,14 @@ impl AppModel {
                 // seeds re-save on the next change exactly as the sim's
                 // save effect refills localStorage after removeItem.
                 self.demo_requests.push(DemoRequest::PurgeStore);
+                // PURGE FLOW (TUI6.2 fix 3's named exception 4 of 4):
+                // /reset wipes the world. The identity was already cleared
+                // above, so this is a same-key screen write — and the swap
+                // semantics are deliberately REPLACED by an explicit
+                // purge-then-restore: every non-launcher parked draft dies
+                // (the live scratch included, by overwrite), the surviving
+                // launcher draft comes back. switch_surface's no-swap fast
+                // path would strand that parked draft instead.
                 self.screen = Screen::Launcher;
                 self.drafts.retain(|key, _| *key == DraftKey::Launcher);
                 self.restore_draft();
@@ -3161,7 +3217,7 @@ impl AppModel {
         if matches!(payload, EventPayload::HarnessStatus(HarnessStatus::Ready))
             && self.screen == Screen::Boot
         {
-            self.screen = Screen::Launcher;
+            self.switch_surface(Screen::Launcher);
         }
         if let EventPayload::UserMessage { .. } = payload {
             self.goto_session_screen();
@@ -3435,7 +3491,7 @@ impl AppModel {
     /// (owner item 1), and the one left behind keeps running.
     pub fn open_session(&mut self, id: &SessionId) {
         if self.active_session.as_ref() == Some(id) {
-            self.screen = Screen::Session;
+            self.switch_surface(Screen::Session);
             return;
         }
         // TUI5 item 9: park the departing surface's draft BEFORE identity
@@ -3473,6 +3529,11 @@ impl AppModel {
         self.active_session = Some(id.clone());
         self.menu_selection = 0;
         self.view_path.clear();
+        // IDENTITY-FLIP SPLIT SEAM (TUI6.2 fix 3's named exception 2 of
+        // 3): the departing surface's draft was stashed at open_session's
+        // entry, BEFORE `active_session` flipped — switch_surface cannot
+        // span the flip because both of its keys derive from it. The
+        // restore below completes the pair under the NEW key.
         self.screen = Screen::Session;
         self.scroll_back.set(0);
         self.scroll_max.set(0);
@@ -3576,6 +3637,11 @@ impl AppModel {
             // flows always mint a session id first (`new_session`).
             self.fresh_session();
         }
+        // IDENTITY-FLIP SPLIT SEAM (TUI6.2 fix 3's named exception 3 of
+        // 3): checkin()/fresh_session() stash the departing draft and
+        // clear `active_session` above — switch_surface cannot span the
+        // flip. The restore below completes the pair under the launcher
+        // key.
         self.screen = Screen::Launcher;
         self.listening = false;
         self.view_path.clear();
@@ -3765,7 +3831,7 @@ impl AppModel {
             {
                 if let Some(path) = path_to_chip(&self.chips, &agent) {
                     self.view_path = path;
-                    self.screen = Screen::Subagent;
+                    self.switch_surface(Screen::Subagent);
                     self.menu_selection = 0;
                     self.scroll_back.set(0);
                 }
@@ -3784,7 +3850,7 @@ impl AppModel {
             // The ⌂ home row and the ✕ close button belong to the subagent
             // screen; ✕ closes only the chip actually being VIEWED.
             Hit::SessionHome if self.screen == Screen::Subagent => {
-                self.screen = Screen::Session;
+                self.switch_surface(Screen::Session);
                 self.scroll_back.set(0);
             }
             Hit::ChipCloseBtn(agent)
@@ -3801,13 +3867,13 @@ impl AppModel {
             }
             Hit::ChipCrumb(path) if self.screen == Screen::Subagent => {
                 if path.is_empty() {
-                    self.screen = Screen::Session;
+                    self.switch_surface(Screen::Session);
                 } else if path
                     .last()
                     .is_some_and(|agent| find_chip(&self.chips, agent).is_some())
                 {
                     self.view_path = path;
-                    self.screen = Screen::Subagent;
+                    self.switch_surface(Screen::Subagent);
                 }
             }
             Hit::AuraEngine if self.screen == Screen::Aura => {

@@ -2027,6 +2027,17 @@ fn draw(
 /// extract the selection's text — the copy path's ground truth. Uses the
 /// same pure [`render`] as the screen, so what copies is exactly what a
 /// redraw of THIS model state shows.
+///
+/// KNOWN, DOCUMENTED TRANSIENT (TUI6.2 fix 7, review r2 finding 7): this
+/// scratch render bumps the model's geometry epoch like any render, so a
+/// click already queued against the LIVE frame's hit map can arrive
+/// wearing the pre-bump stamp and be dropped by the epoch gate until the
+/// pending redraw re-stamps the map. That is the gate failing CLOSED —
+/// the click is discarded, never mapped through stale geometry — and the
+/// copy path only runs on selection release, so the window is one
+/// frame's worth of queued clicks at worst. Accepted; no mechanism
+/// change (weakening the bump would reopen the r1 stale-consumption
+/// class this gate exists to kill).
 #[must_use]
 pub fn rendered_selection_text(
     model: &AppModel,

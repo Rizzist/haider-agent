@@ -572,6 +572,347 @@ fn cluster_families_price_and_wrap_consistently() {
     }
 }
 
+// ---- TUI6.2 fix 1: the sticky column dies with the budget that minted it ----
+
+#[test]
+fn sticky_column_is_invalidated_by_a_budget_change() {
+    // Review r2 finding 1, the reviewer's exact repro: budget 13, caret
+    // 4, Down → 17 (sticky col 4 cached); resize to budget 5; Down with
+    // the STALE column walked to byte 24 — current geometry (caret 17 =
+    // col 2 of row [15,20)) lands 22. The column is mint-tagged with its
+    // budget and re-derived on mismatch.
+    //
+    // MUTATION CHECK (sticky-mint-tag): make `sticky_col_for` trust the
+    // cached column regardless of mint (`Some((_, col)) => col`) and this
+    // fails with 24. Verified by revert.
+    let mut model = session_model();
+    for c in "abcdefghijklmnopqrstuvwxyz1234".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    let (_, hits, _) = draw(&model, 18, 30); // budget 13
+    model.handle(key(KeyCode::Home));
+    for _ in 0..4 {
+        model.handle(key(KeyCode::Right));
+    }
+    model.handle(key(KeyCode::Down));
+    assert_eq!(model.composer.cursor(), 17, "col 4 sticky under budget 13");
+    dispatch_input(&mut model, &hits, Event::Resize(10, 30)); // budget 5
+    model.handle(key(KeyCode::Down));
+    assert_eq!(
+        model.composer.cursor(),
+        22,
+        "the stale col-4 cache would land 24; the re-minted col 2 lands 22"
+    );
+    // ⇧-extension shares the path: ⇧↓ from 22 extends with the FRESH col.
+    model.handle(key_mod(KeyCode::Down, KeyModifiers::SHIFT));
+    assert_eq!(model.composer.cursor(), 27);
+    assert_eq!(model.composer.selection_range(), Some((22, 27)));
+}
+
+#[test]
+fn parked_draft_sticky_column_dies_with_its_budget() {
+    // The reviewer's parked variant: the stale column traveled inside
+    // the parked draft and produced the same byte 24. The mint tag kills
+    // it on wake exactly as it does live.
+    let mut model = launcher_model();
+    for c in "abcdefghijklmnopqrstuvwxyz1234".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    let (_, hits, _) = draw(&model, 18, 30); // budget 13
+    model.handle(key(KeyCode::Home));
+    for _ in 0..4 {
+        model.handle(key(KeyCode::Right));
+    }
+    model.handle(key(KeyCode::Down));
+    assert_eq!(model.composer.cursor(), 17, "sticky (13, 4) minted");
+    // Park under the launcher key; resize while away; come back.
+    let id = common::session_named(&model, "billing-service");
+    model.handle_hit(Hit::AttachSession(id));
+    dispatch_input(&mut model, &hits, Event::Resize(10, 30));
+    model.handle(key_mod(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert_eq!(model.screen, Screen::Launcher);
+    model.handle(key(KeyCode::Down));
+    assert_eq!(
+        model.composer.cursor(),
+        22,
+        "the parked (13, 4) mint is dead under budget 5 — re-derived col 2"
+    );
+}
+
+// ---- TUI6.2 fix 2: every render branch publishes the width ----
+
+#[test]
+fn fresh_empty_render_publishes_its_width() {
+    // Review r2 finding 2, the reviewer's exact repro: a fresh EMPTY
+    // composer rendered at width 18 kept budget 0 (the empty branch
+    // returned before the publish), so type + queued Home, Right×4, Down
+    // before any redraw walked LOGICAL lines — Down on a single logical
+    // line is the history hook, leaving the cursor at 4. Budget 13's
+    // wrapped rows land 17.
+    //
+    // MUTATION CHECK (publish-before-return): move the
+    // `set_wrap_budget` publish in `composer_lines` back below the
+    // empty-composer return and this fails with cursor 4. Verified by
+    // revert.
+    let mut model = launcher_model();
+    let (_, _, _) = draw(&model, 18, 30); // EMPTY composer frame
+    for c in "abcdefghijklmnopqrstuvwxyz1234".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    // All queued BEFORE the next redraw.
+    model.handle(key(KeyCode::Home));
+    for _ in 0..4 {
+        model.handle(key(KeyCode::Right));
+    }
+    model.handle(key(KeyCode::Down));
+    assert_eq!(
+        model.composer.cursor(),
+        17,
+        "the empty frame published budget 13; queued nav wraps"
+    );
+}
+
+// ---- TUI6.2 fix 3: the surface-switch authority ----
+
+#[test]
+fn chip_close_from_aura_swaps_the_draft() {
+    // Review r2 finding 3, the reviewer's exact leak: a background chip
+    // close while the user sat in AURA assigned Screen::Session
+    // directly — the aura draft crossed keys unswapped and could be
+    // SUBMITTED on the session surface. Through switch_surface the aura
+    // draft parks under its own key and the session's draft comes live.
+    //
+    // MUTATION CHECK (switch-authority): revert close_chip_state to
+    // `self.screen = Screen::Session;` and this fails — the session
+    // composer contains "aura draft". Verified by revert.
+    let mut model = launcher_model();
+    model.chips = vec![ChipModel::from_seed(ChipSeed {
+        agent: "t1-docs".to_owned(),
+        parent: None,
+        ros: None,
+        callsign: "Husayn".to_owned(),
+        hon: "(r)",
+        full: "Husayn ibn Ali".to_owned(),
+        name: "docs".to_owned(),
+        model: "fable-5".to_owned(),
+        device: "macbook".to_owned(),
+        state: ChipDisplayState::Running,
+        tokens: 100,
+        prefill: Vec::new(),
+    })];
+    for c in "/aura".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Enter));
+    assert_eq!(model.screen, Screen::Aura);
+    for c in "aura draft".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    // The background close fires while the aura screen is up.
+    model.close_chip_state("t1-docs");
+    assert_eq!(model.screen, Screen::Session);
+    assert!(
+        !model.composer.text().contains("aura draft"),
+        "the aura draft must NOT be submittable on the session surface: {:?}",
+        model.composer.text()
+    );
+    // The draft parked under ITS key: returning to aura recalls it.
+    for c in "/aura".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Enter));
+    assert_eq!(model.screen, Screen::Aura);
+    assert_eq!(model.composer.text(), "aura draft");
+}
+
+// ---- TUI6.2 fix 5: the login card returns what it borrowed ----
+
+#[test]
+fn login_close_restores_the_draft_and_its_history() {
+    // Review r2 finding 5: /login's stash had no paired restore — Esc
+    // and ⌃C only cleared the card, stranding the parked composer AND
+    // its input-history ring (the r1-era safe-adjudication covered text
+    // only). Both close paths now restore.
+    //
+    // MUTATION CHECK (login-close-restore): drop the `restore_draft()`
+    // from login_key's Esc arm and this fails — history_prev on the
+    // post-close composer recalls nothing. Verified by revert.
+    let mut model = launcher_model();
+    model.mode = RuntimeMode::Live;
+    for c in "remember this".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Enter)); // live submit: ring records it
+    for c in "/login anthropic api".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Esc));
+    model.handle(key(KeyCode::Enter));
+    assert!(
+        model.login.is_some(),
+        "card open (flash: {:?})",
+        model.flash
+    );
+    // The queued TUI6.2 empty-draft pin: the draft TEXT is empty by
+    // construction at open (the /login submit consumed it) — the ring is
+    // what the stash protects.
+    assert!(
+        model.composer.is_empty(),
+        "scratch composer while card open"
+    );
+    model.handle(key(KeyCode::Esc)); // close: the card returns the band
+    assert!(model.login.is_none());
+    assert!(
+        model.composer.history_prev(),
+        "the ring came back with the restored draft"
+    );
+    // The ring holds the canonical /login form and the submit before it.
+    assert!(model.composer.history_prev());
+    assert_eq!(model.composer.text(), "remember this");
+}
+
+// ---- TUI6.2 promoted seam pins (the verifier's s1-s6, now shipped) ----
+//
+// MUTATION CHECK (budget-across-swap, the whole group): the s1/s2/s3/s6
+// pins die together when `restore_draft`'s `set_wrap_budget` carry is
+// dropped (the TUI6.1b revert, re-executed against this group). s4 dies
+// with fix 5's restore; s5 rides the fix-2 publish. Verified by revert.
+
+#[test]
+fn s1_reverse_seam_session_draft_wakes_at_current_width() {
+    let mut model = launcher_model();
+    let id = common::session_named(&model, "billing-service");
+    model.handle_hit(Hit::AttachSession(id.clone()));
+    assert_eq!(model.screen, Screen::Session);
+    for c in "abcdefghijklmnopqrst".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    let (_, hits, _) = draw(&model, 20, 30); // budget 15
+    model.handle(key_mod(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert_eq!(model.screen, Screen::Launcher);
+    dispatch_input(&mut model, &hits, Event::Resize(10, 30)); // budget 5
+    model.handle_hit(Hit::AttachSession(id));
+    assert_eq!(model.screen, Screen::Session);
+    assert_eq!(model.composer.text(), "abcdefghijklmnopqrst");
+    model.handle(key(KeyCode::Up)); // queued before any redraw
+    assert_eq!(
+        model.composer.cursor(),
+        14,
+        "the re-attached session draft walks budget 5, not its parked 15"
+    );
+}
+
+#[test]
+fn s2_aura_draft_wakes_at_current_width() {
+    let mut model = launcher_model();
+    for c in "/aura".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Enter));
+    for c in "abcdefghijklmnopqrst".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    let (_, hits, _) = draw(&model, 20, 30); // budget 15
+    model.handle(key(KeyCode::Esc)); // park the aura draft
+    assert_eq!(model.screen, Screen::Launcher);
+    dispatch_input(&mut model, &hits, Event::Resize(10, 30)); // budget 5
+    for c in "/aura".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Enter));
+    assert_eq!(model.composer.text(), "abcdefghijklmnopqrst");
+    model.handle(key(KeyCode::Up)); // queued before any redraw
+    assert_eq!(model.composer.cursor(), 14, "aura instance, same seam law");
+}
+
+#[test]
+fn s3_double_resize_while_parked_last_width_wins() {
+    let mut model = launcher_model();
+    for c in "abcdefghijklmnopqrst".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    let (_, hits, _) = draw(&model, 20, 30);
+    let id = common::session_named(&model, "billing-service");
+    model.handle_hit(Hit::AttachSession(id));
+    dispatch_input(&mut model, &hits, Event::Resize(40, 30)); // budget 35
+    dispatch_input(&mut model, &hits, Event::Resize(12, 30)); // budget 7
+    model.handle(key_mod(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert_eq!(model.screen, Screen::Launcher);
+    model.handle(key(KeyCode::Up)); // queued before any redraw
+    assert_eq!(
+        model.composer.cursor(),
+        13,
+        "the LAST width (budget 7: caret 20 = col 6 of [14,20]) wins — ↑ \
+         lands col 6 of [7,14)"
+    );
+}
+
+#[test]
+fn s4_login_seam_resize_while_card_open() {
+    let mut model = launcher_model();
+    model.mode = RuntimeMode::Live;
+    for c in "/login anthropic api".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Esc));
+    model.handle(key(KeyCode::Enter));
+    assert!(model.login.is_some());
+    let (_, hits, _) = draw(&model, 20, 30);
+    dispatch_input(&mut model, &hits, Event::Resize(10, 30)); // while the card owns the band
+    model.handle(key(KeyCode::Esc)); // close restores (fix 5)
+    for c in "abcdefghijklmnopqrst".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Up)); // queued before any redraw
+    assert_eq!(
+        model.composer.cursor(),
+        14,
+        "the restored draft navigates at the width resized-to under the card"
+    );
+}
+
+#[test]
+fn s5_fresh_draft_wakes_at_current_width() {
+    let mut model = launcher_model();
+    let (_, hits, _) = draw(&model, 20, 30);
+    dispatch_input(&mut model, &hits, Event::Resize(10, 30));
+    // A NEVER-visited surface: attach mints a fresh unwrap_or_default
+    // draft — it must speak the current width immediately.
+    let id = common::session_named(&model, "billing-service");
+    model.handle_hit(Hit::AttachSession(id));
+    assert_eq!(model.screen, Screen::Session);
+    for c in "abcdefghijklmnopqrst".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Up)); // queued before any redraw
+    assert_eq!(model.composer.cursor(), 14, "fresh draft, budget 5 rows");
+}
+
+#[test]
+fn s6_reset_purge_restores_at_current_width() {
+    let mut model = launcher_model();
+    for c in "abcdefghijklmnopqrst".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    let (_, hits, _) = draw(&model, 20, 30);
+    let id = common::session_named(&model, "billing-service");
+    model.handle_hit(Hit::AttachSession(id));
+    dispatch_input(&mut model, &hits, Event::Resize(10, 30));
+    for c in "/reset".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Esc));
+    model.handle(key(KeyCode::Enter));
+    assert_eq!(model.screen, Screen::Launcher);
+    assert_eq!(model.composer.text(), "abcdefghijklmnopqrst");
+    model.handle(key(KeyCode::Up)); // queued before any redraw
+    assert_eq!(
+        model.composer.cursor(),
+        14,
+        "the reset-surviving launcher draft walks the current width"
+    );
+}
+
 // ---- TUI6.1 fix 1: resize can never serve the previous frame's layout ----
 
 #[test]
@@ -1047,8 +1388,20 @@ fn sweep_two_rules(
         if !optional_shown {
             continue;
         }
-        let Some(top) = rows.iter().position(|row| row.contains(band_top)) else {
-            continue;
+        let top = match rows.iter().position(|row| row.contains(band_top)) {
+            Some(top) => top,
+            None => {
+                // TUI6.2 fix 4 de-blind (review r2: this arm silently
+                // `continue`d, so a title-less question card passed the
+                // sweep unnoticed): a band bottom without its top is the
+                // dignity regression itself, never a skip.
+                assert!(
+                    !rows.iter().any(|row| row.contains(band_bottom)),
+                    "{surface} at {width}x{height}: the band's bottom renders \
+                     without its top — options without their question: {rows:?}"
+                );
+                continue;
+            }
         };
         let bottom = rows
             .iter()
@@ -1235,6 +1588,85 @@ fn reserved_rule_sweeps_subagent_and_question_card() {
     // the card's first shed and is already gone at this height.
     let (rows, _, _) = draw(&model, 90, 14);
     assert_two_rules(&rows, "Run the suite against", "2. mocks", "question@90x14");
+}
+
+#[test]
+fn question_card_never_sheds_its_title_while_options_render() {
+    // Review r2 finding 4, the exact counterexample: a FOUR-option card
+    // at 90×12 rendered options 1-4 with the closing rule and a blank
+    // optional gap — and NO question. The card's floor is now
+    // title + options (session parity), so wherever the options render,
+    // the question renders above them.
+    //
+    // MUTATION CHECK (title-in-floor): revert the subagent ledger's
+    // `floor_input` to `options.len()` (drop the `+ 1`) and this fails
+    // at 90×12 — options without their question. Verified by revert.
+    let mut model = subagent_model();
+    let text = "Which environment should the suite target for this run?";
+    let options = ["testcontainers", "mocks", "staging", "production"];
+    model.chips[0].state = ChipDisplayState::InputRequired;
+    model.chips[0].question = Some(ChipQuestion {
+        recovery: false,
+        text: text.to_owned(),
+        options: options.iter().map(|o| (*o).to_owned()).collect(),
+        resolved: false,
+    });
+    model.chips[0]
+        .transcript
+        .apply(&EventPayload::MenuOpened(haider_protocol::menu::Menu {
+            id: haider_protocol::ids::MenuId::new("t1-docs-q4"),
+            kind: haider_protocol::menu::MenuKind::Choice,
+            title: text.to_owned(),
+            body: vec![],
+            options: options
+                .iter()
+                .enumerate()
+                .map(|(index, label)| haider_protocol::menu::MenuOption {
+                    key: format!("o{index}"),
+                    label: (*label).to_owned(),
+                    detail: None,
+                    decision: None,
+                })
+                .collect(),
+            blocking: false,
+            scope: haider_protocol::menu::MenuScope::Subagent {
+                agent: haider_protocol::ids::AgentId::new("t1-docs"),
+            },
+            origin: "subagent".to_owned(),
+            ttl_ms: None,
+            timeout_option: None,
+        }));
+    for height in 1..=20 {
+        let (rows, _, _) = draw(&model, 90, height);
+        let options_shown = rows.iter().any(|row| row.contains("4. production"));
+        // The reviewer's law is a PRIORITY law, not a physics law: the
+        // title must never shed while an OPTIONAL row survives (the r2
+        // frame kept a blank gap and the SubTree). At heights where the
+        // frame is exactly the sacred options (e.g. 90×4 = 4 option
+        // rows, nothing else), the title's absence is the documented
+        // physical degenerate — options outrank the title inside
+        // menu_block, and there is no optional row to trade away.
+        let optional_survives = rows.iter().any(|row| row.contains("subagents"))
+            || rows
+                .iter()
+                .take(rows.len().saturating_sub(1))
+                .any(|row| row.trim().is_empty());
+        if options_shown && optional_survives {
+            assert!(
+                rows.iter().any(|row| row.contains("Which environment")),
+                "90×{height}: options render without their question while \
+                 optional rows survive: {rows:?}"
+            );
+        }
+    }
+    // The r2 frame itself: title + all four options + both rules.
+    let (rows, _, _) = draw(&model, 90, 12);
+    assert_two_rules(
+        &rows,
+        "Which environment",
+        "4. production",
+        "question4@90x12",
+    );
 }
 
 #[test]
