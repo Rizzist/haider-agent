@@ -27,9 +27,11 @@
 //!   identity verification. The derived bytes go to a same-directory temp
 //!   opened through the parent dirfd and land through `renameat`. This
 //!   serializes broker-mediated writes to a target. Immediately before rename,
-//!   the anchored path is checked against the locked inode again, so an
-//!   external replacement is a typed `PathChanged` refusal rather than a
-//!   silent overwrite.
+//!   the anchored path is checked against the locked inode and its original
+//!   content hash, and the parent is freshly resolved from a root fd whose
+//!   identity is still bound to the canonical workspace path. Namespace
+//!   escape, external replacement, and same-inode edits are typed
+//!   `PathChanged` refusals rather than silent overwrites.
 
 use crate::broker::{EffectBroker, EffectOperation, PermissionPolicy};
 use crate::ledger::{ChangeLedgerSink, FsWriteRecord};
@@ -43,7 +45,7 @@ use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use serde_json::{Value, json};
 use std::ffi::{CStr, OsStr, OsString};
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -790,7 +792,9 @@ fn apply_write_at(
     relative: &Path,
     operation: &FsWrite,
 ) -> ToolResult<AppliedPatch> {
-    let (parent, leaf) = open_parent_at(workspace_dir, relative, &operation.path)?;
+    let traversal_root = rustix::io::dup(&workspace_dir)
+        .map_err(|error| ToolError::io("duplicate workspace root", &operation.path, error))?;
+    let (parent, leaf) = open_parent_at(traversal_root, relative, &operation.path)?;
     // Keep the locked current inode alive through rename when overwriting.
     // A missing leaf is valid create semantics; any other lookup error stays
     // typed and no-follow.
@@ -827,13 +831,23 @@ fn apply_write_at(
         remove_temporary(&parent, &temporary_name);
         return Err(error);
     }
-    if let Err(error) = rustix::fs::renameat(&parent, &temporary_name, &parent, &leaf) {
+    let commit_parent =
+        match revalidate_commit_parent(&workspace_dir, relative, &parent, &operation.path) {
+            Ok(parent) => parent,
+            Err(error) => {
+                remove_temporary(&parent, &temporary_name);
+                return Err(error);
+            }
+        };
+    if let Err(error) = replace_temporary_at_commit(
+        &commit_parent,
+        &temporary_name,
+        &leaf,
+        &operation.path,
+        "replace written file",
+    ) {
         remove_temporary(&parent, &temporary_name);
-        return Err(anchored_io_error(
-            "replace written file",
-            &operation.path,
-            error,
-        ));
+        return Err(error);
     }
     drop(source);
     Ok(AppliedPatch {
@@ -905,21 +919,38 @@ fn apply_patch_at_before_replace(
     operation: &FsPatch,
     before_replace: impl FnOnce(),
 ) -> ToolResult<AppliedPatch> {
+    apply_patch_at_with_commit_hooks(workspace_dir, relative, operation, before_replace, || {})
+}
+
+fn apply_patch_at_with_commit_hooks(
+    workspace_dir: OwnedFd,
+    relative: &Path,
+    operation: &FsPatch,
+    before_replace: impl FnOnce(),
+    before_commit: impl FnOnce(),
+) -> ToolResult<AppliedPatch> {
     if operation.preimage.is_empty() {
         return Err(ToolError::invalid_argument(
             "fs_patch preimage cannot be empty",
         ));
     }
-    let (parent, leaf) = open_parent_at(workspace_dir, relative, &operation.path)?;
+    let traversal_root = rustix::io::dup(&workspace_dir)
+        .map_err(|error| ToolError::io("duplicate workspace root", &operation.path, error))?;
+    let (parent, leaf) = open_parent_at(traversal_root, relative, &operation.path)?;
     let (mut source, source_metadata) = open_locked_current_at(&parent, &leaf, &operation.path)?;
     let mut bytes = Vec::new();
     source
         .read_to_end(&mut bytes)
         .map_err(|error| ToolError::io("read", &operation.path, error))?;
+    let source_hash = blake3::hash(&bytes);
     let contents = String::from_utf8(bytes).map_err(|error| ToolError::InvalidArgument {
         message: format!("{} is not UTF-8 text: {error}", operation.path.display()),
     })?;
-    let matches = contents.match_indices(&operation.preimage).count();
+    let matches = contents
+        .as_bytes()
+        .windows(operation.preimage.len())
+        .filter(|candidate| *candidate == operation.preimage.as_bytes())
+        .count();
     if matches != 1 {
         return Err(ToolError::Conflict(FsPatchConflict {
             path: operation.path.clone(),
@@ -959,15 +990,91 @@ fn apply_patch_at_before_replace(
         remove_temporary(&parent, &temporary_name);
         return Err(error);
     }
-    if let Err(error) = rustix::fs::renameat(&parent, &temporary_name, &parent, &leaf) {
+    let commit_parent =
+        match revalidate_commit_parent(&workspace_dir, relative, &parent, &operation.path) {
+            Ok(parent) => parent,
+            Err(error) => {
+                remove_temporary(&parent, &temporary_name);
+                return Err(error);
+            }
+        };
+    // Content identity is the final userspace observation before the atomic
+    // namespace operation. On Apple the syscall itself also rejects a
+    // symlink in any destination component.
+    if let Err(error) = require_unchanged_content(&mut source, source_hash, &operation.path) {
         remove_temporary(&parent, &temporary_name);
-        return Err(anchored_io_error(
-            "replace patched file",
-            &operation.path,
-            error,
-        ));
+        return Err(error);
+    }
+    before_commit();
+    if let Err(error) = replace_temporary_at_commit(
+        &commit_parent,
+        &temporary_name,
+        &leaf,
+        &operation.path,
+        "replace patched file",
+    ) {
+        remove_temporary(&parent, &temporary_name);
+        return Err(error);
     }
     Ok(applied)
+}
+
+#[cfg(target_vendor = "apple")]
+fn replace_temporary_at_commit(
+    parent: &OwnedFd,
+    temporary_name: &OsStr,
+    _leaf: &OsStr,
+    display_path: &Path,
+    operation: &'static str,
+) -> ToolResult<()> {
+    // sys/stdio.h: resolve both rename paths without following *any* symlink.
+    // Passing the authorized absolute destination makes path resolution and
+    // rename one kernel operation, so a parent moved after the userspace
+    // recheck cannot redirect the commit through an outside-pointing symlink.
+    const RENAME_NOFOLLOW_ANY: u32 = 0x0000_0010;
+    let flags = rustix::fs::RenameFlags::from_bits_retain(RENAME_NOFOLLOW_ANY);
+    rustix::fs::renameat_with(parent, temporary_name, rustix::fs::CWD, display_path, flags)
+        .map_err(|error| anchored_io_error(operation, display_path, error))
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn replace_temporary_at_commit(
+    parent: &OwnedFd,
+    temporary_name: &OsStr,
+    leaf: &OsStr,
+    display_path: &Path,
+    operation: &'static str,
+) -> ToolResult<()> {
+    rustix::fs::renameat(parent, temporary_name, parent, leaf)
+        .map_err(|error| anchored_io_error(operation, display_path, error))
+}
+
+fn require_unchanged_content(
+    source: &mut fs::File,
+    expected: blake3::Hash,
+    display_path: &Path,
+) -> ToolResult<()> {
+    source
+        .rewind()
+        .map_err(|error| ToolError::io("rewind patch target", display_path, error))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = source
+            .read(&mut buffer)
+            .map_err(|error| ToolError::io("recheck patch content", display_path, error))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    if hasher.finalize() == expected {
+        return Ok(());
+    }
+    Err(ToolError::PathChanged {
+        path: display_path.to_path_buf(),
+        message: "target content changed before atomic replace".into(),
+    })
 }
 
 fn require_unchanged_target(
@@ -998,6 +1105,120 @@ fn require_unchanged_target(
             error,
         )),
     }
+}
+
+fn revalidate_commit_parent(
+    workspace_dir: &OwnedFd,
+    relative: &Path,
+    held_parent: &OwnedFd,
+    display_path: &Path,
+) -> ToolResult<OwnedFd> {
+    let workspace_root = workspace_root_from_target(display_path, relative).ok_or_else(|| {
+        ToolError::PathChanged {
+            path: display_path.to_path_buf(),
+            message: "authorized target no longer identifies its workspace root".into(),
+        }
+    })?;
+    let canonical_root =
+        fs::canonicalize(&workspace_root).map_err(|error| ToolError::PathChanged {
+            path: display_path.to_path_buf(),
+            message: format!("workspace root changed before atomic replace: {error}"),
+        })?;
+    if canonical_root != workspace_root {
+        return Err(ToolError::PathChanged {
+            path: display_path.to_path_buf(),
+            message: format!(
+                "workspace root resolved to {} before atomic replace",
+                canonical_root.display()
+            ),
+        });
+    }
+    let current_root = rustix::fs::openat(
+        rustix::fs::CWD,
+        &canonical_root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| anchored_io_error("reopen workspace root", display_path, error))?;
+    require_same_directory(
+        workspace_dir,
+        &current_root,
+        display_path,
+        "workspace root identity changed before atomic replace",
+    )?;
+
+    let mut components = normal_components(relative);
+    components.pop();
+    let current_parent = walk_directories(
+        current_root,
+        &components,
+        "reopen patch parent before replace",
+        display_path,
+    )?;
+    require_same_directory(
+        held_parent,
+        &current_parent,
+        display_path,
+        "patch parent left its authorized workspace location before atomic replace",
+    )?;
+    require_commit_parent_path(&current_parent, display_path)?;
+    Ok(current_parent)
+}
+
+fn workspace_root_from_target(display_path: &Path, relative: &Path) -> Option<PathBuf> {
+    let mut workspace_root = display_path.to_path_buf();
+    for _ in normal_components(relative) {
+        if !workspace_root.pop() {
+            return None;
+        }
+    }
+    Some(workspace_root)
+}
+
+fn require_same_directory(
+    expected: &OwnedFd,
+    current: &OwnedFd,
+    display_path: &Path,
+    message: &'static str,
+) -> ToolResult<()> {
+    let expected = rustix::fs::fstat(expected)
+        .map_err(|error| ToolError::io("inspect authorized directory", display_path, error))?;
+    let current = rustix::fs::fstat(current)
+        .map_err(|error| ToolError::io("inspect current directory", display_path, error))?;
+    if expected.st_dev == current.st_dev && expected.st_ino == current.st_ino {
+        return Ok(());
+    }
+    Err(ToolError::PathChanged {
+        path: display_path.to_path_buf(),
+        message: message.into(),
+    })
+}
+
+#[cfg(target_vendor = "apple")]
+fn require_commit_parent_path(parent: &OwnedFd, display_path: &Path) -> ToolResult<()> {
+    let parent_path = rustix::fs::getpath(parent).map_err(|error| ToolError::PathChanged {
+        path: display_path.to_path_buf(),
+        message: format!("patch parent path changed before atomic replace: {error}"),
+    })?;
+    let parent_path = PathBuf::from(OsString::from_vec(parent_path.into_bytes()));
+    if display_path
+        .parent()
+        .is_some_and(|expected_parent| parent_path == expected_parent)
+    {
+        return Ok(());
+    }
+    Err(ToolError::PathChanged {
+        path: display_path.to_path_buf(),
+        message: format!(
+            "patch parent moved from its authorized workspace location before atomic replace: {}",
+            parent_path.display()
+        ),
+    })
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn require_commit_parent_path(_parent: &OwnedFd, _display_path: &Path) -> ToolResult<()> {
+    Ok(())
 }
 
 /// Opens and exclusively locks the inode currently named by `leaf`.
@@ -1380,6 +1601,141 @@ where
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::{MetadataExt, symlink};
+
+    /// MUTATION CHECK: remove the rename-time parent revalidation. Expected
+    /// failure: the patch succeeds and writes `escaped-component/target.txt`.
+    /// Verified by revert in W4a1.1.
+    #[test]
+    fn rename_time_parent_escape_is_typed_path_change() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let workspace_path = directory.path().join("workspace");
+        fs::create_dir(&workspace_path).expect("create workspace");
+        let workspace_path = fs::canonicalize(workspace_path).expect("canonical workspace");
+        let component = workspace_path.join("component");
+        let escaped_component = directory.path().join("escaped-component");
+        let target = component.join("target.txt");
+        fs::create_dir(&component).expect("create workspace component");
+        fs::write(&target, "before").expect("seed target");
+        let workspace = rustix::fs::open(
+            &workspace_path,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .expect("open workspace");
+        let operation = FsPatch::new(&target, "before", "after");
+
+        let result = apply_patch_at_before_replace(
+            workspace,
+            Path::new("component/target.txt"),
+            &operation,
+            || {
+                fs::rename(&component, &escaped_component)
+                    .expect("move held parent outside workspace");
+                symlink(&escaped_component, &component)
+                    .expect("install outside-pointing component symlink");
+            },
+        );
+
+        assert_eq!(
+            fs::read_to_string(escaped_component.join("target.txt")).expect("read escaped target"),
+            "before"
+        );
+        assert!(matches!(result, Err(ToolError::PathChanged { .. })));
+        assert!(
+            fs::read_dir(&escaped_component)
+                .expect("read escaped component")
+                .all(|entry| !entry
+                    .expect("directory entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".haider-patch-"))
+        );
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn parent_move_after_final_revalidation_is_refused_by_atomic_rename_resolution() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let workspace_path = directory.path().join("workspace");
+        fs::create_dir(&workspace_path).expect("create workspace");
+        let workspace_path = fs::canonicalize(workspace_path).expect("canonical workspace");
+        let component = workspace_path.join("component");
+        let escaped_component = directory.path().join("escaped-component");
+        let target = component.join("target.txt");
+        fs::create_dir(&component).expect("create workspace component");
+        fs::write(&target, "before").expect("seed target");
+        let workspace = rustix::fs::open(
+            &workspace_path,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .expect("open workspace");
+        let operation = FsPatch::new(&target, "before", "after");
+
+        let result = apply_patch_at_with_commit_hooks(
+            workspace,
+            Path::new("component/target.txt"),
+            &operation,
+            || {},
+            || {
+                fs::rename(&component, &escaped_component)
+                    .expect("move validated parent outside workspace");
+                symlink(&escaped_component, &component)
+                    .expect("install outside-pointing component symlink");
+            },
+        );
+
+        assert_eq!(
+            fs::read_to_string(escaped_component.join("target.txt")).expect("read escaped target"),
+            "before"
+        );
+        assert!(matches!(result, Err(ToolError::PathChanged { .. })));
+    }
+
+    /// MUTATION CHECK: remove the source-content hash recheck. Expected
+    /// failure: the same-inode external edit is silently replaced by `haider`.
+    /// Verified by revert in W4a1.1.
+    #[test]
+    fn same_inode_concurrent_edit_is_typed_path_change() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let workspace_path = fs::canonicalize(directory.path()).expect("canonical workspace");
+        let target = workspace_path.join("target.txt");
+        fs::write(&target, "before").expect("seed target");
+        let initial_inode = fs::metadata(&target).expect("initial metadata").ino();
+        let workspace = rustix::fs::open(
+            &workspace_path,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .expect("open workspace");
+        let operation = FsPatch::new(&target, "before", "haider");
+
+        let result =
+            apply_patch_at_before_replace(workspace, Path::new("target.txt"), &operation, || {
+                fs::write(&target, "editor").expect("rewrite target in place");
+                assert_eq!(
+                    fs::metadata(&target).expect("rewritten metadata").ino(),
+                    initial_inode,
+                    "reproduction must preserve the target inode"
+                );
+            });
+
+        assert_eq!(
+            fs::read_to_string(&target).expect("read external target"),
+            "editor"
+        );
+        assert!(matches!(result, Err(ToolError::PathChanged { .. })));
+        assert!(
+            fs::read_dir(directory.path())
+                .expect("read temporary directory")
+                .all(|entry| !entry
+                    .expect("directory entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".haider-patch-"))
+        );
+    }
 
     #[test]
     fn external_leaf_replacement_before_patch_rename_is_typed_path_change() {

@@ -461,6 +461,75 @@ async fn ambiguous_preimage_returns_typed_conflict_without_writing() {
     assert!(!ledger.has_fs_writes(&attribution.session, &attribution.turn));
 }
 
+/// MUTATION CHECK: restore non-overlapping `str::match_indices`. Expected
+/// failure: `"aaa"`/`"aa"` is misclassified as one unique match and written.
+#[tokio::test]
+async fn overlapping_preimage_returns_typed_conflict_without_writing() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("overlapping.txt");
+    fs::write(&path, "aaa").expect("seed file");
+    let mut broker = broker_at(RecordingJournal::default(), directory.path());
+    let attribution = TurnAttribution::new(SessionId::new("session"), RunId::new("turn"));
+    let ledger = ChangeLedger::new();
+
+    let error = broker
+        .fs_patch(
+            &FsPatch::new(&path, "aa", "changed"),
+            &allow(EffectClass::FsWrite),
+            &attribution,
+            &ledger,
+        )
+        .await
+        .expect_err("overlapping preimage");
+
+    let ToolError::Conflict(conflict) = error else {
+        panic!("expected typed conflict");
+    };
+    assert_eq!(conflict.matches, 2);
+    assert_eq!(fs::read_to_string(&path).expect("unchanged file"), "aaa");
+    assert!(!ledger.has_fs_writes(&attribution.session, &attribution.turn));
+    assert!(matches!(
+        broker.journal_snapshot().last(),
+        Some(EffectPhase::Outcome {
+            outcome: EffectOutcome::Failed { .. },
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn genuinely_unique_preimage_still_applies() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("unique.txt");
+    fs::write(&path, "zaaz").expect("seed file");
+    let mut broker = broker_at(RecordingJournal::default(), directory.path());
+    let attribution = TurnAttribution::new(SessionId::new("session"), RunId::new("turn"));
+    let ledger = ChangeLedger::new();
+
+    broker
+        .fs_patch(
+            &FsPatch::new(&path, "aa", "changed"),
+            &allow(EffectClass::FsWrite),
+            &attribution,
+            &ledger,
+        )
+        .await
+        .expect("unique preimage applies");
+
+    assert_eq!(
+        fs::read_to_string(&path).expect("patched file"),
+        "zchangedz"
+    );
+    assert!(ledger.has_fs_writes(&attribution.session, &attribution.turn));
+    assert!(matches!(
+        broker.journal_snapshot().last(),
+        Some(EffectPhase::Outcome {
+            outcome: EffectOutcome::Ok,
+            ..
+        })
+    ));
+}
+
 #[tokio::test]
 async fn ledger_attributes_successful_writes_to_the_exact_turn() {
     let directory = tempfile::tempdir().expect("temporary directory");

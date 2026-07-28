@@ -29,6 +29,7 @@ use haider_protocol::envelope::{
 };
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::{DeviceId, EffectId, EventId, RunId, SessionId};
+use haider_protocol::menu::{Menu, MenuAnswer};
 use haider_protocol::provider::{CapabilityDoc, FinishReason, Usage, UsageSource};
 use haider_protocol::session::SessionMetadataV1;
 use haider_protocol::state::{RunState, SessionState};
@@ -50,7 +51,7 @@ use haider_tools::{
 use std::fs;
 use std::future;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex as StdMutex};
 use support::{UdsClient, ready, ready_with_dependencies, test_root};
 use tokio::sync::Semaphore;
@@ -4024,6 +4025,375 @@ async fn w4a1_pending_patch_approval_restarts_on_the_original_menu_cas() {
 }
 
 #[derive(Clone)]
+struct PreDispatchCrashFactory {
+    pause: Arc<PreDispatchPause>,
+    calls: Arc<AtomicUsize>,
+}
+
+struct PreDispatchPause {
+    pause_next: AtomicBool,
+    reached: Semaphore,
+    effect: StdMutex<Option<EffectId>>,
+}
+
+struct PreDispatchCrashJournal {
+    context: WorkerToolContext,
+    pause: Arc<PreDispatchPause>,
+}
+
+#[async_trait]
+impl JournalSink for PreDispatchCrashJournal {
+    async fn append(&mut self, payload: EventPayload) -> ToolResult<()> {
+        if let EventPayload::Effect(EffectPhase::Dispatched { effect }) = &payload
+            && self.pause.pause_next.swap(false, Ordering::SeqCst)
+        {
+            *self.pause.effect.lock().expect("paused effect lock") = Some(effect.clone());
+            self.pause.reached.add_permits(1);
+            future::pending::<()>().await;
+        }
+        TestHubJournal {
+            context: self.context.clone(),
+        }
+        .append(payload)
+        .await
+    }
+}
+
+#[async_trait]
+impl TurnToolFactory for PreDispatchCrashFactory {
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        vec![ToolDefinition {
+            name: "fs_patch".into(),
+            description: "test-paused real fs_patch".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }]
+    }
+
+    async fn create(
+        &self,
+        context: WorkerToolContext,
+    ) -> Result<Option<Arc<dyn ToolDispatcher>>, HaiderError> {
+        let broker = EffectBroker::new(
+            Box::new(PreDispatchCrashJournal {
+                context: context.clone(),
+                pause: self.pause.clone(),
+            }),
+            &context.metadata.cwd,
+            context.store.session_id().clone(),
+            context.store.worker_generation(),
+        )
+        .map_err(|error| HaiderError::new(ErrorCode::Internal, error.to_string(), false))?;
+        let mut policy = PermissionPolicy::default();
+        policy.ask(EffectClass::FsWrite);
+        Ok(Some(Arc::new(PreDispatchCrashDispatcher {
+            broker: tokio::sync::Mutex::new(Some(broker)),
+            policy: tokio::sync::Mutex::new(policy),
+            context,
+            calls: self.calls.clone(),
+        })))
+    }
+}
+
+struct PreDispatchCrashDispatcher {
+    broker: tokio::sync::Mutex<Option<EffectBroker>>,
+    policy: tokio::sync::Mutex<PermissionPolicy>,
+    context: WorkerToolContext,
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl ToolDispatcher for PreDispatchCrashDispatcher {
+    async fn execute(
+        &self,
+        run_id: &RunId,
+        _call_id: &str,
+        name: &str,
+        args: serde_json::Value,
+        _cancel: &CancelToken,
+    ) -> Result<ToolDispatchResult, HaiderError> {
+        assert_eq!(name, "fs_patch");
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let path = args["path"].as_str().expect("path");
+        let preimage = args["patch"]["preimage"].as_str().expect("preimage");
+        let replacement = args["patch"]["replacement"].as_str().expect("replacement");
+        let mut broker = self.broker.lock().await;
+        let broker = broker.as_mut().expect("open broker");
+        let policy = self.policy.lock().await;
+        let result = broker
+            .fs_patch(
+                &FsPatch::new(path, preimage, replacement),
+                &policy,
+                &TurnAttribution::new(self.context.store.session_id().clone(), run_id.clone()),
+                &haider_tools::ChangeLedger::new(),
+            )
+            .await;
+        match result {
+            Ok(result) => Ok(ToolDispatchResult::Completed(result)),
+            Err(haider_tools::ToolError::AuthorizationRequired { menu }) => {
+                let menu = broker.permission_menu(&menu).cloned().ok_or_else(|| {
+                    HaiderError::new(
+                        ErrorCode::Internal,
+                        "test broker approval menu disappeared",
+                        false,
+                    )
+                })?;
+                Ok(ToolDispatchResult::ApprovalRequired(menu))
+            }
+            Err(error) => Err(HaiderError::new(
+                ErrorCode::Internal,
+                error.to_string(),
+                false,
+            )),
+        }
+    }
+
+    async fn resolve_approval(&self, _menu: &Menu, answer: &MenuAnswer) -> Result<(), HaiderError> {
+        let mut broker = self.broker.lock().await;
+        let mut policy = self.policy.lock().await;
+        broker
+            .as_mut()
+            .expect("open broker")
+            .resolve_permission(answer, &mut policy)
+            .map_err(|error| HaiderError::new(ErrorCode::Internal, error.to_string(), false))
+    }
+
+    async fn close(&self) -> Result<(), HaiderError> {
+        let Some(broker) = self.broker.lock().await.take() else {
+            return Ok(());
+        };
+        broker.close().await.map(|_| ()).map_err(|error| {
+            HaiderError::new(ErrorCode::EffectUnknownOutcome, error.to_string(), false)
+        })
+    }
+}
+
+/// Approval is already durably committed when the fresh effect reaches its
+/// persist-before-dispatch boundary. A crash here may resume the effect once
+/// or safely lose it, but can never apply before `Dispatched`, apply twice, or
+/// dispatch ahead of the committed grant.
+#[tokio::test]
+async fn w4a1_committed_approval_crash_before_dispatched_is_safely_lost() {
+    let root = test_root("w4a1-pre-dispatch-crash-");
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace");
+    let target = workspace.join("pre-dispatch.txt");
+    fs::write(&target, "before").expect("seed target");
+    let config = DaemonConfig::new(
+        "w4a1-pre-dispatch-crash",
+        root.path().join("store"),
+        root.path().join("runtime"),
+    );
+    let (mut dependencies, fake) = fake_dependencies(vec![
+        FakeStep::EmitToolCall {
+            call_id: "pre-dispatch-patch".into(),
+            name: "fs_patch".into(),
+            args: serde_json::json!({
+                "path": "pre-dispatch.txt",
+                "patch": {"preimage": "before", "replacement": "after"}
+            }),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "pre-dispatch-patch".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]);
+    let pause = Arc::new(PreDispatchPause {
+        pause_next: AtomicBool::new(true),
+        reached: Semaphore::new(0),
+        effect: StdMutex::new(None),
+    });
+    let calls = Arc::new(AtomicUsize::new(0));
+    dependencies.tool_factory = Arc::new(PreDispatchCrashFactory {
+        pause: pause.clone(),
+        calls: calls.clone(),
+    });
+
+    let first_task = ready_with_dependencies(&config, dependencies.clone()).await;
+    let mut first = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "w4a1-test",
+        "pre-dispatch-before",
+        ClientKind::Headless,
+    )
+    .await;
+    let (session_id, generation) = create_and_attach(&mut first, &config, &workspace).await;
+    send_request(
+        &mut first,
+        &config,
+        "pre-dispatch-submit",
+        submit_body(
+            "pre-dispatch-command",
+            session_id.clone(),
+            generation,
+            "approve then crash before dispatch",
+        ),
+    )
+    .await;
+    let (run_id, _) = next_submit_response(&mut first).await;
+    let (menu, request_seq, opening_generation) = next_permission_menu(&mut first).await;
+    answer_menu(
+        &mut first,
+        &config,
+        "pre-dispatch-answer",
+        "pre-dispatch-answer-command",
+        session_id.clone(),
+        menu.id.clone(),
+        request_seq,
+        opening_generation,
+        "approve_once",
+        0,
+    )
+    .await;
+    pause
+        .reached
+        .acquire()
+        .await
+        .expect("fresh Dispatched append reached")
+        .forget();
+
+    let before_crash = read_session(
+        &mut first,
+        &config,
+        session_id.clone(),
+        "pre-dispatch-before-read",
+    )
+    .await;
+    let before_payloads = before_crash
+        .iter()
+        .filter(|envelope| envelope.run_id.as_ref() == Some(&run_id))
+        .filter_map(|envelope| {
+            serde_json::from_value::<EventPayload>(envelope.payload.clone())
+                .ok()
+                .map(|payload| (envelope.seq, payload))
+        })
+        .collect::<Vec<_>>();
+    let answer_seq = before_payloads
+        .iter()
+        .find_map(|(seq, payload)| {
+            matches!(
+                payload,
+                EventPayload::MenuAnswered(answer) if answer.menu == menu.id
+            )
+            .then_some(*seq)
+        })
+        .expect("committed approval answer");
+    let allowed_seq = before_payloads
+        .iter()
+        .find_map(|(seq, payload)| {
+            matches!(
+                payload,
+                EventPayload::Effect(EffectPhase::Authorized {
+                    verdict: AuthorizationVerdict::Allow,
+                    ..
+                })
+            )
+            .then_some(*seq)
+        })
+        .expect("fresh effect authorized from committed approval");
+    assert!(answer_seq < allowed_seq);
+    assert_eq!(
+        before_payloads
+            .iter()
+            .filter(|(_, payload)| matches!(
+                payload,
+                EventPayload::Effect(EffectPhase::Dispatched { .. })
+            ))
+            .count(),
+        0
+    );
+    assert!(matches!(
+        before_payloads
+            .iter()
+            .rev()
+            .find(|(_, payload)| matches!(payload, EventPayload::RunState(_))),
+        Some((_, EventPayload::RunState(RunState::RunningTool)))
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert!(pause.effect.lock().expect("paused effect lock").is_some());
+    assert_eq!(
+        fs::read_to_string(&target).expect("pre-crash target"),
+        "before"
+    );
+
+    drop(first);
+    first_task.crash().await;
+
+    let second_task = ready_with_dependencies(&config, dependencies).await;
+    let mut second = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "w4a1-test",
+        "pre-dispatch-after",
+        ClientKind::Headless,
+    )
+    .await;
+    attach_existing(
+        &mut second,
+        &config,
+        session_id.clone(),
+        0,
+        "pre-dispatch-replay",
+    )
+    .await;
+    let after_restart =
+        read_session(&mut second, &config, session_id, "pre-dispatch-after-read").await;
+    let after_payloads = after_restart
+        .iter()
+        .filter(|envelope| envelope.run_id.as_ref() == Some(&run_id))
+        .filter_map(|envelope| {
+            serde_json::from_value::<EventPayload>(envelope.payload.clone())
+                .ok()
+                .map(|payload| (envelope.seq, payload))
+        })
+        .collect::<Vec<_>>();
+    let dispatched = after_payloads
+        .iter()
+        .filter_map(|(seq, payload)| match payload {
+            EventPayload::Effect(EffectPhase::Dispatched { .. }) => Some(*seq),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(dispatched.len() <= 1, "effect must never double-dispatch");
+    assert!(
+        dispatched
+            .iter()
+            .all(|dispatch_seq| answer_seq < *dispatch_seq),
+        "a dispatch may only follow the committed grant"
+    );
+    if dispatched.is_empty() {
+        assert_eq!(
+            fs::read_to_string(&target).expect("safely lost target"),
+            "before"
+        );
+        assert!(matches!(
+            after_payloads
+                .iter()
+                .rev()
+                .find(|(_, payload)| matches!(payload, EventPayload::RunState(_))),
+            Some((_, EventPayload::RunState(RunState::Errored)))
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(fake.requests().len(), 1);
+    } else {
+        assert_eq!(
+            fs::read_to_string(&target).expect("resumed target"),
+            "after"
+        );
+        assert!(calls.load(Ordering::SeqCst) <= 3);
+        assert!(fake.requests().len() <= 2);
+    }
+
+    second_task.shutdown_handle().request("test complete");
+    second_task.join().await.expect("second daemon joins");
+}
+
+#[derive(Clone)]
 struct HeldPatchLedger {
     reached: Arc<Semaphore>,
     release: Arc<(StdMutex<bool>, Condvar)>,
@@ -4316,10 +4686,10 @@ async fn w4a1_dispatched_real_fs_patch_restarts_as_unknown_without_redispatch() 
 ///
 /// Each entry is `(test fn, workspace-relative file, seam to revert)`: the
 /// focused test that must fail when the listed seam is reverted, and where a
-/// re-runner finds it (nine of twenty live outside this file). The sweep
+/// re-runner finds it (nine of twenty-one live outside this file). The sweep
 /// itself is executed by hand — revert each seam, run the named test, record
 /// the observation in the commit message; this manifest keeps that procedure
-/// honest by construction: the eleven in-file entries are compile-time
+/// honest by construction: the twelve in-file entries are compile-time
 /// references to their test functions (a rename breaks the build), and every
 /// listed file path is asserted to exist in the workspace.
 ///
@@ -4330,8 +4700,8 @@ async fn w4a1_dispatched_real_fs_patch_restarts_as_unknown_without_redispatch() 
 #[test]
 fn scenario_13_mutation_seam_sweep_manifest_covers_each_load_bearing_boundary() {
     // Compile-time linkage for the in-file entries: renaming any of these
-    // eleven tests without updating the manifest is a build error.
-    let _in_file_sweep_links: [fn(); 11] = [
+    // twelve tests without updating the manifest is a build error.
+    let _in_file_sweep_links: [fn(); 12] = [
         scenario_4_lost_submit_response_replays_one_run_and_one_provider_request,
         scenario_7_two_menu_answers_race_and_only_first_commit_wins,
         scenario_8_wire_cancel_closes_open_items_and_cancelled_is_run_terminal,
@@ -4342,6 +4712,7 @@ fn scenario_13_mutation_seam_sweep_manifest_covers_each_load_bearing_boundary() 
         w4a1_fs_write_requires_committed_cas_and_session_grant_survives_restart,
         w4a1_real_fs_patch_round_trips_approval_and_returns_tool_result,
         w4a1_pending_patch_approval_restarts_on_the_original_menu_cas,
+        w4a1_committed_approval_crash_before_dispatched_is_safely_lost,
         w4a1_dispatched_real_fs_patch_restarts_as_unknown_without_redispatch,
     ];
     const HERE: &str = "crates/haider-daemond/tests/live_turn_rpc_tests.rs";
@@ -4427,6 +4798,11 @@ fn scenario_13_mutation_seam_sweep_manifest_covers_each_load_bearing_boundary() 
             "permission checkpoint recovery preserves the original durable menu CAS",
         ),
         (
+            "w4a1_committed_approval_crash_before_dispatched_is_safely_lost",
+            HERE,
+            "committed grant precedes fresh Dispatched and pre-dispatch crash is once-or-lost",
+        ),
+        (
             "mutating_paths_reject_parent_and_absolute_workspace_escapes",
             "crates/haider-tools/tests/filesystem_tools_tests.rs",
             "canonical workspace boundary for parent and absolute mutating paths",
@@ -4455,7 +4831,7 @@ fn scenario_13_mutation_seam_sweep_manifest_covers_each_load_bearing_boundary() 
         .iter()
         .map(|(_, _, seam)| *seam)
         .collect::<std::collections::HashSet<_>>();
-    assert_eq!(sweep.len(), 20);
+    assert_eq!(sweep.len(), 21);
     assert_eq!(tests.len(), sweep.len());
     assert_eq!(seams.len(), sweep.len());
     let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
