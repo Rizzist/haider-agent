@@ -14,11 +14,12 @@ use std::path::PathBuf;
 
 pub type ToolResult<T> = Result<T, ToolError>;
 
-/// A string-replace patch could not prove that it was editing its pre-image.
+/// A structured exact-preimage patch could not identify one unique target.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FsPatchConflict {
     pub path: PathBuf,
     pub expected_preimage: String,
+    pub matches: usize,
 }
 
 /// Typed failures at the tool boundary.
@@ -144,10 +145,16 @@ impl std::fmt::Display for ToolError {
                 "authorized path {} changed before access: {message}",
                 path.display()
             ),
-            Self::Conflict(conflict) => write!(
+            Self::Conflict(conflict) if conflict.matches == 0 => write!(
                 formatter,
                 "patch conflict for {}: expected pre-image was not present",
                 conflict.path.display()
+            ),
+            Self::Conflict(conflict) => write!(
+                formatter,
+                "patch conflict for {}: expected pre-image matched {} locations",
+                conflict.path.display(),
+                conflict.matches
             ),
             Self::Io {
                 operation,

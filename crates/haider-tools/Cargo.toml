@@ -17,5 +17,8 @@ serde_json.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 
+[dev-dependencies]
+rustix = { workspace = true, features = ["mm"] }
+
 [lints]
 workspace = true
