@@ -1214,7 +1214,9 @@ pub struct AppModel {
     /// two identity-flip split seams (open_session's checkout,
     /// back_to_launcher) whose stash/restore halves bracket an
     /// `active_session` flip the atomic authority cannot span, and the
-    /// /reset purge flow (purge-then-restore replaces the swap). Test
+    /// /reset purge flow (purge-then-restore replaces the swap). The
+    /// DRIVER (runtime.rs) holds no direct write either — its ChipRemove
+    /// arm routes through the authority (TUI6.2c finding 6). Test
     /// fixtures set the field directly on purpose — they construct
     /// states, they do not transition.
     pub screen: Screen,
@@ -1522,6 +1524,19 @@ impl AppModel {
         // started on — every surface transition passes through here, so
         // this is the single cancellation authority.
         self.composer_drag = false;
+        // TUI6.2c (verifier findings 1+2): the login card is
+        // surface-LOCAL — it borrowed THIS surface's band. An
+        // asynchronous surface switch arriving while the card is open
+        // (the live `Created` reply's open_session, a background chip
+        // close, an envelope flip) ABORTS the card (the secret wipes on
+        // drop) and returns the borrowed band FIRST, so the stash below
+        // parks the surface's REAL draft — not the login scratch over it,
+        // which destroyed the parked ring. Every transition passes
+        // through this stash, so the pairing is switch-safe at one seam.
+        if self.login.is_some() {
+            self.close_login_card();
+            self.flash = Some("· /login cancelled — the surface changed".to_owned());
+        }
         let key = self.surface_key();
         // TUI6.1 fix 1 closure: the frame's CURRENT wrap budget outlives
         // the swap — `mem::take` would otherwise leave the scratch
@@ -1572,7 +1587,7 @@ impl AppModel {
     /// `self.screen =` assignment is that bug waiting to recur; the only
     /// sites outside this function are enumerated on the `screen` field's
     /// doc (the founding donation and the two identity-flip split seams).
-    fn switch_surface(&mut self, to: Screen) {
+    pub(crate) fn switch_surface(&mut self, to: Screen) {
         let from = self.screen;
         let from_key = self.surface_key();
         self.screen = to;
@@ -2013,6 +2028,10 @@ impl AppModel {
         if self.screen == Screen::Subagent {
             if key.code == KeyCode::Esc {
                 self.switch_surface(Screen::Session);
+                // TUI6.2c finding 8: the chip view's scroll offset must
+                // not carry onto the session transcript (the ⌂ home row
+                // already resets; esc and the crumb now match).
+                self.scroll_back.set(0);
                 return;
             }
             if self
@@ -2442,12 +2461,9 @@ impl AppModel {
             KeyCode::Esc => {
                 // Drop wipes: `Zeroizing` on the way out. TUI6.2 fix 5
                 // (review r2 finding 5): the close RESTORES the draft the
-                // open parked — the r1-era adjudication covered draft
-                // TEXT only, but the parked composer carries the input
-                // HISTORY ring too, and an unpaired stash stranded both
-                // (overwritable by the next stash under the same key).
-                self.login = None;
-                self.restore_draft();
+                // open parked — text and history ring — via the one
+                // close method.
+                self.close_login_card();
             }
             KeyCode::Enter => {
                 if !card.accepts_input() || card.is_empty() {
@@ -2467,8 +2483,7 @@ impl AppModel {
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => card.push(c),
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 // Same pairing as Esc (TUI6.2 fix 5).
-                self.login = None;
-                self.restore_draft();
+                self.close_login_card();
             }
             _ => {}
         }
@@ -2492,15 +2507,29 @@ impl AppModel {
     }
 
     /// Open the masked card for `/login <provider> api`. The stash here
-    /// pairs with the `restore_draft` on BOTH close paths in `login_key`
-    /// (TUI6.2 fix 5) — the card borrows the band; the surface's draft
-    /// and its history ring come back when it leaves. The draft TEXT is
-    /// empty by construction at this point (the `/login…` submit consumed
-    /// it), but the RING is not — pinned in the login suite.
+    /// pairs with [`Self::close_login_card`] — the card borrows the band;
+    /// the surface's draft and its history ring come back when it leaves.
+    /// The draft TEXT is empty by construction at this point (the
+    /// `/login…` submit consumed it), but the RING is not — pinned in the
+    /// login suite.
     fn open_login_card(&mut self, provider: &str, alias: Option<String>) {
         self.stash_draft();
         self.login = Some(LoginCard::new(provider.to_owned(), alias));
         self.dirty = true;
+    }
+
+    /// Close the masked card and RETURN the band it borrowed (TUI6.2
+    /// fix 5 + TUI6.2c finding 5): the open's stash parked the surface's
+    /// draft — text AND history ring — and every close path must restore
+    /// it. The demo driver's `LoginApi` arm closes the card too, so the
+    /// pairing lives in this one model-owned method, never in a caller
+    /// (`restore_draft` is private; a caller-side `login = None` is the
+    /// stranded-ring bug by construction).
+    pub fn close_login_card(&mut self) {
+        if self.login.take().is_some() {
+            self.restore_draft();
+            self.dirty = true;
+        }
     }
 
     /// One shell-builtin line against the VFS: a session gets a transcript
@@ -3879,6 +3908,7 @@ impl AppModel {
             Hit::ChipCrumb(path) if self.screen == Screen::Subagent => {
                 if path.is_empty() {
                     self.switch_surface(Screen::Session);
+                    self.scroll_back.set(0); // TUI6.2c finding 8
                 } else if path
                     .last()
                     .is_some_and(|agent| find_chip(&self.chips, agent).is_some())
@@ -3938,7 +3968,12 @@ impl AppModel {
     /// the view. The frame's own reconcile stays as the backstop (sim
     /// reads live DOM geometry, tui.js:2648).
     pub fn handle_wheel(&mut self, up: bool) {
-        if !matches!(self.screen, Screen::Session | Screen::Subagent) || self.help_open {
+        // The login gate joins the help gate (TUI6.2c finding 7 —
+        // consistency: nothing scrolls beneath a modal).
+        if !matches!(self.screen, Screen::Session | Screen::Subagent)
+            || self.help_open
+            || self.login.is_some()
+        {
             return;
         }
         self.dirty = true;
@@ -3980,6 +4015,12 @@ impl AppModel {
     /// on hover (sim onMouseEnter, tui.js:2992/3073); everything else is
     /// hover chrome the renderer paints from [`Self::hovered`].
     pub fn handle_hover(&mut self, hit: Option<Hit>) {
+        // TUI6.2c (verifier finding 4): modals own hover exactly as they
+        // own hits and keys — with the help overlay or the login card up,
+        // hover must not move palette/menu selections beneath the modal.
+        if self.help_open || self.login.is_some() {
+            return;
+        }
         if self.hovered == hit {
             return;
         }

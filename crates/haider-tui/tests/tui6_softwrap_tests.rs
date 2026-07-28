@@ -829,6 +829,298 @@ fn login_card_is_modal_against_the_hits_beneath_it() {
     assert!(model.composer.history_prev(), "ring intact after the modal");
 }
 
+// ---- TUI6.2c: total login modality (the re-spawned verifier's finds) ----
+
+#[test]
+fn async_session_open_under_the_login_card_aborts_it_and_keeps_the_ring() {
+    // Verifier finding 1 (P1): on the live launcher, submit races /login
+    // — the daemon's Created reply runs open_session UNDER the open card
+    // (a driver call the hit gate never sees). Pre-fix: the checkout's
+    // stash parked the login scratch OVER the login-parked launcher
+    // draft (ring destroyed), the screen flipped under the card, and the
+    // card's Esc-restore restored nothing. The stash chokepoint now
+    // aborts the card (secret wiped) and returns the borrowed band FIRST.
+    //
+    // MUTATION CHECK (login-switch-safety): remove the login-abort block
+    // from stash_draft and this fails — the ring is destroyed. Verified
+    // by revert.
+    let mut model = launcher_model();
+    model.mode = RuntimeMode::Live;
+    for c in "remember this".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Enter)); // CreateSession in flight
+    for c in "/login anthropic api".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Esc));
+    model.handle(key(KeyCode::Enter));
+    assert!(
+        model.login.is_some(),
+        "card open while the reply is pending"
+    );
+    // The daemon replies: the driver calls open_session — the verifier's
+    // exact route (live.rs LiveReply::Created).
+    let id = common::session_named(&model, "billing-service");
+    model.open_session(&id);
+    assert_eq!(model.screen, Screen::Session);
+    assert!(
+        model.login.is_none(),
+        "the surface switch ABORTS the card — it cannot float over a \
+         surface it never borrowed"
+    );
+    // The launcher draft's ring survived the abort: back on the
+    // launcher, recall works.
+    model.handle(key_mod(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert_eq!(model.screen, Screen::Launcher);
+    assert!(
+        model.composer.history_prev(),
+        "the ring survived the async switch under the card"
+    );
+}
+
+#[test]
+fn background_chip_close_under_the_login_card_aborts_it() {
+    // Verifier finding 2 (P1), their exact route: the card opened on the
+    // AURA composer ("/login anthropic api " — trailing space, since Esc
+    // exits aura instead of dismissing the palette), then the demo
+    // driver's background chip close fired switch_surface(Session) under
+    // it. Pre-fix: the aura→session KEY change hauled the parked draft
+    // live under the modal, the card's close then destroyed it, and the
+    // aura ring died. The stash chokepoint aborts the card on the
+    // key-changing switch. (A SAME-key flip — e.g. a chip close while on
+    // the launcher scratch — swaps nothing and coherently keeps the card:
+    // the corruption class is key change, and the chokepoint rides the
+    // stash that only key changes perform.)
+    let mut model = launcher_model();
+    model.chips = vec![ChipModel::from_seed(ChipSeed {
+        agent: "t1-docs".to_owned(),
+        parent: None,
+        ros: None,
+        callsign: "Husayn".to_owned(),
+        hon: "(r)",
+        full: "Husayn ibn Ali".to_owned(),
+        name: "docs".to_owned(),
+        model: "fable-5".to_owned(),
+        device: "macbook".to_owned(),
+        state: ChipDisplayState::Running,
+        tokens: 100,
+        prefill: Vec::new(),
+    })];
+    for c in "/aura".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Enter));
+    assert_eq!(model.screen, Screen::Aura);
+    for c in "remember this".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Enter)); // aura submit: the ring records it
+    for c in "/login anthropic api ".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Enter));
+    assert!(model.login.is_some(), "card open on the aura surface");
+    model.close_chip_state("t1-docs"); // the background close, mid-login
+    assert_eq!(model.screen, Screen::Session);
+    assert!(
+        model.login.is_none(),
+        "card aborted by the key-changing switch"
+    );
+    assert!(
+        !model.composer.text().contains("remember"),
+        "no aura draft hauled onto the session under the modal"
+    );
+    // The aura ring survived, parked under its own key.
+    for c in "/aura".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Enter));
+    assert_eq!(model.screen, Screen::Aura);
+    assert!(model.composer.history_prev(), "aura ring intact");
+}
+
+#[test]
+fn login_card_outranks_an_arriving_menu_on_the_band() {
+    // Verifier finding 3 (P1): a MenuOpened envelope stole the card's
+    // FACE while the card kept the KEYBOARD — the band rendered the menu,
+    // so pressing `1` for the visible option landed in the masked secret
+    // and Enter staged a garbage credential. The card now outranks the
+    // menu on the band: the menu waits, unrendered and unclickable.
+    //
+    // MUTATION CHECK (card-outranks-menu): drop the `model.login` gate on
+    // the session ledger's `menu` binding and this fails — the option
+    // rows render and emit hits under the card. Verified by revert.
+    let mut model = session_model();
+    model.mode = RuntimeMode::Live;
+    for c in "/login anthropic api".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Esc));
+    model.handle(key(KeyCode::Enter));
+    assert!(
+        model.login.is_some(),
+        "card open (flash: {:?})",
+        model.flash
+    );
+    model.handle(AppEvent::Envelope(Box::new(EventPayload::MenuOpened(
+        haider_protocol::menu::Menu {
+            id: haider_protocol::ids::MenuId::new("perm-1"),
+            kind: haider_protocol::menu::MenuKind::Choice,
+            title: "Allow fs_patch — main.rs?".to_owned(),
+            body: vec![],
+            options: [("allow", "Allow once"), ("deny", "Deny")]
+                .iter()
+                .map(|(key, label)| haider_protocol::menu::MenuOption {
+                    key: (*key).to_owned(),
+                    label: (*label).to_owned(),
+                    detail: None,
+                    decision: None,
+                })
+                .collect(),
+            blocking: true,
+            scope: haider_protocol::menu::MenuScope::Session,
+            origin: "permission".to_owned(),
+            ttl_ms: None,
+            timeout_option: None,
+        },
+    ))));
+    assert!(model.projection.open_menu().is_some(), "menu queued");
+    let (rows, hits, _) = draw(&model, 100, 30);
+    assert!(
+        rows.iter().any(|row| row.contains("API key")),
+        "the band shows the CARD, not the menu"
+    );
+    assert!(
+        !rows.iter().any(|row| row.contains("Allow once")),
+        "the menu waits unrendered: {rows:?}"
+    );
+    assert!(
+        !hits
+            .iter()
+            .any(|(_, hit)| matches!(hit, Hit::MenuOption { .. })),
+        "and unclickable"
+    );
+    // Keystrokes stay the card's: `1` extends the mask, answers nothing.
+    model.handle(key(KeyCode::Char('1')));
+    assert!(model.outbox.is_empty(), "no menu answer from a secret byte");
+    // The card closes → the menu takes the band on the next frame.
+    model.handle(key(KeyCode::Esc));
+    let (rows, _, _) = draw(&model, 100, 30);
+    assert!(rows.iter().any(|row| row.contains("Allow once")));
+}
+
+#[test]
+fn demo_driver_login_close_restores_through_the_one_method() {
+    // Verifier finding 5 (P2): the demo driver's LoginApi arm closed the
+    // card with a bare `login = None`, stranding the parked draft and
+    // ring (restore_draft is private to the model — by design). The
+    // model-owned close_login_card is now the ONE close path; the driver
+    // routes through it.
+    //
+    // MUTATION CHECK (one-close-method): revert the driver arm to
+    // `model.login = None` and this fails — history_prev recalls
+    // nothing after the demo close. Verified by revert.
+    let mut model = launcher_model();
+    for c in "remember this".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Enter));
+    model.requests.clear();
+    for c in "/login anthropic api".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Esc));
+    model.handle(key(KeyCode::Enter));
+    assert!(model.login.is_some());
+    for c in "sk-demo".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Enter)); // stages LoginApi
+    // The demo driver answers the request (runtime.rs LoginApi arm).
+    let (mut driver, _rx) = common::driver_for(&model);
+    common::drain(&mut driver, &mut model);
+    assert!(
+        model.login.is_none(),
+        "the demo declined and closed the card"
+    );
+    assert!(
+        model.composer.history_prev(),
+        "the ring came back through close_login_card"
+    );
+}
+
+#[test]
+fn modals_own_hover_and_wheel_too() {
+    // Verifier findings 4 + 7 (P2/P3): hover moved menu selections and
+    // wheel scrolled beneath the open card — the remaining un-gated
+    // input routes after the TUI6.2b hit gate. Both now gate on the
+    // modal exactly as hits and keys do.
+    let mut model = session_model();
+    model.mode = RuntimeMode::Live;
+    for c in "/login anthropic api".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Esc));
+    model.handle(key(KeyCode::Enter));
+    assert!(model.login.is_some());
+    // A REAL open menu waits behind the card (finding 3's setup) — the
+    // hover arm's own validity check passes for it, so only the modal
+    // gate stands between the hover and the selection.
+    model.handle(AppEvent::Envelope(Box::new(EventPayload::MenuOpened(
+        haider_protocol::menu::Menu {
+            id: haider_protocol::ids::MenuId::new("perm-1"),
+            kind: haider_protocol::menu::MenuKind::Choice,
+            title: "Allow fs_patch — main.rs?".to_owned(),
+            body: vec![],
+            options: [("allow", "Allow once"), ("deny", "Deny")]
+                .iter()
+                .map(|(key, label)| haider_protocol::menu::MenuOption {
+                    key: (*key).to_owned(),
+                    label: (*label).to_owned(),
+                    detail: None,
+                    decision: None,
+                })
+                .collect(),
+            blocking: true,
+            scope: haider_protocol::menu::MenuScope::Session,
+            origin: "permission".to_owned(),
+            ttl_ms: None,
+            timeout_option: None,
+        },
+    ))));
+    assert_eq!(model.menu_selection, 0);
+    model.handle_hover(Some(Hit::MenuOption {
+        menu: haider_protocol::ids::MenuId::new("perm-1"),
+        index: 1,
+    }));
+    assert_eq!(model.menu_selection, 0, "hover gated under the card");
+    let scroll = model.scroll_back.get();
+    model.handle_wheel(true);
+    assert_eq!(
+        model.scroll_back.get(),
+        scroll,
+        "wheel gated under the card"
+    );
+}
+
+#[test]
+fn chip_view_scroll_never_carries_onto_the_session() {
+    // Verifier finding 8 (P3): esc/crumb from the chip view kept the
+    // chip transcript's scroll offset on the session (⌂ and ChipRow
+    // already reset). All exits now match.
+    let mut model = subagent_model();
+    let (_, _, _) = draw(&model, 90, 20); // establish a scroll range
+    model.scroll_back.set(9);
+    model.handle(key(KeyCode::Esc));
+    assert_eq!(model.screen, Screen::Session);
+    assert_eq!(
+        model.scroll_back.get(),
+        0,
+        "esc resets the carried chip-view scroll"
+    );
+}
+
 // ---- TUI6.2 promoted seam pins (the verifier's s1-s6, now shipped) ----
 //
 // MUTATION CHECK (budget-across-swap, the whole group): the s1/s2/s3/s6

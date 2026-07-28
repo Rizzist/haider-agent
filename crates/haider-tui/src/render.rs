@@ -748,7 +748,17 @@ fn render_session(
     //     (handled in `render`) → header line 2 → header rule → input rule
     //     → header line 1 → options never (below option count the menu
     //     WINDOWS them around the selection with ⋮ markers).
-    let menu = model.projection.open_menu();
+    // TUI6.2c (verifier finding 3): the login card OUTRANKS a blocking
+    // menu on the band — the keys already prefer the card (login_key),
+    // and a band that renders the menu while the card owns the keyboard
+    // turns menu answers into typed secret bytes (a `1` meant for an
+    // option landed in the mask; Enter staged a garbage credential). The
+    // menu waits, unrendered and unclickable, until the card closes.
+    let menu = if model.login.is_some() {
+        None
+    } else {
+        model.projection.open_menu()
+    };
     let menu_wrapped_body_rows = menu.map_or(0, |m| wrapped_menu_body(m, area.width).len());
     let needed_input = menu.map_or_else(
         || composer_height(model, area.width),
@@ -1596,7 +1606,13 @@ fn render_subagent(
         render_session(model, theme, frame, area, hits);
         return;
     };
-    let menu = chip.question_menu();
+    // The login card outranks the chip's question card on the band too
+    // (TUI6.2c finding 3, same law as the session menu).
+    let menu = if model.login.is_some() {
+        None
+    } else {
+        chip.question_menu()
+    };
     let needed_input = menu.map_or_else(
         || composer_height(model, area.width),
         |m| {

@@ -1216,7 +1216,11 @@ impl DemoDriver {
             // rather than pretending to store a key (and the secret drops —
             // zeroized — right here).
             AppRequest::LoginApi { .. } => {
-                model.login = None;
+                // TUI6.2c finding 5: through the model's one close method
+                // — a bare `login = None` here stranded the parked draft
+                // and its history ring (restore_draft is private to the
+                // model by design).
+                model.close_login_card();
                 model.flash =
                     Some("· /login — needs the daemon; run `haider` (not --demo)".to_owned());
                 model.dirty = true;
@@ -1617,7 +1621,12 @@ impl DemoDriver {
                     if model.view_path.contains(&agent) {
                         model.view_path.clear();
                         if model.screen == crate::app::Screen::Subagent {
-                            model.screen = crate::app::Screen::Session;
+                            // TUI6.2c finding 6: through the switch
+                            // authority — the driver held the fifth
+                            // unenumerated direct screen write
+                            // (same-key-safe today, the exact recurrence
+                            // shape fix 3 exists to prevent).
+                            model.switch_surface(crate::app::Screen::Session);
                         }
                     }
                     model.dirty = true;
