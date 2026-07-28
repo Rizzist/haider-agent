@@ -425,7 +425,10 @@ pub fn dispatch_input(
         Event::Key(key) if key.kind != KeyEventKind::Release => {
             model.handle(AppEvent::Key(key));
         }
-        Event::Paste(text) => model.handle(AppEvent::Paste(text)),
+        // TUI6.3 fix 2: the paste is wrapped at RECEIPT — the zeroizing
+        // buffer takes the same allocation, so our one owned copy wipes
+        // on drop and Debug-prints redacted.
+        Event::Paste(text) => model.handle(AppEvent::Paste(crate::app::Pasted::new(text))),
         Event::Resize(cols, _) => {
             // TUI6.1 fix 1 (reflow-before-input): the next frame's wrap
             // budget is a pure function of the NEW width, so apply it
@@ -1215,6 +1218,9 @@ impl DemoDriver {
             // `/login … api` needs a daemon. The demo answers honestly
             // rather than pretending to store a key (and the secret drops —
             // zeroized — right here).
+            // The demo's login declines synchronously below, so there is
+            // never an in-flight attempt to retire (TUI6.3 fix 1).
+            AppRequest::LoginRetired { .. } => {}
             AppRequest::LoginApi { .. } => {
                 // TUI6.2c finding 5: through the model's one close method
                 // — a bare `login = None` here stranded the parked draft

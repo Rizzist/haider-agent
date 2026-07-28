@@ -727,6 +727,13 @@ pub struct LoginCard {
     /// The typed key. Never rendered, never persisted, never logged.
     secret: zeroize::Zeroizing<String>,
     pub stage: LoginStage,
+    /// The ATTEMPT IDENTITY (TUI6.3 fix 1, review r3 finding 1): minted
+    /// when the card opens, carried end-to-end — the queued
+    /// [`AppRequest::LoginApi`], the driver's stage/login correlation,
+    /// and every reply gate. Closing the card RETIRES the attempt, so a
+    /// late reply from a cancelled attempt can neither mint the login
+    /// command nor mark a newer card successful.
+    pub attempt: u64,
 }
 
 /// Where the login card is in its two-transaction flow (stage → login).
@@ -760,12 +767,13 @@ impl std::fmt::Debug for LoginCard {
 
 impl LoginCard {
     #[must_use]
-    pub fn new(provider: String, alias: Option<String>) -> Self {
+    pub fn new(provider: String, alias: Option<String>, attempt: u64) -> Self {
         Self {
             provider,
             alias,
             secret: zeroize::Zeroizing::new(String::new()),
             stage: LoginStage::Entry,
+            attempt,
         }
     }
 
@@ -948,6 +956,9 @@ pub enum AppRequest {
     /// The raw key rides HERE and nowhere else — it never enters the
     /// composer, a draft, the input ring, a transcript row or the store.
     LoginApi {
+        /// The card's attempt identity (TUI6.3 fix 1) — the driver binds
+        /// its stage/login correlation to this, and a retire kills it.
+        attempt: u64,
         provider: String,
         alias: Option<String>,
         /// The wire's own secret carrier: zeroized on drop and REDACTED in
@@ -958,6 +969,14 @@ pub enum AppRequest {
         /// re-earning it.)
         secret: haider_rpc::SecretWire,
     },
+    /// The login card CLOSED while its attempt might still be queued or
+    /// in flight (TUI6.3 fix 1): the driver retires every trace of the
+    /// attempt — pending stage correlation, the login command id, the
+    /// deadline — so late replies are ignored, silently (the user already
+    /// saw the cancel). Queued-but-undrained `LoginApi` requests for the
+    /// attempt were already dropped by `close_login_card` before this is
+    /// pushed.
+    LoginRetired { attempt: u64 },
     /// LIVE launcher submit (W3c3, report R11 cut 4): ask the daemon to
     /// create a session for `text`. Deliberately NOT accompanied by a row,
     /// a session id, a screen flip or a turn: in live mode there is no
@@ -1167,12 +1186,60 @@ pub enum DraftKey {
     Aura,
 }
 
+/// Pasted text at the TUI ingress (TUI6.3 fix 2, review r3 finding 2).
+///
+/// A paste is how API keys usually arrive, and the W3c2 `SecretWire`
+/// discipline applies AT THE EDGE: the buffer zeroizes on drop and its
+/// `Debug` is redacted. The protection is UNIVERSAL rather than a
+/// secret-aware split — pasted text is user content either way, the cost
+/// is one wrapper around the same allocation (no copy: `Zeroizing<String>`
+/// takes ownership), and a split path would reopen a printable window
+/// every time a new consumer picked the wrong lane. The clipboard bytes
+/// crossterm itself buffered are upstream of this boundary and out of our
+/// hands; OUR copy is wiped.
+pub struct Pasted(zeroize::Zeroizing<String>);
+
+impl Pasted {
+    #[must_use]
+    pub fn new(text: String) -> Self {
+        Self(zeroize::Zeroizing::new(text))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The zeroizing buffer itself — a TYPE PIN for the hygiene tests:
+    /// the field being `Zeroizing<String>` IS the wipe-on-drop guarantee,
+    /// so a test holds this accessor and any regression to a plain
+    /// `String` fails to compile.
+    #[must_use]
+    pub fn zeroizing_inner(&self) -> &zeroize::Zeroizing<String> {
+        &self.0
+    }
+}
+
+impl From<String> for Pasted {
+    fn from(text: String) -> Self {
+        Self::new(text)
+    }
+}
+
+impl std::fmt::Debug for Pasted {
+    /// Redacted by construction — length omitted too, the `LoginCard`
+    /// precedent (a key's length is itself a hint).
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Pasted(<redacted>)")
+    }
+}
+
 /// Everything the reducer consumes.
 #[derive(Debug)]
 pub enum AppEvent {
     Key(KeyEvent),
     /// Bracketed paste arrives atomically; newlines never submit (rec 14).
-    Paste(String),
+    Paste(Pasted),
     /// Boxed: `EventPayload` is much larger than the other variants.
     Envelope(Box<EventPayload>),
     /// The demo script (or stream) ended.
@@ -1355,6 +1422,10 @@ pub struct AppModel {
     /// frame) has replaced is unrepresentable — the geometry twin of the
     /// text-revision guard.
     pub geometry_epoch: std::cell::Cell<u64>,
+    /// Monotonic login ATTEMPT mint (TUI6.3 fix 1) — each card open takes
+    /// the next value; never reused, so a retired attempt's replies can
+    /// never collide with a live one's.
+    login_attempt_seq: u64,
     /// The sticky origin line is suppressed after a sticky jump until the
     /// next REAL wheel event (sim jumpToSticky, tui.js:2637-2657: the bar
     /// must never cover the row it just revealed).
@@ -1448,6 +1519,7 @@ impl Default for AppModel {
             scroll_back: std::cell::Cell::new(0),
             scroll_max: std::cell::Cell::new(0),
             geometry_epoch: std::cell::Cell::new(0),
+            login_attempt_seq: 0,
             sticky_suppressed: false,
             hovered: None,
             selection: None,
@@ -1825,11 +1897,15 @@ impl AppModel {
             }
             AppEvent::Paste(text) => {
                 self.dirty = true;
+                // The zeroizing wrapper is borrowed, never unwrapped: the
+                // one owned copy wipes when `text` drops at the end of
+                // this arm (TUI6.3 fix 2).
+                let text = text.as_str();
                 // Keys are pasted more often than typed; the paste lands in
                 // the masked buffer and NOWHERE else (no pill token, no
                 // draft, no ring).
                 if let Some(card) = self.login.as_mut() {
-                    card.push_str(&text);
+                    card.push_str(text);
                     return;
                 }
                 // While a blocking menu replaces the composer, paste has no
@@ -2471,9 +2547,11 @@ impl AppModel {
                 }
                 let provider = card.provider.clone();
                 let alias = card.alias.clone();
+                let attempt = card.attempt;
                 let secret = card.take_secret();
                 card.stage = LoginStage::Submitting;
                 self.requests.push(AppRequest::LoginApi {
+                    attempt,
                     provider,
                     alias,
                     secret,
@@ -2514,7 +2592,12 @@ impl AppModel {
     /// login suite.
     fn open_login_card(&mut self, provider: &str, alias: Option<String>) {
         self.stash_draft();
-        self.login = Some(LoginCard::new(provider.to_owned(), alias));
+        self.login_attempt_seq += 1;
+        self.login = Some(LoginCard::new(
+            provider.to_owned(),
+            alias,
+            self.login_attempt_seq,
+        ));
         self.dirty = true;
     }
 
@@ -2526,7 +2609,19 @@ impl AppModel {
     /// (`restore_draft` is private; a caller-side `login = None` is the
     /// stranded-ring bug by construction).
     pub fn close_login_card(&mut self) {
-        if self.login.take().is_some() {
+        if let Some(card) = self.login.take() {
+            // TUI6.3 fix 1(b): the close RETIRES the attempt. A queued,
+            // not-yet-drained submit dies here — a cancelled credential
+            // must never reach the wire — and the driver is told to
+            // invalidate whatever already did (stage correlation, login
+            // command, deadline) so late replies fall on a dead id.
+            self.requests.retain(|request| {
+                !matches!(request, AppRequest::LoginApi { attempt, .. }
+                    if *attempt == card.attempt)
+            });
+            self.requests.push(AppRequest::LoginRetired {
+                attempt: card.attempt,
+            });
             self.restore_draft();
             self.dirty = true;
         }

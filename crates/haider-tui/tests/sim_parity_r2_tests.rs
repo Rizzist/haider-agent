@@ -289,7 +289,7 @@ fn theme_arg_slot_offers_completes_and_runs() {
 #[test]
 fn big_pastes_become_pill_tokens_and_render_gold() {
     let mut model = launcher_model();
-    model.handle(AppEvent::Paste("a\nb\nc\nd\ne".to_owned()));
+    model.handle(AppEvent::Paste("a\nb\nc\nd\ne".to_owned().into()));
     assert_eq!(model.composer, "[Pasted 5 lines] ");
     for c in "ship it".chars() {
         model.handle(key(KeyCode::Char(c)));
@@ -313,7 +313,7 @@ fn big_pastes_become_pill_tokens_and_render_gold() {
 
     // Small pastes stay literal — and KEEP their newlines (r2 P2-4d).
     let mut model = launcher_model();
-    model.handle(AppEvent::Paste("a\nb".to_owned()));
+    model.handle(AppEvent::Paste("a\nb".to_owned().into()));
     assert_eq!(model.composer, "a\nb");
 }
 

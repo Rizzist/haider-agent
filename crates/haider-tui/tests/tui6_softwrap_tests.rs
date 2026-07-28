@@ -448,7 +448,7 @@ fn zero_width_leading_cluster_gets_one_cell_everywhere() {
     // assertion fails (no gold cell at the cluster's column). Verified
     // by revert.
     let mut model = session_model();
-    model.handle(AppEvent::Paste("\u{301}a".to_owned()));
+    model.handle(AppEvent::Paste("\u{301}a".to_owned().into()));
     model.handle(key(KeyCode::Home));
     assert_eq!(model.composer.cursor(), 0);
     let theme = model.theme.theme();

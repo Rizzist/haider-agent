@@ -605,6 +605,10 @@ fn the_login_deadline_is_exposed_to_the_shell_as_a_wakeup() {
     let start = std::time::Instant::now();
     live_pass(&mut driver, &mut model, None, start);
     model.requests.push(AppRequest::LoginApi {
+        // Mechanical TUI6.3 plumbing: the request now carries the card's
+        // attempt identity; this deadline test fabricates the request
+        // directly, so it mints a standalone one.
+        attempt: 1,
         provider: "anthropic".to_owned(),
         alias: None,
         secret: haider_rpc::SecretWire::new("sk-test-000000".to_owned()),

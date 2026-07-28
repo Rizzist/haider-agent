@@ -349,6 +349,19 @@ pub struct LiveDriver {
     /// correlated to it instead of merely coinciding with it (P2-2) and a
     /// retry re-stages UNDER IT rather than minting a second (P1-4).
     login_command: Option<CommandId>,
+    /// The LIVE attempt this driver is staging/logging-in for (TUI6.3
+    /// fix 1): bound when the `LoginApi` request drains, cleared by a
+    /// retire, an abandon, or completion. Reply gates compare against it
+    /// AND against the open card's own attempt — both must agree or the
+    /// reply is a ghost from a cancelled attempt and is ignored whole.
+    login_attempt: Option<u64>,
+    /// Attempts with a `Stage` command in flight, in ISSUE order — the
+    /// RPC socket answers a connection's commands in order, so each
+    /// `Staged` reply pops the front: that is the attempt it answers.
+    /// (Belt and braces: the `Staged` gate also requires the popped
+    /// attempt to BE the live one, so even an ordering violation cannot
+    /// cross-bind a cancelled attempt's vault reference to a new card.)
+    staged_attempts: std::collections::VecDeque<u64>,
     /// When the card's non-durable `vault.stage` was issued. A Stage
     /// swallowed by a disconnect or a wedged daemon would otherwise park
     /// the card at "validating…" with `accepts_input() == false` forever
@@ -409,6 +422,8 @@ impl LiveDriver {
             cold: HashMap::new(),
             attaching: HashMap::new(),
             login_command: None,
+            login_attempt: None,
+            staged_attempts: std::collections::VecDeque::new(),
             login_started: None,
             outbox: Vec::new(),
             menus: HashMap::new(),
@@ -792,6 +807,21 @@ impl LiveDriver {
                 provider,
                 alias,
             } => {
+                // TUI6.3 fix 1(c): correlate the reply to the attempt it
+                // answers — the front of the issue-ordered queue — and
+                // require that attempt to be the LIVE one on both sides
+                // (driver binding AND the open card). The r3 probe showed
+                // abort→re-/login letting an old and a new Staged reuse
+                // one login command id: a credential could commit after
+                // the UI said cancelled. A ghost reply is dropped whole —
+                // no mint, no enqueue, no flash (the user saw the cancel).
+                let answered = self.staged_attempts.pop_front();
+                let live = answered.is_some()
+                    && answered == self.login_attempt
+                    && model.login.as_ref().map(|card| card.attempt) == answered;
+                if !live {
+                    return Vec::new();
+                }
                 // Transaction two. The staged reference is single-use and
                 // expiring, so the login follows immediately.
                 //
@@ -820,8 +850,20 @@ impl LiveDriver {
                 identity,
             } => {
                 self.retire(&command_id);
-                self.close_login(&command_id);
-                model.login_result(Ok(identity));
+                // TUI6.3 fix 1(c): the result lands only on the card that
+                // ASKED — the command must be the live login command and
+                // the open card must be the live attempt. A stale
+                // LoggedIn (its attempt retired, or a newer card open)
+                // touches nothing: the r3 probe had an old result marking
+                // a NEW provider/alias card successful.
+                let owns = self.login_command.as_ref() == Some(&command_id)
+                    && self.login_attempt.is_some()
+                    && model.login.as_ref().map(|card| card.attempt) == self.login_attempt;
+                if owns {
+                    self.close_login(&command_id);
+                    self.login_attempt = None;
+                    model.login_result(Ok(identity));
+                }
                 Vec::new()
             }
             LiveReply::Event {
@@ -962,7 +1004,9 @@ impl LiveDriver {
                 // would otherwise show a login recovery message for a
                 // failure that had nothing to do with the login (P2-2).
                 let owns = command_id.as_ref() == self.login_command.as_ref()
-                    && self.login_command.is_some();
+                    && self.login_command.is_some()
+                    && model.login.as_ref().map(|card| card.attempt) == self.login_attempt
+                    && self.login_attempt.is_some();
                 if owns && model.login.is_some() {
                     model.login_result(Err((code, message)));
                 } else {
@@ -1024,6 +1068,7 @@ impl LiveDriver {
         if self.login_command.as_ref() == Some(command_id) {
             self.login_command = None;
             self.login_started = None;
+            self.login_attempt = None;
         }
     }
 
@@ -1038,6 +1083,10 @@ impl LiveDriver {
             return;
         }
         self.login_started = None;
+        self.login_attempt = None;
+        // Staging is connection-scoped: no reply will ever arrive for
+        // these, so the correlation queue dies with the transaction.
+        self.staged_attempts.clear();
         if let Some(id) = self.login_command.take() {
             self.retire(&id);
         }
@@ -1244,6 +1293,7 @@ impl LiveDriver {
                 None => Vec::new(),
             },
             AppRequest::LoginApi {
+                attempt,
                 provider,
                 alias,
                 secret,
@@ -1254,6 +1304,10 @@ impl LiveDriver {
                 // afresh because the daemon's staged memory is
                 // connection-scoped.
                 self.next_command += 1;
+                // TUI6.3 fix 1: bind the driver to THIS attempt — every
+                // later reply must correlate to it or die.
+                self.login_attempt = Some(attempt);
+                self.staged_attempts.push_back(attempt);
                 // The card is now UNANSWERABLE-BY-ITSELF until a response
                 // lands: arm the deadline that covers BOTH transactions.
                 self.login_started = Some(self.now);
@@ -1263,6 +1317,23 @@ impl LiveDriver {
                     provider,
                     alias,
                 }]
+            }
+            AppRequest::LoginRetired { attempt } => {
+                // TUI6.3 fix 1(b): the card closed — retire the attempt.
+                // Whatever the transaction had in flight (a stage awaiting
+                // its reference, the login command awaiting commit, the
+                // deadline) is invalidated; the reply gates then drop the
+                // ghosts silently. The staged_attempts queue keeps its
+                // entries — each in-flight `Staged` reply still POPS its
+                // tag on arrival and fails the liveness gate.
+                if self.login_attempt == Some(attempt) {
+                    self.login_attempt = None;
+                    self.login_started = None;
+                    if let Some(id) = self.login_command.take() {
+                        self.retire(&id);
+                    }
+                }
+                Vec::new()
             }
             // The request's `after_seq` is the reducer's own last fully
             // applied sequence — the same value [`cursor_of`] reads, from

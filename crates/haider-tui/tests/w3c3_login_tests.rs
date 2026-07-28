@@ -9,7 +9,9 @@
 
 use haider_tui::app::{AppModel, AppRequest, LoginStage, RuntimeMode, login_recovery};
 use haider_tui::commands::{PaletteItem, palette_items};
+use haider_tui::live::{LiveCommand, LiveDriver, LiveReply};
 use haider_tui::render::render;
+use haider_tui::runtime::live_pass;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -157,7 +159,7 @@ fn typing_pasting_and_redrawing_never_put_the_key_on_screen() {
     // token, no draft, no ring.
     let mut pasted = live_model();
     run_slash(&mut pasted, "/login anthropic api");
-    pasted.handle(haider_tui::app::AppEvent::Paste(SENTINEL.to_owned()));
+    pasted.handle(haider_tui::app::AppEvent::Paste(SENTINEL.to_owned().into()));
     assert_eq!(pasted.composer.text(), "");
     let text = frame_text(&pasted, 118, 36);
     assert!(!text.contains(SENTINEL), "a pasted key appeared on screen");
@@ -448,4 +450,243 @@ async fn the_demo_refuses_login_honestly_and_drops_the_key() {
         "…honestly"
     );
     assert!(!format!("{model:?}").contains(SENTINEL));
+}
+
+// ---- TUI6.3 fix 1: the attempt identity (review r3 finding 1) ----
+
+/// Open the card and submit a key, returning the queued attempt id.
+fn submit_login(model: &mut AppModel, key_text: &str) -> u64 {
+    run_slash(model, "/login anthropic api");
+    assert!(model.login.is_some());
+    for c in key_text.chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Enter));
+    model
+        .requests
+        .iter()
+        .find_map(|request| match request {
+            AppRequest::LoginApi { attempt, .. } => Some(*attempt),
+            _ => None,
+        })
+        .expect("submit queued the attempt-carrying request")
+}
+
+#[test]
+fn close_retires_the_queued_login_request_before_dispatch() {
+    // Review r3 finding 1, the pre-dispatch half: Enter queues the
+    // LoginApi request; a close landing while it is still queued must
+    // kill it — a cancelled credential never reaches the wire at all.
+    //
+    // MUTATION CHECK (close-retires-queued): drop the `requests.retain`
+    // from close_login_card and this fails — the dead attempt's Stage
+    // command is issued after the UI said cancelled. Verified by revert.
+    let mut model = live_model();
+    let attempt = submit_login(&mut model, SENTINEL);
+    model.handle(key(KeyCode::Esc)); // close while the request is queued
+    assert!(model.login.is_none());
+    assert!(
+        !model
+            .requests
+            .iter()
+            .any(|request| matches!(request, AppRequest::LoginApi { .. })),
+        "the queued submit died with the card"
+    );
+    assert!(
+        model.requests.iter().any(|request| matches!(
+            request,
+            AppRequest::LoginRetired { attempt: retired } if *retired == attempt
+        )),
+        "and the driver is told to retire the attempt"
+    );
+    // Draining now issues NO stage for the dead attempt.
+    let mut driver = LiveDriver::new("test");
+    let pass = live_pass(&mut driver, &mut model, None, std::time::Instant::now());
+    assert!(
+        !pass
+            .commands
+            .iter()
+            .any(|command| matches!(command, LiveCommand::Stage { .. })),
+        "no Stage for a retired attempt: {:?}",
+        pass.commands
+    );
+}
+
+#[test]
+fn cancelled_attempt_never_mints_and_a_stale_result_never_lands() {
+    // The reviewer's exact r3 probe: abort → immediate re-/login. The
+    // OLD attempt's Staged reply must not mint the login command (its
+    // credential must never commit after the UI said cancelled), and a
+    // stale LoggedIn must not mark the NEW card successful.
+    //
+    // MUTATION CHECK (staged-attempt-gate): force the Staged arm's
+    // `live` to true and this fails — the cancelled attempt's reference
+    // mints a login command. Verified by revert.
+    let mut model = live_model();
+    let mut driver = LiveDriver::new("test");
+    let start = std::time::Instant::now();
+    // Attempt 1: submit, drain (Stage in flight), then abort.
+    let first = submit_login(&mut model, SENTINEL);
+    let pass = live_pass(&mut driver, &mut model, None, start);
+    assert!(
+        pass.commands
+            .iter()
+            .any(|command| matches!(command, LiveCommand::Stage { .. })),
+        "attempt 1 staged"
+    );
+    model.handle(key(KeyCode::Esc)); // abort while the stage is in flight
+    // Attempt 2 opens immediately (the race window).
+    let second = submit_login(&mut model, "sk-ant-SECOND-attempt-key");
+    assert_ne!(first, second, "attempts are never reused");
+    let pass = live_pass(&mut driver, &mut model, None, start);
+    assert!(
+        pass.commands
+            .iter()
+            .any(|command| matches!(command, LiveCommand::Stage { .. })),
+        "attempt 2 staged"
+    );
+    // The OLD Staged reply lands first (socket order): it must die whole.
+    let pass = live_pass(
+        &mut driver,
+        &mut model,
+        Some(LiveReply::Staged {
+            vault_reference: "old-cancelled-ref".to_owned(),
+            provider: "anthropic".to_owned(),
+            alias: None,
+        }),
+        start,
+    );
+    assert!(
+        pass.commands.is_empty(),
+        "the cancelled attempt's reference minted something: {:?}",
+        pass.commands
+    );
+    // The NEW Staged reply mints the login for the LIVE attempt.
+    let pass = live_pass(
+        &mut driver,
+        &mut model,
+        Some(LiveReply::Staged {
+            vault_reference: "new-live-ref".to_owned(),
+            provider: "anthropic".to_owned(),
+            alias: None,
+        }),
+        start,
+    );
+    let command_id = pass
+        .commands
+        .iter()
+        .find_map(|command| match command {
+            LiveCommand::LoginApi {
+                command_id,
+                vault_reference,
+                ..
+            } => {
+                assert_eq!(vault_reference, "new-live-ref");
+                Some(command_id.clone())
+            }
+            _ => None,
+        })
+        .expect("the live attempt logs in");
+    // A STALE LoggedIn (a command id the driver does not own) touches
+    // nothing: the card stays Submitting, no success lands.
+    let _ = live_pass(
+        &mut driver,
+        &mut model,
+        Some(LiveReply::LoggedIn {
+            command_id: haider_rpc::CommandId::new("cmd-stale-ghost"),
+            identity: "ghost@old-attempt".to_owned(),
+        }),
+        start,
+    );
+    assert_eq!(
+        model.login.as_ref().expect("card open").stage,
+        LoginStage::Submitting,
+        "a stale result never marks the new card"
+    );
+    // The REAL LoggedIn commits the live attempt.
+    let _ = live_pass(
+        &mut driver,
+        &mut model,
+        Some(LiveReply::LoggedIn {
+            command_id,
+            identity: "team@anthropic".to_owned(),
+        }),
+        start,
+    );
+    assert_eq!(
+        model.login.as_ref().expect("card open").stage,
+        LoginStage::Done("team@anthropic".to_owned()),
+        "the live attempt's own result lands"
+    );
+}
+
+#[test]
+fn switch_abort_retires_the_inflight_attempt_too() {
+    // The asynchronous close (the TUI6.2c chokepoint) retires exactly
+    // like Esc: a key-changing switch under a Submitting card kills the
+    // attempt end-to-end, and its late Staged reply mints nothing.
+    let mut model = live_model();
+    let mut driver = LiveDriver::new("test");
+    let start = std::time::Instant::now();
+    submit_login(&mut model, SENTINEL);
+    let pass = live_pass(&mut driver, &mut model, None, start);
+    assert_eq!(pass.commands.len(), 1, "stage in flight");
+    // The daemon's Created reply forces open_session — the switch aborts
+    // the card (TUI6.2c) and must ALSO retire the attempt (TUI6.3).
+    let id = common::session_named(&model, "billing-service");
+    model.open_session(&id);
+    assert!(model.login.is_none(), "chokepoint aborted the card");
+    let pass = live_pass(
+        &mut driver,
+        &mut model,
+        Some(LiveReply::Staged {
+            vault_reference: "post-abort-ref".to_owned(),
+            provider: "anthropic".to_owned(),
+            alias: None,
+        }),
+        start,
+    );
+    assert!(
+        !pass.commands.iter().any(|command| matches!(
+            command,
+            LiveCommand::LoginApi { .. } | LiveCommand::Stage { .. }
+        )),
+        "the aborted attempt's reference commits nothing (the Attach is \
+         sync_selection for the opened session, not the login): {:?}",
+        pass.commands
+    );
+}
+
+// ---- TUI6.3 fix 2: paste hygiene (review r3 finding 2) ----
+
+#[test]
+fn pasted_debug_is_redacted_end_to_end() {
+    // A pasted API key must never be printable through Debug — not from
+    // the wrapper, not from the event that carries it (panic teardown
+    // prints events). The W3c2 SecretWire discipline, applied at the TUI
+    // ingress, UNIVERSALLY: pasted text is user content either way, and a
+    // secret-aware split path would reopen a printable window every time
+    // a new consumer picked the wrong lane.
+    use haider_tui::app::{AppEvent, Pasted};
+    let secret = "sk-ant-SENTINEL-paste-99ab";
+    let event = AppEvent::Paste(Pasted::new(secret.to_owned()));
+    let printed = format!("{event:?}");
+    assert!(
+        !printed.contains(secret) && !printed.contains("SENTINEL"),
+        "Debug leaked the paste: {printed}"
+    );
+    assert!(printed.contains("redacted"), "honest redaction marker");
+}
+
+#[test]
+fn pasted_buffer_is_zeroizing_by_type() {
+    // MUTATION CHECK (paste-zeroize-on-drop): the wipe-on-drop guarantee
+    // IS the field's type. Change `Pasted`'s field to a plain `String`
+    // and this fails to COMPILE at the accessor — could-not-compile is
+    // the gate's loudest failure. Verified by revert.
+    use haider_tui::app::Pasted;
+    let pasted = Pasted::new("sk-wipe-me".to_owned());
+    let zeroizing: &zeroize::Zeroizing<String> = pasted.zeroizing_inner();
+    assert_eq!(zeroizing.as_str(), "sk-wipe-me");
+    assert_eq!(pasted.as_str(), "sk-wipe-me");
 }
