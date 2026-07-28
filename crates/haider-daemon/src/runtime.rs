@@ -333,7 +333,7 @@ async fn run_inner(
                 std::sync::Arc::new(crate::accounts::AccountsProviderFactory::new(
                     std::sync::Arc::clone(&accounts_runtime.facade.snapshot),
                     accounts_runtime.vault.clone(),
-                    std::sync::Arc::new(crate::accounts::AnthropicAccountBuilder),
+                    std::sync::Arc::new(crate::accounts::ProductionAccountBuilder),
                 ))
             }
             crate::worker::ProviderFactoryConfig::AccountsWith(builder) => {

@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 pub struct SessionMetadataV1 {
     /// Canonical absolute UTF-8 workspace path.
     pub cwd: String,
-    /// Provider adapter name (`anthropic`, or `fake` in injected tests).
+    /// Provider adapter name (`anthropic`, `openai`, `openai-compatible`, or
+    /// `fake` in injected tests).
     pub provider: String,
     /// Full provider model identifier.
     pub model: String,

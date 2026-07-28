@@ -378,6 +378,7 @@ fn golden_credentials() {
         &CredentialDescriptor {
             alias: CredentialAlias::new("personal-max"),
             provider: "anthropic".into(),
+            base_url: None,
             auth_method: AuthMethod::OAuth,
             identity: "user@example.com".into(),
             status: CredentialStatus::Ok,
@@ -392,6 +393,41 @@ fn golden_credentials() {
             to: CredentialAlias::new("billing-key"),
             cause: RotationCause::RateLimit,
         },
+    );
+}
+
+#[test]
+fn credential_base_url_is_additive_optional_and_unknown_tolerant() {
+    use haider_protocol::credential::CredentialDescriptor;
+
+    let old_wire = r#"{
+        "alias":"custom-endpoint",
+        "provider":"openai-compatible",
+        "auth_method":"api_key",
+        "identity":"local",
+        "status":{"status":"ok"},
+        "active":true,
+        "future_hint":"ignored"
+    }"#;
+    let old: CredentialDescriptor = serde_json::from_str(old_wire).expect("old descriptor");
+    assert_eq!(old.base_url, None);
+
+    let with_endpoint = old_wire.replace(
+        r#""auth_method":"api_key""#,
+        r#""base_url":"http://127.0.0.1:11434/v1","auth_method":"api_key""#,
+    );
+    let current: CredentialDescriptor =
+        serde_json::from_str(&with_endpoint).expect("descriptor with endpoint");
+    assert_eq!(
+        current.base_url.as_deref(),
+        Some("http://127.0.0.1:11434/v1")
+    );
+    assert!(
+        !serde_json::to_value(old)
+            .expect("serialize old descriptor")
+            .as_object()
+            .is_some_and(|object| object.contains_key("base_url")),
+        "None stays absent on the wire"
     );
 }
 

@@ -61,7 +61,8 @@ mod worker;
 
 pub use accounts::{
     AccountProviderBuilder, AccountsDependencies, AnthropicValidator, ConnectionTransport,
-    CredentialValidator, ValidatedIdentity, ValidationError, ValidationFailureKind, VaultProvision,
+    CredentialValidator, ProviderCredentialValidator, ValidatedIdentity, ValidationError,
+    ValidationFailureKind, VaultProvision,
 };
 pub use config::DaemonConfig;
 pub use error::{DaemonError, IncumbentDiagnostics};

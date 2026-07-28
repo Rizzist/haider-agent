@@ -725,7 +725,7 @@ impl HubConnection {
         }
 
         // D3-5: the dependency configuration is the ONE authority on
-        // creatable providers. Production (Accounts) answers {"anthropic"};
+        // creatable providers. Production answers the built-in adapter set;
         // "fake" exists only under injected test configurations.
         let creatable = self.hub.creatable_providers()?;
         if !creatable

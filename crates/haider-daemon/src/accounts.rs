@@ -35,7 +35,9 @@ use haider_protocol::credential::{AuthMethod, CredentialDescriptor, CredentialSt
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::CredentialAlias;
 use haider_provider::{
-    ANTHROPIC_PROVIDER_NAME, AnthropicProvider, Message, Provider, ProviderErrorKind, TurnRequest,
+    ANTHROPIC_PROVIDER_NAME, AnthropicProvider, BUILTIN_PROVIDER_NAMES, Message,
+    OPENAI_COMPATIBLE_PROVIDER_NAME, OPENAI_PROVIDER_NAME, OpenAiCompatibleProvider,
+    OpenAiProvider, Provider, ProviderErrorKind, TurnRequest,
 };
 use haider_rpc::{
     ERROR_CODE_INVALID_ARGUMENT, ERROR_CODE_PERMISSION_DENIED, ERROR_CODE_PROVIDER_ERROR,
@@ -112,10 +114,8 @@ pub trait CredentialValidator: Send + Sync {
     ) -> Result<ValidatedIdentity, ValidationError>;
 }
 
-/// Production validator: one-token Anthropic Messages request through the
-/// audited adapter path (R10: no invented authentication endpoint). Consumes
-/// just enough of the stream to prove authentication, then drops it (the
-/// stream aborts its producer on drop).
+/// Anthropic-specific validator retained as a narrow injectable/live-smoke
+/// seam. Production uses [`ProviderCredentialValidator`].
 pub struct AnthropicValidator;
 
 #[async_trait::async_trait]
@@ -136,39 +136,88 @@ impl CredentialValidator for AnthropicValidator {
                 message: format!("no validator for provider {provider}"),
             });
         }
-        // Mint a SecretHandle through the vault seam (its constructor is
-        // deliberately vault-only); the roundtrip vault is dropped and
-        // zeroed immediately after.
-        let staging = MemoryVault::default();
-        let alias = CredentialAlias::new("login-validation");
-        let handle = staging
-            .put(&alias, secret)
-            .and_then(|()| staging.resolve(&alias))
-            .map_err(|error| ValidationError {
+        validate_provider_api_key(provider, model, secret).await
+    }
+}
+
+/// Production API-key validator for provider-owned endpoints.
+///
+/// Endpoint-addressed compatible accounts join this dispatch when W5c carries
+/// their `base_url` through the account-management command.
+pub struct ProviderCredentialValidator;
+
+#[async_trait::async_trait]
+impl CredentialValidator for ProviderCredentialValidator {
+    fn supports(&self, provider: &str) -> bool {
+        matches!(provider, ANTHROPIC_PROVIDER_NAME | OPENAI_PROVIDER_NAME)
+    }
+
+    async fn validate(
+        &self,
+        provider: &str,
+        model: &str,
+        secret: &[u8],
+    ) -> Result<ValidatedIdentity, ValidationError> {
+        if !self.supports(provider) {
+            return Err(ValidationError {
                 kind: ValidationFailureKind::Unavailable,
-                message: format!("validation staging failed: {}", error.message),
-            })?;
-        let adapter = AnthropicProvider::new(handle, model).map_err(map_provider_error)?;
-        let request = TurnRequest {
-            messages: vec![Message::user_text("ping")],
-            model: model.to_owned(),
-            max_tokens: 1,
-            system_prompt: None,
-            tools: Vec::new(),
-            attachments: Vec::new(),
-        };
-        let mut stream = adapter
-            .stream_turn(request)
-            .await
-            .map_err(map_provider_error)?;
-        match stream.recv().await {
-            // Any event at all proves the request authenticated; the drop
-            // below cancels/drains the stream safely.
-            Some(Ok(_)) | None => Ok(ValidatedIdentity {
-                identity: "anthropic api key".into(),
-            }),
-            Some(Err(error)) => Err(map_provider_error(error)),
+                message: format!("no validator for provider {provider}"),
+            });
         }
+        validate_provider_api_key(provider, model, secret).await
+    }
+}
+
+async fn validate_provider_api_key(
+    provider: &str,
+    model: &str,
+    secret: &[u8],
+) -> Result<ValidatedIdentity, ValidationError> {
+    // Mint a SecretHandle through the vault seam (its constructor is
+    // deliberately vault-only); the roundtrip vault is dropped and
+    // zeroed immediately after.
+    let staging = MemoryVault::default();
+    let alias = CredentialAlias::new("login-validation");
+    let handle = staging
+        .put(&alias, secret)
+        .and_then(|()| staging.resolve(&alias))
+        .map_err(|error| ValidationError {
+            kind: ValidationFailureKind::Unavailable,
+            message: format!("validation staging failed: {}", error.message),
+        })?;
+    let adapter: Arc<dyn Provider> = match provider {
+        ANTHROPIC_PROVIDER_NAME => {
+            Arc::new(AnthropicProvider::new(handle, model).map_err(map_provider_error)?)
+        }
+        OPENAI_PROVIDER_NAME => {
+            Arc::new(OpenAiProvider::new(handle, model).map_err(map_provider_error)?)
+        }
+        _ => {
+            return Err(ValidationError {
+                kind: ValidationFailureKind::Unavailable,
+                message: format!("no validator for provider {provider}"),
+            });
+        }
+    };
+    let request = TurnRequest {
+        messages: vec![Message::user_text("ping")],
+        model: model.to_owned(),
+        max_tokens: 1,
+        system_prompt: None,
+        tools: Vec::new(),
+        attachments: Vec::new(),
+    };
+    let mut stream = adapter
+        .stream_turn(request)
+        .await
+        .map_err(map_provider_error)?;
+    match stream.recv().await {
+        // Any event at all proves the request authenticated; the drop
+        // below cancels/drains the stream safely.
+        Some(Ok(_)) | None => Ok(ValidatedIdentity {
+            identity: format!("{provider} api key"),
+        }),
+        Some(Err(error)) => Err(map_provider_error(error)),
     }
 }
 
@@ -225,7 +274,7 @@ impl Default for AccountsDependencies {
     fn default() -> Self {
         Self {
             vault: VaultProvision::platform_default(),
-            validator: Arc::new(AnthropicValidator),
+            validator: Arc::new(ProviderCredentialValidator),
             descriptor_store: None,
         }
     }
@@ -768,6 +817,7 @@ fn descriptor_for(
     CredentialDescriptor {
         alias: alias.clone(),
         provider: identity.provider.clone(),
+        base_url: None,
         auth_method: AuthMethod::ApiKey,
         identity: identity
             .display_alias
@@ -832,14 +882,28 @@ pub trait AccountProviderBuilder: Send + Sync {
         model: &str,
         alias: &CredentialAlias,
     ) -> Result<Arc<dyn Provider>, HaiderError>;
+
+    /// Descriptor-aware construction. Existing injected builders remain
+    /// source-compatible; production overrides this to consume `base_url`.
+    fn build_descriptor(
+        &self,
+        descriptor: &CredentialDescriptor,
+        credential: haider_accounts::SecretHandle,
+        model: &str,
+    ) -> Result<Arc<dyn Provider>, HaiderError> {
+        self.build(&descriptor.provider, credential, model, &descriptor.alias)
+    }
 }
 
-/// Production builder: Anthropic only.
-pub(crate) struct AnthropicAccountBuilder;
+/// Production builder for every account-backed adapter shipped in this lane.
+pub(crate) struct ProductionAccountBuilder;
 
-impl AccountProviderBuilder for AnthropicAccountBuilder {
+impl AccountProviderBuilder for ProductionAccountBuilder {
     fn providers(&self) -> std::collections::BTreeSet<String> {
-        std::collections::BTreeSet::from([ANTHROPIC_PROVIDER_NAME.to_owned()])
+        BUILTIN_PROVIDER_NAMES
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
     }
 
     fn build(
@@ -849,24 +913,77 @@ impl AccountProviderBuilder for AnthropicAccountBuilder {
         model: &str,
         alias: &CredentialAlias,
     ) -> Result<Arc<dyn Provider>, HaiderError> {
-        if provider != ANTHROPIC_PROVIDER_NAME {
+        build_account_provider(provider, None, credential, model, alias)
+    }
+
+    fn build_descriptor(
+        &self,
+        descriptor: &CredentialDescriptor,
+        credential: haider_accounts::SecretHandle,
+        model: &str,
+    ) -> Result<Arc<dyn Provider>, HaiderError> {
+        build_account_provider(
+            &descriptor.provider,
+            descriptor.base_url.as_deref(),
+            credential,
+            model,
+            &descriptor.alias,
+        )
+    }
+}
+
+fn build_account_provider(
+    provider: &str,
+    base_url: Option<&str>,
+    credential: haider_accounts::SecretHandle,
+    model: &str,
+    alias: &CredentialAlias,
+) -> Result<Arc<dyn Provider>, HaiderError> {
+    let adapter: Arc<dyn Provider> = match provider {
+        ANTHROPIC_PROVIDER_NAME => Arc::new(
+            AnthropicProvider::new(credential, model)
+                .map_err(|error| adapter_construction_error(provider, error))?
+                .with_account(alias.clone()),
+        ),
+        OPENAI_PROVIDER_NAME => Arc::new(
+            OpenAiProvider::new(credential, model)
+                .map_err(|error| adapter_construction_error(provider, error))?
+                .with_account(alias.clone()),
+        ),
+        OPENAI_COMPATIBLE_PROVIDER_NAME => {
+            let base_url = base_url.ok_or_else(|| {
+                HaiderError::new(
+                    ErrorCode::InvalidArgument,
+                    "openai-compatible credential is missing base_url",
+                    false,
+                )
+            })?;
+            Arc::new(
+                OpenAiCompatibleProvider::new(credential, model, base_url)
+                    .map_err(|error| adapter_construction_error(provider, error))?
+                    .with_account(alias.clone()),
+            )
+        }
+        _ => {
             return Err(HaiderError::new(
                 ErrorCode::InvalidArgument,
                 format!("no account-backed adapter for provider {provider}"),
                 false,
             ));
         }
-        let adapter = AnthropicProvider::new(credential, model)
-            .map_err(|error| {
-                HaiderError::new(
-                    ErrorCode::ProviderError,
-                    format!("cannot construct anthropic adapter: {error}"),
-                    false,
-                )
-            })?
-            .with_account(alias.clone());
-        Ok(Arc::new(adapter))
-    }
+    };
+    Ok(adapter)
+}
+
+fn adapter_construction_error(
+    provider: &str,
+    error: haider_provider::ProviderError,
+) -> HaiderError {
+    HaiderError::new(
+        ErrorCode::ProviderError,
+        format!("cannot construct {provider} adapter: {error}"),
+        false,
+    )
 }
 
 /// The production `ProviderFactory` (R6/R10): resolves the ACTIVE descriptor
@@ -939,12 +1056,9 @@ impl crate::worker::ProviderFactory for AccountsProviderFactory {
             ));
         };
         let credential = vault.resolve(&descriptor.alias)?;
-        let provider = self.builder.build(
-            &metadata.provider,
-            credential,
-            &metadata.model,
-            &descriptor.alias,
-        )?;
+        let provider = self
+            .builder
+            .build_descriptor(&descriptor, credential, &metadata.model)?;
         Ok(crate::worker::ResolvedTurnProvider {
             provider,
             provider_name: metadata.provider.clone(),

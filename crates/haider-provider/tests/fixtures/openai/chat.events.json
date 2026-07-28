@@ -1,0 +1,53 @@
+[
+  {
+    "result": "ok",
+    "value": {"event": "text_delta", "text": "Checking "}
+  },
+  {
+    "result": "ok",
+    "value": {"event": "reasoning_delta", "text": "Need a tool."}
+  },
+  {
+    "result": "ok",
+    "value": {
+      "event": "tool_call_start",
+      "call_id": "call_compat",
+      "name": "get_weather"
+    }
+  },
+  {
+    "result": "ok",
+    "value": {
+      "event": "tool_call_args_delta",
+      "call_id": "call_compat",
+      "args_fragment": "{\"city\":"
+    }
+  },
+  {
+    "result": "ok",
+    "value": {
+      "event": "tool_call_args_delta",
+      "call_id": "call_compat",
+      "args_fragment": "\"Tehran\"}"
+    }
+  },
+  {
+    "result": "ok",
+    "value": {"event": "tool_call_end", "call_id": "call_compat"}
+  },
+  {
+    "result": "ok",
+    "value": {
+      "event": "usage_update",
+      "input": 33,
+      "output": 12,
+      "reasoning": 7,
+      "cached": 5,
+      "source": "provider_reported"
+    }
+  },
+  {
+    "result": "ok",
+    "value": {"event": "finish", "reason": "tool_use"}
+  }
+]

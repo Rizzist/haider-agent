@@ -8,6 +8,11 @@ use serde::{Deserialize, Serialize};
 pub struct CredentialDescriptor {
     pub alias: CredentialAlias,
     pub provider: String,
+    /// Optional provider API root for endpoint-addressed adapters.
+    ///
+    /// Absent for provider-owned endpoints such as Anthropic and OpenAI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
     pub auth_method: AuthMethod,
     /// Human account identity (email/handle) for display.
     pub identity: String,

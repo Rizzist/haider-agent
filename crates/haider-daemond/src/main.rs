@@ -86,10 +86,11 @@ fn test_dependencies() -> Result<DaemonDependencies, String> {
     // created with, so the creatable set includes the release default too:
     // otherwise a client using the profile's own provider is rejected at
     // `session.create` for a provider the daemon was never going to call.
-    let providers = std::collections::BTreeSet::from([
-        "fake".to_owned(),
-        haider_provider::ANTHROPIC_PROVIDER_NAME.to_owned(),
-    ]);
+    let mut providers = haider_provider::BUILTIN_PROVIDER_NAMES
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<std::collections::BTreeSet<_>>();
+    providers.insert("fake".to_owned());
     Ok(DaemonDependencies {
         provider_factory: ProviderFactoryConfig::Injected {
             factory: Arc::new(FakeFactory {

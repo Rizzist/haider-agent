@@ -146,7 +146,10 @@ impl ProviderFactoryConfig {
     /// The providers `session.create` may accept under this configuration.
     pub fn creatable_providers(&self) -> BTreeSet<String> {
         match self {
-            Self::Accounts => BTreeSet::from([haider_provider::ANTHROPIC_PROVIDER_NAME.to_owned()]),
+            Self::Accounts => haider_provider::BUILTIN_PROVIDER_NAMES
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
             Self::AccountsWith(builder) => builder.providers(),
             Self::Injected { providers, .. } => providers.clone(),
         }

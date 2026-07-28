@@ -7,6 +7,7 @@ use super::*;
 use haider_core::SqliteStoreHandle;
 
 use crate::session_hub::FrameSendError;
+use crate::worker::ProviderFactory as _;
 
 fn test_store_dir() -> tempfile::TempDir {
     tempfile::Builder::new()
@@ -39,6 +40,112 @@ fn identity_for(profile: &str, command: &str) -> LoginIdentity {
         display_alias: Some("work".into()),
         physical_alias: physical_alias(profile, "anthropic", command),
     }
+}
+
+// MUTATION CHECK (W5a provider dispatch): remove the `openai` arm from
+// `build_account_provider` (restoring the old Anthropic-only builder).
+// Expected failure: the OpenAI resolution below returns InvalidArgument
+// before its capability document can identify the native adapter.
+#[tokio::test]
+async fn production_account_factory_dispatches_openai_and_preserves_anthropic() {
+    let validator = ProviderCredentialValidator;
+    assert!(validator.supports(ANTHROPIC_PROVIDER_NAME));
+    assert!(validator.supports(OPENAI_PROVIDER_NAME));
+    assert!(
+        !validator.supports(OPENAI_COMPATIBLE_PROVIDER_NAME),
+        "W5c must first carry base_url into compatible login validation"
+    );
+
+    let vault = Arc::new(MemoryVault::default());
+    let anthropic_alias = CredentialAlias::new("anthropic-dispatch");
+    let openai_alias = CredentialAlias::new("openai-dispatch");
+    let compatible_alias = CredentialAlias::new("compatible-dispatch");
+    vault
+        .put(&anthropic_alias, b"anthropic-fixture-secret")
+        .unwrap_or_else(|error| panic!("{error:?}"));
+    vault
+        .put(&openai_alias, b"openai-fixture-secret")
+        .unwrap_or_else(|error| panic!("{error:?}"));
+    vault
+        .put(&compatible_alias, b"compatible-fixture-secret")
+        .unwrap_or_else(|error| panic!("{error:?}"));
+    let snapshot = Arc::new(StdMutex::new(vec![
+        CredentialDescriptor {
+            alias: anthropic_alias.clone(),
+            provider: ANTHROPIC_PROVIDER_NAME.into(),
+            base_url: None,
+            auth_method: AuthMethod::ApiKey,
+            identity: "anthropic fixture".into(),
+            status: CredentialStatus::Ok,
+            active: true,
+        },
+        CredentialDescriptor {
+            alias: openai_alias.clone(),
+            provider: OPENAI_PROVIDER_NAME.into(),
+            base_url: None,
+            auth_method: AuthMethod::ApiKey,
+            identity: "openai fixture".into(),
+            status: CredentialStatus::Ok,
+            active: true,
+        },
+        CredentialDescriptor {
+            alias: compatible_alias.clone(),
+            provider: OPENAI_COMPATIBLE_PROVIDER_NAME.into(),
+            base_url: Some("http://127.0.0.1:11434".into()),
+            auth_method: AuthMethod::ApiKey,
+            identity: "compatible fixture".into(),
+            status: CredentialStatus::Ok,
+            active: true,
+        },
+    ]));
+    let factory = AccountsProviderFactory::new(
+        snapshot,
+        VaultProvision::Available(vault as Arc<dyn Vault>),
+        Arc::new(ProductionAccountBuilder),
+    );
+    let metadata = |provider: &str, model: &str| haider_protocol::session::SessionMetadataV1 {
+        cwd: "/tmp/haider-provider-dispatch".into(),
+        provider: provider.into(),
+        model: model.into(),
+        max_tokens: 64,
+        system_prompt_version: None,
+        created_at_ms: 1,
+    };
+
+    let openai = factory
+        .resolve_for_turn(&metadata(OPENAI_PROVIDER_NAME, "gpt-5-test"))
+        .await
+        .unwrap_or_else(|error| panic!("openai dispatch: {error:?}"));
+    let anthropic = factory
+        .resolve_for_turn(&metadata(ANTHROPIC_PROVIDER_NAME, "claude-test"))
+        .await
+        .unwrap_or_else(|error| panic!("anthropic dispatch: {error:?}"));
+    let compatible = factory
+        .resolve_for_turn(&metadata(OPENAI_COMPATIBLE_PROVIDER_NAME, "llama-test"))
+        .await
+        .unwrap_or_else(|error| panic!("compatible dispatch: {error:?}"));
+
+    assert_eq!(
+        openai.provider.capabilities().await.provider,
+        OPENAI_PROVIDER_NAME
+    );
+    assert_eq!(openai.account_alias.as_deref(), Some(openai_alias.as_str()));
+    assert_eq!(
+        anthropic.provider.capabilities().await.provider,
+        ANTHROPIC_PROVIDER_NAME
+    );
+    assert_eq!(
+        anthropic.account_alias.as_deref(),
+        Some(anthropic_alias.as_str())
+    );
+    assert_eq!(
+        compatible.provider_name, OPENAI_COMPATIBLE_PROVIDER_NAME,
+        "successful resolution pins the compatible dispatch arm"
+    );
+    assert_eq!(
+        compatible.account_alias.as_deref(),
+        Some(compatible_alias.as_str())
+    );
 }
 
 // MUTATION CHECK (R10 Keychain namespacing): remove the profile input from
@@ -461,6 +568,7 @@ async fn login_receipt_claims_replay_and_reject_like_every_r2_command() {
     let descriptor = CredentialDescriptor {
         alias: CredentialAlias::new(identity.physical_alias.clone()),
         provider: "anthropic".into(),
+        base_url: None,
         auth_method: AuthMethod::ApiKey,
         identity: "work".into(),
         status: CredentialStatus::Ok,
@@ -613,6 +721,7 @@ async fn reconciliation_closes_every_login_crash_boundary() {
     let descriptor_d = CredentialDescriptor {
         alias: CredentialAlias::new(identity_d.physical_alias.clone()),
         provider: "anthropic".into(),
+        base_url: None,
         auth_method: AuthMethod::ApiKey,
         identity: "healed".into(),
         status: CredentialStatus::Ok,

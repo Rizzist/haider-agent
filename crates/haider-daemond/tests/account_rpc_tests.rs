@@ -759,7 +759,7 @@ async fn sentinel_secret_is_absent_from_store_files_receipts_and_formatted_frame
 // wire path below accepts "fake".
 // Verified by revert on 2026-07-27.
 #[tokio::test]
-async fn production_wire_path_never_accepts_the_fake_provider() {
+async fn production_wire_path_advertises_builtin_providers_but_never_fake() {
     let root = test_root("hacP");
     let workspace = root.path().join("workspace");
     std::fs::create_dir_all(&workspace).unwrap_or_else(|error| panic!("workspace: {error}"));
@@ -787,24 +787,30 @@ async fn production_wire_path_never_accepts_the_fake_provider() {
         "fake is never creatable in production"
     );
 
-    // The production whitelist is exactly {"anthropic"}: creation succeeds
-    // without a credential (resolution happens per logical turn).
-    let accepted = request(
-        &mut client,
-        "req-prod-anthropic",
-        RequestBody::SessionCreate {
-            command_id: CommandId::new("command-prod-anthropic"),
-            cwd: workspace_text,
-            provider: "anthropic".into(),
-            model: "claude-test".into(),
-            max_tokens: 64,
-        },
-    )
-    .await;
-    assert!(
-        matches!(accepted, ResponseBody::SessionCreate { .. }),
-        "anthropic must be creatable on the production path"
-    );
+    // Creation succeeds before credential resolution for all shipped adapter
+    // classes; the account-backed factory resolves on the logical turn.
+    for (provider, model) in [
+        ("anthropic", "claude-test"),
+        ("openai", "gpt-5-test"),
+        ("openai-compatible", "llama-test"),
+    ] {
+        let accepted = request(
+            &mut client,
+            &format!("req-prod-{provider}"),
+            RequestBody::SessionCreate {
+                command_id: CommandId::new(format!("command-prod-{provider}")),
+                cwd: workspace_text.clone(),
+                provider: provider.into(),
+                model: model.into(),
+                max_tokens: 64,
+            },
+        )
+        .await;
+        assert!(
+            matches!(accepted, ResponseBody::SessionCreate { .. }),
+            "{provider} must be creatable on the production path"
+        );
+    }
 
     task.shutdown_handle().request("test complete");
     let _ = task.join().await;

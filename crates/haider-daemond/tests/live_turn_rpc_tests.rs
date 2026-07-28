@@ -69,7 +69,7 @@ impl ProviderFactory for FakeFactory {
     ) -> Result<ResolvedTurnProvider, haider_protocol::error::HaiderError> {
         Ok(ResolvedTurnProvider {
             provider: self.fake.clone(),
-            provider_name: "fake".into(),
+            provider_name: metadata.provider.clone(),
             model: metadata.model.clone(),
             account_alias: None,
         })
@@ -77,11 +77,19 @@ impl ProviderFactory for FakeFactory {
 }
 
 fn fake_dependencies(script: Vec<FakeStep>) -> (DaemonDependencies, Arc<FakeProvider>) {
+    fake_dependencies_for_provider(script, "fake")
+}
+
+fn fake_dependencies_for_provider(
+    script: Vec<FakeStep>,
+    provider_name: &str,
+) -> (DaemonDependencies, Arc<FakeProvider>) {
     let fake = Arc::new(FakeProvider::new(script));
     let dependencies = DaemonDependencies {
-        provider_factory: ProviderFactoryConfig::injected(Arc::new(FakeFactory {
-            fake: fake.clone(),
-        })),
+        provider_factory: ProviderFactoryConfig::Injected {
+            factory: Arc::new(FakeFactory { fake: fake.clone() }),
+            providers: std::collections::BTreeSet::from([provider_name.to_owned()]),
+        },
         ..DaemonDependencies::default()
     };
     (dependencies, fake)
@@ -197,11 +205,20 @@ fn recovery_fixture_envelope(
 }
 
 fn create_body(command_id: &str, cwd: String) -> RequestBody {
+    create_body_for_provider(command_id, cwd, "fake", "fake-v1")
+}
+
+fn create_body_for_provider(
+    command_id: &str,
+    cwd: String,
+    provider: &str,
+    model: &str,
+) -> RequestBody {
     RequestBody::SessionCreate {
         command_id: CommandId::new(command_id),
         cwd,
-        provider: "fake".into(),
-        model: "fake-v1".into(),
+        provider: provider.into(),
+        model: model.into(),
         max_tokens: 4096,
     }
 }
@@ -247,11 +264,26 @@ async fn create_and_attach(
     config: &DaemonConfig,
     workspace: &std::path::Path,
 ) -> (haider_protocol::ids::SessionId, u64) {
+    create_and_attach_for_provider(client, config, workspace, "fake", "fake-v1").await
+}
+
+async fn create_and_attach_for_provider(
+    client: &mut UdsClient,
+    config: &DaemonConfig,
+    workspace: &std::path::Path,
+    provider: &str,
+    model: &str,
+) -> (haider_protocol::ids::SessionId, u64) {
     send_request(
         client,
         config,
         "create",
-        create_body("create-command", workspace.to_string_lossy().into_owned()),
+        create_body_for_provider(
+            "create-command",
+            workspace.to_string_lossy().into_owned(),
+            provider,
+            model,
+        ),
     )
     .await;
     let (session_id, generation) = match client.next().await {
@@ -583,6 +615,71 @@ async fn scenario_1_production_runtime_accepts_an_injected_fake_provider_factory
     let (dependencies, fake) = fake_dependencies(Vec::new());
     let task = ready_with_dependencies(&config, dependencies).await;
     assert!(fake.requests().is_empty());
+    task.shutdown_handle().request("test complete");
+    task.join().await.expect("daemon joins");
+}
+
+#[tokio::test]
+async fn injected_fake_turn_runs_through_the_openai_provider_name() {
+    let root = test_root("w5a-openai-live-");
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace");
+    let config = DaemonConfig::new(
+        "openai-fake-turn",
+        root.path().join("store"),
+        root.path().join("runtime"),
+    );
+    let (dependencies, fake) = fake_dependencies_for_provider(
+        vec![
+            FakeStep::EmitText {
+                text: "openai-shaped route".into(),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::EndTurn,
+            },
+        ],
+        haider_provider::OPENAI_PROVIDER_NAME,
+    );
+    let task = ready_with_dependencies(&config, dependencies).await;
+    let mut client = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "w5a-openai-live-test",
+        "openai-turn-client",
+        ClientKind::Headless,
+    )
+    .await;
+    let (session_id, generation) = create_and_attach_for_provider(
+        &mut client,
+        &config,
+        &workspace,
+        haider_provider::OPENAI_PROVIDER_NAME,
+        "gpt-5-test",
+    )
+    .await;
+    send_request(
+        &mut client,
+        &config,
+        "submit-openai",
+        submit_body(
+            "submit-openai-command",
+            session_id,
+            generation,
+            "route through openai",
+        ),
+    )
+    .await;
+    let (run_id, _) = next_submit_response(&mut client).await;
+    let events = events_until_terminal(&mut client, &run_id).await;
+
+    assert!(
+        events
+            .iter()
+            .any(|(_, payload)| { *payload == EventPayload::RunState(RunState::Done) })
+    );
+    assert_eq!(fake.requests().len(), 1);
+    assert_eq!(fake.requests()[0].model, "gpt-5-test");
+
     task.shutdown_handle().request("test complete");
     task.join().await.expect("daemon joins");
 }

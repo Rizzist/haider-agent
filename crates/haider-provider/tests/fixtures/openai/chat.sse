@@ -1,0 +1,14 @@
+data: {"id":"chatcmpl_sanitized","choices":[{"index":0,"delta":{"content":"Checking "},"finish_reason":null}]}
+
+data: {"id":"chatcmpl_sanitized","choices":[{"index":0,"delta":{"reasoning_content":"Need a tool."},"finish_reason":null}]}
+
+data: {"id":"chatcmpl_sanitized","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_compat","type":"function","function":{"name":"get_weather","arguments":"{\"city\":"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl_sanitized","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"Tehran\"}"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl_sanitized","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: {"id":"chatcmpl_sanitized","choices":[],"usage":{"prompt_tokens":33,"completion_tokens":12,"prompt_tokens_details":{"cached_tokens":5},"completion_tokens_details":{"reasoning_tokens":7},"total_tokens":45}}
+
+data: [DONE]
+

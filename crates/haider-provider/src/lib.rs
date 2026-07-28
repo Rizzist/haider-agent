@@ -13,6 +13,7 @@
 mod anthropic;
 #[cfg(test)]
 mod anthropic_tests;
+mod openai;
 mod wire;
 
 use async_trait::async_trait;
@@ -31,6 +32,19 @@ pub use anthropic::{
     AnthropicRetryPolicy, AnthropicTransportConfig, replay_anthropic_http_error,
     replay_anthropic_sse,
 };
+pub use openai::{
+    OPENAI_COMPATIBLE_PROVIDER_NAME, OPENAI_PROVIDER_NAME, OPENAI_RESPONSES_API_URL, OpenAiCapture,
+    OpenAiCompatibleProvider, OpenAiProvider, OpenAiRetryPolicy, OpenAiTransportConfig,
+    replay_openai_chat_sse, replay_openai_http_error, replay_openai_models_response,
+    replay_openai_responses_sse,
+};
+
+/// Provider classes backed by production account credentials in this release.
+pub const BUILTIN_PROVIDER_NAMES: [&str; 3] = [
+    ANTHROPIC_PROVIDER_NAME,
+    OPENAI_PROVIDER_NAME,
+    OPENAI_COMPATIBLE_PROVIDER_NAME,
+];
 
 /// Crate marker used by the workspace self-test.
 pub const CRATE_NAME: &str = "haider-provider";
