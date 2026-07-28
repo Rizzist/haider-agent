@@ -30,9 +30,11 @@ jobs:
           TAG="${GITHUB_REF_NAME#v}"
           grep -q "^version = \"$TAG\"" Cargo.toml || { echo "tag v$TAG != workspace version"; exit 1; }
       - name: build
-        run: cargo build --release --locked -p haider-cli --target ${{ matrix.target }}
+        run: cargo build --release --locked -p haider-cli -p haider-daemond --target ${{ matrix.target }}
       - name: ad-hoc codesign (diffforge-client trick — quarantine-friendly unsigned distribution)
-        run: codesign --force -s - target/${{ matrix.target }}/release/haider
+        run: |
+          codesign --force -s - target/${{ matrix.target }}/release/haider
+          codesign --force -s - target/${{ matrix.target }}/release/haiderd
       - name: smoke (artifact must match tag + pass self-test)
         run: |
           BIN=target/${{ matrix.target }}/release/haider
@@ -43,9 +45,13 @@ jobs:
       - name: package
         run: |
           BIN=target/${{ matrix.target }}/release/haider
+          DBIN=target/${{ matrix.target }}/release/haiderd
           NAME=haider-${GITHUB_REF_NAME}-${{ matrix.target }}
           mkdir -p dist/$NAME
-          cp "$BIN" dist/$NAME/
+          # BOTH binaries: bare `haider` spawns the SIBLING `haiderd` next to
+          # current_exe() (haider-client/src/spawn.rs) — a bundle without the
+          # daemon cannot enter live mode (v0.0.12 first-cut gap).
+          cp "$BIN" "$DBIN" dist/$NAME/
           tar -C dist -cJf dist/$NAME.tar.xz $NAME
           shasum -a 256 dist/$NAME.tar.xz > dist/$NAME.tar.xz.sha256
       - uses: actions/upload-artifact@v4
