@@ -145,6 +145,12 @@ mistake them for oversights. Each states the exact trigger.
 | crates/haider-daemond/tests/lifecycle_tests.rs | The pre-fix owned-cleanup window (stat then unlink on the PUBLIC name) is not reachable from a test: hitting it needs the daemon's own node present at the stat and replaced before the unlink, inside a sub-microsecond gap. The racing test pins the invariant but does not discriminate that shape. | The adjacent and much wider window — a node that goes live between the preflight probe and the removal — IS covered by `stale_cleanup_never_removes_a_node_that_went_live`, which does discriminate (mutation-verified). |
 | crates/haider-daemon/src/connection.rs (`reject_over_limit`) | Raw `EAGAIN`/`EPIPE` on the over-limit rejection write is untested. | No deterministic hook to force a partial or failed `write(2)` on a freshly accepted socket; the loop's behaviour (retry `EINTR`, stop otherwise, close regardless) is inspected, not exercised. |
 
+## haider-tools filesystem residual (W4a1.2, 2026-07-28)
+
+| Where | Residual | Exact bound / why it stays |
+|---|---|---|
+| crates/haider-tools/src/filesystem.rs (`apply_patch_at_with_commit_hooks`, final content verification / final anchored identity check → `replace_temporary_at_commit`) | A non-cooperating external process can ignore Haider's advisory target lock and either (a) modify the same inode after the final coherent content verification or (b) install a replacement inode after the final anchored identity check; Haider's following rename can overwrite either result. | The same-inode window runs from the final content verification through rename. A write-temp-then-atomic-rename replacement is caught if it lands before the final identity check, but not if it lands in the shorter identity-check→rename window. Haider holds the advisory lock on the originally opened inode across both windows, and production performs no intentional blocking step between the final checks and rename; wall-clock duration is scheduler-dependent. The portable POSIX/macOS APIs used here provide neither mandatory exclusion of a non-cooperating writer nor a rename conditional on destination inode/content. This two-window bound supersedes the narrower same-inode-only description in `docs/briefs/W4a1-review-2-NO_SHIP.md`. |
+
 ## haider-daemon design review (Fable 5, W3b1.5, 2026-07-27)
 
 Folded this round: writer-registry re-drain after the final connection join (D1-1); the

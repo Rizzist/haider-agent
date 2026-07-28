@@ -23,15 +23,20 @@
 //!   walks it component-by-component from the broker's retained root dirfd.
 //!   Every open uses `O_NOFOLLOW`, so a post-authorization symlink swap is a
 //!   typed refusal rather than an access outside the workspace.
-//! - Patch pre-image bytes are read from the one locked target fd used for
-//!   identity verification. The derived bytes go to a same-directory temp
-//!   opened through the parent dirfd and land through `renameat`. This
-//!   serializes broker-mediated writes to a target. Immediately before rename,
-//!   the anchored path is checked against the locked inode and its original
-//!   content hash, and the parent is freshly resolved from a root fd whose
-//!   identity is still bound to the canonical workspace path. Namespace
-//!   escape, external replacement, and same-inode edits are typed
-//!   `PathChanged` refusals rather than silent overwrites.
+//! - Patch pre-image bytes are read as a coherent snapshot from the one
+//!   exclusively locked target fd used for identity verification. The derived
+//!   bytes go to a same-directory temp opened through the parent dirfd and land
+//!   through `renameat`. Both `fs_write` and `fs_patch` hold that advisory lock
+//!   through rename, serializing broker-mediated writes to an existing target.
+//!   Immediately before rename, the anchored path is checked against the locked
+//!   inode and its original content hash, and the parent is freshly resolved
+//!   from a root fd whose identity is still bound to the canonical workspace
+//!   path. On Apple, namespace escapes are atomically refused; on fallback
+//!   platforms, swaps already visible at the final parent recheck are refused.
+//!   External replacements observed by the final identity check and preventable
+//!   same-inode clobbers are also typed refusals rather than silent overwrites.
+//!   The remaining non-cooperating post-check races are bounded in
+//!   `docs/OPTIMIZATIONS.md`.
 
 use crate::broker::{EffectBroker, EffectOperation, PermissionPolicy};
 use crate::ledger::{ChangeLedgerSink, FsWriteRecord};
@@ -45,8 +50,9 @@ use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use serde_json::{Value, json};
 use std::ffi::{CStr, OsStr, OsString};
 use std::fs;
-use std::io::{Read, Seek, Write};
+use std::io::{Read, Write};
 use std::os::unix::ffi::OsStringExt;
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -795,7 +801,9 @@ fn apply_write_at(
     let traversal_root = rustix::io::dup(&workspace_dir)
         .map_err(|error| ToolError::io("duplicate workspace root", &operation.path, error))?;
     let (parent, leaf) = open_parent_at(traversal_root, relative, &operation.path)?;
-    // Keep the locked current inode alive through rename when overwriting.
+    // Keep the advisory-exclusive lock on the current inode alive through
+    // rename when overwriting. `fs_patch` enters through the same lock helper,
+    // so every cooperating Haider mutation of an existing target serializes.
     // A missing leaf is valid create semantics; any other lookup error stays
     // typed and no-follow.
     let source = match rustix::fs::statat(&parent, &leaf, AtFlags::SYMLINK_NOFOLLOW) {
@@ -938,10 +946,7 @@ fn apply_patch_at_with_commit_hooks(
         .map_err(|error| ToolError::io("duplicate workspace root", &operation.path, error))?;
     let (parent, leaf) = open_parent_at(traversal_root, relative, &operation.path)?;
     let (mut source, source_metadata) = open_locked_current_at(&parent, &leaf, &operation.path)?;
-    let mut bytes = Vec::new();
-    source
-        .read_to_end(&mut bytes)
-        .map_err(|error| ToolError::io("read", &operation.path, error))?;
+    let bytes = coherent_file_snapshot(&mut source, &operation.path)?;
     let source_hash = blake3::hash(&bytes);
     let contents = String::from_utf8(bytes).map_err(|error| ToolError::InvalidArgument {
         message: format!("{} is not UTF-8 text: {error}", operation.path.display()),
@@ -998,14 +1003,32 @@ fn apply_patch_at_with_commit_hooks(
                 return Err(error);
             }
         };
-    // Content identity is the final userspace observation before the atomic
-    // namespace operation. On Apple the syscall itself also rejects a
-    // symlink in any destination component.
+    // This is the final userspace content observation before the atomic
+    // namespace operation. The advisory-exclusive target lock is still held,
+    // so a cooperating writer cannot enter this verify→rename span. On Apple
+    // the syscall itself also rejects a symlink in any destination component.
     if let Err(error) = require_unchanged_content(&mut source, source_hash, &operation.path) {
         remove_temporary(&parent, &temporary_name);
         return Err(error);
     }
     before_commit();
+    // Repeat the anchored inode check after the (potentially retried)
+    // coherent content verification. This catches the common editor strategy
+    // of atomically renaming a new inode over the target during that read.
+    if let Err(error) = require_unchanged_target(
+        &commit_parent,
+        &leaf,
+        Some(&source_metadata),
+        &operation.path,
+    ) {
+        remove_temporary(&parent, &temporary_name);
+        return Err(error);
+    }
+    // A non-cooperating writer can ignore the advisory lock: an in-place write
+    // after content verification, or a replacement inode installed after this
+    // identity check, can still race the rename. Their exact bounds are
+    // ledgered in docs/OPTIMIZATIONS.md under "haider-tools filesystem
+    // residual (W4a1.2)".
     if let Err(error) = replace_temporary_at_commit(
         &commit_parent,
         &temporary_name,
@@ -1016,6 +1039,7 @@ fn apply_patch_at_with_commit_hooks(
         remove_temporary(&parent, &temporary_name);
         return Err(error);
     }
+    drop(source);
     Ok(applied)
 }
 
@@ -1054,27 +1078,89 @@ fn require_unchanged_content(
     expected: blake3::Hash,
     display_path: &Path,
 ) -> ToolResult<()> {
-    source
-        .rewind()
-        .map_err(|error| ToolError::io("rewind patch target", display_path, error))?;
-    let mut hasher = blake3::Hasher::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = source
-            .read(&mut buffer)
-            .map_err(|error| ToolError::io("recheck patch content", display_path, error))?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    if hasher.finalize() == expected {
+    if blake3::hash(&coherent_file_snapshot(source, display_path)?) == expected {
         return Ok(());
     }
     Err(ToolError::PathChanged {
         path: display_path.to_path_buf(),
         message: "target content changed before atomic replace".into(),
     })
+}
+
+const COHERENT_SNAPSHOT_ATTEMPTS: usize = 4;
+const MAX_SINGLE_READ_SNAPSHOT_BYTES: usize = i32::MAX as usize - 1;
+
+fn coherent_file_snapshot(source: &mut fs::File, display_path: &Path) -> ToolResult<Vec<u8>> {
+    coherent_file_snapshot_with_reader(source, display_path, |source, buffer| {
+        source.read_at(buffer, 0)
+    })
+}
+
+/// Takes one positional read bracketed by content-changing metadata checks.
+/// The one-read shape prevents the old multi-chunk torn-stream bug; mtime/ctime
+/// detect an in-place writer overlapping that read. The advisory lock excludes
+/// cooperating writers, and bounded retry handles non-cooperating churn without
+/// letting it stall an effect indefinitely.
+fn coherent_file_snapshot_with_reader(
+    source: &mut fs::File,
+    display_path: &Path,
+    mut read_once: impl FnMut(&fs::File, &mut [u8]) -> std::io::Result<usize>,
+) -> ToolResult<Vec<u8>> {
+    for _ in 0..COHERENT_SNAPSHOT_ATTEMPTS {
+        let before = rustix::fs::fstat(&*source)
+            .map_err(|error| ToolError::io("inspect patch snapshot", display_path, error))?;
+        let expected_len = usize::try_from(before.st_size).map_err(|_| ToolError::Runtime {
+            message: format!(
+                "patch target {} is too large to snapshot",
+                display_path.display()
+            ),
+        })?;
+        if expected_len > MAX_SINGLE_READ_SNAPSHOT_BYTES {
+            return Err(ToolError::Runtime {
+                message: format!(
+                    "patch target {} exceeds the {MAX_SINGLE_READ_SNAPSHOT_BYTES}-byte \
+                     coherent-snapshot limit",
+                    display_path.display()
+                ),
+            });
+        }
+        let buffer_len = expected_len + 1;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(buffer_len)
+            .map_err(|error| ToolError::Runtime {
+                message: format!(
+                    "could not reserve a {buffer_len}-byte snapshot for {}: {error}",
+                    display_path.display()
+                ),
+            })?;
+        bytes.resize(buffer_len, 0);
+        let bytes_read = read_once(source, &mut bytes)
+            .map_err(|error| ToolError::io("read patch snapshot", display_path, error))?;
+        let after = rustix::fs::fstat(&*source)
+            .map_err(|error| ToolError::io("reinspect patch snapshot", display_path, error))?;
+        if bytes_read == expected_len && snapshot_metadata_matches(&before, &after) {
+            bytes.truncate(expected_len);
+            return Ok(bytes);
+        }
+    }
+    Err(ToolError::PathChanged {
+        path: display_path.to_path_buf(),
+        message: format!(
+            "target content did not yield a stable snapshot after \
+             {COHERENT_SNAPSHOT_ATTEMPTS} attempts"
+        ),
+    })
+}
+
+fn snapshot_metadata_matches(before: &rustix::fs::Stat, after: &rustix::fs::Stat) -> bool {
+    before.st_dev == after.st_dev
+        && before.st_ino == after.st_ino
+        && before.st_size == after.st_size
+        && before.st_mtime == after.st_mtime
+        && before.st_mtime_nsec == after.st_mtime_nsec
+        && before.st_ctime == after.st_ctime
+        && before.st_ctime_nsec == after.st_ctime_nsec
 }
 
 fn require_unchanged_target(
@@ -1599,13 +1685,22 @@ where
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]
+#[path = "filesystem/tests/w4a12.rs"]
+mod w4a12_tests;
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use std::os::unix::fs::{MetadataExt, symlink};
 
-    /// MUTATION CHECK: remove the rename-time parent revalidation. Expected
-    /// failure: the patch succeeds and writes `escaped-component/target.txt`.
-    /// Verified by revert in W4a1.1.
+    /// MUTATION CHECK (layered): Apple's atomic `RENAME_NOFOLLOW_ANY` is the
+    /// load-bearing final seam; reverting that flag to plain `renameat`
+    /// re-escapes and was verified in W4a1.1. This userspace parent recheck is
+    /// defense-in-depth on Apple and rejects swaps already visible at recheck
+    /// time on platforms/paths without that atomic flag; removing only it on
+    /// Apple does not re-escape because the syscall independently rejects the
+    /// destination symlink.
     #[test]
     fn rename_time_parent_escape_is_typed_path_change() {
         let directory = tempfile::tempdir().expect("temporary directory");
@@ -1653,6 +1748,9 @@ mod tests {
         );
     }
 
+    /// MUTATION CHECK: replace `RENAME_NOFOLLOW_ANY` with plain `renameat`.
+    /// Expected failure: the patch writes the moved outside target. Verified
+    /// by revert in W4a1.1; this is the atomic layer named above.
     #[cfg(target_vendor = "apple")]
     #[test]
     fn parent_move_after_final_revalidation_is_refused_by_atomic_rename_resolution() {
