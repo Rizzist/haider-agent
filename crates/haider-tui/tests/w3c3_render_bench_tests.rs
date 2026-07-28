@@ -141,11 +141,23 @@ fn render_p95_on_1k_3k_and_5k_row_replays_is_recorded_against_the_ledger() {
     // the original ratio restored, with a small absolute cushion for the
     // fact that the two sizes are measured minutes apart on a machine that
     // may be building something else.
-    assert!(
-        p95_5k < p95_1k * 8 + Duration::from_millis(20),
-        "render cost must not blow up super-linearly with history: \
-         1k={p95_1k:?} 5k={p95_5k:?}"
-    );
+    // Debug builds skip the TIMING comparison exactly like the ledger gate
+    // below them (the bounds above are five-run RELEASE measurements; an
+    // unoptimized parallel-workspace run measured 132ms@1k and flaked 1-in-3
+    // even isolated — post-merge gate, 2026-07-28). The render paths still
+    // executed above (crash coverage); release CI enforces the ratio.
+    if cfg!(debug_assertions) {
+        println!(
+            "ratio gate = SKIP (unoptimized build; measured 1k={p95_1k:?} \
+             5k={p95_5k:?}). Run with --release to enforce."
+        );
+    } else {
+        assert!(
+            p95_5k < p95_1k * 8 + Duration::from_millis(20),
+            "render cost must not blow up super-linearly with history: \
+             1k={p95_1k:?} 5k={p95_5k:?}"
+        );
+    }
 
     // 2. THE LEDGER GATE, both directions. Row 17's trigger is ">~2-3k
     //    logical rows OR p95 render >8-10ms" — either half fires it.
