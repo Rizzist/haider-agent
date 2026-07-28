@@ -432,8 +432,10 @@ pub struct CommandContext {
     cwd: String,
     model: String,
     /// Carried across `vault.stage` so the login that follows knows which
-    /// account it is committing. Never a secret.
-    login: Option<(String, Option<String>)>,
+    /// account it is committing — and, since TUI6.4, WHICH ATTEMPT asked:
+    /// the reply is identity-tagged from this context, so stage
+    /// correlation never depends on reply ordering. Never a secret.
+    login: Option<(String, Option<String>, u64)>,
     /// The session an ATTACH was for. An attach carries no durable command
     /// id, so without this a failure cannot be correlated back to the
     /// session it wedged (review P1-5).
@@ -454,11 +456,17 @@ impl CommandContext {
             model,
             login: match command {
                 LiveCommand::Stage {
-                    provider, alias, ..
+                    provider,
+                    alias,
+                    attempt,
+                    ..
                 }
                 | LiveCommand::LoginApi {
-                    provider, alias, ..
-                } => Some((provider.clone(), alias.clone())),
+                    provider,
+                    alias,
+                    attempt,
+                    ..
+                } => Some((provider.clone(), alias.clone(), *attempt)),
                 _ => None,
             },
             attach: match command {
@@ -536,6 +544,8 @@ pub fn request_body(command: LiveCommand) -> RequestBody {
             provider,
             alias,
             vault_reference,
+            // The attempt is CLIENT-side identity (TUI6.4) — never sent.
+            attempt: _,
         } => RequestBody::AccountLoginApi {
             command_id,
             provider,
@@ -607,11 +617,12 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
         } => context
             .login
             .clone()
-            .map_or_else(Vec::new, |(provider, alias)| {
+            .map_or_else(Vec::new, |(provider, alias, attempt)| {
                 vec![LiveReply::Staged {
                     vault_reference,
                     provider,
                     alias,
+                    attempt,
                 }]
             }),
         ResponseBody::AccountLoginApi { descriptor } => {
@@ -629,6 +640,20 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
             ..
         } => context.attach.clone().map_or_else(
             || {
+                // TUI6.4: a STAGE request's error is identity-tagged from
+                // this same context (stages carry no durable command id,
+                // so `command_id` is None exactly when `login` context
+                // exists without one — the login command itself has an
+                // id and keeps the correlated `Failed` path).
+                if context.command_id.is_none()
+                    && let Some((_, _, attempt)) = context.login
+                {
+                    return vec![LiveReply::StageFailed {
+                        attempt,
+                        code: code.clone(),
+                        message: message.clone(),
+                    }];
+                }
                 vec![LiveReply::Failed {
                     command_id: context.command_id.clone(),
                     code: code.clone(),

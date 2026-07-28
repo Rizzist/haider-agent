@@ -392,23 +392,33 @@ fn cursor_row_follows_the_caret_through_the_vertical_window() {
 }
 
 #[test]
-fn overlong_line_windows_around_a_mid_text_caret() {
+fn overlong_line_wraps_around_a_mid_text_caret() {
+    // TUI6 re-scope (directed) of `overlong_line_windows_around_a_mid_text
+    // _caret`: TUI5 pinned the caret-following horizontal WINDOW here (a
+    // `…` right clip with the caret at Home). TUI6 item 1 outlaws the
+    // window and every `…` in the composer — the same scenario now
+    // asserts the WRAP: the head is visible verbatim on the first visual
+    // row, the tail lives on further rows, and no composer row carries an
+    // ellipsis.
     let mut model = session_model();
     for _ in 0..200 {
         model.handle(key(KeyCode::Char('x')));
     }
-    // Caret to the very start: the head shows, the tail clips with ….
+    // Caret to the very start (Home = LOGICAL line edge, the TUI6 item 3
+    // pairing): the head shows on the first wrapped row.
     model.handle(key(KeyCode::Home));
     let theme = model.theme.theme();
     let (rows, _, terminal) = draw(&model, 90, 34);
     let buffer = terminal.backend().buffer();
     let y = row_of(&rows, "❯ xxx");
-    let row = &rows[y as usize];
+    let x_rows: Vec<&String> = rows.iter().filter(|row| row.contains("xxx")).collect();
     assert!(
-        row.ends_with('…') || row.trim_end().ends_with('…'),
-        "right clip: {row:?}"
+        x_rows.len() >= 2,
+        "the 200-cell line wraps into visual rows at 90 cols: {rows:?}"
     );
-    assert!(!row.contains("… x"), "no left clip at the head");
+    for row in &x_rows {
+        assert!(!row.contains('…'), "no ellipsis in the composer: {row:?}");
+    }
     // The caret cell is the FIRST x, reverse-video.
     let cell = &buffer[(4, y)];
     assert_eq!(cell.symbol(), "x");
@@ -743,7 +753,14 @@ fn stale_composer_hit_is_dropped_not_misapplied() {
     // defense-in-depth guard.)
     let surface = model.surface_key();
     let revision = model.composer.revision();
-    model.composer_press(50, "stale content", 3, surface, revision);
+    model.composer_press(
+        50,
+        "stale content",
+        3,
+        surface,
+        revision,
+        model.geometry_epoch.get(),
+    );
     assert_eq!(model.composer.cursor(), 2, "cursor untouched");
     assert!(!model.composer_drag, "no drag armed from a dropped press");
 }
@@ -1243,11 +1260,25 @@ fn stale_hit_with_old_content_never_moves_the_caret() {
     model.composer.set_text("fresh text");
     assert_ne!(model.composer.revision(), stale_revision);
     assert_eq!(model.composer.cursor(), 10);
-    model.composer_press(0, "stale text", 3, surface, stale_revision);
+    model.composer_press(
+        0,
+        "stale text",
+        3,
+        surface,
+        stale_revision,
+        model.geometry_epoch.get(),
+    );
     assert_eq!(model.composer.cursor(), 10, "stale press dropped whole");
     assert!(!model.composer_drag, "no drag armed from a stale press");
     // The same press wearing the CURRENT revision lands.
-    model.composer_press(0, "fresh text", 3, surface, model.composer.revision());
+    model.composer_press(
+        0,
+        "fresh text",
+        3,
+        surface,
+        model.composer.revision(),
+        model.geometry_epoch.get(),
+    );
     assert_eq!(model.composer.cursor(), 3);
     assert!(model.composer_drag);
     model.composer_release();
@@ -1268,6 +1299,7 @@ fn held_drag_dies_with_the_surface_it_started_on() {
         2,
         model.surface_key(),
         model.composer.revision(),
+        model.geometry_epoch.get(),
     );
     assert!(model.composer_drag, "armed on the session surface");
     model.back_to_launcher();
@@ -1369,29 +1401,61 @@ fn shift_up_and_down_extend_to_the_buffer_edges() {
 }
 
 #[test]
-fn tail_window_never_splits_a_grapheme() {
-    // Reviewer repro (P2-5): a char-wise walk could clip inside a
-    // cluster — "…◌́x" orphans the combining mark; ZWJ emoji split.
-    use haider_tui::render::tail_window;
+fn wrap_rows_never_split_a_grapheme() {
+    // TUI6 re-scope (directed) of `tail_window_never_splits_a_grapheme`:
+    // TUI5's horizontal tail-window died with the soft wrap (TUI6 item 1
+    // outlaws windowing and `…` in the composer), but its law — the
+    // reviewer repro P2-5, no clip point inside a cluster — carries over
+    // verbatim to the WRAP points that replaced it: a char-wise wrap walk
+    // would orphan a combining mark or split a ZWJ family at a row edge.
+    //
+    // MUTATION CHECK (wrap-at-grapheme-boundary): make `wrap_rows` walk
+    // `char_indices()` instead of `grapheme_indices(true)` and this fails
+    // (the é cluster splits across rows). Verified by revert.
+    use haider_tui::composer::wrap_rows;
     use unicode_segmentation::UnicodeSegmentation;
-    // Combining sequence at the clip edge: the é (e + U+0301) is either
-    // wholly in or wholly out — never a bare mark after the ….
+    // Combining sequence at the wrap edge: the é (e + U+0301) is either
+    // wholly on one row or wholly on the next — never a bare mark
+    // starting a row.
     let text = format!("{}e\u{301}xyz", "a".repeat(40));
-    let clipped = tail_window(&text, 6);
-    let after = clipped.strip_prefix('…').expect("clipped");
-    assert!(
-        !after.starts_with('\u{301}'),
-        "orphaned combining mark: {clipped:?}"
-    );
-    assert!(text.ends_with(after), "the window is a true suffix");
-    // ZWJ family at the edge: clusters survive whole.
+    let rows = wrap_rows(&text, 6);
+    assert!(rows.len() > 1, "the long line wraps");
+    for row in &rows {
+        let slice = &text[row.start..row.end];
+        assert!(
+            !slice.starts_with('\u{301}'),
+            "orphaned combining mark at a row start: {slice:?}"
+        );
+        // Every wrap point is a grapheme boundary of the WHOLE text.
+        assert!(
+            text.grapheme_indices(true).any(|(i, _)| i == row.start) || row.start == text.len(),
+            "row start {} is not a grapheme boundary",
+            row.start
+        );
+    }
+    // The rows are a partition: concatenated they are the line, in order.
+    let joined: String = rows.iter().map(|row| &text[row.start..row.end]).collect();
+    assert_eq!(joined, text);
+    // ZWJ family at the edge: clusters survive whole. A char-wise walk
+    // breaks BEFORE the trailing 👧 (after its ZWJ) — a row start that is
+    // no grapheme boundary of the text at all, so that is the assertion:
+    // every wrap point must be a boundary the cursor could stop on.
     let text = format!("{}👩\u{200D}👩\u{200D}👧tail", "b".repeat(40));
-    let clipped = tail_window(&text, 8);
-    let after = clipped.strip_prefix('…').expect("clipped");
-    assert!(text.ends_with(after));
-    let first = after.graphemes(true).next().unwrap_or("");
-    assert!(
-        !first.starts_with('\u{200D}'),
-        "window began mid-ZWJ-cluster: {clipped:?}"
-    );
+    for budget in 4..12 {
+        for row in wrap_rows(&text, budget) {
+            assert!(
+                text.grapheme_indices(true).any(|(i, _)| i == row.start) || row.start == text.len(),
+                "row start {} is mid-cluster at budget {budget}",
+                row.start
+            );
+            let first = text[row.start..row.end]
+                .graphemes(true)
+                .next()
+                .unwrap_or("");
+            assert!(
+                !first.starts_with('\u{200D}'),
+                "row began mid-ZWJ-cluster at budget {budget}"
+            );
+        }
+    }
 }

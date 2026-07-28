@@ -523,7 +523,14 @@ fn main() {
     dump(&aura_model, "aura stage — engine swapped · audio muted");
     // TUI3.1 P1-6: the aura stage joins the sacred-row ladder — chrome
     // sheds in order and the composer's cursor row survives every size.
-    dump_at(&aura_model, "aura @ 90×10 (columns shed)", 90, 10);
+    // TUI6.1 fix 2: the orb sheds here too — the reserved closing rule
+    // outranks it (review r1's aura repro).
+    dump_at(
+        &aura_model,
+        "aura @ 90×10 (columns + orb shed — the closing rule holds)",
+        90,
+        10,
+    );
     dump_at(&aura_model, "aura @ 90×5 (orb shed, bar intact)", 90, 5);
     dump_at(&aura_model, "aura @ 90×1 (cursor row only)", 90, 1);
 }

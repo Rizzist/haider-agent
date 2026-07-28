@@ -16,6 +16,16 @@
 //! marks travel with their base. Arabic/RTL text moves in LOGICAL order:
 //! `←` is always "toward the start of the string" (the brief's documented
 //! choice — full bidi caret GEOMETRY is ledgered graphics-tier).
+//!
+//! SOFT WRAP (TUI6 items 1-5): a logical line longer than the render
+//! budget wraps into VISUAL rows at grapheme boundaries ([`wrap_rows`]).
+//! Wrap points are pure geometry over (text, budget) — derived on demand
+//! by the renderer each frame and by ↑/↓ each keypress, NEVER stored —
+//! so a resize reflows by construction. The renderer feeds the current
+//! budget back through a `Cell` ([`Composer::set_wrap_budget`], the
+//! `scroll_max` pattern) so navigation walks the SAME rows the frame
+//! painted while the reducer keeps calling `line_up`/`line_down`
+//! untouched (the stays-put law).
 
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -39,9 +49,15 @@ pub struct Composer {
     /// ACTIVE selection; `a == cursor` is a parked anchor (mouse press
     /// before any drag) and renders as no selection.
     anchor: Option<usize>,
-    /// Preferred display column for a run of ↑/↓ (column-sticky like every
-    /// editor). Any horizontal movement or edit clears it.
-    sticky_col: Option<usize>,
+    /// Preferred display column for a run of ↑/↓ (column-sticky like
+    /// every editor), TAGGED with the wrap budget that MINTED it
+    /// (TUI6.2 fix 1, review r2 finding 1): the column is wrap-ROW
+    ///-relative, so it is geometry state — a budget change (resize,
+    /// draft swap, restore) makes it meaningless. Consumption validates
+    /// the mint tag and re-derives on mismatch, so a stale column is
+    /// unrepresentable at the only sites that read it. Any horizontal
+    /// movement or edit still clears it outright.
+    sticky_col: Option<(usize, usize)>,
     /// Submitted inputs, oldest first (item 6). Transient by law.
     history: Vec<String>,
     /// `Some(i)` while browsing `history[i]`; `None` while editing the
@@ -59,6 +75,15 @@ pub struct Composer {
     /// caret into fresh text. Selection/cursor moves do NOT bump it: they
     /// leave the rendered windows byte-accurate.
     revision: u64,
+    /// The display-cell budget the renderer last wrapped this composer's
+    /// text into (TUI6). Frame FEEDBACK, not wrap state: the render sets
+    /// it every frame ([`crate::render`]'s `scroll_max` discipline) and
+    /// ↑/↓ re-derive the visual rows from it on demand — no wrap POINT is
+    /// ever stored, so the model cannot go stale across a resize (the
+    /// next frame overwrites the budget before the next keypress can
+    /// read it). `0` is the headless degenerate (nothing has rendered):
+    /// visual rows fall back to the logical lines.
+    wrap_budget: std::cell::Cell<usize>,
 }
 
 /// Text-equality against string literals: the pre-TUI5 test corpus (and
@@ -107,6 +132,29 @@ impl Composer {
     #[must_use]
     pub fn revision(&self) -> u64 {
         self.revision
+    }
+
+    /// Frame feedback from the renderer (TUI6): the display-cell budget
+    /// its wrap geometry used this frame. `&self` by design — the render
+    /// borrows the model shared, exactly like `scroll_max`.
+    pub fn set_wrap_budget(&self, budget: usize) {
+        self.wrap_budget.set(budget);
+    }
+
+    /// The last-fed wrap budget (TUI6.1: the draft-swap seam carries the
+    /// ACTIVE composer's budget onto a restored draft — a parked draft's
+    /// own cell is as old as its last render).
+    #[must_use]
+    pub fn wrap_budget(&self) -> usize {
+        self.wrap_budget.get()
+    }
+
+    /// The visual rows of the current draft at the last rendered budget —
+    /// the SAME geometry the frame painted (or one row per logical line
+    /// while nothing has rendered).
+    #[must_use]
+    pub fn visual_rows(&self) -> Vec<WrapRow> {
+        wrap_rows(&self.text, self.wrap_budget.get())
     }
 
     /// The active selection as an ordered byte range, or `None` when the
@@ -347,7 +395,13 @@ impl Composer {
         self.cursor = word_right_of(&self.text, self.cursor);
     }
 
-    /// Home / ⌃A — logical line start (Claude Code binds ⌃A here).
+    /// Home / ⌃A — LOGICAL line start (Claude Code binds ⌃A here).
+    ///
+    /// The TUI6 pairing, documented (brief item 3): ↑/↓ move across
+    /// VISUAL (wrapped) rows, Home/End jump to LOGICAL line edges —
+    /// arrows are visual, jumps are logical, the Claude Code convention.
+    /// On a wrapped line Home therefore crosses wrap points to byte 0 of
+    /// the line, never to the current visual row's start.
     pub fn line_home(&mut self, extend: bool) {
         self.sticky_col = None;
         self.pre_move(extend);
@@ -360,7 +414,8 @@ impl Composer {
         self.cursor = line_start(&self.text, self.cursor);
     }
 
-    /// End / ⌃E — logical line end.
+    /// End / ⌃E — LOGICAL line end (the ↑↓-visual / Home-End-logical
+    /// pairing documented at [`Self::line_home`]).
     pub fn line_end_key(&mut self, extend: bool) {
         self.sticky_col = None;
         self.pre_move(extend);
@@ -373,11 +428,17 @@ impl Composer {
         self.cursor = line_end(&self.text, self.cursor);
     }
 
-    /// ↑ across rows, column-sticky. Returns `false` when already on the
-    /// first row — the caller's history hook (item 6). The composer has
-    /// no soft wrap (overflow scrolls horizontally), so visual rows ARE
-    /// the logical lines; the brief's "visual wrapped rows" reduces to
-    /// this exactly (documented).
+    /// ↑ across VISUAL rows, column-sticky. Returns `false` when already
+    /// on the first row — the caller's history hook (item 6).
+    ///
+    /// TUI6 re-scope (directed): TUI5 shipped this over LOGICAL lines
+    /// with the documented reduction "the composer has no soft wrap, so
+    /// visual rows ARE the logical lines". The owner's soft-wrap law
+    /// (TUI6 items 1/3) removed the reduction: rows here are the wrapped
+    /// [`WrapRow`]s the renderer paints (same [`wrap_rows`] geometry via
+    /// [`Self::visual_rows`]), restoring the TUI5 brief's ORIGINAL
+    /// wording. Headless (budget 0) the rows degrade to the logical
+    /// lines, so the pre-TUI6 unit corpus still describes this function.
     pub fn line_up(&mut self, extend: bool) -> bool {
         // Review P3-6: plain ↑ with an active selection COLLAPSES to its
         // start (native inputs) and consumes the press — recall needs a
@@ -388,8 +449,9 @@ impl Composer {
             self.sticky_col = None;
             return true;
         }
-        let start = line_start(&self.text, self.cursor);
-        if start == 0 {
+        let rows = self.visual_rows();
+        let at = visual_row_of(&rows, self.cursor);
+        if at == 0 {
             // TUI5.1 fix 4: ⇧↑ on the FIRST row extends the selection to
             // the buffer start (item 4's outer-edge law); plain ↑ still
             // falls through to the caller's history hook.
@@ -405,17 +467,14 @@ impl Composer {
         if !extend {
             self.anchor = None;
         }
-        let target = *self
-            .sticky_col
-            .get_or_insert_with(|| display_col(&self.text, self.cursor));
-        let prev_end = start - 1; // the '\n' before this line
-        let prev_start = line_start(&self.text, prev_end);
-        self.cursor = seek_col(&self.text, prev_start, prev_end, target);
+        let target = self.sticky_col_for(rows[at]);
+        self.cursor = seek_col_in_row(&self.text, rows[at - 1], target);
         true
     }
 
-    /// ↓ across rows, column-sticky; `false` on the last row (item 6's
-    /// forward-history hook).
+    /// ↓ across VISUAL rows, column-sticky; `false` on the last row
+    /// (item 6's forward-history hook). Wrap semantics as [`Self::line_up`]
+    /// (the TUI6 re-scope note there).
     pub fn line_down(&mut self, extend: bool) -> bool {
         // Review P3-6 mirror: plain ↓ collapses to the selection END.
         if !extend && let Some((_, sel_end)) = self.selection_range() {
@@ -424,8 +483,9 @@ impl Composer {
             self.sticky_col = None;
             return true;
         }
-        let end = line_end(&self.text, self.cursor);
-        if end >= self.text.len() {
+        let rows = self.visual_rows();
+        let at = visual_row_of(&rows, self.cursor);
+        if at + 1 >= rows.len() {
             // TUI5.1 fix 4 mirror: ⇧↓ on the LAST row extends to the
             // buffer end.
             if extend && self.cursor < self.text.len() {
@@ -440,23 +500,23 @@ impl Composer {
         if !extend {
             self.anchor = None;
         }
-        let target = *self
-            .sticky_col
-            .get_or_insert_with(|| display_col(&self.text, self.cursor));
-        let next_start = end + 1;
-        let next_end = line_end(&self.text, next_start);
-        self.cursor = seek_col(&self.text, next_start, next_end, target);
+        let target = self.sticky_col_for(rows[at]);
+        self.cursor = seek_col_in_row(&self.text, rows[at + 1], target);
         true
     }
 
+    /// On the first VISUAL row (TUI6 — was logical; identical while no
+    /// wrap budget is known).
     #[must_use]
     pub fn on_first_line(&self) -> bool {
-        line_start(&self.text, self.cursor) == 0
+        visual_row_of(&self.visual_rows(), self.cursor) == 0
     }
 
+    /// On the last VISUAL row (TUI6 mirror of [`Self::on_first_line`]).
     #[must_use]
     pub fn on_last_line(&self) -> bool {
-        line_end(&self.text, self.cursor) >= self.text.len()
+        let rows = self.visual_rows();
+        visual_row_of(&rows, self.cursor) + 1 >= rows.len()
     }
 
     // ---- Mouse (item 5) ----
@@ -518,6 +578,26 @@ impl Composer {
         self.anchor = None;
         self.sticky_col = None;
         true
+    }
+
+    /// The sticky column for a ↑/↓ step from the visual row `at` — THE
+    /// one consumption seam of the mint-tagged cache (TUI6.2 fix 1,
+    /// review r2 finding 1: budget 13's cached col 4 walked budget 5's
+    /// rows to byte 24 where the current-geometry col 2 lands 22; the
+    /// parked-draft path preserved the same stale column, and
+    /// ⇧-extension shares this path). A cached column minted under any
+    /// OTHER budget is re-derived from the caret's position in the
+    /// CURRENT row and re-minted — stale reads are unrepresentable.
+    fn sticky_col_for(&mut self, row: WrapRow) -> usize {
+        let budget = self.wrap_budget.get();
+        match self.sticky_col {
+            Some((minted, col)) if minted == budget => col,
+            _ => {
+                let col = cluster_cols(&self.text[row.start..self.cursor]);
+                self.sticky_col = Some((budget, col));
+                col
+            }
+        }
     }
 
     // ---- Internals ----
@@ -614,6 +694,126 @@ fn next_boundary(text: &str, at: usize) -> Option<usize> {
     text[at..].graphemes(true).next().map(|g| at + g.len())
 }
 
+/// One VISUAL row of wrapped composer text (TUI6 items 1-5): the byte
+/// range of `text` it shows (never containing the `\n`) and whether it is
+/// the LAST visual row of its logical line — the row that owns the
+/// line-end caret cell (the position ON the `\n`, or the text end).
+///
+/// A caret byte exactly ON a wrap point belongs to the FOLLOWING row (it
+/// renders at that row's first cell). That is the documented no-affinity
+/// reduction: native inputs disambiguate the two positions with cursor
+/// affinity state; the port keeps the model affinity-free and picks the
+/// next-row reading everywhere — render, click mapping and ↑/↓ all agree
+/// through [`visual_row_of`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WrapRow {
+    /// Absolute byte offset of the row's first grapheme.
+    pub start: usize,
+    /// Absolute byte offset one past the row's last grapheme.
+    pub end: usize,
+    /// Last visual row of its logical line.
+    pub line_last: bool,
+}
+
+/// THE cluster width policy (TUI6.1 fix 3, review r1 finding 3): a
+/// grapheme cluster costs its display width, and a ZERO-WIDTH cluster —
+/// a combining mark or ZWJ standing alone at a line start, reachable by
+/// paste — costs ONE real cell (the renderer gives it a space base, the
+/// way terminals conventionally present a bare combining mark). Every
+/// consumer of composer geometry MUST price clusters through this one
+/// function: `wrap_rows`, `seek_col`, the sticky-column math, click
+/// mapping ([`byte_at_col`]) and the renderer's span builder — render,
+/// click and navigation can then never disagree about which cell a byte
+/// lives in.
+#[must_use]
+pub fn cluster_cells(grapheme: &str) -> usize {
+    grapheme.width().max(1)
+}
+
+/// Display cells of a whole slice under the SAME policy — grapheme-wise,
+/// never `str::width` (which prices a standalone zero-width cluster at 0
+/// and would skew every column right of it by one).
+#[must_use]
+pub fn cluster_cols(text: &str) -> usize {
+    text.graphemes(true).map(cluster_cells).sum()
+}
+
+/// Wrap `text` into visual rows of at most `budget` display cells,
+/// breaking ONLY at grapheme boundaries — the `nearest_boundary`/
+/// `after_edit` discipline extended to wrap points (a wrap point and a
+/// caret stop are the same kind of place, so a row can never orphan a
+/// combining mark or split a ZWJ family). Pure geometry over
+/// (text, budget): derived fresh by every caller, never stored, which is
+/// what makes a resize reflow by construction (TUI6 item 5).
+///
+/// `budget == 0` is the headless degenerate (no renderer has spoken):
+/// every logical line is one visual row. A single grapheme WIDER than
+/// the budget still gets a row of its own — the walk always advances,
+/// the terminal clips the overflow.
+#[must_use]
+pub fn wrap_rows(text: &str, budget: usize) -> Vec<WrapRow> {
+    let mut rows = Vec::new();
+    let mut line_offset = 0;
+    for line in text.split('\n') {
+        if budget == 0 || cluster_cols(line) <= budget {
+            rows.push(WrapRow {
+                start: line_offset,
+                end: line_offset + line.len(),
+                line_last: true,
+            });
+        } else {
+            let mut row_start = 0;
+            let mut col = 0;
+            for (offset, grapheme) in line.grapheme_indices(true) {
+                let width = cluster_cells(grapheme);
+                if offset > row_start && col + width > budget {
+                    rows.push(WrapRow {
+                        start: line_offset + row_start,
+                        end: line_offset + offset,
+                        line_last: false,
+                    });
+                    row_start = offset;
+                    col = 0;
+                }
+                col += width;
+            }
+            rows.push(WrapRow {
+                start: line_offset + row_start,
+                end: line_offset + line.len(),
+                line_last: true,
+            });
+        }
+        line_offset += line.len() + 1;
+    }
+    rows
+}
+
+/// The index of the visual row that renders the caret at `cursor`: the
+/// row containing it, where a caret ON a wrap point belongs to the
+/// following row and a caret at a line's end belongs to the line's LAST
+/// row (the [`WrapRow`] no-affinity law).
+#[must_use]
+pub fn visual_row_of(rows: &[WrapRow], cursor: usize) -> usize {
+    rows.iter()
+        .position(|row| {
+            cursor >= row.start && (cursor < row.end || (row.line_last && cursor == row.end))
+        })
+        .unwrap_or(rows.len().saturating_sub(1))
+}
+
+/// [`seek_col`] scoped to one visual row: the caret lands at the row's
+/// grapheme boundary nearest `target` — but a WRAP row's end boundary is
+/// the next row's start (no-affinity), so ↑/↓ into a full wrap row stop
+/// at its last grapheme instead of sliding through to the row below.
+fn seek_col_in_row(text: &str, row: WrapRow, target: usize) -> usize {
+    let sought = seek_col(text, row.start, row.end, target);
+    if sought == row.end && !row.line_last {
+        prev_boundary(text, sought).map_or(row.start, |prev| prev.max(row.start))
+    } else {
+        sought
+    }
+}
+
 /// Byte index of the current logical line's start.
 #[must_use]
 pub fn line_start(text: &str, at: usize) -> usize {
@@ -626,19 +826,13 @@ pub fn line_end(text: &str, at: usize) -> usize {
     text[at..].find('\n').map_or(text.len(), |i| at + i)
 }
 
-/// Display column (cells) of `at` within its line — wide glyphs count 2.
-#[must_use]
-pub fn display_col(text: &str, at: usize) -> usize {
-    text[line_start(text, at)..at].width()
-}
-
 /// The grapheme boundary in `line_start..=line_end` whose display column
 /// best matches `target`: the last boundary at or before the target cell
 /// (a wide glyph straddling the target keeps the cursor before it).
 fn seek_col(text: &str, start: usize, end: usize, target: usize) -> usize {
     let mut col = 0;
     for (offset, g) in text[start..end].grapheme_indices(true) {
-        let w = g.width();
+        let w = cluster_cells(g);
         if col + w > target {
             return start + offset;
         }
@@ -657,7 +851,7 @@ fn seek_col(text: &str, start: usize, end: usize, target: usize) -> usize {
 pub fn byte_at_col(content: &str, col: usize) -> usize {
     let mut acc = 0;
     for (offset, grapheme) in content.grapheme_indices(true) {
-        let w = grapheme.width().max(1);
+        let w = cluster_cells(grapheme);
         if acc + w > col {
             if col - acc >= w.div_ceil(2).max(1) {
                 return offset + grapheme.len();

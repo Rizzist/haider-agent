@@ -171,7 +171,7 @@ fn reducer_handles_quit_composer_and_navigation() {
     assert_eq!(model.composer, "h");
     // Small pastes KEEP their newlines (review r2 P2-4d: real multi-line
     // composer) — and still never submit.
-    model.handle(AppEvent::Paste("a\nb\r\nc".to_owned()));
+    model.handle(AppEvent::Paste("a\nb\r\nc".to_owned().into()));
     assert_eq!(model.composer, "ha\nb\nc", "pasted newlines never submit");
     model.handle(key(KeyCode::Enter));
     assert_eq!(model.composer, "");
@@ -302,7 +302,7 @@ fn paste_behind_a_blocking_menu_is_dropped() {
         model.handle(AppEvent::Envelope(Box::new(payload)));
     }
     assert!(model.projection.open_menu().is_some());
-    model.handle(AppEvent::Paste("sneaky text".to_owned()));
+    model.handle(AppEvent::Paste("sneaky text".to_owned().into()));
     assert_eq!(
         model.composer, "",
         "paste has no target while the menu replaces the composer"

@@ -727,6 +727,19 @@ pub struct LoginCard {
     /// The typed key. Never rendered, never persisted, never logged.
     secret: zeroize::Zeroizing<String>,
     pub stage: LoginStage,
+    /// The CURRENT stage issuance's ATTEMPT IDENTITY (TUI6.3 fix 1,
+    /// re-scoped by TUI6.5 / review r5): minted at card open AND
+    /// RE-MINTED at every submit — the identity is per-STAGE-ISSUANCE,
+    /// not per-card. r5's probe proved card-scoped identity unsound: a
+    /// timeout cleared the driver binding but the retype revived the
+    /// SAME id, so the timed-out stage's late reply passed both gates
+    /// and minted the stale vault reference. A retry is a NEW issuance;
+    /// the moment it is minted, the previous issuance's id is dead
+    /// forever (never reused, never re-bound). It is carried end-to-end
+    /// — the queued [`AppRequest::LoginApi`], the driver's binding, the
+    /// link's request context, and every reply gate — and closing the
+    /// card retires the current issuance.
+    pub attempt: u64,
 }
 
 /// Where the login card is in its two-transaction flow (stage → login).
@@ -760,12 +773,13 @@ impl std::fmt::Debug for LoginCard {
 
 impl LoginCard {
     #[must_use]
-    pub fn new(provider: String, alias: Option<String>) -> Self {
+    pub fn new(provider: String, alias: Option<String>, attempt: u64) -> Self {
         Self {
             provider,
             alias,
             secret: zeroize::Zeroizing::new(String::new()),
             stage: LoginStage::Entry,
+            attempt,
         }
     }
 
@@ -948,6 +962,9 @@ pub enum AppRequest {
     /// The raw key rides HERE and nowhere else — it never enters the
     /// composer, a draft, the input ring, a transcript row or the store.
     LoginApi {
+        /// The card's attempt identity (TUI6.3 fix 1) — the driver binds
+        /// its stage/login correlation to this, and a retire kills it.
+        attempt: u64,
         provider: String,
         alias: Option<String>,
         /// The wire's own secret carrier: zeroized on drop and REDACTED in
@@ -958,6 +975,14 @@ pub enum AppRequest {
         /// re-earning it.)
         secret: haider_rpc::SecretWire,
     },
+    /// The login card CLOSED while its attempt might still be queued or
+    /// in flight (TUI6.3 fix 1): the driver retires every trace of the
+    /// attempt — pending stage correlation, the login command id, the
+    /// deadline — so late replies are ignored, silently (the user already
+    /// saw the cancel). Queued-but-undrained `LoginApi` requests for the
+    /// attempt were already dropped by `close_login_card` before this is
+    /// pushed.
+    LoginRetired { attempt: u64 },
     /// LIVE launcher submit (W3c3, report R11 cut 4): ask the daemon to
     /// create a session for `text`. Deliberately NOT accompanied by a row,
     /// a session id, a screen flip or a turn: in live mode there is no
@@ -1096,11 +1121,20 @@ pub enum Hit {
     /// mismatch. One authority, no per-callsite length heuristics: a
     /// stale frame's hit can never move the caret into fresh text or
     /// another surface's draft.
+    ///
+    /// TUI6.1 fix 1: it also carries the GEOMETRY EPOCH the frame was
+    /// drawn at ([`AppModel::geometry_epoch`]) — a resize between the
+    /// frame and the click re-lays the band (wrap points AND row
+    /// positions), which the text revision cannot see (resize mutates no
+    /// text, so the TUI5 guard ACCEPTED pre-resize hits). Press and drag
+    /// validate the epoch exactly like the revision: a hit from stale
+    /// geometry is dropped whole, never remapped.
     ComposerText {
         start: usize,
         content: String,
         surface: DraftKey,
         revision: u64,
+        epoch: u64,
     },
 }
 
@@ -1158,12 +1192,60 @@ pub enum DraftKey {
     Aura,
 }
 
+/// Pasted text at the TUI ingress (TUI6.3 fix 2, review r3 finding 2).
+///
+/// A paste is how API keys usually arrive, and the W3c2 `SecretWire`
+/// discipline applies AT THE EDGE: the buffer zeroizes on drop and its
+/// `Debug` is redacted. The protection is UNIVERSAL rather than a
+/// secret-aware split — pasted text is user content either way, the cost
+/// is one wrapper around the same allocation (no copy: `Zeroizing<String>`
+/// takes ownership), and a split path would reopen a printable window
+/// every time a new consumer picked the wrong lane. The clipboard bytes
+/// crossterm itself buffered are upstream of this boundary and out of our
+/// hands; OUR copy is wiped.
+pub struct Pasted(zeroize::Zeroizing<String>);
+
+impl Pasted {
+    #[must_use]
+    pub fn new(text: String) -> Self {
+        Self(zeroize::Zeroizing::new(text))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The zeroizing buffer itself — a TYPE PIN for the hygiene tests:
+    /// the field being `Zeroizing<String>` IS the wipe-on-drop guarantee,
+    /// so a test holds this accessor and any regression to a plain
+    /// `String` fails to compile.
+    #[must_use]
+    pub fn zeroizing_inner(&self) -> &zeroize::Zeroizing<String> {
+        &self.0
+    }
+}
+
+impl From<String> for Pasted {
+    fn from(text: String) -> Self {
+        Self::new(text)
+    }
+}
+
+impl std::fmt::Debug for Pasted {
+    /// Redacted by construction — length omitted too, the `LoginCard`
+    /// precedent (a key's length is itself a hint).
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Pasted(<redacted>)")
+    }
+}
+
 /// Everything the reducer consumes.
 #[derive(Debug)]
 pub enum AppEvent {
     Key(KeyEvent),
     /// Bracketed paste arrives atomically; newlines never submit (rec 14).
-    Paste(String),
+    Paste(Pasted),
     /// Boxed: `EventPayload` is much larger than the other variants.
     Envelope(Box<EventPayload>),
     /// The demo script (or stream) ended.
@@ -1196,6 +1278,20 @@ impl Default for IdentityLine {
 /// The single mutable application state (research rec 3).
 #[derive(Debug)]
 pub struct AppModel {
+    /// WRITE LAW (TUI6.2 fix 3, review r2 finding 3): inside `AppModel`,
+    /// assign this ONLY through [`Self::switch_surface`] — it owns the
+    /// draft swap that keeps a surface change from leaking one surface's
+    /// draft onto another (the r2 Aura→Session chip-close bug). The
+    /// four named exceptions, each documented at its site: the founding
+    /// donation in the launcher submit (the ring travels by design), the
+    /// two identity-flip split seams (open_session's checkout,
+    /// back_to_launcher) whose stash/restore halves bracket an
+    /// `active_session` flip the atomic authority cannot span, and the
+    /// /reset purge flow (purge-then-restore replaces the swap). The
+    /// DRIVER (runtime.rs) holds no direct write either — its ChipRemove
+    /// arm routes through the authority (TUI6.2c finding 6). Test
+    /// fixtures set the field directly on purpose — they construct
+    /// states, they do not transition.
     pub screen: Screen,
     pub theme: ThemeKey,
     pub sanctum_tier: SanctumTier,
@@ -1323,6 +1419,21 @@ pub struct AppModel {
     /// (reconcile-then-apply, review r5 P2-2). Starts at 0 (review r2
     /// P2-6).
     pub scroll_max: std::cell::Cell<u16>,
+    /// The frame-geometry epoch (TUI6.1 fix 1). Bumped by every RESIZE
+    /// (the reducer's only involvement — it versions the frame, it learns
+    /// nothing about wrapping) and by every RENDER (`Cell`: the renderer
+    /// holds `&AppModel`, the `scroll_max` discipline). Composer hits are
+    /// stamped with the epoch of the frame that drew them and press/drag
+    /// validate it, so consuming a layout that a resize (or a newer
+    /// frame) has replaced is unrepresentable — the geometry twin of the
+    /// text-revision guard.
+    pub geometry_epoch: std::cell::Cell<u64>,
+    /// Monotonic login ATTEMPT mint (TUI6.3 fix 1; TUI6.5 re-scope) —
+    /// each card open AND each submit takes the next value (the identity
+    /// is per stage ISSUANCE, not per card); never reused, so a retired
+    /// or timed-out issuance's replies can never collide with a live
+    /// one's.
+    login_attempt_seq: u64,
     /// The sticky origin line is suppressed after a sticky jump until the
     /// next REAL wheel event (sim jumpToSticky, tui.js:2637-2657: the bar
     /// must never cover the row it just revealed).
@@ -1415,6 +1526,8 @@ impl Default for AppModel {
             turn_active: false,
             scroll_back: std::cell::Cell::new(0),
             scroll_max: std::cell::Cell::new(0),
+            geometry_epoch: std::cell::Cell::new(0),
+            login_attempt_seq: 0,
             sticky_suppressed: false,
             hovered: None,
             selection: None,
@@ -1491,16 +1604,46 @@ impl AppModel {
         // started on — every surface transition passes through here, so
         // this is the single cancellation authority.
         self.composer_drag = false;
+        // TUI6.2c (verifier findings 1+2): the login card is
+        // surface-LOCAL — it borrowed THIS surface's band. An
+        // asynchronous surface switch arriving while the card is open
+        // (the live `Created` reply's open_session, a background chip
+        // close, an envelope flip) ABORTS the card (the secret wipes on
+        // drop) and returns the borrowed band FIRST, so the stash below
+        // parks the surface's REAL draft — not the login scratch over it,
+        // which destroyed the parked ring. Every transition passes
+        // through this stash, so the pairing is switch-safe at one seam.
+        if self.login.is_some() {
+            self.close_login_card();
+            self.flash = Some("· /login cancelled — the surface changed".to_owned());
+        }
         let key = self.surface_key();
+        // TUI6.1 fix 1 closure: the frame's CURRENT wrap budget outlives
+        // the swap — `mem::take` would otherwise leave the scratch
+        // composer at the default 0 and `restore_draft`'s carry would
+        // read that instead of the live width.
+        let budget = self.composer.wrap_budget();
         let draft = std::mem::take(&mut self.composer);
         self.drafts.insert(key, draft);
+        self.composer.set_wrap_budget(budget);
     }
 
     /// Bring the NEW surface's parked composer live (empty for a surface
     /// never visited — a fresh session starts with a fresh draft).
+    ///
+    /// TUI6.1 fix 1 closure (the stash-seam half): a parked draft carries
+    /// the wrap budget of ITS last render — frames and possibly resizes
+    /// ago. A queued ↑ racing the post-switch redraw would walk that
+    /// stale width's rows (the review r1 class, one seam over). Every
+    /// band spans the frame's full width, so the OUTGOING composer's
+    /// budget is the current truth for every surface: carry it across
+    /// the swap. This is the only restore path, so a restored draft can
+    /// never wake to a stale width.
     fn restore_draft(&mut self) {
         let key = self.surface_key();
+        let current_budget = self.composer.wrap_budget();
         self.composer = self.drafts.remove(&key).unwrap_or_default();
+        self.composer.set_wrap_budget(current_budget);
     }
 
     /// Flip to the session screen WITH the item-9 draft swap when the
@@ -1511,14 +1654,30 @@ impl AppModel {
     /// nothing — an empty round-trip would be harmless but this keeps the
     /// one-stash-one-restore discipline literal.
     fn goto_session_screen(&mut self) {
-        let from = self.surface_key();
-        let to = self.session_draft_key();
-        if from == to {
-            self.screen = Screen::Session;
+        self.switch_surface(Screen::Session);
+    }
+
+    /// THE surface-switch authority (TUI6.2 fix 3, review r2 finding 3):
+    /// every atomic Screen write goes through here, and when the surface
+    /// KEY changes the draft swap happens as one atom — stash under the
+    /// departing key, restore under the arriving one. The r2 reviewer's
+    /// leak was `close_chip_state` assigning `Screen::Session` directly
+    /// while the user sat in AURA: the aura draft crossed keys unswapped
+    /// and could be SUBMITTED on the session surface. Direct
+    /// `self.screen =` assignment is that bug waiting to recur; the only
+    /// sites outside this function are enumerated on the `screen` field's
+    /// doc (the founding donation and the two identity-flip split seams).
+    pub(crate) fn switch_surface(&mut self, to: Screen) {
+        let from = self.screen;
+        let from_key = self.surface_key();
+        self.screen = to;
+        if self.surface_key() == from_key {
             return;
         }
+        // Keys differ: rewind, then swap with the REAL key on each side.
+        self.screen = from;
         self.stash_draft();
-        self.screen = Screen::Session;
+        self.screen = to;
         self.restore_draft();
     }
 
@@ -1746,11 +1905,15 @@ impl AppModel {
             }
             AppEvent::Paste(text) => {
                 self.dirty = true;
+                // The zeroizing wrapper is borrowed, never unwrapped: the
+                // one owned copy wipes when `text` drops at the end of
+                // this arm (TUI6.3 fix 2).
+                let text = text.as_str();
                 // Keys are pasted more often than typed; the paste lands in
                 // the masked buffer and NOWHERE else (no pill token, no
                 // draft, no ring).
                 if let Some(card) = self.login.as_mut() {
-                    card.push_str(&text);
+                    card.push_str(text);
                     return;
                 }
                 // While a blocking menu replaces the composer, paste has no
@@ -1836,8 +1999,15 @@ impl AppModel {
         col: usize,
         surface: DraftKey,
         revision: u64,
+        epoch: u64,
     ) {
-        if surface != self.surface_key() || revision != self.composer.revision() {
+        // TUI6.1 fix 1: the epoch gate joins the surface/revision gates —
+        // a hit stamped before a resize (or an older frame) is stale
+        // GEOMETRY even when the text never changed.
+        if surface != self.surface_key()
+            || revision != self.composer.revision()
+            || epoch != self.geometry_epoch.get()
+        {
             return;
         }
         // Defense in depth (the revision check subsumes this, but a
@@ -1941,7 +2111,11 @@ impl AppModel {
         // chip view's composer.
         if self.screen == Screen::Subagent {
             if key.code == KeyCode::Esc {
-                self.screen = Screen::Session;
+                self.switch_surface(Screen::Session);
+                // TUI6.2c finding 8: the chip view's scroll offset must
+                // not carry onto the session transcript (the ⌂ home row
+                // already resets; esc and the crumb now match).
+                self.scroll_back.set(0);
                 return;
             }
             if self
@@ -2342,6 +2516,13 @@ impl AppModel {
         // (bare setTimeout in the sim) — only a session replacement voids it,
         // via the origin identity (review r2 P2-6).
         let title = self.session_title.is_none();
+        // FOUNDING DONATION (TUI6.2 fix 3's named exception 1 of 3): the
+        // submit just consumed the launcher draft, and its input RING
+        // deliberately travels with the composer onto the new session
+        // surface (pinned by `founding_message_recalls_in_the_new_session`)
+        // — a switch_surface swap would park the ring under the launcher
+        // key and wake an empty one. The destination key is freshly
+        // minted (new generation), so no parked draft can be clobbered.
         self.screen = Screen::Session;
         self.turn_active = true;
         self.scroll_back.set(0);
@@ -2362,8 +2543,11 @@ impl AppModel {
         };
         match key.code {
             KeyCode::Esc => {
-                // Drop wipes: `Zeroizing` on the way out.
-                self.login = None;
+                // Drop wipes: `Zeroizing` on the way out. TUI6.2 fix 5
+                // (review r2 finding 5): the close RESTORES the draft the
+                // open parked — text and history ring — via the one
+                // close method.
+                self.close_login_card();
             }
             KeyCode::Enter => {
                 if !card.accepts_input() || card.is_empty() {
@@ -2371,9 +2555,20 @@ impl AppModel {
                 }
                 let provider = card.provider.clone();
                 let alias = card.alias.clone();
+                // TUI6.5 (review r5): every SUBMIT is a fresh stage
+                // issuance with a fresh identity — minting here is what
+                // permanently invalidates the previous issuance: its id
+                // can never again equal a live binding or this card's
+                // current attempt, so the timed-out stage's late reply is
+                // dropped BY IDENTITY (no waiter bookkeeping needed — the
+                // reply arrives and dies at the gates).
+                self.login_attempt_seq += 1;
+                card.attempt = self.login_attempt_seq;
+                let attempt = card.attempt;
                 let secret = card.take_secret();
                 card.stage = LoginStage::Submitting;
                 self.requests.push(AppRequest::LoginApi {
+                    attempt,
                     provider,
                     alias,
                     secret,
@@ -2382,7 +2577,8 @@ impl AppModel {
             KeyCode::Backspace => card.backspace(),
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => card.push(c),
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.login = None;
+                // Same pairing as Esc (TUI6.2 fix 5).
+                self.close_login_card();
             }
             _ => {}
         }
@@ -2405,11 +2601,47 @@ impl AppModel {
         }
     }
 
-    /// Open the masked card for `/login <provider> api`.
+    /// Open the masked card for `/login <provider> api`. The stash here
+    /// pairs with [`Self::close_login_card`] — the card borrows the band;
+    /// the surface's draft and its history ring come back when it leaves.
+    /// The draft TEXT is empty by construction at this point (the
+    /// `/login…` submit consumed it), but the RING is not — pinned in the
+    /// login suite.
     fn open_login_card(&mut self, provider: &str, alias: Option<String>) {
         self.stash_draft();
-        self.login = Some(LoginCard::new(provider.to_owned(), alias));
+        self.login_attempt_seq += 1;
+        self.login = Some(LoginCard::new(
+            provider.to_owned(),
+            alias,
+            self.login_attempt_seq,
+        ));
         self.dirty = true;
+    }
+
+    /// Close the masked card and RETURN the band it borrowed (TUI6.2
+    /// fix 5 + TUI6.2c finding 5): the open's stash parked the surface's
+    /// draft — text AND history ring — and every close path must restore
+    /// it. The demo driver's `LoginApi` arm closes the card too, so the
+    /// pairing lives in this one model-owned method, never in a caller
+    /// (`restore_draft` is private; a caller-side `login = None` is the
+    /// stranded-ring bug by construction).
+    pub fn close_login_card(&mut self) {
+        if let Some(card) = self.login.take() {
+            // TUI6.3 fix 1(b): the close RETIRES the attempt. A queued,
+            // not-yet-drained submit dies here — a cancelled credential
+            // must never reach the wire — and the driver is told to
+            // invalidate whatever already did (stage correlation, login
+            // command, deadline) so late replies fall on a dead id.
+            self.requests.retain(|request| {
+                !matches!(request, AppRequest::LoginApi { attempt, .. }
+                    if *attempt == card.attempt)
+            });
+            self.requests.push(AppRequest::LoginRetired {
+                attempt: card.attempt,
+            });
+            self.restore_draft();
+            self.dirty = true;
+        }
     }
 
     /// One shell-builtin line against the VFS: a session gets a transcript
@@ -2543,21 +2775,17 @@ impl AppModel {
             self.refuse_demo_only("Aura Mode");
             return;
         }
-        self.stash_draft();
-        self.screen = Screen::Aura;
-        self.restore_draft();
+        self.switch_surface(Screen::Aura);
     }
 
     /// Esc from the aura stage: back to the session if one is attached,
     /// else the launcher — aura state persists either way.
     fn exit_aura(&mut self) {
-        // TUI5 item 9: the aura's draft parks under its own key; the
-        // return surface's draft comes live below.
-        self.stash_draft();
         // TUI4c: attachment is the map's word now — a checked-out session
         // (or a content-bearing scratch) takes esc back to the session;
-        // an aura entered from the menu returns to the menu.
-        self.screen = if self.active_session.is_some()
+        // an aura entered from the menu returns to the menu. TUI5 item 9
+        // (the draft swap) rides the switch authority.
+        let target = if self.active_session.is_some()
             || !self.projection.entries().is_empty()
             || self.session_name.is_some()
         {
@@ -2565,7 +2793,7 @@ impl AppModel {
         } else {
             Screen::Launcher
         };
-        self.restore_draft();
+        self.switch_surface(target);
     }
 
     /// Chip close lifecycle flags (§2.5) — the DRIVER owns the 5 s removal
@@ -2576,7 +2804,11 @@ impl AppModel {
         // Sim closeChip (tui.js:1176-1178): the screen ALWAYS returns to the
         // session, but the remembered view path only clears when the CLOSED
         // chip is the one being viewed (`viewChipId === chipId ? null : v`).
-        self.screen = Screen::Session;
+        // TUI6.2 fix 3 (review r2 finding 3): through the switch authority
+        // — this ran while the user sat in AURA (a background chip close),
+        // and the direct assignment leaked the aura draft onto the
+        // session surface, submittable there.
+        self.switch_surface(Screen::Session);
         if self.view_path.last().is_some_and(|last| last == agent) {
             self.view_path.clear();
         }
@@ -2834,6 +3066,14 @@ impl AppModel {
                 // seeds re-save on the next change exactly as the sim's
                 // save effect refills localStorage after removeItem.
                 self.demo_requests.push(DemoRequest::PurgeStore);
+                // PURGE FLOW (TUI6.2 fix 3's named exception 4 of 4):
+                // /reset wipes the world. The identity was already cleared
+                // above, so this is a same-key screen write — and the swap
+                // semantics are deliberately REPLACED by an explicit
+                // purge-then-restore: every non-launcher parked draft dies
+                // (the live scratch included, by overwrite), the surviving
+                // launcher draft comes back. switch_surface's no-swap fast
+                // path would strand that parked draft instead.
                 self.screen = Screen::Launcher;
                 self.drafts.retain(|key, _| *key == DraftKey::Launcher);
                 self.restore_draft();
@@ -3118,7 +3358,7 @@ impl AppModel {
         if matches!(payload, EventPayload::HarnessStatus(HarnessStatus::Ready))
             && self.screen == Screen::Boot
         {
-            self.screen = Screen::Launcher;
+            self.switch_surface(Screen::Launcher);
         }
         if let EventPayload::UserMessage { .. } = payload {
             self.goto_session_screen();
@@ -3392,7 +3632,7 @@ impl AppModel {
     /// (owner item 1), and the one left behind keeps running.
     pub fn open_session(&mut self, id: &SessionId) {
         if self.active_session.as_ref() == Some(id) {
-            self.screen = Screen::Session;
+            self.switch_surface(Screen::Session);
             return;
         }
         // TUI5 item 9: park the departing surface's draft BEFORE identity
@@ -3430,6 +3670,11 @@ impl AppModel {
         self.active_session = Some(id.clone());
         self.menu_selection = 0;
         self.view_path.clear();
+        // IDENTITY-FLIP SPLIT SEAM (TUI6.2 fix 3's named exception 2 of
+        // 3): the departing surface's draft was stashed at open_session's
+        // entry, BEFORE `active_session` flipped — switch_surface cannot
+        // span the flip because both of its keys derive from it. The
+        // restore below completes the pair under the NEW key.
         self.screen = Screen::Session;
         self.scroll_back.set(0);
         self.scroll_max.set(0);
@@ -3533,6 +3778,11 @@ impl AppModel {
             // flows always mint a session id first (`new_session`).
             self.fresh_session();
         }
+        // IDENTITY-FLIP SPLIT SEAM (TUI6.2 fix 3's named exception 3 of
+        // 3): checkin()/fresh_session() stash the departing draft and
+        // clear `active_session` above — switch_surface cannot span the
+        // flip. The restore below completes the pair under the launcher
+        // key.
         self.screen = Screen::Launcher;
         self.listening = false;
         self.view_path.clear();
@@ -3639,6 +3889,17 @@ impl AppModel {
         if self.help_open {
             return;
         }
+        // TUI6.2b: the login card is MODAL against hits exactly as it is
+        // against keys (login_key owns the keyboard) — the frame beneath
+        // it still lists clickable rows, and a click that fell through
+        // ran open_session mid-login: its stash overwrote the
+        // login-parked draft (ring destroyed), the screen flipped under
+        // the open card, and the card's Esc-restore later clobbered the
+        // session draft. The card has no hit targets of its own, so the
+        // gate is total.
+        if self.login.is_some() {
+            return;
+        }
         match hit {
             // Every hit below re-checks its OWNING SURFACE: the map may be
             // one frame stale, so a rect from a screen we have since left
@@ -3722,7 +3983,7 @@ impl AppModel {
             {
                 if let Some(path) = path_to_chip(&self.chips, &agent) {
                     self.view_path = path;
-                    self.screen = Screen::Subagent;
+                    self.switch_surface(Screen::Subagent);
                     self.menu_selection = 0;
                     self.scroll_back.set(0);
                 }
@@ -3741,7 +4002,7 @@ impl AppModel {
             // The ⌂ home row and the ✕ close button belong to the subagent
             // screen; ✕ closes only the chip actually being VIEWED.
             Hit::SessionHome if self.screen == Screen::Subagent => {
-                self.screen = Screen::Session;
+                self.switch_surface(Screen::Session);
                 self.scroll_back.set(0);
             }
             Hit::ChipCloseBtn(agent)
@@ -3758,13 +4019,14 @@ impl AppModel {
             }
             Hit::ChipCrumb(path) if self.screen == Screen::Subagent => {
                 if path.is_empty() {
-                    self.screen = Screen::Session;
+                    self.switch_surface(Screen::Session);
+                    self.scroll_back.set(0); // TUI6.2c finding 8
                 } else if path
                     .last()
                     .is_some_and(|agent| find_chip(&self.chips, agent).is_some())
                 {
                     self.view_path = path;
-                    self.screen = Screen::Subagent;
+                    self.switch_surface(Screen::Subagent);
                 }
             }
             Hit::AuraEngine if self.screen == Screen::Aura => {
@@ -3818,7 +4080,12 @@ impl AppModel {
     /// the view. The frame's own reconcile stays as the backstop (sim
     /// reads live DOM geometry, tui.js:2648).
     pub fn handle_wheel(&mut self, up: bool) {
-        if !matches!(self.screen, Screen::Session | Screen::Subagent) || self.help_open {
+        // The login gate joins the help gate (TUI6.2c finding 7 —
+        // consistency: nothing scrolls beneath a modal).
+        if !matches!(self.screen, Screen::Session | Screen::Subagent)
+            || self.help_open
+            || self.login.is_some()
+        {
             return;
         }
         self.dirty = true;
@@ -3838,7 +4105,19 @@ impl AppModel {
     /// Terminal resize: force a redraw. The frame itself reconciles the
     /// scroll offset against the new true range (review r3 P2-2 — render
     /// is the single scroll authority, so no resize-ordering bug exists).
+    ///
+    /// TUI6.1 fix 1: it also advances the GEOMETRY EPOCH, killing every
+    /// composer hit stamped by pre-resize frames — a queued click can win
+    /// the event race against the redraw, and resize bumps no text
+    /// revision, so the TUI5 guard alone accepted stale-layout clicks
+    /// (review r1 finding 1). The wrap-budget half of the same fix lives
+    /// at the dispatch seam (`runtime::dispatch_input`), which reflows
+    /// the composer's budget from the new width BEFORE any queued key can
+    /// navigate the old geometry — the reducer itself stays
+    /// wrap-ignorant.
     pub fn handle_resize(&mut self) {
+        self.geometry_epoch
+            .set(self.geometry_epoch.get().wrapping_add(1));
         self.dirty = true;
     }
 
@@ -3848,6 +4127,12 @@ impl AppModel {
     /// on hover (sim onMouseEnter, tui.js:2992/3073); everything else is
     /// hover chrome the renderer paints from [`Self::hovered`].
     pub fn handle_hover(&mut self, hit: Option<Hit>) {
+        // TUI6.2c (verifier finding 4): modals own hover exactly as they
+        // own hits and keys — with the help overlay or the login card up,
+        // hover must not move palette/menu selections beneath the modal.
+        if self.help_open || self.login.is_some() {
+            return;
+        }
         if self.hovered == hit {
             return;
         }

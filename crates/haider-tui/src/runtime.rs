@@ -425,8 +425,25 @@ pub fn dispatch_input(
         Event::Key(key) if key.kind != KeyEventKind::Release => {
             model.handle(AppEvent::Key(key));
         }
-        Event::Paste(text) => model.handle(AppEvent::Paste(text)),
-        Event::Resize(..) => model.handle_resize(),
+        // TUI6.3 fix 2: the paste is wrapped at RECEIPT — the zeroizing
+        // buffer takes the same allocation, so our one owned copy wipes
+        // on drop and Debug-prints redacted.
+        Event::Paste(text) => model.handle(AppEvent::Paste(crate::app::Pasted::new(text))),
+        Event::Resize(cols, _) => {
+            // TUI6.1 fix 1 (reflow-before-input): the next frame's wrap
+            // budget is a pure function of the NEW width, so apply it
+            // here — before any queued key can walk the previous width's
+            // visual rows (review r1 finding 1: a Down racing the redraw
+            // landed on the old wrap geometry). The reducer stays
+            // wrap-ignorant: this is the dispatch seam, the same layer
+            // that owns the hit map. handle_resize bumps the geometry
+            // epoch, which retires every composer hit the old frames
+            // stamped.
+            model
+                .composer
+                .set_wrap_budget(crate::render::composer_text_budget(cols));
+            model.handle_resize();
+        }
         Event::Mouse(mouse) => {
             let hit_at = |column: u16, row: u16| {
                 hit_map
@@ -460,11 +477,12 @@ pub fn dispatch_input(
                             content,
                             surface,
                             revision,
+                            epoch,
                         },
                     )) = hit_rect_at(hit_map, mouse.column, mouse.row)
                     {
                         let col = usize::from(mouse.column.saturating_sub(rect.x));
-                        model.composer_press(start, &content, col, surface, revision);
+                        model.composer_press(start, &content, col, surface, revision, epoch);
                         return;
                     }
                     model.mouse_down = Some((mouse.column, mouse.row));
@@ -583,13 +601,20 @@ fn composer_byte_at(
             content,
             surface,
             revision,
+            epoch,
         } = hit
         else {
             continue;
         };
         // TUI5.1 fix 2: drag rows bind to surface + revision exactly as
-        // the press does — a stale row is no row.
-        if *surface != model.surface_key() || *revision != model.composer.revision() {
+        // the press does — a stale row is no row. TUI6.1 fix 1: and to
+        // the geometry epoch, so a drag armed before a resize maps
+        // through NOTHING (the caret stays put) instead of the previous
+        // frame's rows.
+        if *surface != model.surface_key()
+            || *revision != model.composer.revision()
+            || *epoch != model.geometry_epoch.get()
+        {
             continue;
         }
         let (top, bottom) = band.get_or_insert((rect.y, rect.y));
@@ -1193,8 +1218,15 @@ impl DemoDriver {
             // `/login … api` needs a daemon. The demo answers honestly
             // rather than pretending to store a key (and the secret drops —
             // zeroized — right here).
+            // The demo's login declines synchronously below, so there is
+            // never an in-flight attempt to retire (TUI6.3 fix 1).
+            AppRequest::LoginRetired { .. } => {}
             AppRequest::LoginApi { .. } => {
-                model.login = None;
+                // TUI6.2c finding 5: through the model's one close method
+                // — a bare `login = None` here stranded the parked draft
+                // and its history ring (restore_draft is private to the
+                // model by design).
+                model.close_login_card();
                 model.flash =
                     Some("· /login — needs the daemon; run `haider` (not --demo)".to_owned());
                 model.dirty = true;
@@ -1595,7 +1627,12 @@ impl DemoDriver {
                     if model.view_path.contains(&agent) {
                         model.view_path.clear();
                         if model.screen == crate::app::Screen::Subagent {
-                            model.screen = crate::app::Screen::Session;
+                            // TUI6.2c finding 6: through the switch
+                            // authority — the driver held the fifth
+                            // unenumerated direct screen write
+                            // (same-key-safe today, the exact recurrence
+                            // shape fix 3 exists to prevent).
+                            model.switch_surface(crate::app::Screen::Session);
                         }
                     }
                     model.dirty = true;
@@ -2005,6 +2042,17 @@ fn draw(
 /// extract the selection's text — the copy path's ground truth. Uses the
 /// same pure [`render`] as the screen, so what copies is exactly what a
 /// redraw of THIS model state shows.
+///
+/// KNOWN, DOCUMENTED TRANSIENT (TUI6.2 fix 7, review r2 finding 7): this
+/// scratch render bumps the model's geometry epoch like any render, so a
+/// click already queued against the LIVE frame's hit map can arrive
+/// wearing the pre-bump stamp and be dropped by the epoch gate until the
+/// pending redraw re-stamps the map. That is the gate failing CLOSED —
+/// the click is discarded, never mapped through stale geometry — and the
+/// copy path only runs on selection release, so the window is one
+/// frame's worth of queued clicks at worst. Accepted; no mechanism
+/// change (weakening the bump would reopen the r1 stale-consumption
+/// class this gate exists to kill).
 #[must_use]
 pub fn rendered_selection_text(
     model: &AppModel,
@@ -2092,9 +2140,11 @@ pub struct LivePass {
 ///
 /// 1. **stamp the clock**, so every deadline in this pass is a pure
 ///    function of the value handed in (tests move time, never sleep);
-/// 2. **reduce the inbound reply** — model mutations first, because the
-///    requests they raise are drained in step 4;
-/// 3. **expire deadlines** the reply may have satisfied;
+/// 2. **expire elapsed deadlines** — BEFORE the reply applies (TUI6.5,
+///    review r5): a stage at its deadline is dead before it can mint;
+///    expiry wins the tie by construction;
+/// 3. **reduce the inbound reply** — model mutations before the request
+///    drain, because the requests they raise are drained in step 4;
 /// 4. **drain the reducer's requests** into commands, handing back the
 ///    shell-owned ones;
 /// 5. **`sync_selection`** — attach-on-selection (R11 cut 4): the launcher
@@ -2107,11 +2157,17 @@ pub fn live_pass(
     now: std::time::Instant,
 ) -> LivePass {
     driver.set_now(now);
+    // TUI6.5 (review r5's same-pass boundary): deadlines expire BEFORE
+    // the inbound reply applies — a stage at or past its deadline must be
+    // DEAD before its reply can mint. The old order let a late Staged
+    // mint LoginApi and only then expired the internal state, leaving the
+    // already-returned command untouched. Expiry-wins-the-tie is the law:
+    // a reply racing its own deadline in one pass mints nothing.
+    driver.expire_login(model);
     let mut commands = Vec::new();
     if let Some(reply) = reply {
         commands.extend(driver.apply(model, reply));
     }
-    driver.expire_login(model);
     let mut shell = Vec::new();
     let requests: Vec<AppRequest> = model.requests.drain(..).collect();
     for request in requests {

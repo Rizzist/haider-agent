@@ -26,6 +26,14 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Render the whole frame for the current screen. Returns the frame's
 /// clickable regions (hit map) for the runtime's mouse dispatch.
 pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
+    // TUI6.1 fix 1: every frame advances the geometry epoch and stamps
+    // its composer hits with the NEW value — only hits from the LATEST
+    // frame with no intervening resize are consumable (handle_resize
+    // bumps the same counter). The Cell is the scroll_max discipline:
+    // frame feedback through a shared borrow, never reducer state.
+    model
+        .geometry_epoch
+        .set(model.geometry_epoch.get().wrapping_add(1));
     let theme = model.theme.theme();
     let area = frame.area();
     // Ground the whole frame in the theme bg.
@@ -46,10 +54,12 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
                     .projection
                     .open_menu()
                     .map_or(1, |menu| menu.options.len()),
+                // Title + options since TUI6.2 fix 4 (matches the
+                // subagent ledger's floor_input).
                 Screen::Subagent => model
                     .viewed_chip()
                     .and_then(crate::app::ChipModel::question_menu)
-                    .map_or(1, |menu| menu.options.len()),
+                    .map_or(1, |menu| menu.options.len() + 1),
                 _ => 1,
             };
             u16::from((area.height as usize) >= 1 + 4 + input_floor)
@@ -324,21 +334,24 @@ fn render_launcher(
     // Sacred-input ledger (review r3 P2-1a, launcher form; r6 P2-1: same
     // shed ladder as the session): the composer grows up to its need but
     // tail-windows to whatever the height allows — the cursor row is never
-    // hidden. Under pressure the gap yields, then the content's sacred
-    // row, then the rule, before the composer loses its row.
-    let needed = composer_height(model);
-    let mut gap: u16 = 1;
+    // hidden. TUI6.1 fix 2 reordered the rungs to `band_rule_reserve`'s
+    // law (review r1: launcher 90×4 kept the OPTIONAL content column and
+    // lost the closing rule): under pressure the content yields, THEN the
+    // closing-rule row (the gap), then the top rule, before the composer
+    // loses its row.
+    let needed = composer_height(model, area.width);
     let mut content_min: u16 = 1;
     let mut rule_h: u16 = 1;
-    let mut input_avail = area.height.saturating_sub(content_min + rule_h + gap);
-    if input_avail < 1 {
-        gap = 0;
-        input_avail = area.height.saturating_sub(content_min + rule_h);
-    }
-    if input_avail < 1 {
+    // TUI6.2 fix 6 (review r2 finding 6): the closing-rule row (the gap,
+    // TUI5's net-zero trick) is DERIVED from `band_rule_reserve` — the
+    // function is the runtime authority here, not a debug-only tie. The
+    // content column yields first when keeping it would starve the
+    // reserved rule (r1's launcher 90×4).
+    if band_rule_reserve(area.height, content_min + rule_h + 1, rule_h) == 0 {
         content_min = 0;
-        input_avail = area.height.saturating_sub(rule_h);
     }
+    let gap = band_rule_reserve(area.height, content_min + rule_h + 1, rule_h);
+    let mut input_avail = area.height.saturating_sub(content_min + rule_h + gap);
     if input_avail < 1 {
         rule_h = 0;
         input_avail = area.height;
@@ -735,10 +748,20 @@ fn render_session(
     //     (handled in `render`) → header line 2 → header rule → input rule
     //     → header line 1 → options never (below option count the menu
     //     WINDOWS them around the selection with ⋮ markers).
-    let menu = model.projection.open_menu();
+    // TUI6.2c (verifier finding 3): the login card OUTRANKS a blocking
+    // menu on the band — the keys already prefer the card (login_key),
+    // and a band that renders the menu while the card owns the keyboard
+    // turns menu answers into typed secret bytes (a `1` meant for an
+    // option landed in the mask; Enter staged a garbage credential). The
+    // menu waits, unrendered and unclickable, until the card closes.
+    let menu = if model.login.is_some() {
+        None
+    } else {
+        model.projection.open_menu()
+    };
     let menu_wrapped_body_rows = menu.map_or(0, |m| wrapped_menu_body(m, area.width).len());
     let needed_input = menu.map_or_else(
-        || composer_height(model),
+        || composer_height(model, area.width),
         |m| u16::try_from(1 + menu_wrapped_body_rows + m.options.len() + 1).unwrap_or(u16::MAX),
     );
     // What the input may claim: everything beyond header(2) + header
@@ -848,6 +871,24 @@ fn render_session(
     };
     let mut palette_height = u16::try_from(palette.len()).unwrap_or(0);
     let mut budget = area.height.saturating_sub(fixed + transcript_min);
+    // TUI6.1 fix 2: the closing rule claims FIRST — before EVERY optional
+    // panel — per `band_rule_reserve`'s law: reserved whenever chrome +
+    // input + the transcript's sacred row leave it a row. It takes a
+    // budget row when one exists, else the spacer gap row (review r1:
+    // session menu 90×10 kept a blank gap where the rule fit; session
+    // with chip 90×11 funded the SubTree and left the band open).
+    let band_rule_h = band_rule_reserve(
+        area.height,
+        chrome + input_height + transcript_min,
+        input_rule_h,
+    );
+    if band_rule_h > 0 {
+        if budget > 0 {
+            budget -= 1;
+        } else {
+            gap = 0;
+        }
+    }
     if palette_height > budget {
         palette_height = 0;
     } else {
@@ -873,6 +914,15 @@ fn render_session(
     } else {
         budget -= todos_height;
     }
+    // The closing rule was reserved ABOVE, before the panels (TUI6.1
+    // fix 2 — sim anatomy: the border-top of whatever follows the
+    // InputBar, SubTree tui.js:4764 / StatusBar tui.js:5497). The PAD is
+    // the InputBar's bottom padding and stays behind every panel but
+    // ahead of the breathing rows (TUI6 item 6 / TUI6d).
+    let band_pad = u16::from(budget > 0 && input_rule_h > 0);
+    if band_pad > 0 {
+        budget -= band_pad;
+    }
     // One breathing row above each block that is actually present, taken
     // last and given up first.
     let want_lead = u16::from(waiting_height > 0);
@@ -889,15 +939,6 @@ fn render_session(
     let lead_waiting = breathe(want_lead, &mut budget);
     let lead_todos = breathe(want_todos_lead, &mut budget);
     let lead_subtree = breathe(want_subtree_lead, &mut budget);
-    // The composer band closes with a frame rule — the sim draws it as the
-    // border-top of whatever follows the InputBar (SubTree tui.js:4764 /
-    // StatusBar tui.js:5497), which is the "bottom line" the owner's
-    // screenshot was missing (item 2).
-    let band_pad = u16::from(budget > 0 && input_rule_h > 0);
-    if band_pad > 0 {
-        budget -= band_pad;
-    }
-    let band_rule_h = u16::from(budget > 0 && input_rule_h > 0);
     let [
         header_area,
         header_rule,
@@ -1565,18 +1606,37 @@ fn render_subagent(
         render_session(model, theme, frame, area, hits);
         return;
     };
-    let menu = chip.question_menu();
+    // The login card outranks the chip's question card on the band too
+    // (TUI6.2c finding 3, same law as the session menu).
+    let menu = if model.login.is_some() {
+        None
+    } else {
+        chip.question_menu()
+    };
     let needed_input = menu.map_or_else(
-        || composer_height(model),
+        || composer_height(model, area.width),
         |m| {
             u16::try_from(1 + wrapped_menu_body(m, area.width).len() + m.options.len() + 1)
                 .unwrap_or(u16::MAX)
         },
     );
-    let floor_input = menu.map_or(1, |m| u16::try_from(m.options.len().max(1)).unwrap_or(1));
-    // Compact ledger (the session screen's shed order, condensed): gap →
-    // subtree → transcript row → header line 2 → rules → header line 1;
-    // the input floor never yields.
+    // TUI6.2 fix 4 (review r2 finding 4, overruling the r1 trade): the
+    // card's sacred floor is TITLE + options — options without their
+    // question is a dignity regression (the 90×12 four-option card shed
+    // its title while a blank optional gap survived). Session parity:
+    // the session ledger funds the full card before any panel; the
+    // subagent floor now does too.
+    let floor_input = menu.map_or(1, |m| {
+        u16::try_from(m.options.len().max(1) + 1).unwrap_or(u16::MAX)
+    });
+    // Compact ledger (the session screen's shed order, condensed).
+    // TUI6.1 fix 2: the closing rule joined it AHEAD of the SubTree and
+    // the gap (review r1: subagent 90×11 / question 90×14 funded the
+    // SubTree while the band stayed open) — shed order is now subtree →
+    // gap → closing rule → transcript row → header line 2 → rules →
+    // header line 1; the input floor never yields. The subtree and gap
+    // rungs carry the rule's provisional row in their extras, so they
+    // shed in its favor per `band_rule_reserve`'s law.
     let mut gap: u16 = 1;
     let mut transcript_min: u16 = 1;
     let mut header_h: u16 = 2;
@@ -1586,10 +1646,11 @@ fn render_subagent(
     let over = |header_h: u16, rules: u16, extras: u16, area: Rect| {
         area.height.saturating_sub(header_h + rules + extras) < floor_input
     };
+    let rule_demand = u16::from(input_rule_h > 0);
     if over(
         header_h,
         header_rule_h + input_rule_h,
-        gap + transcript_min + subtree_height,
+        gap + transcript_min + subtree_height + rule_demand,
         area,
     ) {
         subtree_height = 0;
@@ -1597,11 +1658,26 @@ fn render_subagent(
     if over(
         header_h,
         header_rule_h + input_rule_h,
-        gap + transcript_min,
+        gap + transcript_min + rule_demand,
         area,
     ) {
         gap = 0;
     }
+    // The rule's own claim, through the shared law: reserved whenever the
+    // surviving chrome + the transcript's sacred row + the input floor
+    // leave it a row; it yields to the transcript's sacred row (session
+    // parity), never to the optional panels above.
+    let band_rule_h = band_rule_reserve(
+        area.height,
+        header_h
+            + header_rule_h
+            + input_rule_h
+            + gap
+            + transcript_min
+            + subtree_height
+            + floor_input,
+        input_rule_h,
+    );
     if over(header_h, header_rule_h + input_rule_h, transcript_min, area) {
         transcript_min = 0;
     }
@@ -1618,17 +1694,28 @@ fn render_subagent(
     let chrome = header_h + header_rule_h + input_rule_h;
     let input_avail = area
         .height
-        .saturating_sub(chrome + gap + transcript_min + subtree_height);
+        .saturating_sub(chrome + gap + transcript_min + subtree_height + band_rule_h);
     let input_height = needed_input
         .min(input_avail)
         .max(floor_input.min(area.height.saturating_sub(chrome)))
         .clamp(1, area.height.max(1));
+    // TUI6 item 6 (the band-anatomy sweep — the owner's screenshot was
+    // THIS surface: `❯ message …` straight into `▼ subagents`): the band
+    // closes with the rule reserved above plus an inputBg pad row when a
+    // row remains (the pad is the InputBar's bottom padding and stays
+    // OPTIONAL — behind the rule, per the law).
+    let spare = area.height.saturating_sub(
+        chrome + gap + transcript_min + subtree_height + input_height + band_rule_h,
+    );
+    let band_pad = u16::from(spare > 0 && input_rule_h > 0);
     let [
         header_area,
         header_rule,
         transcript_area,
         rule_area,
         composer_area,
+        band_pad_area,
+        band_rule_area,
         subtree_area,
         _gap,
     ] = Layout::vertical([
@@ -1637,6 +1724,8 @@ fn render_subagent(
         Constraint::Min(transcript_min),
         Constraint::Length(input_rule_h),
         Constraint::Length(input_height),
+        Constraint::Length(band_pad),
+        Constraint::Length(band_rule_h),
         Constraint::Length(subtree_height),
         Constraint::Length(gap),
     ])
@@ -1830,6 +1919,22 @@ fn render_subagent(
     } else {
         render_composer(model, theme, frame, rule_area, composer_area, hits);
     }
+    // The band's closing anatomy (TUI6 item 6): inputBg pad, then the
+    // frame rule — rendered on BOTH the composer and question-card forms,
+    // exactly as the session band does.
+    if band_pad > 0 {
+        frame.render_widget(Block::default().style(theme.input_style()), band_pad_area);
+    }
+    if band_rule_h > 0 {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                "─".repeat(band_rule_area.width as usize),
+                theme.frame_style(),
+            ))
+            .style(theme.text_style()),
+            band_rule_area,
+        );
+    }
     if subtree_height > 0 {
         render_subtree(model, theme, frame, subtree_area, true, hits);
     }
@@ -1868,26 +1973,38 @@ fn render_aura(
     let mut bar_h: u16 = 1;
     let mut bar_rule_h: u16 = 1;
     let mut input_rule_h: u16 = 1;
-    let composer_want = composer_height(model).max(1);
+    let composer_want = composer_height(model, area.width).max(1);
     let over =
         |bar: u16, rules: u16, extras: u16| area.height.saturating_sub(bar + rules + extras) < 1;
+    // TUI6.1 fix 2 (review r1: aura 90×10 kept orb/columns while the
+    // closing rule shed): the rule row (the gap, TUI5's net-zero trick)
+    // outranks the OPTIONAL columns and orb, and yields to the
+    // transcript's sacred row (session parity) — shed order is columns →
+    // orb → closing rule → transcript row → rules → bar. The
+    // columns/orb rungs carry the rule's provisional row (`gap`, still 1
+    // here) in their extras so they shed in its favor; TUI6.2 fix 6
+    // (review r2 finding 6) then DERIVES the rule row from
+    // `band_rule_reserve` over the survivors — the function is the
+    // runtime authority, not a debug-only tie.
     if over(
         bar_h,
         bar_rule_h + input_rule_h,
         gap + columns_h + orb_h + transcript_min,
     ) {
-        gap = 0;
+        columns_h = 0;
     }
     if over(
         bar_h,
         bar_rule_h + input_rule_h,
-        columns_h + orb_h + transcript_min,
+        gap + orb_h + transcript_min,
     ) {
-        columns_h = 0;
-    }
-    if over(bar_h, bar_rule_h + input_rule_h, orb_h + transcript_min) {
         orb_h = 0;
     }
+    gap = band_rule_reserve(
+        area.height,
+        bar_h + bar_rule_h + input_rule_h + columns_h + orb_h + transcript_min + 1,
+        input_rule_h,
+    );
     if over(bar_h, bar_rule_h + input_rule_h, transcript_min) {
         transcript_min = 0;
     }
@@ -1904,6 +2021,12 @@ fn render_aura(
         ))
         .max(1)
         .clamp(1, area.height.max(1));
+    // TUI6 item 6 (band sweep): the aura band CLOSES — the launcher's
+    // net-zero trick verbatim (TUI5 item 1b): the blank gap row under the
+    // composer becomes the frame rule the sim draws as the StatusBar's
+    // border-top (tui.js:5497); it sheds under pressure exactly as the
+    // gap did.
+    let band_rule_h = gap;
     let [
         bar_area,
         bar_rule,
@@ -1912,7 +2035,7 @@ fn render_aura(
         transcript_area,
         rule_area,
         composer_area,
-        _gap,
+        band_rule_area,
     ] = Layout::vertical([
         Constraint::Length(bar_h),
         Constraint::Length(bar_rule_h),
@@ -1921,7 +2044,7 @@ fn render_aura(
         Constraint::Min(transcript_min),
         Constraint::Length(input_rule_h),
         Constraint::Length(composer_h),
-        Constraint::Length(gap),
+        Constraint::Length(band_rule_h),
     ])
     .areas(area);
 
@@ -2163,6 +2286,16 @@ fn render_aura(
     );
 
     render_composer(model, theme, frame, rule_area, composer_area, hits);
+    if band_rule_h > 0 {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                "─".repeat(band_rule_area.width as usize),
+                theme.frame_style(),
+            ))
+            .style(theme.text_style()),
+            band_rule_area,
+        );
+    }
 }
 
 /// The menu's body lines pre-wrapped by display cells into the menu's
@@ -2290,57 +2423,74 @@ fn menu_glyph(menu: &haider_protocol::menu::Menu) -> &'static str {
     }
 }
 
-/// Composer rows currently needed: one per line, capped at
-/// [`COMPOSER_MAX_ROWS`] (sim textarea autoGrow, tui.js:2799-2803); beyond
-/// the cap the composer scrolls to its tail.
-fn composer_height(model: &AppModel) -> u16 {
+/// Display cells one composer text row may fill (TUI6): the frame width
+/// minus the left pad, the 2-cell `❯ `/`⋮ `/indent gutter, and ONE cell
+/// reserved for the line-end caret block. The reserve applies to EVERY
+/// row — not just the cursor row — so wrap points depend on the width
+/// alone: moving the caret can never move a wrap point (item 5's
+/// derive-from-width law).
+/// TUI6.1 fix 2 — the closing-rule reservation law (review r1 finding 2),
+/// stated ONCE and, since TUI6.2 fix 6, the RUNTIME authority on every
+/// surface ledger (r2 finding 6: launcher/aura had duplicated arithmetic
+/// tied to this function only by debug_asserts, which compile out —
+/// their rule rows are now DERIVED from it): the band's lower rule
+/// is RESERVED whenever the rows that outrank it — the surface's
+/// surviving chrome, the top input rule, the sacred input floor, and the
+/// transcript's sacred row where the surface has one — still leave it a
+/// row (`area_h > outranking`). The rule outranks every OPTIONAL row:
+/// panels (palette, ⧗ queue, SubTree, todos, the waiting line), the band
+/// pad, breathing rows, the launcher's content column and aura's
+/// orb/columns. It sheds only when the top-rule + input + lower-rule
+/// triple itself cannot fit (and dies with the top rule, `top_rule_h`).
+/// The reviewer's five failing frames — launcher 90×4, session+chip
+/// 90×11, session menu 90×10, subagent 90×11 / question 90×14, aura
+/// 90×10 — are the height-sweep pins in `tui6_softwrap_tests`.
+fn band_rule_reserve(area_h: u16, outranking: u16, top_rule_h: u16) -> u16 {
+    u16::from(top_rule_h > 0 && area_h > outranking)
+}
+
+pub(crate) fn composer_text_budget(width: u16) -> usize {
+    (width as usize).saturating_sub(COMPOSER_PAD + 2 + 1).max(1)
+}
+
+/// Composer rows currently needed: one VISUAL row per wrapped row of the
+/// draft (TUI6 item 1 — one row initially, growth by WRAPPING), capped at
+/// [`COMPOSER_MAX_ROWS`] (sim textarea autoGrow, tui.js:2799-2803 — the
+/// sim's ONE `<textarea rows={1}>` soft-wraps and autoGrows on every
+/// surface, tui.js:3004-3027); beyond the cap the composer windows
+/// vertically around the caret.
+fn composer_height(model: &AppModel, width: u16) -> u16 {
     // The masked login card REPLACES the composer while it is open
     // (W3c3 M3): title, masked field, hint.
     if model.login.is_some() {
         return LOGIN_CARD_ROWS;
     }
-    let rows = model
-        .composer
-        .text()
-        .split('\n')
-        .count()
+    let rows = crate::composer::wrap_rows(model.composer.text(), composer_text_budget(width))
+        .len()
         .clamp(1, COMPOSER_MAX_ROWS);
     u16::try_from(rows).unwrap_or(1)
-}
-
-/// Keep the editable TAIL of an overlong composer line visible (sim: the
-/// textarea scrolls its caret into view): a leading … plus the last cells
-/// that fit.
-/// (TUI5.1 fix 5: the walk is GRAPHEME-wise — a char walk could clip
-/// inside a cluster, rendering an orphaned combining mark after the …
-/// or splitting a ZWJ emoji. `pub` for the regression tests only.)
-#[doc(hidden)]
-pub fn tail_window(text: &str, budget: usize) -> String {
-    use unicode_segmentation::UnicodeSegmentation;
-    use unicode_width::UnicodeWidthStr;
-    if budget == 0 {
-        return String::new();
-    }
-    if UnicodeWidthStr::width(text) <= budget {
-        return text.to_owned();
-    }
-    let keep = budget.saturating_sub(1);
-    let mut cells = 0usize;
-    let mut start = text.len();
-    for (offset, grapheme) in text.grapheme_indices(true).rev() {
-        let w = UnicodeWidthStr::width(grapheme).max(1);
-        if cells + w > keep {
-            break;
-        }
-        cells += w;
-        start = offset;
-    }
-    format!("…{}", &text[start..])
 }
 
 /// The gold rule + composer rows on the input ground (sim InputBar,
 /// tui.js:5395: `border-top: gold`, `background: inputBg`). Pushes the
 /// talk-chip hit region so the click lands exactly on the chip.
+///
+/// BAND ANATOMY (TUI6 item 6, per Claude Code's own TUI): every surface
+/// that draws an input band closes it with a rule BELOW as well as the
+/// rule above. The sweep's enumeration of input-band render paths and
+/// where each closing rule lives:
+///   - `render_launcher`  — `band_rule_area` (TUI5 item 1b, gap→rule);
+///   - `render_session`   — `band_pad` + `band_rule_area`, on BOTH the
+///     composer and blocking-menu forms (the rule renders outside the
+///     menu if/else);
+///   - `render_subagent`  — `band_pad` + `band_rule_area` (TUI6 — the
+///     owner's screenshot), composer and question-card forms alike;
+///   - `render_aura`      — `band_rule_area` (TUI6, gap→rule);
+///   - the login card and the arg-slot/palette state REPLACE the
+///     composer's CONTENT inside the same band, so they inherit the
+///     hosting surface's two rules — no separate path exists.
+///
+/// Each surface's pair is pinned by a test in `tui6_softwrap_tests`.
 fn render_composer(
     model: &AppModel,
     theme: &Theme,
@@ -2404,6 +2554,7 @@ fn render_composer(
                 content: window.content,
                 surface: model.surface_key(),
                 revision: model.composer.revision(),
+                epoch: model.geometry_epoch.get(),
             },
         ));
     }
@@ -2412,7 +2563,9 @@ fn render_composer(
 /// One composer text row's clickable window (TUI5 item 5): where its
 /// visible content starts on screen and WHAT that content is (byte-exact),
 /// so the runtime can map a click column to a caret byte through the same
-/// values that rendered.
+/// values that rendered. Since TUI6 the rows are WRAP segments of the
+/// draft — `start` is the segment's absolute byte offset and `content` its
+/// text, so a click on any wrapped row lands on that row's own graphemes.
 struct ComposerRowWindow {
     row: u16,
     content_x: u16,
@@ -2446,6 +2599,12 @@ fn login_lines(card: &crate::app::LoginCard, theme: &Theme, width: u16) -> Vec<L
         LoginStage::Entry | LoginStage::Failed(_) if !card.is_empty() => {
             let shown = card.masked_len().min(MASK_CAP);
             let mask = "•".repeat(shown);
+            // JUSTIFIED `…` SURVIVOR (TUI6 item 1 names each): this is
+            // the secrecy CAP, not a caret window — the mask stops
+            // advertising a long key's length. The composer's
+            // no-ellipsis law governs DRAFT text; the mask renders no
+            // draft byte at all. (The other band survivor is the
+            // `◉ listening…` chip label — sim-verbatim chrome.)
             let more = if card.masked_len() > MASK_CAP {
                 "…"
             } else {
@@ -2475,17 +2634,19 @@ fn login_lines(card: &crate::app::LoginCard, theme: &Theme, width: u16) -> Vec<L
 }
 
 /// The composer rows (sim InputBar textarea): padded off the frame edge,
-/// bold gold ❯ sigil, REAL newlines on their own rows, a horizontal
-/// tail-window on any overlong line so the editable end stays visible,
+/// bold gold ❯ sigil, REAL newlines on their own rows, overlong lines
+/// SOFT-WRAPPED at grapheme boundaries into visual rows (TUI6 items 1-5 —
+/// the sim's one `<textarea rows={1}>` wraps and autoGrows, tui.js:3004),
 /// typed text bright with a gold block cursor (or the dim placeholder +
 /// ghost completion), and the right-aligned `[ ◉ talk ]` chip on the first
-/// row.
+/// row. NO horizontal windowing and NO `…` in the composer, ever — the
+/// TUI5 caret-following window died with the wrap.
 ///
 /// `allocated` is the height the layout actually granted: the composer
-/// VERTICALLY tail-windows to it (last lines win — the cursor row is
-/// sacred at any size, review r3 P2-1a), with a faint ⋮ gutter marker when
-/// rows are hidden above. Returns the rows plus the chip's column offset +
-/// width.
+/// VERTICALLY tail-windows to it over VISUAL rows (last rows win — the
+/// cursor row is sacred at any size, review r3 P2-1a), with a faint ⋮
+/// gutter marker when rows are hidden above or below. Returns the rows
+/// plus the chip's column offset + width.
 ///
 /// (W3c3.1, review D3-7: the M3 login card was inserted BETWEEN this doc
 /// comment and the function it documents, orphaning both it and the
@@ -2498,6 +2659,15 @@ fn composer_lines<'a>(
     width: u16,
     allocated: u16,
 ) -> (Vec<Line<'a>>, Option<(u16, u16)>, Vec<ComposerRowWindow>) {
+    // TUI6.2 fix 2 (review r2 finding 2): the frame's wrap budget is
+    // published for EVERY branch — the empty-composer return kept a
+    // fresh surface at budget 0, so type-then-queued-navigation before
+    // the next redraw walked LOGICAL lines (cursor 4 where budget 13's
+    // wrapped rows land 17). The budget is a function of the width
+    // alone; an empty draft and the login card still occupy a band of
+    // this width, so their frames publish it too.
+    let budget = composer_text_budget(width);
+    model.composer.set_wrap_budget(budget);
     // The masked login card owns the input band while it is open. It emits
     // NO click/drag windows and NO talk chip: a composer text window
     // carries its CONTENT for caret mapping, which is precisely the thing
@@ -2596,23 +2766,19 @@ fn composer_lines<'a>(
     let text = model.composer.text();
     let cursor = model.composer.cursor();
     let selection = model.composer.selection_range();
-    // Logical rows with their absolute byte offsets ('\n' has no row of
-    // its own; a cursor ON a '\n' renders at that row's end cell).
-    let mut row_bounds: Vec<(usize, &str)> = Vec::new();
-    let mut offset = 0;
-    for segment in text.split('\n') {
-        row_bounds.push((offset, segment));
-        offset += segment.len() + 1;
-    }
-    let cursor_row_index = row_bounds
-        .iter()
-        .rposition(|(start, segment)| cursor >= *start && cursor <= start + segment.len())
-        .unwrap_or(0);
+    // Visual rows: the draft wrapped at grapheme boundaries into the
+    // frame's budget (TUI6 item 1), published above for every branch so
+    // ↑/↓ walk the SAME rows this frame paints (the scroll_max Cell
+    // pattern — geometry feedback, never stored wrap points; the
+    // reducer stays put).
+    let row_bounds = crate::composer::wrap_rows(text, budget);
+    let cursor_row_index = crate::composer::visual_row_of(&row_bounds, cursor);
     let total = row_bounds.len();
     let window = (allocated.max(1) as usize).min(COMPOSER_MAX_ROWS);
-    // Vertical window: prefer the TAIL (the editable end), but the CURSOR
-    // row is sacred — moving ↑ into scrolled-out rows scrolls the window
-    // up to keep the caret visible (item 1's tail-window state).
+    // Vertical window over VISUAL rows: prefer the TAIL (the editable
+    // end), but the CURSOR row is sacred — moving ↑ into scrolled-out
+    // rows scrolls the window up to keep the caret visible (item 2's
+    // caret-follows law).
     let mut skip = total.saturating_sub(window);
     if cursor_row_index < skip {
         skip = cursor_row_index;
@@ -2623,47 +2789,37 @@ fn composer_lines<'a>(
     let mut rows = Vec::new();
     let mut chip_at = None;
     let mut windows = Vec::new();
-    for (index, (row_start, segment)) in visible.iter().enumerate() {
+    for (index, row) in visible.iter().enumerate() {
         let first_row = index == 0;
         let last_row = index == last;
-        let cursor_row = skip + index == cursor_row_index;
         let mut spans = vec![Span::raw(" ".repeat(COMPOSER_PAD))];
         if first_row && skip == 0 {
             spans.push(sigil.clone());
         } else if first_row {
-            // Earlier lines are scrolled out above (vertical tail window).
+            // Earlier rows are scrolled out above (vertical tail window).
             spans.push(Span::styled("⋮ ", theme.faint_style()));
         } else if last_row && hidden_below {
-            // Later lines are scrolled out below (the cursor pulled the
+            // Later rows are scrolled out below (the cursor pulled the
             // window up) — same honesty as the ⋮ above.
             spans.push(Span::styled("⋮ ", theme.faint_style()));
         } else {
             spans.push(Span::raw("  "));
         }
-        // The cursor row reserves one cell for the end-of-text block;
-        // long rows window horizontally — the CARET stays visible on the
-        // cursor row (item 1), other rows keep their editable tail.
-        let reserve = COMPOSER_PAD + 2 + usize::from(cursor_row);
-        let budget = (width as usize).saturating_sub(reserve);
-        let (vstart, vend, left_ell) = if cursor_row {
-            let slice = composer_cursor_row_spans(
-                &mut spans, segment, *row_start, cursor, selection, budget, theme,
-            );
+        composer_row_spans(&mut spans, text, *row, cursor, selection, theme);
+        if skip + index == cursor_row_index {
             // Inline ghost completion (sim `.ghostline`, tui.js:3028-3034)
-            // — palette queries are single-line, so this is also row 0.
+            // — it rides the CARET'S visual row (an overlong palette query
+            // wraps like any draft, so this is not always row 0).
             if let Some(ghost) = model.ghost() {
                 spans.push(Span::styled(ghost, theme.dim_style()));
                 spans.push(Span::styled(" ⇥ tab", theme.faint_style()));
             }
-            slice
-        } else {
-            composer_plain_row_spans(&mut spans, segment, *row_start, selection, budget, theme)
-        };
+        }
         windows.push(ComposerRowWindow {
             row: u16::try_from(index).unwrap_or(u16::MAX),
-            content_x: u16::try_from(COMPOSER_PAD + 2 + usize::from(left_ell)).unwrap_or(u16::MAX),
-            start: row_start + vstart,
-            content: segment[vstart..vend].to_owned(),
+            content_x: u16::try_from(COMPOSER_PAD + 2).unwrap_or(u16::MAX),
+            start: row.start,
+            content: text[row.start..row.end].to_owned(),
         });
         if first_row {
             chip_at = chip_fit(&mut spans);
@@ -2673,35 +2829,31 @@ fn composer_lines<'a>(
     (rows, chip_at, windows)
 }
 
-/// The cursor row's text spans: a caret-following horizontal window, the
-/// selection band on covered cells, and the cursor CELL — the grapheme
-/// under the caret in reverse-video, or a themed block over a space at the
-/// row's end (TUI5 item 1; the old code APPENDED a `▮` glyph here).
-/// Returns the visible slice `(start, end, left_ellipsis)` for the row's
-/// click window (item 5).
-fn composer_cursor_row_spans<'s>(
+/// One visual row's text spans — since TUI6 the ONE renderer for every
+/// composer row (the TUI5 cursor-row/plain-row split died with the
+/// horizontal caret window; there is nothing left to ellipsize). Groups
+/// the row's graphemes into style runs: the selection band on covered
+/// cells, the cursor CELL (which WINS over the band — the active end must
+/// stay distinct, TUI5 item 4) in reverse-video, plain draft ink
+/// otherwise, and the line-end caret block over a space when the caret
+/// owns this row's end (`line_last` — the position ON the `\n` or at the
+/// text end; a caret ON a wrap point renders on the FOLLOWING row, the
+/// `WrapRow` no-affinity law, so wrap rows never draw the end block).
+fn composer_row_spans<'s>(
     spans: &mut Vec<Span<'s>>,
-    segment: &str,
-    row_start: usize,
+    text: &str,
+    row: crate::composer::WrapRow,
     cursor: usize,
     selection: Option<(usize, usize)>,
-    budget: usize,
     theme: &Theme,
-) -> (usize, usize, bool) {
-    let caret_in_row = cursor.saturating_sub(row_start).min(segment.len());
-    let (vstart, vend, left_ell, right_ell) = caret_window(segment, budget, caret_in_row);
-    if left_ell {
-        spans.push(Span::styled("…", theme.faint_style()));
-    }
-    let visible = &segment[vstart..vend];
-    // Group the visible graphemes into style runs: selection band cells,
-    // the cursor cell (which WINS over the band — the active end must
-    // stay distinct, item 4), and plain draft ink.
+) {
     use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
+    let visible = &text[row.start..row.end];
     let mut run = String::new();
     let mut run_style = theme.bright_style();
     for (grapheme_offset, grapheme) in visible.grapheme_indices(true) {
-        let abs = row_start + vstart + grapheme_offset;
+        let abs = row.start + grapheme_offset;
         let style = if abs == cursor {
             theme.cursor_style()
         } else if selection.is_some_and(|(start, end)| abs >= start && abs < end) {
@@ -2713,120 +2865,27 @@ fn composer_cursor_row_spans<'s>(
             spans.push(Span::styled(std::mem::take(&mut run), run_style));
         }
         run_style = style;
+        // TUI6.1 fix 3: a ZERO-WIDTH cluster (a combining mark or ZWJ
+        // standing alone at a line start, reachable by paste) gets a
+        // SPACE BASE — one real cell, the terminal convention for a bare
+        // mark. This is the render half of `composer::cluster_cells`'s
+        // one-cell price: wrap, click and navigation already charge the
+        // cluster one cell, so painting it at zero cells hid the caret
+        // and skewed every column right of it by one (review r1
+        // finding 3).
+        if grapheme.width() == 0 {
+            run.push(' ');
+        }
         run.push_str(grapheme);
     }
     if !run.is_empty() {
         spans.push(Span::styled(run, run_style));
     }
-    if caret_in_row >= segment.len() {
-        // End-of-row caret (also end-of-text): the block over a space.
+    if row.line_last && cursor == row.end {
+        // Line-end caret (also end-of-text): the block over a space, in
+        // the cell composer_text_budget reserved on every row.
         spans.push(Span::styled(" ", theme.cursor_style()));
     }
-    if right_ell {
-        spans.push(Span::styled("…", theme.faint_style()));
-    }
-    (vstart, vend, left_ell)
-}
-
-/// A non-cursor row: tail-windowed as before, with the selection band on
-/// the covered visible cells. Returns the visible slice
-/// `(start, end, left_ellipsis)` for the row's click window (item 5).
-fn composer_plain_row_spans<'s>(
-    spans: &mut Vec<Span<'s>>,
-    segment: &str,
-    row_start: usize,
-    selection: Option<(usize, usize)>,
-    budget: usize,
-    theme: &Theme,
-) -> (usize, usize, bool) {
-    let windowed = tail_window(segment, budget);
-    // Review P3-5: clipped-ness by COMPARISON — a row genuinely starting
-    // with a literal '…' must keep it as user text, not lose it to
-    // ellipsis sniffing.
-    let (clipped, visible) = if windowed == segment {
-        (false, windowed.as_str())
-    } else {
-        (
-            true,
-            windowed.strip_prefix('…').unwrap_or(windowed.as_str()),
-        )
-    };
-    if clipped {
-        spans.push(Span::styled("…", theme.faint_style()));
-    }
-    let vstart = segment.len() - visible.len();
-    use unicode_segmentation::UnicodeSegmentation;
-    let mut run = String::new();
-    let mut run_style = theme.bright_style();
-    for (grapheme_offset, grapheme) in visible.grapheme_indices(true) {
-        let abs = row_start + vstart + grapheme_offset;
-        let style = if selection.is_some_and(|(start, end)| abs >= start && abs < end) {
-            theme.composer_selection_style()
-        } else {
-            theme.bright_style()
-        };
-        if style != run_style && !run.is_empty() {
-            spans.push(Span::styled(std::mem::take(&mut run), run_style));
-        }
-        run_style = style;
-        run.push_str(grapheme);
-    }
-    if !run.is_empty() {
-        spans.push(Span::styled(run, run_style));
-    }
-    (vstart, segment.len(), clipped)
-}
-
-/// The horizontal window of `line` (display `budget` cells) that keeps the
-/// caret CELL visible: head-anchored while the caret fits from the start,
-/// otherwise ending at the caret's right edge (so a caret at the line end
-/// reproduces the old tail-window exactly). Returns
-/// `(start_byte, end_byte, left_ellipsis, right_ellipsis)` — the ellipses
-/// each consume one cell of the budget.
-fn caret_window(line: &str, budget: usize, caret: usize) -> (usize, usize, bool, bool) {
-    use unicode_segmentation::UnicodeSegmentation;
-    use unicode_width::UnicodeWidthStr;
-    if budget == 0 {
-        return (caret, caret, false, false);
-    }
-    if line.width() <= budget {
-        return (0, line.len(), false, false);
-    }
-    let caret_col = line[..caret].width();
-    let caret_cell = line[caret..]
-        .graphemes(true)
-        .next()
-        .map_or(1, |g| g.width().max(1));
-    // Head window: caret cell fits before the right ellipsis.
-    if caret_col + caret_cell <= budget.saturating_sub(1) {
-        let avail = budget - 1;
-        let mut end = line.len();
-        let mut col = 0;
-        for (offset, grapheme) in line.grapheme_indices(true) {
-            let w = grapheme.width();
-            if col + w > avail {
-                end = offset;
-                break;
-            }
-            col += w;
-        }
-        return (0, end, false, true);
-    }
-    // Tail-side window ending at the caret's right cell edge.
-    let end = (caret + line[caret..].graphemes(true).next().map_or(0, str::len)).min(line.len());
-    let right_ell = end < line.len();
-    let avail = budget.saturating_sub(1 + usize::from(right_ell));
-    let mut start = end;
-    let mut col = 0;
-    for (offset, grapheme) in line[..end].grapheme_indices(true).rev() {
-        let w = grapheme.width();
-        if col + w > avail {
-            break;
-        }
-        col += w;
-        start = offset;
-    }
-    (start, end, true, right_ell)
 }
 
 /// The slash palette (sim CmdMenu, tui.js:5345): a frame rule on top, then
