@@ -731,7 +731,7 @@ dependencies = [
 
 [[package]]
 name = "haider-accounts"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "haider-protocol",
  "security-framework",
@@ -742,7 +742,7 @@ dependencies = [
 
 [[package]]
 name = "haider-cli"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "async-trait",
  "haider-accounts",
@@ -762,7 +762,7 @@ dependencies = [
 
 [[package]]
 name = "haider-client"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "blake3",
  "haider-rpc",
@@ -776,7 +776,7 @@ dependencies = [
 
 [[package]]
 name = "haider-core"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "async-trait",
  "blake3",
@@ -792,7 +792,7 @@ dependencies = [
 
 [[package]]
 name = "haider-daemon"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "async-trait",
  "base64",
@@ -817,7 +817,7 @@ dependencies = [
 
 [[package]]
 name = "haider-daemond"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "async-trait",
  "haider-accounts",
@@ -837,7 +837,7 @@ dependencies = [
 
 [[package]]
 name = "haider-protocol"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "serde",
  "serde_json",
@@ -845,7 +845,7 @@ dependencies = [
 
 [[package]]
 name = "haider-provider"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "async-trait",
  "haider-accounts",
@@ -859,7 +859,7 @@ dependencies = [
 
 [[package]]
 name = "haider-rpc"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "haider-protocol",
  "serde",
@@ -869,7 +869,7 @@ dependencies = [
 
 [[package]]
 name = "haider-store"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "blake3",
  "haider-protocol",
@@ -881,7 +881,7 @@ dependencies = [
 
 [[package]]
 name = "haider-tools"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "async-trait",
  "base64",
@@ -896,7 +896,7 @@ dependencies = [
 
 [[package]]
 name = "haider-tui"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "base64",
  "haider-client",
@@ -915,7 +915,7 @@ dependencies = [
 
 [[package]]
 name = "haider-verify"
-version = "0.0.11"
+version = "0.0.12"
 
 [[package]]
 name = "hashbrown"
@@ -3334,7 +3334,7 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
 name = "xtask"
-version = "0.0.11"
+version = "0.0.12"
 
 [[package]]
 name = "yoke"
