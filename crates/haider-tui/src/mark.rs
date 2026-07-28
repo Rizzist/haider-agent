@@ -54,28 +54,41 @@ pub const BANNER: [&str; 8] = [
     ".####.........##..##........",
 ];
 
-/// The session-header mark: 24 × 4 pixels → 24 cols × 2 terminal rows, so it
+/// The session-header mark: 16 × 4 pixels → 16 cols × 2 terminal rows, so it
 /// spans BOTH header lines beside the info block (owner item 6).
+///
+/// TUI6 item 7: the original 24-wide raster read too wide/blocky beside
+/// `[ ← main ]` at header scale — this is its two-thirds rework (24 → 16
+/// cols exactly), derived by re-scaling the SAME GeezaPro reference the
+/// 24-map was hand-cleaned from, letter by letter: `ر` body 2 px with the
+/// tail clear of the baseline, `ـد` upright on the baseline, `ـيـ` tooth
+/// with the two dots straddling beneath it, `حـ` head bar sweeping one
+/// pixel right into the drop at the frame's right edge (never a filled
+/// wedge — the open bowl IS the letter). The 28×8 launcher/boot banner is
+/// untouched.
 ///
 /// At two rows the baseline and the descenders share one cell row: the
 /// baseline is the upper half and `ر`'s tail and `ي`'s two dots are the
-/// lower half, so they read as `█` bumps hanging off a `▀` rule. That is the
-/// smallest size at which the two dots still register as dots — below it the
-/// mark would be a mangled `ى`, which the dignity rule forbids, so there is
-/// no one-row tier.
+/// lower half, so they read as `█` bumps hanging off a `▀` rule. The
+/// TUI5-era note called 24 px the floor for the dots; at 16 the dots
+/// narrow to the minimum 2-px pair with a 2-px gap and still register —
+/// the real floor is the GAP, which survives the rework. Below THAT the
+/// mark would be a mangled `ى`, which the dignity rule forbids, so there
+/// is still no one-row tier and no narrower map.
 pub const HEADER: [&str; 4] = [
-    "...##...##...##...#####.",
-    "...##...##...##....#####",
-    "......##################",
-    "###........##..##.......",
+    ".##..##..##.###.",
+    ".##..##..##..###",
+    "....############",
+    "##.....##..##...",
 ];
 
 /// Cells the banner needs (its map width).
 pub const BANNER_COLS: u16 = 28;
 /// Terminal rows the banner occupies (half the map's pixel rows).
 pub const BANNER_ROWS: u16 = 4;
-/// Cells the header mark needs.
-pub const HEADER_COLS: u16 = 24;
+/// Cells the header mark needs (TUI6 item 7: two-thirds of the original
+/// 24).
+pub const HEADER_COLS: u16 = 16;
 /// Terminal rows the header mark occupies.
 pub const HEADER_ROWS: u16 = 2;
 

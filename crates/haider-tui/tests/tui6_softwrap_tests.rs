@@ -646,6 +646,72 @@ fn login_card_band_carries_both_rules() {
     assert_two_rules(&rows, "API key", "esc cancel", "login card");
 }
 
+// ---- Item 7: the thinner header mark ----
+
+#[test]
+fn header_mark_is_two_thirds_thinner_and_keeps_its_anatomy() {
+    use haider_tui::mark;
+    /// Ink groups in one pixel row (a letterform stroke = one group).
+    fn groups(row: &str) -> usize {
+        row.split('.').filter(|s| !s.is_empty()).count()
+    }
+    // Two-thirds of the TUI4 24-col raster, exactly; the 28-col
+    // launcher/boot banner is out of scope and untouched.
+    assert_eq!(mark::HEADER_COLS, 16);
+    assert_eq!(mark::HEADER_ROWS, 2);
+    assert_eq!(mark::BANNER_COLS, 28, "launcher banner untouched");
+    for (index, row) in mark::HEADER.iter().enumerate() {
+        assert_eq!(row.len(), 16, "pixel row {index} is 16 wide");
+    }
+    // Anatomy (the same letters, narrower): the upright rows carry FOUR
+    // ink groups — `ر` `ـد` `ـيـ` `حـ` in visual order…
+    assert_eq!(groups(mark::HEADER[0]), 4);
+    assert_eq!(groups(mark::HEADER[1]), 4);
+    // …the baseline is ONE run reaching the right edge, with `ر` standing
+    // clear of it (the word breaks at `د`, which does not join forward)…
+    assert_eq!(groups(mark::HEADER[2]), 1);
+    assert!(mark::HEADER[2].ends_with('#'));
+    assert!(mark::HEADER[2].starts_with("...."), "ر stands clear");
+    // …and the descender row carries THREE groups: the tail plus `ي`'s
+    // two dots, still separated — the legibility floor is the dot GAP,
+    // which the two-thirds rework preserves.
+    assert_eq!(groups(mark::HEADER[3]), 3);
+    // The rendering never exceeds the declared cells, and stays pure
+    // half-block ink.
+    for row in mark::header_rows() {
+        assert!(row.trim_end().chars().count() <= 16);
+        assert!(row.chars().all(|c| "█▀▄ ".contains(c)));
+    }
+}
+
+#[test]
+fn header_mark_dignity_gate_holds_at_the_new_threshold() {
+    // MUTATION CHECK (mark dignity gate): make `header_fits` return true
+    // unconditionally and this fails — a 53-col session would draw the
+    // art into a header that cannot hold it instead of stepping down to
+    // the text tier (whole or nothing; fall back rather than mangle).
+    // Verified by revert.
+    use haider_tui::mark;
+    let threshold = mark::HEADER_COLS + 38; // render's HEADER_MARK_RESERVED
+    assert!(mark::header_fits(threshold, 38));
+    assert!(!mark::header_fits(threshold - 1, 38));
+    let mut model = launcher_model();
+    for c in "walk me through".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Enter));
+    assert_eq!(model.screen, Screen::Session);
+    // At the threshold the art spans BOTH header lines…
+    let (rows, _, _) = draw(&model, threshold, 30);
+    let art = mark::header_rows();
+    assert!(rows[0].contains(art[0].trim_end()), "art line 1");
+    assert!(rows[1].contains(art[1].trim_end()), "art line 2");
+    // …one cell under it, the text mark returns and no art row leaks.
+    let (rows, _, _) = draw(&model, threshold - 1, 30);
+    assert!(rows[0].contains("حيدر"), "text-mark tier below the gate");
+    assert!(!rows[0].contains(art[0].trim_end()), "no clipped art");
+}
+
 // ---- Multi-line + wrap compose: logical lines wrap independently ----
 
 #[test]
