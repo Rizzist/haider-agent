@@ -385,13 +385,21 @@ fn overlong_composer_line_keeps_the_cursor_visible() {
     for c in "TAIL".chars() {
         model.handle(key(KeyCode::Char(c)));
     }
-    // Directed (TUI5 item 1): the cursor row is found by its tail text;
-    // the caret itself is a styled cell directly after it.
+    // Directed (TUI6 item 1, re-scoping the TUI5 form): the overlong line
+    // now WRAPS — the horizontal tail-window and its `…` marker are
+    // outlawed in the composer. The caret stays visible by the same law,
+    // as a styled cell right after the tail text on the LAST wrapped row,
+    // with the wrapped head rows directly above.
     let (rows, _, terminal) = draw(&model, 90, 34);
     let composer_y = row_of(&rows, "TAIL");
     assert!(
-        rows[composer_y as usize].contains('…'),
-        "horizontal tail-window marker present"
+        !rows[composer_y as usize].contains('…'),
+        "no ellipsis in the composer (TUI6): {:?}",
+        rows[composer_y as usize]
+    );
+    assert!(
+        rows[(composer_y - 1) as usize].contains("xxx"),
+        "the wrapped head row sits directly above the tail row"
     );
     let theme = model.theme.theme();
     let buffer = terminal.backend().buffer();

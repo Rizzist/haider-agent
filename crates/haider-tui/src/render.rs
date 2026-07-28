@@ -326,7 +326,7 @@ fn render_launcher(
     // tail-windows to whatever the height allows — the cursor row is never
     // hidden. Under pressure the gap yields, then the content's sacred
     // row, then the rule, before the composer loses its row.
-    let needed = composer_height(model);
+    let needed = composer_height(model, area.width);
     let mut gap: u16 = 1;
     let mut content_min: u16 = 1;
     let mut rule_h: u16 = 1;
@@ -738,7 +738,7 @@ fn render_session(
     let menu = model.projection.open_menu();
     let menu_wrapped_body_rows = menu.map_or(0, |m| wrapped_menu_body(m, area.width).len());
     let needed_input = menu.map_or_else(
-        || composer_height(model),
+        || composer_height(model, area.width),
         |m| u16::try_from(1 + menu_wrapped_body_rows + m.options.len() + 1).unwrap_or(u16::MAX),
     );
     // What the input may claim: everything beyond header(2) + header
@@ -1567,7 +1567,7 @@ fn render_subagent(
     };
     let menu = chip.question_menu();
     let needed_input = menu.map_or_else(
-        || composer_height(model),
+        || composer_height(model, area.width),
         |m| {
             u16::try_from(1 + wrapped_menu_body(m, area.width).len() + m.options.len() + 1)
                 .unwrap_or(u16::MAX)
@@ -1868,7 +1868,7 @@ fn render_aura(
     let mut bar_h: u16 = 1;
     let mut bar_rule_h: u16 = 1;
     let mut input_rule_h: u16 = 1;
-    let composer_want = composer_height(model).max(1);
+    let composer_want = composer_height(model, area.width).max(1);
     let over =
         |bar: u16, rules: u16, extras: u16| area.height.saturating_sub(bar + rules + extras) < 1;
     if over(
@@ -2290,52 +2290,32 @@ fn menu_glyph(menu: &haider_protocol::menu::Menu) -> &'static str {
     }
 }
 
-/// Composer rows currently needed: one per line, capped at
-/// [`COMPOSER_MAX_ROWS`] (sim textarea autoGrow, tui.js:2799-2803); beyond
-/// the cap the composer scrolls to its tail.
-fn composer_height(model: &AppModel) -> u16 {
+/// Display cells one composer text row may fill (TUI6): the frame width
+/// minus the left pad, the 2-cell `❯ `/`⋮ `/indent gutter, and ONE cell
+/// reserved for the line-end caret block. The reserve applies to EVERY
+/// row — not just the cursor row — so wrap points depend on the width
+/// alone: moving the caret can never move a wrap point (item 5's
+/// derive-from-width law).
+fn composer_text_budget(width: u16) -> usize {
+    (width as usize).saturating_sub(COMPOSER_PAD + 2 + 1).max(1)
+}
+
+/// Composer rows currently needed: one VISUAL row per wrapped row of the
+/// draft (TUI6 item 1 — one row initially, growth by WRAPPING), capped at
+/// [`COMPOSER_MAX_ROWS`] (sim textarea autoGrow, tui.js:2799-2803 — the
+/// sim's ONE `<textarea rows={1}>` soft-wraps and autoGrows on every
+/// surface, tui.js:3004-3027); beyond the cap the composer windows
+/// vertically around the caret.
+fn composer_height(model: &AppModel, width: u16) -> u16 {
     // The masked login card REPLACES the composer while it is open
     // (W3c3 M3): title, masked field, hint.
     if model.login.is_some() {
         return LOGIN_CARD_ROWS;
     }
-    let rows = model
-        .composer
-        .text()
-        .split('\n')
-        .count()
+    let rows = crate::composer::wrap_rows(model.composer.text(), composer_text_budget(width))
+        .len()
         .clamp(1, COMPOSER_MAX_ROWS);
     u16::try_from(rows).unwrap_or(1)
-}
-
-/// Keep the editable TAIL of an overlong composer line visible (sim: the
-/// textarea scrolls its caret into view): a leading … plus the last cells
-/// that fit.
-/// (TUI5.1 fix 5: the walk is GRAPHEME-wise — a char walk could clip
-/// inside a cluster, rendering an orphaned combining mark after the …
-/// or splitting a ZWJ emoji. `pub` for the regression tests only.)
-#[doc(hidden)]
-pub fn tail_window(text: &str, budget: usize) -> String {
-    use unicode_segmentation::UnicodeSegmentation;
-    use unicode_width::UnicodeWidthStr;
-    if budget == 0 {
-        return String::new();
-    }
-    if UnicodeWidthStr::width(text) <= budget {
-        return text.to_owned();
-    }
-    let keep = budget.saturating_sub(1);
-    let mut cells = 0usize;
-    let mut start = text.len();
-    for (offset, grapheme) in text.grapheme_indices(true).rev() {
-        let w = UnicodeWidthStr::width(grapheme).max(1);
-        if cells + w > keep {
-            break;
-        }
-        cells += w;
-        start = offset;
-    }
-    format!("…{}", &text[start..])
 }
 
 /// The gold rule + composer rows on the input ground (sim InputBar,
@@ -2412,7 +2392,9 @@ fn render_composer(
 /// One composer text row's clickable window (TUI5 item 5): where its
 /// visible content starts on screen and WHAT that content is (byte-exact),
 /// so the runtime can map a click column to a caret byte through the same
-/// values that rendered.
+/// values that rendered. Since TUI6 the rows are WRAP segments of the
+/// draft — `start` is the segment's absolute byte offset and `content` its
+/// text, so a click on any wrapped row lands on that row's own graphemes.
 struct ComposerRowWindow {
     row: u16,
     content_x: u16,
@@ -2475,17 +2457,19 @@ fn login_lines(card: &crate::app::LoginCard, theme: &Theme, width: u16) -> Vec<L
 }
 
 /// The composer rows (sim InputBar textarea): padded off the frame edge,
-/// bold gold ❯ sigil, REAL newlines on their own rows, a horizontal
-/// tail-window on any overlong line so the editable end stays visible,
+/// bold gold ❯ sigil, REAL newlines on their own rows, overlong lines
+/// SOFT-WRAPPED at grapheme boundaries into visual rows (TUI6 items 1-5 —
+/// the sim's one `<textarea rows={1}>` wraps and autoGrows, tui.js:3004),
 /// typed text bright with a gold block cursor (or the dim placeholder +
 /// ghost completion), and the right-aligned `[ ◉ talk ]` chip on the first
-/// row.
+/// row. NO horizontal windowing and NO `…` in the composer, ever — the
+/// TUI5 caret-following window died with the wrap.
 ///
 /// `allocated` is the height the layout actually granted: the composer
-/// VERTICALLY tail-windows to it (last lines win — the cursor row is
-/// sacred at any size, review r3 P2-1a), with a faint ⋮ gutter marker when
-/// rows are hidden above. Returns the rows plus the chip's column offset +
-/// width.
+/// VERTICALLY tail-windows to it over VISUAL rows (last rows win — the
+/// cursor row is sacred at any size, review r3 P2-1a), with a faint ⋮
+/// gutter marker when rows are hidden above or below. Returns the rows
+/// plus the chip's column offset + width.
 ///
 /// (W3c3.1, review D3-7: the M3 login card was inserted BETWEEN this doc
 /// comment and the function it documents, orphaning both it and the
@@ -2596,23 +2580,21 @@ fn composer_lines<'a>(
     let text = model.composer.text();
     let cursor = model.composer.cursor();
     let selection = model.composer.selection_range();
-    // Logical rows with their absolute byte offsets ('\n' has no row of
-    // its own; a cursor ON a '\n' renders at that row's end cell).
-    let mut row_bounds: Vec<(usize, &str)> = Vec::new();
-    let mut offset = 0;
-    for segment in text.split('\n') {
-        row_bounds.push((offset, segment));
-        offset += segment.len() + 1;
-    }
-    let cursor_row_index = row_bounds
-        .iter()
-        .rposition(|(start, segment)| cursor >= *start && cursor <= start + segment.len())
-        .unwrap_or(0);
+    // Visual rows: the draft wrapped at grapheme boundaries into the
+    // frame's budget (TUI6 item 1). The budget is fed back to the
+    // composer so ↑/↓ walk the SAME rows this frame paints (the
+    // scroll_max Cell pattern — geometry feedback, never stored wrap
+    // points; the reducer stays put).
+    let budget = composer_text_budget(width);
+    model.composer.set_wrap_budget(budget);
+    let row_bounds = crate::composer::wrap_rows(text, budget);
+    let cursor_row_index = crate::composer::visual_row_of(&row_bounds, cursor);
     let total = row_bounds.len();
     let window = (allocated.max(1) as usize).min(COMPOSER_MAX_ROWS);
-    // Vertical window: prefer the TAIL (the editable end), but the CURSOR
-    // row is sacred — moving ↑ into scrolled-out rows scrolls the window
-    // up to keep the caret visible (item 1's tail-window state).
+    // Vertical window over VISUAL rows: prefer the TAIL (the editable
+    // end), but the CURSOR row is sacred — moving ↑ into scrolled-out
+    // rows scrolls the window up to keep the caret visible (item 2's
+    // caret-follows law).
     let mut skip = total.saturating_sub(window);
     if cursor_row_index < skip {
         skip = cursor_row_index;
@@ -2623,47 +2605,36 @@ fn composer_lines<'a>(
     let mut rows = Vec::new();
     let mut chip_at = None;
     let mut windows = Vec::new();
-    for (index, (row_start, segment)) in visible.iter().enumerate() {
+    for (index, row) in visible.iter().enumerate() {
         let first_row = index == 0;
         let last_row = index == last;
-        let cursor_row = skip + index == cursor_row_index;
         let mut spans = vec![Span::raw(" ".repeat(COMPOSER_PAD))];
         if first_row && skip == 0 {
             spans.push(sigil.clone());
         } else if first_row {
-            // Earlier lines are scrolled out above (vertical tail window).
+            // Earlier rows are scrolled out above (vertical tail window).
             spans.push(Span::styled("⋮ ", theme.faint_style()));
         } else if last_row && hidden_below {
-            // Later lines are scrolled out below (the cursor pulled the
+            // Later rows are scrolled out below (the cursor pulled the
             // window up) — same honesty as the ⋮ above.
             spans.push(Span::styled("⋮ ", theme.faint_style()));
         } else {
             spans.push(Span::raw("  "));
         }
-        // The cursor row reserves one cell for the end-of-text block;
-        // long rows window horizontally — the CARET stays visible on the
-        // cursor row (item 1), other rows keep their editable tail.
-        let reserve = COMPOSER_PAD + 2 + usize::from(cursor_row);
-        let budget = (width as usize).saturating_sub(reserve);
-        let (vstart, vend, left_ell) = if cursor_row {
-            let slice = composer_cursor_row_spans(
-                &mut spans, segment, *row_start, cursor, selection, budget, theme,
-            );
+        composer_row_spans(&mut spans, text, *row, cursor, selection, theme);
+        if skip + index == cursor_row_index {
             // Inline ghost completion (sim `.ghostline`, tui.js:3028-3034)
             // — palette queries are single-line, so this is also row 0.
             if let Some(ghost) = model.ghost() {
                 spans.push(Span::styled(ghost, theme.dim_style()));
                 spans.push(Span::styled(" ⇥ tab", theme.faint_style()));
             }
-            slice
-        } else {
-            composer_plain_row_spans(&mut spans, segment, *row_start, selection, budget, theme)
-        };
+        }
         windows.push(ComposerRowWindow {
             row: u16::try_from(index).unwrap_or(u16::MAX),
-            content_x: u16::try_from(COMPOSER_PAD + 2 + usize::from(left_ell)).unwrap_or(u16::MAX),
-            start: row_start + vstart,
-            content: segment[vstart..vend].to_owned(),
+            content_x: u16::try_from(COMPOSER_PAD + 2).unwrap_or(u16::MAX),
+            start: row.start,
+            content: text[row.start..row.end].to_owned(),
         });
         if first_row {
             chip_at = chip_fit(&mut spans);
@@ -2673,35 +2644,30 @@ fn composer_lines<'a>(
     (rows, chip_at, windows)
 }
 
-/// The cursor row's text spans: a caret-following horizontal window, the
-/// selection band on covered cells, and the cursor CELL — the grapheme
-/// under the caret in reverse-video, or a themed block over a space at the
-/// row's end (TUI5 item 1; the old code APPENDED a `▮` glyph here).
-/// Returns the visible slice `(start, end, left_ellipsis)` for the row's
-/// click window (item 5).
-fn composer_cursor_row_spans<'s>(
+/// One visual row's text spans — since TUI6 the ONE renderer for every
+/// composer row (the TUI5 cursor-row/plain-row split died with the
+/// horizontal caret window; there is nothing left to ellipsize). Groups
+/// the row's graphemes into style runs: the selection band on covered
+/// cells, the cursor CELL (which WINS over the band — the active end must
+/// stay distinct, TUI5 item 4) in reverse-video, plain draft ink
+/// otherwise, and the line-end caret block over a space when the caret
+/// owns this row's end (`line_last` — the position ON the `\n` or at the
+/// text end; a caret ON a wrap point renders on the FOLLOWING row, the
+/// `WrapRow` no-affinity law, so wrap rows never draw the end block).
+fn composer_row_spans<'s>(
     spans: &mut Vec<Span<'s>>,
-    segment: &str,
-    row_start: usize,
+    text: &str,
+    row: crate::composer::WrapRow,
     cursor: usize,
     selection: Option<(usize, usize)>,
-    budget: usize,
     theme: &Theme,
-) -> (usize, usize, bool) {
-    let caret_in_row = cursor.saturating_sub(row_start).min(segment.len());
-    let (vstart, vend, left_ell, right_ell) = caret_window(segment, budget, caret_in_row);
-    if left_ell {
-        spans.push(Span::styled("…", theme.faint_style()));
-    }
-    let visible = &segment[vstart..vend];
-    // Group the visible graphemes into style runs: selection band cells,
-    // the cursor cell (which WINS over the band — the active end must
-    // stay distinct, item 4), and plain draft ink.
+) {
     use unicode_segmentation::UnicodeSegmentation;
+    let visible = &text[row.start..row.end];
     let mut run = String::new();
     let mut run_style = theme.bright_style();
     for (grapheme_offset, grapheme) in visible.grapheme_indices(true) {
-        let abs = row_start + vstart + grapheme_offset;
+        let abs = row.start + grapheme_offset;
         let style = if abs == cursor {
             theme.cursor_style()
         } else if selection.is_some_and(|(start, end)| abs >= start && abs < end) {
@@ -2718,115 +2684,11 @@ fn composer_cursor_row_spans<'s>(
     if !run.is_empty() {
         spans.push(Span::styled(run, run_style));
     }
-    if caret_in_row >= segment.len() {
-        // End-of-row caret (also end-of-text): the block over a space.
+    if row.line_last && cursor == row.end {
+        // Line-end caret (also end-of-text): the block over a space, in
+        // the cell composer_text_budget reserved on every row.
         spans.push(Span::styled(" ", theme.cursor_style()));
     }
-    if right_ell {
-        spans.push(Span::styled("…", theme.faint_style()));
-    }
-    (vstart, vend, left_ell)
-}
-
-/// A non-cursor row: tail-windowed as before, with the selection band on
-/// the covered visible cells. Returns the visible slice
-/// `(start, end, left_ellipsis)` for the row's click window (item 5).
-fn composer_plain_row_spans<'s>(
-    spans: &mut Vec<Span<'s>>,
-    segment: &str,
-    row_start: usize,
-    selection: Option<(usize, usize)>,
-    budget: usize,
-    theme: &Theme,
-) -> (usize, usize, bool) {
-    let windowed = tail_window(segment, budget);
-    // Review P3-5: clipped-ness by COMPARISON — a row genuinely starting
-    // with a literal '…' must keep it as user text, not lose it to
-    // ellipsis sniffing.
-    let (clipped, visible) = if windowed == segment {
-        (false, windowed.as_str())
-    } else {
-        (
-            true,
-            windowed.strip_prefix('…').unwrap_or(windowed.as_str()),
-        )
-    };
-    if clipped {
-        spans.push(Span::styled("…", theme.faint_style()));
-    }
-    let vstart = segment.len() - visible.len();
-    use unicode_segmentation::UnicodeSegmentation;
-    let mut run = String::new();
-    let mut run_style = theme.bright_style();
-    for (grapheme_offset, grapheme) in visible.grapheme_indices(true) {
-        let abs = row_start + vstart + grapheme_offset;
-        let style = if selection.is_some_and(|(start, end)| abs >= start && abs < end) {
-            theme.composer_selection_style()
-        } else {
-            theme.bright_style()
-        };
-        if style != run_style && !run.is_empty() {
-            spans.push(Span::styled(std::mem::take(&mut run), run_style));
-        }
-        run_style = style;
-        run.push_str(grapheme);
-    }
-    if !run.is_empty() {
-        spans.push(Span::styled(run, run_style));
-    }
-    (vstart, segment.len(), clipped)
-}
-
-/// The horizontal window of `line` (display `budget` cells) that keeps the
-/// caret CELL visible: head-anchored while the caret fits from the start,
-/// otherwise ending at the caret's right edge (so a caret at the line end
-/// reproduces the old tail-window exactly). Returns
-/// `(start_byte, end_byte, left_ellipsis, right_ellipsis)` — the ellipses
-/// each consume one cell of the budget.
-fn caret_window(line: &str, budget: usize, caret: usize) -> (usize, usize, bool, bool) {
-    use unicode_segmentation::UnicodeSegmentation;
-    use unicode_width::UnicodeWidthStr;
-    if budget == 0 {
-        return (caret, caret, false, false);
-    }
-    if line.width() <= budget {
-        return (0, line.len(), false, false);
-    }
-    let caret_col = line[..caret].width();
-    let caret_cell = line[caret..]
-        .graphemes(true)
-        .next()
-        .map_or(1, |g| g.width().max(1));
-    // Head window: caret cell fits before the right ellipsis.
-    if caret_col + caret_cell <= budget.saturating_sub(1) {
-        let avail = budget - 1;
-        let mut end = line.len();
-        let mut col = 0;
-        for (offset, grapheme) in line.grapheme_indices(true) {
-            let w = grapheme.width();
-            if col + w > avail {
-                end = offset;
-                break;
-            }
-            col += w;
-        }
-        return (0, end, false, true);
-    }
-    // Tail-side window ending at the caret's right cell edge.
-    let end = (caret + line[caret..].graphemes(true).next().map_or(0, str::len)).min(line.len());
-    let right_ell = end < line.len();
-    let avail = budget.saturating_sub(1 + usize::from(right_ell));
-    let mut start = end;
-    let mut col = 0;
-    for (offset, grapheme) in line[..end].grapheme_indices(true).rev() {
-        let w = grapheme.width();
-        if col + w > avail {
-            break;
-        }
-        col += w;
-        start = offset;
-    }
-    (start, end, true, right_ell)
 }
 
 /// The slash palette (sim CmdMenu, tui.js:5345): a frame rule on top, then

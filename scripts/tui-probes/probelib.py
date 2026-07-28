@@ -20,6 +20,7 @@ hermetic gate:
 
 import os
 import pty
+import re
 import select
 import signal
 import struct
@@ -29,6 +30,37 @@ import termios
 import time
 
 import fcntl
+
+# SGR runs / cursor moves / OSC sequences — stripped for TEXT checks;
+# color checks read the raw bytes (the pty-probe-cursor convention).
+ANSI_RE = re.compile(rb"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07")
+
+
+def plain(chunk):
+    """ANSI-stripped bytes."""
+    return ANSI_RE.sub(b"", chunk)
+
+
+def screen_rows(frame):
+    """Reconstruct per-row text from a captured (full-repaint) frame.
+
+    Frames split on cursor-position moves (ESC[row;colH); each addressed
+    run's ANSI-stripped text appends to its ROW, so a resize-forced full
+    repaint yields one text line per screen row (column gaps collapse —
+    good for `in` checks, not for cell geometry). Returns
+    ``{row_number: text}``, 1-based like the terminal. TUI6: the
+    band-anatomy and soft-wrap checks read the screen as ROWS ("a rule
+    above, wrapped rows below it, a rule under those"), which a flat
+    substring search cannot express.
+    """
+    rows = {}
+    parts = re.split(rb"\x1b\[(\d+);(\d+)H", frame)
+    # parts = [preamble, row, col, run, row, col, run, ...]
+    for index in range(1, len(parts) - 2, 3):
+        row = int(parts[index])
+        text = plain(parts[index + 2]).decode("utf-8", "replace")
+        rows[row] = rows.get(row, "") + text
+    return rows
 
 
 def spawn(cols, rows, binary):
