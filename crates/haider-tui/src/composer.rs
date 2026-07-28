@@ -773,12 +773,6 @@ pub fn line_end(text: &str, at: usize) -> usize {
     text[at..].find('\n').map_or(text.len(), |i| at + i)
 }
 
-/// Display column (cells) of `at` within its line — wide glyphs count 2.
-#[must_use]
-pub fn display_col(text: &str, at: usize) -> usize {
-    text[line_start(text, at)..at].width()
-}
-
 /// The grapheme boundary in `line_start..=line_end` whose display column
 /// best matches `target`: the last boundary at or before the target cell
 /// (a wide glyph straddling the target keeps the cursor before it).

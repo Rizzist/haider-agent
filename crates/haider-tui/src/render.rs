@@ -873,6 +873,25 @@ fn render_session(
     } else {
         budget -= todos_height;
     }
+    // The composer band closes with a frame rule — the sim draws it as the
+    // border-top of whatever follows the InputBar (SubTree tui.js:4764 /
+    // StatusBar tui.js:5497), which is the "bottom line" the owner's
+    // screenshot was missing (item 2). TUI6 item 6 fixed the claim order
+    // twice over: the RULE outranks the pad (at exactly one spare row the
+    // band still closes — the rule IS the anatomy, the pad is the
+    // InputBar's bottom padding), and BOTH outrank the breathing rows
+    // below, which the local comment always declared "the FIRST thing to
+    // shed" — the TUI5 arithmetic let a blank breathing row survive a
+    // starved closing rule, recreating the owner's missing-line defect
+    // with a blank in its place (TUI6 review, MINOR 1).
+    let band_rule_h = u16::from(budget > 0 && input_rule_h > 0);
+    if band_rule_h > 0 {
+        budget -= band_rule_h;
+    }
+    let band_pad = u16::from(budget > 0 && input_rule_h > 0);
+    if band_pad > 0 {
+        budget -= band_pad;
+    }
     // One breathing row above each block that is actually present, taken
     // last and given up first.
     let want_lead = u16::from(waiting_height > 0);
@@ -889,19 +908,6 @@ fn render_session(
     let lead_waiting = breathe(want_lead, &mut budget);
     let lead_todos = breathe(want_todos_lead, &mut budget);
     let lead_subtree = breathe(want_subtree_lead, &mut budget);
-    // The composer band closes with a frame rule — the sim draws it as the
-    // border-top of whatever follows the InputBar (SubTree tui.js:4764 /
-    // StatusBar tui.js:5497), which is the "bottom line" the owner's
-    // screenshot was missing (item 2). TUI6 item 6 flipped the claim
-    // order: the RULE outranks the pad, so at exactly one spare row the
-    // band still closes (the rule IS the anatomy; the pad is the
-    // InputBar's bottom padding) — the TUI5 order kept the pad and
-    // dropped the rule there.
-    let band_rule_h = u16::from(budget > 0 && input_rule_h > 0);
-    if band_rule_h > 0 {
-        budget -= band_rule_h;
-    }
-    let band_pad = u16::from(budget > 0 && input_rule_h > 0);
     let [
         header_area,
         header_rule,
@@ -2499,6 +2505,12 @@ fn login_lines(card: &crate::app::LoginCard, theme: &Theme, width: u16) -> Vec<L
         LoginStage::Entry | LoginStage::Failed(_) if !card.is_empty() => {
             let shown = card.masked_len().min(MASK_CAP);
             let mask = "•".repeat(shown);
+            // JUSTIFIED `…` SURVIVOR (TUI6 item 1 names each): this is
+            // the secrecy CAP, not a caret window — the mask stops
+            // advertising a long key's length. The composer's
+            // no-ellipsis law governs DRAFT text; the mask renders no
+            // draft byte at all. (The other band survivor is the
+            // `◉ listening…` chip label — sim-verbatim chrome.)
             let more = if card.masked_len() > MASK_CAP {
                 "…"
             } else {
@@ -2695,7 +2707,8 @@ fn composer_lines<'a>(
         composer_row_spans(&mut spans, text, *row, cursor, selection, theme);
         if skip + index == cursor_row_index {
             // Inline ghost completion (sim `.ghostline`, tui.js:3028-3034)
-            // — palette queries are single-line, so this is also row 0.
+            // — it rides the CARET'S visual row (an overlong palette query
+            // wraps like any draft, so this is not always row 0).
             if let Some(ghost) = model.ghost() {
                 spans.push(Span::styled(ghost, theme.dim_style()));
                 spans.push(Span::styled(" ⇥ tab", theme.faint_style()));

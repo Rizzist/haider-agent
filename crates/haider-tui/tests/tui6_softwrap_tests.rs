@@ -646,6 +646,56 @@ fn login_card_band_carries_both_rules() {
     assert_two_rules(&rows, "API key", "esc cancel", "login card");
 }
 
+#[test]
+fn closing_rule_outranks_breathing_rows_under_pressure() {
+    // MUTATION CHECK (closing-rule-outranks-breathing): restore the
+    // TUI6b claim order (leads before band_rule_h/band_pad in
+    // render_session) and this fails at height 14 — a blank row with no
+    // rule between the band and ▾ subagents. Verified by revert.
+    //
+    // TUI6 review MINOR 1: the session ledger claimed the breathing rows
+    // BEFORE the closing band rule, so at exact starvation a blank
+    // breathing row survived while the rule shed — the owner's item-6
+    // defect recreated with a blank in the rule's place (and the local
+    // comment always said breathing rows shed FIRST). The fixed claim
+    // order makes this invariant hold at EVERY height: whenever any row
+    // separates the band from the SubTree header, at least one of the
+    // separating rows is a rule.
+    let mut model = session_model();
+    model.chips = vec![ChipModel::from_seed(ChipSeed {
+        agent: "t1-docs".to_owned(),
+        parent: None,
+        ros: None,
+        callsign: "Husayn".to_owned(),
+        hon: "(r)",
+        full: "Husayn ibn Ali".to_owned(),
+        name: "docs".to_owned(),
+        model: "fable-5".to_owned(),
+        device: "macbook".to_owned(),
+        state: ChipDisplayState::Running,
+        tokens: 100,
+        prefill: Vec::new(),
+    })];
+    for height in 8..32 {
+        let (rows, _, _) = draw(&model, 90, height);
+        let Some(band_y) = rows.iter().position(|row| row.contains("message haider")) else {
+            continue;
+        };
+        let Some(subtree_y) = rows.iter().position(|row| row.contains("subagents —")) else {
+            continue;
+        };
+        if subtree_y <= band_y + 1 {
+            continue; // zero spare rows — an honest full shed
+        }
+        assert!(
+            rows[band_y + 1..subtree_y].iter().any(|row| is_rule(row)),
+            "height {height}: rows between the band and the SubTree hold \
+             no rule — a breathing/pad row outlived the closing rule: {:?}",
+            &rows[band_y..=subtree_y]
+        );
+    }
+}
+
 // ---- Item 7: the thinner header mark ----
 
 #[test]
