@@ -1511,15 +1511,32 @@ impl AppModel {
         // this is the single cancellation authority.
         self.composer_drag = false;
         let key = self.surface_key();
+        // TUI6.1 fix 1 closure: the frame's CURRENT wrap budget outlives
+        // the swap — `mem::take` would otherwise leave the scratch
+        // composer at the default 0 and `restore_draft`'s carry would
+        // read that instead of the live width.
+        let budget = self.composer.wrap_budget();
         let draft = std::mem::take(&mut self.composer);
         self.drafts.insert(key, draft);
+        self.composer.set_wrap_budget(budget);
     }
 
     /// Bring the NEW surface's parked composer live (empty for a surface
     /// never visited — a fresh session starts with a fresh draft).
+    ///
+    /// TUI6.1 fix 1 closure (the stash-seam half): a parked draft carries
+    /// the wrap budget of ITS last render — frames and possibly resizes
+    /// ago. A queued ↑ racing the post-switch redraw would walk that
+    /// stale width's rows (the review r1 class, one seam over). Every
+    /// band spans the frame's full width, so the OUTGOING composer's
+    /// budget is the current truth for every surface: carry it across
+    /// the swap. This is the only restore path, so a restored draft can
+    /// never wake to a stale width.
     fn restore_draft(&mut self) {
         let key = self.surface_key();
+        let current_budget = self.composer.wrap_budget();
         self.composer = self.drafts.remove(&key).unwrap_or_default();
+        self.composer.set_wrap_budget(current_budget);
     }
 
     /// Flip to the session screen WITH the item-9 draft swap when the

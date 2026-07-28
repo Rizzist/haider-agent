@@ -135,6 +135,14 @@ impl Composer {
         self.wrap_budget.set(budget);
     }
 
+    /// The last-fed wrap budget (TUI6.1: the draft-swap seam carries the
+    /// ACTIVE composer's budget onto a restored draft — a parked draft's
+    /// own cell is as old as its last render).
+    #[must_use]
+    pub fn wrap_budget(&self) -> usize {
+        self.wrap_budget.get()
+    }
+
     /// The visual rows of the current draft at the last rendered budget —
     /// the SAME geometry the frame painted (or one row per logical line
     /// while nothing has rendered).

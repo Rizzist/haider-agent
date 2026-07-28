@@ -575,6 +575,51 @@ fn cluster_families_price_and_wrap_consistently() {
 // ---- TUI6.1 fix 1: resize can never serve the previous frame's layout ----
 
 #[test]
+fn restored_draft_wakes_to_the_current_width_not_its_parked_one() {
+    // TUI6.1 fix 1 closure, the stash-seam half (self-found while
+    // closing review r1's class): a parked draft's wrap-budget Cell is
+    // as old as ITS last render. Repro: draft 20 chars on the LAUNCHER
+    // at 20 cols (budget 15), attach a session (draft parks), resize to
+    // 10 cols while attached, ⌃C back to the launcher, then ↑ QUEUED
+    // before any redraw — pre-closure the ↑ walked the parked 15-cell
+    // rows; the law walks the current 10-col rows (budget 5).
+    //
+    // MUTATION CHECK (budget-across-swap): drop the
+    // `set_wrap_budget(current_budget)` line from restore_draft and this
+    // fails with cursor 5 (the parked 15-cell geometry: 20 → row 1
+    // col 5) instead of 14 (5-cell). Verified by revert.
+    let mut model = launcher_model();
+    for c in "abcdefghijklmnopqrst".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    let (_, hits, _) = draw(&model, 20, 30);
+    // Park the launcher draft by attaching a session (the digit shortcut
+    // needs an EMPTY composer, so attach through the row's hit).
+    let id = common::session_named(&model, "billing-service");
+    model.handle_hit(Hit::AttachSession(id));
+    assert_eq!(model.screen, Screen::Session);
+    // The terminal resizes while the launcher draft is parked.
+    dispatch_input(&mut model, &hits, Event::Resize(10, 30));
+    // ⌃C: back to the launcher — the draft returns…
+    model.handle(key_mod(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert_eq!(model.screen, Screen::Launcher);
+    assert_eq!(model.composer.text(), "abcdefghijklmnopqrst");
+    // …and a ↑ QUEUED before any redraw must walk the CURRENT width's
+    // rows. 10-col geometry (budget 5): rows [0,5) [5,10) [10,15)
+    // [15,20]; the caret at 20 sits at col 5 of the last row, so ↑ seeks
+    // col 5 in [10,15) — past the wrap row's width, clamping to its last
+    // grapheme start, byte 14. The parked 15-cell geometry (rows [0,15)
+    // [15,20]) would land ↑ at byte 5 instead — the mutation check's
+    // expected failure value.
+    model.handle(key(KeyCode::Up));
+    assert_eq!(
+        model.composer.cursor(),
+        14,
+        "the restored draft walks the CURRENT 10-col geometry"
+    );
+}
+
+#[test]
 fn resize_reflows_navigation_before_any_queued_key() {
     // Review r1 finding 1 (P1), the reviewer's exact repro: render at 20
     // cols (budget 15) with the caret at byte 4, dispatch a resize to 10
