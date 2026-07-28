@@ -1033,11 +1033,14 @@ fn apply_patch_at_with_commit_hooks(
         return Err(error);
     }
     // A non-cooperating writer can ignore the advisory lock. On every
-    // filesystem, an in-place write after content verification or a replacement
-    // inode installed after this identity check can still race the rename. On a
-    // clonefile fallback, an undetectably torn verify read is an additional
-    // residual. The exact bounds are ledgered in docs/OPTIMIZATIONS.md under
-    // "haider-tools filesystem residual (W4a1.3)".
+    // filesystem, a same-inode write that lands after the CLONE INSTANT (the
+    // clone read observes the older coherent snapshot, so the writer's newer
+    // content is not seen by the verify), or a replacement inode installed
+    // after this identity check, can still race the rename. The same-inode
+    // check->rename window therefore begins at the clone instant, not after
+    // the verify read completes. On a clonefile fallback, an undetectably torn
+    // verify read is an additional residual. The exact bounds are ledgered in
+    // docs/OPTIMIZATIONS.md under "haider-tools filesystem residual (W4a1.3)".
     if let Err(error) = replace_temporary_at_commit(
         &commit_parent,
         &temporary_name,
