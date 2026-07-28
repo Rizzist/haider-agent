@@ -1,0 +1,21 @@
+# TUI6 — composer soft-wrap (owner wave, 2026-07-28, from the live keystone build)
+
+Owner report (screenshot: session composer showing `❯ …jjjj…jj▊` between the band rules): "main menu tui, chat session input area should be 1 line, but if input increases, it just becomes multi lines (wraps), it doesn't extend 1 line infinitely, that's bad. fix this."
+
+The composer currently has NO soft-wrap: `composer_lines` renders one visual row per LOGICAL line with a horizontal caret-following window (`caret_window`, render.rs ~2786), and `composer.rs:378` documents the simplification ("no soft wrap; visual rows ARE the logical lines"). That documented residual is now the bug. Gates v0.0.12 alongside the W3c3 arc.
+
+## The law
+
+1. **The composer starts at ONE visual row and grows by WRAPPING.** A logical line longer than the row budget wraps at grapheme boundaries into multiple visual rows (no mid-cluster splits — `nearest_boundary`/`after_edit` discipline applies to wrap points identically). NO horizontal windowing, NO `…` ellipses in the composer, ever. `caret_window` dies (or is reduced to the arg-slot/palette single-line surfaces IF any genuinely must stay single-line — justify each survivor).
+2. **Autogrow counts VISUAL rows.** The existing cap (5 rows) and vertical tail-windowing keep working, but over wrapped rows: when content exceeds the cap, the window follows the CARET vertically (the caret must always be visible), not just the tail.
+3. **All geometry follows the visual-row model**: sticky-column ↑/↓ moves across VISUAL rows (the TUI5 brief's original wording — the reduction to logical lines is what this round removes); ⇧↑/⇧↓ extension likewise; Home/End remain LOGICAL-line edges (Claude Code convention) — document the pairing; click-to-place and drag-selection map through the wrapped `ComposerRowWindow`s (each visual row carries its byte range — the struct already does; the ranges become wrap segments).
+4. **Every composer surface**: launcher, session, Aura, arg-slot mode (arg-slot may stay single-line ONLY if the sim says so — check and cite), with per-surface drafts + cursor/selection travel unchanged.
+5. **Resize reflows**: wrap points derive from the CURRENT width every frame (pure render-side wrapping of the model's logical text — the MODEL never stores wrap points; that's what keeps this a render-layer change and the reducer stays-put).
+
+## Discipline
+
+Branch: `w3-c3` (after the frozen r3 review completes — NEVER touch the tree while a reviewer holds it). Tests only UP from 812; MUTATION CHECK + executed reverts on: wrap-at-grapheme-boundary, caret-always-visible-in-window, click-maps-through-wrapped-row. Directed changes expected: the TUI5-era tests that pinned the no-soft-wrap reduction (line_up doc-law, caret_window tests) are RE-SCOPED with inline reasoning, not deleted. Probes: pty-probe-ml gains a long-single-line case asserting the wrap (row count grows, NO `…` in the band, caret visible); pty-probe-cursor's ladder rows must stay green. Full gate + 16-run ladder (the wrap must not disturb the live rows). The sim is read-only law for demo behavior; the owner's law above WINS for the composer.
+
+## Owner addition at launch (2026-07-28, second screenshot — folded in before work started)
+
+6. **Composer band anatomy sweep — EVERY view.** The subagent view has the OPPOSITE defect to TUI5's launcher fix: its input band has no closing rule underneath (screenshot: `❯ message Husayn — steer this subagent…` then straight into the `▼ subagents` tree). The law, per the owner and Claude Code's own TUI: the input band carries a rule ABOVE and a rule BELOW, on every surface that has an input — launcher, session, subagent/chip view, Aura, arg-slot, login card, and any menu-with-input. Sweep them ALL (enumerate the render paths that draw a composer/input band; assert the two-rule anatomy per surface with a test each, not just the one the screenshot showed — TUI5 fixed the launcher band and missed this sibling, so the sweep is the deliverable, not the single fix). Fold into the same probe evidence: the ml/sub/cursor probes' captured frames must show both rules on their respective surfaces.
