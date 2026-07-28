@@ -5,7 +5,7 @@ use haider_protocol::effect::{EffectClass, EffectOutcome, EffectPhase};
 use haider_protocol::ids::{ArtifactRef, RunId, SessionId};
 use haider_tools::{
     CasSink, ChangeLedger, ChangeLedgerSink, EffectBroker, FsList, FsPatch, FsRead, FsSearch,
-    FsWriteRecord, JournalSink, PermissionPolicy, ResultBounds, ToolError, ToolResult,
+    FsWrite, FsWriteRecord, JournalSink, PermissionPolicy, ResultBounds, ToolError, ToolResult,
     TurnAttribution,
 };
 use std::fs;
@@ -337,6 +337,62 @@ fn terminal_phases(phases: &[EffectPhase]) -> Vec<&EffectPhase> {
 }
 
 #[tokio::test]
+async fn fs_write_creates_and_overwrites_with_ledgered_four_phase_effects() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("written.txt");
+    let attribution = TurnAttribution::new(SessionId::new("session"), RunId::new("turn"));
+    let ledger = ChangeLedger::new();
+    let mut broker = broker_at(RecordingJournal::default(), directory.path());
+    let policy = allow(EffectClass::FsWrite);
+
+    broker
+        .fs_write(
+            &FsWrite::new("written.txt", "first\n"),
+            &policy,
+            &attribution,
+            &ledger,
+        )
+        .await
+        .expect("create file");
+    broker
+        .fs_write(
+            &FsWrite::new(&path, "second\n"),
+            &policy,
+            &attribution,
+            &ledger,
+        )
+        .await
+        .expect("overwrite file");
+
+    assert_eq!(
+        fs::read_to_string(&path).expect("read written file"),
+        "second\n"
+    );
+    assert_eq!(
+        ledger
+            .changes_for(&attribution.session, &attribution.turn)
+            .expect("write ledger")
+            .writes
+            .len(),
+        2
+    );
+    let phases = broker.journal_snapshot();
+    assert_eq!(phases.len(), 8);
+    for effect in phases.chunks_exact(4) {
+        assert!(matches!(effect[0], EffectPhase::Intent(_)));
+        assert!(matches!(effect[1], EffectPhase::Authorized { .. }));
+        assert!(matches!(effect[2], EffectPhase::Dispatched { .. }));
+        assert!(matches!(
+            effect[3],
+            EffectPhase::Outcome {
+                outcome: EffectOutcome::Ok,
+                ..
+            }
+        ));
+    }
+}
+
+#[tokio::test]
 async fn preimage_mismatch_returns_typed_conflict_and_failed_outcome() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let path = directory.path().join("conflict.txt");
@@ -363,6 +419,7 @@ async fn preimage_mismatch_returns_typed_conflict_and_failed_outcome() {
         fs::canonicalize(&path).expect("canonical conflict path")
     );
     assert_eq!(conflict.expected_preimage, "stale");
+    assert_eq!(conflict.matches, 0);
     assert_eq!(fs::read_to_string(&path).expect("read file"), "current");
     assert!(!ledger.has_fs_writes(&attribution.session, &attribution.turn));
     assert!(matches!(
@@ -372,6 +429,36 @@ async fn preimage_mismatch_returns_typed_conflict_and_failed_outcome() {
             ..
         })
     ));
+}
+
+#[tokio::test]
+async fn ambiguous_preimage_returns_typed_conflict_without_writing() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("ambiguous.txt");
+    fs::write(&path, "same\nsame\n").expect("seed file");
+    let mut broker = broker_at(RecordingJournal::default(), directory.path());
+    let attribution = TurnAttribution::new(SessionId::new("session"), RunId::new("turn"));
+    let ledger = ChangeLedger::new();
+
+    let error = broker
+        .fs_patch(
+            &FsPatch::new(&path, "same", "changed"),
+            &allow(EffectClass::FsWrite),
+            &attribution,
+            &ledger,
+        )
+        .await
+        .expect_err("ambiguous preimage");
+
+    let ToolError::Conflict(conflict) = error else {
+        panic!("expected typed conflict");
+    };
+    assert_eq!(conflict.matches, 2);
+    assert_eq!(
+        fs::read_to_string(&path).expect("unchanged file"),
+        "same\nsame\n"
+    );
+    assert!(!ledger.has_fs_writes(&attribution.session, &attribution.turn));
 }
 
 #[tokio::test]
@@ -1111,6 +1198,51 @@ async fn workspace_traversal_is_rejected_before_authorization_or_read() {
     assert!(cas.writes.is_empty());
 }
 
+/// MUTATION CHECK: remove `require_under_root` from write/patch resolution.
+/// Expected failure: an outside file is created or replaced. Verified by
+/// revert in W4a1.
+#[tokio::test]
+async fn mutating_paths_reject_parent_and_absolute_workspace_escapes() {
+    let parent = tempfile::tempdir().expect("temporary parent");
+    let workspace = parent.path().join("workspace");
+    fs::create_dir(&workspace).expect("create workspace");
+    let outside = parent.path().join("outside.txt");
+    fs::write(&outside, "outside-before").expect("seed outside");
+    let attribution = TurnAttribution::new(SessionId::new("session"), RunId::new("turn"));
+    let policy = allow(EffectClass::FsWrite);
+    let ledger = ChangeLedger::new();
+    let mut broker = broker_at(RecordingJournal::default(), &workspace);
+
+    let traversal = broker
+        .fs_write(
+            &FsWrite::new("../created-outside.txt", "escaped"),
+            &policy,
+            &attribution,
+            &ledger,
+        )
+        .await
+        .expect_err("parent traversal must be rejected");
+    let absolute = broker
+        .fs_patch(
+            &FsPatch::new(&outside, "outside-before", "outside-after"),
+            &policy,
+            &attribution,
+            &ledger,
+        )
+        .await
+        .expect_err("absolute outside patch must be rejected");
+
+    assert!(matches!(traversal, ToolError::WorkspaceBoundary { .. }));
+    assert!(matches!(absolute, ToolError::WorkspaceBoundary { .. }));
+    assert!(!parent.path().join("created-outside.txt").exists());
+    assert_eq!(
+        fs::read_to_string(&outside).expect("read outside"),
+        "outside-before"
+    );
+    assert!(broker.journal_snapshot().is_empty());
+    assert!(!ledger.has_fs_writes(&attribution.session, &attribution.turn));
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn workspace_symlink_escape_is_rejected_before_authorization_or_read() {
@@ -1136,6 +1268,57 @@ async fn workspace_symlink_escape_is_rejected_before_authorization_or_read() {
         .expect_err("symlink must not leave workspace");
 
     assert!(matches!(error, ToolError::WorkspaceBoundary { .. }));
+    assert!(broker.journal_snapshot().is_empty());
+}
+
+/// MUTATION CHECK: canonicalize only the lexical path or permit a missing
+/// leaf beneath an uncanonicalized parent. Expected failure: one of the
+/// outside targets changes. Verified by revert in W4a1.
+#[cfg(unix)]
+#[tokio::test]
+async fn mutating_paths_reject_leaf_and_parent_symlink_escapes() {
+    use std::os::unix::fs::symlink;
+
+    let parent = tempfile::tempdir().expect("temporary parent");
+    let workspace = parent.path().join("workspace");
+    let outside_dir = parent.path().join("outside");
+    fs::create_dir(&workspace).expect("create workspace");
+    fs::create_dir(&outside_dir).expect("create outside");
+    let outside_file = outside_dir.join("outside.txt");
+    fs::write(&outside_file, "outside-before").expect("seed outside");
+    symlink(&outside_file, workspace.join("leaf-link")).expect("leaf symlink");
+    symlink(&outside_dir, workspace.join("parent-link")).expect("parent symlink");
+    let attribution = TurnAttribution::new(SessionId::new("session"), RunId::new("turn"));
+    let policy = allow(EffectClass::FsWrite);
+    let ledger = ChangeLedger::new();
+    let mut broker = broker_at(RecordingJournal::default(), &workspace);
+
+    let leaf = broker
+        .fs_write(
+            &FsWrite::new("leaf-link", "escaped"),
+            &policy,
+            &attribution,
+            &ledger,
+        )
+        .await
+        .expect_err("leaf symlink escape");
+    let parent_link = broker
+        .fs_write(
+            &FsWrite::new("parent-link/new.txt", "escaped"),
+            &policy,
+            &attribution,
+            &ledger,
+        )
+        .await
+        .expect_err("parent symlink escape");
+
+    assert!(matches!(leaf, ToolError::WorkspaceBoundary { .. }));
+    assert!(matches!(parent_link, ToolError::WorkspaceBoundary { .. }));
+    assert_eq!(
+        fs::read_to_string(&outside_file).expect("read outside"),
+        "outside-before"
+    );
+    assert!(!outside_dir.join("new.txt").exists());
     assert!(broker.journal_snapshot().is_empty());
 }
 

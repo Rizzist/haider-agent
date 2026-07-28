@@ -25,8 +25,8 @@ mod sqlite_store;
 
 pub use actor::{
     CancelToken, EventIdGenerator, HarnessActor, HarnessConfig, HarnessHandle,
-    RequestInputCheckpoint, SubmitCheckpointTurn, SubmitCommittedTurn, SubmitTurn, ToolDispatcher,
-    TurnHandle, TurnOutcome, sanitized_failure_message,
+    RequestInputCheckpoint, SubmitCheckpointTurn, SubmitCommittedTurn, SubmitTurn,
+    ToolDispatchResult, ToolDispatcher, TurnHandle, TurnOutcome, sanitized_failure_message,
 };
 pub use fake_store::MemoryStore;
 pub use haider_store::{

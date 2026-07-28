@@ -29,21 +29,24 @@ use base64::Engine;
 use haider_core::{
     AcceptedTurn, CancelToken, EventIdGenerator, HarnessActor, HarnessConfig,
     PromptHistoryCompiler, RequestInputCheckpoint, StoreHandle, SubmitCheckpointTurn,
-    SubmitCommittedTurn, ToolDispatcher, TurnHandle, sanitized_failure_message,
+    SubmitCommittedTurn, ToolDispatchResult, ToolDispatcher, TurnHandle, sanitized_failure_message,
 };
 use haider_protocol::EventPayload;
-use haider_protocol::effect::{EffectClass, EffectOutcome, EffectPhase};
+use haider_protocol::effect::{
+    AuthorizationVerdict, EffectClass, EffectIntent, EffectOutcome, EffectPhase,
+};
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
 use haider_protocol::error::{ErrorCode, HaiderError};
-use haider_protocol::ids::{DeviceId, EffectId, EventId, RunId, SessionId};
+use haider_protocol::ids::{DeviceId, EffectId, EventId, MenuId, RunId, SessionId};
+use haider_protocol::menu::{DecisionKind, Menu, MenuAnswer, MenuKind};
 use haider_protocol::session::SessionMetadataV1;
 use haider_protocol::state::{RunState, SessionState};
 use haider_protocol::tool::BoundedResult;
 use haider_provider::{Message, ResolvedAttachment};
 use haider_provider::{Provider, ToolDefinition};
 use haider_tools::{
-    CasSink, EffectBroker, FsList, FsRead, FsSearch, JournalSink, PermissionPolicy, ResultBounds,
-    ToolResult,
+    CasSink, ChangeLedger, EffectBroker, FsList, FsPatch, FsRead, FsSearch, FsWrite, JournalSink,
+    PermissionPolicy, ResultBounds, ToolResult, TurnAttribution,
 };
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::Path;
@@ -2125,6 +2128,8 @@ impl TurnToolFactory for BrokerToolFactory {
             tool_definition("fs_read", "Read a UTF-8 file", &["path"]),
             tool_definition("fs_list", "List a directory", &["path"]),
             tool_definition("fs_search", "Search files for text", &["root", "query"]),
+            fs_write_definition(),
+            fs_patch_definition(),
         ]
     }
 
@@ -2132,6 +2137,8 @@ impl TurnToolFactory for BrokerToolFactory {
         &self,
         context: WorkerToolContext,
     ) -> Result<Option<Arc<dyn ToolDispatcher>>, HaiderError> {
+        let durable_permissions = durable_session_permission_state(&context.store).await?;
+        let session_id = context.store.session_id().clone();
         let journal = HubJournalSink::new(&context);
         let broker = EffectBroker::new(
             Box::new(journal),
@@ -2142,32 +2149,42 @@ impl TurnToolFactory for BrokerToolFactory {
         .map_err(tool_error)?;
         let mut policy = PermissionPolicy::default();
         policy.allow(EffectClass::FsRead);
+        policy.ask(EffectClass::FsWrite);
+        for class in durable_permissions.grants {
+            policy.allow_for_session(class);
+        }
         Ok(Some(Arc::new(BrokerToolDispatcher {
             broker: Mutex::new(Some(broker)),
-            policy,
+            policy: Mutex::new(policy),
             cas: Mutex::new(HubArtifactStore {
                 store: context.store,
             }),
+            ledger: ChangeLedger::new(),
+            session_id,
+            durable_permission_bindings: durable_permissions.bindings,
         })))
     }
 }
 
 struct BrokerToolDispatcher {
     broker: Mutex<Option<EffectBroker>>,
-    policy: PermissionPolicy,
+    policy: Mutex<PermissionPolicy>,
     cas: Mutex<HubArtifactStore>,
+    ledger: ChangeLedger,
+    session_id: SessionId,
+    durable_permission_bindings: HashMap<MenuId, (EffectClass, String)>,
 }
 
 #[async_trait]
 impl ToolDispatcher for BrokerToolDispatcher {
     async fn execute(
         &self,
-        _run_id: &RunId,
+        run_id: &RunId,
         _call_id: &str,
         name: &str,
         args: serde_json::Value,
         cancel: &CancelToken,
-    ) -> Result<BoundedResult, HaiderError> {
+    ) -> Result<ToolDispatchResult, HaiderError> {
         if cancel.is_cancelled() {
             return Err(HaiderError::new(
                 ErrorCode::Internal,
@@ -2183,6 +2200,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 false,
             )
         })?;
+        let policy = self.policy.lock().await;
         let mut cas = self.cas.lock().await;
         let result = match name {
             "fs_read" => {
@@ -2190,7 +2208,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 broker
                     .fs_read(
                         &FsRead::new(path),
-                        &self.policy,
+                        &policy,
                         &mut *cas,
                         ResultBounds::default(),
                     )
@@ -2201,7 +2219,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 broker
                     .fs_list(
                         &FsList::new(path),
-                        &self.policy,
+                        &policy,
                         &mut *cas,
                         ResultBounds::default(),
                     )
@@ -2213,9 +2231,43 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 broker
                     .fs_search(
                         &FsSearch::new(root, query),
-                        &self.policy,
+                        &policy,
                         &mut *cas,
                         ResultBounds::default(),
+                    )
+                    .await
+            }
+            "fs_write" => {
+                let path = required_string(&args, "path")?;
+                let content = required_string_allow_empty(&args, "content")?;
+                let attribution = TurnAttribution::new(self.session_id.clone(), run_id.clone());
+                broker
+                    .fs_write(
+                        &FsWrite::new(path, content),
+                        &policy,
+                        &attribution,
+                        &self.ledger,
+                    )
+                    .await
+            }
+            "fs_patch" => {
+                let path = required_string(&args, "path")?;
+                let patch = args.get("patch").ok_or_else(|| {
+                    HaiderError::new(
+                        ErrorCode::InvalidArgument,
+                        "tool argument `patch` must be an object",
+                        false,
+                    )
+                })?;
+                let preimage = required_string(patch, "preimage")?;
+                let replacement = required_string_allow_empty(patch, "replacement")?;
+                let attribution = TurnAttribution::new(self.session_id.clone(), run_id.clone());
+                broker
+                    .fs_patch(
+                        &FsPatch::new(path, preimage, replacement),
+                        &policy,
+                        &attribution,
+                        &self.ledger,
                     )
                     .await
             }
@@ -2227,7 +2279,55 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 ));
             }
         };
-        result.map_err(tool_error)
+        match result {
+            Ok(result) => Ok(ToolDispatchResult::Completed(result)),
+            Err(haider_tools::ToolError::AuthorizationRequired { menu }) => {
+                let menu = broker.permission_menu(&menu).cloned().ok_or_else(|| {
+                    HaiderError::new(
+                        ErrorCode::Internal,
+                        "broker authorization menu disappeared before publication",
+                        false,
+                    )
+                })?;
+                Ok(ToolDispatchResult::ApprovalRequired(menu))
+            }
+            Err(error) => match typed_tool_result(&error) {
+                Some(result) => Ok(ToolDispatchResult::Completed(result)),
+                None => Err(tool_error(error)),
+            },
+        }
+    }
+
+    async fn resolve_approval(&self, menu: &Menu, answer: &MenuAnswer) -> Result<(), HaiderError> {
+        let mut broker = self.broker.lock().await;
+        let broker = broker.as_mut().ok_or_else(|| {
+            HaiderError::new(
+                ErrorCode::Internal,
+                "tool dispatcher is already closed",
+                false,
+            )
+        })?;
+        let mut policy = self.policy.lock().await;
+        if broker.permission_menu(&menu.id).is_some() {
+            broker.resolve_permission(answer, &mut policy)
+        } else {
+            let (class, args_digest) = self
+                .durable_permission_bindings
+                .get(&menu.id)
+                .cloned()
+                .ok_or_else(|| {
+                    HaiderError::new(
+                        ErrorCode::Internal,
+                        format!(
+                            "durable effect binding is missing for permission menu {}",
+                            menu.id
+                        ),
+                        false,
+                    )
+                })?;
+            broker.restore_permission(menu, answer, class, args_digest, &mut policy)
+        }
+        .map_err(tool_error)
     }
 
     async fn close(&self) -> Result<(), HaiderError> {
@@ -2243,6 +2343,106 @@ impl ToolDispatcher for BrokerToolDispatcher {
             )
         })
     }
+}
+
+struct DurablePermissionState {
+    grants: Vec<EffectClass>,
+    bindings: HashMap<MenuId, (EffectClass, String)>,
+}
+
+async fn durable_session_permission_state(
+    store: &HubStoreHandle,
+) -> Result<DurablePermissionState, HaiderError> {
+    let mut cursor = 0;
+    let mut intents = HashMap::<EffectId, EffectIntent>::new();
+    let mut opened = HashMap::<MenuId, Menu>::new();
+    let mut grants = Vec::new();
+    let mut bindings = HashMap::new();
+    loop {
+        let page = StoreHandle::read(store, store.session_id(), cursor, 256).await?;
+        if page.is_empty() {
+            return Ok(DurablePermissionState { grants, bindings });
+        }
+        cursor = page.last().map_or(cursor, |envelope| envelope.seq);
+        for envelope in page {
+            let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload) else {
+                continue;
+            };
+            match payload {
+                EventPayload::Effect(EffectPhase::Intent(intent)) => {
+                    intents.insert(intent.effect.clone(), intent);
+                }
+                EventPayload::Effect(EffectPhase::Authorized {
+                    effect,
+                    verdict: AuthorizationVerdict::Ask { menu },
+                }) => {
+                    let Some(intent) = intents.get(&effect) else {
+                        continue;
+                    };
+                    bindings.insert(menu, (intent.class.clone(), intent.args_digest.clone()));
+                }
+                EventPayload::MenuOpened(menu)
+                    if matches!(menu.kind, MenuKind::Permission { .. }) =>
+                {
+                    opened.insert(menu.id.clone(), menu);
+                }
+                EventPayload::MenuAnswered(answer) => {
+                    let Some(menu) = opened.get(&answer.menu) else {
+                        continue;
+                    };
+                    let Some(option) = selected_menu_option(menu, &answer) else {
+                        continue;
+                    };
+                    if option.decision != Some(DecisionKind::AllowAlways) {
+                        continue;
+                    }
+                    let Some((class, _)) = bindings.get(&menu.id) else {
+                        continue;
+                    };
+                    if !grants.contains(class) {
+                        grants.push(class.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn selected_menu_option<'a>(
+    menu: &'a Menu,
+    answer: &MenuAnswer,
+) -> Option<&'a haider_protocol::menu::MenuOption> {
+    match answer.option_key.as_deref() {
+        Some(key) => menu.options.iter().find(|option| option.key == key),
+        None => usize::try_from(answer.option_index)
+            .ok()
+            .and_then(|index| menu.options.get(index)),
+    }
+}
+
+fn typed_tool_result(error: &haider_tools::ToolError) -> Option<BoundedResult> {
+    let (status, kind) = match error {
+        haider_tools::ToolError::PermissionDenied { .. } => ("denied", "permission_denied"),
+        haider_tools::ToolError::WorkspaceBoundary { .. } => ("rejected", "workspace_boundary"),
+        haider_tools::ToolError::PathChanged { .. } => ("rejected", "path_changed"),
+        haider_tools::ToolError::Conflict(_) => ("conflict", "patch_conflict"),
+        haider_tools::ToolError::InvalidArgument { .. } => ("rejected", "invalid_argument"),
+        _ => return None,
+    };
+    Some(BoundedResult {
+        preview: serde_json::json!({
+            "status": status,
+            "error": {
+                "kind": kind,
+                "message": error.to_string(),
+            }
+        })
+        .to_string(),
+        truncated: false,
+        artifact: None,
+        cursor: None,
+    })
 }
 
 fn request_input_definition() -> ToolDefinition {
@@ -2275,6 +2475,48 @@ fn request_input_definition() -> ToolDefinition {
     }
 }
 
+fn fs_write_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "fs_write".into(),
+        description: "Create or replace one UTF-8 file after explicit approval".into(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "minLength": 1},
+                "content": {"type": "string"}
+            },
+            "required": ["path", "content"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+fn fs_patch_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "fs_patch".into(),
+        description:
+            "Apply one exact-preimage structured hunk to a UTF-8 file after explicit approval"
+                .into(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "minLength": 1},
+                "patch": {
+                    "type": "object",
+                    "properties": {
+                        "preimage": {"type": "string", "minLength": 1},
+                        "replacement": {"type": "string"}
+                    },
+                    "required": ["preimage", "replacement"],
+                    "additionalProperties": false
+                }
+            },
+            "required": ["path", "patch"],
+            "additionalProperties": false
+        }),
+    }
+}
+
 fn tool_definition(name: &str, description: &str, required: &[&str]) -> ToolDefinition {
     let properties = required
         .iter()
@@ -2301,6 +2543,22 @@ fn required_string(args: &serde_json::Value, field: &str) -> Result<String, Haid
             HaiderError::new(
                 ErrorCode::InvalidArgument,
                 format!("tool argument `{field}` must be a non-empty string"),
+                false,
+            )
+        })
+}
+
+fn required_string_allow_empty(
+    args: &serde_json::Value,
+    field: &str,
+) -> Result<String, HaiderError> {
+    args.get(field)
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| {
+            HaiderError::new(
+                ErrorCode::InvalidArgument,
+                format!("tool argument `{field}` must be a string"),
                 false,
             )
         })

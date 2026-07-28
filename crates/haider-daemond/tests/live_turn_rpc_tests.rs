@@ -13,7 +13,7 @@
 mod support;
 
 use async_trait::async_trait;
-use haider_core::{CancelToken, StoreHandle, ToolDispatcher};
+use haider_core::{CancelToken, StoreHandle, ToolDispatchResult, ToolDispatcher};
 use haider_daemon::ProviderFactoryConfig;
 use haider_daemon::{
     DaemonConfig, DaemonDependencies, ProviderFactory, ResolvedTurnProvider, TurnToolFactory,
@@ -32,7 +32,6 @@ use haider_protocol::ids::{DeviceId, EffectId, EventId, RunId, SessionId};
 use haider_protocol::provider::{CapabilityDoc, FinishReason, Usage, UsageSource};
 use haider_protocol::session::SessionMetadataV1;
 use haider_protocol::state::{RunState, SessionState};
-use haider_protocol::tool::BoundedResult;
 use haider_provider::{
     FakeInputKind, FakeInputOption, FakeProvider, FakeStep, Provider, ProviderError,
     ProviderStream, ToolDefinition, TurnRequest,
@@ -44,10 +43,15 @@ use haider_rpc::{
     SeqRange, SessionSummary, WireFrame,
 };
 use haider_store::{EventStore, Store};
+use haider_tools::{
+    ChangeLedgerSink, EffectBroker, FsPatch, FsWriteRecord, JournalSink, PermissionPolicy,
+    ToolResult, TurnAttribution,
+};
 use std::fs;
 use std::future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex as StdMutex};
 use support::{UdsClient, ready, ready_with_dependencies, test_root};
 use tokio::sync::Semaphore;
 
@@ -329,6 +333,93 @@ async fn next_response(client: &mut UdsClient) -> WireFrame {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn answer_menu(
+    client: &mut UdsClient,
+    config: &DaemonConfig,
+    request_id: &str,
+    command_id: &str,
+    session_id: SessionId,
+    menu_id: haider_protocol::ids::MenuId,
+    request_seq: u64,
+    worker_generation: u64,
+    option_key: &str,
+    option_index: u32,
+) {
+    client
+        .send(
+            &WireFrame::MenuAnswer {
+                request_id: Some(RequestId::new(request_id)),
+                command_id: CommandId::new(command_id),
+                session_id,
+                menu_id,
+                request_seq,
+                worker_generation,
+                option_key: option_key.into(),
+                option_index,
+                input: None,
+            },
+            config.frame_limit,
+        )
+        .await;
+    let response = next_response(client).await;
+    assert!(
+        matches!(
+            response,
+            WireFrame::Response {
+                body: ResponseBody::MenuAnswer { .. },
+                ..
+            }
+        ),
+        "expected menu success, got {response:?}"
+    );
+}
+
+async fn next_permission_menu(client: &mut UdsClient) -> (haider_protocol::menu::Menu, u64, u64) {
+    loop {
+        if let WireFrame::Event { envelope, .. } = client.next().await
+            && let Ok(EventPayload::MenuOpened(menu)) =
+                serde_json::from_value::<EventPayload>(envelope.payload)
+            && matches!(
+                menu.kind,
+                haider_protocol::menu::MenuKind::Permission { .. }
+            )
+        {
+            return (menu, envelope.seq, envelope.worker_generation);
+        }
+    }
+}
+
+async fn next_permission_menu_before_create(
+    client: &mut UdsClient,
+    target: &std::path::Path,
+) -> (haider_protocol::menu::Menu, u64, u64) {
+    loop {
+        assert!(
+            !target.exists(),
+            "approval-bypass sentinel: file mutated before a committed approval"
+        );
+        let frame = tokio::select! {
+            frame = client.next() => frame,
+            () = tokio::time::sleep(std::time::Duration::from_millis(1)) => continue,
+        };
+        if let WireFrame::Event { envelope, .. } = frame
+            && let Ok(EventPayload::MenuOpened(menu)) =
+                serde_json::from_value::<EventPayload>(envelope.payload)
+            && matches!(
+                menu.kind,
+                haider_protocol::menu::MenuKind::Permission { .. }
+            )
+        {
+            assert!(
+                !target.exists(),
+                "approval-bypass sentinel: file mutated while opening approval"
+            );
+            return (menu, envelope.seq, envelope.worker_generation);
+        }
+    }
+}
+
 async fn attach_existing(
     client: &mut UdsClient,
     config: &DaemonConfig,
@@ -425,6 +516,37 @@ async fn read_session(
         } = client.next().await
         {
             return result.envelopes;
+        }
+    }
+}
+
+async fn current_generation(
+    client: &mut UdsClient,
+    config: &DaemonConfig,
+    session_id: &SessionId,
+    request_id: &str,
+) -> u64 {
+    send_request(
+        client,
+        config,
+        request_id,
+        RequestBody::SessionList {
+            cursor: None,
+            limit: 128,
+        },
+    )
+    .await;
+    loop {
+        if let WireFrame::Response {
+            body: ResponseBody::SessionList { sessions, .. },
+            ..
+        } = client.next().await
+        {
+            return sessions
+                .into_iter()
+                .find(|session| &session.session_id == session_id)
+                .expect("session is listed")
+                .worker_generation;
         }
     }
 }
@@ -1601,7 +1723,7 @@ impl ToolDispatcher for ClosingHeldEffectDispatcher {
         _name: &str,
         _args: serde_json::Value,
         _cancel: &CancelToken,
-    ) -> Result<BoundedResult, HaiderError> {
+    ) -> Result<ToolDispatchResult, HaiderError> {
         self.append(
             "dispatched",
             EventPayload::Effect(EffectPhase::Dispatched {
@@ -2729,7 +2851,7 @@ impl ToolDispatcher for HoldingEffectDispatcher {
         name: &str,
         _args: serde_json::Value,
         _cancel: &CancelToken,
-    ) -> Result<BoundedResult, HaiderError> {
+    ) -> Result<ToolDispatchResult, HaiderError> {
         if name != "hold_effect" {
             return Err(HaiderError::new(
                 ErrorCode::InvalidArgument,
@@ -2782,7 +2904,7 @@ impl ToolDispatcher for HoldingEffectDispatcher {
             .collect::<Vec<_>>();
         StoreHandle::append(&self.context.store, &mut envelopes).await?;
         self.calls.fetch_add(1, Ordering::SeqCst);
-        future::pending::<Result<BoundedResult, HaiderError>>().await
+        future::pending::<Result<ToolDispatchResult, HaiderError>>().await
     }
 }
 
@@ -3431,14 +3553,773 @@ async fn session_create_requires_control_and_ready_welcome_advertises_implemente
     task.join().await.expect("daemon joins");
 }
 
+/// W4a1 P0 approval-bypass sentinel.
+///
+/// MUTATION CHECK: bypass the `ApprovalRequired` branch in
+/// `HarnessActor::execute_general_tool`, or pre-authorize FsWrite in the
+/// production policy. Expected failure: `denied.txt` appears before the
+/// committed CAS answer, denial mutates it, or the first approved write lands
+/// before its menu is answered. Verified by revert in W4a1.
+#[tokio::test]
+async fn w4a1_fs_write_requires_committed_cas_and_session_grant_survives_restart() {
+    let root = test_root("w4a1-write-approval-");
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace");
+    let denied_path = workspace.join("denied.txt");
+    let approved_path = workspace.join("approved.txt");
+    let inherited_path = workspace.join("inherited.txt");
+    let config = DaemonConfig::new(
+        "w4a1-write-approval",
+        root.path().join("store"),
+        root.path().join("runtime"),
+    );
+    let (dependencies, fake) = fake_dependencies(vec![
+        FakeStep::EmitToolCall {
+            call_id: "write-denied".into(),
+            name: "fs_write".into(),
+            args: serde_json::json!({"path": "denied.txt", "content": "must not land"}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "write-denied".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+        FakeStep::EmitToolCall {
+            call_id: "write-approved".into(),
+            name: "fs_write".into(),
+            args: serde_json::json!({"path": "approved.txt", "content": "approved once"}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "write-approved".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+        FakeStep::EmitToolCall {
+            call_id: "write-inherited".into(),
+            name: "fs_write".into(),
+            args: serde_json::json!({"path": "inherited.txt", "content": "session grant"}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "write-inherited".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]);
+    let first_task = ready_with_dependencies(&config, dependencies.clone()).await;
+    let mut submitter = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "w4a1-test",
+        "write-submitter",
+        ClientKind::Headless,
+    )
+    .await;
+    let (session_id, generation) = create_and_attach(&mut submitter, &config, &workspace).await;
+
+    send_request(
+        &mut submitter,
+        &config,
+        "deny-submit",
+        submit_body(
+            "deny-command",
+            session_id.clone(),
+            generation,
+            "try a denied write",
+        ),
+    )
+    .await;
+    let (denied_run, _) = next_submit_response(&mut submitter).await;
+    let (deny_menu, deny_seq, deny_generation) =
+        next_permission_menu_before_create(&mut submitter, &denied_path).await;
+    assert!(
+        !denied_path.exists(),
+        "write dispatched before committed approval"
+    );
+    assert!(
+        deny_menu
+            .body
+            .iter()
+            .any(|line| line.contains("denied.txt"))
+    );
+    let mut answerer = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "w4a1-test",
+        "write-answerer",
+        ClientKind::Headless,
+    )
+    .await;
+    attach_existing(
+        &mut answerer,
+        &config,
+        session_id.clone(),
+        deny_seq,
+        "answerer-attach",
+    )
+    .await;
+    answer_menu(
+        &mut answerer,
+        &config,
+        "deny-answer",
+        "deny-answer-command",
+        session_id.clone(),
+        deny_menu.id,
+        deny_seq,
+        deny_generation,
+        "deny",
+        2,
+    )
+    .await;
+    let denied_events = events_until_terminal(&mut submitter, &denied_run).await;
+    assert!(!denied_path.exists(), "denied write mutated the workspace");
+    let denied_result = denied_events.iter().find_map(|(_, payload)| match payload {
+        EventPayload::ToolResult { call_id, result } if call_id == "write-denied" => {
+            Some(result.preview.clone())
+        }
+        _ => None,
+    });
+    let denied_json: serde_json::Value =
+        serde_json::from_str(&denied_result.expect("typed denied tool result"))
+            .expect("denied result JSON");
+    assert_eq!(denied_json["status"], "denied");
+
+    send_request(
+        &mut submitter,
+        &config,
+        "approve-submit",
+        submit_body(
+            "approve-command",
+            session_id.clone(),
+            generation,
+            "approve writes for this session",
+        ),
+    )
+    .await;
+    let (approved_run, _) = next_submit_response(&mut submitter).await;
+    let (approve_menu, approve_seq, approve_generation) =
+        next_permission_menu_before_create(&mut submitter, &approved_path).await;
+    assert!(
+        !approved_path.exists(),
+        "approved write landed before the CAS answer"
+    );
+    answer_menu(
+        &mut answerer,
+        &config,
+        "approve-answer",
+        "approve-answer-command",
+        session_id.clone(),
+        approve_menu.id,
+        approve_seq,
+        approve_generation,
+        "approve_for_session",
+        1,
+    )
+    .await;
+    let approved_events = events_until_terminal(&mut submitter, &approved_run).await;
+    assert!(matches!(
+        approved_events.last(),
+        Some((_, EventPayload::RunState(RunState::Done)))
+    ));
+    assert_eq!(
+        fs::read_to_string(&approved_path).expect("approved file"),
+        "approved once"
+    );
+
+    drop(answerer);
+    drop(submitter);
+    first_task
+        .shutdown_handle()
+        .request("restart durability test");
+    first_task.join().await.expect("first daemon joins");
+
+    let second_task = ready_with_dependencies(&config, dependencies).await;
+    let mut restarted = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "w4a1-test",
+        "write-restarted",
+        ClientKind::Headless,
+    )
+    .await;
+    attach_existing(
+        &mut restarted,
+        &config,
+        session_id.clone(),
+        0,
+        "restart-attach",
+    )
+    .await;
+    let restarted_generation =
+        current_generation(&mut restarted, &config, &session_id, "restart-list").await;
+    send_request(
+        &mut restarted,
+        &config,
+        "inherited-submit",
+        submit_body(
+            "inherited-command",
+            session_id,
+            restarted_generation,
+            "use the durable session write grant",
+        ),
+    )
+    .await;
+    let (inherited_run, _) = next_submit_response(&mut restarted).await;
+    let inherited_events = events_until_terminal(&mut restarted, &inherited_run).await;
+    assert!(
+        inherited_events
+            .iter()
+            .all(|(_, payload)| !matches!(payload, EventPayload::MenuOpened(_))),
+        "approve-for-session must not re-prompt after restart"
+    );
+    assert_eq!(
+        fs::read_to_string(&inherited_path).expect("inherited write"),
+        "session grant"
+    );
+    assert_eq!(fake.requests().len(), 6);
+
+    second_task.shutdown_handle().request("test complete");
+    second_task.join().await.expect("second daemon joins");
+}
+
+/// W4a1 live acceptance: the production dispatcher applies the model's
+/// structured patch only after a second control attachment wins the real CAS.
+#[tokio::test]
+async fn w4a1_real_fs_patch_round_trips_approval_and_returns_tool_result() {
+    let root = test_root("w4a1-patch-approval-");
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace");
+    let target = workspace.join("note.txt");
+    fs::write(&target, "before\n").expect("seed target");
+    let config = DaemonConfig::new(
+        "w4a1-patch-approval",
+        root.path().join("store"),
+        root.path().join("runtime"),
+    );
+    let (dependencies, fake) = fake_dependencies(vec![
+        FakeStep::EmitToolCall {
+            call_id: "patch-note".into(),
+            name: "fs_patch".into(),
+            args: serde_json::json!({
+                "path": "note.txt",
+                "patch": {"preimage": "before", "replacement": "after"}
+            }),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "patch-note".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]);
+    let task = ready_with_dependencies(&config, dependencies).await;
+    let mut submitter = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "w4a1-test",
+        "patch-submitter",
+        ClientKind::Headless,
+    )
+    .await;
+    let (session_id, generation) = create_and_attach(&mut submitter, &config, &workspace).await;
+    send_request(
+        &mut submitter,
+        &config,
+        "patch-submit",
+        submit_body(
+            "patch-command",
+            session_id.clone(),
+            generation,
+            "patch note.txt",
+        ),
+    )
+    .await;
+    let (run_id, _) = next_submit_response(&mut submitter).await;
+    let (menu, request_seq, opening_generation) = next_permission_menu(&mut submitter).await;
+    assert_eq!(
+        fs::read_to_string(&target).expect("pre-approval read"),
+        "before\n"
+    );
+    assert!(menu.body.iter().any(|line| line.contains("note.txt")));
+    assert!(
+        menu.body
+            .iter()
+            .any(|line| line.contains("--- expected") && line.contains("+++ replacement"))
+    );
+
+    let mut answerer = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "w4a1-test",
+        "patch-answerer",
+        ClientKind::Headless,
+    )
+    .await;
+    attach_existing(
+        &mut answerer,
+        &config,
+        session_id.clone(),
+        request_seq,
+        "patch-answer-attach",
+    )
+    .await;
+    answer_menu(
+        &mut answerer,
+        &config,
+        "patch-answer",
+        "patch-answer-command",
+        session_id,
+        menu.id,
+        request_seq,
+        opening_generation,
+        "approve_once",
+        0,
+    )
+    .await;
+    let events = events_until_terminal(&mut submitter, &run_id).await;
+    assert!(matches!(
+        events.last(),
+        Some((_, EventPayload::RunState(RunState::Done)))
+    ));
+    assert_eq!(
+        fs::read_to_string(&target).expect("patched target"),
+        "after\n"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|(_, payload)| matches!(payload, EventPayload::ToolResult { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(fake.requests().len(), 2);
+
+    task.shutdown_handle().request("test complete");
+    task.join().await.expect("daemon joins");
+}
+
+#[tokio::test]
+async fn w4a1_pending_patch_approval_restarts_on_the_original_menu_cas() {
+    let root = test_root("w4a1-patch-menu-restart-");
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace");
+    let target = workspace.join("pending.txt");
+    fs::write(&target, "before").expect("seed target");
+    let config = DaemonConfig::new(
+        "w4a1-patch-menu-restart",
+        root.path().join("store"),
+        root.path().join("runtime"),
+    );
+    let (dependencies, fake) = fake_dependencies(vec![
+        FakeStep::EmitToolCall {
+            call_id: "pending-patch".into(),
+            name: "fs_patch".into(),
+            args: serde_json::json!({
+                "path": "pending.txt",
+                "patch": {"preimage": "before", "replacement": "after"}
+            }),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "pending-patch".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]);
+    let first_task = ready_with_dependencies(&config, dependencies.clone()).await;
+    let mut first = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "w4a1-test",
+        "pending-before",
+        ClientKind::Headless,
+    )
+    .await;
+    let (session_id, generation) = create_and_attach(&mut first, &config, &workspace).await;
+    send_request(
+        &mut first,
+        &config,
+        "pending-submit",
+        submit_body(
+            "pending-command",
+            session_id.clone(),
+            generation,
+            "open patch approval",
+        ),
+    )
+    .await;
+    let (run_id, _) = next_submit_response(&mut first).await;
+    let (menu, request_seq, opening_generation) = next_permission_menu(&mut first).await;
+    assert_eq!(
+        fs::read_to_string(&target).expect("pending target"),
+        "before"
+    );
+    drop(first);
+    first_task.crash().await;
+
+    let second_task = ready_with_dependencies(&config, dependencies).await;
+    let mut second = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "w4a1-test",
+        "pending-after",
+        ClientKind::Headless,
+    )
+    .await;
+    attach_existing(
+        &mut second,
+        &config,
+        session_id.clone(),
+        0,
+        "pending-replay",
+    )
+    .await;
+    assert_eq!(
+        fs::read_to_string(&target).expect("pre-answer target"),
+        "before"
+    );
+    answer_menu(
+        &mut second,
+        &config,
+        "pending-answer",
+        "pending-answer-command",
+        session_id,
+        menu.id,
+        request_seq,
+        opening_generation,
+        "approve_once",
+        0,
+    )
+    .await;
+    let events = events_until_terminal(&mut second, &run_id).await;
+    assert!(matches!(
+        events.last(),
+        Some((_, EventPayload::RunState(RunState::Done)))
+    ));
+    assert_eq!(
+        fs::read_to_string(&target).expect("resumed target"),
+        "after"
+    );
+    assert_eq!(fake.requests().len(), 2);
+
+    second_task.shutdown_handle().request("test complete");
+    second_task.join().await.expect("second daemon joins");
+}
+
+#[derive(Clone)]
+struct HeldPatchLedger {
+    reached: Arc<Semaphore>,
+    release: Arc<(StdMutex<bool>, Condvar)>,
+}
+
+impl HeldPatchLedger {
+    fn release(&self) {
+        let (released, wake) = &*self.release;
+        *released.lock().expect("release lock") = true;
+        wake.notify_all();
+    }
+}
+
+impl ChangeLedgerSink for HeldPatchLedger {
+    fn record_fs_write(
+        &self,
+        _session: SessionId,
+        _turn: RunId,
+        _record: FsWriteRecord,
+    ) -> ToolResult<()> {
+        self.reached.add_permits(1);
+        let (released, wake) = &*self.release;
+        let mut released = released.lock().expect("release lock");
+        while !*released {
+            released = wake.wait(released).expect("release wait");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct HeldRealPatchFactory {
+    calls: Arc<AtomicUsize>,
+    ledger: HeldPatchLedger,
+}
+
+#[async_trait]
+impl TurnToolFactory for HeldRealPatchFactory {
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        vec![ToolDefinition {
+            name: "fs_patch".into(),
+            description: "test-held real fs_patch".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }]
+    }
+
+    async fn create(
+        &self,
+        context: WorkerToolContext,
+    ) -> Result<Option<Arc<dyn ToolDispatcher>>, HaiderError> {
+        let mut policy = PermissionPolicy::default();
+        policy.allow(EffectClass::FsWrite);
+        let broker = EffectBroker::new(
+            Box::new(TestHubJournal {
+                context: context.clone(),
+            }),
+            &context.metadata.cwd,
+            context.store.session_id().clone(),
+            context.store.worker_generation(),
+        )
+        .map_err(|error| HaiderError::new(ErrorCode::Internal, error.to_string(), false))?;
+        Ok(Some(Arc::new(HeldRealPatchDispatcher {
+            broker: tokio::sync::Mutex::new(Some(broker)),
+            policy,
+            context,
+            calls: self.calls.clone(),
+            ledger: self.ledger.clone(),
+        })))
+    }
+}
+
+struct TestHubJournal {
+    context: WorkerToolContext,
+}
+
+#[async_trait]
+impl JournalSink for TestHubJournal {
+    async fn append(&mut self, payload: EventPayload) -> ToolResult<()> {
+        let mut envelopes = [EventEnvelope {
+            schema_version: SCHEMA_VERSION,
+            event_id: self.context.event_ids.next(),
+            seq: 0,
+            session_id: self.context.store.session_id().clone(),
+            branch_id: None,
+            run_id: Some(self.context.run_id.clone()),
+            agent_id: None,
+            device_id: self.context.device_id.clone(),
+            authority_epoch: 0,
+            worker_generation: self.context.store.worker_generation(),
+            causation_id: None,
+            correlation_id: None,
+            committed_at_ms: 0,
+            render: RenderTargets {
+                ui: true,
+                durable: true,
+                prompt: PromptRender::Omit,
+            },
+            payload: serde_json::to_value(payload).map_err(|error| {
+                haider_tools::ToolError::Runtime {
+                    message: error.to_string(),
+                }
+            })?,
+        }];
+        StoreHandle::append(&self.context.store, &mut envelopes)
+            .await
+            .map_err(|error| haider_tools::ToolError::Runtime {
+                message: error.message,
+            })?;
+        Ok(())
+    }
+}
+
+struct HeldRealPatchDispatcher {
+    broker: tokio::sync::Mutex<Option<EffectBroker>>,
+    policy: PermissionPolicy,
+    context: WorkerToolContext,
+    calls: Arc<AtomicUsize>,
+    ledger: HeldPatchLedger,
+}
+
+#[async_trait]
+impl ToolDispatcher for HeldRealPatchDispatcher {
+    async fn execute(
+        &self,
+        run_id: &RunId,
+        _call_id: &str,
+        name: &str,
+        args: serde_json::Value,
+        _cancel: &CancelToken,
+    ) -> Result<ToolDispatchResult, HaiderError> {
+        assert_eq!(name, "fs_patch");
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let path = args["path"].as_str().expect("path");
+        let preimage = args["patch"]["preimage"].as_str().expect("preimage");
+        let replacement = args["patch"]["replacement"].as_str().expect("replacement");
+        let mut broker = self.broker.lock().await;
+        let result = broker
+            .as_mut()
+            .expect("open broker")
+            .fs_patch(
+                &FsPatch::new(path, preimage, replacement),
+                &self.policy,
+                &TurnAttribution::new(self.context.store.session_id().clone(), run_id.clone()),
+                &self.ledger,
+            )
+            .await
+            .map_err(|error| HaiderError::new(ErrorCode::Internal, error.to_string(), false))?;
+        Ok(ToolDispatchResult::Completed(result))
+    }
+
+    async fn close(&self) -> Result<(), HaiderError> {
+        let Some(broker) = self.broker.lock().await.take() else {
+            return Ok(());
+        };
+        broker.close().await.map(|_| ()).map_err(|error| {
+            HaiderError::new(ErrorCode::EffectUnknownOutcome, error.to_string(), false)
+        })
+    }
+}
+
+/// MUTATION CHECK: remove startup Dispatched-without-Outcome reconciliation
+/// or retry interrupted RunningTool work. Expected failure: Unknown is absent
+/// or the real patch dispatcher call count exceeds one. Verified by revert in
+/// W4a1.
+#[tokio::test]
+async fn w4a1_dispatched_real_fs_patch_restarts_as_unknown_without_redispatch() {
+    let root = test_root("w4a1-patch-restart-");
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace");
+    let target = workspace.join("restart.txt");
+    fs::write(&target, "before").expect("seed target");
+    let config = DaemonConfig::new(
+        "w4a1-patch-restart",
+        root.path().join("store"),
+        root.path().join("runtime"),
+    );
+    let (mut dependencies, fake) = fake_dependencies(vec![
+        FakeStep::EmitToolCall {
+            call_id: "restart-patch".into(),
+            name: "fs_patch".into(),
+            args: serde_json::json!({
+                "path": "restart.txt",
+                "patch": {"preimage": "before", "replacement": "after"}
+            }),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+    ]);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let ledger = HeldPatchLedger {
+        reached: Arc::new(Semaphore::new(0)),
+        release: Arc::new((StdMutex::new(false), Condvar::new())),
+    };
+    dependencies.tool_factory = Arc::new(HeldRealPatchFactory {
+        calls: calls.clone(),
+        ledger: ledger.clone(),
+    });
+    let first_task = ready_with_dependencies(&config, dependencies.clone()).await;
+    let mut first = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "w4a1-test",
+        "patch-before-crash",
+        ClientKind::Headless,
+    )
+    .await;
+    let (session_id, generation) = create_and_attach(&mut first, &config, &workspace).await;
+    send_request(
+        &mut first,
+        &config,
+        "restart-patch-submit",
+        submit_body(
+            "restart-patch-command",
+            session_id.clone(),
+            generation,
+            "patch once then crash",
+        ),
+    )
+    .await;
+    let (run_id, _) = next_submit_response(&mut first).await;
+    ledger
+        .reached
+        .acquire()
+        .await
+        .expect("real patch reached post-apply ledger boundary")
+        .forget();
+    assert_eq!(
+        fs::read_to_string(&target).expect("applied target"),
+        "after"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    drop(first);
+    first_task.crash().await;
+    ledger.release();
+
+    let second_task = ready_with_dependencies(&config, dependencies).await;
+    let mut second = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "w4a1-test",
+        "patch-after-crash",
+        ClientKind::Headless,
+    )
+    .await;
+    attach_existing(
+        &mut second,
+        &config,
+        session_id.clone(),
+        0,
+        "patch-restart-attach",
+    )
+    .await;
+    let envelopes = read_session(&mut second, &config, session_id, "patch-restart-read").await;
+    let intents = payloads_for_run(&envelopes, &run_id)
+        .filter_map(|payload| match payload {
+            EventPayload::Effect(EffectPhase::Intent(intent))
+                if intent.class == EffectClass::FsWrite =>
+            {
+                Some(intent.effect)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(intents.len(), 1);
+    assert_eq!(
+        payloads_for_run(&envelopes, &run_id)
+            .filter(|payload| matches!(
+                payload,
+                EventPayload::Effect(EffectPhase::Outcome {
+                    effect,
+                    outcome: EffectOutcome::Unknown,
+                }) if *effect == intents[0]
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(fake.requests().len(), 1);
+    assert_eq!(
+        fs::read_to_string(&target).expect("target after restart"),
+        "after"
+    );
+
+    second_task.shutdown_handle().request("test complete");
+    second_task.join().await.expect("second daemon joins");
+}
+
 /// Scenario 13: the manifest for the production-seam mutation sweep.
 ///
 /// Each entry is `(test fn, workspace-relative file, seam to revert)`: the
 /// focused test that must fail when the listed seam is reverted, and where a
-/// re-runner finds it (six of thirteen live outside this file). The sweep
+/// re-runner finds it (nine of twenty live outside this file). The sweep
 /// itself is executed by hand — revert each seam, run the named test, record
 /// the observation in the commit message; this manifest keeps that procedure
-/// honest by construction: the seven in-file entries are compile-time
+/// honest by construction: the eleven in-file entries are compile-time
 /// references to their test functions (a rename breaks the build), and every
 /// listed file path is asserted to exist in the workspace.
 ///
@@ -3449,8 +4330,8 @@ async fn session_create_requires_control_and_ready_welcome_advertises_implemente
 #[test]
 fn scenario_13_mutation_seam_sweep_manifest_covers_each_load_bearing_boundary() {
     // Compile-time linkage for the in-file entries: renaming any of these
-    // seven tests without updating the manifest is a build error.
-    let _in_file_sweep_links: [fn(); 7] = [
+    // eleven tests without updating the manifest is a build error.
+    let _in_file_sweep_links: [fn(); 11] = [
         scenario_4_lost_submit_response_replays_one_run_and_one_provider_request,
         scenario_7_two_menu_answers_race_and_only_first_commit_wins,
         scenario_8_wire_cancel_closes_open_items_and_cancelled_is_run_terminal,
@@ -3458,6 +4339,10 @@ fn scenario_13_mutation_seam_sweep_manifest_covers_each_load_bearing_boundary() 
         scenario_10_restart_replays_request_input_without_reexecuting_prior_request,
         scenario_11_held_effect_becomes_unknown_after_restart_and_never_redispatches,
         scenario_12_reasoning_safe_follow_up_cumulative_usage_and_durable_failure,
+        w4a1_fs_write_requires_committed_cas_and_session_grant_survives_restart,
+        w4a1_real_fs_patch_round_trips_approval_and_returns_tool_result,
+        w4a1_pending_patch_approval_restarts_on_the_original_menu_cas,
+        w4a1_dispatched_real_fs_patch_restarts_as_unknown_without_redispatch,
     ];
     const HERE: &str = "crates/haider-daemond/tests/live_turn_rpc_tests.rs";
     let sweep = [
@@ -3526,6 +4411,41 @@ fn scenario_13_mutation_seam_sweep_manifest_covers_each_load_bearing_boundary() 
             "crates/haider-provider/tests/fake_provider_tests.rs",
             "owned provider producer cancellation",
         ),
+        (
+            "w4a1_fs_write_requires_committed_cas_and_session_grant_survives_restart",
+            HERE,
+            "server-side committed-CAS approval gate and durable class-scoped session grant",
+        ),
+        (
+            "w4a1_real_fs_patch_round_trips_approval_and_returns_tool_result",
+            HERE,
+            "production fs_patch model definition, structured hunk dispatch, and approval preview",
+        ),
+        (
+            "w4a1_pending_patch_approval_restarts_on_the_original_menu_cas",
+            HERE,
+            "permission checkpoint recovery preserves the original durable menu CAS",
+        ),
+        (
+            "mutating_paths_reject_parent_and_absolute_workspace_escapes",
+            "crates/haider-tools/tests/filesystem_tools_tests.rs",
+            "canonical workspace boundary for parent and absolute mutating paths",
+        ),
+        (
+            "mutating_paths_reject_leaf_and_parent_symlink_escapes",
+            "crates/haider-tools/tests/filesystem_tools_tests.rs",
+            "canonical workspace boundary for leaf and parent symlink escapes",
+        ),
+        (
+            "w4a1_dispatched_real_fs_patch_restarts_as_unknown_without_redispatch",
+            HERE,
+            "real fs_patch dispatch crash window reconciles Unknown without retry",
+        ),
+        (
+            "external_leaf_replacement_before_patch_rename_is_typed_path_change",
+            "crates/haider-tools/src/filesystem.rs",
+            "anchored target-identity recheck immediately before atomic patch replacement",
+        ),
     ];
     let tests = sweep
         .iter()
@@ -3535,7 +4455,7 @@ fn scenario_13_mutation_seam_sweep_manifest_covers_each_load_bearing_boundary() 
         .iter()
         .map(|(_, _, seam)| *seam)
         .collect::<std::collections::HashSet<_>>();
-    assert_eq!(sweep.len(), 13);
+    assert_eq!(sweep.len(), 20);
     assert_eq!(tests.len(), sweep.len());
     assert_eq!(seams.len(), sweep.len());
     let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

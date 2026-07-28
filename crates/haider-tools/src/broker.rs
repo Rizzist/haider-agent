@@ -24,10 +24,11 @@
 //!   profile) plus `worker_generation` identity stamped per store-open —
 //!   envelopes carry which generation wrote them; commit-time stale-generation
 //!   REJECTION is not implemented today and would be an additional guard.
-//! - **Digest-bound approvals.** `args_digest` is BLAKE3 over canonical
-//!   (recursively key-sorted) argument JSON — never a tool name. A persistent
-//!   "always allow" stores class + exact digest, so a mutated operation gets
-//!   a new digest and re-asks.
+//! - **Digest-bound one-shot approvals.** `args_digest` is BLAKE3 over
+//!   canonical (recursively key-sorted) argument JSON — never a tool name.
+//!   Approve-once binds class + exact digest. The explicit
+//!   approve-for-session choice is deliberately class-scoped and reconstructed
+//!   by the daemon from the durable menu answer.
 //! - **Intent-bound authorization.** Lifecycle state retains the complete
 //!   journaled intent. Authorization and later transitions accept that intent,
 //!   and reject a reused effect id whose digest or other fields differ.
@@ -120,6 +121,13 @@ pub trait EffectOperation {
     fn summary(&self) -> String;
     fn arguments(&self) -> ToolResult<Value>;
 
+    /// Human-readable, bounded facts shown before an `Ask` operation may
+    /// dispatch. Implementations should identify the target and the proposed
+    /// mutation; authorization never relies on this display text.
+    fn approval_preview(&self) -> Vec<String> {
+        vec![self.summary()]
+    }
+
     /// Returns the arguments used for authorization after resolving any
     /// workspace-relative values. Non-filesystem operations use their regular
     /// arguments; filesystem operations override this to bind canonical paths.
@@ -154,13 +162,14 @@ struct DenyRule {
 /// Permission policy keyed by normalized effect class.
 ///
 /// Classes absent from all three lists default to `Ask`. Overlaps are resolved
-/// conservatively: deny, exact always-allow, allow, ask.
+/// conservatively: deny, exact always-allow, session/class allow, ask.
 #[derive(Debug, Clone, Default)]
 pub struct PermissionPolicy {
     allowlist: Vec<EffectClass>,
     asklist: Vec<EffectClass>,
     denylist: Vec<DenyRule>,
     always_allow: Vec<AlwaysAllowRule>,
+    session_allow: Vec<EffectClass>,
 }
 
 impl PermissionPolicy {
@@ -223,6 +232,19 @@ impl PermissionPolicy {
         &self.always_allow
     }
 
+    /// Adds the durable-menu-derived class grant used by "approve for this
+    /// session". The daemon reconstructs these grants from committed menu
+    /// answers whenever it creates a new turn dispatcher.
+    pub fn allow_for_session(&mut self, class: EffectClass) {
+        if !self.session_allow.contains(&class) {
+            self.session_allow.push(class);
+        }
+    }
+
+    pub fn session_allowlist(&self) -> &[EffectClass] {
+        &self.session_allow
+    }
+
     pub fn allowlist(&self) -> &[EffectClass] {
         &self.allowlist
     }
@@ -251,6 +273,7 @@ impl PermissionPolicy {
             .always_allow
             .iter()
             .any(|rule| rule.class == intent.class && rule.args_digest == intent.args_digest)
+            || self.session_allow.contains(&intent.class)
             || self.allowlist.contains(&intent.class)
         {
             return PolicyDecision::Allow;
@@ -640,6 +663,7 @@ pub struct EffectBroker {
     next_effect: u64,
     next_menu: u64,
     pending_permissions: HashMap<MenuId, PendingPermission>,
+    approval_previews: HashMap<EffectId, Vec<String>>,
     one_shot_rules: Vec<OneShotRule>,
     next_finalizer: u64,
     finalizers: tokio::task::JoinSet<(u64, Option<ToolError>)>,
@@ -708,6 +732,7 @@ impl EffectBroker {
             next_effect: 0,
             next_menu: 0,
             pending_permissions: HashMap::new(),
+            approval_previews: HashMap::new(),
             one_shot_rules: Vec::new(),
             next_finalizer: 0,
             finalizers: tokio::task::JoinSet::new(),
@@ -823,6 +848,8 @@ impl EffectBroker {
         self.append_phase(EffectPhase::Intent(intent.clone()))
             .await?;
         self.journal.insert_intent(intent.clone());
+        self.approval_previews
+            .insert(intent.effect.clone(), operation.approval_preview());
         Ok(intent)
     }
 
@@ -904,33 +931,66 @@ impl EffectBroker {
             })?;
         let decision = selected_decision(&pending.menu, answer)?;
         self.pending_permissions.remove(&answer.menu);
+        self.apply_permission_decision(pending.class, pending.args_digest, decision, policy);
+        Ok(())
+    }
+
+    /// Restores a permission decision from the exact durable menu that the
+    /// daemon's first-committed-wins CAS resolved. This is used when a daemon
+    /// restarts while approval is pending; callers must supply the committed
+    /// menu and answer read from the journal, never raw client input.
+    pub fn restore_permission(
+        &mut self,
+        menu: &Menu,
+        answer: &MenuAnswer,
+        class: EffectClass,
+        args_digest: String,
+        policy: &mut PermissionPolicy,
+    ) -> ToolResult<()> {
+        if answer.menu != menu.id {
+            return Err(ToolError::InvalidMenuAnswer {
+                menu: answer.menu.clone(),
+                message: format!(
+                    "answer targets {}, but durable permission menu is {}",
+                    answer.menu, menu.id
+                ),
+            });
+        }
+        if !matches!(&menu.kind, MenuKind::Permission { .. }) {
+            return Err(ToolError::InvalidArgument {
+                message: format!("menu {} is not a permission menu", menu.id),
+            });
+        }
+        let decision = selected_decision(menu, answer)?;
+        self.apply_permission_decision(class, args_digest, decision, policy);
+        Ok(())
+    }
+
+    fn apply_permission_decision(
+        &mut self,
+        class: EffectClass,
+        args_digest: String,
+        decision: DecisionKind,
+        policy: &mut PermissionPolicy,
+    ) {
         match decision {
             DecisionKind::AllowOnce => self.one_shot_rules.push(OneShotRule {
-                class: pending.class,
-                args_digest: pending.args_digest,
+                class,
+                args_digest,
                 decision: PolicyDecision::Allow,
             }),
-            DecisionKind::AllowAlways => {
-                let rule = AlwaysAllowRule {
-                    class: pending.class,
-                    args_digest: pending.args_digest,
-                };
-                if !policy.always_allow.contains(&rule) {
-                    policy.always_allow.push(rule);
-                }
-            }
+            DecisionKind::AllowAlways => policy.allow_for_session(class),
             DecisionKind::RejectOnce => self.one_shot_rules.push(OneShotRule {
-                class: pending.class,
-                args_digest: pending.args_digest,
+                class,
+                args_digest,
                 decision: PolicyDecision::Deny {
                     reason: "rejected once by user".into(),
                 },
             }),
             DecisionKind::RejectAlways => {
-                policy.deny(pending.class, "rejected always by user");
+                policy.deny(class, "rejected always by user");
             }
         }
-        Ok(())
     }
 
     pub async fn journal_dispatched(&mut self, intent: &EffectIntent) -> ToolResult<()> {
@@ -1128,6 +1188,16 @@ impl EffectBroker {
 
     fn permission_menu_for(&mut self, intent: &EffectIntent) -> Menu {
         self.next_menu += 1;
+        let mut body = self
+            .approval_previews
+            .get(&intent.effect)
+            .cloned()
+            .unwrap_or_else(|| vec![intent.summary.clone()]);
+        body.push(format!("Effect class: {:?}", intent.class));
+        body.push(format!(
+            "Approve for this session allows the {:?} class until the session ends.",
+            intent.class
+        ));
         Menu {
             id: MenuId::new(format!(
                 "permission-{}-{}-{}-{}",
@@ -1140,23 +1210,15 @@ impl EffectBroker {
                 effect_summary: intent.summary.clone(),
             },
             title: format!("Allow {}?", intent.summary),
-            body: vec![
-                format!("Effect class: {:?}", intent.class),
-                format!("Exact argument rule: {}", intent.args_digest),
-            ],
+            body,
             options: vec![
-                permission_option("allow_once", "Allow once", DecisionKind::AllowOnce),
+                permission_option("approve_once", "Approve once", DecisionKind::AllowOnce),
                 permission_option(
-                    "allow_always",
-                    "Always allow this operation",
+                    "approve_for_session",
+                    "Approve for this session",
                     DecisionKind::AllowAlways,
                 ),
-                permission_option("reject_once", "Reject once", DecisionKind::RejectOnce),
-                permission_option(
-                    "reject_always",
-                    "Always reject this class",
-                    DecisionKind::RejectAlways,
-                ),
+                permission_option("deny", "Deny", DecisionKind::RejectOnce),
             ],
             blocking: true,
             scope: MenuScope::Session,

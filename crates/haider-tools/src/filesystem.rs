@@ -26,9 +26,10 @@
 //! - Patch pre-image bytes are read from the one locked target fd used for
 //!   identity verification. The derived bytes go to a same-directory temp
 //!   opened through the parent dirfd and land through `renameat`. This
-//!   serializes broker-mediated writes to a target; under Haider's workspace
-//!   doctrine every AI write is broker-mediated. Concurrent non-broker writers
-//!   are outside this guarantee and belong to §9.2 external-edit detection.
+//!   serializes broker-mediated writes to a target. Immediately before rename,
+//!   the anchored path is checked against the locked inode again, so an
+//!   external replacement is a typed `PathChanged` refusal rather than a
+//!   silent overwrite.
 
 use crate::broker::{EffectBroker, EffectOperation, PermissionPolicy};
 use crate::ledger::{ChangeLedgerSink, FsWriteRecord};
@@ -181,6 +182,59 @@ impl EffectOperation for FsSearch {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FsWrite {
+    pub path: PathBuf,
+    pub content: String,
+}
+
+impl FsWrite {
+    pub fn new(path: impl Into<PathBuf>, content: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            content: content.into(),
+        }
+    }
+}
+
+impl EffectOperation for FsWrite {
+    fn effect_class(&self) -> EffectClass {
+        EffectClass::FsWrite
+    }
+
+    fn summary(&self) -> String {
+        format!("write {}", self.path.display())
+    }
+
+    fn arguments(&self) -> ToolResult<Value> {
+        Ok(json!({
+            "path": path_argument(&self.path)?,
+            "content": self.content,
+        }))
+    }
+
+    fn canonical_arguments(&self, workspace_root: &Path) -> ToolResult<Value> {
+        let path =
+            resolve_workspace_path(workspace_root, &self.path, PathResolution::MissingLeafOk)?;
+        Ok(json!({
+            "path": path_argument(&path)?,
+            "content": self.content,
+        }))
+    }
+
+    fn approval_preview(&self) -> Vec<String> {
+        vec![
+            format!("Target: {}", self.path.display()),
+            format!(
+                "Content: {} UTF-8 bytes, {} lines, blake3:{}",
+                self.content.len(),
+                self.content.lines().count(),
+                blake3::hash(self.content.as_bytes()).to_hex()
+            ),
+        ]
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FsPatch {
     pub path: PathBuf,
     pub preimage: String,
@@ -226,6 +280,21 @@ impl EffectOperation for FsPatch {
             "preimage": self.preimage,
             "replacement": self.replacement,
         }))
+    }
+
+    fn approval_preview(&self) -> Vec<String> {
+        let diff = format!(
+            "--- expected\n+++ replacement\n{}\n{}",
+            prefixed_lines('-', &self.preimage),
+            prefixed_lines('+', &self.replacement)
+        );
+        vec![
+            format!("Target: {}", self.path.display()),
+            format!(
+                "Structured exact-preimage hunk:\n{}",
+                bounded_preview(&diff, 4 * 1024)
+            ),
+        ]
     }
 }
 
@@ -327,6 +396,76 @@ impl EffectBroker {
             Err(error) => Err(error),
         };
         self.finish(&intent, result).await
+    }
+
+    pub async fn fs_write<L>(
+        &mut self,
+        operation: &FsWrite,
+        policy: &PermissionPolicy,
+        attribution: &TurnAttribution,
+        ledger: &L,
+    ) -> ToolResult<BoundedResult>
+    where
+        L: ChangeLedgerSink,
+    {
+        let operation = FsWrite::new(
+            resolve_workspace_path(
+                self.workspace_root(),
+                &operation.path,
+                PathResolution::MissingLeafOk,
+            )?,
+            operation.content.clone(),
+        );
+        let intent = self.begin(&operation, policy).await?;
+        let relative = anchored_relative_path(self.workspace_root(), &operation.path);
+        let workspace_dir = self.duplicate_workspace_dir();
+        let owned_operation = operation.clone();
+        let critical_ledger = ledger.clone();
+        let attribution = attribution.clone();
+        let effect = intent.effect.clone();
+        let summary = intent.summary.clone();
+        let (relative, workspace_dir) = match (relative, workspace_dir) {
+            (Ok(relative), Ok(workspace_dir)) => (relative, workspace_dir),
+            (Err(error), _) | (_, Err(error)) => return self.finish(&intent, Err(error)).await,
+        };
+        let worker = tokio::task::spawn_blocking(move || {
+            apply_write_and_record(
+                workspace_dir,
+                &relative,
+                &owned_operation,
+                &critical_ledger,
+                attribution,
+                effect,
+                summary,
+            )
+        });
+        let worker_abort = worker.abort_handle();
+        let mut worker_cancel = WorkerCancelGuard::new(worker_abort);
+        let finish = self.effect_finish(&intent);
+        let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
+        let finalizer_id = self.register_finalizer(async move {
+            let result = match worker.await {
+                Ok(outcome) => outcome.into_result(),
+                Err(error) if error.is_cancelled() => return None,
+                Err(error) => Err(ToolError::Runtime {
+                    message: format!("blocking filesystem worker failed: {error}"),
+                }),
+            };
+            let result = finish.finish(result).await;
+            let error = result.as_ref().err().cloned();
+            let _ = result_sender.send(result);
+            error
+        });
+        match result_receiver.await {
+            Ok(result) => {
+                worker_cancel.disarm();
+                self.observe_finalizer(finalizer_id);
+                result
+            }
+            Err(error) => Err(ToolError::Runtime {
+                message: format!("filesystem outcome finalizer failed: {error}"),
+            }),
+        }
     }
 
     pub async fn fs_patch<L>(
@@ -579,11 +718,9 @@ fn collect_file_matches(
     Ok(())
 }
 
-/// Replaces the FIRST occurrence of the pre-image; a caller that needs a
-/// unique target must widen the pre-image with surrounding context. Pre-image
-/// presence doubles as the staleness check: if the file no longer contains
-/// it, the patch was computed against old contents and fails as a typed
-/// conflict without writing.
+/// Replaces the unique occurrence of the pre-image. Missing or ambiguous
+/// pre-images fail as typed conflicts, so the model must widen an ambiguous
+/// hunk with surrounding context and can never silently patch the wrong copy.
 struct AppliedPatch {
     result: BoundedResult,
     path: PathBuf,
@@ -607,6 +744,112 @@ impl PatchWorkerOutcome {
             }
         }
     }
+}
+
+fn apply_write_and_record<L>(
+    workspace_dir: OwnedFd,
+    relative: &Path,
+    operation: &FsWrite,
+    ledger: &L,
+    attribution: TurnAttribution,
+    effect: haider_protocol::ids::EffectId,
+    summary: String,
+) -> PatchWorkerOutcome
+where
+    L: ChangeLedgerSink,
+{
+    let applied = match apply_write_at(workspace_dir, relative, operation) {
+        Ok(applied) => applied,
+        Err(error) => return PatchWorkerOutcome::ApplyFailed(error),
+    };
+    let AppliedPatch {
+        result,
+        path,
+        bytes_hash,
+    } = applied;
+    match ledger.record_fs_write(
+        attribution.session,
+        attribution.turn,
+        FsWriteRecord {
+            effect,
+            paths: vec![path],
+            summary,
+            bytes_hash,
+        },
+    ) {
+        Ok(()) => PatchWorkerOutcome::Applied(result),
+        Err(error) => PatchWorkerOutcome::LedgerFailed {
+            error,
+            written: true,
+        },
+    }
+}
+
+fn apply_write_at(
+    workspace_dir: OwnedFd,
+    relative: &Path,
+    operation: &FsWrite,
+) -> ToolResult<AppliedPatch> {
+    let (parent, leaf) = open_parent_at(workspace_dir, relative, &operation.path)?;
+    // Keep the locked current inode alive through rename when overwriting.
+    // A missing leaf is valid create semantics; any other lookup error stays
+    // typed and no-follow.
+    let source = match rustix::fs::statat(&parent, &leaf, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(_) => {
+            let (source, metadata) = open_locked_current_at(&parent, &leaf, &operation.path)?;
+            Some((source, metadata))
+        }
+        Err(rustix::io::Errno::NOENT) => None,
+        Err(error) => {
+            return Err(anchored_io_error(
+                "inspect write target",
+                &operation.path,
+                error,
+            ));
+        }
+    };
+    let bytes = operation.content.as_bytes();
+    let bytes_hash = format!("blake3:{}", blake3::hash(bytes).to_hex());
+    let (temporary_name, temporary_fd) = create_patch_temporary(&parent, &operation.path)?;
+    let mode = source
+        .as_ref()
+        .map_or(0o644, |(_, metadata)| metadata.st_mode);
+    if let Err(error) = write_patch_temporary(temporary_fd, mode, bytes, &operation.path) {
+        remove_temporary(&parent, &temporary_name);
+        return Err(error);
+    }
+    if let Err(error) = require_unchanged_target(
+        &parent,
+        &leaf,
+        source.as_ref().map(|(_, metadata)| metadata),
+        &operation.path,
+    ) {
+        remove_temporary(&parent, &temporary_name);
+        return Err(error);
+    }
+    if let Err(error) = rustix::fs::renameat(&parent, &temporary_name, &parent, &leaf) {
+        remove_temporary(&parent, &temporary_name);
+        return Err(anchored_io_error(
+            "replace written file",
+            &operation.path,
+            error,
+        ));
+    }
+    drop(source);
+    Ok(AppliedPatch {
+        result: BoundedResult {
+            preview: format!(
+                "wrote {} bytes to {}",
+                bytes.len(),
+                operation.path.display()
+            ),
+            truncated: false,
+            artifact: None,
+            cursor: None,
+        },
+        path: operation.path.clone(),
+        bytes_hash,
+    })
 }
 
 fn apply_patch_and_record<L>(
@@ -653,6 +896,15 @@ fn apply_patch_at(
     relative: &Path,
     operation: &FsPatch,
 ) -> ToolResult<AppliedPatch> {
+    apply_patch_at_before_replace(workspace_dir, relative, operation, || {})
+}
+
+fn apply_patch_at_before_replace(
+    workspace_dir: OwnedFd,
+    relative: &Path,
+    operation: &FsPatch,
+    before_replace: impl FnOnce(),
+) -> ToolResult<AppliedPatch> {
     if operation.preimage.is_empty() {
         return Err(ToolError::invalid_argument(
             "fs_patch preimage cannot be empty",
@@ -667,10 +919,12 @@ fn apply_patch_at(
     let contents = String::from_utf8(bytes).map_err(|error| ToolError::InvalidArgument {
         message: format!("{} is not UTF-8 text: {error}", operation.path.display()),
     })?;
-    if !contents.contains(&operation.preimage) {
+    let matches = contents.match_indices(&operation.preimage).count();
+    if matches != 1 {
         return Err(ToolError::Conflict(FsPatchConflict {
             path: operation.path.clone(),
             expected_preimage: operation.preimage.clone(),
+            matches,
         }));
     }
     let patched = contents
@@ -698,6 +952,13 @@ fn apply_patch_at(
         path: operation.path.clone(),
         bytes_hash,
     };
+    before_replace();
+    if let Err(error) =
+        require_unchanged_target(&parent, &leaf, Some(&source_metadata), &operation.path)
+    {
+        remove_temporary(&parent, &temporary_name);
+        return Err(error);
+    }
     if let Err(error) = rustix::fs::renameat(&parent, &temporary_name, &parent, &leaf) {
         remove_temporary(&parent, &temporary_name);
         return Err(anchored_io_error(
@@ -707,6 +968,36 @@ fn apply_patch_at(
         ));
     }
     Ok(applied)
+}
+
+fn require_unchanged_target(
+    parent: &OwnedFd,
+    leaf: &OsStr,
+    expected: Option<&rustix::fs::Stat>,
+    display_path: &Path,
+) -> ToolResult<()> {
+    match (
+        expected,
+        rustix::fs::statat(parent, leaf, AtFlags::SYMLINK_NOFOLLOW),
+    ) {
+        (Some(expected), Ok(current))
+            if expected.st_dev == current.st_dev && expected.st_ino == current.st_ino =>
+        {
+            Ok(())
+        }
+        (None, Err(rustix::io::Errno::NOENT)) => Ok(()),
+        (Some(_), Ok(_)) | (None, Ok(_)) | (Some(_), Err(rustix::io::Errno::NOENT)) => {
+            Err(ToolError::PathChanged {
+                path: display_path.to_path_buf(),
+                message: "target identity changed before atomic replace".into(),
+            })
+        }
+        (_, Err(error)) => Err(anchored_io_error(
+            "recheck target before replace",
+            display_path,
+            error,
+        )),
+    }
 }
 
 /// Opens and exclusively locks the inode currently named by `leaf`.
@@ -977,6 +1268,23 @@ fn join_lines(lines: Vec<String>) -> String {
     }
 }
 
+fn prefixed_lines(prefix: char, text: &str) -> String {
+    text.split_inclusive('\n')
+        .map(|line| format!("{prefix}{line}"))
+        .collect()
+}
+
+fn bounded_preview(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_owned();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}… [preview truncated]", &text[..end])
+}
+
 fn path_argument(path: &Path) -> ToolResult<&str> {
     path.to_str().ok_or_else(|| ToolError::InvalidArgument {
         message: format!("path is not valid UTF-8: {}", path.display()),
@@ -1066,4 +1374,50 @@ where
         .map_err(|error| ToolError::Runtime {
             message: format!("blocking filesystem worker failed: {error}"),
         })?
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn external_leaf_replacement_before_patch_rename_is_typed_path_change() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let target = directory.path().join("target.txt");
+        let parked = directory.path().join("parked.txt");
+        fs::write(&target, "before").expect("seed target");
+        let workspace = rustix::fs::open(
+            directory.path(),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .expect("open workspace");
+        let operation = FsPatch::new(&target, "before", "haider");
+
+        let result =
+            apply_patch_at_before_replace(workspace, Path::new("target.txt"), &operation, || {
+                fs::rename(&target, &parked).expect("replace original target");
+                fs::write(&target, "external").expect("install external replacement");
+            });
+
+        assert!(matches!(result, Err(ToolError::PathChanged { .. })));
+        assert_eq!(
+            fs::read_to_string(&target).expect("read external target"),
+            "external"
+        );
+        assert_eq!(
+            fs::read_to_string(&parked).expect("read parked target"),
+            "before"
+        );
+        assert!(
+            fs::read_dir(directory.path())
+                .expect("read temporary directory")
+                .all(|entry| !entry
+                    .expect("directory entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".haider-patch-"))
+        );
+    }
 }

@@ -191,6 +191,9 @@ pub struct RequestInputCheckpoint {
     pub opening_generation: u64,
     pub tool_item_id: ItemId,
     pub call_id: String,
+    /// `request_input` for question checkpoints, or the mutating tool whose
+    /// broker approval is waiting on the same durable menu CAS.
+    pub tool_name: String,
     pub args: String,
 }
 
@@ -203,6 +206,12 @@ pub struct SubmitCheckpointTurn {
 
 /// Port for general tool execution. `request_input` remains actor-owned
 /// because its durable waiter is part of the turn state machine.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ToolDispatchResult {
+    Completed(BoundedResult),
+    ApprovalRequired(Menu),
+}
+
 #[async_trait]
 pub trait ToolDispatcher: Send + Sync {
     async fn execute(
@@ -212,7 +221,21 @@ pub trait ToolDispatcher: Send + Sync {
         name: &str,
         args: serde_json::Value,
         cancel: &CancelToken,
-    ) -> Result<BoundedResult, HaiderError>;
+    ) -> Result<ToolDispatchResult, HaiderError>;
+
+    /// Applies a permission answer only after the actor has observed the
+    /// daemon CAS's committed `MenuAnswered` envelope.
+    async fn resolve_approval(
+        &self,
+        _menu: &Menu,
+        _answer: &MenuAnswer,
+    ) -> Result<(), HaiderError> {
+        Err(HaiderError::new(
+            ErrorCode::PermissionDenied,
+            "tool dispatcher does not support approval menus",
+            false,
+        ))
+    }
 
     /// Drains process/finalizer ownership after the logical turn ends.
     async fn close(&self) -> Result<(), HaiderError> {
@@ -605,7 +628,7 @@ impl HarnessActor {
             tools.push(ToolAccumulator {
                 item_id: checkpoint.tool_item_id,
                 call_id: checkpoint.call_id.clone(),
-                name: "request_input".into(),
+                name: checkpoint.tool_name.clone(),
                 args: checkpoint.args.clone(),
             });
             let tool_call = match provider_tool_block(&tools, &checkpoint.call_id) {
@@ -622,10 +645,14 @@ impl HarnessActor {
                         .await;
                 }
             };
-            match self
-                .resume_request_input(&run_id, &mut tools, 0, &cancel, checkpoint.menu)
-                .await
-            {
+            let resumed = if checkpoint.tool_name == "request_input" {
+                self.resume_request_input(&run_id, &mut tools, 0, &cancel, checkpoint.menu)
+                    .await
+            } else {
+                self.resume_tool_approval(&run_id, &mut tools, 0, &cancel, checkpoint.menu)
+                    .await
+            };
+            match resumed {
                 Ok(result) => {
                     messages.push(Message::assistant(vec![tool_call]));
                     messages.push(result);
@@ -1369,18 +1396,9 @@ impl HarnessActor {
             self.commit_state(run_id, RunState::RunningTool)
                 .await
                 .map_err(DriveError::Store)?;
-            let execution = dispatcher.execute(
-                run_id,
-                &tools[index].call_id,
-                &tools[index].name,
-                args,
-                cancel,
-            );
-            let result = tokio::select! {
-                biased;
-                () = cancel.cancelled() => return Err(DriveError::Cancelled),
-                result = execution => result.map_err(DriveError::Store)?,
-            };
+            let result = self
+                .execute_general_tool(run_id, &tools[index], args, cancel, &dispatcher)
+                .await?;
             let call_id = tools[index].call_id.clone();
             self.commit_payload(
                 run_id,
@@ -1408,6 +1426,158 @@ impl HarnessActor {
             .await?;
         tools.remove(index);
         Ok(None)
+    }
+
+    async fn execute_general_tool(
+        &mut self,
+        run_id: &RunId,
+        tool: &ToolAccumulator,
+        args: serde_json::Value,
+        cancel: &CancelToken,
+        dispatcher: &Arc<dyn ToolDispatcher>,
+    ) -> Result<BoundedResult, DriveError> {
+        loop {
+            let execution =
+                dispatcher.execute(run_id, &tool.call_id, &tool.name, args.clone(), cancel);
+            let result = tokio::select! {
+                biased;
+                () = cancel.cancelled() => return Err(DriveError::Cancelled),
+                result = execution => result.map_err(DriveError::Store)?,
+            };
+            match result {
+                ToolDispatchResult::Completed(result) => return Ok(result),
+                ToolDispatchResult::ApprovalRequired(menu) => {
+                    self.commit_payload(
+                        run_id,
+                        EventPayload::MenuOpened(menu.clone()),
+                        prompt_omit_render(),
+                    )
+                    .await
+                    .map_err(DriveError::Store)?;
+                    self.commit_state(
+                        run_id,
+                        RunState::InputRequired {
+                            menu: menu.id.clone(),
+                        },
+                    )
+                    .await
+                    .map_err(DriveError::Store)?;
+                    let answer = self
+                        .wait_for_permission_answer(run_id, cancel, &menu)
+                        .await?;
+                    dispatcher
+                        .resolve_approval(&menu, &answer)
+                        .await
+                        .map_err(DriveError::Store)?;
+                    self.commit_state(run_id, RunState::RunningTool)
+                        .await
+                        .map_err(DriveError::Store)?;
+                }
+            }
+        }
+    }
+
+    /// Waits only for the daemon's committed menu-CAS wake. Unlike
+    /// `request_input`, a raw in-process answer must never arm a mutating
+    /// effect: the durable CAS commit is the approval credential.
+    async fn wait_for_permission_answer(
+        &mut self,
+        run_id: &RunId,
+        cancel: &CancelToken,
+        menu: &Menu,
+    ) -> Result<MenuAnswer, DriveError> {
+        loop {
+            let wake = tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    self.commit_payload(
+                        run_id,
+                        EventPayload::MenuClosed {
+                            menu: menu.id.clone(),
+                            reason: MenuCloseReason::Cancelled,
+                        },
+                        prompt_omit_render(),
+                    )
+                    .await
+                    .map_err(DriveError::Store)?;
+                    return Err(DriveError::Cancelled);
+                },
+                changed = self.committed_menus.changed(),
+                    if self.committed_menus.has_changed().is_ok() =>
+                {
+                    match changed {
+                        Ok(()) => self
+                            .committed_menus
+                            .borrow_and_update()
+                            .clone()
+                            .map(MenuWake::Committed),
+                        Err(_) => None,
+                    }
+                },
+                command = self.commands.recv() => command.map(MenuWake::Command),
+            };
+            let Some(wake) = wake else {
+                return Err(DriveError::Provider(provider_protocol_error(
+                    "session actor command channel closed with permission unanswered",
+                )));
+            };
+            match wake {
+                MenuWake::Command(command @ ActorCommand::Submit { .. }) => {
+                    self.defer_submit_or_reject(command);
+                }
+                MenuWake::Command(ActorCommand::AnswerMenu { completed, .. }) => {
+                    let _ = completed.send(Err(HaiderError::new(
+                        ErrorCode::PermissionDenied,
+                        "mutation approval requires the daemon's committed menu CAS",
+                        false,
+                    )));
+                }
+                MenuWake::Command(ActorCommand::Stop { completed }) => {
+                    cancel.cancel();
+                    self.commit_payload(
+                        run_id,
+                        EventPayload::MenuClosed {
+                            menu: menu.id.clone(),
+                            reason: MenuCloseReason::Cancelled,
+                        },
+                        prompt_omit_render(),
+                    )
+                    .await
+                    .map_err(DriveError::Store)?;
+                    let _ = completed.send(());
+                    return Err(DriveError::Cancelled);
+                }
+                MenuWake::Committed(envelope) => {
+                    let payload = serde_json::from_value::<EventPayload>(envelope.payload)
+                        .map_err(|error| {
+                            DriveError::Store(HaiderError::new(
+                                ErrorCode::InvalidArgument,
+                                format!("committed permission wake could not decode: {error}"),
+                                false,
+                            ))
+                        })?;
+                    let EventPayload::MenuAnswered(answer) = payload else {
+                        return Err(DriveError::Store(HaiderError::new(
+                            ErrorCode::InvalidArgument,
+                            "committed permission wake did not contain MenuAnswered",
+                            false,
+                        )));
+                    };
+                    if answer.menu != menu.id {
+                        return Err(DriveError::Store(HaiderError::new(
+                            ErrorCode::MenuNotFound,
+                            format!(
+                                "committed answer for menu {} reached permission waiter for {}",
+                                answer.menu, menu.id
+                            ),
+                            false,
+                        )));
+                    }
+                    validate_permission_selection(menu, &answer).map_err(DriveError::Store)?;
+                    return Ok(answer);
+                }
+            }
+        }
     }
 
     async fn complete_request_input(
@@ -1452,6 +1622,59 @@ impl HarnessActor {
         let request = RequestInput::from_tool_args(args).map_err(tool_error_to_drive)?;
         self.wait_for_request_input(run_id, tools, index, cancel, request, menu)
             .await
+    }
+
+    async fn resume_tool_approval(
+        &mut self,
+        run_id: &RunId,
+        tools: &mut Vec<ToolAccumulator>,
+        index: usize,
+        cancel: &CancelToken,
+        menu: Menu,
+    ) -> Result<Message, DriveError> {
+        let Some(dispatcher) = self.dispatcher.as_ref().map(Arc::clone) else {
+            return Err(DriveError::Store(HaiderError::new(
+                ErrorCode::Internal,
+                "recovered permission checkpoint has no tool dispatcher",
+                false,
+            )));
+        };
+        let answer = self
+            .wait_for_permission_answer(run_id, cancel, &menu)
+            .await?;
+        dispatcher
+            .resolve_approval(&menu, &answer)
+            .await
+            .map_err(DriveError::Store)?;
+        self.commit_state(run_id, RunState::RunningTool)
+            .await
+            .map_err(DriveError::Store)?;
+        let args = parse_tool_args(&tools[index])?;
+        let result = self
+            .execute_general_tool(run_id, &tools[index], args, cancel, &dispatcher)
+            .await?;
+        let call_id = tools[index].call_id.clone();
+        self.commit_payload(
+            run_id,
+            EventPayload::ToolResult {
+                call_id: call_id.clone(),
+                result: result.clone(),
+            },
+            prompt_verbatim_render(),
+        )
+        .await
+        .map_err(DriveError::Store)?;
+        self.commit_tool_completed(run_id, &tools[index], ToolStatus::Completed)
+            .await?;
+        tools.remove(index);
+        self.commit_state(run_id, RunState::Streaming)
+            .await
+            .map_err(DriveError::Store)?;
+        Ok(Message::tool_result(
+            call_id,
+            result.preview,
+            result.truncated,
+        ))
     }
 
     async fn wait_for_request_input(
@@ -2039,6 +2262,31 @@ fn parse_tool_args(tool: &ToolAccumulator) -> Result<serde_json::Value, DriveErr
             tool.call_id,
         )))
     })
+}
+
+fn validate_permission_selection(menu: &Menu, answer: &MenuAnswer) -> Result<(), HaiderError> {
+    let option = if let Some(key) = answer.option_key.as_deref() {
+        menu.options.iter().find(|option| option.key == key)
+    } else {
+        usize::try_from(answer.option_index)
+            .ok()
+            .and_then(|index| menu.options.get(index))
+    }
+    .ok_or_else(|| {
+        HaiderError::new(
+            ErrorCode::InvalidArgument,
+            "permission answer does not select a server-enumerated option",
+            false,
+        )
+    })?;
+    if option.decision.is_none() {
+        return Err(HaiderError::new(
+            ErrorCode::InvalidArgument,
+            format!("permission option `{}` has no decision", option.key),
+            false,
+        ));
+    }
+    Ok(())
 }
 
 fn provider_tool_block(tools: &[ToolAccumulator], call_id: &str) -> Result<Block, DriveError> {

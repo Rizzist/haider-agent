@@ -213,7 +213,7 @@ async fn frozen_clock_restarts_use_generation_stamped_effect_and_menu_ids() {
 }
 
 #[tokio::test]
-async fn allow_always_menu_resolution_creates_the_exact_digest_rule() {
+async fn approve_for_session_menu_resolution_creates_a_class_rule() {
     let mut broker = broker_at(RecordingJournal::default(), source_root(), 1);
     let mut policy = PermissionPolicy::default();
     let operation = FsRead::new("src/lib.rs");
@@ -230,7 +230,7 @@ async fn allow_always_menu_resolution_creates_the_exact_digest_rule() {
     };
     let opened = broker.permission_menu(&menu).expect("menu is available");
     assert!(opened.options.iter().any(|option| {
-        option.key == "allow_always"
+        option.key == "approve_for_session"
             && option.decision == Some(haider_protocol::menu::DecisionKind::AllowAlways)
     }));
 
@@ -238,7 +238,7 @@ async fn allow_always_menu_resolution_creates_the_exact_digest_rule() {
         .resolve_permission(
             &MenuAnswer {
                 menu,
-                option_key: Some("allow_always".into()),
+                option_key: Some("approve_for_session".into()),
                 option_index: 0,
                 value: None,
                 via: AnswerVia::Rpc,
@@ -247,18 +247,17 @@ async fn allow_always_menu_resolution_creates_the_exact_digest_rule() {
         )
         .expect("menu resolves");
 
-    assert_eq!(policy.always_allow_rules().len(), 1);
-    assert_eq!(policy.always_allow_rules()[0].class, EffectClass::FsRead);
-    assert_eq!(
-        policy.always_allow_rules()[0].args_digest,
-        intent.args_digest
-    );
-    let retry = broker.normalize(&operation).await.expect("normalize retry");
+    assert!(policy.always_allow_rules().is_empty());
+    assert_eq!(policy.session_allowlist(), &[EffectClass::FsRead]);
+    let retry = broker
+        .normalize(&FsRead::new("src/broker.rs"))
+        .await
+        .expect("normalize another read in the approved class");
     assert_eq!(
         broker
             .authorize(&retry, &policy)
             .await
-            .expect("retry authorizes"),
+            .expect("class grant authorizes"),
         AuthorizationVerdict::Allow
     );
 }
@@ -297,7 +296,7 @@ async fn unknown_permission_key_fails_closed_and_keeps_menu_answerable() {
         .resolve_permission(
             &MenuAnswer {
                 menu,
-                option_key: Some("reject_once".into()),
+                option_key: Some("deny".into()),
                 option_index: 0,
                 value: None,
                 via: AnswerVia::Rpc,
@@ -369,7 +368,7 @@ async fn allow_once_resolution_grants_a_single_retry() {
         .resolve_permission(
             &MenuAnswer {
                 menu,
-                option_key: Some("allow_once".into()),
+                option_key: Some("approve_once".into()),
                 option_index: 0,
                 value: None,
                 via: AnswerVia::Rpc,
@@ -416,7 +415,7 @@ async fn reject_once_resolution_denies_a_single_retry() {
         .resolve_permission(
             &MenuAnswer {
                 menu,
-                option_key: Some("reject_once".into()),
+                option_key: Some("deny".into()),
                 option_index: 0,
                 value: None,
                 via: AnswerVia::Rpc,

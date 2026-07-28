@@ -18,7 +18,9 @@ pub use broker::{
     EffectOperation, JournalSink, PermissionPolicy, PolicyDecision,
 };
 pub use error::{FsPatchConflict, ToolError, ToolResult};
-pub use filesystem::{CasSink, FsList, FsPatch, FsRead, FsSearch, ResultBounds, TurnAttribution};
+pub use filesystem::{
+    CasSink, FsList, FsPatch, FsRead, FsSearch, FsWrite, ResultBounds, TurnAttribution,
+};
 pub use ledger::{ChangeLedger, ChangeLedgerSink, FsWriteRecord, TurnChanges};
 pub use process::{
     CommandOutputSink, NoopCommandOutputSink, PROCESS_OUTPUT_CHUNK_BYTES, ProcessBounds,

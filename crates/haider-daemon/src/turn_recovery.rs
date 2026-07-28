@@ -9,8 +9,8 @@
 //! - durable `Cancelling` becomes `Cancelled` (items close `Cancelled`, an
 //!   open menu closes `Cancelled`, no `RunFailed` — cancellation is not an
 //!   error);
-//! - a run parked at a durable `request_input` checkpoint (open
-//!   `request_input` tool item without its `ToolResult`, matching
+//! - a run parked at a durable tool-menu checkpoint (an open `request_input`
+//!   or broker-approved mutating tool without its `ToolResult`, matching
 //!   `InputRequired` state and open menu) is reconstructed as a waiter — its
 //!   menu stays PENDING, and neither the provider request that produced it
 //!   nor any dispatched effect is ever repeated;
@@ -246,7 +246,13 @@ fn pending_checkpoint(reduction: &RunReduction) -> Option<RequestInputCheckpoint
         .iter()
         .find_map(|(item_id, open)| match &open.item {
             TurnItem::ToolCall { call_id, name, .. }
-                if name == "request_input" && !reduction.tool_results.contains(call_id) =>
+                if !reduction.tool_results.contains(call_id)
+                    && match &open_menu.menu.kind {
+                        haider_protocol::menu::MenuKind::Permission { .. } => {
+                            name != "request_input"
+                        }
+                        _ => name == "request_input",
+                    } =>
             {
                 Some(RequestInputCheckpoint {
                     menu: open_menu.menu.clone(),
@@ -254,6 +260,7 @@ fn pending_checkpoint(reduction: &RunReduction) -> Option<RequestInputCheckpoint
                     opening_generation: open_menu.opening_generation,
                     tool_item_id: item_id.clone(),
                     call_id: call_id.clone(),
+                    tool_name: name.clone(),
                     args: open.args.clone(),
                 })
             }
