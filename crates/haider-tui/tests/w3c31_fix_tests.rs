@@ -689,6 +689,9 @@ fn a_login_retry_restages_under_the_original_command_id() {
     let staged = pass(&mut driver, &mut model, None);
     assert!(matches!(staged.first(), Some(LiveCommand::Stage { .. })));
 
+    // Directed (TUI6.5): the card open mints identity 1 and the SUBMIT
+    // re-mints — every submit is a new stage issuance — so the first
+    // stage reply factually carries attempt 2.
     let first = pass(
         &mut driver,
         &mut model,
@@ -696,7 +699,7 @@ fn a_login_retry_restages_under_the_original_command_id() {
             vault_reference: "vault-1".to_owned(),
             provider: "anthropic".to_owned(),
             alias: None,
-            attempt: 1,
+            attempt: 2,
         }),
     );
     let original: CommandId = first
@@ -722,6 +725,11 @@ fn a_login_retry_restages_under_the_original_command_id() {
     }
     model.handle(key(ratatui::crossterm::event::KeyCode::Enter));
     pass(&mut driver, &mut model, None);
+    // Directed (TUI6.5, review r5): the retype is a NEW stage issuance
+    // with a FRESH identity (the third mint: open=1, submit=2,
+    // retype=3) — the durable-command law under test is orthogonal (the
+    // COMMAND id persists across issuances; only the issuance tag
+    // moves).
     let retried = pass(
         &mut driver,
         &mut model,
@@ -729,7 +737,7 @@ fn a_login_retry_restages_under_the_original_command_id() {
             vault_reference: "vault-2".to_owned(),
             provider: "anthropic".to_owned(),
             alias: None,
-            attempt: 1,
+            attempt: 3,
         }),
     );
     assert_eq!(
@@ -808,6 +816,8 @@ fn a_disconnect_mid_validation_recovers_the_card_and_retires_the_dead_login() {
     }
     model.handle(key(ratatui::crossterm::event::KeyCode::Enter));
     pass(&mut driver, &mut model, None);
+    // Directed (TUI6.5): open mints 1, the submit re-mints — the reply
+    // factually carries issuance 2.
     pass(
         &mut driver,
         &mut model,
@@ -815,7 +825,7 @@ fn a_disconnect_mid_validation_recovers_the_card_and_retires_the_dead_login() {
             vault_reference: "vault-1".to_owned(),
             provider: "anthropic".to_owned(),
             alias: None,
-            attempt: 1,
+            attempt: 2,
         }),
     );
     assert_eq!(driver.outbox_len(), 1);

@@ -2140,9 +2140,11 @@ pub struct LivePass {
 ///
 /// 1. **stamp the clock**, so every deadline in this pass is a pure
 ///    function of the value handed in (tests move time, never sleep);
-/// 2. **reduce the inbound reply** — model mutations first, because the
-///    requests they raise are drained in step 4;
-/// 3. **expire deadlines** the reply may have satisfied;
+/// 2. **expire elapsed deadlines** — BEFORE the reply applies (TUI6.5,
+///    review r5): a stage at its deadline is dead before it can mint;
+///    expiry wins the tie by construction;
+/// 3. **reduce the inbound reply** — model mutations before the request
+///    drain, because the requests they raise are drained in step 4;
 /// 4. **drain the reducer's requests** into commands, handing back the
 ///    shell-owned ones;
 /// 5. **`sync_selection`** — attach-on-selection (R11 cut 4): the launcher
@@ -2155,11 +2157,17 @@ pub fn live_pass(
     now: std::time::Instant,
 ) -> LivePass {
     driver.set_now(now);
+    // TUI6.5 (review r5's same-pass boundary): deadlines expire BEFORE
+    // the inbound reply applies — a stage at or past its deadline must be
+    // DEAD before its reply can mint. The old order let a late Staged
+    // mint LoginApi and only then expired the internal state, leaving the
+    // already-returned command untouched. Expiry-wins-the-tie is the law:
+    // a reply racing its own deadline in one pass mints nothing.
+    driver.expire_login(model);
     let mut commands = Vec::new();
     if let Some(reply) = reply {
         commands.extend(driver.apply(model, reply));
     }
-    driver.expire_login(model);
     let mut shell = Vec::new();
     let requests: Vec<AppRequest> = model.requests.drain(..).collect();
     for request in requests {

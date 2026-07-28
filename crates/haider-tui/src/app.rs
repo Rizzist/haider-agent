@@ -727,12 +727,18 @@ pub struct LoginCard {
     /// The typed key. Never rendered, never persisted, never logged.
     secret: zeroize::Zeroizing<String>,
     pub stage: LoginStage,
-    /// The ATTEMPT IDENTITY (TUI6.3 fix 1, review r3 finding 1): minted
-    /// when the card opens, carried end-to-end — the queued
-    /// [`AppRequest::LoginApi`], the driver's stage/login correlation,
-    /// and every reply gate. Closing the card RETIRES the attempt, so a
-    /// late reply from a cancelled attempt can neither mint the login
-    /// command nor mark a newer card successful.
+    /// The CURRENT stage issuance's ATTEMPT IDENTITY (TUI6.3 fix 1,
+    /// re-scoped by TUI6.5 / review r5): minted at card open AND
+    /// RE-MINTED at every submit — the identity is per-STAGE-ISSUANCE,
+    /// not per-card. r5's probe proved card-scoped identity unsound: a
+    /// timeout cleared the driver binding but the retype revived the
+    /// SAME id, so the timed-out stage's late reply passed both gates
+    /// and minted the stale vault reference. A retry is a NEW issuance;
+    /// the moment it is minted, the previous issuance's id is dead
+    /// forever (never reused, never re-bound). It is carried end-to-end
+    /// — the queued [`AppRequest::LoginApi`], the driver's binding, the
+    /// link's request context, and every reply gate — and closing the
+    /// card retires the current issuance.
     pub attempt: u64,
 }
 
@@ -1422,9 +1428,11 @@ pub struct AppModel {
     /// frame) has replaced is unrepresentable — the geometry twin of the
     /// text-revision guard.
     pub geometry_epoch: std::cell::Cell<u64>,
-    /// Monotonic login ATTEMPT mint (TUI6.3 fix 1) — each card open takes
-    /// the next value; never reused, so a retired attempt's replies can
-    /// never collide with a live one's.
+    /// Monotonic login ATTEMPT mint (TUI6.3 fix 1; TUI6.5 re-scope) —
+    /// each card open AND each submit takes the next value (the identity
+    /// is per stage ISSUANCE, not per card); never reused, so a retired
+    /// or timed-out issuance's replies can never collide with a live
+    /// one's.
     login_attempt_seq: u64,
     /// The sticky origin line is suppressed after a sticky jump until the
     /// next REAL wheel event (sim jumpToSticky, tui.js:2637-2657: the bar
@@ -2547,6 +2555,15 @@ impl AppModel {
                 }
                 let provider = card.provider.clone();
                 let alias = card.alias.clone();
+                // TUI6.5 (review r5): every SUBMIT is a fresh stage
+                // issuance with a fresh identity — minting here is what
+                // permanently invalidates the previous issuance: its id
+                // can never again equal a live binding or this card's
+                // current attempt, so the timed-out stage's late reply is
+                // dropped BY IDENTITY (no waiter bookkeeping needed — the
+                // reply arrives and dies at the gates).
+                self.login_attempt_seq += 1;
+                card.attempt = self.login_attempt_seq;
                 let attempt = card.attempt;
                 let secret = card.take_secret();
                 card.stage = LoginStage::Submitting;

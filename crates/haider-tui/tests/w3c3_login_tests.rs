@@ -983,3 +983,133 @@ fn retired_failed_reply_is_silent_no_flash() {
         "and the new card is untouched"
     );
 }
+
+// ---- TUI6.5: stage-issuance identity + deadline ordering (review r5) ----
+
+#[test]
+fn timeout_retype_late_old_stage_never_mints() {
+    // The r5 reviewer's exact probe: card-scoped identity let a timeout
+    // clear the driver binding while the RETYPE revived the SAME id, so
+    // the timed-out stage's late reply passed both gates and minted
+    // LoginApi{vault_reference: "OLD-TIMED-OUT-VAULT-REFERENCE"}. Every
+    // submit is now a fresh issuance: the old id is dead forever the
+    // moment the retype mints.
+    //
+    // MUTATION CHECK (fresh-issuance-identity): remove the
+    // `login_attempt_seq += 1; card.attempt = …` re-mint from login_key's
+    // Enter arm and this fails — the old reference mints. Verified by
+    // revert.
+    let mut model = live_model();
+    let mut driver = LiveDriver::new("test");
+    let start = std::time::Instant::now();
+    let first = submit_login(&mut model, SENTINEL);
+    let _ = live_pass(&mut driver, &mut model, None, start);
+    // The stage never answers; the deadline abandons it.
+    let after_deadline =
+        start + haider_tui::live::LOGIN_STAGE_TIMEOUT + std::time::Duration::from_secs(1);
+    let _ = live_pass(&mut driver, &mut model, None, after_deadline);
+    assert!(
+        matches!(
+            model.login.as_ref().expect("card open").stage,
+            LoginStage::Failed(_)
+        ),
+        "timed out to the retype recovery"
+    );
+    // Retype on the SAME card: a NEW issuance.
+    for c in "sk-ant-RETYPED-key".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Enter));
+    let second = model
+        .requests
+        .iter()
+        .find_map(|request| match request {
+            AppRequest::LoginApi { attempt, .. } => Some(*attempt),
+            _ => None,
+        })
+        .expect("retype queued");
+    assert_ne!(first, second, "a retype is a NEW issuance, never a revival");
+    let _ = live_pass(&mut driver, &mut model, None, after_deadline);
+    // The TIMED-OUT stage's late reply, carrying its dead issuance.
+    let pass = live_pass(
+        &mut driver,
+        &mut model,
+        Some(LiveReply::Staged {
+            vault_reference: "OLD-TIMED-OUT-VAULT-REFERENCE".to_owned(),
+            provider: "anthropic".to_owned(),
+            alias: None,
+            attempt: first,
+        }),
+        after_deadline,
+    );
+    assert!(
+        pass.commands.is_empty(),
+        "the timed-out issuance minted: {:?}",
+        pass.commands
+    );
+    assert!(
+        !format!("{pass:?}").contains("OLD-TIMED-OUT-VAULT-REFERENCE"),
+        "the stale reference never leaves live_pass"
+    );
+    // The live issuance completes normally.
+    let pass = live_pass(
+        &mut driver,
+        &mut model,
+        Some(LiveReply::Staged {
+            vault_reference: "retyped-ref".to_owned(),
+            provider: "anthropic".to_owned(),
+            alias: None,
+            attempt: second,
+        }),
+        after_deadline,
+    );
+    assert!(
+        pass.commands
+            .iter()
+            .any(|command| matches!(command, LiveCommand::LoginApi { .. })),
+        "the retype's own issuance mints"
+    );
+}
+
+#[test]
+fn at_deadline_stage_mints_nothing_in_its_own_pass() {
+    // The r5 sibling: live_pass applied an inbound Staged BEFORE expiring
+    // the deadline, so a stage arriving in the very pass its deadline
+    // elapsed still minted — and expiry then retired internal state but
+    // not the already-returned command. Expiry now runs FIRST: at the
+    // boundary, expiry wins and the reply dies at the gates.
+    //
+    // MUTATION CHECK (deadline-before-apply): swap live_pass back to
+    // apply-then-expire and this fails — the at-deadline stage mints.
+    // Verified by revert.
+    let mut model = live_model();
+    let mut driver = LiveDriver::new("test");
+    let start = std::time::Instant::now();
+    let first = submit_login(&mut model, SENTINEL);
+    let _ = live_pass(&mut driver, &mut model, None, start);
+    // The reply arrives in the SAME pass the deadline elapses.
+    let at_deadline = start + haider_tui::live::LOGIN_STAGE_TIMEOUT;
+    let pass = live_pass(
+        &mut driver,
+        &mut model,
+        Some(LiveReply::Staged {
+            vault_reference: "at-deadline-ref".to_owned(),
+            provider: "anthropic".to_owned(),
+            alias: None,
+            attempt: first,
+        }),
+        at_deadline,
+    );
+    assert!(
+        pass.commands.is_empty(),
+        "expiry wins the tie — the at-deadline stage minted: {:?}",
+        pass.commands
+    );
+    assert!(
+        matches!(
+            model.login.as_ref().expect("card open").stage,
+            LoginStage::Failed(_)
+        ),
+        "the card took the honest timeout recovery"
+    );
+}
