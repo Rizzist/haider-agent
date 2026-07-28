@@ -23,20 +23,22 @@
 //!   walks it component-by-component from the broker's retained root dirfd.
 //!   Every open uses `O_NOFOLLOW`, so a post-authorization symlink swap is a
 //!   typed refusal rather than an access outside the workspace.
-//! - Patch pre-image bytes are read as a coherent snapshot from the one
-//!   exclusively locked target fd used for identity verification. The derived
-//!   bytes go to a same-directory temp opened through the parent dirfd and land
-//!   through `renameat`. Both `fs_write` and `fs_patch` hold that advisory lock
-//!   through rename, serializing broker-mediated writes to an existing target.
-//!   Immediately before rename, the anchored path is checked against the locked
-//!   inode and its original content hash, and the parent is freshly resolved
-//!   from a root fd whose identity is still bound to the canonical workspace
-//!   path. On Apple, namespace escapes are atomically refused; on fallback
-//!   platforms, swaps already visible at the final parent recheck are refused.
-//!   External replacements observed by the final identity check and preventable
-//!   same-inode clobbers are also typed refusals rather than silent overwrites.
-//!   The remaining non-cooperating post-check races are bounded in
-//!   `docs/OPTIMIZATIONS.md`.
+//! - Patch pre-image and final-verify bytes use a same-directory `clonefile`
+//!   COW snapshot when Apple provides one. If cloning is unavailable or fails,
+//!   the read degrades to a metadata-guarded best effort; that portable fallback
+//!   cannot exclude an undetectably torn read from a non-cooperating writer.
+//!   The derived bytes go to a same-directory temp opened through the parent
+//!   dirfd and land through `renameat`. Both `fs_write` and `fs_patch` hold the
+//!   target's advisory lock through rename, serializing broker-mediated writes
+//!   to an existing target. Immediately before rename, the anchored path is
+//!   checked against the locked inode and its original content hash, and the
+//!   parent is freshly resolved from a root fd whose identity is still bound to
+//!   the canonical workspace path. On Apple, namespace escapes are atomically
+//!   refused; on fallback platforms, swaps already visible at the final parent
+//!   recheck are refused. External replacements observed by the final identity
+//!   check and preventable same-inode clobbers are typed refusals rather than
+//!   silent overwrites. The remaining non-cooperating races and filesystem
+//!   bounds are ledgered in `docs/OPTIMIZATIONS.md`.
 
 use crate::broker::{EffectBroker, EffectOperation, PermissionPolicy};
 use crate::ledger::{ChangeLedgerSink, FsWriteRecord};
@@ -946,9 +948,10 @@ fn apply_patch_at_with_commit_hooks(
         .map_err(|error| ToolError::io("duplicate workspace root", &operation.path, error))?;
     let (parent, leaf) = open_parent_at(traversal_root, relative, &operation.path)?;
     let (mut source, source_metadata) = open_locked_current_at(&parent, &leaf, &operation.path)?;
-    let bytes = coherent_file_snapshot(&mut source, &operation.path)?;
-    let source_hash = blake3::hash(&bytes);
-    let contents = String::from_utf8(bytes).map_err(|error| ToolError::InvalidArgument {
+    let (source_bytes, _source_basis) =
+        file_snapshot(&parent, &mut source, &operation.path)?.parts();
+    let source_hash = blake3::hash(&source_bytes);
+    let contents = String::from_utf8(source_bytes).map_err(|error| ToolError::InvalidArgument {
         message: format!("{} is not UTF-8 text: {error}", operation.path.display()),
     })?;
     let matches = contents
@@ -1004,17 +1007,22 @@ fn apply_patch_at_with_commit_hooks(
             }
         };
     // This is the final userspace content observation before the atomic
-    // namespace operation. The advisory-exclusive target lock is still held,
-    // so a cooperating writer cannot enter this verify→rename span. On Apple
-    // the syscall itself also rejects a symlink in any destination component.
-    if let Err(error) = require_unchanged_content(&mut source, source_hash, &operation.path) {
+    // namespace operation. A successful same-directory clonefile gives the
+    // verify a coherent COW basis immune to later writes to the original. If
+    // cloning is unavailable or fails, the metadata-bracketed single read is
+    // best-effort: MAP_SHARED writes, or ordinary writes on coarse-timestamp
+    // filesystems, can tear it without detection. The advisory target lock
+    // excludes cooperating writers in either case.
+    if let Err(error) =
+        require_unchanged_content(&parent, &mut source, source_hash, &operation.path)
+    {
         remove_temporary(&parent, &temporary_name);
         return Err(error);
     }
     before_commit();
-    // Repeat the anchored inode check after the (potentially retried)
-    // coherent content verification. This catches the common editor strategy
-    // of atomically renaming a new inode over the target during that read.
+    // Repeat the anchored inode check after the (potentially retried) content
+    // verification. This catches the common editor strategy of atomically
+    // renaming a new inode over the target during that read.
     if let Err(error) = require_unchanged_target(
         &commit_parent,
         &leaf,
@@ -1024,11 +1032,12 @@ fn apply_patch_at_with_commit_hooks(
         remove_temporary(&parent, &temporary_name);
         return Err(error);
     }
-    // A non-cooperating writer can ignore the advisory lock: an in-place write
-    // after content verification, or a replacement inode installed after this
-    // identity check, can still race the rename. Their exact bounds are
-    // ledgered in docs/OPTIMIZATIONS.md under "haider-tools filesystem
-    // residual (W4a1.2)".
+    // A non-cooperating writer can ignore the advisory lock. On every
+    // filesystem, an in-place write after content verification or a replacement
+    // inode installed after this identity check can still race the rename. On a
+    // clonefile fallback, an undetectably torn verify read is an additional
+    // residual. The exact bounds are ledgered in docs/OPTIMIZATIONS.md under
+    // "haider-tools filesystem residual (W4a1.3)".
     if let Err(error) = replace_temporary_at_commit(
         &commit_parent,
         &temporary_name,
@@ -1074,11 +1083,13 @@ fn replace_temporary_at_commit(
 }
 
 fn require_unchanged_content(
+    parent: &OwnedFd,
     source: &mut fs::File,
     expected: blake3::Hash,
     display_path: &Path,
 ) -> ToolResult<()> {
-    if blake3::hash(&coherent_file_snapshot(source, display_path)?) == expected {
+    let (bytes, _basis) = file_snapshot(parent, source, display_path)?.parts();
+    if blake3::hash(&bytes) == expected {
         return Ok(());
     }
     Err(ToolError::PathChanged {
@@ -1087,26 +1098,78 @@ fn require_unchanged_content(
     })
 }
 
-const COHERENT_SNAPSHOT_ATTEMPTS: usize = 4;
+const SNAPSHOT_ATTEMPTS: usize = 4;
 const MAX_SINGLE_READ_SNAPSHOT_BYTES: usize = i32::MAX as usize - 1;
 
-fn coherent_file_snapshot(source: &mut fs::File, display_path: &Path) -> ToolResult<Vec<u8>> {
-    coherent_file_snapshot_with_reader(source, display_path, |source, buffer| {
-        source.read_at(buffer, 0)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotBasis {
+    CowClone,
+    MetadataGuardedFallback,
+}
+
+#[derive(Debug)]
+struct FileSnapshot {
+    bytes: Vec<u8>,
+    basis: SnapshotBasis,
+}
+
+impl FileSnapshot {
+    fn parts(self) -> (Vec<u8>, SnapshotBasis) {
+        (self.bytes, self.basis)
+    }
+}
+
+fn file_snapshot(
+    parent: &OwnedFd,
+    source: &mut fs::File,
+    display_path: &Path,
+) -> ToolResult<FileSnapshot> {
+    file_snapshot_with_reader(
+        parent,
+        source,
+        display_path,
+        try_clone_file_at,
+        |snapshot, buffer| snapshot.read_at(buffer, 0),
+    )
+}
+
+fn file_snapshot_with_reader(
+    parent: &OwnedFd,
+    source: &mut fs::File,
+    display_path: &Path,
+    clone_source: impl FnOnce(&OwnedFd, &fs::File) -> Option<fs::File>,
+    mut read_once: impl FnMut(&fs::File, &mut [u8]) -> std::io::Result<usize>,
+) -> ToolResult<FileSnapshot> {
+    if let Some(mut clone) = clone_source(parent, source) {
+        return metadata_guarded_file_snapshot_with_reader(
+            &mut clone,
+            display_path,
+            &mut read_once,
+        )
+        .map(|bytes| FileSnapshot {
+            bytes,
+            basis: SnapshotBasis::CowClone,
+        });
+    }
+    metadata_guarded_file_snapshot_with_reader(source, display_path, read_once).map(|bytes| {
+        FileSnapshot {
+            bytes,
+            basis: SnapshotBasis::MetadataGuardedFallback,
+        }
     })
 }
 
 /// Takes one positional read bracketed by content-changing metadata checks.
-/// The one-read shape prevents the old multi-chunk torn-stream bug; mtime/ctime
-/// detect an in-place writer overlapping that read. The advisory lock excludes
-/// cooperating writers, and bounded retry handles non-cooperating churn without
-/// letting it stall an effect indefinitely.
-fn coherent_file_snapshot_with_reader(
+/// The one-read shape avoids the old multi-chunk stream tear, and changing
+/// identity, size, or timestamps trigger a bounded retry. This remains
+/// best-effort for a non-cooperating writer: MAP_SHARED writes can leave those
+/// fields unchanged, and ordinary writes may evade coarse timestamps.
+fn metadata_guarded_file_snapshot_with_reader(
     source: &mut fs::File,
     display_path: &Path,
     mut read_once: impl FnMut(&fs::File, &mut [u8]) -> std::io::Result<usize>,
 ) -> ToolResult<Vec<u8>> {
-    for _ in 0..COHERENT_SNAPSHOT_ATTEMPTS {
+    for _ in 0..SNAPSHOT_ATTEMPTS {
         let before = rustix::fs::fstat(&*source)
             .map_err(|error| ToolError::io("inspect patch snapshot", display_path, error))?;
         let expected_len = usize::try_from(before.st_size).map_err(|_| ToolError::Runtime {
@@ -1119,7 +1182,7 @@ fn coherent_file_snapshot_with_reader(
             return Err(ToolError::Runtime {
                 message: format!(
                     "patch target {} exceeds the {MAX_SINGLE_READ_SNAPSHOT_BYTES}-byte \
-                     coherent-snapshot limit",
+                     single-read snapshot limit",
                     display_path.display()
                 ),
             });
@@ -1148,9 +1211,53 @@ fn coherent_file_snapshot_with_reader(
         path: display_path.to_path_buf(),
         message: format!(
             "target content did not yield a stable snapshot after \
-             {COHERENT_SNAPSHOT_ATTEMPTS} attempts"
+             {SNAPSHOT_ATTEMPTS} attempts"
         ),
     })
+}
+
+#[cfg(target_vendor = "apple")]
+fn try_clone_file_at(parent: &OwnedFd, source: &fs::File) -> Option<fs::File> {
+    static NEXT_CLONE: AtomicU64 = AtomicU64::new(0);
+    const MAX_NAME_RETRIES: usize = 16;
+
+    for _ in 0..MAX_NAME_RETRIES {
+        let sequence = NEXT_CLONE.fetch_add(1, Ordering::Relaxed);
+        let name = OsString::from(format!(
+            ".haider-snapshot-{}-{sequence}.tmp",
+            std::process::id()
+        ));
+        match rustix::fs::fclonefileat(source, parent, &name, rustix::fs::CloneFlags::empty()) {
+            Ok(()) => {
+                let clone = match rustix::fs::openat(
+                    parent,
+                    &name,
+                    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                ) {
+                    Ok(clone) => fs::File::from(clone),
+                    Err(_) => {
+                        remove_temporary(parent, &name);
+                        return None;
+                    }
+                };
+                if rustix::fs::unlinkat(parent, &name, AtFlags::empty()).is_err() {
+                    drop(clone);
+                    remove_temporary(parent, &name);
+                    return None;
+                }
+                return Some(clone);
+            }
+            Err(rustix::io::Errno::EXIST) => continue,
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn try_clone_file_at(_parent: &OwnedFd, _source: &fs::File) -> Option<fs::File> {
+    None
 }
 
 fn snapshot_metadata_matches(before: &rustix::fs::Stat, after: &rustix::fs::Stat) -> bool {
@@ -1687,6 +1794,11 @@ where
 #[allow(clippy::expect_used)]
 #[path = "filesystem/tests/w4a12.rs"]
 mod w4a12_tests;
+
+#[cfg(test)]
+#[allow(clippy::expect_used, unsafe_code)]
+#[path = "filesystem/tests/w4a13.rs"]
+mod w4a13_tests;
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]

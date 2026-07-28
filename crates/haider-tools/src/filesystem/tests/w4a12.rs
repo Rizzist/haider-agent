@@ -22,24 +22,25 @@ fn mid_read_in_place_edit_never_false_passes_a_torn_content_hash() {
     let mut source = fs::File::open(&target).expect("open target");
     let mut edited = false;
 
-    let snapshot = coherent_file_snapshot_with_reader(&mut source, &target, |source, buffer| {
-        let prefix_read = source.read_at(&mut buffer[..FIRST_READ_BYTES], 0)?;
-        if !edited {
-            fs::write(&target, &final_bytes).expect("rewrite target in place");
-            assert_eq!(
-                fs::metadata(&target).expect("rewritten metadata").ino(),
-                initial_inode,
-                "reproduction must preserve the target inode"
-            );
-            edited = true;
-        }
-        let suffix_read = source.read_at(
-            &mut buffer[prefix_read..],
-            u64::try_from(prefix_read).expect("prefix offset"),
-        )?;
-        Ok(prefix_read + suffix_read)
-    })
-    .expect("retry to a coherent snapshot");
+    let snapshot =
+        metadata_guarded_file_snapshot_with_reader(&mut source, &target, |source, buffer| {
+            let prefix_read = source.read_at(&mut buffer[..FIRST_READ_BYTES], 0)?;
+            if !edited {
+                fs::write(&target, &final_bytes).expect("rewrite target in place");
+                assert_eq!(
+                    fs::metadata(&target).expect("rewritten metadata").ino(),
+                    initial_inode,
+                    "reproduction must preserve the target inode"
+                );
+                edited = true;
+            }
+            let suffix_read = source.read_at(
+                &mut buffer[prefix_read..],
+                u64::try_from(prefix_read).expect("prefix offset"),
+            )?;
+            Ok(prefix_read + suffix_read)
+        })
+        .expect("retry after the observable metadata change");
 
     assert_ne!(
         blake3::hash(&snapshot),
