@@ -771,6 +771,64 @@ fn login_close_restores_the_draft_and_its_history() {
     assert_eq!(model.composer.text(), "remember this");
 }
 
+#[test]
+fn login_card_is_modal_against_the_hits_beneath_it() {
+    // TUI6.2b (the interrupted verifier's dying finding, confirmed): with
+    // the login card open on the launcher, the launcher's AttachSession
+    // hit rects stayed LIVE underneath the modal. Clicking one ran
+    // open_session mid-login: its stash parked the empty scratch over
+    // the login-parked launcher draft (destroying the ring), checkout
+    // flipped the screen under the still-open card, and the card's later
+    // Esc-restore then clobbered the session draft with an empty one —
+    // three corruptions from one click. The card owns the KEYS already
+    // (login_key); it now owns the HITS too: handle_hit swallows
+    // everything while the card is open.
+    //
+    // MUTATION CHECK (login-modal-hits): drop the `login.is_some()` gate
+    // from handle_hit and this fails — the click attaches a session
+    // under the card. Verified by revert.
+    let mut model = launcher_model();
+    model.mode = RuntimeMode::Live;
+    for c in "remember this".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Enter)); // ring records it
+    for c in "/login anthropic api".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Esc));
+    model.handle(key(KeyCode::Enter));
+    assert!(model.login.is_some(), "card open");
+    // The frame under the card still lists the recent sessions; a click
+    // on one of their rects must be swallowed by the modal.
+    let (_, hits, _) = draw(&model, 100, 30);
+    let attach = hits
+        .iter()
+        .find(|(_, hit)| matches!(hit, Hit::AttachSession(_)))
+        .map(|(rect, _)| *rect);
+    if let Some(rect) = attach {
+        dispatch_input(
+            &mut model,
+            &hits,
+            mouse(MouseEventKind::Down(MouseButton::Left), rect.x + 2, rect.y),
+        );
+        dispatch_input(
+            &mut model,
+            &hits,
+            mouse(MouseEventKind::Up(MouseButton::Left), rect.x + 2, rect.y),
+        );
+    }
+    assert_eq!(
+        model.screen,
+        Screen::Launcher,
+        "no surface change under the card"
+    );
+    assert!(model.login.is_some(), "the card is still open");
+    // The parked draft survived: closing the card restores the ring.
+    model.handle(key(KeyCode::Esc));
+    assert!(model.composer.history_prev(), "ring intact after the modal");
+}
+
 // ---- TUI6.2 promoted seam pins (the verifier's s1-s6, now shipped) ----
 //
 // MUTATION CHECK (budget-across-swap, the whole group): the s1/s2/s3/s6

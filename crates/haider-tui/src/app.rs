@@ -3748,6 +3748,17 @@ impl AppModel {
         if self.help_open {
             return;
         }
+        // TUI6.2b: the login card is MODAL against hits exactly as it is
+        // against keys (login_key owns the keyboard) — the frame beneath
+        // it still lists clickable rows, and a click that fell through
+        // ran open_session mid-login: its stash overwrote the
+        // login-parked draft (ring destroyed), the screen flipped under
+        // the open card, and the card's Esc-restore later clobbered the
+        // session draft. The card has no hit targets of its own, so the
+        // gate is total.
+        if self.login.is_some() {
+            return;
+        }
         match hit {
             // Every hit below re-checks its OWNING SURFACE: the map may be
             // one frame stale, so a rect from a screen we have since left
