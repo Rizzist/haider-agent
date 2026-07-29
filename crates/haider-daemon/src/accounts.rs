@@ -2101,8 +2101,15 @@ impl haider_core::ProviderAttemptResolver for AccountsAttemptResolver {
             .await
         {
             Ok(resolved) => resolved,
+            // Rotation is an optimization over the provider's own failure, so
+            // its bookkeeping must never be MORE fatal than the error that
+            // triggered it: anything the resolver reports as retryable — a
+            // limited alternate, but equally a transient descriptor-store
+            // write — falls back to the ordinary retry/backoff path instead
+            // of ending the turn.
             Err(error)
-                if error.code == ErrorCode::CredentialLimited
+                if error.retryable
+                    || error.code == ErrorCode::CredentialLimited
                     || error.code == ErrorCode::Unauthorized =>
             {
                 return Ok(if error.retryable {

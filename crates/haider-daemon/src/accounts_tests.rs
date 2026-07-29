@@ -8,6 +8,7 @@ use haider_core::SqliteStoreHandle;
 
 use crate::session_hub::FrameSendError;
 use crate::worker::ProviderFactory as _;
+use haider_core::ProviderAttemptResolver as _;
 
 fn test_store_dir() -> tempfile::TempDir {
     tempfile::Builder::new()
@@ -178,6 +179,107 @@ async fn production_account_factory_dispatches_openai_and_preserves_anthropic() 
         compatible.account_alias.as_deref(),
         Some(compatible_alias.as_str())
     );
+}
+
+/// MUTATION CHECK (review of record, W5c.1): drop the `error.retryable` arm
+/// from the attempt resolver's rotation-failure match so the resolver error
+/// propagates. Expected failure: the retryable bookkeeping error escapes as
+/// `Err`, the decision is never `Wait`, and the turn dies on an error the
+/// provider itself said to retry.
+/// Verified by revert on 2026-07-29.
+#[tokio::test]
+async fn retryable_rotation_bookkeeping_failure_waits_instead_of_killing_the_turn() {
+    struct WriteRefusingStore(Vec<CredentialDescriptor>);
+    impl StoreLike for WriteRefusingStore {
+        fn load(&self) -> Result<Vec<CredentialDescriptor>, HaiderError> {
+            Ok(self.0.clone())
+        }
+        fn save(&self, _descriptors: &[CredentialDescriptor]) -> Result<(), HaiderError> {
+            Err(HaiderError::new(
+                ErrorCode::StoreLocked,
+                "descriptor store is temporarily locked",
+                true,
+            ))
+        }
+    }
+
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let primary_alias = CredentialAlias::new("wedged-primary");
+    let alternate_alias = CredentialAlias::new("wedged-backup");
+    let descriptor = |alias: CredentialAlias, active: bool| CredentialDescriptor {
+        alias,
+        provider: OPENAI_PROVIDER_NAME.into(),
+        base_url: None,
+        auth_method: AuthMethod::ApiKey,
+        identity: "wedged fixture".into(),
+        status: CredentialStatus::Ok,
+        active,
+    };
+    let descriptors = vec![
+        descriptor(primary_alias.clone(), true),
+        descriptor(alternate_alias.clone(), false),
+    ];
+    let backing: Box<dyn StoreLike> = Box::new(WriteRefusingStore(descriptors.clone()));
+    let accounts = AccountStore::new(backing).expect("accounts");
+    let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(descriptors));
+    let vault = Arc::new(MemoryVault::new());
+    vault
+        .put(&alternate_alias, b"wedged-alternate-secret")
+        .expect("alternate secret");
+    let mut actor = start_account_actor(AccountActorConfig {
+        store: store.clone(),
+        accounts,
+        vault: vault.clone() as Arc<dyn Vault>,
+        validator: Arc::new(ProviderCredentialValidator),
+        snapshot: Arc::clone(&snapshot),
+        profile_id: "wedged-store".into(),
+        default_model: "gpt-test".into(),
+    });
+    let broker = CredentialBroker::new(
+        vault.clone() as Arc<dyn Vault>,
+        OAuthProviderCatalog::default(),
+        Arc::clone(&snapshot),
+        actor.commands(),
+    )
+    .expect("broker");
+    let factory = AccountsProviderFactory::with_broker(
+        Arc::clone(&snapshot),
+        VaultProvision::Available(vault as Arc<dyn Vault>),
+        Arc::new(ProductionAccountBuilder),
+        broker.clone(),
+    );
+    let resolver = AccountsAttemptResolver::new(
+        factory,
+        haider_protocol::session::SessionMetadataV1 {
+            cwd: "/tmp/wedged-store".into(),
+            provider: OPENAI_PROVIDER_NAME.into(),
+            model: "gpt-test".into(),
+            max_tokens: 64,
+            system_prompt_version: None,
+            created_at_ms: 1,
+        },
+    );
+
+    let decision = resolver
+        .resolve(
+            &primary_alias,
+            &haider_provider::ProviderError::new(
+                haider_provider::ProviderErrorKind::RateLimited,
+                "bounded rate limit",
+            )
+            .with_retry_after_ms(Some(1_000)),
+        )
+        .await
+        .expect("a retryable bookkeeping failure is not a turn-fatal error");
+    assert!(matches!(
+        decision,
+        haider_core::ProviderAttemptDecision::Wait
+    ));
+
+    assert!(broker.shutdown().await);
+    actor.shutdown().await;
+    store.close().await.expect("close");
 }
 
 /// MUTATION CHECK (W5c.1 resolver-backed factory): bypass
