@@ -181,6 +181,152 @@ async fn production_account_factory_dispatches_openai_and_preserves_anthropic() 
     );
 }
 
+/// MUTATION CHECK (review of record, W5b retrospective): weaken any component
+/// of the generation/issuer/audience/resource/subject-hash fence in
+/// `apply_oauth_refresh`, `expire_oauth_refresh`, or `begin_oauth_refresh`.
+/// Expected failure: the late apply overwrites the replacement bundle in the
+/// vault, or a stale-fence expiry/begin reports `true` and marks the
+/// replacement `Expired`.
+///
+/// This pins the PRODUCTION account actor. The `late_refresh_*` tests in
+/// `oauth_tests.rs` drive `start_status_actor`, a test double that
+/// reimplements this fence, so they do not cover these functions at all —
+/// the entire CAS could be deleted at all three sites with the daemon suite
+/// still green.
+/// Verified by revert on 2026-07-29.
+#[tokio::test]
+async fn stale_oauth_fences_cannot_overwrite_or_expire_a_replaced_bundle() {
+    let bundle_at = |generation: u64, access: &[u8]| {
+        haider_accounts::OAuthTokenBundleV1::new(
+            "fake-oauth".into(),
+            "http://127.0.0.1:32109".into(),
+            "fake-audience".into(),
+            Some("fake-api-resource".into()),
+            "Bearer".into(),
+            Zeroizing::new(access.to_vec()),
+            Some(Zeroizing::new(b"OAUTH_REFRESH_FENCE_SENTINEL_4b7e".to_vec())),
+            u64::MAX - 1,
+            Some(u64::MAX),
+            vec!["openid".into(), "inference".into()],
+            haider_accounts::OAuthIdentityV1 {
+                subject_hash: "verified-subject".into(),
+                display_identity: "person@example.invalid".into(),
+            },
+            generation,
+        )
+        .expect("OAuth bundle")
+    };
+    let fence_for = |bundle: &haider_accounts::OAuthTokenBundleV1| OAuthRefreshFence {
+        generation: bundle.generation,
+        issuer: bundle.issuer.clone(),
+        audience: bundle.audience.clone(),
+        resource: bundle.resource.clone(),
+        subject_hash: bundle.identity.subject_hash.clone(),
+    };
+
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let alias = CredentialAlias::new("fenced-oauth");
+    let descriptor = CredentialDescriptor {
+        alias: alias.clone(),
+        provider: "fake-oauth".into(),
+        base_url: None,
+        auth_method: AuthMethod::OAuth,
+        identity: "person@example.invalid".into(),
+        status: CredentialStatus::Ok,
+        active: true,
+    };
+    let mut accounts = memory_accounts();
+    accounts.add(descriptor.clone()).expect("descriptor");
+    let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(accounts.list().to_vec()));
+    let vault = Arc::new(MemoryVault::new());
+
+    // The vault already holds generation 2: a concurrent refresh or re-login
+    // replaced the bundle while an older refresh was still in flight.
+    let replacement = bundle_at(2, b"ACCESS_REPLACEMENT_SENTINEL_c0de");
+    vault
+        .put(&alias, &replacement.encode().expect("encode replacement"))
+        .expect("seed replacement");
+    let superseded = bundle_at(1, b"ACCESS_SUPERSEDED_SENTINEL_0old");
+    let late = bundle_at(1, b"ACCESS_LATE_SENTINEL_dead");
+
+    let mut actor = start_account_actor(AccountActorConfig {
+        store: store.clone(),
+        accounts,
+        vault: vault.clone() as Arc<dyn Vault>,
+        validator: Arc::new(ProviderCredentialValidator),
+        snapshot: Arc::clone(&snapshot),
+        profile_id: "oauth-fence".into(),
+        default_model: "gpt-test".into(),
+    });
+    let commands = actor.commands();
+
+    let (completed, applied) = tokio::sync::oneshot::channel();
+    commands
+        .send(AccountCommand::ApplyOAuthRefresh {
+            descriptor: descriptor.clone(),
+            expected: fence_for(&superseded),
+            encoded_bundle: late.encode().expect("encode late"),
+            completed,
+        })
+        .await
+        .expect("apply command");
+    assert!(matches!(
+        applied.await.expect("apply response"),
+        Err(RefreshApplyError::Stale)
+    ));
+
+    let stored = vault.resolve(&alias).expect("stored bundle");
+    let stored =
+        haider_accounts::OAuthTokenBundleV1::decode(stored.expose_secret()).expect("decode stored");
+    assert_eq!(stored.generation, 2, "replacement must survive a late apply");
+    assert_eq!(
+        stored.access_token_handle().expose_secret(),
+        b"ACCESS_REPLACEMENT_SENTINEL_c0de"
+    );
+
+    let (completed, expired) = tokio::sync::oneshot::channel();
+    commands
+        .send(AccountCommand::ExpireOAuthRefresh {
+            descriptor: descriptor.clone(),
+            expected: fence_for(&superseded),
+            completed,
+        })
+        .await
+        .expect("expire command");
+    assert!(
+        !expired.await.expect("expire response").expect("no error"),
+        "a stale fence must not expire the replacement"
+    );
+
+    let (completed, began) = tokio::sync::oneshot::channel();
+    commands
+        .send(AccountCommand::BeginOAuthRefresh {
+            descriptor: descriptor.clone(),
+            expected: fence_for(&superseded),
+            completed,
+        })
+        .await
+        .expect("begin command");
+    assert!(
+        !began.await.expect("begin response").expect("no error"),
+        "a stale fence must not open a refresh against the replacement"
+    );
+
+    {
+        let current = snapshot.lock().expect("snapshot");
+        assert!(
+            current
+                .iter()
+                .any(|entry| entry.alias == alias && entry.status == CredentialStatus::Ok),
+            "the replacement descriptor must remain usable"
+        );
+    }
+
+    actor.shutdown().await;
+    store.close().await.expect("close");
+}
+
 /// MUTATION CHECK (review of record, W5c.1): drop the `error.retryable` arm
 /// from the attempt resolver's rotation-failure match so the resolver error
 /// propagates. Expected failure: the retryable bookkeeping error escapes as
