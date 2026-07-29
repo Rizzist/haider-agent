@@ -377,13 +377,17 @@ async fn run_inner(
         provider_factory,
         tool_factory: std::sync::Arc::clone(&dependencies.tool_factory),
     };
-    let worker_manager = WorkerManager::start(hub.clone(), worker_dependencies);
+    let worker_manager = WorkerManager::start(
+        hub.clone(),
+        worker_dependencies,
+        config.inject_worker_manager_shutdown_error,
+    );
     let worker_handle = worker_manager.handle();
     hub.install_worker_manager(worker_handle.clone())
         .map_err(DaemonError::from)?;
     let crate::accounts::AccountsRuntime {
         facade: accounts_facade,
-        actor: account_actor,
+        actor: mut account_actor,
         vault: _,
         broker: credential_broker,
     } = accounts_runtime;
@@ -405,6 +409,15 @@ async fn run_inner(
         };
         if let Err(error) = result {
             let _ = worker_manager.shutdown().await;
+            if let Some(broker) = &credential_broker {
+                broker.abort_and_join().await;
+            }
+            if let Some(oauth) = &oauth_coordinator {
+                oauth.abort_and_join().await;
+            }
+            if let Some(actor) = account_actor.as_mut() {
+                actor.force_and_join().await;
+            }
             let _ = hub.shutdown().await;
             let _ = store.close().await;
             return Err(error.into());
@@ -414,6 +427,16 @@ async fn run_inner(
         Ok(endpoint) => endpoint,
         Err(error) => {
             let _ = worker_manager.shutdown().await;
+            if let Some(broker) = &credential_broker {
+                broker.abort_and_join().await;
+            }
+            if let Some(oauth) = &oauth_coordinator {
+                oauth.abort_and_join().await;
+            }
+            if let Some(actor) = account_actor.as_mut() {
+                actor.force_and_join().await;
+            }
+            let _ = hub.shutdown().await;
             let _ = store.flush().await;
             let _ = store.close().await;
             return Err(error);
@@ -528,11 +551,17 @@ async fn run_inner(
     // envelopes under the same deadline (the ledgered W3b1 relaxation).
     let worker_shutdown =
         bounded_finalization(worker_manager.shutdown(), barrier_deadline, &mut shutdown).await;
-    match worker_shutdown {
-        Some(Ok(())) => {}
-        Some(Err(error)) => return Err(error.into()),
-        None => forced = true,
-    }
+    let worker_error = match worker_shutdown {
+        Some(Ok(())) => None,
+        Some(Err(error)) => {
+            forced = true;
+            Some(DaemonError::from(error))
+        }
+        None => {
+            forced = true;
+            None
+        }
+    };
     // R10 drain: new account commands were already rejected by the hub's
     // draining flag; join the account actor (its in-flight login finishes or
     // the deadline forces it — pending receipts + reconciliation carry the
@@ -570,12 +599,21 @@ async fn run_inner(
         actor.force_and_join().await;
     }
     let hub_shutdown = bounded_finalization(hub.shutdown(), barrier_deadline, &mut shutdown).await;
-    match hub_shutdown {
-        Some(Ok(crate::SessionHubShutdownOutcome::Graceful)) => {}
-        Some(Ok(crate::SessionHubShutdownOutcome::Forced)) => forced = true,
-        Some(Err(error)) => return Err(DaemonError::from(error)),
-        None => forced = true,
-    }
+    let hub_error = match hub_shutdown {
+        Some(Ok(crate::SessionHubShutdownOutcome::Graceful)) => None,
+        Some(Ok(crate::SessionHubShutdownOutcome::Forced)) => {
+            forced = true;
+            None
+        }
+        Some(Err(error)) => {
+            forced = true;
+            Some(DaemonError::from(error))
+        }
+        None => {
+            forced = true;
+            None
+        }
+    };
     drain_sender.send_replace(Some(DrainNotice {
         reason,
         instance_id,
@@ -599,8 +637,15 @@ async fn run_inner(
     .await;
 
     // Precedence: a listener failure is the daemon's own fault and outranks
-    // whatever the barrier then reported.
-    if let Some(error) = listener_error.or(finalize_error) {
+    // whatever the barrier then reported. All errors are arbitrated only
+    // after the full tail: in particular, no manager/hub failure may bypass
+    // the account actor's transitive blocking-write join or release the
+    // profile lease before finalization.
+    if let Some(error) = listener_error
+        .or(worker_error)
+        .or(hub_error)
+        .or(finalize_error)
+    {
         return Err(error);
     }
     states.publish(DaemonState::Stopped);

@@ -259,6 +259,7 @@ pub(crate) struct WorkerManagerHandle {
 pub(crate) struct WorkerManager {
     handle: WorkerManagerHandle,
     task: Option<JoinHandle<()>>,
+    inject_shutdown_error: bool,
 }
 
 enum ManagerCommand {
@@ -314,7 +315,11 @@ impl PendingTurn {
 }
 
 impl WorkerManager {
-    pub(crate) fn start(hub: SessionHub, dependencies: WorkerDependencies) -> Self {
+    pub(crate) fn start(
+        hub: SessionHub,
+        dependencies: WorkerDependencies,
+        inject_shutdown_error: bool,
+    ) -> Self {
         let (commands, receiver) = mpsc::channel(MANAGER_CAPACITY);
         let handle = WorkerManagerHandle {
             commands,
@@ -324,6 +329,7 @@ impl WorkerManager {
         Self {
             handle,
             task: Some(task),
+            inject_shutdown_error,
         }
     }
 
@@ -333,6 +339,13 @@ impl WorkerManager {
 
     pub(crate) async fn shutdown(mut self) -> Result<(), HaiderError> {
         self.handle.begin_draining();
+        if self.inject_shutdown_error {
+            return Err(HaiderError::new(
+                ErrorCode::Internal,
+                "injected worker manager shutdown failure",
+                true,
+            ));
+        }
         let (completed, response) = oneshot::channel();
         self.handle
             .commands

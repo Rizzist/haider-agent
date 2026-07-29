@@ -1442,6 +1442,39 @@ impl Vault for ControlledVault {
     }
 }
 
+struct ResolveCountingVault {
+    inner: MemoryVault,
+    resolves: AtomicUsize,
+}
+
+impl ResolveCountingVault {
+    fn new() -> Self {
+        Self {
+            inner: MemoryVault::new(),
+            resolves: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl Vault for ResolveCountingVault {
+    fn put(&self, alias: &CredentialAlias, secret: &[u8]) -> AccountsResult<()> {
+        self.inner.put(alias, secret)
+    }
+
+    fn resolve(&self, alias: &CredentialAlias) -> AccountsResult<SecretHandle> {
+        self.resolves.fetch_add(1, Ordering::SeqCst);
+        self.inner.resolve(alias)
+    }
+
+    fn delete(&self, alias: &CredentialAlias) -> AccountsResult<()> {
+        self.inner.delete(alias)
+    }
+
+    fn list(&self) -> AccountsResult<Vec<CredentialAlias>> {
+        self.inner.list()
+    }
+}
+
 fn oauth_descriptor_for_test() -> CredentialDescriptor {
     CredentialDescriptor {
         alias: CredentialAlias::new("work-oauth"),
@@ -1856,9 +1889,108 @@ async fn concurrent_resolve_waits_for_rotated_descriptor_commit_or_fail_closed_d
     assert!(broker.shutdown().await);
 }
 
+// MUTATION CHECK (W5b.1c P3): remove ONLY `resolve`'s outer
+// `snapshot_allows_oauth` admission gate while leaving `resolve_oauth`'s
+// inner/pre-admitted commit gate intact. Expected failure: the inner gate
+// still rejects the expired descriptor, but only after this test observes an
+// unauthorized vault read. The outer gate is independently load-bearing for
+// reject-before-secret-read admission.
+#[tokio::test]
+async fn outer_oauth_admission_rejects_expired_descriptor_before_vault_read() {
+    let server = FakeOAuthServer::start(FakeMode::Success, false).await;
+    let vault = Arc::new(ResolveCountingVault::new());
+    let mut descriptor = oauth_descriptor_for_test();
+    descriptor.status = CredentialStatus::Expired;
+    vault
+        .put(
+            &descriptor.alias,
+            &oauth_bundle_for_test(&server, now_ms().expect("clock").saturating_add(300_000))
+                .encode()
+                .expect("encode"),
+        )
+        .expect("seed");
+    let (broker, _, descriptor) = broker_for(&server, vault.clone(), descriptor);
+
+    let error = broker
+        .resolve(&descriptor)
+        .await
+        .expect_err("expired descriptor is rejected");
+    assert_eq!(error.code, ErrorCode::Unauthorized);
+    assert_eq!(
+        vault.resolves.load(Ordering::SeqCst),
+        0,
+        "outer admission must reject before reading OAuth secret material"
+    );
+    assert!(broker.shutdown().await);
+}
+
+// MUTATION CHECK (W5b.1c P2): remove `RefreshFlightRegistration`, restoring
+// publication of a flight before cancellable `OwnedTaskSet::spawn`
+// registration. Expected failure: aborting the leader while the task lock is
+// held leaves the flight mapped, so this assertion fails (and a successor
+// would otherwise time out waiting for work that never became live).
+#[tokio::test]
+async fn cancelled_task_registration_poison_removes_the_unowned_refresh_flight() {
+    let server = FakeOAuthServer::start(FakeMode::Success, true).await;
+    let vault = Arc::new(MemoryVault::new());
+    let descriptor = oauth_descriptor_for_test();
+    vault
+        .put(
+            &descriptor.alias,
+            &oauth_bundle_for_test(&server, now_ms().expect("clock").saturating_sub(1))
+                .encode()
+                .expect("encode"),
+        )
+        .expect("seed");
+    let (broker, _, descriptor) = broker_for(&server, vault, descriptor);
+    let task_registration_lock = broker.tasks.tasks.lock().await;
+    let leader = tokio::spawn({
+        let broker = broker.clone();
+        let descriptor = descriptor.clone();
+        async move { broker.resolve(&descriptor).await }
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if !broker.inner.flights.lock().expect("flights").is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("flight is published before task registration");
+
+    leader.abort();
+    let _ = leader.await;
+    assert!(
+        broker.inner.flights.lock().expect("flights").is_empty(),
+        "cancellation before task registration must poison and remove the unowned flight"
+    );
+    drop(task_registration_lock);
+
+    let successor = tokio::spawn({
+        let broker = broker.clone();
+        let descriptor = descriptor.clone();
+        async move { broker.resolve(&descriptor).await }
+    });
+    wait_for_refresh_calls(&server, 1).await;
+    server.release_refresh();
+    let access = tokio::time::timeout(Duration::from_secs(2), successor)
+        .await
+        .expect("successor must not wait on the cancelled flight")
+        .expect("successor join")
+        .expect("successor resolve");
+    assert_eq!(access.expose_secret(), b"ACCESS_ROTATED_SENTINEL_3a19");
+    assert!(broker.shutdown().await);
+}
+
 // MUTATION CHECK (W5b.1b P2-3): discard `JoinError` values in
 // `OwnedTaskSet::join_all`. Expected failure: the flight guard still wakes
 // the resolver closed, but shutdown incorrectly returns `true` (graceful).
+// MUTATION CHECK (W5b.1c P2): remove the admission seal from
+// `RefreshWorkerCompletion::drop`. Expected failure: the waiter is woken
+// before admission is sealed, so the seal assertion below fails and a
+// replacement refresh can enter during panic unwind.
 #[tokio::test]
 async fn refresh_worker_panic_wakes_waiters_and_makes_graceful_shutdown_unclean() {
     let server = FakeOAuthServer::start(FakeMode::Success, false).await;
@@ -1878,6 +2010,22 @@ async fn refresh_worker_panic_wakes_waiters_and_makes_graceful_shutdown_unclean(
         .await
         .expect("panic must not strand the single-flight waiter");
     assert!(result.is_err(), "a panicked refresh worker fails closed");
+    assert!(
+        broker.tasks.sealed.load(Ordering::Acquire),
+        "panic cleanup must seal admission before waking the failed flight"
+    );
+    let replacement = tokio::time::timeout(Duration::from_secs(2), broker.resolve(&descriptor))
+        .await
+        .expect("sealed admission fails replacement work closed");
+    assert!(
+        replacement.is_err(),
+        "a panic must not admit a replacement refresh worker"
+    );
+    assert_eq!(
+        server.state.refresh_calls.load(Ordering::SeqCst),
+        0,
+        "neither the panicked worker nor a replacement may reach the token endpoint"
+    );
     assert!(
         !broker.shutdown().await,
         "a child panic must prevent a clean graceful shutdown report"

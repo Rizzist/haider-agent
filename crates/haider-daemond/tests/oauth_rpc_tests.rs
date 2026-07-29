@@ -1069,11 +1069,26 @@ async fn real_uds_oauth_add_is_capability_and_connection_bound_durable_and_secre
 // the actor tombstones and joins.
 #[tokio::test]
 async fn forced_runtime_joins_blocking_refresh_persistence_before_successor_ready() {
+    blocking_refresh_shutdown_barrier(false).await;
+}
+
+// MUTATION CHECK (W5b.1c P1): restore the early
+// `Some(Err(error)) => return Err(error.into())` from worker-manager shutdown.
+// Expected failure: the injected worker error drops the account actor before
+// its blocking refresh persistence joins, so `stopped_withheld` and successor
+// lease exclusion below fail while the vault write is still live.
+#[tokio::test]
+async fn worker_shutdown_error_still_joins_refresh_persistence_and_withholds_lease() {
+    blocking_refresh_shutdown_barrier(true).await;
+}
+
+async fn blocking_refresh_shutdown_barrier(inject_worker_shutdown_error: bool) {
     let root = test_root("haoB");
     let workspace = root.path().join("workspace");
     std::fs::create_dir_all(&workspace).expect("workspace");
     let mut config = DaemonConfig::new("oauth-barrier", root.path().join("store"), root.path());
     config.drain_timeout = Duration::from_millis(100);
+    config.inject_worker_manager_shutdown_error = inject_worker_shutdown_error;
     let server = FakeServer::start().await;
     let vault = Arc::new(BlockingRotationVault::new());
     let builder = Arc::new(OAuthTurnBuilder {
@@ -1097,6 +1112,10 @@ async fn forced_runtime_joins_blocking_refresh_persistence_before_successor_read
         ..DaemonDependencies::default()
     };
     let task = ready_with_dependencies(&config, dependencies.clone()).await;
+    // Only the predecessor receives the deterministic manager fault. Every
+    // successor below exercises the normal daemon with the same profile,
+    // vault, and account dependencies.
+    config.inject_worker_manager_shutdown_error = false;
     let mut client = control(&config, "barrier-owner").await;
     let (flow_id, authorization_url) = start_flow(
         &mut client,
@@ -1258,11 +1277,10 @@ async fn forced_runtime_joins_blocking_refresh_persistence_before_successor_read
     // Always unblock the non-cancellable test worker before asserting, so the
     // deliberate no-join mutation fails without stranding the test runtime.
     vault.release();
-    let outcome = tokio::time::timeout(DEADLINE, predecessor)
+    let predecessor_result = tokio::time::timeout(DEADLINE, predecessor)
         .await
         .expect("predecessor join deadline")
-        .expect("predecessor owner join")
-        .expect("predecessor daemon outcome");
+        .expect("predecessor owner join");
     assert!(
         stopped_withheld,
         "Stopped must remain withheld while blocking persistence owns cleartext"
@@ -1275,7 +1293,20 @@ async fn forced_runtime_joins_blocking_refresh_persistence_before_successor_read
         successor_was_excluded,
         "a successor must not reach Ready while predecessor persistence is in flight"
     );
-    assert_eq!(outcome, haider_daemon::ShutdownOutcome::Forced);
+    if inject_worker_shutdown_error {
+        let error = predecessor_result.expect_err("injected worker shutdown error propagates");
+        assert!(
+            error
+                .to_string()
+                .contains("injected worker manager shutdown failure"),
+            "the captured worker error propagates only after barrier cleanup: {error}"
+        );
+    } else {
+        assert_eq!(
+            predecessor_result.expect("predecessor daemon outcome"),
+            haider_daemon::ShutdownOutcome::Forced
+        );
+    }
     assert!(
         !vault.cleartext_live.load(Ordering::Acquire),
         "joined blocking persistence no longer owns cleartext bytes"

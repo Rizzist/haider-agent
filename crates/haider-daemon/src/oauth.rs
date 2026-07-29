@@ -66,8 +66,12 @@ impl OwnedTaskSet {
             self.panicked.store(true, Ordering::Release);
             // A task owner that lost a child invariant may drain, but it may
             // not admit more children or call its shutdown graceful.
-            self.sealed.store(true, Ordering::Release);
+            self.seal();
         }
+    }
+
+    fn seal(&self) {
+        self.sealed.store(true, Ordering::Release);
     }
 
     fn spawn_initial(&self, task: impl Future<Output = ()> + Send + 'static) -> bool {
@@ -108,7 +112,7 @@ impl OwnedTaskSet {
     }
 
     async fn join_all(&self) -> bool {
-        self.sealed.store(true, Ordering::Release);
+        self.seal();
         let mut tasks = self.tasks.lock().await;
         while let Some(completed) = tasks.join_next().await {
             self.inspect_join(completed);
@@ -117,7 +121,7 @@ impl OwnedTaskSet {
     }
 
     async fn abort_and_join(&self) {
-        self.sealed.store(true, Ordering::Release);
+        self.seal();
         let mut tasks = self.tasks.lock().await;
         tasks.abort_all();
         while let Some(completed) = tasks.join_next().await {
@@ -1872,15 +1876,22 @@ struct BrokerInner {
 /// honesty; this guard is the immediate fail-closed wakeup for waiters.
 struct RefreshWorkerCompletion {
     broker: Weak<BrokerInner>,
+    task_owner: Weak<OwnedTaskSet>,
     key: RefreshKey,
     flight: Arc<RefreshFlight>,
     armed: bool,
 }
 
 impl RefreshWorkerCompletion {
-    fn new(broker: Weak<BrokerInner>, key: RefreshKey, flight: Arc<RefreshFlight>) -> Self {
+    fn new(
+        broker: Weak<BrokerInner>,
+        task_owner: Weak<OwnedTaskSet>,
+        key: RefreshKey,
+        flight: Arc<RefreshFlight>,
+    ) -> Self {
         Self {
             broker,
+            task_owner,
             key,
             flight,
             armed: true,
@@ -1913,8 +1924,65 @@ impl RefreshWorkerCompletion {
 impl Drop for RefreshWorkerCompletion {
     fn drop(&mut self) {
         if self.armed {
-            self.flight.finish(Err(refresh_worker_failed()));
+            // Seal task admission before either removing the failed flight or
+            // waking its waiters. Otherwise a resolver woken during panic
+            // unwind can register replacement work before JoinSet observes
+            // the panic and seals its owner.
+            if let Some(task_owner) = self.task_owner.upgrade() {
+                task_owner.seal();
+            }
             self.remove_registered_flight();
+            self.flight.finish(Err(refresh_worker_failed()));
+        }
+    }
+}
+
+/// Owns the interval between publishing a new flight and registering its
+/// daemon-owned task. Cancellation of the resolver during `OwnedTaskSet::spawn`
+/// drops this guard, so no mapped flight can survive without a live task.
+struct RefreshFlightRegistration {
+    broker: Weak<BrokerInner>,
+    key: RefreshKey,
+    flight: Arc<RefreshFlight>,
+    armed: bool,
+}
+
+impl RefreshFlightRegistration {
+    fn new(broker: Weak<BrokerInner>, key: RefreshKey, flight: Arc<RefreshFlight>) -> Self {
+        Self {
+            broker,
+            key,
+            flight,
+            armed: true,
+        }
+    }
+
+    fn commit(&mut self) {
+        self.armed = false;
+    }
+
+    fn remove_registered_flight(&self) {
+        let Some(broker) = self.broker.upgrade() else {
+            return;
+        };
+        let mut flights = broker
+            .flights
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if flights
+            .get(&self.key)
+            .is_some_and(|current| Arc::ptr_eq(current, &self.flight))
+        {
+            flights.remove(&self.key);
+        }
+    }
+}
+
+impl Drop for RefreshFlightRegistration {
+    fn drop(&mut self) {
+        if self.armed {
+            self.remove_registered_flight();
+            self.flight.finish(Err(refresh_worker_failed()));
         }
     }
 }
@@ -2077,11 +2145,18 @@ impl CredentialBroker {
             let descriptor = descriptor.clone();
             let flight_for_worker = Arc::clone(&flight);
             let key_for_worker = key.clone();
-            if !self
+            let task_owner = Arc::downgrade(&self.tasks);
+            let mut registration = RefreshFlightRegistration::new(
+                Arc::downgrade(&self.inner),
+                key.clone(),
+                Arc::clone(&flight),
+            );
+            if self
                 .tasks
                 .spawn(async move {
                     let completion = RefreshWorkerCompletion::new(
                         Arc::downgrade(&broker),
+                        task_owner,
                         key_for_worker,
                         flight_for_worker,
                     );
@@ -2108,18 +2183,7 @@ impl CredentialBroker {
                 })
                 .await
             {
-                let mut flights = self
-                    .inner
-                    .flights
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if flights
-                    .get(&key)
-                    .is_some_and(|current| Arc::ptr_eq(current, &flight))
-                {
-                    flights.remove(&key);
-                }
-                flight.finish(Err(broker_stopped()));
+                registration.commit();
             }
         }
         flight.wait().await?;

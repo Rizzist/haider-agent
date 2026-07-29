@@ -240,6 +240,7 @@ async fn accepted_commit_then_shutdown_before_handoff_is_swept_terminal() {
     let manager = crate::worker::WorkerManager::start(
         hub.clone(),
         crate::worker::WorkerDependencies::unconfigured_for_tests(),
+        false,
     );
     let handle = manager.handle();
     handle.begin_draining();
@@ -889,6 +890,7 @@ async fn recovery_terminalization_never_settles_idle_while_another_run_is_active
     let manager = crate::worker::WorkerManager::start(
         hub.clone(),
         crate::worker::WorkerDependencies::unconfigured_for_tests(),
+        false,
     );
     let handle = manager.handle();
 
