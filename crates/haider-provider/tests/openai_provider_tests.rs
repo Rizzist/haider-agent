@@ -5,15 +5,32 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use haider_accounts::{CredentialAlias, MemoryVault, Vault};
-use haider_protocol::provider::{FeatureResolve, StreamEvent};
+use haider_protocol::provider::{Block, FeatureResolve, FinishReason, StreamEvent};
 use haider_provider::{
-    Message, OpenAiCompatibleProvider, OpenAiProvider, OpenAiRetryPolicy, Provider,
-    ProviderErrorKind, ProviderStreamItem, ToolDefinition, TurnRequest, replay_openai_chat_sse,
-    replay_openai_http_error, replay_openai_models_response, replay_openai_responses_sse,
+    Message, MessageRole, OpenAiCompatibleProvider, OpenAiProvider, OpenAiRetryPolicy, Provider,
+    ProviderError, ProviderErrorKind, ProviderStreamItem, ToolDefinition, TurnRequest,
+    replay_openai_chat_sse, replay_openai_http_error, replay_openai_models_response,
+    replay_openai_responses_sse,
 };
 use serde::Deserialize;
 
 const FIXTURE_DIR: &str = "tests/fixtures/openai";
+
+#[derive(Debug, Deserialize)]
+struct Manifest {
+    schema: String,
+    provisional: bool,
+    provenance: String,
+    fixtures: Vec<Fixture>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Fixture {
+    name: String,
+    family: String,
+    wire: String,
+    golden: String,
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "result", content = "value", rename_all = "snake_case")]
@@ -58,7 +75,34 @@ fn compatible_chat_fixture_maps_to_the_same_shared_stream_events() {
 }
 
 #[test]
-fn responses_incomplete_never_closes_partial_tool_arguments() {
+fn manifest_replays_every_declared_openai_fixture_with_provenance() {
+    let directory = fixture_directory();
+    let manifest_bytes = fs::read(directory.join("manifest.json")).expect("manifest bytes");
+    let manifest: Manifest = serde_json::from_slice(&manifest_bytes).expect("manifest JSON");
+
+    assert_eq!(manifest.schema, "haider.openai-fixtures.v1");
+    assert!(manifest.provisional);
+    assert!(!manifest.provenance.trim().is_empty());
+    assert!(!manifest.fixtures.is_empty());
+
+    for fixture in manifest.fixtures {
+        let wire = fs::read(directory.join(&fixture.wire)).expect("fixture wire");
+        let expected: Vec<ExpectedItem> = read_json(&directory.join(&fixture.golden));
+        let expected = expected
+            .into_iter()
+            .map(ExpectedItem::into_result)
+            .collect::<Vec<_>>();
+        let actual = match fixture.family.as_str() {
+            "responses" => replay_openai_responses_sse(&wire),
+            "chat_completions" => replay_openai_chat_sse(&wire),
+            other => panic!("unknown OpenAI fixture family `{other}`"),
+        };
+        assert_eq!(actual, expected, "fixture `{}`", fixture.name);
+    }
+}
+
+#[test]
+fn responses_max_tokens_drops_partial_tool_call_before_actor_sees_it() {
     let wire = br#"event: response.output_item.added
 data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_partial","call_id":"call_partial","name":"write_file","arguments":""}}
 
@@ -72,23 +116,17 @@ data: {"type":"response.incomplete","response":{"status":"incomplete","incomplet
 
     let items = replay_openai_responses_sse(wire);
 
-    assert!(
-        !items.iter().any(|item| matches!(
-            item,
-            Ok(StreamEvent::ToolCallEnd { call_id }) if call_id == "call_partial"
-        )),
-        "partial arguments must remain open for terminal cleanup"
-    );
+    assert_no_tool_events(&items, "call_partial");
     assert!(matches!(
         items.last(),
         Some(Ok(StreamEvent::Finish {
-            reason: haider_protocol::provider::FinishReason::MaxTokens
+            reason: FinishReason::MaxTokens
         }))
     ));
 }
 
 #[test]
-fn chat_length_finish_never_closes_partial_tool_arguments() {
+fn chat_max_tokens_drops_partial_tool_call_before_actor_sees_it() {
     let wire = br#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_partial","type":"function","function":{"name":"write_file","arguments":"{\"path\":"}}]},"finish_reason":null}]}
 
 data: {"choices":[{"index":0,"delta":{},"finish_reason":"length"}]}
@@ -99,17 +137,11 @@ data: [DONE]
 
     let items = replay_openai_chat_sse(wire);
 
-    assert!(
-        !items.iter().any(|item| matches!(
-            item,
-            Ok(StreamEvent::ToolCallEnd { call_id }) if call_id == "call_partial"
-        )),
-        "partial arguments must remain open for terminal cleanup"
-    );
+    assert_no_tool_events(&items, "call_partial");
     assert!(matches!(
         items.last(),
         Some(Ok(StreamEvent::Finish {
-            reason: haider_protocol::provider::FinishReason::MaxTokens
+            reason: FinishReason::MaxTokens
         }))
     ));
 }
@@ -202,6 +234,87 @@ fn compatible_base_url_and_fake_v1_models_response_produce_a_capability_doc() {
     assert_eq!(capabilities.context_limit, 0);
 }
 
+#[test]
+fn compatible_origin_policy_rejects_credential_ssrf_and_accepts_safe_origins() {
+    let rejected = [
+        "http://169.254.169.254",
+        "https://169.254.169.254",
+        "http://10.0.0.8:8080",
+        "https://10.0.0.8",
+        "http://172.16.0.8",
+        "https://172.31.255.254",
+        "http://192.168.1.8",
+        "https://192.168.1.8",
+        "https://[fe80::1]",
+        "https://[::ffff:169.254.169.254]",
+        "https://[::ffff:10.0.0.8]",
+        "http://203.0.113.7",
+        "http://localhost:11434",
+    ];
+    for base_url in rejected {
+        let error = compatible_provider_result("test-model", base_url)
+            .expect_err("unsafe origin must be rejected before transport construction");
+        assert_eq!(error.kind, ProviderErrorKind::InvalidRequest, "{base_url}");
+        assert!(!error.retryable, "{base_url}");
+        assert!(!error.message.contains("fixture-secret"), "{base_url}");
+    }
+
+    for base_url in [
+        "https://api.example.com/openai",
+        "http://127.0.0.1:11434",
+        "http://127.255.255.254:1234",
+        "http://[::1]:1234",
+    ] {
+        compatible_provider_result("test-model", base_url)
+            .unwrap_or_else(|error| panic!("safe origin `{base_url}` rejected: {error}"));
+    }
+}
+
+#[test]
+fn encrypted_reasoning_continuation_reconstructs_exact_next_responses_input() {
+    let directory = fixture_directory();
+    let wire = fs::read(directory.join("reasoning_continuation.sse")).expect("fixture wire");
+    let items = replay_openai_responses_sse(&wire);
+    let opaque = items
+        .iter()
+        .find_map(|item| match item {
+            Ok(StreamEvent::ProviderOpaque { provider, data }) => {
+                Some((provider.clone(), data.clone()))
+            }
+            _ => None,
+        })
+        .expect("encrypted reasoning continuation event");
+    let provider = native_provider("gpt-5-test");
+    let request = TurnRequest {
+        messages: vec![
+            Message::user_text("first"),
+            Message {
+                role: MessageRole::Assistant,
+                blocks: vec![Block::ProviderOpaque {
+                    provider: opaque.0,
+                    data: opaque.1.clone(),
+                }],
+            },
+            Message::user_text("continue"),
+        ],
+        model: "gpt-5-test".into(),
+        max_tokens: 64,
+        system_prompt: None,
+        tools: Vec::new(),
+        attachments: Vec::new(),
+    };
+
+    let payload = provider
+        .request_payload(&request)
+        .expect("opaque continuation replays");
+
+    assert_eq!(
+        payload["include"],
+        serde_json::json!(["reasoning.encrypted_content"])
+    );
+    assert_eq!(payload["input"][1], opaque.1);
+}
+
 #[tokio::test]
 async fn native_capability_doc_is_model_specific() {
     let reasoning = native_provider("gpt-5.6-test").capabilities().await;
@@ -238,6 +351,42 @@ data: {"type":"response.failed","response":{"id":"resp_failed","status":"failed"
     assert!(!stream_error.message.contains("private failure detail"));
 }
 
+/// MUTATION CHECK: remove the `overloaded_error` stream mapping.
+/// Expected failure: `InvalidRequest` replaces retryable `Overloaded`.
+/// Verified by revert on 2026-07-29.
+#[test]
+fn streamed_overloaded_error_is_retryable_overload() {
+    let wire =
+        fs::read(fixture_directory().join("overloaded_responses.sse")).expect("overload fixture");
+    let error = replay_openai_responses_sse(&wire)
+        .into_iter()
+        .next()
+        .expect("overload item")
+        .expect_err("overload is an error");
+
+    assert_eq!(error.kind, ProviderErrorKind::Overloaded);
+    assert!(error.retryable);
+    assert!(!error.message.contains("private overload detail"));
+}
+
+fn assert_no_tool_events(items: &[ProviderStreamItem], call_id: &str) {
+    assert!(
+        !items.iter().any(|item| matches!(
+            item,
+            Ok(StreamEvent::ToolCallStart {
+                call_id: actual,
+                ..
+            } | StreamEvent::ToolCallArgsDelta {
+                call_id: actual,
+                ..
+            } | StreamEvent::ToolCallEnd {
+                call_id: actual,
+            }) if actual == call_id
+        )),
+        "partial tool call `{call_id}` crossed the adapter boundary"
+    );
+}
+
 #[test]
 fn provider_debug_never_exposes_openai_secrets() {
     let secret = "never-log-openai-key";
@@ -266,6 +415,13 @@ fn provider_with_secret(secret: &str, model: &str) -> OpenAiProvider {
 }
 
 fn compatible_provider(model: &str, base_url: impl AsRef<str>) -> OpenAiCompatibleProvider {
+    compatible_provider_result(model, base_url).expect("HTTP client")
+}
+
+fn compatible_provider_result(
+    model: &str,
+    base_url: impl AsRef<str>,
+) -> Result<OpenAiCompatibleProvider, ProviderError> {
     let vault = MemoryVault::new();
     let alias = CredentialAlias::new("compatible-fixture");
     vault
@@ -273,8 +429,7 @@ fn compatible_provider(model: &str, base_url: impl AsRef<str>) -> OpenAiCompatib
         .expect("stores fixture secret");
     let handle = vault.resolve(&alias).expect("resolves fixture secret");
     OpenAiCompatibleProvider::new(handle, model, base_url)
-        .expect("HTTP client")
-        .with_account(alias)
+        .map(|provider| provider.with_account(alias))
 }
 
 fn fixture_directory() -> PathBuf {

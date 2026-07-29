@@ -1,0 +1,11 @@
+[
+  {"result":"ok","value":{"event":"tool_call_start","call_id":"call_a","name":"first_tool"}},
+  {"result":"ok","value":{"event":"tool_call_args_delta","call_id":"call_a","args_fragment":"{\"a\":"}},
+  {"result":"ok","value":{"event":"tool_call_start","call_id":"call_b","name":"second_tool"}},
+  {"result":"ok","value":{"event":"tool_call_args_delta","call_id":"call_b","args_fragment":"{\"b\":"}},
+  {"result":"ok","value":{"event":"tool_call_args_delta","call_id":"call_b","args_fragment":"2}"}},
+  {"result":"ok","value":{"event":"tool_call_args_delta","call_id":"call_a","args_fragment":"1}"}},
+  {"result":"ok","value":{"event":"tool_call_end","call_id":"call_a"}},
+  {"result":"ok","value":{"event":"tool_call_end","call_id":"call_b"}},
+  {"result":"ok","value":{"event":"finish","reason":"tool_use"}}
+]

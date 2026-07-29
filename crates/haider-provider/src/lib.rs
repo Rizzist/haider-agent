@@ -265,6 +265,11 @@ pub enum FakeStep {
     EmitReasoning {
         text: String,
     },
+    /// Emits provider-native continuation state for turn-engine replay tests.
+    EmitProviderOpaque {
+        provider: String,
+        data: serde_json::Value,
+    },
     EmitToolCall {
         call_id: String,
         name: String,
@@ -447,6 +452,11 @@ async fn play_script(script: Arc<Vec<FakeStep>>, sender: mpsc::Sender<ProviderSt
             }
             FakeStep::EmitReasoning { text } => {
                 if !send_event(&sender, StreamEvent::ReasoningDelta { text }).await {
+                    return;
+                }
+            }
+            FakeStep::EmitProviderOpaque { provider, data } => {
+                if !send_event(&sender, StreamEvent::ProviderOpaque { provider, data }).await {
                     return;
                 }
             }

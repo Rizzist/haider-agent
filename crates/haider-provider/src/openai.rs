@@ -7,6 +7,7 @@
 //! LiteLLM, TGI, Hugging Face endpoints, and generic gateways.
 
 use std::collections::{BTreeMap, HashMap};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
@@ -31,6 +32,8 @@ pub const OPENAI_COMPATIBLE_PROVIDER_NAME: &str = "openai-compatible";
 pub const OPENAI_RESPONSES_API_URL: &str = "https://api.openai.com/v1/responses";
 
 const STREAM_CAPACITY: usize = 32;
+const MODELS_BODY_LIMIT: usize = 1024 * 1024;
+const ERROR_BODY_LIMIT: usize = 64 * 1024;
 const TRANSPORT_CONFIG: OpenAiTransportConfig = OpenAiTransportConfig {
     retry_policy: OpenAiRetryPolicy::Never,
     connect_timeout: Duration::from_secs(10),
@@ -288,7 +291,8 @@ impl OpenAiCompatibleProvider {
         if !response.status().is_success() {
             return Err(http_error_from_response(response).await);
         }
-        let body = response.bytes().await.map_err(transport_error)?;
+        let body =
+            read_body_bounded(response, MODELS_BODY_LIMIT, "OpenAI-compatible /v1/models").await?;
         replay_openai_models_response(&self.http.model, &body)
     }
 
@@ -367,10 +371,87 @@ async fn http_error_from_response(response: reqwest::Response) -> ProviderError 
         .get(RETRY_AFTER)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    match response.bytes().await {
+    match read_body_bounded(response, ERROR_BODY_LIMIT, "OpenAI HTTP error").await {
         Ok(body) => replay_openai_http_error(status, retry_after.as_deref(), &body),
-        Err(error) => transport_error(error),
+        Err(error) => classify_http_body_read_error(status, retry_after.as_deref(), error),
     }
+}
+
+fn classify_http_body_read_error(
+    status: u16,
+    retry_after: Option<&str>,
+    mut error: ProviderError,
+) -> ProviderError {
+    if error.kind == ProviderErrorKind::MalformedFrame {
+        let classified = replay_openai_http_error(status, retry_after, &[]);
+        error.kind = classified.kind;
+        error.retryable = classified.retryable;
+        error.retry_after_ms = classified.retry_after_ms;
+    }
+    error
+}
+
+async fn read_body_bounded(
+    response: reqwest::Response,
+    limit: usize,
+    context: &str,
+) -> Result<Vec<u8>, ProviderError> {
+    read_body_source_bounded(response, limit, context).await
+}
+
+trait BodyChunkSource {
+    fn content_length_hint(&self) -> Option<u64>;
+
+    async fn next_body_chunk(
+        &mut self,
+    ) -> Result<Option<impl AsRef<[u8]> + Send + 'static>, ProviderError>;
+}
+
+impl BodyChunkSource for reqwest::Response {
+    fn content_length_hint(&self) -> Option<u64> {
+        self.content_length()
+    }
+
+    async fn next_body_chunk(
+        &mut self,
+    ) -> Result<Option<impl AsRef<[u8]> + Send + 'static>, ProviderError> {
+        self.chunk().await.map_err(transport_error)
+    }
+}
+
+async fn read_body_source_bounded<S: BodyChunkSource>(
+    mut source: S,
+    limit: usize,
+    context: &str,
+) -> Result<Vec<u8>, ProviderError> {
+    if source
+        .content_length_hint()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(body_too_large(context, limit));
+    }
+    let mut body = Vec::with_capacity(
+        source
+            .content_length_hint()
+            .and_then(|length| usize::try_from(length).ok())
+            .unwrap_or_default()
+            .min(limit),
+    );
+    while let Some(chunk) = source.next_body_chunk().await? {
+        let chunk = chunk.as_ref();
+        let Some(length) = body.len().checked_add(chunk.len()) else {
+            return Err(body_too_large(context, limit));
+        };
+        if length > limit {
+            return Err(body_too_large(context, limit));
+        }
+        body.extend_from_slice(chunk);
+    }
+    Ok(body)
+}
+
+fn body_too_large(context: &str, limit: usize) -> ProviderError {
+    malformed(format!("{context} body exceeded the {limit}-byte limit"))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -380,7 +461,31 @@ enum DecoderKind {
 }
 
 async fn stream_response(
-    mut response: reqwest::Response,
+    response: reqwest::Response,
+    account: Option<CredentialAlias>,
+    sender: mpsc::Sender<ProviderStreamItem>,
+    chunk_idle_timeout: Duration,
+    kind: DecoderKind,
+) {
+    stream_sse_source(response, account, sender, chunk_idle_timeout, kind).await;
+}
+
+trait SseChunkSource {
+    async fn next_chunk(
+        &mut self,
+    ) -> Result<Option<impl AsRef<[u8]> + Send + 'static>, ProviderError>;
+}
+
+impl SseChunkSource for reqwest::Response {
+    async fn next_chunk(
+        &mut self,
+    ) -> Result<Option<impl AsRef<[u8]> + Send + 'static>, ProviderError> {
+        self.chunk().await.map_err(transport_error)
+    }
+}
+
+async fn stream_sse_source<S: SseChunkSource>(
+    mut source: S,
     account: Option<CredentialAlias>,
     sender: mpsc::Sender<ProviderStreamItem>,
     chunk_idle_timeout: Duration,
@@ -391,7 +496,7 @@ async fn stream_response(
         DecoderKind::Chat => OpenAiDecoder::Chat(ChatDecoder::new(account)),
     };
     loop {
-        let chunk = match tokio::time::timeout(chunk_idle_timeout, response.chunk()).await {
+        let chunk = match tokio::time::timeout(chunk_idle_timeout, source.next_chunk()).await {
             Ok(Ok(Some(chunk))) => chunk,
             Ok(Ok(None)) => {
                 let items = decoder.finish();
@@ -399,7 +504,7 @@ async fn stream_response(
                 return;
             }
             Ok(Err(error)) => {
-                let _ = sender.send(Err(transport_error(error))).await;
+                let _ = sender.send(Err(error)).await;
                 return;
             }
             Err(_) => {
@@ -409,7 +514,7 @@ async fn stream_response(
                 return;
             }
         };
-        let items = decoder.push(&chunk);
+        let items = decoder.push(chunk.as_ref());
         if !send_items(&sender, items).await || decoder.is_terminal() {
             return;
         }
@@ -546,6 +651,7 @@ struct ResponsesDecoder {
     account: Option<CredentialAlias>,
     open_calls: BTreeMap<usize, ResponseFunctionCall>,
     call_items: HashMap<String, usize>,
+    pending_tool_events: Vec<StreamEvent>,
     saw_tool: bool,
     saw_refusal: bool,
     terminal: bool,
@@ -564,6 +670,7 @@ impl ResponsesDecoder {
             account,
             open_calls: BTreeMap::new(),
             call_items: HashMap::new(),
+            pending_tool_events: Vec::new(),
             saw_tool: false,
             saw_refusal: false,
             terminal: false,
@@ -655,7 +762,7 @@ impl ResponsesDecoder {
             }
             "response.refusal.delta" => {
                 self.saw_refusal = true;
-                Ok(vec![StreamEvent::TextDelta {
+                Ok(vec![StreamEvent::RefusalDelta {
                     text: required_string(&value, "delta", event_type)?,
                 }])
             }
@@ -704,19 +811,21 @@ impl ResponsesDecoder {
             },
         );
         self.saw_tool = true;
-        let mut events = vec![StreamEvent::ToolCallStart { call_id, name }];
+        self.pending_tool_events
+            .push(StreamEvent::ToolCallStart { call_id, name });
         if !initial_arguments.is_empty() {
             let call_id = self
                 .open_calls
                 .get(&output_index)
                 .map(|call| call.call_id.clone())
                 .ok_or_else(|| malformed("OpenAI function call disappeared after start"))?;
-            events.push(StreamEvent::ToolCallArgsDelta {
-                call_id,
-                args_fragment: initial_arguments,
-            });
+            self.pending_tool_events
+                .push(StreamEvent::ToolCallArgsDelta {
+                    call_id,
+                    args_fragment: initial_arguments,
+                });
         }
-        Ok(events)
+        Ok(Vec::new())
     }
 
     fn function_arguments_delta(
@@ -735,14 +844,16 @@ impl ResponsesDecoder {
                 call.call_id
             )));
         }
-        Ok(vec![StreamEvent::ToolCallArgsDelta {
-            call_id: call.call_id.clone(),
-            args_fragment: required_string(
-                value,
-                "delta",
-                "response.function_call_arguments.delta",
-            )?,
-        }])
+        self.pending_tool_events
+            .push(StreamEvent::ToolCallArgsDelta {
+                call_id: call.call_id.clone(),
+                args_fragment: required_string(
+                    value,
+                    "delta",
+                    "response.function_call_arguments.delta",
+                )?,
+            });
+        Ok(Vec::new())
     }
 
     fn function_arguments_done(
@@ -760,8 +871,15 @@ impl ResponsesDecoder {
         let Some(item) = value.get("item").and_then(serde_json::Value::as_object) else {
             return Ok(Vec::new());
         };
-        if item.get("type").and_then(serde_json::Value::as_str) != Some("function_call") {
-            return Ok(Vec::new());
+        match item.get("type").and_then(serde_json::Value::as_str) {
+            Some("reasoning") => {
+                return Ok(vec![StreamEvent::ProviderOpaque {
+                    provider: OPENAI_PROVIDER_NAME.into(),
+                    data: serde_json::Value::Object(item.clone()),
+                }]);
+            }
+            Some("function_call") => {}
+            _ => return Ok(Vec::new()),
         }
         let index = required_usize(value, "output_index", "response.output_item.done")?;
         self.end_call(index)
@@ -796,9 +914,14 @@ impl ResponsesDecoder {
             return Ok(Vec::new());
         }
         call.ended = true;
-        Ok(vec![StreamEvent::ToolCallEnd {
+        self.pending_tool_events.push(StreamEvent::ToolCallEnd {
             call_id: call.call_id.clone(),
-        }])
+        });
+        if self.open_calls.values().all(|call| call.ended) {
+            Ok(std::mem::take(&mut self.pending_tool_events))
+        } else {
+            Ok(Vec::new())
+        }
     }
 
     fn response_terminal(
@@ -813,6 +936,9 @@ impl ResponsesDecoder {
             return Err(malformed(
                 "OpenAI response.completed arrived before a function call was finalized",
             ));
+        }
+        if incomplete {
+            self.pending_tool_events.clear();
         }
         let mut events = Vec::new();
         if let Some(usage) = response.get("usage").filter(|usage| !usage.is_null()) {
@@ -853,6 +979,7 @@ struct ChatDecoder {
     framer: SseFramer,
     account: Option<CredentialAlias>,
     open_calls: BTreeMap<usize, ChatFunctionCall>,
+    pending_tool_events: Vec<StreamEvent>,
     finish_reason: Option<FinishReason>,
     terminal: bool,
 }
@@ -870,6 +997,7 @@ impl ChatDecoder {
             framer: SseFramer::default(),
             account,
             open_calls: BTreeMap::new(),
+            pending_tool_events: Vec::new(),
             finish_reason: None,
             terminal: false,
         }
@@ -971,7 +1099,7 @@ impl ChatDecoder {
             if let Some(refusal) = delta.get("refusal").and_then(serde_json::Value::as_str)
                 && !refusal.is_empty()
             {
-                events.push(StreamEvent::TextDelta {
+                events.push(StreamEvent::RefusalDelta {
                     text: refusal.into(),
                 });
                 self.finish_reason = Some(FinishReason::Refusal);
@@ -1021,7 +1149,6 @@ impl ChatDecoder {
             .get("arguments")
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
-        let mut events = Vec::new();
         if let std::collections::btree_map::Entry::Vacant(entry) = self.open_calls.entry(index) {
             let call_id = id.ok_or_else(|| {
                 malformed(format!(
@@ -1038,7 +1165,7 @@ impl ChatDecoder {
                 name: name.into(),
                 ended: false,
             });
-            events.push(StreamEvent::ToolCallStart {
+            self.pending_tool_events.push(StreamEvent::ToolCallStart {
                 call_id: call_id.into(),
                 name: name.into(),
             });
@@ -1065,34 +1192,32 @@ impl ChatDecoder {
             )));
         }
         if !arguments.is_empty() {
-            events.push(StreamEvent::ToolCallArgsDelta {
-                call_id: call.call_id.clone(),
-                args_fragment: arguments.into(),
-            });
+            self.pending_tool_events
+                .push(StreamEvent::ToolCallArgsDelta {
+                    call_id: call.call_id.clone(),
+                    args_fragment: arguments.into(),
+                });
         }
-        Ok(events)
+        Ok(Vec::new())
     }
 
     fn close_calls(&mut self) -> Vec<StreamEvent> {
-        self.open_calls
-            .values_mut()
-            .filter_map(|call| {
-                if call.ended {
-                    None
-                } else {
-                    call.ended = true;
-                    Some(StreamEvent::ToolCallEnd {
-                        call_id: call.call_id.clone(),
-                    })
-                }
-            })
-            .collect()
+        for call in self.open_calls.values_mut() {
+            if !call.ended {
+                call.ended = true;
+                self.pending_tool_events.push(StreamEvent::ToolCallEnd {
+                    call_id: call.call_id.clone(),
+                });
+            }
+        }
+        std::mem::take(&mut self.pending_tool_events)
     }
 
     fn finish_events(&mut self, reason: FinishReason) -> Vec<StreamEvent> {
         let mut events = if reason == FinishReason::ToolUse {
             self.close_calls()
         } else {
+            self.pending_tool_events.clear();
             Vec::new()
         };
         events.push(StreamEvent::Finish { reason });
@@ -1221,12 +1346,13 @@ fn openai_stream_error(value: &serde_json::Value) -> ProviderError {
         .unwrap_or(value);
     let kind = error
         .get("code")
-        .or_else(|| error.get("type"))
-        .and_then(serde_json::Value::as_str);
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| error.get("type").and_then(serde_json::Value::as_str));
     let provider_kind = match kind {
         Some("invalid_api_key" | "authentication_error") => ProviderErrorKind::Authentication,
         Some("permission_denied" | "insufficient_quota") => ProviderErrorKind::PermissionDenied,
         Some("rate_limit_exceeded" | "rate_limit_error") => ProviderErrorKind::RateLimited,
+        Some("overloaded_error") => ProviderErrorKind::Overloaded,
         Some("server_error" | "timeout") => ProviderErrorKind::Transport,
         _ => ProviderErrorKind::InvalidRequest,
     };
@@ -1376,6 +1502,10 @@ fn responses_request_json(request: &TurnRequest) -> Result<serde_json::Value, Pr
     }
     if model_has_reasoning(&request.model) {
         object.insert("reasoning".into(), serde_json::json!({"summary": "auto"}));
+        object.insert(
+            "include".into(),
+            serde_json::json!(["reasoning.encrypted_content"]),
+        );
     }
     Ok(payload)
 }
@@ -1668,6 +1798,7 @@ fn compatible_endpoints(base_url: &str) -> Result<(String, String, String), Prov
             "OpenAI-compatible base_url must be an http(s) URL without credentials, query, or fragment",
         ));
     }
+    validate_compatible_origin(&parsed)?;
     let api_root = if base_url.ends_with("/v1") {
         base_url.to_owned()
     } else {
@@ -1678,6 +1809,57 @@ fn compatible_endpoints(base_url: &str) -> Result<(String, String, String), Prov
         format!("{api_root}/chat/completions"),
         format!("{api_root}/models"),
     ))
+}
+
+fn validate_compatible_origin(parsed: &reqwest::Url) -> Result<(), ProviderError> {
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| invalid_request("OpenAI-compatible base_url must include a host"))?;
+    let ip = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host)
+        .parse::<IpAddr>()
+        .ok();
+    if ip.is_some_and(blocked_credential_target) {
+        return Err(invalid_request(
+            "OpenAI-compatible base_url must not target a private, link-local, or special-use IP address",
+        ));
+    }
+    if parsed.scheme() == "http" && !ip.is_some_and(|address| address.is_loopback()) {
+        return Err(invalid_request(
+            "OpenAI-compatible remote base_url must use HTTPS; HTTP is allowed only for numeric loopback addresses",
+        ));
+    }
+    Ok(())
+}
+
+fn blocked_credential_target(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => blocked_ipv4_credential_target(address),
+        IpAddr::V6(address) => blocked_ipv6_credential_target(address),
+    }
+}
+
+fn blocked_ipv4_credential_target(address: Ipv4Addr) -> bool {
+    let octets = address.octets();
+    address.is_private()
+        || address.is_link_local()
+        || address.is_unspecified()
+        || address.is_multicast()
+        || address == Ipv4Addr::BROADCAST
+        || octets[0] == 0
+}
+
+fn blocked_ipv6_credential_target(address: Ipv6Addr) -> bool {
+    let segments = address.segments();
+    address
+        .to_ipv4_mapped()
+        .is_some_and(blocked_ipv4_credential_target)
+        || address.is_unspecified()
+        || address.is_multicast()
+        || (segments[0] & 0xffc0) == 0xfe80
+        || (segments[0] & 0xfe00) == 0xfc00
 }
 
 #[derive(Debug, Deserialize)]
@@ -1837,3 +2019,7 @@ fn malformed(message: impl Into<String>) -> ProviderError {
 fn internal(message: impl Into<String>) -> ProviderError {
     ProviderError::new(ProviderErrorKind::Internal, message)
 }
+
+#[cfg(test)]
+#[path = "openai_tests.rs"]
+mod tests;

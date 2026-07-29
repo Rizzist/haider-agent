@@ -1,0 +1,55 @@
+{
+  "schema": "haider.openai-fixtures.v1",
+  "provisional": true,
+  "provenance": "Synthetic OpenAI Responses and OpenAI-compatible Chat Completions streams maintained in-tree; all IDs, refusal text, encrypted content, errors, and usage are non-secret test values.",
+  "fixtures": [
+    {
+      "name": "native_responses",
+      "family": "responses",
+      "wire": "responses.sse",
+      "golden": "responses.events.json"
+    },
+    {
+      "name": "compatible_chat",
+      "family": "chat_completions",
+      "wire": "chat.sse",
+      "golden": "chat.events.json"
+    },
+    {
+      "name": "native_concurrent_tools",
+      "family": "responses",
+      "wire": "concurrent_tools_responses.sse",
+      "golden": "concurrent_tools_responses.events.json"
+    },
+    {
+      "name": "compatible_concurrent_tools",
+      "family": "chat_completions",
+      "wire": "concurrent_tools_chat.sse",
+      "golden": "concurrent_tools_chat.events.json"
+    },
+    {
+      "name": "native_reasoning_continuation",
+      "family": "responses",
+      "wire": "reasoning_continuation.sse",
+      "golden": "reasoning_continuation.events.json"
+    },
+    {
+      "name": "native_refusal",
+      "family": "responses",
+      "wire": "refusal_responses.sse",
+      "golden": "refusal_responses.events.json"
+    },
+    {
+      "name": "compatible_refusal",
+      "family": "chat_completions",
+      "wire": "refusal_chat.sse",
+      "golden": "refusal_chat.events.json"
+    },
+    {
+      "name": "native_overload",
+      "family": "responses",
+      "wire": "overloaded_responses.sse",
+      "golden": "overloaded_responses.events.json"
+    }
+  ]
+}

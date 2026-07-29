@@ -1,0 +1,6 @@
+data: {"id":"chatcmpl_refusal","choices":[{"index":0,"delta":{"refusal":"I cannot help with that."},"finish_reason":null}]}
+
+data: {"id":"chatcmpl_refusal","choices":[{"index":0,"delta":{},"finish_reason":"content_filter"}]}
+
+data: [DONE]
+

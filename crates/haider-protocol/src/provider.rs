@@ -6,6 +6,9 @@ use crate::ids::CredentialAlias;
 use crate::tool::AttachmentBlock;
 use serde::{Deserialize, Serialize};
 
+/// Stable durable-extension kind used for provider-native continuation state.
+pub const PROVIDER_OPAQUE_EXTENSION_KIND: &str = "provider_opaque";
+
 /// Canonical message content block.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "block", rename_all = "snake_case")]
@@ -44,6 +47,16 @@ pub enum StreamEvent {
     },
     ReasoningDelta {
         text: String,
+    },
+    /// Provider refusal content remains semantically distinct from assistant
+    /// text. Consumers may display it, but must not replay it as an answer.
+    RefusalDelta {
+        text: String,
+    },
+    /// Provider-native continuation state for lossless, same-family replay.
+    ProviderOpaque {
+        provider: String,
+        data: serde_json::Value,
     },
     ToolCallStart {
         call_id: String,

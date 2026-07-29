@@ -1,0 +1,6 @@
+event: response.output_item.done
+data: {"type":"response.output_item.done","response_id":"resp_reasoning","output_index":0,"item":{"id":"rs_sanitized","type":"reasoning","summary":[{"type":"summary_text","text":"Synthetic summary."}],"encrypted_content":"encrypted-synthetic-continuation","status":"completed"}}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_reasoning","status":"completed","output":[],"usage":{"input_tokens":4,"input_tokens_details":{"cached_tokens":0},"output_tokens":3,"output_tokens_details":{"reasoning_tokens":3},"total_tokens":7}}}
+

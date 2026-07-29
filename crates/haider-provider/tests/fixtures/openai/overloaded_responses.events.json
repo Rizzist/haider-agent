@@ -1,0 +1,10 @@
+[
+  {
+    "result": "err",
+    "value": {
+      "kind": "overloaded",
+      "message": "OpenAI stream returned an overloaded error",
+      "retryable": true
+    }
+  }
+]

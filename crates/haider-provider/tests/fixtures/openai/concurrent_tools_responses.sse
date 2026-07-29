@@ -1,0 +1,27 @@
+event: response.output_item.added
+data: {"type":"response.output_item.added","response_id":"resp_parallel","output_index":0,"item":{"type":"function_call","id":"fc_a","call_id":"call_a","name":"first_tool","arguments":""}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","response_id":"resp_parallel","output_index":1,"item":{"type":"function_call","id":"fc_b","call_id":"call_b","name":"second_tool","arguments":""}}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","response_id":"resp_parallel","item_id":"fc_a","output_index":0,"delta":"{\"a\":"}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","response_id":"resp_parallel","item_id":"fc_b","output_index":1,"delta":"{\"b\":"}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","response_id":"resp_parallel","item_id":"fc_a","output_index":0,"delta":"1}"}
+
+event: response.function_call_arguments.done
+data: {"type":"response.function_call_arguments.done","response_id":"resp_parallel","item_id":"fc_a","output_index":0,"arguments":"{\"a\":1}"}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","response_id":"resp_parallel","item_id":"fc_b","output_index":1,"delta":"2}"}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","response_id":"resp_parallel","output_index":1,"item":{"type":"function_call","id":"fc_b","call_id":"call_b","name":"second_tool","arguments":"{\"b\":2}"}}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_parallel","status":"completed","output":[],"usage":{"input_tokens":20,"input_tokens_details":{"cached_tokens":0},"output_tokens":10,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":30}}}
+
