@@ -1,10 +1,10 @@
 //! Status-aware provider credential resolution.
 //!
 //! Owned invariant — ROTATION IS A SEAM, NOT A POLICY: when the active
-//! credential is currently limited, this module invokes [`RotationCallback`]
-//! exactly once and applies the decision mechanically, with a single hop — a
-//! limited rotation target is reported as an error, never re-delegated. The
-//! deciding policy lands in D3b; this crate ships only the seam.
+//! credential is currently limited or expired, this module invokes
+//! [`RotationCallback`] exactly once and applies the decision mechanically,
+//! with a single hop — an unusable rotation target is reported as an error,
+//! never re-delegated. The deciding policy lives outside this crate.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -65,7 +65,7 @@ pub trait RotationCallback: Send + Sync {
 }
 
 /// Resolves provider descriptors and secret handles.
-pub struct Resolver<'a, S, V, R> {
+pub struct Resolver<'a, S, V: ?Sized, R: ?Sized> {
     accounts: &'a AccountStore<S>,
     vault: &'a V,
     rotation: &'a R,
@@ -74,8 +74,8 @@ pub struct Resolver<'a, S, V, R> {
 impl<'a, S, V, R> Resolver<'a, S, V, R>
 where
     S: StoreLike,
-    V: Vault,
-    R: RotationCallback,
+    V: Vault + ?Sized,
+    R: RotationCallback + ?Sized,
 {
     /// Creates a resolver over descriptor, vault, and rotation ports.
     #[must_use]
@@ -95,6 +95,19 @@ where
         &self,
         provider: &str,
     ) -> AccountsResult<(CredentialDescriptor, SecretHandle)> {
+        let descriptor = self.resolve_descriptor_for_provider(provider)?;
+        self.resolve_descriptor(descriptor)
+    }
+
+    /// Selects the active usable descriptor without resolving secret bytes.
+    ///
+    /// Daemon account services use this half of the resolver while they own
+    /// descriptor state, then release that ownership before awaiting vault or
+    /// refresh I/O.
+    pub fn resolve_descriptor_for_provider(
+        &self,
+        provider: &str,
+    ) -> AccountsResult<CredentialDescriptor> {
         let now_ms = system_now_ms()?;
         let active = self
             .accounts
@@ -109,16 +122,18 @@ where
             })?;
 
         match active.status {
-            CredentialStatus::Ok => self.resolve_descriptor(active),
-            CredentialStatus::Limited { until_ms } if now_ms >= until_ms => {
-                self.resolve_descriptor(active)
-            }
-            CredentialStatus::Limited { until_ms } => self.resolve_alternate(
+            CredentialStatus::Ok => Ok(active),
+            CredentialStatus::Limited { until_ms } if now_ms >= until_ms => Ok(active),
+            CredentialStatus::Limited { until_ms } => self.resolve_alternate_descriptor(
                 provider,
                 &active.alias,
                 RotationTrigger::RateLimit { until_ms },
             ),
-            CredentialStatus::Expired => Err(unusable(&active.alias, "expired")),
+            CredentialStatus::Expired => self.resolve_alternate_descriptor(
+                provider,
+                &active.alias,
+                RotationTrigger::AuthExpired,
+            ),
             CredentialStatus::Revoked => Err(unusable(&active.alias, "revoked")),
         }
     }
@@ -133,6 +148,21 @@ where
         active_alias: &CredentialAlias,
         trigger: RotationTrigger,
     ) -> AccountsResult<(CredentialDescriptor, SecretHandle)> {
+        let descriptor = self.resolve_alternate_descriptor(provider, active_alias, trigger)?;
+        self.resolve_descriptor(descriptor)
+    }
+
+    /// Applies the one-hop alternate checks without resolving secret bytes.
+    ///
+    /// This is the single load-bearing helper for every trigger: policy is
+    /// invoked once, and the selected target must be same-provider and usable
+    /// now. An unusable target is never offered back to policy.
+    pub fn resolve_alternate_descriptor(
+        &self,
+        provider: &str,
+        active_alias: &CredentialAlias,
+        trigger: RotationTrigger,
+    ) -> AccountsResult<CredentialDescriptor> {
         match self.rotation.on_rotation(active_alias, trigger) {
             RotationDecision::RotateTo(alias) => {
                 let alternate = self.accounts.get(&alias).cloned().ok_or_else(|| {
@@ -153,9 +183,9 @@ where
                     ));
                 }
                 match alternate.status {
-                    CredentialStatus::Ok => self.resolve_descriptor(alternate),
+                    CredentialStatus::Ok => Ok(alternate),
                     CredentialStatus::Limited { until_ms } if system_now_ms()? >= until_ms => {
-                        self.resolve_descriptor(alternate)
+                        Ok(alternate)
                     }
                     CredentialStatus::Limited { until_ms } => {
                         Err(limited(&alternate.alias, until_ms, true))

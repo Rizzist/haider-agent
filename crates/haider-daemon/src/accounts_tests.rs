@@ -8,6 +8,7 @@ use haider_core::SqliteStoreHandle;
 
 use crate::session_hub::FrameSendError;
 use crate::worker::ProviderFactory as _;
+use haider_core::ProviderAttemptResolver as _;
 
 fn test_store_dir() -> tempfile::TempDir {
     tempfile::Builder::new()
@@ -180,6 +181,265 @@ async fn production_account_factory_dispatches_openai_and_preserves_anthropic() 
     );
 }
 
+/// MUTATION CHECK (review of record, W5c.1): drop the `error.retryable` arm
+/// from the attempt resolver's rotation-failure match so the resolver error
+/// propagates. Expected failure: the retryable bookkeeping error escapes as
+/// `Err`, the decision is never `Wait`, and the turn dies on an error the
+/// provider itself said to retry.
+/// Verified by revert on 2026-07-29.
+#[tokio::test]
+async fn retryable_rotation_bookkeeping_failure_waits_instead_of_killing_the_turn() {
+    struct WriteRefusingStore(Vec<CredentialDescriptor>);
+    impl StoreLike for WriteRefusingStore {
+        fn load(&self) -> Result<Vec<CredentialDescriptor>, HaiderError> {
+            Ok(self.0.clone())
+        }
+        fn save(&self, _descriptors: &[CredentialDescriptor]) -> Result<(), HaiderError> {
+            Err(HaiderError::new(
+                ErrorCode::StoreLocked,
+                "descriptor store is temporarily locked",
+                true,
+            ))
+        }
+    }
+
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let primary_alias = CredentialAlias::new("wedged-primary");
+    let alternate_alias = CredentialAlias::new("wedged-backup");
+    let descriptor = |alias: CredentialAlias, active: bool| CredentialDescriptor {
+        alias,
+        provider: OPENAI_PROVIDER_NAME.into(),
+        base_url: None,
+        auth_method: AuthMethod::ApiKey,
+        identity: "wedged fixture".into(),
+        status: CredentialStatus::Ok,
+        active,
+    };
+    let descriptors = vec![
+        descriptor(primary_alias.clone(), true),
+        descriptor(alternate_alias.clone(), false),
+    ];
+    let backing: Box<dyn StoreLike> = Box::new(WriteRefusingStore(descriptors.clone()));
+    let accounts = AccountStore::new(backing).expect("accounts");
+    let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(descriptors));
+    let vault = Arc::new(MemoryVault::new());
+    vault
+        .put(&alternate_alias, b"wedged-alternate-secret")
+        .expect("alternate secret");
+    let mut actor = start_account_actor(AccountActorConfig {
+        store: store.clone(),
+        accounts,
+        vault: vault.clone() as Arc<dyn Vault>,
+        validator: Arc::new(ProviderCredentialValidator),
+        snapshot: Arc::clone(&snapshot),
+        profile_id: "wedged-store".into(),
+        default_model: "gpt-test".into(),
+    });
+    let broker = CredentialBroker::new(
+        vault.clone() as Arc<dyn Vault>,
+        OAuthProviderCatalog::default(),
+        Arc::clone(&snapshot),
+        actor.commands(),
+    )
+    .expect("broker");
+    let factory = AccountsProviderFactory::with_broker(
+        Arc::clone(&snapshot),
+        VaultProvision::Available(vault as Arc<dyn Vault>),
+        Arc::new(ProductionAccountBuilder),
+        broker.clone(),
+    );
+    let resolver = AccountsAttemptResolver::new(
+        factory,
+        haider_protocol::session::SessionMetadataV1 {
+            cwd: "/tmp/wedged-store".into(),
+            provider: OPENAI_PROVIDER_NAME.into(),
+            model: "gpt-test".into(),
+            max_tokens: 64,
+            system_prompt_version: None,
+            created_at_ms: 1,
+        },
+    );
+
+    let decision = resolver
+        .resolve(
+            &primary_alias,
+            &haider_provider::ProviderError::new(
+                haider_provider::ProviderErrorKind::RateLimited,
+                "bounded rate limit",
+            )
+            .with_retry_after_ms(Some(1_000)),
+        )
+        .await
+        .expect("a retryable bookkeeping failure is not a turn-fatal error");
+    assert!(matches!(
+        decision,
+        haider_core::ProviderAttemptDecision::Wait
+    ));
+
+    assert!(broker.shutdown().await);
+    actor.shutdown().await;
+    store.close().await.expect("close");
+}
+
+/// MUTATION CHECK (W5c.1 resolver-backed factory): bypass
+/// `CredentialBroker::resolve_account` and restore direct active-snapshot
+/// resolution. Expected failure: the limited active alias is rejected or
+/// returned instead of the checked one-hop alternate, and no durable
+/// selection/rotation metadata is visible.
+/// Verified by revert (direct bypass and fabricated auth deadline) on
+/// 2026-07-29.
+#[tokio::test]
+async fn factory_uses_checked_resolver_and_durably_selects_one_limited_alternate() {
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let mut accounts = memory_accounts();
+    let limited_alias = CredentialAlias::new("limited-primary");
+    let alternate_alias = CredentialAlias::new("usable-backup");
+    let refresh_failed_alias = CredentialAlias::new("refresh-failed-primary");
+    let refresh_backup_alias = CredentialAlias::new("refresh-usable-backup");
+    accounts
+        .add(CredentialDescriptor {
+            alias: limited_alias.clone(),
+            provider: OPENAI_PROVIDER_NAME.into(),
+            base_url: None,
+            auth_method: AuthMethod::ApiKey,
+            identity: "limited fixture".into(),
+            status: CredentialStatus::Limited { until_ms: u64::MAX },
+            active: true,
+        })
+        .expect("limited descriptor");
+    accounts
+        .add(CredentialDescriptor {
+            alias: alternate_alias.clone(),
+            provider: OPENAI_PROVIDER_NAME.into(),
+            base_url: None,
+            auth_method: AuthMethod::ApiKey,
+            identity: "backup fixture".into(),
+            status: CredentialStatus::Ok,
+            active: false,
+        })
+        .expect("alternate descriptor");
+    accounts
+        .add(CredentialDescriptor {
+            alias: refresh_failed_alias.clone(),
+            provider: ANTHROPIC_PROVIDER_NAME.into(),
+            base_url: None,
+            auth_method: AuthMethod::OAuth,
+            identity: "refresh failed fixture".into(),
+            status: CredentialStatus::Ok,
+            active: true,
+        })
+        .expect("refresh-failed descriptor");
+    accounts
+        .add(CredentialDescriptor {
+            alias: refresh_backup_alias.clone(),
+            provider: ANTHROPIC_PROVIDER_NAME.into(),
+            base_url: None,
+            auth_method: AuthMethod::ApiKey,
+            identity: "refresh backup fixture".into(),
+            status: CredentialStatus::Ok,
+            active: false,
+        })
+        .expect("refresh backup descriptor");
+    let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(accounts.list().to_vec()));
+    let vault = Arc::new(MemoryVault::new());
+    vault
+        .put(&alternate_alias, b"checked-alternate-secret")
+        .expect("alternate vault secret");
+    let mut actor = start_account_actor(AccountActorConfig {
+        store: store.clone(),
+        accounts,
+        vault: vault.clone() as Arc<dyn Vault>,
+        validator: Arc::new(ProviderCredentialValidator),
+        snapshot: Arc::clone(&snapshot),
+        profile_id: "resolver-factory".into(),
+        default_model: "gpt-test".into(),
+    });
+    let broker = CredentialBroker::new(
+        vault.clone() as Arc<dyn Vault>,
+        OAuthProviderCatalog::default(),
+        Arc::clone(&snapshot),
+        actor.commands(),
+    )
+    .expect("broker");
+    let factory = AccountsProviderFactory::with_broker(
+        Arc::clone(&snapshot),
+        VaultProvision::Available(vault as Arc<dyn Vault>),
+        Arc::new(ProductionAccountBuilder),
+        broker.clone(),
+    );
+    let resolved = factory
+        .resolve_for_turn(&haider_protocol::session::SessionMetadataV1 {
+            cwd: "/tmp/resolver-factory".into(),
+            provider: OPENAI_PROVIDER_NAME.into(),
+            model: "gpt-test".into(),
+            max_tokens: 64,
+            system_prompt_version: None,
+            created_at_ms: 1,
+        })
+        .await
+        .expect("checked alternate resolution");
+
+    assert_eq!(
+        resolved.account_alias.as_deref(),
+        Some(alternate_alias.as_str())
+    );
+    assert!(resolved.rotation_budget_consumed);
+    assert_eq!(
+        resolved.initial_rotation,
+        Some(haider_protocol::credential::RotationEvent {
+            provider: OPENAI_PROVIDER_NAME.into(),
+            from: limited_alias.clone(),
+            to: alternate_alias.clone(),
+            cause: haider_protocol::credential::RotationCause::RateLimit,
+        })
+    );
+    let refresh_rotation = broker
+        .resolve_account(
+            ANTHROPIC_PROVIDER_NAME,
+            Some((refresh_failed_alias.clone(), RotationTrigger::RefreshFailed)),
+        )
+        .await
+        .expect("refresh failure uses checked alternate");
+    assert_eq!(
+        refresh_rotation.rotation,
+        Some(haider_protocol::credential::RotationEvent {
+            provider: ANTHROPIC_PROVIDER_NAME.into(),
+            from: refresh_failed_alias.clone(),
+            to: refresh_backup_alias.clone(),
+            cause: haider_protocol::credential::RotationCause::Error,
+        })
+    );
+    {
+        let current = snapshot.lock().expect("snapshot");
+        assert!(
+            current
+                .iter()
+                .any(|descriptor| descriptor.alias == alternate_alias && descriptor.active)
+        );
+        assert!(
+            current
+                .iter()
+                .any(|descriptor| descriptor.alias == limited_alias && !descriptor.active)
+        );
+        assert!(current.iter().any(|descriptor| {
+            descriptor.alias == refresh_failed_alias
+                && matches!(descriptor.status, CredentialStatus::Expired)
+                && !descriptor.active
+        }));
+        assert!(current.iter().any(|descriptor| {
+            descriptor.alias == refresh_backup_alias
+                && descriptor.status == CredentialStatus::Ok
+                && descriptor.active
+        }));
+    }
+    drop(factory);
+    assert!(broker.shutdown().await);
+    actor.shutdown().await;
+    store.close().await.expect("close");
+}
+
 /// MUTATION CHECK: dispatch either OAuth descriptor through its API-key arm,
 /// remove the sanctioned-provider match, or pass the encoded bundle to an
 /// adapter. The broker/factory resolution below fails before capabilities.
@@ -252,7 +512,40 @@ async fn auth_aware_factory_routes_sanctioned_oauth_descriptors_to_subscription_
         openai_descriptor.clone(),
         anthropic_descriptor.clone(),
     ]));
-    let (status_commands, _status_receiver) = mpsc::channel(1);
+    let (status_commands, mut status_receiver) = mpsc::channel(4);
+    let resolver_snapshot = Arc::clone(&snapshot);
+    let status_task = tokio::spawn(async move {
+        while let Some(command) = status_receiver.recv().await {
+            if let AccountCommand::ResolveCredential {
+                provider,
+                failure: None,
+                completed,
+            } = command
+            {
+                let result = resolver_snapshot
+                    .lock()
+                    .ok()
+                    .and_then(|descriptors| {
+                        descriptors
+                            .iter()
+                            .find(|descriptor| descriptor.provider == provider && descriptor.active)
+                            .cloned()
+                    })
+                    .map(|descriptor| ResolvedAccount {
+                        descriptor,
+                        rotation: None,
+                    })
+                    .ok_or_else(|| {
+                        HaiderError::new(
+                            ErrorCode::CredentialMissing,
+                            "test resolver has no active descriptor",
+                            false,
+                        )
+                    });
+                let _ = completed.send(result);
+            }
+        }
+    });
     let broker = CredentialBroker::new(
         vault.clone() as Arc<dyn Vault>,
         OAuthProviderCatalog::default(),
@@ -317,6 +610,8 @@ async fn auth_aware_factory_routes_sanctioned_oauth_descriptors_to_subscription_
         panic!("OAuth provider ID must reject API-key mode");
     };
     assert_eq!(error.code, ErrorCode::InvalidArgument);
+    drop((openai, anthropic, factory));
+    status_task.await.expect("status task");
 }
 
 // MUTATION CHECK (R10 Keychain namespacing): remove the profile input from

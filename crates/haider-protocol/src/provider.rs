@@ -101,6 +101,23 @@ pub struct Usage {
     pub source: UsageSource,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account: Option<CredentialAlias>,
+    /// Per-account subtotals when an automatic rotation spans provider
+    /// requests in one logical turn. Legacy `account` remains populated only
+    /// when exactly one account contributed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accounts: Vec<AccountUsage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AccountUsage {
+    pub account: CredentialAlias,
+    pub input: u64,
+    pub output: u64,
+    #[serde(default)]
+    pub reasoning: u64,
+    #[serde(default)]
+    pub cached: u64,
+    pub source: UsageSource,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

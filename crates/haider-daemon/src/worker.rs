@@ -66,17 +66,22 @@ pub struct ResolvedTurnProvider {
     pub provider: Arc<dyn Provider>,
     pub provider_name: String,
     pub model: String,
-    /// Stamped into every usage snapshot the turn commits; an account change
-    /// inside one logical turn is a protocol error in core.
+    /// Stamped into usage until an automatic pre-event rotation changes it.
     pub account_alias: Option<String>,
+    /// Factory-time alternate committed before the first provider call.
+    pub initial_rotation: Option<haider_protocol::credential::RotationEvent>,
+    /// The initial resolution already spent the logical turn's one hop.
+    pub rotation_budget_consumed: bool,
+    /// Daemon-owned live credential resolver for this logical turn.
+    pub attempt_resolver: Option<Arc<dyn haider_core::ProviderAttemptResolver>>,
 }
 
-/// Injectable, turn-scoped provider resolver (R6, authoritative pinning
-/// site): resolution happens once per logical turn, after durable acceptance
-/// and before `Thinking`/provider work, and the result is pinned across
-/// every provider request in that turn — a login or account switch affects
-/// the NEXT logical turn only. `resolve_for_turn` must return the same
-/// provider name the session's metadata records; `start_turn` rejects a
+/// Injectable, turn-scoped provider resolver (R6/R8): initial resolution
+/// happens after durable acceptance and before provider work. Core may replace
+/// that result only through the returned resolver, once per logical turn and
+/// only before the current request emits an event. Manual login/account
+/// changes still affect the next logical turn. `resolve_for_turn` must return
+/// the provider name recorded in session metadata; `start_turn` rejects a
 /// mismatch.
 #[async_trait]
 pub trait ProviderFactory: Send + Sync {
@@ -1729,6 +1734,9 @@ async fn start_turn(
     config.usage_account = resolved
         .account_alias
         .map(haider_protocol::ids::CredentialAlias::new);
+    config.rotation_budget_consumed = resolved.rotation_budget_consumed;
+    config.initial_rotation = resolved.initial_rotation;
+    config.provider_attempt_resolver = resolved.attempt_resolver;
     config.supervisor_commits_cancelled = true;
     // Last uncancellable startup boundary: provider/tool resolution is done,
     // but the harness actor has not been spawned or submitted. A cancellation

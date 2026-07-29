@@ -234,6 +234,7 @@ pub fn turn_script(turn: u64) -> Vec<EventPayload> {
         cached: 12_000,
         source: UsageSource::ProviderReported,
         account: None,
+        accounts: Vec::new(),
     }));
     script.push(EventPayload::RunState(RunState::Done));
     script
@@ -528,6 +529,7 @@ pub fn seed_session_states(first_generation: u64) -> Vec<crate::session::Session
                         cached: 0,
                         source: haider_protocol::provider::UsageSource::Estimated,
                         account: None,
+                        accounts: Vec::new(),
                     },
                 ));
             if let Some(seed) = sample_seed_chip(index) {

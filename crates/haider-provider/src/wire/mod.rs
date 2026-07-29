@@ -483,6 +483,7 @@ impl StreamState {
                     cached: self.input.cache_read_input_tokens,
                     source: UsageSource::ProviderReported,
                     account: self.account.clone(),
+                    accounts: Vec::new(),
                 })))
             }
             WireEvent::MessageStop => {
