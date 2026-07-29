@@ -249,7 +249,6 @@ fn compatible_origin_policy_rejects_credential_ssrf_and_accepts_safe_origins() {
         "https://[::ffff:169.254.169.254]",
         "https://[::ffff:10.0.0.8]",
         "http://203.0.113.7",
-        "http://localhost:11434",
     ];
     for base_url in rejected {
         let error = compatible_provider_result("test-model", base_url)
@@ -259,6 +258,8 @@ fn compatible_origin_policy_rejects_credential_ssrf_and_accepts_safe_origins() {
         assert!(!error.message.contains("fixture-secret"), "{base_url}");
     }
 
+    // Hostname safety is decided by the async resolve-validate-pin preflight,
+    // covered with injected A/AAAA answers in the adapter's unit tests.
     for base_url in [
         "https://api.example.com/openai",
         "http://127.0.0.1:11434",

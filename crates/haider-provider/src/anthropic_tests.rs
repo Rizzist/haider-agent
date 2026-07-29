@@ -1,17 +1,59 @@
 #![allow(clippy::expect_used)]
 
 use std::future;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
+use haider_accounts::{CredentialAlias, MemoryVault, Vault};
 use haider_protocol::provider::StreamEvent;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
 
-use crate::anthropic::{SseChunkSource, stream_sse_source};
+use crate::anthropic::{AnthropicProvider, SseChunkSource, stream_sse_source};
 use crate::{ProviderError, ProviderErrorKind};
 
 struct HangingFixture {
     first_chunk: Option<Vec<u8>>,
+}
+
+#[test]
+fn anthropic_credential_client_ignores_inherited_proxy_environment() {
+    const CHILD_MARKER: &str = "HAIDER_ANTHROPIC_PROXY_PIN_CHILD";
+    if std::env::var_os(CHILD_MARKER).is_some() {
+        let vault = MemoryVault::new();
+        let alias = CredentialAlias::new("anthropic-proxy-audit");
+        vault
+            .put(&alias, b"anthropic-proxy-sentinel")
+            .expect("store proxy audit secret");
+        let credential = vault.resolve(&alias).expect("resolve proxy audit secret");
+        let provider =
+            AnthropicProvider::new(credential, "claude-audit").expect("Anthropic client");
+        assert!(
+            !provider.client_debug().contains("proxies"),
+            "Anthropic credential-bearing client retained inherited proxy configuration"
+        );
+        return;
+    }
+
+    let output = Command::new(std::env::current_exe().expect("current test binary"))
+        .arg("anthropic_credential_client_ignores_inherited_proxy_environment")
+        .arg("--nocapture")
+        .env(CHILD_MARKER, "1")
+        .env("HTTP_PROXY", "http://127.0.0.1:18080")
+        .env("HTTPS_PROXY", "http://127.0.0.1:18080")
+        .env("ALL_PROXY", "http://127.0.0.1:18080")
+        .env("NO_PROXY", "")
+        .env("no_proxy", "")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run isolated Anthropic proxy child");
+    assert!(
+        output.status.success(),
+        "Anthropic proxy child failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 impl HangingFixture {

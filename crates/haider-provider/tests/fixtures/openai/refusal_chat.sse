@@ -3,4 +3,3 @@ data: {"id":"chatcmpl_refusal","choices":[{"index":0,"delta":{"refusal":"I canno
 data: {"id":"chatcmpl_refusal","choices":[{"index":0,"delta":{},"finish_reason":"content_filter"}]}
 
 data: [DONE]
-

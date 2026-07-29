@@ -3,8 +3,11 @@
 use super::*;
 use std::collections::VecDeque;
 use std::future;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use haider_accounts::{MemoryVault, Vault};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -50,6 +53,36 @@ impl SseChunkSource for HangingFixture {
 struct BodyFixture {
     declared_length: Option<u64>,
     chunks: VecDeque<Vec<u8>>,
+}
+
+struct StubDnsResolver {
+    answers: Mutex<VecDeque<Vec<SocketAddr>>>,
+    calls: AtomicUsize,
+}
+
+impl StubDnsResolver {
+    fn new(answers: impl IntoIterator<Item = Vec<SocketAddr>>) -> Self {
+        Self {
+            answers: Mutex::new(answers.into_iter().collect()),
+            calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl CompatibleDnsResolver for StubDnsResolver {
+    async fn resolve(&self, _host: &str, _port: u16) -> std::io::Result<Vec<SocketAddr>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.answers
+            .lock()
+            .expect("resolver answer lock")
+            .pop_front()
+            .ok_or_else(|| std::io::Error::other("stub resolver was called more than expected"))
+    }
 }
 
 impl BodyChunkSource for BodyFixture {
@@ -158,6 +191,241 @@ async fn dropping_openai_stream_aborts_its_hanging_source() {
     .expect("producer abort drops source");
 }
 
+/// MUTATION CHECK: remove the resolved-address call to
+/// `validate_resolved_compatible_origin`.
+///
+/// Safe code rejects before `get_request` or `post_json_request` can construct
+/// a request carrying the bearer. The mutation makes the metadata-host request
+/// observable here with the exact sentinel header.
+/// Verified by revert on 2026-07-29.
+#[tokio::test]
+async fn hostname_resolution_rejects_every_forbidden_answer_before_bearer_construction() {
+    let forbidden_sets = [
+        vec![SocketAddr::from(([169, 254, 169, 254], 443))],
+        vec![SocketAddr::from(([10, 23, 45, 67], 443))],
+        vec![SocketAddr::from(([172, 16, 45, 67], 443))],
+        vec![SocketAddr::from(([192, 168, 10, 20], 443))],
+        vec![SocketAddr::from(([0, 0, 0, 0], 443))],
+        vec![SocketAddr::new(
+            "fe80::1"
+                .parse::<Ipv6Addr>()
+                .expect("link-local IPv6")
+                .into(),
+            443,
+        )],
+        vec![SocketAddr::new(
+            "fc00::1".parse::<Ipv6Addr>().expect("ULA IPv6").into(),
+            443,
+        )],
+        vec![SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 443)],
+        vec![
+            SocketAddr::from(([93, 184, 216, 34], 443)),
+            SocketAddr::from(([169, 254, 169, 254], 443)),
+        ],
+    ];
+
+    for addresses in forbidden_sets {
+        let resolver = Arc::new(StubDnsResolver::new([addresses]));
+        let provider = compatible_provider_with_resolver(
+            b"resolved-origin-sentinel",
+            "https://model-gateway.test",
+            resolver.clone(),
+        );
+
+        assert_forbidden_origin_request(
+            provider.http.get_request(&provider.models_url).await,
+            "GET",
+        );
+        assert_forbidden_origin_request(
+            provider
+                .http
+                .post_json_request(
+                    &provider.chat_url,
+                    &serde_json::json!({"model":"audit-model"}),
+                )
+                .await,
+            "POST",
+        );
+        assert_eq!(resolver.calls(), 1, "origin must resolve exactly once");
+    }
+}
+
+#[tokio::test]
+async fn plain_http_hostname_requires_every_resolved_address_to_be_loopback() {
+    let loopback = Arc::new(StubDnsResolver::new([vec![
+        SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 11434),
+        SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 11434),
+    ]]));
+    let allowed = compatible_provider_with_resolver(
+        b"loopback-secret",
+        "http://ollama.test:11434",
+        loopback.clone(),
+    );
+    allowed
+        .http
+        .validate_compatible_origin()
+        .await
+        .expect("loopback hostname is a valid plain-HTTP Ollama origin");
+    assert_eq!(loopback.calls(), 1);
+
+    let remote = Arc::new(StubDnsResolver::new([vec![SocketAddr::from((
+        [93, 184, 216, 34],
+        80,
+    ))]]));
+    let rejected = compatible_provider_with_resolver(
+        b"remote-secret",
+        "http://remote-gateway.test",
+        remote.clone(),
+    );
+    let error = rejected
+        .http
+        .validate_compatible_origin()
+        .await
+        .expect_err("plain HTTP must not resolve to a non-loopback address");
+    assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+    assert!(error.message.contains("non-loopback"));
+    assert_eq!(remote.calls(), 1);
+}
+
+#[tokio::test]
+async fn validated_hostname_addresses_are_pinned_through_connection_establishment() {
+    let target = SocketAddr::from(([127, 0, 0, 1], 0));
+    let resolver = Arc::new(StubDnsResolver::new([
+        vec![target],
+        vec![SocketAddr::from(([169, 254, 169, 254], 0))],
+    ]));
+    let provider = compatible_provider_with_resolver(
+        b"rebind-pin-sentinel",
+        "http://ollama-rebind.test:0",
+        resolver.clone(),
+    );
+
+    provider
+        .http
+        .validate_compatible_origin()
+        .await
+        .expect("first resolver answer is valid loopback");
+    let guard = provider
+        .http
+        .origin_guard
+        .as_ref()
+        .expect("hostname origin has a pinning guard");
+    let pinned = guard
+        .validated
+        .get()
+        .expect("origin validation populated the pin cache")
+        .as_ref()
+        .expect("pin cache contains accepted addresses");
+    let request = provider
+        .http
+        .get_request(&provider.models_url)
+        .await
+        .expect("validated origin builds capability request");
+
+    assert_eq!(pinned.as_ref(), &[target]);
+    assert_eq!(request.url().host_str(), Some("ollama-rebind.test"));
+    assert_eq!(request.url().port(), Some(0));
+    assert_eq!(
+        request
+            .headers()
+            .get(AUTHORIZATION)
+            .expect("allowed pinned request carries bearer"),
+        "Bearer rebind-pin-sentinel"
+    );
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        provider.http.client.execute(request),
+    )
+    .await
+    .expect("impossible loopback connection fails promptly")
+    .expect_err("port zero cannot accept the pinned connection");
+    assert_eq!(
+        resolver.calls(),
+        1,
+        "reqwest connection must use the validated cache, not resolve again"
+    );
+    assert_eq!(
+        guard.connection_lookups.load(Ordering::SeqCst),
+        1,
+        "reqwest itself must consume the installed pinned resolver"
+    );
+}
+
+/// MUTATION CHECK: remove `.no_proxy()` from `OpenAiHttp` construction.
+///
+/// The child receives explicit proxy environment variables without mutating
+/// this test process. Safe code's built client has no proxy matcher while its
+/// request still targets the pinned hostname. The mutation exposes the
+/// inherited proxy matcher in reqwest's inspectable client configuration.
+/// Verified by revert on 2026-07-29.
+#[tokio::test]
+async fn compatible_credential_client_ignores_inherited_proxy_environment() {
+    const CHILD_MARKER: &str = "HAIDER_PROXY_PIN_CHILD";
+    if std::env::var_os(CHILD_MARKER).is_some() {
+        let target = SocketAddr::from(([127, 0, 0, 1], 11434));
+        let resolver = Arc::new(StubDnsResolver::new([vec![target]]));
+        let provider = compatible_provider_with_resolver(
+            b"proxy-off-sentinel",
+            "http://proxy-pin.test:11434",
+            resolver,
+        );
+        let request = provider
+            .http
+            .get_request(&provider.models_url)
+            .await
+            .expect("proxy-off client builds pinned request");
+        assert_eq!(request.url().host_str(), Some("proxy-pin.test"));
+        assert_eq!(
+            request
+                .headers()
+                .get(AUTHORIZATION)
+                .expect("allowed loopback request carries bearer"),
+            "Bearer proxy-off-sentinel"
+        );
+        assert!(
+            !format!("{:?}", provider.http.client).contains("proxies"),
+            "credential-bearing client retained inherited proxy configuration"
+        );
+        let vault = MemoryVault::new();
+        let alias = CredentialAlias::new("native-proxy-audit");
+        vault
+            .put(&alias, b"native-proxy-sentinel")
+            .expect("store native proxy audit secret");
+        let credential = vault
+            .resolve(&alias)
+            .expect("resolve native proxy audit secret");
+        let native = OpenAiProvider::new(credential, "gpt-audit").expect("native OpenAI client");
+        assert!(
+            !format!("{:?}", native.http.client).contains("proxies"),
+            "native OpenAI credential-bearing client retained inherited proxy configuration"
+        );
+        return;
+    }
+
+    let output =
+        tokio::process::Command::new(std::env::current_exe().expect("current test binary"))
+            .arg("compatible_credential_client_ignores_inherited_proxy_environment")
+            .arg("--nocapture")
+            .env(CHILD_MARKER, "1")
+            .env("HTTP_PROXY", "http://127.0.0.1:18080")
+            .env("HTTPS_PROXY", "http://127.0.0.1:18080")
+            .env("ALL_PROXY", "http://127.0.0.1:18080")
+            .env("NO_PROXY", "")
+            .env("no_proxy", "")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await
+            .expect("run isolated proxy child");
+
+    assert!(
+        output.status.success(),
+        "proxy child failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// MUTATION CHECK: remove `validate_compatible_origin(&parsed)?`.
 ///
 /// The fallback branch deliberately routes the exact metadata URL through
@@ -172,8 +440,7 @@ async fn metadata_origin_guard_prevents_credential_bearing_request() {
         return;
     }
 
-    let (base_url, chat_url, models_url) =
-        endpoint_result.expect("mutation removed metadata origin guard");
+    let endpoints = endpoint_result.expect("mutation removed metadata origin guard");
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind mutation-only audit proxy");
@@ -196,10 +463,11 @@ async fn metadata_origin_guard_prevents_credential_bearing_request() {
             credential,
             account: Some(alias),
             model: "audit-model".into(),
+            origin_guard: None,
         },
-        base_url,
-        chat_url,
-        models_url,
+        base_url: endpoints.base_url,
+        chat_url: endpoints.chat_url,
+        models_url: endpoints.models_url,
     };
     let capture = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.expect("proxy request");
@@ -226,4 +494,39 @@ async fn metadata_origin_guard_prevents_credential_bearing_request() {
             .contains("authorization: bearer metadata-sentinel-secret")
     );
     panic!("credential-bearing metadata request observed after origin-check mutation");
+}
+
+fn compatible_provider_with_resolver(
+    secret: &[u8],
+    base_url: impl AsRef<str>,
+    resolver: Arc<StubDnsResolver>,
+) -> OpenAiCompatibleProvider {
+    let vault = MemoryVault::new();
+    let alias = CredentialAlias::new("resolved-origin-audit");
+    vault.put(&alias, secret).expect("store audit secret");
+    let credential = vault.resolve(&alias).expect("resolve audit secret");
+    OpenAiCompatibleProvider::new_with_dns_resolver(credential, "audit-model", base_url, resolver)
+        .expect("construct compatible provider")
+        .with_account(alias)
+}
+
+fn assert_forbidden_origin_request(result: Result<reqwest::Request, ProviderError>, method: &str) {
+    match result {
+        Err(error) => {
+            assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+            assert!(!error.retryable);
+        }
+        Ok(request) => {
+            assert_eq!(request.method().as_str(), method);
+            assert_eq!(request.url().host_str(), Some("model-gateway.test"));
+            assert_eq!(
+                request
+                    .headers()
+                    .get(AUTHORIZATION)
+                    .expect("mutated request carries bearer"),
+                "Bearer resolved-origin-sentinel"
+            );
+            panic!("credential-bearing request was built for a forbidden resolved origin");
+        }
+    }
 }

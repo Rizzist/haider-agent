@@ -5,4 +5,3 @@ data: {"id":"chatcmpl_parallel","choices":[{"index":0,"delta":{"tool_calls":[{"i
 data: {"id":"chatcmpl_parallel","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
 
 data: [DONE]
-

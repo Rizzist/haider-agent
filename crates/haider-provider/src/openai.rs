@@ -7,7 +7,12 @@
 //! LiteLLM, TGI, Hugging Face endpoints, and generic gateways.
 
 use std::collections::{BTreeMap, HashMap};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::fmt;
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
@@ -19,7 +24,7 @@ use haider_protocol::provider::{
 use haider_protocol::tool::AttachmentBlock;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderValue, RETRY_AFTER};
 use serde::Deserialize;
-use tokio::sync::mpsc;
+use tokio::sync::{OnceCell, mpsc};
 
 use crate::wire::provider_kind_name;
 use crate::{
@@ -71,29 +76,42 @@ struct OpenAiHttp {
     credential: SecretHandle,
     account: Option<CredentialAlias>,
     model: String,
+    origin_guard: Option<Arc<CompatibleOriginGuard>>,
 }
 
 impl OpenAiHttp {
     fn new(credential: SecretHandle, model: impl Into<String>) -> Result<Self, ProviderError> {
+        Self::new_with_origin_guard(credential, model, None)
+    }
+
+    fn new_with_origin_guard(
+        credential: SecretHandle,
+        model: impl Into<String>,
+        origin_guard: Option<Arc<CompatibleOriginGuard>>,
+    ) -> Result<Self, ProviderError> {
         let transport = TRANSPORT_CONFIG;
-        let client = reqwest::Client::builder()
+        let mut client = reqwest::Client::builder()
+            .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .retry(match transport.retry_policy {
                 OpenAiRetryPolicy::Never => reqwest::retry::never(),
             })
-            .connect_timeout(transport.connect_timeout)
-            .build()
-            .map_err(|error| {
-                ProviderError::new(
-                    ProviderErrorKind::Internal,
-                    format!("could not construct OpenAI HTTP client: {error}"),
-                )
-            })?;
+            .connect_timeout(transport.connect_timeout);
+        if let Some(guard) = &origin_guard {
+            client = client.dns_resolver(Arc::clone(guard));
+        }
+        let client = client.build().map_err(|error| {
+            ProviderError::new(
+                ProviderErrorKind::Internal,
+                format!("could not construct OpenAI HTTP client: {error}"),
+            )
+        })?;
         Ok(Self {
             client,
             credential,
             account: None,
             model: model.into(),
+            origin_guard,
         })
     }
 
@@ -130,31 +148,56 @@ impl OpenAiHttp {
         url: &str,
         payload: &serde_json::Value,
     ) -> Result<reqwest::Response, ProviderError> {
-        let opening = self
-            .client
+        let opening = async {
+            let request = self.post_json_request(url, payload).await?;
+            self.client.execute(request).await.map_err(transport_error)
+        };
+        tokio::time::timeout(TRANSPORT_CONFIG.response_open_timeout, opening)
+            .await
+            .map_err(|_| response_open_timeout_error(TRANSPORT_CONFIG.response_open_timeout))?
+    }
+
+    async fn post_json_request(
+        &self,
+        url: &str,
+        payload: &serde_json::Value,
+    ) -> Result<reqwest::Request, ProviderError> {
+        self.validate_compatible_origin().await?;
+        self.client
             .post(url)
             .header(CONTENT_TYPE, "application/json")
             .header(ACCEPT, "text/event-stream")
             .header(AUTHORIZATION, self.authorization_header()?)
             .json(payload)
-            .send();
-        tokio::time::timeout(TRANSPORT_CONFIG.response_open_timeout, opening)
-            .await
-            .map_err(|_| response_open_timeout_error(TRANSPORT_CONFIG.response_open_timeout))?
+            .build()
             .map_err(transport_error)
     }
 
     async fn get(&self, url: &str) -> Result<reqwest::Response, ProviderError> {
-        let opening = self
-            .client
-            .get(url)
-            .header(ACCEPT, "application/json")
-            .header(AUTHORIZATION, self.authorization_header()?)
-            .send();
+        let opening = async {
+            let request = self.get_request(url).await?;
+            self.client.execute(request).await.map_err(transport_error)
+        };
         tokio::time::timeout(TRANSPORT_CONFIG.response_open_timeout, opening)
             .await
             .map_err(|_| response_open_timeout_error(TRANSPORT_CONFIG.response_open_timeout))?
+    }
+
+    async fn get_request(&self, url: &str) -> Result<reqwest::Request, ProviderError> {
+        self.validate_compatible_origin().await?;
+        self.client
+            .get(url)
+            .header(ACCEPT, "application/json")
+            .header(AUTHORIZATION, self.authorization_header()?)
+            .build()
             .map_err(transport_error)
+    }
+
+    async fn validate_compatible_origin(&self) -> Result<(), ProviderError> {
+        match &self.origin_guard {
+            Some(guard) => guard.validate().await,
+            None => Ok(()),
+        }
     }
 }
 
@@ -245,12 +288,34 @@ impl OpenAiCompatibleProvider {
         model: impl Into<String>,
         base_url: impl AsRef<str>,
     ) -> Result<Self, ProviderError> {
-        let (base_url, chat_url, models_url) = compatible_endpoints(base_url.as_ref())?;
-        Ok(Self {
-            http: OpenAiHttp::new(credential, model)?,
+        Self::new_with_dns_resolver(
+            credential,
+            model,
             base_url,
-            chat_url,
-            models_url,
+            Arc::new(SystemCompatibleDnsResolver),
+        )
+    }
+
+    fn new_with_dns_resolver(
+        credential: SecretHandle,
+        model: impl Into<String>,
+        base_url: impl AsRef<str>,
+        resolver: Arc<dyn CompatibleDnsResolver>,
+    ) -> Result<Self, ProviderError> {
+        let endpoints = compatible_endpoints(base_url.as_ref())?;
+        let origin_guard = endpoints.origin.map(|origin| {
+            Arc::new(CompatibleOriginGuard::new(
+                origin.host,
+                origin.port,
+                origin.plain_http,
+                resolver,
+            ))
+        });
+        Ok(Self {
+            http: OpenAiHttp::new_with_origin_guard(credential, model, origin_guard)?,
+            base_url: endpoints.base_url,
+            chat_url: endpoints.chat_url,
+            models_url: endpoints.models_url,
         })
     }
 
@@ -1779,7 +1844,22 @@ fn model_has_reasoning(model: &str) -> bool {
         || model.contains("gpt-oss")
 }
 
-fn compatible_endpoints(base_url: &str) -> Result<(String, String, String), ProviderError> {
+#[derive(Debug)]
+struct CompatibleEndpoints {
+    base_url: String,
+    chat_url: String,
+    models_url: String,
+    origin: Option<CompatibleHostnameOrigin>,
+}
+
+#[derive(Debug)]
+struct CompatibleHostnameOrigin {
+    host: String,
+    port: u16,
+    plain_http: bool,
+}
+
+fn compatible_endpoints(base_url: &str) -> Result<CompatibleEndpoints, ProviderError> {
     let base_url = base_url.trim().trim_end_matches('/');
     if base_url.is_empty() {
         return Err(invalid_request(
@@ -1799,16 +1879,32 @@ fn compatible_endpoints(base_url: &str) -> Result<(String, String, String), Prov
         ));
     }
     validate_compatible_origin(&parsed)?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| invalid_request("OpenAI-compatible base_url must include a host"))?;
+    let origin = if host.parse::<IpAddr>().is_ok() {
+        None
+    } else {
+        let port = parsed
+            .port_or_known_default()
+            .ok_or_else(|| invalid_request("OpenAI-compatible base_url must include a port"))?;
+        Some(CompatibleHostnameOrigin {
+            host: host.to_owned(),
+            port,
+            plain_http: parsed.scheme() == "http",
+        })
+    };
     let api_root = if base_url.ends_with("/v1") {
         base_url.to_owned()
     } else {
         format!("{base_url}/v1")
     };
-    Ok((
-        base_url.to_owned(),
-        format!("{api_root}/chat/completions"),
-        format!("{api_root}/models"),
-    ))
+    Ok(CompatibleEndpoints {
+        base_url: base_url.to_owned(),
+        chat_url: format!("{api_root}/chat/completions"),
+        models_url: format!("{api_root}/models"),
+        origin,
+    })
 }
 
 fn validate_compatible_origin(parsed: &reqwest::Url) -> Result<(), ProviderError> {
@@ -1826,12 +1922,168 @@ fn validate_compatible_origin(parsed: &reqwest::Url) -> Result<(), ProviderError
             "OpenAI-compatible base_url must not target a private, link-local, or special-use IP address",
         ));
     }
-    if parsed.scheme() == "http" && !ip.is_some_and(|address| address.is_loopback()) {
+    if parsed.scheme() == "http" && ip.is_some_and(|address| !address.is_loopback()) {
         return Err(invalid_request(
-            "OpenAI-compatible remote base_url must use HTTPS; HTTP is allowed only for numeric loopback addresses",
+            "OpenAI-compatible remote base_url must use HTTPS; HTTP is allowed only for loopback addresses",
         ));
     }
     Ok(())
+}
+
+#[async_trait]
+trait CompatibleDnsResolver: Send + Sync {
+    async fn resolve(&self, host: &str, port: u16) -> io::Result<Vec<SocketAddr>>;
+}
+
+#[derive(Debug)]
+struct SystemCompatibleDnsResolver;
+
+#[async_trait]
+impl CompatibleDnsResolver for SystemCompatibleDnsResolver {
+    async fn resolve(&self, host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+        Ok(tokio::net::lookup_host((host, port)).await?.collect())
+    }
+}
+
+struct CompatibleOriginGuard {
+    host: String,
+    port: u16,
+    plain_http: bool,
+    resolver: Arc<dyn CompatibleDnsResolver>,
+    validated: OnceCell<Result<Arc<[SocketAddr]>, ProviderError>>,
+    #[cfg(test)]
+    connection_lookups: AtomicUsize,
+}
+
+struct PinnedAddrs {
+    addresses: Arc<[SocketAddr]>,
+    next: usize,
+}
+
+impl Iterator for PinnedAddrs {
+    type Item = SocketAddr;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let address = self.addresses.get(self.next).copied();
+        self.next += usize::from(address.is_some());
+        address
+    }
+}
+
+impl CompatibleOriginGuard {
+    fn new(
+        host: String,
+        port: u16,
+        plain_http: bool,
+        resolver: Arc<dyn CompatibleDnsResolver>,
+    ) -> Self {
+        Self {
+            host,
+            port,
+            plain_http,
+            resolver,
+            validated: OnceCell::new(),
+            #[cfg(test)]
+            connection_lookups: AtomicUsize::new(0),
+        }
+    }
+
+    async fn validate(&self) -> Result<(), ProviderError> {
+        self.validated_addresses().await.map(|_| ())
+    }
+
+    async fn validated_addresses(&self) -> Result<Arc<[SocketAddr]>, ProviderError> {
+        self.validated
+            .get_or_init(|| async {
+                let addresses = self.resolver.resolve(&self.host, self.port).await.map_err(
+                    |error| {
+                        ProviderError::new(
+                            ProviderErrorKind::Transport,
+                            format!(
+                                "could not resolve OpenAI-compatible base_url host `{}`: {error}",
+                                self.host
+                            ),
+                        )
+                    },
+                )?;
+                validate_resolved_compatible_origin(&self.host, self.plain_http, addresses)
+            })
+            .await
+            .clone()
+    }
+}
+
+impl fmt::Debug for CompatibleOriginGuard {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CompatibleOriginGuard")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("plain_http", &self.plain_http)
+            .field("validated", &self.validated.get().is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl reqwest::dns::Resolve for CompatibleOriginGuard {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        #[cfg(test)]
+        self.connection_lookups.fetch_add(1, Ordering::SeqCst);
+        let requested = name.as_str();
+        let result: Result<
+            reqwest::dns::Addrs,
+            Box<dyn std::error::Error + Send + Sync + 'static>,
+        > = if !requested
+            .trim_end_matches('.')
+            .eq_ignore_ascii_case(self.host.trim_end_matches('.'))
+        {
+            Err(Box::new(io::Error::other(format!(
+                "pinned OpenAI-compatible resolver refused unexpected host `{requested}`"
+            ))))
+        } else {
+            match self.validated.get() {
+                Some(Ok(addresses)) => Ok(Box::new(PinnedAddrs {
+                    addresses: Arc::clone(addresses),
+                    next: 0,
+                })),
+                Some(Err(error)) => Err(Box::new(io::Error::other(error.message.clone()))),
+                None => Err(Box::new(io::Error::other(
+                    "OpenAI-compatible origin was not validated before connection",
+                ))),
+            }
+        };
+        Box::pin(std::future::ready(result))
+    }
+}
+
+fn validate_resolved_compatible_origin(
+    host: &str,
+    plain_http: bool,
+    addresses: Vec<SocketAddr>,
+) -> Result<Arc<[SocketAddr]>, ProviderError> {
+    if addresses.is_empty() {
+        return Err(invalid_request(format!(
+            "OpenAI-compatible base_url host `{host}` resolved to no addresses"
+        )));
+    }
+
+    let mut pinned = Vec::with_capacity(addresses.len());
+    for address in addresses {
+        if blocked_credential_target(address.ip()) {
+            return Err(invalid_request(format!(
+                "OpenAI-compatible base_url host `{host}` resolved to a private, link-local, or special-use IP address"
+            )));
+        }
+        if plain_http && !address.ip().is_loopback() {
+            return Err(invalid_request(format!(
+                "OpenAI-compatible remote base_url must use HTTPS; HTTP host `{host}` resolved to a non-loopback address"
+            )));
+        }
+        if !pinned.contains(&address) {
+            pinned.push(address);
+        }
+    }
+    Ok(pinned.into())
 }
 
 fn blocked_credential_target(address: IpAddr) -> bool {
