@@ -530,3 +530,40 @@ fn assert_forbidden_origin_request(result: Result<reqwest::Request, ProviderErro
         }
     }
 }
+
+/// W5a.2 confirm P2: `host_str()` returns bracketed IPv6 (`[::1]`), so the
+/// literal-vs-hostname classification must strip the brackets — otherwise a
+/// safe IPv6-literal endpoint is misread as a hostname and fails a request-time
+/// DNS lookup. Fail-closed (usability, not SSRF), but IPv6-literal compatible
+/// endpoints must work.
+///
+/// MUTATION CHECK: revert the bracket-strip (classify on the raw `host_str()`).
+/// Expected failure: the loopback and public IPv6-literal cases below become
+/// `Some` (hostname) instead of `None` (pre-validated literal).
+#[test]
+fn ipv6_literal_compatible_base_url_is_classified_as_a_literal_not_a_hostname() {
+    // Loopback IPv6 over plain HTTP (the local-runtime case) is a literal:
+    // origin is None (validated inline, no request-time DNS).
+    let loopback = compatible_endpoints("http://[::1]:11434")
+        .expect("bracketed IPv6 loopback is a valid literal origin");
+    assert!(
+        loopback.origin.is_none(),
+        "[::1] must classify as an IP literal, not a DNS-resolved hostname"
+    );
+
+    // A public IPv6 literal over HTTPS is likewise a literal.
+    let public = compatible_endpoints("https://[2606:4700:4700::1111]:443")
+        .expect("bracketed public IPv6 literal is valid");
+    assert!(
+        public.origin.is_none(),
+        "a public IPv6 literal must classify as a literal"
+    );
+
+    // A real hostname (no brackets) still takes the resolve-validate-pin path.
+    let domain = compatible_endpoints("https://gateway.example.com:8443")
+        .expect("hostname base_url is valid");
+    assert!(
+        domain.origin.is_some(),
+        "a domain must classify as a hostname for resolve-validate-pin"
+    );
+}

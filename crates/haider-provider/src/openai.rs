@@ -1882,7 +1882,14 @@ fn compatible_endpoints(base_url: &str) -> Result<CompatibleEndpoints, ProviderE
     let host = parsed
         .host_str()
         .ok_or_else(|| invalid_request("OpenAI-compatible base_url must include a host"))?;
-    let origin = if host.parse::<IpAddr>().is_ok() {
+    // `host_str()` returns bracketed IPv6 (`[::1]`); strip the brackets before
+    // the literal check so an IPv6 literal is classified as a literal (already
+    // validated by `validate_compatible_origin` above) rather than misread as a
+    // hostname and sent through a request-time DNS lookup that fails. A domain
+    // never contains brackets, so the trim is a no-op for it. Fail-closed either
+    // way — this is a functional fix, not a security boundary (W5a.2 confirm P2).
+    let host_literal = host.trim_start_matches('[').trim_end_matches(']');
+    let origin = if host_literal.parse::<IpAddr>().is_ok() {
         None
     } else {
         let port = parsed
