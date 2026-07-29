@@ -211,6 +211,12 @@ pub async fn run_demo(
     let mut active_theme = model.theme;
     let mut active_title = model.window_title();
 
+    // Query the terminal for a graphics protocol and build the wordmark image
+    // NOW — after raw mode, before the input pump claims stdin — so the
+    // capability response is not eaten by the pump. Degrades to None (the
+    // half-block art) on a non-graphics or non-answering terminal; never hangs.
+    *model.wordmark.borrow_mut() = crate::wordmark::Wordmark::detect();
+
     // Input pump: crossterm's blocking read on a dedicated thread, forwarded
     // into the async loop (no event-stream feature needed).
     let (input_tx, mut input_rx) = mpsc::channel::<Event>(64);
@@ -2227,6 +2233,10 @@ pub async fn run_live(
     sync_window_title(&model.window_title());
     let mut active_theme = model.theme;
     let mut active_title = model.window_title();
+
+    // Graphics wordmark query — after raw mode, before the input pump (see the
+    // run_demo note); None on non-graphics terminals falls back to `crate::mark`.
+    *model.wordmark.borrow_mut() = crate::wordmark::Wordmark::detect();
 
     let (input_tx, mut input_rx) = mpsc::channel::<Event>(64);
     std::thread::spawn(move || {

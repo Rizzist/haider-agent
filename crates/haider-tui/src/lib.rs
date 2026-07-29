@@ -27,6 +27,7 @@ pub mod select;
 pub mod session;
 pub mod style;
 pub mod theme;
+pub mod wordmark;
 
 /// Crate marker used by the workspace self-test.
 pub const CRATE_NAME: &str = "haider-tui";

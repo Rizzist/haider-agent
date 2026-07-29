@@ -312,7 +312,61 @@ fn render_boot(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rec
         let _ = centered(frame, area, compact);
         return;
     }
-    let _ = centered(frame, area, lines);
+    let (block, _) = centered(frame, area, lines);
+    // On a graphics terminal, replace the half-block banner with the crisp
+    // حيدر image — but only when the banner (not the one-line text mark) was
+    // the tier drawn, so the dignity/step-down rule still governs the footprint.
+    if mark_rows == crate::mark::BANNER_ROWS as usize {
+        overlay_wordmark(
+            model,
+            block,
+            1,
+            crate::mark::BANNER_COLS,
+            crate::mark::BANNER_ROWS,
+            frame,
+        );
+    }
+}
+
+/// Overlay the graphics wordmark (when the terminal speaks a graphics protocol)
+/// over the `cols`×`rows` mark cells at `top_offset` inside the centered
+/// `block`, replacing the half-block art with the bundled image. No-op when
+/// there is no graphics protocol (the half-block art stays) or the block is too
+/// small — the mark then reads identically to before this feature.
+fn overlay_wordmark(
+    model: &AppModel,
+    block: Rect,
+    top_offset: u16,
+    cols: u16,
+    rows: u16,
+    frame: &mut Frame<'_>,
+) {
+    if block.width < cols || block.height < top_offset + rows {
+        return;
+    }
+    let rect = Rect {
+        x: block.x + (block.width - cols) / 2,
+        y: block.y + top_offset,
+        width: cols,
+        height: rows,
+    };
+    draw_wordmark_image(model, rect, frame);
+}
+
+/// Draw the graphics wordmark into `rect`, replacing whatever was drawn there.
+/// No-op when the terminal has no graphics protocol (`model.wordmark` is None).
+fn draw_wordmark_image(model: &AppModel, rect: Rect, frame: &mut Frame<'_>) {
+    let mut slot = model.wordmark.borrow_mut();
+    let Some(wordmark) = slot.as_mut() else {
+        return;
+    };
+    if rect.width == 0 || rect.height == 0 {
+        return;
+    }
+    // Wipe the cells first (the half-block art the caller drew), then draw the
+    // image over them so no block ink bleeds around the aspect-fitted wordmark.
+    frame.render_widget(ratatui::widgets::Clear, rect);
+    wordmark.render_into(rect, frame.buffer_mut());
 }
 
 fn render_launcher(
@@ -1041,6 +1095,22 @@ fn render_session(
         .style(theme.text_style()),
         header_area,
     );
+    // Replace the half-block header mark with the crisp حيدر image on a graphics
+    // terminal — same 16×2 footprint, at the fixed slot after the back chip and
+    // its two-space gap. No-op (half-block art stays) when header_fits chose the
+    // art tier and there is no graphics protocol.
+    if crate::mark::header_fits(area.width, HEADER_MARK_RESERVED) {
+        draw_wordmark_image(
+            model,
+            Rect {
+                x: header_area.x + BACK_CHIP_COLS as u16 + 2,
+                y: header_area.y,
+                width: crate::mark::HEADER_COLS,
+                height: crate::mark::HEADER_ROWS,
+            },
+            frame,
+        );
+    }
     frame.render_widget(
         Paragraph::new(Line::styled(
             "─".repeat(header_rule.width as usize),
