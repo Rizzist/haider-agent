@@ -19,6 +19,7 @@ haider-protocol = { path = "../haider-protocol" }
 haider-provider = { path = "../haider-provider" }
 haider-rpc = { path = "../haider-rpc" }
 haider-tools = { path = "../haider-tools" }
+jsonwebtoken.workspace = true
 reqwest.workspace = true
 rustix.workspace = true
 serde.workspace = true

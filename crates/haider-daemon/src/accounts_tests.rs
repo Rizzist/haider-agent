@@ -180,6 +180,145 @@ async fn production_account_factory_dispatches_openai_and_preserves_anthropic() 
     );
 }
 
+/// MUTATION CHECK: dispatch either OAuth descriptor through its API-key arm,
+/// remove the sanctioned-provider match, or pass the encoded bundle to an
+/// adapter. The broker/factory resolution below fails before capabilities.
+/// Verified by revert on 2026-07-29.
+#[tokio::test]
+async fn auth_aware_factory_routes_sanctioned_oauth_descriptors_to_subscription_adapters() {
+    let vault = Arc::new(MemoryVault::default());
+    let openai_alias = CredentialAlias::new("openai-oauth-dispatch");
+    let anthropic_alias = CredentialAlias::new("anthropic-oauth-dispatch");
+    let descriptor = |alias: CredentialAlias, provider: &str| CredentialDescriptor {
+        alias,
+        provider: provider.into(),
+        base_url: None,
+        auth_method: AuthMethod::OAuth,
+        identity: format!("{provider} fixture"),
+        status: CredentialStatus::Ok,
+        active: true,
+    };
+    let openai_descriptor = descriptor(openai_alias.clone(), OPENAI_OAUTH_PROVIDER_NAME);
+    let anthropic_descriptor = descriptor(anthropic_alias.clone(), ANTHROPIC_OAUTH_PROVIDER_NAME);
+    let bundle = |provider: &str, issuer: &str, audience: &str, scopes: &[&str], access: &[u8]| {
+        haider_accounts::OAuthTokenBundleV1::new(
+            provider.into(),
+            issuer.into(),
+            audience.into(),
+            None,
+            "Bearer".into(),
+            Zeroizing::new(access.to_vec()),
+            Some(Zeroizing::new(b"REFRESH_FACTORY_SENTINEL_f0b1".to_vec())),
+            u64::MAX - 2,
+            Some(u64::MAX - 1),
+            scopes.iter().map(|scope| (*scope).to_owned()).collect(),
+            haider_accounts::OAuthIdentityV1 {
+                subject_hash: format!("{provider}-subject"),
+                display_identity: format!("{provider} subscription"),
+            },
+            1,
+        )
+        .expect("OAuth bundle")
+    };
+    vault
+        .put(
+            &openai_alias,
+            &bundle(
+                OPENAI_OAUTH_PROVIDER_NAME,
+                "https://auth.openai.com",
+                "app_EMoamEEZ73f0CkXaXp7hrann",
+                &["openid", "profile", "email", "offline_access"],
+                b"OPENAI_FACTORY_ACCESS_SENTINEL_18a4",
+            )
+            .encode()
+            .expect("encode OpenAI bundle"),
+        )
+        .expect("store OpenAI bundle");
+    vault
+        .put(
+            &anthropic_alias,
+            &bundle(
+                ANTHROPIC_OAUTH_PROVIDER_NAME,
+                "https://claude.ai",
+                "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+                &["user:inference"],
+                b"ANTHROPIC_FACTORY_ACCESS_SENTINEL_d716",
+            )
+            .encode()
+            .expect("encode Anthropic bundle"),
+        )
+        .expect("store Anthropic bundle");
+    let snapshot = Arc::new(StdMutex::new(vec![
+        openai_descriptor.clone(),
+        anthropic_descriptor.clone(),
+    ]));
+    let (status_commands, _status_receiver) = mpsc::channel(1);
+    let broker = CredentialBroker::new(
+        vault.clone() as Arc<dyn Vault>,
+        OAuthProviderCatalog::default(),
+        Arc::clone(&snapshot),
+        status_commands,
+    )
+    .expect("credential broker");
+    let factory = AccountsProviderFactory::with_broker(
+        snapshot,
+        VaultProvision::Available(vault.clone() as Arc<dyn Vault>),
+        Arc::new(ProductionAccountBuilder),
+        broker,
+    );
+    let metadata = |provider: &str, model: &str| haider_protocol::session::SessionMetadataV1 {
+        cwd: "/tmp/haider-oauth-dispatch".into(),
+        provider: provider.into(),
+        model: model.into(),
+        max_tokens: 64,
+        system_prompt_version: None,
+        created_at_ms: 1,
+    };
+    let openai = factory
+        .resolve_for_turn(&metadata(OPENAI_OAUTH_PROVIDER_NAME, "gpt-oauth"))
+        .await
+        .expect("OpenAI OAuth dispatch");
+    let anthropic = factory
+        .resolve_for_turn(&metadata(ANTHROPIC_OAUTH_PROVIDER_NAME, "claude-oauth"))
+        .await
+        .expect("Anthropic OAuth dispatch");
+    assert_eq!(openai.provider_name, OPENAI_OAUTH_PROVIDER_NAME);
+    assert_eq!(
+        openai.provider.credential_surface(),
+        haider_provider::ProviderCredentialSurface::OAuthSubscriptionBearer
+    );
+    assert_eq!(
+        openai.provider.capabilities().await.provider,
+        OPENAI_PROVIDER_NAME
+    );
+    assert_eq!(anthropic.provider_name, ANTHROPIC_OAUTH_PROVIDER_NAME);
+    assert_eq!(
+        anthropic.provider.credential_surface(),
+        haider_provider::ProviderCredentialSurface::OAuthSubscriptionBearer
+    );
+    assert_eq!(
+        anthropic.provider.capabilities().await.provider,
+        ANTHROPIC_PROVIDER_NAME
+    );
+
+    let wrong_alias = CredentialAlias::new("oauth-api-key-crosswire");
+    vault
+        .put(&wrong_alias, b"NEVER_CROSSWIRE_API_KEY_91f0")
+        .expect("store crosswire key");
+    let result = build_account_provider(
+        OPENAI_OAUTH_PROVIDER_NAME,
+        None,
+        AuthMethod::ApiKey,
+        vault.resolve(&wrong_alias).expect("resolve crosswire key"),
+        "gpt-oauth",
+        &wrong_alias,
+    );
+    let Err(error) = result else {
+        panic!("OAuth provider ID must reject API-key mode");
+    };
+    assert_eq!(error.code, ErrorCode::InvalidArgument);
+}
+
 // MUTATION CHECK (R10 Keychain namespacing): remove the profile input from
 // `physical_alias` (hash provider+command only). Expected failure: the two
 // profiles below derive the SAME physical alias and the distinct-secret

@@ -26,6 +26,7 @@ use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderValue, RETRY_AF
 use serde::Deserialize;
 use tokio::sync::{OnceCell, mpsc};
 
+use crate::origin::{FixedDnsResolver, FixedOriginGuard, SystemFixedDnsResolver};
 use crate::wire::provider_kind_name;
 use crate::{
     MessageRole, Provider, ProviderError, ProviderErrorKind, ProviderStream, ProviderStreamItem,
@@ -33,8 +34,15 @@ use crate::{
 };
 
 pub const OPENAI_PROVIDER_NAME: &str = "openai";
+pub const OPENAI_OAUTH_PROVIDER_NAME: &str = "openai-oauth";
 pub const OPENAI_COMPATIBLE_PROVIDER_NAME: &str = "openai-compatible";
 pub const OPENAI_RESPONSES_API_URL: &str = "https://api.openai.com/v1/responses";
+pub const OPENAI_SUBSCRIPTION_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+pub const OPENAI_SUBSCRIPTION_RESPONSES_URL: &str =
+    "https://chatgpt.com/backend-api/codex/responses";
+pub const OPENAI_CODEX_RESPONSES_LITE_HEADER: &str = "x-openai-internal-codex-responses-lite";
+pub const OPENAI_CODEX_RESPONSES_LITE_VALUE: &str = "true";
+const OPENAI_SUBSCRIPTION_HOST: &str = "chatgpt.com";
 
 const STREAM_CAPACITY: usize = 32;
 const MODELS_BODY_LIMIT: usize = 1024 * 1024;
@@ -77,17 +85,43 @@ struct OpenAiHttp {
     account: Option<CredentialAlias>,
     model: String,
     origin_guard: Option<Arc<CompatibleOriginGuard>>,
+    fixed_origin_guard: Option<Arc<FixedOriginGuard>>,
+    codex_responses_lite: bool,
 }
 
 impl OpenAiHttp {
     fn new(credential: SecretHandle, model: impl Into<String>) -> Result<Self, ProviderError> {
-        Self::new_with_origin_guard(credential, model, None)
+        Self::new_with_origin_guards(credential, model, None, None, false)
     }
 
     fn new_with_origin_guard(
         credential: SecretHandle,
         model: impl Into<String>,
         origin_guard: Option<Arc<CompatibleOriginGuard>>,
+    ) -> Result<Self, ProviderError> {
+        Self::new_with_origin_guards(credential, model, origin_guard, None, false)
+    }
+
+    fn new_subscription(
+        credential: SecretHandle,
+        model: impl Into<String>,
+        endpoint: &str,
+        resolver: Arc<dyn FixedDnsResolver>,
+    ) -> Result<Self, ProviderError> {
+        let fixed_origin_guard = Arc::new(FixedOriginGuard::new(
+            endpoint,
+            OPENAI_SUBSCRIPTION_HOST,
+            resolver,
+        )?);
+        Self::new_with_origin_guards(credential, model, None, Some(fixed_origin_guard), true)
+    }
+
+    fn new_with_origin_guards(
+        credential: SecretHandle,
+        model: impl Into<String>,
+        origin_guard: Option<Arc<CompatibleOriginGuard>>,
+        fixed_origin_guard: Option<Arc<FixedOriginGuard>>,
+        codex_responses_lite: bool,
     ) -> Result<Self, ProviderError> {
         let transport = TRANSPORT_CONFIG;
         let mut client = reqwest::Client::builder()
@@ -98,6 +132,9 @@ impl OpenAiHttp {
             })
             .connect_timeout(transport.connect_timeout);
         if let Some(guard) = &origin_guard {
+            client = client.dns_resolver(Arc::clone(guard));
+        }
+        if let Some(guard) = &fixed_origin_guard {
             client = client.dns_resolver(Arc::clone(guard));
         }
         let client = client.build().map_err(|error| {
@@ -112,6 +149,8 @@ impl OpenAiHttp {
             account: None,
             model: model.into(),
             origin_guard,
+            fixed_origin_guard,
+            codex_responses_lite,
         })
     }
 
@@ -162,15 +201,20 @@ impl OpenAiHttp {
         url: &str,
         payload: &serde_json::Value,
     ) -> Result<reqwest::Request, ProviderError> {
-        self.validate_compatible_origin().await?;
-        self.client
+        self.validate_origin(url).await?;
+        let mut request = self
+            .client
             .post(url)
             .header(CONTENT_TYPE, "application/json")
             .header(ACCEPT, "text/event-stream")
-            .header(AUTHORIZATION, self.authorization_header()?)
-            .json(payload)
-            .build()
-            .map_err(transport_error)
+            .header(AUTHORIZATION, self.authorization_header()?);
+        if self.codex_responses_lite {
+            request = request.header(
+                OPENAI_CODEX_RESPONSES_LITE_HEADER,
+                OPENAI_CODEX_RESPONSES_LITE_VALUE,
+            );
+        }
+        request.json(payload).build().map_err(transport_error)
     }
 
     async fn get(&self, url: &str) -> Result<reqwest::Response, ProviderError> {
@@ -184,7 +228,7 @@ impl OpenAiHttp {
     }
 
     async fn get_request(&self, url: &str) -> Result<reqwest::Request, ProviderError> {
-        self.validate_compatible_origin().await?;
+        self.validate_origin(url).await?;
         self.client
             .get(url)
             .header(ACCEPT, "application/json")
@@ -193,6 +237,17 @@ impl OpenAiHttp {
             .map_err(transport_error)
     }
 
+    async fn validate_origin(&self, url: &str) -> Result<(), ProviderError> {
+        if let Some(guard) = &self.origin_guard {
+            guard.validate().await?;
+        }
+        if let Some(guard) = &self.fixed_origin_guard {
+            guard.validate_endpoint(url).await?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
     async fn validate_compatible_origin(&self) -> Result<(), ProviderError> {
         match &self.origin_guard {
             Some(guard) => guard.validate().await,
@@ -213,6 +268,41 @@ impl OpenAiProvider {
         Ok(Self {
             http: OpenAiHttp::new(credential, model)?,
             api_url: OPENAI_RESPONSES_API_URL.into(),
+        })
+    }
+
+    pub fn new_subscription(
+        credential: SecretHandle,
+        model: impl Into<String>,
+        base_url: &str,
+    ) -> Result<Self, ProviderError> {
+        Self::new_subscription_with_dns_resolver(
+            credential,
+            model,
+            base_url,
+            Arc::new(SystemFixedDnsResolver),
+        )
+    }
+
+    fn new_subscription_with_dns_resolver(
+        credential: SecretHandle,
+        model: impl Into<String>,
+        base_url: &str,
+        resolver: Arc<dyn FixedDnsResolver>,
+    ) -> Result<Self, ProviderError> {
+        if base_url != OPENAI_SUBSCRIPTION_BASE_URL {
+            return Err(invalid_request(
+                "OpenAI subscription inference base URL is not sanctioned",
+            ));
+        }
+        Ok(Self {
+            http: OpenAiHttp::new_subscription(
+                credential,
+                model,
+                OPENAI_SUBSCRIPTION_RESPONSES_URL,
+                resolver,
+            )?,
+            api_url: OPENAI_SUBSCRIPTION_RESPONSES_URL.into(),
         })
     }
 
@@ -261,6 +351,14 @@ impl OpenAiProvider {
 
 #[async_trait]
 impl Provider for OpenAiProvider {
+    fn credential_surface(&self) -> crate::ProviderCredentialSurface {
+        if self.http.codex_responses_lite {
+            crate::ProviderCredentialSurface::OAuthSubscriptionBearer
+        } else {
+            crate::ProviderCredentialSurface::ApiKey
+        }
+    }
+
     async fn capabilities(&self) -> CapabilityDoc {
         native_capabilities(&self.http.model)
     }
@@ -380,6 +478,10 @@ impl OpenAiCompatibleProvider {
 
 #[async_trait]
 impl Provider for OpenAiCompatibleProvider {
+    fn credential_surface(&self) -> crate::ProviderCredentialSurface {
+        crate::ProviderCredentialSurface::ApiKey
+    }
+
     async fn capabilities(&self) -> CapabilityDoc {
         self.probe_capabilities()
             .await
@@ -2093,7 +2195,7 @@ fn validate_resolved_compatible_origin(
     Ok(pinned.into())
 }
 
-fn blocked_credential_target(address: IpAddr) -> bool {
+pub(crate) fn blocked_credential_target(address: IpAddr) -> bool {
     match address {
         IpAddr::V4(address) => blocked_ipv4_credential_target(address),
         IpAddr::V6(address) => blocked_ipv6_credential_target(address),

@@ -1,8 +1,9 @@
 //! Daemon-owned OAuth authorization-code/PKCE and credential refresh.
 //!
 //! Live provider grants are a release-owned allowlist, not user
-//! configuration. The shipped sanctioned table is intentionally empty; tests
-//! inject a loopback-only fake registration through [`AccountsDependencies`].
+//! configuration. Only the literal registrations in
+//! [`SANCTIONED_PROVIDER_REGISTRATIONS`] are enabled; tests inject a
+//! loopback-only fake registration through [`AccountsDependencies`].
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
@@ -25,7 +26,7 @@ use haider_rpc::{
 };
 use reqwest::redirect::Policy;
 use serde::de::Visitor;
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq as _;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -134,7 +135,7 @@ impl OwnedTaskSet {
 ///
 /// OWNER FILL POINT: this table is populated only after Haider receives a
 /// sanctioned public-native client registration and documented inference
-/// scopes. A reference CLI registration never belongs here.
+/// scopes. There is no wildcard or user-supplied live-provider path.
 #[derive(Debug, Clone, Copy)]
 pub struct SanctionedOAuthRegistration {
     pub provider_id: &'static str,
@@ -146,8 +147,59 @@ pub struct SanctionedOAuthRegistration {
     pub audience: &'static str,
     pub resource: Option<&'static str>,
     pub redirect_policy: OAuthRedirectPolicy,
+    pub authorize_parameters: &'static [OAuthAuthorizeParameter],
+    pub send_nonce_in_authorize: bool,
+    pub send_audience_in_authorize: bool,
+    pub authorization_code_encoding: OAuthTokenRequestEncoding,
+    pub authorization_code_includes_state: bool,
+    pub refresh_encoding: OAuthTokenRequestEncoding,
+    pub refresh_includes_binding: bool,
     pub retain_refresh_on_omission: bool,
-    pub identity_verifier_factory: fn() -> Arc<dyn OAuthIdentityVerifier>,
+    pub identity_mode: OAuthIdentityMode,
+    pub inference: OAuthInferenceRegistration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OAuthAuthorizeParameter {
+    pub name: &'static str,
+    pub value: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OAuthTokenRequestEncoding {
+    Form,
+    Json,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum OAuthIdentityMode {
+    VerifiedIdToken(fn() -> Arc<dyn OAuthIdentityVerifier>),
+    /// Least-privilege providers that return no ID token or profile scope.
+    ///
+    /// The TLS-authenticated token endpoint proves the grant. Haider stores
+    /// only a one-way access-token fingerprint as the stable local subject;
+    /// refresh keeps the original identity.
+    TokenEndpointGrant {
+        display_identity: &'static str,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OAuthInferenceRegistration {
+    pub base_url: &'static str,
+    pub auth_mode: OAuthInferenceAuthMode,
+    pub header_set: OAuthInferenceHeaderSet,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OAuthInferenceAuthMode {
+    Bearer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OAuthInferenceHeaderSet {
+    OpenAiCodexResponsesLite,
+    AnthropicOAuthBeta,
 }
 
 /// The only callback policy supported by the generic engine.
@@ -157,9 +209,83 @@ pub enum OAuthRedirectPolicy {
     EphemeralIpv4Loopback,
 }
 
-/// Intentionally empty at ship. Do not add copied OpenAI Codex metadata,
-/// guessed ChatGPT scopes, or third-party Claude Max login here.
-pub const SANCTIONED_PROVIDER_REGISTRATIONS: &[SanctionedOAuthRegistration] = &[];
+const OPENAI_AUTHORIZE_PARAMETERS: &[OAuthAuthorizeParameter] = &[
+    OAuthAuthorizeParameter {
+        name: "id_token_add_organizations",
+        value: "true",
+    },
+    OAuthAuthorizeParameter {
+        name: "codex_cli_simplified_flow",
+        value: "true",
+    },
+];
+
+/// The complete release-owned OAuth allowlist. No other provider identifier,
+/// wildcard, endpoint, client ID, or scope can enter the production catalog.
+pub const SANCTIONED_PROVIDER_REGISTRATIONS: &[SanctionedOAuthRegistration] = &[
+    SanctionedOAuthRegistration {
+        provider_id: haider_provider::OPENAI_OAUTH_PROVIDER_NAME,
+        issuer: "https://auth.openai.com",
+        authorization_endpoint: "https://auth.openai.com/oauth/authorize",
+        token_endpoint: "https://auth.openai.com/oauth/token",
+        client_id: "app_EMoamEEZ73f0CkXaXp7hrann",
+        scopes: &["openid", "profile", "email", "offline_access"],
+        audience: "app_EMoamEEZ73f0CkXaXp7hrann",
+        resource: None,
+        redirect_policy: OAuthRedirectPolicy::EphemeralIpv4Loopback,
+        authorize_parameters: OPENAI_AUTHORIZE_PARAMETERS,
+        send_nonce_in_authorize: true,
+        send_audience_in_authorize: false,
+        authorization_code_encoding: OAuthTokenRequestEncoding::Form,
+        authorization_code_includes_state: false,
+        refresh_encoding: OAuthTokenRequestEncoding::Json,
+        refresh_includes_binding: false,
+        retain_refresh_on_omission: true,
+        identity_mode: OAuthIdentityMode::VerifiedIdToken(openai_identity_verifier),
+        inference: OAuthInferenceRegistration {
+            base_url: haider_provider::OPENAI_SUBSCRIPTION_BASE_URL,
+            auth_mode: OAuthInferenceAuthMode::Bearer,
+            header_set: OAuthInferenceHeaderSet::OpenAiCodexResponsesLite,
+        },
+    },
+    SanctionedOAuthRegistration {
+        provider_id: haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME,
+        issuer: "https://claude.ai",
+        authorization_endpoint: "https://claude.ai/oauth/authorize",
+        token_endpoint: "https://console.anthropic.com/v1/oauth/token",
+        client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+        scopes: &["user:inference"],
+        audience: "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+        resource: None,
+        // The generic engine keeps its safest ephemeral numeric-loopback
+        // shape per registration. The fake server exercises this exact URI;
+        // acceptance by Anthropic's live client remains a runtime smoke concern.
+        redirect_policy: OAuthRedirectPolicy::EphemeralIpv4Loopback,
+        authorize_parameters: &[],
+        send_nonce_in_authorize: false,
+        send_audience_in_authorize: false,
+        authorization_code_encoding: OAuthTokenRequestEncoding::Json,
+        authorization_code_includes_state: true,
+        refresh_encoding: OAuthTokenRequestEncoding::Json,
+        refresh_includes_binding: false,
+        retain_refresh_on_omission: true,
+        identity_mode: OAuthIdentityMode::TokenEndpointGrant {
+            display_identity: "Claude Max subscription",
+        },
+        inference: OAuthInferenceRegistration {
+            base_url: haider_provider::ANTHROPIC_OAUTH_BASE_URL,
+            auth_mode: OAuthInferenceAuthMode::Bearer,
+            header_set: OAuthInferenceHeaderSet::AnthropicOAuthBeta,
+        },
+    },
+];
+
+pub(crate) fn sanctioned_inference(provider: &str) -> Option<&'static OAuthInferenceRegistration> {
+    SANCTIONED_PROVIDER_REGISTRATIONS
+        .iter()
+        .find(|registration| registration.provider_id == provider)
+        .map(|registration| &registration.inference)
+}
 
 /// Expected facts an identity verifier must authenticate.
 pub struct OAuthIdentityExpectation<'a> {
@@ -172,12 +298,127 @@ pub struct OAuthIdentityExpectation<'a> {
 ///
 /// Implementations must verify signature, issuer, audience, and nonce. Merely
 /// decoding a JWT payload is not an implementation of this trait.
+#[async_trait::async_trait]
 pub trait OAuthIdentityVerifier: Send + Sync {
-    fn verify(
+    async fn verify(
         &self,
         id_token: &[u8],
         expected: OAuthIdentityExpectation<'_>,
     ) -> Result<OAuthIdentityV1, OAuthPublicError>;
+}
+
+const OPENAI_JWKS_ENDPOINT: &str = "https://auth.openai.com/.well-known/jwks.json";
+
+struct OpenAiIdentityVerifier;
+
+fn openai_identity_verifier() -> Arc<dyn OAuthIdentityVerifier> {
+    Arc::new(OpenAiIdentityVerifier)
+}
+
+#[derive(Deserialize)]
+struct JwksDocument {
+    keys: Vec<RsaJwk>,
+}
+
+#[derive(Deserialize)]
+struct RsaJwk {
+    kty: String,
+    kid: String,
+    #[serde(default)]
+    alg: Option<String>,
+    n: String,
+    e: String,
+}
+
+#[derive(Deserialize)]
+struct OpenAiIdClaims {
+    sub: String,
+    nonce: String,
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[async_trait::async_trait]
+impl OAuthIdentityVerifier for OpenAiIdentityVerifier {
+    async fn verify(
+        &self,
+        id_token: &[u8],
+        expected: OAuthIdentityExpectation<'_>,
+    ) -> Result<OAuthIdentityV1, OAuthPublicError> {
+        let token = std::str::from_utf8(id_token)
+            .map_err(|_| OAuthPublicError::new("id_token_malformed", false))?;
+        let header = jsonwebtoken::decode_header(token)
+            .map_err(|_| OAuthPublicError::new("id_token_malformed", false))?;
+        if header.alg != jsonwebtoken::Algorithm::RS256 {
+            return Err(OAuthPublicError::new("id_token_algorithm_mismatch", false));
+        }
+        let kid = header
+            .kid
+            .as_deref()
+            .ok_or_else(|| OAuthPublicError::new("id_token_key_missing", false))?;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(Policy::none())
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(TOKEN_TIMEOUT)
+            .build()
+            .map_err(|_| OAuthPublicError::new("identity_verifier_unavailable", true))?;
+        let response = client
+            .get(OPENAI_JWKS_ENDPOINT)
+            .send()
+            .await
+            .map_err(|_| OAuthPublicError::new("identity_verifier_unavailable", true))?;
+        if !response.status().is_success() {
+            return Err(OAuthPublicError::new("identity_verifier_unavailable", true));
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > TOKEN_RESPONSE_LIMIT as u64)
+        {
+            return Err(OAuthPublicError::new("identity_keys_malformed", true));
+        }
+        let jwks_bytes = response
+            .bytes()
+            .await
+            .map_err(|_| OAuthPublicError::new("identity_verifier_unavailable", true))?;
+        if jwks_bytes.len() > TOKEN_RESPONSE_LIMIT {
+            return Err(OAuthPublicError::new("identity_keys_malformed", true));
+        }
+        let jwks = serde_json::from_slice::<JwksDocument>(&jwks_bytes)
+            .map_err(|_| OAuthPublicError::new("identity_keys_malformed", true))?;
+        let jwk = jwks
+            .keys
+            .iter()
+            .find(|key| {
+                key.kid == kid
+                    && key.kty == "RSA"
+                    && key.alg.as_deref().is_none_or(|alg| alg == "RS256")
+            })
+            .ok_or_else(|| OAuthPublicError::new("id_token_key_unknown", true))?;
+        let key = jsonwebtoken::DecodingKey::from_rsa_components(&jwk.n, &jwk.e)
+            .map_err(|_| OAuthPublicError::new("identity_keys_malformed", true))?;
+        let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
+        validation.set_audience(&[expected.audience]);
+        validation.set_issuer(&[expected.issuer]);
+        validation.set_required_spec_claims(&["exp", "aud", "iss", "sub"]);
+        let claims = jsonwebtoken::decode::<OpenAiIdClaims>(token, &key, &validation)
+            .map_err(|_| OAuthPublicError::new("identity_claim_mismatch", false))?
+            .claims;
+        if !constant_time_equal(claims.nonce.as_bytes(), expected.nonce) {
+            return Err(OAuthPublicError::new("identity_claim_mismatch", false));
+        }
+        let display_identity = claims
+            .email
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| claims.name.filter(|value| !value.trim().is_empty()))
+            .unwrap_or_else(|| claims.sub.clone());
+        Ok(OAuthIdentityV1 {
+            subject_hash: blake3::hash(claims.sub.as_bytes()).to_hex().to_string(),
+            display_identity,
+        })
+    }
 }
 
 /// A sanitized OAuth failure. `Debug` intentionally omits endpoint bodies.
@@ -211,12 +452,25 @@ pub struct OAuthProviderRegistration {
     authorization_endpoint: Url,
     token_endpoint: Url,
     client_id: String,
-    scopes: BTreeSet<String>,
+    scopes: Vec<String>,
     audience: String,
     resource: Option<String>,
     redirect_policy: OAuthRedirectPolicy,
+    authorize_parameters: Vec<(String, String)>,
+    send_nonce_in_authorize: bool,
+    send_audience_in_authorize: bool,
+    authorization_code_encoding: OAuthTokenRequestEncoding,
+    authorization_code_includes_state: bool,
+    refresh_encoding: OAuthTokenRequestEncoding,
+    refresh_includes_binding: bool,
     retain_refresh_on_omission: bool,
-    identity_verifier: Arc<dyn OAuthIdentityVerifier>,
+    identity_mode: RuntimeIdentityMode,
+}
+
+#[derive(Clone)]
+enum RuntimeIdentityMode {
+    VerifiedIdToken(Arc<dyn OAuthIdentityVerifier>),
+    TokenEndpointGrant { display_identity: String },
 }
 
 impl fmt::Debug for OAuthProviderRegistration {
@@ -239,7 +493,7 @@ impl fmt::Debug for OAuthProviderRegistration {
                 "retain_refresh_on_omission",
                 &self.retain_refresh_on_omission,
             )
-            .field("identity_verifier", &"[VERIFIER]")
+            .field("identity_mode", &"[IDENTITY VERIFIER]")
             .finish()
     }
 }
@@ -263,6 +517,33 @@ impl OAuthProviderRegistration {
         retain_refresh_on_omission: bool,
         identity_verifier: Arc<dyn OAuthIdentityVerifier>,
     ) -> Result<Self, OAuthPublicError> {
+        Self::new_with_identity(
+            provider_id,
+            issuer,
+            authorization_endpoint,
+            token_endpoint,
+            client_id,
+            scopes,
+            audience,
+            resource,
+            retain_refresh_on_omission,
+            RuntimeIdentityMode::VerifiedIdToken(identity_verifier),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_identity(
+        provider_id: impl Into<String>,
+        issuer: impl Into<String>,
+        authorization_endpoint: impl AsRef<str>,
+        token_endpoint: impl AsRef<str>,
+        client_id: impl Into<String>,
+        scopes: impl IntoIterator<Item = String>,
+        audience: impl Into<String>,
+        resource: Option<String>,
+        retain_refresh_on_omission: bool,
+        identity_mode: RuntimeIdentityMode,
+    ) -> Result<Self, OAuthPublicError> {
         let provider_id = provider_id.into();
         let issuer = issuer.into();
         let client_id = client_id.into();
@@ -274,13 +555,15 @@ impl OAuthProviderRegistration {
         validate_metadata_url(&authorization_endpoint)?;
         validate_metadata_url(&token_endpoint)?;
         validate_metadata_url(&issuer_url)?;
-        let scopes = scopes.into_iter().collect::<BTreeSet<_>>();
+        let scopes = scopes.into_iter().collect::<Vec<_>>();
+        let unique_scopes = scopes.iter().collect::<BTreeSet<_>>();
         if provider_id.trim().is_empty()
             || issuer.trim().is_empty()
             || client_id.trim().is_empty()
             || audience.trim().is_empty()
             || scopes.is_empty()
             || scopes.iter().any(|scope| scope.trim().is_empty())
+            || unique_scopes.len() != scopes.len()
         {
             return Err(invalid_metadata());
         }
@@ -294,8 +577,15 @@ impl OAuthProviderRegistration {
             audience,
             resource,
             redirect_policy: OAuthRedirectPolicy::EphemeralIpv4Loopback,
+            authorize_parameters: Vec::new(),
+            send_nonce_in_authorize: true,
+            send_audience_in_authorize: true,
+            authorization_code_encoding: OAuthTokenRequestEncoding::Form,
+            authorization_code_includes_state: false,
+            refresh_encoding: OAuthTokenRequestEncoding::Form,
+            refresh_includes_binding: true,
             retain_refresh_on_omission,
-            identity_verifier,
+            identity_mode,
         })
     }
 
@@ -339,7 +629,17 @@ impl Default for OAuthProviderCatalog {
                 if metadata.redirect_policy != OAuthRedirectPolicy::EphemeralIpv4Loopback {
                     return None;
                 }
-                OAuthProviderRegistration::new(
+                let identity_mode = match metadata.identity_mode {
+                    OAuthIdentityMode::VerifiedIdToken(factory) => {
+                        RuntimeIdentityMode::VerifiedIdToken(factory())
+                    }
+                    OAuthIdentityMode::TokenEndpointGrant { display_identity } => {
+                        RuntimeIdentityMode::TokenEndpointGrant {
+                            display_identity: display_identity.to_owned(),
+                        }
+                    }
+                };
+                let mut registration = OAuthProviderRegistration::new_with_identity(
                     metadata.provider_id,
                     metadata.issuer,
                     metadata.authorization_endpoint,
@@ -349,10 +649,22 @@ impl Default for OAuthProviderCatalog {
                     metadata.audience,
                     metadata.resource.map(str::to_owned),
                     metadata.retain_refresh_on_omission,
-                    (metadata.identity_verifier_factory)(),
+                    identity_mode,
                 )
-                .ok()
-                .map(|registration| (registration.provider_id.clone(), Arc::new(registration)))
+                .ok()?;
+                registration.authorize_parameters = metadata
+                    .authorize_parameters
+                    .iter()
+                    .map(|parameter| (parameter.name.to_owned(), parameter.value.to_owned()))
+                    .collect();
+                registration.send_nonce_in_authorize = metadata.send_nonce_in_authorize;
+                registration.send_audience_in_authorize = metadata.send_audience_in_authorize;
+                registration.authorization_code_encoding = metadata.authorization_code_encoding;
+                registration.authorization_code_includes_state =
+                    metadata.authorization_code_includes_state;
+                registration.refresh_encoding = metadata.refresh_encoding;
+                registration.refresh_includes_binding = metadata.refresh_includes_binding;
+                Some((registration.provider_id.clone(), Arc::new(registration)))
             })
             .collect::<HashMap<_, _>>();
         Self {
@@ -960,22 +1272,21 @@ async fn begin_flow(inner: Arc<CoordinatorInner>, job: StartJob) {
             .append_pair("response_type", "code")
             .append_pair("client_id", &registration.client_id)
             .append_pair("redirect_uri", redirect_uri.as_str())
-            .append_pair(
-                "scope",
-                &registration
-                    .scopes
-                    .iter()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(" "),
-            )
+            .append_pair("scope", &registration.scopes.join(" "))
             .append_pair("state", state_b64.as_str())
             .append_pair("code_challenge", &challenge)
-            .append_pair("code_challenge_method", "S256")
-            .append_pair("nonce", nonce_b64.as_str())
-            .append_pair("audience", &registration.audience);
+            .append_pair("code_challenge_method", "S256");
+        if registration.send_nonce_in_authorize {
+            authorization.append_pair("nonce", nonce_b64.as_str());
+        }
+        if registration.send_audience_in_authorize {
+            authorization.append_pair("audience", &registration.audience);
+        }
         if let Some(resource) = &registration.resource {
             authorization.append_pair("resource", resource);
+        }
+        for (name, value) in &registration.authorize_parameters {
+            authorization.append_pair(name, value);
         }
         // `finish` moves the one state-bearing allocation directly into the
         // zeroizing wire wrapper. No second ordinary URL retains the query.
@@ -1161,6 +1472,7 @@ async fn run_callback_flow(
                             &inner.client,
                             &registration,
                             code.as_slice(),
+                            expected_state.as_bytes(),
                             verifier.as_bytes(),
                             nonce.as_bytes(),
                             redirect_uri.as_str(),
@@ -1396,34 +1708,114 @@ impl AsRef<[u8]> for SecretFormBody {
     }
 }
 
-async fn exchange_authorization_code(
-    client: &reqwest::Client,
+enum SecretTokenBody {
+    Form(SecretFormBody),
+    Json(Zeroizing<Vec<u8>>),
+}
+
+impl SecretTokenBody {
+    fn content_type(&self) -> &'static str {
+        match self {
+            Self::Form(_) => "application/x-www-form-urlencoded",
+            Self::Json(_) => "application/json",
+        }
+    }
+}
+
+impl AsRef<[u8]> for SecretTokenBody {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Form(body) => body.as_ref(),
+            Self::Json(body) => body.as_slice(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct AuthorizationCodeRequest<'a> {
+    grant_type: &'static str,
+    code: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state: Option<&'a str>,
+    client_id: &'a str,
+    redirect_uri: &'a str,
+    code_verifier: &'a str,
+}
+
+#[derive(Serialize)]
+struct RefreshTokenRequest<'a> {
+    grant_type: &'static str,
+    refresh_token: &'a str,
+    client_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    audience: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resource: Option<&'a str>,
+}
+
+fn encode_secret_json<T: Serialize>(value: &T) -> Result<Zeroizing<Vec<u8>>, OAuthPublicError> {
+    let mut body = Zeroizing::new(Vec::new());
+    serde_json::to_writer(&mut *body, value)
+        .map_err(|_| OAuthPublicError::new("oauth_request_encoding_failed", false))?;
+    Ok(body)
+}
+
+fn authorization_code_request_body(
     registration: &OAuthProviderRegistration,
     code: &[u8],
+    state: &[u8],
     verifier: &[u8],
-    nonce: &[u8],
     redirect_uri: &str,
-) -> Result<OAuthTokenBundleV1, OAuthPublicError> {
+) -> Result<SecretTokenBody, OAuthPublicError> {
     let code = std::str::from_utf8(code)
         .map_err(|_| OAuthPublicError::new("invalid_authorization_code", false))?;
     let verifier = std::str::from_utf8(verifier)
         .map_err(|_| OAuthPublicError::new("invalid_pkce_verifier", false))?;
-    let body = {
-        let mut encoded = url::form_urlencoded::Serializer::new(SecretFormBody::empty());
-        encoded
-            .append_pair("grant_type", "authorization_code")
-            .append_pair("code", code)
-            .append_pair("redirect_uri", redirect_uri)
-            .append_pair("client_id", &registration.client_id)
-            .append_pair("code_verifier", verifier);
-        encoded.finish()
+    let state = std::str::from_utf8(state)
+        .map_err(|_| OAuthPublicError::new("invalid_oauth_state", false))?;
+    let request = AuthorizationCodeRequest {
+        grant_type: "authorization_code",
+        code,
+        state: registration
+            .authorization_code_includes_state
+            .then_some(state),
+        client_id: &registration.client_id,
+        redirect_uri,
+        code_verifier: verifier,
     };
+    match registration.authorization_code_encoding {
+        OAuthTokenRequestEncoding::Form => {
+            let mut encoded = url::form_urlencoded::Serializer::new(SecretFormBody::empty());
+            encoded
+                .append_pair("grant_type", request.grant_type)
+                .append_pair("code", request.code);
+            if let Some(state) = request.state {
+                encoded.append_pair("state", state);
+            }
+            encoded
+                .append_pair("client_id", request.client_id)
+                .append_pair("redirect_uri", request.redirect_uri)
+                .append_pair("code_verifier", request.code_verifier);
+            Ok(SecretTokenBody::Form(encoded.finish()))
+        }
+        OAuthTokenRequestEncoding::Json => Ok(SecretTokenBody::Json(encode_secret_json(&request)?)),
+    }
+}
+
+async fn exchange_authorization_code(
+    client: &reqwest::Client,
+    registration: &OAuthProviderRegistration,
+    code: &[u8],
+    state: &[u8],
+    verifier: &[u8],
+    nonce: &[u8],
+    redirect_uri: &str,
+) -> Result<OAuthTokenBundleV1, OAuthPublicError> {
+    let body = authorization_code_request_body(registration, code, state, verifier, redirect_uri)?;
+    let content_type = body.content_type();
     let response = client
         .post(registration.token_endpoint.clone())
-        .header(
-            reqwest::header::CONTENT_TYPE,
-            "application/x-www-form-urlencoded",
-        )
+        .header(reqwest::header::CONTENT_TYPE, content_type)
         // The response body must become exclusively owned after EOF so its
         // source buffers can be scrubbed. A token connection is deliberately
         // not pooled: hyper may otherwise retain a sibling slice of its read
@@ -1441,7 +1833,7 @@ async fn exchange_authorization_code(
     if !status.is_success() {
         return Err(classify_token_error(status.as_u16(), &bytes));
     }
-    token_bundle_from_response(registration, &bytes, nonce, 1, None)
+    token_bundle_from_response(registration, &bytes, nonce, 1, None).await
 }
 
 async fn bounded_response(
@@ -1578,10 +1970,11 @@ struct TokenResponse {
     #[serde(default)]
     refresh_expires_in: Option<u64>,
     scope: String,
-    id_token: SecretJson,
+    #[serde(default)]
+    id_token: Option<SecretJson>,
 }
 
-fn token_bundle_from_response(
+async fn token_bundle_from_response(
     registration: &OAuthProviderRegistration,
     bytes: &[u8],
     nonce: &[u8],
@@ -1604,17 +1997,37 @@ fn token_bundle_from_response(
         .split_ascii_whitespace()
         .map(str::to_owned)
         .collect::<BTreeSet<_>>();
-    if !registration.scopes.is_subset(&scopes) {
+    if !registration
+        .scopes
+        .iter()
+        .all(|scope| scopes.contains(scope))
+    {
         return Err(OAuthPublicError::new("scope_mismatch", false));
     }
-    let identity = registration.identity_verifier.verify(
-        response.id_token.0.as_slice(),
-        OAuthIdentityExpectation {
-            issuer: &registration.issuer,
-            audience: &registration.audience,
-            nonce,
+    let identity = match &registration.identity_mode {
+        RuntimeIdentityMode::VerifiedIdToken(verifier) => {
+            let id_token = response
+                .id_token
+                .as_ref()
+                .ok_or_else(|| OAuthPublicError::new("missing_id_token", false))?;
+            verifier
+                .verify(
+                    id_token.0.as_slice(),
+                    OAuthIdentityExpectation {
+                        issuer: &registration.issuer,
+                        audience: &registration.audience,
+                        nonce,
+                    },
+                )
+                .await?
+        }
+        RuntimeIdentityMode::TokenEndpointGrant { display_identity } => OAuthIdentityV1 {
+            subject_hash: blake3::hash(response.access_token.0.as_slice())
+                .to_hex()
+                .to_string(),
+            display_identity: display_identity.clone(),
         },
-    )?;
+    };
     let now = now_ms().ok_or_else(|| OAuthPublicError::new("clock_unavailable", true))?;
     let expires_at = now
         .checked_add(response.expires_in.saturating_mul(1000))
@@ -2574,26 +2987,11 @@ async fn exchange_refresh_token(
     registration: &OAuthProviderRegistration,
     refresh_token: &[u8],
 ) -> Result<Zeroizing<Vec<u8>>, OAuthPublicError> {
-    let refresh_token = std::str::from_utf8(refresh_token)
-        .map_err(|_| OAuthPublicError::new("invalid_refresh_token", false))?;
-    let body = {
-        let mut encoded = url::form_urlencoded::Serializer::new(SecretFormBody::empty());
-        encoded
-            .append_pair("grant_type", "refresh_token")
-            .append_pair("refresh_token", refresh_token)
-            .append_pair("client_id", &registration.client_id)
-            .append_pair("audience", &registration.audience);
-        if let Some(resource) = &registration.resource {
-            encoded.append_pair("resource", resource);
-        }
-        encoded.finish()
-    };
+    let body = refresh_token_request_body(registration, refresh_token)?;
+    let content_type = body.content_type();
     let response = client
         .post(registration.token_endpoint.clone())
-        .header(
-            reqwest::header::CONTENT_TYPE,
-            "application/x-www-form-urlencoded",
-        )
+        .header(reqwest::header::CONTENT_TYPE, content_type)
         .header(reqwest::header::CONNECTION, "close")
         .body(reqwest::Body::from(bytes::Bytes::from_owner(body)))
         .send()
@@ -2608,6 +3006,43 @@ async fn exchange_refresh_token(
         Ok(bytes)
     } else {
         Err(classify_token_error(status.as_u16(), &bytes))
+    }
+}
+
+fn refresh_token_request_body(
+    registration: &OAuthProviderRegistration,
+    refresh_token: &[u8],
+) -> Result<SecretTokenBody, OAuthPublicError> {
+    let refresh_token = std::str::from_utf8(refresh_token)
+        .map_err(|_| OAuthPublicError::new("invalid_refresh_token", false))?;
+    let request = RefreshTokenRequest {
+        grant_type: "refresh_token",
+        refresh_token,
+        client_id: &registration.client_id,
+        audience: registration
+            .refresh_includes_binding
+            .then_some(registration.audience.as_str()),
+        resource: registration
+            .refresh_includes_binding
+            .then_some(registration.resource.as_deref())
+            .flatten(),
+    };
+    match registration.refresh_encoding {
+        OAuthTokenRequestEncoding::Form => {
+            let mut encoded = url::form_urlencoded::Serializer::new(SecretFormBody::empty());
+            encoded
+                .append_pair("grant_type", request.grant_type)
+                .append_pair("refresh_token", request.refresh_token)
+                .append_pair("client_id", request.client_id);
+            if let Some(audience) = request.audience {
+                encoded.append_pair("audience", audience);
+            }
+            if let Some(resource) = request.resource {
+                encoded.append_pair("resource", resource);
+            }
+            Ok(SecretTokenBody::Form(encoded.finish()))
+        }
+        OAuthTokenRequestEncoding::Json => Ok(SecretTokenBody::Json(encode_secret_json(&request)?)),
     }
 }
 
@@ -2647,7 +3082,11 @@ fn refresh_bundle_from_response(
         .split_ascii_whitespace()
         .map(str::to_owned)
         .collect::<BTreeSet<_>>();
-    if !registration.scopes.is_subset(&scopes) {
+    if !registration
+        .scopes
+        .iter()
+        .all(|scope| scopes.contains(scope))
+    {
         return Err(OAuthPublicError::new("scope_mismatch", false));
     }
     let now = now_ms().ok_or_else(|| OAuthPublicError::new("clock_unavailable", true))?;

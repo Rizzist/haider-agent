@@ -56,6 +56,9 @@ struct FakeState {
     redirect_target_calls: AtomicUsize,
     refresh_calls: AtomicUsize,
     saw_client_secret: AtomicBool,
+    token_encodings: Mutex<Vec<(String, String)>>,
+    expect_refresh_binding: AtomicBool,
+    expect_code_state: AtomicBool,
     verifiers: Mutex<Vec<String>>,
     refresh_gate: Option<Arc<Semaphore>>,
     durable: AtomicBool,
@@ -88,6 +91,9 @@ impl FakeOAuthServer {
             redirect_target_calls: AtomicUsize::new(0),
             refresh_calls: AtomicUsize::new(0),
             saw_client_secret: AtomicBool::new(false),
+            token_encodings: Mutex::new(Vec::new()),
+            expect_refresh_binding: AtomicBool::new(true),
+            expect_code_state: AtomicBool::new(false),
             verifiers: Mutex::new(Vec::new()),
             refresh_gate: (gated_refresh || mode == FakeMode::SlowExchange)
                 .then(|| Arc::new(Semaphore::new(0))),
@@ -137,7 +143,9 @@ impl FakeOAuthServer {
 }
 
 async fn serve_fake_request(mut stream: TcpStream, state: Arc<FakeState>) {
-    let Some((method, target, authorization, body)) = read_http_request(&mut stream).await else {
+    let Some((method, target, authorization, content_type, body)) =
+        read_http_request(&mut stream).await
+    else {
         return;
     };
     if target.starts_with("/authorize") {
@@ -208,24 +216,38 @@ async fn serve_fake_request(mut stream: TcpStream, state: Arc<FakeState>) {
         return;
     }
     state.token_calls.fetch_add(1, Ordering::SeqCst);
-    let form = url::form_urlencoded::parse(body.as_bytes())
-        .map(|(key, value)| (key.into_owned(), value.into_owned()))
-        .collect::<HashMap<_, _>>();
-    let grant = form.get("grant_type").map(String::as_str).unwrap_or("");
+    let fields = if content_type.as_deref() == Some("application/json") {
+        serde_json::from_str::<HashMap<String, String>>(&body).expect("JSON token request")
+    } else {
+        url::form_urlencoded::parse(body.as_bytes())
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect::<HashMap<_, _>>()
+    };
+    let grant = fields.get("grant_type").map(String::as_str).unwrap_or("");
+    state
+        .token_encodings
+        .lock()
+        .expect("token encoding lock")
+        .push((grant.to_owned(), content_type.clone().unwrap_or_default()));
     if grant == "refresh_token" {
         state.refresh_calls.fetch_add(1, Ordering::SeqCst);
-        assert_eq!(form.get("audience").map(String::as_str), Some(AUDIENCE));
-        assert_eq!(
-            form.get("resource").map(String::as_str),
-            Some("fake-api-resource"),
-            "refresh requests must bind the configured resource"
-        );
+        if state.expect_refresh_binding.load(Ordering::SeqCst) {
+            assert_eq!(fields.get("audience").map(String::as_str), Some(AUDIENCE));
+            assert_eq!(
+                fields.get("resource").map(String::as_str),
+                Some("fake-api-resource"),
+                "refresh requests must bind the configured resource"
+            );
+        } else {
+            assert!(!fields.contains_key("audience"));
+            assert!(!fields.contains_key("resource"));
+        }
         if let Some(gate) = &state.refresh_gate {
             let permit = gate.acquire().await.expect("gate");
             permit.forget();
         }
     }
-    if form.contains_key("client_secret") {
+    if fields.contains_key("client_secret") {
         state.saw_client_secret.store(true, Ordering::SeqCst);
     }
     if state.mode == FakeMode::TokenRedirect {
@@ -273,12 +295,21 @@ async fn serve_fake_request(mut stream: TcpStream, state: Arc<FakeState>) {
             .expect("auth lock")
             .clone()
             .expect("authorize first");
-        assert_eq!(form.get("code").map(String::as_str), Some(CODE_SENTINEL));
+        assert_eq!(fields.get("code").map(String::as_str), Some(CODE_SENTINEL));
         assert_eq!(
-            form.get("redirect_uri").map(String::as_str),
+            fields.get("redirect_uri").map(String::as_str),
             Some(seen.redirect_uri.as_str())
         );
-        let verifier = form.get("code_verifier").cloned().unwrap_or_default();
+        if state.expect_code_state.load(Ordering::SeqCst) {
+            assert_eq!(
+                fields.get("state").map(String::as_str),
+                Some(seen.state.as_str()),
+                "provider-declared code exchange must echo state"
+            );
+        } else {
+            assert!(!fields.contains_key("state"));
+        }
+        let verifier = fields.get("code_verifier").cloned().unwrap_or_default();
         state
             .verifiers
             .lock()
@@ -379,7 +410,7 @@ async fn serve_fake_request(mut stream: TcpStream, state: Arc<FakeState>) {
 
 async fn read_http_request(
     stream: &mut TcpStream,
-) -> Option<(String, String, Option<String>, String)> {
+) -> Option<(String, String, Option<String>, Option<String>, String)> {
     let mut bytes = Vec::new();
     let mut chunk = [0_u8; 1024];
     let header_end = loop {
@@ -414,6 +445,11 @@ async fn read_http_request(
         name.eq_ignore_ascii_case("authorization")
             .then(|| value.trim().to_owned())
     });
+    let content_type = headers.split("\r\n").find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("content-type")
+            .then(|| value.trim().to_ascii_lowercase())
+    });
     while bytes.len() < header_end.saturating_add(content_length) {
         let count = stream.read(&mut chunk).await.ok()?;
         if count == 0 {
@@ -422,7 +458,7 @@ async fn read_http_request(
         bytes.extend_from_slice(&chunk[..count]);
     }
     let body = String::from_utf8(bytes[header_end..header_end + content_length].to_vec()).ok()?;
-    Some((method, target, authorization, body))
+    Some((method, target, authorization, content_type, body))
 }
 
 async fn write_http(stream: &mut TcpStream, status: u16, headers: &[(&str, String)], body: &[u8]) {
@@ -454,8 +490,9 @@ async fn write_http(stream: &mut TcpStream, status: u16, headers: &[(&str, Strin
 
 struct FakeIdentityVerifier;
 
+#[async_trait::async_trait]
 impl OAuthIdentityVerifier for FakeIdentityVerifier {
-    fn verify(
+    async fn verify(
         &self,
         id_token: &[u8],
         expected: OAuthIdentityExpectation<'_>,
@@ -500,6 +537,13 @@ async fn coordinator_for(
     ttl: Duration,
 ) -> (OAuthCoordinator, mpsc::UnboundedReceiver<WireFrame>) {
     let registration = server.registration(Arc::new(FakeIdentityVerifier));
+    coordinator_for_registration(registration, ttl).await
+}
+
+async fn coordinator_for_registration(
+    registration: OAuthProviderRegistration,
+    ttl: Duration,
+) -> (OAuthCoordinator, mpsc::UnboundedReceiver<WireFrame>) {
     let catalog = OAuthProviderCatalog::with_test_registrations([registration]).expect("catalog");
     let coordinator = OAuthCoordinator::new(
         "daemon-instance-test".into(),
@@ -570,32 +614,342 @@ async fn wait_ready(coordinator: &OAuthCoordinator, flow_id: &OAuthFlowId) -> OA
     .expect("flow terminal")
 }
 
+/// MUTATION CHECK: remove either sanctioned row, alter any owner constant, or
+/// make catalog lookup accept an API-key/wildcard provider.
+/// Verified by revert on 2026-07-29.
 #[test]
-fn sanctioned_oauth_table_is_empty_and_reports_precise_reasons() {
-    assert!(SANCTIONED_PROVIDER_REGISTRATIONS.is_empty());
+fn sanctioned_oauth_table_has_exact_owner_grants_and_precise_reasons() {
+    assert_eq!(SANCTIONED_PROVIDER_REGISTRATIONS.len(), 2);
+    let openai = SANCTIONED_PROVIDER_REGISTRATIONS
+        .iter()
+        .find(|registration| registration.provider_id == "openai-oauth")
+        .expect("OpenAI OAuth registration");
+    assert_eq!(openai.issuer, "https://auth.openai.com");
+    assert_eq!(
+        openai.authorization_endpoint,
+        "https://auth.openai.com/oauth/authorize"
+    );
+    assert_eq!(openai.token_endpoint, "https://auth.openai.com/oauth/token");
+    assert_eq!(openai.client_id, "app_EMoamEEZ73f0CkXaXp7hrann");
+    assert_eq!(
+        openai.scopes,
+        &["openid", "profile", "email", "offline_access"]
+    );
+    assert_eq!(
+        openai.authorize_parameters,
+        &[
+            OAuthAuthorizeParameter {
+                name: "id_token_add_organizations",
+                value: "true",
+            },
+            OAuthAuthorizeParameter {
+                name: "codex_cli_simplified_flow",
+                value: "true",
+            },
+        ]
+    );
+    assert_eq!(
+        openai.authorization_code_encoding,
+        OAuthTokenRequestEncoding::Form
+    );
+    assert_eq!(openai.refresh_encoding, OAuthTokenRequestEncoding::Json);
+    assert_eq!(
+        openai.inference,
+        OAuthInferenceRegistration {
+            base_url: "https://chatgpt.com/backend-api/codex",
+            auth_mode: OAuthInferenceAuthMode::Bearer,
+            header_set: OAuthInferenceHeaderSet::OpenAiCodexResponsesLite,
+        }
+    );
+
+    let anthropic = SANCTIONED_PROVIDER_REGISTRATIONS
+        .iter()
+        .find(|registration| registration.provider_id == "anthropic-oauth")
+        .expect("Anthropic OAuth registration");
+    assert_eq!(anthropic.issuer, "https://claude.ai");
+    assert_eq!(
+        anthropic.authorization_endpoint,
+        "https://claude.ai/oauth/authorize"
+    );
+    assert_eq!(
+        anthropic.token_endpoint,
+        "https://console.anthropic.com/v1/oauth/token"
+    );
+    assert_eq!(anthropic.client_id, "9d1c250a-e61b-44d9-88ed-5944d1962f5e");
+    assert_eq!(anthropic.scopes, &["user:inference"]);
+    assert_eq!(
+        anthropic.authorization_code_encoding,
+        OAuthTokenRequestEncoding::Json
+    );
+    assert!(anthropic.authorization_code_includes_state);
+    assert_eq!(anthropic.refresh_encoding, OAuthTokenRequestEncoding::Json);
+    assert_eq!(
+        anthropic.inference,
+        OAuthInferenceRegistration {
+            base_url: "https://api.anthropic.com",
+            auth_mode: OAuthInferenceAuthMode::Bearer,
+            header_set: OAuthInferenceHeaderSet::AnthropicOAuthBeta,
+        }
+    );
+    assert_eq!(
+        haider_provider::ANTHROPIC_OAUTH_BETA_VALUE,
+        "oauth-2025-04-20"
+    );
+
     let catalog = OAuthProviderCatalog::default();
-    let openai = catalog.availability("openai", true);
-    assert!(!openai.available);
-    assert!(
-        openai
-            .reason
-            .as_deref()
-            .is_some_and(|reason| reason.contains("no sanctioned"))
+    for provider in ["openai-oauth", "anthropic-oauth"] {
+        assert_eq!(
+            catalog.availability(provider, true),
+            OAuthAvailabilityWire {
+                available: true,
+                reason: None,
+            }
+        );
+    }
+    for provider in ["openai", "anthropic", "*", "other-oauth"] {
+        let unavailable = catalog.availability(provider, true);
+        assert!(!unavailable.available, "{provider} must stay unsanctioned");
+        assert!(
+            unavailable
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("Unavailable:")),
+            "{provider} needs a precise reason"
+        );
+    }
+    assert_eq!(
+        catalog.availability("openai-oauth", false),
+        OAuthAvailabilityWire {
+            available: false,
+            reason: Some(
+                "OAuth requires a supported OS credential vault; plaintext token files are not allowed"
+                    .into()
+            ),
+        }
     );
-    let anthropic = catalog.availability("anthropic", true);
-    assert!(!anthropic.available);
-    assert!(
-        anthropic
-            .reason
-            .as_deref()
-            .is_some_and(|reason| reason.contains("forbids"))
+}
+
+/// MUTATION CHECK: force either body builder to ignore the registration's
+/// encoding or state/binding flags. Exact content-type and field assertions
+/// fail without opening a socket.
+/// Verified by revert on 2026-07-29.
+#[test]
+fn declared_token_encodings_build_exact_provider_payloads() {
+    let registration = || {
+        OAuthProviderRegistration::new(
+            "fake-oauth",
+            "http://127.0.0.1:1",
+            "http://127.0.0.1:1/authorize",
+            "http://127.0.0.1:1/token",
+            "fake-client",
+            ["scope"].map(str::to_owned),
+            "fake-audience",
+            Some("fake-resource".into()),
+            true,
+            Arc::new(FakeIdentityVerifier),
+        )
+        .expect("registration")
+    };
+
+    let mut openai = registration();
+    openai.authorization_code_encoding = OAuthTokenRequestEncoding::Form;
+    openai.authorization_code_includes_state = false;
+    openai.refresh_encoding = OAuthTokenRequestEncoding::Json;
+    openai.refresh_includes_binding = false;
+    let code = authorization_code_request_body(
+        &openai,
+        b"secret-code",
+        b"secret-state",
+        b"secret-verifier",
+        "http://127.0.0.1:43210/callback",
+    )
+    .expect("OpenAI code body");
+    assert_eq!(code.content_type(), "application/x-www-form-urlencoded");
+    let code_fields = url::form_urlencoded::parse(code.as_ref()).collect::<HashMap<_, _>>();
+    assert_eq!(
+        code_fields.get("grant_type").map(|value| value.as_ref()),
+        Some("authorization_code")
+    );
+    assert!(!code_fields.contains_key("state"));
+    let refresh =
+        refresh_token_request_body(&openai, b"secret-refresh").expect("OpenAI refresh body");
+    assert_eq!(refresh.content_type(), "application/json");
+    let refresh_fields: serde_json::Value =
+        serde_json::from_slice(refresh.as_ref()).expect("OpenAI refresh JSON");
+    assert_eq!(
+        refresh_fields
+            .get("grant_type")
+            .and_then(serde_json::Value::as_str),
+        Some("refresh_token")
     );
     assert!(
-        catalog
-            .availability("openai", false)
-            .reason
-            .unwrap_or_default()
-            .contains("plaintext")
+        !refresh_fields
+            .as_object()
+            .expect("refresh object")
+            .contains_key("audience")
+    );
+    assert!(
+        !refresh_fields
+            .as_object()
+            .expect("refresh object")
+            .contains_key("resource")
+    );
+
+    let mut anthropic = registration();
+    anthropic.authorization_code_encoding = OAuthTokenRequestEncoding::Json;
+    anthropic.authorization_code_includes_state = true;
+    anthropic.refresh_encoding = OAuthTokenRequestEncoding::Json;
+    anthropic.refresh_includes_binding = false;
+    let code = authorization_code_request_body(
+        &anthropic,
+        b"secret-code",
+        b"secret-state",
+        b"secret-verifier",
+        "http://127.0.0.1:43210/callback",
+    )
+    .expect("Anthropic code body");
+    assert_eq!(code.content_type(), "application/json");
+    let code_fields: serde_json::Value =
+        serde_json::from_slice(code.as_ref()).expect("Anthropic code JSON");
+    assert_eq!(
+        code_fields.get("state").and_then(serde_json::Value::as_str),
+        Some("secret-state")
+    );
+    let refresh =
+        refresh_token_request_body(&anthropic, b"secret-refresh").expect("Anthropic refresh body");
+    assert_eq!(refresh.content_type(), "application/json");
+}
+
+/// MUTATION CHECK: swap either OpenAI token encoding, remove either extra
+/// authorize parameter, or weaken S256. The named content-type/URL assertions
+/// fail against the fake server.
+/// Verified by revert on 2026-07-29.
+#[tokio::test]
+async fn openai_protocol_uses_extra_authorize_params_form_code_and_json_refresh() {
+    let server = FakeOAuthServer::start(FakeMode::Success, false).await;
+    server
+        .state
+        .expect_refresh_binding
+        .store(false, Ordering::SeqCst);
+    let mut registration = server.registration(Arc::new(FakeIdentityVerifier));
+    registration.authorize_parameters = vec![
+        ("id_token_add_organizations".into(), "true".into()),
+        ("codex_cli_simplified_flow".into(), "true".into()),
+    ];
+    registration.authorization_code_encoding = OAuthTokenRequestEncoding::Form;
+    registration.refresh_encoding = OAuthTokenRequestEncoding::Json;
+    registration.refresh_includes_binding = false;
+    let refresh_registration = registration.clone();
+    let (coordinator, mut receiver) =
+        coordinator_for_registration(registration, Duration::from_secs(5)).await;
+    let (flow_id, authorization_url, _) = started_flow(&mut receiver).await;
+    let parsed = Url::parse(&authorization_url).expect("authorization URL");
+    let parameters = parsed.query_pairs().collect::<HashMap<_, _>>();
+    assert_eq!(
+        parameters
+            .get("id_token_add_organizations")
+            .map(|v| v.as_ref()),
+        Some("true")
+    );
+    assert_eq!(
+        parameters
+            .get("codex_cli_simplified_flow")
+            .map(|v| v.as_ref()),
+        Some("true")
+    );
+    assert_eq!(
+        parameters.get("code_challenge_method").map(|v| v.as_ref()),
+        Some("S256")
+    );
+    reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("browser")
+        .get(authorization_url)
+        .send()
+        .await
+        .expect("browser flow");
+    assert!(matches!(
+        wait_ready(&coordinator, &flow_id).await,
+        OAuthFlowStatusWire::Ready { .. }
+    ));
+
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("refresh client");
+    exchange_refresh_token(&client, &refresh_registration, REFRESH_SENTINEL.as_bytes())
+        .await
+        .expect("JSON refresh");
+    assert_eq!(
+        *server
+            .state
+            .token_encodings
+            .lock()
+            .expect("token encoding lock"),
+        vec![
+            (
+                "authorization_code".into(),
+                "application/x-www-form-urlencoded".into()
+            ),
+            ("refresh_token".into(), "application/json".into()),
+        ]
+    );
+}
+
+/// MUTATION CHECK: drop Anthropic's code-exchange `state` field or change
+/// either declared JSON encoding. The fake endpoint rejects the request and
+/// this named test fails by assertion.
+/// Verified by revert on 2026-07-29.
+#[tokio::test]
+async fn anthropic_protocol_uses_json_code_with_state_and_json_refresh() {
+    let server = FakeOAuthServer::start(FakeMode::Success, false).await;
+    server
+        .state
+        .expect_refresh_binding
+        .store(false, Ordering::SeqCst);
+    server.state.expect_code_state.store(true, Ordering::SeqCst);
+    let mut registration = server.registration(Arc::new(FakeIdentityVerifier));
+    registration.authorization_code_encoding = OAuthTokenRequestEncoding::Json;
+    registration.authorization_code_includes_state = true;
+    registration.refresh_encoding = OAuthTokenRequestEncoding::Json;
+    registration.refresh_includes_binding = false;
+    let refresh_registration = registration.clone();
+    let (coordinator, mut receiver) =
+        coordinator_for_registration(registration, Duration::from_secs(5)).await;
+    let (flow_id, authorization_url, _) = started_flow(&mut receiver).await;
+    reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("browser")
+        .get(authorization_url)
+        .send()
+        .await
+        .expect("browser flow");
+    assert!(matches!(
+        wait_ready(&coordinator, &flow_id).await,
+        OAuthFlowStatusWire::Ready { .. }
+    ));
+
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("refresh client");
+    exchange_refresh_token(&client, &refresh_registration, REFRESH_SENTINEL.as_bytes())
+        .await
+        .expect("JSON refresh");
+    assert_eq!(
+        *server
+            .state
+            .token_encodings
+            .lock()
+            .expect("token encoding lock"),
+        vec![
+            ("authorization_code".into(), "application/json".into()),
+            ("refresh_token".into(), "application/json".into()),
+        ]
     );
 }
 

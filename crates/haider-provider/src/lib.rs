@@ -14,6 +14,7 @@ mod anthropic;
 #[cfg(test)]
 mod anthropic_tests;
 mod openai;
+mod origin;
 mod wire;
 
 use async_trait::async_trait;
@@ -28,21 +29,26 @@ use tokio::sync::mpsc;
 use tokio::time::{Duration, sleep};
 
 pub use anthropic::{
-    ANTHROPIC_API_URL, ANTHROPIC_PROVIDER_NAME, AnthropicCapture, AnthropicProvider,
-    AnthropicRetryPolicy, AnthropicTransportConfig, replay_anthropic_http_error,
-    replay_anthropic_sse,
+    ANTHROPIC_API_URL, ANTHROPIC_OAUTH_BASE_URL, ANTHROPIC_OAUTH_BETA_HEADER,
+    ANTHROPIC_OAUTH_BETA_VALUE, ANTHROPIC_OAUTH_PROVIDER_NAME, ANTHROPIC_PROVIDER_NAME,
+    AnthropicCapture, AnthropicProvider, AnthropicRetryPolicy, AnthropicTransportConfig,
+    replay_anthropic_http_error, replay_anthropic_sse,
 };
 pub use openai::{
-    OPENAI_COMPATIBLE_PROVIDER_NAME, OPENAI_PROVIDER_NAME, OPENAI_RESPONSES_API_URL, OpenAiCapture,
-    OpenAiCompatibleProvider, OpenAiProvider, OpenAiRetryPolicy, OpenAiTransportConfig,
-    replay_openai_chat_sse, replay_openai_http_error, replay_openai_models_response,
-    replay_openai_responses_sse,
+    OPENAI_CODEX_RESPONSES_LITE_HEADER, OPENAI_CODEX_RESPONSES_LITE_VALUE,
+    OPENAI_COMPATIBLE_PROVIDER_NAME, OPENAI_OAUTH_PROVIDER_NAME, OPENAI_PROVIDER_NAME,
+    OPENAI_RESPONSES_API_URL, OPENAI_SUBSCRIPTION_BASE_URL, OPENAI_SUBSCRIPTION_RESPONSES_URL,
+    OpenAiCapture, OpenAiCompatibleProvider, OpenAiProvider, OpenAiRetryPolicy,
+    OpenAiTransportConfig, replay_openai_chat_sse, replay_openai_http_error,
+    replay_openai_models_response, replay_openai_responses_sse,
 };
 
 /// Provider classes backed by production account credentials in this release.
-pub const BUILTIN_PROVIDER_NAMES: [&str; 3] = [
+pub const BUILTIN_PROVIDER_NAMES: [&str; 5] = [
     ANTHROPIC_PROVIDER_NAME,
+    ANTHROPIC_OAUTH_PROVIDER_NAME,
     OPENAI_PROVIDER_NAME,
+    OPENAI_OAUTH_PROVIDER_NAME,
     OPENAI_COMPATIBLE_PROVIDER_NAME,
 ];
 
@@ -107,6 +113,18 @@ pub enum MessageRole {
     User,
     Assistant,
     Tool,
+}
+
+/// The credential surface an adapter will use for its outbound request.
+///
+/// This exposes only the authentication class, never credential material. The
+/// account factory uses it as an audit pin so an OAuth descriptor cannot be
+/// silently routed through an API-key constructor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderCredentialSurface {
+    Opaque,
+    ApiKey,
+    OAuthSubscriptionBearer,
 }
 
 /// Provider-local tool definition. The protocol tool manifest has execution
@@ -245,6 +263,11 @@ impl Drop for ProviderStream {
 /// Asynchronous provider adapter contract.
 #[async_trait]
 pub trait Provider: Send + Sync {
+    /// Describes how this adapter authenticates its outbound request.
+    fn credential_surface(&self) -> ProviderCredentialSurface {
+        ProviderCredentialSurface::Opaque
+    }
+
     async fn capabilities(&self) -> CapabilityDoc;
     async fn stream_turn(&self, request: TurnRequest) -> Result<ProviderStream, ProviderError>;
 }

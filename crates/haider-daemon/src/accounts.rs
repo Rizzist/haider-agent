@@ -38,9 +38,10 @@ use haider_protocol::credential::{AuthMethod, CredentialDescriptor, CredentialSt
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::CredentialAlias;
 use haider_provider::{
-    ANTHROPIC_PROVIDER_NAME, AnthropicProvider, BUILTIN_PROVIDER_NAMES, Message,
-    OPENAI_COMPATIBLE_PROVIDER_NAME, OPENAI_PROVIDER_NAME, OpenAiCompatibleProvider,
-    OpenAiProvider, Provider, ProviderErrorKind, TurnRequest,
+    ANTHROPIC_OAUTH_PROVIDER_NAME, ANTHROPIC_PROVIDER_NAME, AnthropicProvider,
+    BUILTIN_PROVIDER_NAMES, Message, OPENAI_COMPATIBLE_PROVIDER_NAME, OPENAI_OAUTH_PROVIDER_NAME,
+    OPENAI_PROVIDER_NAME, OpenAiCompatibleProvider, OpenAiProvider, Provider, ProviderErrorKind,
+    TurnRequest,
 };
 use haider_rpc::{
     ERROR_CODE_INVALID_ARGUMENT, ERROR_CODE_PERMISSION_DENIED, ERROR_CODE_PROVIDER_ERROR,
@@ -52,8 +53,8 @@ use tokio::time::Instant;
 use zeroize::Zeroizing;
 
 use crate::oauth::{
-    CredentialBroker, OAuthCoordinator, OAuthCoordinatorConfig, OAuthProviderCatalog,
-    OAuthReadyClaim,
+    CredentialBroker, OAuthCoordinator, OAuthCoordinatorConfig, OAuthInferenceAuthMode,
+    OAuthInferenceHeaderSet, OAuthProviderCatalog, OAuthReadyClaim, sanctioned_inference,
 };
 use crate::session_hub::FrameSink;
 
@@ -1548,7 +1549,7 @@ impl AccountProviderBuilder for ProductionAccountBuilder {
         model: &str,
         alias: &CredentialAlias,
     ) -> Result<Arc<dyn Provider>, HaiderError> {
-        build_account_provider(provider, None, credential, model, alias)
+        build_account_provider(provider, None, AuthMethod::ApiKey, credential, model, alias)
     }
 
     fn build_descriptor(
@@ -1560,6 +1561,7 @@ impl AccountProviderBuilder for ProductionAccountBuilder {
         build_account_provider(
             &descriptor.provider,
             descriptor.base_url.as_deref(),
+            descriptor.auth_method,
             credential,
             model,
             &descriptor.alias,
@@ -1570,22 +1572,23 @@ impl AccountProviderBuilder for ProductionAccountBuilder {
 fn build_account_provider(
     provider: &str,
     base_url: Option<&str>,
+    auth_method: AuthMethod,
     credential: haider_accounts::SecretHandle,
     model: &str,
     alias: &CredentialAlias,
 ) -> Result<Arc<dyn Provider>, HaiderError> {
-    let adapter: Arc<dyn Provider> = match provider {
-        ANTHROPIC_PROVIDER_NAME => Arc::new(
+    let adapter: Arc<dyn Provider> = match (provider, auth_method) {
+        (ANTHROPIC_PROVIDER_NAME, AuthMethod::ApiKey) => Arc::new(
             AnthropicProvider::new(credential, model)
                 .map_err(|error| adapter_construction_error(provider, error))?
                 .with_account(alias.clone()),
         ),
-        OPENAI_PROVIDER_NAME => Arc::new(
+        (OPENAI_PROVIDER_NAME, AuthMethod::ApiKey) => Arc::new(
             OpenAiProvider::new(credential, model)
                 .map_err(|error| adapter_construction_error(provider, error))?
                 .with_account(alias.clone()),
         ),
-        OPENAI_COMPATIBLE_PROVIDER_NAME => {
+        (OPENAI_COMPATIBLE_PROVIDER_NAME, AuthMethod::ApiKey) => {
             let base_url = base_url.ok_or_else(|| {
                 HaiderError::new(
                     ErrorCode::InvalidArgument,
@@ -1599,10 +1602,58 @@ fn build_account_provider(
                     .with_account(alias.clone()),
             )
         }
+        (OPENAI_OAUTH_PROVIDER_NAME, AuthMethod::OAuth) => {
+            let inference = sanctioned_inference(provider).ok_or_else(|| {
+                HaiderError::new(
+                    ErrorCode::Unauthorized,
+                    "OpenAI subscription OAuth registration is unavailable",
+                    false,
+                )
+            })?;
+            if inference.auth_mode != OAuthInferenceAuthMode::Bearer
+                || inference.header_set != OAuthInferenceHeaderSet::OpenAiCodexResponsesLite
+            {
+                return Err(HaiderError::new(
+                    ErrorCode::Unauthorized,
+                    "OpenAI subscription inference metadata is invalid",
+                    false,
+                ));
+            }
+            Arc::new(
+                OpenAiProvider::new_subscription(credential, model, inference.base_url)
+                    .map_err(|error| adapter_construction_error(provider, error))?
+                    .with_account(alias.clone()),
+            )
+        }
+        (ANTHROPIC_OAUTH_PROVIDER_NAME, AuthMethod::OAuth) => {
+            let inference = sanctioned_inference(provider).ok_or_else(|| {
+                HaiderError::new(
+                    ErrorCode::Unauthorized,
+                    "Anthropic subscription OAuth registration is unavailable",
+                    false,
+                )
+            })?;
+            if inference.auth_mode != OAuthInferenceAuthMode::Bearer
+                || inference.header_set != OAuthInferenceHeaderSet::AnthropicOAuthBeta
+            {
+                return Err(HaiderError::new(
+                    ErrorCode::Unauthorized,
+                    "Anthropic subscription inference metadata is invalid",
+                    false,
+                ));
+            }
+            Arc::new(
+                AnthropicProvider::new_subscription(credential, model, inference.base_url)
+                    .map_err(|error| adapter_construction_error(provider, error))?
+                    .with_account(alias.clone()),
+            )
+        }
         _ => {
             return Err(HaiderError::new(
                 ErrorCode::InvalidArgument,
-                format!("no account-backed adapter for provider {provider}"),
+                format!(
+                    "no account-backed adapter for provider {provider} with {auth_method:?} authentication"
+                ),
                 false,
             ));
         }
