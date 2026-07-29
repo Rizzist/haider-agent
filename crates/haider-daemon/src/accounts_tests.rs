@@ -204,7 +204,9 @@ async fn stale_oauth_fences_cannot_overwrite_or_expire_a_replaced_bundle() {
             Some("fake-api-resource".into()),
             "Bearer".into(),
             Zeroizing::new(access.to_vec()),
-            Some(Zeroizing::new(b"OAUTH_REFRESH_FENCE_SENTINEL_4b7e".to_vec())),
+            Some(Zeroizing::new(
+                b"OAUTH_REFRESH_FENCE_SENTINEL_4b7e".to_vec(),
+            )),
             u64::MAX - 1,
             Some(u64::MAX),
             vec!["openid".into(), "inference".into()],
@@ -256,6 +258,7 @@ async fn stale_oauth_fences_cannot_overwrite_or_expire_a_replaced_bundle() {
         vault: vault.clone() as Arc<dyn Vault>,
         validator: Arc::new(ProviderCredentialValidator),
         snapshot: Arc::clone(&snapshot),
+        management: None,
         profile_id: "oauth-fence".into(),
         default_model: "gpt-test".into(),
     });
@@ -279,7 +282,10 @@ async fn stale_oauth_fences_cannot_overwrite_or_expire_a_replaced_bundle() {
     let stored = vault.resolve(&alias).expect("stored bundle");
     let stored =
         haider_accounts::OAuthTokenBundleV1::decode(stored.expose_secret()).expect("decode stored");
-    assert_eq!(stored.generation, 2, "replacement must survive a late apply");
+    assert_eq!(
+        stored.generation, 2,
+        "replacement must survive a late apply"
+    );
     assert_eq!(
         stored.access_token_handle().expose_secret(),
         b"ACCESS_REPLACEMENT_SENTINEL_c0de"
@@ -379,6 +385,7 @@ async fn retryable_rotation_bookkeeping_failure_waits_instead_of_killing_the_tur
         vault: vault.clone() as Arc<dyn Vault>,
         validator: Arc::new(ProviderCredentialValidator),
         snapshot: Arc::clone(&snapshot),
+        management: None,
         profile_id: "wedged-store".into(),
         default_model: "gpt-test".into(),
     });
@@ -499,6 +506,7 @@ async fn factory_uses_checked_resolver_and_durably_selects_one_limited_alternate
         vault: vault.clone() as Arc<dyn Vault>,
         validator: Arc::new(ProviderCredentialValidator),
         snapshot: Arc::clone(&snapshot),
+        management: None,
         profile_id: "resolver-factory".into(),
         default_model: "gpt-test".into(),
     });
@@ -947,6 +955,95 @@ fn expect_error(frame: WireFrame) -> (String, bool) {
     }
 }
 
+/// A failed receipt/revision commit cannot publish externally mutated account
+/// state under the prior management revision.
+///
+/// MUTATION CHECK: move `publish_management_snapshot` above
+/// `finalize_login_receipt` in `finalize_and_respond`. Expected runtime
+/// failure: after the injected store close, the descriptor appears in both
+/// published snapshots even though the response is an error and revision is
+/// still zero.
+#[tokio::test]
+async fn login_publishes_only_after_receipt_and_revision_commit() {
+    struct HeldSuccessValidator {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl CredentialValidator for HeldSuccessValidator {
+        fn supports(&self, provider: &str) -> bool {
+            provider == "anthropic"
+        }
+
+        async fn validate(
+            &self,
+            _provider: &str,
+            _model: &str,
+            _secret: &[u8],
+        ) -> Result<ValidatedIdentity, ValidationError> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(ValidatedIdentity {
+                identity: "held success".into(),
+            })
+        }
+    }
+
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(Vec::new()));
+    let management = ManagementSnapshot::new(0, Vec::new(), Vec::new());
+    let vault = Arc::new(MemoryVault::new());
+    let mut actor = start_account_actor(AccountActorConfig {
+        store: store.clone(),
+        accounts: memory_accounts(),
+        vault: vault.clone() as Arc<dyn Vault>,
+        validator: Arc::new(HeldSuccessValidator {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        }),
+        snapshot: Arc::clone(&snapshot),
+        management: Some(management.clone()),
+        profile_id: "publish-order".into(),
+        default_model: "claude-test".into(),
+    });
+    let (sink, mut frames) = channel_sink();
+    actor
+        .commands()
+        .send(AccountCommand::Login(Box::new(login_job(
+            "publish-order-command",
+            "publish-order-request",
+            Some(b"publish-order-secret"),
+            &sink,
+        ))))
+        .await
+        .expect("send login");
+
+    entered.notified().await;
+    store.clone().close().await.expect("close receipt store");
+    release.notify_one();
+    let frame = tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        .await
+        .expect("response deadline")
+        .expect("response");
+    let (code, retryable) = expect_error(frame);
+    assert_eq!(code, ERROR_CODE_PROVIDER_ERROR);
+    assert!(retryable);
+    assert!(
+        !vault.list().expect("vault list").is_empty(),
+        "external vault mutation must have succeeded before finalization failed"
+    );
+    assert!(snapshot.lock().expect("resolver snapshot").is_empty());
+    let view = management.read().expect("management snapshot");
+    assert_eq!(view.revision, 0);
+    assert!(view.descriptors.is_empty());
+
+    actor.shutdown().await;
+}
+
 // MUTATION CHECK (R7/R10 pending-command secret TTL): disable BOTH
 // enforcement sites — `handle_login`'s claim guard
 // `Some(entry) if entry.claimed_at.elapsed() < SECRET_TTL` and the actor
@@ -974,6 +1071,7 @@ async fn pending_login_secret_past_the_ttl_is_wiped_and_forces_restage() {
         &vault,
         &validator,
         &snapshot,
+        None,
         "profile-ttl",
         "claude-test",
         &mut pending,
@@ -1002,6 +1100,7 @@ async fn pending_login_secret_past_the_ttl_is_wiped_and_forces_restage() {
         &vault,
         &validator,
         &snapshot,
+        None,
         "profile-ttl",
         "claude-test",
         &mut pending,
@@ -1066,6 +1165,7 @@ async fn account_actor_answers_restage_required_after_the_pending_ttl() {
         vault: Arc::new(MemoryVault::default()) as Arc<dyn Vault>,
         validator: Arc::clone(&validator) as Arc<dyn CredentialValidator>,
         snapshot,
+        management: None,
         profile_id: "profile-ttl-actor".into(),
         default_model: "claude-test".into(),
     });
@@ -1248,6 +1348,49 @@ async fn login_receipt_claims_replay_and_reject_like_every_r2_command() {
         .close()
         .await
         .unwrap_or_else(|error| panic!("{}", error.message));
+}
+
+/// Pre-ready reconciliation allocates the missing final revision once after
+/// durable descriptor state proves the external mutation succeeded.
+///
+/// MUTATION CHECK: remove the `finalize_reconciled` call from the
+/// pending-plus-descriptor branch of `reconcile_login_receipts`. Expected
+/// runtime failure: the first reconciliation leaves revision zero and the
+/// receipt pending instead of committing revision one.
+#[tokio::test]
+async fn login_reconciliation_advances_a_missing_revision_exactly_once() {
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let identity = identity_for("reconcile-revision", "reconcile-command");
+    let request_json = identity.canonical_json().expect("request JSON");
+    let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
+    store
+        .login_claim_receipt("reconcile-command".into(), request_digest, request_json)
+        .await
+        .expect("claim receipt");
+
+    let alias = CredentialAlias::new(identity.physical_alias.clone());
+    let mut accounts = memory_accounts();
+    accounts
+        .add(descriptor_for(&identity, &alias, Some("reconciled".into())))
+        .expect("persist descriptor");
+    let vault = VaultProvision::Available(Arc::new(MemoryVault::new()) as Arc<dyn Vault>);
+
+    reconcile_login_receipts(&store, &mut accounts, &vault)
+        .await
+        .expect("first reconciliation");
+    assert_eq!(store.management_revision().await.expect("revision"), 1);
+    let rows = store.login_receipts().await.expect("receipt rows");
+    assert_eq!(rows[0].state, "committed");
+    assert_eq!(rows[0].final_revision, Some(1));
+
+    reconcile_login_receipts(&store, &mut accounts, &vault)
+        .await
+        .expect("second reconciliation");
+    assert_eq!(
+        store.management_revision().await.expect("stable revision"),
+        1
+    );
 }
 
 // MUTATION CHECK (R10 step 10): make `reconcile_login_receipts` skip the
@@ -1521,6 +1664,7 @@ async fn oauth_account_add_never_exposes_initial_token_before_vault_persistence(
         vault: vault.clone() as Arc<dyn Vault>,
         validator: Arc::new(ProviderCredentialValidator),
         snapshot: Arc::clone(&snapshot),
+        management: None,
         profile_id: "profile-initial-persist".into(),
         default_model: "unused".into(),
     });
@@ -1640,6 +1784,7 @@ async fn oauth_account_add_actor_crash_after_vault_put_reconciles_production_rec
         vault: vault.clone() as Arc<dyn Vault>,
         validator: Arc::new(ProviderCredentialValidator),
         snapshot: Arc::clone(&snapshot),
+        management: None,
         profile_id: "profile-oauth-crash".into(),
         default_model: "unused".into(),
     });
@@ -1833,6 +1978,8 @@ async fn oauth_reconciliation_closes_crash_before_and_after_vault_put() {
 
 #[tokio::test]
 async fn refresh_cas_ignores_benign_status_and_selection_changes() {
+    let revision_dir = test_store_dir();
+    let revision_store = open_store(revision_dir.path()).await;
     let mut accounts = memory_accounts();
     let identity = oauth_identity_for("profile-cas", "oauth-cas");
     let alias = CredentialAlias::new(identity.physical_alias.clone());
@@ -1883,6 +2030,8 @@ async fn refresh_cas_ignores_benign_status_and_selection_changes() {
         &mut accounts,
         vault.clone() as Arc<dyn Vault>,
         &snapshot,
+        None,
+        &revision_store,
         &captured,
         &OAuthRefreshFence {
             generation: 1,
@@ -1913,6 +2062,8 @@ async fn refresh_cas_ignores_benign_status_and_selection_changes() {
 
 #[tokio::test]
 async fn production_expiry_sink_rejects_a_late_failure_for_a_newer_generation() {
+    let revision_dir = test_store_dir();
+    let revision_store = open_store(revision_dir.path()).await;
     let mut accounts = memory_accounts();
     let identity = oauth_identity_for("profile-expiry-fence", "oauth-fence");
     let alias = CredentialAlias::new(identity.physical_alias.clone());
@@ -1945,6 +2096,8 @@ async fn production_expiry_sink_rejects_a_late_failure_for_a_newer_generation() 
         &mut accounts,
         vault.clone() as Arc<dyn Vault>,
         &snapshot,
+        None,
+        &revision_store,
         &captured,
         &OAuthRefreshFence {
             generation: 1,
@@ -1996,6 +2149,8 @@ async fn production_refresh_begin_durably_fences_restart_before_the_endpoint() {
     }
 
     let durable = Arc::new(StdMutex::new(Vec::new()));
+    let revision_dir = test_store_dir();
+    let revision_store = open_store(revision_dir.path()).await;
     let store: Box<dyn StoreLike> = Box::new(SharedDescriptorStore(Arc::clone(&durable)));
     let mut accounts = AccountStore::new(store).expect("accounts");
     let identity = oauth_identity_for("profile-refresh-begin", "oauth-begin");
@@ -2012,6 +2167,8 @@ async fn production_refresh_begin_durably_fences_restart_before_the_endpoint() {
         &mut accounts,
         vault.clone() as Arc<dyn Vault>,
         &snapshot,
+        None,
+        &revision_store,
         &descriptor,
         &OAuthRefreshFence {
             generation: original.generation,
@@ -2112,6 +2269,8 @@ async fn production_descriptor_failure_tombstones_the_dead_rotated_refresh_token
     }
 
     let durable = Arc::new(StdMutex::new(Vec::new()));
+    let revision_dir = test_store_dir();
+    let revision_store = open_store(revision_dir.path()).await;
     let fail_descriptor = Arc::new(AtomicBool::new(false));
     let store: Box<dyn StoreLike> = Box::new(FailingDescriptorStore {
         durable: Arc::clone(&durable),
@@ -2154,6 +2313,8 @@ async fn production_descriptor_failure_tombstones_the_dead_rotated_refresh_token
             &mut accounts,
             vault.clone() as Arc<dyn Vault>,
             &snapshot,
+            None,
+            &revision_store,
             &descriptor,
             &OAuthRefreshFence {
                 generation: 1,

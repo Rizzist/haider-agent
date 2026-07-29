@@ -42,9 +42,9 @@ use crate::session_hub::{
 };
 use haider_rpc::{
     AttachmentId, Capability, CapabilitySet, ERROR_CODE_OVERLOADED, FEATURE_ACCOUNT_LOGIN_API_V1,
-    FEATURE_SESSION_MUTATION_V1, FEATURE_TURN_CONTROL_V1, FEATURE_VAULT_STAGE_V1, Hello,
-    LifecyclePhase, ProtocolError, RequestId, ServerRange, Welcome, WireFrame, negotiate,
-    uds_codec,
+    FEATURE_ACCOUNT_ROTATION_V1, FEATURE_PROVIDER_MANAGEMENT_V1, FEATURE_SESSION_MUTATION_V1,
+    FEATURE_TURN_CONTROL_V1, FEATURE_VAULT_STAGE_V1, Hello, LifecyclePhase, ProtocolError,
+    RequestId, ServerRange, Welcome, WireFrame, negotiate, uds_codec,
 };
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::PathBuf;
@@ -1364,14 +1364,7 @@ fn negotiate_hello(
             daemon_version: env!("CARGO_PKG_VERSION").into(),
             lifecycle_phase,
             capabilities_granted: negotiated.capabilities_granted.clone(),
-            features: BTreeSet::from([
-                FEATURE_ACCOUNT_LOGIN_API_V1.to_owned(),
-                haider_rpc::FEATURE_ACCOUNT_MANAGEMENT_V1.to_owned(),
-                haider_rpc::FEATURE_ACCOUNT_OAUTH_PKCE_V1.to_owned(),
-                FEATURE_SESSION_MUTATION_V1.to_owned(),
-                FEATURE_TURN_CONTROL_V1.to_owned(),
-                FEATURE_VAULT_STAGE_V1.to_owned(),
-            ]),
+            features: welcome_features(),
         }),
         outbound_limit,
     )?;
@@ -1381,6 +1374,19 @@ fn negotiate_hello(
         capabilities: negotiated.capabilities_granted,
     });
     Ok(false)
+}
+
+fn welcome_features() -> BTreeSet<String> {
+    BTreeSet::from([
+        FEATURE_ACCOUNT_LOGIN_API_V1.to_owned(),
+        haider_rpc::FEATURE_ACCOUNT_MANAGEMENT_V1.to_owned(),
+        haider_rpc::FEATURE_ACCOUNT_OAUTH_PKCE_V1.to_owned(),
+        FEATURE_ACCOUNT_ROTATION_V1.to_owned(),
+        FEATURE_PROVIDER_MANAGEMENT_V1.to_owned(),
+        FEATURE_SESSION_MUTATION_V1.to_owned(),
+        FEATURE_TURN_CONTROL_V1.to_owned(),
+        FEATURE_VAULT_STAGE_V1.to_owned(),
+    ])
 }
 
 fn enqueue_fatal(

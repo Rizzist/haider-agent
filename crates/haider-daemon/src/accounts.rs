@@ -44,14 +44,16 @@ use haider_protocol::credential::{
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::CredentialAlias;
 use haider_provider::{
-    ANTHROPIC_OAUTH_PROVIDER_NAME, ANTHROPIC_PROVIDER_NAME, AnthropicProvider,
-    BUILTIN_PROVIDER_NAMES, Message, OPENAI_COMPATIBLE_PROVIDER_NAME, OPENAI_OAUTH_PROVIDER_NAME,
-    OPENAI_PROVIDER_NAME, OpenAiCompatibleProvider, OpenAiProvider, Provider, ProviderErrorKind,
-    TurnRequest,
+    ANTHROPIC_API_URL, ANTHROPIC_OAUTH_BASE_URL, ANTHROPIC_OAUTH_PROVIDER_NAME,
+    ANTHROPIC_PROVIDER_NAME, AnthropicProvider, BUILTIN_PROVIDER_NAMES, Message,
+    OPENAI_COMPATIBLE_PROVIDER_NAME, OPENAI_OAUTH_PROVIDER_NAME, OPENAI_PROVIDER_NAME,
+    OPENAI_RESPONSES_API_URL, OPENAI_SUBSCRIPTION_RESPONSES_URL, OpenAiCompatibleProvider,
+    OpenAiProvider, Provider, ProviderErrorKind, TurnRequest,
 };
 use haider_rpc::{
     ERROR_CODE_INVALID_ARGUMENT, ERROR_CODE_PERMISSION_DENIED, ERROR_CODE_PROVIDER_ERROR,
-    ERROR_CODE_RESTAGE_REQUIRED, ERROR_CODE_UNAUTHORIZED, RequestId, ResponseBody, StagePurpose,
+    ERROR_CODE_RESTAGE_REQUIRED, ERROR_CODE_UNAUTHORIZED, ProviderApiFamilyWire,
+    ProviderAvailabilityWire, ProviderSummaryWire, RequestId, ResponseBody, StagePurpose,
     WireFrame,
 };
 use tokio::sync::{mpsc, watch};
@@ -465,6 +467,140 @@ pub(crate) fn physical_alias(profile_id: &str, provider: &str, command_id: &str)
 /// preserving its single-writer assumption).
 pub(crate) type AccountsSnapshot = Arc<StdMutex<Vec<CredentialDescriptor>>>;
 
+/// One atomically published management read view. RPC reads take this single
+/// lock so account/provider data can never be paired with another revision.
+#[derive(Clone)]
+pub(crate) struct ManagementSnapshot {
+    inner: Arc<StdMutex<ManagementView>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ManagementView {
+    pub revision: u64,
+    pub descriptors: Vec<CredentialDescriptor>,
+    pub providers: Vec<ProviderSummaryWire>,
+}
+
+impl ManagementSnapshot {
+    fn new(
+        revision: u64,
+        descriptors: Vec<CredentialDescriptor>,
+        providers: Vec<ProviderSummaryWire>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(StdMutex::new(ManagementView {
+                revision,
+                descriptors,
+                providers,
+            })),
+        }
+    }
+
+    pub(crate) fn read(&self) -> Option<ManagementView> {
+        self.inner.lock().ok().map(|view| view.clone())
+    }
+
+    fn publish_accounts(&self, revision: u64, descriptors: Vec<CredentialDescriptor>) {
+        if let Ok(mut view) = self.inner.lock() {
+            view.revision = revision;
+            view.descriptors = descriptors;
+        }
+    }
+}
+
+fn provider_management_summaries(
+    providers: &std::collections::BTreeSet<String>,
+    anthropic_default_model: &str,
+) -> Vec<ProviderSummaryWire> {
+    providers
+        .iter()
+        .map(|provider| {
+            let (
+                api_family,
+                endpoint,
+                models,
+                auth_methods,
+                availability,
+                availability_reason,
+                default_model,
+                enabled,
+            ) = match provider.as_str() {
+                ANTHROPIC_PROVIDER_NAME => (
+                    ProviderApiFamilyWire::AnthropicMessages,
+                    Some(ANTHROPIC_API_URL.to_owned()),
+                    vec![anthropic_default_model.to_owned()],
+                    vec![AuthMethod::ApiKey],
+                    ProviderAvailabilityWire::Available,
+                    None,
+                    Some(anthropic_default_model.to_owned()),
+                    true,
+                ),
+                ANTHROPIC_OAUTH_PROVIDER_NAME => (
+                    ProviderApiFamilyWire::AnthropicMessages,
+                    Some(ANTHROPIC_OAUTH_BASE_URL.to_owned()),
+                    vec![anthropic_default_model.to_owned()],
+                    vec![AuthMethod::OAuth],
+                    ProviderAvailabilityWire::Available,
+                    None,
+                    Some(anthropic_default_model.to_owned()),
+                    true,
+                ),
+                OPENAI_PROVIDER_NAME => (
+                    ProviderApiFamilyWire::OpenAiResponses,
+                    Some(OPENAI_RESPONSES_API_URL.to_owned()),
+                    vec!["gpt-5.6".to_owned()],
+                    vec![AuthMethod::ApiKey],
+                    ProviderAvailabilityWire::Available,
+                    None,
+                    Some("gpt-5.6".to_owned()),
+                    true,
+                ),
+                OPENAI_OAUTH_PROVIDER_NAME => (
+                    ProviderApiFamilyWire::OpenAiResponses,
+                    Some(OPENAI_SUBSCRIPTION_RESPONSES_URL.to_owned()),
+                    vec!["gpt-5.6".to_owned()],
+                    vec![AuthMethod::OAuth],
+                    ProviderAvailabilityWire::Available,
+                    None,
+                    Some("gpt-5.6".to_owned()),
+                    true,
+                ),
+                OPENAI_COMPATIBLE_PROVIDER_NAME => (
+                    ProviderApiFamilyWire::OpenAiChatCompletions,
+                    None,
+                    Vec::new(),
+                    vec![AuthMethod::ApiKey],
+                    ProviderAvailabilityWire::Unavailable,
+                    Some("provider endpoint and models are not configured".to_owned()),
+                    None,
+                    false,
+                ),
+                _ => (
+                    ProviderApiFamilyWire::Unknown,
+                    None,
+                    vec![anthropic_default_model.to_owned()],
+                    Vec::new(),
+                    ProviderAvailabilityWire::Available,
+                    None,
+                    Some(anthropic_default_model.to_owned()),
+                    true,
+                ),
+            };
+            ProviderSummaryWire {
+                provider: provider.clone(),
+                api_family,
+                endpoint,
+                models,
+                auth_methods,
+                availability,
+                availability_reason,
+                default_model,
+                enabled,
+            }
+        })
+        .collect()
+}
+
 /// What the hub needs to route account traffic (installed like the worker
 /// manager).
 #[derive(Clone)]
@@ -473,6 +609,7 @@ pub(crate) struct AccountsFacade {
     pub login: Option<mpsc::Sender<AccountCommand>>,
     pub oauth: Option<OAuthCoordinator>,
     pub snapshot: AccountsSnapshot,
+    pub management: ManagementSnapshot,
     pub vault_supported: bool,
 }
 
@@ -612,6 +749,7 @@ pub(crate) struct AccountActorConfig {
     pub vault: Arc<dyn Vault>,
     pub validator: Arc<dyn CredentialValidator>,
     pub snapshot: AccountsSnapshot,
+    pub management: Option<ManagementSnapshot>,
     pub profile_id: String,
     pub default_model: String,
 }
@@ -643,6 +781,7 @@ async fn run_account_actor(
         vault,
         validator,
         snapshot,
+        management,
         profile_id,
         default_model,
     } = config;
@@ -675,6 +814,7 @@ async fn run_account_actor(
                     vault.as_ref(),
                     validator.as_ref(),
                     &snapshot,
+                    management.as_ref(),
                     &profile_id,
                     &default_model,
                     &mut pending,
@@ -688,6 +828,7 @@ async fn run_account_actor(
                     &mut accounts,
                     Arc::clone(&vault),
                     &snapshot,
+                    management.as_ref(),
                     &profile_id,
                     *job,
                 )
@@ -702,6 +843,8 @@ async fn run_account_actor(
                     &mut accounts,
                     Arc::clone(&vault),
                     &snapshot,
+                    management.as_ref(),
+                    &store,
                     &descriptor,
                     &expected,
                 )
@@ -717,6 +860,8 @@ async fn run_account_actor(
                     &mut accounts,
                     Arc::clone(&vault),
                     &snapshot,
+                    management.as_ref(),
+                    &store,
                     &descriptor,
                     &expected,
                 )
@@ -733,6 +878,8 @@ async fn run_account_actor(
                     &mut accounts,
                     Arc::clone(&vault),
                     &snapshot,
+                    management.as_ref(),
+                    &store,
                     &descriptor,
                     &expected,
                     encoded_bundle,
@@ -746,8 +893,16 @@ async fn run_account_actor(
                 failure,
                 completed,
             } => {
-                let result =
-                    resolve_account(&mut accounts, vault.as_ref(), &snapshot, &provider, failure);
+                let result = resolve_account(
+                    &store,
+                    &mut accounts,
+                    vault.as_ref(),
+                    &snapshot,
+                    management.as_ref(),
+                    &provider,
+                    failure,
+                )
+                .await;
                 let _ = completed.send(result);
             }
         }
@@ -793,10 +948,12 @@ impl RotationCallback for AutomaticAlternate<'_> {
     }
 }
 
-fn resolve_account(
+async fn resolve_account(
+    store: &SqliteStoreHandle,
     accounts: &mut AccountStore<Box<dyn StoreLike>>,
     vault: &dyn Vault,
     snapshot: &AccountsSnapshot,
+    management: Option<&ManagementSnapshot>,
     provider: &str,
     failure: Option<(CredentialAlias, RotationTrigger)>,
 ) -> Result<ResolvedAccount, HaiderError> {
@@ -824,16 +981,25 @@ fn resolve_account(
                 CredentialStatus::Expired
             }
         };
-        if current.status != status {
+        let status_changed = current.status != status;
+        if status_changed {
             accounts.set_status(&from, status)?;
-            refresh_snapshot(snapshot, accounts);
         }
         let policy = AutomaticAlternate {
             descriptors: accounts.list(),
             provider,
         };
         let resolver = Resolver::new(accounts, vault, &policy);
-        let selected = resolver.resolve_alternate_descriptor(provider, &from, trigger)?;
+        let selected = match resolver.resolve_alternate_descriptor(provider, &from, trigger) {
+            Ok(selected) => selected,
+            Err(error) => {
+                if status_changed {
+                    refresh_resolver_snapshot(snapshot, accounts);
+                    publish_next_management_revision(store, snapshot, management, accounts).await?;
+                }
+                return Err(error);
+            }
+        };
         (from, trigger, selected)
     } else {
         let active = accounts
@@ -867,7 +1033,8 @@ fn resolve_account(
     };
 
     accounts.select(&selected.alias)?;
-    refresh_snapshot(snapshot, accounts);
+    refresh_resolver_snapshot(snapshot, accounts);
+    publish_next_management_revision(store, snapshot, management, accounts).await?;
     Ok(ResolvedAccount {
         rotation: Some(RotationEvent {
             provider: provider.to_owned(),
@@ -879,10 +1046,13 @@ fn resolve_account(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn apply_oauth_refresh(
     accounts: &mut AccountStore<Box<dyn StoreLike>>,
     vault: Arc<dyn Vault>,
     snapshot: &AccountsSnapshot,
+    management: Option<&ManagementSnapshot>,
+    store: &SqliteStoreHandle,
     descriptor: &CredentialDescriptor,
     expected: &OAuthRefreshFence,
     encoded_bundle: Zeroizing<Vec<u8>>,
@@ -897,15 +1067,22 @@ async fn apply_oauth_refresh(
     let alias = descriptor.alias.clone();
     let vault_for_read = Arc::clone(&vault);
     let alias_for_read = alias.clone();
-    let current = match tokio::task::spawn_blocking(move || vault_for_read.resolve(&alias_for_read))
-        .await
-    {
-        Ok(Ok(current)) => current,
-        Ok(Err(_)) | Err(_) => {
-            fail_closed_after_refresh_persist(accounts, Arc::clone(&vault), snapshot, &alias).await;
-            return Err(RefreshApplyError::Persist);
-        }
-    };
+    let current =
+        match tokio::task::spawn_blocking(move || vault_for_read.resolve(&alias_for_read)).await {
+            Ok(Ok(current)) => current,
+            Ok(Err(_)) | Err(_) => {
+                fail_closed_after_refresh_persist(
+                    store,
+                    accounts,
+                    Arc::clone(&vault),
+                    snapshot,
+                    management,
+                    &alias,
+                )
+                .await;
+                return Err(RefreshApplyError::Persist);
+            }
+        };
     let current = haider_accounts::OAuthTokenBundleV1::decode(current.expose_secret())
         .map_err(|_| RefreshApplyError::Stale)?;
     if current.generation != expected.generation
@@ -922,7 +1099,8 @@ async fn apply_oauth_refresh(
         tokio::task::spawn_blocking(move || vault_for_put.put(&alias_for_put, &encoded_bundle))
             .await;
     if !matches!(persisted, Ok(Ok(()))) {
-        fail_closed_after_refresh_persist(accounts, vault, snapshot, &alias).await;
+        fail_closed_after_refresh_persist(store, accounts, vault, snapshot, management, &alias)
+            .await;
         return Err(RefreshApplyError::Persist);
     }
     if *force_stop.borrow() {
@@ -930,7 +1108,8 @@ async fn apply_oauth_refresh(
         // boundary. It may have published bytes into the physical vault, but
         // it may not restore the descriptor or survive into a successor:
         // join the fail-closed tombstone before the actor owner can finish.
-        fail_closed_after_refresh_persist(accounts, vault, snapshot, &alias).await;
+        fail_closed_after_refresh_persist(store, accounts, vault, snapshot, management, &alias)
+            .await;
         return Err(RefreshApplyError::Persist);
     }
     if accounts
@@ -942,10 +1121,17 @@ async fn apply_oauth_refresh(
             .set_status(&alias, descriptor.status.clone())
             .is_err()
         {
-            fail_closed_after_refresh_persist(accounts, vault, snapshot, &alias).await;
+            fail_closed_after_refresh_persist(store, accounts, vault, snapshot, management, &alias)
+                .await;
             return Err(RefreshApplyError::Persist);
         }
-        refresh_snapshot(snapshot, accounts);
+        refresh_resolver_snapshot(snapshot, accounts);
+        if publish_next_management_revision(store, snapshot, management, accounts)
+            .await
+            .is_err()
+        {
+            return Err(RefreshApplyError::Persist);
+        }
     }
     Ok(())
 }
@@ -954,6 +1140,8 @@ async fn begin_oauth_refresh(
     accounts: &mut AccountStore<Box<dyn StoreLike>>,
     vault: Arc<dyn Vault>,
     snapshot: &AccountsSnapshot,
+    management: Option<&ManagementSnapshot>,
+    store: &SqliteStoreHandle,
     descriptor: &CredentialDescriptor,
     expected: &OAuthRefreshFence,
 ) -> Result<bool, HaiderError> {
@@ -988,7 +1176,15 @@ async fn begin_oauth_refresh(
     // issuer-mismatch evidence) while Expired prevents any restart from
     // resolving/retrying it. If descriptor persistence itself fails, the
     // vault tombstone is the fail-closed fallback.
-    persist_refresh_expired_or_tombstone(accounts, vault, snapshot, &descriptor.alias).await?;
+    persist_refresh_expired_or_tombstone(
+        store,
+        accounts,
+        vault,
+        snapshot,
+        management,
+        &descriptor.alias,
+    )
+    .await?;
     Ok(true)
 }
 
@@ -996,6 +1192,8 @@ async fn expire_oauth_refresh(
     accounts: &mut AccountStore<Box<dyn StoreLike>>,
     vault: Arc<dyn Vault>,
     snapshot: &AccountsSnapshot,
+    management: Option<&ManagementSnapshot>,
+    store: &SqliteStoreHandle,
     descriptor: &CredentialDescriptor,
     expected: &OAuthRefreshFence,
 ) -> Result<bool, HaiderError> {
@@ -1025,7 +1223,15 @@ async fn expire_oauth_refresh(
     {
         return Ok(false);
     }
-    persist_refresh_expired_or_tombstone(accounts, vault, snapshot, &descriptor.alias).await?;
+    persist_refresh_expired_or_tombstone(
+        store,
+        accounts,
+        vault,
+        snapshot,
+        management,
+        &descriptor.alias,
+    )
+    .await?;
     Ok(true)
 }
 
@@ -1041,9 +1247,11 @@ fn same_credential_identity(
 }
 
 async fn fail_closed_after_refresh_persist(
+    store: &SqliteStoreHandle,
     accounts: &mut AccountStore<Box<dyn StoreLike>>,
     vault: Arc<dyn Vault>,
     snapshot: &AccountsSnapshot,
+    management: Option<&ManagementSnapshot>,
     alias: &CredentialAlias,
 ) {
     // Once the server has rotated the refresh token, a failed local write
@@ -1055,7 +1263,8 @@ async fn fail_closed_after_refresh_persist(
         .set_status(alias, CredentialStatus::Expired)
         .is_ok();
     if status_persisted {
-        refresh_snapshot(snapshot, accounts);
+        refresh_resolver_snapshot(snapshot, accounts);
+        let _ = publish_next_management_revision(store, snapshot, management, accounts).await;
     } else {
         mark_snapshot_expired(snapshot, alias);
     }
@@ -1063,7 +1272,9 @@ async fn fail_closed_after_refresh_persist(
     let alias_for_delete = alias.clone();
     let tombstoned =
         tokio::task::spawn_blocking(move || vault_for_delete.delete(&alias_for_delete)).await;
-    if !matches!(tombstoned, Ok(Ok(()))) && !status_persisted {
+    if matches!(tombstoned, Ok(Ok(()))) && !status_persisted {
+        let _ = publish_marked_management_revision(store, snapshot, management).await;
+    } else if !status_persisted {
         // Both durable barriers failed. The actor's public snapshot remains
         // closed for this process; the command still reports Persist to its
         // caller, and a production test pins the recoverable single-failure
@@ -1073,14 +1284,17 @@ async fn fail_closed_after_refresh_persist(
 }
 
 async fn persist_refresh_expired_or_tombstone(
+    store: &SqliteStoreHandle,
     accounts: &mut AccountStore<Box<dyn StoreLike>>,
     vault: Arc<dyn Vault>,
     snapshot: &AccountsSnapshot,
+    management: Option<&ManagementSnapshot>,
     alias: &CredentialAlias,
 ) -> Result<(), HaiderError> {
     match accounts.set_status(alias, CredentialStatus::Expired) {
         Ok(()) => {
-            refresh_snapshot(snapshot, accounts);
+            refresh_resolver_snapshot(snapshot, accounts);
+            publish_next_management_revision(store, snapshot, management, accounts).await?;
             Ok(())
         }
         Err(status_error) => {
@@ -1096,6 +1310,7 @@ async fn persist_refresh_expired_or_tombstone(
             {
                 Ok(Ok(())) => {
                     mark_snapshot_expired(snapshot, alias);
+                    publish_marked_management_revision(store, snapshot, management).await?;
                     Ok(())
                 }
                 Ok(Err(delete_error)) => Err(HaiderError::new(
@@ -1145,10 +1360,53 @@ fn respond_error(route: &LoginRoute, code: &str, message: &str, retryable: bool)
     );
 }
 
-fn refresh_snapshot(snapshot: &AccountsSnapshot, accounts: &AccountStore<Box<dyn StoreLike>>) {
+fn refresh_resolver_snapshot(
+    snapshot: &AccountsSnapshot,
+    accounts: &AccountStore<Box<dyn StoreLike>>,
+) {
     if let Ok(mut view) = snapshot.lock() {
         *view = accounts.list().to_vec();
     }
+}
+
+fn publish_management_snapshot(
+    snapshot: &AccountsSnapshot,
+    management: Option<&ManagementSnapshot>,
+    accounts: &AccountStore<Box<dyn StoreLike>>,
+    revision: u64,
+) {
+    let descriptors = accounts.list().to_vec();
+    if let Ok(mut view) = snapshot.lock() {
+        *view = descriptors.clone();
+    }
+    if let Some(management) = management {
+        management.publish_accounts(revision, descriptors);
+    }
+}
+
+async fn publish_next_management_revision(
+    store: &SqliteStoreHandle,
+    snapshot: &AccountsSnapshot,
+    management: Option<&ManagementSnapshot>,
+    accounts: &AccountStore<Box<dyn StoreLike>>,
+) -> Result<u64, HaiderError> {
+    let revision = store.advance_management_revision().await?;
+    publish_management_snapshot(snapshot, management, accounts, revision);
+    Ok(revision)
+}
+
+async fn publish_marked_management_revision(
+    store: &SqliteStoreHandle,
+    snapshot: &AccountsSnapshot,
+    management: Option<&ManagementSnapshot>,
+) -> Result<u64, HaiderError> {
+    let revision = store.advance_management_revision().await?;
+    if let Some(management) = management
+        && let Ok(descriptors) = snapshot.lock().map(|view| view.clone())
+    {
+        management.publish_accounts(revision, descriptors);
+    }
+    Ok(revision)
 }
 
 /// The R10 login flow, executed on the actor. See the module charter for the
@@ -1160,6 +1418,7 @@ async fn handle_login(
     vault: &dyn Vault,
     validator: &dyn CredentialValidator,
     snapshot: &AccountsSnapshot,
+    management: Option<&ManagementSnapshot>,
     profile_id: &str,
     default_model: &str,
     pending: &mut HashMap<String, PendingSecret>,
@@ -1237,7 +1496,16 @@ async fn handle_login(
         if accounts.get(&alias).is_some() {
             drop(secret);
             pending.remove(&command_id);
-            finalize_and_respond(store, accounts, snapshot, &command_id, &alias, &route).await;
+            finalize_and_respond(
+                store,
+                accounts,
+                snapshot,
+                management,
+                &command_id,
+                &alias,
+                &route,
+            )
+            .await;
             return;
         }
         if vault.resolve(&alias).is_ok() {
@@ -1253,7 +1521,16 @@ async fn handle_login(
                 );
                 return;
             }
-            finalize_and_respond(store, accounts, snapshot, &command_id, &alias, &route).await;
+            finalize_and_respond(
+                store,
+                accounts,
+                snapshot,
+                management,
+                &command_id,
+                &alias,
+                &route,
+            )
+            .await;
             return;
         }
     }
@@ -1314,7 +1591,16 @@ async fn handle_login(
                 );
                 return;
             }
-            finalize_and_respond(store, accounts, snapshot, &command_id, &alias, &route).await;
+            finalize_and_respond(
+                store,
+                accounts,
+                snapshot,
+                management,
+                &command_id,
+                &alias,
+                &route,
+            )
+            .await;
         }
         Err(error) => match error.kind {
             ValidationFailureKind::Unauthorized | ValidationFailureKind::PermissionDenied => {
@@ -1387,6 +1673,7 @@ async fn handle_oauth_add(
     accounts: &mut AccountStore<Box<dyn StoreLike>>,
     vault: Arc<dyn Vault>,
     snapshot: &AccountsSnapshot,
+    management: Option<&ManagementSnapshot>,
     profile_id: &str,
     job: OAuthAddJob,
 ) {
@@ -1438,7 +1725,16 @@ async fn handle_oauth_add(
     };
     let alias = CredentialAlias::new(identity.physical_alias.clone());
     if resume && accounts.get(&alias).is_some() {
-        finalize_oauth_add(store, accounts, snapshot, &command_id, &alias, &route).await;
+        finalize_oauth_add(
+            store,
+            accounts,
+            snapshot,
+            management,
+            &command_id,
+            &alias,
+            &route,
+        )
+        .await;
         return;
     }
     if resume {
@@ -1461,8 +1757,16 @@ async fn handle_oauth_add(
                         );
                         return;
                     }
-                    finalize_oauth_add(store, accounts, snapshot, &command_id, &alias, &route)
-                        .await;
+                    finalize_oauth_add(
+                        store,
+                        accounts,
+                        snapshot,
+                        management,
+                        &command_id,
+                        &alias,
+                        &route,
+                    )
+                    .await;
                     return;
                 }
                 Err(_) => {
@@ -1541,7 +1845,16 @@ async fn handle_oauth_add(
         );
         return;
     }
-    finalize_oauth_add(store, accounts, snapshot, &command_id, &alias, &route).await;
+    finalize_oauth_add(
+        store,
+        accounts,
+        snapshot,
+        management,
+        &command_id,
+        &alias,
+        &route,
+    )
+    .await;
 }
 
 fn oauth_descriptor(
@@ -1564,6 +1877,7 @@ async fn finalize_oauth_add(
     store: &SqliteStoreHandle,
     accounts: &mut AccountStore<Box<dyn StoreLike>>,
     snapshot: &AccountsSnapshot,
+    management: Option<&ManagementSnapshot>,
     command_id: &str,
     alias: &CredentialAlias,
     route: &LoginRoute,
@@ -1577,8 +1891,7 @@ async fn finalize_oauth_add(
         );
         return;
     };
-    refresh_snapshot(snapshot, accounts);
-    if let Err(error) = store
+    let revision = match store
         .finalize_account_add_receipt(
             command_id.to_owned(),
             AccountAddReceiptResponse {
@@ -1587,9 +1900,13 @@ async fn finalize_oauth_add(
         )
         .await
     {
-        respond_error(route, ERROR_CODE_PROVIDER_ERROR, &error.message, true);
-        return;
-    }
+        Ok(revision) => revision,
+        Err(error) => {
+            respond_error(route, ERROR_CODE_PROVIDER_ERROR, &error.message, true);
+            return;
+        }
+    };
+    publish_management_snapshot(snapshot, management, accounts, revision);
     respond(route, ResponseBody::AccountAdd { descriptor });
 }
 
@@ -1619,6 +1936,7 @@ async fn finalize_and_respond(
     store: &SqliteStoreHandle,
     accounts: &mut AccountStore<Box<dyn StoreLike>>,
     snapshot: &AccountsSnapshot,
+    management: Option<&ManagementSnapshot>,
     command_id: &str,
     alias: &CredentialAlias,
     route: &LoginRoute,
@@ -1632,19 +1950,23 @@ async fn finalize_and_respond(
         );
         return;
     };
-    refresh_snapshot(snapshot, accounts);
     let response = LoginReceiptResponse {
         descriptor: descriptor.clone(),
     };
-    if let Err(error) = store
+    let revision = match store
         .finalize_login_receipt(command_id.to_owned(), response)
         .await
     {
-        // The commit is real (vault + descriptor); the receipt stays
-        // pending and reconciliation finalizes it on the next start.
-        respond_error(route, ERROR_CODE_PROVIDER_ERROR, &error.message, true);
-        return;
-    }
+        Ok(revision) => revision,
+        Err(error) => {
+            // The external commit is real (vault + descriptor); the receipt
+            // stays pending and the old management snapshot remains
+            // published until pre-ready reconciliation finalizes it.
+            respond_error(route, ERROR_CODE_PROVIDER_ERROR, &error.message, true);
+            return;
+        }
+    };
+    publish_management_snapshot(snapshot, management, accounts, revision);
     respond(route, ResponseBody::AccountLoginApi { descriptor });
 }
 
@@ -2212,9 +2534,6 @@ pub(crate) async fn reconcile_login_receipts(
         let alias = CredentialAlias::new(identity.physical_alias.clone());
         match row.state.as_str() {
             "committed" => {
-                if accounts.get(&alias).is_some() {
-                    continue;
-                }
                 let response: LoginReceiptResponse = match row
                     .response_json
                     .as_deref()
@@ -2233,10 +2552,21 @@ pub(crate) async fn reconcile_login_receipts(
                         ));
                     }
                 };
-                let mut descriptor = response.descriptor;
-                // Self-heal without stealing active from a later login.
-                descriptor.active = accounts.active_for_provider(&descriptor.provider).is_none();
-                accounts.add(descriptor)?;
+                if accounts.get(&alias).is_none() {
+                    let mut descriptor = response.descriptor;
+                    // Self-heal without stealing active from a later login.
+                    descriptor.active =
+                        accounts.active_for_provider(&descriptor.provider).is_none();
+                    accounts.add(descriptor)?;
+                }
+                if row.final_revision.is_none() {
+                    store
+                        .ensure_committed_management_revision(
+                            row.command_id.clone(),
+                            "account.login_api".to_owned(),
+                        )
+                        .await?;
+                }
             }
             "pending" => {
                 if accounts.get(&alias).is_some() {
@@ -2278,7 +2608,7 @@ pub(crate) async fn reconcile_oauth_add_receipts(
             })?;
         let alias = CredentialAlias::new(identity.physical_alias.clone());
         match row.state.as_str() {
-            "committed" if accounts.get(&alias).is_none() => {
+            "committed" => {
                 let response: AccountAddReceiptResponse = row
                     .response_json
                     .as_deref()
@@ -2293,9 +2623,20 @@ pub(crate) async fn reconcile_oauth_add_receipts(
                             false,
                         )
                     })?;
-                let mut descriptor = response.descriptor;
-                descriptor.active = accounts.active_for_provider(&descriptor.provider).is_none();
-                accounts.add(descriptor)?;
+                if accounts.get(&alias).is_none() {
+                    let mut descriptor = response.descriptor;
+                    descriptor.active =
+                        accounts.active_for_provider(&descriptor.provider).is_none();
+                    accounts.add(descriptor)?;
+                }
+                if row.final_revision.is_none() {
+                    store
+                        .ensure_committed_management_revision(
+                            row.command_id.clone(),
+                            "account.add".to_owned(),
+                        )
+                        .await?;
+                }
             }
             "pending" if accounts.get(&alias).is_some() => {
                 finalize_oauth_reconciled(store, accounts, &row.command_id, &alias).await?;
@@ -2344,6 +2685,7 @@ async fn finalize_oauth_reconciled(
             AccountAddReceiptResponse { descriptor },
         )
         .await
+        .map(|_| ())
 }
 
 async fn finalize_reconciled(
@@ -2358,6 +2700,7 @@ async fn finalize_reconciled(
     store
         .finalize_login_receipt(command_id.to_owned(), LoginReceiptResponse { descriptor })
         .await
+        .map(|_| ())
 }
 
 // ───────────────────────────── runtime wiring ───────────────────────────────
@@ -2382,6 +2725,7 @@ impl AccountsRuntime {
         profile_id: &str,
         instance_id: &str,
         default_model: &str,
+        provider_names: &std::collections::BTreeSet<String>,
     ) -> Result<Self, HaiderError> {
         let descriptor_store: Box<dyn StoreLike> = match &dependencies.descriptor_store {
             Some(injected) => Box::new(DescriptorStore::Injected(Arc::clone(injected))),
@@ -2391,6 +2735,11 @@ impl AccountsRuntime {
         reconcile_login_receipts(store, &mut accounts, &dependencies.vault).await?;
         reconcile_oauth_add_receipts(store, &mut accounts, &dependencies.vault).await?;
         let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(accounts.list().to_vec()));
+        let management = ManagementSnapshot::new(
+            store.management_revision().await?,
+            accounts.list().to_vec(),
+            provider_management_summaries(provider_names, default_model),
+        );
         match &dependencies.vault {
             VaultProvision::Available(vault) => {
                 let actor = start_account_actor(AccountActorConfig {
@@ -2399,6 +2748,7 @@ impl AccountsRuntime {
                     vault: Arc::clone(vault),
                     validator: Arc::clone(&dependencies.validator),
                     snapshot: Arc::clone(&snapshot),
+                    management: Some(management.clone()),
                     profile_id: profile_id.to_owned(),
                     default_model: default_model.to_owned(),
                 });
@@ -2420,6 +2770,7 @@ impl AccountsRuntime {
                         login: Some(commands),
                         oauth: Some(oauth),
                         snapshot,
+                        management,
                         vault_supported: true,
                     },
                     actor: Some(actor),
@@ -2432,6 +2783,7 @@ impl AccountsRuntime {
                     login: None,
                     oauth: None,
                     snapshot,
+                    management,
                     vault_supported: false,
                 },
                 actor: None,

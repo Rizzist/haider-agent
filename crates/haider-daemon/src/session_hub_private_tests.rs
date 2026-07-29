@@ -15,6 +15,39 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 
+fn provider_summary(provider: &str) -> haider_rpc::ProviderSummaryWire {
+    haider_rpc::ProviderSummaryWire {
+        provider: provider.to_owned(),
+        api_family: haider_rpc::ProviderApiFamilyWire::Unknown,
+        endpoint: None,
+        models: Vec::new(),
+        auth_methods: Vec::new(),
+        availability: haider_rpc::ProviderAvailabilityWire::Unknown,
+        availability_reason: None,
+        default_model: None,
+        enabled: true,
+    }
+}
+
+/// The optional `provider.list` coordinate filters the production snapshot
+/// projection without probing or rebuilding provider data.
+///
+/// MUTATION CHECK: delete the predicate from
+/// `rpc::filter_provider_summaries`. Expected runtime failure: both fixture
+/// providers are returned instead of only `openai`.
+#[test]
+fn provider_list_filter_is_applied_to_the_owned_snapshot_projection() {
+    let providers = vec![provider_summary("anthropic"), provider_summary("openai")];
+    let filtered = rpc::filter_provider_summaries(providers, Some("openai"));
+    assert_eq!(
+        filtered
+            .iter()
+            .map(|summary| summary.provider.as_str())
+            .collect::<Vec<_>>(),
+        vec!["openai"]
+    );
+}
+
 fn run_state_envelope(
     session_id: &SessionId,
     run_id: &RunId,

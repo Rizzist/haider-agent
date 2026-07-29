@@ -13,6 +13,16 @@
 
 use super::*;
 
+pub(super) fn filter_provider_summaries(
+    providers: Vec<haider_rpc::ProviderSummaryWire>,
+    provider: Option<&str>,
+) -> Vec<haider_rpc::ProviderSummaryWire> {
+    providers
+        .into_iter()
+        .filter(|summary| provider.is_none_or(|provider| summary.provider == provider))
+        .collect()
+}
+
 // ─────────── connection RPC surface: list/read/attach/detach/menu ───────────
 
 impl HubConnection {
@@ -325,6 +335,18 @@ impl HubConnection {
                     );
                 }
                 self.account_list(request_id, provider)
+            }
+            RequestBody::ProviderList { provider } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::View) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.provider_list(request_id, provider)
             }
             // `Unknown` and any future method decode alike: a typed,
             // correlated rejection instead of a dropped request.
@@ -758,26 +780,107 @@ impl HubConnection {
                 request_id,
                 body: ResponseBody::AccountList {
                     descriptors: Vec::new(),
+                    revision: None,
+                    provider_active: Vec::new(),
+                    provider_defaults: Vec::new(),
                 },
             });
         };
-        let descriptors = facade
-            .snapshot
-            .lock()
-            .map(|view| {
-                view.iter()
-                    .filter(|descriptor| {
-                        provider
-                            .as_deref()
-                            .is_none_or(|provider| descriptor.provider == provider)
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>()
+        let Some(view) = facade.management.read() else {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_DRAINING,
+                "management snapshot is unavailable",
+                true,
+                None,
+            );
+        };
+        let descriptors = view
+            .descriptors
+            .iter()
+            .filter(|descriptor| {
+                provider
+                    .as_deref()
+                    .is_none_or(|provider| descriptor.provider == provider)
             })
-            .unwrap_or_default();
+            .cloned()
+            .collect::<Vec<_>>();
+        let provider_active = view
+            .descriptors
+            .iter()
+            .filter(|descriptor| {
+                descriptor.active
+                    && provider
+                        .as_deref()
+                        .is_none_or(|provider| descriptor.provider == provider)
+            })
+            .map(|descriptor| haider_rpc::ProviderActiveWire {
+                provider: descriptor.provider.clone(),
+                alias: descriptor.alias.clone(),
+            })
+            .collect();
+        let provider_defaults = view
+            .providers
+            .iter()
+            .filter(|summary| {
+                provider
+                    .as_deref()
+                    .is_none_or(|provider| summary.provider == provider)
+            })
+            .filter_map(|summary| {
+                summary
+                    .default_model
+                    .as_ref()
+                    .map(|model| haider_rpc::ProviderDefaultWire {
+                        provider: summary.provider.clone(),
+                        model: model.clone(),
+                    })
+            })
+            .collect();
         self.send(WireFrame::Response {
             request_id,
-            body: ResponseBody::AccountList { descriptors },
+            body: ResponseBody::AccountList {
+                descriptors,
+                revision: Some(view.revision),
+                provider_active,
+                provider_defaults,
+            },
+        })
+    }
+
+    /// `provider.list`: a short, cached management-snapshot read. Endpoint
+    /// probing and provider validation are never performed on the connection
+    /// task.
+    fn provider_list(
+        &self,
+        request_id: RequestId,
+        provider: Option<String>,
+    ) -> Result<(), SessionHubError> {
+        let Some(facade) = self.hub.accounts()? else {
+            return self.send(WireFrame::Response {
+                request_id,
+                body: ResponseBody::ProviderList {
+                    providers: Vec::new(),
+                    revision: 0,
+                },
+            });
+        };
+        let Some(view) = facade.management.read() else {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_DRAINING,
+                "management snapshot is unavailable",
+                true,
+                None,
+            );
+        };
+        let providers = filter_provider_summaries(view.providers, provider.as_deref());
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::ProviderList {
+                providers,
+                revision: view.revision,
+            },
         })
     }
 

@@ -322,7 +322,7 @@ async fn staged_login_commits_descriptor_lists_it_and_replays_for_lost_responses
     )
     .await;
     match listed {
-        ResponseBody::AccountList { descriptors } => {
+        ResponseBody::AccountList { descriptors, .. } => {
             assert_eq!(descriptors.len(), 1);
             assert_eq!(descriptors[0], descriptor);
         }
@@ -514,7 +514,7 @@ async fn restart_wipes_the_pending_secret_and_a_fresh_stage_completes_the_comman
     )
     .await;
     match listed {
-        ResponseBody::AccountList { descriptors } => assert!(descriptors.is_empty()),
+        ResponseBody::AccountList { descriptors, .. } => assert!(descriptors.is_empty()),
         other => panic!("expected account.list response, got {other:?}"),
     }
 
@@ -580,7 +580,7 @@ async fn committed_receipt_self_heals_a_missing_descriptor_on_restart() {
     )
     .await;
     match listed {
-        ResponseBody::AccountList { descriptors } => {
+        ResponseBody::AccountList { descriptors, .. } => {
             assert_eq!(descriptors.len(), 1, "reconciliation must self-heal");
             assert_eq!(descriptors[0].alias, descriptor.alias);
         }
@@ -641,7 +641,7 @@ async fn vaultless_platforms_answer_the_stable_vault_unsupported_code() {
     .await;
     assert!(matches!(
         listed,
-        ResponseBody::AccountList { descriptors } if descriptors.is_empty()
+        ResponseBody::AccountList { descriptors, .. } if descriptors.is_empty()
     ));
 
     task.shutdown_handle().request("test complete");

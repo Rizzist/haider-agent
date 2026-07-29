@@ -301,6 +301,7 @@ async fn run_inner(
     // before anything can observe Ready (run_inner's receipt-reconciliation
     // phase — W3c1 receipts never persist `pending`; login's can).
     let accounts_started = tokio::time::Instant::now();
+    let creatable_providers = dependencies.provider_factory.creatable_providers();
     let accounts_runtime = match crate::accounts::AccountsRuntime::initialize(
         &store,
         &dependencies.accounts,
@@ -308,6 +309,7 @@ async fn run_inner(
         &config.profile_id,
         &instance_id,
         &config.default_model,
+        &creatable_providers,
     )
     .await
     {
@@ -331,7 +333,6 @@ async fn run_inner(
     // snapshot + vault, so a committed login is picked up by the NEXT
     // logical turn; `"fake"` is creatable only under an injected test
     // configuration, never on the production wire path.
-    let creatable_providers = dependencies.provider_factory.creatable_providers();
     let provider_factory: std::sync::Arc<dyn crate::worker::ProviderFactory> = match &dependencies
         .provider_factory
     {

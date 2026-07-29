@@ -239,6 +239,7 @@ pub struct AccountAddReceiptRow {
     pub state: String,
     pub request_json: String,
     pub response_json: Option<String>,
+    pub final_revision: Option<u64>,
 }
 
 /// Definitive login failure persisted in a failed receipt (401/403 class):
@@ -269,6 +270,7 @@ pub struct LoginReceiptRow {
     pub state: String,
     pub request_json: String,
     pub response_json: Option<String>,
+    pub final_revision: Option<u64>,
 }
 
 /// Result of the atomic cancellation-intent transaction.
@@ -414,6 +416,35 @@ impl Store {
     pub fn advance_daemon_generation(&self) -> StoreResult<u64> {
         let mut connection = self.connection()?;
         next_profile_counter(&mut connection, "daemon_generation", "daemon generation")
+    }
+
+    /// Reads the revision of the coherently published account/provider
+    /// management snapshot.
+    pub fn management_revision(&self) -> StoreResult<u64> {
+        let connection = self.connection()?;
+        let revision: i64 = connection
+            .query_row(
+                "SELECT management_revision FROM profile_meta WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(map_sqlite_error)?;
+        u64::try_from(revision)
+            .map_err(|_| corrupt("database contains a negative management revision"))
+    }
+
+    /// Advances the management revision for an actor-owned state transition
+    /// that has no durable command receipt (for example automatic rotation).
+    ///
+    /// Receipt-backed mutations must use their method-specific finalizer so
+    /// final receipt state and the allocated revision share one transaction.
+    pub fn advance_management_revision(&self) -> StoreResult<u64> {
+        let mut connection = self.connection()?;
+        next_profile_counter(
+            &mut connection,
+            "management_revision",
+            "management revision",
+        )
     }
 
     /// Lists every durable session in stable byte order.
@@ -991,14 +1022,15 @@ impl Store {
         &self,
         command_id: &str,
         response: &LoginReceiptResponse,
-    ) -> StoreResult<()> {
+    ) -> StoreResult<u64> {
         let mut connection = self.connection()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_sqlite_error)?;
-        finalize_command_receipt(
+        let revision = finalize_management_command_receipt(
             &transaction,
             command_id,
+            LOGIN_METHOD,
             "",
             None,
             None,
@@ -1006,7 +1038,8 @@ impl Store {
             now_ms()?,
             "account-login",
         )?;
-        transaction.commit().map_err(map_sqlite_error)
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(revision)
     }
 
     /// Records a DEFINITIVE login failure (401/403): nothing else persists,
@@ -1037,7 +1070,7 @@ impl Store {
         let connection = self.connection()?;
         let mut statement = connection
             .prepare(
-                "SELECT command_id, state, request_json, response_json
+                "SELECT command_id, state, request_json, response_json, final_revision
                  FROM command_receipts
                  WHERE method = ?1 AND state IN ('pending', 'committed')
                  ORDER BY created_at_ms, command_id",
@@ -1045,11 +1078,13 @@ impl Store {
             .map_err(map_sqlite_error)?;
         let rows = statement
             .query_map([LOGIN_METHOD], |row| {
+                let final_revision = row.get::<_, Option<i64>>(4)?.map(sql_u64).transpose()?;
                 Ok(LoginReceiptRow {
                     command_id: row.get(0)?,
                     state: row.get(1)?,
                     request_json: row.get(2)?,
                     response_json: row.get(3)?,
+                    final_revision,
                 })
             })
             .map_err(map_sqlite_error)?
@@ -1111,14 +1146,15 @@ impl Store {
         &self,
         command_id: &str,
         response: &AccountAddReceiptResponse,
-    ) -> StoreResult<()> {
+    ) -> StoreResult<u64> {
         let mut connection = self.connection()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_sqlite_error)?;
-        finalize_command_receipt(
+        let revision = finalize_management_command_receipt(
             &transaction,
             command_id,
+            ACCOUNT_ADD_METHOD,
             "",
             None,
             None,
@@ -1126,14 +1162,15 @@ impl Store {
             now_ms()?,
             "account-add",
         )?;
-        transaction.commit().map_err(map_sqlite_error)
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(revision)
     }
 
     pub fn account_add_receipts(&self) -> StoreResult<Vec<AccountAddReceiptRow>> {
         let connection = self.connection()?;
         let mut statement = connection
             .prepare(
-                "SELECT command_id, state, request_json, response_json
+                "SELECT command_id, state, request_json, response_json, final_revision
                  FROM command_receipts
                  WHERE method = ?1 AND state IN ('pending', 'committed')
                  ORDER BY created_at_ms, command_id",
@@ -1141,17 +1178,77 @@ impl Store {
             .map_err(map_sqlite_error)?;
         let rows = statement
             .query_map([ACCOUNT_ADD_METHOD], |row| {
+                let final_revision = row.get::<_, Option<i64>>(4)?.map(sql_u64).transpose()?;
                 Ok(AccountAddReceiptRow {
                     command_id: row.get(0)?,
                     state: row.get(1)?,
                     request_json: row.get(2)?,
                     response_json: row.get(3)?,
+                    final_revision,
                 })
             })
             .map_err(map_sqlite_error)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(map_sqlite_error)?;
         Ok(rows)
+    }
+
+    /// Gives one already-committed management receipt its missing final
+    /// revision. This is the pre-ready migration/reconciliation seam for
+    /// receipts written by a daemon predating schema v6.
+    pub fn ensure_committed_management_revision(
+        &self,
+        command_id: &str,
+        method: &str,
+    ) -> StoreResult<u64> {
+        if !matches!(method, LOGIN_METHOD | ACCOUNT_ADD_METHOD) {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                format!("method `{method}` is not a management receipt"),
+                false,
+            ));
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        let (stored_method, state, final_revision): (String, String, Option<i64>) = transaction
+            .query_row(
+                "SELECT method, state, final_revision
+                 FROM command_receipts
+                 WHERE command_id = ?1",
+                [command_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(map_sqlite_error)?;
+        if stored_method != method || state != "committed" {
+            return Err(corrupt(format!(
+                "management receipt `{command_id}` is not a committed `{method}` receipt"
+            )));
+        }
+        let revision = if let Some(revision) = final_revision {
+            u64::try_from(revision)
+                .map_err(|_| corrupt("database contains a negative management revision"))?
+        } else {
+            let revision = next_management_revision_in_transaction(&transaction)?;
+            let updated = transaction
+                .execute(
+                    "UPDATE command_receipts
+                     SET final_revision = ?2
+                     WHERE command_id = ?1 AND method = ?3
+                       AND state = 'committed' AND final_revision IS NULL",
+                    params![command_id, to_sqlite_integer(revision)?, method],
+                )
+                .map_err(map_sqlite_error)?;
+            if updated != 1 {
+                return Err(corrupt(
+                    "committed management receipt lost its missing-revision claim",
+                ));
+            }
+            revision
+        };
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(revision)
     }
 
     /// Appends aggregate `Idle` only if every durable run is terminal at the
@@ -1819,6 +1916,87 @@ fn finalize_command_receipt<T: serde::Serialize>(
             "{description} command receipt was not pending at finalization"
         )))
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finalize_management_command_receipt<T: serde::Serialize>(
+    transaction: &Transaction<'_>,
+    command_id: &str,
+    method: &str,
+    session_id: &str,
+    run_id: Option<&str>,
+    accepted_seq: Option<u64>,
+    response: &T,
+    updated_at_ms: u64,
+    description: &str,
+) -> StoreResult<u64> {
+    let (stored_method, state, final_revision): (String, String, Option<i64>) = transaction
+        .query_row(
+            "SELECT method, state, final_revision
+             FROM command_receipts
+             WHERE command_id = ?1",
+            [command_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(map_sqlite_error)?;
+    if stored_method != method || state != "pending" || final_revision.is_some() {
+        return Err(corrupt(format!(
+            "{description} command receipt was not an unrevisioned pending `{method}` receipt"
+        )));
+    }
+    finalize_command_receipt(
+        transaction,
+        command_id,
+        session_id,
+        run_id,
+        accepted_seq,
+        response,
+        updated_at_ms,
+        description,
+    )?;
+    let revision = next_management_revision_in_transaction(transaction)?;
+    let updated = transaction
+        .execute(
+            "UPDATE command_receipts
+             SET final_revision = ?2
+             WHERE command_id = ?1 AND method = ?3
+               AND state = 'committed' AND final_revision IS NULL",
+            params![command_id, to_sqlite_integer(revision)?, method],
+        )
+        .map_err(map_sqlite_error)?;
+    if updated != 1 {
+        return Err(corrupt(format!(
+            "{description} receipt did not accept its final management revision"
+        )));
+    }
+    Ok(revision)
+}
+
+fn next_management_revision_in_transaction(transaction: &Transaction<'_>) -> StoreResult<u64> {
+    let current: i64 = transaction
+        .query_row(
+            "SELECT management_revision FROM profile_meta WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(map_sqlite_error)?;
+    let next = current
+        .checked_add(1)
+        .ok_or_else(|| corrupt("management revision space is exhausted"))?;
+    let updated = transaction
+        .execute(
+            "UPDATE profile_meta
+             SET management_revision = ?1
+             WHERE singleton = 1 AND management_revision = ?2",
+            params![next, current],
+        )
+        .map_err(map_sqlite_error)?;
+    if updated != 1 {
+        return Err(corrupt(
+            "profile metadata is missing its management revision singleton",
+        ));
+    }
+    u64::try_from(next).map_err(|_| corrupt("database contains a negative management revision"))
 }
 
 /// The `failed` twin of [`finalize_command_receipt`] (additive; W3c2's

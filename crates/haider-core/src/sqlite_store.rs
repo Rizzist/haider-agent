@@ -211,7 +211,7 @@ impl SqliteStoreHandle {
         &self,
         command_id: String,
         response: haider_store::LoginReceiptResponse,
-    ) -> Result<(), HaiderError> {
+    ) -> Result<u64, HaiderError> {
         let owner = Arc::clone(&self.owner);
         run_blocking(move || {
             owner.with_store(|store| store.finalize_login_receipt(&command_id, &response))
@@ -259,7 +259,7 @@ impl SqliteStoreHandle {
         &self,
         command_id: String,
         response: haider_store::AccountAddReceiptResponse,
-    ) -> Result<(), HaiderError> {
+    ) -> Result<u64, HaiderError> {
         let owner = Arc::clone(&self.owner);
         run_blocking(move || {
             owner.with_store(|store| store.finalize_account_add_receipt(&command_id, &response))
@@ -272,6 +272,35 @@ impl SqliteStoreHandle {
     ) -> Result<Vec<haider_store::AccountAddReceiptRow>, HaiderError> {
         let owner = Arc::clone(&self.owner);
         run_blocking(move || owner.with_store(|store| store.account_add_receipts())).await
+    }
+
+    /// Blocking-pool adapter for the coherent account/provider revision.
+    pub async fn management_revision(&self) -> Result<u64, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(Store::management_revision)).await
+    }
+
+    /// Advances the revision for an actor-owned transition without a command
+    /// receipt. Durable management commands use their atomic finalizers.
+    pub async fn advance_management_revision(&self) -> Result<u64, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(Store::advance_management_revision)).await
+    }
+
+    /// Idempotently repairs a committed pre-v6 management receipt that has no
+    /// final revision yet.
+    pub async fn ensure_committed_management_revision(
+        &self,
+        command_id: String,
+        method: String,
+    ) -> Result<u64, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.ensure_committed_management_revision(&command_id, &method)
+            })
+        })
+        .await
     }
 
     /// Conditionally commits aggregate `Idle` after a transactional durable
