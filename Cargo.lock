@@ -820,6 +820,7 @@ name = "haider-daemond"
 version = "0.0.13"
 dependencies = [
  "async-trait",
+ "base64",
  "haider-accounts",
  "haider-client",
  "haider-core",

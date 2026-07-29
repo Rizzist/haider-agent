@@ -219,6 +219,7 @@ pub trait ToolDispatcher: Send + Sync {
     async fn execute(
         &self,
         run_id: &RunId,
+        item_id: &ItemId,
         call_id: &str,
         name: &str,
         args: serde_json::Value,
@@ -1456,13 +1457,31 @@ impl HarnessActor {
         dispatcher: &Arc<dyn ToolDispatcher>,
     ) -> Result<BoundedResult, DriveError> {
         loop {
-            let execution =
-                dispatcher.execute(run_id, &tool.call_id, &tool.name, args.clone(), cancel);
+            let execution = dispatcher.execute(
+                run_id,
+                &tool.item_id,
+                &tool.call_id,
+                &tool.name,
+                args.clone(),
+                cancel,
+            );
             let result = tokio::select! {
                 biased;
-                () = cancel.cancelled() => return Err(DriveError::Cancelled),
-                result = execution => result.map_err(DriveError::Store)?,
+                () = cancel.cancelled() => None,
+                result = execution => Some(result),
             };
+            let Some(result) = result else {
+                // Drop the losing execution future first. Process-backed
+                // dispatchers use that drop as their cancellation hand-off;
+                // closing here drains the supervisor before core durably
+                // completes the tool item as Cancelled, so no output delta can
+                // follow the item's terminal event. Close errors cannot turn a
+                // committed user cancellation into a failure; the daemon owner
+                // repeats/logs its idempotent close after the actor settles.
+                let _ = dispatcher.close().await;
+                return Err(DriveError::Cancelled);
+            };
+            let result = result.map_err(DriveError::Store)?;
             match result {
                 ToolDispatchResult::Completed(result) => return Ok(result),
                 ToolDispatchResult::ApprovalRequired(menu) => {

@@ -146,12 +146,23 @@ impl EffectOperation for ProcessExec {
         let resolved = self.resolved(workspace_root)?;
         resolved.arguments()
     }
+
+    fn approval_preview(&self) -> Vec<String> {
+        vec![
+            format!(
+                "Exact command: {}",
+                serde_json::to_string(&self.command)
+                    .unwrap_or_else(|_| format!("{:?}", self.command))
+            ),
+            format!("Working directory: {}", self.cwd.display()),
+        ]
+    }
 }
 
 struct PreparedProcessExec {
     operation: ProcessExec,
-    cwd_fd: OwnedFd,
     cwd_identity: rustix::fs::Stat,
+    bounds: ProcessBounds,
 }
 
 impl PreparedProcessExec {
@@ -159,6 +170,7 @@ impl PreparedProcessExec {
         operation: &ProcessExec,
         workspace_root: &Path,
         workspace_dir: OwnedFd,
+        bounds: ProcessBounds,
     ) -> ToolResult<Self> {
         let operation = operation.resolved(workspace_root)?;
         let cwd_fd = open_directory_beneath(workspace_dir, workspace_root, &operation.cwd)?;
@@ -166,25 +178,35 @@ impl PreparedProcessExec {
             .map_err(|error| ToolError::io("inspect process cwd", &operation.cwd, error))?;
         Ok(Self {
             operation,
-            cwd_fd,
             cwd_identity: identity,
+            bounds,
         })
     }
 
-    fn verify_path_identity(&self) -> ToolResult<()> {
-        let current = rustix::fs::stat(&self.operation.cwd).map_err(|error| {
+    /// Re-walks the authorized cwd from a fresh workspace-root fd immediately
+    /// before spawn and returns that newly confined handle.
+    ///
+    /// A path-following `stat` is insufficient: an attacker can move the
+    /// authorized directory outside and replace its old name with a symlink to
+    /// the same inode. `O_NOFOLLOW` on every fresh component rejects that
+    /// same-inode relocation before the child can `fchdir`.
+    fn cwd_for_spawn(&self, workspace_root: &Path, workspace_dir: OwnedFd) -> ToolResult<OwnedFd> {
+        let cwd_fd = open_directory_beneath(workspace_dir, workspace_root, &self.operation.cwd)
+            .map_err(|error| ToolError::PathChanged {
+                path: self.operation.cwd.clone(),
+                message: format!("cwd no longer resolves through the workspace root: {error}"),
+            })?;
+        let current = rustix::fs::fstat(&cwd_fd).map_err(|error| {
             ToolError::io("verify authorized process cwd", &self.operation.cwd, error)
         })?;
         if current.st_dev != self.cwd_identity.st_dev || current.st_ino != self.cwd_identity.st_ino
         {
-            return Err(ToolError::Runtime {
-                message: format!(
-                    "authorized process cwd changed before spawn: {}",
-                    self.operation.cwd.display()
-                ),
+            return Err(ToolError::PathChanged {
+                path: self.operation.cwd.clone(),
+                message: "process cwd identity changed before spawn".into(),
             });
         }
-        Ok(())
+        Ok(cwd_fd)
     }
 }
 
@@ -194,7 +216,12 @@ impl EffectOperation for PreparedProcessExec {
     }
 
     fn summary(&self) -> String {
-        self.operation.summary()
+        format!(
+            "{} [timeout={}ms, output_cap={} bytes]",
+            self.operation.summary(),
+            self.bounds.wall_timeout.as_millis(),
+            self.bounds.max_output_bytes,
+        )
     }
 
     fn arguments(&self) -> ToolResult<Value> {
@@ -204,11 +231,26 @@ impl EffectOperation for PreparedProcessExec {
     fn canonical_arguments(&self, _workspace_root: &Path) -> ToolResult<Value> {
         self.operation.arguments()
     }
+
+    fn approval_preview(&self) -> Vec<String> {
+        let mut preview = self.operation.approval_preview();
+        preview.push(format!(
+            "Limits: {}ms wall clock, {} output bytes",
+            self.bounds.wall_timeout.as_millis(),
+            self.bounds.max_output_bytes,
+        ));
+        preview
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProcessBounds {
     pub max_inline_bytes: usize,
+    /// Hard combined stdout/stderr byte cap. Reaching it terminates the whole
+    /// process group and reports a typed failed process result.
+    pub max_output_bytes: usize,
+    /// Hard wall-clock limit from successful spawn through process exit.
+    pub wall_timeout: Duration,
     pub kill_grace: Duration,
 }
 
@@ -216,9 +258,18 @@ impl Default for ProcessBounds {
     fn default() -> Self {
         Self {
             max_inline_bytes: 8 * 1024,
+            max_output_bytes: 1024 * 1024,
+            wall_timeout: Duration::from_secs(60),
             kill_grace: Duration::from_secs(2),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessLimit {
+    WallTimeout,
+    OutputCap,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -237,6 +288,9 @@ pub struct ProcessResult {
     pub inline_output: Vec<ProcessOutputChunk>,
     pub artifact: Option<ArtifactRef>,
     pub escalation_note: Option<String>,
+    pub limit_reached: Option<ProcessLimit>,
+    pub wall_timeout_ms: u64,
+    pub max_output_bytes: usize,
     /// Largest raw transcript payload retained in memory at one time.
     ///
     /// This excludes the serialized spill file and includes the chunk being
@@ -290,7 +344,7 @@ pub struct ProcessExecution {
     effect: EffectId,
     cancel: watch::Sender<bool>,
     result: oneshot::Receiver<ToolResult<ProcessResult>>,
-    finalizer: FinalizerObserver,
+    finalizer: Option<FinalizerObserver>,
 }
 
 impl std::fmt::Debug for ProcessExecution {
@@ -317,12 +371,26 @@ impl ProcessExecution {
         self.cancel.send_replace(true);
     }
 
-    pub async fn wait(self) -> ToolResult<ProcessResult> {
-        let result = self.result.await.map_err(|error| ToolError::Runtime {
-            message: format!("process supervisor stopped before reporting its result: {error}"),
-        });
-        self.finalizer.observe();
+    pub async fn wait(mut self) -> ToolResult<ProcessResult> {
+        let result = (&mut self.result)
+            .await
+            .map_err(|error| ToolError::Runtime {
+                message: format!("process supervisor stopped before reporting its result: {error}"),
+            });
+        if let Some(finalizer) = self.finalizer.take() {
+            finalizer.observe();
+        }
         result?
+    }
+}
+
+impl Drop for ProcessExecution {
+    fn drop(&mut self) {
+        // A caller-side cancellation can drop the dispatcher future before it
+        // gets a chance to explicitly cancel this handle. Dropping ownership
+        // must therefore wake the broker-owned supervisor; the finalizer keeps
+        // the TERM → grace → KILL and durable outcome work alive.
+        self.cancel.send_replace(true);
     }
 }
 
@@ -560,6 +628,7 @@ impl EffectBroker {
             operation,
             self.workspace_root(),
             self.duplicate_workspace_dir()?,
+            bounds,
         )?;
         let operation = prepared.operation.clone();
         if self.processes.contains(&operation.call_id).await {
@@ -572,9 +641,11 @@ impl EffectBroker {
             Some(policy) => self.begin(&prepared, policy).await?,
             None => self.begin_user_typed(&prepared).await?,
         };
-        if let Err(error) = prepared.verify_path_identity() {
-            return self.finish(&intent, Err(error)).await;
-        }
+        let cwd_fd =
+            match prepared.cwd_for_spawn(self.workspace_root(), self.duplicate_workspace_dir()?) {
+                Ok(cwd_fd) => cwd_fd,
+                Err(error) => return self.finish(&intent, Err(error)).await,
+            };
         let mut command = Command::new("/bin/sh");
         command
             .arg("-c")
@@ -588,7 +659,6 @@ impl EffectBroker {
                 command.env(name, value);
             }
         }
-        let cwd_fd = prepared.cwd_fd;
         set_anchored_current_dir(&mut command, cwd_fd);
         command.as_std_mut().process_group(0);
         let mut child = match command.spawn() {
@@ -691,7 +761,12 @@ impl EffectBroker {
                     Some(note) => EffectOutcome::CancelledEscalated { note: note.clone() },
                     None => EffectOutcome::Cancelled,
                 },
-                (Ok(_), false) => EffectOutcome::Ok,
+                (Ok(result), false) => match result.limit_reached {
+                    Some(limit) => EffectOutcome::Failed {
+                        error: format!("process limit reached: {limit:?}"),
+                    },
+                    None => EffectOutcome::Ok,
+                },
                 (Err(error), false) => EffectOutcome::Failed {
                     error: error.to_string(),
                 },
@@ -711,7 +786,7 @@ impl EffectBroker {
             effect: intent.effect,
             cancel,
             result,
-            finalizer,
+            finalizer: Some(finalizer),
         })
     }
 
@@ -871,6 +946,9 @@ async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
     let mut escalation_notes = Vec::new();
     let mut lifecycle_events = Vec::new();
     let mut group_leaked = false;
+    let mut limit_reached = None;
+    let mut wall_deadline = Box::pin(sleep(bounds.wall_timeout));
+    let mut wall_deadline_open = true;
     let mut exit_observation = Box::pin(observe_process_leader_exit(pid));
 
     if cancelled {
@@ -907,6 +985,19 @@ async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
                     Err(_) => cancel_open = false,
                 }
             }
+            () = &mut wall_deadline, if wall_deadline_open && !leader_exit_observed && limit_reached.is_none() => {
+                wall_deadline_open = false;
+                limit_reached = Some(ProcessLimit::WallTimeout);
+                begin_group_termination(
+                    pid,
+                    false,
+                    bounds.kill_grace,
+                    &mut kill_deadline,
+                    &mut fatal,
+                    &mut escalation_notes,
+                    &mut lifecycle_events,
+                );
+            }
             () = async {
                 if let Some(deadline) = pipe_drain_deadline.as_mut() {
                     deadline.await;
@@ -922,29 +1013,37 @@ async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
             }
             maybe_chunk = captured.recv(), if output_open => {
                 match maybe_chunk {
-                    Some(Captured::Chunk(stream, bytes)) => {
+                    Some(Captured::Chunk(stream, mut bytes)) => {
+                        if cancelled || limit_reached.is_some() {
+                            continue;
+                        }
+                        let remaining = bounds.max_output_bytes.saturating_sub(output_bytes);
+                        let reached_cap = bytes.len() >= remaining;
+                        bytes.truncate(remaining);
                         transcript_high_water_bytes = transcript_high_water_bytes.max(
                             transcript_payload_bytes.saturating_add(bytes.len())
                         );
                         output_bytes = output_bytes.saturating_add(bytes.len());
-                        let chunk_b64 = BASE64.encode(&bytes);
-                        if let Err(error) = output.emit(
-                            &call_id,
-                            ItemDelta::CommandOutput {
-                                stream,
-                                chunk_b64: chunk_b64.clone(),
-                            },
-                        ).await {
-                            fatal.get_or_insert(error);
-                            begin_group_termination(
-                                pid,
-                                false,
-                                bounds.kill_grace,
-                                &mut kill_deadline,
-                                &mut fatal,
-                                &mut escalation_notes,
-                                &mut lifecycle_events,
-                            );
+                        if !bytes.is_empty() {
+                            let chunk_b64 = BASE64.encode(&bytes);
+                            if let Err(error) = output.emit(
+                                &call_id,
+                                ItemDelta::CommandOutput {
+                                    stream,
+                                    chunk_b64: chunk_b64.clone(),
+                                },
+                            ).await {
+                                fatal.get_or_insert(error);
+                                begin_group_termination(
+                                    pid,
+                                    false,
+                                    bounds.kill_grace,
+                                    &mut kill_deadline,
+                                    &mut fatal,
+                                    &mut escalation_notes,
+                                    &mut lifecycle_events,
+                                );
+                            }
                         }
                         if !transcript_failed
                             && spill.is_none()
@@ -1006,6 +1105,18 @@ async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
                                 transcript_payload_bytes.saturating_add(bytes.len());
                             transcript.push(BufferedOutput { stream, bytes });
                         }
+                        if reached_cap {
+                            limit_reached = Some(ProcessLimit::OutputCap);
+                            begin_group_termination(
+                                pid,
+                                false,
+                                bounds.kill_grace,
+                                &mut kill_deadline,
+                                &mut fatal,
+                                &mut escalation_notes,
+                                &mut lifecycle_events,
+                            );
+                        }
                     }
                     Some(Captured::ReadError(stream, error)) => {
                         fatal.get_or_insert_with(|| ToolError::Runtime {
@@ -1029,6 +1140,7 @@ async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
             }
             observed = &mut exit_observation, if !leader_exit_observed => {
                 leader_exit_observed = true;
+                wall_deadline_open = false;
                 leader_is_zombie = match observed {
                     Ok(()) => {
                         lifecycle_events.push(ProcessLifecycleEvent::LeaderExitObserved);
@@ -1178,6 +1290,8 @@ async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
         effect,
         status: if cancelled {
             ToolStatus::Cancelled
+        } else if limit_reached.is_some() {
+            ToolStatus::Failed
         } else if exit_status
             .as_ref()
             .is_some_and(std::process::ExitStatus::success)
@@ -1193,6 +1307,9 @@ async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
         inline_output,
         artifact,
         escalation_note: escalation_note.clone(),
+        limit_reached,
+        wall_timeout_ms: u64::try_from(bounds.wall_timeout.as_millis()).unwrap_or(u64::MAX),
+        max_output_bytes: bounds.max_output_bytes,
         transcript_high_water_bytes,
         lifecycle_events,
     };

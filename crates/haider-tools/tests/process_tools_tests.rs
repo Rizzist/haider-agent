@@ -15,6 +15,7 @@ use haider_tools::{
     ProcessLifecycleEvent, ProcessOutputChunk, REDACTED_ENV_VALUE, ShellSession, ToolError,
     ToolResult,
 };
+use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -305,7 +306,9 @@ async fn output_flood_spills_while_streaming_and_completes_under_paused_time() {
             RecordingOutput::default(),
             ProcessBounds {
                 max_inline_bytes: 1024,
+                max_output_bytes: 2 * 1024 * 1024,
                 kill_grace: Duration::from_secs(1),
+                ..ProcessBounds::default()
             },
         )
         .await
@@ -342,6 +345,103 @@ async fn output_flood_spills_while_streaming_and_completes_under_paused_time() {
     broker.close().await.expect("broker closes");
 }
 
+#[tokio::test]
+async fn hard_output_cap_terminates_the_process_group_and_reports_the_ledgered_limit() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let (mut broker, journal) = broker(workspace.path());
+    let output = RecordingOutput::default();
+    let output_observer = output.observer();
+    let result = broker
+        .process_exec(
+            &ProcessExec::new("output-cap", "/usr/bin/head -c 1048576 /dev/zero"),
+            &process_policy(),
+            RecordingCas::default(),
+            output,
+            ProcessBounds {
+                max_inline_bytes: 2048,
+                max_output_bytes: 4096,
+                wall_timeout: Duration::from_secs(10),
+                kill_grace: Duration::from_millis(10),
+            },
+        )
+        .await
+        .expect("process starts")
+        .wait()
+        .await
+        .expect("bounded process result");
+    assert_eq!(result.status, ToolStatus::Failed);
+    assert_eq!(
+        result.limit_reached,
+        Some(haider_tools::ProcessLimit::OutputCap)
+    );
+    assert_eq!(result.output_bytes, 4096);
+    assert_eq!(result.max_output_bytes, 4096);
+    assert_eq!(
+        output_bytes(&output_observer.lock().expect("output observer")).len(),
+        4096,
+        "streaming must stop exactly at the hard cap"
+    );
+    assert!(phases(&journal).iter().any(|phase| matches!(
+        phase,
+        EffectPhase::Intent(intent)
+            if intent.summary.contains("timeout=10000ms")
+                && intent.summary.contains("output_cap=4096 bytes")
+    )));
+    assert!(phases(&journal).iter().any(|phase| matches!(
+        phase,
+        EffectPhase::Outcome {
+            outcome: EffectOutcome::Failed { error },
+            ..
+        } if error.contains("OutputCap")
+    )));
+    broker.close().await.expect("broker closes");
+}
+
+#[tokio::test(start_paused = true)]
+async fn wall_timeout_terminates_the_process_group_and_reports_the_ledgered_limit() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let (mut broker, journal) = broker(workspace.path());
+    let wall_timeout = Duration::from_secs(3);
+    let kill_grace = Duration::from_secs(1);
+    let execution = broker
+        .process_exec(
+            &ProcessExec::new("wall-timeout", "trap '' TERM; while :; do :; done"),
+            &process_policy(),
+            RecordingCas::default(),
+            RecordingOutput::default(),
+            ProcessBounds {
+                max_inline_bytes: 1024,
+                max_output_bytes: 4096,
+                wall_timeout,
+                kill_grace,
+            },
+        )
+        .await
+        .expect("process starts");
+    settle().await;
+    tokio::time::advance(wall_timeout).await;
+    settle().await;
+    tokio::time::advance(kill_grace).await;
+    let result = execution.wait().await.expect("bounded process result");
+    assert_eq!(result.status, ToolStatus::Failed);
+    assert_eq!(
+        result.limit_reached,
+        Some(haider_tools::ProcessLimit::WallTimeout)
+    );
+    assert_eq!(
+        result.wall_timeout_ms,
+        u64::try_from(wall_timeout.as_millis()).expect("test duration fits")
+    );
+    assert!(phases(&journal).iter().any(|phase| matches!(
+        phase,
+        EffectPhase::Outcome {
+            outcome: EffectOutcome::Failed { error },
+            ..
+        } if error.contains("WallTimeout")
+    )));
+    broker.close().await.expect("broker closes");
+}
+
 async fn cancellation_during_gated_cas_is_sticky(fail: bool) {
     let workspace = tempfile::tempdir().expect("tempdir");
     let (mut broker, journal) = broker(workspace.path());
@@ -360,6 +460,7 @@ async fn cancellation_during_gated_cas_is_sticky(fail: bool) {
             ProcessBounds {
                 max_inline_bytes: 1024,
                 kill_grace: Duration::from_millis(1),
+                ..ProcessBounds::default()
             },
         )
         .await
@@ -415,6 +516,7 @@ async fn cancellation_wins_over_output_sink_and_cas_failures() {
             ProcessBounds {
                 max_inline_bytes: 1024,
                 kill_grace: grace,
+                ..ProcessBounds::default()
             },
         )
         .await
@@ -462,6 +564,7 @@ async fn shell_exit_sweeps_background_members_of_its_process_group() {
             ProcessBounds {
                 max_inline_bytes: 1024,
                 kill_grace: Duration::from_secs(1),
+                ..ProcessBounds::default()
             },
         )
         .await
@@ -558,9 +661,45 @@ async fn cwd_identity_change_after_authorization_is_refused_before_spawn() {
         )
         .await
         .expect_err("changed cwd identity is rejected");
-    assert!(error.to_string().contains("changed before spawn"));
+    assert!(matches!(error, ToolError::PathChanged { .. }));
     assert!(!anchored.join("marker").exists());
     assert!(!outside.path().join("marker").exists());
+    broker.close().await.expect("broker closes");
+}
+
+#[tokio::test]
+async fn same_inode_cwd_moved_outside_and_symlinked_back_is_refused_before_spawn() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let outside = tempfile::tempdir().expect("outside");
+    let target = workspace.path().join("target");
+    let moved = outside.path().join("moved-authorized-cwd");
+    std::fs::create_dir(&target).expect("target cwd");
+    let journal = SwapCwdJournal {
+        target: target.clone(),
+        anchored: moved.clone(),
+        replacement: moved.clone(),
+        swapped: false,
+    };
+    let mut broker = EffectBroker::new_at(
+        Box::new(journal),
+        workspace.path(),
+        SessionId::new("cwd-same-inode-race"),
+        1,
+        1_700_000_000_000,
+    )
+    .expect("broker");
+    let error = broker
+        .process_exec(
+            &ProcessExec::new("cwd-same-inode-race", "printf spawned > marker").with_cwd("target"),
+            &process_policy(),
+            RecordingCas::default(),
+            RecordingOutput::default(),
+            ProcessBounds::default(),
+        )
+        .await
+        .expect_err("same-inode cwd relocation is rejected");
+    assert!(matches!(error, ToolError::PathChanged { .. }));
+    assert!(!moved.join("marker").exists());
     broker.close().await.expect("broker closes");
 }
 
@@ -632,6 +771,7 @@ async fn cancellation_waits_for_grace_then_kills_the_group_and_is_not_a_failure(
             ProcessBounds {
                 max_inline_bytes: 1024,
                 kill_grace: grace,
+                ..ProcessBounds::default()
             },
         )
         .await
@@ -664,6 +804,50 @@ async fn cancellation_waits_for_grace_then_kills_the_group_and_is_not_a_failure(
         is_cancelled_outcome(&phases[3]),
         "supervised termination is journaled as a cancellation, got {:?}",
         phases[3]
+    );
+    broker.close().await.expect("broker closes");
+}
+
+/// W4a2 cancellation hand-off mutation sentinel.
+///
+/// MUTATION CHECK: remove the `send_replace(true)` in
+/// `ProcessExecution::drop`. The bounded heartbeat command keeps writing
+/// during the observation window and this test fails. Verified by revert in
+/// W4a2.
+#[tokio::test]
+async fn dropping_process_execution_cancels_and_kills_the_child_group() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let heartbeat = workspace.path().join("heartbeat.log");
+    let (mut broker, _journal) = broker(workspace.path());
+    let output = RecordingOutput::default();
+    let output_observer = output.observer();
+    let execution = broker
+        .process_exec(
+            &ProcessExec::new(
+                "drop-cancel",
+                "printf started; i=0; while [ \"$i\" -lt 100 ]; do printf x >> heartbeat.log; i=$((i+1)); sleep 0.01; done",
+            ),
+            &process_policy(),
+            RecordingCas::default(),
+            output,
+            ProcessBounds {
+                kill_grace: Duration::from_millis(10),
+                ..ProcessBounds::default()
+            },
+        )
+        .await
+        .expect("process starts");
+    while output_observer.lock().expect("output observer").is_empty() {
+        tokio::task::yield_now().await;
+    }
+    drop(execution);
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let stopped_size = fs::metadata(&heartbeat).expect("heartbeat metadata").len();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        fs::metadata(&heartbeat).expect("heartbeat metadata").len(),
+        stopped_size,
+        "dropped execution left the child group running"
     );
     broker.close().await.expect("broker closes");
 }
@@ -728,6 +912,7 @@ async fn process_control_kill_is_brokered_and_cancels_the_original_as_an_outcome
             ProcessBounds {
                 max_inline_bytes: 1024,
                 kill_grace: grace,
+                ..ProcessBounds::default()
             },
         )
         .await

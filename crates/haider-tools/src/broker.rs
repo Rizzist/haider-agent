@@ -26,9 +26,10 @@
 //!   REJECTION is not implemented today and would be an additional guard.
 //! - **Digest-bound one-shot approvals.** `args_digest` is BLAKE3 over
 //!   canonical (recursively key-sorted) argument JSON — never a tool name.
-//!   Approve-once binds class + exact digest. The explicit
-//!   approve-for-session choice is deliberately class-scoped and reconstructed
-//!   by the daemon from the durable menu answer.
+//!   Approve-once binds class + exact digest. Session grants are reconstructed
+//!   by the daemon from the durable menu answer. Filesystem grants remain
+//!   class-scoped; process grants are exact command-shape scoped and a
+//!   class-wide `ProcessExec` grant is rejected.
 //! - **Intent-bound authorization.** Lifecycle state retains the complete
 //!   journaled intent. Authorization and later transitions accept that intent,
 //!   and reject a reused effect id whose digest or other fields differ.
@@ -153,6 +154,48 @@ pub struct AlwaysAllowRule {
     pub args_digest: String,
 }
 
+/// Durable scope of an approve-for-session grant.
+///
+/// A command shape is the canonical process argument digest: exact shell
+/// program bytes + canonical cwd + sorted environment allowlist. The call id
+/// is deliberately absent. This is narrower than executable-name or parsed
+/// argv scopes and cannot collapse shell quoting/whitespace with different
+/// semantics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionGrantScope {
+    Class,
+    CommandShape { args_digest: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionGrant {
+    pub class: EffectClass,
+    pub scope: SessionGrantScope,
+}
+
+impl SessionGrant {
+    pub fn for_effect(class: EffectClass, args_digest: impl Into<String>) -> Self {
+        let scope = if class == EffectClass::ProcessExec {
+            SessionGrantScope::CommandShape {
+                args_digest: args_digest.into(),
+            }
+        } else {
+            SessionGrantScope::Class
+        };
+        Self { class, scope }
+    }
+
+    fn matches(&self, intent: &EffectIntent) -> bool {
+        if self.class != intent.class {
+            return false;
+        }
+        match &self.scope {
+            SessionGrantScope::Class => true,
+            SessionGrantScope::CommandShape { args_digest } => args_digest == &intent.args_digest,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct DenyRule {
     class: EffectClass,
@@ -169,7 +212,7 @@ pub struct PermissionPolicy {
     asklist: Vec<EffectClass>,
     denylist: Vec<DenyRule>,
     always_allow: Vec<AlwaysAllowRule>,
-    session_allow: Vec<EffectClass>,
+    session_allow: Vec<SessionGrant>,
 }
 
 impl PermissionPolicy {
@@ -232,16 +275,30 @@ impl PermissionPolicy {
         &self.always_allow
     }
 
-    /// Adds the durable-menu-derived class grant used by "approve for this
-    /// session". The daemon reconstructs these grants from committed menu
-    /// answers whenever it creates a new turn dispatcher.
-    pub fn allow_for_session(&mut self, class: EffectClass) {
-        if !self.session_allow.contains(&class) {
-            self.session_allow.push(class);
-        }
+    /// Adds a durable-menu-derived class grant. `ProcessExec` is deliberately
+    /// refused here: shell session grants must use [`SessionGrantScope::CommandShape`].
+    pub fn allow_for_session(&mut self, class: EffectClass) -> ToolResult<()> {
+        self.allow_session_grant(SessionGrant {
+            class,
+            scope: SessionGrantScope::Class,
+        })
     }
 
-    pub fn session_allowlist(&self) -> &[EffectClass] {
+    /// Adds a reconstructed session grant after validating that process
+    /// execution can never become class-wide.
+    pub fn allow_session_grant(&mut self, grant: SessionGrant) -> ToolResult<()> {
+        if grant.class == EffectClass::ProcessExec && grant.scope == SessionGrantScope::Class {
+            return Err(ToolError::invalid_argument(
+                "class-wide ProcessExec session grants are forbidden",
+            ));
+        }
+        if !self.session_allow.contains(&grant) {
+            self.session_allow.push(grant);
+        }
+        Ok(())
+    }
+
+    pub fn session_allowlist(&self) -> &[SessionGrant] {
         &self.session_allow
     }
 
@@ -273,7 +330,7 @@ impl PermissionPolicy {
             .always_allow
             .iter()
             .any(|rule| rule.class == intent.class && rule.args_digest == intent.args_digest)
-            || self.session_allow.contains(&intent.class)
+            || self.session_allow.iter().any(|grant| grant.matches(intent))
             || self.allowlist.contains(&intent.class)
         {
             return PolicyDecision::Allow;
@@ -931,7 +988,7 @@ impl EffectBroker {
             })?;
         let decision = selected_decision(&pending.menu, answer)?;
         self.pending_permissions.remove(&answer.menu);
-        self.apply_permission_decision(pending.class, pending.args_digest, decision, policy);
+        self.apply_permission_decision(pending.class, pending.args_digest, decision, policy)?;
         Ok(())
     }
 
@@ -962,7 +1019,7 @@ impl EffectBroker {
             });
         }
         let decision = selected_decision(menu, answer)?;
-        self.apply_permission_decision(class, args_digest, decision, policy);
+        self.apply_permission_decision(class, args_digest, decision, policy)?;
         Ok(())
     }
 
@@ -972,14 +1029,16 @@ impl EffectBroker {
         args_digest: String,
         decision: DecisionKind,
         policy: &mut PermissionPolicy,
-    ) {
+    ) -> ToolResult<()> {
         match decision {
             DecisionKind::AllowOnce => self.one_shot_rules.push(OneShotRule {
                 class,
                 args_digest,
                 decision: PolicyDecision::Allow,
             }),
-            DecisionKind::AllowAlways => policy.allow_for_session(class),
+            DecisionKind::AllowAlways => {
+                policy.allow_session_grant(SessionGrant::for_effect(class, args_digest))?
+            }
             DecisionKind::RejectOnce => self.one_shot_rules.push(OneShotRule {
                 class,
                 args_digest,
@@ -991,6 +1050,7 @@ impl EffectBroker {
                 policy.deny(class, "rejected always by user");
             }
         }
+        Ok(())
     }
 
     pub async fn journal_dispatched(&mut self, intent: &EffectIntent) -> ToolResult<()> {
@@ -1194,10 +1254,18 @@ impl EffectBroker {
             .cloned()
             .unwrap_or_else(|| vec![intent.summary.clone()]);
         body.push(format!("Effect class: {:?}", intent.class));
-        body.push(format!(
-            "Approve for this session allows the {:?} class until the session ends.",
-            intent.class
-        ));
+        if intent.class == EffectClass::ProcessExec {
+            body.push(
+                "Approve for this session allows only this exact command shape \
+                 (shell program, canonical cwd, and environment allowlist)."
+                    .into(),
+            );
+        } else {
+            body.push(format!(
+                "Approve for this session allows the {:?} class until the session ends.",
+                intent.class
+            ));
+        }
         Menu {
             id: MenuId::new(format!(
                 "permission-{}-{}-{}-{}",

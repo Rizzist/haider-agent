@@ -37,7 +37,8 @@ use haider_protocol::effect::{
 };
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
 use haider_protocol::error::{ErrorCode, HaiderError};
-use haider_protocol::ids::{DeviceId, EffectId, EventId, MenuId, RunId, SessionId};
+use haider_protocol::ids::{DeviceId, EffectId, EventId, ItemId, MenuId, RunId, SessionId};
+use haider_protocol::item::{ItemDelta, ItemEvent};
 use haider_protocol::menu::{DecisionKind, Menu, MenuAnswer, MenuKind};
 use haider_protocol::session::SessionMetadataV1;
 use haider_protocol::state::{RunState, SessionState};
@@ -45,8 +46,9 @@ use haider_protocol::tool::BoundedResult;
 use haider_provider::{Message, ResolvedAttachment};
 use haider_provider::{Provider, ToolDefinition};
 use haider_tools::{
-    CasSink, ChangeLedger, EffectBroker, FsList, FsPatch, FsRead, FsSearch, FsWrite, JournalSink,
-    PermissionPolicy, ResultBounds, ToolResult, TurnAttribution,
+    CasSink, ChangeLedger, CommandOutputSink, EffectBroker, FsList, FsPatch, FsRead, FsSearch,
+    FsWrite, JournalSink, PermissionPolicy, ProcessBounds, ProcessExec, ProcessResult,
+    ResultBounds, SessionGrant, ToolResult, TurnAttribution,
 };
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::Path;
@@ -2133,6 +2135,7 @@ impl TurnToolFactory for BrokerToolFactory {
             tool_definition("fs_search", "Search files for text", &["root", "query"]),
             fs_write_definition(),
             fs_patch_definition(),
+            exec_definition(),
         ]
     }
 
@@ -2153,9 +2156,15 @@ impl TurnToolFactory for BrokerToolFactory {
         let mut policy = PermissionPolicy::default();
         policy.allow(EffectClass::FsRead);
         policy.ask(EffectClass::FsWrite);
-        for class in durable_permissions.grants {
-            policy.allow_for_session(class);
+        policy.ask(EffectClass::ProcessExec);
+        for grant in durable_permissions.grants {
+            policy.allow_session_grant(grant).map_err(tool_error)?;
         }
+        let output = HubCommandOutputContext {
+            store: context.store.clone(),
+            device_id: context.device_id.clone(),
+            event_ids: Arc::clone(&context.event_ids),
+        };
         Ok(Some(Arc::new(BrokerToolDispatcher {
             broker: Mutex::new(Some(broker)),
             policy: Mutex::new(policy),
@@ -2164,6 +2173,7 @@ impl TurnToolFactory for BrokerToolFactory {
             }),
             ledger: ChangeLedger::new(),
             session_id,
+            output,
             durable_permission_bindings: durable_permissions.bindings,
         })))
     }
@@ -2175,6 +2185,7 @@ struct BrokerToolDispatcher {
     cas: Mutex<HubArtifactStore>,
     ledger: ChangeLedger,
     session_id: SessionId,
+    output: HubCommandOutputContext,
     durable_permission_bindings: HashMap<MenuId, (EffectClass, String)>,
 }
 
@@ -2183,7 +2194,8 @@ impl ToolDispatcher for BrokerToolDispatcher {
     async fn execute(
         &self,
         run_id: &RunId,
-        _call_id: &str,
+        item_id: &ItemId,
+        call_id: &str,
         name: &str,
         args: serde_json::Value,
         cancel: &CancelToken,
@@ -2204,10 +2216,10 @@ impl ToolDispatcher for BrokerToolDispatcher {
             )
         })?;
         let policy = self.policy.lock().await;
-        let mut cas = self.cas.lock().await;
         let result = match name {
             "fs_read" => {
                 let path = required_string(&args, "path")?;
+                let mut cas = self.cas.lock().await;
                 broker
                     .fs_read(
                         &FsRead::new(path),
@@ -2219,6 +2231,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
             }
             "fs_list" => {
                 let path = required_string(&args, "path")?;
+                let mut cas = self.cas.lock().await;
                 broker
                     .fs_list(
                         &FsList::new(path),
@@ -2231,6 +2244,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
             "fs_search" => {
                 let root = required_string(&args, "root")?;
                 let query = required_string(&args, "query")?;
+                let mut cas = self.cas.lock().await;
                 broker
                     .fs_search(
                         &FsSearch::new(root, query),
@@ -2239,6 +2253,25 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         ResultBounds::default(),
                     )
                     .await
+            }
+            "exec" => {
+                let command = required_string(&args, "command")?;
+                let cwd = optional_string(&args, "cwd")?;
+                let mut operation = ProcessExec::new(call_id, command);
+                if let Some(cwd) = cwd {
+                    operation = operation.with_cwd(cwd);
+                }
+                let cas = self.cas.lock().await.clone();
+                let output = self
+                    .output
+                    .sink(run_id.clone(), item_id.clone(), call_id.to_owned());
+                match broker
+                    .process_exec(&operation, &policy, cas, output, ProcessBounds::default())
+                    .await
+                {
+                    Ok(execution) => execution.wait().await.map(process_result),
+                    Err(error) => Err(error),
+                }
             }
             "fs_write" => {
                 let path = required_string(&args, "path")?;
@@ -2349,7 +2382,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
 }
 
 struct DurablePermissionState {
-    grants: Vec<EffectClass>,
+    grants: Vec<SessionGrant>,
     bindings: HashMap<MenuId, (EffectClass, String)>,
 }
 
@@ -2399,11 +2432,12 @@ async fn durable_session_permission_state(
                     if option.decision != Some(DecisionKind::AllowAlways) {
                         continue;
                     }
-                    let Some((class, _)) = bindings.get(&menu.id) else {
+                    let Some((class, args_digest)) = bindings.get(&menu.id) else {
                         continue;
                     };
-                    if !grants.contains(class) {
-                        grants.push(class.clone());
+                    let grant = SessionGrant::for_effect(class.clone(), args_digest.clone());
+                    if !grants.contains(&grant) {
+                        grants.push(grant);
                     }
                 }
                 _ => {}
@@ -2537,6 +2571,31 @@ fn tool_definition(name: &str, description: &str, required: &[&str]) -> ToolDefi
     }
 }
 
+fn exec_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "exec".into(),
+        description: "Run one non-interactive shell command inside the session workspace".into(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 8192,
+                    "description": "Exact shell program passed to /bin/sh -c"
+                },
+                "cwd": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Optional workspace-relative working directory"
+                }
+            },
+            "required": ["command"],
+            "additionalProperties": false,
+        }),
+    }
+}
+
 fn required_string(args: &serde_json::Value, field: &str) -> Result<String, HaiderError> {
     args.get(field)
         .and_then(serde_json::Value::as_str)
@@ -2567,6 +2626,48 @@ fn required_string_allow_empty(
         })
 }
 
+fn optional_string(args: &serde_json::Value, field: &str) -> Result<Option<String>, HaiderError> {
+    let Some(value) = args.get(field) else {
+        return Ok(None);
+    };
+    value
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .map(|value| Some(value.to_owned()))
+        .ok_or_else(|| {
+            HaiderError::new(
+                ErrorCode::InvalidArgument,
+                format!("tool argument `{field}` must be a non-empty string when provided"),
+                false,
+            )
+        })
+}
+
+fn process_result(result: ProcessResult) -> BoundedResult {
+    let artifact = result.artifact.clone();
+    let truncated = artifact.is_some() || result.limit_reached.is_some();
+    BoundedResult {
+        preview: serde_json::json!({
+            "status": result.status,
+            "exit_code": result.exit_code,
+            "output_bytes": result.output_bytes,
+            "inline_output": result.inline_output,
+            "artifact": artifact,
+            "limit_reached": result.limit_reached,
+            "limits": {
+                "wall_timeout_ms": result.wall_timeout_ms,
+                "max_output_bytes": result.max_output_bytes,
+            },
+            "escalation_note": result.escalation_note,
+        })
+        .to_string(),
+        truncated,
+        artifact,
+        cursor: None,
+    }
+}
+
+#[derive(Clone)]
 struct HubArtifactStore {
     store: HubStoreHandle,
 }
@@ -2589,6 +2690,82 @@ impl CasSink for HubArtifactStore {
             .map_err(|error| haider_tools::ToolError::Runtime {
                 message: error.message,
             })
+    }
+}
+
+#[derive(Clone)]
+struct HubCommandOutputContext {
+    store: HubStoreHandle,
+    device_id: DeviceId,
+    event_ids: Arc<EventIdGenerator>,
+}
+
+impl HubCommandOutputContext {
+    fn sink(&self, run_id: RunId, item_id: ItemId, call_id: String) -> HubCommandOutputSink {
+        HubCommandOutputSink {
+            store: self.store.clone(),
+            run_id,
+            item_id,
+            call_id,
+            device_id: self.device_id.clone(),
+            event_ids: Arc::clone(&self.event_ids),
+        }
+    }
+}
+
+struct HubCommandOutputSink {
+    store: HubStoreHandle,
+    run_id: RunId,
+    item_id: ItemId,
+    call_id: String,
+    device_id: DeviceId,
+    event_ids: Arc<EventIdGenerator>,
+}
+
+#[async_trait]
+impl CommandOutputSink for HubCommandOutputSink {
+    async fn emit(&self, call_id: &str, delta: ItemDelta) -> ToolResult<()> {
+        if call_id != self.call_id {
+            return Err(haider_tools::ToolError::Runtime {
+                message: format!(
+                    "process output call id `{call_id}` does not match `{}`",
+                    self.call_id
+                ),
+            });
+        }
+        let mut envelopes = [EventEnvelope {
+            schema_version: SCHEMA_VERSION,
+            event_id: self.event_ids.next(),
+            seq: 0,
+            session_id: self.store.session_id().clone(),
+            branch_id: None,
+            run_id: Some(self.run_id.clone()),
+            agent_id: None,
+            device_id: self.device_id.clone(),
+            authority_epoch: 0,
+            worker_generation: self.store.worker_generation(),
+            causation_id: None,
+            correlation_id: None,
+            committed_at_ms: 0,
+            render: RenderTargets {
+                ui: true,
+                durable: true,
+                prompt: PromptRender::Omit,
+            },
+            payload: serde_json::to_value(EventPayload::Item(ItemEvent::Delta {
+                item_id: self.item_id.clone(),
+                delta,
+            }))
+            .map_err(|error| haider_tools::ToolError::Runtime {
+                message: format!("cannot serialize command output envelope: {error}"),
+            })?,
+        }];
+        StoreHandle::append(&self.store, &mut envelopes)
+            .await
+            .map_err(|error| haider_tools::ToolError::Runtime {
+                message: error.message,
+            })?;
+        Ok(())
     }
 }
 
