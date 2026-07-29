@@ -199,6 +199,7 @@ impl ToolDispatcher for CompletingDispatcher {
     async fn execute(
         &self,
         _run_id: &haider_protocol::ids::RunId,
+        _item_id: &haider_protocol::ids::ItemId,
         _call_id: &str,
         _name: &str,
         _args: serde_json::Value,

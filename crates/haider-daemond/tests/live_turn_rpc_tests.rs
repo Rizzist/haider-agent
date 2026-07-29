@@ -13,6 +13,8 @@
 mod support;
 
 use async_trait::async_trait;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use haider_core::{CancelToken, StoreHandle, ToolDispatchResult, ToolDispatcher};
 use haider_daemon::ProviderFactoryConfig;
 use haider_daemon::{
@@ -29,6 +31,7 @@ use haider_protocol::envelope::{
 };
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::{DeviceId, EffectId, EventId, RunId, SessionId};
+use haider_protocol::item::{ItemDelta, ItemEvent, OutputStream, TurnItem};
 use haider_protocol::menu::{Menu, MenuAnswer};
 use haider_protocol::provider::{CapabilityDoc, FinishReason, Usage, UsageSource};
 use haider_protocol::session::SessionMetadataV1;
@@ -1817,6 +1820,7 @@ impl ToolDispatcher for ClosingHeldEffectDispatcher {
     async fn execute(
         &self,
         _run_id: &RunId,
+        _item_id: &haider_protocol::ids::ItemId,
         _call_id: &str,
         _name: &str,
         _args: serde_json::Value,
@@ -2945,6 +2949,7 @@ impl ToolDispatcher for HoldingEffectDispatcher {
     async fn execute(
         &self,
         _run_id: &RunId,
+        _item_id: &haider_protocol::ids::ItemId,
         _call_id: &str,
         name: &str,
         _args: serde_json::Value,
@@ -3651,6 +3656,338 @@ async fn session_create_requires_control_and_ready_welcome_advertises_implemente
     task.join().await.expect("daemon joins");
 }
 
+/// W4a2 P0 approval-bypass and command-shape sentinel plus live acceptance.
+///
+/// MUTATION CHECKS:
+/// - pre-authorize `ProcessExec` or move spawn before `EffectBroker::begin`:
+///   a marker appears before the real menu CAS commits;
+/// - make the session grant class-wide or ignore its command-shape digest:
+///   `different.log` appears or the different command does not re-prompt.
+/// Both mutations are expected to fail this test and were verified by revert
+/// in W4a2.
+#[tokio::test]
+async fn w4a2_exec_is_cas_gated_streams_output_and_grants_only_the_exact_shape() {
+    let root = test_root("w4a2-exec-approval-");
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace");
+    let denied_path = workspace.join("denied.log");
+    let runs_path = workspace.join("runs.log");
+    let different_path = workspace.join("different.log");
+    let denied_command = "printf denied > denied.log";
+    let approved_command = "printf 'run\\n' >> runs.log; printf stdout-ok; printf stderr-ok >&2";
+    let different_command = "printf different > different.log";
+    let config = DaemonConfig::new(
+        "w4a2-exec-approval",
+        root.path().join("store"),
+        root.path().join("runtime"),
+    );
+    let (dependencies, fake) = fake_dependencies(vec![
+        FakeStep::EmitToolCall {
+            call_id: "exec-denied".into(),
+            name: "exec".into(),
+            args: serde_json::json!({"command": denied_command}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "exec-denied".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+        FakeStep::EmitToolCall {
+            call_id: "exec-approved".into(),
+            name: "exec".into(),
+            args: serde_json::json!({"command": approved_command}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "exec-approved".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+        FakeStep::EmitToolCall {
+            call_id: "exec-same-shape".into(),
+            name: "exec".into(),
+            args: serde_json::json!({"command": approved_command}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "exec-same-shape".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+        FakeStep::EmitToolCall {
+            call_id: "exec-different-shape".into(),
+            name: "exec".into(),
+            args: serde_json::json!({"command": different_command}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "exec-different-shape".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]);
+    let first_task = ready_with_dependencies(&config, dependencies.clone()).await;
+    let mut submitter = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "w4a2-test",
+        "exec-submitter",
+        ClientKind::Headless,
+    )
+    .await;
+    let (session_id, generation) = create_and_attach(&mut submitter, &config, &workspace).await;
+
+    send_request(
+        &mut submitter,
+        &config,
+        "exec-deny-submit",
+        submit_body(
+            "exec-deny-command",
+            session_id.clone(),
+            generation,
+            "try a denied command",
+        ),
+    )
+    .await;
+    let (denied_run, _) = next_submit_response(&mut submitter).await;
+    let (deny_menu, deny_seq, deny_generation) =
+        next_permission_menu_before_create(&mut submitter, &denied_path).await;
+    assert!(
+        deny_menu
+            .body
+            .iter()
+            .any(|line| line.contains(denied_command)),
+        "the approval menu must show the exact command"
+    );
+    assert!(
+        deny_menu
+            .body
+            .iter()
+            .any(|line| line.contains("exact command shape")),
+        "the menu must state the narrow session scope"
+    );
+    let mut answerer = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "w4a2-test",
+        "exec-answerer",
+        ClientKind::Headless,
+    )
+    .await;
+    attach_existing(
+        &mut answerer,
+        &config,
+        session_id.clone(),
+        deny_seq,
+        "exec-answerer-attach",
+    )
+    .await;
+    answer_menu(
+        &mut answerer,
+        &config,
+        "exec-deny-answer",
+        "exec-deny-answer-command",
+        session_id.clone(),
+        deny_menu.id,
+        deny_seq,
+        deny_generation,
+        "deny",
+        2,
+    )
+    .await;
+    let denied_events = events_until_terminal(&mut submitter, &denied_run).await;
+    assert!(!denied_path.exists(), "deny must spawn no process mutation");
+    let denied_preview = denied_events
+        .iter()
+        .find_map(|(_, payload)| match payload {
+            EventPayload::ToolResult { call_id, result } if call_id == "exec-denied" => {
+                Some(&result.preview)
+            }
+            _ => None,
+        })
+        .expect("typed denied exec result");
+    let denied_json: serde_json::Value = serde_json::from_str(denied_preview).expect("denied JSON");
+    assert_eq!(denied_json["status"], "denied");
+
+    send_request(
+        &mut submitter,
+        &config,
+        "exec-approve-submit",
+        submit_body(
+            "exec-approve-command",
+            session_id.clone(),
+            generation,
+            "approve this exact command shape",
+        ),
+    )
+    .await;
+    let (approved_run, _) = next_submit_response(&mut submitter).await;
+    let (approve_menu, approve_seq, approve_generation) =
+        next_permission_menu_before_create(&mut submitter, &runs_path).await;
+    answer_menu(
+        &mut answerer,
+        &config,
+        "exec-approve-answer",
+        "exec-approve-answer-command",
+        session_id.clone(),
+        approve_menu.id,
+        approve_seq,
+        approve_generation,
+        "approve_for_session",
+        1,
+    )
+    .await;
+    let approved_events = events_until_terminal(&mut submitter, &approved_run).await;
+    assert_eq!(
+        fs::read_to_string(&runs_path).expect("approved command ran"),
+        "run\n"
+    );
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    for (_, payload) in &approved_events {
+        if let EventPayload::Item(ItemEvent::Delta {
+            delta: ItemDelta::CommandOutput { stream, chunk_b64 },
+            ..
+        }) = payload
+        {
+            let bytes = BASE64.decode(chunk_b64).expect("command output base64");
+            match stream {
+                OutputStream::Stdout => stdout.extend(bytes),
+                OutputStream::Stderr => stderr.extend(bytes),
+            }
+        }
+    }
+    assert_eq!(stdout, b"stdout-ok");
+    assert_eq!(stderr, b"stderr-ok");
+    let approved_preview = approved_events
+        .iter()
+        .find_map(|(_, payload)| match payload {
+            EventPayload::ToolResult { call_id, result } if call_id == "exec-approved" => {
+                Some(&result.preview)
+            }
+            _ => None,
+        })
+        .expect("exec tool result");
+    let approved_json: serde_json::Value =
+        serde_json::from_str(approved_preview).expect("exec result JSON");
+    assert_eq!(approved_json["status"], "completed");
+    assert_eq!(approved_json["exit_code"], 0);
+    assert_eq!(approved_json["limits"]["max_output_bytes"], 1024 * 1024);
+    assert_eq!(approved_json["limits"]["wall_timeout_ms"], 60_000);
+
+    drop(answerer);
+    drop(submitter);
+    first_task
+        .shutdown_handle()
+        .request("restart command-shape durability test");
+    first_task.join().await.expect("first daemon joins");
+
+    let second_task = ready_with_dependencies(&config, dependencies).await;
+    let mut restarted = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "w4a2-test",
+        "exec-restarted",
+        ClientKind::Headless,
+    )
+    .await;
+    attach_existing(
+        &mut restarted,
+        &config,
+        session_id.clone(),
+        0,
+        "exec-restart-attach",
+    )
+    .await;
+    let restarted_generation =
+        current_generation(&mut restarted, &config, &session_id, "exec-restart-list").await;
+    send_request(
+        &mut restarted,
+        &config,
+        "exec-same-submit",
+        submit_body(
+            "exec-same-command",
+            session_id.clone(),
+            restarted_generation,
+            "run the approved shape again",
+        ),
+    )
+    .await;
+    let (same_run, _) = next_submit_response(&mut restarted).await;
+    let same_events = events_until_terminal(&mut restarted, &same_run).await;
+    assert!(
+        same_events
+            .iter()
+            .all(|(_, payload)| !matches!(payload, EventPayload::MenuOpened(_))),
+        "the same durable command shape must not re-prompt after restart"
+    );
+    assert_eq!(
+        fs::read_to_string(&runs_path).expect("same shape ran"),
+        "run\nrun\n"
+    );
+
+    send_request(
+        &mut restarted,
+        &config,
+        "exec-different-submit",
+        submit_body(
+            "exec-different-command",
+            session_id.clone(),
+            restarted_generation,
+            "try a different command shape",
+        ),
+    )
+    .await;
+    let (different_run, _) = next_submit_response(&mut restarted).await;
+    let (different_menu, different_seq, different_generation) =
+        next_permission_menu_before_create(&mut restarted, &different_path).await;
+    assert!(
+        different_menu
+            .body
+            .iter()
+            .any(|line| line.contains(different_command))
+    );
+    answer_menu(
+        &mut restarted,
+        &config,
+        "exec-different-deny",
+        "exec-different-deny-command",
+        session_id,
+        different_menu.id,
+        different_seq,
+        different_generation,
+        "deny",
+        2,
+    )
+    .await;
+    let different_events = events_until_terminal(&mut restarted, &different_run).await;
+    assert!(
+        !different_path.exists(),
+        "a different command shape must not inherit the session grant"
+    );
+    assert!(matches!(
+        different_events.last(),
+        Some((_, EventPayload::RunState(RunState::Done)))
+    ));
+    assert_eq!(fake.requests().len(), 8);
+
+    second_task.shutdown_handle().request("test complete");
+    second_task.join().await.expect("second daemon joins");
+}
+
 /// W4a1 P0 approval-bypass sentinel.
 ///
 /// MUTATION CHECK: bypass the `ApprovalRequired` branch in
@@ -4203,6 +4540,7 @@ impl ToolDispatcher for PreDispatchCrashDispatcher {
     async fn execute(
         &self,
         run_id: &RunId,
+        _item_id: &haider_protocol::ids::ItemId,
         _call_id: &str,
         name: &str,
         args: serde_json::Value,
@@ -4616,6 +4954,7 @@ impl ToolDispatcher for HeldRealPatchDispatcher {
     async fn execute(
         &self,
         run_id: &RunId,
+        _item_id: &haider_protocol::ids::ItemId,
         _call_id: &str,
         name: &str,
         args: serde_json::Value,
@@ -4779,14 +5118,339 @@ async fn w4a1_dispatched_real_fs_patch_restarts_as_unknown_without_redispatch() 
     second_task.join().await.expect("second daemon joins");
 }
 
+/// W4a2 restart law: a real command that crossed Dispatched is ambiguous
+/// after daemon death and must become Unknown, never execute a second time.
+#[tokio::test]
+async fn w4a2_dispatched_exec_restarts_as_unknown_without_rerun() {
+    let root = test_root("w4a2-exec-restart-");
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace");
+    let attempts = workspace.join("attempts.log");
+    let command = "printf 'attempt\\n' >> attempts.log; printf started; sleep 1";
+    let config = DaemonConfig::new(
+        "w4a2-exec-restart",
+        root.path().join("store"),
+        root.path().join("runtime"),
+    );
+    let (dependencies, fake) = fake_dependencies(vec![
+        FakeStep::EmitToolCall {
+            call_id: "restart-exec".into(),
+            name: "exec".into(),
+            args: serde_json::json!({"command": command}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+    ]);
+    let first_task = ready_with_dependencies(&config, dependencies.clone()).await;
+    let mut first = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "w4a2-test",
+        "exec-before-crash",
+        ClientKind::Headless,
+    )
+    .await;
+    let (session_id, generation) = create_and_attach(&mut first, &config, &workspace).await;
+    send_request(
+        &mut first,
+        &config,
+        "restart-exec-submit",
+        submit_body(
+            "restart-exec-command",
+            session_id.clone(),
+            generation,
+            "run once then crash",
+        ),
+    )
+    .await;
+    let (run_id, _) = next_submit_response(&mut first).await;
+    let (menu, request_seq, opening_generation) = next_permission_menu(&mut first).await;
+    let mut answerer = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "w4a2-test",
+        "exec-restart-answerer",
+        ClientKind::Headless,
+    )
+    .await;
+    attach_existing(
+        &mut answerer,
+        &config,
+        session_id.clone(),
+        request_seq,
+        "exec-restart-answerer-attach",
+    )
+    .await;
+    answer_menu(
+        &mut answerer,
+        &config,
+        "restart-exec-answer",
+        "restart-exec-answer-command",
+        session_id.clone(),
+        menu.id,
+        request_seq,
+        opening_generation,
+        "approve_once",
+        0,
+    )
+    .await;
+    loop {
+        if let WireFrame::Event { envelope, .. } = first.next().await
+            && envelope.run_id.as_ref() == Some(&run_id)
+            && let Ok(EventPayload::Item(ItemEvent::Delta {
+                delta: ItemDelta::CommandOutput { chunk_b64, .. },
+                ..
+            })) = serde_json::from_value::<EventPayload>(envelope.payload)
+            && BASE64
+                .decode(chunk_b64)
+                .expect("command output base64")
+                .windows(b"started".len())
+                .any(|window| window == b"started")
+        {
+            break;
+        }
+    }
+    assert_eq!(
+        fs::read_to_string(&attempts).expect("first dispatch ran"),
+        "attempt\n"
+    );
+    drop(answerer);
+    drop(first);
+    first_task.crash().await;
+
+    let second_task = ready_with_dependencies(&config, dependencies).await;
+    let mut second = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "w4a2-test",
+        "exec-after-crash",
+        ClientKind::Headless,
+    )
+    .await;
+    attach_existing(
+        &mut second,
+        &config,
+        session_id.clone(),
+        0,
+        "exec-restart-attach",
+    )
+    .await;
+    let envelopes = read_session(&mut second, &config, session_id, "exec-restart-read").await;
+    let dispatched = payloads_for_run(&envelopes, &run_id)
+        .filter_map(|payload| match payload {
+            EventPayload::Effect(EffectPhase::Dispatched { effect }) => Some(effect),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(dispatched.len(), 1);
+    assert_eq!(
+        payloads_for_run(&envelopes, &run_id)
+            .filter(|payload| matches!(
+                payload,
+                EventPayload::Effect(EffectPhase::Outcome {
+                    effect,
+                    outcome: EffectOutcome::Unknown,
+                }) if *effect == dispatched[0]
+            ))
+            .count(),
+        1,
+        "startup must reconcile the real exec dispatch to Unknown"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    assert_eq!(
+        fs::read_to_string(&attempts).expect("attempt ledger"),
+        "attempt\n",
+        "restart must not run the command again"
+    );
+    assert_eq!(fake.requests().len(), 1);
+
+    second_task.shutdown_handle().request("test complete");
+    second_task.join().await.expect("second daemon joins");
+}
+
+/// W4a2 cancellation truth / group-sweep sentinel.
+///
+/// MUTATION CHECK: remove `ProcessExecution::drop` cancellation or make the
+/// dispatcher detach the handle. The heartbeat continues growing after
+/// Cancelled+Idle and this test fails. Verified by revert in W4a2.
+#[tokio::test]
+async fn w4a2_cancelled_exec_child_process_group_dies() {
+    let root = test_root("w4a2-exec-cancel-");
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace");
+    let heartbeat = workspace.join("heartbeat.log");
+    let command = "printf x >> heartbeat.log; printf started; while :; do printf x >> heartbeat.log; printf y; sleep 0.01; done";
+    let config = DaemonConfig::new(
+        "w4a2-exec-cancel",
+        root.path().join("store"),
+        root.path().join("runtime"),
+    );
+    let (dependencies, fake) = fake_dependencies(vec![
+        FakeStep::EmitToolCall {
+            call_id: "cancel-exec".into(),
+            name: "exec".into(),
+            args: serde_json::json!({"command": command}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+    ]);
+    let task = ready_with_dependencies(&config, dependencies).await;
+    let mut client = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "w4a2-test",
+        "exec-cancel-client",
+        ClientKind::Headless,
+    )
+    .await;
+    let (session_id, generation) = create_and_attach(&mut client, &config, &workspace).await;
+    send_request(
+        &mut client,
+        &config,
+        "cancel-exec-submit",
+        submit_body(
+            "cancel-exec-command",
+            session_id.clone(),
+            generation,
+            "start then cancel the command",
+        ),
+    )
+    .await;
+    let (run_id, _) = next_submit_response(&mut client).await;
+    let (menu, request_seq, opening_generation) = next_permission_menu(&mut client).await;
+    let mut answerer = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "w4a2-test",
+        "exec-cancel-answerer",
+        ClientKind::Headless,
+    )
+    .await;
+    attach_existing(
+        &mut answerer,
+        &config,
+        session_id.clone(),
+        request_seq,
+        "exec-cancel-answerer-attach",
+    )
+    .await;
+    answer_menu(
+        &mut answerer,
+        &config,
+        "cancel-exec-answer",
+        "cancel-exec-answer-command",
+        session_id.clone(),
+        menu.id,
+        request_seq,
+        opening_generation,
+        "approve_once",
+        0,
+    )
+    .await;
+    loop {
+        if let WireFrame::Event { envelope, .. } = client.next().await
+            && envelope.run_id.as_ref() == Some(&run_id)
+            && let Ok(EventPayload::Item(ItemEvent::Delta {
+                delta: ItemDelta::CommandOutput { chunk_b64, .. },
+                ..
+            })) = serde_json::from_value::<EventPayload>(envelope.payload)
+            && BASE64
+                .decode(chunk_b64)
+                .expect("command output base64")
+                .windows(b"started".len())
+                .any(|window| window == b"started")
+        {
+            break;
+        }
+    }
+    assert!(heartbeat.exists(), "real child started");
+    drop(answerer);
+    send_request(
+        &mut client,
+        &config,
+        "cancel-exec",
+        RequestBody::TurnCancel {
+            command_id: CommandId::new("cancel-exec-rpc-command"),
+            session_id: session_id.clone(),
+            worker_generation: generation,
+            run_id: run_id.clone(),
+        },
+    )
+    .await;
+    let events = events_until_terminal(&mut client, &run_id).await;
+    assert!(matches!(
+        events.last(),
+        Some((_, EventPayload::RunState(RunState::Cancelled)))
+    ));
+    assert!(
+        next_idle(&mut client).await,
+        "cancelled exec settles interrupted Idle only after dispatcher close"
+    );
+    let durable = read_session(
+        &mut client,
+        &config,
+        session_id.clone(),
+        "cancel-exec-durable-read",
+    )
+    .await;
+    let run_items = payloads_for_run(&durable, &run_id)
+        .filter_map(|payload| match payload {
+            EventPayload::Item(item) => Some(item),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let tool_item = run_items
+        .iter()
+        .find_map(|item| match item {
+            ItemEvent::Started {
+                item_id,
+                item: TurnItem::ToolCall { call_id, name, .. },
+            } if call_id == "cancel-exec" && name == "exec" => Some(item_id.clone()),
+            _ => None,
+        })
+        .expect("exec tool item started");
+    let completed = run_items
+        .iter()
+        .position(|item| {
+            matches!(
+                item,
+                ItemEvent::Completed { item_id, .. } if item_id == &tool_item
+            )
+        })
+        .expect("exec tool item completed on cancellation");
+    assert!(
+        run_items[completed + 1..].iter().all(|item| !matches!(
+            item,
+            ItemEvent::Delta {
+                item_id,
+                delta: ItemDelta::CommandOutput { .. },
+            } if item_id == &tool_item
+        )),
+        "command output delta followed the tool item's terminal event"
+    );
+    let stopped_size = fs::metadata(&heartbeat).expect("heartbeat metadata").len();
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_eq!(
+        fs::metadata(&heartbeat).expect("heartbeat metadata").len(),
+        stopped_size,
+        "cancelled child or descendant kept running"
+    );
+    assert_eq!(fake.requests().len(), 1);
+
+    task.shutdown_handle().request("test complete");
+    task.join().await.expect("daemon joins");
+}
+
 /// Scenario 13: the manifest for the production-seam mutation sweep.
 ///
 /// Each entry is `(test fn, workspace-relative file, seam to revert)`: the
 /// focused test that must fail when the listed seam is reverted, and where a
-/// re-runner finds it (nine of twenty-one live outside this file). The sweep
+/// re-runner finds it (thirteen of twenty-eight live outside this file). The sweep
 /// itself is executed by hand — revert each seam, run the named test, record
 /// the observation in the commit message; this manifest keeps that procedure
-/// honest by construction: the twelve in-file entries are compile-time
+/// honest by construction: the fifteen in-file entries are compile-time
 /// references to their test functions (a rename breaks the build), and every
 /// listed file path is asserted to exist in the workspace.
 ///
@@ -4797,8 +5461,8 @@ async fn w4a1_dispatched_real_fs_patch_restarts_as_unknown_without_redispatch() 
 #[test]
 fn scenario_13_mutation_seam_sweep_manifest_covers_each_load_bearing_boundary() {
     // Compile-time linkage for the in-file entries: renaming any of these
-    // twelve tests without updating the manifest is a build error.
-    let _in_file_sweep_links: [fn(); 12] = [
+    // fifteen tests without updating the manifest is a build error.
+    let _in_file_sweep_links: [fn(); 15] = [
         scenario_4_lost_submit_response_replays_one_run_and_one_provider_request,
         scenario_7_two_menu_answers_race_and_only_first_commit_wins,
         scenario_8_wire_cancel_closes_open_items_and_cancelled_is_run_terminal,
@@ -4811,6 +5475,9 @@ fn scenario_13_mutation_seam_sweep_manifest_covers_each_load_bearing_boundary() 
         w4a1_pending_patch_approval_restarts_on_the_original_menu_cas,
         w4a1_committed_approval_crash_before_dispatched_is_safely_lost,
         w4a1_dispatched_real_fs_patch_restarts_as_unknown_without_redispatch,
+        w4a2_exec_is_cas_gated_streams_output_and_grants_only_the_exact_shape,
+        w4a2_dispatched_exec_restarts_as_unknown_without_rerun,
+        w4a2_cancelled_exec_child_process_group_dies,
     ];
     const HERE: &str = "crates/haider-daemond/tests/live_turn_rpc_tests.rs";
     let sweep = [
@@ -4919,6 +5586,41 @@ fn scenario_13_mutation_seam_sweep_manifest_covers_each_load_bearing_boundary() 
             "crates/haider-tools/src/filesystem.rs",
             "anchored target-identity recheck immediately before atomic patch replacement",
         ),
+        (
+            "w4a2_exec_is_cas_gated_streams_output_and_grants_only_the_exact_shape",
+            HERE,
+            "server-side ProcessExec committed-CAS gate and durable exact command-shape grant",
+        ),
+        (
+            "w4a2_dispatched_exec_restarts_as_unknown_without_rerun",
+            HERE,
+            "real exec dispatch crash window reconciles Unknown without command rerun",
+        ),
+        (
+            "w4a2_cancelled_exec_child_process_group_dies",
+            HERE,
+            "turn cancellation drops exec ownership into supervised process-group termination",
+        ),
+        (
+            "hard_output_cap_terminates_the_process_group_and_reports_the_ledgered_limit",
+            "crates/haider-tools/tests/process_tools_tests.rs",
+            "combined stdout/stderr hard cap terminates the process group",
+        ),
+        (
+            "wall_timeout_terminates_the_process_group_and_reports_the_ledgered_limit",
+            "crates/haider-tools/tests/process_tools_tests.rs",
+            "wall-clock deadline terminates the process group",
+        ),
+        (
+            "dropping_process_execution_cancels_and_kills_the_child_group",
+            "crates/haider-tools/tests/process_tools_tests.rs",
+            "dropped daemon tool execution wakes supervised process-group cancellation",
+        ),
+        (
+            "same_inode_cwd_moved_outside_and_symlinked_back_is_refused_before_spawn",
+            "crates/haider-tools/tests/process_tools_tests.rs",
+            "fresh no-follow cwd rewalk rejects same-inode relocation outside the workspace",
+        ),
     ];
     let tests = sweep
         .iter()
@@ -4928,7 +5630,7 @@ fn scenario_13_mutation_seam_sweep_manifest_covers_each_load_bearing_boundary() 
         .iter()
         .map(|(_, _, seam)| *seam)
         .collect::<std::collections::HashSet<_>>();
-    assert_eq!(sweep.len(), 21);
+    assert_eq!(sweep.len(), 28);
     assert_eq!(tests.len(), sweep.len());
     assert_eq!(seams.len(), sweep.len());
     let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

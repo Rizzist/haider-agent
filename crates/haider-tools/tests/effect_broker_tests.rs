@@ -5,7 +5,8 @@ use haider_protocol::effect::{AuthorizationVerdict, EffectClass, EffectOutcome, 
 use haider_protocol::ids::SessionId;
 use haider_protocol::menu::{AnswerVia, MenuAnswer};
 use haider_tools::{
-    EffectBroker, FsPatch, FsRead, JournalSink, PermissionPolicy, ResultBounds, ToolResult,
+    EffectBroker, FsPatch, FsRead, JournalSink, PermissionPolicy, ProcessExec, ResultBounds,
+    ToolResult,
 };
 use std::fs;
 use std::path::Path;
@@ -248,7 +249,13 @@ async fn approve_for_session_menu_resolution_creates_a_class_rule() {
         .expect("menu resolves");
 
     assert!(policy.always_allow_rules().is_empty());
-    assert_eq!(policy.session_allowlist(), &[EffectClass::FsRead]);
+    assert_eq!(
+        policy.session_allowlist(),
+        &[haider_tools::SessionGrant {
+            class: EffectClass::FsRead,
+            scope: haider_tools::SessionGrantScope::Class,
+        }]
+    );
     let retry = broker
         .normalize(&FsRead::new("src/broker.rs"))
         .await
@@ -259,6 +266,105 @@ async fn approve_for_session_menu_resolution_creates_a_class_rule() {
             .await
             .expect("class grant authorizes"),
         AuthorizationVerdict::Allow
+    );
+}
+
+/// W4a2 command-shape sentinel.
+///
+/// MUTATION CHECK: change `SessionGrant::for_effect` to return `Class` for
+/// `ProcessExec`, or ignore the command-shape digest in `matches`. The
+/// different-command assertion must then fail. Verified by revert in W4a2.
+#[tokio::test]
+async fn process_session_grant_is_exact_command_shape_and_never_class_wide() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    fs::create_dir(workspace.path().join("nested")).expect("nested cwd");
+    let mut broker = broker_at(RecordingJournal::default(), workspace.path(), 1);
+    let mut policy = PermissionPolicy::default();
+    policy.ask(EffectClass::ProcessExec);
+    let operation = ProcessExec::new("first-call", "printf exact");
+    let intent = broker
+        .normalize(&operation)
+        .await
+        .expect("normalize command");
+    let AuthorizationVerdict::Ask { menu } = broker
+        .authorize(&intent, &policy)
+        .await
+        .expect("first command asks")
+    else {
+        panic!("process policy must ask");
+    };
+    let opened = broker.permission_menu(&menu).expect("permission menu");
+    assert!(
+        opened
+            .body
+            .iter()
+            .any(|line| line.contains("\"printf exact\"")),
+        "approval must show the exact escaped command"
+    );
+    assert!(
+        opened
+            .body
+            .iter()
+            .any(|line| line.contains("exact command shape"))
+    );
+    broker
+        .resolve_permission(
+            &MenuAnswer {
+                menu,
+                option_key: Some("approve_for_session".into()),
+                option_index: 1,
+                value: None,
+                via: AnswerVia::Rpc,
+            },
+            &mut policy,
+        )
+        .expect("shape grant resolves");
+
+    let same = broker
+        .normalize(&ProcessExec::new("second-call", "printf exact"))
+        .await
+        .expect("normalize same shape");
+    assert_eq!(same.args_digest, intent.args_digest);
+    assert_eq!(
+        broker
+            .authorize(&same, &policy)
+            .await
+            .expect("same shape authorizes"),
+        AuthorizationVerdict::Allow
+    );
+
+    let different = broker
+        .normalize(&ProcessExec::new("different-call", "printf different"))
+        .await
+        .expect("normalize different command");
+    assert!(matches!(
+        broker
+            .authorize(&different, &policy)
+            .await
+            .expect("different shape re-prompts"),
+        AuthorizationVerdict::Ask { .. }
+    ));
+
+    let different_cwd = broker
+        .normalize(
+            &ProcessExec::new("different-cwd", "printf exact")
+                .with_cwd(workspace.path().join("nested")),
+        )
+        .await
+        .expect("normalize different cwd");
+    assert!(matches!(
+        broker
+            .authorize(&different_cwd, &policy)
+            .await
+            .expect("different cwd re-prompts"),
+        AuthorizationVerdict::Ask { .. }
+    ));
+
+    assert!(
+        PermissionPolicy::default()
+            .allow_for_session(EffectClass::ProcessExec)
+            .is_err(),
+        "the API must fail closed on class-wide shell grants"
     );
 }
 
