@@ -30,7 +30,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use haider_accounts::{AccountStore, JsonFileStore, MemoryVault, StoreLike, Vault};
 use haider_core::SqliteStoreHandle;
-use haider_core::{LoginClaim, LoginReceiptFailure, LoginReceiptResponse};
+use haider_core::{
+    AccountAddClaim, AccountAddReceiptResponse, LoginClaim, LoginReceiptFailure,
+    LoginReceiptResponse,
+};
 use haider_protocol::credential::{AuthMethod, CredentialDescriptor, CredentialStatus};
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::CredentialAlias;
@@ -44,10 +47,14 @@ use haider_rpc::{
     ERROR_CODE_RESTAGE_REQUIRED, ERROR_CODE_UNAUTHORIZED, RequestId, ResponseBody, StagePurpose,
     WireFrame,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 use zeroize::Zeroizing;
 
+use crate::oauth::{
+    CredentialBroker, OAuthCoordinator, OAuthCoordinatorConfig, OAuthProviderCatalog,
+    OAuthReadyClaim,
+};
 use crate::session_hub::FrameSink;
 
 /// Staged-secret and pending-login-command lifetime (R7/R10: five minutes).
@@ -268,6 +275,11 @@ pub struct AccountsDependencies {
     /// Descriptor persistence override; `None` uses
     /// `<store_dir>/accounts.json` behind the profile lock.
     pub descriptor_store: Option<Arc<dyn StoreLike>>,
+    /// Release-owned OAuth registrations. Production defaults to the
+    /// intentionally empty sanctioned catalog; tests inject only loopback
+    /// fake registrations.
+    pub oauth_catalog: OAuthProviderCatalog,
+    pub oauth_coordinator: OAuthCoordinatorConfig,
 }
 
 impl Default for AccountsDependencies {
@@ -276,6 +288,8 @@ impl Default for AccountsDependencies {
             vault: VaultProvision::platform_default(),
             validator: Arc::new(ProviderCredentialValidator),
             descriptor_store: None,
+            oauth_catalog: OAuthProviderCatalog::default(),
+            oauth_coordinator: OAuthCoordinatorConfig::default(),
         }
     }
 }
@@ -450,6 +464,7 @@ pub(crate) type AccountsSnapshot = Arc<StdMutex<Vec<CredentialDescriptor>>>;
 pub(crate) struct AccountsFacade {
     /// `None` when the vault is unsupported (no actor runs).
     pub login: Option<mpsc::Sender<AccountCommand>>,
+    pub oauth: Option<OAuthCoordinator>,
     pub snapshot: AccountsSnapshot,
     pub vault_supported: bool,
 }
@@ -473,15 +488,56 @@ pub(crate) struct LoginJob {
     pub route: LoginRoute,
 }
 
+pub(crate) struct OAuthAddJob {
+    pub command_id: String,
+    pub provider: String,
+    pub display_alias: String,
+    pub claim: Option<OAuthReadyClaim>,
+    pub route: LoginRoute,
+}
+
 /// Account actor mailbox items.
+#[derive(Clone)]
+pub(crate) struct OAuthRefreshFence {
+    pub(crate) generation: u64,
+    pub(crate) issuer: String,
+    pub(crate) audience: String,
+    pub(crate) resource: Option<String>,
+    pub(crate) subject_hash: String,
+}
+
 pub(crate) enum AccountCommand {
     Login(Box<LoginJob>),
+    AddOAuth(Box<OAuthAddJob>),
+    BeginOAuthRefresh {
+        descriptor: CredentialDescriptor,
+        expected: OAuthRefreshFence,
+        completed: tokio::sync::oneshot::Sender<Result<bool, HaiderError>>,
+    },
+    ApplyOAuthRefresh {
+        descriptor: CredentialDescriptor,
+        expected: OAuthRefreshFence,
+        encoded_bundle: Zeroizing<Vec<u8>>,
+        completed: tokio::sync::oneshot::Sender<Result<(), RefreshApplyError>>,
+    },
+    ExpireOAuthRefresh {
+        descriptor: CredentialDescriptor,
+        expected: OAuthRefreshFence,
+        completed: tokio::sync::oneshot::Sender<Result<bool, HaiderError>>,
+    },
     Shutdown,
+}
+
+#[derive(Debug)]
+pub(crate) enum RefreshApplyError {
+    Stale,
+    Persist,
 }
 
 /// Owned account actor task (single writer of the descriptor store).
 pub(crate) struct AccountActorHandle {
     commands: mpsc::Sender<AccountCommand>,
+    force_stop: watch::Sender<bool>,
     task: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -492,11 +548,28 @@ impl AccountActorHandle {
 
     /// Graceful drain: stop accepting, finish the in-flight command, join.
     /// Bounded by the caller's drain deadline (R10).
-    pub(crate) async fn shutdown(mut self) {
+    pub(crate) async fn shutdown(&mut self) {
         let _ = self.commands.send(AccountCommand::Shutdown).await;
-        if let Some(task) = self.task.take() {
+        if let Some(task) = self.task.as_mut() {
             let _ = task.await;
         }
+        self.task.take();
+    }
+
+    /// Forced drain: wake an idle actor, fence a refresh that is inside its
+    /// non-cancellable vault write, and join the actor transitively.
+    ///
+    /// The join is deliberately not replaced with `abort`: a
+    /// `spawn_blocking` vault call ignores task abort. Once such a call has
+    /// started, the actor must regain control, durably fail-close a rotated
+    /// bundle, and drop its zeroizing command bytes before the runtime may
+    /// publish `Stopped` or release the profile lock to a successor.
+    pub(crate) async fn force_and_join(&mut self) {
+        self.force_stop.send_replace(true);
+        if let Some(task) = self.task.as_mut() {
+            let _ = task.await;
+        }
+        self.task.take();
     }
 
     /// Abrupt teardown (crash seam): receipts + reconciliation carry truth.
@@ -527,9 +600,11 @@ pub(crate) struct AccountActorConfig {
 
 pub(crate) fn start_account_actor(config: AccountActorConfig) -> AccountActorHandle {
     let (commands, receiver) = mpsc::channel(ACTOR_CAPACITY);
-    let task = tokio::spawn(run_account_actor(config, receiver));
+    let (force_stop, forced) = watch::channel(false);
+    let task = tokio::spawn(run_account_actor(config, receiver, forced));
     AccountActorHandle {
         commands,
+        force_stop,
         task: Some(task),
     }
 }
@@ -542,6 +617,7 @@ struct PendingSecret {
 async fn run_account_actor(
     config: AccountActorConfig,
     mut receiver: mpsc::Receiver<AccountCommand>,
+    mut force_stop: watch::Receiver<bool>,
 ) {
     let AccountActorConfig {
         store,
@@ -555,7 +631,22 @@ async fn run_account_actor(
     // Command-owned secrets surviving a retryable validation, bounded by
     // SECRET_TTL; daemon restart wipes them by construction.
     let mut pending: HashMap<String, PendingSecret> = HashMap::new();
-    while let Some(command) = receiver.recv().await {
+    loop {
+        let command = tokio::select! {
+            biased;
+            changed = force_stop.changed() => {
+                if changed.is_err() || *force_stop.borrow() {
+                    break;
+                }
+                continue;
+            }
+            command = receiver.recv() => {
+                let Some(command) = command else {
+                    break;
+                };
+                command
+            }
+        };
         match command {
             AccountCommand::Shutdown => break,
             AccountCommand::Login(job) => {
@@ -573,7 +664,316 @@ async fn run_account_actor(
                 )
                 .await;
             }
+            AccountCommand::AddOAuth(job) => {
+                handle_oauth_add(
+                    &store,
+                    &mut accounts,
+                    Arc::clone(&vault),
+                    &snapshot,
+                    &profile_id,
+                    *job,
+                )
+                .await;
+            }
+            AccountCommand::BeginOAuthRefresh {
+                descriptor,
+                expected,
+                completed,
+            } => {
+                let result = begin_oauth_refresh(
+                    &mut accounts,
+                    Arc::clone(&vault),
+                    &snapshot,
+                    &descriptor,
+                    &expected,
+                )
+                .await;
+                let _ = completed.send(result);
+            }
+            AccountCommand::ExpireOAuthRefresh {
+                descriptor,
+                expected,
+                completed,
+            } => {
+                let result = expire_oauth_refresh(
+                    &mut accounts,
+                    Arc::clone(&vault),
+                    &snapshot,
+                    &descriptor,
+                    &expected,
+                )
+                .await;
+                let _ = completed.send(result);
+            }
+            AccountCommand::ApplyOAuthRefresh {
+                descriptor,
+                expected,
+                encoded_bundle,
+                completed,
+            } => {
+                let result = apply_oauth_refresh(
+                    &mut accounts,
+                    Arc::clone(&vault),
+                    &snapshot,
+                    &descriptor,
+                    &expected,
+                    encoded_bundle,
+                    &force_stop,
+                )
+                .await;
+                let _ = completed.send(result);
+            }
         }
+        if *force_stop.borrow() {
+            break;
+        }
+    }
+}
+
+async fn apply_oauth_refresh(
+    accounts: &mut AccountStore<Box<dyn StoreLike>>,
+    vault: Arc<dyn Vault>,
+    snapshot: &AccountsSnapshot,
+    descriptor: &CredentialDescriptor,
+    expected: &OAuthRefreshFence,
+    encoded_bundle: Zeroizing<Vec<u8>>,
+    force_stop: &watch::Receiver<bool>,
+) -> Result<(), RefreshApplyError> {
+    if !accounts
+        .get(&descriptor.alias)
+        .is_some_and(|current| same_credential_identity(current, descriptor))
+    {
+        return Err(RefreshApplyError::Stale);
+    }
+    let alias = descriptor.alias.clone();
+    let vault_for_read = Arc::clone(&vault);
+    let alias_for_read = alias.clone();
+    let current = match tokio::task::spawn_blocking(move || vault_for_read.resolve(&alias_for_read))
+        .await
+    {
+        Ok(Ok(current)) => current,
+        Ok(Err(_)) | Err(_) => {
+            fail_closed_after_refresh_persist(accounts, Arc::clone(&vault), snapshot, &alias).await;
+            return Err(RefreshApplyError::Persist);
+        }
+    };
+    let current = haider_accounts::OAuthTokenBundleV1::decode(current.expose_secret())
+        .map_err(|_| RefreshApplyError::Stale)?;
+    if current.generation != expected.generation
+        || current.issuer != expected.issuer
+        || current.audience != expected.audience
+        || current.resource != expected.resource
+        || current.identity.subject_hash != expected.subject_hash
+    {
+        return Err(RefreshApplyError::Stale);
+    }
+    let vault_for_put = Arc::clone(&vault);
+    let alias_for_put = alias.clone();
+    let persisted =
+        tokio::task::spawn_blocking(move || vault_for_put.put(&alias_for_put, &encoded_bundle))
+            .await;
+    if !matches!(persisted, Ok(Ok(()))) {
+        fail_closed_after_refresh_persist(accounts, vault, snapshot, &alias).await;
+        return Err(RefreshApplyError::Persist);
+    }
+    if *force_stop.borrow() {
+        // The blocking write began under a daemon that has crossed its drain
+        // boundary. It may have published bytes into the physical vault, but
+        // it may not restore the descriptor or survive into a successor:
+        // join the fail-closed tombstone before the actor owner can finish.
+        fail_closed_after_refresh_persist(accounts, vault, snapshot, &alias).await;
+        return Err(RefreshApplyError::Persist);
+    }
+    if accounts
+        .get(&alias)
+        .is_some_and(|current| matches!(&current.status, CredentialStatus::Expired))
+        && !matches!(&descriptor.status, CredentialStatus::Expired)
+    {
+        if accounts
+            .set_status(&alias, descriptor.status.clone())
+            .is_err()
+        {
+            fail_closed_after_refresh_persist(accounts, vault, snapshot, &alias).await;
+            return Err(RefreshApplyError::Persist);
+        }
+        refresh_snapshot(snapshot, accounts);
+    }
+    Ok(())
+}
+
+async fn begin_oauth_refresh(
+    accounts: &mut AccountStore<Box<dyn StoreLike>>,
+    vault: Arc<dyn Vault>,
+    snapshot: &AccountsSnapshot,
+    descriptor: &CredentialDescriptor,
+    expected: &OAuthRefreshFence,
+) -> Result<bool, HaiderError> {
+    if !accounts
+        .get(&descriptor.alias)
+        .is_some_and(|current| same_credential_identity(current, descriptor))
+    {
+        return Ok(false);
+    }
+    let vault_for_read = Arc::clone(&vault);
+    let alias_for_read = descriptor.alias.clone();
+    let current =
+        match tokio::task::spawn_blocking(move || vault_for_read.resolve(&alias_for_read)).await {
+            Ok(Ok(current)) => current,
+            Ok(Err(_)) | Err(_) => return Ok(false),
+        };
+    let Ok(current) = haider_accounts::OAuthTokenBundleV1::decode(current.expose_secret()) else {
+        return Ok(false);
+    };
+    if current.generation != expected.generation
+        || current.provider_id != descriptor.provider
+        || current.issuer != expected.issuer
+        || current.audience != expected.audience
+        || current.resource != expected.resource
+        || current.identity.subject_hash != expected.subject_hash
+        || current.identity.display_identity != descriptor.identity
+    {
+        return Ok(false);
+    }
+    // Durable uncertainty marker before the request can rotate server state.
+    // On ordinary storage this retains the original bundle (for audit and
+    // issuer-mismatch evidence) while Expired prevents any restart from
+    // resolving/retrying it. If descriptor persistence itself fails, the
+    // vault tombstone is the fail-closed fallback.
+    persist_refresh_expired_or_tombstone(accounts, vault, snapshot, &descriptor.alias).await?;
+    Ok(true)
+}
+
+async fn expire_oauth_refresh(
+    accounts: &mut AccountStore<Box<dyn StoreLike>>,
+    vault: Arc<dyn Vault>,
+    snapshot: &AccountsSnapshot,
+    descriptor: &CredentialDescriptor,
+    expected: &OAuthRefreshFence,
+) -> Result<bool, HaiderError> {
+    if !accounts
+        .get(&descriptor.alias)
+        .is_some_and(|current| same_credential_identity(current, descriptor))
+    {
+        return Ok(false);
+    }
+    let vault_for_read = Arc::clone(&vault);
+    let alias_for_read = descriptor.alias.clone();
+    let current =
+        match tokio::task::spawn_blocking(move || vault_for_read.resolve(&alias_for_read)).await {
+            Ok(Ok(current)) => current,
+            Ok(Err(_)) | Err(_) => return Ok(false),
+        };
+    let Ok(current) = haider_accounts::OAuthTokenBundleV1::decode(current.expose_secret()) else {
+        return Ok(false);
+    };
+    if current.generation != expected.generation
+        || current.provider_id != descriptor.provider
+        || current.issuer != expected.issuer
+        || current.audience != expected.audience
+        || current.resource != expected.resource
+        || current.identity.subject_hash != expected.subject_hash
+        || current.identity.display_identity != descriptor.identity
+    {
+        return Ok(false);
+    }
+    persist_refresh_expired_or_tombstone(accounts, vault, snapshot, &descriptor.alias).await?;
+    Ok(true)
+}
+
+fn same_credential_identity(
+    current: &CredentialDescriptor,
+    expected: &CredentialDescriptor,
+) -> bool {
+    current.alias == expected.alias
+        && current.provider == expected.provider
+        && current.base_url == expected.base_url
+        && current.auth_method == expected.auth_method
+        && current.identity == expected.identity
+}
+
+async fn fail_closed_after_refresh_persist(
+    accounts: &mut AccountStore<Box<dyn StoreLike>>,
+    vault: Arc<dyn Vault>,
+    snapshot: &AccountsSnapshot,
+    alias: &CredentialAlias,
+) {
+    // Once the server has rotated the refresh token, a failed local write
+    // makes the old vault value unsafe to retry. Persist both fail-closed
+    // barriers independently: Expired keeps normal account resolution out,
+    // while deletion makes even a stale descriptor unable to recover the
+    // server-invalidated token after restart.
+    let status_persisted = accounts
+        .set_status(alias, CredentialStatus::Expired)
+        .is_ok();
+    if status_persisted {
+        refresh_snapshot(snapshot, accounts);
+    } else {
+        mark_snapshot_expired(snapshot, alias);
+    }
+    let vault_for_delete = vault;
+    let alias_for_delete = alias.clone();
+    let tombstoned =
+        tokio::task::spawn_blocking(move || vault_for_delete.delete(&alias_for_delete)).await;
+    if !matches!(tombstoned, Ok(Ok(()))) && !status_persisted {
+        // Both durable barriers failed. The actor's public snapshot remains
+        // closed for this process; the command still reports Persist to its
+        // caller, and a production test pins the recoverable single-failure
+        // boundary (descriptor failure + durable vault tombstone).
+        mark_snapshot_expired(snapshot, alias);
+    }
+}
+
+async fn persist_refresh_expired_or_tombstone(
+    accounts: &mut AccountStore<Box<dyn StoreLike>>,
+    vault: Arc<dyn Vault>,
+    snapshot: &AccountsSnapshot,
+    alias: &CredentialAlias,
+) -> Result<(), HaiderError> {
+    match accounts.set_status(alias, CredentialStatus::Expired) {
+        Ok(()) => {
+            refresh_snapshot(snapshot, accounts);
+            Ok(())
+        }
+        Err(status_error) => {
+            // A rotating server may already have invalidated the stored
+            // refresh token. If the descriptor snapshot cannot durably record
+            // Expired, deleting the vault value is the durable fail-closed
+            // tombstone: restart can no longer resolve and retry the dead
+            // token.
+            let vault_for_delete = vault;
+            let alias_for_delete = alias.clone();
+            match tokio::task::spawn_blocking(move || vault_for_delete.delete(&alias_for_delete))
+                .await
+            {
+                Ok(Ok(())) => {
+                    mark_snapshot_expired(snapshot, alias);
+                    Ok(())
+                }
+                Ok(Err(delete_error)) => Err(HaiderError::new(
+                    ErrorCode::ProviderError,
+                    format!(
+                        "OAuth refresh expiration and vault tombstone both failed: {}; {}",
+                        status_error.message, delete_error.message
+                    ),
+                    false,
+                )),
+                Err(_) => Err(HaiderError::new(
+                    ErrorCode::ProviderError,
+                    "OAuth refresh expiration failed and vault tombstone worker was lost",
+                    false,
+                )),
+            }
+        }
+    }
+}
+
+fn mark_snapshot_expired(snapshot: &AccountsSnapshot, alias: &CredentialAlias) {
+    if let Ok(mut descriptors) = snapshot.lock()
+        && let Some(descriptor) = descriptors
+            .iter_mut()
+            .find(|descriptor| descriptor.alias == *alias)
+    {
+        descriptor.status = CredentialStatus::Expired;
     }
 }
 
@@ -809,6 +1209,241 @@ async fn handle_login(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct OAuthAddIdentity {
+    provider: String,
+    display_alias: String,
+    physical_alias: String,
+    auth_method: String,
+}
+
+impl OAuthAddIdentity {
+    fn canonical_json(&self) -> Result<String, HaiderError> {
+        serde_json::to_string(self).map_err(|error| {
+            HaiderError::new(
+                ErrorCode::InvalidArgument,
+                format!("cannot encode OAuth account coordinates: {error}"),
+                false,
+            )
+        })
+    }
+}
+
+/// Durable OAuth add: receipt claim -> vault bundle -> descriptor -> receipt.
+///
+/// The claimed bundle is command-owned before this function is entered.
+/// Neither it nor the ready reference is ever serialized into SQLite.
+async fn handle_oauth_add(
+    store: &SqliteStoreHandle,
+    accounts: &mut AccountStore<Box<dyn StoreLike>>,
+    vault: Arc<dyn Vault>,
+    snapshot: &AccountsSnapshot,
+    profile_id: &str,
+    job: OAuthAddJob,
+) {
+    let OAuthAddJob {
+        command_id,
+        provider,
+        display_alias,
+        claim,
+        route,
+    } = job;
+    let identity = OAuthAddIdentity {
+        provider: provider.clone(),
+        display_alias,
+        physical_alias: physical_alias(profile_id, &provider, &command_id),
+        auth_method: "oauth".into(),
+    };
+    let request_json = match identity.canonical_json() {
+        Ok(json) => json,
+        Err(error) => {
+            respond_error(&route, ERROR_CODE_INVALID_ARGUMENT, &error.message, false);
+            return;
+        }
+    };
+    let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
+    let receipt = store
+        .account_add_claim_receipt(command_id.clone(), request_digest, request_json)
+        .await;
+    let resume = match receipt {
+        Ok(AccountAddClaim::Committed(response)) => {
+            respond(
+                &route,
+                ResponseBody::AccountAdd {
+                    descriptor: response.descriptor,
+                },
+            );
+            return;
+        }
+        Ok(AccountAddClaim::Fresh) => false,
+        Ok(AccountAddClaim::ResumePending) => true,
+        Err(error) => {
+            respond_error(
+                &route,
+                ERROR_CODE_INVALID_ARGUMENT,
+                &error.message,
+                error.retryable,
+            );
+            return;
+        }
+    };
+    let alias = CredentialAlias::new(identity.physical_alias.clone());
+    if resume && accounts.get(&alias).is_some() {
+        finalize_oauth_add(store, accounts, snapshot, &command_id, &alias, &route).await;
+        return;
+    }
+    if resume {
+        let vault_for_read = Arc::clone(&vault);
+        let alias_for_read = alias.clone();
+        let stored = tokio::task::spawn_blocking(move || vault_for_read.resolve(&alias_for_read))
+            .await
+            .ok()
+            .and_then(Result::ok);
+        if let Some(stored) = stored {
+            match haider_accounts::OAuthTokenBundleV1::decode(stored.expose_secret()) {
+                Ok(bundle) => {
+                    let descriptor = oauth_descriptor(&identity, &alias, &bundle);
+                    if let Err(error) = accounts.add(descriptor) {
+                        respond_error(
+                            &route,
+                            ERROR_CODE_PROVIDER_ERROR,
+                            &format!("resumed OAuth descriptor commit failed: {}", error.message),
+                            true,
+                        );
+                        return;
+                    }
+                    finalize_oauth_add(store, accounts, snapshot, &command_id, &alias, &route)
+                        .await;
+                    return;
+                }
+                Err(_) => {
+                    respond_error(
+                        &route,
+                        ERROR_CODE_UNAUTHORIZED,
+                        "stored OAuth token bundle is invalid; restart sign-in",
+                        false,
+                    );
+                    return;
+                }
+            }
+        }
+    }
+    let Some(claim) = claim else {
+        respond_error(
+            &route,
+            haider_rpc::ERROR_CODE_OAUTH_FLOW_NOT_FOUND,
+            "OAuth ready reference is unavailable; start a fresh browser flow",
+            true,
+        );
+        return;
+    };
+    if claim.bundle.provider_id != identity.provider {
+        respond_error(
+            &route,
+            ERROR_CODE_INVALID_ARGUMENT,
+            "OAuth token provider does not match account.add provider",
+            false,
+        );
+        return;
+    }
+    let descriptor = oauth_descriptor(&identity, &alias, &claim.bundle);
+    let encoded = match claim.bundle.encode() {
+        Ok(encoded) => encoded,
+        Err(error) => {
+            respond_error(&route, ERROR_CODE_UNAUTHORIZED, &error.message, false);
+            return;
+        }
+    };
+    let vault_for_put = Arc::clone(&vault);
+    let alias_for_put = alias.clone();
+    let put =
+        tokio::task::spawn_blocking(move || vault_for_put.put(&alias_for_put, &encoded)).await;
+    match put {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            respond_error(
+                &route,
+                ERROR_CODE_PROVIDER_ERROR,
+                &format!("OAuth vault write failed: {}", error.message),
+                true,
+            );
+            return;
+        }
+        Err(_) => {
+            respond_error(
+                &route,
+                ERROR_CODE_PROVIDER_ERROR,
+                "OAuth vault worker failed",
+                true,
+            );
+            return;
+        }
+    }
+    if let Err(error) = accounts.add(descriptor) {
+        let vault_for_delete = Arc::clone(&vault);
+        let alias_for_delete = alias.clone();
+        let _ =
+            tokio::task::spawn_blocking(move || vault_for_delete.delete(&alias_for_delete)).await;
+        respond_error(
+            &route,
+            ERROR_CODE_PROVIDER_ERROR,
+            &format!("OAuth descriptor save failed: {}", error.message),
+            true,
+        );
+        return;
+    }
+    finalize_oauth_add(store, accounts, snapshot, &command_id, &alias, &route).await;
+}
+
+fn oauth_descriptor(
+    identity: &OAuthAddIdentity,
+    alias: &CredentialAlias,
+    bundle: &haider_accounts::OAuthTokenBundleV1,
+) -> CredentialDescriptor {
+    CredentialDescriptor {
+        alias: alias.clone(),
+        provider: identity.provider.clone(),
+        base_url: None,
+        auth_method: AuthMethod::OAuth,
+        identity: bundle.identity.display_identity.clone(),
+        status: CredentialStatus::Ok,
+        active: true,
+    }
+}
+
+async fn finalize_oauth_add(
+    store: &SqliteStoreHandle,
+    accounts: &mut AccountStore<Box<dyn StoreLike>>,
+    snapshot: &AccountsSnapshot,
+    command_id: &str,
+    alias: &CredentialAlias,
+    route: &LoginRoute,
+) {
+    let Some(descriptor) = accounts.get(alias).cloned() else {
+        respond_error(
+            route,
+            ERROR_CODE_PROVIDER_ERROR,
+            "OAuth descriptor disappeared before receipt finalization",
+            true,
+        );
+        return;
+    };
+    refresh_snapshot(snapshot, accounts);
+    if let Err(error) = store
+        .finalize_account_add_receipt(
+            command_id.to_owned(),
+            AccountAddReceiptResponse {
+                descriptor: descriptor.clone(),
+            },
+        )
+        .await
+    {
+        respond_error(route, ERROR_CODE_PROVIDER_ERROR, &error.message, true);
+        return;
+    }
+    respond(route, ResponseBody::AccountAdd { descriptor });
+}
+
 fn descriptor_for(
     identity: &LoginIdentity,
     alias: &CredentialAlias,
@@ -995,6 +1630,7 @@ pub(crate) struct AccountsProviderFactory {
     snapshot: AccountsSnapshot,
     vault: VaultProvision,
     builder: Arc<dyn AccountProviderBuilder>,
+    broker: Option<CredentialBroker>,
 }
 
 impl AccountsProviderFactory {
@@ -1007,6 +1643,21 @@ impl AccountsProviderFactory {
             snapshot,
             vault,
             builder,
+            broker: None,
+        }
+    }
+
+    pub(crate) fn with_broker(
+        snapshot: AccountsSnapshot,
+        vault: VaultProvision,
+        builder: Arc<dyn AccountProviderBuilder>,
+        broker: CredentialBroker,
+    ) -> Self {
+        Self {
+            snapshot,
+            vault,
+            builder,
+            broker: Some(broker),
         }
     }
 }
@@ -1055,7 +1706,17 @@ impl crate::worker::ProviderFactory for AccountsProviderFactory {
                 false,
             ));
         };
-        let credential = vault.resolve(&descriptor.alias)?;
+        let credential = if let Some(broker) = &self.broker {
+            broker.resolve(&descriptor).await?
+        } else if descriptor.auth_method == AuthMethod::OAuth {
+            return Err(HaiderError::new(
+                ErrorCode::Unauthorized,
+                "OAuth credential requires the auth-aware broker",
+                false,
+            ));
+        } else {
+            vault.resolve(&descriptor.alias)?
+        };
         let provider = self
             .builder
             .build_descriptor(&descriptor, credential, &metadata.model)?;
@@ -1152,6 +1813,93 @@ pub(crate) async fn reconcile_login_receipts(
     Ok(())
 }
 
+pub(crate) async fn reconcile_oauth_add_receipts(
+    store: &SqliteStoreHandle,
+    accounts: &mut AccountStore<Box<dyn StoreLike>>,
+    vault: &VaultProvision,
+) -> Result<(), HaiderError> {
+    for row in store.account_add_receipts().await? {
+        let identity: OAuthAddIdentity =
+            serde_json::from_str(&row.request_json).map_err(|error| {
+                HaiderError::new(
+                    ErrorCode::StoreCorrupt,
+                    format!(
+                        "OAuth account receipt {} has undecodable coordinates: {error}",
+                        row.command_id
+                    ),
+                    false,
+                )
+            })?;
+        let alias = CredentialAlias::new(identity.physical_alias.clone());
+        match row.state.as_str() {
+            "committed" if accounts.get(&alias).is_none() => {
+                let response: AccountAddReceiptResponse = row
+                    .response_json
+                    .as_deref()
+                    .and_then(|json| serde_json::from_str(json).ok())
+                    .ok_or_else(|| {
+                        HaiderError::new(
+                            ErrorCode::StoreCorrupt,
+                            format!(
+                                "committed OAuth account receipt {} has no response",
+                                row.command_id
+                            ),
+                            false,
+                        )
+                    })?;
+                let mut descriptor = response.descriptor;
+                descriptor.active = accounts.active_for_provider(&descriptor.provider).is_none();
+                accounts.add(descriptor)?;
+            }
+            "pending" if accounts.get(&alias).is_some() => {
+                finalize_oauth_reconciled(store, accounts, &row.command_id, &alias).await?;
+            }
+            "pending" => {
+                let VaultProvision::Available(vault) = vault else {
+                    continue;
+                };
+                let Ok(stored) = vault.resolve(&alias) else {
+                    // Browser state and ready refs die on restart. The pending
+                    // semantic command may resume only with a fresh flow.
+                    continue;
+                };
+                let bundle = haider_accounts::OAuthTokenBundleV1::decode(stored.expose_secret())?;
+                if bundle.provider_id != identity.provider {
+                    return Err(HaiderError::new(
+                        ErrorCode::StoreCorrupt,
+                        format!(
+                            "OAuth account receipt {} provider does not match vault bundle",
+                            row.command_id
+                        ),
+                        false,
+                    ));
+                }
+                accounts.add(oauth_descriptor(&identity, &alias, &bundle))?;
+                finalize_oauth_reconciled(store, accounts, &row.command_id, &alias).await?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+async fn finalize_oauth_reconciled(
+    store: &SqliteStoreHandle,
+    accounts: &AccountStore<Box<dyn StoreLike>>,
+    command_id: &str,
+    alias: &CredentialAlias,
+) -> Result<(), HaiderError> {
+    let Some(descriptor) = accounts.get(alias).cloned() else {
+        return Ok(());
+    };
+    store
+        .finalize_account_add_receipt(
+            command_id.to_owned(),
+            AccountAddReceiptResponse { descriptor },
+        )
+        .await
+}
+
 async fn finalize_reconciled(
     store: &SqliteStoreHandle,
     accounts: &AccountStore<Box<dyn StoreLike>>,
@@ -1175,6 +1923,7 @@ pub(crate) struct AccountsRuntime {
     pub actor: Option<AccountActorHandle>,
     /// The vault provision the production provider factory shares.
     pub vault: VaultProvision,
+    pub broker: Option<CredentialBroker>,
 }
 
 impl AccountsRuntime {
@@ -1185,6 +1934,7 @@ impl AccountsRuntime {
         dependencies: &AccountsDependencies,
         store_dir: &std::path::Path,
         profile_id: &str,
+        instance_id: &str,
         default_model: &str,
     ) -> Result<Self, HaiderError> {
         let descriptor_store: Box<dyn StoreLike> = match &dependencies.descriptor_store {
@@ -1193,6 +1943,7 @@ impl AccountsRuntime {
         };
         let mut accounts = AccountStore::new(descriptor_store)?;
         reconcile_login_receipts(store, &mut accounts, &dependencies.vault).await?;
+        reconcile_oauth_add_receipts(store, &mut accounts, &dependencies.vault).await?;
         let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(accounts.list().to_vec()));
         match &dependencies.vault {
             VaultProvision::Available(vault) => {
@@ -1205,24 +1956,41 @@ impl AccountsRuntime {
                     profile_id: profile_id.to_owned(),
                     default_model: default_model.to_owned(),
                 });
+                let commands = actor.commands();
+                let oauth = OAuthCoordinator::new(
+                    instance_id.to_owned(),
+                    dependencies.oauth_catalog.clone(),
+                    dependencies.oauth_coordinator,
+                )
+                .map_err(crate::oauth::oauth_error)?;
+                let broker = CredentialBroker::new(
+                    Arc::clone(vault),
+                    dependencies.oauth_catalog.clone(),
+                    Arc::clone(&snapshot),
+                    commands.clone(),
+                )?;
                 Ok(Self {
                     facade: AccountsFacade {
-                        login: Some(actor.commands()),
+                        login: Some(commands),
+                        oauth: Some(oauth),
                         snapshot,
                         vault_supported: true,
                     },
                     actor: Some(actor),
                     vault: dependencies.vault.clone(),
+                    broker: Some(broker),
                 })
             }
             VaultProvision::Unsupported => Ok(Self {
                 facade: AccountsFacade {
                     login: None,
+                    oauth: None,
                     snapshot,
                     vault_supported: false,
                 },
                 actor: None,
                 vault: VaultProvision::Unsupported,
+                broker: None,
             }),
         }
     }

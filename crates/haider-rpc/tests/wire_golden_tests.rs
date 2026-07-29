@@ -670,3 +670,121 @@ fn account_methods_decode_as_unknown_for_older_readers() {
         }
     );
 }
+
+/// MUTATION CHECK: deriving `Debug` for either sensitive OAuth wire type
+/// leaks the state-bearing URL or ready reference.
+#[test]
+fn oauth_authorization_and_ready_ref_codec_round_trip_but_debug_redacts() {
+    const URL_SENTINEL: &str = "STATE_WIRE_SENTINEL_7fa13d";
+    const READY_SENTINEL: &str = "READY_REF_SENTINEL_4b9c21";
+    let frame = WireFrame::Response {
+        request_id: haider_rpc::RequestId::new("oauth-start"),
+        body: ResponseBody::AccountOAuthStart {
+            availability: haider_rpc::OAuthAvailabilityWire {
+                available: true,
+                reason: None,
+            },
+            flow_id: Some(haider_rpc::OAuthFlowId::new("flow-1")),
+            authorization_url: Some(haider_rpc::OAuthAuthorizationWire::new(format!(
+                "https://auth.example.invalid/authorize?state={URL_SENTINEL}&redirect_uri=http%3A%2F%2F127.0.0.1%3A49152%2Fcallback"
+            ))),
+            provider_origin: Some("https://auth.example.invalid".into()),
+            loopback_port: Some(49_152),
+            expires_at_ms: Some(99),
+        },
+    };
+    let encoded = uds_codec::encode_zeroizing(&frame, DEFAULT_FRAME_LIMIT).expect("encode");
+    let mut decoder = uds_codec::Decoder::new_zeroizing(DEFAULT_FRAME_LIMIT);
+    let batch = decoder.push(&encoded);
+    assert!(batch.error.is_none());
+    assert_eq!(batch.frames, vec![frame.clone()]);
+    let debug = format!("{frame:?}");
+    assert!(!debug.contains(URL_SENTINEL));
+    assert!(debug.contains("provider_origin: \"https://auth.example.invalid\""));
+    assert!(debug.contains("loopback_port: Some(49152)"));
+
+    let ready = haider_rpc::OAuthReadyRefWire::new(READY_SENTINEL);
+    assert!(!format!("{ready:?}").contains(READY_SENTINEL));
+    assert_eq!(
+        serde_json::to_string(&ready).expect("ready encode"),
+        format!("\"{READY_SENTINEL}\"")
+    );
+}
+
+/// MUTATION CHECK: removing one explicit OAuth method arm/tag, making an
+/// additive field mandatory, or removing the unknown status fallback kills
+/// this test.
+#[test]
+fn oauth_methods_features_and_status_are_additive_unknown_tolerant() {
+    for method in [
+        "account.oauth_start",
+        "account.oauth_status",
+        "account.oauth_cancel",
+        "account.add",
+    ] {
+        assert!(
+            transcript().into_iter().any(|frame| {
+                matches!(
+                    frame,
+                    WireFrame::Request { body, .. }
+                        if serde_json::to_value(&body).expect("json")["method"] == method
+                )
+            }),
+            "missing OAuth request golden for {method}"
+        );
+    }
+    let future_status: haider_rpc::OAuthFlowStatusWire =
+        serde_json::from_str(r#"{"status":"future_browser_phase","extra":true}"#)
+            .expect("unknown status");
+    assert_eq!(future_status, haider_rpc::OAuthFlowStatusWire::Unknown);
+
+    let start: RequestBody = serde_json::from_str(
+        r#"{"method":"account.oauth_start","provider":"fake","desired_alias":"work","attempt_id":"a","future":1}"#,
+    )
+    .expect("additive start");
+    assert!(matches!(start, RequestBody::AccountOAuthStart { .. }));
+
+    let welcome = transcript()
+        .into_iter()
+        .find_map(|frame| match frame {
+            WireFrame::Welcome(welcome) if welcome.features.len() == 6 => Some(welcome),
+            _ => None,
+        })
+        .expect("OAuth featured welcome");
+    assert_eq!(
+        serde_json::to_value(welcome).expect("json")["features"],
+        serde_json::json!([
+            haider_rpc::FEATURE_ACCOUNT_LOGIN_API_V1,
+            haider_rpc::FEATURE_ACCOUNT_MANAGEMENT_V1,
+            haider_rpc::FEATURE_ACCOUNT_OAUTH_PKCE_V1,
+            haider_rpc::FEATURE_SESSION_MUTATION_V1,
+            haider_rpc::FEATURE_TURN_CONTROL_V1,
+            haider_rpc::FEATURE_VAULT_STAGE_V1,
+        ])
+    );
+}
+
+#[test]
+fn oauth_status_shapes_cannot_carry_callback_or_token_secrets() {
+    for status in [
+        haider_rpc::OAuthFlowStatusWire::WaitingBrowser,
+        haider_rpc::OAuthFlowStatusWire::Exchanging,
+        haider_rpc::OAuthFlowStatusWire::Failed {
+            public_code: "access_denied".into(),
+        },
+        haider_rpc::OAuthFlowStatusWire::Expired,
+        haider_rpc::OAuthFlowStatusWire::Cancelled,
+    ] {
+        let json = serde_json::to_string(&status).expect("status json");
+        for forbidden in [
+            "authorization_code",
+            "code_verifier",
+            "access_token",
+            "refresh_token",
+            "id_token",
+            "authorization_url",
+        ] {
+            assert!(!json.contains(forbidden));
+        }
+    }
+}

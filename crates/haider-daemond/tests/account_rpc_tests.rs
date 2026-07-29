@@ -176,6 +176,7 @@ impl AccountFixture {
                 vault: VaultProvision::Available(self.vault.clone() as Arc<dyn Vault>),
                 validator: self.validator.clone(),
                 descriptor_store: Some(self.descriptors.clone() as Arc<dyn StoreLike>),
+                ..AccountsDependencies::default()
             },
             ..DaemonDependencies::default()
         }
@@ -672,6 +673,7 @@ async fn sentinel_secret_is_absent_from_store_files_receipts_and_formatted_frame
             vault: VaultProvision::Available(vault.clone() as Arc<dyn Vault>),
             validator: validator.clone(),
             descriptor_store: None,
+            ..AccountsDependencies::default()
         },
         ..DaemonDependencies::default()
     };
@@ -889,6 +891,7 @@ async fn committed_login_is_picked_up_by_the_next_fake_turn() {
             vault: VaultProvision::Available(vault.clone() as Arc<dyn Vault>),
             validator: validator.clone(),
             descriptor_store: None,
+            ..AccountsDependencies::default()
         },
         ..DaemonDependencies::default()
     };

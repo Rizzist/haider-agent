@@ -42,6 +42,38 @@ fn identity_for(profile: &str, command: &str) -> LoginIdentity {
     }
 }
 
+fn oauth_identity_for(profile: &str, command: &str) -> OAuthAddIdentity {
+    OAuthAddIdentity {
+        provider: "fake-oauth".into(),
+        display_alias: "work-oauth".into(),
+        physical_alias: physical_alias(profile, "fake-oauth", command),
+        auth_method: "oauth".into(),
+    }
+}
+
+fn oauth_bundle() -> haider_accounts::OAuthTokenBundleV1 {
+    haider_accounts::OAuthTokenBundleV1::new(
+        "fake-oauth".into(),
+        "http://127.0.0.1:32109".into(),
+        "fake-audience".into(),
+        Some("fake-api-resource".into()),
+        "Bearer".into(),
+        Zeroizing::new(b"OAUTH_ACCESS_RECEIPT_SENTINEL_1fa2".to_vec()),
+        Some(Zeroizing::new(
+            b"OAUTH_REFRESH_RECEIPT_SENTINEL_9c31".to_vec(),
+        )),
+        u64::MAX - 1,
+        Some(u64::MAX),
+        vec!["openid".into(), "inference".into()],
+        haider_accounts::OAuthIdentityV1 {
+            subject_hash: "verified-subject".into(),
+            display_identity: "person@example.invalid".into(),
+        },
+        1,
+    )
+    .expect("OAuth bundle")
+}
+
 // MUTATION CHECK (W5a provider dispatch): remove the `openai` arm from
 // `build_account_provider` (restoring the old Anthropic-only builder).
 // Expected failure: the OpenAI resolution below returns InvalidArgument
@@ -448,7 +480,7 @@ async fn account_actor_answers_restage_required_after_the_pending_ttl() {
     let store = open_store(dir.path()).await;
     let validator = Arc::new(UnavailableValidator::default());
     let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(Vec::new()));
-    let actor = start_account_actor(AccountActorConfig {
+    let mut actor = start_account_actor(AccountActorConfig {
         store: store.clone(),
         accounts: memory_accounts(),
         vault: Arc::new(MemoryVault::default()) as Arc<dyn Vault>,
@@ -780,6 +812,808 @@ async fn reconciliation_closes_every_login_crash_boundary() {
         .close()
         .await
         .unwrap_or_else(|error| panic!("{}", error.message));
+}
+
+#[tokio::test]
+async fn oauth_account_add_receipt_is_distinct_idempotent_and_secret_free() {
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let identity = oauth_identity_for("profile-o", "oauth-command");
+    let request_json = identity.canonical_json().expect("canonical OAuth identity");
+    let digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
+    for secret in [
+        "OAUTH_ACCESS_RECEIPT_SENTINEL_1fa2",
+        "OAUTH_REFRESH_RECEIPT_SENTINEL_9c31",
+        "oauth-ready-ref-must-not-persist",
+    ] {
+        assert!(!request_json.contains(secret));
+    }
+    assert_eq!(
+        store
+            .account_add_claim_receipt(
+                "oauth-command".into(),
+                digest.clone(),
+                request_json.clone(),
+            )
+            .await
+            .expect("fresh"),
+        AccountAddClaim::Fresh
+    );
+    assert_eq!(
+        store
+            .account_add_claim_receipt(
+                "oauth-command".into(),
+                digest.clone(),
+                request_json.clone(),
+            )
+            .await
+            .expect("resume"),
+        AccountAddClaim::ResumePending
+    );
+    let descriptor = oauth_descriptor(
+        &identity,
+        &CredentialAlias::new(identity.physical_alias.clone()),
+        &oauth_bundle(),
+    );
+    store
+        .finalize_account_add_receipt(
+            "oauth-command".into(),
+            AccountAddReceiptResponse {
+                descriptor: descriptor.clone(),
+            },
+        )
+        .await
+        .expect("finalize");
+    assert!(matches!(
+        store
+            .account_add_claim_receipt("oauth-command".into(), digest, request_json)
+            .await
+            .expect("replay"),
+        AccountAddClaim::Committed(response) if response.descriptor == descriptor
+    ));
+
+    // The method is deliberately not aliased to account.login_api.
+    let login_identity = identity_for("profile-o", "oauth-command");
+    let login_json = login_identity.canonical_json().expect("login identity");
+    let login_digest = blake3::hash(login_json.as_bytes()).to_hex().to_string();
+    let collision = store
+        .login_claim_receipt("oauth-command".into(), login_digest, login_json)
+        .await
+        .expect_err("different durable methods cannot share a command id");
+    assert!(collision.message.contains("different method or semantic"));
+
+    store.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn oauth_account_add_never_exposes_initial_token_before_vault_persistence() {
+    use std::sync::Condvar;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct BlockingPutVault {
+        inner: MemoryVault,
+        entered: AtomicBool,
+        release: (StdMutex<bool>, Condvar),
+    }
+
+    impl Vault for BlockingPutVault {
+        fn put(
+            &self,
+            alias: &CredentialAlias,
+            secret: &[u8],
+        ) -> haider_accounts::AccountsResult<()> {
+            self.entered.store(true, Ordering::SeqCst);
+            let (lock, wake) = &self.release;
+            let mut released = lock.lock().expect("release lock");
+            while !*released {
+                released = wake.wait(released).expect("release wait");
+            }
+            self.inner.put(alias, secret)
+        }
+
+        fn resolve(
+            &self,
+            alias: &CredentialAlias,
+        ) -> haider_accounts::AccountsResult<haider_accounts::SecretHandle> {
+            self.inner.resolve(alias)
+        }
+
+        fn delete(&self, alias: &CredentialAlias) -> haider_accounts::AccountsResult<()> {
+            self.inner.delete(alias)
+        }
+
+        fn list(&self) -> haider_accounts::AccountsResult<Vec<CredentialAlias>> {
+            self.inner.list()
+        }
+    }
+
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(Vec::new()));
+    let vault = Arc::new(BlockingPutVault {
+        inner: MemoryVault::new(),
+        entered: AtomicBool::new(false),
+        release: (StdMutex::new(false), Condvar::new()),
+    });
+    let mut actor = start_account_actor(AccountActorConfig {
+        store: store.clone(),
+        accounts: memory_accounts(),
+        vault: vault.clone() as Arc<dyn Vault>,
+        validator: Arc::new(ProviderCredentialValidator),
+        snapshot: Arc::clone(&snapshot),
+        profile_id: "profile-initial-persist".into(),
+        default_model: "unused".into(),
+    });
+    let (sink, mut frames) = channel_sink();
+    actor
+        .commands()
+        .send(AccountCommand::AddOAuth(Box::new(OAuthAddJob {
+            command_id: "oauth-initial-persist".into(),
+            provider: "fake-oauth".into(),
+            display_alias: "work-oauth".into(),
+            claim: Some(OAuthReadyClaim::for_account_test(
+                "fake-oauth",
+                "work-oauth",
+                oauth_bundle(),
+            )),
+            route: LoginRoute {
+                request_id: RequestId::new("oauth-initial-persist-request"),
+                sink,
+            },
+        })))
+        .await
+        .expect("actor command");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !vault.entered.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("vault put entered");
+    let alias = CredentialAlias::new(physical_alias(
+        "profile-initial-persist",
+        "fake-oauth",
+        "oauth-initial-persist",
+    ));
+    assert!(frames.try_recv().is_err(), "no response before vault put");
+    assert!(snapshot.lock().expect("snapshot").is_empty());
+    assert!(
+        vault.resolve(&alias).is_err(),
+        "token is not yet resolvable"
+    );
+    {
+        let (release, wake) = &vault.release;
+        *release.lock().expect("release") = true;
+        wake.notify_all();
+    }
+    let frame = tokio::time::timeout(Duration::from_secs(1), frames.recv())
+        .await
+        .expect("account response")
+        .expect("account frame");
+    assert!(matches!(
+        frame,
+        WireFrame::Response {
+            body: ResponseBody::AccountAdd { .. },
+            ..
+        }
+    ));
+    assert!(vault.resolve(&alias).is_ok());
+    assert_eq!(snapshot.lock().expect("snapshot").len(), 1);
+    actor.shutdown().await;
+    store.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn oauth_account_add_actor_crash_after_vault_put_reconciles_production_receipt() {
+    use std::sync::Condvar;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct PutThenBlockVault {
+        inner: MemoryVault,
+        persisted: AtomicBool,
+        release: (StdMutex<bool>, Condvar),
+    }
+
+    impl Vault for PutThenBlockVault {
+        fn put(
+            &self,
+            alias: &CredentialAlias,
+            secret: &[u8],
+        ) -> haider_accounts::AccountsResult<()> {
+            self.inner.put(alias, secret)?;
+            self.persisted.store(true, Ordering::SeqCst);
+            let (lock, wake) = &self.release;
+            let mut released = lock.lock().expect("release lock");
+            while !*released {
+                released = wake.wait(released).expect("release wait");
+            }
+            Ok(())
+        }
+
+        fn resolve(
+            &self,
+            alias: &CredentialAlias,
+        ) -> haider_accounts::AccountsResult<haider_accounts::SecretHandle> {
+            self.inner.resolve(alias)
+        }
+
+        fn delete(&self, alias: &CredentialAlias) -> haider_accounts::AccountsResult<()> {
+            self.inner.delete(alias)
+        }
+
+        fn list(&self) -> haider_accounts::AccountsResult<Vec<CredentialAlias>> {
+            self.inner.list()
+        }
+    }
+
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(Vec::new()));
+    let vault = Arc::new(PutThenBlockVault {
+        inner: MemoryVault::new(),
+        persisted: AtomicBool::new(false),
+        release: (StdMutex::new(false), Condvar::new()),
+    });
+    let actor = start_account_actor(AccountActorConfig {
+        store: store.clone(),
+        accounts: memory_accounts(),
+        vault: vault.clone() as Arc<dyn Vault>,
+        validator: Arc::new(ProviderCredentialValidator),
+        snapshot: Arc::clone(&snapshot),
+        profile_id: "profile-oauth-crash".into(),
+        default_model: "unused".into(),
+    });
+    let (sink, mut frames) = channel_sink();
+    actor
+        .commands()
+        .send(AccountCommand::AddOAuth(Box::new(OAuthAddJob {
+            command_id: "oauth-crash-command".into(),
+            provider: "fake-oauth".into(),
+            display_alias: "work-oauth".into(),
+            claim: Some(OAuthReadyClaim::for_account_test(
+                "fake-oauth",
+                "work-oauth",
+                oauth_bundle(),
+            )),
+            route: LoginRoute {
+                request_id: RequestId::new("oauth-crash-request"),
+                sink,
+            },
+        })))
+        .await
+        .expect("actor command");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !vault.persisted.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("vault persisted before crash");
+
+    // Crash at the production seam: SQLite receipt is pending and the vault
+    // write is durable, but the actor has not observed the worker return, so
+    // neither descriptor nor response can have been published.
+    actor.crash();
+    assert!(snapshot.lock().expect("snapshot").is_empty());
+    assert!(frames.try_recv().is_err());
+    {
+        let (release, wake) = &vault.release;
+        *release.lock().expect("release") = true;
+        wake.notify_all();
+    }
+    let alias = CredentialAlias::new(physical_alias(
+        "profile-oauth-crash",
+        "fake-oauth",
+        "oauth-crash-command",
+    ));
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while vault.resolve(&alias).is_err() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("durable vault value");
+
+    let mut restarted_accounts = memory_accounts();
+    reconcile_oauth_add_receipts(
+        &store,
+        &mut restarted_accounts,
+        &VaultProvision::Available(vault.clone() as Arc<dyn Vault>),
+    )
+    .await
+    .expect("restart reconciliation");
+    assert!(
+        restarted_accounts.get(&alias).is_some(),
+        "restart reconstructs the descriptor from the durable bundle"
+    );
+    let receipts = store.account_add_receipts().await.expect("receipt rows");
+    assert!(receipts.iter().any(|receipt| {
+        receipt.command_id == "oauth-crash-command" && receipt.state == "committed"
+    }));
+    store.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn oauth_reconciliation_closes_crash_before_and_after_vault_put() {
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let vault = Arc::new(MemoryVault::new());
+    let provision = VaultProvision::Available(vault.clone() as Arc<dyn Vault>);
+    let mut accounts = memory_accounts();
+
+    // A: receipt claimed, crash before vault put. Browser/ready objects are
+    // gone after restart, so this stays pending for a fresh flow.
+    let identity_a = oauth_identity_for("profile-r", "oauth-a");
+    let json_a = identity_a.canonical_json().expect("identity A");
+    let digest_a = blake3::hash(json_a.as_bytes()).to_hex().to_string();
+    assert_eq!(
+        store
+            .account_add_claim_receipt("oauth-a".into(), digest_a, json_a)
+            .await
+            .expect("claim A"),
+        AccountAddClaim::Fresh
+    );
+
+    // B: vault bundle durable, crash before descriptor save. Reconciliation
+    // verifies the versioned bundle, creates the OAuth descriptor, finalizes.
+    let identity_b = oauth_identity_for("profile-r", "oauth-b");
+    let json_b = identity_b.canonical_json().expect("identity B");
+    let digest_b = blake3::hash(json_b.as_bytes()).to_hex().to_string();
+    let _ = store
+        .account_add_claim_receipt("oauth-b".into(), digest_b, json_b)
+        .await
+        .expect("claim B");
+    vault
+        .put(
+            &CredentialAlias::new(identity_b.physical_alias.clone()),
+            &oauth_bundle().encode().expect("encode B"),
+        )
+        .expect("vault B");
+
+    // C: vault + descriptor committed, crash before receipt finalization.
+    let identity_c = oauth_identity_for("profile-r", "oauth-c");
+    let json_c = identity_c.canonical_json().expect("identity C");
+    let digest_c = blake3::hash(json_c.as_bytes()).to_hex().to_string();
+    let _ = store
+        .account_add_claim_receipt("oauth-c".into(), digest_c, json_c)
+        .await
+        .expect("claim C");
+    let bundle_c = oauth_bundle();
+    vault
+        .put(
+            &CredentialAlias::new(identity_c.physical_alias.clone()),
+            &bundle_c.encode().expect("encode C"),
+        )
+        .expect("vault C");
+    accounts
+        .add(oauth_descriptor(
+            &identity_c,
+            &CredentialAlias::new(identity_c.physical_alias.clone()),
+            &bundle_c,
+        ))
+        .expect("descriptor C");
+
+    // D: committed receipt survives a lost descriptor and self-heals without
+    // stealing the active slot from the later credential.
+    let identity_d = oauth_identity_for("profile-r", "oauth-d");
+    let json_d = identity_d.canonical_json().expect("identity D");
+    let digest_d = blake3::hash(json_d.as_bytes()).to_hex().to_string();
+    let _ = store
+        .account_add_claim_receipt("oauth-d".into(), digest_d, json_d)
+        .await
+        .expect("claim D");
+    let mut descriptor_d = oauth_descriptor(
+        &identity_d,
+        &CredentialAlias::new(identity_d.physical_alias.clone()),
+        &oauth_bundle(),
+    );
+    descriptor_d.active = true;
+    store
+        .finalize_account_add_receipt(
+            "oauth-d".into(),
+            AccountAddReceiptResponse {
+                descriptor: descriptor_d.clone(),
+            },
+        )
+        .await
+        .expect("finalize D");
+
+    reconcile_oauth_add_receipts(&store, &mut accounts, &provision)
+        .await
+        .expect("OAuth reconciliation");
+    let rows = store.account_add_receipts().await.expect("receipt rows");
+    let state = |command: &str| {
+        rows.iter()
+            .find(|row| row.command_id == command)
+            .map(|row| row.state.as_str())
+            .unwrap_or("missing")
+    };
+    assert_eq!(state("oauth-a"), "pending");
+    assert_eq!(state("oauth-b"), "committed");
+    assert_eq!(state("oauth-c"), "committed");
+    assert_eq!(state("oauth-d"), "committed");
+    assert!(
+        accounts
+            .get(&CredentialAlias::new(identity_a.physical_alias))
+            .is_none()
+    );
+    assert!(
+        accounts
+            .get(&CredentialAlias::new(identity_b.physical_alias))
+            .is_some()
+    );
+    assert!(
+        accounts
+            .get(&CredentialAlias::new(identity_d.physical_alias))
+            .is_some_and(|descriptor| !descriptor.active)
+    );
+
+    store.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn refresh_cas_ignores_benign_status_and_selection_changes() {
+    let mut accounts = memory_accounts();
+    let identity = oauth_identity_for("profile-cas", "oauth-cas");
+    let alias = CredentialAlias::new(identity.physical_alias.clone());
+    let original = oauth_bundle();
+    let captured = oauth_descriptor(&identity, &alias, &original);
+    accounts
+        .add(captured.clone())
+        .expect("add OAuth descriptor");
+    let other_alias = CredentialAlias::new("other-oauth-account");
+    accounts
+        .add(CredentialDescriptor {
+            alias: other_alias.clone(),
+            provider: captured.provider.clone(),
+            base_url: None,
+            auth_method: AuthMethod::OAuth,
+            identity: "other@example.invalid".into(),
+            status: CredentialStatus::Ok,
+            active: false,
+        })
+        .expect("add other descriptor");
+    accounts
+        .set_status(&alias, CredentialStatus::Limited { until_ms: 123_456 })
+        .expect("limit captured descriptor");
+    accounts
+        .select(&other_alias)
+        .expect("change active selection");
+    let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(accounts.list().to_vec()));
+    let vault = Arc::new(MemoryVault::new());
+    vault
+        .put(&alias, &original.encode().expect("encode original"))
+        .expect("seed vault");
+    let rotated = haider_accounts::OAuthTokenBundleV1::new(
+        original.provider_id.clone(),
+        original.issuer.clone(),
+        original.audience.clone(),
+        original.resource.clone(),
+        "Bearer".into(),
+        Zeroizing::new(b"ROTATED_CAS_ACCESS_58af".to_vec()),
+        Some(Zeroizing::new(b"ROTATED_CAS_REFRESH_914b".to_vec())),
+        u64::MAX - 2,
+        Some(u64::MAX),
+        original.granted_scopes.clone(),
+        original.identity.clone(),
+        2,
+    )
+    .expect("rotated bundle");
+    apply_oauth_refresh(
+        &mut accounts,
+        vault.clone() as Arc<dyn Vault>,
+        &snapshot,
+        &captured,
+        &OAuthRefreshFence {
+            generation: 1,
+            issuer: original.issuer.clone(),
+            audience: original.audience.clone(),
+            resource: original.resource.clone(),
+            subject_hash: original.identity.subject_hash.clone(),
+        },
+        rotated.encode().expect("encode rotated"),
+        &watch::channel(false).1,
+    )
+    .await
+    .expect("benign fields do not fence rotation");
+    let current = accounts.get(&alias).expect("descriptor remains");
+    assert!(!current.active);
+    assert!(matches!(
+        current.status,
+        CredentialStatus::Limited { until_ms: 123_456 }
+    ));
+    let stored = vault.resolve(&alias).expect("rotated vault");
+    assert_eq!(
+        haider_accounts::OAuthTokenBundleV1::decode(stored.expose_secret())
+            .expect("decode rotated")
+            .generation,
+        2
+    );
+}
+
+#[tokio::test]
+async fn production_expiry_sink_rejects_a_late_failure_for_a_newer_generation() {
+    let mut accounts = memory_accounts();
+    let identity = oauth_identity_for("profile-expiry-fence", "oauth-fence");
+    let alias = CredentialAlias::new(identity.physical_alias.clone());
+    let original = oauth_bundle();
+    let captured = oauth_descriptor(&identity, &alias, &original);
+    accounts
+        .add(captured.clone())
+        .expect("add captured descriptor");
+    let vault = Arc::new(MemoryVault::new());
+    let replacement = haider_accounts::OAuthTokenBundleV1::new(
+        original.provider_id.clone(),
+        original.issuer.clone(),
+        original.audience.clone(),
+        original.resource.clone(),
+        "Bearer".into(),
+        Zeroizing::new(b"NEWER_EXPIRY_FENCE_ACCESS_41c8".to_vec()),
+        Some(Zeroizing::new(b"NEWER_EXPIRY_FENCE_REFRESH_911d".to_vec())),
+        u64::MAX - 2,
+        Some(u64::MAX),
+        original.granted_scopes.clone(),
+        original.identity.clone(),
+        9,
+    )
+    .expect("replacement");
+    vault
+        .put(&alias, &replacement.encode().expect("encode replacement"))
+        .expect("seed replacement");
+    let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(accounts.list().to_vec()));
+    let expired = expire_oauth_refresh(
+        &mut accounts,
+        vault.clone() as Arc<dyn Vault>,
+        &snapshot,
+        &captured,
+        &OAuthRefreshFence {
+            generation: 1,
+            issuer: original.issuer.clone(),
+            audience: original.audience.clone(),
+            resource: original.resource.clone(),
+            subject_hash: original.identity.subject_hash.clone(),
+        },
+    )
+    .await
+    .expect("expiry sink");
+    assert!(!expired, "late failure must be a no-op");
+    assert!(matches!(
+        accounts.get(&alias).expect("replacement descriptor").status,
+        CredentialStatus::Ok
+    ));
+    assert_eq!(
+        haider_accounts::OAuthTokenBundleV1::decode(
+            vault
+                .resolve(&alias)
+                .expect("replacement retained")
+                .expose_secret()
+        )
+        .expect("decode replacement")
+        .generation,
+        9
+    );
+}
+
+#[tokio::test]
+async fn production_refresh_begin_durably_fences_restart_before_the_endpoint() {
+    struct SharedDescriptorStore(Arc<StdMutex<Vec<CredentialDescriptor>>>);
+
+    impl StoreLike for SharedDescriptorStore {
+        fn load(&self) -> Result<Vec<CredentialDescriptor>, HaiderError> {
+            Ok(self
+                .0
+                .lock()
+                .map(|descriptors| descriptors.clone())
+                .unwrap_or_default())
+        }
+
+        fn save(&self, descriptors: &[CredentialDescriptor]) -> Result<(), HaiderError> {
+            if let Ok(mut durable) = self.0.lock() {
+                *durable = descriptors.to_vec();
+            }
+            Ok(())
+        }
+    }
+
+    let durable = Arc::new(StdMutex::new(Vec::new()));
+    let store: Box<dyn StoreLike> = Box::new(SharedDescriptorStore(Arc::clone(&durable)));
+    let mut accounts = AccountStore::new(store).expect("accounts");
+    let identity = oauth_identity_for("profile-refresh-begin", "oauth-begin");
+    let alias = CredentialAlias::new(identity.physical_alias.clone());
+    let original = oauth_bundle();
+    let descriptor = oauth_descriptor(&identity, &alias, &original);
+    accounts.add(descriptor.clone()).expect("seed descriptor");
+    let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(accounts.list().to_vec()));
+    let vault = Arc::new(MemoryVault::new());
+    vault
+        .put(&alias, &original.encode().expect("encode original"))
+        .expect("seed vault");
+    let begun = begin_oauth_refresh(
+        &mut accounts,
+        vault.clone() as Arc<dyn Vault>,
+        &snapshot,
+        &descriptor,
+        &OAuthRefreshFence {
+            generation: original.generation,
+            issuer: original.issuer.clone(),
+            audience: original.audience.clone(),
+            resource: original.resource.clone(),
+            subject_hash: original.identity.subject_hash.clone(),
+        },
+    )
+    .await
+    .expect("begin");
+    assert!(begun);
+    assert!(matches!(
+        snapshot.lock().expect("snapshot")[0].status,
+        CredentialStatus::Expired
+    ));
+    assert!(
+        vault.resolve(&alias).is_ok(),
+        "ordinary begin retains the original bundle for audit"
+    );
+
+    let restarted: Box<dyn StoreLike> = Box::new(SharedDescriptorStore(durable));
+    let restarted = AccountStore::new(restarted).expect("restart descriptors");
+    assert!(matches!(
+        restarted.get(&alias).expect("descriptor").status,
+        CredentialStatus::Expired
+    ));
+}
+
+#[tokio::test]
+async fn production_descriptor_failure_tombstones_the_dead_rotated_refresh_token() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct FailingDescriptorStore {
+        durable: Arc<StdMutex<Vec<CredentialDescriptor>>>,
+        fail: Arc<AtomicBool>,
+    }
+
+    impl StoreLike for FailingDescriptorStore {
+        fn load(&self) -> Result<Vec<CredentialDescriptor>, HaiderError> {
+            Ok(self
+                .durable
+                .lock()
+                .map(|descriptors| descriptors.clone())
+                .unwrap_or_default())
+        }
+
+        fn save(&self, descriptors: &[CredentialDescriptor]) -> Result<(), HaiderError> {
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(HaiderError::new(
+                    ErrorCode::ProviderError,
+                    "injected production descriptor persistence failure",
+                    false,
+                ));
+            }
+            if let Ok(mut durable) = self.durable.lock() {
+                *durable = descriptors.to_vec();
+            }
+            Ok(())
+        }
+    }
+
+    struct FailingRotationVault {
+        inner: MemoryVault,
+        fail_put: AtomicBool,
+    }
+
+    impl Vault for FailingRotationVault {
+        fn put(
+            &self,
+            alias: &CredentialAlias,
+            secret: &[u8],
+        ) -> haider_accounts::AccountsResult<()> {
+            if self.fail_put.load(Ordering::SeqCst) {
+                return Err(HaiderError::new(
+                    ErrorCode::ProviderError,
+                    "injected rotated bundle persistence failure",
+                    false,
+                ));
+            }
+            self.inner.put(alias, secret)
+        }
+
+        fn resolve(
+            &self,
+            alias: &CredentialAlias,
+        ) -> haider_accounts::AccountsResult<haider_accounts::SecretHandle> {
+            self.inner.resolve(alias)
+        }
+
+        fn delete(&self, alias: &CredentialAlias) -> haider_accounts::AccountsResult<()> {
+            self.inner.delete(alias)
+        }
+
+        fn list(&self) -> haider_accounts::AccountsResult<Vec<CredentialAlias>> {
+            self.inner.list()
+        }
+    }
+
+    let durable = Arc::new(StdMutex::new(Vec::new()));
+    let fail_descriptor = Arc::new(AtomicBool::new(false));
+    let store: Box<dyn StoreLike> = Box::new(FailingDescriptorStore {
+        durable: Arc::clone(&durable),
+        fail: Arc::clone(&fail_descriptor),
+    });
+    let mut accounts = AccountStore::new(store).expect("accounts");
+    let identity = oauth_identity_for("profile-durable-expiry", "oauth-refresh");
+    let alias = CredentialAlias::new(identity.physical_alias.clone());
+    let original = oauth_bundle();
+    let descriptor = oauth_descriptor(&identity, &alias, &original);
+    accounts.add(descriptor.clone()).expect("seed descriptor");
+    let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(accounts.list().to_vec()));
+    let vault = Arc::new(FailingRotationVault {
+        inner: MemoryVault::new(),
+        fail_put: AtomicBool::new(false),
+    });
+    vault
+        .put(&alias, &original.encode().expect("encode original"))
+        .expect("seed vault");
+    vault.fail_put.store(true, Ordering::SeqCst);
+    fail_descriptor.store(true, Ordering::SeqCst);
+
+    let rotated = haider_accounts::OAuthTokenBundleV1::new(
+        original.provider_id.clone(),
+        original.issuer.clone(),
+        original.audience.clone(),
+        original.resource.clone(),
+        "Bearer".into(),
+        Zeroizing::new(b"ROTATED_DURABILITY_ACCESS_d431".to_vec()),
+        Some(Zeroizing::new(b"ROTATED_DURABILITY_REFRESH_9e2a".to_vec())),
+        u64::MAX - 2,
+        Some(u64::MAX),
+        original.granted_scopes.clone(),
+        original.identity.clone(),
+        2,
+    )
+    .expect("rotated");
+    assert!(matches!(
+        apply_oauth_refresh(
+            &mut accounts,
+            vault.clone() as Arc<dyn Vault>,
+            &snapshot,
+            &descriptor,
+            &OAuthRefreshFence {
+                generation: 1,
+                issuer: original.issuer.clone(),
+                audience: original.audience.clone(),
+                resource: original.resource.clone(),
+                subject_hash: original.identity.subject_hash.clone(),
+            },
+            rotated.encode().expect("encode rotated"),
+            &watch::channel(false).1,
+        )
+        .await,
+        Err(RefreshApplyError::Persist)
+    ));
+    assert!(
+        vault.resolve(&alias).is_err(),
+        "descriptor persistence failure must durably delete the dead token"
+    );
+    assert!(matches!(
+        snapshot.lock().expect("snapshot")[0].status,
+        CredentialStatus::Expired
+    ));
+    assert!(matches!(
+        durable.lock().expect("durable")[0].status,
+        CredentialStatus::Ok
+    ));
+
+    // Restart sees the production descriptor save failure, but the durable
+    // vault tombstone prevents any resolver from obtaining/retrying the dead
+    // generation-1 refresh token.
+    let restarted: Box<dyn StoreLike> = Box::new(FailingDescriptorStore {
+        durable,
+        fail: fail_descriptor,
+    });
+    let restarted = AccountStore::new(restarted).expect("restart descriptors");
+    assert!(matches!(
+        restarted.get(&alias).expect("descriptor").status,
+        CredentialStatus::Ok
+    ));
+    assert!(vault.resolve(&alias).is_err());
 }
 
 /// Release evidence, never the merge gate (§6.2): the PACKAGED default

@@ -14,7 +14,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use haider_protocol::credential::CredentialDescriptor;
+use haider_protocol::credential::{CredentialDescriptor, CredentialStatus};
 use haider_protocol::error::ErrorCode;
 use haider_protocol::ids::CredentialAlias;
 
@@ -256,6 +256,24 @@ impl<S: StoreLike> AccountStore<S> {
         }
         self.commit(next)?;
         Ok(removed)
+    }
+
+    /// Durably changes only the public usability status of `alias`.
+    ///
+    /// OAuth refresh completion uses this actor-owned mutation; callers may
+    /// never edit the descriptor snapshot in place.
+    pub fn set_status(
+        &mut self,
+        alias: &CredentialAlias,
+        status: CredentialStatus,
+    ) -> AccountsResult<()> {
+        let mut next = self.descriptors.clone();
+        let descriptor = next
+            .iter_mut()
+            .find(|descriptor| descriptor.alias == *alias)
+            .ok_or_else(|| missing_alias(alias))?;
+        descriptor.status = status;
+        self.commit(next)
     }
 
     /// Returns all descriptors in stable insertion order.

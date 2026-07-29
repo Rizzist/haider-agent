@@ -738,6 +738,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "zeroize",
 ]
 
 [[package]]
@@ -797,6 +798,7 @@ dependencies = [
  "async-trait",
  "base64",
  "blake3",
+ "bytes",
  "getrandom 0.3.4",
  "haider-accounts",
  "haider-client",
@@ -806,12 +808,16 @@ dependencies = [
  "haider-rpc",
  "haider-store",
  "haider-tools",
+ "reqwest",
  "rustix 1.1.4",
  "serde",
  "serde_json",
+ "sha2",
+ "subtle",
  "tempfile",
  "tokio",
  "tracing",
+ "url",
  "zeroize",
 ]
 
@@ -830,11 +836,18 @@ dependencies = [
  "haider-rpc",
  "haider-store",
  "haider-tools",
+ "haider-tui",
+ "ratatui",
+ "reqwest",
  "rusqlite",
  "rustix 1.1.4",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
+ "tracing",
+ "url",
+ "zeroize",
 ]
 
 [[package]]

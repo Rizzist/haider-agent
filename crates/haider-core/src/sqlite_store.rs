@@ -240,6 +240,40 @@ impl SqliteStoreHandle {
         run_blocking(move || owner.with_store(|store| store.login_receipts())).await
     }
 
+    pub async fn account_add_claim_receipt(
+        &self,
+        command_id: String,
+        request_digest: String,
+        request_json: String,
+    ) -> Result<haider_store::AccountAddClaim, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.account_add_claim_receipt(&command_id, &request_digest, &request_json)
+            })
+        })
+        .await
+    }
+
+    pub async fn finalize_account_add_receipt(
+        &self,
+        command_id: String,
+        response: haider_store::AccountAddReceiptResponse,
+    ) -> Result<(), HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| store.finalize_account_add_receipt(&command_id, &response))
+        })
+        .await
+    }
+
+    pub async fn account_add_receipts(
+        &self,
+    ) -> Result<Vec<haider_store::AccountAddReceiptRow>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.account_add_receipts())).await
+    }
+
     /// Conditionally commits aggregate `Idle` after a transactional durable
     /// quiescence check.
     pub async fn settle_session_idle(

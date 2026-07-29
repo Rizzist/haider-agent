@@ -17,9 +17,11 @@
 //! 5. drain (R17): close the listener, publish `Draining`, broadcast
 //!    `ServerDraining`, wait bounded for connections, flush the store,
 //!    remove the exact owned socket, and close the store LAST — closing
-//!    the store is what releases the profile lock. ONE deadline bounds the
-//!    whole barrier, finalization included, and a second signal forces at any
-//!    point in it.
+//!    the store is what releases the profile lock. One deadline bounds every
+//!    abortable stage, and a second signal forces at any point in it. An
+//!    already-running, non-abortable account-vault write is joined past that
+//!    deadline when necessary; `Stopped` and the profile lock are withheld
+//!    until its rotated value is restored or durably failed closed.
 //!
 //! Overrun semantics, stated once: a blocking SQLite call cannot be cancelled,
 //! so an overrunning flush/close is STARTED and then abandoned — this task
@@ -27,6 +29,8 @@
 //! lock the moment it returns. A caller that restarts the same profile
 //! immediately after a `Forced` outcome may still meet `AlreadyRunning` for
 //! that moment; that is the honest report of a degraded shutdown, not a leak.
+//! Account-vault persistence is stricter because it carries token bytes: it is
+//! never abandoned, and no `Stopped` outcome is published before it joins.
 //!
 //! Shutdown may arrive at any point; the early-exit helpers
 //! ([`shutdown_without_store`], [`shutdown_before_listener`]) run the same
@@ -302,6 +306,7 @@ async fn run_inner(
         &dependencies.accounts,
         &config.store_dir,
         &config.profile_id,
+        &instance_id,
         &config.default_model,
     )
     .await
@@ -327,41 +332,66 @@ async fn run_inner(
     // logical turn; `"fake"` is creatable only under an injected test
     // configuration, never on the production wire path.
     let creatable_providers = dependencies.provider_factory.creatable_providers();
-    let provider_factory: std::sync::Arc<dyn crate::worker::ProviderFactory> =
-        match &dependencies.provider_factory {
-            crate::worker::ProviderFactoryConfig::Accounts => {
-                std::sync::Arc::new(crate::accounts::AccountsProviderFactory::new(
+    let provider_factory: std::sync::Arc<dyn crate::worker::ProviderFactory> = match &dependencies
+        .provider_factory
+    {
+        crate::worker::ProviderFactoryConfig::Accounts => match accounts_runtime.broker.clone() {
+            Some(broker) => {
+                std::sync::Arc::new(crate::accounts::AccountsProviderFactory::with_broker(
                     std::sync::Arc::clone(&accounts_runtime.facade.snapshot),
                     accounts_runtime.vault.clone(),
                     std::sync::Arc::new(crate::accounts::ProductionAccountBuilder),
+                    broker,
                 ))
             }
-            crate::worker::ProviderFactoryConfig::AccountsWith(builder) => {
-                std::sync::Arc::new(crate::accounts::AccountsProviderFactory::new(
+            None => std::sync::Arc::new(crate::accounts::AccountsProviderFactory::new(
+                std::sync::Arc::clone(&accounts_runtime.facade.snapshot),
+                accounts_runtime.vault.clone(),
+                std::sync::Arc::new(crate::accounts::ProductionAccountBuilder),
+            )),
+        },
+        crate::worker::ProviderFactoryConfig::AccountsWith(builder) => {
+            match accounts_runtime.broker.clone() {
+                Some(broker) => {
+                    std::sync::Arc::new(crate::accounts::AccountsProviderFactory::with_broker(
+                        std::sync::Arc::clone(&accounts_runtime.facade.snapshot),
+                        accounts_runtime.vault.clone(),
+                        std::sync::Arc::clone(builder),
+                        broker,
+                    ))
+                }
+                None => std::sync::Arc::new(crate::accounts::AccountsProviderFactory::new(
                     std::sync::Arc::clone(&accounts_runtime.facade.snapshot),
                     accounts_runtime.vault.clone(),
                     std::sync::Arc::clone(builder),
-                ))
+                )),
             }
-            crate::worker::ProviderFactoryConfig::Injected { factory, .. } => {
-                std::sync::Arc::clone(factory)
-            }
-        };
+        }
+        crate::worker::ProviderFactoryConfig::Injected { factory, .. } => {
+            std::sync::Arc::clone(factory)
+        }
+    };
     hub.install_creatable_providers(creatable_providers)
         .map_err(DaemonError::from)?;
     let worker_dependencies = crate::worker::WorkerDependencies {
         provider_factory,
         tool_factory: std::sync::Arc::clone(&dependencies.tool_factory),
     };
-    let worker_manager = WorkerManager::start(hub.clone(), worker_dependencies);
+    let worker_manager = WorkerManager::start(
+        hub.clone(),
+        worker_dependencies,
+        config.inject_worker_manager_shutdown_error,
+    );
     let worker_handle = worker_manager.handle();
     hub.install_worker_manager(worker_handle.clone())
         .map_err(DaemonError::from)?;
     let crate::accounts::AccountsRuntime {
         facade: accounts_facade,
-        actor: account_actor,
+        actor: mut account_actor,
         vault: _,
+        broker: credential_broker,
     } = accounts_runtime;
+    let oauth_coordinator = accounts_facade.oauth.clone();
     hub.install_accounts(accounts_facade)
         .map_err(DaemonError::from)?;
     for work in recovered_work {
@@ -379,6 +409,15 @@ async fn run_inner(
         };
         if let Err(error) = result {
             let _ = worker_manager.shutdown().await;
+            if let Some(broker) = &credential_broker {
+                broker.abort_and_join().await;
+            }
+            if let Some(oauth) = &oauth_coordinator {
+                oauth.abort_and_join().await;
+            }
+            if let Some(actor) = account_actor.as_mut() {
+                actor.force_and_join().await;
+            }
             let _ = hub.shutdown().await;
             let _ = store.close().await;
             return Err(error.into());
@@ -388,6 +427,16 @@ async fn run_inner(
         Ok(endpoint) => endpoint,
         Err(error) => {
             let _ = worker_manager.shutdown().await;
+            if let Some(broker) = &credential_broker {
+                broker.abort_and_join().await;
+            }
+            if let Some(oauth) = &oauth_coordinator {
+                oauth.abort_and_join().await;
+            }
+            if let Some(actor) = account_actor.as_mut() {
+                actor.force_and_join().await;
+            }
+            let _ = hub.shutdown().await;
             let _ = store.flush().await;
             let _ = store.close().await;
             return Err(error);
@@ -434,6 +483,12 @@ async fn run_inner(
         endpoint.close_listener();
         runtime.crash().await;
         worker_manager.crash().await;
+        if let Some(broker) = &credential_broker {
+            broker.abort_and_join().await;
+        }
+        if let Some(oauth) = &oauth_coordinator {
+            oauth.abort_and_join().await;
+        }
         if let Some(actor) = account_actor {
             actor.crash();
         }
@@ -451,9 +506,10 @@ async fn run_inner(
     // R17 drain barrier, in order: stop accepting, publish Draining,
     // broadcast ServerDraining to every connection, bounded completion,
     // flush, remove the exact owned socket, close the store (lock release)
-    // LAST. ONE deadline covers all of it — including the finalization tail —
-    // so nothing can hold the socket or the profile lock past the deadline the
-    // daemon advertised.
+    // LAST. One deadline bounds every abortable stage. A non-abortable account
+    // vault write is the sole fail-safe exception: after the deadline, Stopped
+    // and lock release remain withheld until that write is joined and its
+    // rotated value is durably restored or failed closed.
     endpoint.close_listener();
     let (reason, mut forced) = match request {
         ShutdownRequest::Graceful { reason } => (reason, false),
@@ -495,29 +551,69 @@ async fn run_inner(
     // envelopes under the same deadline (the ledgered W3b1 relaxation).
     let worker_shutdown =
         bounded_finalization(worker_manager.shutdown(), barrier_deadline, &mut shutdown).await;
-    match worker_shutdown {
-        Some(Ok(())) => {}
-        Some(Err(error)) => return Err(error.into()),
-        None => forced = true,
-    }
+    let worker_error = match worker_shutdown {
+        Some(Ok(())) => None,
+        Some(Err(error)) => {
+            forced = true;
+            Some(DaemonError::from(error))
+        }
+        None => {
+            forced = true;
+            None
+        }
+    };
     // R10 drain: new account commands were already rejected by the hub's
     // draining flag; join the account actor (its in-flight login finishes or
     // the deadline forces it — pending receipts + reconciliation carry the
     // truth either way) under the SAME global deadline.
-    if let Some(actor) = account_actor
+    if let Some(broker) = &credential_broker {
+        match bounded_finalization(broker.shutdown(), barrier_deadline, &mut shutdown).await {
+            Some(true) => {}
+            Some(false) => forced = true,
+            None => {
+                forced = true;
+                broker.abort_and_join().await;
+            }
+        }
+    }
+    if let Some(oauth) = &oauth_coordinator {
+        match bounded_finalization(oauth.shutdown(), barrier_deadline, &mut shutdown).await {
+            Some(true) => {}
+            Some(false) => forced = true,
+            None => {
+                forced = true;
+                oauth.abort_and_join().await;
+            }
+        }
+    }
+    if let Some(mut actor) = account_actor
         && bounded_finalization(actor.shutdown(), barrier_deadline, &mut shutdown)
             .await
             .is_none()
     {
         forced = true;
+        // Unlike Tokio tasks, the actor's blocking vault persistence
+        // cannot be aborted. Keep the profile lock and withhold Stopped
+        // until the actor has observed the force fence, tombstoned any
+        // rotated bundle, dropped its zeroizing bytes, and joined.
+        actor.force_and_join().await;
     }
     let hub_shutdown = bounded_finalization(hub.shutdown(), barrier_deadline, &mut shutdown).await;
-    match hub_shutdown {
-        Some(Ok(crate::SessionHubShutdownOutcome::Graceful)) => {}
-        Some(Ok(crate::SessionHubShutdownOutcome::Forced)) => forced = true,
-        Some(Err(error)) => return Err(DaemonError::from(error)),
-        None => forced = true,
-    }
+    let hub_error = match hub_shutdown {
+        Some(Ok(crate::SessionHubShutdownOutcome::Graceful)) => None,
+        Some(Ok(crate::SessionHubShutdownOutcome::Forced)) => {
+            forced = true;
+            None
+        }
+        Some(Err(error)) => {
+            forced = true;
+            Some(DaemonError::from(error))
+        }
+        None => {
+            forced = true;
+            None
+        }
+    };
     drain_sender.send_replace(Some(DrainNotice {
         reason,
         instance_id,
@@ -541,8 +637,15 @@ async fn run_inner(
     .await;
 
     // Precedence: a listener failure is the daemon's own fault and outranks
-    // whatever the barrier then reported.
-    if let Some(error) = listener_error.or(finalize_error) {
+    // whatever the barrier then reported. All errors are arbitrated only
+    // after the full tail: in particular, no manager/hub failure may bypass
+    // the account actor's transitive blocking-write join or release the
+    // profile lease before finalization.
+    if let Some(error) = listener_error
+        .or(worker_error)
+        .or(hub_error)
+        .or(finalize_error)
+    {
         return Err(error);
     }
     states.publish(DaemonState::Stopped);

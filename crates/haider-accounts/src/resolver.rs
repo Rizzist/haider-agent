@@ -8,7 +8,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use haider_protocol::credential::{CredentialDescriptor, CredentialStatus};
+use haider_protocol::credential::{CredentialDescriptor, CredentialStatus, RotationCause};
 use haider_protocol::error::ErrorCode;
 use haider_protocol::ids::CredentialAlias;
 
@@ -25,12 +25,43 @@ pub enum RotationDecision {
     Stop,
 }
 
+/// Why credential resolution is asking the one-hop rotation policy.
+///
+/// Authentication failures are intentionally not represented as invented
+/// rate-limit deadlines. Both map to the protocol's honest `Error` cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RotationTrigger {
+    RateLimit { until_ms: u64 },
+    AuthExpired,
+    RefreshFailed,
+}
+
+impl RotationTrigger {
+    #[must_use]
+    pub fn cause(self) -> RotationCause {
+        match self {
+            Self::RateLimit { .. } => RotationCause::RateLimit,
+            Self::AuthExpired | Self::RefreshFailed => RotationCause::Error,
+        }
+    }
+}
+
 /// Callback seam for the future credential-rotation policy.
 ///
 /// This crate invokes the callback but intentionally supplies no policy.
 pub trait RotationCallback: Send + Sync {
     /// Decides what to do about `alias` being rate-limited until `until_ms`.
     fn on_limited(&self, alias: &CredentialAlias, until_ms: u64) -> RotationDecision;
+
+    /// Decides a typed rotation request. Existing limited-only policies keep
+    /// their behavior; authentication failures fail closed until explicitly
+    /// supported.
+    fn on_rotation(&self, alias: &CredentialAlias, trigger: RotationTrigger) -> RotationDecision {
+        match trigger {
+            RotationTrigger::RateLimit { until_ms } => self.on_limited(alias, until_ms),
+            RotationTrigger::AuthExpired | RotationTrigger::RefreshFailed => RotationDecision::Stop,
+        }
+    }
 }
 
 /// Resolves provider descriptors and secret handles.
@@ -82,9 +113,11 @@ where
             CredentialStatus::Limited { until_ms } if now_ms >= until_ms => {
                 self.resolve_descriptor(active)
             }
-            CredentialStatus::Limited { until_ms } => {
-                self.resolve_limited(provider, &active.alias, until_ms)
-            }
+            CredentialStatus::Limited { until_ms } => self.resolve_alternate(
+                provider,
+                &active.alias,
+                RotationTrigger::RateLimit { until_ms },
+            ),
             CredentialStatus::Expired => Err(unusable(&active.alias, "expired")),
             CredentialStatus::Revoked => Err(unusable(&active.alias, "revoked")),
         }
@@ -94,13 +127,13 @@ where
     /// credential. Single hop: a `RotateTo` target must belong to `provider`
     /// and be usable now, otherwise the resolution fails without another
     /// callback round.
-    fn resolve_limited(
+    pub fn resolve_alternate(
         &self,
         provider: &str,
         active_alias: &CredentialAlias,
-        until_ms: u64,
+        trigger: RotationTrigger,
     ) -> AccountsResult<(CredentialDescriptor, SecretHandle)> {
-        match self.rotation.on_limited(active_alias, until_ms) {
+        match self.rotation.on_rotation(active_alias, trigger) {
             RotationDecision::RotateTo(alias) => {
                 let alternate = self.accounts.get(&alias).cloned().ok_or_else(|| {
                     accounts_error(
@@ -131,8 +164,8 @@ where
                     CredentialStatus::Revoked => Err(unusable(&alternate.alias, "revoked")),
                 }
             }
-            RotationDecision::Wait => Err(limited(active_alias, until_ms, true)),
-            RotationDecision::Stop => Err(limited(active_alias, until_ms, false)),
+            RotationDecision::Wait => Err(trigger_error(active_alias, trigger, true)),
+            RotationDecision::Stop => Err(trigger_error(active_alias, trigger, false)),
         }
     }
 
@@ -142,6 +175,26 @@ where
     ) -> AccountsResult<(CredentialDescriptor, SecretHandle)> {
         let secret = self.vault.resolve(&descriptor.alias)?;
         Ok((descriptor, secret))
+    }
+}
+
+fn trigger_error(
+    alias: &CredentialAlias,
+    trigger: RotationTrigger,
+    retryable: bool,
+) -> haider_protocol::error::HaiderError {
+    match trigger {
+        RotationTrigger::RateLimit { until_ms } => limited(alias, until_ms, retryable),
+        RotationTrigger::AuthExpired => accounts_error(
+            ErrorCode::Unauthorized,
+            format!("credential alias `{alias}` OAuth authorization expired"),
+            retryable,
+        ),
+        RotationTrigger::RefreshFailed => accounts_error(
+            ErrorCode::Unauthorized,
+            format!("credential alias `{alias}` OAuth refresh failed"),
+            retryable,
+        ),
     }
 }
 

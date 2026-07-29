@@ -14,7 +14,7 @@ fn ordinary(bytes: &[u8]) -> QueuedFrame {
 
 fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> QueuedFrame {
     QueuedFrame {
-        bytes: bytes.to_vec(),
+        bytes: bytes.to_vec().into(),
         response_for: Some((attachment.clone(), RequestId::new(request))),
         floor: false,
     }
@@ -491,6 +491,26 @@ fn liveness_context(hub: crate::session_hub::SessionHub) -> ConnectionContext {
         hub,
         endpoint_path: std::path::PathBuf::from("/tmp/liveness-test.sock"),
     }
+}
+
+#[tokio::test]
+async fn kernel_reported_different_uid_peer_is_rejected_before_framing() {
+    let (_dir, hub) = liveness_hub().await;
+    let (client, server) = UnixStream::pair().expect("real UDS pair");
+    let actual_uid = server.peer_cred().expect("kernel credentials").uid();
+    let mut context = liveness_context(hub.clone());
+    context.owner_uid = actual_uid.checked_add(1).expect("different test uid");
+    let (_drain, drain) = watch::channel(None);
+    let error = serve(server, context, drain)
+        .await
+        .expect_err("different UID must be rejected");
+    assert!(
+        error
+            .to_string()
+            .contains(&format!("refusing peer uid {actual_uid}"))
+    );
+    drop(client);
+    hub.shutdown().await.expect("hub shutdown");
 }
 
 async fn handshake_over(client: &mut UnixStream) {

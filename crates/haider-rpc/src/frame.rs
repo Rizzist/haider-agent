@@ -66,6 +66,10 @@ string_id!(
     /// A durable, client-generated idempotency key.
     CommandId
 );
+string_id!(
+    /// One daemon-instance-scoped OAuth browser flow.
+    OAuthFlowId
+);
 
 /// Stable code for a request whose replay cursor is beyond the committed head.
 pub const ERROR_CODE_CURSOR_AHEAD: &str = "cursor_ahead";
@@ -123,6 +127,10 @@ pub const ERROR_CODE_VAULT_UNSUPPORTED: &str = "vault_unsupported";
 /// client must stage the secret again — an explicit recovery action, and
 /// retryable once re-staged.
 pub const ERROR_CODE_RESTAGE_REQUIRED: &str = "restage_required";
+/// Stable code for a provider whose sanctioned OAuth registration is absent.
+pub const ERROR_CODE_OAUTH_UNAVAILABLE: &str = "oauth_unavailable";
+/// Stable code for an absent, expired, or differently-bound OAuth flow/ref.
+pub const ERROR_CODE_OAUTH_FLOW_NOT_FOUND: &str = "oauth_flow_not_found";
 
 /// Daemon implements receipt-backed session creation and metadata.
 pub const FEATURE_SESSION_MUTATION_V1: &str = "session_mutation_v1";
@@ -132,6 +140,10 @@ pub const FEATURE_TURN_CONTROL_V1: &str = "turn_control_v1";
 pub const FEATURE_ACCOUNT_LOGIN_API_V1: &str = "account_login_api_v1";
 /// Daemon implements connection-scoped `vault.stage` secret staging (R7).
 pub const FEATURE_VAULT_STAGE_V1: &str = "vault_stage_v1";
+/// Daemon implements loopback authorization-code/PKCE account flows.
+pub const FEATURE_ACCOUNT_OAUTH_PKCE_V1: &str = "account_oauth_pkce_v1";
+/// Daemon implements durable `account.add` for an OAuth-ready reference.
+pub const FEATURE_ACCOUNT_MANAGEMENT_V1: &str = "account_management_v1";
 
 /// Kind of client taking part in the handshake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -292,6 +304,186 @@ impl Drop for SecretWire {
         use zeroize::Zeroize;
         self.0.zeroize();
     }
+}
+
+/// A transient authorization URL whose query and state are secret-bearing.
+///
+/// This is intentionally not a `String`. Its normal formatting is redacted,
+/// its allocation is zeroized on drop, and renderers must use the separately
+/// returned provider origin + loopback port.
+#[derive(Clone, PartialEq, Eq)]
+pub struct OAuthAuthorizationWire {
+    value: zeroize::Zeroizing<String>,
+    provider_origin: String,
+    loopback_port: Option<u16>,
+}
+
+impl OAuthAuthorizationWire {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self::from_zeroizing(zeroize::Zeroizing::new(value.into()))
+    }
+
+    /// Moves an already-protected authorization URL into the wire value
+    /// without creating a second ordinary secret-bearing allocation.
+    pub fn from_zeroizing(value: zeroize::Zeroizing<String>) -> Self {
+        let (provider_origin, loopback_port) = safe_authorization_display(&value);
+        Self {
+            value,
+            provider_origin,
+            loopback_port,
+        }
+    }
+
+    /// Grants the browser-link boundary a short-lived view of the full URL.
+    pub fn expose_authorization_url(&self) -> &str {
+        self.value.as_str()
+    }
+}
+
+impl std::fmt::Debug for OAuthAuthorizationWire {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OAuthAuthorizationWire")
+            .field("provider_origin", &self.provider_origin)
+            .field("loopback_port", &self.loopback_port)
+            .finish()
+    }
+}
+
+fn safe_authorization_display(value: &str) -> (String, Option<u16>) {
+    let provider_origin = value
+        .find("://")
+        .and_then(|scheme_end| {
+            let authority_start = scheme_end.checked_add(3)?;
+            let authority_end = value[authority_start..]
+                .find(['/', '?', '#'])
+                .map_or(value.len(), |offset| authority_start + offset);
+            (authority_end <= 512).then(|| value[..authority_end].to_owned())
+        })
+        .unwrap_or_else(|| "[REDACTED]".into());
+    let redirect = value
+        .find("redirect_uri=")
+        .map(|start| &value[start + "redirect_uri=".len()..])
+        .unwrap_or("");
+    let marker = find_ascii_case_insensitive(redirect.as_bytes(), b"127.0.0.1%3a")
+        .map(|index| index + b"127.0.0.1%3a".len())
+        .or_else(|| {
+            redirect
+                .find("127.0.0.1:")
+                .map(|index| index + "127.0.0.1:".len())
+        });
+    let loopback_port = marker.and_then(|start| {
+        let digits = redirect[start..]
+            .bytes()
+            .take_while(u8::is_ascii_digit)
+            .collect::<Vec<_>>();
+        std::str::from_utf8(&digits).ok()?.parse::<u16>().ok()
+    });
+    (provider_origin, loopback_port)
+}
+
+fn find_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window.eq_ignore_ascii_case(needle))
+}
+
+impl Serialize for OAuthAuthorizationWire {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.value.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for OAuthAuthorizationWire {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer).map(Self::new)
+    }
+}
+
+/// Single-use daemon-local claim reference for a verified token bundle.
+#[derive(Clone, PartialEq, Eq)]
+pub struct OAuthReadyRefWire(zeroize::Zeroizing<String>);
+
+impl OAuthReadyRefWire {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(zeroize::Zeroizing::new(value.into()))
+    }
+
+    pub fn expose_reference(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl std::fmt::Debug for OAuthReadyRefWire {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("OAuthReadyRefWire([REDACTED])")
+    }
+}
+
+impl Serialize for OAuthReadyRefWire {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.0.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for OAuthReadyRefWire {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer).map(Self::new)
+    }
+}
+
+/// Structured provider OAuth availability. An unavailable method always
+/// carries a precise public reason and never allocates a listener.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OAuthAvailabilityWire {
+    pub available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Public-only flow progress. No variant can carry callback/token secrets or
+/// a raw endpoint error.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum OAuthFlowStatusWire {
+    WaitingBrowser,
+    Exchanging,
+    Ready {
+        oauth_reference: OAuthReadyRefWire,
+        identity: String,
+        expires_at_ms: u64,
+    },
+    Failed {
+        public_code: String,
+    },
+    Expired,
+    Cancelled,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Tolerant method tag for `account.add`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum AccountAddMethod {
+    #[serde(rename = "oauth")]
+    OAuth,
+    #[serde(other)]
+    Unknown,
 }
 
 /// Why a secret is being staged (R7): the daemon validates the reference is
@@ -479,6 +671,40 @@ pub enum RequestBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         validation_model: Option<String>,
     },
+    /// Starts a daemon-owned loopback authorization flow. The response is
+    /// delivered asynchronously after the coordinator binds `127.0.0.1:0`;
+    /// the connection task performs only authorization and bounded handoff.
+    #[serde(rename = "account.oauth_start")]
+    AccountOAuthStart {
+        provider: String,
+        desired_alias: String,
+        attempt_id: String,
+    },
+    /// Reads only the public phase of a connection-bound flow.
+    #[serde(rename = "account.oauth_status")]
+    AccountOAuthStatus {
+        flow_id: OAuthFlowId,
+        attempt_id: String,
+    },
+    /// Idempotently cancels a connection-bound flow.
+    #[serde(rename = "account.oauth_cancel")]
+    AccountOAuthCancel {
+        flow_id: OAuthFlowId,
+        attempt_id: String,
+    },
+    /// Durable OAuth account creation. `oauth_reference` is transient,
+    /// daemon-instance/connection-bound, single-use, and excluded from the
+    /// semantic command digest.
+    #[serde(rename = "account.add")]
+    AccountAdd {
+        command_id: CommandId,
+        provider: String,
+        alias: String,
+        auth_method: AccountAddMethod,
+        flow_id: OAuthFlowId,
+        attempt_id: String,
+        oauth_reference: OAuthReadyRefWire,
+    },
     /// Lists credential descriptors (View); never secrets.
     #[serde(rename = "account.list")]
     AccountList {
@@ -561,6 +787,36 @@ pub enum ResponseBody {
     /// durable receipt. Never carries secret material.
     #[serde(rename = "account.login_api")]
     AccountLoginApi {
+        descriptor: haider_protocol::credential::CredentialDescriptor,
+    },
+    /// Start result. Unavailable registrations return this same structured
+    /// shape with no flow/URL and a precise reason.
+    #[serde(rename = "account.oauth_start")]
+    AccountOAuthStart {
+        availability: OAuthAvailabilityWire,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        flow_id: Option<OAuthFlowId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        authorization_url: Option<OAuthAuthorizationWire>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_origin: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        loopback_port: Option<u16>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expires_at_ms: Option<u64>,
+    },
+    #[serde(rename = "account.oauth_status")]
+    AccountOAuthStatus {
+        flow_id: OAuthFlowId,
+        status: OAuthFlowStatusWire,
+    },
+    #[serde(rename = "account.oauth_cancel")]
+    AccountOAuthCancel {
+        flow_id: OAuthFlowId,
+        status: OAuthFlowStatusWire,
+    },
+    #[serde(rename = "account.add")]
+    AccountAdd {
         descriptor: haider_protocol::credential::CredentialDescriptor,
     },
     /// Credential descriptors (never secrets).

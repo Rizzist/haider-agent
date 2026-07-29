@@ -30,10 +30,11 @@ pub use actor::{
 };
 pub use fake_store::MemoryStore;
 pub use haider_store::{
-    AcceptedTurn, CancelledTurn, CreatedSession, LoginClaim, LoginReceiptFailure,
-    LoginReceiptResponse, LoginReceiptRow, MenuResolutionCommand, MenuResolutionOutcome,
-    SessionCreateCommand, SessionCreateOutcome, TurnAcceptCommand, TurnAcceptOutcome,
-    TurnAdmissionDisposition, TurnCancelCommand, TurnCancelOutcome, TurnCancellationStatus,
+    AcceptedTurn, AccountAddClaim, AccountAddReceiptResponse, AccountAddReceiptRow, CancelledTurn,
+    CreatedSession, LoginClaim, LoginReceiptFailure, LoginReceiptResponse, LoginReceiptRow,
+    MenuResolutionCommand, MenuResolutionOutcome, SessionCreateCommand, SessionCreateOutcome,
+    TurnAcceptCommand, TurnAcceptOutcome, TurnAdmissionDisposition, TurnCancelCommand,
+    TurnCancelOutcome, TurnCancellationStatus,
 };
 pub use prompt_history::PromptHistoryCompiler;
 pub use recovery::{RecoveryReport, reconcile_dispatched_effects};

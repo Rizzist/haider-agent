@@ -9,12 +9,14 @@ use haider_protocol::ids::CredentialAlias;
 use haider_protocol::ids::{DeviceId, EventId, MenuId, RunId, SessionId};
 use haider_protocol::session::SessionMetadataV1;
 use haider_rpc::{
-    AttachMode, AttachState, AttachmentId, CancelStatus, Capability, ClientKind, CommandId,
-    ERROR_CODE_ALREADY_RESOLVED, ERROR_CODE_CAPABILITY_DENIED, ERROR_CODE_CURSOR_AHEAD, ErrorData,
-    FEATURE_ACCOUNT_LOGIN_API_V1, FEATURE_SESSION_MUTATION_V1, FEATURE_TURN_CONTROL_V1,
-    FEATURE_VAULT_STAGE_V1, Hello, LifecyclePhase, MenuInput, ProtocolError, RequestBody,
-    RequestId, ResponseBody, SecretWire, SeqRange, SessionReadResult, SessionSummary, StagePurpose,
-    SubmitDisposition, Welcome, WireFrame,
+    AccountAddMethod, AttachMode, AttachState, AttachmentId, CancelStatus, Capability, ClientKind,
+    CommandId, ERROR_CODE_ALREADY_RESOLVED, ERROR_CODE_CAPABILITY_DENIED, ERROR_CODE_CURSOR_AHEAD,
+    ErrorData, FEATURE_ACCOUNT_LOGIN_API_V1, FEATURE_ACCOUNT_MANAGEMENT_V1,
+    FEATURE_ACCOUNT_OAUTH_PKCE_V1, FEATURE_SESSION_MUTATION_V1, FEATURE_TURN_CONTROL_V1,
+    FEATURE_VAULT_STAGE_V1, Hello, LifecyclePhase, MenuInput, OAuthAuthorizationWire,
+    OAuthAvailabilityWire, OAuthFlowId, OAuthFlowStatusWire, OAuthReadyRefWire, ProtocolError,
+    RequestBody, RequestId, ResponseBody, SecretWire, SeqRange, SessionReadResult, SessionSummary,
+    StagePurpose, SubmitDisposition, Welcome, WireFrame,
 };
 
 pub const TEST_FRAME_LIMIT: usize = 1024 * 1024;
@@ -385,6 +387,99 @@ pub fn transcript() -> Vec<WireFrame> {
                 FEATURE_VAULT_STAGE_V1.to_owned(),
             ]),
         }),
+        // ── W5b append-only OAuth PKCE/account.add surface ───────────────
+        WireFrame::Request {
+            request_id: RequestId::new("request-oauth-start"),
+            body: RequestBody::AccountOAuthStart {
+                provider: "fake-oauth".into(),
+                desired_alias: "work-oauth".into(),
+                attempt_id: "attempt-1".into(),
+            },
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-oauth-start"),
+            body: ResponseBody::AccountOAuthStart {
+                availability: OAuthAvailabilityWire {
+                    available: true,
+                    reason: None,
+                },
+                flow_id: Some(OAuthFlowId::new("oauth-flow-golden")),
+                authorization_url: Some(OAuthAuthorizationWire::new(
+                    "https://auth.example.invalid/authorize?state=golden-placeholder",
+                )),
+                provider_origin: Some("https://auth.example.invalid".into()),
+                loopback_port: Some(49_152),
+                expires_at_ms: Some(1_753_500_060_000),
+            },
+        },
+        WireFrame::Request {
+            request_id: RequestId::new("request-oauth-status"),
+            body: RequestBody::AccountOAuthStatus {
+                flow_id: OAuthFlowId::new("oauth-flow-golden"),
+                attempt_id: "attempt-1".into(),
+            },
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-oauth-status"),
+            body: ResponseBody::AccountOAuthStatus {
+                flow_id: OAuthFlowId::new("oauth-flow-golden"),
+                status: OAuthFlowStatusWire::Ready {
+                    oauth_reference: OAuthReadyRefWire::new("oauth-ready-golden"),
+                    identity: "person@example.invalid".into(),
+                    expires_at_ms: 1_753_500_360_000,
+                },
+            },
+        },
+        WireFrame::Request {
+            request_id: RequestId::new("request-oauth-cancel"),
+            body: RequestBody::AccountOAuthCancel {
+                flow_id: OAuthFlowId::new("oauth-flow-golden"),
+                attempt_id: "attempt-1".into(),
+            },
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-oauth-cancel"),
+            body: ResponseBody::AccountOAuthCancel {
+                flow_id: OAuthFlowId::new("oauth-flow-golden"),
+                status: OAuthFlowStatusWire::Cancelled,
+            },
+        },
+        WireFrame::Request {
+            request_id: RequestId::new("request-account-add"),
+            body: RequestBody::AccountAdd {
+                command_id: CommandId::new("command-account-add"),
+                provider: "fake-oauth".into(),
+                alias: "work-oauth".into(),
+                auth_method: AccountAddMethod::OAuth,
+                flow_id: OAuthFlowId::new("oauth-flow-golden"),
+                attempt_id: "attempt-1".into(),
+                oauth_reference: OAuthReadyRefWire::new("oauth-ready-golden"),
+            },
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-account-add"),
+            body: ResponseBody::AccountAdd {
+                descriptor: golden_oauth_descriptor(),
+            },
+        },
+        WireFrame::Welcome(Welcome {
+            protocol: 1,
+            instance_id: "instance-oauth".into(),
+            daemon_generation: 7,
+            frame_limit: TEST_FRAME_LIMIT as u32,
+            profile_id: "profile-1".into(),
+            daemon_version: "0.0.13".into(),
+            lifecycle_phase: LifecyclePhase::Ready,
+            capabilities_granted: capabilities([Capability::View, Capability::Control]),
+            features: BTreeSet::from([
+                FEATURE_ACCOUNT_LOGIN_API_V1.to_owned(),
+                FEATURE_ACCOUNT_MANAGEMENT_V1.to_owned(),
+                FEATURE_ACCOUNT_OAUTH_PKCE_V1.to_owned(),
+                FEATURE_SESSION_MUTATION_V1.to_owned(),
+                FEATURE_TURN_CONTROL_V1.to_owned(),
+                FEATURE_VAULT_STAGE_V1.to_owned(),
+            ]),
+        }),
     ]
 }
 
@@ -397,6 +492,18 @@ pub fn golden_descriptor() -> CredentialDescriptor {
         base_url: None,
         auth_method: AuthMethod::ApiKey,
         identity: "work".into(),
+        status: CredentialStatus::Ok,
+        active: true,
+    }
+}
+
+pub fn golden_oauth_descriptor() -> CredentialDescriptor {
+    CredentialDescriptor {
+        alias: CredentialAlias::new("fake-oauth-0123456789abcdef01234567"),
+        provider: "fake-oauth".into(),
+        base_url: None,
+        auth_method: AuthMethod::OAuth,
+        identity: "person@example.invalid".into(),
         status: CredentialStatus::Ok,
         active: true,
     }

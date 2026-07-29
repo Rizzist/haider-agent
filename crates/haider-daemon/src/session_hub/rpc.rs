@@ -239,6 +239,81 @@ impl HubConnection {
                     validation_model,
                 )
             }
+            RequestBody::AccountOAuthStart {
+                provider,
+                desired_alias,
+                attempt_id,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.account_oauth_start(request_id, provider, desired_alias, attempt_id)
+            }
+            RequestBody::AccountOAuthStatus {
+                flow_id,
+                attempt_id,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.account_oauth_status(request_id, flow_id, attempt_id)
+            }
+            RequestBody::AccountOAuthCancel {
+                flow_id,
+                attempt_id,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.account_oauth_cancel(request_id, flow_id, attempt_id)
+            }
+            RequestBody::AccountAdd {
+                command_id,
+                provider,
+                alias,
+                auth_method,
+                flow_id,
+                attempt_id,
+                oauth_reference,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.account_add_oauth(
+                    request_id,
+                    command_id,
+                    provider,
+                    alias,
+                    auth_method,
+                    flow_id,
+                    attempt_id,
+                    oauth_reference,
+                )
+            }
             RequestBody::AccountList { provider } => {
                 if let Err(message) = authorize(&self.capabilities, Operation::View) {
                     return self.respond_error(
@@ -439,6 +514,228 @@ impl HubConnection {
                 true,
                 None,
             ),
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => self.respond_error(
+                request_id,
+                ERROR_CODE_DRAINING,
+                "account actor is shut down",
+                true,
+                None,
+            ),
+        }
+    }
+
+    fn account_oauth_start(
+        &self,
+        request_id: RequestId,
+        provider: String,
+        desired_alias: String,
+        attempt_id: String,
+    ) -> Result<(), SessionHubError> {
+        let Some(facade) = self.secret_surface_facade(&request_id)? else {
+            return Ok(());
+        };
+        let Some(oauth) = facade.oauth else {
+            return self.respond_error(
+                request_id,
+                haider_rpc::ERROR_CODE_OAUTH_UNAVAILABLE,
+                "OAuth coordinator is unavailable",
+                false,
+                None,
+            );
+        };
+        if provider.trim().is_empty()
+            || desired_alias.trim().is_empty()
+            || attempt_id.trim().is_empty()
+        {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "OAuth provider, alias, and attempt id must not be empty",
+                false,
+                None,
+            );
+        }
+        let availability = oauth.availability(&provider, true);
+        if !availability.available {
+            return self.send(WireFrame::Response {
+                request_id,
+                body: ResponseBody::AccountOAuthStart {
+                    availability,
+                    flow_id: None,
+                    authorization_url: None,
+                    provider_origin: None,
+                    loopback_port: None,
+                    expires_at_ms: None,
+                },
+            });
+        }
+        let route = crate::oauth::OAuthRoute {
+            request_id: request_id.clone(),
+            sink: Arc::clone(&self.sink),
+        };
+        match oauth.try_start(
+            &self.connection_id,
+            provider,
+            desired_alias,
+            attempt_id,
+            route,
+        ) {
+            Ok(()) => Ok(()),
+            Err(crate::oauth::StartAdmissionError::Busy) => self.respond_error(
+                request_id,
+                haider_rpc::ERROR_CODE_BUSY,
+                "OAuth coordinator is busy",
+                true,
+                None,
+            ),
+            Err(crate::oauth::StartAdmissionError::Closed) => self.respond_error(
+                request_id,
+                ERROR_CODE_DRAINING,
+                "OAuth coordinator is shut down",
+                true,
+                None,
+            ),
+        }
+    }
+
+    fn account_oauth_status(
+        &self,
+        request_id: RequestId,
+        flow_id: haider_rpc::OAuthFlowId,
+        attempt_id: String,
+    ) -> Result<(), SessionHubError> {
+        let Some(facade) = self.secret_surface_facade(&request_id)? else {
+            return Ok(());
+        };
+        let status = facade
+            .oauth
+            .and_then(|oauth| oauth.status(&self.connection_id, &flow_id, &attempt_id));
+        match status {
+            Some(status) => self.send(WireFrame::Response {
+                request_id,
+                body: ResponseBody::AccountOAuthStatus { flow_id, status },
+            }),
+            None => self.respond_error(
+                request_id,
+                haider_rpc::ERROR_CODE_OAUTH_FLOW_NOT_FOUND,
+                "OAuth flow is unavailable for this connection and attempt",
+                true,
+                None,
+            ),
+        }
+    }
+
+    fn account_oauth_cancel(
+        &self,
+        request_id: RequestId,
+        flow_id: haider_rpc::OAuthFlowId,
+        attempt_id: String,
+    ) -> Result<(), SessionHubError> {
+        let Some(facade) = self.secret_surface_facade(&request_id)? else {
+            return Ok(());
+        };
+        let status = facade
+            .oauth
+            .and_then(|oauth| oauth.cancel(&self.connection_id, &flow_id, &attempt_id));
+        match status {
+            Some(status) => self.send(WireFrame::Response {
+                request_id,
+                body: ResponseBody::AccountOAuthCancel { flow_id, status },
+            }),
+            None => self.respond_error(
+                request_id,
+                haider_rpc::ERROR_CODE_OAUTH_FLOW_NOT_FOUND,
+                "OAuth flow is unavailable for this connection and attempt",
+                true,
+                None,
+            ),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn account_add_oauth(
+        &self,
+        request_id: RequestId,
+        command_id: CommandId,
+        provider: String,
+        alias: String,
+        auth_method: haider_rpc::AccountAddMethod,
+        flow_id: haider_rpc::OAuthFlowId,
+        attempt_id: String,
+        oauth_reference: haider_rpc::OAuthReadyRefWire,
+    ) -> Result<(), SessionHubError> {
+        let Some(facade) = self.secret_surface_facade(&request_id)? else {
+            return Ok(());
+        };
+        if !matches!(auth_method, haider_rpc::AccountAddMethod::OAuth)
+            || command_id.as_str().trim().is_empty()
+            || provider.trim().is_empty()
+            || alias.trim().is_empty()
+            || attempt_id.trim().is_empty()
+        {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "account.add requires OAuth method and complete coordinates",
+                false,
+                None,
+            );
+        }
+        let Some(oauth) = facade.oauth else {
+            return self.respond_error(
+                request_id,
+                haider_rpc::ERROR_CODE_OAUTH_UNAVAILABLE,
+                "OAuth coordinator is unavailable",
+                false,
+                None,
+            );
+        };
+        let claim = oauth.claim_ready(
+            &self.connection_id,
+            &flow_id,
+            &attempt_id,
+            &provider,
+            &alias,
+            &oauth_reference,
+        );
+        let Some(login) = facade.login else {
+            if let Some(claim) = claim {
+                oauth.restore_ready(claim);
+            }
+            return self.respond_error(
+                request_id,
+                haider_rpc::ERROR_CODE_VAULT_UNSUPPORTED,
+                "this platform has no supported secret vault",
+                false,
+                None,
+            );
+        };
+        let job = crate::accounts::OAuthAddJob {
+            command_id: command_id.0,
+            provider,
+            display_alias: alias,
+            claim,
+            route: crate::accounts::LoginRoute {
+                request_id: request_id.clone(),
+                sink: Arc::clone(&self.sink),
+            },
+        };
+        match login.try_send(crate::accounts::AccountCommand::AddOAuth(Box::new(job))) {
+            Ok(()) => Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(command)) => {
+                if let crate::accounts::AccountCommand::AddOAuth(job) = command
+                    && let Some(claim) = job.claim
+                {
+                    oauth.restore_ready(claim);
+                }
+                self.respond_error(
+                    request_id,
+                    haider_rpc::ERROR_CODE_BUSY,
+                    "account actor is busy; retry with the same OAuth reference",
+                    true,
+                    None,
+                )
+            }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => self.respond_error(
                 request_id,
                 ERROR_CODE_DRAINING,
@@ -1240,6 +1537,11 @@ impl HubConnection {
         }
         if let Ok(mut stages) = self.stages.lock() {
             *stages = crate::accounts::StagedSecrets::default();
+        }
+        if let Ok(Some(facade)) = self.hub.accounts()
+            && let Some(oauth) = facade.oauth
+        {
+            oauth.cancel_connection(&self.connection_id);
         }
         self.hub.detach_connection(&self.connection_id).await
     }

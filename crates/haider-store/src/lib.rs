@@ -22,11 +22,12 @@ mod profile_lock;
 
 pub use cas::FileCas;
 pub use event_store::{
-    AcceptedTurn, CancelledTurn, CommittedSeqRange, CreatedSession, EventStore, LoginClaim,
-    LoginReceiptFailure, LoginReceiptResponse, LoginReceiptRow, MenuResolutionCommand,
-    MenuResolutionOutcome, ProfileLease, SessionCreateCommand, SessionCreateOutcome, Store,
-    TurnAcceptCommand, TurnAcceptOutcome, TurnAdmissionDisposition, TurnCancelCommand,
-    TurnCancelOutcome, TurnCancellationStatus,
+    AcceptedTurn, AccountAddClaim, AccountAddReceiptResponse, AccountAddReceiptRow, CancelledTurn,
+    CommittedSeqRange, CreatedSession, EventStore, LoginClaim, LoginReceiptFailure,
+    LoginReceiptResponse, LoginReceiptRow, MenuResolutionCommand, MenuResolutionOutcome,
+    ProfileLease, SessionCreateCommand, SessionCreateOutcome, Store, TurnAcceptCommand,
+    TurnAcceptOutcome, TurnAdmissionDisposition, TurnCancelCommand, TurnCancelOutcome,
+    TurnCancellationStatus,
 };
 pub use haider_protocol::error::{ErrorCode, HaiderError};
 

@@ -54,6 +54,7 @@ use tokio::net::UnixStream;
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::time::Instant;
+use zeroize::Zeroizing;
 
 /// Registry of writer tasks, owned by the daemon runtime.
 ///
@@ -175,7 +176,7 @@ enum LaneKey {
 
 #[derive(Debug)]
 struct QueuedFrame {
-    bytes: Vec<u8>,
+    bytes: OutboundBytes,
     /// Set for a staged attach response: popping it clears this attachment's
     /// pending-response marker (response-before-event ordering), and a purge
     /// that still finds it uses the request id to answer the request.
@@ -186,12 +187,49 @@ struct QueuedFrame {
 }
 
 impl QueuedFrame {
-    fn ordinary(bytes: Vec<u8>) -> Self {
+    fn ordinary(bytes: impl Into<OutboundBytes>) -> Self {
         Self {
-            bytes,
+            bytes: bytes.into(),
             response_for: None,
             floor: false,
         }
+    }
+}
+
+struct OutboundBytes(Zeroizing<Vec<u8>>);
+
+impl std::fmt::Debug for OutboundBytes {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("OutboundBytes")
+            .field(&format_args!("[REDACTED; {} bytes]", self.0.len()))
+            .finish()
+    }
+}
+
+impl std::ops::Deref for OutboundBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_slice()
+    }
+}
+
+impl<const N: usize> PartialEq<&[u8; N]> for OutboundBytes {
+    fn eq(&self, other: &&[u8; N]) -> bool {
+        self.0.as_slice() == other.as_slice()
+    }
+}
+
+impl From<Vec<u8>> for OutboundBytes {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self(Zeroizing::new(bytes))
+    }
+}
+
+impl From<Zeroizing<Vec<u8>>> for OutboundBytes {
+    fn from(bytes: Zeroizing<Vec<u8>>) -> Self {
+        Self(bytes)
     }
 }
 
@@ -351,9 +389,10 @@ impl OutboundLane {
     fn offer(
         &self,
         key: LaneKey,
-        bytes: Vec<u8>,
+        bytes: impl Into<OutboundBytes>,
         ticket: Option<&AdmissionTicket>,
     ) -> SendAdmission {
+        let bytes = bytes.into();
         let charged = bytes.len();
         let Ok(mut state) = self.inner.state.lock() else {
             return SendAdmission::Refused;
@@ -722,7 +761,7 @@ impl FrameSink for ConnectionFrameSink {
             .try_push(
                 LaneKey::System,
                 QueuedFrame {
-                    bytes,
+                    bytes: bytes.into(),
                     response_for: marker,
                     floor: false,
                 },
@@ -1327,6 +1366,8 @@ fn negotiate_hello(
             capabilities_granted: negotiated.capabilities_granted.clone(),
             features: BTreeSet::from([
                 FEATURE_ACCOUNT_LOGIN_API_V1.to_owned(),
+                haider_rpc::FEATURE_ACCOUNT_MANAGEMENT_V1.to_owned(),
+                haider_rpc::FEATURE_ACCOUNT_OAUTH_PKCE_V1.to_owned(),
                 FEATURE_SESSION_MUTATION_V1.to_owned(),
                 FEATURE_TURN_CONTROL_V1.to_owned(),
                 FEATURE_VAULT_STAGE_V1.to_owned(),
@@ -1371,8 +1412,11 @@ fn enqueue(
     lane.try_push(LaneKey::System, QueuedFrame::ordinary(bytes))
 }
 
-fn encode_outbound(frame: &WireFrame, outbound_limit: usize) -> Result<Vec<u8>, DaemonError> {
-    uds_codec::encode(frame, outbound_limit).map_err(|error| DaemonError::Protocol {
+fn encode_outbound(
+    frame: &WireFrame,
+    outbound_limit: usize,
+) -> Result<Zeroizing<Vec<u8>>, DaemonError> {
+    uds_codec::encode_zeroizing(frame, outbound_limit).map_err(|error| DaemonError::Protocol {
         message: format!("outbound frame rejected by peer limit: {error}"),
     })
 }

@@ -68,6 +68,12 @@ pub struct DaemonConfig {
     /// profile resolver; the packaged default is
     /// `haider_client::PACKAGED_DEFAULT_MODEL`.
     pub default_model: String,
+    /// Deterministic runtime fault seam used only by shutdown-barrier tests.
+    ///
+    /// Production constructors leave this false. Keeping the injection on the
+    /// per-daemon config avoids process-global state in real-socket tests.
+    #[doc(hidden)]
+    pub inject_worker_manager_shutdown_error: bool,
 }
 
 impl DaemonConfig {
@@ -89,6 +95,7 @@ impl DaemonConfig {
             drain_timeout: Duration::from_secs(5),
             session_hub: SessionHubConfig::default(),
             default_model: haider_client::PACKAGED_DEFAULT_MODEL.to_owned(),
+            inject_worker_manager_shutdown_error: false,
         }
     }
 

@@ -3427,6 +3427,61 @@ async fn combined_pressure_five_lanes_large_envelopes_and_live_commits_lag_no_re
     store.close().await.expect("store closes");
 }
 
+#[tokio::test]
+async fn remote_control_connection_cannot_reach_any_oauth_secret_surface() {
+    let (_root, store, hub) = open_hub(None, 8).await;
+    let sink = Arc::new(CollectSink::default());
+    let connection = hub
+        .open_connection(capabilities(), sink.clone(), ConnectionTransport::Remote)
+        .expect("remote connection");
+    let flow_id = haider_rpc::OAuthFlowId::new("remote-flow");
+    for (index, body) in [
+        RequestBody::AccountOAuthStart {
+            provider: "fake-oauth".into(),
+            desired_alias: "remote".into(),
+            attempt_id: "remote-attempt".into(),
+        },
+        RequestBody::AccountOAuthStatus {
+            flow_id: flow_id.clone(),
+            attempt_id: "remote-attempt".into(),
+        },
+        RequestBody::AccountOAuthCancel {
+            flow_id: flow_id.clone(),
+            attempt_id: "remote-attempt".into(),
+        },
+        RequestBody::AccountAdd {
+            command_id: CommandId::new("remote-command"),
+            provider: "fake-oauth".into(),
+            alias: "remote".into(),
+            auth_method: haider_rpc::AccountAddMethod::OAuth,
+            flow_id: flow_id.clone(),
+            attempt_id: "remote-attempt".into(),
+            oauth_reference: haider_rpc::OAuthReadyRefWire::new("remote-ready"),
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let request_id = RequestId::new(format!("remote-oauth-{index}"));
+        connection
+            .request(request_id.clone(), body)
+            .await
+            .expect("remote request routes");
+        assert!(matches!(
+            sink.next().await,
+            WireFrame::Response {
+                request_id: response_id,
+                body: ResponseBody::Error { code, message, .. },
+            } if response_id == request_id
+                && code == haider_rpc::ERROR_CODE_CAPABILITY_DENIED
+                && message.contains("same-UID")
+        ));
+    }
+    drop(connection);
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
+}
+
 /// P3-2 (W3c1 review r2): the `cancellation_fences_start` CALL SITE in
 /// `start_turn` is load-bearing and pinned by an EXECUTING guard. The
 /// blocked-factory live schedule proves the observable (zero provider
