@@ -69,9 +69,11 @@ pub use config::DaemonConfig;
 pub use error::{DaemonError, IncumbentDiagnostics};
 pub use lifecycle::{DaemonState, Readiness, ShutdownDisposition, ShutdownHandle, ShutdownOutcome};
 pub use oauth::{
-    OAuthCoordinatorConfig, OAuthIdentityExpectation, OAuthIdentityVerifier, OAuthProviderCatalog,
-    OAuthProviderRegistration, OAuthPublicError, OAuthRedirectPolicy,
-    SANCTIONED_PROVIDER_REGISTRATIONS, SanctionedOAuthRegistration,
+    OAuthAuthorizeParameter, OAuthCoordinatorConfig, OAuthIdentityExpectation, OAuthIdentityMode,
+    OAuthIdentityVerifier, OAuthInferenceAuthMode, OAuthInferenceHeaderSet,
+    OAuthInferenceRegistration, OAuthProviderCatalog, OAuthProviderRegistration, OAuthPublicError,
+    OAuthRedirectPolicy, OAuthTokenRequestEncoding, SANCTIONED_PROVIDER_REGISTRATIONS,
+    SanctionedOAuthRegistration,
 };
 pub use runtime::{
     DaemonTask, run_with_signals, run_with_signals_and_dependencies, spawn, spawn_with_dependencies,

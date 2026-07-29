@@ -1,22 +1,29 @@
 //! Anthropic Messages API adapter.
 
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use haider_accounts::SecretHandle;
 use haider_protocol::ids::CredentialAlias;
 use haider_protocol::provider::{CapabilityDoc, FeatureResolve};
-use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderValue, RETRY_AFTER};
+use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderValue, RETRY_AFTER};
 use serde::Deserialize;
 use tokio::sync::mpsc;
 
+use crate::origin::{FixedDnsResolver, FixedOriginGuard, SystemFixedDnsResolver};
 use crate::wire::{SseDecoder, WireApiError, provider_kind_name, request_json};
 use crate::{
     Provider, ProviderError, ProviderErrorKind, ProviderStream, ProviderStreamItem, TurnRequest,
 };
 
 pub const ANTHROPIC_PROVIDER_NAME: &str = "anthropic";
+pub const ANTHROPIC_OAUTH_PROVIDER_NAME: &str = "anthropic-oauth";
 pub const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
+pub const ANTHROPIC_OAUTH_BASE_URL: &str = "https://api.anthropic.com";
+pub const ANTHROPIC_OAUTH_BETA_HEADER: &str = "anthropic-beta";
+pub const ANTHROPIC_OAUTH_BETA_VALUE: &str = "oauth-2025-04-20";
+const ANTHROPIC_API_HOST: &str = "api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const STREAM_CAPACITY: usize = 32;
 const TRANSPORT_CONFIG: AnthropicTransportConfig = AnthropicTransportConfig {
@@ -53,6 +60,14 @@ pub struct AnthropicProvider {
     account: Option<CredentialAlias>,
     model: String,
     api_url: String,
+    auth_mode: AnthropicAuthMode,
+    fixed_origin_guard: Option<Arc<FixedOriginGuard>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnthropicAuthMode {
+    ApiKey,
+    OAuthBearer,
 }
 
 /// Raw response returned only to the explicit fixture-promotion harness.
@@ -65,27 +80,78 @@ pub struct AnthropicCapture {
 
 impl AnthropicProvider {
     pub fn new(credential: SecretHandle, model: impl Into<String>) -> Result<Self, ProviderError> {
+        Self::new_with_auth(credential, model, AnthropicAuthMode::ApiKey, None)
+    }
+
+    pub fn new_subscription(
+        credential: SecretHandle,
+        model: impl Into<String>,
+        base_url: &str,
+    ) -> Result<Self, ProviderError> {
+        Self::new_subscription_with_dns_resolver(
+            credential,
+            model,
+            base_url,
+            Arc::new(SystemFixedDnsResolver),
+        )
+    }
+
+    pub(crate) fn new_subscription_with_dns_resolver(
+        credential: SecretHandle,
+        model: impl Into<String>,
+        base_url: &str,
+        resolver: Arc<dyn FixedDnsResolver>,
+    ) -> Result<Self, ProviderError> {
+        if base_url != ANTHROPIC_OAUTH_BASE_URL {
+            return Err(ProviderError::new(
+                ProviderErrorKind::InvalidRequest,
+                "Anthropic subscription inference base URL is not sanctioned",
+            ));
+        }
+        let guard = Arc::new(FixedOriginGuard::new(
+            ANTHROPIC_API_URL,
+            ANTHROPIC_API_HOST,
+            resolver,
+        )?);
+        Self::new_with_auth(
+            credential,
+            model,
+            AnthropicAuthMode::OAuthBearer,
+            Some(guard),
+        )
+    }
+
+    fn new_with_auth(
+        credential: SecretHandle,
+        model: impl Into<String>,
+        auth_mode: AnthropicAuthMode,
+        fixed_origin_guard: Option<Arc<FixedOriginGuard>>,
+    ) -> Result<Self, ProviderError> {
         let transport = Self::transport_config();
-        let client = reqwest::Client::builder()
+        let mut client = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .retry(match transport.retry_policy {
                 AnthropicRetryPolicy::Never => reqwest::retry::never(),
             })
-            .connect_timeout(transport.connect_timeout)
-            .build()
-            .map_err(|error| {
-                ProviderError::new(
-                    ProviderErrorKind::Internal,
-                    format!("could not construct Anthropic HTTP client: {error}"),
-                )
-            })?;
+            .connect_timeout(transport.connect_timeout);
+        if let Some(guard) = &fixed_origin_guard {
+            client = client.dns_resolver(Arc::clone(guard));
+        }
+        let client = client.build().map_err(|error| {
+            ProviderError::new(
+                ProviderErrorKind::Internal,
+                format!("could not construct Anthropic HTTP client: {error}"),
+            )
+        })?;
         Ok(Self {
             client,
             credential,
             account: None,
             model: model.into(),
             api_url: ANTHROPIC_API_URL.into(),
+            auth_mode,
+            fixed_origin_guard,
         })
     }
 
@@ -112,6 +178,30 @@ impl AnthropicProvider {
     #[cfg(test)]
     pub(crate) fn client_debug(&self) -> String {
         format!("{:?}", self.client)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stall_fixed_connection_resolution(&self) -> bool {
+        let Some(guard) = self.fixed_origin_guard.as_ref() else {
+            return false;
+        };
+        guard.stall_connection_resolution();
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixed_connection_resolution_count(&self) -> Option<usize> {
+        self.fixed_origin_guard
+            .as_ref()
+            .map(|guard| guard.connection_resolution_count())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn execute_request_for_test(
+        &self,
+        request: reqwest::Request,
+    ) -> Result<reqwest::Response, reqwest::Error> {
+        self.client.execute(request).await
     }
 
     /// Builds the secret-free JSON body. Capture tools use this to record the
@@ -171,20 +261,52 @@ impl AnthropicProvider {
         Ok(value)
     }
 
+    fn authorization_header(&self) -> Result<HeaderValue, ProviderError> {
+        let secret = self.credential.expose_secret();
+        let mut bytes = Vec::with_capacity(7 + secret.len());
+        bytes.extend_from_slice(b"Bearer ");
+        bytes.extend_from_slice(secret);
+        let result = HeaderValue::from_bytes(&bytes).map_err(|_| {
+            ProviderError::new(
+                ProviderErrorKind::Authentication,
+                "resolved Anthropic OAuth credential is not a valid HTTP header value",
+            )
+        });
+        bytes.fill(0);
+        let mut value = result?;
+        value.set_sensitive(true);
+        Ok(value)
+    }
+
+    pub(crate) async fn request(
+        &self,
+        payload: &serde_json::Value,
+    ) -> Result<reqwest::Request, ProviderError> {
+        if let Some(guard) = &self.fixed_origin_guard {
+            guard.validate_endpoint(&self.api_url).await?;
+        }
+        let mut request = self
+            .client
+            .post(&self.api_url)
+            .header(CONTENT_TYPE, "application/json")
+            .header(ACCEPT, "text/event-stream")
+            .header("anthropic-version", ANTHROPIC_VERSION);
+        request = match self.auth_mode {
+            AnthropicAuthMode::ApiKey => request.header("x-api-key", self.api_key_header()?),
+            AnthropicAuthMode::OAuthBearer => request
+                .header(AUTHORIZATION, self.authorization_header()?)
+                .header(ANTHROPIC_OAUTH_BETA_HEADER, ANTHROPIC_OAUTH_BETA_VALUE),
+        };
+        request.json(payload).build().map_err(transport_error)
+    }
+
     async fn send_request(
         &self,
         request: &TurnRequest,
     ) -> Result<reqwest::Response, ProviderError> {
         let payload = self.request_payload(request)?;
-        let opening = self
-            .client
-            .post(&self.api_url)
-            .header(CONTENT_TYPE, "application/json")
-            .header(ACCEPT, "text/event-stream")
-            .header("anthropic-version", ANTHROPIC_VERSION)
-            .header("x-api-key", self.api_key_header()?)
-            .json(&payload)
-            .send();
+        let request = self.request(&payload).await?;
+        let opening = self.client.execute(request);
         tokio::time::timeout(Self::transport_config().response_open_timeout, opening)
             .await
             .map_err(|_| {
@@ -196,6 +318,15 @@ impl AnthropicProvider {
 
 #[async_trait]
 impl Provider for AnthropicProvider {
+    fn credential_surface(&self) -> crate::ProviderCredentialSurface {
+        match self.auth_mode {
+            AnthropicAuthMode::ApiKey => crate::ProviderCredentialSurface::ApiKey,
+            AnthropicAuthMode::OAuthBearer => {
+                crate::ProviderCredentialSurface::OAuthSubscriptionBearer
+            }
+        }
+    }
+
     async fn capabilities(&self) -> CapabilityDoc {
         let model = model_capabilities(&self.model);
         CapabilityDoc {

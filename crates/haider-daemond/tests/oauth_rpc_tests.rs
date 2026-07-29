@@ -564,8 +564,9 @@ async fn write_response(stream: &mut TcpStream, status: u16, location: Option<&s
 
 struct FakeVerifier;
 
+#[async_trait::async_trait]
 impl OAuthIdentityVerifier for FakeVerifier {
-    fn verify(
+    async fn verify(
         &self,
         id_token: &[u8],
         expected: OAuthIdentityExpectation<'_>,

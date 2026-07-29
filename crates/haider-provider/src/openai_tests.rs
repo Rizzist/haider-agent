@@ -85,6 +85,18 @@ impl CompatibleDnsResolver for StubDnsResolver {
     }
 }
 
+#[async_trait]
+impl FixedDnsResolver for StubDnsResolver {
+    async fn resolve(&self, _host: &str, _port: u16) -> std::io::Result<Vec<SocketAddr>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.answers
+            .lock()
+            .expect("fixed resolver answer lock")
+            .pop_front()
+            .ok_or_else(|| std::io::Error::other("fixed resolver had no answer"))
+    }
+}
+
 impl BodyChunkSource for BodyFixture {
     fn content_length_hint(&self) -> Option<u64> {
         self.declared_length
@@ -399,6 +411,23 @@ async fn compatible_credential_client_ignores_inherited_proxy_environment() {
             !format!("{:?}", native.http.client).contains("proxies"),
             "native OpenAI credential-bearing client retained inherited proxy configuration"
         );
+        let subscription_vault = MemoryVault::new();
+        let subscription_alias = CredentialAlias::new("subscription-proxy-audit");
+        subscription_vault
+            .put(&subscription_alias, b"subscription-proxy-sentinel")
+            .expect("store subscription proxy audit secret");
+        let subscription = OpenAiProvider::new_subscription(
+            subscription_vault
+                .resolve(&subscription_alias)
+                .expect("resolve subscription proxy secret"),
+            "gpt-audit",
+            OPENAI_SUBSCRIPTION_BASE_URL,
+        )
+        .expect("subscription OpenAI client");
+        assert!(
+            !format!("{:?}", subscription.http.client).contains("proxies"),
+            "subscription OpenAI client retained inherited proxy configuration"
+        );
         return;
     }
 
@@ -424,6 +453,128 @@ async fn compatible_credential_client_ignores_inherited_proxy_environment() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+/// MUTATION CHECK: restore api.openai.com, remove the Codex-lite header, use
+/// x-api-key, point the fixed endpoint at a private host, or remove the pinned
+/// fixed resolver. Each mutation fails a named assertion before any
+/// credential-bearing network request can be sent.
+/// Verified by revert on 2026-07-29.
+#[tokio::test]
+async fn openai_oauth_subscription_is_codex_bearer_lite_and_fixed_origin() {
+    let vault = MemoryVault::new();
+    let alias = CredentialAlias::new("openai-oauth-request-audit");
+    vault
+        .put(&alias, b"OPENAI_OAUTH_ACCESS_SENTINEL_4fd8")
+        .expect("store OAuth access");
+    let resolver = Arc::new(StubDnsResolver::new([vec![SocketAddr::from((
+        [93, 184, 216, 34],
+        443,
+    ))]]));
+    let provider = OpenAiProvider::new_subscription_with_dns_resolver(
+        vault.resolve(&alias).expect("resolve OAuth access"),
+        "gpt-audit",
+        OPENAI_SUBSCRIPTION_BASE_URL,
+        resolver.clone(),
+    )
+    .expect("OpenAI subscription provider");
+    let request = provider
+        .http
+        .post_json_request(&provider.api_url, &serde_json::json!({"model":"gpt-audit"}))
+        .await
+        .expect("fixed request");
+    assert_eq!(
+        request.url().as_str(),
+        "https://chatgpt.com/backend-api/codex/responses"
+    );
+    assert_eq!(
+        request.headers().get(AUTHORIZATION).expect("Bearer header"),
+        "Bearer OPENAI_OAUTH_ACCESS_SENTINEL_4fd8"
+    );
+    assert_eq!(
+        request
+            .headers()
+            .get(OPENAI_CODEX_RESPONSES_LITE_HEADER)
+            .expect("Codex-lite header"),
+        "true"
+    );
+    assert!(!request.headers().contains_key("x-api-key"));
+    assert_eq!(resolver.calls(), 1, "fixed host resolves once before build");
+    let fixed_guard = provider
+        .http
+        .fixed_origin_guard
+        .as_ref()
+        .expect("subscription provider has a fixed-origin guard");
+    fixed_guard.stall_connection_resolution();
+    let execution = provider.http.client.execute(request);
+    tokio::pin!(execution);
+    let resolution_observed = async {
+        while fixed_guard.connection_resolution_count() == 0 {
+            tokio::task::yield_now().await;
+        }
+    };
+    tokio::select! {
+        result = &mut execution => {
+            panic!("fixed connection resolver did not stall the request: {result:?}");
+        }
+        observed = tokio::time::timeout(Duration::from_secs(1), resolution_observed) => {
+            observed.expect("reqwest must consume the pinned fixed resolver");
+        }
+    }
+    assert_eq!(
+        fixed_guard.connection_resolution_count(),
+        1,
+        "one connection lookup must use the pinned fixed resolver"
+    );
+
+    let private_vault = MemoryVault::new();
+    let private_alias = CredentialAlias::new("openai-private-origin-audit");
+    private_vault
+        .put(&private_alias, b"NEVER_SEND_OPENAI_PRIVATE_9c12")
+        .expect("store private-origin sentinel");
+    let rejected = OpenAiHttp::new_subscription(
+        private_vault
+            .resolve(&private_alias)
+            .expect("resolve private-origin sentinel"),
+        "gpt-audit",
+        "http://169.254.169.254/backend-api/codex/responses",
+        Arc::new(StubDnsResolver::new([])),
+    )
+    .expect_err("private fixed endpoint must be rejected");
+    assert_eq!(rejected.kind, ProviderErrorKind::InvalidRequest);
+
+    for rebound_address in [
+        SocketAddr::from(([127, 0, 0, 1], 443)),
+        SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 443)),
+        "[::ffff:127.0.0.1]:443"
+            .parse()
+            .expect("IPv4-mapped loopback address"),
+        "100.100.100.200:443"
+            .parse()
+            .expect("RFC 6598 metadata address"),
+        SocketAddr::from(([169, 254, 169, 254], 443)),
+    ] {
+        let rebound_vault = MemoryVault::new();
+        let rebound_alias = CredentialAlias::new("openai-rebound-origin-audit");
+        rebound_vault
+            .put(&rebound_alias, b"NEVER_SEND_OPENAI_REBOUND_18de")
+            .expect("store rebound sentinel");
+        let rebound = OpenAiProvider::new_subscription_with_dns_resolver(
+            rebound_vault
+                .resolve(&rebound_alias)
+                .expect("resolve rebound sentinel"),
+            "gpt-audit",
+            OPENAI_SUBSCRIPTION_BASE_URL,
+            Arc::new(StubDnsResolver::new([vec![rebound_address]])),
+        )
+        .expect("construct fixed-host rebound audit");
+        let rebound_error = rebound
+            .http
+            .post_json_request(&rebound.api_url, &serde_json::json!({"model":"gpt-audit"}))
+            .await
+            .expect_err("loopback/private DNS answer must fail before bearer construction");
+        assert_eq!(rebound_error.kind, ProviderErrorKind::InvalidRequest);
+    }
 }
 
 /// MUTATION CHECK: remove `validate_compatible_origin(&parsed)?`.
@@ -464,6 +615,8 @@ async fn metadata_origin_guard_prevents_credential_bearing_request() {
             account: Some(alias),
             model: "audit-model".into(),
             origin_guard: None,
+            fixed_origin_guard: None,
+            codex_responses_lite: false,
         },
         base_url: endpoints.base_url,
         chat_url: endpoints.chat_url,

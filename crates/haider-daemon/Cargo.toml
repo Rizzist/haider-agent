@@ -19,6 +19,7 @@ haider-protocol = { path = "../haider-protocol" }
 haider-provider = { path = "../haider-provider" }
 haider-rpc = { path = "../haider-rpc" }
 haider-tools = { path = "../haider-tools" }
+jsonwebtoken.workspace = true
 reqwest.workspace = true
 rustix.workspace = true
 serde.workspace = true
@@ -31,7 +32,9 @@ url.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+futures-util = "0.3"
 haider-store = { path = "../haider-store" }
+http = "1"
 tempfile.workspace = true
 
 [lints]
