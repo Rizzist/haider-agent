@@ -47,7 +47,7 @@ use haider_rpc::{
     ERROR_CODE_RESTAGE_REQUIRED, ERROR_CODE_UNAUTHORIZED, RequestId, ResponseBody, StagePurpose,
     WireFrame,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 use zeroize::Zeroizing;
 
@@ -537,6 +537,7 @@ pub(crate) enum RefreshApplyError {
 /// Owned account actor task (single writer of the descriptor store).
 pub(crate) struct AccountActorHandle {
     commands: mpsc::Sender<AccountCommand>,
+    force_stop: watch::Sender<bool>,
     task: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -547,11 +548,28 @@ impl AccountActorHandle {
 
     /// Graceful drain: stop accepting, finish the in-flight command, join.
     /// Bounded by the caller's drain deadline (R10).
-    pub(crate) async fn shutdown(mut self) {
+    pub(crate) async fn shutdown(&mut self) {
         let _ = self.commands.send(AccountCommand::Shutdown).await;
-        if let Some(task) = self.task.take() {
+        if let Some(task) = self.task.as_mut() {
             let _ = task.await;
         }
+        self.task.take();
+    }
+
+    /// Forced drain: wake an idle actor, fence a refresh that is inside its
+    /// non-cancellable vault write, and join the actor transitively.
+    ///
+    /// The join is deliberately not replaced with `abort`: a
+    /// `spawn_blocking` vault call ignores task abort. Once such a call has
+    /// started, the actor must regain control, durably fail-close a rotated
+    /// bundle, and drop its zeroizing command bytes before the runtime may
+    /// publish `Stopped` or release the profile lock to a successor.
+    pub(crate) async fn force_and_join(&mut self) {
+        self.force_stop.send_replace(true);
+        if let Some(task) = self.task.as_mut() {
+            let _ = task.await;
+        }
+        self.task.take();
     }
 
     /// Abrupt teardown (crash seam): receipts + reconciliation carry truth.
@@ -582,9 +600,11 @@ pub(crate) struct AccountActorConfig {
 
 pub(crate) fn start_account_actor(config: AccountActorConfig) -> AccountActorHandle {
     let (commands, receiver) = mpsc::channel(ACTOR_CAPACITY);
-    let task = tokio::spawn(run_account_actor(config, receiver));
+    let (force_stop, forced) = watch::channel(false);
+    let task = tokio::spawn(run_account_actor(config, receiver, forced));
     AccountActorHandle {
         commands,
+        force_stop,
         task: Some(task),
     }
 }
@@ -597,6 +617,7 @@ struct PendingSecret {
 async fn run_account_actor(
     config: AccountActorConfig,
     mut receiver: mpsc::Receiver<AccountCommand>,
+    mut force_stop: watch::Receiver<bool>,
 ) {
     let AccountActorConfig {
         store,
@@ -610,7 +631,22 @@ async fn run_account_actor(
     // Command-owned secrets surviving a retryable validation, bounded by
     // SECRET_TTL; daemon restart wipes them by construction.
     let mut pending: HashMap<String, PendingSecret> = HashMap::new();
-    while let Some(command) = receiver.recv().await {
+    loop {
+        let command = tokio::select! {
+            biased;
+            changed = force_stop.changed() => {
+                if changed.is_err() || *force_stop.borrow() {
+                    break;
+                }
+                continue;
+            }
+            command = receiver.recv() => {
+                let Some(command) = command else {
+                    break;
+                };
+                command
+            }
+        };
         match command {
             AccountCommand::Shutdown => break,
             AccountCommand::Login(job) => {
@@ -682,10 +718,14 @@ async fn run_account_actor(
                     &descriptor,
                     &expected,
                     encoded_bundle,
+                    &force_stop,
                 )
                 .await;
                 let _ = completed.send(result);
             }
+        }
+        if *force_stop.borrow() {
+            break;
         }
     }
 }
@@ -697,6 +737,7 @@ async fn apply_oauth_refresh(
     descriptor: &CredentialDescriptor,
     expected: &OAuthRefreshFence,
     encoded_bundle: Zeroizing<Vec<u8>>,
+    force_stop: &watch::Receiver<bool>,
 ) -> Result<(), RefreshApplyError> {
     if !accounts
         .get(&descriptor.alias)
@@ -732,6 +773,14 @@ async fn apply_oauth_refresh(
         tokio::task::spawn_blocking(move || vault_for_put.put(&alias_for_put, &encoded_bundle))
             .await;
     if !matches!(persisted, Ok(Ok(()))) {
+        fail_closed_after_refresh_persist(accounts, vault, snapshot, &alias).await;
+        return Err(RefreshApplyError::Persist);
+    }
+    if *force_stop.borrow() {
+        // The blocking write began under a daemon that has crossed its drain
+        // boundary. It may have published bytes into the physical vault, but
+        // it may not restore the descriptor or survive into a successor:
+        // join the fail-closed tombstone before the actor owner can finish.
         fail_closed_after_refresh_persist(accounts, vault, snapshot, &alias).await;
         return Err(RefreshApplyError::Persist);
     }

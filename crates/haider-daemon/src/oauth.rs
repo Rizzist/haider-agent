@@ -48,6 +48,7 @@ const TOKEN_TIMEOUT: Duration = Duration::from_secs(15);
 
 struct OwnedTaskSet {
     sealed: AtomicBool,
+    panicked: AtomicBool,
     tasks: tokio::sync::Mutex<JoinSet<()>>,
 }
 
@@ -55,7 +56,17 @@ impl OwnedTaskSet {
     fn new() -> Self {
         Self {
             sealed: AtomicBool::new(false),
+            panicked: AtomicBool::new(false),
             tasks: tokio::sync::Mutex::new(JoinSet::new()),
+        }
+    }
+
+    fn inspect_join(&self, completed: Result<(), tokio::task::JoinError>) {
+        if completed.is_err_and(|error| error.is_panic()) {
+            self.panicked.store(true, Ordering::Release);
+            // A task owner that lost a child invariant may drain, but it may
+            // not admit more children or call its shutdown graceful.
+            self.sealed.store(true, Ordering::Release);
         }
     }
 
@@ -79,7 +90,12 @@ impl OwnedTaskSet {
                 if self.sealed.load(Ordering::Acquire) {
                     return false;
                 }
-                while tasks.try_join_next().is_some() {}
+                while let Some(completed) = tasks.try_join_next() {
+                    self.inspect_join(completed);
+                }
+                if self.sealed.load(Ordering::Acquire) {
+                    return false;
+                }
                 tasks.spawn(task);
                 return true;
             }
@@ -91,17 +107,22 @@ impl OwnedTaskSet {
         }
     }
 
-    async fn join_all(&self) {
+    async fn join_all(&self) -> bool {
         self.sealed.store(true, Ordering::Release);
         let mut tasks = self.tasks.lock().await;
-        while tasks.join_next().await.is_some() {}
+        while let Some(completed) = tasks.join_next().await {
+            self.inspect_join(completed);
+        }
+        !self.panicked.load(Ordering::Acquire)
     }
 
     async fn abort_and_join(&self) {
         self.sealed.store(true, Ordering::Release);
         let mut tasks = self.tasks.lock().await;
         tasks.abort_all();
-        while tasks.join_next().await.is_some() {}
+        while let Some(completed) = tasks.join_next().await {
+            self.inspect_join(completed);
+        }
     }
 }
 
@@ -634,7 +655,7 @@ impl OAuthCoordinator {
         }
     }
 
-    pub(crate) async fn shutdown(&self) {
+    pub(crate) async fn shutdown(&self) -> bool {
         self.inner.shutting_down.store(true, Ordering::Release);
         self.inner.shutdown.send_replace(true);
         if let Ok(mut active) = self.inner.active_connections.lock() {
@@ -645,7 +666,7 @@ impl OAuthCoordinator {
                 flow.cancel.send_replace(true);
             }
         }
-        self.tasks.join_all().await;
+        self.tasks.join_all().await
     }
 
     pub(crate) async fn abort_and_join(&self) {
@@ -1837,11 +1858,78 @@ struct BrokerInner {
     catalog: OAuthProviderCatalog,
     snapshot: crate::accounts::AccountsSnapshot,
     status_commands: mpsc::Sender<crate::accounts::AccountCommand>,
-    flights: tokio::sync::Mutex<HashMap<RefreshKey, Arc<RefreshFlight>>>,
+    flights: Mutex<HashMap<RefreshKey, Arc<RefreshFlight>>>,
     fences: Mutex<HashMap<String, Arc<AtomicU64>>>,
     shutting_down: AtomicBool,
     client: reqwest::Client,
     refresh_skew: Duration,
+    #[cfg(test)]
+    panic_refresh_worker: AtomicBool,
+}
+
+/// Completes the public single-flight even if the worker unwinds before its
+/// normal `finish` call. `JoinSet` still records the panic for shutdown
+/// honesty; this guard is the immediate fail-closed wakeup for waiters.
+struct RefreshWorkerCompletion {
+    broker: Weak<BrokerInner>,
+    key: RefreshKey,
+    flight: Arc<RefreshFlight>,
+    armed: bool,
+}
+
+impl RefreshWorkerCompletion {
+    fn new(broker: Weak<BrokerInner>, key: RefreshKey, flight: Arc<RefreshFlight>) -> Self {
+        Self {
+            broker,
+            key,
+            flight,
+            armed: true,
+        }
+    }
+
+    fn finish(mut self, result: Result<(), HaiderError>) {
+        self.flight.finish(result);
+        self.remove_registered_flight();
+        self.armed = false;
+    }
+
+    fn remove_registered_flight(&self) {
+        let Some(broker) = self.broker.upgrade() else {
+            return;
+        };
+        let mut flights = broker
+            .flights
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if flights
+            .get(&self.key)
+            .is_some_and(|current| Arc::ptr_eq(current, &self.flight))
+        {
+            flights.remove(&self.key);
+        }
+    }
+}
+
+impl Drop for RefreshWorkerCompletion {
+    fn drop(&mut self) {
+        if self.armed {
+            self.flight.finish(Err(refresh_worker_failed()));
+            self.remove_registered_flight();
+        }
+    }
+}
+
+fn poison_refresh_flights(inner: &BrokerInner) {
+    let flights = inner
+        .flights
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .drain()
+        .map(|(_, flight)| flight)
+        .collect::<Vec<_>>();
+    for flight in flights {
+        flight.finish(Err(refresh_worker_failed()));
+    }
 }
 
 /// Auth-aware credential broker used by provider construction.
@@ -1882,11 +1970,13 @@ impl CredentialBroker {
                 catalog,
                 snapshot,
                 status_commands,
-                flights: tokio::sync::Mutex::new(HashMap::new()),
+                flights: Mutex::new(HashMap::new()),
                 fences: Mutex::new(HashMap::new()),
                 shutting_down: AtomicBool::new(false),
                 client,
                 refresh_skew: Duration::from_secs(30),
+                #[cfg(test)]
+                panic_refresh_worker: AtomicBool::new(false),
             }),
             tasks: Arc::new(OwnedTaskSet::new()),
         })
@@ -1902,15 +1992,14 @@ impl CredentialBroker {
         match descriptor.auth_method {
             AuthMethod::ApiKey => self.resolve_vault(&descriptor.alias).await,
             AuthMethod::OAuth => {
-                if !Self::snapshot_allows_oauth(&self.inner, descriptor)
-                    && !self.has_active_flight(descriptor).await
-                {
-                    return Err(rotation_error(
-                        descriptor,
-                        haider_accounts::RotationTrigger::AuthExpired,
-                        false,
-                        "OAuth credential is expired or was replaced",
-                    ));
+                if !Self::snapshot_allows_oauth(&self.inner, descriptor) {
+                    let Some(flight) = self.active_flight(descriptor) else {
+                        return Err(expired_or_replaced(descriptor));
+                    };
+                    flight.wait().await?;
+                    if !Self::snapshot_allows_oauth(&self.inner, descriptor) {
+                        return Err(expired_or_replaced(descriptor));
+                    }
                 }
                 self.resolve_oauth(descriptor).await
             }
@@ -1923,26 +2012,40 @@ impl CredentialBroker {
     ) -> Result<SecretHandle, HaiderError> {
         let fence = self.fence_for(&descriptor.alias);
         let expected_fence = fence.load(Ordering::Acquire);
-        let stored = self.resolve_vault(&descriptor.alias).await?;
-        let bundle = match OAuthTokenBundleV1::decode(stored.expose_secret()) {
-            Ok(bundle) => bundle,
-            Err(error) => return Err(error),
+        let bundle = loop {
+            let stored = self.resolve_vault(&descriptor.alias).await?;
+            let bundle = OAuthTokenBundleV1::decode(stored.expose_secret())?;
+            if fence.load(Ordering::Acquire) != expected_fence {
+                return Err(stale_refresh());
+            }
+            if let Err(error) = self.validate_bundle(descriptor, &bundle) {
+                let _ =
+                    Self::mark_expired_if_current(&self.inner, descriptor, &bundle, expected_fence)
+                        .await?;
+                return Err(error);
+            }
+            let now = now_ms().ok_or_else(|| {
+                HaiderError::new(ErrorCode::Internal, "system clock is unavailable", true)
+            })?;
+            let skew_ms = duration_ms(self.inner.refresh_skew);
+            if bundle.expires_at_unix_ms <= now.saturating_add(skew_ms) {
+                break bundle;
+            }
+            if Self::snapshot_allows_oauth(&self.inner, descriptor) {
+                return Ok(bundle.access_token_handle());
+            }
+            // A rotated bundle can be physically present while its descriptor
+            // restoration is still pending. The active flight is the commit
+            // barrier: wait for its durable restoration/fail-close result,
+            // then re-read instead of publishing the early vault value.
+            let Some(flight) = self.active_flight(descriptor) else {
+                return Err(expired_or_replaced(descriptor));
+            };
+            flight.wait().await?;
+            if !Self::snapshot_allows_oauth(&self.inner, descriptor) {
+                return Err(expired_or_replaced(descriptor));
+            }
         };
-        if fence.load(Ordering::Acquire) != expected_fence {
-            return Err(stale_refresh());
-        }
-        if let Err(error) = self.validate_bundle(descriptor, &bundle) {
-            let _ = Self::mark_expired_if_current(&self.inner, descriptor, &bundle, expected_fence)
-                .await?;
-            return Err(error);
-        }
-        let now = now_ms().ok_or_else(|| {
-            HaiderError::new(ErrorCode::Internal, "system clock is unavailable", true)
-        })?;
-        let skew_ms = duration_ms(self.inner.refresh_skew);
-        if bundle.expires_at_unix_ms > now.saturating_add(skew_ms) {
-            return Ok(bundle.access_token_handle());
-        }
         let key = RefreshKey {
             provider: descriptor.provider.clone(),
             alias: descriptor.alias.as_str().to_owned(),
@@ -1952,7 +2055,11 @@ impl CredentialBroker {
             fence_epoch: expected_fence,
         };
         let (flight, leader) = {
-            let mut flights = self.inner.flights.lock().await;
+            let mut flights = self
+                .inner
+                .flights
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(flight) = flights.get(&key) {
                 (Arc::clone(flight), false)
             } else {
@@ -1973,6 +2080,15 @@ impl CredentialBroker {
             if !self
                 .tasks
                 .spawn(async move {
+                    let completion = RefreshWorkerCompletion::new(
+                        Arc::downgrade(&broker),
+                        key_for_worker,
+                        flight_for_worker,
+                    );
+                    #[cfg(test)]
+                    if broker.panic_refresh_worker.swap(false, Ordering::AcqRel) {
+                        panic!("injected OAuth refresh worker panic before completion");
+                    }
                     let result = Self::refresh(&broker, &descriptor, &bundle, expected_fence).await;
                     // All waiters observe the same effective outcome. A transient
                     // refresh failure may keep using an access token that has not
@@ -1988,18 +2104,15 @@ impl CredentialBroker {
                         }
                         Err(error) => Err(error),
                     };
-                    flight_for_worker.finish(public_result);
-                    let mut flights = broker.flights.lock().await;
-                    if flights
-                        .get(&key_for_worker)
-                        .is_some_and(|current| Arc::ptr_eq(current, &flight_for_worker))
-                    {
-                        flights.remove(&key_for_worker);
-                    }
+                    completion.finish(public_result);
                 })
                 .await
             {
-                let mut flights = self.inner.flights.lock().await;
+                let mut flights = self
+                    .inner
+                    .flights
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if flights
                     .get(&key)
                     .is_some_and(|current| Arc::ptr_eq(current, &flight))
@@ -2254,10 +2367,16 @@ impl CredentialBroker {
         })
     }
 
-    async fn has_active_flight(&self, descriptor: &CredentialDescriptor) -> bool {
-        self.inner.flights.lock().await.keys().any(|key| {
-            key.alias == descriptor.alias.as_str() && key.provider == descriptor.provider
-        })
+    fn active_flight(&self, descriptor: &CredentialDescriptor) -> Option<Arc<RefreshFlight>> {
+        self.inner
+            .flights
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .find(|(key, _)| {
+                key.alias == descriptor.alias.as_str() && key.provider == descriptor.provider
+            })
+            .map(|(_, flight)| Arc::clone(flight))
     }
 
     fn fence_for_inner(inner: &BrokerInner, alias: &CredentialAlias) -> Arc<AtomicU64> {
@@ -2284,25 +2403,26 @@ impl CredentialBroker {
         Self::fence_for_inner(inner, alias).fetch_add(1, Ordering::AcqRel);
     }
 
-    pub(crate) async fn shutdown(&self) {
+    pub(crate) async fn shutdown(&self) -> bool {
         self.inner.shutting_down.store(true, Ordering::Release);
-        self.tasks.join_all().await;
+        let graceful = self.tasks.join_all().await;
+        if !graceful {
+            poison_refresh_flights(&self.inner);
+        }
+        graceful
     }
 
     pub(crate) async fn abort_and_join(&self) {
         self.inner.shutting_down.store(true, Ordering::Release);
         self.tasks.abort_and_join().await;
-        let flights = self
-            .inner
-            .flights
-            .lock()
-            .await
-            .drain()
-            .map(|(_, flight)| flight)
-            .collect::<Vec<_>>();
-        for flight in flights {
-            flight.finish(Err(broker_stopped()));
-        }
+        poison_refresh_flights(&self.inner);
+    }
+
+    #[cfg(test)]
+    fn panic_next_refresh_worker(&self) {
+        self.inner
+            .panic_refresh_worker
+            .store(true, Ordering::Release);
     }
 
     async fn mark_expired_if_current(
@@ -2356,6 +2476,14 @@ fn broker_stopped() -> HaiderError {
         ErrorCode::ProviderError,
         "OAuth refresh broker is shutting down",
         true,
+    )
+}
+
+fn refresh_worker_failed() -> HaiderError {
+    HaiderError::new(
+        ErrorCode::ProviderError,
+        "OAuth refresh worker failed before durable completion",
+        false,
     )
 }
 
@@ -2512,6 +2640,15 @@ fn rotation_error(
         }
     }));
     error
+}
+
+fn expired_or_replaced(descriptor: &CredentialDescriptor) -> HaiderError {
+    rotation_error(
+        descriptor,
+        haider_accounts::RotationTrigger::AuthExpired,
+        false,
+        "OAuth credential is expired or was replaced",
+    )
 }
 
 fn stale_refresh() -> HaiderError {

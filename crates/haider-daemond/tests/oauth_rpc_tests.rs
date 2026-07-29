@@ -11,34 +11,46 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use haider_accounts::{MemoryVault, OAuthIdentityV1, OAuthTokenBundleV1, Vault};
 use haider_daemon::{
-    AccountsDependencies, DaemonConfig, DaemonDependencies, OAuthCoordinatorConfig,
-    OAuthIdentityExpectation, OAuthIdentityVerifier, OAuthProviderCatalog,
-    OAuthProviderRegistration, OAuthPublicError, VaultProvision,
+    AccountProviderBuilder, AccountsDependencies, DaemonConfig, DaemonDependencies, DaemonState,
+    DaemonTask, OAuthCoordinatorConfig, OAuthIdentityExpectation, OAuthIdentityVerifier,
+    OAuthProviderCatalog, OAuthProviderRegistration, OAuthPublicError, ProviderFactoryConfig,
+    VaultProvision,
 };
+use haider_protocol::EventPayload;
 use haider_protocol::credential::{AuthMethod, CredentialStatus};
+use haider_provider::{FakeProvider, FakeStep, Provider};
 use haider_rpc::{
-    AccountAddMethod, Capability, CapabilitySet, ClientKind, CommandId, DEFAULT_FRAME_LIMIT,
-    ERROR_CODE_CAPABILITY_DENIED, ERROR_CODE_OAUTH_FLOW_NOT_FOUND, OAuthFlowId,
-    OAuthFlowStatusWire, OAuthReadyRefWire, RequestBody, RequestId, ResponseBody, WireFrame,
+    AccountAddMethod, AttachMode, Capability, CapabilitySet, ClientKind, CommandId,
+    DEFAULT_FRAME_LIMIT, ERROR_CODE_CAPABILITY_DENIED, ERROR_CODE_OAUTH_FLOW_NOT_FOUND,
+    OAuthFlowId, OAuthFlowStatusWire, OAuthReadyRefWire, RequestBody, RequestId, ResponseBody,
+    WireFrame,
 };
+use haider_tui::app::{AppEvent, AppModel};
+use haider_tui::render::render;
+use ratatui::Terminal;
+use ratatui::backend::TestBackend;
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use sha2::{Digest, Sha256};
 use support::{DEADLINE, UdsClient, ready_with_dependencies, test_root};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use url::Url;
+use zeroize::Zeroizing;
 
 const CODE: &str = "OAUTH_CODE_SWEEP_812f";
 const ACCESS: &str = "OAUTH_ACCESS_SWEEP_17a3";
 const REFRESH: &str = "OAUTH_REFRESH_SWEEP_6d51";
 const ID_MARKER: &str = "OAUTH_ID_SWEEP_9bc4";
 const RAW_ERROR: &str = "OAUTH_RAW_ERROR_SWEEP_40e8";
+const ROTATED_ACCESS: &str = "OAUTH_ROTATED_BARRIER_ACCESS_f1a7";
+const ROTATED_REFRESH: &str = "OAUTH_ROTATED_BARRIER_REFRESH_0c42";
 const SCOPES: &str = "openid inference profile";
 const LIMIT: usize = DEFAULT_FRAME_LIMIT;
 
@@ -127,6 +139,159 @@ fn assert_tree_secret_free(root: &std::path::Path, sentinels: &[&str]) -> (usize
     (scanned, saw_wal)
 }
 
+fn render_real_tui_login_surface(secret: &str) -> String {
+    let mut model = AppModel::new();
+    model.handle(AppEvent::Envelope(Box::new(
+        haider_protocol::EventPayload::HarnessStatus(haider_protocol::state::HarnessStatus::Ready),
+    )));
+    for character in "/login fake-oauth api work".chars() {
+        model.handle(AppEvent::Key(KeyEvent::new(
+            KeyCode::Char(character),
+            KeyModifiers::NONE,
+        )));
+    }
+    model.handle(AppEvent::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    )));
+    assert!(model.login.is_some(), "the real login card must be open");
+    for character in secret.chars() {
+        model.handle(AppEvent::Key(KeyEvent::new(
+            KeyCode::Char(character),
+            KeyModifiers::NONE,
+        )));
+    }
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).expect("TUI test terminal");
+    terminal
+        .draw(|frame| {
+            render(&model, frame);
+        })
+        .expect("render real TUI surface");
+    let buffer = terminal.backend().buffer();
+    let mut output = String::new();
+    for y in 0..buffer.area.height {
+        for x in 0..buffer.area.width {
+            output.push_str(buffer[(x, y)].symbol());
+        }
+        output.push('\n');
+    }
+    output
+}
+
+struct BlockingRotationVault {
+    inner: MemoryVault,
+    armed: AtomicBool,
+    entered: AtomicBool,
+    cleartext_live: AtomicBool,
+    release: (Mutex<bool>, Condvar),
+}
+
+impl BlockingRotationVault {
+    fn new() -> Self {
+        Self {
+            inner: MemoryVault::new(),
+            armed: AtomicBool::new(false),
+            entered: AtomicBool::new(false),
+            cleartext_live: AtomicBool::new(false),
+            release: (Mutex::new(false), Condvar::new()),
+        }
+    }
+
+    fn arm(&self) {
+        if let Ok(mut released) = self.release.0.lock() {
+            *released = false;
+        }
+        self.entered.store(false, Ordering::Release);
+        self.armed.store(true, Ordering::Release);
+    }
+
+    fn release(&self) {
+        if let Ok(mut released) = self.release.0.lock() {
+            *released = true;
+            self.release.1.notify_all();
+        }
+    }
+}
+
+impl Vault for BlockingRotationVault {
+    fn put(
+        &self,
+        alias: &haider_protocol::ids::CredentialAlias,
+        secret: &[u8],
+    ) -> haider_accounts::AccountsResult<()> {
+        let rotated = self.armed.load(Ordering::Acquire)
+            && OAuthTokenBundleV1::decode(secret).is_ok_and(|bundle| bundle.generation > 1);
+        self.inner.put(alias, secret)?;
+        if rotated {
+            // The physical write has happened, and the closure still owns the
+            // encoded cleartext bytes. This is the exact non-cancellable
+            // `spawn_blocking` boundary the runtime must join transitively.
+            self.cleartext_live.store(true, Ordering::Release);
+            self.entered.store(true, Ordering::Release);
+            let mut released = self
+                .release
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while !*released {
+                released = self
+                    .release
+                    .1
+                    .wait(released)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            self.cleartext_live.store(false, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    fn resolve(
+        &self,
+        alias: &haider_protocol::ids::CredentialAlias,
+    ) -> haider_accounts::AccountsResult<haider_accounts::SecretHandle> {
+        self.inner.resolve(alias)
+    }
+
+    fn delete(
+        &self,
+        alias: &haider_protocol::ids::CredentialAlias,
+    ) -> haider_accounts::AccountsResult<()> {
+        self.inner.delete(alias)
+    }
+
+    fn list(&self) -> haider_accounts::AccountsResult<Vec<haider_protocol::ids::CredentialAlias>> {
+        self.inner.list()
+    }
+}
+
+struct OAuthTurnBuilder {
+    fake: Arc<FakeProvider>,
+    builds: AtomicU64,
+}
+
+impl AccountProviderBuilder for OAuthTurnBuilder {
+    fn providers(&self) -> std::collections::BTreeSet<String> {
+        std::collections::BTreeSet::from(["fake-oauth".to_owned()])
+    }
+
+    fn build(
+        &self,
+        _provider: &str,
+        credential: haider_accounts::SecretHandle,
+        _model: &str,
+        _alias: &haider_protocol::ids::CredentialAlias,
+    ) -> Result<Arc<dyn Provider>, haider_protocol::error::HaiderError> {
+        assert_eq!(
+            credential.expose_secret(),
+            ROTATED_ACCESS.as_bytes(),
+            "only a durably committed rotated access token may reach a provider"
+        );
+        self.builds.fetch_add(1, Ordering::SeqCst);
+        Ok(self.fake.clone())
+    }
+}
+
 #[derive(Clone)]
 struct SeenAuthorization {
     redirect_uri: String,
@@ -140,6 +305,7 @@ struct FakeServer {
     seen: Arc<Mutex<Option<SeenAuthorization>>>,
     verifier: Arc<Mutex<Option<String>>>,
     fail_next_token: Arc<AtomicBool>,
+    refresh_calls: Arc<AtomicU64>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -158,9 +324,11 @@ impl FakeServer {
         let seen = Arc::new(Mutex::new(None));
         let verifier = Arc::new(Mutex::new(None));
         let fail_next_token = Arc::new(AtomicBool::new(false));
+        let refresh_calls = Arc::new(AtomicU64::new(0));
         let seen_for_task = Arc::clone(&seen);
         let verifier_for_task = Arc::clone(&verifier);
         let fail_next_for_task = Arc::clone(&fail_next_token);
+        let refresh_calls_for_task = Arc::clone(&refresh_calls);
         let task = tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
@@ -169,8 +337,17 @@ impl FakeServer {
                 let seen = Arc::clone(&seen_for_task);
                 let verifier = Arc::clone(&verifier_for_task);
                 let fail_next_token = Arc::clone(&fail_next_for_task);
+                let refresh_calls = Arc::clone(&refresh_calls_for_task);
                 tokio::spawn(async move {
-                    serve(stream, address, seen, verifier, fail_next_token).await;
+                    serve(
+                        stream,
+                        address,
+                        seen,
+                        verifier,
+                        fail_next_token,
+                        refresh_calls,
+                    )
+                    .await;
                 });
             }
         });
@@ -179,6 +356,7 @@ impl FakeServer {
             seen,
             verifier,
             fail_next_token,
+            refresh_calls,
             task,
         }
     }
@@ -211,6 +389,7 @@ async fn serve(
     seen: Arc<Mutex<Option<SeenAuthorization>>>,
     captured_verifier: Arc<Mutex<Option<String>>>,
     fail_next_token: Arc<AtomicBool>,
+    refresh_calls: Arc<AtomicU64>,
 ) {
     let Some((method, target, body)) = read_request(&mut stream).await else {
         return;
@@ -265,6 +444,32 @@ async fn serve(
         return;
     }
     assert!(!fields.contains_key("client_secret"));
+    if fields.get("grant_type").map(String::as_str) == Some("refresh_token") {
+        refresh_calls.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(
+            fields.get("refresh_token").map(String::as_str),
+            Some(REFRESH)
+        );
+        assert_eq!(
+            fields.get("audience").map(String::as_str),
+            Some("fake-resource")
+        );
+        assert_eq!(
+            fields.get("resource").map(String::as_str),
+            Some("fake-api-resource")
+        );
+        let token = serde_json::json!({
+            "access_token": ROTATED_ACCESS,
+            "refresh_token": ROTATED_REFRESH,
+            "token_type": "Bearer",
+            "expires_in": 3600,
+            "refresh_expires_in": 7200,
+            "scope": SCOPES
+        })
+        .to_string();
+        write_response(&mut stream, 200, None, token.as_bytes()).await;
+        return;
+    }
     assert_eq!(
         fields.get("grant_type").map(String::as_str),
         Some("authorization_code")
@@ -417,6 +622,33 @@ async fn control(config: &DaemonConfig, instance: &str) -> UdsClient {
         ClientKind::Cli,
     )
     .await
+}
+
+async fn ready_successor_after_forced_close(
+    config: &DaemonConfig,
+    dependencies: DaemonDependencies,
+) -> DaemonTask {
+    tokio::time::timeout(DEADLINE, async {
+        loop {
+            let task = haider_daemon::spawn_with_dependencies(config.clone(), dependencies.clone());
+            let mut readiness = task.readiness();
+            loop {
+                match readiness.current() {
+                    DaemonState::Ready => return task,
+                    DaemonState::Failed { .. } | DaemonState::Stopped => {
+                        let _ = task.join().await;
+                        break;
+                    }
+                    _ => {
+                        readiness.changed().await.expect("readiness remains open");
+                    }
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("successor acquires profile after forced close")
 }
 
 fn dependencies(server: &FakeServer, vault: Arc<MemoryVault>) -> DaemonDependencies {
@@ -643,13 +875,15 @@ async fn real_uds_oauth_add_is_capability_and_connection_bound_durable_and_secre
         .expect("captured successful verifier");
     for sentinel in [
         successful_authorization.state.as_str(),
+        successful_authorization.nonce.as_str(),
         successful_verifier.as_str(),
+        callback.path(),
     ] {
         assert!(
             !success_html
                 .windows(sentinel.len())
                 .any(|window| window == sentinel.as_bytes()),
-            "live success HTML must not echo state or verifier"
+            "live success HTML must not echo state, nonce, verifier, or callback path"
         );
     }
     let add = RequestBody::AccountAdd {
@@ -781,7 +1015,8 @@ async fn real_uds_oauth_add_is_capability_and_connection_bound_durable_and_secre
         successful_verifier.as_str(),
         callback_segment.as_str(),
     ];
-    let public_tui_output = format!("{descriptor:?}{failed_status:?}{oauth_reference:?}");
+    let tui_secret = sentinels.join("|");
+    let public_tui_output = render_real_tui_login_surface(&tui_secret);
     let trace_snapshot = tracing_output.lock().expect("tracing output").clone();
     for output in [&public_tui_output, &trace_snapshot] {
         for sentinel in &sentinels {
@@ -825,6 +1060,323 @@ async fn real_uds_oauth_add_is_capability_and_connection_bound_durable_and_secre
     ));
     restarted.shutdown_handle().request("complete");
     let _ = restarted.join().await;
+}
+
+// MUTATION CHECK (W5b.1b P1-1): remove `AccountActorHandle::force_and_join`
+// from the forced runtime path. Expected failure: the predecessor publishes
+// `Stopped` while `cleartext_live` is still true (and its already-started
+// rotated vault write can race the successor) instead of blocking here until
+// the actor tombstones and joins.
+#[tokio::test]
+async fn forced_runtime_joins_blocking_refresh_persistence_before_successor_ready() {
+    let root = test_root("haoB");
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let mut config = DaemonConfig::new("oauth-barrier", root.path().join("store"), root.path());
+    config.drain_timeout = Duration::from_millis(100);
+    let server = FakeServer::start().await;
+    let vault = Arc::new(BlockingRotationVault::new());
+    let builder = Arc::new(OAuthTurnBuilder {
+        fake: Arc::new(FakeProvider::new(vec![FakeStep::Finish {
+            reason: haider_protocol::provider::FinishReason::EndTurn,
+        }])),
+        builds: AtomicU64::new(0),
+    });
+    let dependencies = DaemonDependencies {
+        provider_factory: ProviderFactoryConfig::AccountsWith(builder.clone()),
+        accounts: AccountsDependencies {
+            vault: VaultProvision::Available(vault.clone() as Arc<dyn Vault>),
+            oauth_catalog: server.catalog(),
+            oauth_coordinator: OAuthCoordinatorConfig {
+                max_flows: 8,
+                max_invalid_callbacks: 4,
+                flow_ttl: Duration::from_secs(5),
+            },
+            ..AccountsDependencies::default()
+        },
+        ..DaemonDependencies::default()
+    };
+    let task = ready_with_dependencies(&config, dependencies.clone()).await;
+    let mut client = control(&config, "barrier-owner").await;
+    let (flow_id, authorization_url) = start_flow(
+        &mut client,
+        "barrier-oauth-start",
+        "barrier-attempt",
+        "work",
+    )
+    .await;
+    let response = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("browser")
+        .get(authorization_url)
+        .send()
+        .await
+        .expect("browser flow");
+    assert!(response.status().is_success());
+    let oauth_reference = ready_reference(&mut client, &flow_id, "barrier-attempt").await;
+    let descriptor = match request(
+        &mut client,
+        "barrier-account-add",
+        RequestBody::AccountAdd {
+            command_id: CommandId::new("barrier-account-command"),
+            provider: "fake-oauth".into(),
+            alias: "work".into(),
+            auth_method: AccountAddMethod::OAuth,
+            flow_id,
+            attempt_id: "barrier-attempt".into(),
+            oauth_reference,
+        },
+    )
+    .await
+    {
+        ResponseBody::AccountAdd { descriptor } => descriptor,
+        other => panic!("unexpected account.add response: {other:?}"),
+    };
+    let stored = vault.resolve(&descriptor.alias).expect("initial bundle");
+    let initial = OAuthTokenBundleV1::decode(stored.expose_secret()).expect("decode initial");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis()
+        .try_into()
+        .expect("millisecond clock");
+    let expiring = OAuthTokenBundleV1::new(
+        initial.provider_id.clone(),
+        initial.issuer.clone(),
+        initial.audience.clone(),
+        initial.resource.clone(),
+        initial.token_type.clone(),
+        Zeroizing::new(initial.access_token().to_vec()),
+        initial
+            .refresh_token()
+            .map(|token| Zeroizing::new(token.to_vec())),
+        now,
+        initial.refresh_expires_at_unix_ms,
+        initial.granted_scopes.clone(),
+        initial.identity.clone(),
+        initial.generation,
+    )
+    .expect("expiring bundle");
+    vault
+        .put(
+            &descriptor.alias,
+            &expiring.encode().expect("encode expiring"),
+        )
+        .expect("seed expiring");
+    vault.arm();
+
+    let created = request(
+        &mut client,
+        "barrier-session-create",
+        RequestBody::SessionCreate {
+            command_id: CommandId::new("barrier-session-command"),
+            cwd: workspace.to_string_lossy().into_owned(),
+            provider: "fake-oauth".into(),
+            model: "fake-model".into(),
+            max_tokens: 64,
+        },
+    )
+    .await;
+    let (session_id, worker_generation) = match created {
+        ResponseBody::SessionCreate {
+            session_id,
+            worker_generation,
+            ..
+        } => (session_id, worker_generation),
+        other => panic!("unexpected session.create response: {other:?}"),
+    };
+    let _ = request(
+        &mut client,
+        "barrier-session-attach",
+        RequestBody::SessionAttach {
+            session_id: session_id.clone(),
+            after_seq: 0,
+            mode: AttachMode::Control,
+        },
+    )
+    .await;
+    client
+        .send(
+            &WireFrame::Request {
+                request_id: RequestId::new("barrier-turn-submit"),
+                body: RequestBody::TurnSubmit {
+                    command_id: CommandId::new("barrier-turn-command"),
+                    session_id: session_id.clone(),
+                    worker_generation,
+                    text: "drive refresh persistence".into(),
+                    attachments: Vec::new(),
+                    mode: haider_protocol::DeliveryMode::Queue,
+                },
+            },
+            LIMIT,
+        )
+        .await;
+    tokio::time::timeout(DEADLINE, async {
+        while !vault.entered.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("rotated spawn_blocking vault write entered");
+    assert_eq!(server.refresh_calls.load(Ordering::SeqCst), 1);
+
+    task.shutdown_handle()
+        .request("force blocking OAuth persistence");
+    let predecessor = tokio::spawn(async move { task.join().await });
+    tokio::time::sleep(config.drain_timeout + Duration::from_millis(100)).await;
+    let stopped_withheld = !predecessor.is_finished();
+    let cleartext_was_live = vault.cleartext_live.load(Ordering::Acquire);
+
+    // A successor that races the in-flight predecessor write must lose the
+    // profile lease before it can initialize accounts or resolve the vault.
+    let premature_successor =
+        haider_daemon::spawn_with_dependencies(config.clone(), dependencies.clone());
+    let mut premature_readiness = premature_successor.readiness();
+    let successor_was_excluded = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match premature_readiness.current() {
+                DaemonState::Ready => break false,
+                DaemonState::Failed { .. } | DaemonState::Stopped => break true,
+                _ => {
+                    if premature_readiness.changed().await.is_none() {
+                        break !matches!(premature_readiness.current(), DaemonState::Ready);
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .unwrap_or(true);
+    premature_successor
+        .shutdown_handle()
+        .request("finish blocked successor probe");
+    let _ = tokio::time::timeout(DEADLINE, premature_successor.join())
+        .await
+        .expect("blocked successor probe joins");
+
+    // Always unblock the non-cancellable test worker before asserting, so the
+    // deliberate no-join mutation fails without stranding the test runtime.
+    vault.release();
+    let outcome = tokio::time::timeout(DEADLINE, predecessor)
+        .await
+        .expect("predecessor join deadline")
+        .expect("predecessor owner join")
+        .expect("predecessor daemon outcome");
+    assert!(
+        stopped_withheld,
+        "Stopped must remain withheld while blocking persistence owns cleartext"
+    );
+    assert!(
+        cleartext_was_live,
+        "the controlled blocking task still owns token bytes at the barrier"
+    );
+    assert!(
+        successor_was_excluded,
+        "a successor must not reach Ready while predecessor persistence is in flight"
+    );
+    assert_eq!(outcome, haider_daemon::ShutdownOutcome::Forced);
+    assert!(
+        !vault.cleartext_live.load(Ordering::Acquire),
+        "joined blocking persistence no longer owns cleartext bytes"
+    );
+    assert!(
+        vault.resolve(&descriptor.alias).is_err(),
+        "forced actor completion tombstones the predecessor's rotated write"
+    );
+
+    let successor = ready_successor_after_forced_close(&config, dependencies).await;
+    let mut after_restart = control(&config, "barrier-successor").await;
+    match request(
+        &mut after_restart,
+        "barrier-list-after-restart",
+        RequestBody::AccountList { provider: None },
+    )
+    .await
+    {
+        ResponseBody::AccountList { descriptors } => assert!(
+            descriptors.iter().any(|current| {
+                current.alias == descriptor.alias
+                    && matches!(current.status, CredentialStatus::Expired)
+            }),
+            "successor sees only the durable fail-closed descriptor"
+        ),
+        other => panic!("unexpected account.list response: {other:?}"),
+    }
+
+    let successor_created = request(
+        &mut after_restart,
+        "barrier-successor-create",
+        RequestBody::SessionCreate {
+            command_id: CommandId::new("barrier-successor-session-command"),
+            cwd: workspace.to_string_lossy().into_owned(),
+            provider: "fake-oauth".into(),
+            model: "fake-model".into(),
+            max_tokens: 64,
+        },
+    )
+    .await;
+    let (successor_session, successor_generation) = match successor_created {
+        ResponseBody::SessionCreate {
+            session_id,
+            worker_generation,
+            ..
+        } => (session_id, worker_generation),
+        other => panic!("unexpected successor session.create: {other:?}"),
+    };
+    let _ = request(
+        &mut after_restart,
+        "barrier-successor-attach",
+        RequestBody::SessionAttach {
+            session_id: successor_session.clone(),
+            after_seq: 0,
+            mode: AttachMode::Control,
+        },
+    )
+    .await;
+    after_restart
+        .send(
+            &WireFrame::Request {
+                request_id: RequestId::new("barrier-successor-submit"),
+                body: RequestBody::TurnSubmit {
+                    command_id: CommandId::new("barrier-successor-turn-command"),
+                    session_id: successor_session,
+                    worker_generation: successor_generation,
+                    text: "must fail without retrying predecessor token".into(),
+                    attachments: Vec::new(),
+                    mode: haider_protocol::DeliveryMode::Queue,
+                },
+            },
+            LIMIT,
+        )
+        .await;
+    tokio::time::timeout(DEADLINE, async {
+        loop {
+            if let WireFrame::Event { envelope, .. } = after_restart.receive().await
+                && let Ok(EventPayload::RunState(state)) =
+                    serde_json::from_value::<EventPayload>(envelope.payload)
+                && state.is_terminal()
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("successor turn terminal");
+    assert_eq!(
+        server.refresh_calls.load(Ordering::SeqCst),
+        1,
+        "the successor must not retry the predecessor's refresh token"
+    );
+    assert_eq!(
+        builder.builds.load(Ordering::SeqCst),
+        0,
+        "no predecessor or successor turn may observe the uncommitted rotation"
+    );
+    successor
+        .shutdown_handle()
+        .request("barrier successor complete");
+    let _ = successor.join().await;
 }
 
 #[tokio::test]

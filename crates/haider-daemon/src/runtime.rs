@@ -17,9 +17,11 @@
 //! 5. drain (R17): close the listener, publish `Draining`, broadcast
 //!    `ServerDraining`, wait bounded for connections, flush the store,
 //!    remove the exact owned socket, and close the store LAST — closing
-//!    the store is what releases the profile lock. ONE deadline bounds the
-//!    whole barrier, finalization included, and a second signal forces at any
-//!    point in it.
+//!    the store is what releases the profile lock. One deadline bounds every
+//!    abortable stage, and a second signal forces at any point in it. An
+//!    already-running, non-abortable account-vault write is joined past that
+//!    deadline when necessary; `Stopped` and the profile lock are withheld
+//!    until its rotated value is restored or durably failed closed.
 //!
 //! Overrun semantics, stated once: a blocking SQLite call cannot be cancelled,
 //! so an overrunning flush/close is STARTED and then abandoned — this task
@@ -27,6 +29,8 @@
 //! lock the moment it returns. A caller that restarts the same profile
 //! immediately after a `Forced` outcome may still meet `AlreadyRunning` for
 //! that moment; that is the honest report of a degraded shutdown, not a leak.
+//! Account-vault persistence is stricter because it carries token bytes: it is
+//! never abandoned, and no `Stopped` outcome is published before it joins.
 //!
 //! Shutdown may arrive at any point; the early-exit helpers
 //! ([`shutdown_without_store`], [`shutdown_before_listener`]) run the same
@@ -479,9 +483,10 @@ async fn run_inner(
     // R17 drain barrier, in order: stop accepting, publish Draining,
     // broadcast ServerDraining to every connection, bounded completion,
     // flush, remove the exact owned socket, close the store (lock release)
-    // LAST. ONE deadline covers all of it — including the finalization tail —
-    // so nothing can hold the socket or the profile lock past the deadline the
-    // daemon advertised.
+    // LAST. One deadline bounds every abortable stage. A non-abortable account
+    // vault write is the sole fail-safe exception: after the deadline, Stopped
+    // and lock release remain withheld until that write is joined and its
+    // rotated value is durably restored or failed closed.
     endpoint.close_listener();
     let (reason, mut forced) = match request {
         ShutdownRequest::Graceful { reason } => (reason, false),
@@ -532,28 +537,37 @@ async fn run_inner(
     // draining flag; join the account actor (its in-flight login finishes or
     // the deadline forces it — pending receipts + reconciliation carry the
     // truth either way) under the SAME global deadline.
-    if let Some(broker) = &credential_broker
-        && bounded_finalization(broker.shutdown(), barrier_deadline, &mut shutdown)
-            .await
-            .is_none()
-    {
-        forced = true;
-        broker.abort_and_join().await;
+    if let Some(broker) = &credential_broker {
+        match bounded_finalization(broker.shutdown(), barrier_deadline, &mut shutdown).await {
+            Some(true) => {}
+            Some(false) => forced = true,
+            None => {
+                forced = true;
+                broker.abort_and_join().await;
+            }
+        }
     }
-    if let Some(oauth) = &oauth_coordinator
-        && bounded_finalization(oauth.shutdown(), barrier_deadline, &mut shutdown)
-            .await
-            .is_none()
-    {
-        forced = true;
-        oauth.abort_and_join().await;
+    if let Some(oauth) = &oauth_coordinator {
+        match bounded_finalization(oauth.shutdown(), barrier_deadline, &mut shutdown).await {
+            Some(true) => {}
+            Some(false) => forced = true,
+            None => {
+                forced = true;
+                oauth.abort_and_join().await;
+            }
+        }
     }
-    if let Some(actor) = account_actor
+    if let Some(mut actor) = account_actor
         && bounded_finalization(actor.shutdown(), barrier_deadline, &mut shutdown)
             .await
             .is_none()
     {
         forced = true;
+        // Unlike Tokio tasks, the actor's blocking vault persistence
+        // cannot be aborted. Keep the profile lock and withhold Stopped
+        // until the actor has observed the force fence, tombstoned any
+        // rotated bundle, dropped its zeroizing bytes, and joined.
+        actor.force_and_join().await;
     }
     let hub_shutdown = bounded_finalization(hub.shutdown(), barrier_deadline, &mut shutdown).await;
     match hub_shutdown {

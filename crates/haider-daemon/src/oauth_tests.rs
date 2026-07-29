@@ -215,6 +215,11 @@ async fn serve_fake_request(mut stream: TcpStream, state: Arc<FakeState>) {
     if grant == "refresh_token" {
         state.refresh_calls.fetch_add(1, Ordering::SeqCst);
         assert_eq!(form.get("audience").map(String::as_str), Some(AUDIENCE));
+        assert_eq!(
+            form.get("resource").map(String::as_str),
+            Some("fake-api-resource"),
+            "refresh requests must bind the configured resource"
+        );
         if let Some(gate) = &state.refresh_gate {
             let permit = gate.acquire().await.expect("gate");
             permit.forget();
@@ -1711,6 +1716,171 @@ async fn concurrent_refresh_is_single_flight_rotates_and_persists_before_return(
     assert!(
         !server.state.saw_client_secret.load(Ordering::SeqCst),
         "a public OAuth refresh request must never send client_secret"
+    );
+}
+
+// MUTATION CHECK (W5b.1b P1-2): restore `resolve`'s old
+// `snapshot_allows_oauth || has_active_flight` admission and/or return a
+// long-lived vault bundle immediately from `resolve_oauth`. The direct
+// `resolve_oauth` contender represents a resolver that crossed the outer
+// admission check immediately before Begin made the snapshot Expired.
+// Expected failure: either contender finishes with the rotated access token
+// while descriptor commit is still blocked, before the fail-closed delete.
+#[tokio::test]
+async fn concurrent_resolve_waits_for_rotated_descriptor_commit_or_fail_closed_delete() {
+    let server = FakeOAuthServer::start(FakeMode::Success, true).await;
+    let vault = Arc::new(MemoryVault::new());
+    let descriptor = oauth_descriptor_for_test();
+    vault
+        .put(
+            &descriptor.alias,
+            &oauth_bundle_for_test(&server, now_ms().expect("clock").saturating_sub(1))
+                .encode()
+                .expect("encode"),
+        )
+        .expect("seed");
+    let snapshot = Arc::new(Mutex::new(vec![descriptor.clone()]));
+    let (commands, mut receiver) = mpsc::channel(8);
+    let published = Arc::new(Semaphore::new(0));
+    let release_commit = Arc::new(Semaphore::new(0));
+    tokio::spawn({
+        let snapshot = Arc::clone(&snapshot);
+        let vault = Arc::clone(&vault);
+        let published = Arc::clone(&published);
+        let release_commit = Arc::clone(&release_commit);
+        async move {
+            while let Some(command) = receiver.recv().await {
+                match command {
+                    crate::accounts::AccountCommand::BeginOAuthRefresh {
+                        descriptor,
+                        completed,
+                        ..
+                    } => {
+                        if let Ok(mut descriptors) = snapshot.lock()
+                            && let Some(current) = descriptors
+                                .iter_mut()
+                                .find(|current| current.alias == descriptor.alias)
+                        {
+                            current.status = CredentialStatus::Expired;
+                        }
+                        let _ = completed.send(Ok(true));
+                    }
+                    crate::accounts::AccountCommand::ApplyOAuthRefresh {
+                        descriptor,
+                        encoded_bundle,
+                        completed,
+                        ..
+                    } => {
+                        let result = vault
+                            .put(&descriptor.alias, &encoded_bundle)
+                            .map_err(|_| crate::accounts::RefreshApplyError::Persist);
+                        published.add_permits(1);
+                        release_commit
+                            .acquire()
+                            .await
+                            .expect("release descriptor commit")
+                            .forget();
+                        let _ = vault.delete(&descriptor.alias);
+                        let _ = completed.send(match result {
+                            Ok(()) => Err(crate::accounts::RefreshApplyError::Persist),
+                            Err(error) => Err(error),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        }
+    });
+    let broker = CredentialBroker::new(
+        vault.clone() as Arc<dyn Vault>,
+        OAuthProviderCatalog::with_test_registrations([
+            server.registration(Arc::new(FakeIdentityVerifier))
+        ])
+        .expect("catalog"),
+        Arc::clone(&snapshot),
+        commands,
+    )
+    .expect("broker");
+    let leader = tokio::spawn({
+        let broker = broker.clone();
+        let descriptor = descriptor.clone();
+        async move { broker.resolve(&descriptor).await }
+    });
+    wait_for_refresh_calls(&server, 1).await;
+    server.release_refresh();
+    published
+        .acquire()
+        .await
+        .expect("rotated vault publish")
+        .forget();
+
+    let mut preadmitted_contender = tokio::spawn({
+        let broker = broker.clone();
+        let descriptor = descriptor.clone();
+        async move { broker.resolve_oauth(&descriptor).await }
+    });
+    let mut public_contender = tokio::spawn({
+        let broker = broker.clone();
+        let descriptor = descriptor.clone();
+        async move { broker.resolve(&descriptor).await }
+    });
+    let preadmitted_early =
+        tokio::time::timeout(Duration::from_millis(100), &mut preadmitted_contender).await;
+    let public_early =
+        tokio::time::timeout(Duration::from_millis(100), &mut public_contender).await;
+    let both_stopped_at_commit = preadmitted_early.is_err() && public_early.is_err();
+    release_commit.add_permits(1);
+    assert!(leader.await.expect("leader joins").is_err());
+    let preadmitted_result = match preadmitted_early {
+        Ok(joined) => joined,
+        Err(_) => preadmitted_contender.await,
+    }
+    .expect("preadmitted contender joins");
+    let public_result = match public_early {
+        Ok(joined) => joined,
+        Err(_) => public_contender.await,
+    }
+    .expect("public contender joins");
+    assert!(
+        both_stopped_at_commit,
+        "neither a preadmitted nor public resolver may publish a physically written rotated bundle before descriptor commit"
+    );
+    assert!(
+        preadmitted_result.is_err() && public_result.is_err(),
+        "the failed descriptor commit must fail preadmitted and public waiters closed"
+    );
+    assert!(
+        vault.resolve(&descriptor.alias).is_err(),
+        "fail-closed completion tombstones the unpublished rotated bundle"
+    );
+    assert!(broker.shutdown().await);
+}
+
+// MUTATION CHECK (W5b.1b P2-3): discard `JoinError` values in
+// `OwnedTaskSet::join_all`. Expected failure: the flight guard still wakes
+// the resolver closed, but shutdown incorrectly returns `true` (graceful).
+#[tokio::test]
+async fn refresh_worker_panic_wakes_waiters_and_makes_graceful_shutdown_unclean() {
+    let server = FakeOAuthServer::start(FakeMode::Success, false).await;
+    let vault = Arc::new(MemoryVault::new());
+    let descriptor = oauth_descriptor_for_test();
+    vault
+        .put(
+            &descriptor.alias,
+            &oauth_bundle_for_test(&server, now_ms().expect("clock").saturating_sub(1))
+                .encode()
+                .expect("encode"),
+        )
+        .expect("seed");
+    let (broker, _, descriptor) = broker_for(&server, vault, descriptor);
+    broker.panic_next_refresh_worker();
+    let result = tokio::time::timeout(Duration::from_secs(2), broker.resolve(&descriptor))
+        .await
+        .expect("panic must not strand the single-flight waiter");
+    assert!(result.is_err(), "a panicked refresh worker fails closed");
+    assert!(
+        !broker.shutdown().await,
+        "a child panic must prevent a clean graceful shutdown report"
     );
 }
 

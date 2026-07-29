@@ -480,7 +480,7 @@ async fn account_actor_answers_restage_required_after_the_pending_ttl() {
     let store = open_store(dir.path()).await;
     let validator = Arc::new(UnavailableValidator::default());
     let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(Vec::new()));
-    let actor = start_account_actor(AccountActorConfig {
+    let mut actor = start_account_actor(AccountActorConfig {
         store: store.clone(),
         accounts: memory_accounts(),
         vault: Arc::new(MemoryVault::default()) as Arc<dyn Vault>,
@@ -935,7 +935,7 @@ async fn oauth_account_add_never_exposes_initial_token_before_vault_persistence(
         entered: AtomicBool::new(false),
         release: (StdMutex::new(false), Condvar::new()),
     });
-    let actor = start_account_actor(AccountActorConfig {
+    let mut actor = start_account_actor(AccountActorConfig {
         store: store.clone(),
         accounts: memory_accounts(),
         vault: vault.clone() as Arc<dyn Vault>,
@@ -1312,6 +1312,7 @@ async fn refresh_cas_ignores_benign_status_and_selection_changes() {
             subject_hash: original.identity.subject_hash.clone(),
         },
         rotated.encode().expect("encode rotated"),
+        &watch::channel(false).1,
     )
     .await
     .expect("benign fields do not fence rotation");
@@ -1582,6 +1583,7 @@ async fn production_descriptor_failure_tombstones_the_dead_rotated_refresh_token
                 subject_hash: original.identity.subject_hash.clone(),
             },
             rotated.encode().expect("encode rotated"),
+            &watch::channel(false).1,
         )
         .await,
         Err(RefreshApplyError::Persist)
