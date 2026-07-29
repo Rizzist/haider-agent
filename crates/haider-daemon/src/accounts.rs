@@ -497,23 +497,38 @@ pub(crate) struct OAuthAddJob {
 }
 
 /// Account actor mailbox items.
+#[derive(Clone)]
+pub(crate) struct OAuthRefreshFence {
+    pub(crate) generation: u64,
+    pub(crate) issuer: String,
+    pub(crate) audience: String,
+    pub(crate) resource: Option<String>,
+    pub(crate) subject_hash: String,
+}
+
 pub(crate) enum AccountCommand {
     Login(Box<LoginJob>),
     AddOAuth(Box<OAuthAddJob>),
+    BeginOAuthRefresh {
+        descriptor: CredentialDescriptor,
+        expected: OAuthRefreshFence,
+        completed: tokio::sync::oneshot::Sender<Result<bool, HaiderError>>,
+    },
     ApplyOAuthRefresh {
         descriptor: CredentialDescriptor,
-        expected_generation: u64,
+        expected: OAuthRefreshFence,
         encoded_bundle: Zeroizing<Vec<u8>>,
         completed: tokio::sync::oneshot::Sender<Result<(), RefreshApplyError>>,
     },
-    SetStatus {
-        alias: CredentialAlias,
-        status: CredentialStatus,
-        completed: tokio::sync::oneshot::Sender<Result<(), HaiderError>>,
+    ExpireOAuthRefresh {
+        descriptor: CredentialDescriptor,
+        expected: OAuthRefreshFence,
+        completed: tokio::sync::oneshot::Sender<Result<bool, HaiderError>>,
     },
     Shutdown,
 }
 
+#[derive(Debug)]
 pub(crate) enum RefreshApplyError {
     Stale,
     Persist,
@@ -624,20 +639,39 @@ async fn run_account_actor(
                 )
                 .await;
             }
-            AccountCommand::SetStatus {
-                alias,
-                status,
+            AccountCommand::BeginOAuthRefresh {
+                descriptor,
+                expected,
                 completed,
             } => {
-                let result = accounts.set_status(&alias, status);
-                if result.is_ok() {
-                    refresh_snapshot(&snapshot, &accounts);
-                }
+                let result = begin_oauth_refresh(
+                    &mut accounts,
+                    Arc::clone(&vault),
+                    &snapshot,
+                    &descriptor,
+                    &expected,
+                )
+                .await;
+                let _ = completed.send(result);
+            }
+            AccountCommand::ExpireOAuthRefresh {
+                descriptor,
+                expected,
+                completed,
+            } => {
+                let result = expire_oauth_refresh(
+                    &mut accounts,
+                    Arc::clone(&vault),
+                    &snapshot,
+                    &descriptor,
+                    &expected,
+                )
+                .await;
                 let _ = completed.send(result);
             }
             AccountCommand::ApplyOAuthRefresh {
                 descriptor,
-                expected_generation,
+                expected,
                 encoded_bundle,
                 completed,
             } => {
@@ -646,7 +680,7 @@ async fn run_account_actor(
                     Arc::clone(&vault),
                     &snapshot,
                     &descriptor,
-                    expected_generation,
+                    &expected,
                     encoded_bundle,
                 )
                 .await;
@@ -661,27 +695,35 @@ async fn apply_oauth_refresh(
     vault: Arc<dyn Vault>,
     snapshot: &AccountsSnapshot,
     descriptor: &CredentialDescriptor,
-    expected_generation: u64,
+    expected: &OAuthRefreshFence,
     encoded_bundle: Zeroizing<Vec<u8>>,
 ) -> Result<(), RefreshApplyError> {
-    if accounts.get(&descriptor.alias) != Some(descriptor) {
+    if !accounts
+        .get(&descriptor.alias)
+        .is_some_and(|current| same_credential_identity(current, descriptor))
+    {
         return Err(RefreshApplyError::Stale);
     }
     let alias = descriptor.alias.clone();
     let vault_for_read = Arc::clone(&vault);
     let alias_for_read = alias.clone();
-    let current =
-        match tokio::task::spawn_blocking(move || vault_for_read.resolve(&alias_for_read)).await {
-            Ok(Ok(current)) => current,
-            Ok(Err(_)) | Err(_) => {
-                mark_refresh_expired(accounts, snapshot, &alias);
-                return Err(RefreshApplyError::Persist);
-            }
-        };
-    let generation = haider_accounts::OAuthTokenBundleV1::decode(current.expose_secret())
-        .map_err(|_| RefreshApplyError::Stale)?
-        .generation;
-    if generation != expected_generation {
+    let current = match tokio::task::spawn_blocking(move || vault_for_read.resolve(&alias_for_read))
+        .await
+    {
+        Ok(Ok(current)) => current,
+        Ok(Err(_)) | Err(_) => {
+            fail_closed_after_refresh_persist(accounts, Arc::clone(&vault), snapshot, &alias).await;
+            return Err(RefreshApplyError::Persist);
+        }
+    };
+    let current = haider_accounts::OAuthTokenBundleV1::decode(current.expose_secret())
+        .map_err(|_| RefreshApplyError::Stale)?;
+    if current.generation != expected.generation
+        || current.issuer != expected.issuer
+        || current.audience != expected.audience
+        || current.resource != expected.resource
+        || current.identity.subject_hash != expected.subject_hash
+    {
         return Err(RefreshApplyError::Stale);
     }
     let vault_for_put = Arc::clone(&vault);
@@ -690,22 +732,199 @@ async fn apply_oauth_refresh(
         tokio::task::spawn_blocking(move || vault_for_put.put(&alias_for_put, &encoded_bundle))
             .await;
     if !matches!(persisted, Ok(Ok(()))) {
-        mark_refresh_expired(accounts, snapshot, &alias);
+        fail_closed_after_refresh_persist(accounts, vault, snapshot, &alias).await;
         return Err(RefreshApplyError::Persist);
+    }
+    if accounts
+        .get(&alias)
+        .is_some_and(|current| matches!(&current.status, CredentialStatus::Expired))
+        && !matches!(&descriptor.status, CredentialStatus::Expired)
+    {
+        if accounts
+            .set_status(&alias, descriptor.status.clone())
+            .is_err()
+        {
+            fail_closed_after_refresh_persist(accounts, vault, snapshot, &alias).await;
+            return Err(RefreshApplyError::Persist);
+        }
+        refresh_snapshot(snapshot, accounts);
     }
     Ok(())
 }
 
-fn mark_refresh_expired(
+async fn begin_oauth_refresh(
     accounts: &mut AccountStore<Box<dyn StoreLike>>,
+    vault: Arc<dyn Vault>,
+    snapshot: &AccountsSnapshot,
+    descriptor: &CredentialDescriptor,
+    expected: &OAuthRefreshFence,
+) -> Result<bool, HaiderError> {
+    if !accounts
+        .get(&descriptor.alias)
+        .is_some_and(|current| same_credential_identity(current, descriptor))
+    {
+        return Ok(false);
+    }
+    let vault_for_read = Arc::clone(&vault);
+    let alias_for_read = descriptor.alias.clone();
+    let current =
+        match tokio::task::spawn_blocking(move || vault_for_read.resolve(&alias_for_read)).await {
+            Ok(Ok(current)) => current,
+            Ok(Err(_)) | Err(_) => return Ok(false),
+        };
+    let Ok(current) = haider_accounts::OAuthTokenBundleV1::decode(current.expose_secret()) else {
+        return Ok(false);
+    };
+    if current.generation != expected.generation
+        || current.provider_id != descriptor.provider
+        || current.issuer != expected.issuer
+        || current.audience != expected.audience
+        || current.resource != expected.resource
+        || current.identity.subject_hash != expected.subject_hash
+        || current.identity.display_identity != descriptor.identity
+    {
+        return Ok(false);
+    }
+    // Durable uncertainty marker before the request can rotate server state.
+    // On ordinary storage this retains the original bundle (for audit and
+    // issuer-mismatch evidence) while Expired prevents any restart from
+    // resolving/retrying it. If descriptor persistence itself fails, the
+    // vault tombstone is the fail-closed fallback.
+    persist_refresh_expired_or_tombstone(accounts, vault, snapshot, &descriptor.alias).await?;
+    Ok(true)
+}
+
+async fn expire_oauth_refresh(
+    accounts: &mut AccountStore<Box<dyn StoreLike>>,
+    vault: Arc<dyn Vault>,
+    snapshot: &AccountsSnapshot,
+    descriptor: &CredentialDescriptor,
+    expected: &OAuthRefreshFence,
+) -> Result<bool, HaiderError> {
+    if !accounts
+        .get(&descriptor.alias)
+        .is_some_and(|current| same_credential_identity(current, descriptor))
+    {
+        return Ok(false);
+    }
+    let vault_for_read = Arc::clone(&vault);
+    let alias_for_read = descriptor.alias.clone();
+    let current =
+        match tokio::task::spawn_blocking(move || vault_for_read.resolve(&alias_for_read)).await {
+            Ok(Ok(current)) => current,
+            Ok(Err(_)) | Err(_) => return Ok(false),
+        };
+    let Ok(current) = haider_accounts::OAuthTokenBundleV1::decode(current.expose_secret()) else {
+        return Ok(false);
+    };
+    if current.generation != expected.generation
+        || current.provider_id != descriptor.provider
+        || current.issuer != expected.issuer
+        || current.audience != expected.audience
+        || current.resource != expected.resource
+        || current.identity.subject_hash != expected.subject_hash
+        || current.identity.display_identity != descriptor.identity
+    {
+        return Ok(false);
+    }
+    persist_refresh_expired_or_tombstone(accounts, vault, snapshot, &descriptor.alias).await?;
+    Ok(true)
+}
+
+fn same_credential_identity(
+    current: &CredentialDescriptor,
+    expected: &CredentialDescriptor,
+) -> bool {
+    current.alias == expected.alias
+        && current.provider == expected.provider
+        && current.base_url == expected.base_url
+        && current.auth_method == expected.auth_method
+        && current.identity == expected.identity
+}
+
+async fn fail_closed_after_refresh_persist(
+    accounts: &mut AccountStore<Box<dyn StoreLike>>,
+    vault: Arc<dyn Vault>,
     snapshot: &AccountsSnapshot,
     alias: &CredentialAlias,
 ) {
-    if accounts
+    // Once the server has rotated the refresh token, a failed local write
+    // makes the old vault value unsafe to retry. Persist both fail-closed
+    // barriers independently: Expired keeps normal account resolution out,
+    // while deletion makes even a stale descriptor unable to recover the
+    // server-invalidated token after restart.
+    let status_persisted = accounts
         .set_status(alias, CredentialStatus::Expired)
-        .is_ok()
-    {
+        .is_ok();
+    if status_persisted {
         refresh_snapshot(snapshot, accounts);
+    } else {
+        mark_snapshot_expired(snapshot, alias);
+    }
+    let vault_for_delete = vault;
+    let alias_for_delete = alias.clone();
+    let tombstoned =
+        tokio::task::spawn_blocking(move || vault_for_delete.delete(&alias_for_delete)).await;
+    if !matches!(tombstoned, Ok(Ok(()))) && !status_persisted {
+        // Both durable barriers failed. The actor's public snapshot remains
+        // closed for this process; the command still reports Persist to its
+        // caller, and a production test pins the recoverable single-failure
+        // boundary (descriptor failure + durable vault tombstone).
+        mark_snapshot_expired(snapshot, alias);
+    }
+}
+
+async fn persist_refresh_expired_or_tombstone(
+    accounts: &mut AccountStore<Box<dyn StoreLike>>,
+    vault: Arc<dyn Vault>,
+    snapshot: &AccountsSnapshot,
+    alias: &CredentialAlias,
+) -> Result<(), HaiderError> {
+    match accounts.set_status(alias, CredentialStatus::Expired) {
+        Ok(()) => {
+            refresh_snapshot(snapshot, accounts);
+            Ok(())
+        }
+        Err(status_error) => {
+            // A rotating server may already have invalidated the stored
+            // refresh token. If the descriptor snapshot cannot durably record
+            // Expired, deleting the vault value is the durable fail-closed
+            // tombstone: restart can no longer resolve and retry the dead
+            // token.
+            let vault_for_delete = vault;
+            let alias_for_delete = alias.clone();
+            match tokio::task::spawn_blocking(move || vault_for_delete.delete(&alias_for_delete))
+                .await
+            {
+                Ok(Ok(())) => {
+                    mark_snapshot_expired(snapshot, alias);
+                    Ok(())
+                }
+                Ok(Err(delete_error)) => Err(HaiderError::new(
+                    ErrorCode::ProviderError,
+                    format!(
+                        "OAuth refresh expiration and vault tombstone both failed: {}; {}",
+                        status_error.message, delete_error.message
+                    ),
+                    false,
+                )),
+                Err(_) => Err(HaiderError::new(
+                    ErrorCode::ProviderError,
+                    "OAuth refresh expiration failed and vault tombstone worker was lost",
+                    false,
+                )),
+            }
+        }
+    }
+}
+
+fn mark_snapshot_expired(snapshot: &AccountsSnapshot, alias: &CredentialAlias) {
+    if let Ok(mut descriptors) = snapshot.lock()
+        && let Some(descriptor) = descriptors
+            .iter_mut()
+            .find(|descriptor| descriptor.alias == *alias)
+    {
+        descriptor.status = CredentialStatus::Expired;
     }
 }
 

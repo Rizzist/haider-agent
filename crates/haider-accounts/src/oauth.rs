@@ -32,6 +32,8 @@ pub struct OAuthIdentityV1 {
 pub struct OAuthTokenBundleV1 {
     pub provider_id: String,
     pub issuer: String,
+    pub audience: String,
+    pub resource: Option<String>,
     pub token_type: String,
     access_token: Zeroizing<Vec<u8>>,
     refresh_token: Option<Zeroizing<Vec<u8>>>,
@@ -48,6 +50,8 @@ impl fmt::Debug for OAuthTokenBundleV1 {
             .debug_struct("OAuthTokenBundleV1")
             .field("provider_id", &self.provider_id)
             .field("issuer", &self.issuer)
+            .field("audience", &self.audience)
+            .field("resource", &self.resource)
             .field("token_type", &self.token_type)
             .field("access_token", &"[REDACTED]")
             .field(
@@ -71,6 +75,8 @@ impl OAuthTokenBundleV1 {
     pub fn new(
         provider_id: String,
         issuer: String,
+        audience: String,
+        resource: Option<String>,
         token_type: String,
         access_token: Zeroizing<Vec<u8>>,
         refresh_token: Option<Zeroizing<Vec<u8>>>,
@@ -83,6 +89,8 @@ impl OAuthTokenBundleV1 {
         let bundle = Self {
             provider_id,
             issuer,
+            audience,
+            resource,
             token_type,
             access_token,
             refresh_token,
@@ -103,6 +111,8 @@ impl OAuthTokenBundleV1 {
             MAGIC.len()
                 + self.provider_id.len()
                 + self.issuer.len()
+                + self.audience.len()
+                + self.resource.as_ref().map_or(0, String::len)
                 + self.access_token.len()
                 + self.refresh_token.as_ref().map_or(0, |token| token.len())
                 + 256,
@@ -113,6 +123,14 @@ impl OAuthTokenBundleV1 {
         push_optional_u64(&mut out, self.refresh_expires_at_unix_ms);
         push_bytes(&mut out, self.provider_id.as_bytes())?;
         push_bytes(&mut out, self.issuer.as_bytes())?;
+        push_bytes(&mut out, self.audience.as_bytes())?;
+        match &self.resource {
+            Some(resource) => {
+                out.push(1);
+                push_bytes(&mut out, resource.as_bytes())?;
+            }
+            None => out.push(0),
+        }
         push_bytes(&mut out, self.token_type.as_bytes())?;
         push_bytes(&mut out, self.access_token.as_slice())?;
         match &self.refresh_token {
@@ -147,6 +165,12 @@ impl OAuthTokenBundleV1 {
         let refresh_expires_at_unix_ms = reader.optional_u64()?;
         let provider_id = reader.public_string()?;
         let issuer = reader.public_string()?;
+        let audience = reader.public_string()?;
+        let resource = match reader.byte()? {
+            0 => None,
+            1 => Some(reader.public_string()?),
+            _ => return Err(invalid_bundle("OAuth resource marker is invalid")),
+        };
         let token_type = reader.public_string()?;
         let access_token = reader.secret()?;
         let refresh_token = match reader.byte()? {
@@ -170,6 +194,8 @@ impl OAuthTokenBundleV1 {
         Self::new(
             provider_id,
             issuer,
+            audience,
+            resource,
             token_type,
             access_token,
             refresh_token,
@@ -204,6 +230,11 @@ impl OAuthTokenBundleV1 {
     fn validate(&self) -> AccountsResult<()> {
         if self.provider_id.trim().is_empty()
             || self.issuer.trim().is_empty()
+            || self.audience.trim().is_empty()
+            || self
+                .resource
+                .as_ref()
+                .is_some_and(|value| value.trim().is_empty())
             || !self.token_type.eq_ignore_ascii_case("bearer")
             || self.access_token.is_empty()
             || self.expires_at_unix_ms == 0
@@ -330,6 +361,8 @@ mod tests {
         OAuthTokenBundleV1::new(
             "fake".into(),
             "https://issuer.invalid".into(),
+            "fake-resource".into(),
+            Some("https://api.invalid".into()),
             "Bearer".into(),
             Zeroizing::new(b"ACCESS_SENTINEL_42".to_vec()),
             Some(Zeroizing::new(b"REFRESH_SENTINEL_42".to_vec())),
@@ -352,6 +385,8 @@ mod tests {
         assert!(encoded.starts_with(MAGIC));
         let decoded = OAuthTokenBundleV1::decode(&encoded).expect("decode");
         assert_eq!(decoded.provider_id, "fake");
+        assert_eq!(decoded.audience, "fake-resource");
+        assert_eq!(decoded.resource.as_deref(), Some("https://api.invalid"));
         assert_eq!(decoded.generation, 7);
         assert_eq!(
             decoded.access_token_handle().expose_secret(),

@@ -836,12 +836,14 @@ dependencies = [
  "haider-rpc",
  "haider-store",
  "haider-tools",
+ "reqwest",
  "rusqlite",
  "rustix 1.1.4",
  "serde_json",
  "sha2",
  "tempfile",
  "tokio",
+ "tracing",
  "url",
 ]
 

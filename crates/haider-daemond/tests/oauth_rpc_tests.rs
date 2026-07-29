@@ -8,7 +8,9 @@
 mod support;
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -41,6 +43,91 @@ const SCOPES: &str = "openid inference profile";
 const LIMIT: usize = DEFAULT_FRAME_LIMIT;
 
 #[derive(Clone)]
+struct TraceCapture {
+    output: Arc<Mutex<String>>,
+    next_span: Arc<AtomicU64>,
+}
+
+struct TraceFields<'a>(&'a Arc<Mutex<String>>);
+
+impl tracing::field::Visit for TraceFields<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if let Ok(mut output) = self.0.lock() {
+            let _ = write!(output, "{}={value:?};", field.name());
+        }
+    }
+}
+
+impl tracing::Subscriber for TraceCapture {
+    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, attributes: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        attributes.record(&mut TraceFields(&self.output));
+        tracing::span::Id::from_u64(self.next_span.fetch_add(1, Ordering::Relaxed).max(1))
+    }
+
+    fn record(&self, _span: &tracing::span::Id, values: &tracing::span::Record<'_>) {
+        values.record(&mut TraceFields(&self.output));
+    }
+
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        if let Ok(mut output) = self.output.lock() {
+            let _ = write!(
+                output,
+                "target={};name={};",
+                event.metadata().target(),
+                event.metadata().name()
+            );
+        }
+        event.record(&mut TraceFields(&self.output));
+    }
+
+    fn enter(&self, _span: &tracing::span::Id) {}
+
+    fn exit(&self, _span: &tracing::span::Id) {}
+}
+
+fn assert_tree_secret_free(root: &std::path::Path, sentinels: &[&str]) -> (usize, bool) {
+    let mut scanned = 0_usize;
+    let mut saw_wal = false;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(directory) = stack.pop() {
+        for entry in std::fs::read_dir(&directory).expect("read store") {
+            let entry = entry.expect("entry");
+            let path = entry.path();
+            let file_type = entry.file_type().expect("entry type");
+            if file_type.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            saw_wal |= path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with("-wal"));
+            let bytes = std::fs::read(&path).expect("read file");
+            for sentinel in sentinels {
+                assert!(
+                    !bytes
+                        .windows(sentinel.len())
+                        .any(|window| window == sentinel.as_bytes()),
+                    "OAuth sentinel leaked into {}",
+                    path.display()
+                );
+            }
+            scanned += 1;
+        }
+    }
+    (scanned, saw_wal)
+}
+
+#[derive(Clone)]
 struct SeenAuthorization {
     redirect_uri: String,
     state: String,
@@ -52,6 +139,7 @@ struct FakeServer {
     address: SocketAddr,
     seen: Arc<Mutex<Option<SeenAuthorization>>>,
     verifier: Arc<Mutex<Option<String>>>,
+    fail_next_token: Arc<AtomicBool>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -69,8 +157,10 @@ impl FakeServer {
         let address = listener.local_addr().expect("fake address");
         let seen = Arc::new(Mutex::new(None));
         let verifier = Arc::new(Mutex::new(None));
+        let fail_next_token = Arc::new(AtomicBool::new(false));
         let seen_for_task = Arc::clone(&seen);
         let verifier_for_task = Arc::clone(&verifier);
+        let fail_next_for_task = Arc::clone(&fail_next_token);
         let task = tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
@@ -78,8 +168,9 @@ impl FakeServer {
                 };
                 let seen = Arc::clone(&seen_for_task);
                 let verifier = Arc::clone(&verifier_for_task);
+                let fail_next_token = Arc::clone(&fail_next_for_task);
                 tokio::spawn(async move {
-                    serve(stream, address, seen, verifier).await;
+                    serve(stream, address, seen, verifier, fail_next_token).await;
                 });
             }
         });
@@ -87,8 +178,13 @@ impl FakeServer {
             address,
             seen,
             verifier,
+            fail_next_token,
             task,
         }
+    }
+
+    fn fail_next_token(&self) {
+        self.fail_next_token.store(true, Ordering::SeqCst);
     }
 
     fn catalog(&self) -> OAuthProviderCatalog {
@@ -100,6 +196,7 @@ impl FakeServer {
             "haider-public-fake",
             ["openid", "inference", "profile"].map(str::to_owned),
             "fake-resource",
+            Some("fake-api-resource".into()),
             true,
             Arc::new(FakeVerifier),
         )
@@ -113,6 +210,7 @@ async fn serve(
     address: SocketAddr,
     seen: Arc<Mutex<Option<SeenAuthorization>>>,
     captured_verifier: Arc<Mutex<Option<String>>>,
+    fail_next_token: Arc<AtomicBool>,
 ) {
     let Some((method, target, body)) = read_request(&mut stream).await else {
         return;
@@ -156,6 +254,16 @@ async fn serve(
     let fields = url::form_urlencoded::parse(body.as_bytes())
         .map(|(key, value)| (key.into_owned(), value.into_owned()))
         .collect::<HashMap<_, _>>();
+    if fail_next_token.swap(false, Ordering::SeqCst) {
+        write_response(
+            &mut stream,
+            400,
+            None,
+            format!(r#"{{"error":"invalid_grant","detail":"{RAW_ERROR}"}}"#).as_bytes(),
+        )
+        .await;
+        return;
+    }
     assert!(!fields.contains_key("client_secret"));
     assert_eq!(
         fields.get("grant_type").map(String::as_str),
@@ -397,6 +505,12 @@ async fn ready_reference(
 
 #[tokio::test]
 async fn real_uds_oauth_add_is_capability_and_connection_bound_durable_and_secret_clean() {
+    let tracing_output = Arc::new(Mutex::new(String::new()));
+    tracing::subscriber::set_global_default(TraceCapture {
+        output: Arc::clone(&tracing_output),
+        next_span: Arc::new(AtomicU64::new(1)),
+    })
+    .expect("install tracing capture");
     let root = test_root("haoW");
     let store_dir = root.path().join("store");
     let config = DaemonConfig::new("oauth-wire", store_dir.clone(), root.path());
@@ -515,6 +629,29 @@ async fn real_uds_oauth_add_is_capability_and_connection_bound_durable_and_secre
         );
     }
     let oauth_reference = ready_reference(&mut owner, &flow_id, "attempt-1").await;
+    let successful_authorization = server
+        .seen
+        .lock()
+        .expect("seen")
+        .clone()
+        .expect("seen successful authorization");
+    let successful_verifier = server
+        .verifier
+        .lock()
+        .expect("verifier")
+        .clone()
+        .expect("captured successful verifier");
+    for sentinel in [
+        successful_authorization.state.as_str(),
+        successful_verifier.as_str(),
+    ] {
+        assert!(
+            !success_html
+                .windows(sentinel.len())
+                .any(|window| window == sentinel.as_bytes()),
+            "live success HTML must not echo state or verifier"
+        );
+    }
     let add = RequestBody::AccountAdd {
         command_id: CommandId::new("oauth-command-1"),
         provider: "fake-oauth".into(),
@@ -542,6 +679,57 @@ async fn real_uds_oauth_add_is_capability_and_connection_bound_durable_and_secre
     let bundle = OAuthTokenBundleV1::decode(stored.expose_secret()).expect("bundle");
     assert_eq!(bundle.access_token(), ACCESS.as_bytes());
     assert_eq!(bundle.refresh_token(), Some(REFRESH.as_bytes()));
+
+    // Exercise the raw token-error sentinel through the live endpoint and
+    // retain only the sanitized public failure.
+    server.fail_next_token();
+    let (failed_flow, failed_authorization_url) = start_flow(
+        &mut owner,
+        "oauth-fail-start",
+        "attempt-fail",
+        "failed-oauth",
+    )
+    .await;
+    reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("failure browser")
+        .get(failed_authorization_url)
+        .send()
+        .await
+        .expect("failure browser callback");
+    let failed_status = tokio::time::timeout(DEADLINE, async {
+        loop {
+            match request(
+                &mut owner,
+                "oauth-fail-status",
+                RequestBody::AccountOAuthStatus {
+                    flow_id: failed_flow.clone(),
+                    attempt_id: "attempt-fail".into(),
+                },
+            )
+            .await
+            {
+                ResponseBody::AccountOAuthStatus {
+                    status: status @ OAuthFlowStatusWire::Failed { public_code: _ },
+                    ..
+                } => return status,
+                ResponseBody::AccountOAuthStatus {
+                    status: OAuthFlowStatusWire::WaitingBrowser | OAuthFlowStatusWire::Exchanging,
+                    ..
+                } => tokio::task::yield_now().await,
+                other => panic!("unexpected failed OAuth status: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("failed flow deadline");
+    assert_eq!(
+        failed_status,
+        OAuthFlowStatusWire::Failed {
+            public_code: "invalid_grant".into()
+        }
+    );
 
     // Dropping the owning card/connection cancels its still-waiting listener
     // and wipes the unclaimed flow; no later connection can drive it.
@@ -575,54 +763,49 @@ async fn real_uds_oauth_add_is_capability_and_connection_bound_durable_and_secre
     .await
     .expect("disconnect must close loopback listener");
 
-    task.shutdown_handle().request("OAuth secret sweep");
-    let _ = task.join().await;
-    let captured = server
-        .seen
-        .lock()
-        .expect("seen")
-        .clone()
-        .expect("seen auth");
-    let verifier = server
-        .verifier
-        .lock()
-        .expect("verifier")
-        .clone()
-        .expect("captured verifier");
-    let sentinels = [
+    let callback_segment = Url::parse(&successful_authorization.redirect_uri)
+        .expect("successful redirect")
+        .path()
+        .rsplit('/')
+        .next()
+        .expect("callback segment")
+        .to_owned();
+    let sentinels = vec![
         CODE,
         ACCESS,
         REFRESH,
         ID_MARKER,
         RAW_ERROR,
-        captured.state.as_str(),
-        verifier.as_str(),
+        successful_authorization.state.as_str(),
+        successful_authorization.nonce.as_str(),
+        successful_verifier.as_str(),
+        callback_segment.as_str(),
     ];
-    let mut scanned = 0_usize;
-    // Cover the full disposable profile/runtime root, including SQLite/WAL,
-    // accounts.json, provider/runtime configuration, and temporary files.
-    let mut stack = vec![root.path().to_path_buf()];
-    while let Some(directory) = stack.pop() {
-        for entry in std::fs::read_dir(&directory).expect("read store") {
-            let path = entry.expect("entry").path();
-            if path.is_dir() {
-                stack.push(path);
-                continue;
-            }
-            let bytes = std::fs::read(&path).expect("read file");
-            for sentinel in sentinels {
-                assert!(
-                    !bytes
-                        .windows(sentinel.len())
-                        .any(|window| window == sentinel.as_bytes()),
-                    "OAuth sentinel leaked into {}",
-                    path.display()
-                );
-            }
-            scanned += 1;
+    let public_tui_output = format!("{descriptor:?}{failed_status:?}{oauth_reference:?}");
+    let trace_snapshot = tracing_output.lock().expect("tracing output").clone();
+    for output in [&public_tui_output, &trace_snapshot] {
+        for sentinel in &sentinels {
+            assert!(
+                !output.contains(sentinel),
+                "OAuth sentinel leaked into captured tracing/TUI output"
+            );
         }
     }
-    assert!(scanned >= 2, "must scan SQLite and accounts.json");
+    // Sweep WHILE Ready, before orderly checkpoint/WAL cleanup.
+    let (live_scanned, saw_live_wal) = assert_tree_secret_free(root.path(), &sentinels);
+    assert!(
+        live_scanned >= 3,
+        "must scan SQLite, WAL, and accounts.json"
+    );
+    assert!(
+        saw_live_wal,
+        "the live secret sweep must include SQLite WAL"
+    );
+
+    task.shutdown_handle().request("OAuth secret sweep");
+    let _ = task.join().await;
+    let (stopped_scanned, _) = assert_tree_secret_free(root.path(), &sentinels);
+    assert!(stopped_scanned >= 2, "post-shutdown sweep remains clean");
 
     // A daemon instance never adopts an old flow id/reference.
     let restarted = ready_with_dependencies(&config, deps).await;

@@ -381,7 +381,7 @@ async fn run_inner(
         facade: accounts_facade,
         actor: account_actor,
         vault: _,
-        broker: _,
+        broker: credential_broker,
     } = accounts_runtime;
     let oauth_coordinator = accounts_facade.oauth.clone();
     hub.install_accounts(accounts_facade)
@@ -456,8 +456,11 @@ async fn run_inner(
         endpoint.close_listener();
         runtime.crash().await;
         worker_manager.crash().await;
+        if let Some(broker) = &credential_broker {
+            broker.abort_and_join().await;
+        }
         if let Some(oauth) = &oauth_coordinator {
-            oauth.shutdown();
+            oauth.abort_and_join().await;
         }
         if let Some(actor) = account_actor {
             actor.crash();
@@ -529,8 +532,21 @@ async fn run_inner(
     // draining flag; join the account actor (its in-flight login finishes or
     // the deadline forces it — pending receipts + reconciliation carry the
     // truth either way) under the SAME global deadline.
-    if let Some(oauth) = &oauth_coordinator {
-        oauth.shutdown();
+    if let Some(broker) = &credential_broker
+        && bounded_finalization(broker.shutdown(), barrier_deadline, &mut shutdown)
+            .await
+            .is_none()
+    {
+        forced = true;
+        broker.abort_and_join().await;
+    }
+    if let Some(oauth) = &oauth_coordinator
+        && bounded_finalization(oauth.shutdown(), barrier_deadline, &mut shutdown)
+            .await
+            .is_none()
+    {
+        forced = true;
+        oauth.abort_and_join().await;
     }
     if let Some(actor) = account_actor
         && bounded_finalization(actor.shutdown(), barrier_deadline, &mut shutdown)

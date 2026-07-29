@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
+use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -30,9 +31,10 @@ use subtle::ConstantTimeEq as _;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, mpsc, oneshot, watch};
+use tokio::task::JoinSet;
 use tokio::time::Instant;
 use url::Url;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::accounts::SECRET_TTL;
 use crate::session_hub::FrameSink;
@@ -43,6 +45,65 @@ const MIN_RANDOM_BYTES: usize = 32;
 const MAX_TOKEN_LIFETIME_SECS: u64 = 366 * 24 * 60 * 60;
 const CALLBACK_READ_TIMEOUT: Duration = Duration::from_secs(2);
 const TOKEN_TIMEOUT: Duration = Duration::from_secs(15);
+
+struct OwnedTaskSet {
+    sealed: AtomicBool,
+    tasks: tokio::sync::Mutex<JoinSet<()>>,
+}
+
+impl OwnedTaskSet {
+    fn new() -> Self {
+        Self {
+            sealed: AtomicBool::new(false),
+            tasks: tokio::sync::Mutex::new(JoinSet::new()),
+        }
+    }
+
+    fn spawn_initial(&self, task: impl Future<Output = ()> + Send + 'static) -> bool {
+        let Ok(mut tasks) = self.tasks.try_lock() else {
+            return false;
+        };
+        if self.sealed.load(Ordering::Acquire) {
+            return false;
+        }
+        tasks.spawn(task);
+        true
+    }
+
+    async fn spawn(&self, task: impl Future<Output = ()> + Send + 'static) -> bool {
+        loop {
+            if self.sealed.load(Ordering::Acquire) {
+                return false;
+            }
+            if let Ok(mut tasks) = self.tasks.try_lock() {
+                if self.sealed.load(Ordering::Acquire) {
+                    return false;
+                }
+                while tasks.try_join_next().is_some() {}
+                tasks.spawn(task);
+                return true;
+            }
+            // Never wait on the registration lock: shutdown joins tasks while
+            // holding it. Rechecking the seal lets an in-progress start
+            // worker leave instead of deadlocking the owner that is joining
+            // that same worker.
+            tokio::task::yield_now().await;
+        }
+    }
+
+    async fn join_all(&self) {
+        self.sealed.store(true, Ordering::Release);
+        let mut tasks = self.tasks.lock().await;
+        while tasks.join_next().await.is_some() {}
+    }
+
+    async fn abort_and_join(&self) {
+        self.sealed.store(true, Ordering::Release);
+        let mut tasks = self.tasks.lock().await;
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+    }
+}
 
 /// Release-owned provider metadata shape.
 ///
@@ -58,6 +119,7 @@ pub struct SanctionedOAuthRegistration {
     pub client_id: &'static str,
     pub scopes: &'static [&'static str],
     pub audience: &'static str,
+    pub resource: Option<&'static str>,
     pub redirect_policy: OAuthRedirectPolicy,
     pub retain_refresh_on_omission: bool,
     pub identity_verifier_factory: fn() -> Arc<dyn OAuthIdentityVerifier>,
@@ -126,6 +188,7 @@ pub struct OAuthProviderRegistration {
     client_id: String,
     scopes: BTreeSet<String>,
     audience: String,
+    resource: Option<String>,
     redirect_policy: OAuthRedirectPolicy,
     retain_refresh_on_omission: bool,
     identity_verifier: Arc<dyn OAuthIdentityVerifier>,
@@ -145,6 +208,7 @@ impl fmt::Debug for OAuthProviderRegistration {
             .field("client_id", &self.client_id)
             .field("scopes", &self.scopes)
             .field("audience", &self.audience)
+            .field("resource", &self.resource)
             .field("redirect_policy", &self.redirect_policy)
             .field(
                 "retain_refresh_on_omission",
@@ -170,6 +234,7 @@ impl OAuthProviderRegistration {
         client_id: impl Into<String>,
         scopes: impl IntoIterator<Item = String>,
         audience: impl Into<String>,
+        resource: Option<String>,
         retain_refresh_on_omission: bool,
         identity_verifier: Arc<dyn OAuthIdentityVerifier>,
     ) -> Result<Self, OAuthPublicError> {
@@ -202,6 +267,7 @@ impl OAuthProviderRegistration {
             client_id,
             scopes,
             audience,
+            resource,
             redirect_policy: OAuthRedirectPolicy::EphemeralIpv4Loopback,
             retain_refresh_on_omission,
             identity_verifier,
@@ -256,6 +322,7 @@ impl Default for OAuthProviderCatalog {
                     metadata.client_id,
                     metadata.scopes.iter().map(|scope| (*scope).to_owned()),
                     metadata.audience,
+                    metadata.resource.map(str::to_owned),
                     metadata.retain_refresh_on_omission,
                     (metadata.identity_verifier_factory)(),
                 )
@@ -404,6 +471,8 @@ struct CoordinatorInner {
     flows: Mutex<HashMap<String, FlowEntry>>,
     active_connections: Mutex<HashSet<String>>,
     shutting_down: AtomicBool,
+    shutdown: watch::Sender<bool>,
+    tasks: Weak<OwnedTaskSet>,
     next_flow: AtomicU64,
     client: reqwest::Client,
 }
@@ -424,6 +493,7 @@ impl Drop for CoordinatorInner {
 pub(crate) struct OAuthCoordinator {
     inner: Arc<CoordinatorInner>,
     starts: mpsc::Sender<StartJob>,
+    tasks: Arc<OwnedTaskSet>,
 }
 
 impl OAuthCoordinator {
@@ -442,6 +512,7 @@ impl OAuthCoordinator {
             .timeout(TOKEN_TIMEOUT)
             .build()
             .map_err(|_| OAuthPublicError::new("oauth_transport_unavailable", true))?;
+        let tasks = Arc::new(OwnedTaskSet::new());
         let inner = Arc::new(CoordinatorInner {
             instance_id,
             catalog,
@@ -449,12 +520,21 @@ impl OAuthCoordinator {
             flows: Mutex::new(HashMap::new()),
             active_connections: Mutex::new(HashSet::new()),
             shutting_down: AtomicBool::new(false),
+            shutdown: watch::channel(false).0,
+            tasks: Arc::downgrade(&tasks),
             next_flow: AtomicU64::new(0),
             client,
         });
         let (starts, receiver) = mpsc::channel(config.max_flows);
-        tokio::spawn(run_start_worker(Arc::downgrade(&inner), receiver));
-        Ok(Self { inner, starts })
+        let shutdown = inner.shutdown.subscribe();
+        if !tasks.spawn_initial(run_start_worker(Arc::downgrade(&inner), receiver, shutdown)) {
+            return Err(OAuthPublicError::new("oauth_task_owner_unavailable", true));
+        }
+        Ok(Self {
+            inner,
+            starts,
+            tasks,
+        })
     }
 
     pub(crate) fn availability(
@@ -554,8 +634,9 @@ impl OAuthCoordinator {
         }
     }
 
-    pub(crate) fn shutdown(&self) {
+    pub(crate) async fn shutdown(&self) {
         self.inner.shutting_down.store(true, Ordering::Release);
+        self.inner.shutdown.send_replace(true);
         if let Ok(mut active) = self.inner.active_connections.lock() {
             active.clear();
         }
@@ -564,6 +645,21 @@ impl OAuthCoordinator {
                 flow.cancel.send_replace(true);
             }
         }
+        self.tasks.join_all().await;
+    }
+
+    pub(crate) async fn abort_and_join(&self) {
+        self.inner.shutting_down.store(true, Ordering::Release);
+        self.inner.shutdown.send_replace(true);
+        if let Ok(mut active) = self.inner.active_connections.lock() {
+            active.clear();
+        }
+        if let Ok(mut flows) = self.inner.flows.lock() {
+            for (_, flow) in flows.drain() {
+                flow.cancel.send_replace(true);
+            }
+        }
+        self.tasks.abort_and_join().await;
     }
 
     pub(crate) fn claim_ready(
@@ -668,10 +764,51 @@ pub(crate) struct OAuthReadyClaim {
     pub(crate) bundle: OAuthTokenBundleV1,
 }
 
-async fn run_start_worker(inner: Weak<CoordinatorInner>, mut receiver: mpsc::Receiver<StartJob>) {
-    while let Some(job) = receiver.recv().await {
+#[cfg(test)]
+impl OAuthReadyClaim {
+    pub(crate) fn for_account_test(
+        provider: &str,
+        desired_alias: &str,
+        bundle: OAuthTokenBundleV1,
+    ) -> Self {
+        Self {
+            flow_id: OAuthFlowId::new("oauth-flow-account-test"),
+            owner: FlowOwner {
+                daemon_instance: "daemon-account-test".into(),
+                connection_id: "connection-account-test".into(),
+            },
+            provider: provider.into(),
+            desired_alias: desired_alias.into(),
+            attempt_id: "attempt-account-test".into(),
+            expires_at_ms: u64::MAX,
+            deadline: Instant::now() + Duration::from_secs(60),
+            reference: Zeroizing::new("oauth-ready-account-test".into()),
+            bundle,
+        }
+    }
+}
+
+async fn run_start_worker(
+    inner: Weak<CoordinatorInner>,
+    mut receiver: mpsc::Receiver<StartJob>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    loop {
+        let job = tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return;
+                }
+                continue;
+            }
+            job = receiver.recv() => job,
+        };
+        let Some(job) = job else {
+            return;
+        };
         let Some(inner) = inner.upgrade() else {
-            break;
+            return;
         };
         begin_flow(inner, job).await;
     }
@@ -790,32 +927,35 @@ async fn begin_flow(inner: Arc<CoordinatorInner>, job: StartJob) {
         callback_path.as_str()
     ));
     let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier_b64.as_bytes()));
-    let mut authorization = url::form_urlencoded::Serializer::new(SecretFormBody::new(format!(
-        "{}?",
-        registration.authorization_endpoint
-    )));
-    authorization
-        .append_pair("response_type", "code")
-        .append_pair("client_id", &registration.client_id)
-        .append_pair("redirect_uri", redirect_uri.as_str())
-        .append_pair(
-            "scope",
-            &registration
-                .scopes
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(" "),
-        )
-        .append_pair("state", state_b64.as_str())
-        .append_pair("code_challenge", &challenge)
-        .append_pair("code_challenge_method", "S256")
-        .append_pair("nonce", nonce_b64.as_str())
-        .append_pair("audience", &registration.audience);
-    // `finish` moves the one state-bearing allocation directly into the
-    // zeroizing wire wrapper. No second ordinary URL retains the query.
-    let authorization_url =
-        OAuthAuthorizationWire::from_zeroizing(authorization.finish().into_zeroizing());
+    let authorization_url = {
+        let mut authorization = url::form_urlencoded::Serializer::new(SecretFormBody::new(
+            format!("{}?", registration.authorization_endpoint),
+        ));
+        authorization
+            .append_pair("response_type", "code")
+            .append_pair("client_id", &registration.client_id)
+            .append_pair("redirect_uri", redirect_uri.as_str())
+            .append_pair(
+                "scope",
+                &registration
+                    .scopes
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            )
+            .append_pair("state", state_b64.as_str())
+            .append_pair("code_challenge", &challenge)
+            .append_pair("code_challenge_method", "S256")
+            .append_pair("nonce", nonce_b64.as_str())
+            .append_pair("audience", &registration.audience);
+        if let Some(resource) = &registration.resource {
+            authorization.append_pair("resource", resource);
+        }
+        // `finish` moves the one state-bearing allocation directly into the
+        // zeroizing wire wrapper. No second ordinary URL retains the query.
+        OAuthAuthorizationWire::from_zeroizing(authorization.finish().into_zeroizing())
+    };
     let flow_id = match random_id(
         "oauth-flow",
         inner.next_flow.fetch_add(1, Ordering::Relaxed),
@@ -884,19 +1024,30 @@ async fn begin_flow(inner: Arc<CoordinatorInner>, job: StartJob) {
             expires_at_ms: Some(expires_at_ms),
         },
     );
-    tokio::spawn(run_callback_flow(
-        inner,
-        flow_id,
-        registration,
-        listener,
-        callback_path,
-        bound.port(),
-        state_b64,
-        verifier_b64,
-        nonce_b64,
-        redirect_uri,
-        cancel_rx,
-    ));
+    let task_inner = Arc::clone(&inner);
+    let Some(tasks) = inner.tasks.upgrade() else {
+        return;
+    };
+    if !tasks
+        .spawn(run_callback_flow(
+            task_inner,
+            flow_id.clone(),
+            registration,
+            listener,
+            callback_path,
+            bound.port(),
+            state_b64,
+            verifier_b64,
+            nonce_b64,
+            redirect_uri,
+            cancel_rx,
+        ))
+        .await
+        && let Ok(mut flows) = inner.flows.lock()
+        && let Some(flow) = flows.remove(flow_id.as_str())
+    {
+        flow.cancel.send_replace(true);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1169,8 +1320,15 @@ fn parse_callback(
     } else {
         match errors.pop().as_ref().map(|error| error.as_slice()) {
             Some(b"access_denied") => CallbackResult::Denied("access_denied"),
-            Some(_) => CallbackResult::Denied("authorization_denied"),
-            None => CallbackResult::Invalid,
+            Some(
+                b"invalid_request"
+                | b"unauthorized_client"
+                | b"unsupported_response_type"
+                | b"invalid_scope"
+                | b"server_error"
+                | b"temporarily_unavailable",
+            ) => CallbackResult::Denied("authorization_denied"),
+            Some(_) | None => CallbackResult::Invalid,
         }
     }
 }
@@ -1241,6 +1399,11 @@ async fn exchange_authorization_code(
             reqwest::header::CONTENT_TYPE,
             "application/x-www-form-urlencoded",
         )
+        // The response body must become exclusively owned after EOF so its
+        // source buffers can be scrubbed. A token connection is deliberately
+        // not pooled: hyper may otherwise retain a sibling slice of its read
+        // buffer and make `Bytes::try_into_mut` fail.
+        .header(reqwest::header::CONNECTION, "close")
         .body(reqwest::Body::from(bytes::Bytes::from_owner(body)))
         .send()
         .await
@@ -1259,22 +1422,59 @@ async fn exchange_authorization_code(
 async fn bounded_response(
     mut response: reqwest::Response,
 ) -> Result<Zeroizing<Vec<u8>>, OAuthPublicError> {
-    if response
+    let declared_oversized = response
         .content_length()
-        .is_some_and(|length| length > TOKEN_RESPONSE_LIMIT as u64)
-    {
+        .is_some_and(|length| length > TOKEN_RESPONSE_LIMIT as u64);
+    let mut source_chunks = Vec::new();
+    let mut source_len = 0_usize;
+    let mut oversized = false;
+    let mut transport_failed = false;
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                source_len = source_len.saturating_add(chunk.len());
+                source_chunks.push(chunk);
+                if source_len > TOKEN_RESPONSE_LIMIT {
+                    oversized = true;
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(_) => {
+                transport_failed = true;
+                break;
+            }
+        }
+    }
+    // Exhaustion (or dropping an oversized/incomplete body) closes the
+    // Connection: close transport and releases hyper's non-secret sibling
+    // slices. Every token-bearing Bytes allocation is now either mutable and
+    // scrubbed below or rejected before it can be parsed.
+    drop(response);
+    let mut bytes = Zeroizing::new(Vec::with_capacity(source_len.min(TOKEN_RESPONSE_LIMIT)));
+    for chunk in source_chunks {
+        let mut chunk = match chunk.try_into_mut() {
+            Ok(chunk) => chunk,
+            Err(_) => {
+                // Returning would free an allocation containing token/error
+                // bytes without scrubbing it. Connection: close plus full
+                // body release makes normal network chunks exclusive; if
+                // that invariant is ever violated, process death is the only
+                // safe-Rust fail-closed action (Bytes offers no mutable
+                // access to shared backing storage).
+                std::process::abort();
+            }
+        };
+        if !oversized {
+            bytes.extend_from_slice(chunk.as_ref());
+        }
+        chunk.as_mut().zeroize();
+    }
+    if declared_oversized || oversized {
         return Err(OAuthPublicError::new("token_response_oversized", false));
     }
-    let mut bytes = Zeroizing::new(Vec::new());
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|_| OAuthPublicError::new("token_endpoint_unavailable", true))?
-    {
-        if bytes.len().saturating_add(chunk.len()) > TOKEN_RESPONSE_LIMIT {
-            return Err(OAuthPublicError::new("token_response_oversized", false));
-        }
-        bytes.extend_from_slice(&chunk);
+    if transport_failed {
+        return Err(OAuthPublicError::new("token_endpoint_unavailable", true));
     }
     Ok(bytes)
 }
@@ -1407,6 +1607,8 @@ fn token_bundle_from_response(
     OAuthTokenBundleV1::new(
         registration.provider_id.clone(),
         registration.issuer.clone(),
+        registration.audience.clone(),
+        registration.resource.clone(),
         response.token_type,
         response.access_token.0,
         refresh_token,
@@ -1592,6 +1794,9 @@ struct RefreshKey {
     provider: String,
     alias: String,
     generation: u64,
+    issuer: String,
+    subject_hash: String,
+    fence_epoch: u64,
 }
 
 struct RefreshFlight {
@@ -1630,9 +1835,11 @@ impl RefreshFlight {
 struct BrokerInner {
     vault: Arc<dyn Vault>,
     catalog: OAuthProviderCatalog,
+    snapshot: crate::accounts::AccountsSnapshot,
     status_commands: mpsc::Sender<crate::accounts::AccountCommand>,
     flights: tokio::sync::Mutex<HashMap<RefreshKey, Arc<RefreshFlight>>>,
     fences: Mutex<HashMap<String, Arc<AtomicU64>>>,
+    shutting_down: AtomicBool,
     client: reqwest::Client,
     refresh_skew: Duration,
 }
@@ -1646,13 +1853,14 @@ struct BrokerInner {
 #[derive(Clone)]
 pub(crate) struct CredentialBroker {
     inner: Arc<BrokerInner>,
+    tasks: Arc<OwnedTaskSet>,
 }
 
 impl CredentialBroker {
     pub(crate) fn new(
         vault: Arc<dyn Vault>,
         catalog: OAuthProviderCatalog,
-        _snapshot: crate::accounts::AccountsSnapshot,
+        snapshot: crate::accounts::AccountsSnapshot,
         status_commands: mpsc::Sender<crate::accounts::AccountCommand>,
     ) -> Result<Self, HaiderError> {
         let client = reqwest::Client::builder()
@@ -1672,12 +1880,15 @@ impl CredentialBroker {
             inner: Arc::new(BrokerInner {
                 vault,
                 catalog,
+                snapshot,
                 status_commands,
                 flights: tokio::sync::Mutex::new(HashMap::new()),
                 fences: Mutex::new(HashMap::new()),
+                shutting_down: AtomicBool::new(false),
                 client,
                 refresh_skew: Duration::from_secs(30),
             }),
+            tasks: Arc::new(OwnedTaskSet::new()),
         })
     }
 
@@ -1685,9 +1896,24 @@ impl CredentialBroker {
         &self,
         descriptor: &CredentialDescriptor,
     ) -> Result<SecretHandle, HaiderError> {
+        if self.inner.shutting_down.load(Ordering::Acquire) {
+            return Err(broker_stopped());
+        }
         match descriptor.auth_method {
             AuthMethod::ApiKey => self.resolve_vault(&descriptor.alias).await,
-            AuthMethod::OAuth => self.resolve_oauth(descriptor).await,
+            AuthMethod::OAuth => {
+                if !Self::snapshot_allows_oauth(&self.inner, descriptor)
+                    && !self.has_active_flight(descriptor).await
+                {
+                    return Err(rotation_error(
+                        descriptor,
+                        haider_accounts::RotationTrigger::AuthExpired,
+                        false,
+                        "OAuth credential is expired or was replaced",
+                    ));
+                }
+                self.resolve_oauth(descriptor).await
+            }
         }
     }
 
@@ -1695,16 +1921,19 @@ impl CredentialBroker {
         &self,
         descriptor: &CredentialDescriptor,
     ) -> Result<SecretHandle, HaiderError> {
+        let fence = self.fence_for(&descriptor.alias);
+        let expected_fence = fence.load(Ordering::Acquire);
         let stored = self.resolve_vault(&descriptor.alias).await?;
         let bundle = match OAuthTokenBundleV1::decode(stored.expose_secret()) {
             Ok(bundle) => bundle,
-            Err(error) => {
-                self.mark_expired(&descriptor.alias).await?;
-                return Err(error);
-            }
+            Err(error) => return Err(error),
         };
+        if fence.load(Ordering::Acquire) != expected_fence {
+            return Err(stale_refresh());
+        }
         if let Err(error) = self.validate_bundle(descriptor, &bundle) {
-            self.mark_expired(&descriptor.alias).await?;
+            let _ = Self::mark_expired_if_current(&self.inner, descriptor, &bundle, expected_fence)
+                .await?;
             return Err(error);
         }
         let now = now_ms().ok_or_else(|| {
@@ -1718,6 +1947,9 @@ impl CredentialBroker {
             provider: descriptor.provider.clone(),
             alias: descriptor.alias.as_str().to_owned(),
             generation: bundle.generation,
+            issuer: bundle.issuer.clone(),
+            subject_hash: bundle.identity.subject_hash.clone(),
+            fence_epoch: expected_fence,
         };
         let (flight, leader) = {
             let mut flights = self.inner.flights.lock().await;
@@ -1734,47 +1966,70 @@ impl CredentialBroker {
             // provider request must not abandon the flight, strand waiters,
             // or allow another refresh while a blocking vault write is still
             // completing.
-            let broker = self.clone();
+            let broker = Arc::clone(&self.inner);
             let descriptor = descriptor.clone();
             let flight_for_worker = Arc::clone(&flight);
             let key_for_worker = key.clone();
-            tokio::spawn(async move {
-                let result = broker.refresh(&descriptor, &bundle).await;
-                // All waiters observe the same effective outcome. A transient
-                // refresh failure may keep using an access token that has not
-                // actually expired.
-                let public_result = match result {
-                    Ok(_) => Ok(()),
-                    Err(error)
-                        if error.retryable
-                            && now_ms()
-                                .is_some_and(|current| bundle.expires_at_unix_ms > current) =>
+            if !self
+                .tasks
+                .spawn(async move {
+                    let result = Self::refresh(&broker, &descriptor, &bundle, expected_fence).await;
+                    // All waiters observe the same effective outcome. A transient
+                    // refresh failure may keep using an access token that has not
+                    // actually expired.
+                    let public_result = match result {
+                        Ok(_) => Ok(()),
+                        Err(error)
+                            if error.retryable
+                                && now_ms()
+                                    .is_some_and(|current| bundle.expires_at_unix_ms > current) =>
+                        {
+                            Ok(())
+                        }
+                        Err(error) => Err(error),
+                    };
+                    flight_for_worker.finish(public_result);
+                    let mut flights = broker.flights.lock().await;
+                    if flights
+                        .get(&key_for_worker)
+                        .is_some_and(|current| Arc::ptr_eq(current, &flight_for_worker))
                     {
-                        Ok(())
+                        flights.remove(&key_for_worker);
                     }
-                    Err(error) => Err(error),
-                };
-                flight_for_worker.finish(public_result);
-                let mut flights = broker.inner.flights.lock().await;
+                })
+                .await
+            {
+                let mut flights = self.inner.flights.lock().await;
                 if flights
-                    .get(&key_for_worker)
-                    .is_some_and(|current| Arc::ptr_eq(current, &flight_for_worker))
+                    .get(&key)
+                    .is_some_and(|current| Arc::ptr_eq(current, &flight))
                 {
-                    flights.remove(&key_for_worker);
+                    flights.remove(&key);
                 }
-            });
+                flight.finish(Err(broker_stopped()));
+            }
         }
         flight.wait().await?;
+        if !Self::snapshot_allows_oauth(&self.inner, descriptor) {
+            return Err(rotation_error(
+                descriptor,
+                haider_accounts::RotationTrigger::AuthExpired,
+                false,
+                "OAuth credential is expired or was replaced",
+            ));
+        }
         let stored = self.resolve_vault(&descriptor.alias).await?;
         let refreshed = match OAuthTokenBundleV1::decode(stored.expose_secret()) {
             Ok(bundle) => bundle,
-            Err(error) => {
-                self.mark_expired(&descriptor.alias).await?;
-                return Err(error);
-            }
+            Err(error) => return Err(error),
         };
+        if fence.load(Ordering::Acquire) != expected_fence {
+            return Err(stale_refresh());
+        }
         if let Err(error) = self.validate_bundle(descriptor, &refreshed) {
-            self.mark_expired(&descriptor.alias).await?;
+            let _ =
+                Self::mark_expired_if_current(&self.inner, descriptor, &refreshed, expected_fence)
+                    .await?;
             return Err(error);
         }
         if now_ms().is_none_or(|current| refreshed.expires_at_unix_ms <= current) {
@@ -1788,11 +2043,16 @@ impl CredentialBroker {
     }
 
     async fn refresh(
-        &self,
+        inner: &Arc<BrokerInner>,
         descriptor: &CredentialDescriptor,
         bundle: &OAuthTokenBundleV1,
+        expected_fence: u64,
     ) -> Result<SecretHandle, HaiderError> {
-        let Some(registration) = self.inner.catalog.registration(&descriptor.provider) else {
+        let fence = Self::fence_for_inner(inner, &descriptor.alias);
+        if fence.load(Ordering::Acquire) != expected_fence {
+            return Err(stale_refresh());
+        }
+        let Some(registration) = inner.catalog.registration(&descriptor.provider) else {
             return Err(rotation_error(
                 descriptor,
                 haider_accounts::RotationTrigger::RefreshFailed,
@@ -1801,7 +2061,8 @@ impl CredentialBroker {
             ));
         };
         let Some(refresh_token) = bundle.refresh_token() else {
-            self.mark_expired(&descriptor.alias).await?;
+            let _ =
+                Self::mark_expired_if_current(inner, descriptor, bundle, expected_fence).await?;
             return Err(rotation_error(
                 descriptor,
                 haider_accounts::RotationTrigger::AuthExpired,
@@ -1813,7 +2074,8 @@ impl CredentialBroker {
             .refresh_expires_at_unix_ms
             .is_some_and(|expires_at| now_ms().is_none_or(|now| now >= expires_at))
         {
-            self.mark_expired(&descriptor.alias).await?;
+            let _ =
+                Self::mark_expired_if_current(inner, descriptor, bundle, expected_fence).await?;
             return Err(rotation_error(
                 descriptor,
                 haider_accounts::RotationTrigger::AuthExpired,
@@ -1821,15 +2083,41 @@ impl CredentialBroker {
                 "OAuth refresh token has expired",
             ));
         }
-        let fence = self.fence_for(&descriptor.alias);
-        let expected_fence = fence.load(Ordering::Acquire);
-        let response =
-            exchange_refresh_token(&self.inner.client, &registration, refresh_token).await;
+        let (begun, begin_result) = oneshot::channel();
+        inner
+            .status_commands
+            .send(crate::accounts::AccountCommand::BeginOAuthRefresh {
+                descriptor: descriptor.clone(),
+                expected: refresh_fence(bundle),
+                completed: begun,
+            })
+            .await
+            .map_err(|_| {
+                HaiderError::new(
+                    ErrorCode::ProviderError,
+                    "OAuth account actor is unavailable before refresh",
+                    false,
+                )
+            })?;
+        match begin_result.await {
+            Ok(Ok(true)) => {}
+            Ok(Ok(false)) => return Err(stale_refresh()),
+            Ok(Err(error)) => return Err(error),
+            Err(_) => {
+                return Err(HaiderError::new(
+                    ErrorCode::ProviderError,
+                    "OAuth refresh preparation was lost",
+                    false,
+                ));
+            }
+        }
+        let response = exchange_refresh_token(&inner.client, &registration, refresh_token).await;
         let refreshed = match response {
             Ok(bytes) => refresh_bundle_from_response(&registration, &bytes, bundle),
             Err(error) if error.retryable => return Err(oauth_error(error)),
             Err(error) => {
-                self.mark_expired(&descriptor.alias).await?;
+                let _ = Self::mark_expired_if_current(inner, descriptor, bundle, expected_fence)
+                    .await?;
                 let trigger = if error.code == "invalid_grant" {
                     haider_accounts::RotationTrigger::AuthExpired
                 } else {
@@ -1846,7 +2134,8 @@ impl CredentialBroker {
         let refreshed = match refreshed {
             Ok(bundle) => bundle,
             Err(_) => {
-                self.mark_expired(&descriptor.alias).await?;
+                let _ = Self::mark_expired_if_current(inner, descriptor, bundle, expected_fence)
+                    .await?;
                 return Err(rotation_error(
                     descriptor,
                     haider_accounts::RotationTrigger::RefreshFailed,
@@ -1860,11 +2149,11 @@ impl CredentialBroker {
         }
         let encoded = refreshed.encode()?;
         let (completed, result) = oneshot::channel();
-        self.inner
+        inner
             .status_commands
             .send(crate::accounts::AccountCommand::ApplyOAuthRefresh {
                 descriptor: descriptor.clone(),
-                expected_generation: bundle.generation,
+                expected: refresh_fence(bundle),
                 encoded_bundle: encoded,
                 completed,
             })
@@ -1885,7 +2174,7 @@ impl CredentialBroker {
                 // A rotating server may already have invalidated the old
                 // refresh token. Never release the new access token or retry
                 // the old one.
-                self.invalidate(&descriptor.alias);
+                Self::invalidate_inner(inner, &descriptor.alias);
                 return Err(rotation_error(
                     descriptor,
                     haider_accounts::RotationTrigger::RefreshFailed,
@@ -1931,6 +2220,8 @@ impl CredentialBroker {
         };
         if bundle.provider_id != descriptor.provider
             || bundle.issuer != registration.issuer
+            || bundle.audience != registration.audience
+            || bundle.resource != registration.resource
             || !bundle.token_type.eq_ignore_ascii_case("bearer")
             || !registration
                 .scopes
@@ -1947,7 +2238,30 @@ impl CredentialBroker {
     }
 
     fn fence_for(&self, alias: &CredentialAlias) -> Arc<AtomicU64> {
-        self.inner
+        Self::fence_for_inner(&self.inner, alias)
+    }
+
+    fn snapshot_allows_oauth(inner: &BrokerInner, expected: &CredentialDescriptor) -> bool {
+        inner.snapshot.lock().is_ok_and(|descriptors| {
+            descriptors.iter().any(|current| {
+                current.alias == expected.alias
+                    && current.provider == expected.provider
+                    && current.base_url == expected.base_url
+                    && current.auth_method == expected.auth_method
+                    && current.identity == expected.identity
+                    && !matches!(&current.status, CredentialStatus::Expired)
+            })
+        })
+    }
+
+    async fn has_active_flight(&self, descriptor: &CredentialDescriptor) -> bool {
+        self.inner.flights.lock().await.keys().any(|key| {
+            key.alias == descriptor.alias.as_str() && key.provider == descriptor.provider
+        })
+    }
+
+    fn fence_for_inner(inner: &BrokerInner, alias: &CredentialAlias) -> Arc<AtomicU64> {
+        inner
             .fences
             .lock()
             .map(|mut fences| {
@@ -1961,17 +2275,52 @@ impl CredentialBroker {
     }
 
     /// Removal/replacement fence used by W5c and race tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn invalidate(&self, alias: &CredentialAlias) {
-        self.fence_for(alias).fetch_add(1, Ordering::AcqRel);
+        Self::invalidate_inner(&self.inner, alias);
     }
 
-    async fn mark_expired(&self, alias: &CredentialAlias) -> Result<(), HaiderError> {
+    fn invalidate_inner(inner: &BrokerInner, alias: &CredentialAlias) {
+        Self::fence_for_inner(inner, alias).fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub(crate) async fn shutdown(&self) {
+        self.inner.shutting_down.store(true, Ordering::Release);
+        self.tasks.join_all().await;
+    }
+
+    pub(crate) async fn abort_and_join(&self) {
+        self.inner.shutting_down.store(true, Ordering::Release);
+        self.tasks.abort_and_join().await;
+        let flights = self
+            .inner
+            .flights
+            .lock()
+            .await
+            .drain()
+            .map(|(_, flight)| flight)
+            .collect::<Vec<_>>();
+        for flight in flights {
+            flight.finish(Err(broker_stopped()));
+        }
+    }
+
+    async fn mark_expired_if_current(
+        inner: &BrokerInner,
+        descriptor: &CredentialDescriptor,
+        bundle: &OAuthTokenBundleV1,
+        expected_fence: u64,
+    ) -> Result<bool, HaiderError> {
+        if Self::fence_for_inner(inner, &descriptor.alias).load(Ordering::Acquire) != expected_fence
+        {
+            return Ok(false);
+        }
         let (completed, result) = oneshot::channel();
-        self.inner
+        inner
             .status_commands
-            .send(crate::accounts::AccountCommand::SetStatus {
-                alias: alias.clone(),
-                status: CredentialStatus::Expired,
+            .send(crate::accounts::AccountCommand::ExpireOAuthRefresh {
+                descriptor: descriptor.clone(),
+                expected: refresh_fence(bundle),
                 completed,
             })
             .await
@@ -1992,6 +2341,24 @@ impl CredentialBroker {
     }
 }
 
+fn refresh_fence(bundle: &OAuthTokenBundleV1) -> crate::accounts::OAuthRefreshFence {
+    crate::accounts::OAuthRefreshFence {
+        generation: bundle.generation,
+        issuer: bundle.issuer.clone(),
+        audience: bundle.audience.clone(),
+        resource: bundle.resource.clone(),
+        subject_hash: bundle.identity.subject_hash.clone(),
+    }
+}
+
+fn broker_stopped() -> HaiderError {
+    HaiderError::new(
+        ErrorCode::ProviderError,
+        "OAuth refresh broker is shutting down",
+        true,
+    )
+}
+
 #[derive(Deserialize)]
 struct RefreshTokenResponse {
     access_token: SecretJson,
@@ -2002,6 +2369,12 @@ struct RefreshTokenResponse {
     #[serde(default)]
     refresh_expires_in: Option<u64>,
     scope: String,
+    #[serde(default, alias = "iss")]
+    issuer: Option<String>,
+    #[serde(default)]
+    audience: Option<String>,
+    #[serde(default)]
+    resource: Option<String>,
 }
 
 async fn exchange_refresh_token(
@@ -2016,7 +2389,11 @@ async fn exchange_refresh_token(
         encoded
             .append_pair("grant_type", "refresh_token")
             .append_pair("refresh_token", refresh_token)
-            .append_pair("client_id", &registration.client_id);
+            .append_pair("client_id", &registration.client_id)
+            .append_pair("audience", &registration.audience);
+        if let Some(resource) = &registration.resource {
+            encoded.append_pair("resource", resource);
+        }
         encoded.finish()
     };
     let response = client
@@ -2025,6 +2402,7 @@ async fn exchange_refresh_token(
             reqwest::header::CONTENT_TYPE,
             "application/x-www-form-urlencoded",
         )
+        .header(reqwest::header::CONNECTION, "close")
         .body(reqwest::Body::from(bytes::Bytes::from_owner(body)))
         .send()
         .await
@@ -2048,7 +2426,22 @@ fn refresh_bundle_from_response(
 ) -> Result<OAuthTokenBundleV1, OAuthPublicError> {
     let response = serde_json::from_slice::<RefreshTokenResponse>(bytes)
         .map_err(|_| OAuthPublicError::new("malformed_token_response", false))?;
-    if !response.token_type.eq_ignore_ascii_case("bearer")
+    if prior.issuer != registration.issuer
+        || prior.audience != registration.audience
+        || prior.resource != registration.resource
+        || response
+            .issuer
+            .as_deref()
+            .is_some_and(|issuer| issuer != prior.issuer)
+        || response
+            .audience
+            .as_deref()
+            .is_some_and(|audience| audience != prior.audience)
+        || response
+            .resource
+            .as_deref()
+            .is_some_and(|resource| Some(resource) != prior.resource.as_deref())
+        || !response.token_type.eq_ignore_ascii_case("bearer")
         || response.expires_in == 0
         || response.expires_in > MAX_TOKEN_LIFETIME_SECS
         || response
@@ -2071,22 +2464,29 @@ fn refresh_bundle_from_response(
         None if registration.retain_refresh_on_omission => prior
             .refresh_token()
             .map(|token| Zeroizing::new(token.to_vec())),
-        None => None,
+        None => return Err(OAuthPublicError::new("missing_refresh_token", false)),
+    };
+    let refresh_expires_at = match response.refresh_expires_in {
+        Some(seconds) => now.checked_add(seconds.saturating_mul(1000)),
+        None => prior.refresh_expires_at_unix_ms,
     };
     OAuthTokenBundleV1::new(
         registration.provider_id.clone(),
         registration.issuer.clone(),
+        prior.audience.clone(),
+        prior.resource.clone(),
         response.token_type,
         response.access_token.0,
         refresh_token,
         now.checked_add(response.expires_in.saturating_mul(1000))
             .ok_or_else(|| OAuthPublicError::new("invalid_token_response", false))?,
-        response
-            .refresh_expires_in
-            .and_then(|seconds| now.checked_add(seconds.saturating_mul(1000))),
+        refresh_expires_at,
         scopes.into_iter().collect(),
         prior.identity.clone(),
-        prior.generation.saturating_add(1),
+        prior
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| OAuthPublicError::new("invalid_token_response", false))?,
     )
     .map_err(|_| OAuthPublicError::new("invalid_token_response", false))
 }
