@@ -42,6 +42,7 @@ pub use openai::{
     OpenAiTransportConfig, replay_openai_chat_sse, replay_openai_http_error,
     replay_openai_models_response, replay_openai_responses_sse,
 };
+pub use origin::{FixedDnsResolver, FixedOriginGuard, SystemFixedDnsResolver};
 
 /// Provider classes backed by production account credentials in this release.
 pub const BUILTIN_PROVIDER_NAMES: [&str; 5] = [

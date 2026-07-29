@@ -2,6 +2,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 
+use futures_util::StreamExt as _;
 use haider_accounts::{AccountsResult, MemoryVault};
 use haider_protocol::credential::CredentialStatus;
 use tokio::sync::Semaphore;
@@ -17,6 +18,21 @@ const RAW_ERROR_SENTINEL: &str = "RAW_TOKEN_ERROR_SENTINEL_29af";
 const RAW_BODY_SENTINEL: &str = "RAW_TOKEN_BODY_SENTINEL_a83c";
 const SCOPES: &str = "openid inference profile";
 const AUDIENCE: &str = "fake-resource";
+
+struct StubFixedResolver {
+    address: SocketAddr,
+    calls: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl FixedDnsResolver for StubFixedResolver {
+    async fn resolve(&self, host: &str, port: u16) -> std::io::Result<Vec<SocketAddr>> {
+        assert_eq!(host, OPENAI_JWKS_HOST);
+        assert_eq!(port, 443);
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(vec![self.address])
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FakeMode {
@@ -486,6 +502,67 @@ async fn write_http(stream: &mut TcpStream, status: u16, headers: &[(&str, Strin
     stream.write_all(head.as_bytes()).await.expect("fake head");
     stream.write_all(body).await.expect("fake body");
     let _ = stream.shutdown().await;
+}
+
+/// MUTATION CHECK: remove the JWKS fixed-origin resolver and endpoint
+/// validation. The identity-error/resolver assertions fail for the unpinned
+/// client.
+/// Verified by revert on 2026-07-29.
+#[tokio::test]
+async fn openai_jwks_private_dns_answer_is_rejected_before_key_use() {
+    let resolver = Arc::new(StubFixedResolver {
+        address: SocketAddr::from(([169, 254, 169, 254], 443)),
+        calls: AtomicUsize::new(0),
+    });
+    let verifier = OpenAiIdentityVerifier::new_for_test(OPENAI_JWKS_ENDPOINT, resolver.clone());
+    let error = verifier
+        .verify(
+            b"eyJhbGciOiJSUzI1NiIsImtpZCI6ImF1ZGl0LWtleSJ9.e30.AA",
+            OAuthIdentityExpectation {
+                issuer: "https://auth.openai.com",
+                audience: "audit-audience",
+                nonce: b"audit-nonce",
+            },
+        )
+        .await
+        .expect_err("private JWKS DNS answer must reject identity verification");
+    assert_eq!(error.code, "identity_verifier_unavailable");
+    assert_eq!(
+        resolver.calls.load(Ordering::SeqCst),
+        1,
+        "JWKS host must resolve through the fixed-origin guard"
+    );
+}
+
+/// MUTATION CHECK: restore `response.bytes()` plus a post-read size check.
+/// The named timeout assertion fails while that reader waits for the rest of
+/// the deliberately unfinished oversized chunked response.
+/// Verified by revert on 2026-07-29.
+#[tokio::test]
+async fn openai_jwks_chunked_body_stops_at_limit() {
+    let chunk_len = 16 * 1024;
+    let bounded_chunks = futures_util::stream::iter(
+        (0..(TOKEN_RESPONSE_LIMIT / chunk_len))
+            .map(move |_| Ok::<_, std::io::Error>(bytes::Bytes::from(vec![b'x'; chunk_len]))),
+    );
+    let over_limit = futures_util::stream::once(async { Ok(bytes::Bytes::from(vec![b'x'])) });
+    let unfinished = futures_util::stream::pending::<Result<bytes::Bytes, std::io::Error>>();
+    let body = reqwest::Body::wrap_stream(bounded_chunks.chain(over_limit).chain(unfinished));
+    let response: reqwest::Response = http::Response::builder()
+        .header(http::header::TRANSFER_ENCODING, "chunked")
+        .body(body)
+        .expect("chunked JWKS response")
+        .into();
+    assert_eq!(
+        response.content_length(),
+        None,
+        "fixture must exercise a response without Content-Length"
+    );
+    let error = tokio::time::timeout(Duration::from_secs(2), bounded_jwks_response(response))
+        .await
+        .expect("JWKS reader must stop when the streaming limit is crossed")
+        .expect_err("oversized chunked JWKS must be rejected");
+    assert_eq!(error.code, "identity_keys_malformed");
 }
 
 struct FakeIdentityVerifier;
@@ -2969,9 +3046,11 @@ fn token_response_source_chunks_are_exclusively_owned_and_scrubbed() {
             && source
                 .matches("reqwest::header::CONNECTION, \"close\"")
                 .count()
-                == 2
+                // Three key-bearing transports must each close: authorization-code
+                // exchange, refresh, and the W5b.2a JWKS fetch.
+                == 3
             && source.contains("chunk.as_mut().zeroize();"),
-        "token transports must close before every source chunk is mutable-owned and scrubbed"
+        "token and JWKS transports must close before every source chunk is mutable-owned and scrubbed"
     );
 }
 

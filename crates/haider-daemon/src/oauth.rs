@@ -20,6 +20,7 @@ use haider_accounts::{SecretHandle, Vault};
 use haider_protocol::credential::{AuthMethod, CredentialDescriptor, CredentialStatus};
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::CredentialAlias;
+use haider_provider::{FixedDnsResolver, FixedOriginGuard, SystemFixedDnsResolver};
 use haider_rpc::{
     ERROR_CODE_BUSY, OAuthAuthorizationWire, OAuthAvailabilityWire, OAuthFlowId,
     OAuthFlowStatusWire, OAuthReadyRefWire, RequestId, ResponseBody, WireFrame,
@@ -308,11 +309,32 @@ pub trait OAuthIdentityVerifier: Send + Sync {
 }
 
 const OPENAI_JWKS_ENDPOINT: &str = "https://auth.openai.com/.well-known/jwks.json";
+const OPENAI_JWKS_HOST: &str = "auth.openai.com";
 
-struct OpenAiIdentityVerifier;
+struct OpenAiIdentityVerifier {
+    jwks_endpoint: String,
+    resolver: Arc<dyn FixedDnsResolver>,
+}
+
+impl OpenAiIdentityVerifier {
+    fn production() -> Self {
+        Self {
+            jwks_endpoint: OPENAI_JWKS_ENDPOINT.to_owned(),
+            resolver: Arc::new(SystemFixedDnsResolver),
+        }
+    }
+
+    #[cfg(test)]
+    fn new_for_test(jwks_endpoint: impl Into<String>, resolver: Arc<dyn FixedDnsResolver>) -> Self {
+        Self {
+            jwks_endpoint: jwks_endpoint.into(),
+            resolver,
+        }
+    }
+}
 
 fn openai_identity_verifier() -> Arc<dyn OAuthIdentityVerifier> {
-    Arc::new(OpenAiIdentityVerifier)
+    Arc::new(OpenAiIdentityVerifier::production())
 }
 
 #[derive(Deserialize)]
@@ -358,34 +380,36 @@ impl OAuthIdentityVerifier for OpenAiIdentityVerifier {
             .kid
             .as_deref()
             .ok_or_else(|| OAuthPublicError::new("id_token_key_missing", false))?;
+        let origin_guard = Arc::new(
+            FixedOriginGuard::new(
+                &self.jwks_endpoint,
+                OPENAI_JWKS_HOST,
+                Arc::clone(&self.resolver),
+            )
+            .map_err(|_| OAuthPublicError::new("identity_verifier_unavailable", true))?,
+        );
         let client = reqwest::Client::builder()
             .no_proxy()
             .redirect(Policy::none())
             .connect_timeout(Duration::from_secs(5))
             .timeout(TOKEN_TIMEOUT)
+            .dns_resolver(Arc::clone(&origin_guard))
             .build()
             .map_err(|_| OAuthPublicError::new("identity_verifier_unavailable", true))?;
+        origin_guard
+            .validate_endpoint(&self.jwks_endpoint)
+            .await
+            .map_err(|_| OAuthPublicError::new("identity_verifier_unavailable", true))?;
         let response = client
-            .get(OPENAI_JWKS_ENDPOINT)
+            .get(&self.jwks_endpoint)
+            .header(reqwest::header::CONNECTION, "close")
             .send()
             .await
             .map_err(|_| OAuthPublicError::new("identity_verifier_unavailable", true))?;
         if !response.status().is_success() {
             return Err(OAuthPublicError::new("identity_verifier_unavailable", true));
         }
-        if response
-            .content_length()
-            .is_some_and(|length| length > TOKEN_RESPONSE_LIMIT as u64)
-        {
-            return Err(OAuthPublicError::new("identity_keys_malformed", true));
-        }
-        let jwks_bytes = response
-            .bytes()
-            .await
-            .map_err(|_| OAuthPublicError::new("identity_verifier_unavailable", true))?;
-        if jwks_bytes.len() > TOKEN_RESPONSE_LIMIT {
-            return Err(OAuthPublicError::new("identity_keys_malformed", true));
-        }
+        let jwks_bytes = bounded_jwks_response(response).await?;
         let jwks = serde_json::from_slice::<JwksDocument>(&jwks_bytes)
             .map_err(|_| OAuthPublicError::new("identity_keys_malformed", true))?;
         let jwk = jwks
@@ -1894,6 +1918,18 @@ async fn bounded_response(
         return Err(OAuthPublicError::new("token_endpoint_unavailable", true));
     }
     Ok(bytes)
+}
+
+async fn bounded_jwks_response(
+    response: reqwest::Response,
+) -> Result<Zeroizing<Vec<u8>>, OAuthPublicError> {
+    match bounded_response(response).await {
+        Ok(bytes) => Ok(bytes),
+        Err(error) if error.code == "token_response_oversized" => {
+            Err(OAuthPublicError::new("identity_keys_malformed", true))
+        }
+        Err(_) => Err(OAuthPublicError::new("identity_verifier_unavailable", true)),
+    }
 }
 
 fn classify_token_error(status: u16, body: &[u8]) -> OAuthPublicError {

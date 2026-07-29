@@ -12,12 +12,14 @@ use crate::openai::blocked_credential_target;
 use crate::{ProviderError, ProviderErrorKind};
 
 #[async_trait]
-pub(crate) trait FixedDnsResolver: Send + Sync {
+pub trait FixedDnsResolver: Send + Sync {
+    /// Resolve one trusted fixed-origin host and port.
     async fn resolve(&self, host: &str, port: u16) -> io::Result<Vec<SocketAddr>>;
 }
 
+/// Production DNS resolver for a [`FixedOriginGuard`].
 #[derive(Debug)]
-pub(crate) struct SystemFixedDnsResolver;
+pub struct SystemFixedDnsResolver;
 
 #[async_trait]
 impl FixedDnsResolver for SystemFixedDnsResolver {
@@ -26,7 +28,8 @@ impl FixedDnsResolver for SystemFixedDnsResolver {
     }
 }
 
-pub(crate) struct FixedOriginGuard {
+/// Resolve-once guard that validates and pins a credential-bearing HTTPS origin.
+pub struct FixedOriginGuard {
     endpoint: reqwest::Url,
     host: String,
     port: u16,
@@ -54,7 +57,8 @@ impl Iterator for PinnedAddrs {
 }
 
 impl FixedOriginGuard {
-    pub(crate) fn new(
+    /// Construct a guard for one exact HTTPS endpoint and trusted host.
+    pub fn new(
         endpoint: &str,
         trusted_host: &str,
         resolver: Arc<dyn FixedDnsResolver>,
@@ -88,7 +92,8 @@ impl FixedOriginGuard {
         })
     }
 
-    pub(crate) async fn validate_endpoint(&self, endpoint: &str) -> Result<(), ProviderError> {
+    /// Validate the exact endpoint and resolve its pinned public addresses.
+    pub async fn validate_endpoint(&self, endpoint: &str) -> Result<(), ProviderError> {
         let requested = reqwest::Url::parse(endpoint)
             .map_err(|_| invalid_origin("fixed inference endpoint is not a valid URL"))?;
         if requested != self.endpoint {

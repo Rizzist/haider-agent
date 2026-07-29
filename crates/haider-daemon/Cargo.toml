@@ -32,7 +32,9 @@ url.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+futures-util = "0.3"
 haider-store = { path = "../haider-store" }
+http = "1"
 tempfile.workspace = true
 
 [lints]
