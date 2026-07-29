@@ -19,6 +19,8 @@ tokio.workspace = true
 serde_json.workspace = true
 unicode-segmentation.workspace = true
 unicode-width.workspace = true
+ratatui-image = { version = "11", default-features = false, features = ["crossterm"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [dev-dependencies]
 zeroize.workspace = true

@@ -1469,6 +1469,15 @@ pub struct AppModel {
     /// midpoint; `% 3` drives the rail shimmer). Pure render phase:
     /// never persisted, never touching projections or arms.
     pub anim_phase: u8,
+    /// The حيدر wordmark as a real graphics-protocol image, when the terminal
+    /// speaks one — set once at startup by the runtime (see
+    /// [`crate::wordmark::Wordmark::detect`]) and read by render to draw a crisp
+    /// wordmark in the boot banner and session header instead of the half-block
+    /// art. `None` (the default, and every non-graphics terminal) means render
+    /// falls back to `crate::mark`. Behind a `RefCell` because render takes
+    /// `&AppModel` while the image protocol needs `&mut` to re-encode on a size
+    /// change. Never persisted; a pure presentation cache.
+    pub wordmark: std::cell::RefCell<Option<crate::wordmark::Wordmark>>,
 }
 
 impl Default for AppModel {
@@ -1536,6 +1545,10 @@ impl Default for AppModel {
             should_quit: false,
             dirty: true,
             anim_phase: 0,
+            // No graphics wordmark until the runtime queries the terminal at
+            // startup; every non-graphics terminal and all tests stay None and
+            // render falls back to the half-block art in `crate::mark`.
+            wordmark: std::cell::RefCell::new(None),
         }
     }
 }
