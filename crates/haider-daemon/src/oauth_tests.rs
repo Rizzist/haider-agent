@@ -2281,7 +2281,7 @@ async fn concurrent_resolve_waits_for_rotated_descriptor_commit_or_fail_closed_d
     let mut preadmitted_contender = tokio::spawn({
         let broker = broker.clone();
         let descriptor = descriptor.clone();
-        async move { broker.resolve_oauth(&descriptor).await }
+        async move { broker.resolve_oauth(&descriptor, false).await }
     });
     let mut public_contender = tokio::spawn({
         let broker = broker.clone();

@@ -676,6 +676,7 @@ fn fake_provider_for_cli(prompt: &str) -> Result<FakeProvider, serde_json::Error
                     cached: 0,
                     source: UsageSource::LocallyExact,
                     account: None,
+                    accounts: Vec::new(),
                 },
             },
             FakeStep::Finish {

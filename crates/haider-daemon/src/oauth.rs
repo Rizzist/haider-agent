@@ -2518,14 +2518,60 @@ impl CredentialBroker {
                         return Err(expired_or_replaced(descriptor));
                     }
                 }
-                self.resolve_oauth(descriptor).await
+                self.resolve_oauth(descriptor, false).await
             }
         }
+    }
+
+    pub(crate) async fn refresh_after_auth_failure(
+        &self,
+        descriptor: &CredentialDescriptor,
+    ) -> Result<SecretHandle, HaiderError> {
+        match descriptor.auth_method {
+            AuthMethod::OAuth => self.resolve_oauth(descriptor, true).await,
+            AuthMethod::ApiKey => Err(rotation_error(
+                descriptor,
+                haider_accounts::RotationTrigger::AuthExpired,
+                false,
+                "API credential authentication failed",
+            )),
+        }
+    }
+
+    pub(crate) async fn resolve_account(
+        &self,
+        provider: &str,
+        failure: Option<(CredentialAlias, haider_accounts::RotationTrigger)>,
+    ) -> Result<crate::accounts::ResolvedAccount, HaiderError> {
+        let (completed, result) = oneshot::channel();
+        self.inner
+            .status_commands
+            .send(crate::accounts::AccountCommand::ResolveCredential {
+                provider: provider.to_owned(),
+                failure,
+                completed,
+            })
+            .await
+            .map_err(|_| {
+                HaiderError::new(
+                    ErrorCode::ProviderError,
+                    "account resolver service is unavailable",
+                    true,
+                )
+            })?;
+        result.await.map_err(|_| {
+            HaiderError::new(
+                ErrorCode::ProviderError,
+                "account resolver service dropped its response",
+                true,
+            )
+        })?
     }
 
     async fn resolve_oauth(
         &self,
         descriptor: &CredentialDescriptor,
+        force_refresh: bool,
     ) -> Result<SecretHandle, HaiderError> {
         let fence = self.fence_for(&descriptor.alias);
         let expected_fence = fence.load(Ordering::Acquire);
@@ -2545,7 +2591,7 @@ impl CredentialBroker {
                 HaiderError::new(ErrorCode::Internal, "system clock is unavailable", true)
             })?;
             let skew_ms = duration_ms(self.inner.refresh_skew);
-            if bundle.expires_at_unix_ms <= now.saturating_add(skew_ms) {
+            if force_refresh || bundle.expires_at_unix_ms <= now.saturating_add(skew_ms) {
                 break bundle;
             }
             if Self::snapshot_allows_oauth(&self.inner, descriptor) {
@@ -2620,7 +2666,8 @@ impl CredentialBroker {
                     let public_result = match result {
                         Ok(_) => Ok(()),
                         Err(error)
-                            if error.retryable
+                            if !force_refresh
+                                && error.retryable
                                 && now_ms()
                                     .is_some_and(|current| bundle.expires_at_unix_ms > current) =>
                         {

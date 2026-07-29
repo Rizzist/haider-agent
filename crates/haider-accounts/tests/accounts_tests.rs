@@ -12,8 +12,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use haider_accounts::{
     AccountStore, AccountsResult, AuthMethod, CredentialAlias, CredentialDescriptor,
     CredentialStatus, ErrorCode, JsonFileStore, KeychainVault, MemoryVault, Resolver,
-    RotationCallback, RotationDecision, StoreLike, Vault, import_env,
+    RotationCallback, RotationDecision, RotationTrigger, StoreLike, Vault, import_env,
 };
+use haider_protocol::credential::RotationCause;
 
 #[cfg(unix)]
 const NOT_UNICODE_HELPER_FLAG: &str = "HAIDER_ACCOUNTS_NOT_UNICODE_HELPER";
@@ -265,6 +266,60 @@ fn rotation_target_that_is_also_limited_stops_after_one_callback() {
     assert_eq!(callback.calls(), 1);
 }
 
+/// MUTATION CHECK (W5c.1 typed alternate seam): restore the old direct
+/// `Expired` rejection or map either authentication trigger to a rate-limit
+/// cause/deadline. Expected failure: the checked alternate is not selected,
+/// the callback count changes, or the cause/status assertions fail.
+/// Verified by revert on 2026-07-29.
+#[test]
+fn authentication_triggers_use_one_checked_error_rotation_without_a_fake_deadline() {
+    let mut accounts = AccountStore::new(SnapshotStore::default()).unwrap();
+    accounts
+        .add(descriptor(
+            "expired-active",
+            "openai",
+            CredentialStatus::Expired,
+            true,
+        ))
+        .unwrap();
+    accounts
+        .add(descriptor(
+            "usable-alternate",
+            "openai",
+            CredentialStatus::Ok,
+            false,
+        ))
+        .unwrap();
+    let vault = MemoryVault::new();
+    vault
+        .put(
+            &CredentialAlias::new("usable-alternate"),
+            b"alternate-secret",
+        )
+        .unwrap();
+    let callback = FixedRotation::new(RotationDecision::RotateTo(CredentialAlias::new(
+        "usable-alternate",
+    )));
+    let resolver = Resolver::new(&accounts, &vault, &callback);
+
+    let (selected, secret) = resolver.resolve_for_provider("openai").unwrap();
+
+    assert_eq!(selected.alias, CredentialAlias::new("usable-alternate"));
+    assert_eq!(secret.expose_secret(), b"alternate-secret");
+    assert_eq!(callback.calls(), 1, "policy is invoked exactly once");
+    assert_eq!(RotationTrigger::AuthExpired.cause(), RotationCause::Error);
+    assert_eq!(RotationTrigger::RefreshFailed.cause(), RotationCause::Error);
+    assert!(
+        matches!(
+            accounts
+                .get(&CredentialAlias::new("expired-active"))
+                .map(|descriptor| &descriptor.status),
+            Some(CredentialStatus::Expired)
+        ),
+        "authentication failure must not invent a Limited deadline"
+    );
+}
+
 #[test]
 fn wait_and_stop_decisions_preserve_retryability() {
     for (decision, expected_retryable) in [
@@ -510,6 +565,11 @@ impl FixedRotation {
 
 impl RotationCallback for FixedRotation {
     fn on_limited(&self, _alias: &CredentialAlias, _until_ms: u64) -> RotationDecision {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.decision.clone()
+    }
+
+    fn on_rotation(&self, _alias: &CredentialAlias, _trigger: RotationTrigger) -> RotationDecision {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.decision.clone()
     }

@@ -122,6 +122,9 @@ impl ProviderFactory for FakeFactory {
             provider_name: metadata.provider.clone(),
             model: metadata.model.clone(),
             account_alias: None,
+            initial_rotation: None,
+            rotation_budget_consumed: false,
+            attempt_resolver: None,
         })
     }
 }

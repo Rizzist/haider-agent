@@ -25,16 +25,22 @@
 //!   crash boundary on the next start.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use haider_accounts::{AccountStore, JsonFileStore, MemoryVault, StoreLike, Vault};
+use haider_accounts::{
+    AccountStore, JsonFileStore, MemoryVault, Resolver, RotationCallback, RotationDecision,
+    RotationTrigger, StoreLike, Vault,
+};
 use haider_core::SqliteStoreHandle;
 use haider_core::{
     AccountAddClaim, AccountAddReceiptResponse, LoginClaim, LoginReceiptFailure,
     LoginReceiptResponse,
 };
-use haider_protocol::credential::{AuthMethod, CredentialDescriptor, CredentialStatus};
+use haider_protocol::credential::{
+    AuthMethod, CredentialDescriptor, CredentialStatus, RotationCause, RotationEvent,
+};
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::CredentialAlias;
 use haider_provider::{
@@ -526,7 +532,18 @@ pub(crate) enum AccountCommand {
         expected: OAuthRefreshFence,
         completed: tokio::sync::oneshot::Sender<Result<bool, HaiderError>>,
     },
+    ResolveCredential {
+        provider: String,
+        failure: Option<(CredentialAlias, RotationTrigger)>,
+        completed: tokio::sync::oneshot::Sender<Result<ResolvedAccount, HaiderError>>,
+    },
     Shutdown,
+}
+
+#[derive(Debug)]
+pub(crate) struct ResolvedAccount {
+    pub descriptor: CredentialDescriptor,
+    pub rotation: Option<RotationEvent>,
 }
 
 #[derive(Debug)]
@@ -724,11 +741,142 @@ async fn run_account_actor(
                 .await;
                 let _ = completed.send(result);
             }
+            AccountCommand::ResolveCredential {
+                provider,
+                failure,
+                completed,
+            } => {
+                let result =
+                    resolve_account(&mut accounts, vault.as_ref(), &snapshot, &provider, failure);
+                let _ = completed.send(result);
+            }
         }
         if *force_stop.borrow() {
             break;
         }
     }
+}
+
+struct AutomaticAlternate<'a> {
+    descriptors: &'a [CredentialDescriptor],
+    provider: &'a str,
+}
+
+impl AutomaticAlternate<'_> {
+    fn decide(&self, active: &CredentialAlias, trigger: RotationTrigger) -> RotationDecision {
+        let now_ms = unix_ms_after(Duration::ZERO);
+        if let Some(alternate) = self.descriptors.iter().find(|descriptor| {
+            descriptor.provider == self.provider
+                && descriptor.alias != *active
+                && match descriptor.status {
+                    CredentialStatus::Ok => true,
+                    CredentialStatus::Limited { until_ms } => now_ms >= until_ms,
+                    CredentialStatus::Expired | CredentialStatus::Revoked => false,
+                }
+        }) {
+            RotationDecision::RotateTo(alternate.alias.clone())
+        } else if matches!(trigger, RotationTrigger::RateLimit { .. }) {
+            RotationDecision::Wait
+        } else {
+            RotationDecision::Stop
+        }
+    }
+}
+
+impl RotationCallback for AutomaticAlternate<'_> {
+    fn on_limited(&self, alias: &CredentialAlias, until_ms: u64) -> RotationDecision {
+        self.decide(alias, RotationTrigger::RateLimit { until_ms })
+    }
+
+    fn on_rotation(&self, alias: &CredentialAlias, trigger: RotationTrigger) -> RotationDecision {
+        self.decide(alias, trigger)
+    }
+}
+
+fn resolve_account(
+    accounts: &mut AccountStore<Box<dyn StoreLike>>,
+    vault: &dyn Vault,
+    snapshot: &AccountsSnapshot,
+    provider: &str,
+    failure: Option<(CredentialAlias, RotationTrigger)>,
+) -> Result<ResolvedAccount, HaiderError> {
+    let (from, trigger, selected) = if let Some((from, trigger)) = failure {
+        let current = accounts.get(&from).cloned().ok_or_else(|| {
+            HaiderError::new(
+                ErrorCode::CredentialMissing,
+                format!("credential alias `{from}` does not exist"),
+                false,
+            )
+        })?;
+        if current.provider != provider {
+            return Err(HaiderError::new(
+                ErrorCode::InvalidArgument,
+                format!(
+                    "credential alias `{from}` belongs to provider `{}`, not `{provider}`",
+                    current.provider
+                ),
+                false,
+            ));
+        }
+        let status = match trigger {
+            RotationTrigger::RateLimit { until_ms } => CredentialStatus::Limited { until_ms },
+            RotationTrigger::AuthExpired | RotationTrigger::RefreshFailed => {
+                CredentialStatus::Expired
+            }
+        };
+        if current.status != status {
+            accounts.set_status(&from, status)?;
+            refresh_snapshot(snapshot, accounts);
+        }
+        let policy = AutomaticAlternate {
+            descriptors: accounts.list(),
+            provider,
+        };
+        let resolver = Resolver::new(accounts, vault, &policy);
+        let selected = resolver.resolve_alternate_descriptor(provider, &from, trigger)?;
+        (from, trigger, selected)
+    } else {
+        let active = accounts
+            .active_for_provider(provider)
+            .cloned()
+            .ok_or_else(|| {
+                HaiderError::new(
+                    ErrorCode::CredentialMissing,
+                    format!("provider `{provider}` has no active credential"),
+                    false,
+                )
+            })?;
+        let trigger = match active.status {
+            CredentialStatus::Limited { until_ms } => Some(RotationTrigger::RateLimit { until_ms }),
+            CredentialStatus::Expired => Some(RotationTrigger::AuthExpired),
+            CredentialStatus::Ok | CredentialStatus::Revoked => None,
+        };
+        let policy = AutomaticAlternate {
+            descriptors: accounts.list(),
+            provider,
+        };
+        let resolver = Resolver::new(accounts, vault, &policy);
+        let selected = resolver.resolve_descriptor_for_provider(provider)?;
+        let Some(trigger) = trigger.filter(|_| selected.alias != active.alias) else {
+            return Ok(ResolvedAccount {
+                descriptor: selected,
+                rotation: None,
+            });
+        };
+        (active.alias, trigger, selected)
+    };
+
+    accounts.select(&selected.alias)?;
+    refresh_snapshot(snapshot, accounts);
+    Ok(ResolvedAccount {
+        rotation: Some(RotationEvent {
+            provider: provider.to_owned(),
+            from,
+            to: selected.alias.clone(),
+            cause: trigger.cause(),
+        }),
+        descriptor: selected,
+    })
 }
 
 async fn apply_oauth_refresh(
@@ -1672,16 +1820,28 @@ fn adapter_construction_error(
     )
 }
 
-/// The production `ProviderFactory` (R6/R10): resolves the ACTIVE descriptor
-/// for the session's provider once per logical turn — after durable
-/// acceptance, before any provider work — so a committed login is picked up
-/// by the NEXT logical turn with zero worker changes, while an in-flight
-/// turn stays pinned to the provider it resolved.
+#[derive(Clone)]
 pub(crate) struct AccountsProviderFactory {
     snapshot: AccountsSnapshot,
     vault: VaultProvision,
     builder: Arc<dyn AccountProviderBuilder>,
     broker: Option<CredentialBroker>,
+}
+
+struct ReadOnlySnapshotStore(Vec<CredentialDescriptor>);
+
+impl StoreLike for ReadOnlySnapshotStore {
+    fn load(&self) -> Result<Vec<CredentialDescriptor>, HaiderError> {
+        Ok(self.0.clone())
+    }
+
+    fn save(&self, _descriptors: &[CredentialDescriptor]) -> Result<(), HaiderError> {
+        Err(HaiderError::new(
+            ErrorCode::StoreLocked,
+            "read-only account snapshot cannot be mutated",
+            true,
+        ))
+    }
 }
 
 impl AccountsProviderFactory {
@@ -1711,6 +1871,265 @@ impl AccountsProviderFactory {
             broker: Some(broker),
         }
     }
+
+    async fn resolve_account(
+        &self,
+        provider: &str,
+        failure: Option<(CredentialAlias, RotationTrigger)>,
+    ) -> Result<ResolvedAccount, HaiderError> {
+        if let Some(broker) = &self.broker {
+            return broker.resolve_account(provider, failure).await;
+        }
+        if failure.is_some() {
+            return Err(HaiderError::new(
+                ErrorCode::ProviderError,
+                "live account rotation requires the account resolver service",
+                false,
+            ));
+        }
+        let descriptors = self
+            .snapshot
+            .lock()
+            .map(|snapshot| snapshot.clone())
+            .map_err(|_| {
+                HaiderError::new(
+                    ErrorCode::ProviderError,
+                    "account snapshot is unavailable",
+                    true,
+                )
+            })?;
+        let VaultProvision::Available(vault) = &self.vault else {
+            return Err(HaiderError::new(
+                ErrorCode::CredentialMissing,
+                "this platform has no supported secret vault",
+                false,
+            ));
+        };
+        let accounts = AccountStore::new(ReadOnlySnapshotStore(descriptors))?;
+        let active = accounts
+            .active_for_provider(provider)
+            .cloned()
+            .ok_or_else(|| {
+                HaiderError::new(
+                    ErrorCode::CredentialMissing,
+                    format!("provider `{provider}` has no active credential"),
+                    false,
+                )
+            })?;
+        let policy = AutomaticAlternate {
+            descriptors: accounts.list(),
+            provider,
+        };
+        let resolver = Resolver::new(&accounts, vault.as_ref(), &policy);
+        let descriptor = resolver.resolve_descriptor_for_provider(provider)?;
+        let rotation = (descriptor.alias != active.alias).then(|| RotationEvent {
+            provider: provider.to_owned(),
+            from: active.alias,
+            to: descriptor.alias.clone(),
+            cause: match active.status {
+                CredentialStatus::Limited { .. } => RotationCause::RateLimit,
+                CredentialStatus::Expired | CredentialStatus::Revoked | CredentialStatus::Ok => {
+                    RotationCause::Error
+                }
+            },
+        });
+        Ok(ResolvedAccount {
+            descriptor,
+            rotation,
+        })
+    }
+
+    async fn resolve_secret(
+        &self,
+        descriptor: &CredentialDescriptor,
+    ) -> Result<haider_accounts::SecretHandle, HaiderError> {
+        if let Some(broker) = &self.broker {
+            broker.resolve(descriptor).await
+        } else if descriptor.auth_method == AuthMethod::OAuth {
+            Err(HaiderError::new(
+                ErrorCode::Unauthorized,
+                "OAuth credential requires the auth-aware broker",
+                false,
+            ))
+        } else {
+            let VaultProvision::Available(vault) = &self.vault else {
+                return Err(HaiderError::new(
+                    ErrorCode::CredentialMissing,
+                    "this platform has no supported secret vault",
+                    false,
+                ));
+            };
+            vault.resolve(&descriptor.alias)
+        }
+    }
+
+    async fn resolve_provider(
+        &self,
+        metadata: &haider_protocol::session::SessionMetadataV1,
+    ) -> Result<(ResolvedAccount, Arc<dyn Provider>), HaiderError> {
+        let mut resolved = self.resolve_account(&metadata.provider, None).await?;
+        let credential = match self.resolve_secret(&resolved.descriptor).await {
+            Ok(credential) => credential,
+            Err(error) => {
+                let Some(trigger) = rotation_trigger_from_error(&error) else {
+                    return Err(error);
+                };
+                if resolved.rotation.is_some() {
+                    return Err(error);
+                }
+                resolved = self
+                    .resolve_account(
+                        &metadata.provider,
+                        Some((resolved.descriptor.alias.clone(), trigger)),
+                    )
+                    .await?;
+                self.resolve_secret(&resolved.descriptor).await?
+            }
+        };
+        let provider =
+            self.builder
+                .build_descriptor(&resolved.descriptor, credential, &metadata.model)?;
+        Ok((resolved, provider))
+    }
+}
+
+struct AccountsAttemptResolver {
+    factory: AccountsProviderFactory,
+    metadata: haider_protocol::session::SessionMetadataV1,
+    auth_refresh_attempted: AtomicBool,
+}
+
+impl AccountsAttemptResolver {
+    fn new(
+        factory: AccountsProviderFactory,
+        metadata: haider_protocol::session::SessionMetadataV1,
+    ) -> Self {
+        Self {
+            factory,
+            metadata,
+            auth_refresh_attempted: AtomicBool::new(false),
+        }
+    }
+
+    fn current_descriptor(&self, alias: &CredentialAlias) -> Option<CredentialDescriptor> {
+        self.factory.snapshot.lock().ok().and_then(|snapshot| {
+            snapshot
+                .iter()
+                .find(|descriptor| {
+                    descriptor.alias == *alias && descriptor.provider == self.metadata.provider
+                })
+                .cloned()
+        })
+    }
+}
+
+impl std::fmt::Debug for AccountsAttemptResolver {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AccountsAttemptResolver")
+            .field("provider", &self.metadata.provider)
+            .field("model", &self.metadata.model)
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait::async_trait]
+impl haider_core::ProviderAttemptResolver for AccountsAttemptResolver {
+    async fn resolve(
+        &self,
+        current_account: &CredentialAlias,
+        error: &haider_provider::ProviderError,
+    ) -> Result<haider_core::ProviderAttemptDecision, HaiderError> {
+        let trigger = match error.kind {
+            ProviderErrorKind::RateLimited => {
+                let Some(delay_ms) = error.retry_after_ms else {
+                    return Ok(haider_core::ProviderAttemptDecision::Wait);
+                };
+                RotationTrigger::RateLimit {
+                    until_ms: unix_ms_after(Duration::from_millis(delay_ms)),
+                }
+            }
+            ProviderErrorKind::Authentication => {
+                let Some(current) = self.current_descriptor(current_account) else {
+                    return Ok(haider_core::ProviderAttemptDecision::Stop);
+                };
+                if current.auth_method == AuthMethod::OAuth
+                    && !self.auth_refresh_attempted.swap(true, Ordering::AcqRel)
+                {
+                    let Some(broker) = &self.factory.broker else {
+                        return Ok(haider_core::ProviderAttemptDecision::Stop);
+                    };
+                    match broker.refresh_after_auth_failure(&current).await {
+                        Ok(credential) => {
+                            let provider = self.factory.builder.build_descriptor(
+                                &current,
+                                credential,
+                                &self.metadata.model,
+                            )?;
+                            return Ok(haider_core::ProviderAttemptDecision::Retry {
+                                provider,
+                                account: current.alias,
+                            });
+                        }
+                        Err(refresh_error) => {
+                            let Some(trigger) = rotation_trigger_from_error(&refresh_error) else {
+                                return Ok(haider_core::ProviderAttemptDecision::Stop);
+                            };
+                            trigger
+                        }
+                    }
+                } else {
+                    RotationTrigger::AuthExpired
+                }
+            }
+            ProviderErrorKind::PermissionDenied
+            | ProviderErrorKind::Overloaded
+            | ProviderErrorKind::InvalidRequest
+            | ProviderErrorKind::Transport
+            | ProviderErrorKind::MalformedFrame
+            | ProviderErrorKind::InvalidUtf8
+            | ProviderErrorKind::Internal => {
+                return Ok(haider_core::ProviderAttemptDecision::Wait);
+            }
+        };
+        let resolved = match self
+            .factory
+            .resolve_account(
+                &self.metadata.provider,
+                Some((current_account.clone(), trigger)),
+            )
+            .await
+        {
+            Ok(resolved) => resolved,
+            Err(error)
+                if error.code == ErrorCode::CredentialLimited
+                    || error.code == ErrorCode::Unauthorized =>
+            {
+                return Ok(if error.retryable {
+                    haider_core::ProviderAttemptDecision::Wait
+                } else {
+                    haider_core::ProviderAttemptDecision::Stop
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        let Some(rotation) = resolved.rotation else {
+            return Ok(haider_core::ProviderAttemptDecision::Stop);
+        };
+        let credential = self.factory.resolve_secret(&resolved.descriptor).await?;
+        let provider = self.factory.builder.build_descriptor(
+            &resolved.descriptor,
+            credential,
+            &self.metadata.model,
+        )?;
+        Ok(haider_core::ProviderAttemptDecision::Rotate(
+            haider_core::ResolvedProviderAttempt {
+                provider,
+                account: resolved.descriptor.alias,
+                rotation,
+            },
+        ))
+    }
 }
 
 #[async_trait::async_trait]
@@ -1719,64 +2138,33 @@ impl crate::worker::ProviderFactory for AccountsProviderFactory {
         &self,
         metadata: &haider_protocol::session::SessionMetadataV1,
     ) -> Result<crate::worker::ResolvedTurnProvider, HaiderError> {
-        let descriptor = self
-            .snapshot
-            .lock()
-            .ok()
-            .and_then(|view| {
-                view.iter()
-                    .find(|descriptor| {
-                        descriptor.provider == metadata.provider && descriptor.active
-                    })
-                    .cloned()
-            })
-            .ok_or_else(|| {
-                HaiderError::new(
-                    ErrorCode::CredentialMissing,
-                    format!(
-                        "no active credential for provider {}; run /login",
-                        metadata.provider
-                    ),
-                    false,
-                )
-            })?;
-        if descriptor.status != CredentialStatus::Ok {
-            return Err(HaiderError::new(
-                ErrorCode::Unauthorized,
-                format!(
-                    "active credential {} is not usable ({:?}); run /login again",
-                    descriptor.alias, descriptor.status
-                ),
-                false,
-            ));
-        }
-        let VaultProvision::Available(vault) = &self.vault else {
-            return Err(HaiderError::new(
-                ErrorCode::CredentialMissing,
-                "this platform has no supported secret vault",
-                false,
-            ));
-        };
-        let credential = if let Some(broker) = &self.broker {
-            broker.resolve(&descriptor).await?
-        } else if descriptor.auth_method == AuthMethod::OAuth {
-            return Err(HaiderError::new(
-                ErrorCode::Unauthorized,
-                "OAuth credential requires the auth-aware broker",
-                false,
-            ));
-        } else {
-            vault.resolve(&descriptor.alias)?
-        };
-        let provider = self
-            .builder
-            .build_descriptor(&descriptor, credential, &metadata.model)?;
+        let (resolved, provider) = self.resolve_provider(metadata).await?;
+        let rotation_budget_consumed = resolved.rotation.is_some();
         Ok(crate::worker::ResolvedTurnProvider {
             provider,
             provider_name: metadata.provider.clone(),
             model: metadata.model.clone(),
-            account_alias: Some(descriptor.alias.as_str().to_owned()),
+            account_alias: Some(resolved.descriptor.alias.as_str().to_owned()),
+            initial_rotation: resolved.rotation,
+            rotation_budget_consumed,
+            attempt_resolver: self.broker.as_ref().map(|_| {
+                Arc::new(AccountsAttemptResolver::new(self.clone(), metadata.clone()))
+                    as Arc<dyn haider_core::ProviderAttemptResolver>
+            }),
         })
+    }
+}
+
+fn rotation_trigger_from_error(error: &HaiderError) -> Option<RotationTrigger> {
+    match error
+        .details
+        .as_ref()
+        .and_then(|details| details.get("rotation_trigger"))
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("auth_expired") => Some(RotationTrigger::AuthExpired),
+        Some("refresh_failed") => Some(RotationTrigger::RefreshFailed),
+        _ => None,
     }
 }
 

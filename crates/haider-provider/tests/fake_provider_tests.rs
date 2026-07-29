@@ -60,6 +60,7 @@ async fn json_fixture_drives_events_and_records_request() {
             cached: 0,
             source: UsageSource::LocallyExact,
             account: None,
+            accounts: Vec::new(),
         })
     );
     assert_eq!(

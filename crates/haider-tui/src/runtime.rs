@@ -1910,6 +1910,7 @@ impl Player {
                 cached: 0,
                 source: UsageSource::Estimated,
                 account: None,
+                accounts: Vec::new(),
             }))
         };
         for beat in beats {

@@ -34,6 +34,7 @@ use crate::{StoreHandle, unix_time_ms};
 use async_trait::async_trait;
 use haider_protocol::DeliveryMode;
 use haider_protocol::EventPayload;
+use haider_protocol::credential::RotationEvent;
 use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
 };
@@ -44,7 +45,7 @@ use haider_protocol::ids::{
 use haider_protocol::item::{ItemDelta, ItemEvent, ToolStatus, TurnItem};
 use haider_protocol::menu::{Menu, MenuAnswer, MenuCloseReason};
 use haider_protocol::provider::{
-    Block, FinishReason, PROVIDER_OPAQUE_EXTENSION_KIND, StreamEvent, Usage,
+    AccountUsage, Block, FinishReason, PROVIDER_OPAQUE_EXTENSION_KIND, StreamEvent, Usage,
 };
 use haider_protocol::state::{RunState, WaitReason};
 use haider_protocol::tool::BoundedResult;
@@ -87,6 +88,13 @@ pub struct HarnessConfig {
     pub attachments: Vec<ResolvedAttachment>,
     /// Account pinned by the turn-scoped provider resolver.
     pub usage_account: Option<CredentialAlias>,
+    /// A factory-time alternate that must be committed before provider work.
+    pub initial_rotation: Option<RotationEvent>,
+    /// Logical-turn-wide one-hop allowance. This is distinct from provider
+    /// attempt counters, which reset between tool-loop requests.
+    pub rotation_budget_consumed: bool,
+    /// Daemon-owned resolver consulted only at a pre-first-event boundary.
+    pub provider_attempt_resolver: Option<Arc<dyn ProviderAttemptResolver>>,
     pub command_capacity: usize,
     pub broadcast_capacity: usize,
     /// Hard ceiling on provider requests made by one logical turn.
@@ -123,6 +131,9 @@ impl HarnessConfig {
             tools: Vec::new(),
             attachments: Vec::new(),
             usage_account: None,
+            initial_rotation: None,
+            rotation_budget_consumed: false,
+            provider_attempt_resolver: None,
             command_capacity: 8,
             broadcast_capacity: 128,
             max_provider_requests_per_turn: DEFAULT_MAX_PROVIDER_REQUESTS_PER_TURN,
@@ -212,6 +223,40 @@ pub struct SubmitCheckpointTurn {
 pub enum ToolDispatchResult {
     Completed(BoundedResult),
     ApprovalRequired(Menu),
+}
+
+/// A provider/account replacement for the current logical turn.
+pub struct ResolvedProviderAttempt {
+    pub provider: Arc<dyn Provider>,
+    pub account: CredentialAlias,
+    pub rotation: RotationEvent,
+}
+
+/// Result of consulting the daemon at an eligible pre-first-event failure.
+pub enum ProviderAttemptDecision {
+    /// Retry with refreshed credentials for the same account. This does not
+    /// consume the account-rotation allowance.
+    Retry {
+        provider: Arc<dyn Provider>,
+        account: CredentialAlias,
+    },
+    /// Commit the supplied durable event, then retry with the alternate.
+    Rotate(ResolvedProviderAttempt),
+    /// Keep the existing provider and apply ordinary retry/backoff policy.
+    Wait,
+    /// Surface the original provider failure.
+    Stop,
+}
+
+/// Provider-neutral live-credential seam. Core owns the event boundary and
+/// one-hop budget; daemon implementations own account status and refresh.
+#[async_trait]
+pub trait ProviderAttemptResolver: Send + Sync + std::fmt::Debug {
+    async fn resolve(
+        &self,
+        current_account: &CredentialAlias,
+        error: &ProviderError,
+    ) -> Result<ProviderAttemptDecision, HaiderError>;
 }
 
 #[async_trait]
@@ -686,6 +731,22 @@ impl HarnessActor {
         if let Err(error) = self.commit_state(&run_id, RunState::Thinking).await {
             return self.errored_state_outcome(&run_id, error).await;
         }
+        let mut provider = Arc::clone(&self.provider);
+        let mut usage_account = self.config.usage_account.clone();
+        let mut rotation_budget_consumed = self.config.rotation_budget_consumed;
+        if let Some(initial_rotation) = self.config.initial_rotation.take() {
+            if let Err(error) = self
+                .commit_payload(
+                    &run_id,
+                    EventPayload::Rotation(initial_rotation),
+                    prompt_omit_render(),
+                )
+                .await
+            {
+                return self.errored_state_outcome(&run_id, error).await;
+            }
+            rotation_budget_consumed = true;
+        }
         let mut provider_request_count = 0usize;
         let mut provider_attempt = 0usize;
         let mut completed_usage: Option<Usage> = None;
@@ -718,8 +779,8 @@ impl HarnessActor {
                 attachments: self.config.attachments.clone(),
             };
             let mut request_usage: Option<Usage> = None;
-            let provider = Arc::clone(&self.provider);
-            let mut opening = Box::pin(provider.stream_turn(provider_request));
+            let attempt_provider = Arc::clone(&provider);
+            let mut opening = Box::pin(attempt_provider.stream_turn(provider_request));
             let mut stream = loop {
                 let opened = tokio::select! {
                     biased;
@@ -778,15 +839,22 @@ impl HarnessActor {
                 }
                 match opened {
                     Ok(stream) => break stream,
-                    Err(error)
-                        if provider_error_allows_retry(&error)
-                            && provider_attempt < MAX_PROVIDER_ATTEMPTS =>
-                    {
-                        if let Err(wait_error) = self
-                            .wait_before_provider_retry(&run_id, &cancel, provider_attempt, &error)
+                    Err(error) => {
+                        if let Err(error) = self
+                            .prepare_pre_first_event_retry(
+                                ProviderRetryContext {
+                                    run_id: &run_id,
+                                    cancel: &cancel,
+                                },
+                                provider_attempt,
+                                &mut provider,
+                                &mut usage_account,
+                                &mut rotation_budget_consumed,
+                                error,
+                            )
                             .await
                         {
-                            return match wait_error {
+                            return match error {
                                 DriveError::Cancelled => {
                                     self.cancelled_outcome_with_items(
                                         &run_id,
@@ -809,17 +877,6 @@ impl HarnessActor {
                             };
                         }
                         continue 'requests;
-                    }
-                    Err(error) => {
-                        return self
-                            .provider_failure_outcome_with_items(
-                                &run_id,
-                                &mut message,
-                                &mut reasoning,
-                                &mut tools,
-                                error,
-                            )
-                            .await;
                     }
                 }
             };
@@ -908,16 +965,22 @@ impl HarnessActor {
                         provider_event_seen = true;
                         event
                     }
-                    Err(error)
-                        if !provider_event_seen
-                            && provider_error_allows_retry(&error)
-                            && provider_attempt < MAX_PROVIDER_ATTEMPTS =>
-                    {
-                        if let Err(wait_error) = self
-                            .wait_before_provider_retry(&run_id, &cancel, provider_attempt, &error)
+                    Err(error) if !provider_event_seen => {
+                        if let Err(error) = self
+                            .prepare_pre_first_event_retry(
+                                ProviderRetryContext {
+                                    run_id: &run_id,
+                                    cancel: &cancel,
+                                },
+                                provider_attempt,
+                                &mut provider,
+                                &mut usage_account,
+                                &mut rotation_budget_consumed,
+                                error,
+                            )
                             .await
                         {
-                            return match wait_error {
+                            return match error {
                                 DriveError::Cancelled => {
                                     self.cancelled_outcome_with_items(
                                         &run_id,
@@ -1012,8 +1075,16 @@ impl HarnessActor {
                         }
                     }
                     StreamEvent::UsageUpdate(mut usage) => {
-                        if let Some(account) = &self.config.usage_account {
+                        if let Some(account) = &usage_account {
                             usage.account = Some(account.clone());
+                            usage.accounts = vec![AccountUsage {
+                                account: account.clone(),
+                                input: usage.input,
+                                output: usage.output,
+                                reasoning: usage.reasoning,
+                                cached: usage.cached,
+                                source: usage.source,
+                            }];
                         }
                         request_usage = Some(usage.clone());
                         match cumulative_usage(completed_usage.as_ref(), &usage) {
@@ -1230,6 +1301,84 @@ impl HarnessActor {
         .await
         .map_err(DriveError::Store)?;
         Ok(())
+    }
+
+    async fn prepare_pre_first_event_retry(
+        &mut self,
+        context: ProviderRetryContext<'_>,
+        provider_attempt: usize,
+        provider: &mut Arc<dyn Provider>,
+        account: &mut Option<CredentialAlias>,
+        rotation_budget_consumed: &mut bool,
+        error: ProviderError,
+    ) -> Result<(), DriveError> {
+        if !*rotation_budget_consumed
+            && provider_error_allows_rotation(&error)
+            && let (Some(resolver), Some(current_account)) = (
+                self.config.provider_attempt_resolver.clone(),
+                account.clone(),
+            )
+        {
+            let resolution = tokio::select! {
+                biased;
+                () = context.cancel.cancelled() => return Err(DriveError::Cancelled),
+                resolution = resolver.resolve(&current_account, &error) => resolution,
+            }
+            .map_err(DriveError::Account)?;
+            match resolution {
+                ProviderAttemptDecision::Retry {
+                    provider: refreshed,
+                    account: refreshed_account,
+                } => {
+                    if refreshed_account != current_account {
+                        return Err(DriveError::Provider(provider_protocol_error(
+                            "credential refresh changed account without a rotation event",
+                        )));
+                    }
+                    *provider = refreshed;
+                    *account = Some(refreshed_account);
+                    return Ok(());
+                }
+                ProviderAttemptDecision::Rotate(resolved) => {
+                    if resolved.account != resolved.rotation.to
+                        || resolved.rotation.from != current_account
+                    {
+                        return Err(DriveError::Provider(provider_protocol_error(
+                            "attempt resolver returned inconsistent rotation coordinates",
+                        )));
+                    }
+                    self.commit_payload(
+                        context.run_id,
+                        EventPayload::Rotation(resolved.rotation),
+                        prompt_omit_render(),
+                    )
+                    .await
+                    .map_err(DriveError::Store)?;
+                    *provider = resolved.provider;
+                    *account = Some(resolved.account);
+                    *rotation_budget_consumed = true;
+                    return Ok(());
+                }
+                ProviderAttemptDecision::Wait => {
+                    *rotation_budget_consumed = true;
+                }
+                ProviderAttemptDecision::Stop => {
+                    *rotation_budget_consumed = true;
+                    return Err(DriveError::Provider(error));
+                }
+            }
+        }
+        if provider_error_allows_retry(&error) && provider_attempt < MAX_PROVIDER_ATTEMPTS {
+            self.wait_before_provider_retry(
+                context.run_id,
+                context.cancel,
+                provider_attempt,
+                &error,
+            )
+            .await
+        } else {
+            Err(DriveError::Provider(error))
+        }
     }
 
     /// Commits `Waiting { RateLimit | ProviderBackoff }`, sleeps, then
@@ -2320,8 +2469,15 @@ impl HarnessActor {
 #[derive(Debug)]
 enum DriveError {
     Provider(ProviderError),
+    Account(HaiderError),
     Store(HaiderError),
     Cancelled,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProviderRetryContext<'a> {
+    run_id: &'a RunId,
+    cancel: &'a CancelToken,
 }
 
 /// One in-flight text or reasoning item (started, not yet completed).
@@ -2450,15 +2606,46 @@ fn provider_error_allows_retry(error: &ProviderError) -> bool {
         )
 }
 
+fn provider_error_allows_rotation(error: &ProviderError) -> bool {
+    match error.kind {
+        ProviderErrorKind::RateLimited => error
+            .retry_after_ms
+            .is_some_and(|delay| delay <= MAX_PROVIDER_RETRY_AFTER_MS),
+        ProviderErrorKind::Authentication => true,
+        ProviderErrorKind::PermissionDenied
+        | ProviderErrorKind::Overloaded
+        | ProviderErrorKind::InvalidRequest
+        | ProviderErrorKind::Transport
+        | ProviderErrorKind::MalformedFrame
+        | ProviderErrorKind::InvalidUtf8
+        | ProviderErrorKind::Internal => false,
+    }
+}
+
 fn cumulative_usage(completed: Option<&Usage>, current: &Usage) -> Result<Usage, DriveError> {
     let Some(completed) = completed else {
         return Ok(current.clone());
     };
-    if completed.account != current.account {
-        return Err(DriveError::Provider(provider_protocol_error(
-            "provider account changed inside one logical turn",
-        )));
+    let mut accounts = completed.accounts.clone();
+    for current_account in &current.accounts {
+        if let Some(total) = accounts
+            .iter_mut()
+            .find(|total| total.account == current_account.account)
+        {
+            total.input = total.input.saturating_add(current_account.input);
+            total.output = total.output.saturating_add(current_account.output);
+            total.reasoning = total.reasoning.saturating_add(current_account.reasoning);
+            total.cached = total.cached.saturating_add(current_account.cached);
+            total.source = current_account.source;
+        } else {
+            accounts.push(current_account.clone());
+        }
     }
+    let account = match accounts.as_slice() {
+        [only] => Some(only.account.clone()),
+        [] if completed.account == current.account => current.account.clone(),
+        _ => None,
+    };
     Ok(Usage {
         // Usage is accounting telemetry, not a reason to rewrite an otherwise
         // successful turn into Errored. Saturation preserves monotonic
@@ -2468,7 +2655,8 @@ fn cumulative_usage(completed: Option<&Usage>, current: &Usage) -> Result<Usage,
         reasoning: completed.reasoning.saturating_add(current.reasoning),
         cached: completed.cached.saturating_add(current.cached),
         source: current.source,
-        account: current.account.clone(),
+        account,
+        accounts,
     })
 }
 
@@ -2487,6 +2675,7 @@ mod usage_tests {
             cached: u64::MAX - 3,
             source: UsageSource::ProviderReported,
             account: None,
+            accounts: Vec::new(),
         };
         let current = Usage {
             input: 1,
@@ -2495,6 +2684,7 @@ mod usage_tests {
             cached: 4,
             source: UsageSource::ProviderReported,
             account: None,
+            accounts: Vec::new(),
         };
         let cumulative = cumulative_usage(Some(&completed), &current).expect("same account");
         assert_eq!(cumulative.input, u64::MAX);
@@ -2532,7 +2722,7 @@ pub fn sanitized_failure_message(message: &str) -> String {
 fn drive_error_to_haider(error: DriveError) -> HaiderError {
     match error {
         DriveError::Provider(error) => provider_error_to_haider(error),
-        DriveError::Store(error) => error,
+        DriveError::Account(error) | DriveError::Store(error) => error,
         DriveError::Cancelled => HaiderError::new(
             ErrorCode::Internal,
             "cancelled drive error escaped its turn outcome boundary",

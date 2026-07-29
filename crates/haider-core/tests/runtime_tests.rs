@@ -2,13 +2,15 @@
 
 use async_trait::async_trait;
 use haider_core::{
-    CommittedRange, HarnessActor, HarnessConfig, HarnessHandle, MemoryStore, StoreHandle,
+    CommittedRange, HarnessActor, HarnessConfig, HarnessHandle, MemoryStore,
+    ProviderAttemptDecision, ProviderAttemptResolver, ResolvedProviderAttempt, StoreHandle,
     SubmitTurn, ToolDispatchResult, ToolDispatcher,
 };
 use haider_protocol::EventPayload;
+use haider_protocol::credential::{RotationCause, RotationEvent};
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::error::{ErrorCode, HaiderError};
-use haider_protocol::ids::{DeviceId, ItemId, SessionId};
+use haider_protocol::ids::{CredentialAlias, DeviceId, ItemId, SessionId};
 use haider_protocol::item::{ItemEvent, ToolStatus, TurnItem};
 use haider_protocol::provider::{Block, CapabilityDoc, FinishReason, Usage, UsageSource};
 use haider_protocol::state::RunState;
@@ -84,6 +86,7 @@ async fn full_turn_commits_exact_projected_sequence() {
         cached: 3,
         source: UsageSource::ProviderReported,
         account: None,
+        accounts: Vec::new(),
     };
     let (handle, store, provider) = runtime(vec![
         FakeStep::EmitText {
@@ -457,6 +460,359 @@ async fn provider_error_after_first_event_is_never_retried() {
         .expect("outcome");
     assert_eq!(outcome.state, RunState::Errored);
     assert_eq!(provider.requests().len(), 1);
+}
+
+/// MUTATION CHECK (W5c.1 safe-boundary rotation): clear the logical-turn
+/// consumed flag after A→B, leave it clear after policy returns `Wait`,
+/// initialize it false after an initial rotation, or allow resolver entry
+/// after `provider_event_seen`. Expected failure: this test observes a second
+/// resolver call/C request, a missing pre-B durable event, or replay after
+/// text/reasoning/tool output.
+/// Verified by revert (live second hop, repeated wait policy, initial second
+/// hop, post-event rotation, and legacy single-account usage rejection) on
+/// 2026-07-29.
+#[tokio::test(start_paused = true)]
+async fn rotation_is_once_pre_first_event_and_durable_before_the_alternate() {
+    let rate_limit = || {
+        ProviderError::new(ProviderErrorKind::RateLimited, "bounded rate limit")
+            .with_retry_after_ms(Some(0))
+    };
+
+    let durable_store = Arc::new(MemoryStore::new());
+    let primary = Arc::new(CountingOpeningErrorProvider::new(rate_limit()));
+    let alternate = Arc::new(RotationAwareFinishProvider {
+        store: Arc::clone(&durable_store),
+        requests: AtomicUsize::new(0),
+        saw_rotation_before_request: AtomicBool::new(false),
+    });
+    let forbidden_second = Arc::new(FakeProvider::new(vec![FakeStep::Finish {
+        reason: FinishReason::EndTurn,
+    }]));
+    let resolver = Arc::new(ScriptedRotationResolver {
+        calls: AtomicUsize::new(0),
+        first: alternate.clone(),
+        first_alias: CredentialAlias::new("account-b"),
+        second: forbidden_second.clone(),
+        second_alias: CredentialAlias::new("account-c"),
+    });
+    let mut durable_config = config();
+    durable_config.usage_account = Some(CredentialAlias::new("account-a"));
+    durable_config.provider_attempt_resolver = Some(resolver.clone());
+    let durable_handle =
+        HarnessActor::spawn(durable_config, primary.clone(), durable_store.clone());
+    let durable_outcome = durable_handle
+        .submit_turn(SubmitTurn::new("rotate before output"))
+        .await
+        .expect("turn accepted")
+        .wait()
+        .await
+        .expect("outcome");
+    assert_eq!(durable_outcome.state, RunState::Done);
+    assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(primary.requests.load(Ordering::SeqCst), 1);
+    assert_eq!(alternate.requests.load(Ordering::SeqCst), 1);
+    assert!(alternate.saw_rotation_before_request.load(Ordering::SeqCst));
+    assert!(forbidden_second.requests().is_empty());
+    assert_eq!(
+        durable_store
+            .events(&SessionId::new(SESSION))
+            .await
+            .iter()
+            .filter(|event| matches!(typed(event), EventPayload::Rotation(_)))
+            .count(),
+        1
+    );
+
+    let once_store = Arc::new(MemoryStore::new());
+    let once_primary = Arc::new(CountingOpeningErrorProvider::new(rate_limit()));
+    let once_alternate = Arc::new(CountingOpeningErrorProvider::new(rate_limit()));
+    let once_forbidden = Arc::new(FakeProvider::new(vec![FakeStep::Finish {
+        reason: FinishReason::EndTurn,
+    }]));
+    let once_resolver = Arc::new(ScriptedRotationResolver {
+        calls: AtomicUsize::new(0),
+        first: once_alternate.clone(),
+        first_alias: CredentialAlias::new("once-b"),
+        second: once_forbidden.clone(),
+        second_alias: CredentialAlias::new("once-c"),
+    });
+    let mut once_config = config();
+    once_config.usage_account = Some(CredentialAlias::new("once-a"));
+    once_config.provider_attempt_resolver = Some(once_resolver.clone());
+    let once_handle = HarnessActor::spawn(once_config, once_primary, once_store.clone());
+    let once_outcome = once_handle
+        .submit_turn(SubmitTurn::new("never rotate twice"))
+        .await
+        .expect("turn accepted")
+        .wait()
+        .await
+        .expect("outcome");
+    assert_eq!(once_outcome.state, RunState::Errored);
+    assert_eq!(once_resolver.calls.load(Ordering::SeqCst), 1);
+    assert!(once_forbidden.requests().is_empty());
+    assert_eq!(
+        once_store
+            .events(&SessionId::new(SESSION))
+            .await
+            .iter()
+            .filter(|event| matches!(typed(event), EventPayload::Rotation(_)))
+            .count(),
+        1
+    );
+
+    let wait_provider = Arc::new(FakeProvider::new(vec![
+        FakeStep::Error {
+            kind: ProviderErrorKind::RateLimited,
+            message: "no usable alternate".into(),
+            retry_after_ms: Some(0),
+        },
+        FakeStep::Error {
+            kind: ProviderErrorKind::RateLimited,
+            message: "still no usable alternate".into(),
+            retry_after_ms: Some(0),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let wait_resolver = Arc::new(WaitingAttemptResolver {
+        calls: AtomicUsize::new(0),
+    });
+    let mut wait_config = config();
+    wait_config.usage_account = Some(CredentialAlias::new("wait-a"));
+    wait_config.provider_attempt_resolver = Some(wait_resolver.clone());
+    let wait_handle = HarnessActor::spawn(
+        wait_config,
+        wait_provider.clone(),
+        Arc::new(MemoryStore::new()),
+    );
+    let wait_outcome = wait_handle
+        .submit_turn(SubmitTurn::new("consult policy once without an alternate"))
+        .await
+        .expect("turn accepted")
+        .wait()
+        .await
+        .expect("outcome");
+    assert_eq!(wait_outcome.state, RunState::Done);
+    assert_eq!(wait_resolver.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(wait_provider.requests().len(), 3);
+
+    let initial_store = Arc::new(MemoryStore::new());
+    let initial_provider = Arc::new(CountingOpeningErrorProvider::inspecting(
+        rate_limit(),
+        Arc::clone(&initial_store),
+    ));
+    let initial_forbidden = Arc::new(FakeProvider::new(vec![FakeStep::Finish {
+        reason: FinishReason::EndTurn,
+    }]));
+    let initial_resolver = Arc::new(ScriptedRotationResolver {
+        calls: AtomicUsize::new(0),
+        first: initial_forbidden.clone(),
+        first_alias: CredentialAlias::new("initial-c"),
+        second: initial_forbidden.clone(),
+        second_alias: CredentialAlias::new("initial-d"),
+    });
+    let mut initial_config = config();
+    initial_config.usage_account = Some(CredentialAlias::new("initial-b"));
+    initial_config.initial_rotation = Some(RotationEvent {
+        provider: "fake".into(),
+        from: CredentialAlias::new("initial-a"),
+        to: CredentialAlias::new("initial-b"),
+        cause: RotationCause::RateLimit,
+    });
+    initial_config.rotation_budget_consumed = true;
+    initial_config.provider_attempt_resolver = Some(initial_resolver.clone());
+    let initial_handle =
+        HarnessActor::spawn(initial_config, initial_provider.clone(), initial_store);
+    let initial_outcome = initial_handle
+        .submit_turn(SubmitTurn::new("initial hop spends budget"))
+        .await
+        .expect("turn accepted")
+        .wait()
+        .await
+        .expect("outcome");
+    assert_eq!(initial_outcome.state, RunState::Errored);
+    assert_eq!(initial_resolver.calls.load(Ordering::SeqCst), 0);
+    assert!(initial_forbidden.requests().is_empty());
+    assert!(
+        initial_provider
+            .saw_rotation_before_request
+            .load(Ordering::SeqCst)
+    );
+
+    for script in [
+        vec![
+            FakeStep::EmitText {
+                text: "visible".into(),
+            },
+            FakeStep::Error {
+                kind: ProviderErrorKind::RateLimited,
+                message: "after text".into(),
+                retry_after_ms: Some(0),
+            },
+        ],
+        vec![
+            FakeStep::EmitReasoning {
+                text: "visible reasoning".into(),
+            },
+            FakeStep::Error {
+                kind: ProviderErrorKind::RateLimited,
+                message: "after reasoning".into(),
+                retry_after_ms: Some(0),
+            },
+        ],
+        vec![
+            FakeStep::EmitToolCallStart {
+                call_id: "call-boundary".into(),
+                name: "inspect".into(),
+            },
+            FakeStep::EmitToolArgsDelta {
+                call_id: "call-boundary".into(),
+                fragment: "{\"path\":\"src\"".into(),
+            },
+            FakeStep::Error {
+                kind: ProviderErrorKind::RateLimited,
+                message: "after tool delta".into(),
+                retry_after_ms: Some(0),
+            },
+        ],
+    ] {
+        let partial = Arc::new(FakeProvider::new(script));
+        let forbidden = Arc::new(FakeProvider::new(vec![FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        }]));
+        let partial_resolver = Arc::new(ScriptedRotationResolver {
+            calls: AtomicUsize::new(0),
+            first: forbidden.clone(),
+            first_alias: CredentialAlias::new("partial-b"),
+            second: forbidden.clone(),
+            second_alias: CredentialAlias::new("partial-c"),
+        });
+        let partial_store = Arc::new(MemoryStore::new());
+        let mut partial_config = config();
+        partial_config.usage_account = Some(CredentialAlias::new("partial-a"));
+        partial_config.provider_attempt_resolver = Some(partial_resolver.clone());
+        let partial_handle =
+            HarnessActor::spawn(partial_config, partial.clone(), partial_store.clone());
+        let partial_outcome = partial_handle
+            .submit_turn(SubmitTurn::new("surface partial output honestly"))
+            .await
+            .expect("turn accepted")
+            .wait()
+            .await
+            .expect("outcome");
+        assert_eq!(partial_outcome.state, RunState::Errored);
+        assert_eq!(partial.requests().len(), 1);
+        assert_eq!(partial_resolver.calls.load(Ordering::SeqCst), 0);
+        assert!(forbidden.requests().is_empty());
+        assert!(
+            !partial_store
+                .events(&SessionId::new(SESSION))
+                .await
+                .iter()
+                .any(|event| matches!(typed(event), EventPayload::Rotation(_)))
+        );
+    }
+
+    let usage_store = Arc::new(MemoryStore::new());
+    let usage_primary = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitUsage {
+            usage: Usage {
+                input: 10,
+                output: 4,
+                reasoning: 2,
+                cached: 1,
+                source: UsageSource::ProviderReported,
+                account: None,
+                accounts: Vec::new(),
+            },
+        },
+        FakeStep::EmitToolCall {
+            call_id: "usage-tool".into(),
+            name: "inspect".into(),
+            args: serde_json::json!({}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::Error {
+            kind: ProviderErrorKind::RateLimited,
+            message: "rotate on the second provider request".into(),
+            retry_after_ms: Some(0),
+        },
+    ]));
+    let usage_alternate = Arc::new(FakeProvider::new(vec![
+        FakeStep::ExpectToolResult {
+            call_id: "usage-tool".into(),
+        },
+        FakeStep::EmitUsage {
+            usage: Usage {
+                input: 6,
+                output: 3,
+                reasoning: 1,
+                cached: 2,
+                source: UsageSource::ProviderReported,
+                account: None,
+                accounts: Vec::new(),
+            },
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let usage_forbidden = Arc::new(FakeProvider::new(Vec::new()));
+    let usage_resolver = Arc::new(ScriptedRotationResolver {
+        calls: AtomicUsize::new(0),
+        first: usage_alternate.clone(),
+        first_alias: CredentialAlias::new("usage-b"),
+        second: usage_forbidden.clone(),
+        second_alias: CredentialAlias::new("usage-c"),
+    });
+    let mut usage_config = config();
+    usage_config.usage_account = Some(CredentialAlias::new("usage-a"));
+    usage_config.provider_attempt_resolver = Some(usage_resolver.clone());
+    let (usage_actor, usage_handle) = HarnessActor::new_with_dispatcher(
+        usage_config,
+        usage_primary.clone(),
+        usage_store.clone(),
+        Some(Arc::new(CompletingDispatcher)),
+    );
+    let _usage_actor_task = tokio::spawn(usage_actor.run());
+    let usage_outcome = usage_handle
+        .submit_turn(SubmitTurn::new("attribute both accounts"))
+        .await
+        .expect("turn accepted")
+        .wait()
+        .await
+        .expect("outcome");
+    assert_eq!(usage_outcome.state, RunState::Done);
+    assert_eq!(usage_resolver.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(usage_primary.requests().len(), 2);
+    assert_eq!(usage_alternate.requests().len(), 1);
+    assert!(usage_forbidden.requests().is_empty());
+    let cumulative = usage_store
+        .events(&SessionId::new(SESSION))
+        .await
+        .iter()
+        .filter_map(|event| match typed(event) {
+            EventPayload::Usage(usage) => Some(usage),
+            _ => None,
+        })
+        .next_back()
+        .expect("cumulative usage");
+    assert_eq!(cumulative.input, 16);
+    assert_eq!(cumulative.output, 7);
+    assert_eq!(cumulative.reasoning, 3);
+    assert_eq!(cumulative.cached, 3);
+    assert_eq!(cumulative.account, None);
+    assert_eq!(
+        cumulative
+            .accounts
+            .iter()
+            .map(|usage| (usage.account.as_str(), usage.input, usage.output))
+            .collect::<Vec<_>>(),
+        vec![("usage-a", 10, 4), ("usage-b", 6, 3)]
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -1114,6 +1470,103 @@ struct ImmediateErrorProvider {
     error: ProviderError,
 }
 
+struct CountingOpeningErrorProvider {
+    error: ProviderError,
+    requests: AtomicUsize,
+    store: Option<Arc<MemoryStore>>,
+    saw_rotation_before_request: AtomicBool,
+}
+
+impl CountingOpeningErrorProvider {
+    fn new(error: ProviderError) -> Self {
+        Self {
+            error,
+            requests: AtomicUsize::new(0),
+            store: None,
+            saw_rotation_before_request: AtomicBool::new(false),
+        }
+    }
+
+    fn inspecting(error: ProviderError, store: Arc<MemoryStore>) -> Self {
+        Self {
+            error,
+            requests: AtomicUsize::new(0),
+            store: Some(store),
+            saw_rotation_before_request: AtomicBool::new(false),
+        }
+    }
+}
+
+struct RotationAwareFinishProvider {
+    store: Arc<MemoryStore>,
+    requests: AtomicUsize,
+    saw_rotation_before_request: AtomicBool,
+}
+
+struct ScriptedRotationResolver {
+    calls: AtomicUsize,
+    first: Arc<dyn Provider>,
+    first_alias: CredentialAlias,
+    second: Arc<dyn Provider>,
+    second_alias: CredentialAlias,
+}
+
+#[derive(Debug)]
+struct WaitingAttemptResolver {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl ProviderAttemptResolver for WaitingAttemptResolver {
+    async fn resolve(
+        &self,
+        _current_account: &CredentialAlias,
+        _error: &ProviderError,
+    ) -> Result<ProviderAttemptDecision, HaiderError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(ProviderAttemptDecision::Wait)
+    }
+}
+
+impl std::fmt::Debug for ScriptedRotationResolver {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ScriptedRotationResolver")
+            .field("calls", &self.calls.load(Ordering::SeqCst))
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl ProviderAttemptResolver for ScriptedRotationResolver {
+    async fn resolve(
+        &self,
+        current_account: &CredentialAlias,
+        error: &ProviderError,
+    ) -> Result<ProviderAttemptDecision, HaiderError> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        let (provider, account) = if call == 0 {
+            (Arc::clone(&self.first), self.first_alias.clone())
+        } else {
+            (Arc::clone(&self.second), self.second_alias.clone())
+        };
+        Ok(ProviderAttemptDecision::Rotate(ResolvedProviderAttempt {
+            provider,
+            account: account.clone(),
+            rotation: RotationEvent {
+                provider: "fake".into(),
+                from: current_account.clone(),
+                to: account,
+                cause: if error.kind == ProviderErrorKind::RateLimited {
+                    RotationCause::RateLimit
+                } else {
+                    RotationCause::Error
+                },
+            },
+        }))
+    }
+}
+
 #[async_trait]
 impl Provider for ImmediateErrorProvider {
     async fn capabilities(&self) -> CapabilityDoc {
@@ -1122,6 +1575,54 @@ impl Provider for ImmediateErrorProvider {
 
     async fn stream_turn(&self, _request: TurnRequest) -> Result<ProviderStream, ProviderError> {
         Err(self.error.clone())
+    }
+}
+
+#[async_trait]
+impl Provider for CountingOpeningErrorProvider {
+    async fn capabilities(&self) -> CapabilityDoc {
+        FakeProvider::new(Vec::new()).capabilities().await
+    }
+
+    async fn stream_turn(&self, _request: TurnRequest) -> Result<ProviderStream, ProviderError> {
+        self.requests.fetch_add(1, Ordering::SeqCst);
+        if let Some(store) = &self.store {
+            let saw_rotation = store
+                .events(&SessionId::new(SESSION))
+                .await
+                .iter()
+                .any(|event| matches!(typed(event), EventPayload::Rotation(_)));
+            self.saw_rotation_before_request
+                .store(saw_rotation, Ordering::SeqCst);
+        }
+        Err(self.error.clone())
+    }
+}
+
+#[async_trait]
+impl Provider for RotationAwareFinishProvider {
+    async fn capabilities(&self) -> CapabilityDoc {
+        FakeProvider::new(Vec::new()).capabilities().await
+    }
+
+    async fn stream_turn(&self, _request: TurnRequest) -> Result<ProviderStream, ProviderError> {
+        self.requests.fetch_add(1, Ordering::SeqCst);
+        let saw_rotation = self
+            .store
+            .events(&SessionId::new(SESSION))
+            .await
+            .iter()
+            .any(|event| matches!(typed(event), EventPayload::Rotation(_)));
+        self.saw_rotation_before_request
+            .store(saw_rotation, Ordering::SeqCst);
+        let (sender, receiver) = mpsc::channel(1);
+        sender
+            .send(Ok(haider_protocol::provider::StreamEvent::Finish {
+                reason: FinishReason::EndTurn,
+            }))
+            .await
+            .expect("finish receiver");
+        Ok(receiver.into())
     }
 }
 

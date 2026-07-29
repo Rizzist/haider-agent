@@ -2252,6 +2252,7 @@ fn openai_usage(
             .unwrap_or(0),
         source: UsageSource::ProviderReported,
         account,
+        accounts: Vec::new(),
     })
 }
 
@@ -2274,6 +2275,7 @@ fn chat_usage(
             .unwrap_or(0),
         source: UsageSource::ProviderReported,
         account,
+        accounts: Vec::new(),
     })
 }
 

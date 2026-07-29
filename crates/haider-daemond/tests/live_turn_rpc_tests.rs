@@ -75,6 +75,9 @@ impl ProviderFactory for FakeFactory {
             provider_name: metadata.provider.clone(),
             model: metadata.model.clone(),
             account_alias: None,
+            initial_rotation: None,
+            rotation_budget_consumed: false,
+            attempt_resolver: None,
         })
     }
 }
@@ -120,6 +123,9 @@ impl ProviderFactory for DurableEntryFactory {
             provider_name: "fake".into(),
             model: metadata.model.clone(),
             account_alias: None,
+            initial_rotation: None,
+            rotation_budget_consumed: false,
+            attempt_resolver: None,
         })
     }
 }
@@ -718,6 +724,7 @@ async fn scenario_3_submit_streams_one_contiguous_durable_turn_over_real_uds() {
         cached: 3,
         source: UsageSource::ProviderReported,
         account: None,
+        accounts: Vec::new(),
     };
     let fake = Arc::new(FakeProvider::new(vec![
         FakeStep::EmitText {
@@ -1650,6 +1657,9 @@ impl ProviderFactory for BlockingProviderFactory {
             provider_name: "fake".into(),
             model: metadata.model.clone(),
             account_alias: None,
+            initial_rotation: None,
+            rotation_budget_consumed: false,
+            attempt_resolver: None,
         })
     }
 }
@@ -2398,6 +2408,9 @@ impl ProviderFactory for PanicOnceFactory {
             provider_name: "fake".into(),
             model: metadata.model.clone(),
             account_alias: None,
+            initial_rotation: None,
+            rotation_budget_consumed: false,
+            attempt_resolver: None,
         })
     }
 }
@@ -3130,6 +3143,7 @@ async fn scenario_12_reasoning_safe_follow_up_cumulative_usage_and_durable_failu
         cached: 2,
         source: UsageSource::ProviderReported,
         account: None,
+        accounts: Vec::new(),
     };
     let second_usage = Usage {
         input: 6,
@@ -3138,6 +3152,7 @@ async fn scenario_12_reasoning_safe_follow_up_cumulative_usage_and_durable_failu
         cached: 1,
         source: UsageSource::ProviderReported,
         account: None,
+        accounts: Vec::new(),
     };
     let expected_cumulative = Usage {
         input: 16,
@@ -3146,6 +3161,7 @@ async fn scenario_12_reasoning_safe_follow_up_cumulative_usage_and_durable_failu
         cached: 3,
         source: UsageSource::ProviderReported,
         account: None,
+        accounts: Vec::new(),
     };
     let (dependencies, fake) = fake_dependencies(vec![
         FakeStep::EmitReasoning {

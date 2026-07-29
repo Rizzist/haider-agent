@@ -449,6 +449,7 @@ fn golden_usage_account_tagged() {
             cached: 800,
             source: UsageSource::ProviderReported,
             account: Some(CredentialAlias::new("personal-max")),
+            accounts: Vec::new(),
         },
     );
 }
