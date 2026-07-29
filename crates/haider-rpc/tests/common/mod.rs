@@ -11,12 +11,14 @@ use haider_protocol::session::SessionMetadataV1;
 use haider_rpc::{
     AccountAddMethod, AttachMode, AttachState, AttachmentId, CancelStatus, Capability, ClientKind,
     CommandId, ERROR_CODE_ALREADY_RESOLVED, ERROR_CODE_CAPABILITY_DENIED, ERROR_CODE_CURSOR_AHEAD,
-    ErrorData, FEATURE_ACCOUNT_LOGIN_API_V1, FEATURE_ACCOUNT_MANAGEMENT_V1,
-    FEATURE_ACCOUNT_OAUTH_PKCE_V1, FEATURE_SESSION_MUTATION_V1, FEATURE_TURN_CONTROL_V1,
+    ERROR_CODE_REVISION_CONFLICT, ErrorData, FEATURE_ACCOUNT_LOGIN_API_V1,
+    FEATURE_ACCOUNT_MANAGEMENT_V1, FEATURE_ACCOUNT_OAUTH_PKCE_V1, FEATURE_ACCOUNT_ROTATION_V1,
+    FEATURE_PROVIDER_MANAGEMENT_V1, FEATURE_SESSION_MUTATION_V1, FEATURE_TURN_CONTROL_V1,
     FEATURE_VAULT_STAGE_V1, Hello, LifecyclePhase, MenuInput, OAuthAuthorizationWire,
     OAuthAvailabilityWire, OAuthFlowId, OAuthFlowStatusWire, OAuthReadyRefWire, ProtocolError,
-    RequestBody, RequestId, ResponseBody, SecretWire, SeqRange, SessionReadResult, SessionSummary,
-    StagePurpose, SubmitDisposition, Welcome, WireFrame,
+    ProviderActiveWire, ProviderApiFamilyWire, ProviderAvailabilityWire, ProviderDefaultWire,
+    ProviderSummaryWire, RequestBody, RequestId, ResponseBody, SecretWire, SeqRange,
+    SessionReadResult, SessionSummary, StagePurpose, SubmitDisposition, Welcome, WireFrame,
 };
 
 pub const TEST_FRAME_LIMIT: usize = 1024 * 1024;
@@ -369,6 +371,9 @@ pub fn transcript() -> Vec<WireFrame> {
             request_id: RequestId::new("request-accounts"),
             body: ResponseBody::AccountList {
                 descriptors: vec![golden_descriptor()],
+                revision: None,
+                provider_active: Vec::new(),
+                provider_defaults: Vec::new(),
             },
         },
         WireFrame::Welcome(Welcome {
@@ -475,6 +480,77 @@ pub fn transcript() -> Vec<WireFrame> {
                 FEATURE_ACCOUNT_LOGIN_API_V1.to_owned(),
                 FEATURE_ACCOUNT_MANAGEMENT_V1.to_owned(),
                 FEATURE_ACCOUNT_OAUTH_PKCE_V1.to_owned(),
+                FEATURE_SESSION_MUTATION_V1.to_owned(),
+                FEATURE_TURN_CONTROL_V1.to_owned(),
+                FEATURE_VAULT_STAGE_V1.to_owned(),
+            ]),
+        }),
+        // ── W5c.2a append-only management reads + revision spine ────────
+        WireFrame::Response {
+            request_id: RequestId::new("request-accounts-managed"),
+            body: ResponseBody::AccountList {
+                descriptors: vec![golden_descriptor()],
+                revision: Some(7),
+                provider_active: vec![ProviderActiveWire {
+                    provider: "anthropic".into(),
+                    alias: golden_descriptor().alias,
+                }],
+                provider_defaults: vec![ProviderDefaultWire {
+                    provider: "anthropic".into(),
+                    model: "claude-opus-5".into(),
+                }],
+            },
+        },
+        WireFrame::Request {
+            request_id: RequestId::new("request-providers"),
+            body: RequestBody::ProviderList {
+                provider: Some("openai".into()),
+            },
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-providers"),
+            body: ResponseBody::ProviderList {
+                providers: vec![ProviderSummaryWire {
+                    provider: "openai".into(),
+                    api_family: ProviderApiFamilyWire::OpenAiResponses,
+                    endpoint: Some("https://api.openai.com/v1/responses".into()),
+                    models: vec!["gpt-5.6".into()],
+                    auth_methods: vec![AuthMethod::ApiKey],
+                    availability: ProviderAvailabilityWire::Available,
+                    availability_reason: None,
+                    default_model: Some("gpt-5.6".into()),
+                    enabled: true,
+                }],
+                revision: 7,
+            },
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-revision-conflict"),
+            body: ResponseBody::Error {
+                code: ERROR_CODE_REVISION_CONFLICT.into(),
+                message: "management snapshot changed".into(),
+                retryable: true,
+                data: Some(ErrorData::RevisionConflict {
+                    expected_revision: 6,
+                    current_revision: 7,
+                }),
+            },
+        },
+        WireFrame::Welcome(Welcome {
+            protocol: 1,
+            instance_id: "instance-management".into(),
+            daemon_generation: 8,
+            frame_limit: TEST_FRAME_LIMIT as u32,
+            profile_id: "profile-1".into(),
+            daemon_version: "0.0.13".into(),
+            lifecycle_phase: LifecyclePhase::Ready,
+            capabilities_granted: capabilities([Capability::View, Capability::Control]),
+            features: BTreeSet::from([
+                FEATURE_ACCOUNT_LOGIN_API_V1.to_owned(),
+                FEATURE_ACCOUNT_MANAGEMENT_V1.to_owned(),
+                FEATURE_ACCOUNT_OAUTH_PKCE_V1.to_owned(),
+                FEATURE_ACCOUNT_ROTATION_V1.to_owned(),
+                FEATURE_PROVIDER_MANAGEMENT_V1.to_owned(),
                 FEATURE_SESSION_MUTATION_V1.to_owned(),
                 FEATURE_TURN_CONTROL_V1.to_owned(),
                 FEATURE_VAULT_STAGE_V1.to_owned(),

@@ -131,6 +131,9 @@ pub const ERROR_CODE_RESTAGE_REQUIRED: &str = "restage_required";
 pub const ERROR_CODE_OAUTH_UNAVAILABLE: &str = "oauth_unavailable";
 /// Stable code for an absent, expired, or differently-bound OAuth flow/ref.
 pub const ERROR_CODE_OAUTH_FLOW_NOT_FOUND: &str = "oauth_flow_not_found";
+/// Stable code for a management mutation fenced by a newer account/provider
+/// snapshot. Retrying after refreshing that snapshot is the intended recovery.
+pub const ERROR_CODE_REVISION_CONFLICT: &str = "revision_conflict";
 
 /// Daemon implements receipt-backed session creation and metadata.
 pub const FEATURE_SESSION_MUTATION_V1: &str = "session_mutation_v1";
@@ -144,6 +147,10 @@ pub const FEATURE_VAULT_STAGE_V1: &str = "vault_stage_v1";
 pub const FEATURE_ACCOUNT_OAUTH_PKCE_V1: &str = "account_oauth_pkce_v1";
 /// Daemon implements durable `account.add` for an OAuth-ready reference.
 pub const FEATURE_ACCOUNT_MANAGEMENT_V1: &str = "account_management_v1";
+/// Daemon implements provider management reads.
+pub const FEATURE_PROVIDER_MANAGEMENT_V1: &str = "provider_management_v1";
+/// Daemon implements live same-provider account rotation.
+pub const FEATURE_ACCOUNT_ROTATION_V1: &str = "account_rotation_v1";
 
 /// Kind of client taking part in the handshake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -453,6 +460,66 @@ pub struct OAuthAvailabilityWire {
     pub reason: Option<String>,
 }
 
+/// Provider adapter family. Unlike the frozen account enums, this enum is
+/// tolerant from its first release so an older client can still display a
+/// provider introduced by a newer daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ProviderApiFamilyWire {
+    AnthropicMessages,
+    #[serde(rename = "openai_responses")]
+    OpenAiResponses,
+    #[serde(rename = "openai_chat_completions")]
+    OpenAiChatCompletions,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Whether a configured provider is currently available for new work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ProviderAvailabilityWire {
+    Available,
+    Unavailable,
+    #[serde(other)]
+    Unknown,
+}
+
+/// One provider's read-only management projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderSummaryWire {
+    pub provider: String,
+    pub api_family: ProviderApiFamilyWire,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub models: Vec<String>,
+    #[serde(default)]
+    pub auth_methods: Vec<haider_protocol::credential::AuthMethod>,
+    pub availability: ProviderAvailabilityWire,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub availability_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
+    pub enabled: bool,
+}
+
+/// Active account coordinate published beside `account.list`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderActiveWire {
+    pub provider: String,
+    pub alias: haider_protocol::ids::CredentialAlias,
+}
+
+/// Provider default-model coordinate published beside `account.list`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderDefaultWire {
+    pub provider: String,
+    pub model: String,
+}
+
 /// Public-only flow progress. No variant can carry callback/token secrets or
 /// a raw endpoint error.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -711,6 +778,13 @@ pub enum RequestBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider: Option<String>,
     },
+    /// Lists provider management summaries from the daemon's published
+    /// snapshot. This read never probes an endpoint inline.
+    #[serde(rename = "provider.list")]
+    ProviderList {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+    },
     /// Decode artifact for a method this crate does not know (tolerance
     /// discipline). W3b answers it with a protocol error, not a panic.
     #[serde(other)]
@@ -824,6 +898,19 @@ pub enum ResponseBody {
     AccountList {
         #[serde(default)]
         descriptors: Vec<haider_protocol::credential::CredentialDescriptor>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        revision: Option<u64>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        provider_active: Vec<ProviderActiveWire>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        provider_defaults: Vec<ProviderDefaultWire>,
+    },
+    /// Provider management summaries and their coherent snapshot revision.
+    #[serde(rename = "provider.list")]
+    ProviderList {
+        #[serde(default)]
+        providers: Vec<ProviderSummaryWire>,
+        revision: u64,
     },
     /// Successful durable menu resolution. The same-command retry receives
     /// the original sequence; a different command receives
@@ -906,6 +993,12 @@ pub enum ErrorData {
     AlreadyResolved {
         /// Sequence of the envelope recording the winning resolution.
         resolution_seq: u64,
+    },
+    /// A management compare-and-set request observed a newer snapshot
+    /// ([`ERROR_CODE_REVISION_CONFLICT`]).
+    RevisionConflict {
+        expected_revision: u64,
+        current_revision: u64,
     },
     /// Decode artifact for a data kind this crate does not know (tolerance
     /// discipline).

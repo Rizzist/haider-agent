@@ -12,10 +12,13 @@ use haider_rpc::{
     ERROR_CODE_CAPABILITY_DENIED, ERROR_CODE_CREDENTIAL_MISSING, ERROR_CODE_CURSOR_AHEAD,
     ERROR_CODE_DRAINING, ERROR_CODE_INVALID_ARGUMENT, ERROR_CODE_INVALID_CURSOR,
     ERROR_CODE_NOT_FOUND, ERROR_CODE_OVERLOADED, ERROR_CODE_PERMISSION_DENIED,
-    ERROR_CODE_PROVIDER_ERROR, ERROR_CODE_RESTAGE_REQUIRED, ERROR_CODE_RUN_NOT_ACTIVE,
-    ERROR_CODE_STALE_GENERATION, ERROR_CODE_UNAUTHORIZED, ERROR_CODE_VAULT_UNSUPPORTED,
-    FEATURE_SESSION_MUTATION_V1, FEATURE_TURN_CONTROL_V1, Hello, RequestBody, ResponseBody,
-    SubmitDisposition, WIRE_PROTOCOL_VERSION, Welcome, WireFrame, uds_codec, ws_codec,
+    ERROR_CODE_PROVIDER_ERROR, ERROR_CODE_RESTAGE_REQUIRED, ERROR_CODE_REVISION_CONFLICT,
+    ERROR_CODE_RUN_NOT_ACTIVE, ERROR_CODE_STALE_GENERATION, ERROR_CODE_UNAUTHORIZED,
+    ERROR_CODE_VAULT_UNSUPPORTED, FEATURE_ACCOUNT_LOGIN_API_V1, FEATURE_ACCOUNT_MANAGEMENT_V1,
+    FEATURE_ACCOUNT_OAUTH_PKCE_V1, FEATURE_ACCOUNT_ROTATION_V1, FEATURE_PROVIDER_MANAGEMENT_V1,
+    FEATURE_SESSION_MUTATION_V1, FEATURE_TURN_CONTROL_V1, FEATURE_VAULT_STAGE_V1, Hello,
+    RequestBody, ResponseBody, SubmitDisposition, WIRE_PROTOCOL_VERSION, Welcome, WireFrame,
+    uds_codec, ws_codec,
 };
 use serde::{Deserialize, Serialize};
 
@@ -787,4 +790,155 @@ fn oauth_status_shapes_cannot_carry_callback_or_token_secrets() {
             assert!(!json.contains(forbidden));
         }
     }
+}
+
+/// W5c.2a's additive account read and tolerant provider vocabulary.
+///
+/// MUTATION CHECK: remove `#[serde(other)]` from
+/// `ProviderApiFamilyWire::Unknown`. Expected runtime failure: decoding
+/// `"future_native_family"` below returns an error instead of `Unknown`.
+#[test]
+fn management_reads_preserve_legacy_account_list_and_tolerate_future_providers() {
+    let legacy: ResponseBody =
+        serde_json::from_str(r#"{"method":"account.list","descriptors":[]}"#)
+            .expect("legacy account.list");
+    assert_eq!(
+        legacy,
+        ResponseBody::AccountList {
+            descriptors: Vec::new(),
+            revision: None,
+            provider_active: Vec::new(),
+            provider_defaults: Vec::new(),
+        }
+    );
+    assert_eq!(
+        serde_json::to_value(&legacy).expect("legacy re-encode"),
+        serde_json::json!({"method":"account.list","descriptors":[]})
+    );
+
+    let managed = transcript()
+        .into_iter()
+        .find(|frame| {
+            matches!(
+                frame,
+                WireFrame::Response {
+                    body: ResponseBody::AccountList {
+                        revision: Some(7),
+                        ..
+                    },
+                    ..
+                }
+            )
+        })
+        .expect("managed account.list golden");
+    let value = serde_json::to_value(managed).expect("managed account JSON");
+    assert_eq!(value["body"]["revision"], 7);
+    assert_eq!(
+        value["body"]["provider_active"],
+        serde_json::json!([{
+            "provider": "anthropic",
+            "alias": "anthropic-0123456789abcdef01234567"
+        }])
+    );
+    assert_eq!(
+        value["body"]["provider_defaults"],
+        serde_json::json!([{"provider": "anthropic", "model": "claude-opus-5"}])
+    );
+
+    let family: haider_rpc::ProviderApiFamilyWire =
+        serde_json::from_str(r#""future_native_family""#).expect("future family");
+    let availability: haider_rpc::ProviderAvailabilityWire =
+        serde_json::from_str(r#""degraded_by_moon_phase""#).expect("future availability");
+    assert_eq!(family, haider_rpc::ProviderApiFamilyWire::Unknown);
+    assert_eq!(availability, haider_rpc::ProviderAvailabilityWire::Unknown);
+}
+
+/// The account enums remain the original closed v1 vocabulary.
+///
+/// MUTATION CHECK: add `#[serde(alias = "passkey")]` to
+/// `AuthMethod::ApiKey`. Expected runtime failure: the first `is_err`
+/// assertion becomes false because the forbidden value decodes as an API key.
+#[test]
+fn account_auth_method_and_credential_status_remain_closed() {
+    assert!(
+        serde_json::from_str::<haider_protocol::credential::AuthMethod>(r#""passkey""#).is_err()
+    );
+    assert!(
+        serde_json::from_str::<haider_protocol::credential::CredentialStatus>(
+            r#"{"status":"future_health"}"#
+        )
+        .is_err()
+    );
+}
+
+/// Stable optimistic-concurrency error bytes, including bounded coordinates.
+///
+/// MUTATION CHECK: change `ERROR_CODE_REVISION_CONFLICT` to
+/// `"revision_changed"`. Expected runtime failure: the stable literal and
+/// exact response-body assertions mismatch.
+#[test]
+fn revision_conflict_code_and_structured_body_are_golden() {
+    assert_eq!(ERROR_CODE_REVISION_CONFLICT, "revision_conflict");
+    let frame = transcript()
+        .into_iter()
+        .find(|frame| {
+            matches!(
+                frame,
+                WireFrame::Response {
+                    body: ResponseBody::Error { code, .. },
+                    ..
+                } if code == ERROR_CODE_REVISION_CONFLICT
+            )
+        })
+        .expect("revision conflict golden");
+    let value = serde_json::to_value(frame).expect("revision conflict JSON");
+    assert_eq!(
+        value["body"],
+        serde_json::json!({
+            "method": "error",
+            "code": "revision_conflict",
+            "message": "management snapshot changed",
+            "retryable": true,
+            "data": {
+                "kind": "revision_conflict",
+                "expected_revision": 6,
+                "current_revision": 7
+            }
+        })
+    );
+}
+
+/// The W5c.2a provider read and all honestly served feature families.
+///
+/// MUTATION CHECK: remove `#[serde(rename = "provider.list")]` from the
+/// `ResponseBody::ProviderList` variant. Expected runtime failure: the
+/// response method disappears from the exact transcript scan below.
+#[test]
+fn provider_list_and_management_feature_families_are_golden() {
+    for kind in ["request", "response"] {
+        assert!(transcript().into_iter().any(|frame| {
+            let value = serde_json::to_value(frame).expect("frame JSON");
+            value["kind"] == kind && value["body"]["method"] == "provider.list"
+        }));
+    }
+    let welcome = transcript()
+        .into_iter()
+        .find_map(|frame| match frame {
+            WireFrame::Welcome(welcome) if welcome.features.len() == 8 => Some(welcome),
+            _ => None,
+        })
+        .expect("management-feature Welcome");
+    assert_eq!(
+        serde_json::to_value(welcome).expect("Welcome JSON")["features"],
+        serde_json::json!([
+            FEATURE_ACCOUNT_LOGIN_API_V1,
+            FEATURE_ACCOUNT_MANAGEMENT_V1,
+            FEATURE_ACCOUNT_OAUTH_PKCE_V1,
+            FEATURE_ACCOUNT_ROTATION_V1,
+            FEATURE_PROVIDER_MANAGEMENT_V1,
+            FEATURE_SESSION_MUTATION_V1,
+            FEATURE_TURN_CONTROL_V1,
+            FEATURE_VAULT_STAGE_V1,
+        ])
+    );
 }

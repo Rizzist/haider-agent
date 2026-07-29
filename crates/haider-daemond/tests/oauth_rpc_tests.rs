@@ -1326,7 +1326,7 @@ async fn blocking_refresh_shutdown_barrier(inject_worker_shutdown_error: bool) {
     )
     .await
     {
-        ResponseBody::AccountList { descriptors } => assert!(
+        ResponseBody::AccountList { descriptors, .. } => assert!(
             descriptors.iter().any(|current| {
                 current.alias == descriptor.alias
                     && matches!(current.status, CredentialStatus::Expired)
