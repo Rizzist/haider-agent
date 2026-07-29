@@ -702,6 +702,7 @@ fn anthropic_provider_for_cli(
             .add(CredentialDescriptor {
                 alias,
                 provider: ANTHROPIC_PROVIDER_NAME.into(),
+                base_url: None,
                 auth_method: AuthMethod::ApiKey,
                 identity: format!("{ANTHROPIC_KEY_ENV} import"),
                 status: CredentialStatus::Ok,

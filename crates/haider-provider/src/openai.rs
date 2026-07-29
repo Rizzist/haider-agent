@@ -1,0 +1,2284 @@
+//! OpenAI Responses API and OpenAI-compatible Chat Completions adapters.
+//!
+//! The native adapter uses Responses because its typed output-item stream maps
+//! directly to Haider's text, reasoning-summary, tool-call, usage, and finish
+//! events. The compatible adapter reuses the same transport policy but speaks
+//! Chat Completions, the common wire implemented by vLLM, Ollama, LM Studio,
+//! LiteLLM, TGI, Hugging Face endpoints, and generic gateways.
+
+use std::collections::{BTreeMap, HashMap};
+use std::fmt;
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, SystemTime};
+
+use async_trait::async_trait;
+use haider_accounts::SecretHandle;
+use haider_protocol::ids::CredentialAlias;
+use haider_protocol::provider::{
+    Block, CapabilityDoc, FeatureResolve, FinishReason, StreamEvent, Usage, UsageSource,
+};
+use haider_protocol::tool::AttachmentBlock;
+use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderValue, RETRY_AFTER};
+use serde::Deserialize;
+use tokio::sync::{OnceCell, mpsc};
+
+use crate::wire::provider_kind_name;
+use crate::{
+    MessageRole, Provider, ProviderError, ProviderErrorKind, ProviderStream, ProviderStreamItem,
+    TurnRequest, Utf8Assembler,
+};
+
+pub const OPENAI_PROVIDER_NAME: &str = "openai";
+pub const OPENAI_COMPATIBLE_PROVIDER_NAME: &str = "openai-compatible";
+pub const OPENAI_RESPONSES_API_URL: &str = "https://api.openai.com/v1/responses";
+
+const STREAM_CAPACITY: usize = 32;
+const MODELS_BODY_LIMIT: usize = 1024 * 1024;
+const ERROR_BODY_LIMIT: usize = 64 * 1024;
+const TRANSPORT_CONFIG: OpenAiTransportConfig = OpenAiTransportConfig {
+    retry_policy: OpenAiRetryPolicy::Never,
+    connect_timeout: Duration::from_secs(10),
+    response_open_timeout: Duration::from_secs(30),
+    chunk_idle_timeout: Duration::from_secs(90),
+};
+
+/// Retry behavior owned by the OpenAI HTTP adapters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenAiRetryPolicy {
+    /// Surface each transport failure once; the actor owns retry/backoff.
+    Never,
+}
+
+/// Inspectable transport invariants shared by native and compatible adapters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenAiTransportConfig {
+    pub retry_policy: OpenAiRetryPolicy,
+    pub connect_timeout: Duration,
+    pub response_open_timeout: Duration,
+    pub chunk_idle_timeout: Duration,
+}
+
+/// Raw response returned only to explicit fixture-promotion harnesses.
+#[derive(Debug)]
+pub struct OpenAiCapture {
+    pub status: u16,
+    pub retry_after: Option<String>,
+    pub body: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct OpenAiHttp {
+    client: reqwest::Client,
+    credential: SecretHandle,
+    account: Option<CredentialAlias>,
+    model: String,
+    origin_guard: Option<Arc<CompatibleOriginGuard>>,
+}
+
+impl OpenAiHttp {
+    fn new(credential: SecretHandle, model: impl Into<String>) -> Result<Self, ProviderError> {
+        Self::new_with_origin_guard(credential, model, None)
+    }
+
+    fn new_with_origin_guard(
+        credential: SecretHandle,
+        model: impl Into<String>,
+        origin_guard: Option<Arc<CompatibleOriginGuard>>,
+    ) -> Result<Self, ProviderError> {
+        let transport = TRANSPORT_CONFIG;
+        let mut client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(match transport.retry_policy {
+                OpenAiRetryPolicy::Never => reqwest::retry::never(),
+            })
+            .connect_timeout(transport.connect_timeout);
+        if let Some(guard) = &origin_guard {
+            client = client.dns_resolver(Arc::clone(guard));
+        }
+        let client = client.build().map_err(|error| {
+            ProviderError::new(
+                ProviderErrorKind::Internal,
+                format!("could not construct OpenAI HTTP client: {error}"),
+            )
+        })?;
+        Ok(Self {
+            client,
+            credential,
+            account: None,
+            model: model.into(),
+            origin_guard,
+        })
+    }
+
+    fn validate_model(&self, request: &TurnRequest) -> Result<(), ProviderError> {
+        if request.model == self.model {
+            Ok(())
+        } else {
+            Err(invalid_request(format!(
+                "OpenAI provider selected model `{}`, but turn requested `{}`",
+                self.model, request.model
+            )))
+        }
+    }
+
+    fn authorization_header(&self) -> Result<HeaderValue, ProviderError> {
+        let secret = self.credential.expose_secret();
+        let mut bytes = Vec::with_capacity(7 + secret.len());
+        bytes.extend_from_slice(b"Bearer ");
+        bytes.extend_from_slice(secret);
+        let result = HeaderValue::from_bytes(&bytes).map_err(|_| {
+            ProviderError::new(
+                ProviderErrorKind::Authentication,
+                "resolved OpenAI credential is not a valid HTTP header value",
+            )
+        });
+        bytes.fill(0);
+        let mut value = result?;
+        value.set_sensitive(true);
+        Ok(value)
+    }
+
+    async fn post_json(
+        &self,
+        url: &str,
+        payload: &serde_json::Value,
+    ) -> Result<reqwest::Response, ProviderError> {
+        let opening = async {
+            let request = self.post_json_request(url, payload).await?;
+            self.client.execute(request).await.map_err(transport_error)
+        };
+        tokio::time::timeout(TRANSPORT_CONFIG.response_open_timeout, opening)
+            .await
+            .map_err(|_| response_open_timeout_error(TRANSPORT_CONFIG.response_open_timeout))?
+    }
+
+    async fn post_json_request(
+        &self,
+        url: &str,
+        payload: &serde_json::Value,
+    ) -> Result<reqwest::Request, ProviderError> {
+        self.validate_compatible_origin().await?;
+        self.client
+            .post(url)
+            .header(CONTENT_TYPE, "application/json")
+            .header(ACCEPT, "text/event-stream")
+            .header(AUTHORIZATION, self.authorization_header()?)
+            .json(payload)
+            .build()
+            .map_err(transport_error)
+    }
+
+    async fn get(&self, url: &str) -> Result<reqwest::Response, ProviderError> {
+        let opening = async {
+            let request = self.get_request(url).await?;
+            self.client.execute(request).await.map_err(transport_error)
+        };
+        tokio::time::timeout(TRANSPORT_CONFIG.response_open_timeout, opening)
+            .await
+            .map_err(|_| response_open_timeout_error(TRANSPORT_CONFIG.response_open_timeout))?
+    }
+
+    async fn get_request(&self, url: &str) -> Result<reqwest::Request, ProviderError> {
+        self.validate_compatible_origin().await?;
+        self.client
+            .get(url)
+            .header(ACCEPT, "application/json")
+            .header(AUTHORIZATION, self.authorization_header()?)
+            .build()
+            .map_err(transport_error)
+    }
+
+    async fn validate_compatible_origin(&self) -> Result<(), ProviderError> {
+        match &self.origin_guard {
+            Some(guard) => guard.validate().await,
+            None => Ok(()),
+        }
+    }
+}
+
+/// OpenAI-native adapter using `POST /v1/responses`.
+#[derive(Debug)]
+pub struct OpenAiProvider {
+    http: OpenAiHttp,
+    api_url: String,
+}
+
+impl OpenAiProvider {
+    pub fn new(credential: SecretHandle, model: impl Into<String>) -> Result<Self, ProviderError> {
+        Ok(Self {
+            http: OpenAiHttp::new(credential, model)?,
+            api_url: OPENAI_RESPONSES_API_URL.into(),
+        })
+    }
+
+    #[must_use]
+    pub const fn transport_config() -> OpenAiTransportConfig {
+        TRANSPORT_CONFIG
+    }
+
+    #[must_use]
+    pub fn with_account(mut self, account: CredentialAlias) -> Self {
+        self.http.account = Some(account);
+        self
+    }
+
+    /// Overrides the endpoint for an explicit capture/test harness.
+    #[must_use]
+    pub fn with_api_url(mut self, api_url: impl Into<String>) -> Self {
+        self.api_url = api_url.into();
+        self
+    }
+
+    pub fn request_payload(
+        &self,
+        request: &TurnRequest,
+    ) -> Result<serde_json::Value, ProviderError> {
+        self.http.validate_model(request)?;
+        responses_request_json(request)
+    }
+
+    pub async fn capture_response(
+        &self,
+        request: &TurnRequest,
+    ) -> Result<OpenAiCapture, ProviderError> {
+        let response = self.send_request(request).await?;
+        capture(response).await
+    }
+
+    async fn send_request(
+        &self,
+        request: &TurnRequest,
+    ) -> Result<reqwest::Response, ProviderError> {
+        let payload = self.request_payload(request)?;
+        self.http.post_json(&self.api_url, &payload).await
+    }
+}
+
+#[async_trait]
+impl Provider for OpenAiProvider {
+    async fn capabilities(&self) -> CapabilityDoc {
+        native_capabilities(&self.http.model)
+    }
+
+    async fn stream_turn(&self, request: TurnRequest) -> Result<ProviderStream, ProviderError> {
+        let response = self.send_request(&request).await?;
+        checked_stream(response, self.http.account.clone(), DecoderKind::Responses).await
+    }
+}
+
+/// One generic OpenAI-compatible adapter parameterized by a credential base
+/// URL. It deliberately uses Chat Completions rather than assuming that a
+/// third-party endpoint implements the newer Responses API.
+#[derive(Debug)]
+pub struct OpenAiCompatibleProvider {
+    http: OpenAiHttp,
+    base_url: String,
+    chat_url: String,
+    models_url: String,
+}
+
+impl OpenAiCompatibleProvider {
+    pub fn new(
+        credential: SecretHandle,
+        model: impl Into<String>,
+        base_url: impl AsRef<str>,
+    ) -> Result<Self, ProviderError> {
+        Self::new_with_dns_resolver(
+            credential,
+            model,
+            base_url,
+            Arc::new(SystemCompatibleDnsResolver),
+        )
+    }
+
+    fn new_with_dns_resolver(
+        credential: SecretHandle,
+        model: impl Into<String>,
+        base_url: impl AsRef<str>,
+        resolver: Arc<dyn CompatibleDnsResolver>,
+    ) -> Result<Self, ProviderError> {
+        let endpoints = compatible_endpoints(base_url.as_ref())?;
+        let origin_guard = endpoints.origin.map(|origin| {
+            Arc::new(CompatibleOriginGuard::new(
+                origin.host,
+                origin.port,
+                origin.plain_http,
+                resolver,
+            ))
+        });
+        Ok(Self {
+            http: OpenAiHttp::new_with_origin_guard(credential, model, origin_guard)?,
+            base_url: endpoints.base_url,
+            chat_url: endpoints.chat_url,
+            models_url: endpoints.models_url,
+        })
+    }
+
+    #[must_use]
+    pub const fn transport_config() -> OpenAiTransportConfig {
+        TRANSPORT_CONFIG
+    }
+
+    #[must_use]
+    pub fn with_account(mut self, account: CredentialAlias) -> Self {
+        self.http.account = Some(account);
+        self
+    }
+
+    #[must_use]
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    #[must_use]
+    pub fn models_url(&self) -> &str {
+        &self.models_url
+    }
+
+    pub fn request_payload(
+        &self,
+        request: &TurnRequest,
+    ) -> Result<serde_json::Value, ProviderError> {
+        self.http.validate_model(request)?;
+        chat_request_json(request)
+    }
+
+    /// Probes `GET /v1/models` and derives only conservative capabilities from
+    /// the presence and name of the configured model. The models endpoint does
+    /// not itself prove tool/vision/reasoning support.
+    pub async fn probe_capabilities(&self) -> Result<CapabilityDoc, ProviderError> {
+        let response = self.http.get(&self.models_url).await?;
+        if !response.status().is_success() {
+            return Err(http_error_from_response(response).await);
+        }
+        let body =
+            read_body_bounded(response, MODELS_BODY_LIMIT, "OpenAI-compatible /v1/models").await?;
+        replay_openai_models_response(&self.http.model, &body)
+    }
+
+    pub async fn capture_response(
+        &self,
+        request: &TurnRequest,
+    ) -> Result<OpenAiCapture, ProviderError> {
+        let response = self.send_request(request).await?;
+        capture(response).await
+    }
+
+    async fn send_request(
+        &self,
+        request: &TurnRequest,
+    ) -> Result<reqwest::Response, ProviderError> {
+        let payload = self.request_payload(request)?;
+        self.http.post_json(&self.chat_url, &payload).await
+    }
+}
+
+#[async_trait]
+impl Provider for OpenAiCompatibleProvider {
+    async fn capabilities(&self) -> CapabilityDoc {
+        self.probe_capabilities()
+            .await
+            .unwrap_or_else(|_| unavailable_compatible_capabilities())
+    }
+
+    async fn stream_turn(&self, request: TurnRequest) -> Result<ProviderStream, ProviderError> {
+        let response = self.send_request(&request).await?;
+        checked_stream(response, self.http.account.clone(), DecoderKind::Chat).await
+    }
+}
+
+async fn capture(response: reqwest::Response) -> Result<OpenAiCapture, ProviderError> {
+    let status = response.status().as_u16();
+    let retry_after = response
+        .headers()
+        .get(RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let body = response.bytes().await.map_err(transport_error)?.to_vec();
+    Ok(OpenAiCapture {
+        status,
+        retry_after,
+        body,
+    })
+}
+
+async fn checked_stream(
+    response: reqwest::Response,
+    account: Option<CredentialAlias>,
+    decoder: DecoderKind,
+) -> Result<ProviderStream, ProviderError> {
+    if !response.status().is_success() {
+        return Err(http_error_from_response(response).await);
+    }
+    let (sender, receiver) = mpsc::channel(STREAM_CAPACITY);
+    let producer = tokio::spawn(async move {
+        stream_response(
+            response,
+            account,
+            sender,
+            TRANSPORT_CONFIG.chunk_idle_timeout,
+            decoder,
+        )
+        .await;
+    });
+    Ok(ProviderStream::owned(receiver, producer))
+}
+
+async fn http_error_from_response(response: reqwest::Response) -> ProviderError {
+    let status = response.status().as_u16();
+    let retry_after = response
+        .headers()
+        .get(RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    match read_body_bounded(response, ERROR_BODY_LIMIT, "OpenAI HTTP error").await {
+        Ok(body) => replay_openai_http_error(status, retry_after.as_deref(), &body),
+        Err(error) => classify_http_body_read_error(status, retry_after.as_deref(), error),
+    }
+}
+
+fn classify_http_body_read_error(
+    status: u16,
+    retry_after: Option<&str>,
+    mut error: ProviderError,
+) -> ProviderError {
+    if error.kind == ProviderErrorKind::MalformedFrame {
+        let classified = replay_openai_http_error(status, retry_after, &[]);
+        error.kind = classified.kind;
+        error.retryable = classified.retryable;
+        error.retry_after_ms = classified.retry_after_ms;
+    }
+    error
+}
+
+async fn read_body_bounded(
+    response: reqwest::Response,
+    limit: usize,
+    context: &str,
+) -> Result<Vec<u8>, ProviderError> {
+    read_body_source_bounded(response, limit, context).await
+}
+
+trait BodyChunkSource {
+    fn content_length_hint(&self) -> Option<u64>;
+
+    async fn next_body_chunk(
+        &mut self,
+    ) -> Result<Option<impl AsRef<[u8]> + Send + 'static>, ProviderError>;
+}
+
+impl BodyChunkSource for reqwest::Response {
+    fn content_length_hint(&self) -> Option<u64> {
+        self.content_length()
+    }
+
+    async fn next_body_chunk(
+        &mut self,
+    ) -> Result<Option<impl AsRef<[u8]> + Send + 'static>, ProviderError> {
+        self.chunk().await.map_err(transport_error)
+    }
+}
+
+async fn read_body_source_bounded<S: BodyChunkSource>(
+    mut source: S,
+    limit: usize,
+    context: &str,
+) -> Result<Vec<u8>, ProviderError> {
+    if source
+        .content_length_hint()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(body_too_large(context, limit));
+    }
+    let mut body = Vec::with_capacity(
+        source
+            .content_length_hint()
+            .and_then(|length| usize::try_from(length).ok())
+            .unwrap_or_default()
+            .min(limit),
+    );
+    while let Some(chunk) = source.next_body_chunk().await? {
+        let chunk = chunk.as_ref();
+        let Some(length) = body.len().checked_add(chunk.len()) else {
+            return Err(body_too_large(context, limit));
+        };
+        if length > limit {
+            return Err(body_too_large(context, limit));
+        }
+        body.extend_from_slice(chunk);
+    }
+    Ok(body)
+}
+
+fn body_too_large(context: &str, limit: usize) -> ProviderError {
+    malformed(format!("{context} body exceeded the {limit}-byte limit"))
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DecoderKind {
+    Responses,
+    Chat,
+}
+
+async fn stream_response(
+    response: reqwest::Response,
+    account: Option<CredentialAlias>,
+    sender: mpsc::Sender<ProviderStreamItem>,
+    chunk_idle_timeout: Duration,
+    kind: DecoderKind,
+) {
+    stream_sse_source(response, account, sender, chunk_idle_timeout, kind).await;
+}
+
+trait SseChunkSource {
+    async fn next_chunk(
+        &mut self,
+    ) -> Result<Option<impl AsRef<[u8]> + Send + 'static>, ProviderError>;
+}
+
+impl SseChunkSource for reqwest::Response {
+    async fn next_chunk(
+        &mut self,
+    ) -> Result<Option<impl AsRef<[u8]> + Send + 'static>, ProviderError> {
+        self.chunk().await.map_err(transport_error)
+    }
+}
+
+async fn stream_sse_source<S: SseChunkSource>(
+    mut source: S,
+    account: Option<CredentialAlias>,
+    sender: mpsc::Sender<ProviderStreamItem>,
+    chunk_idle_timeout: Duration,
+    kind: DecoderKind,
+) {
+    let mut decoder = match kind {
+        DecoderKind::Responses => OpenAiDecoder::Responses(ResponsesDecoder::new(account)),
+        DecoderKind::Chat => OpenAiDecoder::Chat(ChatDecoder::new(account)),
+    };
+    loop {
+        let chunk = match tokio::time::timeout(chunk_idle_timeout, source.next_chunk()).await {
+            Ok(Ok(Some(chunk))) => chunk,
+            Ok(Ok(None)) => {
+                let items = decoder.finish();
+                let _ = send_items(&sender, items).await;
+                return;
+            }
+            Ok(Err(error)) => {
+                let _ = sender.send(Err(error)).await;
+                return;
+            }
+            Err(_) => {
+                let _ = sender
+                    .send(Err(stream_idle_error(chunk_idle_timeout)))
+                    .await;
+                return;
+            }
+        };
+        let items = decoder.push(chunk.as_ref());
+        if !send_items(&sender, items).await || decoder.is_terminal() {
+            return;
+        }
+    }
+}
+
+async fn send_items(
+    sender: &mpsc::Sender<ProviderStreamItem>,
+    items: Vec<ProviderStreamItem>,
+) -> bool {
+    for item in items {
+        if sender.send(item).await.is_err() {
+            return false;
+        }
+    }
+    true
+}
+
+enum OpenAiDecoder {
+    Responses(ResponsesDecoder),
+    Chat(ChatDecoder),
+}
+
+impl OpenAiDecoder {
+    fn push(&mut self, bytes: &[u8]) -> Vec<ProviderStreamItem> {
+        match self {
+            Self::Responses(decoder) => decoder.push(bytes),
+            Self::Chat(decoder) => decoder.push(bytes),
+        }
+    }
+
+    fn finish(&mut self) -> Vec<ProviderStreamItem> {
+        match self {
+            Self::Responses(decoder) => decoder.finish(),
+            Self::Chat(decoder) => decoder.finish(),
+        }
+    }
+
+    fn is_terminal(&self) -> bool {
+        match self {
+            Self::Responses(decoder) => decoder.terminal,
+            Self::Chat(decoder) => decoder.terminal,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SseFrame {
+    event: Option<String>,
+    data: String,
+}
+
+#[derive(Debug, Default)]
+struct SseFramer {
+    utf8: Utf8Assembler,
+    line_buffer: String,
+    event_name: Option<String>,
+    data_lines: Vec<String>,
+}
+
+impl SseFramer {
+    fn push(&mut self, bytes: &[u8]) -> Result<Vec<SseFrame>, ProviderError> {
+        let decoded = self.utf8.push(bytes)?;
+        let mut frames = Vec::new();
+        for text in decoded {
+            self.line_buffer.push_str(&text);
+            while let Some(newline) = self.line_buffer.find('\n') {
+                let mut line = self.line_buffer.drain(..=newline).collect::<String>();
+                line.pop();
+                if line.ends_with('\r') {
+                    line.pop();
+                }
+                if let Some(frame) = self.accept_line(&line) {
+                    frames.push(frame);
+                }
+            }
+        }
+        Ok(frames)
+    }
+
+    fn finish(&mut self) -> Result<Vec<SseFrame>, ProviderError> {
+        if self.utf8.has_pending() {
+            return Err(malformed("OpenAI SSE stream ended inside a UTF-8 scalar"));
+        }
+        let mut frames = Vec::new();
+        if !self.line_buffer.is_empty() {
+            let line = std::mem::take(&mut self.line_buffer);
+            if let Some(frame) = self.accept_line(line.trim_end_matches('\r')) {
+                frames.push(frame);
+            }
+        }
+        if let Some(frame) = self.dispatch_frame() {
+            frames.push(frame);
+        }
+        Ok(frames)
+    }
+
+    fn accept_line(&mut self, line: &str) -> Option<SseFrame> {
+        if line.is_empty() {
+            return self.dispatch_frame();
+        }
+        if line.starts_with(':') {
+            return None;
+        }
+        let (field, value) = line.split_once(':').map_or((line, ""), |(field, value)| {
+            (field, value.strip_prefix(' ').unwrap_or(value))
+        });
+        match field {
+            "event" => self.event_name = Some(value.to_owned()),
+            "data" => self.data_lines.push(value.to_owned()),
+            "id" | "retry" => {}
+            _ => {}
+        }
+        None
+    }
+
+    fn dispatch_frame(&mut self) -> Option<SseFrame> {
+        if self.data_lines.is_empty() {
+            self.event_name = None;
+            return None;
+        }
+        let frame = SseFrame {
+            event: self.event_name.take(),
+            data: self.data_lines.join("\n"),
+        };
+        self.data_lines.clear();
+        Some(frame)
+    }
+}
+
+#[derive(Debug)]
+struct ResponsesDecoder {
+    framer: SseFramer,
+    account: Option<CredentialAlias>,
+    open_calls: BTreeMap<usize, ResponseFunctionCall>,
+    call_items: HashMap<String, usize>,
+    pending_tool_events: Vec<StreamEvent>,
+    saw_tool: bool,
+    saw_refusal: bool,
+    terminal: bool,
+}
+
+#[derive(Debug)]
+struct ResponseFunctionCall {
+    call_id: String,
+    ended: bool,
+}
+
+impl ResponsesDecoder {
+    fn new(account: Option<CredentialAlias>) -> Self {
+        Self {
+            framer: SseFramer::default(),
+            account,
+            open_calls: BTreeMap::new(),
+            call_items: HashMap::new(),
+            pending_tool_events: Vec::new(),
+            saw_tool: false,
+            saw_refusal: false,
+            terminal: false,
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) -> Vec<ProviderStreamItem> {
+        if self.terminal {
+            return Vec::new();
+        }
+        let frames = match self.framer.push(bytes) {
+            Ok(frames) => frames,
+            Err(error) => return self.fail(error),
+        };
+        self.accept_frames(frames)
+    }
+
+    fn finish(&mut self) -> Vec<ProviderStreamItem> {
+        if self.terminal {
+            return Vec::new();
+        }
+        let frames = match self.framer.finish() {
+            Ok(frames) => frames,
+            Err(error) => return self.fail(error),
+        };
+        let items = self.accept_frames(frames);
+        if self.terminal || items.iter().any(Result::is_err) {
+            items
+        } else {
+            let mut items = items;
+            items.push(Err(malformed(
+                "OpenAI Responses SSE ended before a terminal response event",
+            )));
+            self.terminal = true;
+            items
+        }
+    }
+
+    fn accept_frames(&mut self, frames: Vec<SseFrame>) -> Vec<ProviderStreamItem> {
+        let mut output = Vec::new();
+        for frame in frames {
+            let items = match self.dispatch(frame) {
+                Ok(items) => items.into_iter().map(Ok).collect::<Vec<_>>(),
+                Err(error) => vec![Err(error)],
+            };
+            let terminal = items
+                .iter()
+                .any(|item| matches!(item, Err(_) | Ok(StreamEvent::Finish { .. })));
+            output.extend(items);
+            if terminal {
+                self.terminal = true;
+                break;
+            }
+        }
+        output
+    }
+
+    fn dispatch(&mut self, frame: SseFrame) -> Result<Vec<StreamEvent>, ProviderError> {
+        if frame.data == "[DONE]" {
+            return Ok(Vec::new());
+        }
+        let value: serde_json::Value = serde_json::from_str(&frame.data).map_err(|error| {
+            malformed(format!(
+                "OpenAI Responses SSE data is not valid JSON: {error}"
+            ))
+        })?;
+        let event_type = value
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| malformed("OpenAI Responses SSE event has no type"))?;
+        if frame
+            .event
+            .as_deref()
+            .is_some_and(|event| event != event_type)
+        {
+            return Err(malformed(format!(
+                "OpenAI Responses SSE event `{}` disagrees with data type `{event_type}`",
+                frame.event.as_deref().unwrap_or_default()
+            )));
+        }
+        match event_type {
+            "response.output_text.delta" => Ok(vec![StreamEvent::TextDelta {
+                text: required_string(&value, "delta", event_type)?,
+            }]),
+            "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+                Ok(vec![StreamEvent::ReasoningDelta {
+                    text: required_string(&value, "delta", event_type)?,
+                }])
+            }
+            "response.refusal.delta" => {
+                self.saw_refusal = true;
+                Ok(vec![StreamEvent::RefusalDelta {
+                    text: required_string(&value, "delta", event_type)?,
+                }])
+            }
+            "response.output_item.added" => self.output_item_added(&value),
+            "response.function_call_arguments.delta" => self.function_arguments_delta(&value),
+            "response.function_call_arguments.done" => self.function_arguments_done(&value),
+            "response.output_item.done" => self.output_item_done(&value),
+            "response.completed" => self.response_terminal(&value, false),
+            "response.incomplete" => self.response_terminal(&value, true),
+            "response.failed" | "error" => Err(openai_stream_error(&value)),
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    fn output_item_added(
+        &mut self,
+        value: &serde_json::Value,
+    ) -> Result<Vec<StreamEvent>, ProviderError> {
+        let item = value
+            .get("item")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| malformed("OpenAI response.output_item.added has no item"))?;
+        if item.get("type").and_then(serde_json::Value::as_str) != Some("function_call") {
+            return Ok(Vec::new());
+        }
+        let output_index = required_usize(value, "output_index", "response.output_item.added")?;
+        if self.open_calls.contains_key(&output_index) {
+            return Err(malformed(format!(
+                "OpenAI function-call output index {output_index} started twice"
+            )));
+        }
+        let item_id = object_string(item, "id", "response.output_item.added item")?;
+        let call_id = object_string(item, "call_id", "response.output_item.added item")?;
+        let name = object_string(item, "name", "response.output_item.added item")?;
+        let initial_arguments = item
+            .get("arguments")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        self.call_items.insert(item_id.clone(), output_index);
+        self.open_calls.insert(
+            output_index,
+            ResponseFunctionCall {
+                call_id: call_id.clone(),
+                ended: false,
+            },
+        );
+        self.saw_tool = true;
+        self.pending_tool_events
+            .push(StreamEvent::ToolCallStart { call_id, name });
+        if !initial_arguments.is_empty() {
+            let call_id = self
+                .open_calls
+                .get(&output_index)
+                .map(|call| call.call_id.clone())
+                .ok_or_else(|| malformed("OpenAI function call disappeared after start"))?;
+            self.pending_tool_events
+                .push(StreamEvent::ToolCallArgsDelta {
+                    call_id,
+                    args_fragment: initial_arguments,
+                });
+        }
+        Ok(Vec::new())
+    }
+
+    fn function_arguments_delta(
+        &mut self,
+        value: &serde_json::Value,
+    ) -> Result<Vec<StreamEvent>, ProviderError> {
+        let index = self.call_index(value, "response.function_call_arguments.delta")?;
+        let call = self.open_calls.get(&index).ok_or_else(|| {
+            malformed(format!(
+                "OpenAI function arguments reference unopened output index {index}"
+            ))
+        })?;
+        if call.ended {
+            return Err(malformed(format!(
+                "OpenAI function arguments arrived after call `{}` ended",
+                call.call_id
+            )));
+        }
+        self.pending_tool_events
+            .push(StreamEvent::ToolCallArgsDelta {
+                call_id: call.call_id.clone(),
+                args_fragment: required_string(
+                    value,
+                    "delta",
+                    "response.function_call_arguments.delta",
+                )?,
+            });
+        Ok(Vec::new())
+    }
+
+    fn function_arguments_done(
+        &mut self,
+        value: &serde_json::Value,
+    ) -> Result<Vec<StreamEvent>, ProviderError> {
+        let index = self.call_index(value, "response.function_call_arguments.done")?;
+        self.end_call(index)
+    }
+
+    fn output_item_done(
+        &mut self,
+        value: &serde_json::Value,
+    ) -> Result<Vec<StreamEvent>, ProviderError> {
+        let Some(item) = value.get("item").and_then(serde_json::Value::as_object) else {
+            return Ok(Vec::new());
+        };
+        match item.get("type").and_then(serde_json::Value::as_str) {
+            Some("reasoning") => {
+                return Ok(vec![StreamEvent::ProviderOpaque {
+                    provider: OPENAI_PROVIDER_NAME.into(),
+                    data: serde_json::Value::Object(item.clone()),
+                }]);
+            }
+            Some("function_call") => {}
+            _ => return Ok(Vec::new()),
+        }
+        let index = required_usize(value, "output_index", "response.output_item.done")?;
+        self.end_call(index)
+    }
+
+    fn call_index(&self, value: &serde_json::Value, event: &str) -> Result<usize, ProviderError> {
+        if let Some(index) = value
+            .get("output_index")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|index| usize::try_from(index).ok())
+        {
+            return Ok(index);
+        }
+        let item_id = value
+            .get("item_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| malformed(format!("OpenAI {event} has no output_index or item_id")))?;
+        self.call_items.get(item_id).copied().ok_or_else(|| {
+            malformed(format!(
+                "OpenAI {event} references unknown item `{item_id}`"
+            ))
+        })
+    }
+
+    fn end_call(&mut self, index: usize) -> Result<Vec<StreamEvent>, ProviderError> {
+        let call = self.open_calls.get_mut(&index).ok_or_else(|| {
+            malformed(format!(
+                "OpenAI function-call end references unopened output index {index}"
+            ))
+        })?;
+        if call.ended {
+            return Ok(Vec::new());
+        }
+        call.ended = true;
+        self.pending_tool_events.push(StreamEvent::ToolCallEnd {
+            call_id: call.call_id.clone(),
+        });
+        if self.open_calls.values().all(|call| call.ended) {
+            Ok(std::mem::take(&mut self.pending_tool_events))
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    fn response_terminal(
+        &mut self,
+        value: &serde_json::Value,
+        incomplete: bool,
+    ) -> Result<Vec<StreamEvent>, ProviderError> {
+        let response = value
+            .get("response")
+            .ok_or_else(|| malformed("OpenAI terminal response event has no response object"))?;
+        if !incomplete && self.open_calls.values().any(|call| !call.ended) {
+            return Err(malformed(
+                "OpenAI response.completed arrived before a function call was finalized",
+            ));
+        }
+        if incomplete {
+            self.pending_tool_events.clear();
+        }
+        let mut events = Vec::new();
+        if let Some(usage) = response.get("usage").filter(|usage| !usage.is_null()) {
+            events.push(StreamEvent::UsageUpdate(openai_usage(
+                usage,
+                self.account.clone(),
+            )?));
+        }
+        let reason = if incomplete {
+            match response
+                .get("incomplete_details")
+                .and_then(|details| details.get("reason"))
+                .and_then(serde_json::Value::as_str)
+            {
+                Some("max_output_tokens" | "max_tokens") => FinishReason::MaxTokens,
+                Some("content_filter") => FinishReason::Refusal,
+                _ => FinishReason::Error,
+            }
+        } else if self.saw_refusal {
+            FinishReason::Refusal
+        } else if self.saw_tool {
+            FinishReason::ToolUse
+        } else {
+            FinishReason::EndTurn
+        };
+        events.push(StreamEvent::Finish { reason });
+        Ok(events)
+    }
+
+    fn fail(&mut self, error: ProviderError) -> Vec<ProviderStreamItem> {
+        self.terminal = true;
+        vec![Err(error)]
+    }
+}
+
+#[derive(Debug)]
+struct ChatDecoder {
+    framer: SseFramer,
+    account: Option<CredentialAlias>,
+    open_calls: BTreeMap<usize, ChatFunctionCall>,
+    pending_tool_events: Vec<StreamEvent>,
+    finish_reason: Option<FinishReason>,
+    terminal: bool,
+}
+
+#[derive(Debug)]
+struct ChatFunctionCall {
+    call_id: String,
+    name: String,
+    ended: bool,
+}
+
+impl ChatDecoder {
+    fn new(account: Option<CredentialAlias>) -> Self {
+        Self {
+            framer: SseFramer::default(),
+            account,
+            open_calls: BTreeMap::new(),
+            pending_tool_events: Vec::new(),
+            finish_reason: None,
+            terminal: false,
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) -> Vec<ProviderStreamItem> {
+        if self.terminal {
+            return Vec::new();
+        }
+        let frames = match self.framer.push(bytes) {
+            Ok(frames) => frames,
+            Err(error) => return self.fail(error),
+        };
+        self.accept_frames(frames)
+    }
+
+    fn finish(&mut self) -> Vec<ProviderStreamItem> {
+        if self.terminal {
+            return Vec::new();
+        }
+        let frames = match self.framer.finish() {
+            Ok(frames) => frames,
+            Err(error) => return self.fail(error),
+        };
+        let mut items = self.accept_frames(frames);
+        if self.terminal {
+            return items;
+        }
+        if let Some(reason) = self.finish_reason {
+            items.extend(self.finish_events(reason).into_iter().map(Ok));
+            self.terminal = true;
+            items
+        } else {
+            items.push(Err(malformed(
+                "OpenAI-compatible Chat SSE ended before [DONE] or finish_reason",
+            )));
+            self.terminal = true;
+            items
+        }
+    }
+
+    fn accept_frames(&mut self, frames: Vec<SseFrame>) -> Vec<ProviderStreamItem> {
+        let mut output = Vec::new();
+        for frame in frames {
+            let items = match self.dispatch(frame) {
+                Ok(items) => items.into_iter().map(Ok).collect::<Vec<_>>(),
+                Err(error) => vec![Err(error)],
+            };
+            let terminal = items
+                .iter()
+                .any(|item| matches!(item, Err(_) | Ok(StreamEvent::Finish { .. })));
+            output.extend(items);
+            if terminal {
+                self.terminal = true;
+                break;
+            }
+        }
+        output
+    }
+
+    fn dispatch(&mut self, frame: SseFrame) -> Result<Vec<StreamEvent>, ProviderError> {
+        if frame.data == "[DONE]" {
+            return Ok(self.finish_events(self.finish_reason.unwrap_or(FinishReason::EndTurn)));
+        }
+        let value: serde_json::Value = serde_json::from_str(&frame.data).map_err(|error| {
+            malformed(format!(
+                "OpenAI-compatible Chat SSE data is not valid JSON: {error}"
+            ))
+        })?;
+        if value.get("error").is_some() {
+            return Err(openai_stream_error(&value));
+        }
+        let mut events = Vec::new();
+        if let Some(usage) = value.get("usage").filter(|usage| !usage.is_null()) {
+            events.push(StreamEvent::UsageUpdate(chat_usage(
+                usage,
+                self.account.clone(),
+            )?));
+        }
+        let choices = value
+            .get("choices")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| malformed("OpenAI-compatible Chat chunk has no choices array"))?;
+        for choice in choices {
+            let delta = choice.get("delta").unwrap_or(&serde_json::Value::Null);
+            if let Some(text) = delta.get("content").and_then(serde_json::Value::as_str)
+                && !text.is_empty()
+            {
+                events.push(StreamEvent::TextDelta { text: text.into() });
+            }
+            if let Some(text) = delta
+                .get("reasoning_content")
+                .or_else(|| delta.get("reasoning"))
+                .and_then(serde_json::Value::as_str)
+                && !text.is_empty()
+            {
+                events.push(StreamEvent::ReasoningDelta { text: text.into() });
+            }
+            if let Some(refusal) = delta.get("refusal").and_then(serde_json::Value::as_str)
+                && !refusal.is_empty()
+            {
+                events.push(StreamEvent::RefusalDelta {
+                    text: refusal.into(),
+                });
+                self.finish_reason = Some(FinishReason::Refusal);
+            }
+            if let Some(tool_calls) = delta
+                .get("tool_calls")
+                .and_then(serde_json::Value::as_array)
+            {
+                for tool_call in tool_calls {
+                    events.extend(self.tool_delta(tool_call)?);
+                }
+            }
+            if let Some(reason) = choice
+                .get("finish_reason")
+                .and_then(serde_json::Value::as_str)
+            {
+                let reason = normalize_chat_finish_reason(reason)?;
+                if self
+                    .finish_reason
+                    .is_some_and(|existing| existing != reason)
+                {
+                    return Err(malformed(
+                        "OpenAI-compatible Chat stream changed its finish_reason",
+                    ));
+                }
+                self.finish_reason = Some(reason);
+                if reason == FinishReason::ToolUse {
+                    events.extend(self.close_calls());
+                }
+            }
+        }
+        Ok(events)
+    }
+
+    fn tool_delta(&mut self, value: &serde_json::Value) -> Result<Vec<StreamEvent>, ProviderError> {
+        let index = required_usize(value, "index", "Chat tool-call delta")?;
+        let id = value
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.is_empty());
+        let function = value.get("function").unwrap_or(&serde_json::Value::Null);
+        let name = function
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .filter(|name| !name.is_empty());
+        let arguments = function
+            .get("arguments")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if let std::collections::btree_map::Entry::Vacant(entry) = self.open_calls.entry(index) {
+            let call_id = id.ok_or_else(|| {
+                malformed(format!(
+                    "OpenAI-compatible tool index {index} started without an id"
+                ))
+            })?;
+            let name = name.ok_or_else(|| {
+                malformed(format!(
+                    "OpenAI-compatible tool index {index} started without a name"
+                ))
+            })?;
+            entry.insert(ChatFunctionCall {
+                call_id: call_id.into(),
+                name: name.into(),
+                ended: false,
+            });
+            self.pending_tool_events.push(StreamEvent::ToolCallStart {
+                call_id: call_id.into(),
+                name: name.into(),
+            });
+        }
+        let call = self.open_calls.get(&index).ok_or_else(|| {
+            malformed(format!(
+                "OpenAI-compatible tool index {index} disappeared after start"
+            ))
+        })?;
+        if id.is_some_and(|id| id != call.call_id) {
+            return Err(malformed(format!(
+                "OpenAI-compatible tool index {index} changed call id"
+            )));
+        }
+        if name.is_some_and(|name| name != call.name) {
+            return Err(malformed(format!(
+                "OpenAI-compatible tool index {index} changed function name"
+            )));
+        }
+        if call.ended && !arguments.is_empty() {
+            return Err(malformed(format!(
+                "OpenAI-compatible arguments arrived after call `{}` ended",
+                call.call_id
+            )));
+        }
+        if !arguments.is_empty() {
+            self.pending_tool_events
+                .push(StreamEvent::ToolCallArgsDelta {
+                    call_id: call.call_id.clone(),
+                    args_fragment: arguments.into(),
+                });
+        }
+        Ok(Vec::new())
+    }
+
+    fn close_calls(&mut self) -> Vec<StreamEvent> {
+        for call in self.open_calls.values_mut() {
+            if !call.ended {
+                call.ended = true;
+                self.pending_tool_events.push(StreamEvent::ToolCallEnd {
+                    call_id: call.call_id.clone(),
+                });
+            }
+        }
+        std::mem::take(&mut self.pending_tool_events)
+    }
+
+    fn finish_events(&mut self, reason: FinishReason) -> Vec<StreamEvent> {
+        let mut events = if reason == FinishReason::ToolUse {
+            self.close_calls()
+        } else {
+            self.pending_tool_events.clear();
+            Vec::new()
+        };
+        events.push(StreamEvent::Finish { reason });
+        events
+    }
+
+    fn fail(&mut self, error: ProviderError) -> Vec<ProviderStreamItem> {
+        self.terminal = true;
+        vec![Err(error)]
+    }
+}
+
+/// Replays native Responses SSE bytes through the live incremental decoder.
+#[must_use]
+pub fn replay_openai_responses_sse(bytes: &[u8]) -> Vec<ProviderStreamItem> {
+    let mut decoder = ResponsesDecoder::new(None);
+    let mut items = Vec::new();
+    for chunk in bytes.chunks(7) {
+        items.extend(decoder.push(chunk));
+        if decoder.terminal {
+            return items;
+        }
+    }
+    items.extend(decoder.finish());
+    items
+}
+
+/// Replays compatible Chat Completions SSE bytes through the live decoder.
+#[must_use]
+pub fn replay_openai_chat_sse(bytes: &[u8]) -> Vec<ProviderStreamItem> {
+    let mut decoder = ChatDecoder::new(None);
+    let mut items = Vec::new();
+    for chunk in bytes.chunks(7) {
+        items.extend(decoder.push(chunk));
+        if decoder.terminal {
+            return items;
+        }
+    }
+    items.extend(decoder.finish());
+    items
+}
+
+/// Replays a fake/captured `GET /v1/models` body through the live capability
+/// parser without requiring a listening socket.
+pub fn replay_openai_models_response(
+    model: &str,
+    body: &[u8],
+) -> Result<CapabilityDoc, ProviderError> {
+    let models: ModelsEnvelope = serde_json::from_slice(body).map_err(|error| {
+        malformed(format!(
+            "OpenAI-compatible /v1/models response is not valid JSON: {error}"
+        ))
+    })?;
+    if !models.data.iter().any(|entry| entry.id == model) {
+        return Err(invalid_request(format!(
+            "OpenAI-compatible endpoint does not advertise configured model `{model}`"
+        )));
+    }
+    Ok(compatible_capabilities(model))
+}
+
+/// Replays a captured non-success OpenAI-shaped HTTP response.
+#[must_use]
+pub fn replay_openai_http_error(
+    status: u16,
+    retry_after: Option<&str>,
+    body: &[u8],
+) -> ProviderError {
+    let parsed = serde_json::from_slice::<OpenAiErrorEnvelope>(body).ok();
+    let error_type = parsed
+        .as_ref()
+        .and_then(|envelope| envelope.error.kind.as_deref());
+    let error_code = parsed
+        .as_ref()
+        .and_then(|envelope| envelope.error.code.as_deref());
+    let kind = match status {
+        401 => ProviderErrorKind::Authentication,
+        403 => ProviderErrorKind::PermissionDenied,
+        429 => ProviderErrorKind::RateLimited,
+        503 => ProviderErrorKind::Overloaded,
+        408 | 500..=599 => ProviderErrorKind::Transport,
+        _ => match error_code.or(error_type) {
+            Some("invalid_api_key" | "authentication_error") => ProviderErrorKind::Authentication,
+            Some("insufficient_quota" | "permission_denied") => ProviderErrorKind::PermissionDenied,
+            Some("rate_limit_exceeded" | "rate_limit_error") => ProviderErrorKind::RateLimited,
+            Some("server_error" | "timeout") => ProviderErrorKind::Transport,
+            _ => ProviderErrorKind::InvalidRequest,
+        },
+    };
+    let retry_after_ms = matches!(
+        kind,
+        ProviderErrorKind::RateLimited
+            | ProviderErrorKind::Overloaded
+            | ProviderErrorKind::Transport
+    )
+    .then(|| parse_retry_after(retry_after))
+    .flatten();
+    ProviderError::new(
+        kind,
+        format!("OpenAI HTTP {status} returned {}", provider_kind_name(kind)),
+    )
+    .with_retry_after_ms(retry_after_ms)
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiErrorEnvelope {
+    error: OpenAiApiError,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiApiError {
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
+    #[serde(default)]
+    code: Option<String>,
+}
+
+fn openai_stream_error(value: &serde_json::Value) -> ProviderError {
+    let error = value
+        .get("error")
+        .or_else(|| {
+            value
+                .get("response")
+                .and_then(|response| response.get("error"))
+        })
+        .unwrap_or(value);
+    let kind = error
+        .get("code")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| error.get("type").and_then(serde_json::Value::as_str));
+    let provider_kind = match kind {
+        Some("invalid_api_key" | "authentication_error") => ProviderErrorKind::Authentication,
+        Some("permission_denied" | "insufficient_quota") => ProviderErrorKind::PermissionDenied,
+        Some("rate_limit_exceeded" | "rate_limit_error") => ProviderErrorKind::RateLimited,
+        Some("overloaded_error") => ProviderErrorKind::Overloaded,
+        Some("server_error" | "timeout") => ProviderErrorKind::Transport,
+        _ => ProviderErrorKind::InvalidRequest,
+    };
+    ProviderError::new(
+        provider_kind,
+        format!(
+            "OpenAI stream returned {}",
+            provider_kind_name(provider_kind)
+        ),
+    )
+}
+
+fn responses_request_json(request: &TurnRequest) -> Result<serde_json::Value, ProviderError> {
+    let attachments = attachment_index(request)?;
+    let mut input = Vec::new();
+    for message in &request.messages {
+        let mut content = Vec::new();
+        for block in &message.blocks {
+            match block {
+                Block::Text { text } if message.role != MessageRole::Tool => {
+                    content.push(serde_json::json!({"type": "input_text", "text": text}));
+                }
+                Block::Text { .. } => {
+                    return Err(invalid_request(
+                        "OpenAI tool messages cannot contain plain text blocks",
+                    ));
+                }
+                Block::Reasoning { .. } => {
+                    return Err(invalid_request(
+                        "normalized reasoning summaries cannot be replayed as OpenAI reasoning items",
+                    ));
+                }
+                Block::ToolCall {
+                    call_id,
+                    name,
+                    args,
+                } if message.role == MessageRole::Assistant => {
+                    flush_response_message(&mut input, message.role, &mut content);
+                    let arguments = serde_json::to_string(args).map_err(|error| {
+                        invalid_request(format!(
+                            "OpenAI tool arguments could not be encoded: {error}"
+                        ))
+                    })?;
+                    input.push(serde_json::json!({
+                        "type": "function_call",
+                        "call_id": call_id,
+                        "name": name,
+                        "arguments": arguments,
+                    }));
+                }
+                Block::ToolCall { .. } => {
+                    return Err(invalid_request(
+                        "OpenAI function_call items are only valid in assistant messages",
+                    ));
+                }
+                Block::ToolResult {
+                    call_id, preview, ..
+                } if matches!(message.role, MessageRole::User | MessageRole::Tool) => {
+                    flush_response_message(&mut input, message.role, &mut content);
+                    input.push(serde_json::json!({
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": preview,
+                    }));
+                }
+                Block::ToolResult { .. } => {
+                    return Err(invalid_request(
+                        "OpenAI function_call_output items are only valid in user/tool messages",
+                    ));
+                }
+                Block::Attachment(AttachmentBlock::Image { artifact, mime, .. })
+                    if message.role == MessageRole::User =>
+                {
+                    let data = resolved_attachment(&attachments, artifact.as_str())?;
+                    content.push(serde_json::json!({
+                        "type": "input_image",
+                        "image_url": format!("data:{mime};base64,{data}"),
+                        "detail": "auto",
+                    }));
+                }
+                Block::Attachment(AttachmentBlock::Image { .. }) => {
+                    return Err(invalid_request(
+                        "OpenAI image inputs are only valid in user messages",
+                    ));
+                }
+                Block::Attachment(AttachmentBlock::PastedText { artifact, .. }) => {
+                    return Err(invalid_request(format!(
+                        "pasted-text attachment `{artifact}` was not resolved by the prompt compiler"
+                    )));
+                }
+                Block::Attachment(AttachmentBlock::Skill { name, .. }) => {
+                    return Err(invalid_request(format!(
+                        "skill attachment `{name}` was not resolved by the prompt compiler"
+                    )));
+                }
+                Block::ProviderOpaque { provider, data }
+                    if provider == OPENAI_PROVIDER_NAME && data.is_object() =>
+                {
+                    flush_response_message(&mut input, message.role, &mut content);
+                    input.push(data.clone());
+                }
+                Block::ProviderOpaque { provider, .. } if provider == OPENAI_PROVIDER_NAME => {
+                    return Err(invalid_request(
+                        "OpenAI provider-opaque input item must be a JSON object",
+                    ));
+                }
+                Block::ProviderOpaque { provider, .. } => {
+                    return Err(invalid_request(format!(
+                        "provider-opaque block for `{provider}` cannot be sent to OpenAI"
+                    )));
+                }
+            }
+        }
+        flush_response_message(&mut input, message.role, &mut content);
+    }
+    let tools = request
+        .tools
+        .iter()
+        .map(|tool| {
+            serde_json::json!({
+                "type": "function",
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.input_schema,
+                "strict": false,
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut payload = serde_json::json!({
+        "model": request.model,
+        "max_output_tokens": request.max_tokens,
+        "input": input,
+        "stream": true,
+        "store": false,
+    });
+    let object = payload
+        .as_object_mut()
+        .ok_or_else(|| internal("OpenAI Responses request payload was not a JSON object"))?;
+    if let Some(instructions) = &request.system_prompt {
+        object.insert(
+            "instructions".into(),
+            serde_json::Value::String(instructions.clone()),
+        );
+    }
+    if !tools.is_empty() {
+        object.insert("tools".into(), serde_json::Value::Array(tools));
+    }
+    if model_has_reasoning(&request.model) {
+        object.insert("reasoning".into(), serde_json::json!({"summary": "auto"}));
+        object.insert(
+            "include".into(),
+            serde_json::json!(["reasoning.encrypted_content"]),
+        );
+    }
+    Ok(payload)
+}
+
+fn flush_response_message(
+    input: &mut Vec<serde_json::Value>,
+    role: MessageRole,
+    content: &mut Vec<serde_json::Value>,
+) {
+    if content.is_empty() {
+        return;
+    }
+    let role = match role {
+        MessageRole::User | MessageRole::Tool => "user",
+        MessageRole::Assistant => "assistant",
+    };
+    input.push(serde_json::json!({
+        "type": "message",
+        "role": role,
+        "content": std::mem::take(content),
+    }));
+}
+
+fn chat_request_json(request: &TurnRequest) -> Result<serde_json::Value, ProviderError> {
+    let attachments = attachment_index(request)?;
+    let mut messages = Vec::new();
+    if let Some(system) = &request.system_prompt {
+        messages.push(serde_json::json!({"role": "system", "content": system}));
+    }
+    for message in &request.messages {
+        match message.role {
+            MessageRole::Assistant => {
+                let mut text = String::new();
+                let mut tool_calls = Vec::new();
+                for block in &message.blocks {
+                    match block {
+                        Block::Text { text: delta } => text.push_str(delta),
+                        Block::ToolCall {
+                            call_id,
+                            name,
+                            args,
+                        } => {
+                            let arguments = serde_json::to_string(args).map_err(|error| {
+                                invalid_request(format!(
+                                    "OpenAI-compatible tool arguments could not be encoded: {error}"
+                                ))
+                            })?;
+                            tool_calls.push(serde_json::json!({
+                                "id": call_id,
+                                "type": "function",
+                                "function": {"name": name, "arguments": arguments},
+                            }));
+                        }
+                        Block::ProviderOpaque { provider, data }
+                            if provider == OPENAI_COMPATIBLE_PROVIDER_NAME && data.is_object() =>
+                        {
+                            messages.push(data.clone());
+                        }
+                        Block::Reasoning { .. } => {
+                            return Err(invalid_request(
+                                "normalized reasoning summaries cannot be replayed on the OpenAI-compatible wire",
+                            ));
+                        }
+                        _ => {
+                            return Err(invalid_request(
+                                "OpenAI-compatible assistant messages support only text and tool calls",
+                            ));
+                        }
+                    }
+                }
+                let mut wire = serde_json::json!({
+                    "role": "assistant",
+                    "content": (!text.is_empty()).then_some(text),
+                });
+                if !tool_calls.is_empty() {
+                    wire.as_object_mut()
+                        .ok_or_else(|| internal("Chat assistant message was not an object"))?
+                        .insert("tool_calls".into(), serde_json::Value::Array(tool_calls));
+                }
+                messages.push(wire);
+            }
+            MessageRole::User => {
+                let mut content = Vec::new();
+                let mut results = Vec::new();
+                for block in &message.blocks {
+                    match block {
+                        Block::Text { text } => {
+                            content.push(serde_json::json!({"type": "text", "text": text}));
+                        }
+                        Block::Attachment(AttachmentBlock::Image { artifact, mime, .. }) => {
+                            let data = resolved_attachment(&attachments, artifact.as_str())?;
+                            content.push(serde_json::json!({
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": format!("data:{mime};base64,{data}"),
+                                    "detail": "auto",
+                                }
+                            }));
+                        }
+                        Block::ToolResult {
+                            call_id, preview, ..
+                        } => results.push((call_id, preview)),
+                        Block::ProviderOpaque { provider, data }
+                            if provider == OPENAI_COMPATIBLE_PROVIDER_NAME && data.is_object() =>
+                        {
+                            messages.push(data.clone());
+                        }
+                        Block::Reasoning { .. } => {
+                            return Err(invalid_request(
+                                "normalized reasoning summaries cannot be replayed on the OpenAI-compatible wire",
+                            ));
+                        }
+                        _ => {
+                            return Err(invalid_request(
+                                "OpenAI-compatible user message contains an unsupported block",
+                            ));
+                        }
+                    }
+                }
+                if !content.is_empty() {
+                    messages.push(serde_json::json!({"role": "user", "content": content}));
+                }
+                for (call_id, preview) in results {
+                    messages.push(serde_json::json!({
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": preview,
+                    }));
+                }
+            }
+            MessageRole::Tool => {
+                for block in &message.blocks {
+                    match block {
+                        Block::ToolResult {
+                            call_id, preview, ..
+                        } => messages.push(serde_json::json!({
+                            "role": "tool",
+                            "tool_call_id": call_id,
+                            "content": preview,
+                        })),
+                        _ => {
+                            return Err(invalid_request(
+                                "OpenAI-compatible tool messages require tool-result blocks",
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let tools = request
+        .tools
+        .iter()
+        .map(|tool| {
+            serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.input_schema,
+                    "strict": false,
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut payload = serde_json::json!({
+        "model": request.model,
+        "max_tokens": request.max_tokens,
+        "messages": messages,
+        "stream": true,
+        "stream_options": {"include_usage": true},
+    });
+    if !tools.is_empty() {
+        payload
+            .as_object_mut()
+            .ok_or_else(|| internal("Chat request payload was not an object"))?
+            .insert("tools".into(), serde_json::Value::Array(tools));
+    }
+    Ok(payload)
+}
+
+fn attachment_index(request: &TurnRequest) -> Result<HashMap<&str, &str>, ProviderError> {
+    let mut attachments = HashMap::new();
+    for attachment in &request.attachments {
+        if attachments
+            .insert(
+                attachment.artifact.as_str(),
+                attachment.data_base64.as_str(),
+            )
+            .is_some()
+        {
+            return Err(invalid_request(format!(
+                "attachment `{}` was resolved more than once",
+                attachment.artifact
+            )));
+        }
+    }
+    Ok(attachments)
+}
+
+fn resolved_attachment<'a>(
+    attachments: &'a HashMap<&str, &str>,
+    artifact: &str,
+) -> Result<&'a str, ProviderError> {
+    attachments.get(artifact).copied().ok_or_else(|| {
+        invalid_request(format!(
+            "image attachment `{artifact}` has no resolved base64 data"
+        ))
+    })
+}
+
+fn native_capabilities(model: &str) -> CapabilityDoc {
+    let context_limit = if model.starts_with("gpt-5.4")
+        || model.starts_with("gpt-5.5")
+        || model.starts_with("gpt-5.6")
+        || model.starts_with("gpt-4.1")
+    {
+        1_000_000
+    } else if model.starts_with("gpt-5") {
+        400_000
+    } else {
+        128_000
+    };
+    CapabilityDoc {
+        provider: OPENAI_PROVIDER_NAME.into(),
+        parallel_tools: FeatureResolve::Native,
+        streaming_tool_args: FeatureResolve::Native,
+        vision: FeatureResolve::Native,
+        thinking_visible: if model_has_reasoning(model) {
+            FeatureResolve::Native
+        } else {
+            FeatureResolve::Unsupported
+        },
+        context_limit,
+    }
+}
+
+fn compatible_capabilities(_model: &str) -> CapabilityDoc {
+    CapabilityDoc {
+        provider: OPENAI_COMPATIBLE_PROVIDER_NAME.into(),
+        // `/v1/models` proves availability only. The generic OpenAI schema
+        // carries none of these feature or limit facts, so do not infer them
+        // from a vendor-controlled model identifier.
+        parallel_tools: FeatureResolve::Unsupported,
+        streaming_tool_args: FeatureResolve::Unsupported,
+        vision: FeatureResolve::Unsupported,
+        thinking_visible: FeatureResolve::Unsupported,
+        context_limit: 0,
+    }
+}
+
+fn unavailable_compatible_capabilities() -> CapabilityDoc {
+    CapabilityDoc {
+        provider: OPENAI_COMPATIBLE_PROVIDER_NAME.into(),
+        parallel_tools: FeatureResolve::Unsupported,
+        streaming_tool_args: FeatureResolve::Unsupported,
+        vision: FeatureResolve::Unsupported,
+        thinking_visible: FeatureResolve::Unsupported,
+        context_limit: 0,
+    }
+}
+
+fn model_has_reasoning(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    model.starts_with("gpt-5")
+        || model.starts_with("o1")
+        || model.starts_with("o3")
+        || model.starts_with("o4")
+        || model.contains("reasoning")
+        || model.contains("deepseek-r1")
+        || model.contains("gpt-oss")
+}
+
+#[derive(Debug)]
+struct CompatibleEndpoints {
+    base_url: String,
+    chat_url: String,
+    models_url: String,
+    origin: Option<CompatibleHostnameOrigin>,
+}
+
+#[derive(Debug)]
+struct CompatibleHostnameOrigin {
+    host: String,
+    port: u16,
+    plain_http: bool,
+}
+
+fn compatible_endpoints(base_url: &str) -> Result<CompatibleEndpoints, ProviderError> {
+    let base_url = base_url.trim().trim_end_matches('/');
+    if base_url.is_empty() {
+        return Err(invalid_request(
+            "OpenAI-compatible credentials require a base_url",
+        ));
+    }
+    let parsed = reqwest::Url::parse(base_url)
+        .map_err(|error| invalid_request(format!("invalid OpenAI-compatible base_url: {error}")))?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(invalid_request(
+            "OpenAI-compatible base_url must be an http(s) URL without credentials, query, or fragment",
+        ));
+    }
+    validate_compatible_origin(&parsed)?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| invalid_request("OpenAI-compatible base_url must include a host"))?;
+    // `host_str()` returns bracketed IPv6 (`[::1]`); strip the brackets before
+    // the literal check so an IPv6 literal is classified as a literal (already
+    // validated by `validate_compatible_origin` above) rather than misread as a
+    // hostname and sent through a request-time DNS lookup that fails. A domain
+    // never contains brackets, so the trim is a no-op for it. Fail-closed either
+    // way — this is a functional fix, not a security boundary (W5a.2 confirm P2).
+    let host_literal = host.trim_start_matches('[').trim_end_matches(']');
+    let origin = if host_literal.parse::<IpAddr>().is_ok() {
+        None
+    } else {
+        let port = parsed
+            .port_or_known_default()
+            .ok_or_else(|| invalid_request("OpenAI-compatible base_url must include a port"))?;
+        Some(CompatibleHostnameOrigin {
+            host: host.to_owned(),
+            port,
+            plain_http: parsed.scheme() == "http",
+        })
+    };
+    let api_root = if base_url.ends_with("/v1") {
+        base_url.to_owned()
+    } else {
+        format!("{base_url}/v1")
+    };
+    Ok(CompatibleEndpoints {
+        base_url: base_url.to_owned(),
+        chat_url: format!("{api_root}/chat/completions"),
+        models_url: format!("{api_root}/models"),
+        origin,
+    })
+}
+
+fn validate_compatible_origin(parsed: &reqwest::Url) -> Result<(), ProviderError> {
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| invalid_request("OpenAI-compatible base_url must include a host"))?;
+    let ip = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host)
+        .parse::<IpAddr>()
+        .ok();
+    if ip.is_some_and(blocked_credential_target) {
+        return Err(invalid_request(
+            "OpenAI-compatible base_url must not target a private, link-local, or special-use IP address",
+        ));
+    }
+    if parsed.scheme() == "http" && ip.is_some_and(|address| !address.is_loopback()) {
+        return Err(invalid_request(
+            "OpenAI-compatible remote base_url must use HTTPS; HTTP is allowed only for loopback addresses",
+        ));
+    }
+    Ok(())
+}
+
+#[async_trait]
+trait CompatibleDnsResolver: Send + Sync {
+    async fn resolve(&self, host: &str, port: u16) -> io::Result<Vec<SocketAddr>>;
+}
+
+#[derive(Debug)]
+struct SystemCompatibleDnsResolver;
+
+#[async_trait]
+impl CompatibleDnsResolver for SystemCompatibleDnsResolver {
+    async fn resolve(&self, host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+        Ok(tokio::net::lookup_host((host, port)).await?.collect())
+    }
+}
+
+struct CompatibleOriginGuard {
+    host: String,
+    port: u16,
+    plain_http: bool,
+    resolver: Arc<dyn CompatibleDnsResolver>,
+    validated: OnceCell<Result<Arc<[SocketAddr]>, ProviderError>>,
+    #[cfg(test)]
+    connection_lookups: AtomicUsize,
+}
+
+struct PinnedAddrs {
+    addresses: Arc<[SocketAddr]>,
+    next: usize,
+}
+
+impl Iterator for PinnedAddrs {
+    type Item = SocketAddr;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let address = self.addresses.get(self.next).copied();
+        self.next += usize::from(address.is_some());
+        address
+    }
+}
+
+impl CompatibleOriginGuard {
+    fn new(
+        host: String,
+        port: u16,
+        plain_http: bool,
+        resolver: Arc<dyn CompatibleDnsResolver>,
+    ) -> Self {
+        Self {
+            host,
+            port,
+            plain_http,
+            resolver,
+            validated: OnceCell::new(),
+            #[cfg(test)]
+            connection_lookups: AtomicUsize::new(0),
+        }
+    }
+
+    async fn validate(&self) -> Result<(), ProviderError> {
+        self.validated_addresses().await.map(|_| ())
+    }
+
+    async fn validated_addresses(&self) -> Result<Arc<[SocketAddr]>, ProviderError> {
+        self.validated
+            .get_or_init(|| async {
+                let addresses = self.resolver.resolve(&self.host, self.port).await.map_err(
+                    |error| {
+                        ProviderError::new(
+                            ProviderErrorKind::Transport,
+                            format!(
+                                "could not resolve OpenAI-compatible base_url host `{}`: {error}",
+                                self.host
+                            ),
+                        )
+                    },
+                )?;
+                validate_resolved_compatible_origin(&self.host, self.plain_http, addresses)
+            })
+            .await
+            .clone()
+    }
+}
+
+impl fmt::Debug for CompatibleOriginGuard {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CompatibleOriginGuard")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("plain_http", &self.plain_http)
+            .field("validated", &self.validated.get().is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl reqwest::dns::Resolve for CompatibleOriginGuard {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        #[cfg(test)]
+        self.connection_lookups.fetch_add(1, Ordering::SeqCst);
+        let requested = name.as_str();
+        let result: Result<
+            reqwest::dns::Addrs,
+            Box<dyn std::error::Error + Send + Sync + 'static>,
+        > = if !requested
+            .trim_end_matches('.')
+            .eq_ignore_ascii_case(self.host.trim_end_matches('.'))
+        {
+            Err(Box::new(io::Error::other(format!(
+                "pinned OpenAI-compatible resolver refused unexpected host `{requested}`"
+            ))))
+        } else {
+            match self.validated.get() {
+                Some(Ok(addresses)) => Ok(Box::new(PinnedAddrs {
+                    addresses: Arc::clone(addresses),
+                    next: 0,
+                })),
+                Some(Err(error)) => Err(Box::new(io::Error::other(error.message.clone()))),
+                None => Err(Box::new(io::Error::other(
+                    "OpenAI-compatible origin was not validated before connection",
+                ))),
+            }
+        };
+        Box::pin(std::future::ready(result))
+    }
+}
+
+fn validate_resolved_compatible_origin(
+    host: &str,
+    plain_http: bool,
+    addresses: Vec<SocketAddr>,
+) -> Result<Arc<[SocketAddr]>, ProviderError> {
+    if addresses.is_empty() {
+        return Err(invalid_request(format!(
+            "OpenAI-compatible base_url host `{host}` resolved to no addresses"
+        )));
+    }
+
+    let mut pinned = Vec::with_capacity(addresses.len());
+    for address in addresses {
+        if blocked_credential_target(address.ip()) {
+            return Err(invalid_request(format!(
+                "OpenAI-compatible base_url host `{host}` resolved to a private, link-local, or special-use IP address"
+            )));
+        }
+        if plain_http && !address.ip().is_loopback() {
+            return Err(invalid_request(format!(
+                "OpenAI-compatible remote base_url must use HTTPS; HTTP host `{host}` resolved to a non-loopback address"
+            )));
+        }
+        if !pinned.contains(&address) {
+            pinned.push(address);
+        }
+    }
+    Ok(pinned.into())
+}
+
+fn blocked_credential_target(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => blocked_ipv4_credential_target(address),
+        IpAddr::V6(address) => blocked_ipv6_credential_target(address),
+    }
+}
+
+fn blocked_ipv4_credential_target(address: Ipv4Addr) -> bool {
+    let octets = address.octets();
+    address.is_private()
+        || address.is_link_local()
+        || address.is_unspecified()
+        || address.is_multicast()
+        || address == Ipv4Addr::BROADCAST
+        || octets[0] == 0
+}
+
+fn blocked_ipv6_credential_target(address: Ipv6Addr) -> bool {
+    let segments = address.segments();
+    address
+        .to_ipv4_mapped()
+        .is_some_and(blocked_ipv4_credential_target)
+        || address.is_unspecified()
+        || address.is_multicast()
+        || (segments[0] & 0xffc0) == 0xfe80
+        || (segments[0] & 0xfe00) == 0xfc00
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelsEnvelope {
+    data: Vec<ModelEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelEntry {
+    id: String,
+}
+
+fn openai_usage(
+    value: &serde_json::Value,
+    account: Option<CredentialAlias>,
+) -> Result<Usage, ProviderError> {
+    Ok(Usage {
+        input: required_u64(value, "input_tokens", "OpenAI usage")?,
+        output: required_u64(value, "output_tokens", "OpenAI usage")?,
+        reasoning: value
+            .get("output_tokens_details")
+            .and_then(|details| details.get("reasoning_tokens"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        cached: value
+            .get("input_tokens_details")
+            .and_then(|details| details.get("cached_tokens"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        source: UsageSource::ProviderReported,
+        account,
+    })
+}
+
+fn chat_usage(
+    value: &serde_json::Value,
+    account: Option<CredentialAlias>,
+) -> Result<Usage, ProviderError> {
+    Ok(Usage {
+        input: required_u64(value, "prompt_tokens", "Chat usage")?,
+        output: required_u64(value, "completion_tokens", "Chat usage")?,
+        reasoning: value
+            .get("completion_tokens_details")
+            .and_then(|details| details.get("reasoning_tokens"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        cached: value
+            .get("prompt_tokens_details")
+            .and_then(|details| details.get("cached_tokens"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        source: UsageSource::ProviderReported,
+        account,
+    })
+}
+
+fn required_string(
+    value: &serde_json::Value,
+    field: &str,
+    event: &str,
+) -> Result<String, ProviderError> {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| malformed(format!("OpenAI {event} has no string `{field}`")))
+}
+
+fn object_string(
+    value: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    event: &str,
+) -> Result<String, ProviderError> {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| malformed(format!("OpenAI {event} has no string `{field}`")))
+}
+
+fn required_u64(value: &serde_json::Value, field: &str, event: &str) -> Result<u64, ProviderError> {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| malformed(format!("{event} has no integer `{field}`")))
+}
+
+fn required_usize(
+    value: &serde_json::Value,
+    field: &str,
+    event: &str,
+) -> Result<usize, ProviderError> {
+    let integer = required_u64(value, field, event)?;
+    usize::try_from(integer)
+        .map_err(|_| malformed(format!("{event} `{field}` does not fit in usize")))
+}
+
+fn normalize_chat_finish_reason(reason: &str) -> Result<FinishReason, ProviderError> {
+    match reason {
+        "stop" => Ok(FinishReason::EndTurn),
+        "tool_calls" | "function_call" => Ok(FinishReason::ToolUse),
+        "length" => Ok(FinishReason::MaxTokens),
+        "content_filter" => Ok(FinishReason::Refusal),
+        other => Err(malformed(format!(
+            "OpenAI-compatible Chat returned unknown finish_reason `{other}`"
+        ))),
+    }
+}
+
+fn parse_retry_after(value: Option<&str>) -> Option<u64> {
+    let value = value?.trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return seconds.checked_mul(1_000);
+    }
+    let retry_at = httpdate::parse_http_date(value).ok()?;
+    let duration = retry_at
+        .duration_since(SystemTime::now())
+        .unwrap_or_default();
+    u64::try_from(duration.as_millis()).ok()
+}
+
+fn transport_error(error: reqwest::Error) -> ProviderError {
+    ProviderError::new(
+        ProviderErrorKind::Transport,
+        format!("OpenAI HTTP transport failed: {error}"),
+    )
+}
+
+fn response_open_timeout_error(timeout: Duration) -> ProviderError {
+    ProviderError::new(
+        ProviderErrorKind::Transport,
+        format!(
+            "OpenAI response did not open within {} seconds",
+            timeout.as_secs()
+        ),
+    )
+}
+
+fn stream_idle_error(timeout: Duration) -> ProviderError {
+    ProviderError::new(
+        ProviderErrorKind::Transport,
+        format!(
+            "OpenAI SSE stream received no data for {} seconds",
+            timeout.as_secs()
+        ),
+    )
+}
+
+fn invalid_request(message: impl Into<String>) -> ProviderError {
+    ProviderError::new(ProviderErrorKind::InvalidRequest, message)
+}
+
+fn malformed(message: impl Into<String>) -> ProviderError {
+    ProviderError::new(ProviderErrorKind::MalformedFrame, message)
+}
+
+fn internal(message: impl Into<String>) -> ProviderError {
+    ProviderError::new(ProviderErrorKind::Internal, message)
+}
+
+#[cfg(test)]
+#[path = "openai_tests.rs"]
+mod tests;

@@ -43,7 +43,9 @@ use haider_protocol::ids::{
 };
 use haider_protocol::item::{ItemDelta, ItemEvent, ToolStatus, TurnItem};
 use haider_protocol::menu::{Menu, MenuAnswer, MenuCloseReason};
-use haider_protocol::provider::{Block, FinishReason, StreamEvent, Usage};
+use haider_protocol::provider::{
+    Block, FinishReason, PROVIDER_OPAQUE_EXTENSION_KIND, StreamEvent, Usage,
+};
 use haider_protocol::state::{RunState, WaitReason};
 use haider_protocol::tool::BoundedResult;
 use haider_provider::{
@@ -964,6 +966,23 @@ impl HarnessActor {
                         self.apply_text_delta(&run_id, &mut reasoning, text, true)
                             .await
                             .map(|()| None)
+                    }
+                    StreamEvent::RefusalDelta { .. } => {
+                        // Refusal content has its own provider channel. The
+                        // terminal Refusal outcome survives, but this content
+                        // must never become assistant text or prompt history.
+                        Ok(None)
+                    }
+                    StreamEvent::ProviderOpaque { provider, data } => {
+                        async {
+                            self.complete_text(&run_id, &mut message, false).await?;
+                            self.complete_text(&run_id, &mut reasoning, true).await?;
+                            let block = Block::ProviderOpaque { provider, data };
+                            self.commit_provider_opaque(&run_id, &block).await?;
+                            assistant_blocks.push(block);
+                            Ok(None)
+                        }
+                        .await
                     }
                     StreamEvent::ToolCallStart { call_id, name } => {
                         async {
@@ -2106,6 +2125,56 @@ impl HarnessActor {
             .await
     }
 
+    /// Atomically journals a hidden provider-native block as one closed item.
+    ///
+    /// A single append keeps the item-lifecycle and worker-seal laws intact:
+    /// no store failure can expose `Started` without its matching `Completed`.
+    async fn commit_provider_opaque(
+        &mut self,
+        run_id: &RunId,
+        block: &Block,
+    ) -> Result<(), DriveError> {
+        let Block::ProviderOpaque { provider, data } = block else {
+            return Err(DriveError::Provider(provider_protocol_error(
+                "provider-opaque commit received a non-opaque block",
+            )));
+        };
+        let item_id = self.next_item_id();
+        let item = TurnItem::Extension {
+            kind: PROVIDER_OPAQUE_EXTENSION_KIND.into(),
+            data: serde_json::json!({
+                "provider": provider,
+                "data": data,
+            }),
+        };
+        let render = hidden_prompt_verbatim_render();
+        let mut envelopes = [
+            self.uncommitted_envelope(
+                run_id,
+                EventPayload::Item(ItemEvent::Started {
+                    item_id: item_id.clone(),
+                    item: item.clone(),
+                }),
+                render,
+            )
+            .map_err(DriveError::Store)?,
+            self.uncommitted_envelope(
+                run_id,
+                EventPayload::Item(ItemEvent::Completed { item_id, item }),
+                render,
+            )
+            .map_err(DriveError::Store)?,
+        ];
+        self.store
+            .append(&mut envelopes)
+            .await
+            .map_err(DriveError::Store)?;
+        for committed in envelopes {
+            let _ = self.events.send(committed);
+        }
+        Ok(())
+    }
+
     /// Stamps identity/fencing fields, appends (the store assigns `seq` and
     /// `committed_at_ms`), then broadcasts the committed envelope.
     async fn commit_payload(
@@ -2479,6 +2548,16 @@ fn prompt_omit_render() -> RenderTargets {
 fn prompt_verbatim_render() -> RenderTargets {
     RenderTargets {
         ui: true,
+        durable: true,
+        prompt: PromptRender::Verbatim,
+    }
+}
+
+/// Durable + prompt-verbatim, hidden from UI because encrypted continuation
+/// state is provider machinery rather than user-visible reasoning.
+fn hidden_prompt_verbatim_render() -> RenderTargets {
+    RenderTargets {
+        ui: false,
         durable: true,
         prompt: PromptRender::Verbatim,
     }

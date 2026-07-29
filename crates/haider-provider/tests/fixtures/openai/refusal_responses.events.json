@@ -1,0 +1,21 @@
+[
+  {
+    "result": "ok",
+    "value": {"event": "refusal_delta", "text": "I cannot help with that."}
+  },
+  {
+    "result": "ok",
+    "value": {
+      "event": "usage_update",
+      "input": 8,
+      "output": 6,
+      "reasoning": 0,
+      "cached": 0,
+      "source": "provider_reported"
+    }
+  },
+  {
+    "result": "ok",
+    "value": {"event": "finish", "reason": "refusal"}
+  }
+]

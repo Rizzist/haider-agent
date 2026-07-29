@@ -31,6 +31,7 @@ fn descriptor(
     CredentialDescriptor {
         alias: CredentialAlias::new(alias),
         provider: provider.to_owned(),
+        base_url: None,
         auth_method: AuthMethod::ApiKey,
         identity: format!("{alias}@example.test"),
         status,

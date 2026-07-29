@@ -1,0 +1,21 @@
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","response_id":"resp_sanitized","output_index":0,"content_index":0,"delta":"Checking "}
+
+event: response.reasoning_summary_text.delta
+data: {"type":"response.reasoning_summary_text.delta","response_id":"resp_sanitized","item_id":"rs_sanitized","output_index":1,"summary_index":0,"delta":"I should use the weather tool."}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","response_id":"resp_sanitized","output_index":2,"item":{"type":"function_call","id":"fc_sanitized","call_id":"call_sanitized","name":"get_weather","arguments":""}}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","response_id":"resp_sanitized","item_id":"fc_sanitized","output_index":2,"delta":"{\"city\":"}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","response_id":"resp_sanitized","item_id":"fc_sanitized","output_index":2,"delta":"\"Tehran\"}"}
+
+event: response.function_call_arguments.done
+data: {"type":"response.function_call_arguments.done","response_id":"resp_sanitized","item_id":"fc_sanitized","output_index":2,"arguments":"{\"city\":\"Tehran\"}"}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_sanitized","status":"completed","output":[],"usage":{"input_tokens":41,"input_tokens_details":{"cached_tokens":11},"output_tokens":17,"output_tokens_details":{"reasoning_tokens":9},"total_tokens":58}}}
+

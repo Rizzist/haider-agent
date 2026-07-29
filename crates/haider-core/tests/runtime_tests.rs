@@ -3,15 +3,16 @@
 use async_trait::async_trait;
 use haider_core::{
     CommittedRange, HarnessActor, HarnessConfig, HarnessHandle, MemoryStore, StoreHandle,
-    SubmitTurn,
+    SubmitTurn, ToolDispatchResult, ToolDispatcher,
 };
 use haider_protocol::EventPayload;
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::{DeviceId, ItemId, SessionId};
 use haider_protocol::item::{ItemEvent, ToolStatus, TurnItem};
-use haider_protocol::provider::{CapabilityDoc, FinishReason, Usage, UsageSource};
+use haider_protocol::provider::{Block, CapabilityDoc, FinishReason, Usage, UsageSource};
 use haider_protocol::state::RunState;
+use haider_protocol::tool::BoundedResult;
 use haider_provider::{
     FakeProvider, FakeStep, Provider, ProviderError, ProviderErrorKind, ProviderStream, TurnRequest,
 };
@@ -189,6 +190,113 @@ async fn full_turn_commits_exact_projected_sequence() {
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].model, "fake-model");
     assert_eq!(requests[0].max_tokens, 4096);
+}
+
+struct CompletingDispatcher;
+
+#[async_trait]
+impl ToolDispatcher for CompletingDispatcher {
+    async fn execute(
+        &self,
+        _run_id: &haider_protocol::ids::RunId,
+        _call_id: &str,
+        _name: &str,
+        _args: serde_json::Value,
+        _cancel: &haider_core::CancelToken,
+    ) -> Result<ToolDispatchResult, HaiderError> {
+        Ok(ToolDispatchResult::Completed(BoundedResult {
+            preview: "done".into(),
+            truncated: false,
+            artifact: None,
+            cursor: None,
+        }))
+    }
+}
+
+#[tokio::test]
+async fn provider_opaque_state_is_journaled_and_replayed_on_tool_follow_up() {
+    let opaque = serde_json::json!({
+        "id": "rs_sanitized",
+        "type": "reasoning",
+        "encrypted_content": "encrypted-synthetic-continuation",
+        "summary": []
+    });
+    let provider = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitProviderOpaque {
+            provider: "openai".into(),
+            data: opaque.clone(),
+        },
+        FakeStep::EmitToolCall {
+            call_id: "call-opaque".into(),
+            name: "inspect".into(),
+            args: serde_json::json!({"path":"src/lib.rs"}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::EmitText {
+            text: "continued".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let store = Arc::new(MemoryStore::new());
+    let (actor, handle) = HarnessActor::new_with_dispatcher(
+        config(),
+        provider.clone(),
+        store.clone(),
+        Some(Arc::new(CompletingDispatcher)),
+    );
+    let actor_task = tokio::spawn(actor.run());
+    let turn = handle
+        .submit_turn(SubmitTurn::new("continue safely"))
+        .await
+        .expect("turn accepted");
+    let outcome = turn.wait().await.expect("turn outcome");
+    assert_eq!(outcome.finish_reason, FinishReason::EndTurn);
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests[1].messages.iter().any(|message| {
+            message.blocks.iter().any(|block| {
+                matches!(
+                    block,
+                    Block::ProviderOpaque { provider, data }
+                        if provider == "openai" && data == &opaque
+                )
+            })
+        }),
+        "the exact opaque continuation must enter the next TurnRequest"
+    );
+
+    let events = store.events(&SessionId::new(SESSION)).await;
+    let opaque_events = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                typed(event),
+                EventPayload::Item(ItemEvent::Started {
+                    item: TurnItem::Extension { ref kind, .. },
+                    ..
+                } | ItemEvent::Completed {
+                    item: TurnItem::Extension { ref kind, .. },
+                    ..
+                }) if kind == "provider_opaque"
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(opaque_events.len(), 2);
+    assert!(opaque_events.iter().all(|event| {
+        !event.render.ui
+            && event.render.durable
+            && event.render.prompt == haider_protocol::envelope::PromptRender::Verbatim
+    }));
+    assert_items_closed_before_terminal(&events);
+
+    drop(handle);
+    actor_task.await.expect("actor exits");
 }
 
 #[tokio::test]

@@ -67,6 +67,7 @@ impl AnthropicProvider {
     pub fn new(credential: SecretHandle, model: impl Into<String>) -> Result<Self, ProviderError> {
         let transport = Self::transport_config();
         let client = reqwest::Client::builder()
+            .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .retry(match transport.retry_policy {
                 AnthropicRetryPolicy::Never => reqwest::retry::never(),
@@ -106,6 +107,11 @@ impl AnthropicProvider {
     pub fn with_api_url(mut self, api_url: impl Into<String>) -> Self {
         self.api_url = api_url.into();
         self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn client_debug(&self) -> String {
+        format!("{:?}", self.client)
     }
 
     /// Builds the secret-free JSON body. Capture tools use this to record the

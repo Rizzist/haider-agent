@@ -1,0 +1,5 @@
+event: response.refusal.delta
+data: {"type":"response.refusal.delta","response_id":"resp_refusal","output_index":0,"content_index":0,"delta":"I cannot help with that."}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_refusal","status":"completed","output":[],"usage":{"input_tokens":8,"input_tokens_details":{"cached_tokens":0},"output_tokens":6,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":14}}}

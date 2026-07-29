@@ -1,0 +1,2 @@
+event: response.failed
+data: {"type":"response.failed","response":{"id":"resp_overload","status":"failed","error":{"code":null,"type":"overloaded_error","message":"private overload detail"}}}

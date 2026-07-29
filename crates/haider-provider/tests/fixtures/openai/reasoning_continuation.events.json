@@ -1,0 +1,31 @@
+[
+  {
+    "result": "ok",
+    "value": {
+      "event": "provider_opaque",
+      "provider": "openai",
+      "data": {
+        "id": "rs_sanitized",
+        "type": "reasoning",
+        "summary": [{"type": "summary_text", "text": "Synthetic summary."}],
+        "encrypted_content": "encrypted-synthetic-continuation",
+        "status": "completed"
+      }
+    }
+  },
+  {
+    "result": "ok",
+    "value": {
+      "event": "usage_update",
+      "input": 4,
+      "output": 3,
+      "reasoning": 3,
+      "cached": 0,
+      "source": "provider_reported"
+    }
+  },
+  {
+    "result": "ok",
+    "value": {"event": "finish", "reason": "end_turn"}
+  }
+]

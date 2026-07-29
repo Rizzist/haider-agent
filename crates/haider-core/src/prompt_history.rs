@@ -6,7 +6,7 @@ use haider_protocol::envelope::PromptRender;
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::{AgentId, BranchId, RunId, SessionId};
 use haider_protocol::item::{ItemEvent, TurnItem};
-use haider_protocol::provider::Block;
+use haider_protocol::provider::{Block, PROVIDER_OPAQUE_EXTENSION_KIND};
 use haider_protocol::state::RunState;
 use haider_protocol::tool::BoundedResult;
 use haider_provider::{Message, MessageRole};
@@ -118,6 +118,13 @@ impl PromptHistoryCompiler {
                                 ));
                             }
                         }
+                        TurnItem::Extension { kind, data }
+                            if kind == PROVIDER_OPAQUE_EXTENSION_KIND =>
+                        {
+                            if let Some(block) = provider_opaque_extension(data) {
+                                messages.push(Message::assistant(vec![block]));
+                            }
+                        }
                         // Reasoning is intentionally excluded: normalized
                         // summaries cannot recreate provider-signed thinking.
                         _ => {}
@@ -142,6 +149,13 @@ impl PromptHistoryCompiler {
         }
         Ok(messages)
     }
+}
+
+fn provider_opaque_extension(data: serde_json::Value) -> Option<Block> {
+    let object = data.as_object()?;
+    let provider = object.get("provider")?.as_str()?.to_owned();
+    let data = object.get("data")?.clone();
+    Some(Block::ProviderOpaque { provider, data })
 }
 
 #[cfg(test)]

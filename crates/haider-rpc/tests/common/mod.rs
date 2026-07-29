@@ -394,6 +394,7 @@ pub fn golden_descriptor() -> CredentialDescriptor {
     CredentialDescriptor {
         alias: CredentialAlias::new("anthropic-0123456789abcdef01234567"),
         provider: "anthropic".into(),
+        base_url: None,
         auth_method: AuthMethod::ApiKey,
         identity: "work".into(),
         status: CredentialStatus::Ok,
