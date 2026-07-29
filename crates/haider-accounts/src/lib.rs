@@ -17,6 +17,7 @@ mod env_bridge;
 mod keychain;
 #[cfg(test)]
 mod keychain_tests;
+mod oauth;
 mod resolver;
 mod store;
 mod vault;
@@ -28,7 +29,8 @@ pub use haider_protocol::credential::{
 pub use haider_protocol::error::{ErrorCode, HaiderError};
 pub use haider_protocol::ids::CredentialAlias;
 pub use keychain::{KEYCHAIN_SERVICE, KeychainVault};
-pub use resolver::{Resolver, RotationCallback, RotationDecision};
+pub use oauth::{OAuthIdentityV1, OAuthTokenBundleV1};
+pub use resolver::{Resolver, RotationCallback, RotationDecision, RotationTrigger};
 pub use store::{ACCOUNTS_FILE_NAME, AccountStore, JsonFileStore, StoreLike};
 pub use vault::{MemoryVault, SecretHandle, Vault};
 

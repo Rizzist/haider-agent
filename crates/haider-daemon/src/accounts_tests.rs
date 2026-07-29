@@ -42,6 +42,36 @@ fn identity_for(profile: &str, command: &str) -> LoginIdentity {
     }
 }
 
+fn oauth_identity_for(profile: &str, command: &str) -> OAuthAddIdentity {
+    OAuthAddIdentity {
+        provider: "fake-oauth".into(),
+        display_alias: "work-oauth".into(),
+        physical_alias: physical_alias(profile, "fake-oauth", command),
+        auth_method: "oauth".into(),
+    }
+}
+
+fn oauth_bundle() -> haider_accounts::OAuthTokenBundleV1 {
+    haider_accounts::OAuthTokenBundleV1::new(
+        "fake-oauth".into(),
+        "http://127.0.0.1:32109".into(),
+        "Bearer".into(),
+        Zeroizing::new(b"OAUTH_ACCESS_RECEIPT_SENTINEL_1fa2".to_vec()),
+        Some(Zeroizing::new(
+            b"OAUTH_REFRESH_RECEIPT_SENTINEL_9c31".to_vec(),
+        )),
+        u64::MAX - 1,
+        Some(u64::MAX),
+        vec!["openid".into(), "inference".into()],
+        haider_accounts::OAuthIdentityV1 {
+            subject_hash: "verified-subject".into(),
+            display_identity: "person@example.invalid".into(),
+        },
+        1,
+    )
+    .expect("OAuth bundle")
+}
+
 // MUTATION CHECK (W5a provider dispatch): remove the `openai` arm from
 // `build_account_provider` (restoring the old Anthropic-only builder).
 // Expected failure: the OpenAI resolution below returns InvalidArgument
@@ -780,6 +810,195 @@ async fn reconciliation_closes_every_login_crash_boundary() {
         .close()
         .await
         .unwrap_or_else(|error| panic!("{}", error.message));
+}
+
+#[tokio::test]
+async fn oauth_account_add_receipt_is_distinct_idempotent_and_secret_free() {
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let identity = oauth_identity_for("profile-o", "oauth-command");
+    let request_json = identity.canonical_json().expect("canonical OAuth identity");
+    let digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
+    for secret in [
+        "OAUTH_ACCESS_RECEIPT_SENTINEL_1fa2",
+        "OAUTH_REFRESH_RECEIPT_SENTINEL_9c31",
+        "oauth-ready-ref-must-not-persist",
+    ] {
+        assert!(!request_json.contains(secret));
+    }
+    assert_eq!(
+        store
+            .account_add_claim_receipt(
+                "oauth-command".into(),
+                digest.clone(),
+                request_json.clone(),
+            )
+            .await
+            .expect("fresh"),
+        AccountAddClaim::Fresh
+    );
+    assert_eq!(
+        store
+            .account_add_claim_receipt(
+                "oauth-command".into(),
+                digest.clone(),
+                request_json.clone(),
+            )
+            .await
+            .expect("resume"),
+        AccountAddClaim::ResumePending
+    );
+    let descriptor = oauth_descriptor(
+        &identity,
+        &CredentialAlias::new(identity.physical_alias.clone()),
+        &oauth_bundle(),
+    );
+    store
+        .finalize_account_add_receipt(
+            "oauth-command".into(),
+            AccountAddReceiptResponse {
+                descriptor: descriptor.clone(),
+            },
+        )
+        .await
+        .expect("finalize");
+    assert!(matches!(
+        store
+            .account_add_claim_receipt("oauth-command".into(), digest, request_json)
+            .await
+            .expect("replay"),
+        AccountAddClaim::Committed(response) if response.descriptor == descriptor
+    ));
+
+    // The method is deliberately not aliased to account.login_api.
+    let login_identity = identity_for("profile-o", "oauth-command");
+    let login_json = login_identity.canonical_json().expect("login identity");
+    let login_digest = blake3::hash(login_json.as_bytes()).to_hex().to_string();
+    let collision = store
+        .login_claim_receipt("oauth-command".into(), login_digest, login_json)
+        .await
+        .expect_err("different durable methods cannot share a command id");
+    assert!(collision.message.contains("different method or semantic"));
+
+    store.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn oauth_reconciliation_closes_crash_before_and_after_vault_put() {
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let vault = Arc::new(MemoryVault::new());
+    let provision = VaultProvision::Available(vault.clone() as Arc<dyn Vault>);
+    let mut accounts = memory_accounts();
+
+    // A: receipt claimed, crash before vault put. Browser/ready objects are
+    // gone after restart, so this stays pending for a fresh flow.
+    let identity_a = oauth_identity_for("profile-r", "oauth-a");
+    let json_a = identity_a.canonical_json().expect("identity A");
+    let digest_a = blake3::hash(json_a.as_bytes()).to_hex().to_string();
+    assert_eq!(
+        store
+            .account_add_claim_receipt("oauth-a".into(), digest_a, json_a)
+            .await
+            .expect("claim A"),
+        AccountAddClaim::Fresh
+    );
+
+    // B: vault bundle durable, crash before descriptor save. Reconciliation
+    // verifies the versioned bundle, creates the OAuth descriptor, finalizes.
+    let identity_b = oauth_identity_for("profile-r", "oauth-b");
+    let json_b = identity_b.canonical_json().expect("identity B");
+    let digest_b = blake3::hash(json_b.as_bytes()).to_hex().to_string();
+    let _ = store
+        .account_add_claim_receipt("oauth-b".into(), digest_b, json_b)
+        .await
+        .expect("claim B");
+    vault
+        .put(
+            &CredentialAlias::new(identity_b.physical_alias.clone()),
+            &oauth_bundle().encode().expect("encode B"),
+        )
+        .expect("vault B");
+
+    // C: vault + descriptor committed, crash before receipt finalization.
+    let identity_c = oauth_identity_for("profile-r", "oauth-c");
+    let json_c = identity_c.canonical_json().expect("identity C");
+    let digest_c = blake3::hash(json_c.as_bytes()).to_hex().to_string();
+    let _ = store
+        .account_add_claim_receipt("oauth-c".into(), digest_c, json_c)
+        .await
+        .expect("claim C");
+    let bundle_c = oauth_bundle();
+    vault
+        .put(
+            &CredentialAlias::new(identity_c.physical_alias.clone()),
+            &bundle_c.encode().expect("encode C"),
+        )
+        .expect("vault C");
+    accounts
+        .add(oauth_descriptor(
+            &identity_c,
+            &CredentialAlias::new(identity_c.physical_alias.clone()),
+            &bundle_c,
+        ))
+        .expect("descriptor C");
+
+    // D: committed receipt survives a lost descriptor and self-heals without
+    // stealing the active slot from the later credential.
+    let identity_d = oauth_identity_for("profile-r", "oauth-d");
+    let json_d = identity_d.canonical_json().expect("identity D");
+    let digest_d = blake3::hash(json_d.as_bytes()).to_hex().to_string();
+    let _ = store
+        .account_add_claim_receipt("oauth-d".into(), digest_d, json_d)
+        .await
+        .expect("claim D");
+    let mut descriptor_d = oauth_descriptor(
+        &identity_d,
+        &CredentialAlias::new(identity_d.physical_alias.clone()),
+        &oauth_bundle(),
+    );
+    descriptor_d.active = true;
+    store
+        .finalize_account_add_receipt(
+            "oauth-d".into(),
+            AccountAddReceiptResponse {
+                descriptor: descriptor_d.clone(),
+            },
+        )
+        .await
+        .expect("finalize D");
+
+    reconcile_oauth_add_receipts(&store, &mut accounts, &provision)
+        .await
+        .expect("OAuth reconciliation");
+    let rows = store.account_add_receipts().await.expect("receipt rows");
+    let state = |command: &str| {
+        rows.iter()
+            .find(|row| row.command_id == command)
+            .map(|row| row.state.as_str())
+            .unwrap_or("missing")
+    };
+    assert_eq!(state("oauth-a"), "pending");
+    assert_eq!(state("oauth-b"), "committed");
+    assert_eq!(state("oauth-c"), "committed");
+    assert_eq!(state("oauth-d"), "committed");
+    assert!(
+        accounts
+            .get(&CredentialAlias::new(identity_a.physical_alias))
+            .is_none()
+    );
+    assert!(
+        accounts
+            .get(&CredentialAlias::new(identity_b.physical_alias))
+            .is_some()
+    );
+    assert!(
+        accounts
+            .get(&CredentialAlias::new(identity_d.physical_alias))
+            .is_some_and(|descriptor| !descriptor.active)
+    );
+
+    store.close().await.expect("close");
 }
 
 /// Release evidence, never the merge gate (§6.2): the PACKAGED default

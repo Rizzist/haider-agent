@@ -205,6 +205,8 @@ pub struct CancelledTurn {
 
 /// Method tag of the durable `account.login_api` command (R10).
 const LOGIN_METHOD: &str = "account.login_api";
+/// Method tag of the durable OAuth `account.add` command.
+const ACCOUNT_ADD_METHOD: &str = "account.add";
 
 /// Committed login response persisted in the receipt: the descriptor only —
 /// receipt metadata NEVER contains the secret or the ephemeral vault
@@ -212,6 +214,31 @@ const LOGIN_METHOD: &str = "account.login_api";
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LoginReceiptResponse {
     pub descriptor: CredentialDescriptor,
+}
+
+/// Committed OAuth account-add response. Like login receipts, it contains
+/// only the public descriptor; the ready ref and token bundle never enter
+/// SQLite.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AccountAddReceiptResponse {
+    pub descriptor: CredentialDescriptor,
+}
+
+/// Outcome of [`Store::account_add_claim_receipt`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum AccountAddClaim {
+    Fresh,
+    ResumePending,
+    Committed(Box<AccountAddReceiptResponse>),
+}
+
+/// One pending/committed OAuth account-add receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountAddReceiptRow {
+    pub command_id: String,
+    pub state: String,
+    pub request_json: String,
+    pub response_json: Option<String>,
 }
 
 /// Definitive login failure persisted in a failed receipt (401/403 class):
@@ -1019,6 +1046,102 @@ impl Store {
         let rows = statement
             .query_map([LOGIN_METHOD], |row| {
                 Ok(LoginReceiptRow {
+                    command_id: row.get(0)?,
+                    state: row.get(1)?,
+                    request_json: row.get(2)?,
+                    response_json: row.get(3)?,
+                })
+            })
+            .map_err(map_sqlite_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_sqlite_error)?;
+        Ok(rows)
+    }
+
+    /// Claims a durable OAuth `account.add` without ever recording its
+    /// ephemeral ready reference or token bundle.
+    pub fn account_add_claim_receipt(
+        &self,
+        command_id: &str,
+        request_digest: &str,
+        request_json: &str,
+    ) -> StoreResult<AccountAddClaim> {
+        validate_command_identity(command_id, request_digest, request_json)?;
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        if let Some(response) = lookup_command_response::<AccountAddReceiptResponse>(
+            &transaction,
+            command_id,
+            ACCOUNT_ADD_METHOD,
+            request_digest,
+            request_json,
+            "account-add",
+        )? {
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(AccountAddClaim::Committed(Box::new(response)));
+        }
+        let existed = transaction
+            .query_row(
+                "SELECT 1 FROM command_receipts WHERE command_id = ?1",
+                [command_id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(map_sqlite_error)?
+            .is_some();
+        claim_pending_receipt(
+            &transaction,
+            command_id,
+            ACCOUNT_ADD_METHOD,
+            request_digest,
+            request_json,
+            now_ms()?,
+        )?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(if existed {
+            AccountAddClaim::ResumePending
+        } else {
+            AccountAddClaim::Fresh
+        })
+    }
+
+    pub fn finalize_account_add_receipt(
+        &self,
+        command_id: &str,
+        response: &AccountAddReceiptResponse,
+    ) -> StoreResult<()> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        finalize_command_receipt(
+            &transaction,
+            command_id,
+            "",
+            None,
+            None,
+            response,
+            now_ms()?,
+            "account-add",
+        )?;
+        transaction.commit().map_err(map_sqlite_error)
+    }
+
+    pub fn account_add_receipts(&self) -> StoreResult<Vec<AccountAddReceiptRow>> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT command_id, state, request_json, response_json
+                 FROM command_receipts
+                 WHERE method = ?1 AND state IN ('pending', 'committed')
+                 ORDER BY created_at_ms, command_id",
+            )
+            .map_err(map_sqlite_error)?;
+        let rows = statement
+            .query_map([ACCOUNT_ADD_METHOD], |row| {
+                Ok(AccountAddReceiptRow {
                     command_id: row.get(0)?,
                     state: row.get(1)?,
                     request_json: row.get(2)?,

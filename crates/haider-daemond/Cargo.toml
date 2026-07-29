@@ -31,7 +31,9 @@ haider-tools = { path = "../haider-tools" }
 rustix.workspace = true
 rusqlite.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tempfile.workspace = true
+url.workspace = true
 
 [lints]
 workspace = true

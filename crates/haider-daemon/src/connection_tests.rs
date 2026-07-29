@@ -14,7 +14,7 @@ fn ordinary(bytes: &[u8]) -> QueuedFrame {
 
 fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> QueuedFrame {
     QueuedFrame {
-        bytes: bytes.to_vec(),
+        bytes: bytes.to_vec().into(),
         response_for: Some((attachment.clone(), RequestId::new(request))),
         floor: false,
     }

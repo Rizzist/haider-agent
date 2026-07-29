@@ -30,7 +30,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use haider_accounts::{AccountStore, JsonFileStore, MemoryVault, StoreLike, Vault};
 use haider_core::SqliteStoreHandle;
-use haider_core::{LoginClaim, LoginReceiptFailure, LoginReceiptResponse};
+use haider_core::{
+    AccountAddClaim, AccountAddReceiptResponse, LoginClaim, LoginReceiptFailure,
+    LoginReceiptResponse,
+};
 use haider_protocol::credential::{AuthMethod, CredentialDescriptor, CredentialStatus};
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::CredentialAlias;
@@ -48,6 +51,10 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 use zeroize::Zeroizing;
 
+use crate::oauth::{
+    CredentialBroker, OAuthCoordinator, OAuthCoordinatorConfig, OAuthProviderCatalog,
+    OAuthReadyClaim,
+};
 use crate::session_hub::FrameSink;
 
 /// Staged-secret and pending-login-command lifetime (R7/R10: five minutes).
@@ -268,6 +275,11 @@ pub struct AccountsDependencies {
     /// Descriptor persistence override; `None` uses
     /// `<store_dir>/accounts.json` behind the profile lock.
     pub descriptor_store: Option<Arc<dyn StoreLike>>,
+    /// Release-owned OAuth registrations. Production defaults to the
+    /// intentionally empty sanctioned catalog; tests inject only loopback
+    /// fake registrations.
+    pub oauth_catalog: OAuthProviderCatalog,
+    pub oauth_coordinator: OAuthCoordinatorConfig,
 }
 
 impl Default for AccountsDependencies {
@@ -276,6 +288,8 @@ impl Default for AccountsDependencies {
             vault: VaultProvision::platform_default(),
             validator: Arc::new(ProviderCredentialValidator),
             descriptor_store: None,
+            oauth_catalog: OAuthProviderCatalog::default(),
+            oauth_coordinator: OAuthCoordinatorConfig::default(),
         }
     }
 }
@@ -450,6 +464,7 @@ pub(crate) type AccountsSnapshot = Arc<StdMutex<Vec<CredentialDescriptor>>>;
 pub(crate) struct AccountsFacade {
     /// `None` when the vault is unsupported (no actor runs).
     pub login: Option<mpsc::Sender<AccountCommand>>,
+    pub oauth: Option<OAuthCoordinator>,
     pub snapshot: AccountsSnapshot,
     pub vault_supported: bool,
 }
@@ -473,10 +488,35 @@ pub(crate) struct LoginJob {
     pub route: LoginRoute,
 }
 
+pub(crate) struct OAuthAddJob {
+    pub command_id: String,
+    pub provider: String,
+    pub display_alias: String,
+    pub claim: Option<OAuthReadyClaim>,
+    pub route: LoginRoute,
+}
+
 /// Account actor mailbox items.
 pub(crate) enum AccountCommand {
     Login(Box<LoginJob>),
+    AddOAuth(Box<OAuthAddJob>),
+    ApplyOAuthRefresh {
+        descriptor: CredentialDescriptor,
+        expected_generation: u64,
+        encoded_bundle: Zeroizing<Vec<u8>>,
+        completed: tokio::sync::oneshot::Sender<Result<(), RefreshApplyError>>,
+    },
+    SetStatus {
+        alias: CredentialAlias,
+        status: CredentialStatus,
+        completed: tokio::sync::oneshot::Sender<Result<(), HaiderError>>,
+    },
     Shutdown,
+}
+
+pub(crate) enum RefreshApplyError {
+    Stale,
+    Persist,
 }
 
 /// Owned account actor task (single writer of the descriptor store).
@@ -573,7 +613,99 @@ async fn run_account_actor(
                 )
                 .await;
             }
+            AccountCommand::AddOAuth(job) => {
+                handle_oauth_add(
+                    &store,
+                    &mut accounts,
+                    Arc::clone(&vault),
+                    &snapshot,
+                    &profile_id,
+                    *job,
+                )
+                .await;
+            }
+            AccountCommand::SetStatus {
+                alias,
+                status,
+                completed,
+            } => {
+                let result = accounts.set_status(&alias, status);
+                if result.is_ok() {
+                    refresh_snapshot(&snapshot, &accounts);
+                }
+                let _ = completed.send(result);
+            }
+            AccountCommand::ApplyOAuthRefresh {
+                descriptor,
+                expected_generation,
+                encoded_bundle,
+                completed,
+            } => {
+                let result = apply_oauth_refresh(
+                    &mut accounts,
+                    Arc::clone(&vault),
+                    &snapshot,
+                    &descriptor,
+                    expected_generation,
+                    encoded_bundle,
+                )
+                .await;
+                let _ = completed.send(result);
+            }
         }
+    }
+}
+
+async fn apply_oauth_refresh(
+    accounts: &mut AccountStore<Box<dyn StoreLike>>,
+    vault: Arc<dyn Vault>,
+    snapshot: &AccountsSnapshot,
+    descriptor: &CredentialDescriptor,
+    expected_generation: u64,
+    encoded_bundle: Zeroizing<Vec<u8>>,
+) -> Result<(), RefreshApplyError> {
+    if accounts.get(&descriptor.alias) != Some(descriptor) {
+        return Err(RefreshApplyError::Stale);
+    }
+    let alias = descriptor.alias.clone();
+    let vault_for_read = Arc::clone(&vault);
+    let alias_for_read = alias.clone();
+    let current =
+        match tokio::task::spawn_blocking(move || vault_for_read.resolve(&alias_for_read)).await {
+            Ok(Ok(current)) => current,
+            Ok(Err(_)) | Err(_) => {
+                mark_refresh_expired(accounts, snapshot, &alias);
+                return Err(RefreshApplyError::Persist);
+            }
+        };
+    let generation = haider_accounts::OAuthTokenBundleV1::decode(current.expose_secret())
+        .map_err(|_| RefreshApplyError::Stale)?
+        .generation;
+    if generation != expected_generation {
+        return Err(RefreshApplyError::Stale);
+    }
+    let vault_for_put = Arc::clone(&vault);
+    let alias_for_put = alias.clone();
+    let persisted =
+        tokio::task::spawn_blocking(move || vault_for_put.put(&alias_for_put, &encoded_bundle))
+            .await;
+    if !matches!(persisted, Ok(Ok(()))) {
+        mark_refresh_expired(accounts, snapshot, &alias);
+        return Err(RefreshApplyError::Persist);
+    }
+    Ok(())
+}
+
+fn mark_refresh_expired(
+    accounts: &mut AccountStore<Box<dyn StoreLike>>,
+    snapshot: &AccountsSnapshot,
+    alias: &CredentialAlias,
+) {
+    if accounts
+        .set_status(alias, CredentialStatus::Expired)
+        .is_ok()
+    {
+        refresh_snapshot(snapshot, accounts);
     }
 }
 
@@ -809,6 +941,241 @@ async fn handle_login(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct OAuthAddIdentity {
+    provider: String,
+    display_alias: String,
+    physical_alias: String,
+    auth_method: String,
+}
+
+impl OAuthAddIdentity {
+    fn canonical_json(&self) -> Result<String, HaiderError> {
+        serde_json::to_string(self).map_err(|error| {
+            HaiderError::new(
+                ErrorCode::InvalidArgument,
+                format!("cannot encode OAuth account coordinates: {error}"),
+                false,
+            )
+        })
+    }
+}
+
+/// Durable OAuth add: receipt claim -> vault bundle -> descriptor -> receipt.
+///
+/// The claimed bundle is command-owned before this function is entered.
+/// Neither it nor the ready reference is ever serialized into SQLite.
+async fn handle_oauth_add(
+    store: &SqliteStoreHandle,
+    accounts: &mut AccountStore<Box<dyn StoreLike>>,
+    vault: Arc<dyn Vault>,
+    snapshot: &AccountsSnapshot,
+    profile_id: &str,
+    job: OAuthAddJob,
+) {
+    let OAuthAddJob {
+        command_id,
+        provider,
+        display_alias,
+        claim,
+        route,
+    } = job;
+    let identity = OAuthAddIdentity {
+        provider: provider.clone(),
+        display_alias,
+        physical_alias: physical_alias(profile_id, &provider, &command_id),
+        auth_method: "oauth".into(),
+    };
+    let request_json = match identity.canonical_json() {
+        Ok(json) => json,
+        Err(error) => {
+            respond_error(&route, ERROR_CODE_INVALID_ARGUMENT, &error.message, false);
+            return;
+        }
+    };
+    let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
+    let receipt = store
+        .account_add_claim_receipt(command_id.clone(), request_digest, request_json)
+        .await;
+    let resume = match receipt {
+        Ok(AccountAddClaim::Committed(response)) => {
+            respond(
+                &route,
+                ResponseBody::AccountAdd {
+                    descriptor: response.descriptor,
+                },
+            );
+            return;
+        }
+        Ok(AccountAddClaim::Fresh) => false,
+        Ok(AccountAddClaim::ResumePending) => true,
+        Err(error) => {
+            respond_error(
+                &route,
+                ERROR_CODE_INVALID_ARGUMENT,
+                &error.message,
+                error.retryable,
+            );
+            return;
+        }
+    };
+    let alias = CredentialAlias::new(identity.physical_alias.clone());
+    if resume && accounts.get(&alias).is_some() {
+        finalize_oauth_add(store, accounts, snapshot, &command_id, &alias, &route).await;
+        return;
+    }
+    if resume {
+        let vault_for_read = Arc::clone(&vault);
+        let alias_for_read = alias.clone();
+        let stored = tokio::task::spawn_blocking(move || vault_for_read.resolve(&alias_for_read))
+            .await
+            .ok()
+            .and_then(Result::ok);
+        if let Some(stored) = stored {
+            match haider_accounts::OAuthTokenBundleV1::decode(stored.expose_secret()) {
+                Ok(bundle) => {
+                    let descriptor = oauth_descriptor(&identity, &alias, &bundle);
+                    if let Err(error) = accounts.add(descriptor) {
+                        respond_error(
+                            &route,
+                            ERROR_CODE_PROVIDER_ERROR,
+                            &format!("resumed OAuth descriptor commit failed: {}", error.message),
+                            true,
+                        );
+                        return;
+                    }
+                    finalize_oauth_add(store, accounts, snapshot, &command_id, &alias, &route)
+                        .await;
+                    return;
+                }
+                Err(_) => {
+                    respond_error(
+                        &route,
+                        ERROR_CODE_UNAUTHORIZED,
+                        "stored OAuth token bundle is invalid; restart sign-in",
+                        false,
+                    );
+                    return;
+                }
+            }
+        }
+    }
+    let Some(claim) = claim else {
+        respond_error(
+            &route,
+            haider_rpc::ERROR_CODE_OAUTH_FLOW_NOT_FOUND,
+            "OAuth ready reference is unavailable; start a fresh browser flow",
+            true,
+        );
+        return;
+    };
+    if claim.bundle.provider_id != identity.provider {
+        respond_error(
+            &route,
+            ERROR_CODE_INVALID_ARGUMENT,
+            "OAuth token provider does not match account.add provider",
+            false,
+        );
+        return;
+    }
+    let descriptor = oauth_descriptor(&identity, &alias, &claim.bundle);
+    let encoded = match claim.bundle.encode() {
+        Ok(encoded) => encoded,
+        Err(error) => {
+            respond_error(&route, ERROR_CODE_UNAUTHORIZED, &error.message, false);
+            return;
+        }
+    };
+    let vault_for_put = Arc::clone(&vault);
+    let alias_for_put = alias.clone();
+    let put =
+        tokio::task::spawn_blocking(move || vault_for_put.put(&alias_for_put, &encoded)).await;
+    match put {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            respond_error(
+                &route,
+                ERROR_CODE_PROVIDER_ERROR,
+                &format!("OAuth vault write failed: {}", error.message),
+                true,
+            );
+            return;
+        }
+        Err(_) => {
+            respond_error(
+                &route,
+                ERROR_CODE_PROVIDER_ERROR,
+                "OAuth vault worker failed",
+                true,
+            );
+            return;
+        }
+    }
+    if let Err(error) = accounts.add(descriptor) {
+        let vault_for_delete = Arc::clone(&vault);
+        let alias_for_delete = alias.clone();
+        let _ =
+            tokio::task::spawn_blocking(move || vault_for_delete.delete(&alias_for_delete)).await;
+        respond_error(
+            &route,
+            ERROR_CODE_PROVIDER_ERROR,
+            &format!("OAuth descriptor save failed: {}", error.message),
+            true,
+        );
+        return;
+    }
+    finalize_oauth_add(store, accounts, snapshot, &command_id, &alias, &route).await;
+}
+
+fn oauth_descriptor(
+    identity: &OAuthAddIdentity,
+    alias: &CredentialAlias,
+    bundle: &haider_accounts::OAuthTokenBundleV1,
+) -> CredentialDescriptor {
+    CredentialDescriptor {
+        alias: alias.clone(),
+        provider: identity.provider.clone(),
+        base_url: None,
+        auth_method: AuthMethod::OAuth,
+        identity: bundle.identity.display_identity.clone(),
+        status: CredentialStatus::Ok,
+        active: true,
+    }
+}
+
+async fn finalize_oauth_add(
+    store: &SqliteStoreHandle,
+    accounts: &mut AccountStore<Box<dyn StoreLike>>,
+    snapshot: &AccountsSnapshot,
+    command_id: &str,
+    alias: &CredentialAlias,
+    route: &LoginRoute,
+) {
+    let Some(descriptor) = accounts.get(alias).cloned() else {
+        respond_error(
+            route,
+            ERROR_CODE_PROVIDER_ERROR,
+            "OAuth descriptor disappeared before receipt finalization",
+            true,
+        );
+        return;
+    };
+    refresh_snapshot(snapshot, accounts);
+    if let Err(error) = store
+        .finalize_account_add_receipt(
+            command_id.to_owned(),
+            AccountAddReceiptResponse {
+                descriptor: descriptor.clone(),
+            },
+        )
+        .await
+    {
+        respond_error(route, ERROR_CODE_PROVIDER_ERROR, &error.message, true);
+        return;
+    }
+    respond(route, ResponseBody::AccountAdd { descriptor });
+}
+
 fn descriptor_for(
     identity: &LoginIdentity,
     alias: &CredentialAlias,
@@ -995,6 +1362,7 @@ pub(crate) struct AccountsProviderFactory {
     snapshot: AccountsSnapshot,
     vault: VaultProvision,
     builder: Arc<dyn AccountProviderBuilder>,
+    broker: Option<CredentialBroker>,
 }
 
 impl AccountsProviderFactory {
@@ -1007,6 +1375,21 @@ impl AccountsProviderFactory {
             snapshot,
             vault,
             builder,
+            broker: None,
+        }
+    }
+
+    pub(crate) fn with_broker(
+        snapshot: AccountsSnapshot,
+        vault: VaultProvision,
+        builder: Arc<dyn AccountProviderBuilder>,
+        broker: CredentialBroker,
+    ) -> Self {
+        Self {
+            snapshot,
+            vault,
+            builder,
+            broker: Some(broker),
         }
     }
 }
@@ -1055,7 +1438,17 @@ impl crate::worker::ProviderFactory for AccountsProviderFactory {
                 false,
             ));
         };
-        let credential = vault.resolve(&descriptor.alias)?;
+        let credential = if let Some(broker) = &self.broker {
+            broker.resolve(&descriptor).await?
+        } else if descriptor.auth_method == AuthMethod::OAuth {
+            return Err(HaiderError::new(
+                ErrorCode::Unauthorized,
+                "OAuth credential requires the auth-aware broker",
+                false,
+            ));
+        } else {
+            vault.resolve(&descriptor.alias)?
+        };
         let provider = self
             .builder
             .build_descriptor(&descriptor, credential, &metadata.model)?;
@@ -1152,6 +1545,93 @@ pub(crate) async fn reconcile_login_receipts(
     Ok(())
 }
 
+pub(crate) async fn reconcile_oauth_add_receipts(
+    store: &SqliteStoreHandle,
+    accounts: &mut AccountStore<Box<dyn StoreLike>>,
+    vault: &VaultProvision,
+) -> Result<(), HaiderError> {
+    for row in store.account_add_receipts().await? {
+        let identity: OAuthAddIdentity =
+            serde_json::from_str(&row.request_json).map_err(|error| {
+                HaiderError::new(
+                    ErrorCode::StoreCorrupt,
+                    format!(
+                        "OAuth account receipt {} has undecodable coordinates: {error}",
+                        row.command_id
+                    ),
+                    false,
+                )
+            })?;
+        let alias = CredentialAlias::new(identity.physical_alias.clone());
+        match row.state.as_str() {
+            "committed" if accounts.get(&alias).is_none() => {
+                let response: AccountAddReceiptResponse = row
+                    .response_json
+                    .as_deref()
+                    .and_then(|json| serde_json::from_str(json).ok())
+                    .ok_or_else(|| {
+                        HaiderError::new(
+                            ErrorCode::StoreCorrupt,
+                            format!(
+                                "committed OAuth account receipt {} has no response",
+                                row.command_id
+                            ),
+                            false,
+                        )
+                    })?;
+                let mut descriptor = response.descriptor;
+                descriptor.active = accounts.active_for_provider(&descriptor.provider).is_none();
+                accounts.add(descriptor)?;
+            }
+            "pending" if accounts.get(&alias).is_some() => {
+                finalize_oauth_reconciled(store, accounts, &row.command_id, &alias).await?;
+            }
+            "pending" => {
+                let VaultProvision::Available(vault) = vault else {
+                    continue;
+                };
+                let Ok(stored) = vault.resolve(&alias) else {
+                    // Browser state and ready refs die on restart. The pending
+                    // semantic command may resume only with a fresh flow.
+                    continue;
+                };
+                let bundle = haider_accounts::OAuthTokenBundleV1::decode(stored.expose_secret())?;
+                if bundle.provider_id != identity.provider {
+                    return Err(HaiderError::new(
+                        ErrorCode::StoreCorrupt,
+                        format!(
+                            "OAuth account receipt {} provider does not match vault bundle",
+                            row.command_id
+                        ),
+                        false,
+                    ));
+                }
+                accounts.add(oauth_descriptor(&identity, &alias, &bundle))?;
+                finalize_oauth_reconciled(store, accounts, &row.command_id, &alias).await?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+async fn finalize_oauth_reconciled(
+    store: &SqliteStoreHandle,
+    accounts: &AccountStore<Box<dyn StoreLike>>,
+    command_id: &str,
+    alias: &CredentialAlias,
+) -> Result<(), HaiderError> {
+    let Some(descriptor) = accounts.get(alias).cloned() else {
+        return Ok(());
+    };
+    store
+        .finalize_account_add_receipt(
+            command_id.to_owned(),
+            AccountAddReceiptResponse { descriptor },
+        )
+        .await
+}
+
 async fn finalize_reconciled(
     store: &SqliteStoreHandle,
     accounts: &AccountStore<Box<dyn StoreLike>>,
@@ -1175,6 +1655,7 @@ pub(crate) struct AccountsRuntime {
     pub actor: Option<AccountActorHandle>,
     /// The vault provision the production provider factory shares.
     pub vault: VaultProvision,
+    pub broker: Option<CredentialBroker>,
 }
 
 impl AccountsRuntime {
@@ -1185,6 +1666,7 @@ impl AccountsRuntime {
         dependencies: &AccountsDependencies,
         store_dir: &std::path::Path,
         profile_id: &str,
+        instance_id: &str,
         default_model: &str,
     ) -> Result<Self, HaiderError> {
         let descriptor_store: Box<dyn StoreLike> = match &dependencies.descriptor_store {
@@ -1193,6 +1675,7 @@ impl AccountsRuntime {
         };
         let mut accounts = AccountStore::new(descriptor_store)?;
         reconcile_login_receipts(store, &mut accounts, &dependencies.vault).await?;
+        reconcile_oauth_add_receipts(store, &mut accounts, &dependencies.vault).await?;
         let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(accounts.list().to_vec()));
         match &dependencies.vault {
             VaultProvision::Available(vault) => {
@@ -1205,24 +1688,41 @@ impl AccountsRuntime {
                     profile_id: profile_id.to_owned(),
                     default_model: default_model.to_owned(),
                 });
+                let commands = actor.commands();
+                let oauth = OAuthCoordinator::new(
+                    instance_id.to_owned(),
+                    dependencies.oauth_catalog.clone(),
+                    dependencies.oauth_coordinator,
+                )
+                .map_err(crate::oauth::oauth_error)?;
+                let broker = CredentialBroker::new(
+                    Arc::clone(vault),
+                    dependencies.oauth_catalog.clone(),
+                    Arc::clone(&snapshot),
+                    commands.clone(),
+                )?;
                 Ok(Self {
                     facade: AccountsFacade {
-                        login: Some(actor.commands()),
+                        login: Some(commands),
+                        oauth: Some(oauth),
                         snapshot,
                         vault_supported: true,
                     },
                     actor: Some(actor),
                     vault: dependencies.vault.clone(),
+                    broker: Some(broker),
                 })
             }
             VaultProvision::Unsupported => Ok(Self {
                 facade: AccountsFacade {
                     login: None,
+                    oauth: None,
                     snapshot,
                     vault_supported: false,
                 },
                 actor: None,
                 vault: VaultProvision::Unsupported,
+                broker: None,
             }),
         }
     }

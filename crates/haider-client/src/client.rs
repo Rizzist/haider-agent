@@ -210,7 +210,7 @@ pub async fn connect(path: &Path, config: ClientConfig) -> Result<Connected, Con
     let bytes = uds_codec::encode(&hello, config.frame_limit).map_err(ConnectError::Frame)?;
     let handshake = async {
         stream.write_all(&bytes).await.map_err(ConnectError::Io)?;
-        let mut decoder = uds_codec::Decoder::new(config.frame_limit);
+        let mut decoder = uds_codec::Decoder::new_zeroizing(config.frame_limit);
         let mut buffer = [0_u8; 16 * 1024];
         let mut leftovers = VecDeque::new();
         loop {

@@ -13,6 +13,7 @@ use std::sync::Mutex;
 
 use haider_protocol::error::ErrorCode;
 use haider_protocol::ids::CredentialAlias;
+use zeroize::Zeroizing;
 
 use crate::{AccountsResult, accounts_error};
 
@@ -20,14 +21,20 @@ use crate::{AccountsResult, accounts_error};
 ///
 /// Callers must opt in to secret access through [`Self::expose_secret`].
 pub struct SecretHandle {
-    secret: Box<[u8]>,
+    secret: Zeroizing<Box<[u8]>>,
 }
 
 impl SecretHandle {
     /// Crate-private on purpose: only [`Vault`] implementations mint handles.
     pub(crate) fn new(secret: Vec<u8>) -> Self {
         Self {
-            secret: secret.into_boxed_slice(),
+            secret: Zeroizing::new(secret.into_boxed_slice()),
+        }
+    }
+
+    pub(crate) fn from_zeroizing(secret: &Zeroizing<Vec<u8>>) -> Self {
+        Self {
+            secret: Zeroizing::new(secret.as_slice().into()),
         }
     }
 
@@ -53,14 +60,6 @@ impl fmt::Display for SecretHandle {
     }
 }
 
-impl Drop for SecretHandle {
-    fn drop(&mut self) {
-        // Best-effort scrub only: the compiler may elide it, and copies made
-        // by callers of `expose_secret` are out of our hands.
-        self.secret.fill(0);
-    }
-}
-
 /// Storage boundary for credential secrets.
 pub trait Vault: Send + Sync {
     /// Creates or replaces the secret associated with `alias`.
@@ -81,7 +80,7 @@ pub trait Vault: Send + Sync {
 /// Deliberately not `Debug`: the map values are raw secret bytes.
 #[derive(Default)]
 pub struct MemoryVault {
-    secrets: Mutex<BTreeMap<String, Vec<u8>>>,
+    secrets: Mutex<BTreeMap<String, Zeroizing<Vec<u8>>>>,
 }
 
 impl MemoryVault {
@@ -91,7 +90,9 @@ impl MemoryVault {
         Self::default()
     }
 
-    fn lock(&self) -> AccountsResult<std::sync::MutexGuard<'_, BTreeMap<String, Vec<u8>>>> {
+    fn lock(
+        &self,
+    ) -> AccountsResult<std::sync::MutexGuard<'_, BTreeMap<String, Zeroizing<Vec<u8>>>>> {
         self.secrets.lock().map_err(|_| {
             accounts_error(ErrorCode::Internal, "memory vault lock was poisoned", false)
         })
@@ -100,11 +101,11 @@ impl MemoryVault {
 
 impl Vault for MemoryVault {
     fn put(&self, alias: &CredentialAlias, secret: &[u8]) -> AccountsResult<()> {
-        if let Some(mut previous) = self
+        if let Some(previous) = self
             .lock()?
-            .insert(alias.as_str().to_owned(), secret.to_vec())
+            .insert(alias.as_str().to_owned(), Zeroizing::new(secret.to_vec()))
         {
-            previous.fill(0);
+            drop(previous);
         }
         Ok(())
     }
@@ -117,13 +118,11 @@ impl Vault for MemoryVault {
                 false,
             )
         })?;
-        Ok(SecretHandle::new(secret))
+        Ok(SecretHandle::from_zeroizing(&secret))
     }
 
     fn delete(&self, alias: &CredentialAlias) -> AccountsResult<()> {
-        if let Some(mut secret) = self.lock()?.remove(alias.as_str()) {
-            secret.fill(0);
-        }
+        drop(self.lock()?.remove(alias.as_str()));
         Ok(())
     }
 
@@ -138,14 +137,10 @@ impl Vault for MemoryVault {
 
 impl Drop for MemoryVault {
     fn drop(&mut self) {
-        // Best-effort scrub of secrets still held at teardown (see the
-        // caveats on `SecretHandle`'s `Drop`).
-        let secrets = self
-            .secrets
+        // `Zeroizing` values scrub themselves even on poisoned teardown.
+        self.secrets
             .get_mut()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for secret in secrets.values_mut() {
-            secret.fill(0);
-        }
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
     }
 }

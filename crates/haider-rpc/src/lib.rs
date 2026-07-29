@@ -27,17 +27,20 @@ pub mod ws_codec;
 
 pub use codec::CodecError;
 pub use frame::{
-    AttachMode, AttachState, AttachmentId, CancelStatus, Capability, CapabilitySet, ClientKind,
-    CommandId, DEFAULT_FRAME_LIMIT, ERROR_CODE_ALREADY_RESOLVED, ERROR_CODE_BUSY,
-    ERROR_CODE_CAPABILITY_DENIED, ERROR_CODE_CREDENTIAL_MISSING, ERROR_CODE_CURSOR_AHEAD,
-    ERROR_CODE_DRAINING, ERROR_CODE_INVALID_ARGUMENT, ERROR_CODE_INVALID_CURSOR,
-    ERROR_CODE_NOT_FOUND, ERROR_CODE_OVERLOADED, ERROR_CODE_PERMISSION_DENIED,
+    AccountAddMethod, AttachMode, AttachState, AttachmentId, CancelStatus, Capability,
+    CapabilitySet, ClientKind, CommandId, DEFAULT_FRAME_LIMIT, ERROR_CODE_ALREADY_RESOLVED,
+    ERROR_CODE_BUSY, ERROR_CODE_CAPABILITY_DENIED, ERROR_CODE_CREDENTIAL_MISSING,
+    ERROR_CODE_CURSOR_AHEAD, ERROR_CODE_DRAINING, ERROR_CODE_INVALID_ARGUMENT,
+    ERROR_CODE_INVALID_CURSOR, ERROR_CODE_NOT_FOUND, ERROR_CODE_OAUTH_FLOW_NOT_FOUND,
+    ERROR_CODE_OAUTH_UNAVAILABLE, ERROR_CODE_OVERLOADED, ERROR_CODE_PERMISSION_DENIED,
     ERROR_CODE_PROVIDER_ERROR, ERROR_CODE_RESTAGE_REQUIRED, ERROR_CODE_RUN_NOT_ACTIVE,
     ERROR_CODE_STALE_GENERATION, ERROR_CODE_UNAUTHORIZED, ERROR_CODE_VAULT_UNSUPPORTED, ErrorData,
-    FEATURE_ACCOUNT_LOGIN_API_V1, FEATURE_SESSION_MUTATION_V1, FEATURE_TURN_CONTROL_V1,
-    FEATURE_VAULT_STAGE_V1, Hello, LifecyclePhase, MenuInput, ProtocolError, RequestBody,
-    RequestId, ResponseBody, SecretWire, SeqRange, SessionReadResult, SessionSummary, StagePurpose,
-    SubmitDisposition, WIRE_PROTOCOL_VERSION, Welcome, WireFrame,
+    FEATURE_ACCOUNT_LOGIN_API_V1, FEATURE_ACCOUNT_MANAGEMENT_V1, FEATURE_ACCOUNT_OAUTH_PKCE_V1,
+    FEATURE_SESSION_MUTATION_V1, FEATURE_TURN_CONTROL_V1, FEATURE_VAULT_STAGE_V1, Hello,
+    LifecyclePhase, MenuInput, OAuthAuthorizationWire, OAuthAvailabilityWire, OAuthFlowId,
+    OAuthFlowStatusWire, OAuthReadyRefWire, ProtocolError, RequestBody, RequestId, ResponseBody,
+    SecretWire, SeqRange, SessionReadResult, SessionSummary, StagePurpose, SubmitDisposition,
+    WIRE_PROTOCOL_VERSION, Welcome, WireFrame,
 };
 pub use negotiation::{Negotiated, ServerRange, negotiate};
 

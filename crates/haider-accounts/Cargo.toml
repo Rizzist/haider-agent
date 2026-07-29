@@ -10,6 +10,7 @@ rust-version.workspace = true
 haider-protocol = { path = "../haider-protocol" }
 serde.workspace = true
 serde_json.workspace = true
+zeroize.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3.7"
