@@ -1548,6 +1548,11 @@ pub struct AppModel {
     pub sanctum_tier: SanctumTier,
     pub projection: SessionProjection,
     pub identity: IdentityLine,
+    /// The user EXPLICITLY chose a provider/model/account this run
+    /// (`/model`, `/provider`, or clicking an account). Once pinned, the
+    /// daemon-truth bootstrap below never overwrites their choice; until
+    /// then the identity line is only a seed and daemon reality wins.
+    pub identity_pinned: bool,
     /// The ACTIVE surface's composer (TUI5): text + first-class cursor +
     /// selection + input ring. Nothing in it persists (item 8).
     pub composer: crate::composer::Composer,
@@ -1756,6 +1761,7 @@ impl Default for AppModel {
             sanctum_tier: SanctumTier::default(),
             projection: SessionProjection::new(),
             identity: IdentityLine::default(),
+            identity_pinned: false,
             composer: crate::composer::Composer::new(),
             drafts: std::collections::HashMap::new(),
             session_title: None,
@@ -3285,7 +3291,62 @@ impl AppModel {
             descriptor.alias,
             auth_label(descriptor.auth_method)
         ));
+        // Choosing an account IS choosing the session identity (W5f-2):
+        // the committed pick rides into the composer line and pins, so the
+        // next `session.create` carries it and no later snapshot undoes it.
+        self.adopt_identity(&descriptor.provider, descriptor.alias.as_str(), true);
         self.dirty = true;
+    }
+
+    /// Point the composer identity at `provider`/`alias`, taking the model
+    /// from the provider's own declaration (its default, else its first
+    /// discovered slug — NEVER an invented one; with nothing discovered the
+    /// current model stands until `/model` can offer real candidates).
+    fn adopt_identity(&mut self, provider: &str, alias: &str, pin: bool) {
+        if self.identity.provider != provider {
+            self.identity.provider = provider.to_owned();
+        }
+        if self.identity.account != alias {
+            self.identity.account = alias.to_owned();
+        }
+        if let Some(model) = self
+            .providers
+            .providers
+            .iter()
+            .find(|summary| summary.provider == provider)
+            .and_then(|summary| {
+                summary
+                    .default_model
+                    .clone()
+                    .or_else(|| summary.models.first().cloned())
+            })
+            && self.identity.model_short != model
+        {
+            self.identity.model_short = model;
+        }
+        self.identity_pinned |= pin;
+        self.dirty = true;
+    }
+
+    /// Daemon-truth identity bootstrap (W5f-2): until the user pins a
+    /// choice, the composer identity follows the ACTIVE account — so the
+    /// first session lands on a provider that can actually serve a turn
+    /// instead of the demo seed pair. Called by the LIVE driver whenever an
+    /// account or provider snapshot applies; demo never calls it.
+    pub fn bootstrap_identity_from_daemon(&mut self) {
+        if self.identity_pinned {
+            return;
+        }
+        let Some((provider, alias)) = self
+            .accounts
+            .rows
+            .iter()
+            .find(|row| row.selected)
+            .map(|row| (row.provider.clone(), row.alias.clone()))
+        else {
+            return;
+        };
+        self.adopt_identity(&provider, &alias, false);
     }
 
     /// A failed `account.set_active`: clear the pending gate and surface the
@@ -4037,6 +4098,7 @@ impl AppModel {
                 {
                     // The model is DISCOVERED, so selecting it is honest.
                     self.identity.model_short = slug.clone();
+                    self.identity_pinned = true;
                     self.flash = Some(format!("· model → {slug}"));
                 } else {
                     self.flash = Some(format!(
@@ -4062,6 +4124,7 @@ impl AppModel {
                     .find(|(name, _)| name.eq_ignore_ascii_case(&requested))
                 {
                     self.identity.provider = name.clone();
+                    self.identity_pinned = true;
                     self.flash = Some(format!("· provider → {name} · {health}"));
                 } else {
                     self.flash = Some(format!("· no provider \"{requested}\" in the registry"));

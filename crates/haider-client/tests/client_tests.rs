@@ -478,7 +478,17 @@ async fn fatal_protocol_error_frame_fails_pending_requests() {
             }
         },
     );
-    let connected = connect(&endpoint, ClientConfig::default())
+    // Starvation-proofed (W5f-3): under full-gate CPU contention the
+    // client's own keepalive deadline could beat the fake daemon's fatal
+    // frame, resolving the request to a DIFFERENT disconnect variant and
+    // flaking this fixture. The property under test is frame routing, not
+    // keepalive timing — give the keepalive room starvation cannot beat.
+    let config = ClientConfig {
+        ping_interval: Duration::from_secs(120),
+        pong_deadline: Duration::from_secs(120),
+        ..ClientConfig::default()
+    };
+    let connected = connect(&endpoint, config)
         .await
         .expect("connect fake daemon");
     let error = connected
