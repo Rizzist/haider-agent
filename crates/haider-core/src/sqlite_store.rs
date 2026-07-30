@@ -426,6 +426,55 @@ impl SqliteStoreHandle {
         run_blocking(move || owner.with_store(Store::advance_management_revision)).await
     }
 
+    /// Reads a provider's durable last-known model catalog.
+    pub async fn provider_models(
+        &self,
+        provider: String,
+    ) -> Result<Option<haider_store::CachedModels>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.provider_models(&provider))).await
+    }
+
+    /// Replaces a provider's durable last-known model catalog.
+    pub async fn put_provider_models(
+        &self,
+        provider: String,
+        models_json: String,
+        etag: Option<String>,
+        fetched_at_ms: u64,
+    ) -> Result<(), HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.put_provider_models(&provider, &models_json, etag.as_deref(), fetched_at_ms)
+            })
+        })
+        .await
+    }
+
+    /// Atomically replaces a provider catalog and advances the management
+    /// revision for publication.
+    pub async fn put_provider_models_and_advance_management_revision(
+        &self,
+        provider: String,
+        models_json: String,
+        etag: Option<String>,
+        fetched_at_ms: u64,
+    ) -> Result<u64, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.put_provider_models_and_advance_management_revision(
+                    &provider,
+                    &models_json,
+                    etag.as_deref(),
+                    fetched_at_ms,
+                )
+            })
+        })
+        .await
+    }
+
     /// Idempotently repairs a committed pre-v6 management receipt that has no
     /// final revision yet.
     pub async fn ensure_committed_management_revision(

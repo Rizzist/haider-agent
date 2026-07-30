@@ -36,7 +36,7 @@ const MAX_CATALOG_BYTES: usize = 1024 * 1024;
 const CATALOG_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// One model as the PROVIDER described it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DiscoveredModel {
     /// The wire id used in a turn request.
     pub slug: String,

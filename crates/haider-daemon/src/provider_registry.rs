@@ -1,5 +1,6 @@
 //! Durable provider-profile registry owned by the account/provider actor.
 
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -9,8 +10,9 @@ use haider_protocol::credential::AuthMethod;
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_provider::{
     ANTHROPIC_API_URL, ANTHROPIC_OAUTH_BASE_URL, ANTHROPIC_OAUTH_PROVIDER_NAME,
-    ANTHROPIC_PROVIDER_NAME, OPENAI_COMPATIBLE_PROVIDER_NAME, OPENAI_OAUTH_PROVIDER_NAME,
-    OPENAI_PROVIDER_NAME, OPENAI_RESPONSES_API_URL, OPENAI_SUBSCRIPTION_RESPONSES_URL,
+    ANTHROPIC_PROVIDER_NAME, DiscoveredModel, OPENAI_COMPATIBLE_PROVIDER_NAME,
+    OPENAI_OAUTH_PROVIDER_NAME, OPENAI_PROVIDER_NAME, OPENAI_RESPONSES_API_URL,
+    OPENAI_SUBSCRIPTION_RESPONSES_URL, pickable,
 };
 use haider_rpc::{
     ProviderApiFamilyWire, ProviderAuthRequirementWire, ProviderAvailabilityWire,
@@ -155,13 +157,50 @@ impl ProviderRegistryStoreLike for Box<dyn ProviderRegistryStoreLike> {
     }
 }
 
+pub(crate) trait ProviderModelSourceLike: Send + Sync {
+    fn models(&self, provider: &str) -> Option<Vec<DiscoveredModel>>;
+    fn replace(&self, provider: String, models: Vec<DiscoveredModel>);
+}
+
+/// Typed, in-memory projection of the durable provider-model cache.
+///
+/// Production hydrates this before publishing the first management snapshot
+/// and the account actor replaces entries only after the corresponding
+/// SQLite write succeeds.
+#[derive(Default)]
+pub(crate) struct CachedProviderModelSource {
+    models: std::sync::Mutex<HashMap<String, Vec<DiscoveredModel>>>,
+}
+
+impl ProviderModelSourceLike for CachedProviderModelSource {
+    fn models(&self, provider: &str) -> Option<Vec<DiscoveredModel>> {
+        self.models
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(provider)
+            .cloned()
+    }
+
+    fn replace(&self, provider: String, models: Vec<DiscoveredModel>) {
+        self.models
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(provider, models);
+    }
+}
+
 pub(crate) struct ProviderRegistry<S> {
     store: S,
     profiles: Vec<ProviderProfileV1>,
+    model_source: Arc<dyn ProviderModelSourceLike>,
 }
 
 impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
-    pub(crate) fn new(store: S, initial: Vec<ProviderProfileV1>) -> Result<Self, HaiderError> {
+    pub(crate) fn new(
+        store: S,
+        initial: Vec<ProviderProfileV1>,
+        model_source: Arc<dyn ProviderModelSourceLike>,
+    ) -> Result<Self, HaiderError> {
         let mut profiles = store.load()?;
         if profiles.is_empty() {
             profiles = initial;
@@ -180,7 +219,11 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
             validate_profiles(&profiles)?;
             store.save(&profiles)?;
         }
-        Ok(Self { store, profiles })
+        Ok(Self {
+            store,
+            profiles,
+            model_source,
+        })
     }
 
     pub(crate) fn get(&self, provider: &str) -> Option<&ProviderProfileV1> {
@@ -190,7 +233,19 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
     }
 
     pub(crate) fn summaries(&self) -> Vec<ProviderSummaryWire> {
-        self.profiles.iter().map(provider_summary).collect()
+        self.profiles
+            .iter()
+            .map(|profile| self.summary_profile(profile))
+            .collect()
+    }
+
+    pub(crate) fn summary(&self, provider: &str) -> Option<ProviderSummaryWire> {
+        self.get(provider)
+            .map(|profile| self.summary_profile(profile))
+    }
+
+    pub(crate) fn replace_models(&self, provider: String, models: Vec<DiscoveredModel>) {
+        self.model_source.replace(provider, models);
     }
 
     pub(crate) fn configure(
@@ -214,6 +269,15 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
         &self,
         input: ProviderConfigureInput,
     ) -> Result<(Vec<ProviderProfileV1>, ProviderProfileV1), HaiderError> {
+        let discovered_models = self.discovered_slugs(&input.provider);
+        self.configured_profiles_with_inventory(input, &discovered_models)
+    }
+
+    fn configured_profiles_with_inventory(
+        &self,
+        input: ProviderConfigureInput,
+        discovered_models: &[String],
+    ) -> Result<(Vec<ProviderProfileV1>, ProviderProfileV1), HaiderError> {
         validate_provider_id(&input.provider)?;
         let mut next = self.profiles.clone();
         let profile = if let Some(existing) = next
@@ -223,8 +287,7 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
             require_matching_identity(existing, &input)?;
             existing.enabled = input.enabled;
             existing.configured_models = normalized_models(input.models)?;
-            existing.default_model =
-                validated_default(&existing.configured_models, input.default_model)?;
+            existing.default_model = validated_default(discovered_models, input.default_model)?;
             existing.clone()
         } else {
             let api_family = input
@@ -251,7 +314,7 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
                 ));
             }
             let configured_models = normalized_models(input.models)?;
-            let default_model = validated_default(&configured_models, input.default_model)?;
+            let default_model = validated_default(discovered_models, input.default_model)?;
             let profile = ProviderProfileV1 {
                 provider_id: input.provider.clone(),
                 display_name: input.provider,
@@ -266,15 +329,33 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
             next.push(profile.clone());
             profile
         };
-        if profile.enabled
-            && (profile.configured_models.is_empty() || profile.default_model.is_none())
-        {
+        if profile.enabled && (discovered_models.is_empty() || profile.default_model.is_none()) {
             return Err(invalid(
-                "an enabled provider requires at least one model and a default model",
+                "an enabled provider requires a discovered model inventory and a default model",
             ));
         }
         validate_profiles(&next)?;
         Ok((next, profile))
+    }
+
+    /// Replays a pre-v8 pending configure receipt. A missing discovered
+    /// inventory identifies the legacy recovery case: v8 commands cannot be
+    /// claimed until discovery validation has succeeded, and cache rows are
+    /// never deleted.
+    pub(crate) fn reconcile_configure(
+        &mut self,
+        input: ProviderConfigureInput,
+    ) -> Result<ProviderProfileV1, HaiderError> {
+        let discovered_models = self.discovered_slugs(&input.provider);
+        let inventory = if discovered_models.is_empty() {
+            normalized_models(input.models.clone())?
+        } else {
+            discovered_models
+        };
+        let (next, profile) = self.configured_profiles_with_inventory(input, &inventory)?;
+        self.store.save(&next)?;
+        self.profiles = next;
+        Ok(profile)
     }
 
     pub(crate) fn validate_default_model(
@@ -282,17 +363,17 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
         provider: &str,
         model: &str,
     ) -> Result<(), HaiderError> {
-        let profile = self
-            .get(provider)
-            .ok_or_else(|| invalid(format!("provider `{provider}` is not registered")))?;
+        if self.get(provider).is_none() {
+            return Err(invalid(format!("provider `{provider}` is not registered")));
+        }
         let model = model.trim();
-        if !profile
-            .configured_models
+        if !self
+            .discovered_slugs(provider)
             .iter()
-            .any(|configured| configured == model)
+            .any(|discovered| discovered == model)
         {
             return Err(invalid(format!(
-                "model `{model}` is not registered for provider `{provider}`"
+                "model `{model}` is not in the discovered inventory for provider `{provider}`"
             )));
         }
         Ok(())
@@ -317,6 +398,58 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
         self.profiles = next;
         Ok(result)
     }
+
+    /// Replays a pre-v8 pending default-model receipt against its durable
+    /// legacy inventory when no discovered cache existed at migration time.
+    pub(crate) fn reconcile_set_default_model(
+        &mut self,
+        provider: &str,
+        model: &str,
+    ) -> Result<ProviderProfileV1, HaiderError> {
+        if !self.discovered_slugs(provider).is_empty() {
+            return self.set_default_model(provider, model);
+        }
+        let profile = self
+            .get(provider)
+            .ok_or_else(|| invalid(format!("provider `{provider}` is not registered")))?;
+        let model = model.trim();
+        if !profile
+            .configured_models
+            .iter()
+            .any(|configured| configured == model)
+        {
+            return Err(invalid(format!(
+                "legacy model `{model}` is not registered for provider `{provider}`"
+            )));
+        }
+        let mut next = self.profiles.clone();
+        let profile = next
+            .iter_mut()
+            .find(|profile| profile.provider_id == provider)
+            .ok_or_else(|| invalid(format!("provider `{provider}` is not registered")))?;
+        profile.default_model = Some(model.to_owned());
+        let result = profile.clone();
+        validate_profiles(&next)?;
+        self.store.save(&next)?;
+        self.profiles = next;
+        Ok(result)
+    }
+
+    fn discovered_slugs(&self, provider: &str) -> Vec<String> {
+        self.model_source
+            .models(provider)
+            .map(|models| {
+                pickable(&models)
+                    .into_iter()
+                    .map(|model| model.slug)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn summary_profile(&self, profile: &ProviderProfileV1) -> ProviderSummaryWire {
+        provider_summary(profile, self.discovered_slugs(&profile.provider_id))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -340,20 +473,29 @@ pub(crate) fn initial_provider_profiles(
         .collect()
 }
 
-pub(crate) fn provider_summary(profile: &ProviderProfileV1) -> ProviderSummaryWire {
+fn provider_summary(
+    profile: &ProviderProfileV1,
+    discovered_models: Vec<String>,
+) -> ProviderSummaryWire {
     let auth_methods = match profile.auth_requirement {
         ProviderAuthRequirementWire::ApiKey => vec![AuthMethod::ApiKey],
         ProviderAuthRequirementWire::OAuth => vec![AuthMethod::OAuth],
         ProviderAuthRequirementWire::None | ProviderAuthRequirementWire::Unknown => Vec::new(),
         _ => Vec::new(),
     };
-    let available =
-        profile.enabled && !matches!(profile.api_family, ProviderApiFamilyWire::Unknown);
+    let available = profile.enabled
+        && !matches!(profile.api_family, ProviderApiFamilyWire::Unknown)
+        && !discovered_models.is_empty();
+    let default_model = profile
+        .default_model
+        .as_ref()
+        .filter(|default| discovered_models.iter().any(|model| model == *default))
+        .cloned();
     ProviderSummaryWire {
         provider: profile.provider_id.clone(),
         api_family: profile.api_family,
         endpoint: profile.base_url.clone(),
-        models: profile.configured_models.clone(),
+        models: discovered_models,
         auth_methods,
         availability: if available {
             ProviderAvailabilityWire::Available
@@ -365,73 +507,63 @@ pub(crate) fn provider_summary(profile: &ProviderProfileV1) -> ProviderSummaryWi
                 "provider adapter is not registered".to_owned()
             } else if !profile.enabled {
                 "provider is disabled".to_owned()
-            } else {
+            } else if matches!(profile.api_family, ProviderApiFamilyWire::Unknown) {
                 "provider API family is unavailable".to_owned()
+            } else {
+                "provider model inventory is unavailable".to_owned()
             }
         }),
-        default_model: profile.default_model.clone(),
+        default_model,
         enabled: profile.enabled,
     }
 }
 
 fn builtin_or_unknown(provider: &str, anthropic_default_model: &str) -> ProviderProfileV1 {
-    let (api_family, base_url, auth_requirement, models, default_model, enabled, provenance) =
-        match provider {
-            ANTHROPIC_PROVIDER_NAME => (
-                ProviderApiFamilyWire::AnthropicMessages,
-                Some(ANTHROPIC_API_URL.to_owned()),
-                ProviderAuthRequirementWire::ApiKey,
-                vec![anthropic_default_model.to_owned()],
-                Some(anthropic_default_model.to_owned()),
-                true,
-                ProviderProvenance::BuiltIn,
-            ),
-            ANTHROPIC_OAUTH_PROVIDER_NAME => (
-                ProviderApiFamilyWire::AnthropicMessages,
-                Some(ANTHROPIC_OAUTH_BASE_URL.to_owned()),
-                ProviderAuthRequirementWire::OAuth,
-                vec![anthropic_default_model.to_owned()],
-                Some(anthropic_default_model.to_owned()),
-                true,
-                ProviderProvenance::BuiltIn,
-            ),
-            OPENAI_PROVIDER_NAME => (
-                ProviderApiFamilyWire::OpenAiResponses,
-                Some(OPENAI_RESPONSES_API_URL.to_owned()),
-                ProviderAuthRequirementWire::ApiKey,
-                vec!["gpt-5.6".to_owned()],
-                Some("gpt-5.6".to_owned()),
-                true,
-                ProviderProvenance::BuiltIn,
-            ),
-            OPENAI_OAUTH_PROVIDER_NAME => (
-                ProviderApiFamilyWire::OpenAiResponses,
-                Some(OPENAI_SUBSCRIPTION_RESPONSES_URL.to_owned()),
-                ProviderAuthRequirementWire::OAuth,
-                vec!["gpt-5.6".to_owned()],
-                Some("gpt-5.6".to_owned()),
-                true,
-                ProviderProvenance::BuiltIn,
-            ),
-            OPENAI_COMPATIBLE_PROVIDER_NAME => (
-                ProviderApiFamilyWire::OpenAiChatCompletions,
-                None,
-                ProviderAuthRequirementWire::ApiKey,
-                Vec::new(),
-                None,
-                false,
-                ProviderProvenance::BuiltIn,
-            ),
-            _ => (
-                ProviderApiFamilyWire::Unknown,
-                None,
-                ProviderAuthRequirementWire::Unknown,
-                Vec::new(),
-                None,
-                false,
-                ProviderProvenance::Unknown,
-            ),
-        };
+    let _ = anthropic_default_model;
+    let (api_family, base_url, auth_requirement, enabled, provenance) = match provider {
+        ANTHROPIC_PROVIDER_NAME => (
+            ProviderApiFamilyWire::AnthropicMessages,
+            Some(ANTHROPIC_API_URL.to_owned()),
+            ProviderAuthRequirementWire::ApiKey,
+            true,
+            ProviderProvenance::BuiltIn,
+        ),
+        ANTHROPIC_OAUTH_PROVIDER_NAME => (
+            ProviderApiFamilyWire::AnthropicMessages,
+            Some(ANTHROPIC_OAUTH_BASE_URL.to_owned()),
+            ProviderAuthRequirementWire::OAuth,
+            true,
+            ProviderProvenance::BuiltIn,
+        ),
+        OPENAI_PROVIDER_NAME => (
+            ProviderApiFamilyWire::OpenAiResponses,
+            Some(OPENAI_RESPONSES_API_URL.to_owned()),
+            ProviderAuthRequirementWire::ApiKey,
+            true,
+            ProviderProvenance::BuiltIn,
+        ),
+        OPENAI_OAUTH_PROVIDER_NAME => (
+            ProviderApiFamilyWire::OpenAiResponses,
+            Some(OPENAI_SUBSCRIPTION_RESPONSES_URL.to_owned()),
+            ProviderAuthRequirementWire::OAuth,
+            true,
+            ProviderProvenance::BuiltIn,
+        ),
+        OPENAI_COMPATIBLE_PROVIDER_NAME => (
+            ProviderApiFamilyWire::OpenAiChatCompletions,
+            None,
+            ProviderAuthRequirementWire::ApiKey,
+            false,
+            ProviderProvenance::BuiltIn,
+        ),
+        _ => (
+            ProviderApiFamilyWire::Unknown,
+            None,
+            ProviderAuthRequirementWire::Unknown,
+            false,
+            ProviderProvenance::Unknown,
+        ),
+    };
     ProviderProfileV1 {
         provider_id: provider.to_owned(),
         display_name: provider.to_owned(),
@@ -439,8 +571,8 @@ fn builtin_or_unknown(provider: &str, anthropic_default_model: &str) -> Provider
         base_url,
         enabled,
         auth_requirement,
-        configured_models: models,
-        default_model,
+        configured_models: Vec::new(),
+        default_model: None,
         provenance,
     }
 }
@@ -508,30 +640,6 @@ fn validate_profiles(profiles: &[ProviderProfileV1]) -> Result<(), HaiderError> 
                 ErrorCode::StoreCorrupt,
                 format!(
                     "provider registry contains duplicate id `{}`",
-                    profile.provider_id
-                ),
-                false,
-            ));
-        }
-        validated_default(&profile.configured_models, profile.default_model.clone()).map_err(
-            |error| {
-                HaiderError::new(
-                    ErrorCode::StoreCorrupt,
-                    format!(
-                        "provider registry profile `{}` is invalid: {}",
-                        profile.provider_id, error.message
-                    ),
-                    false,
-                )
-            },
-        )?;
-        if profile.enabled
-            && (profile.configured_models.is_empty() || profile.default_model.is_none())
-        {
-            return Err(HaiderError::new(
-                ErrorCode::StoreCorrupt,
-                format!(
-                    "enabled provider registry profile `{}` requires models and a default",
                     profile.provider_id
                 ),
                 false,

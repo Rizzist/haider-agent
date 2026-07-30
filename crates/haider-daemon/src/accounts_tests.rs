@@ -54,15 +54,42 @@ impl ProviderRegistryStoreLike for TestProviderStore {
 
 fn test_provider_registry() -> ProviderRegistry<Box<dyn ProviderRegistryStoreLike>> {
     let store: Box<dyn ProviderRegistryStoreLike> = Box::new(TestProviderStore::default());
+    let model_source = Arc::new(CachedProviderModelSource::default());
+    for provider in [
+        ANTHROPIC_PROVIDER_NAME,
+        ANTHROPIC_OAUTH_PROVIDER_NAME,
+        OPENAI_PROVIDER_NAME,
+        OPENAI_OAUTH_PROVIDER_NAME,
+        "custom",
+    ] {
+        model_source.replace(
+            provider.to_owned(),
+            ["claude-test", "gpt-test", "model-a", "model-b", "unused"]
+                .into_iter()
+                .map(|slug| haider_provider::DiscoveredModel {
+                    slug: slug.to_owned(),
+                    display_name: format!("Fixture {slug}"),
+                    description: Some("provider-owned test fixture".to_owned()),
+                    default_effort: None,
+                    supported_efforts: Vec::new(),
+                    visible: true,
+                    priority: None,
+                })
+                .collect(),
+        );
+    }
     ProviderRegistry::new(
         store,
         initial_provider_profiles(
             &std::collections::BTreeSet::from([
                 ANTHROPIC_PROVIDER_NAME.to_owned(),
+                ANTHROPIC_OAUTH_PROVIDER_NAME.to_owned(),
                 OPENAI_PROVIDER_NAME.to_owned(),
+                OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
             ]),
             "claude-test",
         ),
+        model_source,
     )
     .expect("provider registry")
 }
@@ -422,14 +449,16 @@ async fn reserved_alias_fences_login_and_oauth_add_until_remove_finalizes() {
         .expect("login response");
     match frame {
         WireFrame::Response {
-            body:
-                ResponseBody::Error {
-                    code, retryable, ..
-                },
+            body: ResponseBody::Error {
+                code, retryable, ..
+            },
             ..
         } => {
             assert_eq!(code, ERROR_CODE_BUSY, "reserved alias must answer busy");
-            assert!(retryable, "removal cleanup is transient — must be retryable");
+            assert!(
+                retryable,
+                "removal cleanup is transient — must be retryable"
+            );
         }
         other => panic!("reserved login must be rejected, got {other:?}"),
     }
@@ -462,10 +491,9 @@ async fn reserved_alias_fences_login_and_oauth_add_until_remove_finalizes() {
         .expect("oauth response");
     match frame {
         WireFrame::Response {
-            body:
-                ResponseBody::Error {
-                    code, retryable, ..
-                },
+            body: ResponseBody::Error {
+                code, retryable, ..
+            },
             ..
         } => {
             assert_eq!(code, ERROR_CODE_BUSY);
@@ -3125,7 +3153,11 @@ async fn provider_mutations_replay_before_validation_and_publish_one_snapshot() 
         .iter()
         .find(|provider| provider.provider == "custom")
         .expect("custom provider");
-    assert_eq!(custom.models, vec!["model-a"]);
+    assert!(
+        custom.models.iter().any(|model| model == "model-a")
+            && custom.models.iter().any(|model| model == "model-b"),
+        "management keeps the injected discovered inventory, not provider.configure literals"
+    );
     assert_eq!(custom.default_model.as_deref(), Some("model-a"));
     drop(view);
     actor.shutdown().await;
@@ -3262,6 +3294,626 @@ async fn pending_remove_reconciliation_retries_orphan_deletion_before_release() 
             .is_empty()
     );
     assert_eq!(store.management_revision().await.expect("revision"), 1);
+}
+
+/// Pending W5c provider receipts remain recoverable immediately after the
+/// v8 migration, before any discovered catalog exists.
+///
+/// MUTATION CHECK: replace the `reconcile_set_default_model` and
+/// `reconcile_configure` calls in `reconcile_provider_receipts` with their
+/// normal discovered-only twins. Expected runtime failure:
+/// `reconcile_provider_receipts` returns `InvalidArgument` because the
+/// migrated cache is empty, leaving both receipts pending.
+/// Verified by revert on 2026-07-30.
+#[tokio::test]
+async fn pre_v8_pending_provider_receipts_reconcile_without_a_discovered_cache() {
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let legacy_profiles = vec![
+        ProviderProfileV1 {
+            provider_id: "legacy-default".to_owned(),
+            display_name: "legacy-default".to_owned(),
+            api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
+            base_url: Some("https://legacy-default.example.invalid".to_owned()),
+            enabled: true,
+            auth_requirement: ProviderAuthRequirementWire::ApiKey,
+            configured_models: vec![
+                "frontier-legacy-a".to_owned(),
+                "frontier-legacy-b".to_owned(),
+            ],
+            default_model: Some("frontier-legacy-a".to_owned()),
+            provenance: crate::provider_registry::ProviderProvenance::Custom,
+        },
+        ProviderProfileV1 {
+            provider_id: "legacy-configure".to_owned(),
+            display_name: "legacy-configure".to_owned(),
+            api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
+            base_url: Some("https://legacy-configure.example.invalid".to_owned()),
+            enabled: true,
+            auth_requirement: ProviderAuthRequirementWire::ApiKey,
+            configured_models: vec!["frontier-legacy-old".to_owned()],
+            default_model: Some("frontier-legacy-old".to_owned()),
+            provenance: crate::provider_registry::ProviderProvenance::Custom,
+        },
+    ];
+    let provider_store: Box<dyn ProviderRegistryStoreLike> =
+        Box::new(TestProviderStore(StdMutex::new(legacy_profiles.clone())));
+    let mut providers = ProviderRegistry::new(
+        provider_store,
+        legacy_profiles,
+        Arc::new(CachedProviderModelSource::default()),
+    )
+    .expect("legacy provider registry");
+
+    let default_identity = SetDefaultModelIdentity {
+        provider: "legacy-default".to_owned(),
+        model: "frontier-legacy-b".to_owned(),
+        expected_revision: 0,
+    };
+    let (default_json, default_digest) = command_json(&default_identity).expect("default identity");
+    assert!(matches!(
+        store
+            .management_claim_receipt::<ProviderReceipt>(
+                "legacy-default-pending".to_owned(),
+                ACCOUNT_SET_DEFAULT_MODEL_METHOD.to_owned(),
+                default_digest,
+                default_json,
+                None,
+                Some(0),
+            )
+            .await
+            .expect("claim legacy default"),
+        ManagementClaim::Fresh
+    ));
+
+    let configure_input = ProviderConfigureInput {
+        provider: "legacy-configure".to_owned(),
+        api_family: None,
+        origin: None,
+        auth_requirement: None,
+        enabled: true,
+        models: vec!["frontier-legacy-new".to_owned()],
+        default_model: Some("frontier-legacy-new".to_owned()),
+    };
+    let configure_identity = ProviderConfigureIdentity {
+        input: configure_input.clone(),
+        expected_revision: 0,
+    };
+    let (configure_json, configure_digest) =
+        command_json(&configure_identity).expect("configure identity");
+    assert!(matches!(
+        store
+            .management_claim_receipt::<ProviderReceipt>(
+                "legacy-configure-pending".to_owned(),
+                PROVIDER_CONFIGURE_METHOD.to_owned(),
+                configure_digest,
+                configure_json,
+                Some(serde_json::to_string(&configure_input).expect("recovery JSON")),
+                Some(0),
+            )
+            .await
+            .expect("claim legacy configure"),
+        ManagementClaim::Fresh
+    ));
+
+    reconcile_provider_receipts(&store, &mut providers)
+        .await
+        .expect("legacy receipt reconciliation");
+    assert_eq!(store.management_revision().await.expect("revision"), 2);
+    assert!(
+        store
+            .management_receipts(ACCOUNT_SET_DEFAULT_MODEL_METHOD.to_owned())
+            .await
+            .expect("default receipts")
+            .iter()
+            .all(|row| row.state == "committed")
+    );
+    assert!(
+        store
+            .management_receipts(PROVIDER_CONFIGURE_METHOD.to_owned())
+            .await
+            .expect("configure receipts")
+            .iter()
+            .all(|row| row.state == "committed")
+    );
+    let configured = providers
+        .get("legacy-configure")
+        .expect("reconciled configured profile");
+    assert_eq!(configured.configured_models, vec!["frontier-legacy-new"]);
+    let summary = providers
+        .summary("legacy-configure")
+        .expect("legacy summary");
+    assert!(summary.models.is_empty());
+    assert_eq!(summary.default_model, None);
+    store.close().await.expect("close");
+}
+
+struct UnusedIdentityVerifier;
+
+#[async_trait::async_trait]
+impl crate::oauth::OAuthIdentityVerifier for UnusedIdentityVerifier {
+    async fn verify(
+        &self,
+        _id_token: &[u8],
+        _expected: crate::oauth::OAuthIdentityExpectation<'_>,
+    ) -> Result<haider_accounts::OAuthIdentityV1, crate::oauth::OAuthPublicError> {
+        panic!("the unexpired model-refresh fixture must not verify an ID token")
+    }
+}
+
+struct BlockingModelDiscoverer {
+    started: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    seen: StdMutex<Vec<(CatalogSource, String, Option<String>)>>,
+    results: StdMutex<std::collections::VecDeque<ModelDiscoveryFixture>>,
+}
+
+enum ModelDiscoveryFixture {
+    Return(Result<DiscoveredCatalog, CatalogError>),
+    Panic,
+}
+
+#[async_trait::async_trait]
+impl ProviderModelDiscoverer for BlockingModelDiscoverer {
+    async fn discover(
+        &self,
+        source: CatalogSource,
+        access_token: &str,
+        etag: Option<&str>,
+    ) -> Result<DiscoveredCatalog, CatalogError> {
+        self.seen.lock().expect("seen lock").push((
+            source,
+            access_token.to_owned(),
+            etag.map(str::to_owned),
+        ));
+        self.started.notify_one();
+        self.release.notified().await;
+        let result = self
+            .results
+            .lock()
+            .expect("results lock")
+            .pop_front()
+            .expect("queued discovery result");
+        match result {
+            ModelDiscoveryFixture::Return(result) => result,
+            ModelDiscoveryFixture::Panic => panic!("injected model discovery panic"),
+        }
+    }
+}
+
+fn refresh_oauth_catalog() -> OAuthProviderCatalog {
+    let registration = crate::oauth::OAuthProviderRegistration::new(
+        OPENAI_OAUTH_PROVIDER_NAME,
+        "http://127.0.0.1:32111",
+        "http://127.0.0.1:32111/authorize",
+        "http://127.0.0.1:32111/token",
+        "model-refresh-client",
+        vec!["inference".to_owned()],
+        "model-refresh-audience",
+        Some("model-refresh-resource".to_owned()),
+        true,
+        Arc::new(UnusedIdentityVerifier),
+    )
+    .expect("test registration");
+    OAuthProviderCatalog::with_test_registrations([registration]).expect("test catalog")
+}
+
+fn refresh_oauth_bundle() -> haider_accounts::OAuthTokenBundleV1 {
+    haider_accounts::OAuthTokenBundleV1::new(
+        OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
+        "http://127.0.0.1:32111".to_owned(),
+        "model-refresh-audience".to_owned(),
+        Some("model-refresh-resource".to_owned()),
+        "Bearer".to_owned(),
+        Zeroizing::new(b"MODEL_REFRESH_ACCESS_SENTINEL_73c1".to_vec()),
+        Some(Zeroizing::new(
+            b"MODEL_REFRESH_UNUSED_REFRESH_SENTINEL_442a".to_vec(),
+        )),
+        u64::MAX - 1,
+        Some(u64::MAX),
+        vec!["inference".to_owned()],
+        haider_accounts::OAuthIdentityV1 {
+            subject_hash: "model-refresh-subject".to_owned(),
+            display_identity: "model refresh fixture".to_owned(),
+        },
+        1,
+    )
+    .expect("model refresh bundle")
+}
+
+/// Refresh HTTP is handed to an owned task, broker resolution exposes only
+/// the OAuth access token, and the actor alone publishes the durable result.
+///
+/// MUTATION CHECK 1: after `begin_provider_models_refresh` returns in the
+/// `RefreshProviderModels` actor arm, await `model_refreshes.join_next()`
+/// before receiving another command. Expected runtime failure: the
+/// `ResolveCredential` request times out while discovery is blocked.
+///
+/// MUTATION CHECK 2: replace `management.publish(...)` in the successful
+/// refresh completion with `management.publish_accounts(...)`. Expected
+/// runtime failure: the final management snapshot still contains the old
+/// fixture inventory instead of `frontier-refresh`.
+///
+/// MUTATION CHECK 3: replace the cached ETag extraction in
+/// `begin_provider_models_refresh` with `let etag = None`. Expected runtime
+/// failure: the second discovery observation has no `W/"refresh-etag"`
+/// conditional validator.
+///
+/// MUTATION CHECK 4: in the `CatalogError::Unavailable` completion arm,
+/// upsert the prior cache with a new timestamp before responding. Expected
+/// runtime failure: the exact cached-row equality after the third refresh
+/// observes a changed `fetched_at_ms`.
+///
+/// MUTATION CHECK 5: drop the JoinError cleanup/response in the actor's
+/// `model_refreshes.join_next_with_id()` arm. Expected runtime failure: the
+/// panicked discovery's correlation receives no retryable provider error
+/// (and its retry remains permanently busy).
+///
+/// MUTATION CHECK 6: restore the immediate `break` in the
+/// `AccountCommand::Shutdown` arm. Expected runtime failure: graceful
+/// shutdown completes while discovery is still blocked and drops the
+/// accepted refresh response.
+/// All six verified by revert on 2026-07-30.
+#[tokio::test]
+async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provenance() {
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let alias = CredentialAlias::new("model-refresh-active");
+    let descriptor = CredentialDescriptor {
+        alias: alias.clone(),
+        provider: OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
+        base_url: None,
+        auth_method: AuthMethod::OAuth,
+        identity: "model refresh fixture".to_owned(),
+        status: CredentialStatus::Ok,
+        active: true,
+    };
+    let mut accounts = memory_accounts();
+    accounts.add(descriptor.clone()).expect("descriptor");
+    let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(accounts.list().to_vec()));
+    let vault = Arc::new(MemoryVault::new());
+    vault
+        .put(
+            &alias,
+            &refresh_oauth_bundle().encode().expect("encode bundle"),
+        )
+        .expect("seed OAuth bundle");
+    let providers = test_provider_registry();
+    let management = ManagementSnapshot::new(0, accounts.list().to_vec(), providers.summaries());
+    let discoverer = Arc::new(BlockingModelDiscoverer {
+        started: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+        seen: StdMutex::new(Vec::new()),
+        results: StdMutex::new(std::collections::VecDeque::from([
+            ModelDiscoveryFixture::Return(Ok(DiscoveredCatalog {
+                models: vec![haider_provider::DiscoveredModel {
+                    slug: "frontier-refresh".to_owned(),
+                    display_name: "Provider Refresh Fixture".to_owned(),
+                    description: Some("provider-owned refresh provenance".to_owned()),
+                    default_effort: Some("medium".to_owned()),
+                    supported_efforts: vec!["low".to_owned(), "medium".to_owned()],
+                    visible: true,
+                    priority: Some(7),
+                }],
+                etag: Some(r#"W/"refresh-etag""#.to_owned()),
+            })),
+            ModelDiscoveryFixture::Return(Err(CatalogError::NotModified)),
+            ModelDiscoveryFixture::Return(Err(CatalogError::Unavailable {
+                reason: "fixture catalog is unavailable".to_owned(),
+            })),
+            ModelDiscoveryFixture::Panic,
+            ModelDiscoveryFixture::Return(Err(CatalogError::NotModified)),
+            ModelDiscoveryFixture::Return(Err(CatalogError::NotModified)),
+        ])),
+    });
+    let discoverer_trait: Arc<dyn ProviderModelDiscoverer> = discoverer.clone();
+    let broker_vault = vault.clone() as Arc<dyn Vault>;
+    let broker_snapshot = Arc::clone(&snapshot);
+    let (mut actor, broker) = start_account_actor_with_services(
+        AccountActorConfig {
+            store: store.clone(),
+            accounts,
+            vault: vault as Arc<dyn Vault>,
+            validator: Arc::new(ProviderCredentialValidator),
+            snapshot: Arc::clone(&snapshot),
+            management: Some(management.clone()),
+            profile_id: "model-refresh".to_owned(),
+            default_model: "unused".to_owned(),
+            providers,
+            provider_endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
+            reserved_aliases: HashSet::new(),
+            refresh_fences: RefreshFenceRegistry::default(),
+        },
+        |commands| {
+            CredentialBroker::new(
+                broker_vault,
+                refresh_oauth_catalog(),
+                broker_snapshot,
+                commands,
+            )
+        },
+        discoverer_trait,
+    )
+    .expect("actor with broker");
+
+    let (sink, mut frames) = channel_sink();
+    actor
+        .commands()
+        .send(AccountCommand::RefreshProviderModels {
+            provider: OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
+            completed: LoginRoute {
+                request_id: RequestId::new("refresh-models"),
+                sink,
+            },
+        })
+        .await
+        .expect("refresh handoff");
+    tokio::time::timeout(Duration::from_secs(2), discoverer.started.notified())
+        .await
+        .expect("discovery started");
+
+    let (completed, resolved) = tokio::sync::oneshot::channel();
+    actor
+        .commands()
+        .send(AccountCommand::ResolveCredential {
+            provider: OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
+            failure: None,
+            completed,
+        })
+        .await
+        .expect("resolver handoff");
+    let resolved = tokio::time::timeout(Duration::from_secs(1), resolved)
+        .await
+        .expect("actor remained responsive")
+        .expect("resolver response")
+        .expect("active descriptor");
+    assert_eq!(resolved.descriptor.alias, alias);
+
+    discoverer.release.notify_one();
+    let frame = tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        .await
+        .expect("refresh response deadline")
+        .expect("refresh response");
+    match frame {
+        WireFrame::Response {
+            request_id,
+            body: ResponseBody::ProviderModelsRefresh { provider, revision },
+        } => {
+            assert_eq!(request_id.as_str(), "refresh-models");
+            assert_eq!(revision, 1);
+            assert_eq!(provider.models, vec!["frontier-refresh"]);
+            assert_eq!(provider.default_model, None);
+        }
+        other => panic!("unexpected refresh response: {other:?}"),
+    }
+
+    let seen = discoverer.seen.lock().expect("seen lock").clone();
+    assert_eq!(
+        seen.first(),
+        Some(&(
+            CatalogSource::OpenAiSubscription,
+            "MODEL_REFRESH_ACCESS_SENTINEL_73c1".to_owned(),
+            None,
+        )),
+        "discovery receives the broker-extracted access token, never the encoded bundle"
+    );
+    let cached = store
+        .provider_models(OPENAI_OAUTH_PROVIDER_NAME.to_owned())
+        .await
+        .expect("cache read")
+        .expect("cache row");
+    let cached_models: Vec<haider_provider::DiscoveredModel> =
+        serde_json::from_str(&cached.models_json).expect("cached catalog");
+    assert_eq!(cached_models[0].slug, "frontier-refresh");
+    assert_eq!(cached.etag.as_deref(), Some(r#"W/"refresh-etag""#));
+    let view = management.read().expect("management view");
+    assert_eq!(view.revision, 1);
+    let summary = view
+        .providers
+        .iter()
+        .find(|summary| summary.provider == OPENAI_OAUTH_PROVIDER_NAME)
+        .expect("refreshed provider");
+    assert_eq!(summary.models, vec!["frontier-refresh"]);
+
+    tokio::time::sleep(Duration::from_millis(2)).await;
+    let (sink, mut not_modified_frames) = channel_sink();
+    actor
+        .commands()
+        .send(AccountCommand::RefreshProviderModels {
+            provider: OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
+            completed: LoginRoute {
+                request_id: RequestId::new("refresh-models-not-modified"),
+                sink,
+            },
+        })
+        .await
+        .expect("conditional refresh handoff");
+    tokio::time::timeout(Duration::from_secs(2), discoverer.started.notified())
+        .await
+        .expect("conditional discovery started");
+    discoverer.release.notify_one();
+    let frame = tokio::time::timeout(Duration::from_secs(2), not_modified_frames.recv())
+        .await
+        .expect("not-modified response deadline")
+        .expect("not-modified response");
+    assert!(matches!(
+        frame,
+        WireFrame::Response {
+            body: ResponseBody::ProviderModelsRefresh { revision: 1, .. },
+            ..
+        }
+    ));
+    let touched = store
+        .provider_models(OPENAI_OAUTH_PROVIDER_NAME.to_owned())
+        .await
+        .expect("touched cache read")
+        .expect("touched cache row");
+    assert_eq!(touched.models_json, cached.models_json);
+    assert_eq!(touched.etag, cached.etag);
+    assert!(
+        touched.fetched_at_ms > cached.fetched_at_ms,
+        "304 refresh must touch only the fetch timestamp"
+    );
+    assert_eq!(store.management_revision().await.expect("revision"), 1);
+    let seen = discoverer.seen.lock().expect("seen lock").clone();
+    assert_eq!(
+        seen.get(1).and_then(|(_, _, etag)| etag.as_deref()),
+        Some(r#"W/"refresh-etag""#)
+    );
+
+    tokio::time::sleep(Duration::from_millis(2)).await;
+    let before_unavailable = touched;
+    let (sink, mut unavailable_frames) = channel_sink();
+    actor
+        .commands()
+        .send(AccountCommand::RefreshProviderModels {
+            provider: OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
+            completed: LoginRoute {
+                request_id: RequestId::new("refresh-models-unavailable"),
+                sink,
+            },
+        })
+        .await
+        .expect("unavailable refresh handoff");
+    tokio::time::timeout(Duration::from_secs(2), discoverer.started.notified())
+        .await
+        .expect("unavailable discovery started");
+    discoverer.release.notify_one();
+    let frame = tokio::time::timeout(Duration::from_secs(2), unavailable_frames.recv())
+        .await
+        .expect("unavailable response deadline")
+        .expect("unavailable response");
+    match frame {
+        WireFrame::Response {
+            body:
+                ResponseBody::Error {
+                    code,
+                    message,
+                    retryable,
+                    data: Some(ErrorData::ProviderModelsUnavailable { provider, reason }),
+                },
+            ..
+        } => {
+            assert_eq!(code, ERROR_CODE_PROVIDER_ERROR);
+            assert_eq!(message, "fixture catalog is unavailable");
+            assert!(!retryable);
+            assert_eq!(provider, OPENAI_OAUTH_PROVIDER_NAME);
+            assert_eq!(reason, "fixture catalog is unavailable");
+        }
+        other => panic!("unexpected unavailable response: {other:?}"),
+    }
+    assert_eq!(
+        store
+            .provider_models(OPENAI_OAUTH_PROVIDER_NAME.to_owned())
+            .await
+            .expect("cache after unavailable")
+            .expect("cache remains"),
+        before_unavailable
+    );
+    assert_eq!(store.management_revision().await.expect("revision"), 1);
+
+    let (sink, mut panic_frames) = channel_sink();
+    actor
+        .commands()
+        .send(AccountCommand::RefreshProviderModels {
+            provider: OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
+            completed: LoginRoute {
+                request_id: RequestId::new("refresh-models-panic"),
+                sink,
+            },
+        })
+        .await
+        .expect("panic refresh handoff");
+    tokio::time::timeout(Duration::from_secs(2), discoverer.started.notified())
+        .await
+        .expect("panic discovery started");
+    discoverer.release.notify_one();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), panic_frames.recv())
+            .await
+            .expect("panic response deadline")
+            .expect("panic response"),
+        WireFrame::Response {
+            body:
+                ResponseBody::Error {
+                    code,
+                    retryable: true,
+                    data: None,
+                    ..
+                },
+            ..
+        } if code == ERROR_CODE_PROVIDER_ERROR
+    ));
+
+    let (sink, mut recovered_frames) = channel_sink();
+    actor
+        .commands()
+        .send(AccountCommand::RefreshProviderModels {
+            provider: OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
+            completed: LoginRoute {
+                request_id: RequestId::new("refresh-models-after-panic"),
+                sink,
+            },
+        })
+        .await
+        .expect("post-panic refresh handoff");
+    tokio::time::timeout(Duration::from_secs(2), discoverer.started.notified())
+        .await
+        .expect("post-panic discovery started");
+    discoverer.release.notify_one();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), recovered_frames.recv())
+            .await
+            .expect("post-panic response deadline")
+            .expect("post-panic response"),
+        WireFrame::Response {
+            body: ResponseBody::ProviderModelsRefresh { revision: 1, .. },
+            ..
+        }
+    ));
+
+    let (sink, mut draining_frames) = channel_sink();
+    actor
+        .commands()
+        .send(AccountCommand::RefreshProviderModels {
+            provider: OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
+            completed: LoginRoute {
+                request_id: RequestId::new("refresh-models-during-drain"),
+                sink,
+            },
+        })
+        .await
+        .expect("draining refresh handoff");
+    tokio::time::timeout(Duration::from_secs(2), discoverer.started.notified())
+        .await
+        .expect("draining discovery started");
+    let mut shutdown = tokio::spawn(async move {
+        actor.shutdown().await;
+        actor
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), &mut shutdown)
+            .await
+            .is_err(),
+        "graceful shutdown must wait for the accepted discovery"
+    );
+    discoverer.release.notify_one();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), draining_frames.recv())
+            .await
+            .expect("draining response deadline")
+            .expect("draining response"),
+        WireFrame::Response {
+            body: ResponseBody::ProviderModelsRefresh { revision: 1, .. },
+            ..
+        }
+    ));
+    let _actor = tokio::time::timeout(Duration::from_secs(2), shutdown)
+        .await
+        .expect("graceful actor shutdown deadline")
+        .expect("graceful actor shutdown");
+    assert!(broker.shutdown().await);
+    store.close().await.expect("close");
 }
 
 /// Release evidence, never the merge gate (§6.2): the PACKAGED default

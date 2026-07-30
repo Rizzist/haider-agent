@@ -151,6 +151,8 @@ pub const FEATURE_ACCOUNT_MANAGEMENT_V1: &str = "account_management_v1";
 pub const FEATURE_PROVIDER_MANAGEMENT_V1: &str = "provider_management_v1";
 /// Daemon implements durable `provider.configure`.
 pub const FEATURE_PROVIDER_CONFIGURE_V1: &str = "provider_configure_v1";
+/// Daemon implements provider-owned model discovery refresh.
+pub const FEATURE_PROVIDER_MODELS_V1: &str = "provider_models_v1";
 /// Daemon implements live same-provider account rotation.
 pub const FEATURE_ACCOUNT_ROTATION_V1: &str = "account_rotation_v1";
 
@@ -826,6 +828,10 @@ pub enum RequestBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider: Option<String>,
     },
+    /// Refreshes one OAuth provider's model inventory from the provider's own
+    /// authenticated catalog.
+    #[serde(rename = "provider.models_refresh")]
+    ProviderModelsRefresh { provider: String },
     /// Creates a custom provider or safely updates mutable fields on an
     /// existing profile. Identity fields are required on create and may be
     /// omitted on update; when supplied for an existing profile they must
@@ -993,6 +999,11 @@ pub enum ResponseBody {
         providers: Vec<ProviderSummaryWire>,
         revision: u64,
     },
+    #[serde(rename = "provider.models_refresh")]
+    ProviderModelsRefresh {
+        provider: ProviderSummaryWire,
+        revision: u64,
+    },
     #[serde(rename = "provider.configure")]
     ProviderConfigure {
         provider: ProviderSummaryWire,
@@ -1086,6 +1097,8 @@ pub enum ErrorData {
         expected_revision: u64,
         current_revision: u64,
     },
+    /// The provider did not serve a model catalog to the active credential.
+    ProviderModelsUnavailable { provider: String, reason: String },
     /// Decode artifact for a data kind this crate does not know (tolerance
     /// discipline).
     #[serde(other)]
