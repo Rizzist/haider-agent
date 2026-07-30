@@ -797,9 +797,8 @@ fn render_accounts(
     let mut lines: Vec<Line<'_>> = Vec::new();
     // (line index, hit) pairs resolved to rects after layout.
     let mut line_hits: Vec<(usize, Hit)> = Vec::new();
-    // Add-row buttons: (line index, column offset, width) in ISSUE order —
-    // consumed positionally against the `Hit::AccountAdd` entries below.
-    let mut add_button_rects: Vec<(usize, u16, u16)> = Vec::new();
+    // Add-row buttons: (footer line, column offset, width, hit).
+    let mut add_button_rects: Vec<(usize, u16, u16, Hit)> = Vec::new();
 
     lines.push(Line::from(vec![
         Span::styled(
@@ -914,18 +913,75 @@ fn render_accounts(
                 ));
             }
             let mut line = Line::from(spans);
-            // Keyboard cursor (W5 accessibility extension): the same
-            // hover band the mouse rows take.
-            if model.accounts.cursor == index {
+            // Hover chrome: the mouse band (owner ask) OR the keyboard
+            // cursor — the same hover band either way.
+            let row_hit = Hit::AccountRow(row.alias.clone());
+            if model.accounts.cursor == index || model.hovered.as_ref() == Some(&row_hit) {
                 line = hover_band(line, true, area.width, theme);
             }
-            line_hits.push((lines.len(), Hit::AccountRow(row.alias.clone())));
+            line_hits.push((lines.len(), row_hit));
             lines.push(line);
         }
     }
 
-    lines.push(Line::raw(""));
-    // The ONE global add row after all groups (sim tui.js:3621-3628).
+    // The ONE global add row (sim tui.js:3621-3628) + hints — anchored to
+    // the BOTTOM of the screen (owner ask 2026-07-30: with few or zero
+    // accounts the flowed position sat awkwardly high). `footer_lines`
+    // renders at area.bottom − its height; the list keeps the top.
+    let mut footer_lines: Vec<Line<'_>> = Vec::new();
+    // The OAuth add card (W5e-1, sim authFlow MenuBox tui.js:3629-3682) —
+    // rendered with the bottom chrome, above the add row.
+    if let Some(card) = &model.oauth_add {
+        footer_lines.push(Line::from(vec![
+            Span::styled("◉ ", theme.gold_style()),
+            Span::styled(
+                format!("authorize {} — OAuth (loopback PKCE)", card.title),
+                theme.warn_style(),
+            ),
+        ]));
+        match &card.phase {
+            crate::app::OAuthAddPhase::Starting => {
+                footer_lines.push(Line::styled(
+                    "  starting the loopback flow…",
+                    theme.dim_style(),
+                ));
+            }
+            crate::app::OAuthAddPhase::WaitingBrowser { origin, .. } => {
+                footer_lines.push(Line::styled(
+                    format!(
+                        "  your browser opened {} — approve there; tokens land in the vault",
+                        if origin.is_empty() { "the provider" } else { origin }
+                    ),
+                    theme.dim_style(),
+                ));
+                footer_lines.push(Line::styled(
+                    format!("  alias: {} · usage billed to the subscription", card.alias),
+                    theme.faint_style(),
+                ));
+                footer_lines.push(Line::from(vec![Span::styled(
+                    "  [1] open the link again · [2] cancel",
+                    theme.gold_style(),
+                )]));
+            }
+            crate::app::OAuthAddPhase::Exchanging => {
+                footer_lines.push(Line::styled(
+                    "  approved — exchanging the code…",
+                    theme.pulse_ink(theme.gold, model.anim_phase),
+                ));
+            }
+            crate::app::OAuthAddPhase::Adding => {
+                footer_lines.push(Line::styled(
+                    "  committing the account…",
+                    theme.pulse_ink(theme.gold, model.anim_phase),
+                ));
+            }
+            crate::app::OAuthAddPhase::Failed { message } => {
+                footer_lines.push(Line::styled(format!("  ✗ {message}"), theme.err_style()));
+                footer_lines.push(Line::styled("  [2] close", theme.gold_style()));
+            }
+        }
+        footer_lines.push(Line::raw(""));
+    }
     for chunk in [
         [
             ("+ OpenAI (OAuth)", crate::app::AccountAddKind::OpenAiOAuth),
@@ -944,74 +1000,80 @@ fn render_accounts(
             ),
         ],
     ] {
-        // One hit per BUTTON needs per-span rects; simplest honest cut:
-        // one row per button column chunk, each button its own line-third.
-        // Buttons are short — three per row fits 80 cols.
-        let spans: Vec<Span<'_>> = chunk
-            .iter()
-            .flat_map(|(label, _)| {
-                vec![
-                    Span::styled(format!("[{label}]"), theme.gold_style()),
-                    Span::raw("  "),
-                ]
-            })
-            .collect();
-        // The row's first button anchors the hit resolution below: store
-        // each button with its column offset.
+        // One hit per BUTTON: per-button column rects, hover-aware (owner
+        // ask): the hovered button renders on the hover band.
+        let mut spans: Vec<Span<'_>> = Vec::new();
         let mut offset = 0u16;
         for (label, kind) in chunk {
-            line_hits.push((lines.len(), Hit::AccountAdd(kind)));
-            // Column-aware rect fixed up after layout via the offset list.
+            let hit = Hit::AccountAdd(kind);
+            let hovered = model.hovered.as_ref() == Some(&hit);
             let width = label.chars().count() as u16 + 2;
-            add_button_rects.push((lines.len(), offset, width));
+            add_button_rects.push((footer_lines.len(), offset, width, hit));
+            spans.push(Span::styled(
+                format!("[{label}]"),
+                if hovered {
+                    theme.hover_style().patch(theme.gold_style())
+                } else {
+                    theme.gold_style()
+                },
+            ));
+            spans.push(Span::raw("  "));
             offset += width + 2;
         }
-        lines.push(Line::from(spans));
+        footer_lines.push(Line::from(spans));
     }
-
-    lines.push(Line::raw(""));
-    lines.push(Line::styled(
+    footer_lines.push(Line::raw(""));
+    footer_lines.push(Line::styled(
         "click an account to make it active for its provider · + adds via OAuth / API · esc back",
         theme.faint_style(),
     ));
 
-    let paragraph = Paragraph::new(lines.clone());
-    frame.render_widget(paragraph, area);
+    let footer_height = footer_lines.len() as u16;
+    let footer_top = area.y + area.height.saturating_sub(footer_height);
+    // The list gets everything above the footer (truncated if it would
+    // collide; the footer is the fixed chrome).
+    let list_height = footer_top.saturating_sub(area.y);
+    lines.truncate(list_height as usize);
+    frame.render_widget(Paragraph::new(lines.clone()), area);
+    let footer_area = Rect {
+        x: area.x,
+        y: footer_top,
+        width: area.width,
+        height: footer_height.min(area.height),
+    };
+    frame.render_widget(Paragraph::new(footer_lines), footer_area);
 
-    // Resolve hits: full-width rows for accounts, column rects for buttons.
-    let mut button_cursor = 0usize;
+    // Resolve hits: full-width rows for accounts (top block coordinates),
+    // column rects for the bottom-anchored buttons (footer coordinates).
     for (line_index, hit) in line_hits {
         let y = area.y + line_index as u16;
-        if y >= area.y + area.height {
+        if y >= footer_top {
+            continue; // truncated behind the footer
+        }
+        hits.push((
+            Rect {
+                x: area.x,
+                y,
+                width: area.width,
+                height: 1,
+            },
+            hit,
+        ));
+    }
+    for (footer_line, x, width, hit) in add_button_rects {
+        let y = footer_top + footer_line as u16;
+        if y >= area.y + area.height || x >= area.width {
             continue;
         }
-        match &hit {
-            Hit::AccountAdd(_) => {
-                if let Some((_, x, width)) = add_button_rects.get(button_cursor) {
-                    hits.push((
-                        Rect {
-                            x: area.x + x,
-                            y,
-                            width: (*width).min(area.width.saturating_sub(*x)),
-                            height: 1,
-                        },
-                        hit,
-                    ));
-                }
-                button_cursor += 1;
-            }
-            _ => {
-                hits.push((
-                    Rect {
-                        x: area.x,
-                        y,
-                        width: area.width,
-                        height: 1,
-                    },
-                    hit,
-                ));
-            }
-        }
+        hits.push((
+            Rect {
+                x: area.x + x,
+                y,
+                width: width.min(area.width - x),
+                height: 1,
+            },
+            hit,
+        ));
     }
 }
 

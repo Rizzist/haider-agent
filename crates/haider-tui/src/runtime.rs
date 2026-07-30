@@ -1258,6 +1258,28 @@ impl DemoDriver {
                 let revision = model.providers.revision.map_or(1, |current| current + 1);
                 model.apply_default_model_set(summary, revision);
             }
+            AppRequest::OAuthAddStart {
+                provider, attempt, ..
+            } => {
+                // The demo card goes straight to the sim's authorize step
+                // (tui.js:3633): a canned loopback URL, `[1]` simulates.
+                let origin = match provider.as_str() {
+                    "openai-oauth" => "auth.openai.com",
+                    _ => "claude.ai",
+                };
+                model.oauth_add_phase(
+                    attempt,
+                    crate::app::OAuthAddPhase::WaitingBrowser {
+                        url: "http://localhost:1455/callback (demo)".to_owned(),
+                        origin: origin.to_owned(),
+                    },
+                );
+            }
+            AppRequest::OAuthAddCancel { .. } => {}
+            AppRequest::OpenUrl { url } => {
+                model.flash = Some(format!("· browser (demo): {url}"));
+                model.dirty = true;
+            }
             AppRequest::AccountSetActive { alias } => {
                 let Some(row) = model
                     .accounts
@@ -2232,6 +2254,8 @@ pub fn live_pass(
     // a reply racing its own deadline in one pass mints nothing.
     driver.expire_login(model);
     let mut commands = Vec::new();
+    // The OAuth poll sweep (W5e-1): same clock as the login deadline.
+    commands.extend(driver.oauth_poll());
     if let Some(reply) = reply {
         commands.extend(driver.apply(model, reply));
     }
@@ -2239,7 +2263,10 @@ pub fn live_pass(
     let requests: Vec<AppRequest> = model.requests.drain(..).collect();
     for request in requests {
         match request {
-            AppRequest::CopySelection | AppRequest::CopyText(_) | AppRequest::Quit => {
+            AppRequest::CopySelection
+            | AppRequest::CopyText(_)
+            | AppRequest::OpenUrl { .. }
+            | AppRequest::Quit => {
                 shell.push(request);
             }
             request => commands.extend(driver.handle_request(model, request)),

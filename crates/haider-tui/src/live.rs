@@ -160,6 +160,34 @@ pub enum LiveCommand {
     AccountSetActive { command_id: CommandId, alias: String },
     /// `provider.list` for the `/providers` screen (W5d). A read.
     ProviderList,
+    /// `account.oauth_start` (W5e-1). Transient — never outboxed; a lost
+    /// response is answered by a fresh card, never a replay.
+    OAuthStart {
+        provider: String,
+        desired_alias: String,
+        attempt_id: String,
+    },
+    /// `account.oauth_status` poll for the bound flow.
+    OAuthStatus {
+        flow_id: haider_rpc::OAuthFlowId,
+        attempt_id: String,
+    },
+    /// `account.oauth_cancel` (idempotent).
+    OAuthCancel {
+        flow_id: haider_rpc::OAuthFlowId,
+        attempt_id: String,
+    },
+    /// `account.add` for a READY flow reference. DURABLE: the reference is
+    /// excluded from the semantic digest, so a retry replays the committed
+    /// descriptor.
+    AccountAddOAuth {
+        command_id: CommandId,
+        provider: String,
+        alias: String,
+        flow_id: haider_rpc::OAuthFlowId,
+        attempt_id: String,
+        oauth_reference: haider_rpc::OAuthReadyRefWire,
+    },
     /// `account.set_default_model` under the expected-revision CAS (W5d).
     SetDefaultModel {
         command_id: CommandId,
@@ -181,11 +209,15 @@ impl LiveCommand {
             Self::LoginApi { command_id, .. } => Some(command_id),
             Self::AccountSetActive { command_id, .. } => Some(command_id),
             Self::SetDefaultModel { command_id, .. } => Some(command_id),
+            Self::AccountAddOAuth { command_id, .. } => Some(command_id),
             Self::List { .. }
             | Self::Attach { .. }
             | Self::Detach { .. }
             | Self::AccountList
             | Self::ProviderList
+            | Self::OAuthStart { .. }
+            | Self::OAuthStatus { .. }
+            | Self::OAuthCancel { .. }
             // A stage carries no durable identity BY DESIGN (see above).
             | Self::Stage { .. } => None,
         }
@@ -330,6 +362,24 @@ pub enum LiveReply {
         provider: haider_rpc::ProviderSummaryWire,
         revision: u64,
     },
+    /// `account.oauth_start` answered (attempt-tagged via context).
+    OAuthStarted {
+        attempt_id: String,
+        availability: haider_rpc::OAuthAvailabilityWire,
+        flow_id: Option<haider_rpc::OAuthFlowId>,
+        authorization_url: Option<String>,
+        provider_origin: Option<String>,
+    },
+    /// `account.oauth_status` answered.
+    OAuthFlowStatus {
+        flow_id: haider_rpc::OAuthFlowId,
+        status: haider_rpc::OAuthFlowStatusWire,
+    },
+    /// `account.add` committed the OAuth descriptor.
+    AccountAdded {
+        command_id: CommandId,
+        descriptor: haider_protocol::credential::CredentialDescriptor,
+    },
     /// The connection died; the shell will dial again.
     Disconnected {
         reason: String,
@@ -350,6 +400,23 @@ struct Pending {
     command_id: CommandId,
     command: LiveCommand,
 }
+
+/// The driver's OAuth add flight (W5e-1). One at a time — the card is total
+/// over the accounts screen. Poll cadence bounded by [`OAUTH_POLL_INTERVAL`].
+#[derive(Debug)]
+struct OAuthFlight {
+    attempt: u64,
+    attempt_id: String,
+    provider: String,
+    alias: String,
+    flow: Option<haider_rpc::OAuthFlowId>,
+    last_poll: Option<std::time::Instant>,
+    /// The durable add command once READY fired (correlates its failure).
+    add_command: Option<CommandId>,
+}
+
+/// `account.oauth_status` poll cadence while the browser owns the flow.
+const OAUTH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1500);
 
 /// The committed coordinates of one open menu (report R11 cut 4): a live
 /// answer is built from the OPENING envelope, never from local state.
@@ -446,6 +513,8 @@ pub struct LiveDriver {
     pending_account_select: Option<(CommandId, String)>,
     /// The in-flight `account.set_default_model`: (command, provider).
     pending_default_model: Option<(CommandId, String)>,
+    /// The one OAuth add flight (W5e-1): the card's whole driver state.
+    oauth_flight: Option<OAuthFlight>,
     /// Durable mutations awaiting a response, in issue order.
     outbox: Vec<Pending>,
     /// Committed menu coordinates, by menu id.
@@ -506,6 +575,7 @@ impl LiveDriver {
             login_started: None,
             pending_account_select: None,
             pending_default_model: None,
+            oauth_flight: None,
             outbox: Vec::new(),
             menus: HashMap::new(),
             generations: HashMap::new(),
@@ -1006,6 +1076,118 @@ impl LiveDriver {
                 model.apply_default_model_set(provider, revision);
                 Vec::new()
             }
+            LiveReply::OAuthStarted {
+                attempt_id,
+                availability,
+                flow_id,
+                authorization_url,
+                provider_origin,
+            } => {
+                let Some(flight) = self
+                    .oauth_flight
+                    .as_mut()
+                    .filter(|flight| flight.attempt_id == attempt_id)
+                else {
+                    return Vec::new(); // retired card's ghost — silent
+                };
+                if !availability.available {
+                    let attempt = flight.attempt;
+                    let reason = availability
+                        .reason
+                        .unwrap_or_else(|| "OAuth is unavailable for this provider".to_owned());
+                    self.oauth_flight = None;
+                    model.oauth_add_failed(attempt, &reason);
+                    return Vec::new();
+                }
+                let (Some(flow_id), Some(url)) = (flow_id, authorization_url) else {
+                    let attempt = flight.attempt;
+                    self.oauth_flight = None;
+                    model.oauth_add_failed(attempt, "the daemon returned no authorization URL");
+                    return Vec::new();
+                };
+                flight.flow = Some(flow_id);
+                flight.last_poll = Some(self.now);
+                let attempt = flight.attempt;
+                model.oauth_add_phase(
+                    attempt,
+                    crate::app::OAuthAddPhase::WaitingBrowser {
+                        url: url.clone(),
+                        origin: provider_origin.unwrap_or_default(),
+                    },
+                );
+                // The authorize hop: open the user's browser (runtime effect).
+                model.requests.push(AppRequest::OpenUrl { url });
+                Vec::new()
+            }
+            LiveReply::OAuthFlowStatus { flow_id, status } => {
+                let Some(flight) = self
+                    .oauth_flight
+                    .as_mut()
+                    .filter(|flight| flight.flow.as_ref() == Some(&flow_id))
+                else {
+                    return Vec::new();
+                };
+                let attempt = flight.attempt;
+                match status {
+                    haider_rpc::OAuthFlowStatusWire::WaitingBrowser => Vec::new(),
+                    haider_rpc::OAuthFlowStatusWire::Exchanging => {
+                        model.oauth_add_phase(attempt, crate::app::OAuthAddPhase::Exchanging);
+                        Vec::new()
+                    }
+                    haider_rpc::OAuthFlowStatusWire::Ready {
+                        oauth_reference, ..
+                    } => {
+                        if flight.add_command.is_some() {
+                            return Vec::new(); // add already in flight
+                        }
+                        self.next_command += 1;
+                        let command_id = CommandId::new(format!(
+                            "{}-{}",
+                            self.instance, self.next_command
+                        ));
+                        flight.add_command = Some(command_id.clone());
+                        let command = LiveCommand::AccountAddOAuth {
+                            command_id,
+                            provider: flight.provider.clone(),
+                            alias: flight.alias.clone(),
+                            flow_id,
+                            attempt_id: flight.attempt_id.clone(),
+                            oauth_reference,
+                        };
+                        model.oauth_add_phase(attempt, crate::app::OAuthAddPhase::Adding);
+                        vec![self.enqueue(command)]
+                    }
+                    haider_rpc::OAuthFlowStatusWire::Failed { public_code } => {
+                        self.oauth_flight = None;
+                        model.oauth_add_failed(attempt, &format!("authorize failed: {public_code}"));
+                        Vec::new()
+                    }
+                    haider_rpc::OAuthFlowStatusWire::Expired => {
+                        self.oauth_flight = None;
+                        model.oauth_add_failed(attempt, "the authorize window expired — start again");
+                        Vec::new()
+                    }
+                    haider_rpc::OAuthFlowStatusWire::Cancelled => {
+                        self.oauth_flight = None;
+                        model.oauth_add_failed(attempt, "the flow was cancelled");
+                        Vec::new()
+                    }
+                    _ => Vec::new(),
+                }
+            }
+            LiveReply::AccountAdded {
+                command_id,
+                descriptor,
+            } => {
+                self.retire(&command_id);
+                if let Some(flight) = self
+                    .oauth_flight
+                    .take_if(|flight| flight.add_command.as_ref() == Some(&command_id))
+                {
+                    model.oauth_add_completed(flight.attempt, &descriptor);
+                }
+                Vec::new()
+            }
             LiveReply::Event {
                 attachment,
                 session,
@@ -1165,6 +1347,18 @@ impl LiveDriver {
                 {
                     self.retire(id);
                     model.dirty = true;
+                    return Vec::new();
+                }
+                // A failed OAuth `account.add` fails the card in place.
+                if let Some(id) = &command_id
+                    && let Some(flight) = self
+                        .oauth_flight
+                        .take_if(|flight| flight.add_command.as_ref() == Some(id))
+                {
+                    if !retryable {
+                        self.retire(id);
+                    }
+                    model.oauth_add_failed(flight.attempt, &message);
                     return Vec::new();
                 }
                 // A failed `account.set_default_model` releases its gate;
@@ -1335,8 +1529,47 @@ impl LiveDriver {
     /// at "validating…", closed to input, until the user pressed a key.
     #[must_use]
     pub fn next_deadline(&self) -> Option<std::time::Instant> {
-        self.login_started
-            .map(|started| started + LOGIN_STAGE_TIMEOUT)
+        let login = self
+            .login_started
+            .map(|started| started + LOGIN_STAGE_TIMEOUT);
+        // The OAuth poll cadence: wake when the next status poll is due.
+        let oauth = self
+            .oauth_flight
+            .as_ref()
+            .filter(|flight| flight.flow.is_some() && flight.add_command.is_none())
+            .and_then(|flight| flight.last_poll)
+            .map(|last| last + OAUTH_POLL_INTERVAL);
+        match (login, oauth) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// The OAuth poll sweep (W5e-1), driven by the same pass that expires
+    /// logins: when the card is waiting on the browser and the cadence is
+    /// due, emit one `account.oauth_status`.
+    pub(crate) fn oauth_poll(&mut self) -> Vec<LiveCommand> {
+        let Some(flight) = self
+            .oauth_flight
+            .as_mut()
+            .filter(|flight| flight.add_command.is_none())
+        else {
+            return Vec::new();
+        };
+        let Some(flow_id) = flight.flow.clone() else {
+            return Vec::new();
+        };
+        let due = flight
+            .last_poll
+            .is_none_or(|last| self.now.duration_since(last) >= OAUTH_POLL_INTERVAL);
+        if !due {
+            return Vec::new();
+        }
+        flight.last_poll = Some(self.now);
+        vec![LiveCommand::OAuthStatus {
+            flow_id,
+            attempt_id: flight.attempt_id.clone(),
+        }]
     }
 
     /// The pass's deadline sweep — see [`LOGIN_STAGE_TIMEOUT`]. Driven by
@@ -1568,6 +1801,46 @@ impl LiveDriver {
             // `/accounts` (W5d): a read — never in the outbox.
             AppRequest::AccountsRefresh => vec![LiveCommand::AccountList],
             AppRequest::ProvidersRefresh => vec![LiveCommand::ProviderList],
+            AppRequest::OAuthAddStart {
+                provider,
+                alias,
+                attempt,
+            } => {
+                self.next_command += 1;
+                let attempt_id = format!("{}-oauth-{}", self.instance, self.next_command);
+                self.oauth_flight = Some(OAuthFlight {
+                    attempt,
+                    attempt_id: attempt_id.clone(),
+                    provider: provider.clone(),
+                    alias: alias.clone(),
+                    flow: None,
+                    last_poll: None,
+                    add_command: None,
+                });
+                vec![LiveCommand::OAuthStart {
+                    provider,
+                    desired_alias: alias,
+                    attempt_id,
+                }]
+            }
+            AppRequest::OAuthAddCancel { attempt } => {
+                let Some(flight) = self
+                    .oauth_flight
+                    .take_if(|flight| flight.attempt == attempt)
+                else {
+                    return Vec::new();
+                };
+                match flight.flow {
+                    Some(flow_id) => vec![LiveCommand::OAuthCancel {
+                        flow_id,
+                        attempt_id: flight.attempt_id,
+                    }],
+                    None => Vec::new(),
+                }
+            }
+            // OpenUrl is runtime-owned (like CopySelection) — never a wire
+            // command; reaching here means a headless drain: no-op.
+            AppRequest::OpenUrl { .. } => Vec::new(),
             AppRequest::SetDefaultModel {
                 provider,
                 model,
