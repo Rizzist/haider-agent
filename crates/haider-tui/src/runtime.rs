@@ -1221,6 +1221,41 @@ impl DemoDriver {
             | AppRequest::CopyText(_)
             | AppRequest::Reattach { .. }
             | AppRequest::CreateSession { .. } => {}
+            // `/accounts` (W5d): the demo world answers from the sim's seed
+            // list, synchronously — through the SAME reducer seams as live
+            // (apply_snapshot / apply_account_selected), so the
+            // forbidden-optimism gates run in both modes.
+            AppRequest::AccountsRefresh => {
+                if model.accounts.rows.is_empty() {
+                    model
+                        .accounts
+                        .apply_snapshot(crate::mock::seed_account_rows(), None);
+                }
+                model.dirty = true;
+            }
+            AppRequest::AccountSetActive { alias } => {
+                let Some(row) = model
+                    .accounts
+                    .rows
+                    .iter()
+                    .find(|row| row.alias == alias)
+                    .cloned()
+                else {
+                    model.account_select_failed(&alias, "unknown account");
+                    return;
+                };
+                let descriptor = haider_protocol::credential::CredentialDescriptor {
+                    alias: haider_protocol::ids::CredentialAlias::new(row.alias),
+                    provider: row.provider,
+                    base_url: row.base_url,
+                    auth_method: row.method,
+                    identity: row.identity,
+                    status: row.status,
+                    active: true,
+                };
+                let revision = model.accounts.revision.map_or(1, |current| current + 1);
+                model.apply_account_selected(&descriptor, revision);
+            }
             // `/login … api` needs a daemon. The demo answers honestly
             // rather than pretending to store a key (and the secret drops —
             // zeroized — right here).

@@ -201,6 +201,89 @@ pub enum Screen {
     Session,
     Subagent,
     Aura,
+    /// `/accounts` — the sim's harness-owned credential list
+    /// (tui.js:3588-3688), backed by `account.list` in live mode.
+    Accounts,
+}
+
+/// Sim `AUTH_LABEL` (tui.js:145): the badge text per auth method.
+#[must_use]
+pub fn auth_label(method: haider_protocol::credential::AuthMethod) -> &'static str {
+    match method {
+        haider_protocol::credential::AuthMethod::OAuth => "oauth",
+        haider_protocol::credential::AuthMethod::ApiKey => "api key",
+    }
+}
+
+/// One `/accounts` row (sim seedAccounts shape, tui.js:146-154), projected
+/// from `account.list` descriptors in live mode or the demo seed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AccountRow {
+    pub alias: String,
+    pub provider: String,
+    pub method: haider_protocol::credential::AuthMethod,
+    pub identity: String,
+    /// `Ok` renders the sim's literal `active`; Limited/Expired/Revoked are
+    /// additive W5 status vocabulary with their own snapshots.
+    pub status: haider_protocol::credential::CredentialStatus,
+    pub selected: bool,
+    pub base_url: Option<String>,
+}
+
+impl AccountRow {
+    /// Projects one `account.list` descriptor into a screen row.
+    #[must_use]
+    pub fn from_descriptor(
+        descriptor: &haider_protocol::credential::CredentialDescriptor,
+    ) -> Self {
+        Self {
+            alias: descriptor.alias.as_str().to_owned(),
+            provider: descriptor.provider.clone(),
+            method: descriptor.auth_method,
+            identity: descriptor.identity.clone(),
+            status: descriptor.status.clone(),
+            selected: descriptor.active,
+            base_url: descriptor.base_url.clone(),
+        }
+    }
+}
+
+/// The `/accounts` screen state. OPTIMISTIC SELECTION IS FORBIDDEN (report
+/// §5.1): the dot moves only when a correlated daemon result or a
+/// newer-revision snapshot applies — never on click.
+#[derive(Debug, Default)]
+pub struct AccountsState {
+    pub rows: Vec<AccountRow>,
+    /// Management revision the rows were read at; an older reply is DROPPED.
+    pub revision: Option<u64>,
+    /// Last account action (sim `acctMsg`), shown under the head line.
+    pub message: Option<String>,
+    /// In-flight `account.set_active` target. While `Some`, the rows do not
+    /// move and further selects are refused (one at a time).
+    pub pending_select: Option<String>,
+    /// Keyboard highlight over the flattened selectable rows (W5
+    /// accessibility extension — separately goldened).
+    pub cursor: usize,
+}
+
+impl AccountsState {
+    /// Applies an `account.list` snapshot, gated on revision monotonicity.
+    /// `None` revisions (older daemons) always apply.
+    pub fn apply_snapshot(&mut self, rows: Vec<AccountRow>, revision: Option<u64>) -> bool {
+        if let (Some(current), Some(new)) = (self.revision, revision)
+            && new < current
+        {
+            return false;
+        }
+        self.rows = rows;
+        if revision.is_some() {
+            self.revision = revision;
+        }
+        if self.cursor >= self.rows.len() {
+            self.cursor = self.rows.len().saturating_sub(1);
+        }
+        true
+    }
 }
 
 /// A chip's pending question (the amber `?` / recovery `⌁`).
@@ -998,6 +1081,13 @@ pub enum AppRequest {
         session: haider_protocol::ids::SessionId,
         after_seq: u64,
     },
+    /// Fetch/refresh the `/accounts` rows (`account.list`). Pushed on
+    /// entering the screen; the demo driver answers from the seed list.
+    AccountsRefresh,
+    /// `account.set_active` for the clicked/entered row. The model already
+    /// holds `pending_select` — the dot moves only when the driver's reply
+    /// applies (optimism forbidden, report §5.1).
+    AccountSetActive { alias: String },
     /// Quit the app.
     Quit,
 }
@@ -1136,6 +1226,22 @@ pub enum Hit {
         revision: u64,
         epoch: u64,
     },
+    /// One `/accounts` row, by its GLOBAL alias (value-carrying: a stale
+    /// rect can only ever select the row it was measured on).
+    AccountRow(String),
+    /// One add-row button on `/accounts` (sim tui.js:3621-3628).
+    AccountAdd(AccountAddKind),
+}
+
+/// The `/accounts` add-row buttons (sim order, tui.js:3621-3628).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountAddKind {
+    OpenAiOAuth,
+    AnthropicOAuth,
+    OpenAiApi,
+    AnthropicApi,
+    HuggingFace,
+    Custom,
 }
 
 /// One answer on its way to the client, tagged with the SURFACE GENERATION
@@ -1478,6 +1584,8 @@ pub struct AppModel {
     /// `&AppModel` while the image protocol needs `&mut` to re-encode on a size
     /// change. Never persisted; a pure presentation cache.
     pub wordmark: std::cell::RefCell<Option<crate::wordmark::Wordmark>>,
+    /// `/accounts` screen state (rows, revision gate, pending select).
+    pub accounts: AccountsState,
 }
 
 impl Default for AppModel {
@@ -1549,6 +1657,7 @@ impl Default for AppModel {
             // startup; every non-graphics terminal and all tests stay None and
             // render falls back to the half-block art in `crate::mark`.
             wordmark: std::cell::RefCell::new(None),
+            accounts: AccountsState::default(),
         }
     }
 }
@@ -1707,6 +1816,7 @@ impl AppModel {
         match self.screen {
             Screen::Boot => "haider — starting".to_owned(),
             Screen::Launcher => "haider — launcher".to_owned(),
+            Screen::Accounts => "haider — accounts".to_owned(),
             Screen::Session | Screen::Subagent | Screen::Aura => {
                 // Strip control characters: user text must never smuggle
                 // escape sequences into OSC 2 (review r1 P1).
@@ -1784,6 +1894,9 @@ impl AppModel {
             // Launcher: a busy row's ◉ dot pulse + rail shimmer
             // (tui.js:4386-4394).
             Screen::Launcher => self.sessions.iter().any(crate::session::SessionState::busy),
+            // Accounts: a static list — only an in-flight select animates
+            // (the pending row's `…` beat).
+            Screen::Accounts => self.accounts.pending_select.is_some(),
             Screen::Session | Screen::Subagent => {
                 // `● thinking…` (tui.js:4458-4462) · the ⚒ running tool
                 // glyph (tui.js:4524-4530) · the processing todo's box
@@ -2143,6 +2256,14 @@ impl AppModel {
         // the launcher; exiting never resets aura state.
         if self.screen == Screen::Aura && key.code == KeyCode::Esc {
             self.exit_aura();
+            return;
+        }
+        // `/accounts` (sim tui.js:2516-2519): the screen has no composer —
+        // esc walks back, ↑/↓/enter drive the row cursor, everything else
+        // is swallowed. The login card's total modality already consumed
+        // the key above when a card is open.
+        if self.screen == Screen::Accounts {
+            self.handle_accounts_key(key.code);
             return;
         }
         // A blocking menu REPLACES the composer (sim §3 law).
@@ -2809,6 +2930,166 @@ impl AppModel {
         self.switch_surface(target);
     }
 
+    /// THE ONE DOOR into `/accounts` (`/accounts`, `/account`, and the
+    /// launcher's ⚿ row all come through here). Clears the stale action
+    /// message (sim `startLogin`/screen-entry behavior) and asks the driver
+    /// for fresh rows — demo answers from the seed, live from
+    /// `account.list`.
+    fn enter_accounts(&mut self) {
+        if self.screen == Screen::Accounts {
+            return;
+        }
+        self.accounts.message = None;
+        self.switch_surface(Screen::Accounts);
+        self.requests.push(AppRequest::AccountsRefresh);
+        self.dirty = true;
+    }
+
+    /// Esc from `/accounts` (sim tui.js:2516-2519): with a login card open
+    /// the card's own total-modality already consumed the key; otherwise
+    /// back to the session if one is attached, else the launcher.
+    fn exit_accounts(&mut self) {
+        let target = if self.active_session.is_some()
+            || !self.projection.entries().is_empty()
+            || self.session_name.is_some()
+        {
+            Screen::Session
+        } else {
+            Screen::Launcher
+        };
+        self.switch_surface(target);
+        self.dirty = true;
+    }
+
+    /// Click/Enter on an accounts row (sim `useAccount`, tui.js:2160-2168).
+    ///
+    /// OPTIMISM FORBIDDEN (report §5.1): this sets `pending_select` and
+    /// pushes the request — the rows themselves DO NOT move here. The dot
+    /// moves in [`Self::apply_account_selected`] / a newer snapshot.
+    pub fn select_account(&mut self, alias: &str) {
+        if self.accounts.pending_select.is_some() {
+            return;
+        }
+        let Some(row) = self.accounts.rows.iter().find(|row| row.alias == alias) else {
+            self.accounts.message =
+                Some(format!("· no account \"{alias}\" — /accounts to see them"));
+            self.dirty = true;
+            return;
+        };
+        if row.selected {
+            // Sim parity: re-clicking the active row re-emits the message
+            // without a daemon round-trip (useAccount has no early return).
+            self.accounts.message = Some(format!(
+                "✓ {} → {} · {} · active",
+                row.provider,
+                row.alias,
+                auth_label(row.method)
+            ));
+            self.dirty = true;
+            return;
+        }
+        // W5 extension (additive status vocabulary): an unusable row is
+        // refused locally with an honest reason instead of a doomed RPC.
+        match row.status {
+            haider_protocol::credential::CredentialStatus::Expired
+            | haider_protocol::credential::CredentialStatus::Revoked => {
+                self.accounts.message =
+                    Some(format!("· {alias} is not usable — /login to re-authenticate"));
+                self.dirty = true;
+                return;
+            }
+            haider_protocol::credential::CredentialStatus::Ok
+            | haider_protocol::credential::CredentialStatus::Limited { .. } => {}
+        }
+        self.accounts.pending_select = Some(alias.to_owned());
+        self.accounts.message = None;
+        self.requests.push(AppRequest::AccountSetActive {
+            alias: alias.to_owned(),
+        });
+        self.dirty = true;
+    }
+
+    /// A correlated `account.set_active` result: move the dot within the
+    /// descriptor's provider, stamp the revision, emit the sim's message.
+    /// Late/foreign results are gated by `pending_select` + revision.
+    pub fn apply_account_selected(
+        &mut self,
+        descriptor: &haider_protocol::credential::CredentialDescriptor,
+        revision: u64,
+    ) {
+        if self
+            .accounts
+            .pending_select
+            .as_deref()
+            .is_some_and(|pending| pending == descriptor.alias.as_str())
+        {
+            self.accounts.pending_select = None;
+        }
+        if let Some(current) = self.accounts.revision
+            && revision < current
+        {
+            return;
+        }
+        for row in &mut self.accounts.rows {
+            if row.provider == descriptor.provider {
+                row.selected = row.alias == descriptor.alias.as_str();
+            }
+        }
+        self.accounts.revision = Some(revision);
+        self.accounts.message = Some(format!(
+            "✓ {} → {} · {} · active",
+            descriptor.provider,
+            descriptor.alias,
+            auth_label(descriptor.auth_method)
+        ));
+        self.dirty = true;
+    }
+
+    /// A failed `account.set_active`: clear the pending gate and surface the
+    /// public reason. The rows never moved, so there is nothing to undo.
+    pub fn account_select_failed(&mut self, alias: &str, message: &str) {
+        if self
+            .accounts
+            .pending_select
+            .as_deref()
+            .is_some_and(|pending| pending == alias)
+        {
+            self.accounts.pending_select = None;
+        }
+        self.accounts.message = Some(format!("· {alias}: {message}"));
+        self.dirty = true;
+    }
+
+    /// Keys on the `/accounts` screen (no composer; the login card, when
+    /// open, is total-modal and never reaches here).
+    fn handle_accounts_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc => self.exit_accounts(),
+            KeyCode::Up => {
+                self.accounts.cursor = self.accounts.cursor.saturating_sub(1);
+                self.dirty = true;
+            }
+            KeyCode::Down => {
+                if !self.accounts.rows.is_empty() {
+                    self.accounts.cursor =
+                        (self.accounts.cursor + 1).min(self.accounts.rows.len() - 1);
+                }
+                self.dirty = true;
+            }
+            KeyCode::Enter => {
+                if let Some(alias) = self
+                    .accounts
+                    .rows
+                    .get(self.accounts.cursor)
+                    .map(|row| row.alias.clone())
+                {
+                    self.select_account(&alias);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Chip close lifecycle flags (§2.5) — the DRIVER owns the 5 s removal
     /// timer and the resume check; returns whether the chip WAS live
     /// (closing the last live child discharges the wait).
@@ -3214,13 +3495,34 @@ impl AppModel {
                         .to_owned(),
                 );
             }
+            "accounts" => self.enter_accounts(),
+            "account" => {
+                // Sim tui.js:1770-1780: no alias → note listing them; a
+                // known alias selects (same daemon-gated path as a click);
+                // an unknown alias says so.
+                let alias = remainder.trim().to_owned();
+                if alias.is_empty() {
+                    if self.accounts.rows.is_empty() {
+                        self.enter_accounts();
+                    } else {
+                        let names: Vec<&str> = self
+                            .accounts
+                            .rows
+                            .iter()
+                            .map(|row| row.alias.as_str())
+                            .collect();
+                        self.flash = Some(format!("· accounts — {}", names.join(" · ")));
+                    }
+                } else {
+                    self.enter_accounts();
+                    self.select_account(&alias);
+                }
+            }
             "" => {}
             other => {
                 // Known stubs name their wave; typos say so (review r1 P2).
                 let wave = match other {
-                    "model" | "provider" | "account" | "accounts" => {
-                        Some("the account switchboard (W3)")
-                    }
+                    "model" | "provider" => Some("the account switchboard (W5d)"),
                     "tree" | "fork" | "rename" | "tokens" => Some("the daemon wave (W3)"),
                     "peers" => Some("the mesh wave (post-v0.1)"),
                     "hooks" | "update" => Some("the gates wave (W4)"),
@@ -3923,18 +4225,44 @@ impl AppModel {
             }
             Hit::ExtraRow(which) if self.screen == Screen::Launcher => match which {
                 LauncherRow::Aura => self.enter_aura(),
-                LauncherRow::Accounts => {
-                    self.flash = Some(
-                        "· /accounts — UI ready; lands with the account switchboard (W3)"
-                            .to_owned(),
-                    );
-                }
+                LauncherRow::Accounts => self.enter_accounts(),
                 LauncherRow::Peers => {
                     self.flash = Some(
                         "· /peers — UI ready; lands with the mesh wave (post-v0.1)".to_owned(),
                     );
                 }
             },
+            // `/accounts` rows: click = make active for its provider (sim
+            // tui.js:3604 onClick useAccount). Value-carrying alias, and
+            // NEVER an optimistic flip — select_account only requests.
+            Hit::AccountRow(alias) if self.screen == Screen::Accounts => {
+                self.select_account(&alias);
+            }
+            Hit::AccountAdd(kind) if self.screen == Screen::Accounts => {
+                self.accounts.message = None;
+                match kind {
+                    // API-key adds ride the existing masked LoginCard flow
+                    // (TUI6 total modality; the alias field prefills from
+                    // the provider).
+                    AccountAddKind::OpenAiApi => self.open_login_card("openai", None),
+                    AccountAddKind::AnthropicApi => self.open_login_card("anthropic", None),
+                    // OAuth/HF/custom cards land with the W5e login wave —
+                    // honest stubs, never a fake card (sim parity is the
+                    // BUTTON ROW, not unbuilt machinery behind it).
+                    AccountAddKind::OpenAiOAuth | AccountAddKind::AnthropicOAuth => {
+                        self.flash = Some(
+                            "· OAuth add — UI ready; the loopback flow's card lands with W5e"
+                                .to_owned(),
+                        );
+                    }
+                    AccountAddKind::HuggingFace | AccountAddKind::Custom => {
+                        self.flash = Some(
+                            "· custom providers — /login lands them with W5e (provider.configure is live)"
+                                .to_owned(),
+                        );
+                    }
+                }
+            }
             // Dismissed/replaced palettes drop the click.
             Hit::PaletteRow(item) if self.palette_open() => self.activate_palette_item(item),
             Hit::MenuOption { menu, index } => {

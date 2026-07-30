@@ -555,6 +555,10 @@ pub fn request_body(command: LiveCommand) -> RequestBody {
             // profile — the client never invents a validation model.
             validation_model: None,
         },
+        LiveCommand::AccountList => RequestBody::AccountList { provider: None },
+        LiveCommand::AccountSetActive { command_id, alias } => {
+            RequestBody::AccountSetActive { command_id, alias }
+        }
         LiveCommand::Answer { .. } => unreachable!("answers ride send_frame, not request"),
     }
 }
@@ -633,6 +637,25 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
                 }]
             })
         }
+        ResponseBody::AccountList {
+            descriptors,
+            revision,
+            ..
+        } => vec![LiveReply::Accounts {
+            descriptors,
+            revision,
+        }],
+        ResponseBody::AccountSetActive {
+            descriptor,
+            revision,
+            ..
+        } => context.command_id.clone().map_or_else(Vec::new, |id| {
+            vec![LiveReply::AccountSelected {
+                command_id: id,
+                descriptor,
+                revision,
+            }]
+        }),
         ResponseBody::Error {
             code,
             message,
