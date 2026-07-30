@@ -46,9 +46,10 @@ use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::CredentialAlias;
 use haider_provider::{
     ANTHROPIC_OAUTH_PROVIDER_NAME, ANTHROPIC_PROVIDER_NAME, AnthropicProvider,
-    BUILTIN_PROVIDER_NAMES, Message, OPENAI_COMPATIBLE_PROVIDER_NAME, OPENAI_OAUTH_PROVIDER_NAME,
-    OPENAI_PROVIDER_NAME, OpenAiCompatibleProvider, OpenAiProvider, Provider, ProviderErrorKind,
-    TurnRequest,
+    BUILTIN_PROVIDER_NAMES, CatalogError, CatalogSource, DiscoveredCatalog, Message,
+    OPENAI_COMPATIBLE_PROVIDER_NAME, OPENAI_OAUTH_PROVIDER_NAME, OPENAI_PROVIDER_NAME,
+    OpenAiCompatibleProvider, OpenAiProvider, Provider, ProviderErrorKind, TurnRequest,
+    discover_models,
 };
 use haider_rpc::{
     ERROR_CODE_BUSY, ERROR_CODE_CREDENTIAL_MISSING, ERROR_CODE_INVALID_ARGUMENT,
@@ -57,6 +58,7 @@ use haider_rpc::{
     RequestId, ResponseBody, StagePurpose, WireFrame,
 };
 use tokio::sync::{mpsc, watch};
+use tokio::task::JoinSet;
 use tokio::time::Instant;
 use zeroize::Zeroizing;
 
@@ -66,9 +68,9 @@ use crate::oauth::{
     sanctioned_inference,
 };
 use crate::provider_registry::{
-    JsonProviderRegistryStore, ProductionProviderEndpointValidator, ProviderConfigureInput,
-    ProviderEndpointValidator, ProviderRegistry, ProviderRegistryStoreLike,
-    initial_provider_profiles, provider_summary,
+    CachedProviderModelSource, JsonProviderRegistryStore, ProductionProviderEndpointValidator,
+    ProviderConfigureInput, ProviderEndpointValidator, ProviderModelSourceLike, ProviderRegistry,
+    ProviderRegistryStoreLike, initial_provider_profiles,
 };
 use crate::session_hub::FrameSink;
 
@@ -538,7 +540,7 @@ pub(crate) struct ManagementView {
 }
 
 impl ManagementSnapshot {
-    fn new(
+    pub(crate) fn new(
         revision: u64,
         descriptors: Vec<CredentialDescriptor>,
         providers: Vec<ProviderSummaryWire>,
@@ -593,6 +595,7 @@ pub(crate) struct AccountsFacade {
 
 /// Correlated response route back to the requesting connection. Disconnect
 /// drops only this route, never the durable command.
+#[derive(Clone)]
 pub(crate) struct LoginRoute {
     pub request_id: RequestId,
     pub sink: Arc<dyn FrameSink>,
@@ -664,6 +667,16 @@ pub(crate) enum AccountCommand {
     Remove(Box<RemoveAccountJob>),
     SetDefaultModel(Box<SetDefaultModelJob>),
     ConfigureProvider(Box<ProviderConfigureJob>),
+    RefreshProviderModels {
+        provider: String,
+        completed: LoginRoute,
+    },
+    ProviderModelsRefreshCompleted {
+        provider: String,
+        cached: Option<haider_core::CachedModels>,
+        result: ProviderModelsRefreshResult,
+        completed: LoginRoute,
+    },
     BeginOAuthRefresh {
         descriptor: CredentialDescriptor,
         expected: OAuthRefreshFence,
@@ -686,6 +699,11 @@ pub(crate) enum AccountCommand {
         completed: tokio::sync::oneshot::Sender<Result<ResolvedAccount, HaiderError>>,
     },
     Shutdown,
+}
+
+pub(crate) enum ProviderModelsRefreshResult {
+    Discovery(Result<DiscoveredCatalog, CatalogError>),
+    Credential(HaiderError),
 }
 
 #[derive(Debug)]
@@ -769,10 +787,92 @@ pub(crate) struct AccountActorConfig {
     pub refresh_fences: RefreshFenceRegistry,
 }
 
+#[async_trait::async_trait]
+trait ProviderModelDiscoverer: Send + Sync {
+    async fn discover(
+        &self,
+        source: CatalogSource,
+        access_token: &str,
+        etag: Option<&str>,
+    ) -> Result<DiscoveredCatalog, CatalogError>;
+}
+
+struct ProductionProviderModelDiscoverer;
+
+#[async_trait::async_trait]
+impl ProviderModelDiscoverer for ProductionProviderModelDiscoverer {
+    async fn discover(
+        &self,
+        source: CatalogSource,
+        access_token: &str,
+        etag: Option<&str>,
+    ) -> Result<DiscoveredCatalog, CatalogError> {
+        discover_models(source, access_token, etag).await
+    }
+}
+
 pub(crate) fn start_account_actor(config: AccountActorConfig) -> AccountActorHandle {
     let (commands, receiver) = mpsc::channel(ACTOR_CAPACITY);
     let (force_stop, forced) = watch::channel(false);
-    let task = tokio::spawn(run_account_actor(config, receiver, forced));
+    spawn_account_actor(
+        config,
+        commands,
+        receiver,
+        force_stop,
+        forced,
+        None,
+        Arc::new(ProductionProviderModelDiscoverer),
+    )
+}
+
+fn start_account_actor_with_broker(
+    config: AccountActorConfig,
+    build_broker: impl FnOnce(mpsc::Sender<AccountCommand>) -> Result<CredentialBroker, HaiderError>,
+) -> Result<(AccountActorHandle, CredentialBroker), HaiderError> {
+    start_account_actor_with_services(
+        config,
+        build_broker,
+        Arc::new(ProductionProviderModelDiscoverer),
+    )
+}
+
+fn start_account_actor_with_services(
+    config: AccountActorConfig,
+    build_broker: impl FnOnce(mpsc::Sender<AccountCommand>) -> Result<CredentialBroker, HaiderError>,
+    model_discoverer: Arc<dyn ProviderModelDiscoverer>,
+) -> Result<(AccountActorHandle, CredentialBroker), HaiderError> {
+    let (commands, receiver) = mpsc::channel(ACTOR_CAPACITY);
+    let (force_stop, forced) = watch::channel(false);
+    let broker = build_broker(commands.clone())?;
+    let handle = spawn_account_actor(
+        config,
+        commands,
+        receiver,
+        force_stop,
+        forced,
+        Some(broker.clone()),
+        model_discoverer,
+    );
+    Ok((handle, broker))
+}
+
+fn spawn_account_actor(
+    config: AccountActorConfig,
+    commands: mpsc::Sender<AccountCommand>,
+    receiver: mpsc::Receiver<AccountCommand>,
+    force_stop: watch::Sender<bool>,
+    forced: watch::Receiver<bool>,
+    broker: Option<CredentialBroker>,
+    model_discoverer: Arc<dyn ProviderModelDiscoverer>,
+) -> AccountActorHandle {
+    let task = tokio::spawn(run_account_actor(
+        config,
+        commands.clone(),
+        receiver,
+        forced,
+        broker,
+        model_discoverer,
+    ));
     AccountActorHandle {
         commands,
         force_stop,
@@ -787,8 +887,11 @@ struct PendingSecret {
 
 async fn run_account_actor(
     config: AccountActorConfig,
+    commands: mpsc::Sender<AccountCommand>,
     mut receiver: mpsc::Receiver<AccountCommand>,
     mut force_stop: watch::Receiver<bool>,
+    broker: Option<CredentialBroker>,
+    model_discoverer: Arc<dyn ProviderModelDiscoverer>,
 ) {
     let AccountActorConfig {
         store,
@@ -807,7 +910,14 @@ async fn run_account_actor(
     // Command-owned secrets surviving a retryable validation, bounded by
     // SECRET_TTL; daemon restart wipes them by construction.
     let mut pending: HashMap<String, PendingSecret> = HashMap::new();
+    let mut model_refreshes = JoinSet::new();
+    let mut model_refresh_routes = HashMap::new();
+    let mut refreshing_providers = HashSet::new();
+    let mut draining = false;
     loop {
+        if draining && model_refreshes.is_empty() && refreshing_providers.is_empty() {
+            break;
+        }
         let command = tokio::select! {
             biased;
             changed = force_stop.changed() => {
@@ -822,9 +932,36 @@ async fn run_account_actor(
                 };
                 command
             }
+            completed = model_refreshes.join_next_with_id(), if !model_refreshes.is_empty() => {
+                if let Some(completed) = completed {
+                    match completed {
+                        Ok((task_id, ())) => {
+                            model_refresh_routes.remove(&task_id);
+                        }
+                        Err(error) => {
+                            let task_id = error.id();
+                            tracing::warn!(%task_id, "provider model refresh worker was lost");
+                            if let Some((provider, route)) =
+                                model_refresh_routes.remove(&task_id)
+                            {
+                                refreshing_providers.remove(&provider);
+                                respond_error(
+                                    &route,
+                                    ERROR_CODE_PROVIDER_ERROR,
+                                    "provider model refresh worker failed",
+                                    true,
+                                );
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
         };
         match command {
-            AccountCommand::Shutdown => break,
+            AccountCommand::Shutdown => {
+                draining = true;
+            }
             AccountCommand::Login(job) => {
                 pending.retain(|_, entry| entry.claimed_at.elapsed() < SECRET_TTL);
                 handle_login(
@@ -898,6 +1035,52 @@ async fn run_account_actor(
                     &mut providers,
                     Arc::clone(&provider_endpoint_validator),
                     *job,
+                )
+                .await;
+            }
+            AccountCommand::RefreshProviderModels {
+                provider,
+                completed,
+            } => {
+                if draining {
+                    respond_error(
+                        &completed,
+                        ERROR_CODE_BUSY,
+                        "account actor is shutting down",
+                        true,
+                    );
+                    continue;
+                }
+                begin_provider_models_refresh(
+                    &store,
+                    &accounts,
+                    broker.as_ref(),
+                    &model_discoverer,
+                    &commands,
+                    &mut model_refreshes,
+                    &mut model_refresh_routes,
+                    &mut refreshing_providers,
+                    provider,
+                    completed,
+                )
+                .await;
+            }
+            AccountCommand::ProviderModelsRefreshCompleted {
+                provider,
+                cached,
+                result,
+                completed,
+            } => {
+                refreshing_providers.remove(&provider);
+                finish_provider_models_refresh(
+                    &store,
+                    &accounts,
+                    management.as_ref(),
+                    &providers,
+                    provider,
+                    cached,
+                    result,
+                    &completed,
                 )
                 .await;
             }
@@ -980,6 +1163,279 @@ async fn run_account_actor(
             break;
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn begin_provider_models_refresh(
+    store: &SqliteStoreHandle,
+    accounts: &AccountStore<Box<dyn StoreLike>>,
+    broker: Option<&CredentialBroker>,
+    model_discoverer: &Arc<dyn ProviderModelDiscoverer>,
+    commands: &mpsc::Sender<AccountCommand>,
+    refresh_tasks: &mut JoinSet<()>,
+    refresh_routes: &mut HashMap<tokio::task::Id, (String, LoginRoute)>,
+    refreshing_providers: &mut HashSet<String>,
+    provider: String,
+    completed: LoginRoute,
+) {
+    let Some(source) = catalog_source(&provider) else {
+        respond_provider_models_unavailable(
+            &completed,
+            &provider,
+            "provider does not expose a subscription model catalog",
+        );
+        return;
+    };
+    if refreshing_providers.contains(&provider) {
+        respond_error(
+            &completed,
+            ERROR_CODE_BUSY,
+            "a model refresh is already running for this provider",
+            true,
+        );
+        return;
+    }
+    let Some(descriptor) = accounts.active_for_provider(&provider).cloned() else {
+        respond_error(
+            &completed,
+            ERROR_CODE_CREDENTIAL_MISSING,
+            "provider has no active credential",
+            false,
+        );
+        return;
+    };
+    if descriptor.auth_method != AuthMethod::OAuth {
+        respond_provider_models_unavailable(
+            &completed,
+            &provider,
+            "provider model discovery requires an active OAuth credential",
+        );
+        return;
+    }
+    let Some(broker) = broker.cloned() else {
+        respond_error(
+            &completed,
+            ERROR_CODE_CREDENTIAL_MISSING,
+            "OAuth credential broker is unavailable",
+            true,
+        );
+        return;
+    };
+    let cached = match store.provider_models(provider.clone()).await {
+        Ok(cached) => cached,
+        Err(error) => {
+            respond_error(
+                &completed,
+                ERROR_CODE_PROVIDER_ERROR,
+                &error.message,
+                error.retryable,
+            );
+            return;
+        }
+    };
+    let etag = cached.as_ref().and_then(|cached| cached.etag.clone());
+    refreshing_providers.insert(provider.clone());
+    let commands = commands.clone();
+    let model_discoverer = Arc::clone(model_discoverer);
+    let task_provider = provider.clone();
+    let task_completed = completed.clone();
+    let refresh_task = refresh_tasks.spawn(async move {
+        let result = match broker.resolve(&descriptor).await {
+            Ok(access_token) => {
+                let access_token =
+                    std::str::from_utf8(access_token.expose_secret()).map_err(|_| {
+                        HaiderError::new(
+                            ErrorCode::CredentialMissing,
+                            "OAuth access token is not valid UTF-8",
+                            false,
+                        )
+                    });
+                match access_token {
+                    Ok(access_token) => ProviderModelsRefreshResult::Discovery(
+                        model_discoverer
+                            .discover(source, access_token, etag.as_deref())
+                            .await,
+                    ),
+                    Err(error) => ProviderModelsRefreshResult::Credential(error),
+                }
+            }
+            Err(error) => ProviderModelsRefreshResult::Credential(error),
+        };
+        let _ = commands
+            .send(AccountCommand::ProviderModelsRefreshCompleted {
+                provider: task_provider,
+                cached,
+                result,
+                completed: task_completed,
+            })
+            .await;
+    });
+    refresh_routes.insert(refresh_task.id(), (provider, completed));
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finish_provider_models_refresh(
+    store: &SqliteStoreHandle,
+    accounts: &AccountStore<Box<dyn StoreLike>>,
+    management: Option<&ManagementSnapshot>,
+    providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+    provider: String,
+    cached: Option<haider_core::CachedModels>,
+    result: ProviderModelsRefreshResult,
+    completed: &LoginRoute,
+) {
+    match result {
+        ProviderModelsRefreshResult::Discovery(Ok(catalog)) => {
+            let models_json = match serde_json::to_string(&catalog.models) {
+                Ok(models_json) => models_json,
+                Err(error) => {
+                    respond_error(
+                        completed,
+                        ERROR_CODE_PROVIDER_ERROR,
+                        &format!("could not encode provider model catalog: {error}"),
+                        false,
+                    );
+                    return;
+                }
+            };
+            let revision = match store
+                .put_provider_models_and_advance_management_revision(
+                    provider.clone(),
+                    models_json,
+                    catalog.etag,
+                    unix_ms_after(Duration::ZERO),
+                )
+                .await
+            {
+                Ok(revision) => revision,
+                Err(error) => {
+                    respond_error(
+                        completed,
+                        ERROR_CODE_PROVIDER_ERROR,
+                        &error.message,
+                        error.retryable,
+                    );
+                    return;
+                }
+            };
+            providers.replace_models(provider.clone(), catalog.models);
+            let summaries = providers.summaries();
+            let Some(summary) = summaries
+                .iter()
+                .find(|summary| summary.provider == provider)
+                .cloned()
+            else {
+                respond_provider_models_unavailable(
+                    completed,
+                    &provider,
+                    "provider is not registered",
+                );
+                return;
+            };
+            if let Some(management) = management {
+                management.publish(revision, accounts.list().to_vec(), summaries);
+            }
+            respond(
+                completed,
+                ResponseBody::ProviderModelsRefresh {
+                    provider: summary,
+                    revision,
+                },
+            );
+        }
+        ProviderModelsRefreshResult::Discovery(Err(CatalogError::NotModified)) => {
+            let Some(cached) = cached else {
+                respond_error(
+                    completed,
+                    ERROR_CODE_PROVIDER_ERROR,
+                    "provider returned not-modified without a cached catalog",
+                    true,
+                );
+                return;
+            };
+            if let Err(error) = store
+                .put_provider_models(
+                    provider.clone(),
+                    cached.models_json,
+                    cached.etag,
+                    unix_ms_after(Duration::ZERO),
+                )
+                .await
+            {
+                respond_error(
+                    completed,
+                    ERROR_CODE_PROVIDER_ERROR,
+                    &error.message,
+                    error.retryable,
+                );
+                return;
+            }
+            let revision = match store.management_revision().await {
+                Ok(revision) => revision,
+                Err(error) => {
+                    respond_error(
+                        completed,
+                        ERROR_CODE_PROVIDER_ERROR,
+                        &error.message,
+                        error.retryable,
+                    );
+                    return;
+                }
+            };
+            let Some(summary) = providers.summary(&provider) else {
+                respond_provider_models_unavailable(
+                    completed,
+                    &provider,
+                    "provider is not registered",
+                );
+                return;
+            };
+            respond(
+                completed,
+                ResponseBody::ProviderModelsRefresh {
+                    provider: summary,
+                    revision,
+                },
+            );
+        }
+        ProviderModelsRefreshResult::Discovery(Err(CatalogError::Unavailable { reason })) => {
+            respond_provider_models_unavailable(completed, &provider, &reason);
+        }
+        ProviderModelsRefreshResult::Discovery(Err(CatalogError::Transport { reason })) => {
+            respond_error(completed, ERROR_CODE_PROVIDER_ERROR, &reason, true);
+        }
+        ProviderModelsRefreshResult::Credential(error) => {
+            respond_error(
+                completed,
+                ERROR_CODE_PROVIDER_ERROR,
+                &error.message,
+                error.retryable,
+            );
+        }
+    }
+}
+
+fn catalog_source(provider: &str) -> Option<CatalogSource> {
+    match provider {
+        OPENAI_OAUTH_PROVIDER_NAME => Some(CatalogSource::OpenAiSubscription),
+        ANTHROPIC_OAUTH_PROVIDER_NAME => Some(CatalogSource::AnthropicSubscription),
+        _ => None,
+    }
+}
+
+fn respond_provider_models_unavailable(route: &LoginRoute, provider: &str, reason: &str) {
+    respond(
+        route,
+        ResponseBody::Error {
+            code: ERROR_CODE_PROVIDER_ERROR.into(),
+            message: reason.to_owned(),
+            retryable: false,
+            data: Some(ErrorData::ProviderModelsUnavailable {
+                provider: provider.to_owned(),
+                reason: reason.to_owned(),
+            }),
+        },
+    );
 }
 
 struct AutomaticAlternate<'a> {
@@ -2128,9 +2584,18 @@ async fn handle_set_default_model(
             return;
         }
     };
-    let receipt = ProviderReceipt {
-        provider: provider_summary(&profile),
+    let Some(provider) = providers.summary(&profile.provider_id) else {
+        respond_management_error(
+            &job.route,
+            &HaiderError::new(
+                ErrorCode::StoreCorrupt,
+                "configured provider disappeared before receipt finalization",
+                false,
+            ),
+        );
+        return;
     };
+    let receipt = ProviderReceipt { provider };
     let revision = match store
         .finalize_management_receipt(
             job.command_id,
@@ -2300,9 +2765,18 @@ async fn handle_provider_configure(
             return;
         }
     };
-    let receipt = ProviderReceipt {
-        provider: provider_summary(&profile),
+    let Some(provider) = providers.summary(&profile.provider_id) else {
+        respond_management_error(
+            &job.route,
+            &HaiderError::new(
+                ErrorCode::StoreCorrupt,
+                "configured provider disappeared before receipt finalization",
+                false,
+            ),
+        );
+        return;
     };
+    let receipt = ProviderReceipt { provider };
     let revision = match store
         .finalize_management_receipt(
             job.command_id,
@@ -3791,7 +4265,7 @@ async fn reconcile_provider_receipts(
                             false,
                         )
                     })?;
-                providers.set_default_model(&identity.provider, &identity.model)?
+                providers.reconcile_set_default_model(&identity.provider, &identity.model)?
             } else {
                 let input: ProviderConfigureInput = row
                     .recovery_json
@@ -3804,15 +4278,20 @@ async fn reconcile_provider_receipts(
                             false,
                         )
                     })?;
-                providers.configure(input)?
+                providers.reconcile_configure(input)?
             };
+            let summary = providers.summary(&profile.provider_id).ok_or_else(|| {
+                HaiderError::new(
+                    ErrorCode::StoreCorrupt,
+                    "reconciled provider disappeared before receipt finalization",
+                    false,
+                )
+            })?;
             store
                 .finalize_management_receipt(
                     row.command_id,
                     method.to_owned(),
-                    ProviderReceipt {
-                        provider: provider_summary(&profile),
-                    },
+                    ProviderReceipt { provider: summary },
                 )
                 .await?;
         }
@@ -3884,10 +4363,31 @@ impl AccountsRuntime {
         let mut accounts = AccountStore::new(descriptor_store)?;
         let provider_store: Box<dyn ProviderRegistryStoreLike> =
             Box::new(JsonProviderRegistryStore::new(store_dir));
+        let model_source = Arc::new(CachedProviderModelSource::default());
         let mut providers = ProviderRegistry::new(
             provider_store,
             initial_provider_profiles(provider_names, default_model),
+            model_source.clone(),
         )?;
+        let provider_ids = providers
+            .summaries()
+            .into_iter()
+            .map(|summary| summary.provider)
+            .collect::<Vec<_>>();
+        for provider in provider_ids {
+            if let Some(cached) = store.provider_models(provider.clone()).await? {
+                let models = serde_json::from_str(&cached.models_json).map_err(|error| {
+                    HaiderError::new(
+                        ErrorCode::StoreCorrupt,
+                        format!(
+                            "cached model catalog for provider `{provider}` is invalid: {error}"
+                        ),
+                        false,
+                    )
+                })?;
+                model_source.replace(provider.clone(), models);
+            }
+        }
         // R10: every daemon vault consumer funnels through this ONE wrap.
         // Global aliases are the descriptor coordinate, but the Keychain is
         // machine-global — the physical key must stay profile-scoped so two
@@ -3920,7 +4420,7 @@ impl AccountsRuntime {
             VaultProvision::Unsupported => Arc::new(MemoryVault::default()),
         };
         let refresh_fences = RefreshFenceRegistry::default();
-        let actor = start_account_actor(AccountActorConfig {
+        let actor_config = AccountActorConfig {
             store: store.clone(),
             accounts,
             vault: actor_vault,
@@ -3933,8 +4433,7 @@ impl AccountsRuntime {
             provider_endpoint_validator: Arc::clone(&dependencies.provider_endpoint_validator),
             reserved_aliases,
             refresh_fences: refresh_fences.clone(),
-        });
-        let commands = actor.commands();
+        };
         match &vault {
             VaultProvision::Available(scoped) => {
                 let oauth = OAuthCoordinator::new(
@@ -3943,13 +4442,16 @@ impl AccountsRuntime {
                     dependencies.oauth_coordinator,
                 )
                 .map_err(crate::oauth::oauth_error)?;
-                let broker = CredentialBroker::new_with_fences(
-                    Arc::clone(scoped),
-                    dependencies.oauth_catalog.clone(),
-                    Arc::clone(&snapshot),
-                    commands.clone(),
-                    refresh_fences,
-                )?;
+                let (actor, broker) = start_account_actor_with_broker(actor_config, |commands| {
+                    CredentialBroker::new_with_fences(
+                        Arc::clone(scoped),
+                        dependencies.oauth_catalog.clone(),
+                        Arc::clone(&snapshot),
+                        commands,
+                        refresh_fences,
+                    )
+                })?;
+                let commands = actor.commands();
                 Ok(Self {
                     facade: AccountsFacade {
                         login: Some(commands),
@@ -3963,18 +4465,22 @@ impl AccountsRuntime {
                     broker: Some(broker),
                 })
             }
-            VaultProvision::Unsupported => Ok(Self {
-                facade: AccountsFacade {
-                    login: Some(commands),
-                    oauth: None,
-                    snapshot,
-                    management,
-                    vault_supported: false,
-                },
-                actor: Some(actor),
-                vault: VaultProvision::Unsupported,
-                broker: None,
-            }),
+            VaultProvision::Unsupported => {
+                let actor = start_account_actor(actor_config);
+                let commands = actor.commands();
+                Ok(Self {
+                    facade: AccountsFacade {
+                        login: Some(commands),
+                        oauth: None,
+                        snapshot,
+                        management,
+                        vault_supported: false,
+                    },
+                    actor: Some(actor),
+                    vault: VaultProvision::Unsupported,
+                    broker: None,
+                })
+            }
         }
     }
 }

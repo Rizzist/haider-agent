@@ -16,9 +16,9 @@ use haider_rpc::{
     ERROR_CODE_RUN_NOT_ACTIVE, ERROR_CODE_STALE_GENERATION, ERROR_CODE_UNAUTHORIZED,
     ERROR_CODE_VAULT_UNSUPPORTED, FEATURE_ACCOUNT_LOGIN_API_V1, FEATURE_ACCOUNT_MANAGEMENT_V1,
     FEATURE_ACCOUNT_OAUTH_PKCE_V1, FEATURE_ACCOUNT_ROTATION_V1, FEATURE_PROVIDER_CONFIGURE_V1,
-    FEATURE_PROVIDER_MANAGEMENT_V1, FEATURE_SESSION_MUTATION_V1, FEATURE_TURN_CONTROL_V1,
-    FEATURE_VAULT_STAGE_V1, Hello, RequestBody, ResponseBody, SubmitDisposition,
-    WIRE_PROTOCOL_VERSION, Welcome, WireFrame, uds_codec, ws_codec,
+    FEATURE_PROVIDER_MANAGEMENT_V1, FEATURE_PROVIDER_MODELS_V1, FEATURE_SESSION_MUTATION_V1,
+    FEATURE_TURN_CONTROL_V1, FEATURE_VAULT_STAGE_V1, Hello, RequestBody, ResponseBody,
+    SubmitDisposition, WIRE_PROTOCOL_VERSION, Welcome, WireFrame, uds_codec, ws_codec,
 };
 use serde::{Deserialize, Serialize};
 
@@ -842,7 +842,7 @@ fn management_reads_preserve_legacy_account_list_and_tolerate_future_providers()
     );
     assert_eq!(
         value["body"]["provider_defaults"],
-        serde_json::json!([{"provider": "anthropic", "model": "claude-opus-5"}])
+        serde_json::json!([{"provider": "anthropic", "model": "frontier-anthropic"}])
     );
 
     let family: haider_rpc::ProviderApiFamilyWire =
@@ -911,9 +911,10 @@ fn revision_conflict_code_and_structured_body_are_golden() {
 /// The provider read/mutation methods and all honestly served feature
 /// families.
 ///
-/// MUTATION CHECK: remove `FEATURE_PROVIDER_CONFIGURE_V1` from the final
-/// Welcome. Expected runtime failure: the exact nine-feature assertion below
-/// omits `provider_configure_v1`.
+/// MUTATION CHECK: remove `FEATURE_PROVIDER_MODELS_V1` from the final Welcome.
+/// Expected runtime failure: the exact ten-feature assertion below omits
+/// `provider_models_v1`.
+/// Verified by revert on 2026-07-30.
 #[test]
 fn provider_list_and_management_feature_families_are_golden() {
     for method in [
@@ -922,6 +923,7 @@ fn provider_list_and_management_feature_families_are_golden() {
         "account.remove",
         "account.set_default_model",
         "provider.configure",
+        "provider.models_refresh",
     ] {
         for kind in ["request", "response"] {
             assert!(transcript().into_iter().any(|frame| {
@@ -933,7 +935,7 @@ fn provider_list_and_management_feature_families_are_golden() {
     let welcome = transcript()
         .into_iter()
         .find_map(|frame| match frame {
-            WireFrame::Welcome(welcome) if welcome.features.len() == 9 => Some(welcome),
+            WireFrame::Welcome(welcome) if welcome.features.len() == 10 => Some(welcome),
             _ => None,
         })
         .expect("management-feature Welcome");
@@ -946,9 +948,38 @@ fn provider_list_and_management_feature_families_are_golden() {
             FEATURE_ACCOUNT_ROTATION_V1,
             FEATURE_PROVIDER_CONFIGURE_V1,
             FEATURE_PROVIDER_MANAGEMENT_V1,
+            FEATURE_PROVIDER_MODELS_V1,
             FEATURE_SESSION_MUTATION_V1,
             FEATURE_TURN_CONTROL_V1,
             FEATURE_VAULT_STAGE_V1,
         ])
+    );
+}
+
+#[test]
+fn provider_models_unavailable_reason_is_typed_and_golden() {
+    let frame = transcript()
+        .into_iter()
+        .find(|frame| {
+            matches!(
+                frame,
+                WireFrame::Response {
+                    body: ResponseBody::Error {
+                        data: Some(haider_rpc::ErrorData::ProviderModelsUnavailable { .. }),
+                        ..
+                    },
+                    ..
+                }
+            )
+        })
+        .expect("typed model-unavailable golden");
+    let value = serde_json::to_value(frame).expect("error JSON");
+    assert_eq!(
+        value["body"]["data"],
+        serde_json::json!({
+            "kind": "provider_models_unavailable",
+            "provider": "anthropic-oauth",
+            "reason": "provider did not serve a list to this credential"
+        })
     );
 }

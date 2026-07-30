@@ -48,6 +48,119 @@ fn provider_list_filter_is_applied_to_the_owned_snapshot_projection() {
     );
 }
 
+#[derive(Default)]
+struct CapturingFrameSink(Mutex<Vec<WireFrame>>);
+
+impl FrameSink for CapturingFrameSink {
+    fn try_send(&self, frame: WireFrame) -> Result<(), FrameSendError> {
+        self.0.lock().expect("capturing sink").push(frame);
+        Ok(())
+    }
+}
+
+/// The new refresh method requires Control and hands a correlation-owned job
+/// to the bounded account actor mailbox.
+///
+/// MUTATION CHECK: authorize `RequestBody::ProviderModelsRefresh` with
+/// `Operation::View` instead of `Operation::Control`. Expected runtime
+/// failure: the view-only request enters the actor mailbox and its sink has
+/// no `capability_denied` response.
+/// Verified by revert on 2026-07-30.
+#[tokio::test]
+async fn provider_models_refresh_requires_control_and_hands_off_correlation() {
+    let root = tempfile::tempdir().expect("temp store");
+    let store = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("store opens");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub opens");
+    let (commands, mut actor_mailbox) = mpsc::channel(2);
+    hub.install_accounts(crate::accounts::AccountsFacade {
+        login: Some(commands),
+        oauth: None,
+        snapshot: Arc::new(Mutex::new(Vec::new())),
+        management: crate::accounts::ManagementSnapshot::new(0, Vec::new(), Vec::new()),
+        vault_supported: true,
+    })
+    .expect("install accounts");
+
+    let view_sink = Arc::new(CapturingFrameSink::default());
+    let view = hub
+        .open_connection(
+            std::collections::BTreeSet::from([haider_rpc::Capability::View]),
+            view_sink.clone(),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("view connection");
+    view.request(
+        haider_rpc::RequestId::new("view-refresh"),
+        haider_rpc::RequestBody::ProviderModelsRefresh {
+            provider: "openai-oauth".to_owned(),
+        },
+    )
+    .await
+    .expect("view rejection");
+    assert!(actor_mailbox.try_recv().is_err());
+    assert!(matches!(
+        view_sink.0.lock().expect("view frames").as_slice(),
+        [WireFrame::Response {
+            body: haider_rpc::ResponseBody::Error { code, .. },
+            ..
+        }] if code == haider_rpc::ERROR_CODE_CAPABILITY_DENIED
+    ));
+
+    let control_sink = Arc::new(CapturingFrameSink::default());
+    let control = hub
+        .open_connection(
+            std::collections::BTreeSet::from([
+                haider_rpc::Capability::View,
+                haider_rpc::Capability::Control,
+            ]),
+            control_sink.clone(),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("control connection");
+    control
+        .request(
+            haider_rpc::RequestId::new("control-refresh"),
+            haider_rpc::RequestBody::ProviderModelsRefresh {
+                provider: "openai-oauth".to_owned(),
+            },
+        )
+        .await
+        .expect("control handoff");
+    let command = actor_mailbox.recv().await.expect("owned actor job");
+    let crate::accounts::AccountCommand::RefreshProviderModels {
+        provider,
+        completed,
+    } = command
+    else {
+        panic!("unexpected actor command");
+    };
+    assert_eq!(provider, "openai-oauth");
+    completed
+        .sink
+        .try_send(WireFrame::Response {
+            request_id: completed.request_id,
+            body: haider_rpc::ResponseBody::ProviderModelsRefresh {
+                provider: provider_summary("openai-oauth"),
+                revision: 4,
+            },
+        })
+        .expect("correlated response");
+    assert!(matches!(
+        control_sink.0.lock().expect("control frames").as_slice(),
+        [WireFrame::Response {
+            request_id,
+            body: haider_rpc::ResponseBody::ProviderModelsRefresh { revision: 4, .. },
+        }] if request_id.as_str() == "control-refresh"
+    ));
+
+    drop(view);
+    drop(control);
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
 fn run_state_envelope(
     session_id: &SessionId,
     run_id: &RunId,

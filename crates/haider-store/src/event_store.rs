@@ -287,6 +287,14 @@ pub struct AccountRemoveReceiptRow {
     pub was_active: bool,
 }
 
+/// One provider's durable last-known model catalog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedModels {
+    pub models_json: String,
+    pub etag: Option<String>,
+    pub fetched_at_ms: u64,
+}
+
 /// Definitive login failure persisted in a failed receipt (401/403 class):
 /// stable code + human message, never provider body or key text.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -490,6 +498,100 @@ impl Store {
             "management_revision",
             "management revision",
         )
+    }
+
+    /// Reads a provider's last-known model catalog.
+    pub fn provider_models(&self, provider: &str) -> StoreResult<Option<CachedModels>> {
+        let connection = self.connection()?;
+        let cached = connection
+            .query_row(
+                "SELECT models_json, etag, fetched_at_ms
+                 FROM provider_models
+                 WHERE provider = ?1",
+                [provider],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(map_sqlite_error)?;
+        cached
+            .map(|(models_json, etag, fetched_at_ms)| {
+                let fetched_at_ms = u64::try_from(fetched_at_ms)
+                    .map_err(|_| corrupt("provider model cache has a negative fetch timestamp"))?;
+                Ok(CachedModels {
+                    models_json,
+                    etag,
+                    fetched_at_ms,
+                })
+            })
+            .transpose()
+    }
+
+    /// Replaces one provider's last-known model catalog.
+    pub fn put_provider_models(
+        &self,
+        provider: &str,
+        models_json: &str,
+        etag: Option<&str>,
+        fetched_at_ms: u64,
+    ) -> StoreResult<()> {
+        let connection = self.connection()?;
+        connection
+            .execute(
+                "INSERT INTO provider_models(provider, models_json, etag, fetched_at_ms)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(provider) DO UPDATE SET
+                     models_json = excluded.models_json,
+                     etag = excluded.etag,
+                     fetched_at_ms = excluded.fetched_at_ms",
+                params![
+                    provider,
+                    models_json,
+                    etag,
+                    to_sqlite_integer(fetched_at_ms)?
+                ],
+            )
+            .map_err(map_sqlite_error)?;
+        Ok(())
+    }
+
+    /// Replaces one provider catalog and advances the management revision in
+    /// the same immediate transaction.
+    pub fn put_provider_models_and_advance_management_revision(
+        &self,
+        provider: &str,
+        models_json: &str,
+        etag: Option<&str>,
+        fetched_at_ms: u64,
+    ) -> StoreResult<u64> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        transaction
+            .execute(
+                "INSERT INTO provider_models(provider, models_json, etag, fetched_at_ms)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(provider) DO UPDATE SET
+                     models_json = excluded.models_json,
+                     etag = excluded.etag,
+                     fetched_at_ms = excluded.fetched_at_ms",
+                params![
+                    provider,
+                    models_json,
+                    etag,
+                    to_sqlite_integer(fetched_at_ms)?
+                ],
+            )
+            .map_err(map_sqlite_error)?;
+        let revision = next_management_revision_in_transaction(&transaction)?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(revision)
     }
 
     /// Lists every durable session in stable byte order.

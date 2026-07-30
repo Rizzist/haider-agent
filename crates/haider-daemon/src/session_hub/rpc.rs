@@ -399,6 +399,18 @@ impl HubConnection {
                 }
                 self.provider_list(request_id, provider)
             }
+            RequestBody::ProviderModelsRefresh { provider } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.provider_models_refresh(request_id, provider)
+            }
             RequestBody::ProviderConfigure {
                 command_id,
                 provider,
@@ -1038,6 +1050,32 @@ impl HubConnection {
                     },
                 },
             )),
+        )
+    }
+
+    fn provider_models_refresh(
+        &self,
+        request_id: RequestId,
+        provider: String,
+    ) -> Result<(), SessionHubError> {
+        if provider.trim().is_empty() {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "model-refresh provider must not be empty",
+                false,
+                None,
+            );
+        }
+        self.send_management_command(
+            request_id.clone(),
+            crate::accounts::AccountCommand::RefreshProviderModels {
+                provider,
+                completed: crate::accounts::LoginRoute {
+                    request_id,
+                    sink: Arc::clone(&self.sink),
+                },
+            },
         )
     }
 
