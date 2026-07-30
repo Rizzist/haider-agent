@@ -61,8 +61,19 @@ impl Wordmark {
     ///
     /// TIMING: must run after raw mode is entered and BEFORE the input-pump
     /// thread starts, or the pump consumes the terminal's query response.
+    ///
+    /// v0.0.15 field bug (the swallowed-first-key probe): on a terminal that
+    /// NEVER answers the query, the stdio reader's timeout path leaves the
+    /// next stdin byte to be consumed and discarded — the user's first
+    /// keypress after launch silently vanished (a leading `/` most visibly).
+    /// The query is therefore gated on ENVIRONMENT EVIDENCE of a terminal
+    /// that actually answers graphics-capability queries; everything else
+    /// skips straight to the half-block art without ever touching stdin.
     #[must_use]
     pub fn detect() -> Option<Self> {
+        if !graphics_terminal_likely(&|name| std::env::var(name).ok()) {
+            return None;
+        }
         let picker = Picker::from_query_stdio().ok()?;
         let kind = picker.protocol_type();
         if matches!(kind, ProtocolType::Halfblocks) {
@@ -90,4 +101,33 @@ impl Wordmark {
             .resize(Resize::Fit(None))
             .render(area, buf, &mut self.protocol);
     }
+}
+
+/// Environment evidence that this terminal answers graphics-capability
+/// queries (so the query's response reader is guaranteed its answer and can
+/// never eat a user keystroke). Conservative allowlist: the terminals that
+/// speak Kitty graphics or iTerm2 inline images and ANSWER queries.
+///
+/// Pure over an env lookup so tests can drive it without touching the
+/// process environment (edition 2024 makes `set_var` unsafe).
+#[must_use]
+pub fn graphics_terminal_likely(env: &dyn Fn(&str) -> Option<String>) -> bool {
+    if env("KITTY_WINDOW_ID").is_some() {
+        return true;
+    }
+    if env("TERM").is_some_and(|term| term.contains("kitty") || term.contains("ghostty")) {
+        return true;
+    }
+    if env("TERM_PROGRAM").is_some_and(|program| {
+        matches!(
+            program.as_str(),
+            "iTerm.app" | "WezTerm" | "ghostty" | "rio" | "vscode"
+        )
+    }) {
+        return true;
+    }
+    if env("WEZTERM_EXECUTABLE").is_some() || env("KONSOLE_VERSION").is_some() {
+        return true;
+    }
+    false
 }
