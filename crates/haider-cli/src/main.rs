@@ -67,12 +67,14 @@ async fn main() -> ExitCode {
         [command] if command == "--ready" => front_door(FrontDoor::Report).await,
         [command, rest @ ..] if command == "run" => run_command(rest).await,
         [command, rest @ ..] if command == "tui" => tui_command(rest).await,
+        [command, rest @ ..] if command == "import" => import_command(rest).await,
         [other, ..] => {
             eprintln!(
                 "haider: unknown or incomplete command `{other}` \
                  (supports: --version, self-test, run --jsonl <prompt>, \
                  run --jsonl --provider anthropic --model <id> <prompt>, \
-                 tui [--theme dawn|ivory|dark], tui --demo [--plain], --ready)"
+                 tui [--theme dawn|ivory|dark], tui --demo [--plain], \
+                 import [codex|claude-code], --ready)"
             );
             ExitCode::from(2)
         }
@@ -81,6 +83,139 @@ async fn main() -> ExitCode {
         // that connection.
         [] => front_door(FrontDoor::Tui).await,
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ImportDispatch {
+    List,
+    Source(ImportSource),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ImportSource {
+    Codex,
+    ClaudeCode,
+}
+
+impl ImportSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::ClaudeCode => "claude-code",
+        }
+    }
+
+    fn env_override(self) -> &'static str {
+        match self {
+            Self::Codex => "HAIDER_CODEX_AUTH_PATH",
+            Self::ClaudeCode => "HAIDER_CLAUDE_CREDS_PATH",
+        }
+    }
+
+    fn home_relative_path(self) -> &'static str {
+        match self {
+            Self::Codex => ".codex/auth.json",
+            Self::ClaudeCode => ".claude/.credentials.json",
+        }
+    }
+}
+
+pub(crate) fn parse_import_dispatch(rest: &[String]) -> Result<ImportDispatch, String> {
+    match rest {
+        [] => Ok(ImportDispatch::List),
+        [source] if source == "codex" => Ok(ImportDispatch::Source(ImportSource::Codex)),
+        [source] if source == "claude-code" => Ok(ImportDispatch::Source(ImportSource::ClaudeCode)),
+        [source] => Err(format!(
+            "unknown source `{source}` (expected codex or claude-code)"
+        )),
+        _ => Err("expected at most one source: codex or claude-code".into()),
+    }
+}
+
+async fn import_command(rest: &[String]) -> ExitCode {
+    let dispatch = match parse_import_dispatch(rest) {
+        Ok(dispatch) => dispatch,
+        Err(message) => {
+            eprintln!("haider import: {message}");
+            return ExitCode::from(2);
+        }
+    };
+    let ImportDispatch::Source(source) = dispatch else {
+        for source in [ImportSource::Codex, ImportSource::ClaudeCode] {
+            let path = import_source_path(source);
+            let status = if path.is_file() { "exists" } else { "missing" };
+            println!("{}: {status} ({})", source.as_str(), path.display());
+        }
+        return ExitCode::SUCCESS;
+    };
+    let env = haider_client::ProfileEnv::capture();
+    let profile = match haider_client::resolve_profile(&env) {
+        Ok(profile) => profile,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut options = haider_client::EnsureOptions::default();
+    options
+        .required_features
+        .insert(haider_rpc::FEATURE_ACCOUNT_OAUTH_IMPORT_V1.to_owned());
+    let ensured = match haider_client::ensure_daemon(&profile, options).await {
+        Ok(ensured) => ensured,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let response = ensured
+        .client
+        .request(haider_rpc::RequestBody::AccountOAuthImport {
+            command_id: haider_rpc::CommandId::new(import_command_id()),
+            source: source.as_str().to_owned(),
+        })
+        .await;
+    ensured.client.close();
+    match response {
+        Ok(haider_rpc::ResponseBody::AccountOAuthImport { descriptor, .. }) => {
+            println!(
+                "imported {} ({}) — {}",
+                descriptor.alias, descriptor.provider, descriptor.identity
+            );
+            ExitCode::SUCCESS
+        }
+        Ok(haider_rpc::ResponseBody::Error { message, .. }) => {
+            eprintln!("{message}");
+            ExitCode::FAILURE
+        }
+        Ok(_) => {
+            eprintln!("daemon returned an unexpected response to account.oauth_import");
+            ExitCode::FAILURE
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn import_source_path(source: ImportSource) -> PathBuf {
+    if let Some(path) = std::env::var_os(source.env_override()).filter(|value| !value.is_empty()) {
+        return PathBuf::from(path);
+    }
+    std::env::var_os("HOME").map_or_else(
+        || PathBuf::from("~").join(source.home_relative_path()),
+        |home| PathBuf::from(home).join(source.home_relative_path()),
+    )
+}
+
+fn import_command_id() -> String {
+    format!(
+        "oauth-import-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_nanos())
+    )
 }
 
 /// What the front door does once the daemon is ready.

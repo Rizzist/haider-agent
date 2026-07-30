@@ -295,6 +295,18 @@ impl HubConnection {
                 }
                 self.account_oauth_cancel(request_id, flow_id, attempt_id)
             }
+            RequestBody::AccountOAuthImport { command_id, source } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.account_oauth_import(request_id, command_id, source)
+            }
             RequestBody::AccountAdd {
                 command_id,
                 provider,
@@ -712,6 +724,62 @@ impl HubConnection {
                 request_id,
                 ERROR_CODE_DRAINING,
                 "OAuth coordinator is shut down",
+                true,
+                None,
+            ),
+        }
+    }
+
+    fn account_oauth_import(
+        &self,
+        request_id: RequestId,
+        command_id: CommandId,
+        source: String,
+    ) -> Result<(), SessionHubError> {
+        let Some(facade) = self.secret_surface_facade(&request_id)? else {
+            return Ok(());
+        };
+        if command_id.as_str().trim().is_empty()
+            || !matches!(source.as_str(), "codex" | "claude-code")
+        {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "account.oauth_import requires a command id and source `codex` or `claude-code`",
+                false,
+                None,
+            );
+        }
+        let Some(commands) = facade.login else {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_DRAINING,
+                "account actor is shut down",
+                true,
+                None,
+            );
+        };
+        let job = crate::accounts::OAuthImportJob {
+            command_id: command_id.0,
+            source,
+            route: crate::accounts::LoginRoute {
+                request_id: request_id.clone(),
+                sink: Arc::clone(&self.sink),
+            },
+        };
+        match commands.try_send(crate::accounts::AccountCommand::ImportOAuth(Box::new(job))) {
+            Ok(()) => Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => self.respond_error(
+                request_id,
+                haider_rpc::ERROR_CODE_BUSY,
+                "account actor is busy; retry with the same command id",
+                true,
+                None,
+            ),
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => self.respond_error(
+                request_id,
+                ERROR_CODE_DRAINING,
+                "account actor is shut down",
                 true,
                 None,
             ),

@@ -217,6 +217,47 @@ impl<S: StoreLike> AccountStore<S> {
         self.commit(next)
     }
 
+    /// Atomically replaces one descriptor without changing its active slot.
+    ///
+    /// OAuth token rotation uses this after its new bundle is durable. The
+    /// alias, provider, auth method, and base URL are immutable coordinates;
+    /// replacement may update only public identity/status metadata.
+    pub fn replace(&mut self, mut descriptor: CredentialDescriptor) -> AccountsResult<()> {
+        validate_descriptor(&descriptor)?;
+        let index = self
+            .descriptors
+            .iter()
+            .position(|existing| existing.alias == descriptor.alias)
+            .ok_or_else(|| missing_alias(&descriptor.alias))?;
+        let previous = &self.descriptors[index];
+        if previous.provider != descriptor.provider {
+            return Err(accounts_error(
+                ErrorCode::InvalidArgument,
+                format!(
+                    "credential alias `{}` belongs to provider `{}`, not `{}`",
+                    descriptor.alias, previous.provider, descriptor.provider
+                ),
+                false,
+            ));
+        }
+        if previous.auth_method != descriptor.auth_method
+            || previous.base_url != descriptor.base_url
+        {
+            return Err(accounts_error(
+                ErrorCode::InvalidArgument,
+                format!(
+                    "credential alias `{}` cannot change authentication coordinates during replacement",
+                    descriptor.alias
+                ),
+                false,
+            ));
+        }
+        descriptor.active = previous.active;
+        let mut next = self.descriptors.clone();
+        next[index] = descriptor;
+        self.commit(next)
+    }
+
     /// Makes `alias` the active account for its provider.
     pub fn select(&mut self, alias: &CredentialAlias) -> AccountsResult<()> {
         let provider = self
