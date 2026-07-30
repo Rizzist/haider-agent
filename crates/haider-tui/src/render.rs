@@ -571,6 +571,7 @@ fn render_launcher(
         // (the 1-3 keys stay as silent bindings).
         let busy = entry.busy();
         let live = entry.live();
+        let errored = entry.errored();
         let (rail, dot, dot_style) = if busy {
             (
                 // The gold→maroon→gold gradient crossing the sliver
@@ -579,6 +580,10 @@ fn render_launcher(
                 "◉",
                 theme.pulse_ink(theme.gold, model.anim_phase),
             )
+        } else if errored {
+            // The turn DIED — the badge's ✗ in the badge's warn tone,
+            // still (nothing pulses for a corpse). Owner report, W5f-0.
+            (Span::raw(" "), "✗", theme.warn_style())
         } else {
             (Span::raw(" "), "●", theme.ok_style())
         };
@@ -607,6 +612,8 @@ fn render_launcher(
             ));
         } else if busy {
             spans.push(Span::styled("  running… ·", theme.gold_style()));
+        } else if errored {
+            spans.push(Span::styled("  errored ·", theme.warn_style()));
         }
         let turns = entry.turns();
         // Sim renders the blurb segment only when a blurb exists
@@ -878,10 +885,7 @@ fn render_accounts(
             };
             let mut spans = vec![
                 Span::raw("  "),
-                Span::styled(
-                    format!("{} ", if selected { "●" } else { "○" }),
-                    dot_style,
-                ),
+                Span::styled(format!("{} ", if selected { "●" } else { "○" }), dot_style),
                 Span::styled(
                     row.alias.clone(),
                     theme
@@ -950,7 +954,11 @@ fn render_accounts(
                 footer_lines.push(Line::styled(
                     format!(
                         "  your browser opened {} — approve there; tokens land in the vault",
-                        if origin.is_empty() { "the provider" } else { origin }
+                        if origin.is_empty() {
+                            "the provider"
+                        } else {
+                            origin
+                        }
                     ),
                     theme.dim_style(),
                 ));
@@ -992,7 +1000,10 @@ fn render_accounts(
             ("+ OpenAI (API)", crate::app::AccountAddKind::OpenAiApi),
         ],
         [
-            ("+ Anthropic (API)", crate::app::AccountAddKind::AnthropicApi),
+            (
+                "+ Anthropic (API)",
+                crate::app::AccountAddKind::AnthropicApi,
+            ),
             ("+ HuggingFace", crate::app::AccountAddKind::HuggingFace),
             (
                 "+ Custom (OpenAI-compatible)",
@@ -1173,7 +1184,8 @@ fn render_providers(
                 .filter(|(provider, _)| *provider == summary.provider);
             for model_name in &summary.models {
                 let is_default = summary.default_model.as_deref() == Some(model_name);
-                let is_pending = pending.is_some_and(|(_, pending_model)| pending_model == model_name);
+                let is_pending =
+                    pending.is_some_and(|(_, pending_model)| pending_model == model_name);
                 let label = if is_default {
                     format!("{model_name}*")
                 } else if is_pending {

@@ -11,9 +11,9 @@
 //!   yields the same event sequence (`Delay` only adds wall time).
 
 mod anthropic;
-mod catalog;
 #[cfg(test)]
 mod anthropic_tests;
+mod catalog;
 mod openai;
 mod origin;
 mod wire;
@@ -35,6 +35,10 @@ pub use anthropic::{
     AnthropicCapture, AnthropicProvider, AnthropicRetryPolicy, AnthropicTransportConfig,
     replay_anthropic_http_error, replay_anthropic_sse,
 };
+pub use catalog::{
+    CatalogError, CatalogSource, DiscoveredCatalog, DiscoveredModel, discover_models,
+    discover_models_with_resolver, parse_catalog, pickable,
+};
 pub use openai::{
     OPENAI_CODEX_RESPONSES_LITE_HEADER, OPENAI_CODEX_RESPONSES_LITE_VALUE,
     OPENAI_COMPATIBLE_PROVIDER_NAME, OPENAI_OAUTH_PROVIDER_NAME, OPENAI_PROVIDER_NAME,
@@ -43,10 +47,6 @@ pub use openai::{
     OpenAiTransportConfig, replay_openai_chat_sse, replay_openai_http_error,
     replay_openai_models_response, replay_openai_responses_sse,
     validate_openai_compatible_endpoint,
-};
-pub use catalog::{
-    CatalogError, CatalogSource, DiscoveredCatalog, DiscoveredModel, discover_models,
-    discover_models_with_resolver, parse_catalog, pickable,
 };
 pub use origin::{FixedDnsResolver, FixedOriginGuard, SystemFixedDnsResolver};
 

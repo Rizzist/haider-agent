@@ -44,9 +44,7 @@ fn providers_model() -> AppModel {
         "entering the screen must request summaries"
     );
     model.requests.clear();
-    model
-        .providers
-        .apply_snapshot(seed_provider_summaries(), 1);
+    model.providers.apply_snapshot(seed_provider_summaries(), 1);
     model
 }
 
@@ -144,9 +142,7 @@ fn default_marker_moves_only_on_the_correlated_reply() {
 #[test]
 fn a_stale_default_result_cannot_regress_newer_rows() {
     let mut model = providers_model();
-    model
-        .providers
-        .apply_snapshot(seed_provider_summaries(), 9);
+    model.providers.apply_snapshot(seed_provider_summaries(), 9);
 
     model.set_default_model("openai", "o4-mini");
     let mut stale = seed_provider_summaries()
@@ -201,7 +197,11 @@ fn revision_conflict_releases_the_gate_and_refreshes() {
     model.set_default_model("openai", "o4-mini");
     model.requests.clear();
 
-    model.default_model_failed("openai", "expected management revision 1, current revision is 4", true);
+    model.default_model_failed(
+        "openai",
+        "expected management revision 1, current revision is 4",
+        true,
+    );
     assert!(model.providers.pending_default.is_none());
     assert!(
         model

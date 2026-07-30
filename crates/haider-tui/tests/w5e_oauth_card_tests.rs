@@ -47,7 +47,9 @@ fn draw(model: &AppModel, width: u16, height: u16) -> String {
 }
 
 fn open_card(model: &mut AppModel) {
-    model.handle_hit(Hit::AccountAdd(haider_tui::app::AccountAddKind::OpenAiOAuth));
+    model.handle_hit(Hit::AccountAdd(
+        haider_tui::app::AccountAddKind::OpenAiOAuth,
+    ));
 }
 
 /// The add row + hints anchor to the BOTTOM of the screen (owner ask): even

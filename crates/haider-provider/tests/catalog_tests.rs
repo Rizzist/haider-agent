@@ -89,8 +89,8 @@ fn codex_shape_parses_with_its_effort_ladder() {
 /// Verified by revert on 2026-07-30.
 #[test]
 fn provider_visibility_and_priority_drive_the_picker() {
-    let models = parse_catalog(CatalogSource::OpenAiSubscription, &codex_payload())
-        .expect("parses");
+    let models =
+        parse_catalog(CatalogSource::OpenAiSubscription, &codex_payload()).expect("parses");
     let listed = pickable(&models);
     let slugs: Vec<&str> = listed.iter().map(|model| model.slug.as_str()).collect();
     assert_eq!(

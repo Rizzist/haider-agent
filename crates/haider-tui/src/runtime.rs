@@ -1242,7 +1242,9 @@ impl DemoDriver {
                 model.dirty = true;
             }
             AppRequest::SetDefaultModel {
-                provider, model: default, ..
+                provider,
+                model: default,
+                ..
             } => {
                 let Some(mut summary) = model
                     .providers
@@ -2162,6 +2164,28 @@ pub fn rendered_selection_text(
 /// (best-effort mirror for remote/embedded terminals — always emitted, but
 /// unverifiable, so it never upgrades the flash: the flash reports the
 /// channel we can actually observe).
+/// The browser hop's effects, opener-injected so tests can pin BOTH
+/// outcomes without spawning anything.
+///
+/// Success stays quiet — the OAuth card already narrates ("your browser
+/// opened …"). Failure must not strand the user behind copy that claims a
+/// browser opened: the URL lands on the clipboard and the flash says so.
+pub fn open_url_effects(
+    model: &mut AppModel,
+    url: &str,
+    opener: &dyn Fn(&str) -> std::io::Result<()>,
+) {
+    if opener(url).is_ok() {
+        return;
+    }
+    copy_selection_effects(model, url);
+    model.flash = Some(
+        "· couldn't open a browser — the sign-in link is on your clipboard ([1] retries)"
+            .to_owned(),
+    );
+    model.dirty = true;
+}
+
 fn copy_selection_effects(model: &mut AppModel, text: &str) {
     let confirmed = crate::clipboard::copy_local(text);
     let mut out = stdout();
@@ -2212,7 +2236,23 @@ pub struct LivePass {
     /// (a rendered selection) or the process (quit). Handed BACK rather
     /// than swallowed, so the pass stays free of IO and every other
     /// request is provably translated into a command.
-    pub shell: Vec<AppRequest>,
+    pub shell: Vec<ShellRequest>,
+}
+
+/// The CLOSED vocabulary of shell-owned effects. `run_live` must match
+/// every variant — no `_` arm can exist over a type this small, which is
+/// the structural fix for the browser-never-opened bug: `OpenUrl` reached
+/// the executor as a full `AppRequest` and died in its catch-all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShellRequest {
+    /// Copy the rendered selection (needs the terminal's frame).
+    CopySelection,
+    /// Copy model-known text (composer selection).
+    CopyText(String),
+    /// Open a URL in the user's browser (the OAuth authorize hop).
+    OpenUrl(String),
+    /// End the process.
+    Quit,
 }
 
 /// ONE PASS of the live loop's tail — the ordering that makes live mode
@@ -2263,12 +2303,10 @@ pub fn live_pass(
     let requests: Vec<AppRequest> = model.requests.drain(..).collect();
     for request in requests {
         match request {
-            AppRequest::CopySelection
-            | AppRequest::CopyText(_)
-            | AppRequest::OpenUrl { .. }
-            | AppRequest::Quit => {
-                shell.push(request);
-            }
+            AppRequest::CopySelection => shell.push(ShellRequest::CopySelection),
+            AppRequest::CopyText(text) => shell.push(ShellRequest::CopyText(text)),
+            AppRequest::OpenUrl { url } => shell.push(ShellRequest::OpenUrl(url)),
+            AppRequest::Quit => shell.push(ShellRequest::Quit),
             request => commands.extend(driver.handle_request(model, request)),
         }
     }
@@ -2411,20 +2449,22 @@ pub async fn run_live(
         }
         let pass = live_pass(&mut driver, &mut model, inbound, std::time::Instant::now());
         pending.extend(pass.commands);
+        // Exhaustive over the CLOSED shell vocabulary — adding a variant
+        // without an arm here is a compile error, never a silent drop.
         for request in pass.shell {
             match request {
-                AppRequest::CopySelection => {
+                ShellRequest::CopySelection => {
                     if let Some(selection) = model.selection {
                         let size = terminal.size()?;
                         let text = rendered_selection_text(&model, size, &selection);
                         copy_selection_effects(&mut model, &text);
                     }
                 }
-                AppRequest::CopyText(text) => copy_selection_effects(&mut model, &text),
-                AppRequest::Quit => model.should_quit = true,
-                // `live_pass` hands back exactly the shell-owned arms; any
-                // other request was already translated into a command.
-                _ => {}
+                ShellRequest::CopyText(text) => copy_selection_effects(&mut model, &text),
+                ShellRequest::OpenUrl(url) => {
+                    open_url_effects(&mut model, &url, &crate::browser::open_url);
+                }
+                ShellRequest::Quit => model.should_quit = true,
             }
         }
         if model.theme != active_theme {

@@ -85,7 +85,10 @@ fn provider_and_account_slots_are_daemon_truth() {
     let model = model_with_catalog();
     let providers = values(&palette_items("provider ", true, &model.dynamic_slots()));
     assert!(providers.contains(&"openai".to_owned()));
-    assert!(providers.contains(&"google".to_owned()), "unavailable providers still listed");
+    assert!(
+        providers.contains(&"google".to_owned()),
+        "unavailable providers still listed"
+    );
 
     let items = palette_items("account ", false, &model.dynamic_slots());
     let aliases = values(&items);
@@ -97,7 +100,10 @@ fn provider_and_account_slots_are_daemon_truth() {
             _ => None,
         })
         .expect("row");
-    assert!(in_use.contains("in use"), "the active alias is marked: {in_use:?}");
+    assert!(
+        in_use.contains("in use"),
+        "the active alias is marked: {in_use:?}"
+    );
     assert!(in_use.contains("oauth"), "auth label rides: {in_use:?}");
 }
 
@@ -105,7 +111,11 @@ fn provider_and_account_slots_are_daemon_truth() {
 #[test]
 fn dynamic_slots_filter_by_prefix() {
     let model = model_with_catalog();
-    let offered = values(&palette_items("model gpt-5.6-c", true, &model.dynamic_slots()));
+    let offered = values(&palette_items(
+        "model gpt-5.6-c",
+        true,
+        &model.dynamic_slots(),
+    ));
     assert_eq!(offered, vec!["gpt-5.6-codex"]);
 }
 

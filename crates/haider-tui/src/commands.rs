@@ -244,11 +244,7 @@ fn dynamic_args(
 /// `getSuggestions` "lead" case, tui.js:243-247). After the space the
 /// palette stays on the argument slot.
 #[must_use]
-pub fn palette_items(
-    query: &str,
-    in_session: bool,
-    slots: &DynamicSlots,
-) -> Vec<PaletteItem> {
+pub fn palette_items(query: &str, in_session: bool, slots: &DynamicSlots) -> Vec<PaletteItem> {
     let ends_space = query.ends_with(char::is_whitespace);
     let mut tokens = query.split_whitespace();
     let first = tokens.next().unwrap_or("").to_ascii_lowercase();
