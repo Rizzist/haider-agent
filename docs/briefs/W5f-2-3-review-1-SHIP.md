@@ -36,6 +36,14 @@ Two live-turn killers found by READING the create path before probing:
   under full-gate contention, never isolated). Passing runs never wait;
   only real failures pay the longer bound.
 
+## W5f-2b — truth rides the connect (found in review, fixed WITH its own
+## test + executed mutation before merge — the TUI6 no-unreviewed-closer law)
+
+The bootstrap fires when snapshots APPLY, but `resume()` never asked for
+them: at launch the launcher would sit on demo seeds until the user
+happened to open /accounts. `resume()` now issues `AccountList` +
+`ProviderList` beside the session `List` on every (re)connect.
+
 ## Mutations (executed post-commit)
 
 | # | Mutation | Result |
@@ -44,11 +52,12 @@ Two live-turn killers found by READING the create path before probing:
 | M2 | bootstrap ignores `identity_pinned` | KILLED — 2 tests |
 | M3 | account click adopts without pinning | KILLED — 1 test |
 | M4 | create passes the raw context window | KILLED — 1 test |
+| M5 | resume forgets the front-door reads | KILLED — 1 test |
 
 ## Gate
 
 haider-tui full suite green (47 binaries); haider-client green; clippy
-`-D warnings` clean; ledger 1097 → 1101. Full per-crate gate:
+`-D warnings` clean; ledger 1097 → 1102. Full per-crate gate:
 `gate13.out`.
 
 ## Honest residuals
