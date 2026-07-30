@@ -201,7 +201,7 @@ fn palette_row_hits_align_and_click_runs_that_row() {
     assert_eq!(names, ["/theme", "/tree", "/tokens", "/tools"]);
     let (rows, hits, _) = draw(&model, 118, 34);
     for (item, label) in items.iter().zip(["/theme", "/tree", "/tokens", "/tools"]) {
-        let rect = rect_for(&hits, Hit::PaletteRow(*item));
+        let rect = rect_for(&hits, Hit::PaletteRow(item.clone()));
         assert_eq!(rect.y, row_of(&rows, label), "palette row {label} aligned");
     }
     assert_eq!(
@@ -221,7 +221,7 @@ fn palette_row_hits_align_and_click_runs_that_row() {
     );
     // Clicking the /tree row runs /tree (honest wave flash) — the hit
     // carries the VALUE it was rendered with.
-    model.handle_hit(Hit::PaletteRow(items[1]));
+    model.handle_hit(Hit::PaletteRow(items[1].clone()));
     assert!(model.flash.as_deref().unwrap_or("").contains("/tree"));
 }
 

@@ -118,13 +118,16 @@ const fn session_cmd(
 /// executable slot today — the full arg-slot table lands with the daemon's
 /// real command arguments. `Eq` matters: mouse hits carry the VALUE so a
 /// stale hit map can never activate a different row (review r2 P2-2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PaletteItem {
     Cmd(&'static CommandSpec),
     Arg {
         cmd: &'static str,
-        value: &'static str,
-        desc: &'static str,
+        /// OWNED (W5e-3): argument candidates are no longer all compile-time
+        /// constants — `/model` and `/provider` rows come from the DISCOVERED
+        /// catalog, `/account` from live aliases.
+        value: String,
+        desc: String,
     },
 }
 
@@ -140,10 +143,10 @@ impl PaletteItem {
 
     /// The dim description column (sim `.cdesc`).
     #[must_use]
-    pub const fn desc(&self) -> &'static str {
+    pub fn desc(&self) -> &str {
         match self {
             Self::Cmd(spec) => spec.desc,
-            Self::Arg { desc, .. } => desc,
+            Self::Arg { desc, .. } => desc.as_str(),
         }
     }
 }
@@ -159,7 +162,9 @@ pub const PALETTE_MAX_ROWS: usize = 8;
 /// one account command this release makes executable.
 #[must_use]
 pub fn has_arg_slots(name: &str) -> bool {
-    matches!(name, "theme" | "login")
+    // W5e-3 adds the three DISCOVERED slots. `/model` and `/provider` are
+    // session-scoped commands; `/account` works anywhere.
+    matches!(name, "theme" | "login" | "model" | "provider" | "account")
 }
 
 /// `/login`'s two argument slots: provider, then method. The provider list
@@ -180,8 +185,8 @@ fn login_args(slot: usize, fragment: &str) -> Vec<PaletteItem> {
         .filter(|(value, _)| value.starts_with(fragment))
         .map(|(value, desc)| PaletteItem::Arg {
             cmd: "login",
-            value,
-            desc,
+            value: (*value).to_owned(),
+            desc: (*desc).to_owned(),
         })
         .collect()
 }
@@ -194,8 +199,41 @@ fn theme_args(fragment: &str) -> Vec<PaletteItem> {
         .filter(|key| key.name().starts_with(fragment))
         .map(|key| PaletteItem::Arg {
             cmd: "theme",
-            value: key.name(),
-            desc: key.theme().label,
+            value: key.name().to_owned(),
+            desc: key.theme().label.to_owned(),
+        })
+        .collect()
+}
+
+/// Live candidates for the argument slots that are no longer static
+/// (W5e-3). Everything here is DAEMON TRUTH — providers and models come from
+/// the discovered catalog, accounts from `account.list`. An empty vector
+/// means "the daemon has not told us yet", which renders as no rows rather
+/// than as invented ones.
+#[derive(Debug, Default, Clone)]
+pub struct DynamicSlots {
+    /// `(provider, description)` for `/provider` and `/login`'s first slot.
+    pub providers: Vec<(String, String)>,
+    /// `(slug, description)` for `/model` — the ACTIVE provider's discovered
+    /// models, already filtered to pickable and ordered by the provider's own
+    /// priority.
+    pub models: Vec<(String, String)>,
+    /// `(alias, description)` for `/account`.
+    pub accounts: Vec<(String, String)>,
+}
+
+fn dynamic_args(
+    cmd: &'static str,
+    candidates: &[(String, String)],
+    fragment: &str,
+) -> Vec<PaletteItem> {
+    candidates
+        .iter()
+        .filter(|(value, _)| value.to_ascii_lowercase().starts_with(fragment))
+        .map(|(value, desc)| PaletteItem::Arg {
+            cmd,
+            value: value.clone(),
+            desc: desc.clone(),
         })
         .collect()
 }
@@ -206,7 +244,11 @@ fn theme_args(fragment: &str) -> Vec<PaletteItem> {
 /// `getSuggestions` "lead" case, tui.js:243-247). After the space the
 /// palette stays on the argument slot.
 #[must_use]
-pub fn palette_items(query: &str, in_session: bool) -> Vec<PaletteItem> {
+pub fn palette_items(
+    query: &str,
+    in_session: bool,
+    slots: &DynamicSlots,
+) -> Vec<PaletteItem> {
     let ends_space = query.ends_with(char::is_whitespace);
     let mut tokens = query.split_whitespace();
     let first = tokens.next().unwrap_or("").to_ascii_lowercase();
@@ -225,6 +267,9 @@ pub fn palette_items(query: &str, in_session: bool) -> Vec<PaletteItem> {
         {
             return match first.as_str() {
                 "login" => login_args(0, ""),
+                "model" => dynamic_args("model", &slots.models, ""),
+                "provider" => dynamic_args("provider", &slots.providers, ""),
+                "account" => dynamic_args("account", &slots.accounts, ""),
                 _ => theme_args(""),
             };
         }
@@ -245,6 +290,10 @@ pub fn palette_items(query: &str, in_session: bool) -> Vec<PaletteItem> {
     match first.as_str() {
         "theme" if done_args == 0 => theme_args(&fragment),
         "login" if done_args < 2 => login_args(done_args, &fragment),
+        // W5e-3: fed from the discovered catalog / live account list.
+        "model" if done_args == 0 => dynamic_args("model", &slots.models, &fragment),
+        "provider" if done_args == 0 => dynamic_args("provider", &slots.providers, &fragment),
+        "account" if done_args == 0 => dynamic_args("account", &slots.accounts, &fragment),
         _ => Vec::new(),
     }
 }
