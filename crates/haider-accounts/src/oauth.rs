@@ -13,6 +13,7 @@ use zeroize::Zeroizing;
 use crate::{AccountsResult, SecretHandle, accounts_error};
 
 const MAGIC: &[u8] = b"HAIDER_OAUTH_BUNDLE\x01";
+const REFRESH_ON_FIRST_USE_MARKER: &[u8] = b"HAIDER_IMPORT_REFRESH\x01";
 const MAX_BUNDLE_BYTES: usize = 256 * 1024;
 const MAX_FIELD_BYTES: usize = 64 * 1024;
 const MAX_SCOPES: usize = 128;
@@ -42,6 +43,7 @@ pub struct OAuthTokenBundleV1 {
     pub granted_scopes: Vec<String>,
     pub identity: OAuthIdentityV1,
     pub generation: u64,
+    refresh_on_first_use: bool,
 }
 
 impl fmt::Debug for OAuthTokenBundleV1 {
@@ -99,6 +101,7 @@ impl OAuthTokenBundleV1 {
             granted_scopes,
             identity,
             generation,
+            refresh_on_first_use: false,
         };
         bundle.validate()?;
         Ok(bundle)
@@ -148,6 +151,9 @@ impl OAuthTokenBundleV1 {
         }
         push_bytes(&mut out, self.identity.subject_hash.as_bytes())?;
         push_bytes(&mut out, self.identity.display_identity.as_bytes())?;
+        if self.refresh_on_first_use {
+            out.extend_from_slice(REFRESH_ON_FIRST_USE_MARKER);
+        }
         if out.len() > MAX_BUNDLE_BYTES {
             return Err(invalid_bundle("OAuth token bundle is oversized"));
         }
@@ -188,10 +194,14 @@ impl OAuthTokenBundleV1 {
         }
         let subject_hash = reader.public_string()?;
         let display_identity = reader.public_string()?;
-        if !reader.is_empty() {
+        let refresh_on_first_use = if reader.is_empty() {
+            false
+        } else if reader.remaining == REFRESH_ON_FIRST_USE_MARKER {
+            true
+        } else {
             return Err(invalid_bundle("OAuth token bundle has trailing bytes"));
-        }
-        Self::new(
+        };
+        let mut bundle = Self::new(
             provider_id,
             issuer,
             audience,
@@ -207,7 +217,9 @@ impl OAuthTokenBundleV1 {
                 display_identity,
             },
             generation,
-        )
+        )?;
+        bundle.refresh_on_first_use = refresh_on_first_use;
+        Ok(bundle)
     }
 
     /// Produces the only credential bytes adapters may receive for OAuth:
@@ -225,6 +237,22 @@ impl OAuthTokenBundleV1 {
     #[must_use]
     pub fn access_token(&self) -> &[u8] {
         self.access_token.as_slice()
+    }
+
+    /// Marks an imported fallback bundle for one eager broker refresh.
+    ///
+    /// The marker is stored inside the vault payload, never in a descriptor
+    /// or receipt. A refreshed bundle is built normally and therefore clears
+    /// it durably.
+    #[must_use]
+    pub fn with_refresh_on_first_use(mut self) -> Self {
+        self.refresh_on_first_use = true;
+        self
+    }
+
+    #[must_use]
+    pub fn refresh_on_first_use(&self) -> bool {
+        self.refresh_on_first_use
     }
 
     fn validate(&self) -> AccountsResult<()> {

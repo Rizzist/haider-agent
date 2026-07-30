@@ -8,7 +8,9 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::future::Future;
+use std::io::Read as _;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -43,10 +45,16 @@ use crate::session_hub::FrameSink;
 
 const CALLBACK_RESPONSE_LIMIT: usize = 8 * 1024;
 const TOKEN_RESPONSE_LIMIT: usize = 256 * 1024;
+const IMPORT_FILE_LIMIT: u64 = 256 * 1024;
 const MIN_RANDOM_BYTES: usize = 32;
 const MAX_TOKEN_LIFETIME_SECS: u64 = 366 * 24 * 60 * 60;
 const CALLBACK_READ_TIMEOUT: Duration = Duration::from_secs(2);
 const TOKEN_TIMEOUT: Duration = Duration::from_secs(15);
+const OAUTH_REFRESH_SKEW: Duration = Duration::from_secs(30);
+// Codex auth.json has no explicit expiry outside the access-token JWT. An
+// unparseable import is stamped this far ahead and marked inside its vault
+// bundle for one eager refresh on first resolution.
+const CODEX_IMPORT_FALLBACK_WINDOW: Duration = Duration::from_secs(15 * 60);
 
 struct OwnedTaskSet {
     sealed: AtomicBool,
@@ -759,6 +767,345 @@ impl OAuthProviderCatalog {
     fn registration(&self, provider: &str) -> Option<Arc<OAuthProviderRegistration>> {
         self.registrations.get(provider).cloned()
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OAuthImportSourceSpec {
+    pub source: &'static str,
+    pub provider: &'static str,
+    pub default_alias: &'static str,
+    env_override: &'static str,
+    home_relative_path: &'static str,
+}
+
+pub(crate) fn oauth_import_source_spec(source: &str) -> Result<OAuthImportSourceSpec, HaiderError> {
+    match source {
+        "codex" => Ok(OAuthImportSourceSpec {
+            source: "codex",
+            provider: haider_provider::OPENAI_OAUTH_PROVIDER_NAME,
+            default_alias: haider_provider::OPENAI_OAUTH_PROVIDER_NAME,
+            env_override: "HAIDER_CODEX_AUTH_PATH",
+            home_relative_path: ".codex/auth.json",
+        }),
+        "claude-code" => Ok(OAuthImportSourceSpec {
+            source: "claude-code",
+            provider: haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME,
+            default_alias: haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME,
+            env_override: "HAIDER_CLAUDE_CREDS_PATH",
+            home_relative_path: ".claude/.credentials.json",
+        }),
+        _ => Err(HaiderError::new(
+            ErrorCode::InvalidArgument,
+            "OAuth import source must be `codex` or `claude-code`",
+            false,
+        )),
+    }
+}
+
+pub(crate) fn oauth_import_path(source: &str) -> Result<PathBuf, HaiderError> {
+    let spec = oauth_import_source_spec(source)?;
+    if let Some(path) = std::env::var_os(spec.env_override).filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(path));
+    }
+    let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) else {
+        return Err(HaiderError::new(
+            ErrorCode::CredentialMissing,
+            format!(
+                "cannot locate OAuth import source `{}`: HOME and {} are unset",
+                spec.source, spec.env_override
+            ),
+            false,
+        ));
+    };
+    Ok(PathBuf::from(home).join(spec.home_relative_path))
+}
+
+/// Reads and converts one daemon-local CLI credential file.
+///
+/// The returned bundle is the first and only object allowed to leave this
+/// function. File bytes and all token fields stay in zeroizing storage.
+pub(crate) fn load_oauth_import_bundle(
+    source: &str,
+    generation: u64,
+) -> Result<OAuthTokenBundleV1, HaiderError> {
+    let spec = oauth_import_source_spec(source)?;
+    let path = oauth_import_path(source)?;
+    let bytes = read_oauth_import_file(&path, spec.source)?;
+    let registration = OAuthProviderCatalog::default()
+        .registration(spec.provider)
+        .ok_or_else(|| {
+            HaiderError::new(
+                ErrorCode::Unauthorized,
+                format!(
+                    "OAuth import source `{}` has no sanctioned provider registration",
+                    spec.source
+                ),
+                false,
+            )
+        })?;
+    match spec.source {
+        "codex" => codex_import_bundle(&path, &bytes, &registration, generation),
+        "claude-code" => claude_import_bundle(&path, &bytes, &registration, generation),
+        _ => unreachable!("source spec is closed"),
+    }
+}
+
+fn read_oauth_import_file(path: &Path, source: &str) -> Result<Zeroizing<Vec<u8>>, HaiderError> {
+    let file = std::fs::File::open(path).map_err(|error| {
+        HaiderError::new(
+            ErrorCode::CredentialMissing,
+            format!(
+                "cannot read OAuth import source `{source}` at `{}`: {error}",
+                path.display()
+            ),
+            false,
+        )
+    })?;
+    let mut bytes = Zeroizing::new(Vec::new());
+    file.take(IMPORT_FILE_LIMIT.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            HaiderError::new(
+                ErrorCode::CredentialMissing,
+                format!(
+                    "cannot read OAuth import source `{source}` at `{}`: {error}",
+                    path.display()
+                ),
+                false,
+            )
+        })?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > IMPORT_FILE_LIMIT {
+        return Err(HaiderError::new(
+            ErrorCode::InvalidArgument,
+            format!(
+                "OAuth import source `{source}` at `{}` is too large",
+                path.display()
+            ),
+            false,
+        ));
+    }
+    Ok(bytes)
+}
+
+#[derive(Deserialize)]
+struct CodexAuthFile {
+    tokens: CodexTokens,
+}
+
+#[derive(Deserialize)]
+struct CodexTokens {
+    #[serde(default)]
+    id_token: Option<SecretJson>,
+    access_token: SecretJson,
+    refresh_token: SecretJson,
+    #[serde(default)]
+    account_id: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+struct ImportedJwtClaims {
+    #[serde(default)]
+    exp: Option<u64>,
+    #[serde(default)]
+    sub: Option<String>,
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    chatgpt_account_id: Option<String>,
+    #[serde(default, rename = "https://api.openai.com/auth")]
+    openai_auth: Option<ImportedOpenAiAuthClaims>,
+}
+
+#[derive(Default, Deserialize)]
+struct ImportedOpenAiAuthClaims {
+    #[serde(default)]
+    chatgpt_account_id: Option<String>,
+}
+
+fn codex_import_bundle(
+    path: &Path,
+    bytes: &[u8],
+    registration: &OAuthProviderRegistration,
+    generation: u64,
+) -> Result<OAuthTokenBundleV1, HaiderError> {
+    let auth: CodexAuthFile =
+        serde_json::from_slice(bytes).map_err(|error| malformed_import(path, "codex", &error))?;
+    let parsed_expiry = unverified_jwt_expiry_ms(auth.tokens.access_token.0.as_slice());
+    let refresh_on_first_use = parsed_expiry.is_none();
+    let expires_at_unix_ms = parsed_expiry
+        .or_else(|| {
+            now_ms().and_then(|now| now.checked_add(duration_ms(CODEX_IMPORT_FALLBACK_WINDOW)))
+        })
+        .ok_or_else(|| {
+            HaiderError::new(
+                ErrorCode::Internal,
+                "cannot stamp fallback OAuth import expiry",
+                true,
+            )
+        })?;
+    let identity_claims = auth
+        .tokens
+        .id_token
+        .as_ref()
+        .and_then(|token| decode_unverified_jwt_payload::<ImportedJwtClaims>(token.0.as_slice()))
+        .unwrap_or_default();
+    let account_id = identity_claims
+        .chatgpt_account_id
+        .and_then(nonempty)
+        .or_else(|| {
+            identity_claims
+                .openai_auth
+                .and_then(|claims| claims.chatgpt_account_id.and_then(nonempty))
+        })
+        .or_else(|| auth.tokens.account_id.and_then(nonempty));
+    let display_identity = identity_claims
+        .email
+        .and_then(nonempty)
+        .or_else(|| account_id.clone())
+        .unwrap_or_else(|| "imported".to_owned());
+    let subject = identity_claims
+        .sub
+        .and_then(nonempty)
+        .or(account_id)
+        .unwrap_or_else(|| "imported".to_owned());
+    let bundle = OAuthTokenBundleV1::new(
+        registration.provider_id.clone(),
+        registration.issuer.clone(),
+        registration.audience.clone(),
+        registration.resource.clone(),
+        "Bearer".into(),
+        auth.tokens.access_token.0,
+        Some(auth.tokens.refresh_token.0),
+        expires_at_unix_ms,
+        None,
+        registration.scopes.clone(),
+        OAuthIdentityV1 {
+            subject_hash: blake3::hash(subject.as_bytes()).to_hex().to_string(),
+            display_identity,
+        },
+        generation,
+    )
+    .map_err(|_| invalid_import(path, "codex"))?;
+    Ok(if refresh_on_first_use {
+        bundle.with_refresh_on_first_use()
+    } else {
+        bundle
+    })
+}
+
+#[derive(Deserialize)]
+struct ClaudeCredentialsFile {
+    #[serde(rename = "claudeAiOauth")]
+    oauth: ClaudeCredentials,
+}
+
+#[derive(Deserialize)]
+struct ClaudeCredentials {
+    #[serde(rename = "accessToken")]
+    access_token: SecretJson,
+    #[serde(rename = "refreshToken")]
+    refresh_token: SecretJson,
+    #[serde(rename = "expiresAt")]
+    expires_at_unix_ms: u64,
+    scopes: Vec<String>,
+    #[serde(default, rename = "subscriptionType")]
+    _subscription_type: Option<String>,
+}
+
+fn claude_import_bundle(
+    path: &Path,
+    bytes: &[u8],
+    registration: &OAuthProviderRegistration,
+    generation: u64,
+) -> Result<OAuthTokenBundleV1, HaiderError> {
+    let credentials: ClaudeCredentialsFile = serde_json::from_slice(bytes)
+        .map_err(|error| malformed_import(path, "claude-code", &error))?;
+    if !registration
+        .scopes
+        .iter()
+        .all(|scope| credentials.oauth.scopes.contains(scope))
+    {
+        return Err(invalid_import(path, "claude-code"));
+    }
+    let identity = OAuthIdentityV1 {
+        subject_hash: blake3::hash(credentials.oauth.access_token.0.as_slice())
+            .to_hex()
+            .to_string(),
+        display_identity: "Claude Max subscription".into(),
+    };
+    OAuthTokenBundleV1::new(
+        registration.provider_id.clone(),
+        registration.issuer.clone(),
+        registration.audience.clone(),
+        registration.resource.clone(),
+        "Bearer".into(),
+        credentials.oauth.access_token.0,
+        Some(credentials.oauth.refresh_token.0),
+        credentials.oauth.expires_at_unix_ms,
+        None,
+        credentials.oauth.scopes,
+        identity,
+        generation,
+    )
+    .map_err(|_| invalid_import(path, "claude-code"))
+}
+
+fn decode_unverified_jwt_payload<T>(token: &[u8]) -> Option<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let token = std::str::from_utf8(token).ok()?;
+    let mut segments = token.split('.');
+    let _header = segments.next()?;
+    let payload = segments.next()?;
+    let _signature = segments.next()?;
+    let mut decoded = Zeroizing::new(Vec::new());
+    URL_SAFE_NO_PAD
+        .decode_vec(payload.as_bytes(), &mut decoded)
+        .ok()?;
+    serde_json::from_slice(&decoded).ok()
+}
+
+fn unverified_jwt_expiry_ms(token: &[u8]) -> Option<u64> {
+    decode_unverified_jwt_payload::<ImportedJwtClaims>(token)?
+        .exp?
+        .checked_mul(1000)
+        .filter(|expiry| *expiry != 0)
+}
+
+fn codex_import_fallback_refresh_candidate(bundle: &OAuthTokenBundleV1, now: u64) -> bool {
+    bundle.provider_id == haider_provider::OPENAI_OAUTH_PROVIDER_NAME
+        && bundle.refresh_on_first_use()
+        && bundle.expires_at_unix_ms
+            <= now.saturating_add(duration_ms(CODEX_IMPORT_FALLBACK_WINDOW))
+}
+
+fn nonempty(value: String) -> Option<String> {
+    (!value.trim().is_empty()).then_some(value)
+}
+
+fn malformed_import(path: &Path, source: &str, error: &serde_json::Error) -> HaiderError {
+    HaiderError::new(
+        ErrorCode::InvalidArgument,
+        format!(
+            "OAuth import source `{source}` at `{}` is malformed JSON at line {}, column {}",
+            path.display(),
+            error.line(),
+            error.column()
+        ),
+        false,
+    )
+}
+
+fn invalid_import(path: &Path, source: &str) -> HaiderError {
+    HaiderError::new(
+        ErrorCode::InvalidArgument,
+        format!(
+            "OAuth import source `{source}` at `{}` has invalid credential fields",
+            path.display()
+        ),
+        false,
+    )
 }
 
 fn is_numeric_loopback_http(url: &Url) -> bool {
@@ -2536,7 +2883,7 @@ impl CredentialBroker {
                 fences,
                 shutting_down: AtomicBool::new(false),
                 client,
-                refresh_skew: Duration::from_secs(30),
+                refresh_skew: OAUTH_REFRESH_SKEW,
                 #[cfg(test)]
                 panic_refresh_worker: AtomicBool::new(false),
             }),
@@ -2636,7 +2983,10 @@ impl CredentialBroker {
                 HaiderError::new(ErrorCode::Internal, "system clock is unavailable", true)
             })?;
             let skew_ms = duration_ms(self.inner.refresh_skew);
-            if force_refresh || bundle.expires_at_unix_ms <= now.saturating_add(skew_ms) {
+            if force_refresh
+                || bundle.expires_at_unix_ms <= now.saturating_add(skew_ms)
+                || codex_import_fallback_refresh_candidate(&bundle, now)
+            {
                 break bundle;
             }
             if Self::snapshot_allows_oauth(&self.inner, descriptor) {

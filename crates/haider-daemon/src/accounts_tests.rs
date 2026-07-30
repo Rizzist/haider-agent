@@ -1075,6 +1075,88 @@ fn channel_sink() -> (Arc<dyn FrameSink>, mpsc::UnboundedReceiver<WireFrame>) {
     (Arc::new(ChannelSink(sender)), receiver)
 }
 
+const OAUTH_IMPORT_ENV_CHILD: &str = "HAIDER_TEST_OAUTH_IMPORT_ENV_CHILD";
+
+fn run_oauth_import_env_child(test_name: &str, overrides: &[(&str, &std::path::Path)]) -> bool {
+    if std::env::var_os(OAUTH_IMPORT_ENV_CHILD).is_some() {
+        return false;
+    }
+    let mut command = std::process::Command::new(
+        std::env::current_exe().expect("current daemon test executable"),
+    );
+    command
+        .args(["--exact", test_name, "--nocapture"])
+        .env(OAUTH_IMPORT_ENV_CHILD, "1");
+    for (key, path) in overrides {
+        command.env(key, path);
+    }
+    let output = command.output().expect("spawn isolated import test");
+    assert!(
+        output.status.success(),
+        "isolated import test failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    true
+}
+
+const CODEX_IMPORT_FIXTURE_1: &[u8] = br#"{
+  "OPENAI_API_KEY": null,
+  "tokens": {
+    "id_token": "fake-id-token-1",
+    "access_token": "fake-access-token-1",
+    "refresh_token": "fake-refresh-token-1",
+    "account_id": "fake-account-1"
+  },
+  "last_refresh": "2026-07-30T00:00:00Z"
+}"#;
+
+const CODEX_IMPORT_FIXTURE_2: &[u8] = br#"{
+  "tokens": {
+    "id_token": "fake-id-token-2",
+    "access_token": "fake-access-token-2",
+    "refresh_token": "fake-refresh-token-2",
+    "account_id": "fake-account-1"
+  }
+}"#;
+
+const CLAUDE_IMPORT_FIXTURE: &[u8] = br#"{
+  "claudeAiOauth": {
+    "accessToken": "fake-claude-access-token-1",
+    "refreshToken": "fake-claude-refresh-token-1",
+    "expiresAt": 4102444800123,
+    "scopes": ["user:inference"],
+    "subscriptionType": "max"
+  }
+}"#;
+
+fn start_oauth_import_test_actor(
+    store: &SqliteStoreHandle,
+    vault: Arc<MemoryVault>,
+    reserved_aliases: HashSet<String>,
+    refresh_fences: RefreshFenceRegistry,
+) -> (AccountActorHandle, AccountsSnapshot, ManagementSnapshot) {
+    let accounts = memory_accounts();
+    let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(Vec::new()));
+    let providers = test_provider_registry();
+    let management = ManagementSnapshot::new(0, Vec::new(), providers.summaries());
+    let actor = start_account_actor(AccountActorConfig {
+        store: store.clone(),
+        accounts,
+        vault: vault as Arc<dyn Vault>,
+        validator: Arc::new(ProviderCredentialValidator),
+        snapshot: Arc::clone(&snapshot),
+        management: Some(management.clone()),
+        profile_id: "oauth-import-test".into(),
+        default_model: "unused".into(),
+        providers,
+        provider_endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
+        reserved_aliases,
+        refresh_fences,
+    });
+    (actor, snapshot, management)
+}
+
 /// Always reports the R10 "validation unavailable" arm — the retryable
 /// failure that leaves the secret with the COMMAND — and counts its calls,
 /// so a reused expired secret is visible as a second validation.
@@ -3942,4 +4024,647 @@ async fn live_smoke_packaged_default_model_validates_a_real_key() {
             )
         });
     assert!(!identity.identity.is_empty());
+}
+
+async fn send_oauth_import(
+    commands: &mpsc::Sender<AccountCommand>,
+    sink: Arc<dyn FrameSink>,
+    command_id: &str,
+    source: &str,
+) {
+    commands
+        .send(AccountCommand::ImportOAuth(Box::new(OAuthImportJob {
+            command_id: command_id.to_owned(),
+            source: source.to_owned(),
+            route: LoginRoute {
+                request_id: RequestId::new(format!("{command_id}-request")),
+                sink,
+            },
+        })))
+        .await
+        .expect("send OAuth import");
+}
+
+fn openai_import_test_bundle(
+    access_token: &[u8],
+    refresh_token: &[u8],
+    generation: u64,
+) -> haider_accounts::OAuthTokenBundleV1 {
+    haider_accounts::OAuthTokenBundleV1::new(
+        OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
+        "https://auth.openai.com".into(),
+        "app_EMoamEEZ73f0CkXaXp7hrann".into(),
+        None,
+        "Bearer".into(),
+        Zeroizing::new(access_token.to_vec()),
+        Some(Zeroizing::new(refresh_token.to_vec())),
+        u64::MAX - 1,
+        None,
+        ["openid", "profile", "email", "offline_access"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        haider_accounts::OAuthIdentityV1 {
+            subject_hash: blake3::hash(b"fake-account-1").to_hex().to_string(),
+            display_identity: "fake-account-1".into(),
+        },
+        generation,
+    )
+    .expect("OpenAI import test bundle")
+}
+
+/// MUTATION CHECK: let any historical import receipt prove source ownership.
+/// Expected runtime failure: the old Codex receipt replaces the later
+/// loopback-PKCE incarnation at `openai-oauth` instead of selecting
+/// `openai-oauth-2`.
+#[tokio::test]
+async fn oauth_import_source_ownership_tracks_the_latest_alias_incarnation() {
+    let store_dir = test_store_dir();
+    let store = open_store(store_dir.path()).await;
+    let mut accounts = memory_accounts();
+    let alias = CredentialAlias::new(OPENAI_OAUTH_PROVIDER_NAME);
+    let descriptor = oauth_descriptor_for(
+        OPENAI_OAUTH_PROVIDER_NAME,
+        &alias,
+        &openai_import_test_bundle(b"fake-access-token-1", b"fake-refresh-token-1", 1),
+        true,
+    );
+    accounts.add(descriptor.clone()).expect("seed descriptor");
+
+    let imported = OAuthImportIdentity {
+        source: "codex".to_owned(),
+        alias: alias.as_str().to_owned(),
+        provider: OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
+    };
+    let imported_json = imported.canonical_json().expect("import coordinates");
+    let imported_digest = blake3::hash(imported_json.as_bytes()).to_hex().to_string();
+    assert_eq!(
+        store
+            .account_add_claim_receipt("old-import".to_owned(), imported_digest, imported_json,)
+            .await
+            .expect("claim old import"),
+        AccountAddClaim::Fresh
+    );
+    assert_eq!(
+        store
+            .finalize_account_add_receipt(
+                "old-import".to_owned(),
+                AccountAddReceiptResponse {
+                    descriptor: descriptor.clone(),
+                },
+            )
+            .await
+            .expect("finalize old import"),
+        1
+    );
+
+    let loopback = OAuthAddIdentity {
+        provider: OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
+        display_alias: alias.as_str().to_owned(),
+        physical_alias: alias.as_str().to_owned(),
+        auth_method: "oauth".to_owned(),
+    };
+    let loopback_json = loopback.canonical_json().expect("loopback coordinates");
+    let loopback_digest = blake3::hash(loopback_json.as_bytes()).to_hex().to_string();
+    assert_eq!(
+        store
+            .account_add_claim_receipt("later-loopback".to_owned(), loopback_digest, loopback_json,)
+            .await
+            .expect("claim loopback add"),
+        AccountAddClaim::Fresh
+    );
+    assert_eq!(
+        store
+            .finalize_account_add_receipt(
+                "later-loopback".to_owned(),
+                AccountAddReceiptResponse { descriptor },
+            )
+            .await
+            .expect("finalize loopback add"),
+        2
+    );
+
+    let selected = select_oauth_import_alias(
+        &store,
+        &accounts,
+        "new-import",
+        "codex",
+        OPENAI_OAUTH_PROVIDER_NAME,
+        OPENAI_OAUTH_PROVIDER_NAME,
+    )
+    .await
+    .expect("select alias");
+    assert_eq!(selected.as_str(), "openai-oauth-2");
+
+    store.close().await.expect("close");
+}
+
+/// MUTATION CHECK: stamp the Codex import with a non-sanctioned issuer or
+/// serialize a token into its receipt. Expected runtime failure: the bundle
+/// metadata or secret-free receipt assertions below fail after the command
+/// has crossed the real actor/vault/revision seam.
+#[tokio::test(flavor = "current_thread")]
+async fn codex_import_commits_refreshable_bundle_and_secret_free_receipt() {
+    let fixture_dir = test_store_dir();
+    let source_path = fixture_dir.path().join("codex-auth.json");
+    std::fs::write(&source_path, CODEX_IMPORT_FIXTURE_1).expect("write Codex fixture");
+    if run_oauth_import_env_child(
+        "accounts::accounts_tests::codex_import_commits_refreshable_bundle_and_secret_free_receipt",
+        &[("HAIDER_CODEX_AUTH_PATH", &source_path)],
+    ) {
+        return;
+    }
+
+    let store_dir = test_store_dir();
+    let store = open_store(store_dir.path()).await;
+    let vault = Arc::new(MemoryVault::new());
+    let (mut actor, snapshot, management) = start_oauth_import_test_actor(
+        &store,
+        Arc::clone(&vault),
+        HashSet::new(),
+        RefreshFenceRegistry::default(),
+    );
+    let (sink, mut frames) = channel_sink();
+    send_oauth_import(&actor.commands(), sink, "import-codex-1", "codex").await;
+    let frame = tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        .await
+        .expect("Codex import response deadline")
+        .expect("Codex import response");
+    let descriptor = match frame {
+        WireFrame::Response {
+            body:
+                ResponseBody::AccountOAuthImport {
+                    descriptor,
+                    revision,
+                },
+            ..
+        } => {
+            assert_eq!(revision, 1);
+            descriptor
+        }
+        other => panic!("unexpected Codex import response: {other:?}"),
+    };
+    assert_eq!(descriptor.alias.as_str(), OPENAI_OAUTH_PROVIDER_NAME);
+    assert_eq!(descriptor.provider, OPENAI_OAUTH_PROVIDER_NAME);
+    assert_eq!(descriptor.identity, "fake-account-1");
+    assert!(descriptor.active);
+    {
+        let current = snapshot.lock().expect("snapshot");
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0], descriptor);
+    }
+    assert_eq!(management.read().expect("management").revision, 1);
+
+    let stored = vault
+        .resolve(&CredentialAlias::new(OPENAI_OAUTH_PROVIDER_NAME))
+        .expect("stored Codex bundle");
+    let bundle = haider_accounts::OAuthTokenBundleV1::decode(stored.expose_secret())
+        .expect("decode Codex bundle");
+    assert_eq!(bundle.provider_id, OPENAI_OAUTH_PROVIDER_NAME);
+    assert_eq!(bundle.issuer, "https://auth.openai.com");
+    assert_eq!(bundle.audience, "app_EMoamEEZ73f0CkXaXp7hrann");
+    assert!(bundle.token_type.eq_ignore_ascii_case("bearer"));
+    assert_eq!(bundle.access_token(), b"fake-access-token-1");
+    assert_eq!(
+        bundle.refresh_token(),
+        Some(b"fake-refresh-token-1".as_slice())
+    );
+    assert_eq!(bundle.generation, 1);
+    assert!(
+        bundle.refresh_on_first_use(),
+        "fallback refresh marker was not retained in the vault bundle"
+    );
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("test clock after epoch")
+        .as_millis();
+    let now_ms = u64::try_from(now_ms).expect("test clock fits u64 milliseconds");
+    assert!(
+        bundle.expires_at_unix_ms >= now_ms.saturating_add(13 * 60 * 1000)
+            && bundle.expires_at_unix_ms <= now_ms.saturating_add(16 * 60 * 1000),
+        "non-JWT fake token did not receive the short refresh-on-first-use fallback"
+    );
+    assert!(
+        ["openid", "profile", "email", "offline_access"]
+            .into_iter()
+            .all(|scope| bundle.granted_scopes.iter().any(|granted| granted == scope))
+    );
+
+    let receipts = store.account_add_receipts().await.expect("import receipts");
+    let receipt = receipts
+        .iter()
+        .find(|row| row.command_id == "import-codex-1")
+        .expect("Codex receipt");
+    assert_eq!(
+        receipt.request_json,
+        r#"{"source":"codex","alias":"openai-oauth","provider":"openai-oauth"}"#
+    );
+    let durable = format!(
+        "{}{}",
+        receipt.request_json,
+        receipt.response_json.as_deref().unwrap_or_default()
+    );
+    for secret in [
+        "fake-access-token-1",
+        "fake-refresh-token-1",
+        "fake-id-token-1",
+    ] {
+        assert!(!durable.contains(secret), "receipt leaked {secret}");
+    }
+
+    actor.shutdown().await;
+    store.close().await.expect("close");
+}
+
+/// MUTATION CHECK: ignore Claude Code's `expiresAt` and stamp a fallback.
+/// Expected runtime failure: the decoded bundle expiry differs from the
+/// exact millisecond value in the daemon-read fixture.
+#[tokio::test(flavor = "current_thread")]
+async fn claude_code_import_honors_expiry_and_anthropic_registration() {
+    let fixture_dir = test_store_dir();
+    let source_path = fixture_dir.path().join("claude-credentials.json");
+    std::fs::write(&source_path, CLAUDE_IMPORT_FIXTURE).expect("write Claude fixture");
+    if run_oauth_import_env_child(
+        "accounts::accounts_tests::claude_code_import_honors_expiry_and_anthropic_registration",
+        &[("HAIDER_CLAUDE_CREDS_PATH", &source_path)],
+    ) {
+        return;
+    }
+
+    let store_dir = test_store_dir();
+    let store = open_store(store_dir.path()).await;
+    let vault = Arc::new(MemoryVault::new());
+    let (mut actor, snapshot, management) = start_oauth_import_test_actor(
+        &store,
+        Arc::clone(&vault),
+        HashSet::new(),
+        RefreshFenceRegistry::default(),
+    );
+    let (sink, mut frames) = channel_sink();
+    send_oauth_import(&actor.commands(), sink, "import-claude-1", "claude-code").await;
+    let descriptor = match tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        .await
+        .expect("Claude import response deadline")
+        .expect("Claude import response")
+    {
+        WireFrame::Response {
+            body:
+                ResponseBody::AccountOAuthImport {
+                    descriptor,
+                    revision: 1,
+                },
+            ..
+        } => descriptor,
+        other => panic!("unexpected Claude import response: {other:?}"),
+    };
+    assert_eq!(descriptor.alias.as_str(), ANTHROPIC_OAUTH_PROVIDER_NAME);
+    assert_eq!(descriptor.provider, ANTHROPIC_OAUTH_PROVIDER_NAME);
+    assert_eq!(descriptor.identity, "Claude Max subscription");
+    assert!(descriptor.active);
+    assert_eq!(snapshot.lock().expect("snapshot").len(), 1);
+    assert_eq!(management.read().expect("management").revision, 1);
+    let stored = vault
+        .resolve(&CredentialAlias::new(ANTHROPIC_OAUTH_PROVIDER_NAME))
+        .expect("stored Claude bundle");
+    let bundle = haider_accounts::OAuthTokenBundleV1::decode(stored.expose_secret())
+        .expect("decode Claude bundle");
+    assert_eq!(bundle.provider_id, ANTHROPIC_OAUTH_PROVIDER_NAME);
+    assert_eq!(bundle.issuer, "https://claude.ai");
+    assert_eq!(bundle.audience, "9d1c250a-e61b-44d9-88ed-5944d1962f5e");
+    assert_eq!(bundle.expires_at_unix_ms, 4_102_444_800_123);
+    assert_eq!(bundle.access_token(), b"fake-claude-access-token-1");
+    assert_eq!(
+        bundle.refresh_token(),
+        Some(b"fake-claude-refresh-token-1".as_slice())
+    );
+    assert_eq!(bundle.granted_scopes, ["user:inference"]);
+
+    actor.shutdown().await;
+    store.close().await.expect("close");
+}
+
+/// MUTATION CHECK: downgrade a missing/malformed import into a partial
+/// commit. Expected runtime failure: either the descriptor snapshot, vault
+/// list, or management revision changes despite the path-naming error.
+#[tokio::test(flavor = "current_thread")]
+async fn malformed_and_missing_imports_name_paths_and_commit_nothing() {
+    let fixture_dir = test_store_dir();
+    let malformed_path = fixture_dir.path().join("malformed-codex.json");
+    std::fs::write(&malformed_path, br#"{"tokens":"not-an-object"}"#)
+        .expect("write malformed fixture");
+    let missing_path = fixture_dir.path().join("missing-claude.json");
+    if run_oauth_import_env_child(
+        "accounts::accounts_tests::malformed_and_missing_imports_name_paths_and_commit_nothing",
+        &[
+            ("HAIDER_CODEX_AUTH_PATH", &malformed_path),
+            ("HAIDER_CLAUDE_CREDS_PATH", &missing_path),
+        ],
+    ) {
+        return;
+    }
+    let malformed_path = std::path::PathBuf::from(
+        std::env::var_os("HAIDER_CODEX_AUTH_PATH").expect("isolated Codex path"),
+    );
+    let missing_path = std::path::PathBuf::from(
+        std::env::var_os("HAIDER_CLAUDE_CREDS_PATH").expect("isolated Claude path"),
+    );
+
+    let store_dir = test_store_dir();
+    let store = open_store(store_dir.path()).await;
+    let vault = Arc::new(MemoryVault::new());
+    let (mut actor, snapshot, management) = start_oauth_import_test_actor(
+        &store,
+        Arc::clone(&vault),
+        HashSet::new(),
+        RefreshFenceRegistry::default(),
+    );
+    let (sink, mut frames) = channel_sink();
+    send_oauth_import(
+        &actor.commands(),
+        Arc::clone(&sink),
+        "import-malformed",
+        "codex",
+    )
+    .await;
+    let malformed_message = match tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        .await
+        .expect("malformed response deadline")
+        .expect("malformed response")
+    {
+        WireFrame::Response {
+            body: ResponseBody::Error { message, .. },
+            ..
+        } => message,
+        other => panic!("malformed import unexpectedly succeeded: {other:?}"),
+    };
+    assert!(malformed_message.contains(&malformed_path.display().to_string()));
+
+    send_oauth_import(&actor.commands(), sink, "import-missing", "claude-code").await;
+    let missing_message = match tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        .await
+        .expect("missing response deadline")
+        .expect("missing response")
+    {
+        WireFrame::Response {
+            body: ResponseBody::Error { message, .. },
+            ..
+        } => message,
+        other => panic!("missing import unexpectedly succeeded: {other:?}"),
+    };
+    assert!(missing_message.contains(&missing_path.display().to_string()));
+    assert!(snapshot.lock().expect("snapshot").is_empty());
+    assert!(vault.list().expect("vault list").is_empty());
+    assert_eq!(management.read().expect("management").revision, 0);
+
+    actor.shutdown().await;
+    store.close().await.expect("close");
+}
+
+/// MUTATION CHECK: skip the import's pending-login reservation check.
+/// Expected runtime failure: the command commits `openai-oauth` over the
+/// durable in-flight login instead of returning retryable `busy`.
+#[tokio::test(flavor = "current_thread")]
+async fn oauth_import_obeys_the_reserved_alias_fence() {
+    let fixture_dir = test_store_dir();
+    let source_path = fixture_dir.path().join("codex-auth.json");
+    std::fs::write(&source_path, CODEX_IMPORT_FIXTURE_1).expect("write Codex fixture");
+    if run_oauth_import_env_child(
+        "accounts::accounts_tests::oauth_import_obeys_the_reserved_alias_fence",
+        &[("HAIDER_CODEX_AUTH_PATH", &source_path)],
+    ) {
+        return;
+    }
+
+    let store_dir = test_store_dir();
+    let store = open_store(store_dir.path()).await;
+    let login_identity = LoginIdentity {
+        provider: OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
+        resolved_model: "gpt-test".to_owned(),
+        display_alias: Some(OPENAI_OAUTH_PROVIDER_NAME.to_owned()),
+        physical_alias: OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
+    };
+    let login_json = login_identity.canonical_json().expect("login coordinates");
+    let login_digest = blake3::hash(login_json.as_bytes()).to_hex().to_string();
+    assert_eq!(
+        store
+            .login_claim_receipt(
+                "pending-login-reservation".to_owned(),
+                login_digest,
+                login_json,
+            )
+            .await
+            .expect("claim pending login"),
+        LoginClaim::Fresh
+    );
+    let vault = Arc::new(MemoryVault::new());
+    let (mut actor, snapshot, management) = start_oauth_import_test_actor(
+        &store,
+        Arc::clone(&vault),
+        HashSet::new(),
+        RefreshFenceRegistry::default(),
+    );
+    let (sink, mut frames) = channel_sink();
+    send_oauth_import(&actor.commands(), sink, "import-reserved", "codex").await;
+    match tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        .await
+        .expect("reserved response deadline")
+        .expect("reserved response")
+    {
+        WireFrame::Response {
+            body: ResponseBody::Error {
+                code, retryable, ..
+            },
+            ..
+        } => {
+            assert_eq!(code, ERROR_CODE_BUSY);
+            assert!(retryable);
+        }
+        other => panic!("reserved import unexpectedly succeeded: {other:?}"),
+    }
+    assert!(snapshot.lock().expect("snapshot").is_empty());
+    assert!(vault.list().expect("vault list").is_empty());
+    assert_eq!(management.read().expect("management").revision, 0);
+
+    actor.shutdown().await;
+    store.close().await.expect("close");
+}
+
+/// MUTATION CHECK: remove `refresh_fences.invalidate(&alias)` from re-import.
+/// Expected runtime failure: the epoch-zero late refresh below overwrites the
+/// generation-two imported bundle instead of returning `Stale`; changing the
+/// replacement to active also fails the active-slot assertions.
+#[tokio::test(flavor = "current_thread")]
+async fn reimport_replaces_bundle_fences_refresh_and_preserves_other_active_account() {
+    let fixture_dir = test_store_dir();
+    let source_path = fixture_dir.path().join("codex-auth.json");
+    std::fs::write(&source_path, CODEX_IMPORT_FIXTURE_1).expect("write Codex fixture 1");
+    if run_oauth_import_env_child(
+        "accounts::accounts_tests::reimport_replaces_bundle_fences_refresh_and_preserves_other_active_account",
+        &[("HAIDER_CODEX_AUTH_PATH", &source_path)],
+    ) {
+        return;
+    }
+    let source_path = std::path::PathBuf::from(
+        std::env::var_os("HAIDER_CODEX_AUTH_PATH").expect("isolated Codex path"),
+    );
+
+    let store_dir = test_store_dir();
+    let store = open_store(store_dir.path()).await;
+    let vault = Arc::new(MemoryVault::new());
+    let refresh_fences = RefreshFenceRegistry::default();
+    let (mut actor, snapshot, _management) =
+        start_oauth_import_test_actor(&store, Arc::clone(&vault), HashSet::new(), refresh_fences);
+    let commands = actor.commands();
+    let (sink, mut frames) = channel_sink();
+    send_oauth_import(&commands, Arc::clone(&sink), "import-codex-first", "codex").await;
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), frames.recv())
+            .await
+            .expect("first import deadline")
+            .expect("first import response"),
+        WireFrame::Response {
+            body: ResponseBody::AccountOAuthImport { revision: 1, .. },
+            ..
+        }
+    ));
+
+    commands
+        .send(AccountCommand::AddOAuth(Box::new(OAuthAddJob {
+            command_id: "add-manual-oauth".into(),
+            provider: OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
+            display_alias: "manual-oauth".into(),
+            claim: Some(OAuthReadyClaim::for_account_test(
+                OPENAI_OAUTH_PROVIDER_NAME,
+                "manual-oauth",
+                openai_import_test_bundle(
+                    b"fake-manual-access-token",
+                    b"fake-manual-refresh-token",
+                    1,
+                ),
+            )),
+            route: LoginRoute {
+                request_id: RequestId::new("add-manual-oauth-request"),
+                sink: Arc::clone(&sink),
+            },
+        })))
+        .await
+        .expect("add manual OAuth account");
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), frames.recv())
+            .await
+            .expect("manual add deadline")
+            .expect("manual add response"),
+        WireFrame::Response {
+            body: ResponseBody::AccountAdd { .. },
+            ..
+        }
+    ));
+    commands
+        .send(AccountCommand::SetActive(Box::new(SetActiveJob {
+            command_id: "activate-manual-oauth".into(),
+            alias: "manual-oauth".into(),
+            route: LoginRoute {
+                request_id: RequestId::new("activate-manual-oauth-request"),
+                sink: Arc::clone(&sink),
+            },
+        })))
+        .await
+        .expect("activate manual OAuth");
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), frames.recv())
+            .await
+            .expect("set active deadline")
+            .expect("set active response"),
+        WireFrame::Response {
+            body: ResponseBody::AccountSetActive { revision: 3, .. },
+            ..
+        }
+    ));
+
+    std::fs::write(&source_path, CODEX_IMPORT_FIXTURE_2).expect("write Codex fixture 2");
+    send_oauth_import(&commands, Arc::clone(&sink), "import-codex-second", "codex").await;
+    let imported_descriptor = match tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        .await
+        .expect("second import deadline")
+        .expect("second import response")
+    {
+        WireFrame::Response {
+            body:
+                ResponseBody::AccountOAuthImport {
+                    descriptor,
+                    revision: 4,
+                },
+            ..
+        } => descriptor,
+        other => panic!("unexpected second import response: {other:?}"),
+    };
+    assert_eq!(
+        imported_descriptor.alias.as_str(),
+        OPENAI_OAUTH_PROVIDER_NAME
+    );
+    assert!(!imported_descriptor.active, "re-import stole active slot");
+    {
+        let descriptors = snapshot.lock().expect("snapshot");
+        assert!(descriptors.iter().any(|descriptor| {
+            descriptor.alias.as_str() == "manual-oauth" && descriptor.active
+        }));
+        assert!(descriptors.iter().any(|descriptor| {
+            descriptor.alias.as_str() == OPENAI_OAUTH_PROVIDER_NAME && !descriptor.active
+        }));
+    }
+    let alias = CredentialAlias::new(OPENAI_OAUTH_PROVIDER_NAME);
+    let stored = vault.resolve(&alias).expect("re-imported bundle");
+    let bundle = haider_accounts::OAuthTokenBundleV1::decode(stored.expose_secret())
+        .expect("decode re-imported bundle");
+    assert_eq!(bundle.access_token(), b"fake-access-token-2");
+    assert_eq!(
+        bundle.refresh_token(),
+        Some(b"fake-refresh-token-2".as_slice())
+    );
+    assert_eq!(bundle.generation, 2);
+
+    let late = haider_accounts::OAuthTokenBundleV1::new(
+        bundle.provider_id.clone(),
+        bundle.issuer.clone(),
+        bundle.audience.clone(),
+        bundle.resource.clone(),
+        "Bearer".into(),
+        Zeroizing::new(b"fake-late-access-token".to_vec()),
+        Some(Zeroizing::new(b"fake-late-refresh-token".to_vec())),
+        u64::MAX - 1,
+        None,
+        bundle.granted_scopes.clone(),
+        bundle.identity.clone(),
+        3,
+    )
+    .expect("late refresh bundle");
+    let (completed, applied) = tokio::sync::oneshot::channel();
+    commands
+        .send(AccountCommand::ApplyOAuthRefresh {
+            descriptor: imported_descriptor,
+            expected: OAuthRefreshFence {
+                fence_epoch: 0,
+                generation: bundle.generation,
+                issuer: bundle.issuer.clone(),
+                audience: bundle.audience.clone(),
+                resource: bundle.resource.clone(),
+                subject_hash: bundle.identity.subject_hash.clone(),
+            },
+            encoded_bundle: late.encode().expect("encode late refresh"),
+            completed,
+        })
+        .await
+        .expect("send late refresh");
+    assert!(matches!(
+        applied.await.expect("late refresh response"),
+        Err(RefreshApplyError::Stale)
+    ));
+    let stored = vault.resolve(&alias).expect("bundle after stale refresh");
+    let stored = haider_accounts::OAuthTokenBundleV1::decode(stored.expose_secret())
+        .expect("decode bundle after stale refresh");
+    assert_eq!(stored.access_token(), b"fake-access-token-2");
+    assert_eq!(stored.generation, 2);
+
+    actor.shutdown().await;
+    store.close().await.expect("close");
 }

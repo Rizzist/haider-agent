@@ -31,7 +31,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use haider_accounts::{
     AccountStore, JsonFileStore, MemoryVault, Resolver, RotationCallback, RotationDecision,
-    RotationTrigger, StoreLike, Vault,
+    RotationTrigger, SecretHandle, StoreLike, Vault,
 };
 use haider_core::SqliteStoreHandle;
 use haider_core::{
@@ -57,6 +57,7 @@ use haider_rpc::{
     ERROR_CODE_REVISION_CONFLICT, ERROR_CODE_UNAUTHORIZED, ErrorData, ProviderSummaryWire,
     RequestId, ResponseBody, StagePurpose, WireFrame,
 };
+use subtle::ConstantTimeEq as _;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
@@ -65,7 +66,7 @@ use zeroize::Zeroizing;
 use crate::oauth::{
     CredentialBroker, OAuthCoordinator, OAuthCoordinatorConfig, OAuthInferenceAuthMode,
     OAuthInferenceHeaderSet, OAuthProviderCatalog, OAuthReadyClaim, RefreshFenceRegistry,
-    sanctioned_inference,
+    load_oauth_import_bundle, oauth_import_source_spec, sanctioned_inference,
 };
 use crate::provider_registry::{
     CachedProviderModelSource, JsonProviderRegistryStore, ProductionProviderEndpointValidator,
@@ -621,6 +622,12 @@ pub(crate) struct OAuthAddJob {
     pub route: LoginRoute,
 }
 
+pub(crate) struct OAuthImportJob {
+    pub command_id: String,
+    pub source: String,
+    pub route: LoginRoute,
+}
+
 pub(crate) struct SetActiveJob {
     pub command_id: String,
     pub alias: String,
@@ -663,6 +670,7 @@ pub(crate) struct OAuthRefreshFence {
 pub(crate) enum AccountCommand {
     Login(Box<LoginJob>),
     AddOAuth(Box<OAuthAddJob>),
+    ImportOAuth(Box<OAuthImportJob>),
     SetActive(Box<SetActiveJob>),
     Remove(Box<RemoveAccountJob>),
     SetDefaultModel(Box<SetDefaultModelJob>),
@@ -988,6 +996,19 @@ async fn run_account_actor(
                     management.as_ref(),
                     &profile_id,
                     &reserved_aliases,
+                    *job,
+                )
+                .await;
+            }
+            AccountCommand::ImportOAuth(job) => {
+                handle_oauth_import(
+                    &store,
+                    &mut accounts,
+                    Arc::clone(&vault),
+                    &snapshot,
+                    management.as_ref(),
+                    &reserved_aliases,
+                    &refresh_fences,
                     *job,
                 )
                 .await;
@@ -3075,6 +3096,48 @@ struct OAuthAddIdentity {
     auth_method: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct OAuthImportIdentity {
+    source: String,
+    alias: String,
+    provider: String,
+}
+
+impl OAuthImportIdentity {
+    fn canonical_json(&self) -> Result<String, HaiderError> {
+        serde_json::to_string(self).map_err(|error| {
+            HaiderError::new(
+                ErrorCode::InvalidArgument,
+                format!("cannot encode OAuth import coordinates: {error}"),
+                false,
+            )
+        })
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum OAuthReceiptIdentity {
+    Import(OAuthImportIdentity),
+    Add(OAuthAddIdentity),
+}
+
+impl OAuthReceiptIdentity {
+    fn provider(&self) -> &str {
+        match self {
+            Self::Import(identity) => &identity.provider,
+            Self::Add(identity) => &identity.provider,
+        }
+    }
+
+    fn alias(&self) -> &str {
+        match self {
+            Self::Import(identity) => &identity.alias,
+            Self::Add(identity) => &identity.physical_alias,
+        }
+    }
+}
+
 impl OAuthAddIdentity {
     fn canonical_json(&self) -> Result<String, HaiderError> {
         serde_json::to_string(self).map_err(|error| {
@@ -3166,7 +3229,7 @@ async fn handle_oauth_add(
         return;
     }
     if resume && accounts.get(&alias).is_some() {
-        finalize_oauth_add(
+        finalize_oauth_commit(
             store,
             accounts,
             snapshot,
@@ -3174,6 +3237,7 @@ async fn handle_oauth_add(
             &command_id,
             &alias,
             &route,
+            OAuthCommitResponse::Add,
         )
         .await;
         return;
@@ -3188,7 +3252,12 @@ async fn handle_oauth_add(
         if let Some(stored) = stored {
             match haider_accounts::OAuthTokenBundleV1::decode(stored.expose_secret()) {
                 Ok(bundle) => {
-                    let descriptor = oauth_descriptor(&identity, &alias, &bundle);
+                    let descriptor = oauth_descriptor_for(
+                        &identity.provider,
+                        &alias,
+                        &bundle,
+                        accounts.active_for_provider(&identity.provider).is_none(),
+                    );
                     if let Err(error) = accounts.add(descriptor) {
                         respond_error(
                             &route,
@@ -3198,7 +3267,7 @@ async fn handle_oauth_add(
                         );
                         return;
                     }
-                    finalize_oauth_add(
+                    finalize_oauth_commit(
                         store,
                         accounts,
                         snapshot,
@@ -3206,6 +3275,7 @@ async fn handle_oauth_add(
                         &command_id,
                         &alias,
                         &route,
+                        OAuthCommitResponse::Add,
                     )
                     .await;
                     return;
@@ -3240,53 +3310,25 @@ async fn handle_oauth_add(
         );
         return;
     }
-    let descriptor = oauth_descriptor(&identity, &alias, &claim.bundle);
-    let encoded = match claim.bundle.encode() {
-        Ok(encoded) => encoded,
-        Err(error) => {
-            respond_error(&route, ERROR_CODE_UNAUTHORIZED, &error.message, false);
-            return;
-        }
-    };
-    let vault_for_put = Arc::clone(&vault);
-    let alias_for_put = alias.clone();
-    let put =
-        tokio::task::spawn_blocking(move || vault_for_put.put(&alias_for_put, &encoded)).await;
-    match put {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => {
-            respond_error(
-                &route,
-                ERROR_CODE_PROVIDER_ERROR,
-                &format!("OAuth vault write failed: {}", error.message),
-                true,
-            );
-            return;
-        }
-        Err(_) => {
-            respond_error(
-                &route,
-                ERROR_CODE_PROVIDER_ERROR,
-                "OAuth vault worker failed",
-                true,
-            );
-            return;
-        }
-    }
-    if let Err(error) = accounts.add(descriptor) {
-        let vault_for_delete = Arc::clone(&vault);
-        let alias_for_delete = alias.clone();
-        let _ =
-            tokio::task::spawn_blocking(move || vault_for_delete.delete(&alias_for_delete)).await;
+    if let Err(error) = persist_oauth_bundle(
+        accounts,
+        Arc::clone(&vault),
+        &identity.provider,
+        &alias,
+        claim.bundle,
+        None,
+    )
+    .await
+    {
         respond_error(
             &route,
             ERROR_CODE_PROVIDER_ERROR,
-            &format!("OAuth descriptor save failed: {}", error.message),
-            true,
+            &error.message,
+            error.retryable,
         );
         return;
     }
-    finalize_oauth_add(
+    finalize_oauth_commit(
         store,
         accounts,
         snapshot,
@@ -3294,27 +3336,546 @@ async fn handle_oauth_add(
         &command_id,
         &alias,
         &route,
+        OAuthCommitResponse::Add,
     )
     .await;
 }
 
+const ACCOUNT_ADD_RECEIPT_METHOD: &str = "account.add";
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_oauth_import(
+    store: &SqliteStoreHandle,
+    accounts: &mut AccountStore<Box<dyn StoreLike>>,
+    vault: Arc<dyn Vault>,
+    snapshot: &AccountsSnapshot,
+    management: Option<&ManagementSnapshot>,
+    reserved_aliases: &HashSet<String>,
+    refresh_fences: &RefreshFenceRegistry,
+    job: OAuthImportJob,
+) {
+    let spec = match oauth_import_source_spec(&job.source) {
+        Ok(spec) => spec,
+        Err(error) => {
+            respond_management_error(&job.route, &error);
+            return;
+        }
+    };
+    let alias = match select_oauth_import_alias(
+        store,
+        accounts,
+        &job.command_id,
+        spec.source,
+        spec.provider,
+        spec.default_alias,
+    )
+    .await
+    {
+        Ok(alias) => alias,
+        Err(error) => {
+            respond_management_error(&job.route, &error);
+            return;
+        }
+    };
+    let identity = OAuthImportIdentity {
+        source: spec.source.to_owned(),
+        alias: alias.as_str().to_owned(),
+        provider: spec.provider.to_owned(),
+    };
+    let request_json = match identity.canonical_json() {
+        Ok(json) => json,
+        Err(error) => {
+            respond_management_error(&job.route, &error);
+            return;
+        }
+    };
+    let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
+    match store
+        .management_receipt_preflight::<AccountAddReceiptResponse>(
+            job.command_id.clone(),
+            ACCOUNT_ADD_RECEIPT_METHOD.to_owned(),
+            request_digest.clone(),
+            request_json.clone(),
+        )
+        .await
+    {
+        Ok(Some(ManagementClaim::Committed { response, revision })) => {
+            respond(
+                &job.route,
+                ResponseBody::AccountOAuthImport {
+                    descriptor: response.descriptor,
+                    revision,
+                },
+            );
+            return;
+        }
+        Ok(Some(ManagementClaim::ResumePending { .. })) | Ok(None) => {}
+        Ok(Some(ManagementClaim::Fresh)) => unreachable!("preflight never returns Fresh"),
+        Err(error) => {
+            respond_management_error(&job.route, &error);
+            return;
+        }
+    }
+    let resume = match store
+        .account_add_claim_receipt(job.command_id.clone(), request_digest, request_json)
+        .await
+    {
+        Ok(AccountAddClaim::Fresh) => false,
+        Ok(AccountAddClaim::ResumePending) => true,
+        Ok(AccountAddClaim::Committed(response)) => {
+            let revision = match store.account_add_receipts().await.ok().and_then(|rows| {
+                rows.into_iter()
+                    .find(|row| row.command_id == job.command_id)
+                    .and_then(|row| row.final_revision)
+            }) {
+                Some(revision) => revision,
+                None => {
+                    respond_management_error(
+                        &job.route,
+                        &HaiderError::new(
+                            ErrorCode::StoreCorrupt,
+                            "committed OAuth import receipt has no revision",
+                            false,
+                        ),
+                    );
+                    return;
+                }
+            };
+            respond(
+                &job.route,
+                ResponseBody::AccountOAuthImport {
+                    descriptor: response.descriptor,
+                    revision,
+                },
+            );
+            return;
+        }
+        Err(error) => {
+            respond_management_error(&job.route, &error);
+            return;
+        }
+    };
+    if reserved_aliases.contains(alias.as_str()) {
+        respond_management_error(
+            &job.route,
+            &HaiderError::new(
+                ErrorCode::Busy,
+                "account alias is reserved by pending removal cleanup",
+                true,
+            ),
+        );
+        return;
+    }
+    match alias_has_pending_login_reservation(store, &alias).await {
+        Ok(false) => {}
+        Ok(true) => {
+            respond_management_error(
+                &job.route,
+                &HaiderError::new(
+                    ErrorCode::Busy,
+                    "account alias is reserved by a pending login",
+                    true,
+                ),
+            );
+            return;
+        }
+        Err(error) => {
+            respond_management_error(&job.route, &error);
+            return;
+        }
+    }
+    let replacing = accounts.get(&alias).cloned();
+    if replacing.as_ref().is_some_and(|descriptor| {
+        descriptor.provider != spec.provider || descriptor.auth_method != AuthMethod::OAuth
+    }) {
+        respond_management_error(
+            &job.route,
+            &HaiderError::new(
+                ErrorCode::InvalidArgument,
+                format!(
+                    "credential alias `{alias}` is not a replaceable `{}` OAuth account",
+                    spec.provider
+                ),
+                false,
+            ),
+        );
+        return;
+    }
+    let prior_secret = if replacing.is_some() {
+        let vault_for_read = Arc::clone(&vault);
+        let alias_for_read = alias.clone();
+        match tokio::task::spawn_blocking(move || vault_for_read.resolve(&alias_for_read)).await {
+            Ok(Ok(stored)) => Some(stored),
+            Ok(Err(error)) => {
+                respond_management_error(&job.route, &error);
+                return;
+            }
+            Err(_) => {
+                respond_management_error(
+                    &job.route,
+                    &HaiderError::new(ErrorCode::ProviderError, "OAuth vault worker failed", true),
+                );
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    let prior_bundle = match prior_secret.as_ref() {
+        Some(stored) => match haider_accounts::OAuthTokenBundleV1::decode(stored.expose_secret()) {
+            Ok(bundle) if bundle.provider_id == spec.provider => Some(bundle),
+            _ => {
+                respond_management_error(
+                    &job.route,
+                    &HaiderError::new(
+                        ErrorCode::Unauthorized,
+                        "stored OAuth token bundle is invalid; remove the account and import again",
+                        false,
+                    ),
+                );
+                return;
+            }
+        },
+        None => None,
+    };
+    let generation = match prior_bundle.as_ref() {
+        Some(bundle) => match bundle.generation.checked_add(1) {
+            Some(generation) => generation,
+            None => {
+                respond_management_error(
+                    &job.route,
+                    &HaiderError::new(
+                        ErrorCode::ProviderError,
+                        "OAuth token generation is exhausted",
+                        false,
+                    ),
+                );
+                return;
+            }
+        },
+        None => 1,
+    };
+    let source = spec.source.to_owned();
+    let imported =
+        match tokio::task::spawn_blocking(move || load_oauth_import_bundle(&source, generation))
+            .await
+        {
+            Ok(Ok(bundle)) => bundle,
+            Ok(Err(error)) => {
+                respond_management_error(&job.route, &error);
+                return;
+            }
+            Err(_) => {
+                respond_management_error(
+                    &job.route,
+                    &HaiderError::new(
+                        ErrorCode::ProviderError,
+                        "OAuth import file worker failed",
+                        true,
+                    ),
+                );
+                return;
+            }
+        };
+    if imported.provider_id != spec.provider {
+        respond_management_error(
+            &job.route,
+            &HaiderError::new(
+                ErrorCode::InvalidArgument,
+                "OAuth import source resolved to the wrong provider",
+                false,
+            ),
+        );
+        return;
+    }
+    if resume
+        && let Some(prior) = prior_bundle.as_ref()
+        && same_oauth_import(prior, &imported)
+    {
+        let descriptor = oauth_descriptor_for(
+            spec.provider,
+            &alias,
+            prior,
+            replacing
+                .as_ref()
+                .is_some_and(|descriptor| descriptor.active)
+                || accounts.active_for_provider(spec.provider).is_none(),
+        );
+        let committed = if replacing.is_some() {
+            accounts.replace(descriptor)
+        } else {
+            accounts.add(descriptor)
+        };
+        if let Err(error) = committed {
+            respond_management_error(&job.route, &error);
+            return;
+        }
+        finalize_oauth_commit(
+            store,
+            accounts,
+            snapshot,
+            management,
+            &job.command_id,
+            &alias,
+            &job.route,
+            OAuthCommitResponse::Import,
+        )
+        .await;
+        return;
+    }
+    if replacing.is_some() {
+        refresh_fences.invalidate(&alias);
+    }
+    if let Err(error) = persist_oauth_bundle(
+        accounts,
+        Arc::clone(&vault),
+        spec.provider,
+        &alias,
+        imported,
+        prior_secret,
+    )
+    .await
+    {
+        respond_management_error(&job.route, &error);
+        return;
+    }
+    finalize_oauth_commit(
+        store,
+        accounts,
+        snapshot,
+        management,
+        &job.command_id,
+        &alias,
+        &job.route,
+        OAuthCommitResponse::Import,
+    )
+    .await;
+}
+
+async fn select_oauth_import_alias(
+    store: &SqliteStoreHandle,
+    accounts: &AccountStore<Box<dyn StoreLike>>,
+    command_id: &str,
+    source: &str,
+    provider: &str,
+    default_alias: &str,
+) -> Result<CredentialAlias, HaiderError> {
+    let receipts = store.account_add_receipts().await?;
+    if let Some(identity) = receipts
+        .iter()
+        .find(|row| row.command_id == command_id)
+        .and_then(|row| serde_json::from_str::<OAuthImportIdentity>(&row.request_json).ok())
+    {
+        return normalize_account_alias(&identity.alias).map(CredentialAlias::new);
+    }
+    // A historical import receipt is not enough to prove that the current
+    // descriptor still belongs to that source: the alias may have been
+    // removed and later reused by a loopback OAuth add. The latest committed
+    // account.add revision for each alias is the incarnation authority.
+    let mut prior_aliases = latest_oauth_receipt_identities(&receipts)
+        .into_values()
+        .filter_map(|(_, identity)| match identity {
+            OAuthReceiptIdentity::Import(identity)
+                if identity.source == source
+                    && identity.provider == provider
+                    && accounts
+                        .get(&CredentialAlias::new(&identity.alias))
+                        .is_some_and(|descriptor| {
+                            descriptor.provider == provider
+                                && descriptor.auth_method == AuthMethod::OAuth
+                        }) =>
+            {
+                Some(identity.alias)
+            }
+            OAuthReceiptIdentity::Import(_) | OAuthReceiptIdentity::Add(_) => None,
+        })
+        .collect::<Vec<_>>();
+    prior_aliases.sort_by_key(|alias| oauth_alias_rank(default_alias, alias));
+    if let Some(alias) = prior_aliases.into_iter().next() {
+        return Ok(CredentialAlias::new(alias));
+    }
+    let mut candidate = default_alias.to_owned();
+    let mut suffix = 1_u32;
+    while accounts
+        .list()
+        .iter()
+        .any(|descriptor| descriptor.alias.as_str() == candidate)
+    {
+        suffix = suffix.checked_add(1).ok_or_else(|| {
+            HaiderError::new(
+                ErrorCode::InvalidArgument,
+                "OAuth import alias suffix space is exhausted",
+                false,
+            )
+        })?;
+        candidate = format!("{default_alias}-{suffix}");
+    }
+    Ok(CredentialAlias::new(candidate))
+}
+
+fn latest_oauth_receipt_identities(
+    receipts: &[haider_core::AccountAddReceiptRow],
+) -> HashMap<String, (u64, OAuthReceiptIdentity)> {
+    let mut latest_by_alias = HashMap::new();
+    for row in receipts.iter().filter(|row| row.state == "committed") {
+        let (Some(revision), Ok(identity)) = (
+            row.final_revision,
+            serde_json::from_str::<OAuthReceiptIdentity>(&row.request_json),
+        ) else {
+            continue;
+        };
+        let alias = identity.alias().to_owned();
+        if latest_by_alias
+            .get(&alias)
+            .is_none_or(|(current, _)| revision > *current)
+        {
+            latest_by_alias.insert(alias, (revision, identity));
+        }
+    }
+    latest_by_alias
+}
+
+async fn alias_has_pending_login_reservation(
+    store: &SqliteStoreHandle,
+    alias: &CredentialAlias,
+) -> Result<bool, HaiderError> {
+    for row in store
+        .login_receipts()
+        .await?
+        .into_iter()
+        .filter(|row| row.state == "pending")
+    {
+        let identity: LoginIdentity = serde_json::from_str(&row.request_json).map_err(|error| {
+            HaiderError::new(
+                ErrorCode::StoreCorrupt,
+                format!(
+                    "pending login receipt {} has undecodable request coordinates: {error}",
+                    row.command_id
+                ),
+                false,
+            )
+        })?;
+        if identity.physical_alias == alias.as_str() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn oauth_alias_rank(default_alias: &str, alias: &str) -> u32 {
+    if alias == default_alias {
+        return 0;
+    }
+    alias
+        .strip_prefix(default_alias)
+        .and_then(|suffix| suffix.strip_prefix('-'))
+        .and_then(|suffix| suffix.parse::<u32>().ok())
+        .unwrap_or(u32::MAX)
+}
+
+fn same_oauth_import(
+    prior: &haider_accounts::OAuthTokenBundleV1,
+    imported: &haider_accounts::OAuthTokenBundleV1,
+) -> bool {
+    prior.provider_id == imported.provider_id
+        && prior.issuer == imported.issuer
+        && prior.audience == imported.audience
+        && prior.resource == imported.resource
+        && prior.token_type.eq_ignore_ascii_case(&imported.token_type)
+        && prior.granted_scopes == imported.granted_scopes
+        && bool::from(prior.access_token().ct_eq(imported.access_token()))
+        && match (prior.refresh_token(), imported.refresh_token()) {
+            (Some(prior), Some(imported)) => bool::from(prior.ct_eq(imported)),
+            (None, None) => true,
+            _ => false,
+        }
+}
+
+async fn persist_oauth_bundle(
+    accounts: &mut AccountStore<Box<dyn StoreLike>>,
+    vault: Arc<dyn Vault>,
+    provider: &str,
+    alias: &CredentialAlias,
+    bundle: haider_accounts::OAuthTokenBundleV1,
+    prior_secret: Option<SecretHandle>,
+) -> Result<(), HaiderError> {
+    let replacing = prior_secret.is_some();
+    let active = accounts.get(alias).map_or_else(
+        || accounts.active_for_provider(provider).is_none(),
+        |descriptor| descriptor.active,
+    );
+    let descriptor = oauth_descriptor_for(provider, alias, &bundle, active);
+    let encoded = bundle.encode()?;
+    let vault_for_put = Arc::clone(&vault);
+    let alias_for_put = alias.clone();
+    tokio::task::spawn_blocking(move || vault_for_put.put(&alias_for_put, &encoded))
+        .await
+        .map_err(|_| {
+            HaiderError::new(ErrorCode::ProviderError, "OAuth vault worker failed", true)
+        })??;
+    let descriptor_result = if replacing {
+        accounts.replace(descriptor)
+    } else {
+        accounts.add(descriptor)
+    };
+    if let Err(error) = descriptor_result {
+        let vault_for_rollback = Arc::clone(&vault);
+        let alias_for_rollback = alias.clone();
+        let rollback = tokio::task::spawn_blocking(move || match prior_secret {
+            Some(previous) => vault_for_rollback.put(&alias_for_rollback, previous.expose_secret()),
+            None => vault_for_rollback.delete(&alias_for_rollback),
+        })
+        .await;
+        if !matches!(rollback, Ok(Ok(()))) {
+            return Err(HaiderError::new(
+                ErrorCode::ProviderError,
+                "OAuth descriptor save and vault rollback failed",
+                true,
+            ));
+        }
+        return Err(HaiderError::new(
+            ErrorCode::ProviderError,
+            format!("OAuth descriptor save failed: {}", error.message),
+            true,
+        ));
+    }
+    Ok(())
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 fn oauth_descriptor(
     identity: &OAuthAddIdentity,
     alias: &CredentialAlias,
     bundle: &haider_accounts::OAuthTokenBundleV1,
 ) -> CredentialDescriptor {
+    oauth_descriptor_for(&identity.provider, alias, bundle, true)
+}
+
+fn oauth_descriptor_for(
+    provider: &str,
+    alias: &CredentialAlias,
+    bundle: &haider_accounts::OAuthTokenBundleV1,
+    active: bool,
+) -> CredentialDescriptor {
     CredentialDescriptor {
         alias: alias.clone(),
-        provider: identity.provider.clone(),
+        provider: provider.to_owned(),
         base_url: None,
         auth_method: AuthMethod::OAuth,
         identity: bundle.identity.display_identity.clone(),
         status: CredentialStatus::Ok,
-        active: true,
+        active,
     }
 }
 
-async fn finalize_oauth_add(
+#[derive(Clone, Copy)]
+enum OAuthCommitResponse {
+    Add,
+    Import,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finalize_oauth_commit(
     store: &SqliteStoreHandle,
     accounts: &mut AccountStore<Box<dyn StoreLike>>,
     snapshot: &AccountsSnapshot,
@@ -3322,14 +3883,20 @@ async fn finalize_oauth_add(
     command_id: &str,
     alias: &CredentialAlias,
     route: &LoginRoute,
+    response: OAuthCommitResponse,
 ) {
     let Some(descriptor) = accounts.get(alias).cloned() else {
-        respond_error(
-            route,
-            ERROR_CODE_PROVIDER_ERROR,
+        let error = HaiderError::new(
+            ErrorCode::ProviderError,
             "OAuth descriptor disappeared before receipt finalization",
             true,
         );
+        match response {
+            OAuthCommitResponse::Add => {
+                respond_error(route, ERROR_CODE_PROVIDER_ERROR, &error.message, true);
+            }
+            OAuthCommitResponse::Import => respond_management_error(route, &error),
+        }
         return;
     };
     let revision = match store
@@ -3343,12 +3910,26 @@ async fn finalize_oauth_add(
     {
         Ok(revision) => revision,
         Err(error) => {
-            respond_error(route, ERROR_CODE_PROVIDER_ERROR, &error.message, true);
+            match response {
+                OAuthCommitResponse::Add => {
+                    respond_error(route, ERROR_CODE_PROVIDER_ERROR, &error.message, true);
+                }
+                OAuthCommitResponse::Import => respond_management_error(route, &error),
+            }
             return;
         }
     };
     publish_management_snapshot(snapshot, management, accounts, revision);
-    respond(route, ResponseBody::AccountAdd { descriptor });
+    match response {
+        OAuthCommitResponse::Add => respond(route, ResponseBody::AccountAdd { descriptor }),
+        OAuthCommitResponse::Import => respond(
+            route,
+            ResponseBody::AccountOAuthImport {
+                descriptor,
+                revision,
+            },
+        ),
+    }
 }
 
 fn descriptor_for(
@@ -4045,7 +4626,7 @@ pub(crate) async fn reconcile_oauth_add_receipts(
         .into_iter()
         .collect::<HashSet<_>>();
     for row in store.account_add_receipts().await? {
-        let identity: OAuthAddIdentity =
+        let identity: OAuthReceiptIdentity =
             serde_json::from_str(&row.request_json).map_err(|error| {
                 HaiderError::new(
                     ErrorCode::StoreCorrupt,
@@ -4056,7 +4637,9 @@ pub(crate) async fn reconcile_oauth_add_receipts(
                     false,
                 )
             })?;
-        let alias = CredentialAlias::new(identity.physical_alias.clone());
+        let provider = identity.provider().to_owned();
+        let alias = CredentialAlias::new(identity.alias());
+        let is_import = matches!(identity, OAuthReceiptIdentity::Import(_));
         if reserved.contains(alias.as_str()) {
             continue;
         }
@@ -4091,9 +4674,17 @@ pub(crate) async fn reconcile_oauth_add_receipts(
                         .await?;
                 }
             }
-            "pending" if accounts.get(&alias).is_some() => {
+            "pending" if accounts.get(&alias).is_some() && !is_import => {
                 finalize_oauth_reconciled(store, accounts, &row.command_id, &alias).await?;
             }
+            // A replacement import starts with a live descriptor and bundle,
+            // so startup cannot distinguish "claimed, no vault write" from
+            // "new bundle durable, descriptor write pending" using the
+            // deliberately secret-free `{source,alias,provider}` receipt.
+            // Leave it pending for same-command retry, which compares the
+            // daemon-read source against the current bundle and safely
+            // completes either side of that boundary.
+            "pending" if accounts.get(&alias).is_some() && is_import => {}
             "pending" => {
                 let VaultProvision::Available(vault) = vault else {
                     continue;
@@ -4104,7 +4695,7 @@ pub(crate) async fn reconcile_oauth_add_receipts(
                     continue;
                 };
                 let bundle = haider_accounts::OAuthTokenBundleV1::decode(stored.expose_secret())?;
-                if bundle.provider_id != identity.provider {
+                if bundle.provider_id != provider {
                     return Err(HaiderError::new(
                         ErrorCode::StoreCorrupt,
                         format!(
@@ -4114,7 +4705,16 @@ pub(crate) async fn reconcile_oauth_add_receipts(
                         false,
                     ));
                 }
-                accounts.add(oauth_descriptor(&identity, &alias, &bundle))?;
+                let active = accounts.get(&alias).map_or_else(
+                    || accounts.active_for_provider(&provider).is_none(),
+                    |descriptor| descriptor.active,
+                );
+                let descriptor = oauth_descriptor_for(&provider, &alias, &bundle, active);
+                if accounts.get(&alias).is_some() {
+                    accounts.replace(descriptor)?;
+                } else {
+                    accounts.add(descriptor)?;
+                }
                 finalize_oauth_reconciled(store, accounts, &row.command_id, &alias).await?;
             }
             _ => {}

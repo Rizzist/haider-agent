@@ -24,7 +24,9 @@ use tokio::time::timeout;
 #[path = "../src/main.rs"]
 mod cli_main;
 
-use cli_main::{exit_code_for_outcome, stream_jsonl_turn};
+use cli_main::{
+    ImportDispatch, ImportSource, exit_code_for_outcome, parse_import_dispatch, stream_jsonl_turn,
+};
 
 struct HaiderCommand {
     command: Command,
@@ -79,6 +81,42 @@ fn self_test_reports_ok_json() {
 fn unknown_command_exits_2() {
     let out = haider().arg("frobnicate").output().expect("binary runs");
     assert_eq!(out.status.code(), Some(2));
+}
+
+/// MUTATION CHECK: route `codex` to `ClaudeCode`. Expected runtime failure:
+/// the parsed source differs from the source the daemon must read.
+#[test]
+fn import_codex_dispatches_to_codex_source() {
+    assert_eq!(
+        parse_import_dispatch(&["codex".to_owned()]),
+        Ok(ImportDispatch::Source(ImportSource::Codex))
+    );
+}
+
+/// MUTATION CHECK: reject the `claude-code` match arm. Expected runtime
+/// failure: this supported source parses as an error.
+#[test]
+fn import_claude_code_dispatches_to_claude_source() {
+    assert_eq!(
+        parse_import_dispatch(&["claude-code".to_owned()]),
+        Ok(ImportDispatch::Source(ImportSource::ClaudeCode))
+    );
+}
+
+/// MUTATION CHECK: make bare import default to Codex. Expected runtime
+/// failure: the parser performs an import instead of selecting the safe
+/// existence-only listing.
+#[test]
+fn bare_import_dispatches_to_source_listing() {
+    assert_eq!(parse_import_dispatch(&[]), Ok(ImportDispatch::List));
+}
+
+/// MUTATION CHECK: accept an arbitrary import source. Expected runtime
+/// failure: `other-cli` no longer returns the usage error asserted here.
+#[test]
+fn unknown_import_source_is_rejected() {
+    let error = parse_import_dispatch(&["other-cli".to_owned()]).expect_err("unknown source");
+    assert!(error.contains("unknown source `other-cli`"));
 }
 
 #[test]

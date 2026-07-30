@@ -3427,6 +3427,10 @@ async fn combined_pressure_five_lanes_large_envelopes_and_live_commits_lag_no_re
     store.close().await.expect("store closes");
 }
 
+/// MUTATION CHECK: let `account.oauth_import` bypass
+/// `secret_surface_facade`. Expected runtime failure: the remote import
+/// request is handed to the actor instead of returning the same-UID
+/// capability denial asserted for every OAuth secret surface.
 #[tokio::test]
 async fn remote_control_connection_cannot_reach_any_oauth_secret_surface() {
     let (_root, store, hub) = open_hub(None, 8).await;
@@ -3448,6 +3452,10 @@ async fn remote_control_connection_cannot_reach_any_oauth_secret_surface() {
         RequestBody::AccountOAuthCancel {
             flow_id: flow_id.clone(),
             attempt_id: "remote-attempt".into(),
+        },
+        RequestBody::AccountOAuthImport {
+            command_id: CommandId::new("remote-import-command"),
+            source: "codex".into(),
         },
         RequestBody::AccountAdd {
             command_id: CommandId::new("remote-command"),

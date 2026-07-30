@@ -3,8 +3,11 @@
 
 mod common;
 
-use common::{TEST_FRAME_LIMIT, transcript};
-use haider_rpc::{CodecError, WireFrame, uds_codec, ws_codec};
+use common::{TEST_FRAME_LIMIT, golden_descriptor, transcript};
+use haider_rpc::{
+    CodecError, CommandId, FEATURE_ACCOUNT_OAUTH_IMPORT_V1, RequestBody, RequestId, ResponseBody,
+    WireFrame, uds_codec, ws_codec,
+};
 
 struct CodecCase {
     name: &'static str,
@@ -73,6 +76,40 @@ fn both_transports_use_identical_json_body_bytes() {
         let announced = u32::from_be_bytes(uds[..4].try_into().expect("prefix")) as usize;
         assert_eq!(announced, ws.len());
         assert_eq!(&uds[4..], ws.as_bytes());
+    }
+}
+
+/// MUTATION CHECK: change the import feature literal or either
+/// `account.oauth_import` serde rename. Expected runtime failure: the literal
+/// or encoded-method assertion no longer matches the served wire contract.
+#[test]
+fn oauth_import_bodies_round_trip_and_feature_is_pinned() {
+    assert_eq!(FEATURE_ACCOUNT_OAUTH_IMPORT_V1, "account_oauth_import_v1");
+    let frames = [
+        WireFrame::Request {
+            request_id: RequestId::new("request-oauth-import"),
+            body: RequestBody::AccountOAuthImport {
+                command_id: CommandId::new("command-oauth-import"),
+                source: "codex".into(),
+            },
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-oauth-import"),
+            body: ResponseBody::AccountOAuthImport {
+                descriptor: golden_descriptor(),
+                revision: 17,
+            },
+        },
+    ];
+    for frame in frames {
+        let ws = ws_codec::encode(&frame, TEST_FRAME_LIMIT).expect("WS encode");
+        assert!(ws.contains(r#""method":"account.oauth_import""#));
+        assert_eq!(
+            ws_codec::decode(&ws, TEST_FRAME_LIMIT).expect("WS decode"),
+            frame
+        );
+        let uds = uds_codec::encode(&frame, TEST_FRAME_LIMIT).expect("UDS encode");
+        assert_eq!(uds_decode(&uds), frame);
     }
 }
 

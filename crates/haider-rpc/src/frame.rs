@@ -145,6 +145,8 @@ pub const FEATURE_ACCOUNT_LOGIN_API_V1: &str = "account_login_api_v1";
 pub const FEATURE_VAULT_STAGE_V1: &str = "vault_stage_v1";
 /// Daemon implements loopback authorization-code/PKCE account flows.
 pub const FEATURE_ACCOUNT_OAUTH_PKCE_V1: &str = "account_oauth_pkce_v1";
+/// Daemon imports OAuth credentials from approved, daemon-local CLI stores.
+pub const FEATURE_ACCOUNT_OAUTH_IMPORT_V1: &str = "account_oauth_import_v1";
 /// Daemon implements durable `account.add` for an OAuth-ready reference.
 pub const FEATURE_ACCOUNT_MANAGEMENT_V1: &str = "account_management_v1";
 /// Daemon implements provider management reads.
@@ -779,6 +781,14 @@ pub enum RequestBody {
         flow_id: OAuthFlowId,
         attempt_id: String,
     },
+    /// Imports a sanctioned OAuth bundle from a daemon-local CLI credential
+    /// store. Only the source name crosses the wire; token material is read
+    /// and retained by the daemon.
+    #[serde(rename = "account.oauth_import")]
+    AccountOAuthImport {
+        command_id: CommandId,
+        source: String,
+    },
     /// Durable OAuth account creation. `oauth_reference` is transient,
     /// daemon-instance/connection-bound, single-use, and excluded from the
     /// semantic command digest.
@@ -956,6 +966,11 @@ pub enum ResponseBody {
     AccountOAuthCancel {
         flow_id: OAuthFlowId,
         status: OAuthFlowStatusWire,
+    },
+    #[serde(rename = "account.oauth_import")]
+    AccountOAuthImport {
+        descriptor: haider_protocol::credential::CredentialDescriptor,
+        revision: u64,
     },
     #[serde(rename = "account.add")]
     AccountAdd {

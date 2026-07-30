@@ -1,0 +1,6 @@
+feat(accounts): import OAuth credentials from installed CLIs
+
+Add daemon-local Codex and Claude Code credential import through the existing
+OAuth vault, descriptor, receipt, revision, and refresh paths. Expose the
+feature over RPC and the `haider import` CLI while keeping tokens off the wire
+and out of durable receipts.

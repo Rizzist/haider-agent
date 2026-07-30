@@ -806,6 +806,162 @@ fn sanctioned_oauth_table_has_exact_owner_grants_and_precise_reasons() {
     );
 }
 
+/// MUTATION CHECK 1: remove the imported-Codex branch from `resolve_oauth`.
+/// Expected runtime failure: the imported bundle returns its old access token
+/// without the refresh call asserted below. MUTATION CHECK 2: carry the
+/// import's one-use marker into `refreshed_bundle`. Expected runtime failure:
+/// the second resolution refreshes again. MUTATION CHECK 3: default ordinary
+/// bundles to the import marker. Expected runtime failure: the opaque
+/// loopback-PKCE bundle also refreshes instead of retaining the normal
+/// 30-second broker skew.
+#[tokio::test]
+async fn codex_fallback_refresh_is_one_use_and_import_scoped_at_the_broker_call_site() {
+    let server = FakeOAuthServer::start(FakeMode::Success, false).await;
+    let mut registration = server.registration(Arc::new(FakeIdentityVerifier));
+    registration.provider_id = haider_provider::OPENAI_OAUTH_PROVIDER_NAME.to_owned();
+    let catalog =
+        OAuthProviderCatalog::with_test_registrations([registration.clone()]).expect("catalog");
+    let before = now_ms().expect("clock");
+    let bundle = codex_import_bundle(
+        Path::new("/tmp/fake-codex-auth.json"),
+        br#"{"tokens":{"access_token":"fake-access-token-1","refresh_token":"fake-refresh-token-1","account_id":"fake-account-id-1"}}"#,
+        &registration,
+        1,
+    )
+    .expect("Codex fallback bundle");
+    assert!(
+        bundle.expires_at_unix_ms > before.saturating_add(14 * 60 * 1000),
+        "fallback remains approximately 15 minutes"
+    );
+    let imported_descriptor = CredentialDescriptor {
+        alias: CredentialAlias::new("openai-oauth"),
+        provider: haider_provider::OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
+        base_url: None,
+        auth_method: AuthMethod::OAuth,
+        identity: bundle.identity.display_identity.clone(),
+        status: CredentialStatus::Ok,
+        active: true,
+    };
+    let vault = Arc::new(MemoryVault::new());
+    vault
+        .put(
+            &imported_descriptor.alias,
+            &bundle.encode().expect("encode imported bundle"),
+        )
+        .expect("seed imported bundle");
+    let imported_snapshot = Arc::new(Mutex::new(vec![imported_descriptor.clone()]));
+    let imported_broker = CredentialBroker::new_with_fences(
+        vault.clone(),
+        catalog.clone(),
+        Arc::clone(&imported_snapshot),
+        start_status_actor(&imported_snapshot, vault.clone()),
+        RefreshFenceRegistry::default(),
+    )
+    .expect("imported broker");
+    let refreshed = imported_broker
+        .resolve(&imported_descriptor)
+        .await
+        .expect("resolve imported fallback");
+    assert_eq!(refreshed.expose_secret(), b"ACCESS_ROTATED_SENTINEL_3a19");
+    assert_eq!(server.state.refresh_calls.load(Ordering::SeqCst), 1);
+    let retained_refresh = imported_broker
+        .resolve(&imported_descriptor)
+        .await
+        .expect("resolve refreshed import");
+    assert_eq!(
+        retained_refresh.expose_secret(),
+        b"ACCESS_ROTATED_SENTINEL_3a19"
+    );
+    assert_eq!(
+        server.state.refresh_calls.load(Ordering::SeqCst),
+        1,
+        "the import marker must clear after the first durable refresh"
+    );
+    assert!(imported_broker.shutdown().await);
+
+    let pkce_alias = CredentialAlias::new("openai-oauth-2");
+    let pkce_descriptor = CredentialDescriptor {
+        alias: pkce_alias.clone(),
+        provider: haider_provider::OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
+        base_url: None,
+        auth_method: AuthMethod::OAuth,
+        identity: "fake-pkce-person@example.invalid".to_owned(),
+        status: CredentialStatus::Ok,
+        active: false,
+    };
+    let now = now_ms().expect("clock");
+    let pkce_bundle = OAuthTokenBundleV1::new(
+        haider_provider::OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
+        registration.issuer.clone(),
+        registration.audience.clone(),
+        registration.resource.clone(),
+        "Bearer".to_owned(),
+        Zeroizing::new(b"fake-pkce-access-token-1".to_vec()),
+        Some(Zeroizing::new(b"fake-pkce-refresh-token-1".to_vec())),
+        now.saturating_add(10 * 60 * 1000),
+        None,
+        registration.scopes.clone(),
+        OAuthIdentityV1 {
+            subject_hash: "fake-pkce-subject-hash".to_owned(),
+            display_identity: pkce_descriptor.identity.clone(),
+        },
+        1,
+    )
+    .expect("PKCE bundle");
+    vault
+        .put(
+            &pkce_alias,
+            &pkce_bundle.encode().expect("encode PKCE bundle"),
+        )
+        .expect("seed PKCE bundle");
+    let pkce_snapshot = Arc::new(Mutex::new(vec![pkce_descriptor.clone()]));
+    let pkce_broker = CredentialBroker::new_with_fences(
+        vault.clone(),
+        catalog,
+        Arc::clone(&pkce_snapshot),
+        start_status_actor(&pkce_snapshot, vault),
+        RefreshFenceRegistry::default(),
+    )
+    .expect("PKCE broker");
+    let retained = pkce_broker
+        .resolve(&pkce_descriptor)
+        .await
+        .expect("resolve PKCE bundle");
+    assert_eq!(retained.expose_secret(), b"fake-pkce-access-token-1");
+    assert_eq!(
+        server.state.refresh_calls.load(Ordering::SeqCst),
+        1,
+        "opaque PKCE token must retain the normal refresh skew"
+    );
+    assert!(pkce_broker.shutdown().await);
+}
+
+/// MUTATION CHECK: skip unverified JWT payload parsing during Codex import.
+/// Expected runtime failure: the fake access-token expiry, id-token email, or
+/// nested ChatGPT account identity below falls back instead of being stored.
+#[test]
+fn codex_import_leniently_reads_fake_jwt_claims() {
+    let registration = OAuthProviderCatalog::default()
+        .registration(haider_provider::OPENAI_OAUTH_PROVIDER_NAME)
+        .expect("OpenAI OAuth registration");
+    let bundle = codex_import_bundle(
+        Path::new("/tmp/fake-codex-auth.json"),
+        br#"{"tokens":{"id_token":"fake-id-token-header.eyJlbWFpbCI6ImZha2UtcGVyc29uQGV4YW1wbGUuaW52YWxpZCIsImh0dHBzOi8vYXBpLm9wZW5haS5jb20vYXV0aCI6eyJjaGF0Z3B0X2FjY291bnRfaWQiOiJmYWtlLWFjY291bnQtaWQtMSJ9fQ.fake-id-token-signature","access_token":"fake-access-token-header.eyJleHAiOjQxMDI0NDQ4MDB9.fake-access-token-signature","refresh_token":"fake-refresh-token-1"}}"#,
+        &registration,
+        1,
+    )
+    .expect("Codex JWT-claim bundle");
+    assert_eq!(bundle.expires_at_unix_ms, 4_102_444_800_000);
+    assert_eq!(
+        bundle.identity.display_identity,
+        "fake-person@example.invalid"
+    );
+    assert_eq!(
+        bundle.identity.subject_hash,
+        blake3::hash(b"fake-account-id-1").to_hex().to_string()
+    );
+}
+
 /// MUTATION CHECK: force either body builder to ignore the registration's
 /// encoding or state/binding flags. Exact content-type and field assertions
 /// fail without opening a socket.
