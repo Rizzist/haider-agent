@@ -80,15 +80,15 @@ fn an_unpinned_identity_follows_the_imported_active_account() {
             revision: Some(1),
         },
     );
-    assert_eq!(model.identity.provider, "openai-oauth");
-    assert_eq!(model.identity.account, "openai-oauth");
-    assert_ne!(
+    // Account truth ALONE must not adopt: a half-identity (right provider,
+    // demo-seed model) would send a foreign slug to the subscription API.
+    assert_eq!(
         model.identity.provider, seed_provider,
-        "the demo seed pair must not survive daemon truth"
+        "no adoption before the provider's model truth arrives"
     );
 
-    // The provider snapshot completes the bootstrap with the provider's OWN
-    // declared default model — never an invented slug.
+    // The provider snapshot completes the picture: NOW the identity adopts
+    // the account AND the provider's OWN declared default model.
     pass(
         &mut driver,
         &mut model,
@@ -101,6 +101,8 @@ fn an_unpinned_identity_follows_the_imported_active_account() {
             revision: 1,
         },
     );
+    assert_eq!(model.identity.provider, "openai-oauth");
+    assert_eq!(model.identity.account, "openai-oauth");
     assert_eq!(model.identity.model_short, "gpt-5.6-codex");
     assert!(
         !model.identity_pinned,
@@ -219,16 +221,32 @@ fn session_create_requests_an_output_budget_not_the_context_window() {
     );
 }
 
-/// MUTATION CHECK (W5f-2): drop `AccountList`/`ProviderList` from
-/// `resume`'s front-door command set. Expected runtime failure: the
-/// reconnect below produces neither read, so the bootstrap's snapshots
-/// never arrive and the launcher sits on demo seeds until the user
-/// happens to open /accounts.
+/// MUTATION CHECK (W5f-2/2c): drop `AccountList`/`ProviderList` from
+/// `resume`'s front-door command set, and separately from `boot`'s.
+/// Expected runtime failure: the corresponding half below produces
+/// neither read, so the bootstrap's snapshots never arrive and the
+/// launcher sits on demo seeds — `boot` is EXACTLY what the v0.0.21
+/// live probe caught missing (Reconnected only fires on redials).
 /// Verified by revert on 2026-07-30.
 #[test]
 fn connecting_asks_for_account_and_provider_truth() {
     let mut model = live_model();
     let mut driver = LiveDriver::new("test");
+
+    // The FIRST connect (boot) — the half the live probe caught.
+    let boot = driver.boot();
+    assert!(
+        boot.iter()
+            .any(|command| matches!(command, LiveCommand::AccountList)),
+        "boot must ask for account truth: {boot:?}"
+    );
+    assert!(
+        boot.iter()
+            .any(|command| matches!(command, LiveCommand::ProviderList)),
+        "and provider truth: {boot:?}"
+    );
+
+    // Every redial (resume) keeps the same front-door reads.
     let pass = live_pass(
         &mut driver,
         &mut model,
@@ -239,7 +257,7 @@ fn connecting_asks_for_account_and_provider_truth() {
         pass.commands
             .iter()
             .any(|command| matches!(command, LiveCommand::AccountList)),
-        "the connect must ask for account truth: {:?}",
+        "a reconnect must ask for account truth: {:?}",
         pass.commands
     );
     assert!(
