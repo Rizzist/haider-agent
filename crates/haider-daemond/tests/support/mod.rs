@@ -23,7 +23,12 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
-pub const DEADLINE: Duration = Duration::from_secs(10);
+// 60s, not 10 (W5f-3): the full per-crate gate runs this suite's daemons
+// under heavy compile/test contention, and the 10s ceiling flaked
+// `worker_aware_drain_terminalizes_durable_queued_turns_before_store_close`
+// three times — always under load, never isolated. A passing run never
+// waits; only real failures pay the longer bound.
+pub const DEADLINE: Duration = Duration::from_secs(60);
 
 pub fn test_root(prefix: &str) -> tempfile::TempDir {
     #[cfg(target_os = "macos")]

@@ -568,6 +568,23 @@ pub struct LiveDriver {
 /// behind `accepts_input() == false`.
 pub const LOGIN_STAGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Ceiling on the OUTPUT-token budget `session.create` requests (W5f-2).
+///
+/// `session.create`'s `max_tokens` reaches the providers as the per-request
+/// OUTPUT cap (`max_output_tokens` / `max_tokens`) — it was being fed the
+/// identity's CONTEXT window (200k), which Anthropic rejects outright and
+/// OpenAI clamps unpredictably. 30k sits inside every current subscription
+/// model's output limit while leaving real headroom; a context window
+/// smaller than the ceiling still wins.
+pub const SESSION_OUTPUT_CAP: u64 = 30_000;
+
+/// The output budget a new session may request: the ceiling, bounded by the
+/// (smaller) context window when one is declared.
+#[must_use]
+pub fn session_output_cap(context_window: u64) -> u64 {
+    SESSION_OUTPUT_CAP.min(context_window.max(1))
+}
+
 impl LiveDriver {
     /// A driver for one client instance. `instance` must be unique per
     /// process (the client instance id serves).
@@ -1041,6 +1058,9 @@ impl LiveDriver {
                     .map(crate::app::AccountRow::from_descriptor)
                     .collect();
                 if model.accounts.apply_snapshot(rows, revision) {
+                    // Daemon truth landed: an unpinned identity follows the
+                    // active account (W5f-2) so the first session can serve.
+                    model.bootstrap_identity_from_daemon();
                     model.dirty = true;
                 }
                 Vec::new()
@@ -1066,6 +1086,9 @@ impl LiveDriver {
                 revision,
             } => {
                 if model.providers.apply_snapshot(providers, revision) {
+                    // The provider snapshot may complete the bootstrap the
+                    // account snapshot started (either order works).
+                    model.bootstrap_identity_from_daemon();
                     model.dirty = true;
                 }
                 Vec::new()
@@ -1769,7 +1792,7 @@ impl LiveDriver {
                     cwd: model.cwd.clone(),
                     provider: model.identity.provider.clone(),
                     model: model.identity.model_short.clone(),
-                    max_tokens: model.identity.context_window,
+                    max_tokens: session_output_cap(model.identity.context_window),
                     first_text: text,
                 })]
             }
