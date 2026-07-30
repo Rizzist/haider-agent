@@ -27,18 +27,27 @@ fn same_global_alias_in_two_profiles_never_collides() {
     profile_b.put(&alias, b"B_SECRET").expect("b put");
 
     assert_eq!(
-        profile_a.resolve(&alias).expect("a resolve").expose_secret(),
+        profile_a
+            .resolve(&alias)
+            .expect("a resolve")
+            .expose_secret(),
         b"A_SECRET",
         "profile B's login must not clobber profile A's secret"
     );
     assert_eq!(
-        profile_b.resolve(&alias).expect("b resolve").expose_secret(),
+        profile_b
+            .resolve(&alias)
+            .expect("b resolve")
+            .expose_secret(),
         b"B_SECRET"
     );
 
     profile_b.delete(&alias).expect("b delete");
     assert_eq!(
-        profile_a.resolve(&alias).expect("a survives").expose_secret(),
+        profile_a
+            .resolve(&alias)
+            .expect("a survives")
+            .expose_secret(),
         b"A_SECRET",
         "a remove in profile B must not delete profile A's item"
     );

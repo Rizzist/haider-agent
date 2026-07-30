@@ -878,10 +878,7 @@ fn render_accounts(
             };
             let mut spans = vec![
                 Span::raw("  "),
-                Span::styled(
-                    format!("{} ", if selected { "●" } else { "○" }),
-                    dot_style,
-                ),
+                Span::styled(format!("{} ", if selected { "●" } else { "○" }), dot_style),
                 Span::styled(
                     row.alias.clone(),
                     theme
@@ -950,7 +947,11 @@ fn render_accounts(
                 footer_lines.push(Line::styled(
                     format!(
                         "  your browser opened {} — approve there; tokens land in the vault",
-                        if origin.is_empty() { "the provider" } else { origin }
+                        if origin.is_empty() {
+                            "the provider"
+                        } else {
+                            origin
+                        }
                     ),
                     theme.dim_style(),
                 ));
@@ -992,7 +993,10 @@ fn render_accounts(
             ("+ OpenAI (API)", crate::app::AccountAddKind::OpenAiApi),
         ],
         [
-            ("+ Anthropic (API)", crate::app::AccountAddKind::AnthropicApi),
+            (
+                "+ Anthropic (API)",
+                crate::app::AccountAddKind::AnthropicApi,
+            ),
             ("+ HuggingFace", crate::app::AccountAddKind::HuggingFace),
             (
                 "+ Custom (OpenAI-compatible)",
@@ -1173,7 +1177,8 @@ fn render_providers(
                 .filter(|(provider, _)| *provider == summary.provider);
             for model_name in &summary.models {
                 let is_default = summary.default_model.as_deref() == Some(model_name);
-                let is_pending = pending.is_some_and(|(_, pending_model)| pending_model == model_name);
+                let is_pending =
+                    pending.is_some_and(|(_, pending_model)| pending_model == model_name);
                 let label = if is_default {
                     format!("{model_name}*")
                 } else if is_pending {

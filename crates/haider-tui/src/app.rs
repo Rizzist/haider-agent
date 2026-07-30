@@ -237,9 +237,7 @@ pub struct AccountRow {
 impl AccountRow {
     /// Projects one `account.list` descriptor into a screen row.
     #[must_use]
-    pub fn from_descriptor(
-        descriptor: &haider_protocol::credential::CredentialDescriptor,
-    ) -> Self {
+    pub fn from_descriptor(descriptor: &haider_protocol::credential::CredentialDescriptor) -> Self {
         Self {
             alias: descriptor.alias.as_str().to_owned(),
             provider: descriptor.provider.clone(),
@@ -1372,7 +1370,10 @@ pub enum Hit {
     /// One add-row button on `/accounts` (sim tui.js:3621-3628).
     AccountAdd(AccountAddKind),
     /// One `/providers` model chip: click sets the provider default.
-    ProviderModel { provider: String, model: String },
+    ProviderModel {
+        provider: String,
+        model: String,
+    },
     /// The `/providers` row's `[accounts]` navigation chip.
     ProviderAccounts,
 }
@@ -3234,8 +3235,9 @@ impl AppModel {
         match row.status {
             haider_protocol::credential::CredentialStatus::Expired
             | haider_protocol::credential::CredentialStatus::Revoked => {
-                self.accounts.message =
-                    Some(format!("· {alias} is not usable — /login to re-authenticate"));
+                self.accounts.message = Some(format!(
+                    "· {alias} is not usable — /login to re-authenticate"
+                ));
                 self.dirty = true;
                 return;
             }
@@ -3436,7 +3438,8 @@ impl AppModel {
             | AccountAddKind::Custom => return,
         };
         let alias = {
-            let taken = |candidate: &str| self.accounts.rows.iter().any(|row| row.alias == candidate);
+            let taken =
+                |candidate: &str| self.accounts.rows.iter().any(|row| row.alias == candidate);
             let mut candidate = provider.to_owned();
             let mut suffix = 1u32;
             while taken(&candidate) {
@@ -3554,9 +3557,8 @@ impl AppModel {
                             base_url: None,
                         });
                         self.oauth_add = None;
-                        self.accounts.message = Some(format!(
-                            "✓ {provider} → {alias} · oauth · active"
-                        ));
+                        self.accounts.message =
+                            Some(format!("✓ {provider} → {alias} · oauth · active"));
                         let _ = attempt;
                         self.dirty = true;
                     } else {
@@ -4017,12 +4019,13 @@ impl AppModel {
                 let requested = remainder.trim().to_owned();
                 let slots = self.dynamic_slots();
                 if slots.models.is_empty() {
-                    self.flash = Some(if self.daemon_serves(haider_rpc::FEATURE_PROVIDER_MODELS_V1)
-                    {
-                        "· no models discovered yet — /providers then refresh".to_owned()
-                    } else {
-                        self.stale_daemon_note("model discovery")
-                    });
+                    self.flash = Some(
+                        if self.daemon_serves(haider_rpc::FEATURE_PROVIDER_MODELS_V1) {
+                            "· no models discovered yet — /providers then refresh".to_owned()
+                        } else {
+                            self.stale_daemon_note("model discovery")
+                        },
+                    );
                 } else if requested.is_empty() {
                     let names: Vec<&str> =
                         slots.models.iter().map(|(slug, _)| slug.as_str()).collect();
@@ -4061,8 +4064,7 @@ impl AppModel {
                     self.identity.provider = name.clone();
                     self.flash = Some(format!("· provider → {name} · {health}"));
                 } else {
-                    self.flash =
-                        Some(format!("· no provider \"{requested}\" in the registry"));
+                    self.flash = Some(format!("· no provider \"{requested}\" in the registry"));
                 }
             }
             "account" => {
@@ -4091,7 +4093,6 @@ impl AppModel {
             other => {
                 // Known stubs name their wave; typos say so (review r1 P2).
                 let wave = match other {
-
                     "tree" | "fork" | "rename" | "tokens" => Some("the daemon wave (W3)"),
                     "peers" => Some("the mesh wave (post-v0.1)"),
                     "hooks" | "update" => Some("the gates wave (W4)"),
@@ -4824,8 +4825,7 @@ impl AppModel {
                         if self.daemon_serves(haider_rpc::FEATURE_ACCOUNT_OAUTH_PKCE_V1) {
                             self.open_oauth_add(kind);
                         } else {
-                            self.accounts.message =
-                                Some(self.stale_daemon_note("OAuth sign-in"));
+                            self.accounts.message = Some(self.stale_daemon_note("OAuth sign-in"));
                             self.dirty = true;
                         }
                     }

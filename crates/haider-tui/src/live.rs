@@ -157,7 +157,10 @@ pub enum LiveCommand {
     /// `account.set_active` (W5d). DURABLE mutation: the same command id
     /// replays the same committed result. `alias` rides along client-side
     /// so a failure reply can clear the exact pending row.
-    AccountSetActive { command_id: CommandId, alias: String },
+    AccountSetActive {
+        command_id: CommandId,
+        alias: String,
+    },
     /// `provider.list` for the `/providers` screen (W5d). A read.
     ProviderList,
     /// `account.oauth_start` (W5e-1). Transient — never outboxed; a lost
@@ -1162,10 +1165,8 @@ impl LiveDriver {
                             return Vec::new(); // add already in flight
                         }
                         self.next_command += 1;
-                        let command_id = CommandId::new(format!(
-                            "{}-{}",
-                            self.instance, self.next_command
-                        ));
+                        let command_id =
+                            CommandId::new(format!("{}-{}", self.instance, self.next_command));
                         flight.add_command = Some(command_id.clone());
                         let command = LiveCommand::AccountAddOAuth {
                             command_id,
@@ -1180,12 +1181,16 @@ impl LiveDriver {
                     }
                     haider_rpc::OAuthFlowStatusWire::Failed { public_code } => {
                         self.oauth_flight = None;
-                        model.oauth_add_failed(attempt, &format!("authorize failed: {public_code}"));
+                        model
+                            .oauth_add_failed(attempt, &format!("authorize failed: {public_code}"));
                         Vec::new()
                     }
                     haider_rpc::OAuthFlowStatusWire::Expired => {
                         self.oauth_flight = None;
-                        model.oauth_add_failed(attempt, "the authorize window expired — start again");
+                        model.oauth_add_failed(
+                            attempt,
+                            "the authorize window expired — start again",
+                        );
                         Vec::new()
                     }
                     haider_rpc::OAuthFlowStatusWire::Cancelled => {

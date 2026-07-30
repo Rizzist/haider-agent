@@ -40,7 +40,9 @@ fn live_accounts_model(features: &[&str]) -> AppModel {
 fn a_daemon_without_the_oauth_feature_never_opens_the_card() {
     // A stale daemon: it serves login but not the OAuth PKCE family.
     let mut model = live_accounts_model(&["account_login_api_v1"]);
-    model.handle_hit(Hit::AccountAdd(haider_tui::app::AccountAddKind::OpenAiOAuth));
+    model.handle_hit(Hit::AccountAdd(
+        haider_tui::app::AccountAddKind::OpenAiOAuth,
+    ));
 
     assert!(
         model.oauth_add.is_none(),
@@ -65,7 +67,9 @@ fn a_capable_daemon_opens_the_card() {
         "account_oauth_pkce_v1",
         "account_management_v1",
     ]);
-    model.handle_hit(Hit::AccountAdd(haider_tui::app::AccountAddKind::AnthropicOAuth));
+    model.handle_hit(Hit::AccountAdd(
+        haider_tui::app::AccountAddKind::AnthropicOAuth,
+    ));
 
     let card = model.oauth_add.as_ref().expect("card opens");
     assert_eq!(card.provider, "anthropic-oauth");
@@ -90,7 +94,9 @@ fn demo_mode_is_always_capable() {
         model.daemon_features.is_empty(),
         "demo has no daemon features"
     );
-    model.handle_hit(Hit::AccountAdd(haider_tui::app::AccountAddKind::OpenAiOAuth));
+    model.handle_hit(Hit::AccountAdd(
+        haider_tui::app::AccountAddKind::OpenAiOAuth,
+    ));
     assert!(
         model.oauth_add.is_some(),
         "demo must still open its simulated card"
@@ -106,7 +112,9 @@ fn demo_mode_is_always_capable() {
 #[test]
 fn a_failed_start_reports_into_the_card_not_into_the_void() {
     let mut model = live_accounts_model(&["account_oauth_pkce_v1"]);
-    model.handle_hit(Hit::AccountAdd(haider_tui::app::AccountAddKind::OpenAiOAuth));
+    model.handle_hit(Hit::AccountAdd(
+        haider_tui::app::AccountAddKind::OpenAiOAuth,
+    ));
     let attempt = model.oauth_add.as_ref().expect("card").attempt;
     assert!(matches!(
         model.oauth_add.as_ref().expect("card").phase,
@@ -114,7 +122,10 @@ fn a_failed_start_reports_into_the_card_not_into_the_void() {
     ));
 
     // What the driver does when the identity-tagged failure lands.
-    model.oauth_add_failed(attempt, "oauth_unavailable — provider registration unavailable");
+    model.oauth_add_failed(
+        attempt,
+        "oauth_unavailable — provider registration unavailable",
+    );
 
     match &model.oauth_add.as_ref().expect("card stays open").phase {
         OAuthAddPhase::Failed { message } => {
@@ -159,11 +170,13 @@ fn the_link_maps_a_failed_oauth_start_to_an_identity_tagged_reply() {
         },
     );
     match replies.as_slice() {
-        [LiveReply::OAuthStartFailed {
-            attempt_id,
-            code,
-            message,
-        }] => {
+        [
+            LiveReply::OAuthStartFailed {
+                attempt_id,
+                code,
+                message,
+            },
+        ] => {
             assert_eq!(attempt_id, "inst-oauth-7");
             assert_eq!(code, "oauth_unavailable");
             assert_eq!(message, "provider registration unavailable");

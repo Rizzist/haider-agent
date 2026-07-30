@@ -124,7 +124,10 @@ fn approval_card_colors_the_patch_preview_by_diff_prefix() {
     );
     // The options and title still render (the card stays a first-class
     // blocking menu — coloring must not break the card chrome).
-    assert!(rows.iter().any(|row| row.contains("Allow patch src/lib.rs?")));
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("Allow patch src/lib.rs?"))
+    );
     assert!(rows.iter().any(|row| row.contains("1. Approve once")));
     assert!(rows.iter().any(|row| row.contains("2. Deny")));
 }

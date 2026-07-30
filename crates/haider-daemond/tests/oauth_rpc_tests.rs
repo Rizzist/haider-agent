@@ -911,7 +911,10 @@ async fn real_uds_oauth_add_is_capability_and_connection_bound_durable_and_secre
         ResponseBody::AccountAdd { descriptor: replay } if replay == descriptor
     ));
     let stored = vault
-        .resolve(&haider_daemon::scoped_vault_alias("oauth-wire", &descriptor.alias))
+        .resolve(&haider_daemon::scoped_vault_alias(
+            "oauth-wire",
+            &descriptor.alias,
+        ))
         .expect("vault bundle");
     let bundle = OAuthTokenBundleV1::decode(stored.expose_secret()).expect("bundle");
     assert_eq!(bundle.access_token(), ACCESS.as_bytes());
@@ -1156,7 +1159,10 @@ async fn blocking_refresh_shutdown_barrier(inject_worker_shutdown_error: bool) {
         other => panic!("unexpected account.add response: {other:?}"),
     };
     let stored = vault
-        .resolve(&haider_daemon::scoped_vault_alias("oauth-barrier", &descriptor.alias))
+        .resolve(&haider_daemon::scoped_vault_alias(
+            "oauth-barrier",
+            &descriptor.alias,
+        ))
         .expect("initial bundle");
     let initial = OAuthTokenBundleV1::decode(stored.expose_secret()).expect("decode initial");
     let now = std::time::SystemTime::now()
@@ -1318,7 +1324,10 @@ async fn blocking_refresh_shutdown_barrier(inject_worker_shutdown_error: bool) {
     );
     assert!(
         vault
-            .resolve(&haider_daemon::scoped_vault_alias("oauth-barrier", &descriptor.alias))
+            .resolve(&haider_daemon::scoped_vault_alias(
+                "oauth-barrier",
+                &descriptor.alias
+            ))
             .is_err(),
         "forced actor completion tombstones the predecessor's rotated write"
     );

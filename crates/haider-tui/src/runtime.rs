@@ -1242,7 +1242,9 @@ impl DemoDriver {
                 model.dirty = true;
             }
             AppRequest::SetDefaultModel {
-                provider, model: default, ..
+                provider,
+                model: default,
+                ..
             } => {
                 let Some(mut summary) = model
                     .providers

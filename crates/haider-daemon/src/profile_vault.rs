@@ -71,9 +71,7 @@ impl Vault for ProfileVault {
             // raw alias. Those aliases were derived per-profile (blake3 over
             // profile + provider + command), so this read cannot observe
             // another profile's item.
-            Err(error) if error.code == ErrorCode::CredentialMissing => {
-                self.inner.resolve(alias)
-            }
+            Err(error) if error.code == ErrorCode::CredentialMissing => self.inner.resolve(alias),
             Err(error) => Err(error),
         }
     }

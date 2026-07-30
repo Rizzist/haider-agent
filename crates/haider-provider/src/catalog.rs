@@ -178,9 +178,12 @@ pub async fn discover_models_with_resolver(
             .header("anthropic-version", "2023-06-01");
     }
 
-    let response = request.send().await.map_err(|error| CatalogError::Transport {
-        reason: format!("model catalog request failed: {error}"),
-    })?;
+    let response = request
+        .send()
+        .await
+        .map_err(|error| CatalogError::Transport {
+            reason: format!("model catalog request failed: {error}"),
+        })?;
     if response.status() == reqwest::StatusCode::NOT_MODIFIED {
         return Err(CatalogError::NotModified);
     }
@@ -313,8 +316,11 @@ pub fn parse_catalog(
 /// are dropped — the provider said not to list them.
 #[must_use]
 pub fn pickable(models: &[DiscoveredModel]) -> Vec<DiscoveredModel> {
-    let mut visible: Vec<DiscoveredModel> =
-        models.iter().filter(|model| model.visible).cloned().collect();
+    let mut visible: Vec<DiscoveredModel> = models
+        .iter()
+        .filter(|model| model.visible)
+        .cloned()
+        .collect();
     visible.sort_by(|left, right| {
         left.priority
             .unwrap_or(i64::MAX)

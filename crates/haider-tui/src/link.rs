@@ -744,16 +744,19 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
             authorization_url,
             provider_origin,
             ..
-        } => context.oauth_attempt.clone().map_or_else(Vec::new, |attempt_id| {
-            vec![LiveReply::OAuthStarted {
-                attempt_id,
-                availability,
-                flow_id,
-                authorization_url: authorization_url
-                    .map(|url| url.expose_authorization_url().to_owned()),
-                provider_origin,
-            }]
-        }),
+        } => context
+            .oauth_attempt
+            .clone()
+            .map_or_else(Vec::new, |attempt_id| {
+                vec![LiveReply::OAuthStarted {
+                    attempt_id,
+                    availability,
+                    flow_id,
+                    authorization_url: authorization_url
+                        .map(|url| url.expose_authorization_url().to_owned()),
+                    provider_origin,
+                }]
+            }),
         ResponseBody::AccountOAuthStatus { flow_id, status } => {
             vec![LiveReply::OAuthFlowStatus { flow_id, status }]
         }
