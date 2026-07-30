@@ -371,6 +371,117 @@ async fn stale_oauth_fences_cannot_overwrite_or_expire_a_replaced_bundle() {
     store.close().await.expect("close");
 }
 
+/// MUTATION CHECK (review of record, W5c.2b): disable both reserved-alias
+/// fences (`if reserved_aliases.contains(alias.as_str())` in `handle_login`
+/// and `handle_oauth_add`, e.g. via `if false && …`). Expected runtime
+/// failure: both commands below succeed instead of answering the retryable
+/// `busy` rejection, so a login could re-occupy an alias whose removal
+/// cleanup is still pending — a crash between vault-delete retries would then
+/// delete the NEW credential's secret.
+/// Verified by revert on 2026-07-30.
+#[tokio::test]
+async fn reserved_alias_fences_login_and_oauth_add_until_remove_finalizes() {
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(Vec::new()));
+    let vault = Arc::new(MemoryVault::new());
+    let mut actor = start_account_actor(AccountActorConfig {
+        store: store.clone(),
+        accounts: memory_accounts(),
+        vault: vault.clone() as Arc<dyn Vault>,
+        validator: Arc::new(ProviderCredentialValidator),
+        snapshot: Arc::clone(&snapshot),
+        management: None,
+        profile_id: "reserved-fence".into(),
+        default_model: "claude-test".into(),
+        providers: test_provider_registry(),
+        provider_endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
+        reserved_aliases: HashSet::from(["work".to_owned(), "work-oauth".to_owned()]),
+        refresh_fences: RefreshFenceRegistry::default(),
+    });
+
+    let (sink, mut frames) = channel_sink();
+    actor
+        .commands()
+        .send(AccountCommand::Login(Box::new(LoginJob {
+            command_id: "reserved-login".into(),
+            provider: "anthropic".into(),
+            display_alias: Some("work".into()),
+            validation_model: Some("claude-test".into()),
+            secret: Some(Zeroizing::new(b"sk-reserved".to_vec())),
+            route: LoginRoute {
+                request_id: RequestId::new("reserved-login-request"),
+                sink: Arc::clone(&sink),
+            },
+        })))
+        .await
+        .expect("send login");
+    let frame = tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        .await
+        .expect("login response deadline")
+        .expect("login response");
+    match frame {
+        WireFrame::Response {
+            body:
+                ResponseBody::Error {
+                    code, retryable, ..
+                },
+            ..
+        } => {
+            assert_eq!(code, ERROR_CODE_BUSY, "reserved alias must answer busy");
+            assert!(retryable, "removal cleanup is transient — must be retryable");
+        }
+        other => panic!("reserved login must be rejected, got {other:?}"),
+    }
+    assert!(
+        snapshot.lock().expect("snapshot").is_empty(),
+        "no descriptor may be committed for a reserved alias"
+    );
+
+    actor
+        .commands()
+        .send(AccountCommand::AddOAuth(Box::new(OAuthAddJob {
+            command_id: "reserved-oauth".into(),
+            provider: "fake-oauth".into(),
+            display_alias: "work-oauth".into(),
+            claim: Some(OAuthReadyClaim::for_account_test(
+                "fake-oauth",
+                "work-oauth",
+                oauth_bundle(),
+            )),
+            route: LoginRoute {
+                request_id: RequestId::new("reserved-oauth-request"),
+                sink,
+            },
+        })))
+        .await
+        .expect("send oauth add");
+    let frame = tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        .await
+        .expect("oauth response deadline")
+        .expect("oauth response");
+    match frame {
+        WireFrame::Response {
+            body:
+                ResponseBody::Error {
+                    code, retryable, ..
+                },
+            ..
+        } => {
+            assert_eq!(code, ERROR_CODE_BUSY);
+            assert!(retryable);
+        }
+        other => panic!("reserved oauth add must be rejected, got {other:?}"),
+    }
+    assert!(
+        vault.list().expect("vault list").is_empty(),
+        "no secret may be written for a reserved alias"
+    );
+
+    actor.shutdown().await;
+    store.close().await.expect("close");
+}
+
 /// MUTATION CHECK (review of record, W5c.1): drop the `error.retryable` arm
 /// from the attempt resolver's rotation-failure match so the resolver error
 /// propagates. Expected failure: the retryable bookkeeping error escapes as

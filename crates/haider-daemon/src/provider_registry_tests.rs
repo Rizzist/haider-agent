@@ -25,6 +25,41 @@ impl ProviderRegistryStoreLike for MemoryProviderStore {
     }
 }
 
+/// MUTATION CHECK (review of record, W5c.2b): weaken the availability
+/// derivation to `profile.enabled` alone (drop the
+/// `api_family != Unknown` conjunct). Expected runtime failure: the enabled
+/// Unknown-family profile below is reported `Available`.
+///
+/// This is the tolerant-decode case the factory pin above cannot reach: a
+/// NEWER daemon writes an enabled profile with an api_family this build does
+/// not know, `#[serde(other)]` decodes it as `Unknown`, and this daemon must
+/// not advertise a provider it cannot construct an adapter for.
+/// Verified by revert on 2026-07-30.
+#[test]
+fn enabled_profile_with_unknown_api_family_is_never_available() {
+    let store = MemoryProviderStore::default();
+    store
+        .save(&[ProviderProfileV1 {
+            provider_id: "from-the-future".to_owned(),
+            display_name: "From The Future".to_owned(),
+            api_family: ProviderApiFamilyWire::Unknown,
+            base_url: Some("https://api.future.example".to_owned()),
+            enabled: true,
+            auth_requirement: ProviderAuthRequirementWire::Unknown,
+            configured_models: vec!["future-model".to_owned()],
+            default_model: Some("future-model".to_owned()),
+            provenance: ProviderProvenance::Custom,
+        }])
+        .expect("seed store");
+    let registry = ProviderRegistry::new(store, Vec::new()).expect("registry");
+    let summary = registry.summaries().into_iter().next().expect("summary");
+    assert_eq!(
+        summary.availability,
+        ProviderAvailabilityWire::Unavailable,
+        "an adapter this build cannot construct must never render available"
+    );
+}
+
 /// MUTATION CHECK: replace the unknown arm in `builtin_or_unknown` with the
 /// Anthropic profile. Expected runtime failure: `future-provider` is reported
 /// enabled/Available with the Anthropic default instead of unavailable.
