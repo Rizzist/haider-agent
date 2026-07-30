@@ -1233,6 +1233,31 @@ impl DemoDriver {
                 }
                 model.dirty = true;
             }
+            AppRequest::ProvidersRefresh => {
+                if model.providers.providers.is_empty() {
+                    model
+                        .providers
+                        .apply_snapshot(crate::mock::seed_provider_summaries(), 1);
+                }
+                model.dirty = true;
+            }
+            AppRequest::SetDefaultModel {
+                provider, model: default, ..
+            } => {
+                let Some(mut summary) = model
+                    .providers
+                    .providers
+                    .iter()
+                    .find(|summary| summary.provider == provider)
+                    .cloned()
+                else {
+                    model.default_model_failed(&provider, "unknown provider", false);
+                    return;
+                };
+                summary.default_model = Some(default);
+                let revision = model.providers.revision.map_or(1, |current| current + 1);
+                model.apply_default_model_set(summary, revision);
+            }
             AppRequest::AccountSetActive { alias } => {
                 let Some(row) = model
                     .accounts

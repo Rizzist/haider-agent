@@ -158,6 +158,15 @@ pub enum LiveCommand {
     /// replays the same committed result. `alias` rides along client-side
     /// so a failure reply can clear the exact pending row.
     AccountSetActive { command_id: CommandId, alias: String },
+    /// `provider.list` for the `/providers` screen (W5d). A read.
+    ProviderList,
+    /// `account.set_default_model` under the expected-revision CAS (W5d).
+    SetDefaultModel {
+        command_id: CommandId,
+        provider: String,
+        model: String,
+        expected_revision: u64,
+    },
 }
 
 impl LiveCommand {
@@ -171,10 +180,12 @@ impl LiveCommand {
             | Self::Answer { command_id, .. } => Some(command_id),
             Self::LoginApi { command_id, .. } => Some(command_id),
             Self::AccountSetActive { command_id, .. } => Some(command_id),
+            Self::SetDefaultModel { command_id, .. } => Some(command_id),
             Self::List { .. }
             | Self::Attach { .. }
             | Self::Detach { .. }
             | Self::AccountList
+            | Self::ProviderList
             // A stage carries no durable identity BY DESIGN (see above).
             | Self::Stage { .. } => None,
         }
@@ -308,6 +319,17 @@ pub enum LiveReply {
         descriptor: haider_protocol::credential::CredentialDescriptor,
         revision: u64,
     },
+    /// `provider.list` answered (W5d `/providers`).
+    Providers {
+        providers: Vec<haider_rpc::ProviderSummaryWire>,
+        revision: u64,
+    },
+    /// `account.set_default_model` committed.
+    DefaultModelSet {
+        command_id: CommandId,
+        provider: haider_rpc::ProviderSummaryWire,
+        revision: u64,
+    },
     /// The connection died; the shell will dial again.
     Disconnected {
         reason: String,
@@ -422,6 +444,8 @@ pub struct LiveDriver {
     /// The in-flight `account.set_active`, so a failure clears the exact
     /// pending row (W5d) instead of only flashing.
     pending_account_select: Option<(CommandId, String)>,
+    /// The in-flight `account.set_default_model`: (command, provider).
+    pending_default_model: Option<(CommandId, String)>,
     /// Durable mutations awaiting a response, in issue order.
     outbox: Vec<Pending>,
     /// Committed menu coordinates, by menu id.
@@ -481,6 +505,7 @@ impl LiveDriver {
             retired_logins: std::collections::HashSet::new(),
             login_started: None,
             pending_account_select: None,
+            pending_default_model: None,
             outbox: Vec::new(),
             menus: HashMap::new(),
             generations: HashMap::new(),
@@ -956,6 +981,31 @@ impl LiveDriver {
                 model.apply_account_selected(&descriptor, revision);
                 Vec::new()
             }
+            LiveReply::Providers {
+                providers,
+                revision,
+            } => {
+                if model.providers.apply_snapshot(providers, revision) {
+                    model.dirty = true;
+                }
+                Vec::new()
+            }
+            LiveReply::DefaultModelSet {
+                command_id,
+                provider,
+                revision,
+            } => {
+                self.retire(&command_id);
+                if self
+                    .pending_default_model
+                    .as_ref()
+                    .is_some_and(|(id, _)| *id == command_id)
+                {
+                    self.pending_default_model = None;
+                }
+                model.apply_default_model_set(provider, revision);
+                Vec::new()
+            }
             LiveReply::Event {
                 attachment,
                 session,
@@ -1115,6 +1165,23 @@ impl LiveDriver {
                 {
                     self.retire(id);
                     model.dirty = true;
+                    return Vec::new();
+                }
+                // A failed `account.set_default_model` releases its gate;
+                // a revision_conflict also refreshes (the CAS proved the
+                // snapshot stale).
+                if let Some(id) = &command_id
+                    && self
+                        .pending_default_model
+                        .as_ref()
+                        .is_some_and(|(pending, _)| pending == id)
+                    && let Some((_, provider)) = self.pending_default_model.take()
+                {
+                    if !retryable {
+                        self.retire(id);
+                    }
+                    let refresh = code == haider_rpc::ERROR_CODE_REVISION_CONFLICT;
+                    model.default_model_failed(&provider, &message, refresh);
                     return Vec::new();
                 }
                 // A failed `account.set_active` clears its exact pending
@@ -1500,6 +1567,21 @@ impl LiveDriver {
             }
             // `/accounts` (W5d): a read — never in the outbox.
             AppRequest::AccountsRefresh => vec![LiveCommand::AccountList],
+            AppRequest::ProvidersRefresh => vec![LiveCommand::ProviderList],
+            AppRequest::SetDefaultModel {
+                provider,
+                model,
+                expected_revision,
+            } => {
+                let command_id = self.mint();
+                self.pending_default_model = Some((command_id.clone(), provider.clone()));
+                vec![self.enqueue(LiveCommand::SetDefaultModel {
+                    command_id,
+                    provider,
+                    model,
+                    expected_revision,
+                })]
+            }
             AppRequest::AccountSetActive { alias } => {
                 let command_id = self.mint();
                 self.pending_account_select = Some((command_id.clone(), alias.clone()));

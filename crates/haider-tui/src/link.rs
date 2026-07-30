@@ -559,6 +559,18 @@ pub fn request_body(command: LiveCommand) -> RequestBody {
         LiveCommand::AccountSetActive { command_id, alias } => {
             RequestBody::AccountSetActive { command_id, alias }
         }
+        LiveCommand::ProviderList => RequestBody::ProviderList { provider: None },
+        LiveCommand::SetDefaultModel {
+            command_id,
+            provider,
+            model,
+            expected_revision,
+        } => RequestBody::AccountSetDefaultModel {
+            command_id,
+            provider,
+            model,
+            expected_revision,
+        },
         LiveCommand::Answer { .. } => unreachable!("answers ride send_frame, not request"),
     }
 }
@@ -656,6 +668,22 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
                 revision,
             }]
         }),
+        ResponseBody::ProviderList {
+            providers,
+            revision,
+        } => vec![LiveReply::Providers {
+            providers,
+            revision,
+        }],
+        ResponseBody::AccountSetDefaultModel { provider, revision } => {
+            context.command_id.clone().map_or_else(Vec::new, |id| {
+                vec![LiveReply::DefaultModelSet {
+                    command_id: id,
+                    provider,
+                    revision,
+                }]
+            })
+        }
         ResponseBody::Error {
             code,
             message,
