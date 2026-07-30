@@ -14,9 +14,9 @@
 //!   keeps it so the same command can retry without retyping; expiry or
 //!   daemon restart wipes it and answers `restage_required`.
 //! - Secrets live only in zeroizing memory, never in receipts, envelopes,
-//!   logs, formatted errors, or descriptor JSON. The physical vault alias is
-//!   derived from profile identity + command id, so identical display
-//!   aliases in different profiles can never collide in the Keychain (R10).
+//!   logs, formatted errors, or descriptor JSON. Descriptor and vault calls
+//!   use the same normalized public alias; physical vault-slot naming is not
+//!   exposed on the wire.
 //! - `accounts.json` and the Keychain cannot share one SQLite transaction:
 //!   the pending receipt is the recovery protocol. Commit order is Keychain
 //!   first, descriptor add/select + parent-fsynced save, then receipt
@@ -24,7 +24,7 @@
 //!   just-written vault alias. `reconcile_login_receipts` closes every
 //!   crash boundary on the next start.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -35,8 +35,9 @@ use haider_accounts::{
 };
 use haider_core::SqliteStoreHandle;
 use haider_core::{
+    ACCOUNT_REMOVE_METHOD, ACCOUNT_SET_ACTIVE_METHOD, ACCOUNT_SET_DEFAULT_MODEL_METHOD,
     AccountAddClaim, AccountAddReceiptResponse, LoginClaim, LoginReceiptFailure,
-    LoginReceiptResponse,
+    LoginReceiptResponse, ManagementClaim, PROVIDER_CONFIGURE_METHOD,
 };
 use haider_protocol::credential::{
     AuthMethod, CredentialDescriptor, CredentialStatus, RotationCause, RotationEvent,
@@ -44,17 +45,16 @@ use haider_protocol::credential::{
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::CredentialAlias;
 use haider_provider::{
-    ANTHROPIC_API_URL, ANTHROPIC_OAUTH_BASE_URL, ANTHROPIC_OAUTH_PROVIDER_NAME,
-    ANTHROPIC_PROVIDER_NAME, AnthropicProvider, BUILTIN_PROVIDER_NAMES, Message,
-    OPENAI_COMPATIBLE_PROVIDER_NAME, OPENAI_OAUTH_PROVIDER_NAME, OPENAI_PROVIDER_NAME,
-    OPENAI_RESPONSES_API_URL, OPENAI_SUBSCRIPTION_RESPONSES_URL, OpenAiCompatibleProvider,
-    OpenAiProvider, Provider, ProviderErrorKind, TurnRequest,
+    ANTHROPIC_OAUTH_PROVIDER_NAME, ANTHROPIC_PROVIDER_NAME, AnthropicProvider,
+    BUILTIN_PROVIDER_NAMES, Message, OPENAI_COMPATIBLE_PROVIDER_NAME, OPENAI_OAUTH_PROVIDER_NAME,
+    OPENAI_PROVIDER_NAME, OpenAiCompatibleProvider, OpenAiProvider, Provider, ProviderErrorKind,
+    TurnRequest,
 };
 use haider_rpc::{
-    ERROR_CODE_INVALID_ARGUMENT, ERROR_CODE_PERMISSION_DENIED, ERROR_CODE_PROVIDER_ERROR,
-    ERROR_CODE_RESTAGE_REQUIRED, ERROR_CODE_UNAUTHORIZED, ProviderApiFamilyWire,
-    ProviderAvailabilityWire, ProviderSummaryWire, RequestId, ResponseBody, StagePurpose,
-    WireFrame,
+    ERROR_CODE_BUSY, ERROR_CODE_CREDENTIAL_MISSING, ERROR_CODE_INVALID_ARGUMENT,
+    ERROR_CODE_PERMISSION_DENIED, ERROR_CODE_PROVIDER_ERROR, ERROR_CODE_RESTAGE_REQUIRED,
+    ERROR_CODE_REVISION_CONFLICT, ERROR_CODE_UNAUTHORIZED, ErrorData, ProviderSummaryWire,
+    RequestId, ResponseBody, StagePurpose, WireFrame,
 };
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
@@ -62,7 +62,13 @@ use zeroize::Zeroizing;
 
 use crate::oauth::{
     CredentialBroker, OAuthCoordinator, OAuthCoordinatorConfig, OAuthInferenceAuthMode,
-    OAuthInferenceHeaderSet, OAuthProviderCatalog, OAuthReadyClaim, sanctioned_inference,
+    OAuthInferenceHeaderSet, OAuthProviderCatalog, OAuthReadyClaim, RefreshFenceRegistry,
+    sanctioned_inference,
+};
+use crate::provider_registry::{
+    JsonProviderRegistryStore, ProductionProviderEndpointValidator, ProviderConfigureInput,
+    ProviderEndpointValidator, ProviderRegistry, ProviderRegistryStoreLike,
+    initial_provider_profiles, provider_summary,
 };
 use crate::session_hub::FrameSink;
 
@@ -289,6 +295,8 @@ pub struct AccountsDependencies {
     /// fake registrations.
     pub oauth_catalog: OAuthProviderCatalog,
     pub oauth_coordinator: OAuthCoordinatorConfig,
+    /// Validates custom provider origins on the account actor's owned task.
+    pub provider_endpoint_validator: Arc<dyn ProviderEndpointValidator>,
 }
 
 impl Default for AccountsDependencies {
@@ -299,6 +307,7 @@ impl Default for AccountsDependencies {
             descriptor_store: None,
             oauth_catalog: OAuthProviderCatalog::default(),
             oauth_coordinator: OAuthCoordinatorConfig::default(),
+            provider_endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
         }
     }
 }
@@ -423,7 +432,8 @@ fn unix_ms_after(delta: Duration) -> u64 {
 // ───────────────────────── canonical login identity ─────────────────────────
 
 /// Canonical `request_json` of the durable login command (R7): the semantic
-/// provider/resolved-model/alias operation plus the derived physical alias —
+/// provider/resolved-model/global-alias operation (the legacy field name
+/// `physical_alias` now stores that logical alias for receipt compatibility)
 /// and deliberately NOT the ephemeral vault reference or any secret.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct LoginIdentity {
@@ -448,6 +458,7 @@ impl LoginIdentity {
 /// Stable physical Keychain/vault alias: profile-namespaced (R10) and
 /// command-derived, so identical display aliases in two profiles resolve
 /// distinct secrets and a login retry recomputes the same alias.
+#[cfg(test)]
 pub(crate) fn physical_alias(profile_id: &str, provider: &str, command_id: &str) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"haider-login-alias-v1\n");
@@ -458,6 +469,51 @@ pub(crate) fn physical_alias(profile_id: &str, provider: &str, command_id: &str)
     hasher.update(command_id.as_bytes());
     let digest = hasher.finalize().to_hex();
     format!("{provider}-{}", &digest.as_str()[..32])
+}
+
+fn canonical_api_alias(provider: &str, command_id: &str) -> String {
+    let provider = provider
+        .bytes()
+        .map(|byte| {
+            let byte = byte.to_ascii_lowercase();
+            if byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(&byte) {
+                char::from(byte)
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let provider = provider.trim_matches(['.', '_', '-']);
+    let provider = if provider.is_empty() {
+        "provider"
+    } else {
+        provider
+    };
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"haider-account-api-alias-v1\n");
+    hasher.update(command_id.as_bytes());
+    let digest = hasher.finalize().to_hex();
+    let prefix_len = provider.len().min(46);
+    format!("{}-api-{}", &provider[..prefix_len], &digest.as_str()[..12])
+}
+
+fn normalize_account_alias(alias: &str) -> Result<String, HaiderError> {
+    let alias = alias.trim().to_ascii_lowercase();
+    let bytes = alias.as_bytes();
+    if bytes.is_empty()
+        || bytes.len() > 64
+        || !bytes[0].is_ascii_alphanumeric()
+        || !bytes
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(byte))
+    {
+        return Err(HaiderError::new(
+            ErrorCode::InvalidArgument,
+            "account alias must match [a-z0-9][a-z0-9._-]{0,63}",
+            false,
+        ));
+    }
+    Ok(alias)
 }
 
 // ─────────────────────────────── the actor ──────────────────────────────────
@@ -506,99 +562,21 @@ impl ManagementSnapshot {
             view.descriptors = descriptors;
         }
     }
-}
 
-fn provider_management_summaries(
-    providers: &std::collections::BTreeSet<String>,
-    anthropic_default_model: &str,
-) -> Vec<ProviderSummaryWire> {
-    providers
-        .iter()
-        .map(|provider| {
-            let (
-                api_family,
-                endpoint,
-                models,
-                auth_methods,
-                availability,
-                availability_reason,
-                default_model,
-                enabled,
-            ) = match provider.as_str() {
-                ANTHROPIC_PROVIDER_NAME => (
-                    ProviderApiFamilyWire::AnthropicMessages,
-                    Some(ANTHROPIC_API_URL.to_owned()),
-                    vec![anthropic_default_model.to_owned()],
-                    vec![AuthMethod::ApiKey],
-                    ProviderAvailabilityWire::Available,
-                    None,
-                    Some(anthropic_default_model.to_owned()),
-                    true,
-                ),
-                ANTHROPIC_OAUTH_PROVIDER_NAME => (
-                    ProviderApiFamilyWire::AnthropicMessages,
-                    Some(ANTHROPIC_OAUTH_BASE_URL.to_owned()),
-                    vec![anthropic_default_model.to_owned()],
-                    vec![AuthMethod::OAuth],
-                    ProviderAvailabilityWire::Available,
-                    None,
-                    Some(anthropic_default_model.to_owned()),
-                    true,
-                ),
-                OPENAI_PROVIDER_NAME => (
-                    ProviderApiFamilyWire::OpenAiResponses,
-                    Some(OPENAI_RESPONSES_API_URL.to_owned()),
-                    vec!["gpt-5.6".to_owned()],
-                    vec![AuthMethod::ApiKey],
-                    ProviderAvailabilityWire::Available,
-                    None,
-                    Some("gpt-5.6".to_owned()),
-                    true,
-                ),
-                OPENAI_OAUTH_PROVIDER_NAME => (
-                    ProviderApiFamilyWire::OpenAiResponses,
-                    Some(OPENAI_SUBSCRIPTION_RESPONSES_URL.to_owned()),
-                    vec!["gpt-5.6".to_owned()],
-                    vec![AuthMethod::OAuth],
-                    ProviderAvailabilityWire::Available,
-                    None,
-                    Some("gpt-5.6".to_owned()),
-                    true,
-                ),
-                OPENAI_COMPATIBLE_PROVIDER_NAME => (
-                    ProviderApiFamilyWire::OpenAiChatCompletions,
-                    None,
-                    Vec::new(),
-                    vec![AuthMethod::ApiKey],
-                    ProviderAvailabilityWire::Unavailable,
-                    Some("provider endpoint and models are not configured".to_owned()),
-                    None,
-                    false,
-                ),
-                _ => (
-                    ProviderApiFamilyWire::Unknown,
-                    None,
-                    vec![anthropic_default_model.to_owned()],
-                    Vec::new(),
-                    ProviderAvailabilityWire::Available,
-                    None,
-                    Some(anthropic_default_model.to_owned()),
-                    true,
-                ),
+    fn publish(
+        &self,
+        revision: u64,
+        descriptors: Vec<CredentialDescriptor>,
+        providers: Vec<ProviderSummaryWire>,
+    ) {
+        if let Ok(mut view) = self.inner.lock() {
+            *view = ManagementView {
+                revision,
+                descriptors,
+                providers,
             };
-            ProviderSummaryWire {
-                provider: provider.clone(),
-                api_family,
-                endpoint,
-                models,
-                auth_methods,
-                availability,
-                availability_reason,
-                default_model,
-                enabled,
-            }
-        })
-        .collect()
+        }
+    }
 }
 
 /// What the hub needs to route account traffic (installed like the worker
@@ -640,9 +618,38 @@ pub(crate) struct OAuthAddJob {
     pub route: LoginRoute,
 }
 
+pub(crate) struct SetActiveJob {
+    pub command_id: String,
+    pub alias: String,
+    pub route: LoginRoute,
+}
+
+pub(crate) struct RemoveAccountJob {
+    pub command_id: String,
+    pub alias: String,
+    pub expected_revision: Option<u64>,
+    pub route: LoginRoute,
+}
+
+pub(crate) struct SetDefaultModelJob {
+    pub command_id: String,
+    pub provider: String,
+    pub model: String,
+    pub expected_revision: u64,
+    pub route: LoginRoute,
+}
+
+pub(crate) struct ProviderConfigureJob {
+    pub command_id: String,
+    pub input: ProviderConfigureInput,
+    pub expected_revision: u64,
+    pub route: LoginRoute,
+}
+
 /// Account actor mailbox items.
 #[derive(Clone)]
 pub(crate) struct OAuthRefreshFence {
+    pub(crate) fence_epoch: u64,
     pub(crate) generation: u64,
     pub(crate) issuer: String,
     pub(crate) audience: String,
@@ -653,6 +660,10 @@ pub(crate) struct OAuthRefreshFence {
 pub(crate) enum AccountCommand {
     Login(Box<LoginJob>),
     AddOAuth(Box<OAuthAddJob>),
+    SetActive(Box<SetActiveJob>),
+    Remove(Box<RemoveAccountJob>),
+    SetDefaultModel(Box<SetDefaultModelJob>),
+    ConfigureProvider(Box<ProviderConfigureJob>),
     BeginOAuthRefresh {
         descriptor: CredentialDescriptor,
         expected: OAuthRefreshFence,
@@ -752,6 +763,10 @@ pub(crate) struct AccountActorConfig {
     pub management: Option<ManagementSnapshot>,
     pub profile_id: String,
     pub default_model: String,
+    pub providers: ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+    pub provider_endpoint_validator: Arc<dyn ProviderEndpointValidator>,
+    pub reserved_aliases: HashSet<String>,
+    pub refresh_fences: RefreshFenceRegistry,
 }
 
 pub(crate) fn start_account_actor(config: AccountActorConfig) -> AccountActorHandle {
@@ -784,6 +799,10 @@ async fn run_account_actor(
         management,
         profile_id,
         default_model,
+        mut providers,
+        provider_endpoint_validator,
+        mut reserved_aliases,
+        refresh_fences,
     } = config;
     // Command-owned secrets surviving a retryable validation, bounded by
     // SECRET_TTL; daemon restart wipes them by construction.
@@ -818,6 +837,7 @@ async fn run_account_actor(
                     &profile_id,
                     &default_model,
                     &mut pending,
+                    &reserved_aliases,
                     *job,
                 )
                 .await;
@@ -830,6 +850,53 @@ async fn run_account_actor(
                     &snapshot,
                     management.as_ref(),
                     &profile_id,
+                    &reserved_aliases,
+                    *job,
+                )
+                .await;
+            }
+            AccountCommand::SetActive(job) => {
+                handle_set_active(
+                    &store,
+                    &mut accounts,
+                    &snapshot,
+                    management.as_ref(),
+                    &providers,
+                    *job,
+                )
+                .await;
+            }
+            AccountCommand::Remove(job) => {
+                handle_remove_account(
+                    &store,
+                    &mut accounts,
+                    Arc::clone(&vault),
+                    &snapshot,
+                    management.as_ref(),
+                    &providers,
+                    &mut reserved_aliases,
+                    &refresh_fences,
+                    *job,
+                )
+                .await;
+            }
+            AccountCommand::SetDefaultModel(job) => {
+                handle_set_default_model(
+                    &store,
+                    &accounts,
+                    management.as_ref(),
+                    &mut providers,
+                    *job,
+                )
+                .await;
+            }
+            AccountCommand::ConfigureProvider(job) => {
+                handle_provider_configure(
+                    &store,
+                    &accounts,
+                    management.as_ref(),
+                    &mut providers,
+                    Arc::clone(&provider_endpoint_validator),
                     *job,
                 )
                 .await;
@@ -847,6 +914,7 @@ async fn run_account_actor(
                     &store,
                     &descriptor,
                     &expected,
+                    &refresh_fences,
                 )
                 .await;
                 let _ = completed.send(result);
@@ -864,6 +932,7 @@ async fn run_account_actor(
                     &store,
                     &descriptor,
                     &expected,
+                    &refresh_fences,
                 )
                 .await;
                 let _ = completed.send(result);
@@ -883,6 +952,7 @@ async fn run_account_actor(
                     &descriptor,
                     &expected,
                     encoded_bundle,
+                    &refresh_fences,
                     &force_stop,
                 )
                 .await;
@@ -1056,8 +1126,12 @@ async fn apply_oauth_refresh(
     descriptor: &CredentialDescriptor,
     expected: &OAuthRefreshFence,
     encoded_bundle: Zeroizing<Vec<u8>>,
+    refresh_fences: &RefreshFenceRegistry,
     force_stop: &watch::Receiver<bool>,
 ) -> Result<(), RefreshApplyError> {
+    if refresh_fences.current(&descriptor.alias) != expected.fence_epoch {
+        return Err(RefreshApplyError::Stale);
+    }
     if !accounts
         .get(&descriptor.alias)
         .is_some_and(|current| same_credential_identity(current, descriptor))
@@ -1136,6 +1210,7 @@ async fn apply_oauth_refresh(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn begin_oauth_refresh(
     accounts: &mut AccountStore<Box<dyn StoreLike>>,
     vault: Arc<dyn Vault>,
@@ -1144,7 +1219,11 @@ async fn begin_oauth_refresh(
     store: &SqliteStoreHandle,
     descriptor: &CredentialDescriptor,
     expected: &OAuthRefreshFence,
+    refresh_fences: &RefreshFenceRegistry,
 ) -> Result<bool, HaiderError> {
+    if refresh_fences.current(&descriptor.alias) != expected.fence_epoch {
+        return Ok(false);
+    }
     if !accounts
         .get(&descriptor.alias)
         .is_some_and(|current| same_credential_identity(current, descriptor))
@@ -1188,6 +1267,7 @@ async fn begin_oauth_refresh(
     Ok(true)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn expire_oauth_refresh(
     accounts: &mut AccountStore<Box<dyn StoreLike>>,
     vault: Arc<dyn Vault>,
@@ -1196,7 +1276,11 @@ async fn expire_oauth_refresh(
     store: &SqliteStoreHandle,
     descriptor: &CredentialDescriptor,
     expected: &OAuthRefreshFence,
+    refresh_fences: &RefreshFenceRegistry,
 ) -> Result<bool, HaiderError> {
+    if refresh_fences.current(&descriptor.alias) != expected.fence_epoch {
+        return Ok(false);
+    }
     if !accounts
         .get(&descriptor.alias)
         .is_some_and(|current| same_credential_identity(current, descriptor))
@@ -1369,6 +1453,21 @@ fn refresh_resolver_snapshot(
     }
 }
 
+fn try_refresh_resolver_snapshot(
+    snapshot: &AccountsSnapshot,
+    accounts: &AccountStore<Box<dyn StoreLike>>,
+) -> Result<(), HaiderError> {
+    let mut view = snapshot.lock().map_err(|_| {
+        HaiderError::new(
+            ErrorCode::Internal,
+            "account resolver snapshot is unavailable",
+            true,
+        )
+    })?;
+    *view = accounts.list().to_vec();
+    Ok(())
+}
+
 fn publish_management_snapshot(
     snapshot: &AccountsSnapshot,
     management: Option<&ManagementSnapshot>,
@@ -1409,6 +1508,827 @@ async fn publish_marked_management_revision(
     Ok(revision)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct SetActiveIdentity {
+    alias: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct SetActiveRecovery {
+    provider: String,
+    prior_alias: Option<CredentialAlias>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct SetActiveReceipt {
+    descriptor: CredentialDescriptor,
+    prior_alias: Option<CredentialAlias>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct RemoveIdentity {
+    alias: String,
+    expected_revision: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct RemoveRecovery {
+    provider: String,
+    was_active: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct RemoveReceipt {
+    removed_alias: CredentialAlias,
+    replacement_active_alias: Option<CredentialAlias>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct SetDefaultModelIdentity {
+    provider: String,
+    model: String,
+    expected_revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct ProviderConfigureIdentity {
+    input: ProviderConfigureInput,
+    expected_revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct ProviderReceipt {
+    provider: ProviderSummaryWire,
+}
+
+fn command_json<T: serde::Serialize>(value: &T) -> Result<(String, String), HaiderError> {
+    let json = serde_json::to_string(value).map_err(|error| {
+        HaiderError::new(
+            ErrorCode::InvalidArgument,
+            format!("cannot encode management command coordinates: {error}"),
+            false,
+        )
+    })?;
+    let digest = blake3::hash(json.as_bytes()).to_hex().to_string();
+    Ok((json, digest))
+}
+
+fn respond_management_error(route: &LoginRoute, error: &HaiderError) {
+    let (code, data) = match error.code {
+        ErrorCode::RevisionConflict => {
+            let expected_revision = error
+                .details
+                .as_ref()
+                .and_then(|details| details.get("expected_revision"))
+                .and_then(serde_json::Value::as_u64);
+            let current_revision = error
+                .details
+                .as_ref()
+                .and_then(|details| details.get("current_revision"))
+                .and_then(serde_json::Value::as_u64);
+            let data = expected_revision.zip(current_revision).map(
+                |(expected_revision, current_revision)| ErrorData::RevisionConflict {
+                    expected_revision,
+                    current_revision,
+                },
+            );
+            (ERROR_CODE_REVISION_CONFLICT, data)
+        }
+        ErrorCode::Busy => (ERROR_CODE_BUSY, None),
+        ErrorCode::CredentialMissing => (ERROR_CODE_CREDENTIAL_MISSING, None),
+        ErrorCode::InvalidArgument => (ERROR_CODE_INVALID_ARGUMENT, None),
+        _ => (ERROR_CODE_PROVIDER_ERROR, None),
+    };
+    respond(
+        route,
+        ResponseBody::Error {
+            code: code.to_owned(),
+            message: error.message.clone(),
+            retryable: error.retryable,
+            data,
+        },
+    );
+}
+
+async fn check_expected_revision(
+    store: &SqliteStoreHandle,
+    expected_revision: u64,
+) -> Result<(), HaiderError> {
+    let current_revision = store.management_revision().await?;
+    if expected_revision == current_revision {
+        return Ok(());
+    }
+    let mut error = HaiderError::new(
+        ErrorCode::RevisionConflict,
+        format!(
+            "expected management revision {expected_revision}, current revision is {current_revision}"
+        ),
+        true,
+    );
+    error.details = Some(serde_json::json!({
+        "expected_revision": expected_revision,
+        "current_revision": current_revision,
+    }));
+    Err(error)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_set_active(
+    store: &SqliteStoreHandle,
+    accounts: &mut AccountStore<Box<dyn StoreLike>>,
+    snapshot: &AccountsSnapshot,
+    management: Option<&ManagementSnapshot>,
+    providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+    job: SetActiveJob,
+) {
+    let alias = match normalize_account_alias(&job.alias) {
+        Ok(alias) => CredentialAlias::new(alias),
+        Err(error) => {
+            respond_management_error(&job.route, &error);
+            return;
+        }
+    };
+    let identity = SetActiveIdentity {
+        alias: alias.as_str().to_owned(),
+    };
+    let (request_json, request_digest) = match command_json(&identity) {
+        Ok(value) => value,
+        Err(error) => {
+            respond_management_error(&job.route, &error);
+            return;
+        }
+    };
+    let preflight = store
+        .management_receipt_preflight::<SetActiveReceipt>(
+            job.command_id.clone(),
+            ACCOUNT_SET_ACTIVE_METHOD.to_owned(),
+            request_digest.clone(),
+            request_json.clone(),
+        )
+        .await;
+    let recovery = match preflight {
+        Ok(Some(ManagementClaim::Committed { response, revision })) => {
+            respond(
+                &job.route,
+                ResponseBody::AccountSetActive {
+                    descriptor: response.descriptor,
+                    prior_alias: response.prior_alias,
+                    revision,
+                },
+            );
+            return;
+        }
+        Ok(Some(ManagementClaim::ResumePending { recovery_json })) => {
+            match recovery_json.and_then(|json| serde_json::from_str(&json).ok()) {
+                Some(recovery) => recovery,
+                None => {
+                    respond_management_error(
+                        &job.route,
+                        &HaiderError::new(
+                            ErrorCode::StoreCorrupt,
+                            "pending set-active receipt has no recovery coordinates",
+                            false,
+                        ),
+                    );
+                    return;
+                }
+            }
+        }
+        Ok(Some(ManagementClaim::Fresh)) => unreachable!("preflight never returns Fresh"),
+        Ok(None) => {
+            let Some(descriptor) = accounts.get(&alias) else {
+                respond_management_error(
+                    &job.route,
+                    &HaiderError::new(
+                        ErrorCode::CredentialMissing,
+                        format!("credential alias `{alias}` does not exist"),
+                        false,
+                    ),
+                );
+                return;
+            };
+            SetActiveRecovery {
+                provider: descriptor.provider.clone(),
+                prior_alias: accounts
+                    .active_for_provider(&descriptor.provider)
+                    .map(|active| active.alias.clone()),
+            }
+        }
+        Err(error) => {
+            respond_management_error(&job.route, &error);
+            return;
+        }
+    };
+    let recovery_json = match serde_json::to_string(&recovery) {
+        Ok(json) => json,
+        Err(error) => {
+            respond_management_error(
+                &job.route,
+                &HaiderError::new(ErrorCode::Internal, error.to_string(), false),
+            );
+            return;
+        }
+    };
+    match store
+        .management_claim_receipt::<SetActiveReceipt>(
+            job.command_id.clone(),
+            ACCOUNT_SET_ACTIVE_METHOD.to_owned(),
+            request_digest,
+            request_json,
+            Some(recovery_json),
+            None,
+        )
+        .await
+    {
+        Ok(ManagementClaim::Committed { response, revision }) => {
+            respond(
+                &job.route,
+                ResponseBody::AccountSetActive {
+                    descriptor: response.descriptor,
+                    prior_alias: response.prior_alias,
+                    revision,
+                },
+            );
+            return;
+        }
+        Ok(ManagementClaim::Fresh | ManagementClaim::ResumePending { .. }) => {}
+        Err(error) => {
+            respond_management_error(&job.route, &error);
+            return;
+        }
+    }
+    if accounts
+        .get(&alias)
+        .is_none_or(|descriptor| descriptor.provider != recovery.provider)
+    {
+        respond_management_error(
+            &job.route,
+            &HaiderError::new(
+                ErrorCode::CredentialMissing,
+                format!("credential alias `{alias}` is no longer available"),
+                false,
+            ),
+        );
+        return;
+    }
+    if let Err(error) = accounts.select(&alias) {
+        respond_management_error(&job.route, &error);
+        return;
+    }
+    if let Err(error) = try_refresh_resolver_snapshot(snapshot, accounts) {
+        respond_management_error(&job.route, &error);
+        return;
+    }
+    let Some(descriptor) = accounts.get(&alias).cloned() else {
+        respond_management_error(
+            &job.route,
+            &HaiderError::new(
+                ErrorCode::CredentialMissing,
+                format!("credential alias `{alias}` disappeared after selection"),
+                true,
+            ),
+        );
+        return;
+    };
+    let receipt = SetActiveReceipt {
+        descriptor: descriptor.clone(),
+        prior_alias: recovery.prior_alias,
+    };
+    let revision = match store
+        .finalize_management_receipt(
+            job.command_id,
+            ACCOUNT_SET_ACTIVE_METHOD.to_owned(),
+            receipt.clone(),
+        )
+        .await
+    {
+        Ok(revision) => revision,
+        Err(error) => {
+            respond_management_error(&job.route, &error);
+            return;
+        }
+    };
+    if let Some(management) = management {
+        management.publish(revision, accounts.list().to_vec(), providers.summaries());
+    }
+    respond(
+        &job.route,
+        ResponseBody::AccountSetActive {
+            descriptor,
+            prior_alias: receipt.prior_alias,
+            revision,
+        },
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_remove_account(
+    store: &SqliteStoreHandle,
+    accounts: &mut AccountStore<Box<dyn StoreLike>>,
+    vault: Arc<dyn Vault>,
+    snapshot: &AccountsSnapshot,
+    management: Option<&ManagementSnapshot>,
+    providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+    reserved_aliases: &mut HashSet<String>,
+    refresh_fences: &RefreshFenceRegistry,
+    job: RemoveAccountJob,
+) {
+    let alias = match normalize_account_alias(&job.alias) {
+        Ok(alias) => CredentialAlias::new(alias),
+        Err(error) => {
+            respond_management_error(&job.route, &error);
+            return;
+        }
+    };
+    let identity = RemoveIdentity {
+        alias: alias.as_str().to_owned(),
+        expected_revision: job.expected_revision,
+    };
+    let (request_json, request_digest) = match command_json(&identity) {
+        Ok(value) => value,
+        Err(error) => {
+            respond_management_error(&job.route, &error);
+            return;
+        }
+    };
+    let preflight = store
+        .management_receipt_preflight::<RemoveReceipt>(
+            job.command_id.clone(),
+            ACCOUNT_REMOVE_METHOD.to_owned(),
+            request_digest.clone(),
+            request_json.clone(),
+        )
+        .await;
+    if matches!(&preflight, Ok(None))
+        && let Some(expected_revision) = job.expected_revision
+        && let Err(error) = check_expected_revision(store, expected_revision).await
+    {
+        respond_management_error(&job.route, &error);
+        return;
+    }
+    let recovery = match preflight {
+        Ok(Some(ManagementClaim::Committed { response, revision })) => {
+            respond(
+                &job.route,
+                ResponseBody::AccountRemove {
+                    removed_alias: response.removed_alias,
+                    replacement_active_alias: response.replacement_active_alias,
+                    revision,
+                },
+            );
+            return;
+        }
+        Ok(Some(ManagementClaim::ResumePending { recovery_json })) => {
+            match recovery_json.and_then(|json| serde_json::from_str(&json).ok()) {
+                Some(recovery) => recovery,
+                None => {
+                    respond_management_error(
+                        &job.route,
+                        &HaiderError::new(
+                            ErrorCode::StoreCorrupt,
+                            "pending remove receipt has no recovery coordinates",
+                            false,
+                        ),
+                    );
+                    return;
+                }
+            }
+        }
+        Ok(Some(ManagementClaim::Fresh)) => unreachable!("preflight never returns Fresh"),
+        Ok(None) => {
+            let Some(descriptor) = accounts.get(&alias) else {
+                respond_management_error(
+                    &job.route,
+                    &HaiderError::new(
+                        ErrorCode::CredentialMissing,
+                        format!("credential alias `{alias}` does not exist"),
+                        false,
+                    ),
+                );
+                return;
+            };
+            RemoveRecovery {
+                provider: descriptor.provider.clone(),
+                was_active: descriptor.active,
+            }
+        }
+        Err(error) => {
+            respond_management_error(&job.route, &error);
+            return;
+        }
+    };
+    let recovery_json = match serde_json::to_string(&recovery) {
+        Ok(recovery_json) => recovery_json,
+        Err(error) => {
+            respond_management_error(
+                &job.route,
+                &HaiderError::new(
+                    ErrorCode::Internal,
+                    format!("could not encode remove recovery coordinates: {error}"),
+                    false,
+                ),
+            );
+            return;
+        }
+    };
+    match store
+        .account_remove_claim_receipt::<RemoveReceipt>(
+            job.command_id.clone(),
+            request_digest,
+            request_json,
+            recovery_json,
+            job.expected_revision,
+            alias.as_str().to_owned(),
+            recovery.provider.clone(),
+            recovery.was_active,
+        )
+        .await
+    {
+        Ok(ManagementClaim::Committed { response, revision }) => {
+            respond(
+                &job.route,
+                ResponseBody::AccountRemove {
+                    removed_alias: response.removed_alias,
+                    replacement_active_alias: response.replacement_active_alias,
+                    revision,
+                },
+            );
+            return;
+        }
+        Ok(ManagementClaim::Fresh | ManagementClaim::ResumePending { .. }) => {}
+        Err(error) => {
+            respond_management_error(&job.route, &error);
+            return;
+        }
+    }
+    reserved_aliases.insert(alias.as_str().to_owned());
+    // The exchange runs outside this actor. Advancing the shared epoch before
+    // descriptor publication and deletion makes a late completion stale even
+    // if the same alias is later re-added with identical durable metadata.
+    refresh_fences.invalidate(&alias);
+    if let Some(descriptor) = accounts.get(&alias) {
+        if descriptor.provider != recovery.provider {
+            respond_management_error(
+                &job.route,
+                &HaiderError::new(
+                    ErrorCode::StoreCorrupt,
+                    "reserved remove alias changed provider",
+                    false,
+                ),
+            );
+            return;
+        }
+        if let Err(error) = accounts.remove(&alias) {
+            respond_management_error(&job.route, &error);
+            return;
+        }
+    }
+    // Resolver publication deliberately precedes vault deletion. The public
+    // management snapshot waits for the receipt/revision transaction.
+    if let Err(error) = try_refresh_resolver_snapshot(snapshot, accounts) {
+        respond_management_error(&job.route, &error);
+        return;
+    }
+    let replacement_active_alias = accounts
+        .active_for_provider(&recovery.provider)
+        .map(|descriptor| descriptor.alias.clone());
+    let alias_for_delete = alias.clone();
+    let delete = tokio::task::spawn_blocking(move || vault.delete(&alias_for_delete)).await;
+    match delete {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            respond_management_error(&job.route, &error);
+            return;
+        }
+        Err(_) => {
+            respond_management_error(
+                &job.route,
+                &HaiderError::new(
+                    ErrorCode::Internal,
+                    "account vault deletion worker was lost",
+                    true,
+                ),
+            );
+            return;
+        }
+    }
+    let receipt = RemoveReceipt {
+        removed_alias: alias.clone(),
+        replacement_active_alias: replacement_active_alias.clone(),
+    };
+    let revision = match store
+        .finalize_account_remove_receipt(job.command_id, receipt)
+        .await
+    {
+        Ok(revision) => revision,
+        Err(error) => {
+            respond_management_error(&job.route, &error);
+            return;
+        }
+    };
+    reserved_aliases.remove(alias.as_str());
+    if let Some(management) = management {
+        management.publish(revision, accounts.list().to_vec(), providers.summaries());
+    }
+    respond(
+        &job.route,
+        ResponseBody::AccountRemove {
+            removed_alias: alias,
+            replacement_active_alias,
+            revision,
+        },
+    );
+}
+
+async fn handle_set_default_model(
+    store: &SqliteStoreHandle,
+    accounts: &AccountStore<Box<dyn StoreLike>>,
+    management: Option<&ManagementSnapshot>,
+    providers: &mut ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+    job: SetDefaultModelJob,
+) {
+    let identity = SetDefaultModelIdentity {
+        provider: job.provider.clone(),
+        model: job.model.trim().to_owned(),
+        expected_revision: job.expected_revision,
+    };
+    let (request_json, request_digest) = match command_json(&identity) {
+        Ok(value) => value,
+        Err(error) => {
+            respond_management_error(&job.route, &error);
+            return;
+        }
+    };
+    let preflight = store
+        .management_receipt_preflight::<ProviderReceipt>(
+            job.command_id.clone(),
+            ACCOUNT_SET_DEFAULT_MODEL_METHOD.to_owned(),
+            request_digest.clone(),
+            request_json.clone(),
+        )
+        .await;
+    if matches!(&preflight, Ok(None))
+        && let Err(error) = check_expected_revision(store, job.expected_revision).await
+    {
+        respond_management_error(&job.route, &error);
+        return;
+    }
+    match preflight {
+        Ok(Some(ManagementClaim::Committed { response, revision })) => {
+            respond(
+                &job.route,
+                ResponseBody::AccountSetDefaultModel {
+                    provider: response.provider,
+                    revision,
+                },
+            );
+            return;
+        }
+        Ok(_) => {}
+        Err(error) => {
+            respond_management_error(&job.route, &error);
+            return;
+        }
+    }
+    if let Err(error) = providers.validate_default_model(&identity.provider, &identity.model) {
+        respond_management_error(&job.route, &error);
+        return;
+    }
+    match store
+        .management_claim_receipt::<ProviderReceipt>(
+            job.command_id.clone(),
+            ACCOUNT_SET_DEFAULT_MODEL_METHOD.to_owned(),
+            request_digest,
+            request_json,
+            None,
+            Some(job.expected_revision),
+        )
+        .await
+    {
+        Ok(ManagementClaim::Committed { response, revision }) => {
+            respond(
+                &job.route,
+                ResponseBody::AccountSetDefaultModel {
+                    provider: response.provider,
+                    revision,
+                },
+            );
+            return;
+        }
+        Ok(ManagementClaim::Fresh | ManagementClaim::ResumePending { .. }) => {}
+        Err(error) => {
+            respond_management_error(&job.route, &error);
+            return;
+        }
+    }
+    let profile = match providers.set_default_model(&identity.provider, &identity.model) {
+        Ok(profile) => profile,
+        Err(error) => {
+            respond_management_error(&job.route, &error);
+            return;
+        }
+    };
+    let receipt = ProviderReceipt {
+        provider: provider_summary(&profile),
+    };
+    let revision = match store
+        .finalize_management_receipt(
+            job.command_id,
+            ACCOUNT_SET_DEFAULT_MODEL_METHOD.to_owned(),
+            receipt.clone(),
+        )
+        .await
+    {
+        Ok(revision) => revision,
+        Err(error) => {
+            respond_management_error(&job.route, &error);
+            return;
+        }
+    };
+    if let Some(management) = management {
+        management.publish(revision, accounts.list().to_vec(), providers.summaries());
+    }
+    respond(
+        &job.route,
+        ResponseBody::AccountSetDefaultModel {
+            provider: receipt.provider,
+            revision,
+        },
+    );
+}
+
+async fn handle_provider_configure(
+    store: &SqliteStoreHandle,
+    accounts: &AccountStore<Box<dyn StoreLike>>,
+    management: Option<&ManagementSnapshot>,
+    providers: &mut ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+    endpoint_validator: Arc<dyn ProviderEndpointValidator>,
+    mut job: ProviderConfigureJob,
+) {
+    let identity = ProviderConfigureIdentity {
+        input: job.input.clone(),
+        expected_revision: job.expected_revision,
+    };
+    let (request_json, request_digest) = match command_json(&identity) {
+        Ok(value) => value,
+        Err(error) => {
+            respond_management_error(&job.route, &error);
+            return;
+        }
+    };
+    let preflight = store
+        .management_receipt_preflight::<ProviderReceipt>(
+            job.command_id.clone(),
+            PROVIDER_CONFIGURE_METHOD.to_owned(),
+            request_digest.clone(),
+            request_json.clone(),
+        )
+        .await;
+    if matches!(&preflight, Ok(None))
+        && let Err(error) = check_expected_revision(store, job.expected_revision).await
+    {
+        respond_management_error(&job.route, &error);
+        return;
+    }
+    match preflight {
+        Ok(Some(ManagementClaim::Committed { response, revision })) => {
+            respond(
+                &job.route,
+                ResponseBody::ProviderConfigure {
+                    provider: response.provider,
+                    revision,
+                },
+            );
+            return;
+        }
+        Ok(_) => {}
+        Err(error) => {
+            respond_management_error(&job.route, &error);
+            return;
+        }
+    }
+    if let Err(error) = providers.validate_configure(job.input.clone()) {
+        respond_management_error(&job.route, &error);
+        return;
+    }
+    if providers.get(&job.input.provider).is_none() {
+        let Some(origin) = job.input.origin.as_deref() else {
+            respond_management_error(
+                &job.route,
+                &HaiderError::new(
+                    ErrorCode::InvalidArgument,
+                    "new provider configuration requires an origin",
+                    false,
+                ),
+            );
+            return;
+        };
+        let origin = origin.to_owned();
+        let validation =
+            tokio::spawn(async move { endpoint_validator.validate(&origin).await }).await;
+        match validation {
+            Ok(Ok(canonical_origin)) => job.input.origin = Some(canonical_origin),
+            Ok(Err(error)) => {
+                respond_management_error(&job.route, &error);
+                return;
+            }
+            Err(_) => {
+                respond_management_error(
+                    &job.route,
+                    &HaiderError::new(
+                        ErrorCode::Internal,
+                        "provider endpoint validation worker was lost",
+                        true,
+                    ),
+                );
+                return;
+            }
+        }
+    }
+    let recovery_json = match serde_json::to_string(&job.input) {
+        Ok(recovery_json) => recovery_json,
+        Err(error) => {
+            respond_management_error(
+                &job.route,
+                &HaiderError::new(
+                    ErrorCode::Internal,
+                    format!("could not encode provider recovery coordinates: {error}"),
+                    false,
+                ),
+            );
+            return;
+        }
+    };
+    match store
+        .management_claim_receipt::<ProviderReceipt>(
+            job.command_id.clone(),
+            PROVIDER_CONFIGURE_METHOD.to_owned(),
+            request_digest,
+            request_json,
+            Some(recovery_json),
+            Some(job.expected_revision),
+        )
+        .await
+    {
+        Ok(ManagementClaim::Committed { response, revision }) => {
+            respond(
+                &job.route,
+                ResponseBody::ProviderConfigure {
+                    provider: response.provider,
+                    revision,
+                },
+            );
+            return;
+        }
+        Ok(ManagementClaim::ResumePending {
+            recovery_json: Some(recovery),
+        }) => {
+            if let Ok(input) = serde_json::from_str(&recovery) {
+                job.input = input;
+            }
+        }
+        Ok(ManagementClaim::Fresh | ManagementClaim::ResumePending { .. }) => {}
+        Err(error) => {
+            respond_management_error(&job.route, &error);
+            return;
+        }
+    }
+    let profile = match providers.configure(job.input) {
+        Ok(profile) => profile,
+        Err(error) => {
+            respond_management_error(&job.route, &error);
+            return;
+        }
+    };
+    let receipt = ProviderReceipt {
+        provider: provider_summary(&profile),
+    };
+    let revision = match store
+        .finalize_management_receipt(
+            job.command_id,
+            PROVIDER_CONFIGURE_METHOD.to_owned(),
+            receipt.clone(),
+        )
+        .await
+    {
+        Ok(revision) => revision,
+        Err(error) => {
+            respond_management_error(&job.route, &error);
+            return;
+        }
+    };
+    if let Some(management) = management {
+        management.publish(revision, accounts.list().to_vec(), providers.summaries());
+    }
+    respond(
+        &job.route,
+        ResponseBody::ProviderConfigure {
+            provider: receipt.provider,
+            revision,
+        },
+    );
+}
+
 /// The R10 login flow, executed on the actor. See the module charter for the
 /// commit-order and ownership laws this implements.
 #[allow(clippy::too_many_arguments)]
@@ -1419,9 +2339,10 @@ async fn handle_login(
     validator: &dyn CredentialValidator,
     snapshot: &AccountsSnapshot,
     management: Option<&ManagementSnapshot>,
-    profile_id: &str,
+    _profile_id: &str,
     default_model: &str,
     pending: &mut HashMap<String, PendingSecret>,
+    reserved_aliases: &HashSet<String>,
     job: LoginJob,
 ) {
     let LoginJob {
@@ -1441,11 +2362,21 @@ async fn handle_login(
         );
         return;
     }
+    let selected_alias = match display_alias {
+        Some(alias) => match normalize_account_alias(&alias) {
+            Ok(alias) => alias,
+            Err(error) => {
+                respond_error(&route, ERROR_CODE_INVALID_ARGUMENT, &error.message, false);
+                return;
+            }
+        },
+        None => canonical_api_alias(&provider, &command_id),
+    };
     let identity = LoginIdentity {
         provider: provider.clone(),
         resolved_model: validation_model.unwrap_or_else(|| default_model.to_owned()),
-        display_alias: display_alias.clone(),
-        physical_alias: physical_alias(profile_id, &provider, &command_id),
+        display_alias: Some(selected_alias.clone()),
+        physical_alias: selected_alias,
     };
     let request_json = match identity.canonical_json() {
         Ok(json) => json,
@@ -1489,6 +2420,24 @@ async fn handle_login(
     };
 
     let alias = CredentialAlias::new(identity.physical_alias.clone());
+    if reserved_aliases.contains(alias.as_str()) {
+        if let Some(secret) = secret {
+            pending.insert(
+                command_id,
+                PendingSecret {
+                    secret,
+                    claimed_at: Instant::now(),
+                },
+            );
+        }
+        respond_error(
+            &route,
+            ERROR_CODE_BUSY,
+            "account alias is reserved by pending removal cleanup",
+            true,
+        );
+        return;
+    }
     if resume {
         // Crash-boundary reconciliation at command time (R10 step 10):
         // descriptor present -> finalize; vault-only -> resume descriptor
@@ -1668,13 +2617,15 @@ impl OAuthAddIdentity {
 ///
 /// The claimed bundle is command-owned before this function is entered.
 /// Neither it nor the ready reference is ever serialized into SQLite.
+#[allow(clippy::too_many_arguments)]
 async fn handle_oauth_add(
     store: &SqliteStoreHandle,
     accounts: &mut AccountStore<Box<dyn StoreLike>>,
     vault: Arc<dyn Vault>,
     snapshot: &AccountsSnapshot,
     management: Option<&ManagementSnapshot>,
-    profile_id: &str,
+    _profile_id: &str,
+    reserved_aliases: &HashSet<String>,
     job: OAuthAddJob,
 ) {
     let OAuthAddJob {
@@ -1684,10 +2635,17 @@ async fn handle_oauth_add(
         claim,
         route,
     } = job;
+    let display_alias = match normalize_account_alias(&display_alias) {
+        Ok(alias) => alias,
+        Err(error) => {
+            respond_error(&route, ERROR_CODE_INVALID_ARGUMENT, &error.message, false);
+            return;
+        }
+    };
     let identity = OAuthAddIdentity {
         provider: provider.clone(),
+        physical_alias: display_alias.clone(),
         display_alias,
-        physical_alias: physical_alias(profile_id, &provider, &command_id),
         auth_method: "oauth".into(),
     };
     let request_json = match identity.canonical_json() {
@@ -1724,6 +2682,15 @@ async fn handle_oauth_add(
         }
     };
     let alias = CredentialAlias::new(identity.physical_alias.clone());
+    if reserved_aliases.contains(alias.as_str()) {
+        respond_error(
+            &route,
+            ERROR_CODE_BUSY,
+            "account alias is reserved by pending removal cleanup",
+            true,
+        );
+        return;
+    }
     if resume && accounts.get(&alias).is_some() {
         finalize_oauth_add(
             store,
@@ -1920,11 +2887,7 @@ fn descriptor_for(
         provider: identity.provider.clone(),
         base_url: None,
         auth_method: AuthMethod::ApiKey,
-        identity: identity
-            .display_alias
-            .clone()
-            .or(validated_identity)
-            .unwrap_or_else(|| "api-key login".into()),
+        identity: validated_identity.unwrap_or_else(|| "api-key login".into()),
         status: CredentialStatus::Ok,
         // A committed login becomes the provider's active credential; the
         // store deselects the previous active in the same snapshot.
@@ -2517,6 +3480,11 @@ pub(crate) async fn reconcile_login_receipts(
     vault: &VaultProvision,
 ) -> Result<(), HaiderError> {
     let rows = store.login_receipts().await?;
+    let reserved = store
+        .reserved_account_aliases()
+        .await?
+        .into_iter()
+        .collect::<HashSet<_>>();
     for row in rows {
         let identity: LoginIdentity = match serde_json::from_str(&row.request_json) {
             Ok(identity) => identity,
@@ -2532,6 +3500,9 @@ pub(crate) async fn reconcile_login_receipts(
             }
         };
         let alias = CredentialAlias::new(identity.physical_alias.clone());
+        if reserved.contains(alias.as_str()) {
+            continue;
+        }
         match row.state.as_str() {
             "committed" => {
                 let response: LoginReceiptResponse = match row
@@ -2594,6 +3565,11 @@ pub(crate) async fn reconcile_oauth_add_receipts(
     accounts: &mut AccountStore<Box<dyn StoreLike>>,
     vault: &VaultProvision,
 ) -> Result<(), HaiderError> {
+    let reserved = store
+        .reserved_account_aliases()
+        .await?
+        .into_iter()
+        .collect::<HashSet<_>>();
     for row in store.account_add_receipts().await? {
         let identity: OAuthAddIdentity =
             serde_json::from_str(&row.request_json).map_err(|error| {
@@ -2607,6 +3583,9 @@ pub(crate) async fn reconcile_oauth_add_receipts(
                 )
             })?;
         let alias = CredentialAlias::new(identity.physical_alias.clone());
+        if reserved.contains(alias.as_str()) {
+            continue;
+        }
         match row.state.as_str() {
             "committed" => {
                 let response: AccountAddReceiptResponse = row
@@ -2665,6 +3644,177 @@ pub(crate) async fn reconcile_oauth_add_receipts(
                 finalize_oauth_reconciled(store, accounts, &row.command_id, &alias).await?;
             }
             _ => {}
+        }
+    }
+    Ok(())
+}
+
+async fn reconcile_remove_receipts(
+    store: &SqliteStoreHandle,
+    accounts: &mut AccountStore<Box<dyn StoreLike>>,
+    vault: &VaultProvision,
+) -> Result<(), HaiderError> {
+    for row in store.account_remove_receipts().await? {
+        let alias = CredentialAlias::new(row.alias);
+        if let Some(descriptor) = accounts.get(&alias) {
+            if descriptor.provider != row.provider {
+                return Err(HaiderError::new(
+                    ErrorCode::StoreCorrupt,
+                    format!(
+                        "pending remove receipt {} reserved an alias for the wrong provider",
+                        row.receipt.command_id
+                    ),
+                    false,
+                ));
+            }
+            accounts.remove(&alias)?;
+        }
+        let VaultProvision::Available(vault) = vault else {
+            continue;
+        };
+        let vault = Arc::clone(vault);
+        let alias_for_delete = alias.clone();
+        let deleted = tokio::task::spawn_blocking(move || vault.delete(&alias_for_delete)).await;
+        if !matches!(deleted, Ok(Ok(()))) {
+            // Keep both the pending receipt and durable reservation. Ready may
+            // proceed, but add/login stays fenced and same-command remove
+            // retries this idempotent deletion.
+            continue;
+        }
+        let replacement_active_alias = accounts
+            .active_for_provider(&row.provider)
+            .map(|descriptor| descriptor.alias.clone());
+        store
+            .finalize_account_remove_receipt(
+                row.receipt.command_id,
+                RemoveReceipt {
+                    removed_alias: alias,
+                    replacement_active_alias,
+                },
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+async fn reconcile_set_active_receipts(
+    store: &SqliteStoreHandle,
+    accounts: &mut AccountStore<Box<dyn StoreLike>>,
+) -> Result<(), HaiderError> {
+    for row in store
+        .management_receipts(ACCOUNT_SET_ACTIVE_METHOD.to_owned())
+        .await?
+    {
+        if row.state == "committed" {
+            if row.final_revision.is_none() {
+                store
+                    .ensure_committed_management_revision(
+                        row.command_id,
+                        ACCOUNT_SET_ACTIVE_METHOD.to_owned(),
+                    )
+                    .await?;
+            }
+            continue;
+        }
+        let identity: SetActiveIdentity =
+            serde_json::from_str(&row.request_json).map_err(|error| {
+                HaiderError::new(
+                    ErrorCode::StoreCorrupt,
+                    format!("pending set-active identity is invalid: {error}"),
+                    false,
+                )
+            })?;
+        let recovery: SetActiveRecovery = row
+            .recovery_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str(json).ok())
+            .ok_or_else(|| {
+                HaiderError::new(
+                    ErrorCode::StoreCorrupt,
+                    "pending set-active receipt has no recovery coordinates",
+                    false,
+                )
+            })?;
+        let alias = CredentialAlias::new(identity.alias);
+        let Some(descriptor) = accounts.get(&alias) else {
+            continue;
+        };
+        if descriptor.provider != recovery.provider {
+            return Err(HaiderError::new(
+                ErrorCode::StoreCorrupt,
+                "pending set-active alias changed provider",
+                false,
+            ));
+        }
+        accounts.select(&alias)?;
+        let descriptor = accounts.get(&alias).cloned().ok_or_else(|| {
+            HaiderError::new(
+                ErrorCode::StoreCorrupt,
+                "set-active reconciliation lost the selected descriptor",
+                false,
+            )
+        })?;
+        store
+            .finalize_management_receipt(
+                row.command_id,
+                ACCOUNT_SET_ACTIVE_METHOD.to_owned(),
+                SetActiveReceipt {
+                    descriptor,
+                    prior_alias: recovery.prior_alias,
+                },
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+async fn reconcile_provider_receipts(
+    store: &SqliteStoreHandle,
+    providers: &mut ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+) -> Result<(), HaiderError> {
+    for method in [ACCOUNT_SET_DEFAULT_MODEL_METHOD, PROVIDER_CONFIGURE_METHOD] {
+        for row in store.management_receipts(method.to_owned()).await? {
+            if row.state == "committed" {
+                if row.final_revision.is_none() {
+                    store
+                        .ensure_committed_management_revision(row.command_id, method.to_owned())
+                        .await?;
+                }
+                continue;
+            }
+            let profile = if method == ACCOUNT_SET_DEFAULT_MODEL_METHOD {
+                let identity: SetDefaultModelIdentity = serde_json::from_str(&row.request_json)
+                    .map_err(|error| {
+                        HaiderError::new(
+                            ErrorCode::StoreCorrupt,
+                            format!("pending default-model identity is invalid: {error}"),
+                            false,
+                        )
+                    })?;
+                providers.set_default_model(&identity.provider, &identity.model)?
+            } else {
+                let input: ProviderConfigureInput = row
+                    .recovery_json
+                    .as_deref()
+                    .and_then(|json| serde_json::from_str(json).ok())
+                    .ok_or_else(|| {
+                        HaiderError::new(
+                            ErrorCode::StoreCorrupt,
+                            "pending provider-configure receipt has no recovery coordinates",
+                            false,
+                        )
+                    })?;
+                providers.configure(input)?
+            };
+            store
+                .finalize_management_receipt(
+                    row.command_id,
+                    method.to_owned(),
+                    ProviderReceipt {
+                        provider: provider_summary(&profile),
+                    },
+                )
+                .await?;
         }
     }
     Ok(())
@@ -2732,38 +3882,73 @@ impl AccountsRuntime {
             None => Box::new(DescriptorStore::Json(JsonFileStore::new(store_dir))),
         };
         let mut accounts = AccountStore::new(descriptor_store)?;
-        reconcile_login_receipts(store, &mut accounts, &dependencies.vault).await?;
-        reconcile_oauth_add_receipts(store, &mut accounts, &dependencies.vault).await?;
+        let provider_store: Box<dyn ProviderRegistryStoreLike> =
+            Box::new(JsonProviderRegistryStore::new(store_dir));
+        let mut providers = ProviderRegistry::new(
+            provider_store,
+            initial_provider_profiles(provider_names, default_model),
+        )?;
+        // R10: every daemon vault consumer funnels through this ONE wrap.
+        // Global aliases are the descriptor coordinate, but the Keychain is
+        // machine-global — the physical key must stay profile-scoped so two
+        // profiles' identical aliases can never collide (see profile_vault.rs).
+        let vault = match &dependencies.vault {
+            VaultProvision::Available(inner) => VaultProvision::Available(Arc::new(
+                crate::profile_vault::ProfileVault::new(Arc::clone(inner), profile_id),
+            )
+                as Arc<dyn Vault>),
+            VaultProvision::Unsupported => VaultProvision::Unsupported,
+        };
+        reconcile_remove_receipts(store, &mut accounts, &vault).await?;
+        reconcile_login_receipts(store, &mut accounts, &vault).await?;
+        reconcile_oauth_add_receipts(store, &mut accounts, &vault).await?;
+        reconcile_set_active_receipts(store, &mut accounts).await?;
+        reconcile_provider_receipts(store, &mut providers).await?;
+        let reserved_aliases = store
+            .reserved_account_aliases()
+            .await?
+            .into_iter()
+            .collect::<HashSet<_>>();
         let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(accounts.list().to_vec()));
         let management = ManagementSnapshot::new(
             store.management_revision().await?,
             accounts.list().to_vec(),
-            provider_management_summaries(provider_names, default_model),
+            providers.summaries(),
         );
-        match &dependencies.vault {
-            VaultProvision::Available(vault) => {
-                let actor = start_account_actor(AccountActorConfig {
-                    store: store.clone(),
-                    accounts,
-                    vault: Arc::clone(vault),
-                    validator: Arc::clone(&dependencies.validator),
-                    snapshot: Arc::clone(&snapshot),
-                    management: Some(management.clone()),
-                    profile_id: profile_id.to_owned(),
-                    default_model: default_model.to_owned(),
-                });
-                let commands = actor.commands();
+        let actor_vault: Arc<dyn Vault> = match &vault {
+            VaultProvision::Available(vault) => Arc::clone(vault),
+            VaultProvision::Unsupported => Arc::new(MemoryVault::default()),
+        };
+        let refresh_fences = RefreshFenceRegistry::default();
+        let actor = start_account_actor(AccountActorConfig {
+            store: store.clone(),
+            accounts,
+            vault: actor_vault,
+            validator: Arc::clone(&dependencies.validator),
+            snapshot: Arc::clone(&snapshot),
+            management: Some(management.clone()),
+            profile_id: profile_id.to_owned(),
+            default_model: default_model.to_owned(),
+            providers,
+            provider_endpoint_validator: Arc::clone(&dependencies.provider_endpoint_validator),
+            reserved_aliases,
+            refresh_fences: refresh_fences.clone(),
+        });
+        let commands = actor.commands();
+        match &vault {
+            VaultProvision::Available(scoped) => {
                 let oauth = OAuthCoordinator::new(
                     instance_id.to_owned(),
                     dependencies.oauth_catalog.clone(),
                     dependencies.oauth_coordinator,
                 )
                 .map_err(crate::oauth::oauth_error)?;
-                let broker = CredentialBroker::new(
-                    Arc::clone(vault),
+                let broker = CredentialBroker::new_with_fences(
+                    Arc::clone(scoped),
                     dependencies.oauth_catalog.clone(),
                     Arc::clone(&snapshot),
                     commands.clone(),
+                    refresh_fences,
                 )?;
                 Ok(Self {
                     facade: AccountsFacade {
@@ -2774,19 +3959,19 @@ impl AccountsRuntime {
                         vault_supported: true,
                     },
                     actor: Some(actor),
-                    vault: dependencies.vault.clone(),
+                    vault,
                     broker: Some(broker),
                 })
             }
             VaultProvision::Unsupported => Ok(Self {
                 facade: AccountsFacade {
-                    login: None,
+                    login: Some(commands),
                     oauth: None,
                     snapshot,
                     management,
                     vault_supported: false,
                 },
-                actor: None,
+                actor: Some(actor),
                 vault: VaultProvision::Unsupported,
                 broker: None,
             }),

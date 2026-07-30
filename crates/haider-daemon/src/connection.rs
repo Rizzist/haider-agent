@@ -42,9 +42,10 @@ use crate::session_hub::{
 };
 use haider_rpc::{
     AttachmentId, Capability, CapabilitySet, ERROR_CODE_OVERLOADED, FEATURE_ACCOUNT_LOGIN_API_V1,
-    FEATURE_ACCOUNT_ROTATION_V1, FEATURE_PROVIDER_MANAGEMENT_V1, FEATURE_SESSION_MUTATION_V1,
-    FEATURE_TURN_CONTROL_V1, FEATURE_VAULT_STAGE_V1, Hello, LifecyclePhase, ProtocolError,
-    RequestId, ServerRange, Welcome, WireFrame, negotiate, uds_codec,
+    FEATURE_ACCOUNT_ROTATION_V1, FEATURE_PROVIDER_CONFIGURE_V1, FEATURE_PROVIDER_MANAGEMENT_V1,
+    FEATURE_SESSION_MUTATION_V1, FEATURE_TURN_CONTROL_V1, FEATURE_VAULT_STAGE_V1, Hello,
+    LifecyclePhase, ProtocolError, RequestId, ServerRange, Welcome, WireFrame, negotiate,
+    uds_codec,
 };
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::PathBuf;
@@ -1382,6 +1383,7 @@ fn welcome_features() -> BTreeSet<String> {
         haider_rpc::FEATURE_ACCOUNT_MANAGEMENT_V1.to_owned(),
         haider_rpc::FEATURE_ACCOUNT_OAUTH_PKCE_V1.to_owned(),
         FEATURE_ACCOUNT_ROTATION_V1.to_owned(),
+        FEATURE_PROVIDER_CONFIGURE_V1.to_owned(),
         FEATURE_PROVIDER_MANAGEMENT_V1.to_owned(),
         FEATURE_SESSION_MUTATION_V1.to_owned(),
         FEATURE_TURN_CONTROL_V1.to_owned(),

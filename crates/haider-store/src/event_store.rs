@@ -207,6 +207,22 @@ pub struct CancelledTurn {
 const LOGIN_METHOD: &str = "account.login_api";
 /// Method tag of the durable OAuth `account.add` command.
 const ACCOUNT_ADD_METHOD: &str = "account.add";
+pub const ACCOUNT_SET_ACTIVE_METHOD: &str = "account.set_active";
+pub const ACCOUNT_REMOVE_METHOD: &str = "account.remove";
+pub const ACCOUNT_SET_DEFAULT_MODEL_METHOD: &str = "account.set_default_model";
+pub const PROVIDER_CONFIGURE_METHOD: &str = "provider.configure";
+
+fn is_management_method(method: &str) -> bool {
+    matches!(
+        method,
+        LOGIN_METHOD
+            | ACCOUNT_ADD_METHOD
+            | ACCOUNT_SET_ACTIVE_METHOD
+            | ACCOUNT_REMOVE_METHOD
+            | ACCOUNT_SET_DEFAULT_MODEL_METHOD
+            | PROVIDER_CONFIGURE_METHOD
+    )
+}
 
 /// Committed login response persisted in the receipt: the descriptor only —
 /// receipt metadata NEVER contains the secret or the ephemeral vault
@@ -240,6 +256,35 @@ pub struct AccountAddReceiptRow {
     pub request_json: String,
     pub response_json: Option<String>,
     pub final_revision: Option<u64>,
+}
+
+/// Receipt claim for one W5 durable account/provider mutation.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ManagementClaim<T> {
+    Fresh,
+    ResumePending { recovery_json: Option<String> },
+    Committed { response: Box<T>, revision: u64 },
+}
+
+/// Pending/committed durable account/provider mutation receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagementReceiptRow {
+    pub command_id: String,
+    pub method: String,
+    pub state: String,
+    pub request_json: String,
+    pub recovery_json: Option<String>,
+    pub response_json: Option<String>,
+    pub final_revision: Option<u64>,
+}
+
+/// Durable remove reservation joined to its command receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountRemoveReceiptRow {
+    pub receipt: ManagementReceiptRow,
+    pub alias: String,
+    pub provider: String,
+    pub was_active: bool,
 }
 
 /// Definitive login failure persisted in a failed receipt (401/403 class):
@@ -1193,6 +1238,334 @@ impl Store {
         Ok(rows)
     }
 
+    /// Claims a W5 account/provider mutation after checking receipt replay
+    /// and, only for a genuinely new command, the optional expected revision.
+    ///
+    /// `recovery_json` contains public, server-derived coordinates needed to
+    /// finish a pending command after a crash. It is never part of semantic
+    /// command identity and must never contain secret material.
+    pub fn management_claim_receipt<T>(
+        &self,
+        command_id: &str,
+        method: &str,
+        request_digest: &str,
+        request_json: &str,
+        recovery_json: Option<&str>,
+        expected_revision: Option<u64>,
+    ) -> StoreResult<ManagementClaim<T>>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        if !matches!(
+            method,
+            ACCOUNT_SET_ACTIVE_METHOD
+                | ACCOUNT_SET_DEFAULT_MODEL_METHOD
+                | PROVIDER_CONFIGURE_METHOD
+        ) {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                format!("method `{method}` is not a generic management mutation"),
+                false,
+            ));
+        }
+        validate_command_identity(command_id, request_digest, request_json)?;
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        let claim = claim_management_receipt_in_transaction(
+            &transaction,
+            command_id,
+            method,
+            request_digest,
+            request_json,
+            recovery_json,
+            expected_revision,
+        )?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(claim)
+    }
+
+    /// Read-only replay/pending preflight used before server-derived resource
+    /// validation. `None` means the command id is genuinely new.
+    pub fn management_receipt_preflight<T>(
+        &self,
+        command_id: &str,
+        method: &str,
+        request_digest: &str,
+        request_json: &str,
+    ) -> StoreResult<Option<ManagementClaim<T>>>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        if !is_management_method(method) {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                format!("method `{method}` is not a management receipt"),
+                false,
+            ));
+        }
+        validate_command_identity(command_id, request_digest, request_json)?;
+        let connection = self.connection()?;
+        if let Some(response) = lookup_command_response::<T>(
+            &connection,
+            command_id,
+            method,
+            request_digest,
+            request_json,
+            "management mutation",
+        )? {
+            let revision: Option<i64> = connection
+                .query_row(
+                    "SELECT final_revision FROM command_receipts WHERE command_id = ?1",
+                    [command_id],
+                    |row| row.get(0),
+                )
+                .map_err(map_sqlite_error)?;
+            let revision = revision
+                .ok_or_else(|| corrupt("committed management receipt has no final revision"))
+                .and_then(|revision| {
+                    u64::try_from(revision)
+                        .map_err(|_| corrupt("management receipt has a negative final revision"))
+                })?;
+            return Ok(Some(ManagementClaim::Committed {
+                response: Box::new(response),
+                revision,
+            }));
+        }
+        let recovery_json = connection
+            .query_row(
+                "SELECT recovery_json FROM command_receipts WHERE command_id = ?1",
+                [command_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(map_sqlite_error)?;
+        Ok(recovery_json.map(|recovery_json| ManagementClaim::ResumePending { recovery_json }))
+    }
+
+    /// Atomically claims both the durable remove receipt and the alias
+    /// reservation that fences concurrent/restarted account creation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn account_remove_claim_receipt<T>(
+        &self,
+        command_id: &str,
+        request_digest: &str,
+        request_json: &str,
+        recovery_json: &str,
+        expected_revision: Option<u64>,
+        alias: &str,
+        provider: &str,
+        was_active: bool,
+    ) -> StoreResult<ManagementClaim<T>>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        validate_command_identity(command_id, request_digest, request_json)?;
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        let claim = claim_management_receipt_in_transaction(
+            &transaction,
+            command_id,
+            ACCOUNT_REMOVE_METHOD,
+            request_digest,
+            request_json,
+            Some(recovery_json),
+            expected_revision,
+        )?;
+        if !matches!(claim, ManagementClaim::Committed { .. }) {
+            transaction
+                .execute(
+                    "INSERT OR IGNORE INTO account_alias_reservations(
+                        alias, command_id, provider, was_active, created_at_ms
+                     ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        alias,
+                        command_id,
+                        provider,
+                        i64::from(was_active),
+                        to_sqlite_integer(now_ms()?)?,
+                    ],
+                )
+                .map_err(map_sqlite_error)?;
+            let reservation: Option<(String, String, i64)> = transaction
+                .query_row(
+                    "SELECT command_id, provider, was_active
+                     FROM account_alias_reservations WHERE alias = ?1",
+                    [alias],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()
+                .map_err(map_sqlite_error)?;
+            if reservation.as_ref()
+                != Some(&(
+                    command_id.to_owned(),
+                    provider.to_owned(),
+                    i64::from(was_active),
+                ))
+            {
+                return Err(store_error(
+                    ErrorCode::Busy,
+                    format!("credential alias `{alias}` is reserved by pending removal cleanup"),
+                    true,
+                ));
+            }
+        }
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(claim)
+    }
+
+    /// Finalizes a generic W5 management receipt and allocates its revision
+    /// in the same SQLite transaction.
+    pub fn finalize_management_receipt<T: serde::Serialize>(
+        &self,
+        command_id: &str,
+        method: &str,
+        response: &T,
+    ) -> StoreResult<u64> {
+        if !matches!(
+            method,
+            ACCOUNT_SET_ACTIVE_METHOD
+                | ACCOUNT_SET_DEFAULT_MODEL_METHOD
+                | PROVIDER_CONFIGURE_METHOD
+        ) {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                format!("method `{method}` is not a generic management mutation"),
+                false,
+            ));
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        let revision = finalize_management_command_receipt(
+            &transaction,
+            command_id,
+            method,
+            "",
+            None,
+            None,
+            response,
+            now_ms()?,
+            "management mutation",
+        )?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(revision)
+    }
+
+    /// Finalizes remove and releases its alias reservation atomically with the
+    /// receipt and management-revision commit.
+    pub fn finalize_account_remove_receipt<T: serde::Serialize>(
+        &self,
+        command_id: &str,
+        response: &T,
+    ) -> StoreResult<u64> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        let revision = finalize_management_command_receipt(
+            &transaction,
+            command_id,
+            ACCOUNT_REMOVE_METHOD,
+            "",
+            None,
+            None,
+            response,
+            now_ms()?,
+            "account-remove",
+        )?;
+        let released = transaction
+            .execute(
+                "DELETE FROM account_alias_reservations WHERE command_id = ?1",
+                [command_id],
+            )
+            .map_err(map_sqlite_error)?;
+        if released != 1 {
+            return Err(corrupt(
+                "account-remove finalizer did not release exactly one alias reservation",
+            ));
+        }
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(revision)
+    }
+
+    pub fn management_receipts(&self, method: &str) -> StoreResult<Vec<ManagementReceiptRow>> {
+        if !is_management_method(method) {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                format!("method `{method}` is not a management receipt"),
+                false,
+            ));
+        }
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT command_id, method, state, request_json, recovery_json,
+                        response_json, final_revision
+                 FROM command_receipts
+                 WHERE method = ?1 AND state IN ('pending', 'committed')
+                 ORDER BY created_at_ms, command_id",
+            )
+            .map_err(map_sqlite_error)?;
+        statement
+            .query_map([method], management_receipt_row)
+            .map_err(map_sqlite_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_sqlite_error)
+    }
+
+    /// Pending removals and their durable reservations, used before Ready.
+    pub fn account_remove_receipts(&self) -> StoreResult<Vec<AccountRemoveReceiptRow>> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT r.command_id, r.method, r.state, r.request_json,
+                        r.recovery_json, r.response_json, r.final_revision,
+                        a.alias, a.provider, a.was_active
+                 FROM command_receipts r
+                 JOIN account_alias_reservations a ON a.command_id = r.command_id
+                 WHERE r.method = ?1 AND r.state = 'pending'
+                 ORDER BY r.created_at_ms, r.command_id",
+            )
+            .map_err(map_sqlite_error)?;
+        statement
+            .query_map([ACCOUNT_REMOVE_METHOD], |row| {
+                Ok(AccountRemoveReceiptRow {
+                    receipt: ManagementReceiptRow {
+                        command_id: row.get(0)?,
+                        method: row.get(1)?,
+                        state: row.get(2)?,
+                        request_json: row.get(3)?,
+                        recovery_json: row.get(4)?,
+                        response_json: row.get(5)?,
+                        final_revision: row.get::<_, Option<i64>>(6)?.map(sql_u64).transpose()?,
+                    },
+                    alias: row.get(7)?,
+                    provider: row.get(8)?,
+                    was_active: row.get::<_, i64>(9)? != 0,
+                })
+            })
+            .map_err(map_sqlite_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_sqlite_error)
+    }
+
+    pub fn reserved_account_aliases(&self) -> StoreResult<Vec<String>> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare("SELECT alias FROM account_alias_reservations ORDER BY alias")
+            .map_err(map_sqlite_error)?;
+        statement
+            .query_map([], |row| row.get(0))
+            .map_err(map_sqlite_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_sqlite_error)
+    }
+
     /// Gives one already-committed management receipt its missing final
     /// revision. This is the pre-ready migration/reconciliation seam for
     /// receipts written by a daemon predating schema v6.
@@ -1201,7 +1574,7 @@ impl Store {
         command_id: &str,
         method: &str,
     ) -> StoreResult<u64> {
-        if !matches!(method, LOGIN_METHOD | ACCOUNT_ADD_METHOD) {
+        if !is_management_method(method) {
             return Err(store_error(
                 ErrorCode::InvalidArgument,
                 format!("method `{method}` is not a management receipt"),
@@ -1493,6 +1866,118 @@ fn validate_command_identity(
         )
     })?;
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn claim_management_receipt_in_transaction<T>(
+    transaction: &Transaction<'_>,
+    command_id: &str,
+    method: &str,
+    request_digest: &str,
+    request_json: &str,
+    recovery_json: Option<&str>,
+    expected_revision: Option<u64>,
+) -> StoreResult<ManagementClaim<T>>
+where
+    T: serde::de::DeserializeOwned,
+{
+    if let Some(response) = lookup_command_response::<T>(
+        transaction,
+        command_id,
+        method,
+        request_digest,
+        request_json,
+        "management mutation",
+    )? {
+        let revision: Option<i64> = transaction
+            .query_row(
+                "SELECT final_revision FROM command_receipts WHERE command_id = ?1",
+                [command_id],
+                |row| row.get(0),
+            )
+            .map_err(map_sqlite_error)?;
+        let revision = revision
+            .ok_or_else(|| corrupt("committed management receipt has no final revision"))
+            .and_then(|revision| {
+                u64::try_from(revision)
+                    .map_err(|_| corrupt("management receipt has a negative final revision"))
+            })?;
+        return Ok(ManagementClaim::Committed {
+            response: Box::new(response),
+            revision,
+        });
+    }
+
+    let existing_recovery: Option<Option<String>> = transaction
+        .query_row(
+            "SELECT recovery_json FROM command_receipts WHERE command_id = ?1",
+            [command_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(map_sqlite_error)?;
+    if existing_recovery.is_none()
+        && let Some(expected_revision) = expected_revision
+    {
+        let current: i64 = transaction
+            .query_row(
+                "SELECT management_revision FROM profile_meta WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(map_sqlite_error)?;
+        let current_revision = u64::try_from(current)
+            .map_err(|_| corrupt("database contains a negative management revision"))?;
+        if expected_revision != current_revision {
+            let mut error = store_error(
+                ErrorCode::RevisionConflict,
+                format!(
+                    "expected management revision {expected_revision}, current revision is {current_revision}"
+                ),
+                true,
+            );
+            error.details = Some(serde_json::json!({
+                "expected_revision": expected_revision,
+                "current_revision": current_revision,
+            }));
+            return Err(error);
+        }
+    }
+
+    claim_pending_receipt(
+        transaction,
+        command_id,
+        method,
+        request_digest,
+        request_json,
+        now_ms()?,
+    )?;
+    if existing_recovery.is_none() {
+        transaction
+            .execute(
+                "UPDATE command_receipts SET recovery_json = ?2
+                 WHERE command_id = ?1 AND state = 'pending'",
+                params![command_id, recovery_json],
+            )
+            .map_err(map_sqlite_error)?;
+        Ok(ManagementClaim::Fresh)
+    } else {
+        Ok(ManagementClaim::ResumePending {
+            recovery_json: existing_recovery.flatten(),
+        })
+    }
+}
+
+fn management_receipt_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManagementReceiptRow> {
+    Ok(ManagementReceiptRow {
+        command_id: row.get(0)?,
+        method: row.get(1)?,
+        state: row.get(2)?,
+        request_json: row.get(3)?,
+        recovery_json: row.get(4)?,
+        response_json: row.get(5)?,
+        final_revision: row.get::<_, Option<i64>>(6)?.map(sql_u64).transpose()?,
+    })
 }
 
 fn lookup_session_create_receipt(

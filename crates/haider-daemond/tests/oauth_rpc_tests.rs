@@ -910,7 +910,9 @@ async fn real_uds_oauth_add_is_capability_and_connection_bound_durable_and_secre
         request(&mut owner, "oauth-add-replay", add).await,
         ResponseBody::AccountAdd { descriptor: replay } if replay == descriptor
     ));
-    let stored = vault.resolve(&descriptor.alias).expect("vault bundle");
+    let stored = vault
+        .resolve(&haider_daemon::scoped_vault_alias("oauth-wire", &descriptor.alias))
+        .expect("vault bundle");
     let bundle = OAuthTokenBundleV1::decode(stored.expose_secret()).expect("bundle");
     assert_eq!(bundle.access_token(), ACCESS.as_bytes());
     assert_eq!(bundle.refresh_token(), Some(REFRESH.as_bytes()));
@@ -1153,7 +1155,9 @@ async fn blocking_refresh_shutdown_barrier(inject_worker_shutdown_error: bool) {
         ResponseBody::AccountAdd { descriptor } => descriptor,
         other => panic!("unexpected account.add response: {other:?}"),
     };
-    let stored = vault.resolve(&descriptor.alias).expect("initial bundle");
+    let stored = vault
+        .resolve(&haider_daemon::scoped_vault_alias("oauth-barrier", &descriptor.alias))
+        .expect("initial bundle");
     let initial = OAuthTokenBundleV1::decode(stored.expose_secret()).expect("decode initial");
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1180,7 +1184,7 @@ async fn blocking_refresh_shutdown_barrier(inject_worker_shutdown_error: bool) {
     .expect("expiring bundle");
     vault
         .put(
-            &descriptor.alias,
+            &haider_daemon::scoped_vault_alias("oauth-barrier", &descriptor.alias),
             &expiring.encode().expect("encode expiring"),
         )
         .expect("seed expiring");
@@ -1313,7 +1317,9 @@ async fn blocking_refresh_shutdown_barrier(inject_worker_shutdown_error: bool) {
         "joined blocking persistence no longer owns cleartext bytes"
     );
     assert!(
-        vault.resolve(&descriptor.alias).is_err(),
+        vault
+            .resolve(&haider_daemon::scoped_vault_alias("oauth-barrier", &descriptor.alias))
+            .is_err(),
         "forced actor completion tombstones the predecessor's rotated write"
     );
 

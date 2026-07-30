@@ -274,6 +274,145 @@ impl SqliteStoreHandle {
         run_blocking(move || owner.with_store(|store| store.account_add_receipts())).await
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn management_claim_receipt<T>(
+        &self,
+        command_id: String,
+        method: String,
+        request_digest: String,
+        request_json: String,
+        recovery_json: Option<String>,
+        expected_revision: Option<u64>,
+    ) -> Result<haider_store::ManagementClaim<T>, HaiderError>
+    where
+        T: serde::de::DeserializeOwned + Send + 'static,
+    {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.management_claim_receipt(
+                    &command_id,
+                    &method,
+                    &request_digest,
+                    &request_json,
+                    recovery_json.as_deref(),
+                    expected_revision,
+                )
+            })
+        })
+        .await
+    }
+
+    pub async fn management_receipt_preflight<T>(
+        &self,
+        command_id: String,
+        method: String,
+        request_digest: String,
+        request_json: String,
+    ) -> Result<Option<haider_store::ManagementClaim<T>>, HaiderError>
+    where
+        T: serde::de::DeserializeOwned + Send + 'static,
+    {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.management_receipt_preflight(
+                    &command_id,
+                    &method,
+                    &request_digest,
+                    &request_json,
+                )
+            })
+        })
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn account_remove_claim_receipt<T>(
+        &self,
+        command_id: String,
+        request_digest: String,
+        request_json: String,
+        recovery_json: String,
+        expected_revision: Option<u64>,
+        alias: String,
+        provider: String,
+        was_active: bool,
+    ) -> Result<haider_store::ManagementClaim<T>, HaiderError>
+    where
+        T: serde::de::DeserializeOwned + Send + 'static,
+    {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.account_remove_claim_receipt(
+                    &command_id,
+                    &request_digest,
+                    &request_json,
+                    &recovery_json,
+                    expected_revision,
+                    &alias,
+                    &provider,
+                    was_active,
+                )
+            })
+        })
+        .await
+    }
+
+    pub async fn finalize_management_receipt<T>(
+        &self,
+        command_id: String,
+        method: String,
+        response: T,
+    ) -> Result<u64, HaiderError>
+    where
+        T: serde::Serialize + Send + 'static,
+    {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.finalize_management_receipt(&command_id, &method, &response)
+            })
+        })
+        .await
+    }
+
+    pub async fn finalize_account_remove_receipt<T>(
+        &self,
+        command_id: String,
+        response: T,
+    ) -> Result<u64, HaiderError>
+    where
+        T: serde::Serialize + Send + 'static,
+    {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| store.finalize_account_remove_receipt(&command_id, &response))
+        })
+        .await
+    }
+
+    pub async fn management_receipts(
+        &self,
+        method: String,
+    ) -> Result<Vec<haider_store::ManagementReceiptRow>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.management_receipts(&method))).await
+    }
+
+    pub async fn account_remove_receipts(
+        &self,
+    ) -> Result<Vec<haider_store::AccountRemoveReceiptRow>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(Store::account_remove_receipts)).await
+    }
+
+    pub async fn reserved_account_aliases(&self) -> Result<Vec<String>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(Store::reserved_account_aliases)).await
+    }
+
     /// Blocking-pool adapter for the coherent account/provider revision.
     pub async fn management_revision(&self) -> Result<u64, HaiderError> {
         let owner = Arc::clone(&self.owner);

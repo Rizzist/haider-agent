@@ -14,7 +14,7 @@ use crate::{StoreResult, now_ms, store_error, to_sqlite_integer};
 use haider_protocol::error::{ErrorCode, HaiderError};
 use rusqlite::{Connection, TransactionBehavior, params};
 
-pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 6;
+pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 7;
 
 struct Migration {
     version: u32,
@@ -117,6 +117,23 @@ const MIGRATIONS: &[Migration] = &[
             ALTER TABLE command_receipts
             ADD COLUMN final_revision INTEGER
             CHECK (final_revision IS NULL OR final_revision > 0);
+        ",
+    },
+    Migration {
+        version: 7,
+        sql: "
+            ALTER TABLE command_receipts
+            ADD COLUMN recovery_json TEXT;
+
+            CREATE TABLE account_alias_reservations (
+                alias           TEXT PRIMARY KEY,
+                command_id      TEXT NOT NULL UNIQUE,
+                provider        TEXT NOT NULL,
+                was_active      INTEGER NOT NULL
+                    CHECK (was_active IN (0, 1)),
+                created_at_ms   INTEGER NOT NULL,
+                FOREIGN KEY (command_id) REFERENCES command_receipts(command_id)
+            );
         ",
     },
 ];

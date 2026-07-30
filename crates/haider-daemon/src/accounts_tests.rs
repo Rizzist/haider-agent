@@ -6,9 +6,11 @@
 use super::*;
 use haider_core::SqliteStoreHandle;
 
+use crate::provider_registry::ProviderProfileV1;
 use crate::session_hub::FrameSendError;
 use crate::worker::ProviderFactory as _;
 use haider_core::ProviderAttemptResolver as _;
+use haider_rpc::{ProviderApiFamilyWire, ProviderAuthRequirementWire};
 
 fn test_store_dir() -> tempfile::TempDir {
     tempfile::Builder::new()
@@ -32,6 +34,37 @@ fn memory_accounts() -> AccountStore<Box<dyn StoreLike>> {
     }
     let store: Box<dyn StoreLike> = Box::new(Ephemeral(StdMutex::new(Vec::new())));
     AccountStore::new(store).unwrap_or_else(|error| panic!("accounts: {error:?}"))
+}
+
+#[derive(Default)]
+struct TestProviderStore(StdMutex<Vec<ProviderProfileV1>>);
+
+impl ProviderRegistryStoreLike for TestProviderStore {
+    fn load(&self) -> Result<Vec<ProviderProfileV1>, HaiderError> {
+        Ok(self.0.lock().map(|view| view.clone()).unwrap_or_default())
+    }
+
+    fn save(&self, profiles: &[ProviderProfileV1]) -> Result<(), HaiderError> {
+        if let Ok(mut view) = self.0.lock() {
+            *view = profiles.to_vec();
+        }
+        Ok(())
+    }
+}
+
+fn test_provider_registry() -> ProviderRegistry<Box<dyn ProviderRegistryStoreLike>> {
+    let store: Box<dyn ProviderRegistryStoreLike> = Box::new(TestProviderStore::default());
+    ProviderRegistry::new(
+        store,
+        initial_provider_profiles(
+            &std::collections::BTreeSet::from([
+                ANTHROPIC_PROVIDER_NAME.to_owned(),
+                OPENAI_PROVIDER_NAME.to_owned(),
+            ]),
+            "claude-test",
+        ),
+    )
+    .expect("provider registry")
 }
 
 fn identity_for(profile: &str, command: &str) -> LoginIdentity {
@@ -219,6 +252,7 @@ async fn stale_oauth_fences_cannot_overwrite_or_expire_a_replaced_bundle() {
         .expect("OAuth bundle")
     };
     let fence_for = |bundle: &haider_accounts::OAuthTokenBundleV1| OAuthRefreshFence {
+        fence_epoch: 0,
         generation: bundle.generation,
         issuer: bundle.issuer.clone(),
         audience: bundle.audience.clone(),
@@ -261,6 +295,10 @@ async fn stale_oauth_fences_cannot_overwrite_or_expire_a_replaced_bundle() {
         management: None,
         profile_id: "oauth-fence".into(),
         default_model: "gpt-test".into(),
+        providers: test_provider_registry(),
+        provider_endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
+        reserved_aliases: HashSet::new(),
+        refresh_fences: RefreshFenceRegistry::default(),
     });
     let commands = actor.commands();
 
@@ -333,6 +371,117 @@ async fn stale_oauth_fences_cannot_overwrite_or_expire_a_replaced_bundle() {
     store.close().await.expect("close");
 }
 
+/// MUTATION CHECK (review of record, W5c.2b): disable both reserved-alias
+/// fences (`if reserved_aliases.contains(alias.as_str())` in `handle_login`
+/// and `handle_oauth_add`, e.g. via `if false && …`). Expected runtime
+/// failure: both commands below succeed instead of answering the retryable
+/// `busy` rejection, so a login could re-occupy an alias whose removal
+/// cleanup is still pending — a crash between vault-delete retries would then
+/// delete the NEW credential's secret.
+/// Verified by revert on 2026-07-30.
+#[tokio::test]
+async fn reserved_alias_fences_login_and_oauth_add_until_remove_finalizes() {
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(Vec::new()));
+    let vault = Arc::new(MemoryVault::new());
+    let mut actor = start_account_actor(AccountActorConfig {
+        store: store.clone(),
+        accounts: memory_accounts(),
+        vault: vault.clone() as Arc<dyn Vault>,
+        validator: Arc::new(ProviderCredentialValidator),
+        snapshot: Arc::clone(&snapshot),
+        management: None,
+        profile_id: "reserved-fence".into(),
+        default_model: "claude-test".into(),
+        providers: test_provider_registry(),
+        provider_endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
+        reserved_aliases: HashSet::from(["work".to_owned(), "work-oauth".to_owned()]),
+        refresh_fences: RefreshFenceRegistry::default(),
+    });
+
+    let (sink, mut frames) = channel_sink();
+    actor
+        .commands()
+        .send(AccountCommand::Login(Box::new(LoginJob {
+            command_id: "reserved-login".into(),
+            provider: "anthropic".into(),
+            display_alias: Some("work".into()),
+            validation_model: Some("claude-test".into()),
+            secret: Some(Zeroizing::new(b"sk-reserved".to_vec())),
+            route: LoginRoute {
+                request_id: RequestId::new("reserved-login-request"),
+                sink: Arc::clone(&sink),
+            },
+        })))
+        .await
+        .expect("send login");
+    let frame = tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        .await
+        .expect("login response deadline")
+        .expect("login response");
+    match frame {
+        WireFrame::Response {
+            body:
+                ResponseBody::Error {
+                    code, retryable, ..
+                },
+            ..
+        } => {
+            assert_eq!(code, ERROR_CODE_BUSY, "reserved alias must answer busy");
+            assert!(retryable, "removal cleanup is transient — must be retryable");
+        }
+        other => panic!("reserved login must be rejected, got {other:?}"),
+    }
+    assert!(
+        snapshot.lock().expect("snapshot").is_empty(),
+        "no descriptor may be committed for a reserved alias"
+    );
+
+    actor
+        .commands()
+        .send(AccountCommand::AddOAuth(Box::new(OAuthAddJob {
+            command_id: "reserved-oauth".into(),
+            provider: "fake-oauth".into(),
+            display_alias: "work-oauth".into(),
+            claim: Some(OAuthReadyClaim::for_account_test(
+                "fake-oauth",
+                "work-oauth",
+                oauth_bundle(),
+            )),
+            route: LoginRoute {
+                request_id: RequestId::new("reserved-oauth-request"),
+                sink,
+            },
+        })))
+        .await
+        .expect("send oauth add");
+    let frame = tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        .await
+        .expect("oauth response deadline")
+        .expect("oauth response");
+    match frame {
+        WireFrame::Response {
+            body:
+                ResponseBody::Error {
+                    code, retryable, ..
+                },
+            ..
+        } => {
+            assert_eq!(code, ERROR_CODE_BUSY);
+            assert!(retryable);
+        }
+        other => panic!("reserved oauth add must be rejected, got {other:?}"),
+    }
+    assert!(
+        vault.list().expect("vault list").is_empty(),
+        "no secret may be written for a reserved alias"
+    );
+
+    actor.shutdown().await;
+    store.close().await.expect("close");
+}
+
 /// MUTATION CHECK (review of record, W5c.1): drop the `error.retryable` arm
 /// from the attempt resolver's rotation-failure match so the resolver error
 /// propagates. Expected failure: the retryable bookkeeping error escapes as
@@ -388,6 +537,10 @@ async fn retryable_rotation_bookkeeping_failure_waits_instead_of_killing_the_tur
         management: None,
         profile_id: "wedged-store".into(),
         default_model: "gpt-test".into(),
+        providers: test_provider_registry(),
+        provider_endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
+        reserved_aliases: HashSet::new(),
+        refresh_fences: RefreshFenceRegistry::default(),
     });
     let broker = CredentialBroker::new(
         vault.clone() as Arc<dyn Vault>,
@@ -509,6 +662,10 @@ async fn factory_uses_checked_resolver_and_durably_selects_one_limited_alternate
         management: None,
         profile_id: "resolver-factory".into(),
         default_model: "gpt-test".into(),
+        providers: test_provider_registry(),
+        provider_endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
+        reserved_aliases: HashSet::new(),
+        refresh_fences: RefreshFenceRegistry::default(),
     });
     let broker = CredentialBroker::new(
         vault.clone() as Arc<dyn Vault>,
@@ -1009,6 +1166,10 @@ async fn login_publishes_only_after_receipt_and_revision_commit() {
         management: Some(management.clone()),
         profile_id: "publish-order".into(),
         default_model: "claude-test".into(),
+        providers: test_provider_registry(),
+        provider_endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
+        reserved_aliases: HashSet::new(),
+        refresh_fences: RefreshFenceRegistry::default(),
     });
     let (sink, mut frames) = channel_sink();
     actor
@@ -1075,6 +1236,7 @@ async fn pending_login_secret_past_the_ttl_is_wiped_and_forces_restage() {
         "profile-ttl",
         "claude-test",
         &mut pending,
+        &HashSet::new(),
         login_job("command-ttl", "req-1", Some(b"sk-retained"), &sink),
     )
     .await;
@@ -1104,6 +1266,7 @@ async fn pending_login_secret_past_the_ttl_is_wiped_and_forces_restage() {
         "profile-ttl",
         "claude-test",
         &mut pending,
+        &HashSet::new(),
         login_job("command-ttl", "req-2", None, &sink),
     )
     .await;
@@ -1168,6 +1331,10 @@ async fn account_actor_answers_restage_required_after_the_pending_ttl() {
         management: None,
         profile_id: "profile-ttl-actor".into(),
         default_model: "claude-test".into(),
+        providers: test_provider_registry(),
+        provider_endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
+        reserved_aliases: HashSet::new(),
+        refresh_fences: RefreshFenceRegistry::default(),
     });
     let commands = actor.commands();
     let (sink, mut frames) = channel_sink();
@@ -1667,6 +1834,10 @@ async fn oauth_account_add_never_exposes_initial_token_before_vault_persistence(
         management: None,
         profile_id: "profile-initial-persist".into(),
         default_model: "unused".into(),
+        providers: test_provider_registry(),
+        provider_endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
+        reserved_aliases: HashSet::new(),
+        refresh_fences: RefreshFenceRegistry::default(),
     });
     let (sink, mut frames) = channel_sink();
     actor
@@ -1694,11 +1865,7 @@ async fn oauth_account_add_never_exposes_initial_token_before_vault_persistence(
     })
     .await
     .expect("vault put entered");
-    let alias = CredentialAlias::new(physical_alias(
-        "profile-initial-persist",
-        "fake-oauth",
-        "oauth-initial-persist",
-    ));
+    let alias = CredentialAlias::new("work-oauth");
     assert!(frames.try_recv().is_err(), "no response before vault put");
     assert!(snapshot.lock().expect("snapshot").is_empty());
     assert!(
@@ -1787,6 +1954,10 @@ async fn oauth_account_add_actor_crash_after_vault_put_reconciles_production_rec
         management: None,
         profile_id: "profile-oauth-crash".into(),
         default_model: "unused".into(),
+        providers: test_provider_registry(),
+        provider_endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
+        reserved_aliases: HashSet::new(),
+        refresh_fences: RefreshFenceRegistry::default(),
     });
     let (sink, mut frames) = channel_sink();
     actor
@@ -1826,11 +1997,7 @@ async fn oauth_account_add_actor_crash_after_vault_put_reconciles_production_rec
         *release.lock().expect("release") = true;
         wake.notify_all();
     }
-    let alias = CredentialAlias::new(physical_alias(
-        "profile-oauth-crash",
-        "fake-oauth",
-        "oauth-crash-command",
-    ));
+    let alias = CredentialAlias::new("work-oauth");
     tokio::time::timeout(Duration::from_secs(1), async {
         while vault.resolve(&alias).is_err() {
             tokio::task::yield_now().await;
@@ -2034,6 +2201,7 @@ async fn refresh_cas_ignores_benign_status_and_selection_changes() {
         &revision_store,
         &captured,
         &OAuthRefreshFence {
+            fence_epoch: 0,
             generation: 1,
             issuer: original.issuer.clone(),
             audience: original.audience.clone(),
@@ -2041,6 +2209,7 @@ async fn refresh_cas_ignores_benign_status_and_selection_changes() {
             subject_hash: original.identity.subject_hash.clone(),
         },
         rotated.encode().expect("encode rotated"),
+        &RefreshFenceRegistry::default(),
         &watch::channel(false).1,
     )
     .await
@@ -2100,12 +2269,14 @@ async fn production_expiry_sink_rejects_a_late_failure_for_a_newer_generation() 
         &revision_store,
         &captured,
         &OAuthRefreshFence {
+            fence_epoch: 0,
             generation: 1,
             issuer: original.issuer.clone(),
             audience: original.audience.clone(),
             resource: original.resource.clone(),
             subject_hash: original.identity.subject_hash.clone(),
         },
+        &RefreshFenceRegistry::default(),
     )
     .await
     .expect("expiry sink");
@@ -2171,12 +2342,14 @@ async fn production_refresh_begin_durably_fences_restart_before_the_endpoint() {
         &revision_store,
         &descriptor,
         &OAuthRefreshFence {
+            fence_epoch: 0,
             generation: original.generation,
             issuer: original.issuer.clone(),
             audience: original.audience.clone(),
             resource: original.resource.clone(),
             subject_hash: original.identity.subject_hash.clone(),
         },
+        &RefreshFenceRegistry::default(),
     )
     .await
     .expect("begin");
@@ -2317,6 +2490,7 @@ async fn production_descriptor_failure_tombstones_the_dead_rotated_refresh_token
             &revision_store,
             &descriptor,
             &OAuthRefreshFence {
+                fence_epoch: 0,
                 generation: 1,
                 issuer: original.issuer.clone(),
                 audience: original.audience.clone(),
@@ -2324,6 +2498,7 @@ async fn production_descriptor_failure_tombstones_the_dead_rotated_refresh_token
                 subject_hash: original.identity.subject_hash.clone(),
             },
             rotated.encode().expect("encode rotated"),
+            &RefreshFenceRegistry::default(),
             &watch::channel(false).1,
         )
         .await,
@@ -2355,6 +2530,738 @@ async fn production_descriptor_failure_tombstones_the_dead_rotated_refresh_token
         CredentialStatus::Ok
     ));
     assert!(vault.resolve(&alias).is_err());
+}
+
+/// Durable set-active/remove publication, deterministic successor selection,
+/// committed replay, and the remove/re-add refresh epoch all run through the
+/// production account actor.
+///
+/// MUTATION CHECK: remove `refresh_fences.invalidate(&alias)` from
+/// `handle_remove_account`. Expected runtime failure: the late refresh below
+/// returns `Ok(())` and replaces the re-added generation-one vault bundle
+/// with `LATE_REMOVE_REFRESH_ACCESS_7cc1`.
+#[tokio::test]
+async fn durable_remove_fences_late_refresh_across_same_alias_readd() {
+    let bundle = oauth_bundle();
+    let primary_alias = CredentialAlias::new("oauth-primary");
+    let removed_alias = CredentialAlias::new("oauth-removed");
+    let descriptor = |alias: CredentialAlias, active: bool| CredentialDescriptor {
+        alias,
+        provider: "fake-oauth".into(),
+        base_url: None,
+        auth_method: AuthMethod::OAuth,
+        identity: bundle.identity.display_identity.clone(),
+        status: CredentialStatus::Ok,
+        active,
+    };
+    let mut accounts = memory_accounts();
+    accounts
+        .add(descriptor(primary_alias.clone(), true))
+        .expect("primary descriptor");
+    accounts
+        .add(descriptor(removed_alias.clone(), false))
+        .expect("secondary descriptor");
+
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let vault = Arc::new(MemoryVault::new());
+    let encoded = bundle.encode().expect("encode original bundle");
+    vault
+        .put(&primary_alias, &encoded)
+        .expect("seed primary bundle");
+    vault
+        .put(&removed_alias, &encoded)
+        .expect("seed removable bundle");
+    let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(accounts.list().to_vec()));
+    let management = ManagementSnapshot::new(0, accounts.list().to_vec(), Vec::new());
+    let refresh_fences = RefreshFenceRegistry::default();
+    let mut actor = start_account_actor(AccountActorConfig {
+        store: store.clone(),
+        accounts,
+        vault: vault.clone() as Arc<dyn Vault>,
+        validator: Arc::new(ProviderCredentialValidator),
+        snapshot: Arc::clone(&snapshot),
+        management: Some(management.clone()),
+        profile_id: "remove-refresh-fence".into(),
+        default_model: "unused".into(),
+        providers: test_provider_registry(),
+        provider_endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
+        reserved_aliases: HashSet::new(),
+        refresh_fences: refresh_fences.clone(),
+    });
+    let commands = actor.commands();
+    let (sink, mut frames) = channel_sink();
+
+    commands
+        .send(AccountCommand::SetActive(Box::new(SetActiveJob {
+            command_id: "set-active-before-remove".into(),
+            alias: removed_alias.as_str().into(),
+            route: LoginRoute {
+                request_id: RequestId::new("set-active-before-remove-request"),
+                sink: Arc::clone(&sink),
+            },
+        })))
+        .await
+        .expect("send set-active");
+    match tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        .await
+        .expect("set-active deadline")
+        .expect("set-active response")
+    {
+        WireFrame::Response {
+            body:
+                ResponseBody::AccountSetActive {
+                    descriptor,
+                    prior_alias,
+                    revision,
+                },
+            ..
+        } => {
+            assert_eq!(descriptor.alias, removed_alias);
+            assert_eq!(prior_alias, Some(primary_alias.clone()));
+            assert_eq!(revision, 1);
+        }
+        other => panic!("unexpected set-active response: {other:?}"),
+    }
+
+    commands
+        .send(AccountCommand::Remove(Box::new(RemoveAccountJob {
+            command_id: "remove-active-oauth".into(),
+            alias: removed_alias.as_str().into(),
+            expected_revision: Some(1),
+            route: LoginRoute {
+                request_id: RequestId::new("remove-active-oauth-request"),
+                sink: Arc::clone(&sink),
+            },
+        })))
+        .await
+        .expect("send remove");
+    match tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        .await
+        .expect("remove deadline")
+        .expect("remove response")
+    {
+        WireFrame::Response {
+            body:
+                ResponseBody::AccountRemove {
+                    removed_alias: response_alias,
+                    replacement_active_alias,
+                    revision,
+                },
+            ..
+        } => {
+            assert_eq!(response_alias, removed_alias);
+            assert_eq!(replacement_active_alias, Some(primary_alias.clone()));
+            assert_eq!(revision, 2);
+        }
+        other => panic!("unexpected remove response: {other:?}"),
+    }
+    assert!(vault.resolve(&removed_alias).is_err());
+    assert!(
+        store
+            .reserved_account_aliases()
+            .await
+            .expect("reservations")
+            .is_empty()
+    );
+    let after_remove = management.read().expect("management snapshot");
+    assert_eq!(after_remove.revision, 2);
+    assert_eq!(after_remove.descriptors.len(), 1);
+    assert_eq!(after_remove.descriptors[0].alias, primary_alias);
+    assert!(after_remove.descriptors[0].active);
+    drop(after_remove);
+
+    commands
+        .send(AccountCommand::AddOAuth(Box::new(OAuthAddJob {
+            command_id: "readd-removed-oauth".into(),
+            provider: "fake-oauth".into(),
+            display_alias: removed_alias.as_str().into(),
+            claim: Some(OAuthReadyClaim::for_account_test(
+                "fake-oauth",
+                removed_alias.as_str(),
+                oauth_bundle(),
+            )),
+            route: LoginRoute {
+                request_id: RequestId::new("readd-removed-oauth-request"),
+                sink: Arc::clone(&sink),
+            },
+        })))
+        .await
+        .expect("send re-add");
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), frames.recv())
+            .await
+            .expect("re-add deadline")
+            .expect("re-add response"),
+        WireFrame::Response {
+            body: ResponseBody::AccountAdd { .. },
+            ..
+        }
+    ));
+
+    let late = haider_accounts::OAuthTokenBundleV1::new(
+        bundle.provider_id.clone(),
+        bundle.issuer.clone(),
+        bundle.audience.clone(),
+        bundle.resource.clone(),
+        "Bearer".into(),
+        Zeroizing::new(b"LATE_REMOVE_REFRESH_ACCESS_7cc1".to_vec()),
+        Some(Zeroizing::new(b"LATE_REMOVE_REFRESH_REFRESH_91ea".to_vec())),
+        u64::MAX - 2,
+        Some(u64::MAX),
+        bundle.granted_scopes.clone(),
+        bundle.identity.clone(),
+        2,
+    )
+    .expect("late bundle");
+    let (completed, result) = tokio::sync::oneshot::channel();
+    commands
+        .send(AccountCommand::ApplyOAuthRefresh {
+            descriptor: descriptor(removed_alias.clone(), true),
+            expected: OAuthRefreshFence {
+                fence_epoch: 0,
+                generation: bundle.generation,
+                issuer: bundle.issuer.clone(),
+                audience: bundle.audience.clone(),
+                resource: bundle.resource.clone(),
+                subject_hash: bundle.identity.subject_hash.clone(),
+            },
+            encoded_bundle: late.encode().expect("encode late bundle"),
+            completed,
+        })
+        .await
+        .expect("send late refresh");
+    assert!(matches!(
+        result.await.expect("late refresh completion"),
+        Err(RefreshApplyError::Stale)
+    ));
+    let retained = haider_accounts::OAuthTokenBundleV1::decode(
+        vault
+            .resolve(&removed_alias)
+            .expect("re-added bundle retained")
+            .expose_secret(),
+    )
+    .expect("decode retained bundle");
+    assert_eq!(retained.generation, 1);
+
+    commands
+        .send(AccountCommand::SetActive(Box::new(SetActiveJob {
+            command_id: "set-active-before-remove".into(),
+            alias: removed_alias.as_str().into(),
+            route: LoginRoute {
+                request_id: RequestId::new("set-active-replay-request"),
+                sink,
+            },
+        })))
+        .await
+        .expect("send set-active replay");
+    match tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        .await
+        .expect("replay deadline")
+        .expect("replay response")
+    {
+        WireFrame::Response {
+            body: ResponseBody::AccountSetActive { revision, .. },
+            ..
+        } => assert_eq!(revision, 1),
+        other => panic!("unexpected replay response: {other:?}"),
+    }
+
+    actor.shutdown().await;
+}
+
+/// An omitted API alias is command-derived before secret validation and is
+/// retained in the durable semantic identity for replay.
+///
+/// MUTATION CHECK: hash `provider.as_bytes()` instead of
+/// `command_id.as_bytes()` in `canonical_api_alias`. Expected runtime
+/// failure: the response alias differs from the independently command-derived
+/// alias asserted below.
+#[tokio::test]
+async fn omitted_api_alias_is_stable_command_derived_and_secret_free() {
+    struct SuccessValidator;
+
+    #[async_trait::async_trait]
+    impl CredentialValidator for SuccessValidator {
+        fn supports(&self, provider: &str) -> bool {
+            provider == "anthropic"
+        }
+
+        async fn validate(
+            &self,
+            _provider: &str,
+            _model: &str,
+            _secret: &[u8],
+        ) -> Result<ValidatedIdentity, ValidationError> {
+            Ok(ValidatedIdentity {
+                identity: "validated-person@example.invalid".into(),
+            })
+        }
+    }
+
+    let command_id = "omitted-alias-command";
+    let mut expected_hasher = blake3::Hasher::new();
+    expected_hasher.update(b"haider-account-api-alias-v1\n");
+    expected_hasher.update(command_id.as_bytes());
+    let expected_digest = expected_hasher.finalize().to_hex();
+    let expected_alias = format!("anthropic-api-{}", &expected_digest.as_str()[..12]);
+    assert_eq!(canonical_api_alias("anthropic", command_id), expected_alias);
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let vault = Arc::new(MemoryVault::new());
+    let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(Vec::new()));
+    let mut actor = start_account_actor(AccountActorConfig {
+        store: store.clone(),
+        accounts: memory_accounts(),
+        vault: vault.clone() as Arc<dyn Vault>,
+        validator: Arc::new(SuccessValidator),
+        snapshot,
+        management: None,
+        profile_id: "omitted-alias".into(),
+        default_model: "claude-test".into(),
+        providers: test_provider_registry(),
+        provider_endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
+        reserved_aliases: HashSet::new(),
+        refresh_fences: RefreshFenceRegistry::default(),
+    });
+    let commands = actor.commands();
+    let (sink, mut frames) = channel_sink();
+    commands
+        .send(AccountCommand::Login(Box::new(LoginJob {
+            command_id: command_id.into(),
+            provider: "anthropic".into(),
+            display_alias: None,
+            validation_model: Some("claude-test".into()),
+            secret: Some(Zeroizing::new(
+                b"OMITTED_ALIAS_SECRET_SENTINEL_86b2".to_vec(),
+            )),
+            route: LoginRoute {
+                request_id: RequestId::new("omitted-alias-request"),
+                sink: Arc::clone(&sink),
+            },
+        })))
+        .await
+        .expect("send login");
+    match tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        .await
+        .expect("login deadline")
+        .expect("login response")
+    {
+        WireFrame::Response {
+            body: ResponseBody::AccountLoginApi { descriptor },
+            ..
+        } => {
+            assert_eq!(descriptor.alias.as_str(), expected_alias);
+            assert_eq!(descriptor.identity, "validated-person@example.invalid");
+        }
+        other => panic!("unexpected login response: {other:?}"),
+    }
+    assert!(
+        vault
+            .resolve(&CredentialAlias::new(expected_alias.clone()))
+            .is_ok()
+    );
+    let receipts = store.login_receipts().await.expect("login receipts");
+    let identity: LoginIdentity =
+        serde_json::from_str(&receipts[0].request_json).expect("login identity");
+    assert_eq!(
+        identity.display_alias.as_deref(),
+        Some(expected_alias.as_str())
+    );
+    assert_eq!(identity.physical_alias, expected_alias);
+    assert!(!receipts[0].request_json.contains("SENTINEL"));
+    assert!(!receipts[0].request_json.contains("validated-person"));
+
+    commands
+        .send(AccountCommand::Login(Box::new(LoginJob {
+            command_id: command_id.into(),
+            provider: "anthropic".into(),
+            display_alias: None,
+            validation_model: Some("claude-test".into()),
+            secret: None,
+            route: LoginRoute {
+                request_id: RequestId::new("omitted-alias-replay"),
+                sink,
+            },
+        })))
+        .await
+        .expect("send replay");
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), frames.recv())
+            .await
+            .expect("replay deadline")
+            .expect("replay response"),
+        WireFrame::Response {
+            body: ResponseBody::AccountLoginApi { .. },
+            ..
+        }
+    ));
+    actor.shutdown().await;
+}
+
+/// Provider configuration and default-model mutation share the account actor,
+/// coherent snapshot, receipt replay, and revision CAS.
+///
+/// MUTATION CHECK: move `validate_default_model` above
+/// `management_receipt_preflight` in `handle_set_default_model`. Expected
+/// runtime failure: replaying `set-custom-default-b` after model B is removed
+/// returns `invalid_argument` instead of its committed revision-two receipt.
+#[tokio::test]
+async fn provider_mutations_replay_before_validation_and_publish_one_snapshot() {
+    struct CanonicalEndpointValidator {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProviderEndpointValidator for CanonicalEndpointValidator {
+        async fn validate(&self, origin: &str) -> Result<String, HaiderError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(origin.trim_end_matches('/').to_owned())
+        }
+    }
+
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let accounts = memory_accounts();
+    let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(Vec::new()));
+    let management = ManagementSnapshot::new(0, Vec::new(), Vec::new());
+    let endpoint_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut actor = start_account_actor(AccountActorConfig {
+        store: store.clone(),
+        accounts,
+        vault: Arc::new(MemoryVault::new()),
+        validator: Arc::new(ProviderCredentialValidator),
+        snapshot,
+        management: Some(management.clone()),
+        profile_id: "provider-mutations".into(),
+        default_model: "unused".into(),
+        providers: test_provider_registry(),
+        provider_endpoint_validator: Arc::new(CanonicalEndpointValidator {
+            calls: Arc::clone(&endpoint_calls),
+        }),
+        reserved_aliases: HashSet::new(),
+        refresh_fences: RefreshFenceRegistry::default(),
+    });
+    let commands = actor.commands();
+    let (sink, mut frames) = channel_sink();
+
+    let configure = |command_id: &str,
+                     request_id: &str,
+                     input: ProviderConfigureInput,
+                     expected_revision: u64| {
+        AccountCommand::ConfigureProvider(Box::new(ProviderConfigureJob {
+            command_id: command_id.into(),
+            input,
+            expected_revision,
+            route: LoginRoute {
+                request_id: RequestId::new(request_id),
+                sink: Arc::clone(&sink),
+            },
+        }))
+    };
+    commands
+        .send(configure(
+            "configure-custom",
+            "configure-custom-request",
+            ProviderConfigureInput {
+                provider: "custom".into(),
+                api_family: Some(ProviderApiFamilyWire::OpenAiChatCompletions),
+                origin: Some("https://models.example.invalid/".into()),
+                auth_requirement: Some(ProviderAuthRequirementWire::ApiKey),
+                enabled: true,
+                models: vec!["model-a".into(), "model-b".into()],
+                default_model: Some("model-a".into()),
+            },
+            0,
+        ))
+        .await
+        .expect("send configure");
+    match tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        .await
+        .expect("configure deadline")
+        .expect("configure response")
+    {
+        WireFrame::Response {
+            body: ResponseBody::ProviderConfigure { provider, revision },
+            ..
+        } => {
+            assert_eq!(provider.provider, "custom");
+            assert_eq!(
+                provider.endpoint.as_deref(),
+                Some("https://models.example.invalid")
+            );
+            assert_eq!(provider.default_model.as_deref(), Some("model-a"));
+            assert_eq!(revision, 1);
+        }
+        other => panic!("unexpected configure response: {other:?}"),
+    }
+    assert_eq!(endpoint_calls.load(Ordering::SeqCst), 1);
+
+    let set_default = |command_id: &str, request_id: &str, model: &str, expected_revision| {
+        AccountCommand::SetDefaultModel(Box::new(SetDefaultModelJob {
+            command_id: command_id.into(),
+            provider: "custom".into(),
+            model: model.into(),
+            expected_revision,
+            route: LoginRoute {
+                request_id: RequestId::new(request_id),
+                sink: Arc::clone(&sink),
+            },
+        }))
+    };
+    commands
+        .send(set_default(
+            "set-custom-default-b",
+            "set-custom-default-b-request",
+            "model-b",
+            1,
+        ))
+        .await
+        .expect("send default");
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), frames.recv())
+            .await
+            .expect("default deadline")
+            .expect("default response"),
+        WireFrame::Response {
+            body: ResponseBody::AccountSetDefaultModel { revision: 2, .. },
+            ..
+        }
+    ));
+
+    commands
+        .send(configure(
+            "configure-custom-models",
+            "configure-custom-models-request",
+            ProviderConfigureInput {
+                provider: "custom".into(),
+                api_family: None,
+                origin: None,
+                auth_requirement: None,
+                enabled: true,
+                models: vec!["model-a".into()],
+                default_model: Some("model-a".into()),
+            },
+            2,
+        ))
+        .await
+        .expect("send model update");
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), frames.recv())
+            .await
+            .expect("model update deadline")
+            .expect("model update response"),
+        WireFrame::Response {
+            body: ResponseBody::ProviderConfigure { revision: 3, .. },
+            ..
+        }
+    ));
+    assert_eq!(endpoint_calls.load(Ordering::SeqCst), 1);
+
+    commands
+        .send(set_default(
+            "set-custom-default-b",
+            "set-custom-default-b-replay",
+            "model-b",
+            1,
+        ))
+        .await
+        .expect("send committed replay");
+    match tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        .await
+        .expect("replay deadline")
+        .expect("replay response")
+    {
+        WireFrame::Response {
+            body: ResponseBody::AccountSetDefaultModel { provider, revision },
+            ..
+        } => {
+            assert_eq!(revision, 2);
+            assert_eq!(provider.default_model.as_deref(), Some("model-b"));
+        }
+        other => panic!("unexpected default replay: {other:?}"),
+    }
+
+    commands
+        .send(set_default(
+            "stale-custom-default",
+            "stale-custom-default-request",
+            "model-b",
+            1,
+        ))
+        .await
+        .expect("send stale mutation");
+    match tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        .await
+        .expect("stale deadline")
+        .expect("stale response")
+    {
+        WireFrame::Response {
+            body:
+                ResponseBody::Error {
+                    code,
+                    retryable,
+                    data:
+                        Some(ErrorData::RevisionConflict {
+                            expected_revision,
+                            current_revision,
+                        }),
+                    ..
+                },
+            ..
+        } => {
+            assert_eq!(code, ERROR_CODE_REVISION_CONFLICT);
+            assert!(retryable);
+            assert_eq!(expected_revision, 1);
+            assert_eq!(current_revision, 3);
+        }
+        other => panic!("unexpected stale response: {other:?}"),
+    }
+
+    let view = management.read().expect("management snapshot");
+    assert_eq!(view.revision, 3);
+    let custom = view
+        .providers
+        .iter()
+        .find(|provider| provider.provider == "custom")
+        .expect("custom provider");
+    assert_eq!(custom.models, vec!["model-a"]);
+    assert_eq!(custom.default_model.as_deref(), Some("model-a"));
+    drop(view);
+    actor.shutdown().await;
+}
+
+/// Startup reconciliation keeps a failed vault deletion pending and reserved,
+/// then completes it idempotently on the next reconciliation attempt.
+///
+/// MUTATION CHECK: remove the `continue` from the failed-delete branch in
+/// `reconcile_remove_receipts`, allowing receipt finalization after a failed
+/// vault delete. Expected runtime failure: the first-phase reservation and
+/// pending-receipt assertions below observe an empty/committed state while
+/// the orphan secret is still present.
+#[tokio::test]
+async fn pending_remove_reconciliation_retries_orphan_deletion_before_release() {
+    struct DeleteGateVault {
+        inner: MemoryVault,
+        fail_delete: AtomicBool,
+    }
+
+    impl Vault for DeleteGateVault {
+        fn put(
+            &self,
+            alias: &CredentialAlias,
+            secret: &[u8],
+        ) -> haider_accounts::AccountsResult<()> {
+            self.inner.put(alias, secret)
+        }
+
+        fn resolve(
+            &self,
+            alias: &CredentialAlias,
+        ) -> haider_accounts::AccountsResult<haider_accounts::SecretHandle> {
+            self.inner.resolve(alias)
+        }
+
+        fn delete(&self, alias: &CredentialAlias) -> haider_accounts::AccountsResult<()> {
+            if self.fail_delete.load(Ordering::SeqCst) {
+                return Err(HaiderError::new(
+                    ErrorCode::Internal,
+                    "injected vault deletion failure",
+                    true,
+                ));
+            }
+            self.inner.delete(alias)
+        }
+
+        fn list(&self) -> haider_accounts::AccountsResult<Vec<CredentialAlias>> {
+            self.inner.list()
+        }
+    }
+
+    let alias = CredentialAlias::new("remove-orphan");
+    let mut accounts = memory_accounts();
+    accounts
+        .add(CredentialDescriptor {
+            alias: alias.clone(),
+            provider: "anthropic".into(),
+            base_url: None,
+            auth_method: AuthMethod::ApiKey,
+            identity: "orphan fixture".into(),
+            status: CredentialStatus::Ok,
+            active: true,
+        })
+        .expect("descriptor");
+    let vault = Arc::new(DeleteGateVault {
+        inner: MemoryVault::new(),
+        fail_delete: AtomicBool::new(true),
+    });
+    vault
+        .put(&alias, b"ORPHAN_REMOVE_SECRET_441a")
+        .expect("seed secret");
+    let provision = VaultProvision::Available(vault.clone() as Arc<dyn Vault>);
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let request_json = r#"{"alias":"remove-orphan","expected_revision":0}"#.to_owned();
+    let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
+    assert!(matches!(
+        store
+            .account_remove_claim_receipt::<RemoveReceipt>(
+                "pending-remove-orphan".into(),
+                request_digest,
+                request_json,
+                r#"{"provider":"anthropic","was_active":true}"#.into(),
+                Some(0),
+                alias.as_str().into(),
+                "anthropic".into(),
+                true,
+            )
+            .await
+            .expect("claim remove"),
+        ManagementClaim::Fresh
+    ));
+
+    reconcile_remove_receipts(&store, &mut accounts, &provision)
+        .await
+        .expect("first reconciliation");
+    assert!(accounts.get(&alias).is_none());
+    assert!(vault.resolve(&alias).is_ok(), "failed delete leaves orphan");
+    assert_eq!(
+        store
+            .reserved_account_aliases()
+            .await
+            .expect("reserved aliases"),
+        vec![alias.as_str().to_owned()]
+    );
+    assert_eq!(
+        store
+            .account_remove_receipts()
+            .await
+            .expect("pending receipt")
+            .len(),
+        1
+    );
+    assert_eq!(store.management_revision().await.expect("revision"), 0);
+
+    vault.fail_delete.store(false, Ordering::SeqCst);
+    reconcile_remove_receipts(&store, &mut accounts, &provision)
+        .await
+        .expect("second reconciliation");
+    assert!(vault.resolve(&alias).is_err());
+    assert!(
+        store
+            .reserved_account_aliases()
+            .await
+            .expect("released reservation")
+            .is_empty()
+    );
+    assert!(
+        store
+            .account_remove_receipts()
+            .await
+            .expect("finalized receipt")
+            .is_empty()
+    );
+    assert_eq!(store.management_revision().await.expect("revision"), 1);
 }
 
 /// Release evidence, never the merge gate (§6.2): the PACKAGED default

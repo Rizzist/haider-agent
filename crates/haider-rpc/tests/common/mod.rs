@@ -13,10 +13,11 @@ use haider_rpc::{
     CommandId, ERROR_CODE_ALREADY_RESOLVED, ERROR_CODE_CAPABILITY_DENIED, ERROR_CODE_CURSOR_AHEAD,
     ERROR_CODE_REVISION_CONFLICT, ErrorData, FEATURE_ACCOUNT_LOGIN_API_V1,
     FEATURE_ACCOUNT_MANAGEMENT_V1, FEATURE_ACCOUNT_OAUTH_PKCE_V1, FEATURE_ACCOUNT_ROTATION_V1,
-    FEATURE_PROVIDER_MANAGEMENT_V1, FEATURE_SESSION_MUTATION_V1, FEATURE_TURN_CONTROL_V1,
-    FEATURE_VAULT_STAGE_V1, Hello, LifecyclePhase, MenuInput, OAuthAuthorizationWire,
-    OAuthAvailabilityWire, OAuthFlowId, OAuthFlowStatusWire, OAuthReadyRefWire, ProtocolError,
-    ProviderActiveWire, ProviderApiFamilyWire, ProviderAvailabilityWire, ProviderDefaultWire,
+    FEATURE_PROVIDER_CONFIGURE_V1, FEATURE_PROVIDER_MANAGEMENT_V1, FEATURE_SESSION_MUTATION_V1,
+    FEATURE_TURN_CONTROL_V1, FEATURE_VAULT_STAGE_V1, Hello, LifecyclePhase, MenuInput,
+    OAuthAuthorizationWire, OAuthAvailabilityWire, OAuthFlowId, OAuthFlowStatusWire,
+    OAuthReadyRefWire, ProtocolError, ProviderActiveWire, ProviderApiFamilyWire,
+    ProviderAuthRequirementWire, ProviderAvailabilityWire, ProviderDefaultWire,
     ProviderSummaryWire, RequestBody, RequestId, ResponseBody, SecretWire, SeqRange,
     SessionReadResult, SessionSummary, StagePurpose, SubmitDisposition, Welcome, WireFrame,
 };
@@ -524,6 +525,94 @@ pub fn transcript() -> Vec<WireFrame> {
                 revision: 7,
             },
         },
+        WireFrame::Request {
+            request_id: RequestId::new("request-set-active"),
+            body: RequestBody::AccountSetActive {
+                command_id: CommandId::new("command-set-active"),
+                alias: "work".into(),
+            },
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-set-active"),
+            body: ResponseBody::AccountSetActive {
+                descriptor: golden_descriptor(),
+                prior_alias: Some(CredentialAlias::new("personal")),
+                revision: 8,
+            },
+        },
+        WireFrame::Request {
+            request_id: RequestId::new("request-remove"),
+            body: RequestBody::AccountRemove {
+                command_id: CommandId::new("command-remove"),
+                alias: "work".into(),
+                expected_revision: Some(8),
+            },
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-remove"),
+            body: ResponseBody::AccountRemove {
+                removed_alias: CredentialAlias::new("work"),
+                replacement_active_alias: Some(CredentialAlias::new("personal")),
+                revision: 9,
+            },
+        },
+        WireFrame::Request {
+            request_id: RequestId::new("request-default-model"),
+            body: RequestBody::AccountSetDefaultModel {
+                command_id: CommandId::new("command-default-model"),
+                provider: "openai".into(),
+                model: "gpt-5.6".into(),
+                expected_revision: 9,
+            },
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-default-model"),
+            body: ResponseBody::AccountSetDefaultModel {
+                provider: ProviderSummaryWire {
+                    provider: "openai".into(),
+                    api_family: ProviderApiFamilyWire::OpenAiResponses,
+                    endpoint: Some("https://api.openai.com/v1/responses".into()),
+                    models: vec!["gpt-5.6".into()],
+                    auth_methods: vec![AuthMethod::ApiKey],
+                    availability: ProviderAvailabilityWire::Available,
+                    availability_reason: None,
+                    default_model: Some("gpt-5.6".into()),
+                    enabled: true,
+                },
+                revision: 10,
+            },
+        },
+        WireFrame::Request {
+            request_id: RequestId::new("request-provider-configure"),
+            body: RequestBody::ProviderConfigure {
+                command_id: CommandId::new("command-provider-configure"),
+                provider: "local-lab".into(),
+                api_family: Some(ProviderApiFamilyWire::OpenAiChatCompletions),
+                origin: Some("http://127.0.0.1:11434".into()),
+                auth_requirement: Some(ProviderAuthRequirementWire::None),
+                enabled: true,
+                models: vec!["gpt-oss-120b".into()],
+                default_model: Some("gpt-oss-120b".into()),
+                expected_revision: 10,
+            },
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-provider-configure"),
+            body: ResponseBody::ProviderConfigure {
+                provider: ProviderSummaryWire {
+                    provider: "local-lab".into(),
+                    api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
+                    endpoint: Some("http://127.0.0.1:11434".into()),
+                    models: vec!["gpt-oss-120b".into()],
+                    auth_methods: Vec::new(),
+                    availability: ProviderAvailabilityWire::Available,
+                    availability_reason: None,
+                    default_model: Some("gpt-oss-120b".into()),
+                    enabled: true,
+                },
+                revision: 11,
+            },
+        },
         WireFrame::Response {
             request_id: RequestId::new("request-revision-conflict"),
             body: ResponseBody::Error {
@@ -550,6 +639,7 @@ pub fn transcript() -> Vec<WireFrame> {
                 FEATURE_ACCOUNT_MANAGEMENT_V1.to_owned(),
                 FEATURE_ACCOUNT_OAUTH_PKCE_V1.to_owned(),
                 FEATURE_ACCOUNT_ROTATION_V1.to_owned(),
+                FEATURE_PROVIDER_CONFIGURE_V1.to_owned(),
                 FEATURE_PROVIDER_MANAGEMENT_V1.to_owned(),
                 FEATURE_SESSION_MUTATION_V1.to_owned(),
                 FEATURE_TURN_CONTROL_V1.to_owned(),
@@ -559,7 +649,7 @@ pub fn transcript() -> Vec<WireFrame> {
     ]
 }
 
-/// Golden credential descriptor: physical (vault) alias identity, display
+/// Golden credential descriptor: public global alias, verified display
 /// identity in `identity`, never secret material.
 pub fn golden_descriptor() -> CredentialDescriptor {
     CredentialDescriptor {

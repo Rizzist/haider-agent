@@ -324,6 +324,57 @@ impl HubConnection {
                     oauth_reference,
                 )
             }
+            RequestBody::AccountSetActive { command_id, alias } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.account_set_active(request_id, command_id, alias)
+            }
+            RequestBody::AccountRemove {
+                command_id,
+                alias,
+                expected_revision,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.account_remove(request_id, command_id, alias, expected_revision)
+            }
+            RequestBody::AccountSetDefaultModel {
+                command_id,
+                provider,
+                model,
+                expected_revision,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.account_set_default_model(
+                    request_id,
+                    command_id,
+                    provider,
+                    model,
+                    expected_revision,
+                )
+            }
             RequestBody::AccountList { provider } => {
                 if let Err(message) = authorize(&self.capabilities, Operation::View) {
                     return self.respond_error(
@@ -347,6 +398,41 @@ impl HubConnection {
                     );
                 }
                 self.provider_list(request_id, provider)
+            }
+            RequestBody::ProviderConfigure {
+                command_id,
+                provider,
+                api_family,
+                origin,
+                auth_requirement,
+                enabled,
+                models,
+                default_model,
+                expected_revision,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.provider_configure(
+                    request_id,
+                    command_id,
+                    crate::provider_registry::ProviderConfigureInput {
+                        provider,
+                        api_family,
+                        origin,
+                        auth_requirement,
+                        enabled,
+                        models,
+                        default_model,
+                    },
+                    expected_revision,
+                )
             }
             // `Unknown` and any future method decode alike: a typed,
             // correlated rejection instead of a dropped request.
@@ -766,6 +852,193 @@ impl HubConnection {
                 None,
             ),
         }
+    }
+
+    fn send_management_command(
+        &self,
+        request_id: RequestId,
+        command: crate::accounts::AccountCommand,
+    ) -> Result<(), SessionHubError> {
+        let Some(facade) = self.hub.accounts()? else {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_DRAINING,
+                "account/provider actor is unavailable",
+                true,
+                None,
+            );
+        };
+        let Some(commands) = facade.login else {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_DRAINING,
+                "account/provider actor is unavailable",
+                true,
+                None,
+            );
+        };
+        match commands.try_send(command) {
+            Ok(()) => Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => self.respond_error(
+                request_id,
+                haider_rpc::ERROR_CODE_BUSY,
+                "account/provider actor mailbox is full",
+                true,
+                None,
+            ),
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => self.respond_error(
+                request_id,
+                ERROR_CODE_DRAINING,
+                "account/provider actor is shut down",
+                true,
+                None,
+            ),
+        }
+    }
+
+    fn account_set_active(
+        &self,
+        request_id: RequestId,
+        command_id: CommandId,
+        alias: String,
+    ) -> Result<(), SessionHubError> {
+        if command_id.as_str().trim().is_empty() || alias.trim().is_empty() {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "set-active command id and alias must not be empty",
+                false,
+                None,
+            );
+        }
+        self.send_management_command(
+            request_id.clone(),
+            crate::accounts::AccountCommand::SetActive(Box::new(crate::accounts::SetActiveJob {
+                command_id: command_id.0,
+                alias,
+                route: crate::accounts::LoginRoute {
+                    request_id,
+                    sink: Arc::clone(&self.sink),
+                },
+            })),
+        )
+    }
+
+    fn account_remove(
+        &self,
+        request_id: RequestId,
+        command_id: CommandId,
+        alias: String,
+        expected_revision: Option<u64>,
+    ) -> Result<(), SessionHubError> {
+        if command_id.as_str().trim().is_empty() || alias.trim().is_empty() {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "remove command id and alias must not be empty",
+                false,
+                None,
+            );
+        }
+        self.send_management_command(
+            request_id.clone(),
+            crate::accounts::AccountCommand::Remove(Box::new(crate::accounts::RemoveAccountJob {
+                command_id: command_id.0,
+                alias,
+                expected_revision,
+                route: crate::accounts::LoginRoute {
+                    request_id,
+                    sink: Arc::clone(&self.sink),
+                },
+            })),
+        )
+    }
+
+    fn account_set_default_model(
+        &self,
+        request_id: RequestId,
+        command_id: CommandId,
+        provider: String,
+        model: String,
+        expected_revision: u64,
+    ) -> Result<(), SessionHubError> {
+        if command_id.as_str().trim().is_empty()
+            || provider.trim().is_empty()
+            || model.trim().is_empty()
+        {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "default-model command id, provider, and model must not be empty",
+                false,
+                None,
+            );
+        }
+        self.send_management_command(
+            request_id.clone(),
+            crate::accounts::AccountCommand::SetDefaultModel(Box::new(
+                crate::accounts::SetDefaultModelJob {
+                    command_id: command_id.0,
+                    provider,
+                    model,
+                    expected_revision,
+                    route: crate::accounts::LoginRoute {
+                        request_id,
+                        sink: Arc::clone(&self.sink),
+                    },
+                },
+            )),
+        )
+    }
+
+    fn provider_configure(
+        &self,
+        request_id: RequestId,
+        command_id: CommandId,
+        input: crate::provider_registry::ProviderConfigureInput,
+        expected_revision: u64,
+    ) -> Result<(), SessionHubError> {
+        if command_id.as_str().trim().is_empty() || input.provider.trim().is_empty() {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "provider-configure command id and provider must not be empty",
+                false,
+                None,
+            );
+        }
+        if input
+            .api_family
+            .is_some_and(|family| matches!(family, haider_rpc::ProviderApiFamilyWire::Unknown))
+            || input.auth_requirement.is_some_and(|requirement| {
+                matches!(
+                    requirement,
+                    haider_rpc::ProviderAuthRequirementWire::Unknown
+                )
+            })
+        {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "provider configuration contains an unknown identity field",
+                false,
+                None,
+            );
+        }
+        self.send_management_command(
+            request_id.clone(),
+            crate::accounts::AccountCommand::ConfigureProvider(Box::new(
+                crate::accounts::ProviderConfigureJob {
+                    command_id: command_id.0,
+                    input,
+                    expected_revision,
+                    route: crate::accounts::LoginRoute {
+                        request_id,
+                        sink: Arc::clone(&self.sink),
+                    },
+                },
+            )),
+        )
     }
 
     /// `account.list`: inline snapshot read (short command; the actor is the

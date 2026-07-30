@@ -149,6 +149,8 @@ pub const FEATURE_ACCOUNT_OAUTH_PKCE_V1: &str = "account_oauth_pkce_v1";
 pub const FEATURE_ACCOUNT_MANAGEMENT_V1: &str = "account_management_v1";
 /// Daemon implements provider management reads.
 pub const FEATURE_PROVIDER_MANAGEMENT_V1: &str = "provider_management_v1";
+/// Daemon implements durable `provider.configure`.
+pub const FEATURE_PROVIDER_CONFIGURE_V1: &str = "provider_configure_v1";
 /// Daemon implements live same-provider account rotation.
 pub const FEATURE_ACCOUNT_ROTATION_V1: &str = "account_rotation_v1";
 
@@ -476,6 +478,22 @@ pub enum ProviderApiFamilyWire {
     Unknown,
 }
 
+/// Immutable authentication requirement of a provider profile.
+///
+/// Custom providers may use API-key bearer authentication or no
+/// authentication. OAuth is release-owned metadata and cannot be created by
+/// an arbitrary endpoint configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ProviderAuthRequirementWire {
+    ApiKey,
+    OAuth,
+    None,
+    #[serde(other)]
+    Unknown,
+}
+
 /// Whether a configured provider is currently available for new work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -772,6 +790,29 @@ pub enum RequestBody {
         attempt_id: String,
         oauth_reference: OAuthReadyRefWire,
     },
+    /// Durably selects the globally named account. The provider is
+    /// intentionally absent: the daemon derives it from descriptor truth.
+    #[serde(rename = "account.set_active")]
+    AccountSetActive {
+        command_id: CommandId,
+        alias: String,
+    },
+    /// Durably removes one globally named account.
+    #[serde(rename = "account.remove")]
+    AccountRemove {
+        command_id: CommandId,
+        alias: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_revision: Option<u64>,
+    },
+    /// Changes only a registered provider's default model.
+    #[serde(rename = "account.set_default_model")]
+    AccountSetDefaultModel {
+        command_id: CommandId,
+        provider: String,
+        model: String,
+        expected_revision: u64,
+    },
     /// Lists credential descriptors (View); never secrets.
     #[serde(rename = "account.list")]
     AccountList {
@@ -784,6 +825,27 @@ pub enum RequestBody {
     ProviderList {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider: Option<String>,
+    },
+    /// Creates a custom provider or safely updates mutable fields on an
+    /// existing profile. Identity fields are required on create and may be
+    /// omitted on update; when supplied for an existing profile they must
+    /// match exactly.
+    #[serde(rename = "provider.configure")]
+    ProviderConfigure {
+        command_id: CommandId,
+        provider: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_family: Option<ProviderApiFamilyWire>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth_requirement: Option<ProviderAuthRequirementWire>,
+        enabled: bool,
+        #[serde(default)]
+        models: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        default_model: Option<String>,
+        expected_revision: u64,
     },
     /// Decode artifact for a method this crate does not know (tolerance
     /// discipline). W3b answers it with a protocol error, not a panic.
@@ -893,6 +955,25 @@ pub enum ResponseBody {
     AccountAdd {
         descriptor: haider_protocol::credential::CredentialDescriptor,
     },
+    #[serde(rename = "account.set_active")]
+    AccountSetActive {
+        descriptor: haider_protocol::credential::CredentialDescriptor,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prior_alias: Option<haider_protocol::ids::CredentialAlias>,
+        revision: u64,
+    },
+    #[serde(rename = "account.remove")]
+    AccountRemove {
+        removed_alias: haider_protocol::ids::CredentialAlias,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replacement_active_alias: Option<haider_protocol::ids::CredentialAlias>,
+        revision: u64,
+    },
+    #[serde(rename = "account.set_default_model")]
+    AccountSetDefaultModel {
+        provider: ProviderSummaryWire,
+        revision: u64,
+    },
     /// Credential descriptors (never secrets).
     #[serde(rename = "account.list")]
     AccountList {
@@ -910,6 +991,11 @@ pub enum ResponseBody {
     ProviderList {
         #[serde(default)]
         providers: Vec<ProviderSummaryWire>,
+        revision: u64,
+    },
+    #[serde(rename = "provider.configure")]
+    ProviderConfigure {
+        provider: ProviderSummaryWire,
         revision: u64,
     },
     /// Successful durable menu resolution. The same-command retry receives

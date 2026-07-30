@@ -2306,13 +2306,41 @@ impl RefreshFlight {
     }
 }
 
+#[derive(Clone, Default)]
+pub(crate) struct RefreshFenceRegistry {
+    fences: Arc<Mutex<HashMap<String, Arc<AtomicU64>>>>,
+}
+
+impl RefreshFenceRegistry {
+    fn fence_for(&self, alias: &CredentialAlias) -> Arc<AtomicU64> {
+        self.fences
+            .lock()
+            .map(|mut fences| {
+                Arc::clone(
+                    fences
+                        .entry(alias.as_str().to_owned())
+                        .or_insert_with(|| Arc::new(AtomicU64::new(0))),
+                )
+            })
+            .unwrap_or_else(|_| Arc::new(AtomicU64::new(u64::MAX)))
+    }
+
+    pub(crate) fn current(&self, alias: &CredentialAlias) -> u64 {
+        self.fence_for(alias).load(Ordering::Acquire)
+    }
+
+    pub(crate) fn invalidate(&self, alias: &CredentialAlias) {
+        self.fence_for(alias).fetch_add(1, Ordering::AcqRel);
+    }
+}
+
 struct BrokerInner {
     vault: Arc<dyn Vault>,
     catalog: OAuthProviderCatalog,
     snapshot: crate::accounts::AccountsSnapshot,
     status_commands: mpsc::Sender<crate::accounts::AccountCommand>,
     flights: Mutex<HashMap<RefreshKey, Arc<RefreshFlight>>>,
-    fences: Mutex<HashMap<String, Arc<AtomicU64>>>,
+    fences: RefreshFenceRegistry,
     shutting_down: AtomicBool,
     client: reqwest::Client,
     refresh_skew: Duration,
@@ -2462,11 +2490,28 @@ pub(crate) struct CredentialBroker {
 }
 
 impl CredentialBroker {
+    #[cfg(test)]
     pub(crate) fn new(
         vault: Arc<dyn Vault>,
         catalog: OAuthProviderCatalog,
         snapshot: crate::accounts::AccountsSnapshot,
         status_commands: mpsc::Sender<crate::accounts::AccountCommand>,
+    ) -> Result<Self, HaiderError> {
+        Self::new_with_fences(
+            vault,
+            catalog,
+            snapshot,
+            status_commands,
+            RefreshFenceRegistry::default(),
+        )
+    }
+
+    pub(crate) fn new_with_fences(
+        vault: Arc<dyn Vault>,
+        catalog: OAuthProviderCatalog,
+        snapshot: crate::accounts::AccountsSnapshot,
+        status_commands: mpsc::Sender<crate::accounts::AccountCommand>,
+        fences: RefreshFenceRegistry,
     ) -> Result<Self, HaiderError> {
         let client = reqwest::Client::builder()
             .no_proxy()
@@ -2488,7 +2533,7 @@ impl CredentialBroker {
                 snapshot,
                 status_commands,
                 flights: Mutex::new(HashMap::new()),
-                fences: Mutex::new(HashMap::new()),
+                fences,
                 shutting_down: AtomicBool::new(false),
                 client,
                 refresh_skew: Duration::from_secs(30),
@@ -2761,7 +2806,7 @@ impl CredentialBroker {
             .status_commands
             .send(crate::accounts::AccountCommand::BeginOAuthRefresh {
                 descriptor: descriptor.clone(),
-                expected: refresh_fence(bundle),
+                expected: refresh_fence(bundle, expected_fence),
                 completed: begun,
             })
             .await
@@ -2826,7 +2871,7 @@ impl CredentialBroker {
             .status_commands
             .send(crate::accounts::AccountCommand::ApplyOAuthRefresh {
                 descriptor: descriptor.clone(),
-                expected: refresh_fence(bundle),
+                expected: refresh_fence(bundle, expected_fence),
                 encoded_bundle: encoded,
                 completed,
             })
@@ -2940,17 +2985,7 @@ impl CredentialBroker {
     }
 
     fn fence_for_inner(inner: &BrokerInner, alias: &CredentialAlias) -> Arc<AtomicU64> {
-        inner
-            .fences
-            .lock()
-            .map(|mut fences| {
-                Arc::clone(
-                    fences
-                        .entry(alias.as_str().to_owned())
-                        .or_insert_with(|| Arc::new(AtomicU64::new(0))),
-                )
-            })
-            .unwrap_or_else(|_| Arc::new(AtomicU64::new(u64::MAX)))
+        inner.fences.fence_for(alias)
     }
 
     /// Removal/replacement fence used by W5c and race tests.
@@ -2960,7 +2995,7 @@ impl CredentialBroker {
     }
 
     fn invalidate_inner(inner: &BrokerInner, alias: &CredentialAlias) {
-        Self::fence_for_inner(inner, alias).fetch_add(1, Ordering::AcqRel);
+        inner.fences.invalidate(alias);
     }
 
     pub(crate) async fn shutdown(&self) -> bool {
@@ -3000,7 +3035,7 @@ impl CredentialBroker {
             .status_commands
             .send(crate::accounts::AccountCommand::ExpireOAuthRefresh {
                 descriptor: descriptor.clone(),
-                expected: refresh_fence(bundle),
+                expected: refresh_fence(bundle, expected_fence),
                 completed,
             })
             .await
@@ -3021,8 +3056,12 @@ impl CredentialBroker {
     }
 }
 
-fn refresh_fence(bundle: &OAuthTokenBundleV1) -> crate::accounts::OAuthRefreshFence {
+fn refresh_fence(
+    bundle: &OAuthTokenBundleV1,
+    fence_epoch: u64,
+) -> crate::accounts::OAuthRefreshFence {
     crate::accounts::OAuthRefreshFence {
+        fence_epoch,
         generation: bundle.generation,
         issuer: bundle.issuer.clone(),
         audience: bundle.audience.clone(),

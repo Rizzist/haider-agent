@@ -30,6 +30,7 @@ pub enum ErrorCode {
     MenuAlreadyAnswered,
     SingleWriterViolation,
     Busy,
+    RevisionConflict,
     LoopLimit,
     // providers
     ProviderError,

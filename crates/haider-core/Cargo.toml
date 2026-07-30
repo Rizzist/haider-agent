@@ -13,6 +13,7 @@ haider-protocol = { path = "../haider-protocol" }
 haider-provider = { path = "../haider-provider" }
 haider-store = { path = "../haider-store" }
 haider-tools = { path = "../haider-tools" }
+serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true

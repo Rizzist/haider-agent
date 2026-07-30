@@ -21,11 +21,11 @@ fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> Qu
 }
 
 /// The production handshake feature set includes every management family
-/// served by W5c.2a and the already-merged OAuth and rotation work.
+/// served by W5c.2b and the already-merged OAuth and rotation work.
 ///
-/// MUTATION CHECK: remove `FEATURE_PROVIDER_MANAGEMENT_V1` from
+/// MUTATION CHECK: remove `FEATURE_PROVIDER_CONFIGURE_V1` from
 /// `welcome_features`. Expected runtime failure: the exact feature-set
-/// assertion reports that `provider_management_v1` is missing.
+/// assertion reports that `provider_configure_v1` is missing.
 #[test]
 fn welcome_features_pin_served_management_families() {
     assert_eq!(
@@ -35,6 +35,7 @@ fn welcome_features_pin_served_management_families() {
             haider_rpc::FEATURE_ACCOUNT_MANAGEMENT_V1.to_owned(),
             haider_rpc::FEATURE_ACCOUNT_OAUTH_PKCE_V1.to_owned(),
             FEATURE_ACCOUNT_ROTATION_V1.to_owned(),
+            FEATURE_PROVIDER_CONFIGURE_V1.to_owned(),
             FEATURE_PROVIDER_MANAGEMENT_V1.to_owned(),
             FEATURE_SESSION_MUTATION_V1.to_owned(),
             FEATURE_TURN_CONTROL_V1.to_owned(),

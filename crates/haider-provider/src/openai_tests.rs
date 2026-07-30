@@ -299,6 +299,51 @@ async fn plain_http_hostname_requires_every_resolved_address_to_be_loopback() {
     assert_eq!(remote.calls(), 1);
 }
 
+/// MUTATION CHECK: remove the shared `validate_compatible_origin` call from
+/// `compatible_endpoints`. Expected runtime failure: this management probe
+/// advances to transport I/O instead of returning the actionable
+/// non-loopback plain-HTTP rejection.
+#[tokio::test]
+async fn configured_endpoint_probe_rejects_remote_plain_http_with_guard_vocabulary() {
+    let error = validate_openai_compatible_endpoint("http://203.0.113.7")
+        .await
+        .expect_err("remote plain HTTP must fail before probing");
+    assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+    assert!(error.message.contains("must use HTTPS"));
+    assert!(error.message.contains("HTTP"));
+    assert!(error.message.contains("loopback"));
+}
+
+/// MUTATION CHECK: replace `Policy::none()` in
+/// `validate_openai_compatible_endpoint` with reqwest's redirect default.
+/// Expected runtime failure: this test returns the redirected final origin as
+/// valid instead of reporting the actionable redirect rejection.
+#[tokio::test]
+async fn configured_endpoint_probe_rejects_redirects() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind redirect fixture");
+    let origin = format!("http://{}", listener.local_addr().expect("fixture address"));
+    let fixture = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept probe");
+        let mut request = [0_u8; 2048];
+        let _ = socket.read(&mut request).await.expect("read probe");
+        socket
+            .write_all(
+                b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9/v1/models\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .expect("write redirect");
+    });
+    let error = validate_openai_compatible_endpoint(&origin)
+        .await
+        .expect_err("redirects must not be followed");
+    fixture.await.expect("redirect fixture");
+    assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+    assert!(error.message.contains("redirects are not allowed"));
+    assert!(error.message.contains("final origin"));
+}
+
 #[tokio::test]
 async fn validated_hostname_addresses_are_pinned_through_connection_establishment() {
     let target = SocketAddr::from(([127, 0, 0, 1], 0));
