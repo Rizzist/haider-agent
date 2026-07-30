@@ -697,7 +697,16 @@ impl LiveDriver {
     /// entering live mode must not attach to everything it can see.
     #[must_use]
     pub fn boot(&self) -> Vec<LiveCommand> {
-        vec![LiveCommand::List { cursor: None }]
+        // The FIRST connect needs the same front-door truth as a redial:
+        // the identity bootstrap fires when account/provider snapshots
+        // APPLY, and `resume()` only runs on reconnects — the live probe
+        // caught the launcher sitting on demo seeds because boot never
+        // asked (W5f-2c).
+        vec![
+            LiveCommand::List { cursor: None },
+            LiveCommand::AccountList,
+            LiveCommand::ProviderList,
+        ]
     }
 
     // ---------------------------------------------------------- commands --

@@ -3346,6 +3346,19 @@ impl AppModel {
         else {
             return;
         };
+        // Adopt only once the provider's MODEL truth is here: a
+        // half-adopted identity (right provider, demo-seed model) would
+        // send a foreign slug to the subscription API and 400. The next
+        // snapshot completes the picture; nothing is lost by waiting.
+        let model_known = self
+            .providers
+            .providers
+            .iter()
+            .find(|summary| summary.provider == provider)
+            .is_some_and(|summary| summary.default_model.is_some() || !summary.models.is_empty());
+        if !model_known {
+            return;
+        }
         self.adopt_identity(&provider, &alias, false);
     }
 
