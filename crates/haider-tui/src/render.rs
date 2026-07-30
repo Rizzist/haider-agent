@@ -2792,12 +2792,56 @@ fn render_aura(
 
 /// The menu's body lines pre-wrapped by display cells into the menu's
 /// content width (sim `.iml` white-space: pre-wrap, tui.js:4946).
-fn wrapped_menu_body(menu: &haider_protocol::menu::Menu, width: u16) -> Vec<String> {
+fn wrapped_menu_body(menu: &haider_protocol::menu::Menu, width: u16) -> Vec<(String, DiffTone)> {
     let budget = (width as usize).saturating_sub(2).max(1);
     menu.body
         .iter()
-        .flat_map(|body_line| wrap_body(body_line, budget))
+        .flat_map(|body_line| {
+            // Classify per LOGICAL line (pre-wrap), so a wrapped
+            // continuation of a long `+` row stays green.
+            body_line.split('\n').flat_map(move |logical| {
+                let tone = DiffTone::of(logical);
+                wrap_body(logical, budget)
+                    .into_iter()
+                    .map(move |row| (row, tone))
+            })
+        })
         .collect()
+}
+
+/// W4a4: diff-aware body tone for the approval card (and any menu whose
+/// body carries a patch preview). The daemon's `approval_preview` emits
+/// `-`/`+` prefixed preimage/replacement lines and `---`/`+++` headers
+/// (haider-tools filesystem.rs); everything else stays the dim body tone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiffTone {
+    Body,
+    Add,
+    Del,
+    Meta,
+}
+
+impl DiffTone {
+    fn of(line: &str) -> Self {
+        if line.starts_with("+++") || line.starts_with("---") || line.starts_with("@@") {
+            Self::Meta
+        } else if line.starts_with('+') {
+            Self::Add
+        } else if line.starts_with('-') {
+            Self::Del
+        } else {
+            Self::Body
+        }
+    }
+
+    fn style(self, theme: &Theme) -> ratatui::style::Style {
+        match self {
+            Self::Body => theme.dim_style(),
+            Self::Add => theme.ok_style(),
+            Self::Del => theme.err_style(),
+            Self::Meta => theme.faint_style(),
+        }
+    }
 }
 
 /// The blocking menu's rows within the allocated area (sim InputMenu under
@@ -2855,10 +2899,10 @@ fn menu_block(
             theme.warn_style(),
         )]));
     }
-    for body_row in body_rows {
+    for (body_row, tone) in body_rows {
         lines.push(Line::from(vec![
             Span::raw(" "),
-            Span::styled(body_row, theme.dim_style()),
+            Span::styled(body_row, tone.style(theme)),
         ]));
     }
     for (offset, option) in menu.options.iter().skip(start).take(window_len).enumerate() {
