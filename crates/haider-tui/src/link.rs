@@ -70,6 +70,9 @@ pub const HELD_REPLY_CAP: usize = 512;
 pub struct Link {
     pub commands: mpsc::Sender<LiveCommand>,
     pub replies: mpsc::Receiver<LiveReply>,
+    /// What the daemon advertised at handshake (W5e-1b feature gating).
+    pub daemon_features: std::collections::BTreeSet<String>,
+    pub daemon_version: String,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -77,6 +80,9 @@ impl Link {
     /// Start the link over an already-negotiated connection.
     #[must_use]
     pub fn start(client: RpcClient, profile: ResolvedProfile, config: ClientConfig) -> Self {
+        // Capture the handshake facts BEFORE the client moves into the task.
+        let daemon_features = client.welcome().features.iter().cloned().collect();
+        let daemon_version = client.welcome().daemon_version.clone();
         let (commands_tx, commands_rx) = mpsc::channel(LINK_CAPACITY);
         let (replies_tx, replies) = mpsc::channel(LINK_CAPACITY);
         let task = tokio::spawn(run_link(
@@ -89,6 +95,8 @@ impl Link {
         Self {
             commands: commands_tx,
             replies,
+            daemon_features,
+            daemon_version,
             task,
         }
     }
@@ -776,6 +784,19 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
                 {
                     return vec![LiveReply::StageFailed {
                         attempt,
+                        code: code.clone(),
+                        message: message.clone(),
+                    }];
+                }
+                // W5e-1b: `account.oauth_start` is NON-DURABLE, so its error
+                // reply carries no command_id — the generic `Failed` path
+                // cannot correlate it and the add card would wait at
+                // "starting the loopback flow…" forever (observed live on
+                // v0.0.18). Identity-tag it from the same context, exactly
+                // as TUI6.4 does for a stage.
+                if let Some(attempt_id) = context.oauth_attempt.clone() {
+                    return vec![LiveReply::OAuthStartFailed {
+                        attempt_id,
                         code: code.clone(),
                         message: message.clone(),
                     }];

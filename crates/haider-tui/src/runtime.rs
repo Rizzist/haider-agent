@@ -2314,6 +2314,10 @@ pub async fn run_live(
     };
     let mut driver = LiveDriver::new(instance);
     let mut link = crate::link::Link::start(client, profile, config);
+    // W5e-1b: what this daemon actually serves gates the UI's affordances,
+    // so a stale daemon shows an honest note instead of a failed request.
+    model.daemon_features = link.daemon_features.clone();
+    model.daemon_version = Some(link.daemon_version.clone());
 
     let _guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
