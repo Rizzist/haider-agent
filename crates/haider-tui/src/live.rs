@@ -152,6 +152,12 @@ pub enum LiveCommand {
         option_index: u32,
         input: Option<MenuInput>,
     },
+    /// `account.list` for the `/accounts` screen (W5d). A read.
+    AccountList,
+    /// `account.set_active` (W5d). DURABLE mutation: the same command id
+    /// replays the same committed result. `alias` rides along client-side
+    /// so a failure reply can clear the exact pending row.
+    AccountSetActive { command_id: CommandId, alias: String },
 }
 
 impl LiveCommand {
@@ -164,9 +170,11 @@ impl LiveCommand {
             | Self::Cancel { command_id, .. }
             | Self::Answer { command_id, .. } => Some(command_id),
             Self::LoginApi { command_id, .. } => Some(command_id),
+            Self::AccountSetActive { command_id, .. } => Some(command_id),
             Self::List { .. }
             | Self::Attach { .. }
             | Self::Detach { .. }
+            | Self::AccountList
             // A stage carries no durable identity BY DESIGN (see above).
             | Self::Stage { .. } => None,
         }
@@ -288,6 +296,18 @@ pub enum LiveReply {
         message: String,
         retryable: bool,
     },
+    /// `account.list` answered (W5d `/accounts`).
+    Accounts {
+        descriptors: Vec<haider_protocol::credential::CredentialDescriptor>,
+        revision: Option<u64>,
+    },
+    /// `account.set_active` committed: the selected descriptor + the
+    /// management revision the mutation finalized at.
+    AccountSelected {
+        command_id: CommandId,
+        descriptor: haider_protocol::credential::CredentialDescriptor,
+        revision: u64,
+    },
     /// The connection died; the shell will dial again.
     Disconnected {
         reason: String,
@@ -399,6 +419,9 @@ pub struct LiveDriver {
     /// the card at "validating…" with `accepts_input() == false` forever
     /// (review W3c3 D2-5).
     login_started: Option<std::time::Instant>,
+    /// The in-flight `account.set_active`, so a failure clears the exact
+    /// pending row (W5d) instead of only flashing.
+    pending_account_select: Option<(CommandId, String)>,
     /// Durable mutations awaiting a response, in issue order.
     outbox: Vec<Pending>,
     /// Committed menu coordinates, by menu id.
@@ -457,6 +480,7 @@ impl LiveDriver {
             login_attempt: None,
             retired_logins: std::collections::HashSet::new(),
             login_started: None,
+            pending_account_select: None,
             outbox: Vec::new(),
             menus: HashMap::new(),
             generations: HashMap::new(),
@@ -903,6 +927,35 @@ impl LiveDriver {
                 }
                 Vec::new()
             }
+            LiveReply::Accounts {
+                descriptors,
+                revision,
+            } => {
+                let rows = descriptors
+                    .iter()
+                    .map(crate::app::AccountRow::from_descriptor)
+                    .collect();
+                if model.accounts.apply_snapshot(rows, revision) {
+                    model.dirty = true;
+                }
+                Vec::new()
+            }
+            LiveReply::AccountSelected {
+                command_id,
+                descriptor,
+                revision,
+            } => {
+                self.retire(&command_id);
+                if self
+                    .pending_account_select
+                    .as_ref()
+                    .is_some_and(|(id, _)| *id == command_id)
+                {
+                    self.pending_account_select = None;
+                }
+                model.apply_account_selected(&descriptor, revision);
+                Vec::new()
+            }
             LiveReply::Event {
                 attachment,
                 session,
@@ -1062,6 +1115,22 @@ impl LiveDriver {
                 {
                     self.retire(id);
                     model.dirty = true;
+                    return Vec::new();
+                }
+                // A failed `account.set_active` clears its exact pending
+                // row (W5d) — the model's rows never moved, so this is
+                // gate-release + honest message, no rollback.
+                if let Some(id) = &command_id
+                    && self
+                        .pending_account_select
+                        .as_ref()
+                        .is_some_and(|(pending, _)| pending == id)
+                    && let Some((_, alias)) = self.pending_account_select.take()
+                {
+                    if !retryable {
+                        self.retire(id);
+                    }
+                    model.account_select_failed(&alias, &message);
                     return Vec::new();
                 }
                 // A rejected TURN must release the optimistic mid-turn UI,
@@ -1428,6 +1497,13 @@ impl LiveDriver {
                     }
                 }
                 Vec::new()
+            }
+            // `/accounts` (W5d): a read — never in the outbox.
+            AppRequest::AccountsRefresh => vec![LiveCommand::AccountList],
+            AppRequest::AccountSetActive { alias } => {
+                let command_id = self.mint();
+                self.pending_account_select = Some((command_id.clone(), alias.clone()));
+                vec![self.enqueue(LiveCommand::AccountSetActive { command_id, alias })]
             }
             // The request's `after_seq` is the reducer's own last fully
             // applied sequence — the same value [`cursor_of`] reads, from

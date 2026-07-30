@@ -277,6 +277,86 @@ pub const SEED_ACCOUNT_PROVIDERS: usize = 5;
 /// ci-runner-7 is exec-only. The launcher's Peers meta quotes this count.
 pub const SEED_HOST_CAPABLE_PEERS: usize = 3;
 
+/// The sim's seed accounts VERBATIM (tui.js:146-154) as `/accounts` rows.
+/// `SEED_ACCOUNTS`/`SEED_ACCOUNT_PROVIDERS` above must stay derived from
+/// this list — the accounts screen test pins that equality.
+#[must_use]
+pub fn seed_account_rows() -> Vec<crate::app::AccountRow> {
+    use haider_protocol::credential::{AuthMethod, CredentialStatus};
+    let row = |alias: &str,
+               provider: &str,
+               method: AuthMethod,
+               identity: &str,
+               selected: bool,
+               base_url: Option<&str>| crate::app::AccountRow {
+        alias: alias.to_owned(),
+        provider: provider.to_owned(),
+        method,
+        identity: identity.to_owned(),
+        status: CredentialStatus::Ok,
+        selected,
+        base_url: base_url.map(str::to_owned),
+    };
+    vec![
+        row(
+            "work-chatgpt",
+            "openai",
+            AuthMethod::OAuth,
+            "you@work.com · ChatGPT",
+            true,
+            None,
+        ),
+        row(
+            "billing-key",
+            "openai",
+            AuthMethod::ApiKey,
+            "sk-…a91f",
+            false,
+            None,
+        ),
+        row(
+            "personal-max",
+            "anthropic",
+            AuthMethod::OAuth,
+            "you@me.com · Claude Max",
+            true,
+            None,
+        ),
+        row(
+            "ci-key",
+            "anthropic",
+            AuthMethod::ApiKey,
+            "sk-ant-…7c2d",
+            false,
+            None,
+        ),
+        row(
+            "gemini-key",
+            "google",
+            AuthMethod::ApiKey,
+            "AIza…4b1",
+            true,
+            None,
+        ),
+        row(
+            "vllm-local",
+            "local",
+            AuthMethod::ApiKey,
+            "sk-…local · qwen3-coder",
+            true,
+            Some("http://127.0.0.1:8000/v1"),
+        ),
+        row(
+            "hf-endpoint",
+            "huggingface",
+            AuthMethod::ApiKey,
+            "hf_…5a1 · llama-3-70b",
+            true,
+            Some("https://llama-3-70b.endpoints.huggingface.cloud/v1"),
+        ),
+    ]
+}
+
 impl SampleSession {
     /// Sim `sessionBusy` (tui.js:789-792): live subagents OR a busy run.
     #[must_use]

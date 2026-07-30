@@ -64,7 +64,7 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
             };
             u16::from((area.height as usize) >= 1 + 4 + input_floor)
         }
-        Screen::Boot | Screen::Launcher => 1,
+        Screen::Boot | Screen::Launcher | Screen::Accounts => 1,
     };
     let [body, status] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(status_height)]).areas(area);
@@ -74,6 +74,7 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
         Screen::Session => render_session(model, theme, frame, body, &mut hits),
         Screen::Subagent => render_subagent(model, theme, frame, body, &mut hits),
         Screen::Aura => render_aura(model, theme, frame, body, &mut hits),
+        Screen::Accounts => render_accounts(model, theme, frame, body, &mut hits),
     }
     if model.help_open {
         render_help(theme, frame, body);
@@ -777,6 +778,239 @@ fn render_launcher(
             .style(theme.text_style()),
             band_rule_area,
         );
+    }
+}
+
+/// `/accounts` (W5d) — the sim's harness-owned credential list, 1:1
+/// hierarchy (tui.js:3588-3688): head · optional action message · provider
+/// groups (base URL on the group header) · rows with ●/○ + AUTH_LABEL +
+/// identity + status + "in use" · ONE global add row after all groups ·
+/// hints. The dot NEVER moves at render time — rows are daemon truth.
+fn render_accounts(
+    model: &AppModel,
+    theme: &Theme,
+    frame: &mut Frame<'_>,
+    area: Rect,
+    hits: &mut Vec<(Rect, Hit)>,
+) {
+    let mut lines: Vec<Line<'_>> = Vec::new();
+    // (line index, hit) pairs resolved to rects after layout.
+    let mut line_hits: Vec<(usize, Hit)> = Vec::new();
+    // Add-row buttons: (line index, column offset, width) in ISSUE order —
+    // consumed positionally against the `Hit::AccountAdd` entries below.
+    let mut add_button_rects: Vec<(usize, u16, u16)> = Vec::new();
+
+    lines.push(Line::from(vec![
+        Span::styled(
+            "ACCOUNTS",
+            theme
+                .bright_style()
+                .add_modifier(ratatui::style::Modifier::BOLD),
+        ),
+        Span::styled(
+            " — auth is harness-owned · the ADE reads this list",
+            theme.dim_style(),
+        ),
+    ]));
+    if let Some(message) = &model.accounts.message {
+        lines.push(Line::styled(message.clone(), theme.gold_style()));
+    }
+    lines.push(Line::raw(""));
+
+    // Provider groups in FIRST-SEEN order (sim: Set insertion order over
+    // the account list, tui.js:3593).
+    let mut providers: Vec<&str> = Vec::new();
+    for row in &model.accounts.rows {
+        if !providers.contains(&row.provider.as_str()) {
+            providers.push(&row.provider);
+        }
+    }
+    if model.accounts.rows.is_empty() {
+        lines.push(Line::styled(
+            "  no accounts yet — add one below, or /login <provider> api",
+            theme.dim_style(),
+        ));
+    }
+    for provider in providers {
+        // Sim tui.js:3596-3599: the group header shows the FIRST base URL
+        // any of its accounts carries.
+        let base_url = model
+            .accounts
+            .rows
+            .iter()
+            .find(|row| row.provider == provider && row.base_url.is_some())
+            .and_then(|row| row.base_url.clone());
+        let mut header = vec![Span::styled(
+            provider.to_owned(),
+            theme
+                .bright_style()
+                .add_modifier(ratatui::style::Modifier::BOLD),
+        )];
+        if let Some(url) = base_url {
+            header.push(Span::styled(format!(" · {url}"), theme.faint_style()));
+        }
+        lines.push(Line::from(header));
+        for (index, row) in model
+            .accounts
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.provider == provider)
+        {
+            let selected = row.selected;
+            let pending = model
+                .accounts
+                .pending_select
+                .as_deref()
+                .is_some_and(|alias| alias == row.alias);
+            let dot_style = if selected {
+                theme.gold_style()
+            } else {
+                theme.dim_style()
+            };
+            let status_text = match row.status {
+                haider_protocol::credential::CredentialStatus::Ok => "active".to_owned(),
+                haider_protocol::credential::CredentialStatus::Limited { .. } => {
+                    "rate-limited".to_owned()
+                }
+                haider_protocol::credential::CredentialStatus::Expired => "expired".to_owned(),
+                haider_protocol::credential::CredentialStatus::Revoked => "revoked".to_owned(),
+            };
+            let mut spans = vec![
+                Span::raw("  "),
+                Span::styled(
+                    format!("{} ", if selected { "●" } else { "○" }),
+                    dot_style,
+                ),
+                Span::styled(
+                    row.alias.clone(),
+                    theme
+                        .bright_style()
+                        .add_modifier(ratatui::style::Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" [{}]", crate::app::auth_label(row.method)),
+                    if row.method == haider_protocol::credential::AuthMethod::OAuth {
+                        theme.gold_style()
+                    } else {
+                        theme.dim_style()
+                    },
+                ),
+                Span::styled(
+                    format!(" · {} · {status_text}", row.identity),
+                    theme.dim_style(),
+                ),
+            ];
+            if selected {
+                spans.push(Span::styled(" · in use", theme.gold_style()));
+            }
+            if pending {
+                // Visible in-flight feedback WITHOUT moving the dot
+                // (forbidden optimism, report §5.1).
+                spans.push(Span::styled(
+                    " …",
+                    theme.pulse_ink(theme.gold, model.anim_phase),
+                ));
+            }
+            let mut line = Line::from(spans);
+            // Keyboard cursor (W5 accessibility extension): the same
+            // hover band the mouse rows take.
+            if model.accounts.cursor == index {
+                line = hover_band(line, true, area.width, theme);
+            }
+            line_hits.push((lines.len(), Hit::AccountRow(row.alias.clone())));
+            lines.push(line);
+        }
+    }
+
+    lines.push(Line::raw(""));
+    // The ONE global add row after all groups (sim tui.js:3621-3628).
+    for chunk in [
+        [
+            ("+ OpenAI (OAuth)", crate::app::AccountAddKind::OpenAiOAuth),
+            (
+                "+ Anthropic (OAuth)",
+                crate::app::AccountAddKind::AnthropicOAuth,
+            ),
+            ("+ OpenAI (API)", crate::app::AccountAddKind::OpenAiApi),
+        ],
+        [
+            ("+ Anthropic (API)", crate::app::AccountAddKind::AnthropicApi),
+            ("+ HuggingFace", crate::app::AccountAddKind::HuggingFace),
+            (
+                "+ Custom (OpenAI-compatible)",
+                crate::app::AccountAddKind::Custom,
+            ),
+        ],
+    ] {
+        // One hit per BUTTON needs per-span rects; simplest honest cut:
+        // one row per button column chunk, each button its own line-third.
+        // Buttons are short — three per row fits 80 cols.
+        let spans: Vec<Span<'_>> = chunk
+            .iter()
+            .flat_map(|(label, _)| {
+                vec![
+                    Span::styled(format!("[{label}]"), theme.gold_style()),
+                    Span::raw("  "),
+                ]
+            })
+            .collect();
+        // The row's first button anchors the hit resolution below: store
+        // each button with its column offset.
+        let mut offset = 0u16;
+        for (label, kind) in chunk {
+            line_hits.push((lines.len(), Hit::AccountAdd(kind)));
+            // Column-aware rect fixed up after layout via the offset list.
+            let width = label.chars().count() as u16 + 2;
+            add_button_rects.push((lines.len(), offset, width));
+            offset += width + 2;
+        }
+        lines.push(Line::from(spans));
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "click an account to make it active for its provider · + adds via OAuth / API · esc back",
+        theme.faint_style(),
+    ));
+
+    let paragraph = Paragraph::new(lines.clone());
+    frame.render_widget(paragraph, area);
+
+    // Resolve hits: full-width rows for accounts, column rects for buttons.
+    let mut button_cursor = 0usize;
+    for (line_index, hit) in line_hits {
+        let y = area.y + line_index as u16;
+        if y >= area.y + area.height {
+            continue;
+        }
+        match &hit {
+            Hit::AccountAdd(_) => {
+                if let Some((_, x, width)) = add_button_rects.get(button_cursor) {
+                    hits.push((
+                        Rect {
+                            x: area.x + x,
+                            y,
+                            width: (*width).min(area.width.saturating_sub(*x)),
+                            height: 1,
+                        },
+                        hit,
+                    ));
+                }
+                button_cursor += 1;
+            }
+            _ => {
+                hits.push((
+                    Rect {
+                        x: area.x,
+                        y,
+                        width: area.width,
+                        height: 1,
+                    },
+                    hit,
+                ));
+            }
+        }
     }
 }
 
