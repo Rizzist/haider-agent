@@ -298,19 +298,33 @@ async fn staged_login_commits_descriptor_lists_it_and_replays_for_lost_responses
         .await,
     );
     assert_eq!(descriptor.provider, "anthropic");
-    assert_eq!(descriptor.identity, "work");
+    // W5c.2b: the descriptor's alias IS the client's global alias, and the
+    // identity is the validator-resolved provider identity — no longer the
+    // display alias echoed back.
+    assert_eq!(descriptor.identity, "scripted identity");
     assert!(descriptor.active);
-    assert!(
-        descriptor.alias.as_str().starts_with("anthropic-"),
-        "physical alias is the vault identity: {}",
-        descriptor.alias
+    assert_eq!(
+        descriptor.alias.as_str(),
+        "work",
+        "the global alias is the descriptor coordinate"
     );
-    // The vault holds the secret under the physical alias.
+    // The vault holds the secret under the PROFILE-SCOPED physical key
+    // (R10): the raw global alias is never a machine-global Keychain key.
     let resolved = fixture
         .vault
-        .resolve(&CredentialAlias::new(descriptor.alias.as_str()))
+        .resolve(&haider_daemon::scoped_vault_alias(
+            "profile-login",
+            &CredentialAlias::new(descriptor.alias.as_str()),
+        ))
         .unwrap_or_else(|error| panic!("{error:?}"));
     assert_eq!(resolved.expose_secret(), b"sk-live-login-1");
+    assert!(
+        fixture
+            .vault
+            .resolve(&CredentialAlias::new(descriptor.alias.as_str()))
+            .is_err(),
+        "the raw global alias must not address a Keychain item"
+    );
 
     // account.list serves the committed descriptor (View surface).
     let listed = request(
@@ -467,9 +481,13 @@ async fn retryable_validation_keeps_the_pending_command_for_a_stageless_retry() 
         .await,
     );
     assert_eq!(fixture.validator.calls(), 2);
+    // R10: the physical item lives under the profile-scoped key.
     let resolved = fixture
         .vault
-        .resolve(&CredentialAlias::new(descriptor.alias.as_str()))
+        .resolve(&haider_daemon::scoped_vault_alias(
+            "profile-retry",
+            &CredentialAlias::new(descriptor.alias.as_str()),
+        ))
         .unwrap_or_else(|error| panic!("{error:?}"));
     assert_eq!(resolved.expose_secret(), b"sk-eventually-good");
 

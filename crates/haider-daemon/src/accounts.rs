@@ -3888,9 +3888,20 @@ impl AccountsRuntime {
             provider_store,
             initial_provider_profiles(provider_names, default_model),
         )?;
-        reconcile_remove_receipts(store, &mut accounts, &dependencies.vault).await?;
-        reconcile_login_receipts(store, &mut accounts, &dependencies.vault).await?;
-        reconcile_oauth_add_receipts(store, &mut accounts, &dependencies.vault).await?;
+        // R10: every daemon vault consumer funnels through this ONE wrap.
+        // Global aliases are the descriptor coordinate, but the Keychain is
+        // machine-global — the physical key must stay profile-scoped so two
+        // profiles' identical aliases can never collide (see profile_vault.rs).
+        let vault = match &dependencies.vault {
+            VaultProvision::Available(inner) => VaultProvision::Available(Arc::new(
+                crate::profile_vault::ProfileVault::new(Arc::clone(inner), profile_id),
+            )
+                as Arc<dyn Vault>),
+            VaultProvision::Unsupported => VaultProvision::Unsupported,
+        };
+        reconcile_remove_receipts(store, &mut accounts, &vault).await?;
+        reconcile_login_receipts(store, &mut accounts, &vault).await?;
+        reconcile_oauth_add_receipts(store, &mut accounts, &vault).await?;
         reconcile_set_active_receipts(store, &mut accounts).await?;
         reconcile_provider_receipts(store, &mut providers).await?;
         let reserved_aliases = store
@@ -3904,7 +3915,7 @@ impl AccountsRuntime {
             accounts.list().to_vec(),
             providers.summaries(),
         );
-        let actor_vault: Arc<dyn Vault> = match &dependencies.vault {
+        let actor_vault: Arc<dyn Vault> = match &vault {
             VaultProvision::Available(vault) => Arc::clone(vault),
             VaultProvision::Unsupported => Arc::new(MemoryVault::default()),
         };
@@ -3924,8 +3935,8 @@ impl AccountsRuntime {
             refresh_fences: refresh_fences.clone(),
         });
         let commands = actor.commands();
-        match &dependencies.vault {
-            VaultProvision::Available(vault) => {
+        match &vault {
+            VaultProvision::Available(scoped) => {
                 let oauth = OAuthCoordinator::new(
                     instance_id.to_owned(),
                     dependencies.oauth_catalog.clone(),
@@ -3933,7 +3944,7 @@ impl AccountsRuntime {
                 )
                 .map_err(crate::oauth::oauth_error)?;
                 let broker = CredentialBroker::new_with_fences(
-                    Arc::clone(vault),
+                    Arc::clone(scoped),
                     dependencies.oauth_catalog.clone(),
                     Arc::clone(&snapshot),
                     commands.clone(),
@@ -3948,7 +3959,7 @@ impl AccountsRuntime {
                         vault_supported: true,
                     },
                     actor: Some(actor),
-                    vault: dependencies.vault.clone(),
+                    vault,
                     broker: Some(broker),
                 })
             }

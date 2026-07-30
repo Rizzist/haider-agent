@@ -55,6 +55,7 @@ mod endpoint;
 mod error;
 mod lifecycle;
 mod oauth;
+mod profile_vault;
 mod provider_registry;
 mod runtime;
 mod session_hub;
@@ -76,6 +77,7 @@ pub use oauth::{
     OAuthRedirectPolicy, OAuthTokenRequestEncoding, SANCTIONED_PROVIDER_REGISTRATIONS,
     SanctionedOAuthRegistration,
 };
+pub use profile_vault::{ProfileVault, scoped_vault_alias};
 pub use provider_registry::{ProductionProviderEndpointValidator, ProviderEndpointValidator};
 pub use runtime::{
     DaemonTask, run_with_signals, run_with_signals_and_dependencies, spawn, spawn_with_dependencies,
