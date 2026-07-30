@@ -22,9 +22,11 @@ mod profile_lock;
 
 pub use cas::FileCas;
 pub use event_store::{
-    AcceptedTurn, AccountAddClaim, AccountAddReceiptResponse, AccountAddReceiptRow, CancelledTurn,
-    CommittedSeqRange, CreatedSession, EventStore, LoginClaim, LoginReceiptFailure,
-    LoginReceiptResponse, LoginReceiptRow, MenuResolutionCommand, MenuResolutionOutcome,
+    ACCOUNT_REMOVE_METHOD, ACCOUNT_SET_ACTIVE_METHOD, ACCOUNT_SET_DEFAULT_MODEL_METHOD,
+    AcceptedTurn, AccountAddClaim, AccountAddReceiptResponse, AccountAddReceiptRow,
+    AccountRemoveReceiptRow, CancelledTurn, CommittedSeqRange, CreatedSession, EventStore,
+    LoginClaim, LoginReceiptFailure, LoginReceiptResponse, LoginReceiptRow, ManagementClaim,
+    ManagementReceiptRow, MenuResolutionCommand, MenuResolutionOutcome, PROVIDER_CONFIGURE_METHOD,
     ProfileLease, SessionCreateCommand, SessionCreateOutcome, Store, TurnAcceptCommand,
     TurnAcceptOutcome, TurnAdmissionDisposition, TurnCancelCommand, TurnCancelOutcome,
     TurnCancellationStatus,

@@ -15,10 +15,10 @@ use haider_rpc::{
     ERROR_CODE_PROVIDER_ERROR, ERROR_CODE_RESTAGE_REQUIRED, ERROR_CODE_REVISION_CONFLICT,
     ERROR_CODE_RUN_NOT_ACTIVE, ERROR_CODE_STALE_GENERATION, ERROR_CODE_UNAUTHORIZED,
     ERROR_CODE_VAULT_UNSUPPORTED, FEATURE_ACCOUNT_LOGIN_API_V1, FEATURE_ACCOUNT_MANAGEMENT_V1,
-    FEATURE_ACCOUNT_OAUTH_PKCE_V1, FEATURE_ACCOUNT_ROTATION_V1, FEATURE_PROVIDER_MANAGEMENT_V1,
-    FEATURE_SESSION_MUTATION_V1, FEATURE_TURN_CONTROL_V1, FEATURE_VAULT_STAGE_V1, Hello,
-    RequestBody, ResponseBody, SubmitDisposition, WIRE_PROTOCOL_VERSION, Welcome, WireFrame,
-    uds_codec, ws_codec,
+    FEATURE_ACCOUNT_OAUTH_PKCE_V1, FEATURE_ACCOUNT_ROTATION_V1, FEATURE_PROVIDER_CONFIGURE_V1,
+    FEATURE_PROVIDER_MANAGEMENT_V1, FEATURE_SESSION_MUTATION_V1, FEATURE_TURN_CONTROL_V1,
+    FEATURE_VAULT_STAGE_V1, Hello, RequestBody, ResponseBody, SubmitDisposition,
+    WIRE_PROTOCOL_VERSION, Welcome, WireFrame, uds_codec, ws_codec,
 };
 use serde::{Deserialize, Serialize};
 
@@ -908,23 +908,32 @@ fn revision_conflict_code_and_structured_body_are_golden() {
     );
 }
 
-/// The W5c.2a provider read and all honestly served feature families.
+/// The provider read/mutation methods and all honestly served feature
+/// families.
 ///
-/// MUTATION CHECK: remove `#[serde(rename = "provider.list")]` from the
-/// `ResponseBody::ProviderList` variant. Expected runtime failure: the
-/// response method disappears from the exact transcript scan below.
+/// MUTATION CHECK: remove `FEATURE_PROVIDER_CONFIGURE_V1` from the final
+/// Welcome. Expected runtime failure: the exact nine-feature assertion below
+/// omits `provider_configure_v1`.
 #[test]
 fn provider_list_and_management_feature_families_are_golden() {
-    for kind in ["request", "response"] {
-        assert!(transcript().into_iter().any(|frame| {
-            let value = serde_json::to_value(frame).expect("frame JSON");
-            value["kind"] == kind && value["body"]["method"] == "provider.list"
-        }));
+    for method in [
+        "provider.list",
+        "account.set_active",
+        "account.remove",
+        "account.set_default_model",
+        "provider.configure",
+    ] {
+        for kind in ["request", "response"] {
+            assert!(transcript().into_iter().any(|frame| {
+                let value = serde_json::to_value(frame).expect("frame JSON");
+                value["kind"] == kind && value["body"]["method"] == method
+            }));
+        }
     }
     let welcome = transcript()
         .into_iter()
         .find_map(|frame| match frame {
-            WireFrame::Welcome(welcome) if welcome.features.len() == 8 => Some(welcome),
+            WireFrame::Welcome(welcome) if welcome.features.len() == 9 => Some(welcome),
             _ => None,
         })
         .expect("management-feature Welcome");
@@ -935,6 +944,7 @@ fn provider_list_and_management_feature_families_are_golden() {
             FEATURE_ACCOUNT_MANAGEMENT_V1,
             FEATURE_ACCOUNT_OAUTH_PKCE_V1,
             FEATURE_ACCOUNT_ROTATION_V1,
+            FEATURE_PROVIDER_CONFIGURE_V1,
             FEATURE_PROVIDER_MANAGEMENT_V1,
             FEATURE_SESSION_MUTATION_V1,
             FEATURE_TURN_CONTROL_V1,

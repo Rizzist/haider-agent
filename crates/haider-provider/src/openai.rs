@@ -2016,6 +2016,53 @@ fn compatible_endpoints(base_url: &str) -> Result<CompatibleEndpoints, ProviderE
     })
 }
 
+/// Validates and probes a configured OpenAI-compatible endpoint without
+/// attaching credential material.
+///
+/// This is the provider-registry entry point for W5 management. It reuses the
+/// adapter's URL, SSRF, DNS pinning, timeout, and no-redirect policy so the
+/// daemon cannot grow a second, weaker endpoint validator.
+pub async fn validate_openai_compatible_endpoint(base_url: &str) -> Result<String, ProviderError> {
+    let endpoints = compatible_endpoints(base_url)?;
+    let mut client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .connect_timeout(TRANSPORT_CONFIG.connect_timeout);
+    let guard = endpoints.origin.map(|origin| {
+        Arc::new(CompatibleOriginGuard::new(
+            origin.host,
+            origin.port,
+            origin.plain_http,
+            Arc::new(SystemCompatibleDnsResolver),
+        ))
+    });
+    if let Some(guard) = &guard {
+        guard.validate().await?;
+        client = client.dns_resolver(Arc::clone(guard));
+    }
+    let client = client.build().map_err(|error| {
+        ProviderError::new(
+            ProviderErrorKind::Internal,
+            format!("could not construct OpenAI-compatible endpoint validator: {error}"),
+        )
+    })?;
+    let opening = client
+        .get(&endpoints.models_url)
+        .header(ACCEPT, "application/json")
+        .send();
+    let response = tokio::time::timeout(TRANSPORT_CONFIG.response_open_timeout, opening)
+        .await
+        .map_err(|_| response_open_timeout_error(TRANSPORT_CONFIG.response_open_timeout))?
+        .map_err(transport_error)?;
+    if response.status().is_redirection() {
+        return Err(invalid_request(
+            "OpenAI-compatible endpoint redirects are not allowed; configure the final origin",
+        ));
+    }
+    Ok(endpoints.base_url)
+}
+
 fn validate_compatible_origin(parsed: &reqwest::Url) -> Result<(), ProviderError> {
     let host = parsed
         .host_str()

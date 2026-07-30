@@ -41,6 +41,7 @@ pub use openai::{
     OpenAiCapture, OpenAiCompatibleProvider, OpenAiProvider, OpenAiRetryPolicy,
     OpenAiTransportConfig, replay_openai_chat_sse, replay_openai_http_error,
     replay_openai_models_response, replay_openai_responses_sse,
+    validate_openai_compatible_endpoint,
 };
 pub use origin::{FixedDnsResolver, FixedOriginGuard, SystemFixedDnsResolver};
 
