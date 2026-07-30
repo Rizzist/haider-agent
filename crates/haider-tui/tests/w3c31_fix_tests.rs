@@ -17,7 +17,7 @@ use haider_rpc::{AttachmentId, CommandId, SessionSummary};
 use haider_tui::app::{AppModel, AppRequest, Hit, RuntimeMode, Screen};
 use haider_tui::identity::UiGeneration;
 use haider_tui::live::{LiveCommand, LiveDriver, LiveReply};
-use haider_tui::runtime::live_pass;
+use haider_tui::runtime::{ShellRequest, live_pass};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 
@@ -1100,7 +1100,7 @@ fn the_loop_pass_hands_back_the_shell_owned_requests_and_translates_the_rest() {
     let produced = live_pass(&mut driver, &mut model, None, std::time::Instant::now());
     assert_eq!(
         produced.shell,
-        vec![AppRequest::Quit, AppRequest::CopyText("x".to_owned())],
+        vec![ShellRequest::Quit, ShellRequest::CopyText("x".to_owned())],
         "the terminal/process work comes back for the shell to perform"
     );
     assert!(

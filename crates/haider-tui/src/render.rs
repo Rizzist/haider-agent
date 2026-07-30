@@ -571,6 +571,7 @@ fn render_launcher(
         // (the 1-3 keys stay as silent bindings).
         let busy = entry.busy();
         let live = entry.live();
+        let errored = entry.errored();
         let (rail, dot, dot_style) = if busy {
             (
                 // The gold→maroon→gold gradient crossing the sliver
@@ -579,6 +580,10 @@ fn render_launcher(
                 "◉",
                 theme.pulse_ink(theme.gold, model.anim_phase),
             )
+        } else if errored {
+            // The turn DIED — the badge's ✗ in the badge's warn tone,
+            // still (nothing pulses for a corpse). Owner report, W5f-0.
+            (Span::raw(" "), "✗", theme.warn_style())
         } else {
             (Span::raw(" "), "●", theme.ok_style())
         };
@@ -607,6 +612,8 @@ fn render_launcher(
             ));
         } else if busy {
             spans.push(Span::styled("  running… ·", theme.gold_style()));
+        } else if errored {
+            spans.push(Span::styled("  errored ·", theme.warn_style()));
         }
         let turns = entry.turns();
         // Sim renders the blurb segment only when a blurb exists

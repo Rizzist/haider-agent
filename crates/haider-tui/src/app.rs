@@ -4423,7 +4423,13 @@ impl AppModel {
                     } else {
                         format!("/{}", index + 1)
                     };
-                    let status = if entry.busy() { "running" } else { "idle" };
+                    let status = if entry.busy() {
+                        "running"
+                    } else if entry.errored() {
+                        "errored"
+                    } else {
+                        "idle"
+                    };
                     let name = entry.name.as_deref().unwrap_or("—");
                     format!(
                         "{reach}  {}  {name}  {status}  {} turns",

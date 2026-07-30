@@ -596,6 +596,14 @@ impl SessionProjection {
         self.voice_live
     }
 
+    /// The last turn ended in `Errored` — a TERMINAL state, distinct from
+    /// every "still going" badge. Launcher rows read this so a dead turn
+    /// is never dressed as a running one (owner report, W5f-0).
+    #[must_use]
+    pub const fn run_errored(&self) -> bool {
+        matches!(self.run, Some(RunState::Errored))
+    }
+
     /// The status-bar badge, sim `BADGE_LABEL` goldens.
     #[must_use]
     pub fn badge(&self) -> String {

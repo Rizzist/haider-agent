@@ -113,9 +113,23 @@ impl SessionState {
     /// Sim `sessionBusy` (tui.js:789-792): live chips OR a non-idle run
     /// state. `IDLE_I` counts as busy there (only plain idle is excluded);
     /// the projection's badge speaks the same vocabulary.
+    ///
+    /// `✗ ERRORED` is carved OUT (owner report, W5f-0): it is a TERMINAL
+    /// state the sim only ever held for 1.8s, so "non-idle badge → busy"
+    /// silently dressed a dead live turn as `running…` on the launcher —
+    /// forever, gold pulse and all.
     #[must_use]
     pub fn busy(&self) -> bool {
-        self.live() > 0 || self.turn_active || self.projection.badge() != "IDLE"
+        self.live() > 0
+            || self.turn_active
+            || (self.projection.badge() != "IDLE" && !self.projection.run_errored())
+    }
+
+    /// The row's honest third state: the last turn DIED and nothing has
+    /// started since. Live chips or a new turn outrank it.
+    #[must_use]
+    pub fn errored(&self) -> bool {
+        self.live() == 0 && !self.turn_active && self.projection.run_errored()
     }
 
     /// Turns shown on the launcher row (sim: user entries of the active
