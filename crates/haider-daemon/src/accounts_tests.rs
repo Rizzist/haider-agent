@@ -4668,3 +4668,85 @@ async fn reimport_replaces_bundle_fences_refresh_and_preserves_other_active_acco
     actor.shutdown().await;
     store.close().await.expect("close");
 }
+
+/// MUTATION CHECK (W5f-4): remove the
+/// `Ok(Err(error)) if error.code == ErrorCode::CredentialMissing => None`
+/// arm from `handle_oauth_import`'s prior-secret read (let the migration
+/// case fall through to the fatal `respond_management_error`). Expected
+/// runtime failure: the re-import below — over a descriptor whose vault
+/// secret was retired (the Keychain→file-vault upgrade) — errors instead
+/// of restoring the account. Confirmed live 2026-07-30: this is the exact
+/// path an upgrading user hits.
+/// Verified by revert on 2026-07-30.
+#[tokio::test(flavor = "current_thread")]
+async fn reimport_over_a_retired_secret_restores_the_account() {
+    let fixture_dir = test_store_dir();
+    let source_path = fixture_dir.path().join("codex-auth.json");
+    std::fs::write(&source_path, CODEX_IMPORT_FIXTURE_1).expect("write Codex fixture");
+    if run_oauth_import_env_child(
+        "accounts::accounts_tests::reimport_over_a_retired_secret_restores_the_account",
+        &[("HAIDER_CODEX_AUTH_PATH", &source_path)],
+    ) {
+        return;
+    }
+
+    let store_dir = test_store_dir();
+    let store = open_store(store_dir.path()).await;
+    let vault = Arc::new(MemoryVault::new());
+    let (mut actor, snapshot, _management) = start_oauth_import_test_actor(
+        &store,
+        Arc::clone(&vault),
+        HashSet::new(),
+        RefreshFenceRegistry::default(),
+    );
+    let commands = actor.commands();
+    let (sink, mut frames) = channel_sink();
+
+    // First import: descriptor + vault secret committed.
+    send_oauth_import(&commands, Arc::clone(&sink), "import-pre-upgrade", "codex").await;
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), frames.recv())
+            .await
+            .expect("first import deadline")
+            .expect("first import response"),
+        WireFrame::Response {
+            body: ResponseBody::AccountOAuthImport { revision: 1, .. },
+            ..
+        }
+    ));
+
+    // The upgrade: the descriptor survives, but its secret is GONE (the old
+    // Keychain item the user could not identify, deleted).
+    let alias = CredentialAlias::new(OPENAI_OAUTH_PROVIDER_NAME);
+    vault.delete(&alias).expect("retire the prior secret");
+    assert!(
+        vault.resolve(&alias).is_err(),
+        "the prior secret must be gone to model the migration"
+    );
+
+    // Re-import must RESTORE, not error.
+    send_oauth_import(&commands, Arc::clone(&sink), "import-post-upgrade", "codex").await;
+    match tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        .await
+        .expect("re-import deadline")
+        .expect("re-import response")
+    {
+        WireFrame::Response {
+            body: ResponseBody::AccountOAuthImport { descriptor, .. },
+            ..
+        } => {
+            assert_eq!(descriptor.alias.as_str(), OPENAI_OAUTH_PROVIDER_NAME);
+            assert!(descriptor.active, "the restored account stays active");
+        }
+        other => panic!("re-import over a retired secret must succeed, got {other:?}"),
+    }
+    // The secret is back in the vault, and the account list still holds one.
+    assert!(
+        vault.resolve(&alias).is_ok(),
+        "the re-import restored the vault secret"
+    );
+    assert_eq!(snapshot.lock().expect("snapshot").len(), 1);
+
+    actor.shutdown().await;
+    store.close().await.expect("close");
+}
