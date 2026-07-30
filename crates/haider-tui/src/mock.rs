@@ -357,6 +357,91 @@ pub fn seed_account_rows() -> Vec<crate::app::AccountRow> {
     ]
 }
 
+/// Demo `/providers` summaries — consistent with the demo world's account
+/// seed and the sim's MODELS providers (the sim has no providers screen;
+/// this is W5d demo scaffolding, not sim parity).
+#[must_use]
+pub fn seed_provider_summaries() -> Vec<haider_rpc::ProviderSummaryWire> {
+    use haider_protocol::credential::AuthMethod;
+    use haider_rpc::{ProviderApiFamilyWire, ProviderAvailabilityWire, ProviderSummaryWire};
+    let summary = |provider: &str,
+                   api_family: ProviderApiFamilyWire,
+                   endpoint: Option<&str>,
+                   models: &[&str],
+                   auth: &[AuthMethod],
+                   availability: ProviderAvailabilityWire,
+                   reason: Option<&str>,
+                   default_model: Option<&str>,
+                   enabled: bool| ProviderSummaryWire {
+        provider: provider.to_owned(),
+        api_family,
+        endpoint: endpoint.map(str::to_owned),
+        models: models.iter().map(|&model| model.to_owned()).collect(),
+        auth_methods: auth.to_vec(),
+        availability,
+        availability_reason: reason.map(str::to_owned),
+        default_model: default_model.map(str::to_owned),
+        enabled,
+    };
+    vec![
+        summary(
+            "openai",
+            ProviderApiFamilyWire::OpenAiResponses,
+            Some("https://api.openai.com/v1"),
+            &["gpt-5.6", "gpt-5.6-codex", "o4-mini"],
+            &[AuthMethod::OAuth, AuthMethod::ApiKey],
+            ProviderAvailabilityWire::Available,
+            None,
+            Some("gpt-5.6-codex"),
+            true,
+        ),
+        summary(
+            "anthropic",
+            ProviderApiFamilyWire::AnthropicMessages,
+            Some("https://api.anthropic.com"),
+            &["claude-opus-5", "claude-sonnet-5"],
+            &[AuthMethod::OAuth, AuthMethod::ApiKey],
+            ProviderAvailabilityWire::Available,
+            None,
+            Some("claude-opus-5"),
+            true,
+        ),
+        summary(
+            "google",
+            ProviderApiFamilyWire::Unknown,
+            None,
+            &[],
+            &[],
+            ProviderAvailabilityWire::Unavailable,
+            Some("adapter not installed"),
+            None,
+            false,
+        ),
+        summary(
+            "local",
+            ProviderApiFamilyWire::OpenAiChatCompletions,
+            Some("http://127.0.0.1:8000/v1"),
+            &["qwen3-coder"],
+            &[AuthMethod::ApiKey],
+            ProviderAvailabilityWire::Available,
+            None,
+            Some("qwen3-coder"),
+            true,
+        ),
+        summary(
+            "huggingface",
+            ProviderApiFamilyWire::OpenAiChatCompletions,
+            Some("https://llama-3-70b.endpoints.huggingface.cloud/v1"),
+            &["llama-3-70b"],
+            &[AuthMethod::ApiKey],
+            ProviderAvailabilityWire::Available,
+            None,
+            Some("llama-3-70b"),
+            true,
+        ),
+    ]
+}
+
 impl SampleSession {
     /// Sim `sessionBusy` (tui.js:789-792): live subagents OR a busy run.
     #[must_use]

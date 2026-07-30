@@ -49,6 +49,13 @@ pub const COMMANDS: &[CommandSpec] = &[
         "Switch the active account for its provider",
         "<alias>",
     ),
+    // W5d addition (report §5.2): the sim has no providers screen, so this
+    // entry is registry-extension, not sim parity.
+    cmd(
+        "providers",
+        "Providers — registry truth: endpoints, models, defaults, health",
+        "",
+    ),
     cmd("login", "Add a provider account", "<provider> <oauth|api>"),
     cmd(
         "clear",
@@ -248,6 +255,7 @@ pub const HELP_TEXT: &[&str] = &[
     "commands",
     "  /model [name]      switch model — fable-5 · gpt-5.6 · gemini-3 · qwen3",
     "  /provider [name]   anthropic · openai · google · local",
+    "  /providers         provider registry — endpoints, models, defaults, health",
     "  /theme [name]      dawn · ivory · dark",
     "  /tree              session tree — main-line view, ⏎ opens forks, f forks at a node",
     "  /fork              fork the session at the current point",

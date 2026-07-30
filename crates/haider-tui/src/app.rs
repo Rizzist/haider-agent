@@ -204,6 +204,10 @@ pub enum Screen {
     /// `/accounts` — the sim's harness-owned credential list
     /// (tui.js:3588-3688), backed by `account.list` in live mode.
     Accounts,
+    /// `/providers` — registry truth (report §5.2). The sim has NO such
+    /// screen: this layout is owner-directed, provisional until the
+    /// v0.0.15 install-probe sign-off.
+    Providers,
 }
 
 /// Sim `AUTH_LABEL` (tui.js:145): the badge text per auth method.
@@ -282,6 +286,69 @@ impl AccountsState {
         if self.cursor >= self.rows.len() {
             self.cursor = self.rows.len().saturating_sub(1);
         }
+        true
+    }
+}
+
+/// The `/providers` screen state (report §5.2). Same daemon-truth law as
+/// `/accounts`: a default-model change applies only on the correlated,
+/// revision-gated reply.
+#[derive(Debug, Default)]
+pub struct ProvidersState {
+    pub providers: Vec<haider_rpc::ProviderSummaryWire>,
+    pub revision: Option<u64>,
+    pub message: Option<String>,
+    /// In-flight `account.set_default_model`: (provider, model).
+    pub pending_default: Option<(String, String)>,
+    pub cursor: usize,
+}
+
+impl ProvidersState {
+    /// Applies a `provider.list` snapshot, gated on revision monotonicity.
+    pub fn apply_snapshot(
+        &mut self,
+        providers: Vec<haider_rpc::ProviderSummaryWire>,
+        revision: u64,
+    ) -> bool {
+        if let Some(current) = self.revision
+            && revision < current
+        {
+            return false;
+        }
+        self.providers = providers;
+        self.revision = Some(revision);
+        if self.cursor >= self.providers.len() {
+            self.cursor = self.providers.len().saturating_sub(1);
+        }
+        true
+    }
+
+    /// Applies a committed default-model change (one provider summary).
+    pub fn apply_default_set(
+        &mut self,
+        summary: haider_rpc::ProviderSummaryWire,
+        revision: u64,
+    ) -> bool {
+        if self
+            .pending_default
+            .as_ref()
+            .is_some_and(|(provider, _)| *provider == summary.provider)
+        {
+            self.pending_default = None;
+        }
+        if let Some(current) = self.revision
+            && revision < current
+        {
+            return false;
+        }
+        if let Some(slot) = self
+            .providers
+            .iter_mut()
+            .find(|existing| existing.provider == summary.provider)
+        {
+            *slot = summary;
+        }
+        self.revision = Some(revision);
         true
     }
 }
@@ -1088,6 +1155,15 @@ pub enum AppRequest {
     /// holds `pending_select` — the dot moves only when the driver's reply
     /// applies (optimism forbidden, report §5.1).
     AccountSetActive { alias: String },
+    /// Fetch/refresh the `/providers` summaries (`provider.list`).
+    ProvidersRefresh,
+    /// `account.set_default_model` under the expected-revision CAS. The
+    /// default marker moves only on the correlated reply.
+    SetDefaultModel {
+        provider: String,
+        model: String,
+        expected_revision: u64,
+    },
     /// Quit the app.
     Quit,
 }
@@ -1231,6 +1307,10 @@ pub enum Hit {
     AccountRow(String),
     /// One add-row button on `/accounts` (sim tui.js:3621-3628).
     AccountAdd(AccountAddKind),
+    /// One `/providers` model chip: click sets the provider default.
+    ProviderModel { provider: String, model: String },
+    /// The `/providers` row's `[accounts]` navigation chip.
+    ProviderAccounts,
 }
 
 /// The `/accounts` add-row buttons (sim order, tui.js:3621-3628).
@@ -1586,6 +1666,8 @@ pub struct AppModel {
     pub wordmark: std::cell::RefCell<Option<crate::wordmark::Wordmark>>,
     /// `/accounts` screen state (rows, revision gate, pending select).
     pub accounts: AccountsState,
+    /// `/providers` screen state (report §5.2).
+    pub providers: ProvidersState,
 }
 
 impl Default for AppModel {
@@ -1658,6 +1740,7 @@ impl Default for AppModel {
             // render falls back to the half-block art in `crate::mark`.
             wordmark: std::cell::RefCell::new(None),
             accounts: AccountsState::default(),
+            providers: ProvidersState::default(),
         }
     }
 }
@@ -1817,6 +1900,7 @@ impl AppModel {
             Screen::Boot => "haider — starting".to_owned(),
             Screen::Launcher => "haider — launcher".to_owned(),
             Screen::Accounts => "haider — accounts".to_owned(),
+            Screen::Providers => "haider — providers".to_owned(),
             Screen::Session | Screen::Subagent | Screen::Aura => {
                 // Strip control characters: user text must never smuggle
                 // escape sequences into OSC 2 (review r1 P1).
@@ -1897,6 +1981,7 @@ impl AppModel {
             // Accounts: a static list — only an in-flight select animates
             // (the pending row's `…` beat).
             Screen::Accounts => self.accounts.pending_select.is_some(),
+            Screen::Providers => self.providers.pending_default.is_some(),
             Screen::Session | Screen::Subagent => {
                 // `● thinking…` (tui.js:4458-4462) · the ⚒ running tool
                 // glyph (tui.js:4524-4530) · the processing todo's box
@@ -2264,6 +2349,10 @@ impl AppModel {
         // the key above when a card is open.
         if self.screen == Screen::Accounts {
             self.handle_accounts_key(key.code);
+            return;
+        }
+        if self.screen == Screen::Providers {
+            self.handle_providers_key(key.code);
             return;
         }
         // A blocking menu REPLACES the composer (sim §3 law).
@@ -3060,6 +3149,125 @@ impl AppModel {
         self.dirty = true;
     }
 
+    /// THE ONE DOOR into `/providers` (report §5.2).
+    fn enter_providers(&mut self) {
+        if self.screen == Screen::Providers {
+            return;
+        }
+        self.providers.message = None;
+        self.switch_surface(Screen::Providers);
+        self.requests.push(AppRequest::ProvidersRefresh);
+        self.dirty = true;
+    }
+
+    /// Esc from `/providers`: same routing as `/accounts`.
+    fn exit_providers(&mut self) {
+        let target = if self.active_session.is_some()
+            || !self.projection.entries().is_empty()
+            || self.session_name.is_some()
+        {
+            Screen::Session
+        } else {
+            Screen::Launcher
+        };
+        self.switch_surface(target);
+        self.dirty = true;
+    }
+
+    /// Click on a model chip: request the default change under the CAS.
+    /// The `*` marker moves ONLY on the correlated reply (§5.1's law
+    /// applied to the management screen).
+    pub fn set_default_model(&mut self, provider: &str, model: &str) {
+        if self.providers.pending_default.is_some() {
+            return;
+        }
+        let Some(summary) = self
+            .providers
+            .providers
+            .iter()
+            .find(|summary| summary.provider == provider)
+        else {
+            return;
+        };
+        if summary.default_model.as_deref() == Some(model) {
+            self.providers.message = Some(format!("· {model} is already {provider}'s default"));
+            self.dirty = true;
+            return;
+        }
+        if !summary.models.iter().any(|known| known == model) {
+            self.providers.message =
+                Some(format!("· {provider} has no model \"{model}\" configured"));
+            self.dirty = true;
+            return;
+        }
+        let Some(expected_revision) = self.providers.revision else {
+            self.providers.message =
+                Some("· provider snapshot not loaded yet — try again".to_owned());
+            self.dirty = true;
+            return;
+        };
+        self.providers.pending_default = Some((provider.to_owned(), model.to_owned()));
+        self.providers.message = None;
+        self.requests.push(AppRequest::SetDefaultModel {
+            provider: provider.to_owned(),
+            model: model.to_owned(),
+            expected_revision,
+        });
+        self.dirty = true;
+    }
+
+    /// A committed default-model change (correlated + revision-gated).
+    pub fn apply_default_model_set(
+        &mut self,
+        summary: haider_rpc::ProviderSummaryWire,
+        revision: u64,
+    ) {
+        let provider = summary.provider.clone();
+        let model = summary.default_model.clone().unwrap_or_default();
+        if self.providers.apply_default_set(summary, revision) {
+            self.providers.message = Some(format!("✓ {provider} default → {model}"));
+        }
+        self.dirty = true;
+    }
+
+    /// A failed default-model change: release the gate, honest reason. A
+    /// `revision_conflict` also refreshes the snapshot (the CAS told us we
+    /// are stale).
+    pub fn default_model_failed(&mut self, provider: &str, message: &str, refresh: bool) {
+        if self
+            .providers
+            .pending_default
+            .as_ref()
+            .is_some_and(|(pending, _)| pending == provider)
+        {
+            self.providers.pending_default = None;
+        }
+        self.providers.message = Some(format!("· {provider}: {message}"));
+        if refresh {
+            self.requests.push(AppRequest::ProvidersRefresh);
+        }
+        self.dirty = true;
+    }
+
+    /// Keys on the `/providers` screen.
+    fn handle_providers_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc => self.exit_providers(),
+            KeyCode::Up => {
+                self.providers.cursor = self.providers.cursor.saturating_sub(1);
+                self.dirty = true;
+            }
+            KeyCode::Down => {
+                if !self.providers.providers.is_empty() {
+                    self.providers.cursor =
+                        (self.providers.cursor + 1).min(self.providers.providers.len() - 1);
+                }
+                self.dirty = true;
+            }
+            _ => {}
+        }
+    }
+
     /// Keys on the `/accounts` screen (no composer; the login card, when
     /// open, is total-modal and never reaches here).
     fn handle_accounts_key(&mut self, code: KeyCode) {
@@ -3496,6 +3704,7 @@ impl AppModel {
                 );
             }
             "accounts" => self.enter_accounts(),
+            "providers" => self.enter_providers(),
             "account" => {
                 // Sim tui.js:1770-1780: no alias → note listing them; a
                 // known alias selects (same daemon-gated path as a click);
@@ -4262,6 +4471,12 @@ impl AppModel {
                         );
                     }
                 }
+            }
+            Hit::ProviderModel { provider, model } if self.screen == Screen::Providers => {
+                self.set_default_model(&provider, &model);
+            }
+            Hit::ProviderAccounts if self.screen == Screen::Providers => {
+                self.enter_accounts();
             }
             // Dismissed/replaced palettes drop the click.
             Hit::PaletteRow(item) if self.palette_open() => self.activate_palette_item(item),

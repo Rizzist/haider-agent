@@ -64,7 +64,7 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
             };
             u16::from((area.height as usize) >= 1 + 4 + input_floor)
         }
-        Screen::Boot | Screen::Launcher | Screen::Accounts => 1,
+        Screen::Boot | Screen::Launcher | Screen::Accounts | Screen::Providers => 1,
     };
     let [body, status] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(status_height)]).areas(area);
@@ -75,6 +75,7 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
         Screen::Subagent => render_subagent(model, theme, frame, body, &mut hits),
         Screen::Aura => render_aura(model, theme, frame, body, &mut hits),
         Screen::Accounts => render_accounts(model, theme, frame, body, &mut hits),
+        Screen::Providers => render_providers(model, theme, frame, body, &mut hits),
     }
     if model.help_open {
         render_help(theme, frame, body);
@@ -1011,6 +1012,193 @@ fn render_accounts(
                 ));
             }
         }
+    }
+}
+
+/// `/providers` (W5d, report §5.2) — registry truth. The sim has NO such
+/// screen: this layout is owner-directed and PROVISIONAL until the v0.0.15
+/// install-probe sign-off (the brief records the gate). Rows are daemon
+/// truth; the default marker moves only on the correlated reply.
+fn render_providers(
+    model: &AppModel,
+    theme: &Theme,
+    frame: &mut Frame<'_>,
+    area: Rect,
+    hits: &mut Vec<(Rect, Hit)>,
+) {
+    let mut lines: Vec<Line<'_>> = Vec::new();
+    // (line, column, width, hit) — chips resolved to rects after layout.
+    let mut chip_hits: Vec<(usize, u16, u16, Hit)> = Vec::new();
+
+    lines.push(Line::from(vec![
+        Span::styled(
+            "PROVIDERS",
+            theme
+                .bright_style()
+                .add_modifier(ratatui::style::Modifier::BOLD),
+        ),
+        Span::styled(
+            " — registry truth · accounts live in /accounts",
+            theme.dim_style(),
+        ),
+    ]));
+    if let Some(message) = &model.providers.message {
+        lines.push(Line::styled(message.clone(), theme.gold_style()));
+    }
+    lines.push(Line::raw(""));
+
+    if model.providers.providers.is_empty() {
+        lines.push(Line::styled(
+            "  no providers in the registry snapshot yet",
+            theme.dim_style(),
+        ));
+    }
+    for (index, summary) in model.providers.providers.iter().enumerate() {
+        use haider_rpc::ProviderAvailabilityWire;
+        let (dot, dot_style, health) = match summary.availability {
+            ProviderAvailabilityWire::Available => ("●", theme.ok_style(), "available".to_owned()),
+            ProviderAvailabilityWire::Unavailable => (
+                "○",
+                theme.dim_style(),
+                summary
+                    .availability_reason
+                    .clone()
+                    .unwrap_or_else(|| "unavailable".to_owned()),
+            ),
+            ProviderAvailabilityWire::Unknown => ("◌", theme.dim_style(), "unknown".to_owned()),
+            _ => ("◌", theme.dim_style(), "unknown".to_owned()),
+        };
+        let mut header = Line::from(vec![
+            Span::styled(
+                summary.provider.clone(),
+                theme
+                    .bright_style()
+                    .add_modifier(ratatui::style::Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(format!("{dot} {health}"), dot_style),
+        ]);
+        if model.providers.cursor == index {
+            header = hover_band(header, true, area.width, theme);
+        }
+        lines.push(header);
+
+        // API family · endpoint (safe display — never interpolated into a
+        // command).
+        let family = match summary.api_family {
+            haider_rpc::ProviderApiFamilyWire::AnthropicMessages => "messages",
+            haider_rpc::ProviderApiFamilyWire::OpenAiResponses => "responses",
+            haider_rpc::ProviderApiFamilyWire::OpenAiChatCompletions => "openai-compatible",
+            _ => "unknown api",
+        };
+        let endpoint = summary.endpoint.clone().unwrap_or_else(|| "—".to_owned());
+        lines.push(Line::styled(
+            format!("    {family} · {endpoint}"),
+            theme.faint_style(),
+        ));
+
+        // Model chips: the default carries `*`; clicking a chip requests
+        // the default change (CAS-fenced, never optimistic).
+        if summary.models.is_empty() {
+            lines.push(Line::styled("    models: —", theme.dim_style()));
+        } else {
+            let mut spans = vec![Span::styled("    models: ", theme.dim_style())];
+            let mut offset = 4 + "models: ".len() as u16;
+            let pending = model
+                .providers
+                .pending_default
+                .as_ref()
+                .filter(|(provider, _)| *provider == summary.provider);
+            for model_name in &summary.models {
+                let is_default = summary.default_model.as_deref() == Some(model_name);
+                let is_pending = pending.is_some_and(|(_, pending_model)| pending_model == model_name);
+                let label = if is_default {
+                    format!("{model_name}*")
+                } else if is_pending {
+                    format!("{model_name}…")
+                } else {
+                    model_name.clone()
+                };
+                let width = label.chars().count() as u16;
+                chip_hits.push((
+                    lines.len(),
+                    offset,
+                    width,
+                    Hit::ProviderModel {
+                        provider: summary.provider.clone(),
+                        model: model_name.clone(),
+                    },
+                ));
+                spans.push(Span::styled(
+                    label,
+                    if is_default {
+                        theme.gold_style()
+                    } else if is_pending {
+                        theme.pulse_ink(theme.gold, model.anim_phase)
+                    } else {
+                        theme.text_style()
+                    },
+                ));
+                spans.push(Span::raw("  "));
+                offset += width + 2;
+            }
+            lines.push(Line::from(spans));
+        }
+
+        // Active account projection (from the accounts snapshot when the
+        // user has visited /accounts; an em-dash otherwise — never a guess).
+        let account_line = model
+            .accounts
+            .rows
+            .iter()
+            .find(|row| row.provider == summary.provider && row.selected)
+            .map_or_else(
+                || "    account: — (/accounts)".to_owned(),
+                |row| {
+                    format!(
+                        "    account: {} · {} · in use",
+                        row.alias,
+                        crate::app::auth_label(row.method)
+                    )
+                },
+            );
+        let accounts_label = "[accounts]";
+        let account_offset = account_line.chars().count() as u16 + 2;
+        chip_hits.push((
+            lines.len(),
+            account_offset,
+            accounts_label.chars().count() as u16,
+            Hit::ProviderAccounts,
+        ));
+        lines.push(Line::from(vec![
+            Span::styled(account_line, theme.dim_style()),
+            Span::raw("  "),
+            Span::styled(accounts_label, theme.gold_style()),
+        ]));
+        lines.push(Line::raw(""));
+    }
+
+    lines.push(Line::styled(
+        "click a model to make it the provider default · [accounts] switches credentials · esc back",
+        theme.faint_style(),
+    ));
+
+    frame.render_widget(Paragraph::new(lines), area);
+
+    for (line_index, x, width, hit) in chip_hits {
+        let y = area.y + line_index as u16;
+        if y >= area.y + area.height || x >= area.width {
+            continue;
+        }
+        hits.push((
+            Rect {
+                x: area.x + x,
+                y,
+                width: width.min(area.width - x),
+                height: 1,
+            },
+            hit,
+        ));
     }
 }
 
