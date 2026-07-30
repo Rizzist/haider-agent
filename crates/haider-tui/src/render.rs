@@ -3553,7 +3553,7 @@ fn palette_row_hits(model: &AppModel, area: Rect, hits: &mut Vec<(Rect, Hit)>) {
                     width: area.width,
                     height: 1,
                 },
-                Hit::PaletteRow(*item),
+                Hit::PaletteRow(item.clone()),
             ));
         }
     }

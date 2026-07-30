@@ -83,27 +83,24 @@ fn login_has_argument_slots_for_provider_then_method() {
     //
     // MUTATION CHECK: drop `"login"` from `commands::has_arg_slots` and the
     // fully-typed-command case below returns the command row, not slots.
-    let providers = palette_items("login ", false);
+    let providers = palette_items("login ", false, &Default::default());
     assert!(
         providers.iter().any(|item| matches!(
             item,
-            PaletteItem::Arg {
-                value: "anthropic",
-                ..
-            }
+            PaletteItem::Arg { value, .. } if value == "anthropic"
         )),
         "slot 0 offers providers"
     );
-    let methods = palette_items("login anthropic ", false);
+    let methods = palette_items("login anthropic ", false, &Default::default());
     let values: Vec<String> = methods.iter().map(PaletteItem::label).collect();
     assert_eq!(values, vec!["api", "oauth"], "slot 1 offers the methods");
     assert!(
-        palette_items("login anthropic api ", false).is_empty(),
+        palette_items("login anthropic api ", false, &Default::default()).is_empty(),
         "there is no third slot"
     );
     // A fully-typed `/login` jumps straight to its first slot.
     assert!(matches!(
-        palette_items("login", false).first(),
+        palette_items("login", false, &Default::default()).first(),
         Some(PaletteItem::Arg { cmd: "login", .. })
     ));
 }

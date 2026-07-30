@@ -2122,6 +2122,76 @@ impl AppModel {
     /// Current palette rows (commands, or `/theme`'s argument slot) for
     /// rendering and completion.
     #[must_use]
+    /// The live candidates for the discovered argument slots (W5e-3).
+    /// Providers and models come from `provider.list`'s published summaries
+    /// (which serve the DISCOVERED catalog since W5e-2); accounts from
+    /// `account.list`. Nothing here is a compile-time list.
+    pub fn dynamic_slots(&self) -> crate::commands::DynamicSlots {
+        let providers = self
+            .providers
+            .providers
+            .iter()
+            .map(|summary| {
+                let health = match summary.availability {
+                    haider_rpc::ProviderAvailabilityWire::Available => "available",
+                    _ => summary
+                        .availability_reason
+                        .as_deref()
+                        .unwrap_or("unavailable"),
+                };
+                (summary.provider.clone(), health.to_owned())
+            })
+            .collect();
+        // `/model` offers the ACTIVE provider's models. The session's
+        // provider wins; otherwise the first summary that has any.
+        let active_provider = Some(self.identity.provider.clone())
+            .filter(|provider| !provider.is_empty())
+            .or_else(|| {
+                self.providers
+                    .providers
+                    .iter()
+                    .find(|summary| !summary.models.is_empty())
+                    .map(|summary| summary.provider.clone())
+            })
+            .unwrap_or_default();
+        let models = self
+            .providers
+            .providers
+            .iter()
+            .find(|summary| summary.provider == active_provider)
+            .map(|summary| {
+                summary
+                    .models
+                    .iter()
+                    .map(|slug| {
+                        let mut desc = active_provider.clone();
+                        if summary.default_model.as_deref() == Some(slug.as_str()) {
+                            desc.push_str(" · default");
+                        }
+                        (slug.clone(), desc)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let accounts = self
+            .accounts
+            .rows
+            .iter()
+            .map(|row| {
+                let mut desc = format!("{} · {}", row.provider, auth_label(row.method));
+                if row.selected {
+                    desc.push_str(" · in use");
+                }
+                (row.alias.clone(), desc)
+            })
+            .collect();
+        crate::commands::DynamicSlots {
+            providers,
+            models,
+            accounts,
+        }
+    }
+
     pub fn palette_items(&self) -> Vec<PaletteItem> {
         palette_items(
             self.composer.text().trim_start_matches('/'),
@@ -2129,6 +2199,7 @@ impl AppModel {
                 self.screen,
                 Screen::Session | Screen::Subagent | Screen::Aura
             ),
+            &self.dynamic_slots(),
         )
     }
 
@@ -2143,7 +2214,7 @@ impl AppModel {
         let items = self.palette_items();
         let item = items
             .get(self.palette_selection.min(items.len().saturating_sub(1)))
-            .copied()?;
+            .cloned()?;
         let body = self.composer.text().strip_prefix('/')?;
         match item {
             // Command rows exist only while the body is one unfinished
@@ -2482,7 +2553,7 @@ impl AppModel {
                     let items = self.palette_items();
                     match items
                         .get(self.palette_selection.min(items.len().saturating_sub(1)))
-                        .copied()
+                        .cloned()
                     {
                         Some(PaletteItem::Cmd(spec)) => {
                             self.composer.set_text(if has_arg_slots(spec.name) {
@@ -2515,7 +2586,7 @@ impl AppModel {
                     let items = self.palette_items();
                     match items
                         .get(self.palette_selection.min(items.len().saturating_sub(1)))
-                        .copied()
+                        .cloned()
                     {
                         Some(item) => self.activate_palette_item(item),
                         None => self.execute_slash(),
@@ -3940,6 +4011,60 @@ impl AppModel {
             }
             "accounts" => self.enter_accounts(),
             "providers" => self.enter_providers(),
+            // W5e-3: choose from the DISCOVERED catalog. Both are
+            // feature-gated BEFORE shipping this time (the W5e-1b lesson).
+            "model" => {
+                let requested = remainder.trim().to_owned();
+                let slots = self.dynamic_slots();
+                if slots.models.is_empty() {
+                    self.flash = Some(if self.daemon_serves(haider_rpc::FEATURE_PROVIDER_MODELS_V1)
+                    {
+                        "· no models discovered yet — /providers then refresh".to_owned()
+                    } else {
+                        self.stale_daemon_note("model discovery")
+                    });
+                } else if requested.is_empty() {
+                    let names: Vec<&str> =
+                        slots.models.iter().map(|(slug, _)| slug.as_str()).collect();
+                    self.flash = Some(format!("· models — {}", names.join(" · ")));
+                } else if let Some((slug, _)) = slots
+                    .models
+                    .iter()
+                    .find(|(slug, _)| slug.eq_ignore_ascii_case(&requested))
+                {
+                    // The model is DISCOVERED, so selecting it is honest.
+                    self.identity.model_short = slug.clone();
+                    self.flash = Some(format!("· model → {slug}"));
+                } else {
+                    self.flash = Some(format!(
+                        "· \"{requested}\" is not in this provider's discovered models"
+                    ));
+                }
+            }
+            "provider" => {
+                let requested = remainder.trim().to_owned();
+                let slots = self.dynamic_slots();
+                if slots.providers.is_empty() {
+                    self.flash = Some(self.stale_daemon_note("provider listing"));
+                } else if requested.is_empty() {
+                    let names: Vec<&str> = slots
+                        .providers
+                        .iter()
+                        .map(|(name, _)| name.as_str())
+                        .collect();
+                    self.flash = Some(format!("· providers — {}", names.join(" · ")));
+                } else if let Some((name, health)) = slots
+                    .providers
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case(&requested))
+                {
+                    self.identity.provider = name.clone();
+                    self.flash = Some(format!("· provider → {name} · {health}"));
+                } else {
+                    self.flash =
+                        Some(format!("· no provider \"{requested}\" in the registry"));
+                }
+            }
             "account" => {
                 // Sim tui.js:1770-1780: no alias → note listing them; a
                 // known alias selects (same daemon-gated path as a click);
@@ -3966,7 +4091,7 @@ impl AppModel {
             other => {
                 // Known stubs name their wave; typos say so (review r1 P2).
                 let wave = match other {
-                    "model" | "provider" => Some("the account switchboard (W5d)"),
+
                     "tree" | "fork" | "rename" | "tokens" => Some("the daemon wave (W3)"),
                     "peers" => Some("the mesh wave (post-v0.1)"),
                     "hooks" | "update" => Some("the gates wave (W4)"),
