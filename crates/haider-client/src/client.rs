@@ -313,6 +313,11 @@ pub struct RpcClient {
     events: StdMutex<Option<mpsc::Receiver<WireFrame>>>,
     outbound_limit: usize,
     tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// The handshake the connection negotiated on. Retained so a client that
+    /// only receives the `RpcClient` (the TUI's `run_live`) can still gate
+    /// its affordances on what the daemon ADVERTISED — report §4.1's
+    /// "hide/disable only the methods whose feature is absent".
+    welcome: Welcome,
 }
 
 impl RpcClient {
@@ -363,7 +368,15 @@ impl RpcClient {
             events: StdMutex::new(Some(events_rx)),
             outbound_limit,
             tasks,
+            welcome: welcome.clone(),
         }
+    }
+
+    /// The negotiated handshake (daemon version, granted capabilities, and
+    /// the advertised feature set).
+    #[must_use]
+    pub fn welcome(&self) -> &Welcome {
+        &self.welcome
     }
 
     /// Current lifecycle state.

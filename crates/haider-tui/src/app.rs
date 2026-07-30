@@ -270,6 +270,27 @@ pub struct AccountsState {
     pub cursor: usize,
 }
 
+impl AppModel {
+    /// Whether the connected daemon serves a method family. Demo mode
+    /// answers everything locally, so it is always capable there.
+    #[must_use]
+    pub fn daemon_serves(&self, feature: &str) -> bool {
+        self.mode.fabricates_locally() || self.daemon_features.contains(feature)
+    }
+
+    /// The honest refusal for a method this daemon does not serve — names
+    /// the stale daemon rather than letting the request fail obscurely.
+    #[must_use]
+    pub fn stale_daemon_note(&self, what: &str) -> String {
+        match &self.daemon_version {
+            Some(version) => format!(
+                "· {what} needs a newer daemon (running v{version}) — restart it to pick up this release"
+            ),
+            None => format!("· {what} is not served by the connected daemon"),
+        }
+    }
+}
+
 impl AccountsState {
     /// Applies an `account.list` snapshot, gated on revision monotonicity.
     /// `None` revisions (older daemons) always apply.
@@ -1711,6 +1732,15 @@ pub struct AppModel {
     pub accounts: AccountsState,
     /// `/providers` screen state (report §5.2).
     pub providers: ProvidersState,
+    /// What the CONNECTED daemon advertised in `Welcome` (features +
+    /// version). Empty in demo mode — demo answers everything locally.
+    ///
+    /// W5e-1b: report §4.1 says "clients hide/disable only the methods whose
+    /// feature is absent"; until this existed the TUI offered every button
+    /// regardless and a stale daemon answered `unknown session method`
+    /// (observed live: a daemon two days and five releases old).
+    pub daemon_features: std::collections::BTreeSet<String>,
+    pub daemon_version: Option<String>,
     /// The open OAuth add card, if any (accounts screen overlay).
     pub oauth_add: Option<OAuthAddCard>,
     /// Monotonic attempt counter for OAuth add cards.
@@ -1788,6 +1818,8 @@ impl Default for AppModel {
             wordmark: std::cell::RefCell::new(None),
             accounts: AccountsState::default(),
             providers: ProvidersState::default(),
+            daemon_features: std::collections::BTreeSet::new(),
+            daemon_version: None,
             oauth_add: None,
             oauth_attempt_seq: 0,
         }
@@ -4662,7 +4694,15 @@ impl AppModel {
                     // card drives account.oauth_start/status + account.add
                     // live, and the sim's simulated authorize in demo.
                     AccountAddKind::OpenAiOAuth | AccountAddKind::AnthropicOAuth => {
-                        self.open_oauth_add(kind);
+                        // Feature-gated (report §4.1): never offer a method
+                        // the connected daemon cannot serve.
+                        if self.daemon_serves(haider_rpc::FEATURE_ACCOUNT_OAUTH_PKCE_V1) {
+                            self.open_oauth_add(kind);
+                        } else {
+                            self.accounts.message =
+                                Some(self.stale_daemon_note("OAuth sign-in"));
+                            self.dirty = true;
+                        }
                     }
                     AccountAddKind::HuggingFace | AccountAddKind::Custom => {
                         self.flash = Some(

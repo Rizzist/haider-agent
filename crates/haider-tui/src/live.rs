@@ -362,6 +362,13 @@ pub enum LiveReply {
         provider: haider_rpc::ProviderSummaryWire,
         revision: u64,
     },
+    /// `account.oauth_start` FAILED. Identity-tagged because the request is
+    /// non-durable and its error reply has no command_id to correlate by.
+    OAuthStartFailed {
+        attempt_id: String,
+        code: String,
+        message: String,
+    },
     /// `account.oauth_start` answered (attempt-tagged via context).
     OAuthStarted {
         attempt_id: String,
@@ -1117,6 +1124,20 @@ impl LiveDriver {
                 );
                 // The authorize hop: open the user's browser (runtime effect).
                 model.requests.push(AppRequest::OpenUrl { url });
+                Vec::new()
+            }
+            LiveReply::OAuthStartFailed {
+                attempt_id,
+                code,
+                message,
+            } => {
+                let Some(flight) = self
+                    .oauth_flight
+                    .take_if(|flight| flight.attempt_id == attempt_id)
+                else {
+                    return Vec::new(); // a retired card's ghost — silent
+                };
+                model.oauth_add_failed(flight.attempt, &format!("{code} — {message}"));
                 Vec::new()
             }
             LiveReply::OAuthFlowStatus { flow_id, status } => {
