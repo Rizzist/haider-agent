@@ -36,8 +36,8 @@ pub use anthropic::{
     replay_anthropic_http_error, replay_anthropic_sse,
 };
 pub use catalog::{
-    CatalogError, CatalogSource, DiscoveredCatalog, DiscoveredModel, discover_models,
-    discover_models_with_resolver, parse_catalog, pickable,
+    CatalogError, CatalogSource, DiscoveredCatalog, DiscoveredModel, catalog_request_url,
+    discover_models, discover_models_with_resolver, parse_catalog, pickable,
 };
 pub use openai::{
     OPENAI_CODEX_RESPONSES_LITE_HEADER, OPENAI_CODEX_RESPONSES_LITE_VALUE,

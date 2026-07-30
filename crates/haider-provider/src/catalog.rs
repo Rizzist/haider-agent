@@ -99,6 +99,23 @@ pub enum CatalogSource {
     AnthropicSubscription,
 }
 
+/// The final request URL for a source's model catalog.
+///
+/// The codex backend REQUIRES a `client_version` query param — a bearer-only
+/// GET 400s with `missing field 'client_version'` (confirmed against the live
+/// endpoint 2026-07-30). Any well-formed value returns the full catalog; the
+/// value does not gate the model list. The origin guard pins the base
+/// host/path, so the query is not part of the SSRF surface.
+#[must_use]
+pub fn catalog_request_url(source: CatalogSource, endpoint: &str) -> String {
+    match source {
+        CatalogSource::OpenAiSubscription => {
+            format!("{endpoint}?client_version={OPENAI_CODEX_MODELS_CLIENT_VERSION}")
+        }
+        CatalogSource::AnthropicSubscription => endpoint.to_owned(),
+    }
+}
+
 impl CatalogSource {
     /// The exact endpoint discovery will request (and pin).
     #[must_use]
@@ -169,18 +186,7 @@ pub async fn discover_models_with_resolver(
             reason: "model catalog transport is unavailable".to_owned(),
         })?;
 
-    // The codex backend REQUIRES a `client_version` query param — a
-    // bearer-only GET 400s with `missing field 'client_version'` (confirmed
-    // against the live endpoint 2026-07-30). Any well-formed value returns
-    // the full catalog; the value does not gate the model list. The origin
-    // guard above pinned the base host/path, so the query is not part of the
-    // SSRF surface.
-    let request_url = match source {
-        CatalogSource::OpenAiSubscription => {
-            format!("{endpoint}?client_version={OPENAI_CODEX_MODELS_CLIENT_VERSION}")
-        }
-        CatalogSource::AnthropicSubscription => endpoint.clone(),
-    };
+    let request_url = catalog_request_url(source, &endpoint);
     let mut request = client
         .get(&request_url)
         .bearer_auth(access_token)

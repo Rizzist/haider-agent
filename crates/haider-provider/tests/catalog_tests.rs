@@ -182,3 +182,30 @@ fn display_name_falls_back_to_the_slug() {
         }]
     );
 }
+
+/// MUTATION CHECK (W5f-2d): drop the `client_version` query param from
+/// `catalog_request_url` for the OpenAI subscription source. Expected
+/// runtime failure: the URL no longer carries `client_version`, which is a
+/// hard 400 against the live codex endpoint (`missing field
+/// 'client_version'`, confirmed 2026-07-30).
+/// Verified by revert on 2026-07-30.
+#[test]
+fn the_openai_models_request_carries_client_version() {
+    let url = haider_provider::catalog_request_url(
+        CatalogSource::OpenAiSubscription,
+        "https://chatgpt.com/backend-api/codex/models",
+    );
+    assert!(
+        url.contains("client_version="),
+        "the codex models request must carry client_version: {url}"
+    );
+    // Anthropic's endpoint takes no such param.
+    let anthropic = haider_provider::catalog_request_url(
+        CatalogSource::AnthropicSubscription,
+        "https://api.anthropic.com/v1/models",
+    );
+    assert!(
+        !anthropic.contains('?'),
+        "the Anthropic request adds no query: {anthropic}"
+    );
+}
