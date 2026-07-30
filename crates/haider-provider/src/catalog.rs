@@ -34,6 +34,12 @@ use crate::origin::{FixedDnsResolver, FixedOriginGuard, SystemFixedDnsResolver};
 /// per-model base instructions, so this is generous but still bounded.
 const MAX_CATALOG_BYTES: usize = 1024 * 1024;
 const CATALOG_TIMEOUT: Duration = Duration::from_secs(15);
+/// Value for the codex model endpoint's required `client_version` query
+/// param. The backend only checks PRESENCE and well-formedness — it does
+/// not gate the returned catalog on the value — so a stable recent codex
+/// version keeps us a good citizen without pinning haider to codex's
+/// release cadence.
+const OPENAI_CODEX_MODELS_CLIENT_VERSION: &str = "0.145.0";
 
 /// One model as the PROVIDER described it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -163,8 +169,20 @@ pub async fn discover_models_with_resolver(
             reason: "model catalog transport is unavailable".to_owned(),
         })?;
 
+    // The codex backend REQUIRES a `client_version` query param — a
+    // bearer-only GET 400s with `missing field 'client_version'` (confirmed
+    // against the live endpoint 2026-07-30). Any well-formed value returns
+    // the full catalog; the value does not gate the model list. The origin
+    // guard above pinned the base host/path, so the query is not part of the
+    // SSRF surface.
+    let request_url = match source {
+        CatalogSource::OpenAiSubscription => {
+            format!("{endpoint}?client_version={OPENAI_CODEX_MODELS_CLIENT_VERSION}")
+        }
+        CatalogSource::AnthropicSubscription => endpoint.clone(),
+    };
     let mut request = client
-        .get(&endpoint)
+        .get(&request_url)
         .bearer_auth(access_token)
         .header(reqwest::header::CONNECTION, "close")
         .header(reqwest::header::ACCEPT, "application/json");

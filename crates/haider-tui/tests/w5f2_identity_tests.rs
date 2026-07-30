@@ -268,3 +268,90 @@ fn connecting_asks_for_account_and_provider_truth() {
         pass.commands
     );
 }
+
+/// MUTATION CHECK (W5f-2d): make the driver's Accounts arm return
+/// `Vec::new()` instead of `self.provider_model_refreshes(model)`. Expected
+/// runtime failure: an active OAuth account with no catalog triggers no
+/// discovery, so the picker and bootstrap stay empty forever — the exact
+/// live symptom before this fix (identity stuck on the demo seed).
+/// Verified by revert on 2026-07-30.
+#[test]
+fn an_active_oauth_account_with_no_catalog_triggers_discovery() {
+    let mut model = live_model();
+    let mut driver = LiveDriver::new("test");
+    let pass = live_pass(
+        &mut driver,
+        &mut model,
+        Some(LiveReply::Accounts {
+            descriptors: vec![oauth_descriptor("openai-oauth", "openai-oauth", true)],
+            revision: Some(1),
+        }),
+        std::time::Instant::now(),
+    );
+    assert!(
+        pass.commands.iter().any(|command| matches!(
+            command,
+            LiveCommand::RefreshProviderModels { provider } if provider == "openai-oauth"
+        )),
+        "the active OAuth provider must have its catalog discovered: {:?}",
+        pass.commands
+    );
+
+    // ONE request per provider per connection — a second snapshot does not
+    // re-ask.
+    let again = live_pass(
+        &mut driver,
+        &mut model,
+        Some(LiveReply::Accounts {
+            descriptors: vec![oauth_descriptor("openai-oauth", "openai-oauth", true)],
+            revision: Some(2),
+        }),
+        std::time::Instant::now(),
+    );
+    assert!(
+        !again
+            .commands
+            .iter()
+            .any(|command| matches!(command, LiveCommand::RefreshProviderModels { .. })),
+        "discovery must not storm on every snapshot: {:?}",
+        again.commands
+    );
+}
+
+/// The refreshed catalog lands via `ProviderModelsRefreshed` and completes
+/// the bootstrap to the provider's real default model.
+#[test]
+fn a_refreshed_catalog_completes_the_bootstrap() {
+    let mut model = live_model();
+    let mut driver = LiveDriver::new("test");
+    let seed_provider = model.identity.provider.clone();
+    // Account active, provider present but WITHOUT models yet.
+    live_pass(
+        &mut driver,
+        &mut model,
+        Some(LiveReply::Accounts {
+            descriptors: vec![oauth_descriptor("openai-oauth", "openai-oauth", true)],
+            revision: Some(1),
+        }),
+        std::time::Instant::now(),
+    );
+    assert_eq!(
+        model.identity.provider, seed_provider,
+        "no adoption before the catalog arrives"
+    );
+    // The catalog arrives.
+    pass(
+        &mut driver,
+        &mut model,
+        LiveReply::ProviderModelsRefreshed {
+            provider: provider_summary(
+                "openai-oauth",
+                &["gpt-5.6-sol", "gpt-5.6-terra"],
+                "gpt-5.6-sol",
+            ),
+            revision: 2,
+        },
+    );
+    assert_eq!(model.identity.provider, "openai-oauth");
+    assert_eq!(model.identity.model_short, "gpt-5.6-sol");
+}

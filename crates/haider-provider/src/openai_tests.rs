@@ -765,3 +765,73 @@ fn ipv6_literal_compatible_base_url_is_classified_as_a_literal_not_a_hostname() 
         "a domain must classify as a hostname for resolve-validate-pin"
     );
 }
+
+fn probe_request(model: &str) -> TurnRequest {
+    TurnRequest {
+        messages: vec![crate::Message::user_text("say PINGACK")],
+        model: model.to_owned(),
+        max_tokens: 200_000,
+        system_prompt: Some("Be terse.".to_owned()),
+        tools: Vec::new(),
+        attachments: Vec::new(),
+    }
+}
+
+/// MUTATION CHECK (W5f-2d): in `responses_request_json`, keep inserting
+/// `max_output_tokens` under lite, or drop the `parallel_tool_calls=false` /
+/// `reasoning.context=all_turns` inserts. Expected runtime failure: the
+/// assertions below fail — and against the LIVE codex endpoint each of those
+/// three is a hard 400 (confirmed 2026-07-30: "Unsupported parameter:
+/// max_output_tokens", "requires parallel_tool_calls to be false", "requires
+/// reasoning.context to be all_turns").
+/// Verified by revert on 2026-07-30.
+#[test]
+fn codex_lite_payload_meets_the_subscription_contract() {
+    let payload =
+        responses_request_json(&probe_request("gpt-5.6-sol"), true).expect("lite payload");
+    let object = payload.as_object().expect("object");
+    assert!(
+        !object.contains_key("max_output_tokens"),
+        "lite REJECTS max_output_tokens: {payload}"
+    );
+    assert_eq!(
+        object.get("parallel_tool_calls"),
+        Some(&serde_json::Value::Bool(false)),
+        "lite requires parallel_tool_calls=false"
+    );
+    assert_eq!(
+        payload
+            .get("reasoning")
+            .and_then(|reasoning| reasoning.get("context"))
+            .and_then(|context| context.as_str()),
+        Some("all_turns"),
+        "lite requires reasoning.context=all_turns: {payload}"
+    );
+}
+
+/// The API-key Responses path is UNCHANGED: it still sends the output cap and
+/// never the lite-only fields.
+#[test]
+fn api_key_payload_keeps_max_output_tokens_and_no_lite_fields() {
+    let payload =
+        responses_request_json(&probe_request("gpt-5.6-sol"), false).expect("api-key payload");
+    let object = payload.as_object().expect("object");
+    assert_eq!(
+        object
+            .get("max_output_tokens")
+            .and_then(|value| value.as_u64()),
+        Some(200_000),
+        "the API-key path keeps its output cap"
+    );
+    assert!(
+        !object.contains_key("parallel_tool_calls"),
+        "the lite-only field must not leak onto the API-key path"
+    );
+    assert_eq!(
+        payload
+            .get("reasoning")
+            .and_then(|reasoning| reasoning.get("context")),
+        None,
+        "no all_turns context on the API-key path"
+    );
+}

@@ -267,21 +267,21 @@ fn map_provider_error(error: haider_provider::ProviderError) -> ValidationError 
 #[derive(Clone)]
 pub enum VaultProvision {
     Available(Arc<dyn Vault>),
+    /// Resolve to the profile's file vault during `initialize` (it owns the
+    /// store dir). The default on every platform since W5f-4.
+    PlatformDefault,
     Unsupported,
 }
 
 impl VaultProvision {
-    /// Platform default: macOS Keychain; every other platform is
-    /// `Unsupported` and rejects login with stable `vault_unsupported`.
+    /// Platform default (W5f-4): the profile's on-disk [`FileVault`], on
+    /// every platform. The macOS Keychain default was retired — every
+    /// haider build is ad-hoc-signed, so the Keychain saw a fresh app each
+    /// release and prompted for the login-keychain PASSWORD from a binary
+    /// the user could not identify.
+    #[must_use]
     pub fn platform_default() -> Self {
-        #[cfg(target_os = "macos")]
-        {
-            Self::Available(Arc::new(haider_accounts::KeychainVault::new()))
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            Self::Unsupported
-        }
+        Self::PlatformDefault
     }
 }
 
@@ -3506,6 +3506,12 @@ async fn handle_oauth_import(
         let alias_for_read = alias.clone();
         match tokio::task::spawn_blocking(move || vault_for_read.resolve(&alias_for_read)).await {
             Ok(Ok(stored)) => Some(stored),
+            // The descriptor row exists but its secret is GONE (a
+            // Keychain→file-vault upgrade, W5f-4; or a torn write). Re-import
+            // is exactly the recovery: proceed as if fresh — no prior bundle
+            // to increment a generation from, and the new secret restores the
+            // account. Any OTHER vault fault is real and still fails.
+            Ok(Err(error)) if error.code == ErrorCode::CredentialMissing => None,
             Ok(Err(error)) => {
                 respond_management_error(&job.route, &error);
                 return;
@@ -3799,7 +3805,13 @@ async fn persist_oauth_bundle(
     bundle: haider_accounts::OAuthTokenBundleV1,
     prior_secret: Option<SecretHandle>,
 ) -> Result<(), HaiderError> {
-    let replacing = prior_secret.is_some();
+    // The STORE is the authority on whether the descriptor row exists —
+    // not `prior_secret`. A vanished prior secret (a Keychain→file-vault
+    // upgrade, W5f-4; or a torn write) still has a live descriptor row, and
+    // that row must be REPLACED, not add-rejected as a duplicate. Rollback
+    // below still keys off `prior_secret`: with none, a failed save deletes
+    // what we just wrote rather than restoring bytes that were already gone.
+    let replacing = accounts.get(alias).is_some();
     let active = accounts.get(alias).map_or_else(
         || accounts.active_for_provider(provider).is_none(),
         |descriptor| descriptor.active,
@@ -4992,12 +5004,27 @@ impl AccountsRuntime {
         // Global aliases are the descriptor coordinate, but the Keychain is
         // machine-global — the physical key must stay profile-scoped so two
         // profiles' identical aliases can never collide (see profile_vault.rs).
-        let vault = match &dependencies.vault {
-            VaultProvision::Available(inner) => VaultProvision::Available(Arc::new(
-                crate::profile_vault::ProfileVault::new(Arc::clone(inner), profile_id),
-            )
-                as Arc<dyn Vault>),
-            VaultProvision::Unsupported => VaultProvision::Unsupported,
+        // Resolve the SOURCE secret store first: an injected vault (tests,
+        // an explicit override) is used as-is; the platform default is the
+        // profile's own file vault under the store dir (W5f-4); `Unsupported`
+        // stays an explicit opt-out that rejects login. `PlatformDefault` is
+        // consumed HERE and never reaches the matches below.
+        let source: Option<Arc<dyn Vault>> = match &dependencies.vault {
+            VaultProvision::Available(inner) => Some(Arc::clone(inner)),
+            VaultProvision::PlatformDefault => Some(Arc::new(haider_accounts::FileVault::new(
+                store_dir.join("vault"),
+            )) as Arc<dyn Vault>),
+            VaultProvision::Unsupported => None,
+        };
+        // R10: every daemon vault consumer funnels through this ONE wrap.
+        // Global aliases are the descriptor coordinate, but the physical key
+        // must stay profile-scoped so two profiles' identical aliases can
+        // never collide (see profile_vault.rs).
+        let vault = match source {
+            Some(inner) => VaultProvision::Available(Arc::new(
+                crate::profile_vault::ProfileVault::new(inner, profile_id),
+            ) as Arc<dyn Vault>),
+            None => VaultProvision::Unsupported,
         };
         reconcile_remove_receipts(store, &mut accounts, &vault).await?;
         reconcile_login_receipts(store, &mut accounts, &vault).await?;
@@ -5018,6 +5045,9 @@ impl AccountsRuntime {
         let actor_vault: Arc<dyn Vault> = match &vault {
             VaultProvision::Available(vault) => Arc::clone(vault),
             VaultProvision::Unsupported => Arc::new(MemoryVault::default()),
+            VaultProvision::PlatformDefault => {
+                unreachable!("PlatformDefault is resolved to a concrete vault above")
+            }
         };
         let refresh_fences = RefreshFenceRegistry::default();
         let actor_config = AccountActorConfig {
@@ -5064,6 +5094,9 @@ impl AccountsRuntime {
                     vault,
                     broker: Some(broker),
                 })
+            }
+            VaultProvision::PlatformDefault => {
+                unreachable!("PlatformDefault is resolved to a concrete vault above")
             }
             VaultProvision::Unsupported => {
                 let actor = start_account_actor(actor_config);

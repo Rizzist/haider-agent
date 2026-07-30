@@ -838,9 +838,10 @@ dependencies = [
 
 [[package]]
 name = "haider-accounts"
-version = "0.0.21"
+version = "0.0.22"
 dependencies = [
  "haider-protocol",
+ "hex",
  "security-framework",
  "serde",
  "serde_json",
@@ -850,7 +851,7 @@ dependencies = [
 
 [[package]]
 name = "haider-cli"
-version = "0.0.21"
+version = "0.0.22"
 dependencies = [
  "async-trait",
  "haider-accounts",
@@ -870,7 +871,7 @@ dependencies = [
 
 [[package]]
 name = "haider-client"
-version = "0.0.21"
+version = "0.0.22"
 dependencies = [
  "blake3",
  "haider-rpc",
@@ -884,7 +885,7 @@ dependencies = [
 
 [[package]]
 name = "haider-core"
-version = "0.0.21"
+version = "0.0.22"
 dependencies = [
  "async-trait",
  "blake3",
@@ -901,7 +902,7 @@ dependencies = [
 
 [[package]]
 name = "haider-daemon"
-version = "0.0.21"
+version = "0.0.22"
 dependencies = [
  "async-trait",
  "base64",
@@ -934,7 +935,7 @@ dependencies = [
 
 [[package]]
 name = "haider-daemond"
-version = "0.0.21"
+version = "0.0.22"
 dependencies = [
  "async-trait",
  "base64",
@@ -963,7 +964,7 @@ dependencies = [
 
 [[package]]
 name = "haider-protocol"
-version = "0.0.21"
+version = "0.0.22"
 dependencies = [
  "serde",
  "serde_json",
@@ -971,7 +972,7 @@ dependencies = [
 
 [[package]]
 name = "haider-provider"
-version = "0.0.21"
+version = "0.0.22"
 dependencies = [
  "async-trait",
  "haider-accounts",
@@ -985,7 +986,7 @@ dependencies = [
 
 [[package]]
 name = "haider-rpc"
-version = "0.0.21"
+version = "0.0.22"
 dependencies = [
  "haider-protocol",
  "serde",
@@ -995,7 +996,7 @@ dependencies = [
 
 [[package]]
 name = "haider-store"
-version = "0.0.21"
+version = "0.0.22"
 dependencies = [
  "blake3",
  "haider-protocol",
@@ -1007,7 +1008,7 @@ dependencies = [
 
 [[package]]
 name = "haider-tools"
-version = "0.0.21"
+version = "0.0.22"
 dependencies = [
  "async-trait",
  "base64",
@@ -1022,7 +1023,7 @@ dependencies = [
 
 [[package]]
 name = "haider-tui"
-version = "0.0.21"
+version = "0.0.22"
 dependencies = [
  "base64",
  "haider-client",
@@ -1043,7 +1044,7 @@ dependencies = [
 
 [[package]]
 name = "haider-verify"
-version = "0.0.21"
+version = "0.0.22"
 
 [[package]]
 name = "hashbrown"
@@ -3844,7 +3845,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.0.21"
+version = "0.0.22"
 
 [[package]]
 name = "yoke"

@@ -14,6 +14,9 @@
 //!   decision mechanically and ships no policy (that lands in D3b).
 
 mod env_bridge;
+mod file_vault;
+#[cfg(test)]
+mod file_vault_tests;
 mod keychain;
 #[cfg(test)]
 mod keychain_tests;
@@ -23,6 +26,7 @@ mod store;
 mod vault;
 
 pub use env_bridge::import_env;
+pub use file_vault::FileVault;
 pub use haider_protocol::credential::{
     AuthMethod, CredentialDescriptor, CredentialStatus, RotationEvent,
 };

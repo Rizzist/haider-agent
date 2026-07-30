@@ -329,7 +329,7 @@ impl OpenAiProvider {
         request: &TurnRequest,
     ) -> Result<serde_json::Value, ProviderError> {
         self.http.validate_model(request)?;
-        responses_request_json(request)
+        responses_request_json(request, self.http.codex_responses_lite)
     }
 
     pub async fn capture_response(
@@ -1532,7 +1532,10 @@ fn openai_stream_error(value: &serde_json::Value) -> ProviderError {
     )
 }
 
-fn responses_request_json(request: &TurnRequest) -> Result<serde_json::Value, ProviderError> {
+fn responses_request_json(
+    request: &TurnRequest,
+    codex_responses_lite: bool,
+) -> Result<serde_json::Value, ProviderError> {
     let attachments = attachment_index(request)?;
     let mut input = Vec::new();
     for message in &request.messages {
@@ -1648,9 +1651,15 @@ fn responses_request_json(request: &TurnRequest) -> Result<serde_json::Value, Pr
             })
         })
         .collect::<Vec<_>>();
+    // The codex responses-lite endpoint (subscription OAuth) enforces its
+    // own contract, confirmed against the live endpoint 2026-07-30:
+    //   - `max_output_tokens` is REJECTED as unsupported;
+    //   - `parallel_tool_calls` MUST be false;
+    //   - `reasoning.context` MUST be `all_turns` (even for non-reasoning
+    //     models).
+    // The API-key Responses path keeps its original shape.
     let mut payload = serde_json::json!({
         "model": request.model,
-        "max_output_tokens": request.max_tokens,
         "input": input,
         "stream": true,
         "store": false,
@@ -1658,6 +1667,14 @@ fn responses_request_json(request: &TurnRequest) -> Result<serde_json::Value, Pr
     let object = payload
         .as_object_mut()
         .ok_or_else(|| internal("OpenAI Responses request payload was not a JSON object"))?;
+    if codex_responses_lite {
+        object.insert("parallel_tool_calls".into(), serde_json::Value::Bool(false));
+    } else {
+        object.insert(
+            "max_output_tokens".into(),
+            serde_json::json!(request.max_tokens),
+        );
+    }
     if let Some(instructions) = &request.system_prompt {
         object.insert(
             "instructions".into(),
@@ -1667,12 +1684,25 @@ fn responses_request_json(request: &TurnRequest) -> Result<serde_json::Value, Pr
     if !tools.is_empty() {
         object.insert("tools".into(), serde_json::Value::Array(tools));
     }
-    if model_has_reasoning(&request.model) {
-        object.insert("reasoning".into(), serde_json::json!({"summary": "auto"}));
-        object.insert(
-            "include".into(),
-            serde_json::json!(["reasoning.encrypted_content"]),
-        );
+    // Reasoning object: `summary: auto` + encrypted-content include for
+    // reasoning models; lite ADDS the required `context: all_turns` and
+    // ensures the object exists even for a non-reasoning model.
+    let reasoning_model = model_has_reasoning(&request.model);
+    if reasoning_model || codex_responses_lite {
+        let mut reasoning = serde_json::Map::new();
+        if reasoning_model {
+            reasoning.insert("summary".into(), serde_json::json!("auto"));
+        }
+        if codex_responses_lite {
+            reasoning.insert("context".into(), serde_json::json!("all_turns"));
+        }
+        object.insert("reasoning".into(), serde_json::Value::Object(reasoning));
+        if reasoning_model {
+            object.insert(
+                "include".into(),
+                serde_json::json!(["reasoning.encrypted_content"]),
+            );
+        }
     }
     Ok(payload)
 }

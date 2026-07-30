@@ -163,6 +163,12 @@ pub enum LiveCommand {
     },
     /// `provider.list` for the `/providers` screen (W5d). A read.
     ProviderList,
+    /// `provider.models_refresh` (W5f-2d): discover the provider's live
+    /// catalog from its subscription source. Triggered when an active OAuth
+    /// account has no discovered models yet — the fetch needs its token.
+    RefreshProviderModels {
+        provider: String,
+    },
     /// `account.oauth_start` (W5e-1). Transient — never outboxed; a lost
     /// response is answered by a fresh card, never a replay.
     OAuthStart {
@@ -218,6 +224,7 @@ impl LiveCommand {
             | Self::Detach { .. }
             | Self::AccountList
             | Self::ProviderList
+            | Self::RefreshProviderModels { .. }
             | Self::OAuthStart { .. }
             | Self::OAuthStatus { .. }
             | Self::OAuthCancel { .. }
@@ -357,6 +364,12 @@ pub enum LiveReply {
     /// `provider.list` answered (W5d `/providers`).
     Providers {
         providers: Vec<haider_rpc::ProviderSummaryWire>,
+        revision: u64,
+    },
+    /// `provider.models_refresh` answered (W5f-2d): one provider's summary,
+    /// now carrying its discovered catalog.
+    ProviderModelsRefreshed {
+        provider: haider_rpc::ProviderSummaryWire,
         revision: u64,
     },
     /// `account.set_default_model` committed.
@@ -551,6 +564,11 @@ pub struct LiveDriver {
     /// Text handed to `session.create`, held until the daemon names the
     /// session it created.
     creating: HashMap<CommandId, String>,
+    /// Providers a model-refresh has already been requested for this
+    /// connection (W5f-2d) — so an active OAuth account with no discovered
+    /// catalog triggers ONE fetch, not one per snapshot. Cleared on redial
+    /// (a fresh daemon may answer differently).
+    models_requested: std::collections::HashSet<String>,
     /// The pass clock. `live_pass` stamps it once per pass so the driver's
     /// deadlines are a pure function of the value it was handed — a test
     /// moves time by calling [`Self::set_now`], never by sleeping.
@@ -612,6 +630,7 @@ impl LiveDriver {
             connected: true,
             pending_first_turn: HashMap::new(),
             creating: HashMap::new(),
+            models_requested: std::collections::HashSet::new(),
             now: std::time::Instant::now(),
         }
     }
@@ -1072,7 +1091,9 @@ impl LiveDriver {
                     model.bootstrap_identity_from_daemon();
                     model.dirty = true;
                 }
-                Vec::new()
+                // An active OAuth account with no catalog yet needs one
+                // discovered before the picker or the bootstrap can work.
+                self.provider_model_refreshes(model)
             }
             LiveReply::AccountSelected {
                 command_id,
@@ -1097,6 +1118,17 @@ impl LiveDriver {
                 if model.providers.apply_snapshot(providers, revision) {
                     // The provider snapshot may complete the bootstrap the
                     // account snapshot started (either order works).
+                    model.bootstrap_identity_from_daemon();
+                    model.dirty = true;
+                }
+                // Providers may have arrived before accounts — re-check
+                // whether an active OAuth provider still needs its catalog.
+                self.provider_model_refreshes(model)
+            }
+            LiveReply::ProviderModelsRefreshed { provider, revision } => {
+                if model.providers.apply_models_refresh(provider, revision) {
+                    // The catalog is here: NOW the bootstrap can adopt the
+                    // provider's real default model (W5f-2d).
                     model.bootstrap_identity_from_daemon();
                     model.dirty = true;
                 }
@@ -1733,7 +1765,37 @@ impl LiveDriver {
     /// Rebuild the world on a fresh connection: reattach every session that
     /// was in the working set, each from ITS OWN last applied cursor, then
     /// resend the outbox under its durable ids.
+    /// Discover the catalog for any ACTIVE OAuth account whose provider has
+    /// no models yet (W5f-2d): the picker and the identity bootstrap both
+    /// need real slugs, and the fetch needs the account's token. One request
+    /// per provider per connection — the dedup set stops a snapshot storm.
+    fn provider_model_refreshes(&mut self, model: &AppModel) -> Vec<LiveCommand> {
+        let mut commands = Vec::new();
+        for row in &model.accounts.rows {
+            if !row.selected || row.method != haider_protocol::credential::AuthMethod::OAuth {
+                continue;
+            }
+            let has_models = model
+                .providers
+                .providers
+                .iter()
+                .find(|summary| summary.provider == row.provider)
+                .is_some_and(|summary| !summary.models.is_empty());
+            if has_models || self.models_requested.contains(&row.provider) {
+                continue;
+            }
+            self.models_requested.insert(row.provider.clone());
+            commands.push(LiveCommand::RefreshProviderModels {
+                provider: row.provider.clone(),
+            });
+        }
+        commands
+    }
+
     fn resume(&mut self, model: &mut AppModel) -> Vec<LiveCommand> {
+        // A fresh socket's daemon may answer discovery differently — let it
+        // be asked again (W5f-2d).
+        self.models_requested.clear();
         // Account + provider truth ride the connect (W5f-2): the identity
         // bootstrap fires when their snapshots APPLY, so without asking at
         // the front door the launcher would sit on demo seeds until the

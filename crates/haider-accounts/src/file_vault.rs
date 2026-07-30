@@ -1,0 +1,184 @@
+//! File-backed secret vault — the DEFAULT vault on every platform (W5f-4).
+//!
+//! R10 amendment (owner decision, 2026-07-30): the macOS Keychain default is
+//! retired. Every haider build is ad-hoc-signed, so the Keychain saw a "new"
+//! app each release and escalated to a login-keychain PASSWORD prompt from a
+//! binary the user couldn't identify. The file vault stores each secret in
+//! its own file under a daemon-owned directory with the same protection
+//! model the peer CLIs use for their own tokens (`~/.codex/auth.json`,
+//! `~/.claude/.credentials.json`): directory `0700`, files `0600`, owner
+//! only. Secrets remain inside [`SecretHandle`] / zeroizing buffers in
+//! memory, and never appear in errors — an alias is the only identifier a
+//! message may carry.
+//!
+//! On-disk layout: `<root>/<hex(alias bytes)>.vault`. Hex is reversible (so
+//! `list` recovers aliases without a side index), filesystem-safe, and
+//! preserves byte order (so lexical filename order IS lexical alias order).
+//! Writes are atomic: a `0600` temp file in the same directory, then rename.
+
+use std::io::Write;
+use std::path::PathBuf;
+
+use haider_protocol::error::ErrorCode;
+use haider_protocol::ids::CredentialAlias;
+use zeroize::Zeroizing;
+
+use crate::vault::{SecretHandle, Vault};
+use crate::{AccountsResult, accounts_error};
+
+/// Largest secret the vault will store or read back — matches the OAuth
+/// bundle ceiling with headroom; anything bigger is a corrupt write, not a
+/// credential.
+const MAX_SECRET_BYTES: u64 = 512 * 1024;
+
+const VAULT_SUFFIX: &str = ".vault";
+
+/// File-per-alias vault rooted at a daemon-owned directory.
+pub struct FileVault {
+    root: PathBuf,
+}
+
+impl FileVault {
+    /// A vault rooted at `root`. The directory is created (mode `0700`) on
+    /// first write; a read-only operation on a missing root behaves as an
+    /// empty vault.
+    #[must_use]
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    fn path_for(&self, alias: &CredentialAlias) -> PathBuf {
+        self.root
+            .join(format!("{}{VAULT_SUFFIX}", hex::encode(alias.as_str())))
+    }
+
+    fn ensure_root(&self) -> AccountsResult<()> {
+        if self.root.is_dir() {
+            return Ok(());
+        }
+        std::fs::create_dir_all(&self.root)
+            .map_err(|error| io_error("create vault directory", &error))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&self.root, std::fs::Permissions::from_mode(0o700))
+                .map_err(|error| io_error("restrict vault directory", &error))?;
+        }
+        Ok(())
+    }
+}
+
+impl Vault for FileVault {
+    fn put(&self, alias: &CredentialAlias, secret: &[u8]) -> AccountsResult<()> {
+        if u64::try_from(secret.len()).unwrap_or(u64::MAX) > MAX_SECRET_BYTES {
+            return Err(accounts_error(
+                ErrorCode::InvalidArgument,
+                format!("secret for alias `{alias}` exceeds the vault size limit"),
+                false,
+            ));
+        }
+        self.ensure_root()?;
+        let target = self.path_for(alias);
+        // Atomic replace: same-directory temp file, restrictive from birth,
+        // then rename over the target. A crash leaves either the old secret
+        // or the new one, never a torn file — and the temp name carries the
+        // hex alias (public), never secret material.
+        let temp = self.root.join(format!(
+            ".{}.tmp-{}",
+            hex::encode(alias.as_str()),
+            std::process::id()
+        ));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let result = (|| {
+            let mut file = options
+                .open(&temp)
+                .map_err(|error| io_error("stage vault write", &error))?;
+            file.write_all(secret)
+                .and_then(|()| file.sync_all())
+                .map_err(|error| io_error("write vault secret", &error))?;
+            drop(file);
+            std::fs::rename(&temp, &target).map_err(|error| io_error("commit vault secret", &error))
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temp);
+        }
+        result
+    }
+
+    fn resolve(&self, alias: &CredentialAlias) -> AccountsResult<SecretHandle> {
+        let path = self.path_for(alias);
+        let metadata = std::fs::metadata(&path).map_err(|_| missing(alias))?;
+        if metadata.len() > MAX_SECRET_BYTES {
+            return Err(accounts_error(
+                ErrorCode::StoreCorrupt,
+                format!("vault entry for alias `{alias}` is oversized"),
+                false,
+            ));
+        }
+        let bytes = Zeroizing::new(
+            std::fs::read(&path).map_err(|error| io_error("read vault secret", &error))?,
+        );
+        Ok(SecretHandle::from_zeroizing(&bytes))
+    }
+
+    fn delete(&self, alias: &CredentialAlias) -> AccountsResult<()> {
+        match std::fs::remove_file(self.path_for(alias)) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(io_error("delete vault secret", &error)),
+        }
+    }
+
+    fn list(&self) -> AccountsResult<Vec<CredentialAlias>> {
+        let entries = match std::fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(io_error("list vault directory", &error)),
+        };
+        let mut aliases = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| io_error("list vault directory", &error))?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            // Anything that is not `<hex>.vault` — temp files, strays — is
+            // not vault data and is silently skipped, never an error.
+            let Some(stem) = name.strip_suffix(VAULT_SUFFIX) else {
+                continue;
+            };
+            let Ok(decoded) = hex::decode(stem) else {
+                continue;
+            };
+            let Ok(alias) = String::from_utf8(decoded) else {
+                continue;
+            };
+            aliases.push(CredentialAlias::new(alias));
+        }
+        aliases.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        Ok(aliases)
+    }
+}
+
+fn missing(alias: &CredentialAlias) -> haider_protocol::error::HaiderError {
+    accounts_error(
+        ErrorCode::CredentialMissing,
+        format!("credential alias `{alias}` is not in the vault"),
+        false,
+    )
+}
+
+fn io_error(operation: &str, error: &std::io::Error) -> haider_protocol::error::HaiderError {
+    accounts_error(
+        ErrorCode::Internal,
+        // The io::Error's own message never contains secret bytes: every
+        // operation name here describes vault plumbing, and paths carry hex
+        // aliases only.
+        format!("could not {operation}: {error}"),
+        error.kind() == std::io::ErrorKind::Interrupted,
+    )
+}

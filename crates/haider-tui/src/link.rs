@@ -575,6 +575,9 @@ pub fn request_body(command: LiveCommand) -> RequestBody {
             RequestBody::AccountSetActive { command_id, alias }
         }
         LiveCommand::ProviderList => RequestBody::ProviderList { provider: None },
+        LiveCommand::RefreshProviderModels { provider } => {
+            RequestBody::ProviderModelsRefresh { provider }
+        }
         LiveCommand::SetDefaultModel {
             command_id,
             provider,
@@ -729,6 +732,9 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
             providers,
             revision,
         }],
+        ResponseBody::ProviderModelsRefresh { provider, revision } => {
+            vec![LiveReply::ProviderModelsRefreshed { provider, revision }]
+        }
         ResponseBody::AccountSetDefaultModel { provider, revision } => {
             context.command_id.clone().map_or_else(Vec::new, |id| {
                 vec![LiveReply::DefaultModelSet {

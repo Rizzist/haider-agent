@@ -401,6 +401,32 @@ impl ProvidersState {
         self.revision = Some(revision);
         true
     }
+
+    /// Merges one provider's refreshed summary — its discovered catalog
+    /// (W5f-2d). Upserts (found → replace; absent → push) under the same
+    /// revision gate as the snapshot.
+    pub fn apply_models_refresh(
+        &mut self,
+        summary: haider_rpc::ProviderSummaryWire,
+        revision: u64,
+    ) -> bool {
+        if let Some(current) = self.revision
+            && revision < current
+        {
+            return false;
+        }
+        if let Some(slot) = self
+            .providers
+            .iter_mut()
+            .find(|existing| existing.provider == summary.provider)
+        {
+            *slot = summary;
+        } else {
+            self.providers.push(summary);
+        }
+        self.revision = Some(revision);
+        true
+    }
 }
 
 /// A chip's pending question (the amber `?` / recovery `⌁`).
