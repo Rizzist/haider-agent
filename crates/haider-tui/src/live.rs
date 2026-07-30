@@ -1725,7 +1725,15 @@ impl LiveDriver {
     /// was in the working set, each from ITS OWN last applied cursor, then
     /// resend the outbox under its durable ids.
     fn resume(&mut self, model: &mut AppModel) -> Vec<LiveCommand> {
-        let mut commands = vec![LiveCommand::List { cursor: None }];
+        // Account + provider truth ride the connect (W5f-2): the identity
+        // bootstrap fires when their snapshots APPLY, so without asking at
+        // the front door the launcher would sit on demo seeds until the
+        // user happened to open /accounts. Reads, never in the outbox.
+        let mut commands = vec![
+            LiveCommand::List { cursor: None },
+            LiveCommand::AccountList,
+            LiveCommand::ProviderList,
+        ];
         // Priority order: the attached surface first, then the sessions the
         // user is waiting on, then the rest — so a capped working set
         // rebuilds the ones that matter.

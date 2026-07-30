@@ -218,3 +218,35 @@ fn session_create_requests_an_output_budget_not_the_context_window() {
         "zero never reaches the daemon's reject"
     );
 }
+
+/// MUTATION CHECK (W5f-2): drop `AccountList`/`ProviderList` from
+/// `resume`'s front-door command set. Expected runtime failure: the
+/// reconnect below produces neither read, so the bootstrap's snapshots
+/// never arrive and the launcher sits on demo seeds until the user
+/// happens to open /accounts.
+/// Verified by revert on 2026-07-30.
+#[test]
+fn connecting_asks_for_account_and_provider_truth() {
+    let mut model = live_model();
+    let mut driver = LiveDriver::new("test");
+    let pass = live_pass(
+        &mut driver,
+        &mut model,
+        Some(LiveReply::Reconnected),
+        std::time::Instant::now(),
+    );
+    assert!(
+        pass.commands
+            .iter()
+            .any(|command| matches!(command, LiveCommand::AccountList)),
+        "the connect must ask for account truth: {:?}",
+        pass.commands
+    );
+    assert!(
+        pass.commands
+            .iter()
+            .any(|command| matches!(command, LiveCommand::ProviderList)),
+        "and provider truth: {:?}",
+        pass.commands
+    );
+}
