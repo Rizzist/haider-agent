@@ -290,6 +290,37 @@ impl AccountsState {
     }
 }
 
+/// The `/accounts` OAuth add card (sim authFlow, tui.js:3629-3682): a
+/// total-flow overlay above the add row. LIVE: the daemon's loopback PKCE
+/// flow drives the phases; DEMO: `[1]` simulates the authorize exactly like
+/// the sim's "authorize in browser (simulated)".
+#[derive(Debug, Clone, PartialEq)]
+pub struct OAuthAddCard {
+    /// Wire provider (`openai-oauth` / `anthropic-oauth`) in live mode;
+    /// the demo completes under the sim's provider names instead.
+    pub provider: String,
+    pub title: &'static str,
+    pub alias: String,
+    /// Client-side attempt identity (the login-card discipline, TUI6.3):
+    /// every driver reply must correlate to it or die silently.
+    pub attempt: u64,
+    pub phase: OAuthAddPhase,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum OAuthAddPhase {
+    /// `account.oauth_start` is in flight.
+    Starting,
+    /// The browser owns the authorize; the loopback waits.
+    WaitingBrowser { url: String, origin: String },
+    /// Callback consumed; the daemon is exchanging the code.
+    Exchanging,
+    /// `account.add` is committing the ready reference.
+    Adding,
+    /// Terminal public failure; `[2]`/esc closes.
+    Failed { message: String },
+}
+
 /// The `/providers` screen state (report §5.2). Same daemon-truth law as
 /// `/accounts`: a default-model change applies only on the correlated,
 /// revision-gated reply.
@@ -1164,6 +1195,18 @@ pub enum AppRequest {
         model: String,
         expected_revision: u64,
     },
+    /// Start an OAuth add flow (`account.oauth_start`) for the card.
+    OAuthAddStart {
+        provider: String,
+        alias: String,
+        attempt: u64,
+    },
+    /// Cancel the card's flow (`account.oauth_cancel` when one is bound).
+    OAuthAddCancel { attempt: u64 },
+    /// Open a URL in the user's browser (runtime-owned effect; the demo
+    /// flashes it instead). Carried for the OAuth authorize hop — the URL
+    /// always originates from the daemon's sanctioned registration.
+    OpenUrl { url: String },
     /// Quit the app.
     Quit,
 }
@@ -1668,6 +1711,10 @@ pub struct AppModel {
     pub accounts: AccountsState,
     /// `/providers` screen state (report §5.2).
     pub providers: ProvidersState,
+    /// The open OAuth add card, if any (accounts screen overlay).
+    pub oauth_add: Option<OAuthAddCard>,
+    /// Monotonic attempt counter for OAuth add cards.
+    pub oauth_attempt_seq: u64,
 }
 
 impl Default for AppModel {
@@ -1741,6 +1788,8 @@ impl Default for AppModel {
             wordmark: std::cell::RefCell::new(None),
             accounts: AccountsState::default(),
             providers: ProvidersState::default(),
+            oauth_add: None,
+            oauth_attempt_seq: 0,
         }
     }
 }
@@ -3268,9 +3317,163 @@ impl AppModel {
         }
     }
 
+    /// Opens the OAuth add card and starts the flow. Alias derivation per
+    /// §5.3: `<provider>` then the smallest free numeric suffix against the
+    /// CURRENT rows (the daemon re-checks uniqueness at commit).
+    fn open_oauth_add(&mut self, kind: AccountAddKind) {
+        if self.oauth_add.is_some() {
+            return;
+        }
+        let (provider, title) = match kind {
+            AccountAddKind::OpenAiOAuth => ("openai-oauth", "OpenAI — ChatGPT"),
+            AccountAddKind::AnthropicOAuth => ("anthropic-oauth", "Anthropic — Claude"),
+            AccountAddKind::OpenAiApi
+            | AccountAddKind::AnthropicApi
+            | AccountAddKind::HuggingFace
+            | AccountAddKind::Custom => return,
+        };
+        let alias = {
+            let taken = |candidate: &str| self.accounts.rows.iter().any(|row| row.alias == candidate);
+            let mut candidate = provider.to_owned();
+            let mut suffix = 1u32;
+            while taken(&candidate) {
+                suffix += 1;
+                candidate = format!("{provider}-{suffix}");
+            }
+            candidate
+        };
+        self.oauth_attempt_seq += 1;
+        let attempt = self.oauth_attempt_seq;
+        self.accounts.message = None;
+        self.oauth_add = Some(OAuthAddCard {
+            provider: provider.to_owned(),
+            title,
+            alias: alias.clone(),
+            attempt,
+            phase: OAuthAddPhase::Starting,
+        });
+        self.requests.push(AppRequest::OAuthAddStart {
+            provider: provider.to_owned(),
+            alias,
+            attempt,
+        });
+        self.dirty = true;
+    }
+
+    /// Closes the card and cancels its flow (esc / `[2]` — sim cancelAuth).
+    fn cancel_oauth_add(&mut self) {
+        if let Some(card) = self.oauth_add.take() {
+            self.requests.push(AppRequest::OAuthAddCancel {
+                attempt: card.attempt,
+            });
+            self.accounts.message = Some("· authorize cancelled".to_owned());
+            self.dirty = true;
+        }
+    }
+
+    /// Driver-applied phase change, attempt-gated: a retired card's late
+    /// reply touches nothing (the login-card law).
+    pub fn oauth_add_phase(&mut self, attempt: u64, phase: OAuthAddPhase) {
+        if let Some(card) = self.oauth_add.as_mut()
+            && card.attempt == attempt
+        {
+            card.phase = phase;
+            self.dirty = true;
+        }
+    }
+
+    /// Terminal public failure for the card (attempt-gated).
+    pub fn oauth_add_failed(&mut self, attempt: u64, message: &str) {
+        if let Some(card) = self.oauth_add.as_mut()
+            && card.attempt == attempt
+        {
+            card.phase = OAuthAddPhase::Failed {
+                message: message.to_owned(),
+            };
+            self.dirty = true;
+        }
+    }
+
+    /// The durable add committed: close the card, note the identity, and
+    /// refresh rows from the daemon (single authority — no local insert).
+    pub fn oauth_add_completed(
+        &mut self,
+        attempt: u64,
+        descriptor: &haider_protocol::credential::CredentialDescriptor,
+    ) {
+        if self
+            .oauth_add
+            .as_ref()
+            .is_some_and(|card| card.attempt == attempt)
+        {
+            self.oauth_add = None;
+            self.accounts.message = Some(format!(
+                "✓ {} → {} · oauth · {}",
+                descriptor.provider, descriptor.alias, descriptor.identity
+            ));
+            self.requests.push(AppRequest::AccountsRefresh);
+            self.dirty = true;
+        }
+    }
+
+    /// Card keys (total over the accounts screen while open, sim
+    /// tui.js:2495): `[1]` re-opens the browser link (or SIMULATES the
+    /// authorize in demo, sim parity); `[2]`/esc cancels.
+    fn handle_oauth_card_key(&mut self, code: KeyCode) {
+        let Some(card) = self.oauth_add.as_ref() else {
+            return;
+        };
+        match code {
+            KeyCode::Esc | KeyCode::Char('2') => self.cancel_oauth_add(),
+            KeyCode::Char('1') => match &card.phase {
+                OAuthAddPhase::WaitingBrowser { url, .. } => {
+                    if self.mode.fabricates_locally() {
+                        // Sim confirmAuth: the simulated authorize lands the
+                        // account locally and selects it for its provider.
+                        let (provider, identity) = match card.provider.as_str() {
+                            "openai-oauth" => ("openai", "you@work.com · ChatGPT"),
+                            _ => ("anthropic", "you@me.com · Claude Max"),
+                        };
+                        let alias = card.alias.clone();
+                        let attempt = card.attempt;
+                        for row in &mut self.accounts.rows {
+                            if row.provider == provider {
+                                row.selected = false;
+                            }
+                        }
+                        self.accounts.rows.push(AccountRow {
+                            alias: alias.clone(),
+                            provider: provider.to_owned(),
+                            method: haider_protocol::credential::AuthMethod::OAuth,
+                            identity: identity.to_owned(),
+                            status: haider_protocol::credential::CredentialStatus::Ok,
+                            selected: true,
+                            base_url: None,
+                        });
+                        self.oauth_add = None;
+                        self.accounts.message = Some(format!(
+                            "✓ {provider} → {alias} · oauth · active"
+                        ));
+                        let _ = attempt;
+                        self.dirty = true;
+                    } else {
+                        self.requests.push(AppRequest::OpenUrl { url: url.clone() });
+                    }
+                }
+                OAuthAddPhase::Failed { .. } => self.cancel_oauth_add(),
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+
     /// Keys on the `/accounts` screen (no composer; the login card, when
     /// open, is total-modal and never reaches here).
     fn handle_accounts_key(&mut self, code: KeyCode) {
+        if self.oauth_add.is_some() {
+            self.handle_oauth_card_key(code);
+            return;
+        }
         match code {
             KeyCode::Esc => self.exit_accounts(),
             KeyCode::Up => {
@@ -4455,14 +4658,11 @@ impl AppModel {
                     // the provider).
                     AccountAddKind::OpenAiApi => self.open_login_card("openai", None),
                     AccountAddKind::AnthropicApi => self.open_login_card("anthropic", None),
-                    // OAuth/HF/custom cards land with the W5e login wave —
-                    // honest stubs, never a fake card (sim parity is the
-                    // BUTTON ROW, not unbuilt machinery behind it).
+                    // OAuth adds run the REAL loopback flow (W5e-1): the
+                    // card drives account.oauth_start/status + account.add
+                    // live, and the sim's simulated authorize in demo.
                     AccountAddKind::OpenAiOAuth | AccountAddKind::AnthropicOAuth => {
-                        self.flash = Some(
-                            "· OAuth add — UI ready; the loopback flow's card lands with W5e"
-                                .to_owned(),
-                        );
+                        self.open_oauth_add(kind);
                     }
                     AccountAddKind::HuggingFace | AccountAddKind::Custom => {
                         self.flash = Some(

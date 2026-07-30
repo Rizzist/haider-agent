@@ -428,6 +428,8 @@ async fn issue(
 /// daemon — the workspace forbids inline test modules, and an unmapped
 /// response body is a silently swallowed reply.
 pub struct CommandContext {
+    /// The OAuth start's attempt id, so the reply is identity-tagged.
+    pub oauth_attempt: Option<String>,
     command_id: Option<haider_rpc::CommandId>,
     cwd: String,
     model: String,
@@ -450,6 +452,10 @@ impl CommandContext {
             LiveCommand::Create { cwd, model, .. } => (cwd.clone(), model.clone()),
             _ => (String::new(), String::new()),
         };
+        let oauth_attempt = match command {
+            LiveCommand::OAuthStart { attempt_id, .. } => Some(attempt_id.clone()),
+            _ => None,
+        };
         Self {
             command_id: command.command_id().cloned(),
             cwd,
@@ -469,6 +475,7 @@ impl CommandContext {
                 } => Some((provider.clone(), alias.clone(), *attempt)),
                 _ => None,
             },
+            oauth_attempt,
             attach: match command {
                 LiveCommand::Attach { session, .. } => Some(session.clone()),
                 _ => None,
@@ -570,6 +577,45 @@ pub fn request_body(command: LiveCommand) -> RequestBody {
             provider,
             model,
             expected_revision,
+        },
+        LiveCommand::OAuthStart {
+            provider,
+            desired_alias,
+            attempt_id,
+        } => RequestBody::AccountOAuthStart {
+            provider,
+            desired_alias,
+            attempt_id,
+        },
+        LiveCommand::OAuthStatus {
+            flow_id,
+            attempt_id,
+        } => RequestBody::AccountOAuthStatus {
+            flow_id,
+            attempt_id,
+        },
+        LiveCommand::OAuthCancel {
+            flow_id,
+            attempt_id,
+        } => RequestBody::AccountOAuthCancel {
+            flow_id,
+            attempt_id,
+        },
+        LiveCommand::AccountAddOAuth {
+            command_id,
+            provider,
+            alias,
+            flow_id,
+            attempt_id,
+            oauth_reference,
+        } => RequestBody::AccountAdd {
+            command_id,
+            provider,
+            alias,
+            auth_method: haider_rpc::AccountAddMethod::OAuth,
+            flow_id,
+            attempt_id,
+            oauth_reference,
         },
         LiveCommand::Answer { .. } => unreachable!("answers ride send_frame, not request"),
     }
@@ -681,6 +727,35 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
                     command_id: id,
                     provider,
                     revision,
+                }]
+            })
+        }
+        ResponseBody::AccountOAuthStart {
+            availability,
+            flow_id,
+            authorization_url,
+            provider_origin,
+            ..
+        } => context.oauth_attempt.clone().map_or_else(Vec::new, |attempt_id| {
+            vec![LiveReply::OAuthStarted {
+                attempt_id,
+                availability,
+                flow_id,
+                authorization_url: authorization_url
+                    .map(|url| url.expose_authorization_url().to_owned()),
+                provider_origin,
+            }]
+        }),
+        ResponseBody::AccountOAuthStatus { flow_id, status } => {
+            vec![LiveReply::OAuthFlowStatus { flow_id, status }]
+        }
+        // Cancel's answer needs no driver fact: the card already closed.
+        ResponseBody::AccountOAuthCancel { .. } => Vec::new(),
+        ResponseBody::AccountAdd { descriptor } => {
+            context.command_id.clone().map_or_else(Vec::new, |id| {
+                vec![LiveReply::AccountAdded {
+                    command_id: id,
+                    descriptor,
                 }]
             })
         }
