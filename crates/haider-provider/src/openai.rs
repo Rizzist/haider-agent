@@ -1460,12 +1460,23 @@ pub fn replay_openai_http_error(
     let error_code = parsed
         .as_ref()
         .and_then(|envelope| envelope.error.code.as_deref());
+    let context_exceeded = matches!(
+        error_code.or(error_type),
+        Some(
+            "context_length_exceeded"
+                | "context_window_exceeded"
+                | "model_context_window_exceeded"
+                | "prompt_too_long"
+                | "input_too_large"
+        )
+    );
     let kind = match status {
         401 => ProviderErrorKind::Authentication,
         403 => ProviderErrorKind::PermissionDenied,
         429 => ProviderErrorKind::RateLimited,
         503 => ProviderErrorKind::Overloaded,
         408 | 500..=599 => ProviderErrorKind::Transport,
+        _ if context_exceeded => ProviderErrorKind::ContextExceeded,
         _ => match error_code.or(error_type) {
             Some("invalid_api_key" | "authentication_error") => ProviderErrorKind::Authentication,
             Some("insufficient_quota" | "permission_denied") => ProviderErrorKind::PermissionDenied,
@@ -1520,6 +1531,13 @@ fn openai_stream_error(value: &serde_json::Value) -> ProviderError {
         Some("permission_denied" | "insufficient_quota") => ProviderErrorKind::PermissionDenied,
         Some("rate_limit_exceeded" | "rate_limit_error") => ProviderErrorKind::RateLimited,
         Some("overloaded_error") => ProviderErrorKind::Overloaded,
+        Some(
+            "context_length_exceeded"
+            | "context_window_exceeded"
+            | "model_context_window_exceeded"
+            | "prompt_too_long"
+            | "input_too_large",
+        ) => ProviderErrorKind::ContextExceeded,
         Some("server_error" | "timeout") => ProviderErrorKind::Transport,
         _ => ProviderErrorKind::InvalidRequest,
     };

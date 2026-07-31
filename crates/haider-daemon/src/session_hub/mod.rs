@@ -730,6 +730,7 @@ enum ActorCommand {
     },
     WorkerAppend {
         lease_id: WorkerLeaseId,
+        expected_head: Option<u64>,
         envelopes: Vec<RawEnvelope>,
         completed: oneshot::Sender<Result<Vec<RawEnvelope>, HaiderError>>,
     },
@@ -1916,6 +1917,7 @@ impl StoreHandle for HubStoreHandle {
             .commands
             .send(ActorCommand::WorkerAppend {
                 lease_id: self.lease_id.clone(),
+                expected_head: None,
                 envelopes: envelopes.to_vec(),
                 completed,
             })
@@ -1946,6 +1948,92 @@ impl StoreHandle for HubStoreHandle {
     async fn latest_seq(&self, session_id: &SessionId) -> Result<u64, HaiderError> {
         self.ensure_session(session_id)?;
         self.hub.inner.store.latest_seq(session_id).await
+    }
+}
+
+impl HubStoreHandle {
+    /// Appends a worker batch only while the session journal still has the
+    /// exact head observed by the caller. The session actor performs the
+    /// comparison and append without yielding to another session command.
+    pub(crate) async fn append_at_head(
+        &self,
+        expected_head: u64,
+        envelopes: &mut [RawEnvelope],
+    ) -> Result<haider_core::CommittedRange, HaiderError> {
+        let Some(first) = envelopes.first() else {
+            return Err(HaiderError::new(
+                ErrorCode::InvalidArgument,
+                "cannot append an empty worker envelope batch",
+                false,
+            ));
+        };
+        if envelopes.iter().any(|envelope| {
+            envelope.session_id != self.session_id
+                || envelope.worker_generation != self.worker_generation
+        }) {
+            return Err(HaiderError::new(
+                ErrorCode::SingleWriterViolation,
+                "worker envelope identity does not match its lease",
+                false,
+            ));
+        }
+        let actor = self
+            .hub
+            .existing_actor(&first.session_id)
+            .map_err(hub_error_as_store)?
+            .ok_or_else(hub_closed_store_error)?;
+        let (completed, response) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::WorkerAppend {
+                lease_id: self.lease_id.clone(),
+                expected_head: Some(expected_head),
+                envelopes: envelopes.to_vec(),
+                completed,
+            })
+            .await
+            .map_err(|_| hub_closed_store_error())?;
+        let committed = response.await.map_err(|_| hub_closed_store_error())??;
+        envelopes.clone_from_slice(&committed);
+        Ok(haider_core::CommittedRange {
+            first_seq: committed.first().map_or(0, |envelope| envelope.seq),
+            last_seq: committed.last().map_or(0, |envelope| envelope.seq),
+        })
+    }
+
+    pub(crate) async fn claim_context_compaction_receipt(
+        &self,
+        command_id: String,
+        request_digest: String,
+        request_json: String,
+    ) -> Result<haider_core::ContextCompactionClaim, HaiderError> {
+        self.hub
+            .inner
+            .store
+            .claim_context_compaction_receipt(command_id, request_digest, request_json)
+            .await
+    }
+
+    pub(crate) async fn finalize_context_compaction_receipt(
+        &self,
+        command_id: String,
+        response: haider_core::ContextCompactionReceiptResponse,
+    ) -> Result<(), HaiderError> {
+        self.hub
+            .inner
+            .store
+            .finalize_context_compaction_receipt(command_id, response)
+            .await
+    }
+}
+
+#[async_trait::async_trait]
+impl haider_core::ArtifactReader for HubStoreHandle {
+    async fn read_artifact(
+        &self,
+        artifact: &haider_protocol::ids::ArtifactRef,
+    ) -> Result<Vec<u8>, HaiderError> {
+        self.get_artifact(artifact.clone()).await
     }
 }
 

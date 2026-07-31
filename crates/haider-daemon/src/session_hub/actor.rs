@@ -180,6 +180,7 @@ pub(super) async fn run_session_actor(
             }
             ActorCommand::WorkerAppend {
                 lease_id,
+                expected_head,
                 mut envelopes,
                 completed,
             } => {
@@ -189,6 +190,18 @@ pub(super) async fn run_session_actor(
                         ErrorCode::SingleWriterViolation,
                         "worker lease was superseded",
                         false,
+                    )));
+                    continue;
+                }
+                if let Some(expected_head) = expected_head
+                    && head != expected_head
+                {
+                    let _ = completed.send(Err(HaiderError::new(
+                        ErrorCode::Busy,
+                        format!(
+                            "session history advanced from {expected_head} to {head} during compaction"
+                        ),
+                        true,
                     )));
                     continue;
                 }

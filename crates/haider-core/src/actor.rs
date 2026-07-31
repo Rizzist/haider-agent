@@ -30,7 +30,7 @@
 //! the [`EventIdGenerator`] namespace: supervisor-installed and shared with
 //! the effect journal in the daemon, self-minted in standalone use.
 
-use crate::{StoreHandle, unix_time_ms};
+use crate::{PromptHistoryCompiler, StoreHandle, unix_time_ms};
 use async_trait::async_trait;
 use haider_protocol::DeliveryMode;
 use haider_protocol::EventPayload;
@@ -40,8 +40,12 @@ use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
 };
 use haider_protocol::error::{ErrorCode, HaiderError};
+use haider_protocol::history::{
+    COMPACTION_INTENT_EXTENSION_KIND, CONTINUATION_CHECKPOINT_EXTENSION_KIND, CompactionIntent,
+    CompactionResume, ContinuationCheckpoint, NodeKind, TreeNode,
+};
 use haider_protocol::ids::{
-    AgentId, BranchId, CredentialAlias, DeviceId, EventId, ItemId, MenuId, RunId, SessionId,
+    AgentId, BranchId, CredentialAlias, DeviceId, EventId, ItemId, MenuId, NodeId, RunId, SessionId,
 };
 use haider_protocol::item::{ItemDelta, ItemEvent, ToolStatus, TurnItem};
 use haider_protocol::menu::{Menu, MenuAnswer, MenuCloseReason};
@@ -50,6 +54,7 @@ use haider_protocol::provider::{
 };
 use haider_protocol::state::{RunState, WaitReason};
 use haider_protocol::tool::BoundedResult;
+use haider_protocol::verify::VerifyVerdict;
 use haider_provider::{
     Message, Provider, ProviderError, ProviderErrorKind, ResolvedAttachment, ToolDefinition,
     TurnRequest,
@@ -61,6 +66,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 const DEFAULT_MAX_PROVIDER_REQUESTS_PER_TURN: usize = 32;
+const DEFAULT_MAX_CONTINUATIONS_PER_TURN: usize = 8;
 const DEFAULT_DEFERRED_COMMAND_CAPACITY: usize = 64;
 const MAX_PROVIDER_ATTEMPTS: usize = 3;
 const RETRY_BASE_MS: u64 = 25;
@@ -81,6 +87,11 @@ pub struct HarnessConfig {
     pub worker_generation: u64,
     pub model: String,
     pub max_tokens: u64,
+    /// Provider-declared active-model context window. `None` stays unknown;
+    /// inferred adapter tables are not authoritative for compaction policy.
+    pub context_window: Option<u64>,
+    /// Daemon-validated space reserved for provider output on every request.
+    pub reserved_output_tokens: u64,
     /// Deterministic daemon-owned policy bound to every request in this actor.
     pub system_prompt: Option<String>,
     /// General tools the paired dispatcher can execute.
@@ -96,10 +107,15 @@ pub struct HarnessConfig {
     pub rotation_budget_consumed: bool,
     /// Daemon-owned resolver consulted only at a pre-first-event boundary.
     pub provider_attempt_resolver: Option<Arc<dyn ProviderAttemptResolver>>,
+    /// Durable compaction implementation installed by the daemon. Standalone
+    /// actors surface context overflow when none is configured.
+    pub context_compactor: Option<Arc<dyn ContextCompactor>>,
     pub command_capacity: usize,
     pub broadcast_capacity: usize,
     /// Hard ceiling on provider requests made by one logical turn.
     pub max_provider_requests_per_turn: usize,
+    /// Independent guard against providers repeatedly exhausting output.
+    pub max_continuations_per_turn: usize,
     /// Maximum number of submissions parked behind the active turn.
     pub deferred_command_capacity: usize,
     /// Daemon supervisors close/reconcile their effect broker before writing
@@ -128,6 +144,8 @@ impl HarnessConfig {
             worker_generation,
             model: "fake-model".into(),
             max_tokens: 4096,
+            context_window: None,
+            reserved_output_tokens: 4096,
             system_prompt: None,
             tools: Vec::new(),
             attachments: Vec::new(),
@@ -135,9 +153,11 @@ impl HarnessConfig {
             initial_rotation: None,
             rotation_budget_consumed: false,
             provider_attempt_resolver: None,
+            context_compactor: None,
             command_capacity: 8,
             broadcast_capacity: 128,
             max_provider_requests_per_turn: DEFAULT_MAX_PROVIDER_REQUESTS_PER_TURN,
+            max_continuations_per_turn: DEFAULT_MAX_CONTINUATIONS_PER_TURN,
             deferred_command_capacity: DEFAULT_DEFERRED_COMMAND_CAPACITY,
             supervisor_commits_cancelled: false,
             event_ids: None,
@@ -302,6 +322,24 @@ pub trait ProviderAttemptResolver: Send + Sync + std::fmt::Debug {
         current_account: &CredentialAlias,
         error: &ProviderError,
     ) -> Result<ProviderAttemptDecision, HaiderError>;
+}
+
+/// Two-phase compaction port. `plan` is journaled before `compact` performs
+/// private summarization and commits the final immutable overlay node.
+#[async_trait]
+pub trait ContextCompactor: Send + Sync + std::fmt::Debug {
+    async fn plan(
+        &self,
+        run_id: &RunId,
+        resume_cause: CompactionResume,
+    ) -> Result<CompactionIntent, HaiderError>;
+
+    async fn compact(
+        &self,
+        run_id: &RunId,
+        intent: &CompactionIntent,
+        covered_messages: Vec<Message>,
+    ) -> Result<Message, HaiderError>;
 }
 
 #[async_trait]
@@ -637,7 +675,10 @@ pub struct HarnessActor {
     /// Actor start instant (ms) — embedded in event ids for global uniqueness.
     started_at_ms: u64,
     next_item: u64,
+    next_node: u64,
     next_menu: u64,
+    tree_head_initialized: bool,
+    tree_head: Option<NodeId>,
     deferred_commands: VecDeque<ActorCommand>,
     pending_nudges: Vec<String>,
 }
@@ -688,7 +729,10 @@ impl HarnessActor {
                 event_ids,
                 started_at_ms,
                 next_item: 0,
+                next_node: 0,
                 next_menu: 0,
+                tree_head_initialized: false,
+                tree_head: None,
                 deferred_commands: VecDeque::new(),
                 pending_nudges: Vec::new(),
             },
@@ -757,7 +801,7 @@ impl HarnessActor {
                     return self.errored_state_outcome(&run_id, error).await;
                 }
                 if let Err(error) = self
-                    .commit_payload(
+                    .commit_tree_fragment(
                         &run_id,
                         EventPayload::UserMessage {
                             text: submit.text.clone(),
@@ -765,6 +809,10 @@ impl HarnessActor {
                             mode: DeliveryMode::Steer,
                         },
                         prompt_verbatim_render(),
+                        NodeKind::UserTurn {
+                            text: submit.text.clone(),
+                            attachments: Vec::new(),
+                        },
                     )
                     .await
                 {
@@ -792,6 +840,10 @@ impl HarnessActor {
                 )
             }
         };
+        // The compiler always places the accepted current user message last.
+        // Everything before it is the only prefix eligible for mid-turn
+        // forced compaction; current-run content remains a verbatim suffix.
+        let current_turn_start = messages.len().saturating_sub(1);
 
         let mut message: Option<TextAccumulator> = None;
         let mut reasoning: Option<TextAccumulator> = None;
@@ -946,6 +998,8 @@ impl HarnessActor {
             rotation_budget_consumed = true;
         }
         let mut provider_request_count = 0usize;
+        let mut continuation_count = 0usize;
+        let mut forced_compaction_used = false;
         let mut provider_attempt = 0usize;
         let mut completed_usage: Option<Usage> = None;
 
@@ -955,6 +1009,25 @@ impl HarnessActor {
                     .into_iter()
                     .map(Message::user_text),
             );
+            if let Err(error) = self
+                .enforce_context_hard_fit(
+                    &run_id,
+                    &mut messages,
+                    current_turn_start,
+                    &mut forced_compaction_used,
+                )
+                .await
+            {
+                return self
+                    .drive_error_outcome_with_items(
+                        &run_id,
+                        &mut message,
+                        &mut reasoning,
+                        &mut tools,
+                        error,
+                    )
+                    .await;
+            }
             if provider_attempt == 0 {
                 provider_request_count = provider_request_count.saturating_add(1);
             }
@@ -1042,6 +1115,29 @@ impl HarnessActor {
                 }
                 match opened {
                     Ok(stream) => break stream,
+                    Err(error) if error.kind == ProviderErrorKind::ContextExceeded => {
+                        if let Err(error) = self
+                            .force_context_compaction(
+                                &run_id,
+                                &mut messages,
+                                current_turn_start,
+                                &mut forced_compaction_used,
+                            )
+                            .await
+                        {
+                            return self
+                                .drive_error_outcome_with_items(
+                                    &run_id,
+                                    &mut message,
+                                    &mut reasoning,
+                                    &mut tools,
+                                    error,
+                                )
+                                .await;
+                        }
+                        provider_attempt = 0;
+                        continue 'requests;
+                    }
                     Err(error) => {
                         if let Err(error) = self
                             .prepare_pre_first_event_retry(
@@ -1089,7 +1185,7 @@ impl HarnessActor {
 
             let mut assistant_blocks = Vec::new();
             let mut tool_results = Vec::new();
-            let mut provider_event_seen = false;
+            let mut provider_content_seen = false;
             loop {
                 let next = tokio::select! {
                     // Cancellation owns ties. Provider progress is polled
@@ -1165,10 +1261,38 @@ impl HarnessActor {
                 };
                 let event = match next {
                     Ok(event) => {
-                        provider_event_seen = true;
+                        if !matches!(event, StreamEvent::UsageUpdate(_)) {
+                            provider_content_seen = true;
+                        }
                         event
                     }
-                    Err(error) if !provider_event_seen => {
+                    Err(error)
+                        if error.kind == ProviderErrorKind::ContextExceeded
+                            && !provider_content_seen =>
+                    {
+                        if let Err(error) = self
+                            .force_context_compaction(
+                                &run_id,
+                                &mut messages,
+                                current_turn_start,
+                                &mut forced_compaction_used,
+                            )
+                            .await
+                        {
+                            return self
+                                .drive_error_outcome_with_items(
+                                    &run_id,
+                                    &mut message,
+                                    &mut reasoning,
+                                    &mut tools,
+                                    error,
+                                )
+                                .await;
+                        }
+                        provider_attempt = 0;
+                        continue 'requests;
+                    }
+                    Err(error) if !provider_content_seen => {
                         if let Err(error) = self
                             .prepare_pre_first_event_retry(
                                 ProviderRetryContext {
@@ -1433,22 +1557,18 @@ impl HarnessActor {
                             }
                         }
                         if !tool_results.is_empty() {
-                            if let Some(usage) = request_usage.take() {
-                                completed_usage =
-                                    match cumulative_usage(completed_usage.as_ref(), &usage) {
-                                        Ok(usage) => Some(usage),
-                                        Err(error) => {
-                                            return self
-                                                .drive_error_outcome_with_items(
-                                                    &run_id,
-                                                    &mut message,
-                                                    &mut reasoning,
-                                                    &mut tools,
-                                                    error,
-                                                )
-                                                .await;
-                                        }
-                                    };
+                            if let Err(error) =
+                                finalize_request_usage(&mut completed_usage, &mut request_usage)
+                            {
+                                return self
+                                    .drive_error_outcome_with_items(
+                                        &run_id,
+                                        &mut message,
+                                        &mut reasoning,
+                                        &mut tools,
+                                        error,
+                                    )
+                                    .await;
                             }
                             provider_attempt = 0;
                             messages.append(&mut tool_results);
@@ -1458,7 +1578,94 @@ impl HarnessActor {
                             }
                             continue 'requests;
                         }
+                        if reason == FinishReason::MaxTokens {
+                            continuation_count = continuation_count.saturating_add(1);
+                            if continuation_count > self.config.max_continuations_per_turn {
+                                return self
+                                    .errored_outcome_with_items(
+                                        &run_id,
+                                        &mut message,
+                                        &mut reasoning,
+                                        &mut tools,
+                                        continuation_limit_error(
+                                            continuation_count,
+                                            self.config.max_continuations_per_turn,
+                                        ),
+                                    )
+                                    .await;
+                            }
+                            if let Err(error) =
+                                finalize_request_usage(&mut completed_usage, &mut request_usage)
+                            {
+                                return self
+                                    .drive_error_outcome_with_items(
+                                        &run_id,
+                                        &mut message,
+                                        &mut reasoning,
+                                        &mut tools,
+                                        error,
+                                    )
+                                    .await;
+                            }
+                            let request_index =
+                                u32::try_from(provider_request_count).unwrap_or(u32::MAX);
+                            let checkpoint = match serde_json::to_value(ContinuationCheckpoint {
+                                reason: FinishReason::MaxTokens,
+                                request_index,
+                            }) {
+                                Ok(checkpoint) => checkpoint,
+                                Err(error) => {
+                                    return self
+                                        .errored_outcome_with_items(
+                                            &run_id,
+                                            &mut message,
+                                            &mut reasoning,
+                                            &mut tools,
+                                            HaiderError::new(
+                                                ErrorCode::Internal,
+                                                format!(
+                                                    "continuation checkpoint could not serialize: {error}"
+                                                ),
+                                                false,
+                                            ),
+                                        )
+                                        .await;
+                                }
+                            };
+                            if let Err(error) = self
+                                .commit_hidden_extension_marker(
+                                    &run_id,
+                                    CONTINUATION_CHECKPOINT_EXTENSION_KIND,
+                                    checkpoint,
+                                )
+                                .await
+                            {
+                                return self.errored_state_outcome(&run_id, error).await;
+                            }
+                            messages.push(Message::user_text(
+                                "Continue exactly where you stopped. Do not repeat completed content.",
+                            ));
+                            provider_attempt = 0;
+                            if let Err(error) = self.commit_state(&run_id, RunState::Thinking).await
+                            {
+                                return self.errored_state_outcome(&run_id, error).await;
+                            }
+                            continue 'requests;
+                        }
                         if !self.pending_nudges.is_empty() {
+                            if let Err(error) =
+                                finalize_request_usage(&mut completed_usage, &mut request_usage)
+                            {
+                                return self
+                                    .drive_error_outcome_with_items(
+                                        &run_id,
+                                        &mut message,
+                                        &mut reasoning,
+                                        &mut tools,
+                                        error,
+                                    )
+                                    .await;
+                            }
                             provider_attempt = 0;
                             if let Err(error) = self.commit_state(&run_id, RunState::Thinking).await
                             {
@@ -1641,6 +1848,106 @@ impl HarnessActor {
         } else {
             Err(DriveError::Provider(error))
         }
+    }
+
+    async fn force_context_compaction(
+        &mut self,
+        run_id: &RunId,
+        messages: &mut Vec<Message>,
+        current_turn_start: usize,
+        forced_compaction_used: &mut bool,
+    ) -> Result<(), DriveError> {
+        if *forced_compaction_used {
+            return Err(DriveError::Provider(ProviderError::new(
+                ProviderErrorKind::ContextExceeded,
+                "provider context overflow repeated after forced compaction",
+            )));
+        }
+        if current_turn_start == 0 || current_turn_start > messages.len() {
+            return Err(DriveError::Provider(ProviderError::new(
+                ProviderErrorKind::ContextExceeded,
+                "provider context overflow has no prior history prefix to compact",
+            )));
+        }
+        let compactor = self.config.context_compactor.clone().ok_or_else(|| {
+            DriveError::Provider(ProviderError::new(
+                ProviderErrorKind::ContextExceeded,
+                "provider context overflow requires a configured context compactor",
+            ))
+        })?;
+        let intent = compactor
+            .plan(run_id, CompactionResume::AutoMidTurn)
+            .await
+            .map_err(DriveError::Store)?;
+        self.commit_hidden_extension_marker(
+            run_id,
+            COMPACTION_INTENT_EXTENSION_KIND,
+            serde_json::to_value(&intent).map_err(|error| {
+                DriveError::Store(HaiderError::new(
+                    ErrorCode::Internal,
+                    format!("compaction intent could not serialize: {error}"),
+                    false,
+                ))
+            })?,
+        )
+        .await
+        .map_err(DriveError::Store)?;
+        self.commit_state(run_id, RunState::Compacting)
+            .await
+            .map_err(DriveError::Store)?;
+
+        let suffix = messages.split_off(current_turn_start);
+        let covered = std::mem::take(messages);
+        let summary = compactor
+            .compact(run_id, &intent, covered)
+            .await
+            .map_err(DriveError::Store)?;
+        messages.push(summary);
+        messages.extend(suffix);
+        *forced_compaction_used = true;
+        // The compactor atomically commits its final overlay/item together
+        // with this resumed state; mirror that durable fact into the watch.
+        self.state.send_replace(Some(RunState::Thinking));
+        Ok(())
+    }
+
+    /// Enforces the daemon-pinned hard-fit budget immediately before every
+    /// provider request. Unknown catalog windows deliberately disable this
+    /// proactive guard; provider-reported overflow can still force one
+    /// compaction through the same one-shot path.
+    async fn enforce_context_hard_fit(
+        &mut self,
+        run_id: &RunId,
+        messages: &mut Vec<Message>,
+        current_turn_start: usize,
+        forced_compaction_used: &mut bool,
+    ) -> Result<(), DriveError> {
+        let Some(window) = self.config.context_window else {
+            return Ok(());
+        };
+        let input_budget = window
+            .checked_sub(self.config.reserved_output_tokens)
+            .ok_or_else(|| {
+                DriveError::Provider(ProviderError::new(
+                    ProviderErrorKind::ContextExceeded,
+                    "reserved output budget leaves no provider input capacity",
+                ))
+            })?;
+        if estimated_request_input_tokens(&self.config, messages) <= input_budget {
+            return Ok(());
+        }
+        self.force_context_compaction(run_id, messages, current_turn_start, forced_compaction_used)
+            .await?;
+        let compacted = estimated_request_input_tokens(&self.config, messages);
+        if compacted > input_budget {
+            return Err(DriveError::Provider(ProviderError::new(
+                ProviderErrorKind::ContextExceeded,
+                format!(
+                    "compacted provider input estimate {compacted} exceeds budget {input_budget}"
+                ),
+            )));
+        }
+        Ok(())
     }
 
     /// Commits `Waiting { RateLimit | ProviderBackoff }`, sleeps, then
@@ -2806,8 +3113,36 @@ impl HarnessActor {
         run_id: &RunId,
         item: ItemEvent,
     ) -> Result<RawEnvelope, HaiderError> {
-        self.commit_payload(run_id, EventPayload::Item(item), prompt_verbatim_render())
+        let node_kind = match &item {
+            ItemEvent::Completed {
+                item: TurnItem::AgentMessage { text },
+                ..
+            } => Some(NodeKind::AssistantCommit {
+                text: text.clone(),
+                verdict: VerifyVerdict::NotApplicable,
+            }),
+            ItemEvent::Completed {
+                item: TurnItem::ToolCall { name, status, .. },
+                ..
+            } => Some(NodeKind::ToolExchange {
+                tool: name.clone(),
+                summary: format!("tool call settled as {status:?}"),
+                artifact: None,
+            }),
+            _ => None,
+        };
+        if let Some(node_kind) = node_kind {
+            self.commit_tree_fragment(
+                run_id,
+                EventPayload::Item(item),
+                prompt_verbatim_render(),
+                node_kind,
+            )
             .await
+        } else {
+            self.commit_payload(run_id, EventPayload::Item(item), prompt_verbatim_render())
+                .await
+        }
     }
 
     /// Atomically journals a hidden provider-native block as one closed item.
@@ -2833,6 +3168,15 @@ impl HarnessActor {
             }),
         };
         let render = hidden_prompt_verbatim_render();
+        let parent = self.tree_parent().await.map_err(DriveError::Store)?;
+        let node = TreeNode {
+            node: self.next_node_id(),
+            parent,
+            kind: NodeKind::AssistantCommit {
+                text: String::new(),
+                verdict: VerifyVerdict::NotApplicable,
+            },
+        };
         let mut envelopes = [
             self.uncommitted_envelope(
                 run_id,
@@ -2849,6 +3193,12 @@ impl HarnessActor {
                 render,
             )
             .map_err(DriveError::Store)?,
+            self.uncommitted_envelope(
+                run_id,
+                EventPayload::NodeCommitted(node.clone()),
+                prompt_omit_render(),
+            )
+            .map_err(DriveError::Store)?,
         ];
         self.store
             .append(&mut envelopes)
@@ -2857,7 +3207,86 @@ impl HarnessActor {
         for committed in envelopes {
             let _ = self.events.send(committed);
         }
+        self.tree_head = Some(node.node);
         Ok(())
+    }
+
+    async fn commit_hidden_extension_marker(
+        &mut self,
+        run_id: &RunId,
+        kind: &str,
+        data: serde_json::Value,
+    ) -> Result<(), HaiderError> {
+        let item_id = self.next_item_id();
+        let item = TurnItem::Extension {
+            kind: kind.to_owned(),
+            data,
+        };
+        let render = hidden_prompt_omit_render();
+        let mut envelopes = [
+            self.uncommitted_envelope(
+                run_id,
+                EventPayload::Item(ItemEvent::Started {
+                    item_id: item_id.clone(),
+                    item: item.clone(),
+                }),
+                render,
+            )?,
+            self.uncommitted_envelope(
+                run_id,
+                EventPayload::Item(ItemEvent::Completed { item_id, item }),
+                render,
+            )?,
+        ];
+        self.store.append(&mut envelopes).await?;
+        for committed in envelopes {
+            let _ = self.events.send(committed);
+        }
+        Ok(())
+    }
+
+    /// Atomically closes one exact journal fragment with the immutable tree
+    /// node that selects it. A crash exposes both or neither to compilation.
+    async fn commit_tree_fragment(
+        &mut self,
+        run_id: &RunId,
+        payload: EventPayload,
+        render: RenderTargets,
+        kind: NodeKind,
+    ) -> Result<RawEnvelope, HaiderError> {
+        let node = TreeNode {
+            node: self.next_node_id(),
+            parent: self.tree_parent().await?,
+            kind,
+        };
+        let mut envelopes = [
+            self.uncommitted_envelope(run_id, payload, render)?,
+            self.uncommitted_envelope(
+                run_id,
+                EventPayload::NodeCommitted(node.clone()),
+                prompt_omit_render(),
+            )?,
+        ];
+        self.store.append(&mut envelopes).await?;
+        for committed in &envelopes {
+            let _ = self.events.send(committed.clone());
+        }
+        self.tree_head = Some(node.node);
+        Ok(envelopes[0].clone())
+    }
+
+    async fn tree_parent(&mut self) -> Result<Option<NodeId>, HaiderError> {
+        if !self.tree_head_initialized {
+            self.tree_head = PromptHistoryCompiler::latest_head(
+                self.store.as_ref(),
+                &self.config.session_id,
+                self.config.branch_id.as_ref(),
+                self.config.agent_id.as_ref(),
+            )
+            .await?;
+            self.tree_head_initialized = true;
+        }
+        Ok(self.tree_head.clone())
     }
 
     /// Stamps identity/fencing fields, appends (the store assigns `seq` and
@@ -2906,6 +3335,17 @@ impl HarnessActor {
             render,
             payload,
         })
+    }
+
+    fn next_node_id(&mut self) -> NodeId {
+        self.next_node = self.next_node.saturating_add(1);
+        NodeId::new(format!(
+            "node-{}-{}-{}-{}",
+            self.config.session_id,
+            self.config.worker_generation,
+            self.started_at_ms,
+            self.next_node
+        ))
     }
 
     fn next_run_id(&mut self) -> RunId {
@@ -3104,6 +3544,19 @@ fn loop_limit_error(count: usize, limit: usize) -> HaiderError {
     error
 }
 
+fn continuation_limit_error(count: usize, limit: usize) -> HaiderError {
+    let mut error = HaiderError::new(
+        ErrorCode::LoopLimit,
+        format!("provider continuation limit exceeded at continuation {count} (limit {limit})"),
+        false,
+    );
+    error.details = Some(serde_json::json!({
+        "continuation_count": count,
+        "continuation_limit": limit,
+    }));
+    error
+}
+
 fn submit_busy_error(capacity: usize) -> HaiderError {
     let mut error = HaiderError::new(
         ErrorCode::Busy,
@@ -3147,6 +3600,7 @@ fn provider_error_allows_rotation(error: &ProviderError) -> bool {
         ProviderErrorKind::Authentication => true,
         ProviderErrorKind::PermissionDenied
         | ProviderErrorKind::Overloaded
+        | ProviderErrorKind::ContextExceeded
         | ProviderErrorKind::InvalidRequest
         | ProviderErrorKind::Transport
         | ProviderErrorKind::MalformedFrame
@@ -3191,6 +3645,31 @@ fn cumulative_usage(completed: Option<&Usage>, current: &Usage) -> Result<Usage,
         account,
         accounts,
     })
+}
+
+fn finalize_request_usage(
+    completed: &mut Option<Usage>,
+    current: &mut Option<Usage>,
+) -> Result<(), DriveError> {
+    if let Some(usage) = current.take() {
+        *completed = Some(cumulative_usage(completed.as_ref(), &usage)?);
+    }
+    Ok(())
+}
+
+/// Conservative provider-neutral estimate used only for the known-window
+/// hard-fit safety check. W7b may replace this with provider/tokenizer truth;
+/// it must remain separate from cumulative billing usage.
+fn estimated_request_input_tokens(config: &HarnessConfig, messages: &[Message]) -> u64 {
+    let bytes = serde_json::to_vec(&(
+        messages,
+        &config.system_prompt,
+        &config.tools,
+        &config.attachments,
+    ))
+    .map(|encoded| u64::try_from(encoded.len()).unwrap_or(u64::MAX))
+    .unwrap_or(u64::MAX);
+    bytes.saturating_add(3) / 4
 }
 
 #[cfg(test)]
@@ -3302,5 +3781,14 @@ fn hidden_prompt_verbatim_render() -> RenderTargets {
         ui: false,
         durable: true,
         prompt: PromptRender::Verbatim,
+    }
+}
+
+/// Durable + UI-hidden marker, excluded from provider prompt rendering.
+fn hidden_prompt_omit_render() -> RenderTargets {
+    RenderTargets {
+        ui: false,
+        durable: true,
+        prompt: PromptRender::Omit,
     }
 }

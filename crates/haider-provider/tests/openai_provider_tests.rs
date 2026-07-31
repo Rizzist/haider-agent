@@ -125,6 +125,20 @@ data: {"type":"response.incomplete","response":{"status":"incomplete","incomplet
     ));
 }
 
+/// MUTATION CHECK: classify `context_length_exceeded` as InvalidRequest.
+/// Expected runtime failure: forced compaction cannot distinguish overflow.
+#[test]
+fn context_exceeded_http_fixture_has_a_distinct_non_retryable_kind() {
+    let error = replay_openai_http_error(
+        400,
+        None,
+        include_bytes!("fixtures/openai/context_exceeded.http.json"),
+    );
+
+    assert_eq!(error.kind, ProviderErrorKind::ContextExceeded);
+    assert!(!error.retryable);
+}
+
 #[test]
 fn chat_max_tokens_drops_partial_tool_call_before_actor_sees_it() {
     let wire = br#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_partial","type":"function","function":{"name":"write_file","arguments":"{\"path\":"}}]},"finish_reason":null}]}

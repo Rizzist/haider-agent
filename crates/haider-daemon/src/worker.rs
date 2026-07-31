@@ -28,7 +28,8 @@ use crate::turn_recovery::{cancelled_resumption_payloads, failed_resumption_payl
 use async_trait::async_trait;
 use base64::Engine;
 use haider_core::{
-    AcceptedTurn, CancelToken, ChildWaitCheckpoint, DeferredTicket, DeferredToolResult,
+    AcceptedTurn, CancelToken, ChildWaitCheckpoint, ContextCompactionClaim,
+    ContextCompactionReceiptResponse, ContextCompactor, DeferredTicket, DeferredToolResult,
     EventIdGenerator, HarnessActor, HarnessConfig, PromptHistoryCompiler, RequestInputCheckpoint,
     StoreHandle, SubmitCheckpointTurn, SubmitChildWaitTurn, SubmitCommittedTurn,
     ToolDispatchResult, ToolDispatcher, TurnHandle, sanitized_failure_message,
@@ -39,16 +40,20 @@ use haider_protocol::effect::{
 };
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
 use haider_protocol::error::{ErrorCode, HaiderError};
-use haider_protocol::ids::{
-    AgentId, DeviceId, EffectId, EventId, ItemId, MenuId, RunId, SessionId,
+use haider_protocol::history::{
+    COMPACTION_INTENT_EXTENSION_KIND, CompactionIntent, CompactionResume, NodeKind, TreeNode,
 };
-use haider_protocol::item::{ItemDelta, ItemEvent};
+use haider_protocol::ids::{
+    AgentId, DeviceId, EffectId, EventId, ItemId, MenuId, NodeId, RunId, SessionId,
+};
+use haider_protocol::item::{ItemDelta, ItemEvent, TurnItem};
 use haider_protocol::menu::{DecisionKind, Menu, MenuAnswer, MenuKind};
+use haider_protocol::provider::{FinishReason, StreamEvent};
 use haider_protocol::session::SessionMetadataV1;
 use haider_protocol::state::{RunState, SessionState};
 use haider_protocol::tool::BoundedResult;
 use haider_provider::{Message, ResolvedAttachment};
-use haider_provider::{Provider, ToolDefinition};
+use haider_provider::{Provider, ToolDefinition, TurnRequest};
 use haider_tools::{
     CasSink, ChangeLedger, CommandOutputSink, EffectBroker, FsList, FsPatch, FsRead, FsSearch,
     FsWrite, JournalSink, PermissionPolicy, ProcessBounds, ProcessExec, ProcessResult,
@@ -70,6 +75,8 @@ pub struct ResolvedTurnProvider {
     pub provider: Arc<dyn Provider>,
     pub provider_name: String,
     pub model: String,
+    /// Exact provider-catalog declaration for `model`; never inferred.
+    pub context_window: Option<u64>,
     /// Stamped into usage until an automatic pre-event rotation changes it.
     pub account_alias: Option<String>,
     /// Factory-time alternate committed before the first provider call.
@@ -78,6 +85,13 @@ pub struct ResolvedTurnProvider {
     pub rotation_budget_consumed: bool,
     /// Daemon-owned live credential resolver for this logical turn.
     pub attempt_resolver: Option<Arc<dyn haider_core::ProviderAttemptResolver>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AcceptedCompaction {
+    pub run_id: RunId,
+    pub accepted_seq: u64,
+    pub worker_generation: u64,
 }
 
 /// Injectable, turn-scoped provider resolver (R6/R8): initial resolution
@@ -93,6 +107,196 @@ pub trait ProviderFactory: Send + Sync {
         &self,
         metadata: &SessionMetadataV1,
     ) -> Result<ResolvedTurnProvider, HaiderError>;
+}
+
+struct DaemonContextCompactor {
+    store: HubStoreHandle,
+    provider: Arc<dyn Provider>,
+    model: String,
+    max_tokens: u64,
+    attachments: Vec<ResolvedAttachment>,
+    device_id: DeviceId,
+    event_ids: Arc<EventIdGenerator>,
+    agent_id: Option<AgentId>,
+}
+
+impl std::fmt::Debug for DaemonContextCompactor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DaemonContextCompactor")
+            .field("session_id", self.store.session_id())
+            .field("model", &self.model)
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl ContextCompactor for DaemonContextCompactor {
+    async fn plan(
+        &self,
+        run_id: &RunId,
+        resume_cause: CompactionResume,
+    ) -> Result<CompactionIntent, HaiderError> {
+        PromptHistoryCompiler::plan_compaction(
+            &self.store,
+            self.store.session_id(),
+            None,
+            self.agent_id.as_ref(),
+            run_id,
+            format!("compact-{}", self.event_ids.next()),
+            resume_cause,
+        )
+        .await
+    }
+
+    async fn compact(
+        &self,
+        run_id: &RunId,
+        intent: &CompactionIntent,
+        mut covered_messages: Vec<Message>,
+    ) -> Result<Message, HaiderError> {
+        covered_messages.push(Message::user_text(
+            "Summarize the preceding conversation for lossless continuation. Preserve decisions, constraints, exact identifiers, unresolved work, and tool outcomes. Return only the summary.",
+        ));
+        let request = TurnRequest {
+            messages: covered_messages.clone(),
+            model: self.model.clone(),
+            max_tokens: self.max_tokens.min(4096),
+            system_prompt: None,
+            tools: Vec::new(),
+            attachments: self.attachments.clone(),
+        };
+        let mut stream = self.provider.stream_turn(request).await.map_err(|error| {
+            HaiderError::new(
+                ErrorCode::ProviderError,
+                format!("context summarization could not start: {error}"),
+                error.retryable,
+            )
+        })?;
+        let mut summary = String::new();
+        let mut finished = false;
+        while let Some(item) = stream.recv().await {
+            match item.map_err(|error| {
+                HaiderError::new(
+                    ErrorCode::ProviderError,
+                    format!("context summarization failed: {error}"),
+                    error.retryable,
+                )
+            })? {
+                StreamEvent::TextDelta { text } => summary.push_str(&text),
+                StreamEvent::ReasoningDelta { .. } | StreamEvent::UsageUpdate(_) => {}
+                StreamEvent::Finish {
+                    reason: FinishReason::EndTurn,
+                } => {
+                    finished = true;
+                    break;
+                }
+                StreamEvent::Finish { reason } => {
+                    return Err(HaiderError::new(
+                        ErrorCode::ProviderError,
+                        format!("context summarization ended with {reason:?}"),
+                        false,
+                    ));
+                }
+                StreamEvent::ProviderOpaque { .. }
+                | StreamEvent::RefusalDelta { .. }
+                | StreamEvent::ToolCallStart { .. }
+                | StreamEvent::ToolCallArgsDelta { .. }
+                | StreamEvent::ToolCallEnd { .. } => {
+                    return Err(HaiderError::new(
+                        ErrorCode::ProviderError,
+                        "context summarization returned unsupported structured output",
+                        false,
+                    ));
+                }
+            }
+        }
+        if !finished || summary.trim().is_empty() {
+            return Err(HaiderError::new(
+                ErrorCode::ProviderError,
+                "context summarization returned no completed summary",
+                false,
+            ));
+        }
+
+        let artifact = self.store.put_artifact(summary.as_bytes().to_vec()).await?;
+        // Snapshot the journal head before deriving the tree parent. If any
+        // turn, steer, or other append races this scan, the actor-side CAS
+        // below rejects the compaction node instead of forking off a stale
+        // parent and orphaning the concurrently accepted history.
+        let expected_head = StoreHandle::latest_seq(&self.store, self.store.session_id()).await?;
+        let parent = PromptHistoryCompiler::latest_head(
+            &self.store,
+            self.store.session_id(),
+            None,
+            self.agent_id.as_ref(),
+        )
+        .await?;
+        let tokens_before = approximate_message_tokens(&covered_messages);
+        let tokens_after = approximate_text_tokens(&summary);
+        let item_id = ItemId::new(format!("compaction-item-{}", intent.operation_id));
+        let item = TurnItem::ContextCompaction {
+            summary_artifact: artifact.clone(),
+            tokens_before: Some(tokens_before),
+            tokens_after: Some(tokens_after),
+        };
+        let node = TreeNode {
+            node: NodeId::new(format!("compaction-node-{}", intent.operation_id)),
+            parent,
+            kind: NodeKind::Compaction {
+                covers_from: intent.covers_from.clone(),
+                covers_to: intent.covers_to.clone(),
+                summary_artifact: artifact,
+                tokens_before,
+                tokens_after,
+                resume_cause: intent.resume_cause.clone(),
+            },
+        };
+        let payloads = vec![
+            EventPayload::Item(ItemEvent::Started {
+                item_id: item_id.clone(),
+                item: item.clone(),
+            }),
+            EventPayload::Item(ItemEvent::Completed { item_id, item }),
+            EventPayload::NodeCommitted(node),
+            EventPayload::RunState(match intent.resume_cause {
+                CompactionResume::AutoMidTurn => RunState::Thinking,
+                CompactionResume::ManualIdle => RunState::Done,
+            }),
+        ];
+        let mut envelopes = payloads
+            .into_iter()
+            .map(|payload| {
+                let mut envelope = supervisor_envelope(
+                    &self.store,
+                    &self.device_id,
+                    Some(run_id.clone()),
+                    self.event_ids.next(),
+                    payload,
+                )?;
+                envelope.agent_id = self.agent_id.clone();
+                Ok(envelope)
+            })
+            .collect::<Result<Vec<_>, HaiderError>>()?;
+        self.store
+            .append_at_head(expected_head, &mut envelopes)
+            .await?;
+        Ok(Message::user_text(summary))
+    }
+}
+
+fn approximate_message_tokens(messages: &[Message]) -> u64 {
+    serde_json::to_vec(messages)
+        .map(|bytes| approximate_len_tokens(bytes.len()))
+        .unwrap_or(u64::MAX)
+}
+
+fn approximate_text_tokens(text: &str) -> u64 {
+    approximate_len_tokens(text.len())
+}
+
+fn approximate_len_tokens(bytes: usize) -> u64 {
+    u64::try_from(bytes).unwrap_or(u64::MAX).saturating_add(3) / 4
 }
 
 /// Inputs available to a turn-scoped tool dispatcher factory.
@@ -289,6 +493,12 @@ enum ManagerCommand {
         text: String,
         completed: oneshot::Sender<Result<(), HaiderError>>,
     },
+    Compact {
+        session_id: SessionId,
+        command_id: String,
+        worker_generation: u64,
+        completed: oneshot::Sender<Result<AcceptedCompaction, HaiderError>>,
+    },
     Shutdown {
         completed: oneshot::Sender<Result<(), HaiderError>>,
     },
@@ -300,6 +510,11 @@ enum SupervisorCommand {
         run_id: RunId,
         text: String,
         completed: oneshot::Sender<Result<(), HaiderError>>,
+    },
+    Compact {
+        command_id: String,
+        worker_generation: u64,
+        completed: oneshot::Sender<Result<AcceptedCompaction, HaiderError>>,
     },
     Shutdown,
 }
@@ -455,6 +670,24 @@ impl WorkerManagerHandle {
                 session_id,
                 run_id,
                 text,
+                completed,
+            })
+            .map_err(manager_try_send)?;
+        response.await.map_err(|_| manager_stopped())?
+    }
+
+    pub(crate) async fn compact(
+        &self,
+        session_id: SessionId,
+        command_id: String,
+        worker_generation: u64,
+    ) -> Result<AcceptedCompaction, HaiderError> {
+        let (completed, response) = oneshot::channel();
+        self.commands
+            .try_send(ManagerCommand::Compact {
+                session_id,
+                command_id,
+                worker_generation,
                 completed,
             })
             .map_err(manager_try_send)?;
@@ -647,6 +880,48 @@ async fn run_manager(
                             ..
                         }) => (completed, manager_busy("session supervisor queue is full")),
                         mpsc::error::TrySendError::Closed(SupervisorCommand::Nudge {
+                            completed,
+                            ..
+                        }) => (completed, manager_stopped()),
+                        _ => unreachable!(),
+                    };
+                    let _ = completed.send(Err(error));
+                }
+            }
+            ManagerCommand::Compact {
+                session_id,
+                command_id,
+                worker_generation,
+                completed,
+            } => {
+                let supervisor = match supervisor_for(
+                    &hub,
+                    &dependencies,
+                    &mut supervisors,
+                    &mut tasks,
+                    &mut task_sessions,
+                    &mut incarnations,
+                    session_id,
+                )
+                .await
+                {
+                    Ok(supervisor) => supervisor,
+                    Err(error) => {
+                        let _ = completed.send(Err(error));
+                        continue;
+                    }
+                };
+                if let Err(error) = supervisor.try_send(SupervisorCommand::Compact {
+                    command_id,
+                    worker_generation,
+                    completed,
+                }) {
+                    let (completed, error) = match error {
+                        mpsc::error::TrySendError::Full(SupervisorCommand::Compact {
+                            completed,
+                            ..
+                        }) => (completed, manager_busy("session supervisor queue is full")),
+                        mpsc::error::TrySendError::Closed(SupervisorCommand::Compact {
                             completed,
                             ..
                         }) => (completed, manager_stopped()),
@@ -1151,6 +1426,13 @@ async fn run_supervisor(
                             };
                             let _ = completed.send(result);
                         }
+                        Some(SupervisorCommand::Compact { completed, .. }) => {
+                            let _ = completed.send(Err(HaiderError::new(
+                                ErrorCode::Busy,
+                                "manual context compaction is idle-only",
+                                true,
+                            )));
+                        }
                         Some(SupervisorCommand::Shutdown) | None => {
                             stopping = true;
                             // P3-4/W6c (park, don't cancel): request-input and
@@ -1378,6 +1660,23 @@ async fn run_supervisor(
                             "daemon steer found no active run",
                             false,
                         )));
+                    }
+                    Some(SupervisorCommand::Compact {
+                        command_id,
+                        worker_generation,
+                        completed,
+                    }) => {
+                        let result = perform_manual_compaction(
+                            &dependencies,
+                            &metadata,
+                            &lease,
+                            &device_id,
+                            Arc::clone(&event_ids),
+                            command_id,
+                            worker_generation,
+                        )
+                        .await;
+                        let _ = completed.send(result);
                     }
                     Some(SupervisorCommand::Shutdown) | None => {
                         stopping = true;
@@ -1791,6 +2090,278 @@ async fn cancel_durable_queued_turns(
     last
 }
 
+struct DurableCompactionReceipt {
+    run_id: RunId,
+    accepted_seq: u64,
+    worker_generation: u64,
+    intent: CompactionIntent,
+    committed: bool,
+}
+
+async fn find_compaction_receipt(
+    store: &HubStoreHandle,
+    command_id: &str,
+) -> Result<Option<DurableCompactionReceipt>, HaiderError> {
+    let operation_id = format!("manual-{command_id}");
+    let node_id = format!("compaction-node-{operation_id}");
+    let mut receipt = None;
+    let mut committed = false;
+    let mut cursor = 0;
+    loop {
+        let page = StoreHandle::read(store, store.session_id(), cursor, 256).await?;
+        if page.is_empty() {
+            break;
+        }
+        cursor = page.last().map_or(cursor, |envelope| envelope.seq);
+        for envelope in page {
+            let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload) else {
+                continue;
+            };
+            match payload {
+                EventPayload::Item(ItemEvent::Completed {
+                    item: TurnItem::Extension { kind, data },
+                    ..
+                }) if kind == COMPACTION_INTENT_EXTENSION_KIND => {
+                    let intent =
+                        serde_json::from_value::<CompactionIntent>(data).map_err(|error| {
+                            HaiderError::new(
+                                ErrorCode::StoreCorrupt,
+                                format!("manual compaction intent is invalid: {error}"),
+                                false,
+                            )
+                        })?;
+                    if intent.operation_id != operation_id {
+                        continue;
+                    }
+                    let run_id = envelope.run_id.ok_or_else(|| {
+                        HaiderError::new(
+                            ErrorCode::StoreCorrupt,
+                            "manual compaction intent has no run id",
+                            false,
+                        )
+                    })?;
+                    receipt = Some((run_id, envelope.seq, envelope.worker_generation, intent));
+                }
+                EventPayload::NodeCommitted(node) if node.node.as_str() == node_id => {
+                    committed = true;
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(receipt.map(
+        |(run_id, accepted_seq, worker_generation, intent)| DurableCompactionReceipt {
+            run_id,
+            accepted_seq,
+            worker_generation,
+            intent,
+            committed,
+        },
+    ))
+}
+
+async fn perform_manual_compaction(
+    dependencies: &WorkerDependencies,
+    metadata: &SessionMetadataV1,
+    lease: &HubStoreHandle,
+    device_id: &DeviceId,
+    event_ids: Arc<EventIdGenerator>,
+    command_id: String,
+    worker_generation: u64,
+) -> Result<AcceptedCompaction, HaiderError> {
+    let request_json = serde_json::to_string(&serde_json::json!({
+        "session_id": lease.session_id(),
+        "worker_generation": worker_generation,
+    }))
+    .map_err(|error| {
+        HaiderError::new(
+            ErrorCode::Internal,
+            format!("session-compact request could not serialize: {error}"),
+            false,
+        )
+    })?;
+    let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
+    // The global command receipt is claimed before intent. Its committed
+    // replay wins over generation fencing, exactly like turn submission.
+    match lease
+        .claim_context_compaction_receipt(command_id.clone(), request_digest, request_json)
+        .await?
+    {
+        ContextCompactionClaim::Committed(response) => {
+            return Ok(AcceptedCompaction {
+                run_id: response.run_id,
+                accepted_seq: response.accepted_seq,
+                worker_generation: response.worker_generation,
+            });
+        }
+        ContextCompactionClaim::Fresh | ContextCompactionClaim::ResumePending => {}
+    }
+
+    let existing = find_compaction_receipt(lease, &command_id).await?;
+    if let Some(receipt) = existing.as_ref()
+        && receipt.committed
+    {
+        let accepted = AcceptedCompaction {
+            run_id: receipt.run_id.clone(),
+            accepted_seq: receipt.accepted_seq,
+            worker_generation: receipt.worker_generation,
+        };
+        lease
+            .finalize_context_compaction_receipt(
+                command_id,
+                ContextCompactionReceiptResponse {
+                    session_id: lease.session_id().clone(),
+                    run_id: accepted.run_id.clone(),
+                    accepted_seq: accepted.accepted_seq,
+                    worker_generation: accepted.worker_generation,
+                },
+            )
+            .await?;
+        return Ok(accepted);
+    }
+    if worker_generation != lease.worker_generation() {
+        return Err(HaiderError::new(
+            ErrorCode::SingleWriterViolation,
+            format!(
+                "manual compaction generation {worker_generation} is stale; current generation is {}",
+                lease.worker_generation()
+            ),
+            false,
+        ));
+    }
+    if existing.is_none()
+        && durable_runs(lease)
+            .await?
+            .iter()
+            .any(|(_, state, _)| !state.is_terminal())
+    {
+        return Err(HaiderError::new(
+            ErrorCode::Busy,
+            "manual context compaction is idle-only",
+            true,
+        ));
+    }
+
+    let delegation = dependencies.delegation.clone().ok_or_else(|| {
+        HaiderError::new(
+            ErrorCode::Internal,
+            "worker delegation coordinator is not installed",
+            false,
+        )
+    })?;
+    let agent_id = delegation.agent_for_session(lease.session_id()).await?;
+    let resolved = dependencies
+        .provider_factory
+        .resolve_for_turn(metadata)
+        .await?;
+    if resolved.provider_name != metadata.provider {
+        return Err(HaiderError::new(
+            ErrorCode::ProviderError,
+            "provider factory returned a different provider than the session",
+            false,
+        ));
+    }
+    let mut messages = PromptHistoryCompiler::compile_idle_with_artifacts(
+        lease,
+        lease,
+        lease.session_id(),
+        None,
+        agent_id.as_ref(),
+    )
+    .await?;
+    let attachments = resolve_prompt_attachments(lease, &mut messages).await?;
+    let (run_id, accepted_seq, intent) = if let Some(existing) = existing {
+        (existing.run_id, existing.accepted_seq, existing.intent)
+    } else {
+        let run_id = RunId::new(format!("manual-compact-{command_id}"));
+        let intent = PromptHistoryCompiler::plan_idle_compaction(
+            lease,
+            lease.session_id(),
+            None,
+            agent_id.as_ref(),
+            format!("manual-{command_id}"),
+        )
+        .await?;
+        let intent_item_id = ItemId::new(format!("compaction-intent-{}", intent.operation_id));
+        let intent_item = TurnItem::Extension {
+            kind: COMPACTION_INTENT_EXTENSION_KIND.into(),
+            data: serde_json::to_value(&intent).map_err(|error| {
+                HaiderError::new(
+                    ErrorCode::Internal,
+                    format!("manual compaction intent could not serialize: {error}"),
+                    false,
+                )
+            })?,
+        };
+        let mut envelopes = vec![
+            supervisor_envelope(
+                lease,
+                device_id,
+                Some(run_id.clone()),
+                event_ids.next(),
+                EventPayload::Item(ItemEvent::Started {
+                    item_id: intent_item_id.clone(),
+                    item: intent_item.clone(),
+                }),
+            )?,
+            supervisor_envelope(
+                lease,
+                device_id,
+                Some(run_id.clone()),
+                event_ids.next(),
+                EventPayload::Item(ItemEvent::Completed {
+                    item_id: intent_item_id,
+                    item: intent_item,
+                }),
+            )?,
+            supervisor_envelope(
+                lease,
+                device_id,
+                Some(run_id.clone()),
+                event_ids.next(),
+                EventPayload::RunState(RunState::Compacting),
+            )?,
+        ];
+        for envelope in &mut envelopes {
+            envelope.agent_id = agent_id.clone();
+        }
+        let range = StoreHandle::append(lease, &mut envelopes).await?;
+        (run_id, range.first_seq.saturating_add(1), intent)
+    };
+    let compactor = DaemonContextCompactor {
+        store: lease.clone(),
+        provider: resolved.provider,
+        model: resolved.model,
+        max_tokens: metadata.max_tokens,
+        attachments,
+        device_id: device_id.clone(),
+        event_ids: Arc::clone(&event_ids),
+        agent_id,
+    };
+    if let Err(error) = compactor.compact(&run_id, &intent, messages).await {
+        append_failure(lease, device_id, &run_id, &event_ids, error.clone()).await?;
+        return Err(error);
+    }
+    append_session_idle(lease, device_id, &event_ids, false).await?;
+    let accepted = AcceptedCompaction {
+        run_id,
+        accepted_seq,
+        worker_generation,
+    };
+    lease
+        .finalize_context_compaction_receipt(
+            command_id,
+            ContextCompactionReceiptResponse {
+                session_id: lease.session_id().clone(),
+                run_id: accepted.run_id.clone(),
+                accepted_seq: accepted.accepted_seq,
+                worker_generation: accepted.worker_generation,
+            },
+        )
+        .await?;
+    Ok(accepted)
+}
+
 /// Assembles and starts one accepted turn: provider resolution (R6 pinning —
 /// this is the once-per-logical-turn call), committed-history compilation
 /// (R4), tool dispatcher creation, harness registration under the lease, and
@@ -1842,7 +2413,8 @@ async fn start_turn(
     })?;
     let agent_id = delegation.agent_for_session(lease.session_id()).await?;
     let prompt_compile_started = Instant::now();
-    let mut messages = PromptHistoryCompiler::compile(
+    let mut messages = PromptHistoryCompiler::compile_with_artifacts(
+        lease,
         lease,
         lease.session_id(),
         None,
@@ -1877,10 +2449,24 @@ async fn start_turn(
         0,
         lease.worker_generation(),
     )
-    .with_event_ids(event_ids);
+    .with_event_ids(Arc::clone(&event_ids));
     config.model = resolved.model;
+    config.context_window = resolved.context_window;
     config.agent_id = agent_id;
     config.max_tokens = metadata.max_tokens;
+    config.reserved_output_tokens = metadata.max_tokens;
+    if let Some(window) = config.context_window
+        && config.reserved_output_tokens >= window
+    {
+        return Err(HaiderError::new(
+            ErrorCode::InvalidArgument,
+            format!(
+                "reserved output budget {} must be smaller than model context window {}",
+                config.reserved_output_tokens, window
+            ),
+            false,
+        ));
+    }
     config.system_prompt = Some(SystemPromptBuilder::build(metadata));
     config.tools = dependencies.tool_factory.definitions();
     // W6c children retain the spawn tool. The coordinator derives their
@@ -1888,6 +2474,16 @@ async fn start_turn(
     // result at the cap; hiding the tool would turn that recoverable model
     // decision into provider-specific behavior.
     config.attachments = attachments;
+    config.context_compactor = Some(Arc::new(DaemonContextCompactor {
+        store: lease.clone(),
+        provider: Arc::clone(&resolved.provider),
+        model: config.model.clone(),
+        max_tokens: config.max_tokens,
+        attachments: config.attachments.clone(),
+        device_id: device_id.clone(),
+        event_ids: Arc::clone(&event_ids),
+        agent_id: config.agent_id.clone(),
+    }));
     config.usage_account = resolved
         .account_alias
         .map(haider_protocol::ids::CredentialAlias::new);

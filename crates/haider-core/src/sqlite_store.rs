@@ -4,7 +4,7 @@
 //! runs on Tokio's blocking pool. The wrapped [`Store`] owns one connection and
 //! the profile lock until [`SqliteStoreHandle::close`] or final fallback drop.
 
-use crate::{CommittedRange, StoreHandle};
+use crate::{ArtifactReader, CommittedRange, StoreHandle};
 use async_trait::async_trait;
 use haider_protocol::agent::ChildReport;
 use haider_protocol::envelope::RawEnvelope;
@@ -12,10 +12,10 @@ use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::{AgentId, ArtifactRef, RunId, SessionId};
 use haider_protocol::session::SessionMetadataV1;
 use haider_store::{
-    AcceptedTurn, CancelledTurn, Cas, DelegationCreateOutcome, DelegationRecord, EventStore,
-    MenuResolutionCommand, MenuResolutionOutcome, ProfileLease, SessionCreateCommand,
-    SessionCreateOutcome, Store, TurnAcceptCommand, TurnAcceptOutcome, TurnCancelCommand,
-    TurnCancelOutcome,
+    AcceptedTurn, CancelledTurn, Cas, ContextCompactionClaim, ContextCompactionReceiptResponse,
+    DelegationCreateOutcome, DelegationRecord, EventStore, MenuResolutionCommand,
+    MenuResolutionOutcome, ProfileLease, SessionCreateCommand, SessionCreateOutcome, Store,
+    TurnAcceptCommand, TurnAcceptOutcome, TurnCancelCommand, TurnCancelOutcome,
 };
 use haider_tools::{CasSink, ToolResult};
 use std::path::Path;
@@ -599,6 +599,35 @@ impl SqliteStoreHandle {
         .await
     }
 
+    pub async fn claim_context_compaction_receipt(
+        &self,
+        command_id: String,
+        request_digest: String,
+        request_json: String,
+    ) -> Result<ContextCompactionClaim, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.claim_context_compaction_receipt(&command_id, &request_digest, &request_json)
+            })
+        })
+        .await
+    }
+
+    pub async fn finalize_context_compaction_receipt(
+        &self,
+        command_id: String,
+        response: ContextCompactionReceiptResponse,
+    ) -> Result<(), HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.finalize_context_compaction_receipt(&command_id, &response)
+            })
+        })
+        .await
+    }
+
     /// Reads one true-weight-budgeted replay page (`Store::read_page` law:
     /// retained rows stop at the budget, but a non-empty result always
     /// contains at least one envelope).
@@ -719,6 +748,13 @@ impl StoreHandle for SqliteStoreHandle {
         let owner = Arc::clone(&self.owner);
         let session_id = session_id.clone();
         run_blocking(move || owner.with_store(|store| store.latest_seq(&session_id))).await
+    }
+}
+
+#[async_trait]
+impl ArtifactReader for SqliteStoreHandle {
+    async fn read_artifact(&self, artifact: &ArtifactRef) -> Result<Vec<u8>, HaiderError> {
+        self.get(artifact).await
     }
 }
 

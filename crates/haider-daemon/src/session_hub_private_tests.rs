@@ -301,6 +301,7 @@ async fn cancelling_committed_before_worker_done_rejects_done() {
         .commands
         .send(ActorCommand::WorkerAppend {
             lease_id: lease.lease_id.clone(),
+            expected_head: None,
             envelopes: vec![run_state_envelope(
                 &session_id,
                 &run_id,
@@ -351,6 +352,90 @@ async fn cancelling_committed_before_worker_done_rejects_done() {
     );
     hub.shutdown().await.expect("hub stops");
     store.close().await.expect("store closes");
+}
+
+/// MUTATION CHECK: ignore `expected_head` in the worker append arm. Expected
+/// runtime failure: the stale batch commits after the intervening append,
+/// which would let a compaction node fork from an obsolete tree parent.
+#[tokio::test]
+async fn worker_head_cas_rejects_a_compaction_batch_after_history_advances() {
+    let root = tempfile::tempdir().expect("temp store");
+    let store = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("store opens");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub opens");
+    let session_id = SessionId::new("compaction-head-cas");
+    let run_id = RunId::new("compaction-head-cas-run");
+    let generation = store.worker_generation();
+    let mut queued = [run_state_envelope(
+        &session_id,
+        &run_id,
+        generation,
+        "compaction-cas-queued",
+        RunState::Queued,
+    )];
+    hub.append(&mut queued).await.expect("queued prefix");
+    let expected_head = store.latest_seq(&session_id).await.expect("head");
+    let lease = hub
+        .acquire_worker_lease(session_id.clone())
+        .await
+        .expect("lease");
+    let actor = hub
+        .existing_actor(&session_id)
+        .expect("actor lookup")
+        .expect("actor exists");
+
+    let (advance_completed, advance_response) = oneshot::channel();
+    actor
+        .commands
+        .send(ActorCommand::Append {
+            envelopes: vec![run_state_envelope(
+                &session_id,
+                &run_id,
+                generation,
+                "compaction-cas-advance",
+                RunState::Thinking,
+            )],
+            completed: advance_completed,
+        })
+        .await
+        .expect("advance queues");
+    let (cas_completed, cas_response) = oneshot::channel();
+    actor
+        .commands
+        .send(ActorCommand::WorkerAppend {
+            lease_id: lease.lease_id.clone(),
+            expected_head: Some(expected_head),
+            envelopes: vec![run_state_envelope(
+                &session_id,
+                &run_id,
+                generation,
+                "compaction-cas-stale",
+                RunState::Streaming,
+            )],
+            completed: cas_completed,
+        })
+        .await
+        .expect("CAS queues behind advance");
+
+    advance_response
+        .await
+        .expect("advance response")
+        .expect("advance commits");
+    let error = cas_response
+        .await
+        .expect("CAS response")
+        .expect_err("stale compaction append is rejected");
+    assert_eq!(error.code, ErrorCode::Busy);
+    let history = store.read(&session_id, 0, 16).await.expect("history");
+    assert!(
+        !history
+            .iter()
+            .any(|event| { event.event_id == EventId::new("compaction-cas-stale") })
+    );
+
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
 }
 
 /// Exact D2g handoff schedule: acceptance is durably committed, the external

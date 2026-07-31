@@ -259,6 +259,33 @@ fn missing_image_data_is_a_typed_invalid_request() {
     assert!(!error.retryable);
 }
 
+/// MUTATION CHECK: map `model_context_window_exceeded` to MaxTokens or leave
+/// the HTTP body generic. Expected runtime failure: one of these assertions
+/// observes continuation/generic rejection instead of forced compaction.
+#[test]
+fn context_exceeded_http_and_sse_fixtures_are_distinct_from_max_tokens() {
+    let http = replay_anthropic_http_error(
+        400,
+        None,
+        include_bytes!("fixtures/anthropic/context_exceeded.http.json"),
+    );
+    assert_eq!(http.kind, ProviderErrorKind::ContextExceeded);
+    assert!(!http.retryable);
+
+    let items = replay_anthropic_sse(include_bytes!("fixtures/anthropic/context_exceeded.sse"));
+    assert!(items.iter().any(|item| {
+        matches!(item, Err(error) if error.kind == ProviderErrorKind::ContextExceeded)
+    }));
+    assert!(!items.iter().any(|item| {
+        matches!(
+            item,
+            Ok(StreamEvent::Finish {
+                reason: FinishReason::MaxTokens
+            })
+        )
+    }));
+}
+
 #[tokio::test]
 async fn capability_table_is_model_specific_and_conservative_for_unknown_ids() {
     let cases = [

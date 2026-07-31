@@ -4735,6 +4735,14 @@ impl AccountsProviderFactory {
             .find(|profile| profile.provider == provider)
     }
 
+    fn model_context_window(&self, provider: &str, model: &str) -> Option<u64> {
+        self.provider_profile(provider)?
+            .model_details
+            .into_iter()
+            .find(|detail| detail.name == model)
+            .and_then(|detail| detail.context_window)
+    }
+
     fn build_provider(
         &self,
         descriptor: &CredentialDescriptor,
@@ -4956,6 +4964,7 @@ impl haider_core::ProviderAttemptResolver for AccountsAttemptResolver {
             }
             ProviderErrorKind::PermissionDenied
             | ProviderErrorKind::Overloaded
+            | ProviderErrorKind::ContextExceeded
             | ProviderErrorKind::InvalidRequest
             | ProviderErrorKind::Transport
             | ProviderErrorKind::MalformedFrame
@@ -5017,10 +5026,12 @@ impl crate::worker::ProviderFactory for AccountsProviderFactory {
     ) -> Result<crate::worker::ResolvedTurnProvider, HaiderError> {
         let (resolved, provider) = self.resolve_provider(metadata).await?;
         let rotation_budget_consumed = resolved.rotation.is_some();
+        let context_window = self.model_context_window(&metadata.provider, &metadata.model);
         Ok(crate::worker::ResolvedTurnProvider {
             provider,
             provider_name: metadata.provider.clone(),
             model: metadata.model.clone(),
+            context_window,
             account_alias: Some(resolved.descriptor.alias.as_str().to_owned()),
             initial_rotation: resolved.rotation,
             rotation_budget_consumed,

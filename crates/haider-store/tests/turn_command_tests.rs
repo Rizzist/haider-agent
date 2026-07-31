@@ -58,7 +58,7 @@ fn submit(
 
 /// MUTATION CHECK: split receipt/Queued/UserMessage/ActiveRun across
 /// transactions. Expected failure: the returned accepted sequence or exact
-/// four-event durable prefix is incomplete.
+/// durable acceptance/tree prefix is incomplete.
 #[test]
 fn submit_atomically_commits_receipt_and_runnable_prefix() {
     let root = tempfile::tempdir().expect("tempdir");
@@ -79,14 +79,15 @@ fn submit_atomically_commits_receipt_and_runnable_prefix() {
     assert_eq!(accepted.disposition, TurnAdmissionDisposition::Started);
     assert_eq!(
         envelopes.iter().map(|event| event.seq).collect::<Vec<_>>(),
-        [2, 3, 4]
+        [2, 3, 4, 5]
     );
-    assert_eq!(store.latest_seq(&session_id).expect("head"), 4);
+    assert_eq!(store.latest_seq(&session_id).expect("head"), 5);
 }
 
 /// MUTATION CHECK: queue a fresh run or append a second `Queued` prefix for a
 /// same-run steer. Expected runtime failure: disposition is not
-/// `SteerPending`, or more than the one durable UserMessage is appended.
+/// `SteerPending`, more than one UserMessage is appended, or its atomic tree
+/// node sidecar is absent.
 #[test]
 fn same_run_steer_commits_one_message_without_minting_a_new_turn() {
     let root = tempfile::tempdir().expect("tempdir");
@@ -128,13 +129,20 @@ fn same_run_steer_commits_one_message_without_minting_a_new_turn() {
     };
     assert_eq!(accepted.disposition, TurnAdmissionDisposition::SteerPending);
     assert_eq!(accepted.run_id, RunId::new("run-steer"));
-    assert_eq!(envelopes.len(), 1);
+    assert_eq!(envelopes.len(), 2);
     assert_eq!(accepted.accepted_seq, envelopes[0].seq);
     assert!(matches!(
         serde_json::from_value::<haider_protocol::EventPayload>(envelopes[0].payload.clone())
             .expect("payload"),
         haider_protocol::EventPayload::UserMessage { text, mode, .. }
             if text == "report your status or conclude" && mode == DeliveryMode::Steer
+    ));
+    assert!(matches!(
+        serde_json::from_value::<haider_protocol::EventPayload>(envelopes[1].payload.clone())
+            .expect("tree payload"),
+        haider_protocol::EventPayload::NodeCommitted(node)
+            if matches!(node.kind, haider_protocol::history::NodeKind::UserTurn { ref text, .. }
+                if text == "report your status or conclude")
     ));
     assert!(matches!(
         store.accept_turn(&command).expect("steer replay"),
@@ -213,7 +221,7 @@ fn submit_replay_is_idempotent_and_changed_body_is_rejected() {
     changed.request_digest = "other".into();
     changed.request_json = r#"{"text":"other"}"#.into();
     assert!(store.accept_turn(&changed).is_err());
-    assert_eq!(store.latest_seq(&session_id).expect("head"), 4);
+    assert_eq!(store.latest_seq(&session_id).expect("head"), 5);
 }
 
 /// MUTATION CHECK: look up the receipt before taking the IMMEDIATE write

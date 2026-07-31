@@ -23,7 +23,8 @@ use std::process::{Child, ExitStatus, Stdio};
 use std::time::Duration;
 
 use haider_rpc::{
-    FEATURE_SESSION_MUTATION_V1, FEATURE_TURN_CONTROL_V1, LifecyclePhase, ProtocolError, Welcome,
+    FEATURE_CONTEXT_COMPACTION_V1, FEATURE_SESSION_MUTATION_V1, FEATURE_TURN_CONTROL_V1,
+    LifecyclePhase, ProtocolError, Welcome,
 };
 use tokio::time::{Instant, sleep};
 
@@ -37,6 +38,7 @@ use crate::profile::ResolvedProfile;
 /// feature at use time.
 pub fn required_live_features() -> BTreeSet<String> {
     BTreeSet::from([
+        FEATURE_CONTEXT_COMPACTION_V1.to_owned(),
         FEATURE_SESSION_MUTATION_V1.to_owned(),
         FEATURE_TURN_CONTROL_V1.to_owned(),
     ])

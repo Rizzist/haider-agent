@@ -1,13 +1,23 @@
 #![allow(clippy::expect_used)]
 
-use haider_core::{MemoryStore, PromptHistoryCompiler, StoreHandle};
+use async_trait::async_trait;
+use haider_core::{
+    ArtifactReader, MemoryStore, PromptHistoryCompiler, SessionCreateCommand, SqliteStoreHandle,
+    StoreHandle,
+};
 use haider_protocol::DeliveryMode;
 use haider_protocol::EventPayload;
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
-use haider_protocol::ids::{DeviceId, EventId, ItemId, RunId, SessionId};
-use haider_protocol::item::{ItemEvent, TurnItem};
+use haider_protocol::history::{
+    COMPACTION_INTENT_EXTENSION_KIND, CompactionIntent, CompactionResume, NodeKind, TreeNode,
+};
+use haider_protocol::ids::{ArtifactRef, DeviceId, EventId, ItemId, NodeId, RunId, SessionId};
+use haider_protocol::item::{ItemEvent, ToolStatus, TurnItem};
 use haider_protocol::provider::{Block, PROVIDER_OPAQUE_EXTENSION_KIND};
 use haider_protocol::state::RunState;
+use haider_protocol::tool::BoundedResult;
+use haider_protocol::verify::VerifyVerdict;
+use std::collections::HashMap;
 
 fn envelope(
     session_id: &SessionId,
@@ -36,6 +46,44 @@ fn envelope(
             prompt,
         },
         payload: serde_json::to_value(payload).expect("payload"),
+    }
+}
+
+fn node(
+    session_id: &SessionId,
+    run_id: &RunId,
+    id: &str,
+    parent: Option<&str>,
+    kind: NodeKind,
+) -> haider_protocol::envelope::RawEnvelope {
+    envelope(
+        session_id,
+        run_id,
+        &format!("commit-{id}"),
+        EventPayload::NodeCommitted(TreeNode {
+            node: NodeId::new(id),
+            parent: parent.map(NodeId::new),
+            kind,
+        }),
+        PromptRender::Omit,
+    )
+}
+
+struct TestArtifacts(HashMap<ArtifactRef, Vec<u8>>);
+
+#[async_trait]
+impl ArtifactReader for TestArtifacts {
+    async fn read_artifact(
+        &self,
+        artifact: &ArtifactRef,
+    ) -> Result<Vec<u8>, haider_protocol::error::HaiderError> {
+        self.0.get(artifact).cloned().ok_or_else(|| {
+            haider_protocol::error::HaiderError::new(
+                haider_protocol::error::ErrorCode::StoreCorrupt,
+                format!("missing test artifact {artifact}"),
+                false,
+            )
+        })
     }
 }
 
@@ -115,4 +163,636 @@ async fn provider_opaque_extension_rehydrates_for_a_terminal_prior_run() {
             )
         })
     }));
+}
+
+/// The activation law: tree selection changes which committed fragments are
+/// eligible, never how an eligible fragment is encoded for a provider.
+///
+/// MUTATION CHECK: drop opaque extensions, re-serialize tool exchanges from
+/// `NodeKind`, or reorder tool result/call rendering in the tree path.
+/// Expected runtime failure: the serialized provider-message bytes differ.
+#[tokio::test]
+async fn tree_compilation_is_byte_identical_to_journal_rendering() {
+    let store = MemoryStore::new();
+    let session_id = SessionId::new("tree-equivalence-session");
+    let prior = RunId::new("tree-equivalence-prior");
+    let current = RunId::new("tree-equivalence-current");
+    let opaque = serde_json::json!({
+        "id": "rs_exact",
+        "type": "reasoning",
+        "encrypted_content": "signed-provider-state",
+        "summary": [{"type":"summary_text","text":"kept byte-for-byte"}]
+    });
+    let mut events = vec![
+        envelope(
+            &session_id,
+            &prior,
+            "equivalence-user",
+            EventPayload::UserMessage {
+                text: "inspect the file".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        ),
+        node(
+            &session_id,
+            &prior,
+            "n-user",
+            None,
+            NodeKind::UserTurn {
+                text: "inspect the file".into(),
+                attachments: Vec::new(),
+            },
+        ),
+        envelope(
+            &session_id,
+            &prior,
+            "equivalence-opaque",
+            EventPayload::Item(ItemEvent::Completed {
+                item_id: ItemId::new("opaque-item"),
+                item: TurnItem::Extension {
+                    kind: PROVIDER_OPAQUE_EXTENSION_KIND.into(),
+                    data: serde_json::json!({
+                        "provider": "openai",
+                        "data": opaque,
+                    }),
+                },
+            }),
+            PromptRender::Verbatim,
+        ),
+        node(
+            &session_id,
+            &prior,
+            "n-opaque",
+            Some("n-user"),
+            NodeKind::AssistantCommit {
+                text: String::new(),
+                verdict: VerifyVerdict::NotApplicable,
+            },
+        ),
+        envelope(
+            &session_id,
+            &prior,
+            "equivalence-result",
+            EventPayload::ToolResult {
+                call_id: "call-exact".into(),
+                result: BoundedResult {
+                    preview: "exact\nresult".into(),
+                    truncated: true,
+                    artifact: None,
+                    cursor: Some("cursor-7".into()),
+                },
+            },
+            PromptRender::Verbatim,
+        ),
+        envelope(
+            &session_id,
+            &prior,
+            "equivalence-call",
+            EventPayload::Item(ItemEvent::Completed {
+                item_id: ItemId::new("tool-item"),
+                item: TurnItem::ToolCall {
+                    call_id: "call-exact".into(),
+                    name: "fs_read".into(),
+                    args: serde_json::json!({"path":"a.txt","line":7}),
+                    status: ToolStatus::Completed,
+                },
+            }),
+            PromptRender::Verbatim,
+        ),
+        node(
+            &session_id,
+            &prior,
+            "n-tool",
+            Some("n-opaque"),
+            NodeKind::ToolExchange {
+                tool: "fs_read".into(),
+                summary: "not used for provider rendering".into(),
+                artifact: None,
+            },
+        ),
+        envelope(
+            &session_id,
+            &prior,
+            "equivalence-assistant",
+            EventPayload::Item(ItemEvent::Completed {
+                item_id: ItemId::new("assistant-item"),
+                item: TurnItem::AgentMessage {
+                    text: "The file is valid.".into(),
+                },
+            }),
+            PromptRender::Verbatim,
+        ),
+        node(
+            &session_id,
+            &prior,
+            "n-assistant",
+            Some("n-tool"),
+            NodeKind::AssistantCommit {
+                text: "The file is valid.".into(),
+                verdict: VerifyVerdict::NotApplicable,
+            },
+        ),
+        envelope(
+            &session_id,
+            &prior,
+            "equivalence-done",
+            EventPayload::RunState(RunState::Done),
+            PromptRender::Omit,
+        ),
+        envelope(
+            &session_id,
+            &current,
+            "equivalence-current-user",
+            EventPayload::UserMessage {
+                text: "continue".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        ),
+        node(
+            &session_id,
+            &current,
+            "n-current",
+            Some("n-assistant"),
+            NodeKind::UserTurn {
+                text: "continue".into(),
+                attachments: Vec::new(),
+            },
+        ),
+    ];
+    StoreHandle::append(&store, &mut events)
+        .await
+        .expect("append equivalence history");
+
+    let journal = PromptHistoryCompiler::compile_journal(&store, &session_id, None, None, &current)
+        .await
+        .expect("compile journal oracle");
+    let tree = PromptHistoryCompiler::compile(&store, &session_id, None, None, &current)
+        .await
+        .expect("compile tree projection");
+
+    assert_eq!(
+        serde_json::to_vec(&tree).expect("serialize tree prompt"),
+        serde_json::to_vec(&journal).expect("serialize journal prompt")
+    );
+}
+
+/// MUTATION CHECK: retain covered journal fragments after inserting the
+/// summary. Expected runtime failure: `old prefix` remains in the prompt or
+/// the two restart-equivalent compiles produce different bytes.
+#[tokio::test]
+async fn compaction_substitutes_summary_and_keeps_only_the_suffix() {
+    let root = tempfile::tempdir().expect("temp profile");
+    let store = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("open store");
+    let session_id = SessionId::new("compacted-session");
+    let first = RunId::new("compacted-first");
+    let second = RunId::new("compacted-second");
+    let current = RunId::new("compacted-current");
+    store
+        .create_session(SessionCreateCommand {
+            command_id: "create-compacted-session".into(),
+            request_digest: "create-compacted-session-digest".into(),
+            request_json: r#"{"session":"compacted-session"}"#.into(),
+            session_id: session_id.clone(),
+            cwd: std::env::current_dir()
+                .expect("cwd")
+                .to_string_lossy()
+                .into_owned(),
+            provider: "fake".into(),
+            model: "fake-model".into(),
+            max_tokens: 4096,
+            system_prompt_version: "test-v1".into(),
+            event_id: EventId::new("created-compacted-session"),
+            device_id: DeviceId::new("compaction-restart-test"),
+        })
+        .await
+        .expect("create compacted session");
+    let artifact = store
+        .put(b"durable summary".to_vec())
+        .await
+        .expect("put durable summary");
+    let mut events = vec![
+        envelope(
+            &session_id,
+            &first,
+            "compacted-old-user",
+            EventPayload::UserMessage {
+                text: "old prefix".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        ),
+        node(
+            &session_id,
+            &first,
+            "compact-n1",
+            None,
+            NodeKind::UserTurn {
+                text: "old prefix".into(),
+                attachments: Vec::new(),
+            },
+        ),
+        envelope(
+            &session_id,
+            &first,
+            "compacted-old-assistant",
+            EventPayload::Item(ItemEvent::Completed {
+                item_id: ItemId::new("old-answer"),
+                item: TurnItem::AgentMessage {
+                    text: "old answer".into(),
+                },
+            }),
+            PromptRender::Verbatim,
+        ),
+        node(
+            &session_id,
+            &first,
+            "compact-n2",
+            Some("compact-n1"),
+            NodeKind::AssistantCommit {
+                text: "old answer".into(),
+                verdict: VerifyVerdict::NotApplicable,
+            },
+        ),
+        envelope(
+            &session_id,
+            &first,
+            "compacted-first-done",
+            EventPayload::RunState(RunState::Done),
+            PromptRender::Omit,
+        ),
+        node(
+            &session_id,
+            &first,
+            "compact-overlay",
+            Some("compact-n2"),
+            NodeKind::Compaction {
+                covers_from: NodeId::new("compact-n1"),
+                covers_to: NodeId::new("compact-n2"),
+                summary_artifact: artifact.clone(),
+                tokens_before: 100,
+                tokens_after: 12,
+                resume_cause: CompactionResume::ManualIdle,
+            },
+        ),
+        envelope(
+            &session_id,
+            &second,
+            "compacted-suffix-user",
+            EventPayload::UserMessage {
+                text: "suffix user".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        ),
+        node(
+            &session_id,
+            &second,
+            "compact-n3",
+            Some("compact-overlay"),
+            NodeKind::UserTurn {
+                text: "suffix user".into(),
+                attachments: Vec::new(),
+            },
+        ),
+        envelope(
+            &session_id,
+            &second,
+            "compacted-suffix-assistant",
+            EventPayload::Item(ItemEvent::Completed {
+                item_id: ItemId::new("suffix-answer"),
+                item: TurnItem::AgentMessage {
+                    text: "suffix answer".into(),
+                },
+            }),
+            PromptRender::Verbatim,
+        ),
+        node(
+            &session_id,
+            &second,
+            "compact-n4",
+            Some("compact-n3"),
+            NodeKind::AssistantCommit {
+                text: "suffix answer".into(),
+                verdict: VerifyVerdict::NotApplicable,
+            },
+        ),
+        envelope(
+            &session_id,
+            &second,
+            "compacted-second-done",
+            EventPayload::RunState(RunState::Done),
+            PromptRender::Omit,
+        ),
+        envelope(
+            &session_id,
+            &current,
+            "compacted-current-user",
+            EventPayload::UserMessage {
+                text: "current".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        ),
+        node(
+            &session_id,
+            &current,
+            "compact-n5",
+            Some("compact-n4"),
+            NodeKind::UserTurn {
+                text: "current".into(),
+                attachments: Vec::new(),
+            },
+        ),
+    ];
+    StoreHandle::append(&store, &mut events)
+        .await
+        .expect("append compacted history");
+    let first_compile = PromptHistoryCompiler::compile_with_artifacts(
+        &store,
+        &store,
+        &session_id,
+        None,
+        None,
+        &current,
+    )
+    .await
+    .expect("compile compacted projection");
+    store.close().await.expect("close before restart");
+    let restarted = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("reopen store");
+    let restarted_compile = PromptHistoryCompiler::compile_with_artifacts(
+        &restarted,
+        &restarted,
+        &session_id,
+        None,
+        None,
+        &current,
+    )
+    .await
+    .expect("compile after restart-equivalent replay");
+    let text = first_compile
+        .iter()
+        .flat_map(|message| &message.blocks)
+        .filter_map(|block| match block {
+            Block::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        text,
+        ["durable summary", "suffix user", "suffix answer", "current"]
+    );
+    assert_eq!(
+        serde_json::to_vec(&first_compile).expect("serialize first compile"),
+        serde_json::to_vec(&restarted_compile).expect("serialize restarted compile")
+    );
+    restarted.close().await.expect("close restarted store");
+}
+
+/// MUTATION CHECK: make intent itself switch the projection. Expected runtime
+/// failure: the original prefix disappears before a compaction node commits.
+/// Removing the durable intent also fails the explicit marker assertion.
+#[tokio::test]
+async fn crash_after_intent_never_half_substitutes_the_prompt() {
+    let store = MemoryStore::new();
+    let session_id = SessionId::new("intent-crash-session");
+    let prior = RunId::new("intent-prior");
+    let compaction = RunId::new("intent-compaction");
+    let current = RunId::new("intent-current");
+    let intent = CompactionIntent {
+        operation_id: "crashed-compaction".into(),
+        covers_from: NodeId::new("intent-n1"),
+        covers_to: NodeId::new("intent-n2"),
+        resume_cause: CompactionResume::ManualIdle,
+    };
+    let mut events = vec![
+        envelope(
+            &session_id,
+            &prior,
+            "intent-old-user",
+            EventPayload::UserMessage {
+                text: "original prefix".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        ),
+        node(
+            &session_id,
+            &prior,
+            "intent-n1",
+            None,
+            NodeKind::UserTurn {
+                text: "original prefix".into(),
+                attachments: Vec::new(),
+            },
+        ),
+        envelope(
+            &session_id,
+            &prior,
+            "intent-old-answer",
+            EventPayload::Item(ItemEvent::Completed {
+                item_id: ItemId::new("intent-answer"),
+                item: TurnItem::AgentMessage {
+                    text: "original answer".into(),
+                },
+            }),
+            PromptRender::Verbatim,
+        ),
+        node(
+            &session_id,
+            &prior,
+            "intent-n2",
+            Some("intent-n1"),
+            NodeKind::AssistantCommit {
+                text: "original answer".into(),
+                verdict: VerifyVerdict::NotApplicable,
+            },
+        ),
+        envelope(
+            &session_id,
+            &prior,
+            "intent-prior-done",
+            EventPayload::RunState(RunState::Done),
+            PromptRender::Omit,
+        ),
+        envelope(
+            &session_id,
+            &compaction,
+            "intent-marker",
+            EventPayload::Item(ItemEvent::Completed {
+                item_id: ItemId::new("intent-marker-item"),
+                item: TurnItem::Extension {
+                    kind: COMPACTION_INTENT_EXTENSION_KIND.into(),
+                    data: serde_json::to_value(intent).expect("intent"),
+                },
+            }),
+            PromptRender::Omit,
+        ),
+        envelope(
+            &session_id,
+            &compaction,
+            "intent-compacting",
+            EventPayload::RunState(RunState::Compacting),
+            PromptRender::Omit,
+        ),
+        envelope(
+            &session_id,
+            &current,
+            "intent-current-user",
+            EventPayload::UserMessage {
+                text: "after restart".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        ),
+        node(
+            &session_id,
+            &current,
+            "intent-current-node",
+            Some("intent-n2"),
+            NodeKind::UserTurn {
+                text: "after restart".into(),
+                attachments: Vec::new(),
+            },
+        ),
+    ];
+    StoreHandle::append(&store, &mut events)
+        .await
+        .expect("append intent crash history");
+
+    let compiled = PromptHistoryCompiler::compile(&store, &session_id, None, None, &current)
+        .await
+        .expect("compile original projection");
+    let text = compiled
+        .iter()
+        .flat_map(|message| &message.blocks)
+        .filter_map(|block| match block {
+            Block::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        text,
+        ["original prefix", "original answer", "after restart"]
+    );
+    assert_eq!(
+        store
+            .events(&session_id)
+            .await
+            .iter()
+            .filter(|event| matches!(
+                serde_json::from_value::<EventPayload>(event.payload.clone()),
+                Ok(EventPayload::Item(ItemEvent::Completed {
+                    item: TurnItem::Extension { ref kind, .. },
+                    ..
+                })) if kind == COMPACTION_INTENT_EXTENSION_KIND
+            ))
+            .count(),
+        1
+    );
+}
+
+/// A committed projection switch may never silently resurrect its covered
+/// prefix when CAS is missing or corrupt.
+#[tokio::test]
+async fn missing_compaction_artifact_is_store_corruption() {
+    let store = MemoryStore::new();
+    let session_id = SessionId::new("missing-summary-session");
+    let prior = RunId::new("missing-summary-prior");
+    let current = RunId::new("missing-summary-current");
+    let missing = ArtifactRef::new("blake3:missing-summary");
+    let mut events = vec![
+        envelope(
+            &session_id,
+            &prior,
+            "missing-user",
+            EventPayload::UserMessage {
+                text: "covered".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        ),
+        node(
+            &session_id,
+            &prior,
+            "missing-n1",
+            None,
+            NodeKind::UserTurn {
+                text: "covered".into(),
+                attachments: Vec::new(),
+            },
+        ),
+        envelope(
+            &session_id,
+            &prior,
+            "missing-prior-done",
+            EventPayload::RunState(RunState::Done),
+            PromptRender::Omit,
+        ),
+        node(
+            &session_id,
+            &prior,
+            "missing-overlay",
+            Some("missing-n1"),
+            NodeKind::Compaction {
+                covers_from: NodeId::new("missing-n1"),
+                covers_to: NodeId::new("missing-n1"),
+                summary_artifact: missing,
+                tokens_before: 10,
+                tokens_after: 2,
+                resume_cause: CompactionResume::ManualIdle,
+            },
+        ),
+        envelope(
+            &session_id,
+            &current,
+            "missing-current-user",
+            EventPayload::UserMessage {
+                text: "current".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        ),
+        node(
+            &session_id,
+            &current,
+            "missing-current-node",
+            Some("missing-overlay"),
+            NodeKind::UserTurn {
+                text: "current".into(),
+                attachments: Vec::new(),
+            },
+        ),
+    ];
+    StoreHandle::append(&store, &mut events)
+        .await
+        .expect("append missing artifact history");
+    let artifacts = TestArtifacts(HashMap::new());
+
+    let error = PromptHistoryCompiler::compile_with_artifacts(
+        &store,
+        &artifacts,
+        &session_id,
+        None,
+        None,
+        &current,
+    )
+    .await
+    .expect_err("missing summary must fail closed");
+    assert_eq!(error.code, haider_protocol::error::ErrorCode::StoreCorrupt);
 }

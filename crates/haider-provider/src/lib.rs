@@ -175,6 +175,9 @@ pub enum ProviderErrorKind {
     PermissionDenied,
     RateLimited,
     Overloaded,
+    /// The provider rejected the request because its input does not fit the
+    /// active model context window. Core may compact and retry this once.
+    ContextExceeded,
     InvalidRequest,
     Transport,
     MalformedFrame,

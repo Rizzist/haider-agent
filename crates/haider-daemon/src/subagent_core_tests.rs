@@ -91,6 +91,7 @@ impl ProviderFactory for FixedProviderFactory {
             provider: self.provider.clone(),
             provider_name: metadata.provider.clone(),
             model: metadata.model.clone(),
+            context_window: None,
             account_alias: None,
             initial_rotation: None,
             rotation_budget_consumed: false,

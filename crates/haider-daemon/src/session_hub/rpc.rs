@@ -208,6 +208,35 @@ impl HubConnection {
                 )
                 .await
             }
+            RequestBody::SessionCompact {
+                command_id,
+                session_id,
+                worker_generation,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                if !self
+                    .hub
+                    .holds_control_attachment(&self.connection_id, &session_id)?
+                {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        "context compaction requires a control attachment to this session",
+                        false,
+                        None,
+                    );
+                }
+                self.session_compact(request_id, command_id, session_id, worker_generation)
+                    .await
+            }
             RequestBody::VaultStage {
                 stage_id,
                 purpose,
@@ -1345,6 +1374,42 @@ impl HubConnection {
         self.respond_turn_accepted(request_id, accepted)
     }
 
+    async fn session_compact(
+        &self,
+        request_id: RequestId,
+        command_id: CommandId,
+        session_id: SessionId,
+        worker_generation: u64,
+    ) -> Result<(), SessionHubError> {
+        if command_id.as_str().is_empty() {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "session-compact command id must not be empty",
+                false,
+                None,
+            );
+        }
+        let accepted = match self
+            .hub
+            .worker_manager()?
+            .compact(session_id.clone(), command_id.0, worker_generation)
+            .await
+        {
+            Ok(accepted) => accepted,
+            Err(error) => return self.respond_turn_error(request_id, error),
+        };
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::SessionCompact {
+                session_id,
+                run_id: accepted.run_id,
+                accepted_seq: accepted.accepted_seq,
+                worker_generation: accepted.worker_generation,
+            },
+        })
+    }
+
     async fn turn_cancel(
         &self,
         request_id: RequestId,
@@ -1538,11 +1603,12 @@ impl HubConnection {
                 None,
             );
         }
-        if model.trim().is_empty() || max_tokens == 0 {
+        const MAX_DAEMON_OUTPUT_RESERVE: u64 = 30_000;
+        if model.trim().is_empty() || max_tokens == 0 || max_tokens > MAX_DAEMON_OUTPUT_RESERVE {
             return self.respond_error(
                 request_id,
                 ERROR_CODE_INVALID_ARGUMENT,
-                "session model must be non-empty and max_tokens must be positive",
+                "session model must be non-empty and max_tokens must be in 1..=30000",
                 false,
                 None,
             );

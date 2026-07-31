@@ -22,9 +22,11 @@ use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION, envelope_weight_bytes,
 };
 use haider_protocol::error::{ErrorCode, HaiderError};
+use haider_protocol::history::{COMPACTION_INTENT_EXTENSION_KIND, NodeKind, TreeNode};
 use haider_protocol::ids::{
-    AgentId, ArtifactRef, DeviceId, EventId, ItemId, MenuId, RunId, SessionId,
+    AgentId, ArtifactRef, DeviceId, EventId, ItemId, MenuId, NodeId, RunId, SessionId,
 };
+use haider_protocol::item::{ItemEvent, TurnItem};
 use haider_protocol::menu::{Menu, MenuAnswer, MenuKind};
 use haider_protocol::session::SessionMetadataV1;
 use haider_protocol::state::{RunState, SessionState};
@@ -296,6 +298,23 @@ pub struct AccountAddReceiptRow {
     pub request_json: String,
     pub response_json: Option<String>,
     pub final_revision: Option<u64>,
+}
+
+/// Durable response for the idle-only `session.compact` command.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ContextCompactionReceiptResponse {
+    pub session_id: SessionId,
+    pub run_id: RunId,
+    pub accepted_seq: u64,
+    pub worker_generation: u64,
+}
+
+/// Claim result for one manual context-compaction command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContextCompactionClaim {
+    Fresh,
+    ResumePending,
+    Committed(Box<ContextCompactionReceiptResponse>),
 }
 
 /// Receipt claim for one W5 durable account/provider mutation.
@@ -909,6 +928,82 @@ impl Store {
         append_envelopes(self, envelopes, true)
     }
 
+    /// Claims the global command-id namespace for `session.compact` before
+    /// its durable intent is appended. Committed replay is intentionally
+    /// unfenced so a lost response survives daemon restart.
+    pub fn claim_context_compaction_receipt(
+        &self,
+        command_id: &str,
+        request_digest: &str,
+        request_json: &str,
+    ) -> StoreResult<ContextCompactionClaim> {
+        validate_command_identity(command_id, request_digest, request_json)?;
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        if let Some(response) = lookup_command_response::<ContextCompactionReceiptResponse>(
+            &transaction,
+            command_id,
+            "session.compact",
+            request_digest,
+            request_json,
+            "session-compact",
+        )? {
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(ContextCompactionClaim::Committed(Box::new(response)));
+        }
+        let pending = transaction
+            .query_row(
+                "SELECT 1 FROM command_receipts WHERE command_id = ?1",
+                [command_id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(map_sqlite_error)?
+            .is_some();
+        claim_pending_receipt(
+            &transaction,
+            command_id,
+            "session.compact",
+            request_digest,
+            request_json,
+            now_ms()?,
+        )?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(if pending {
+            ContextCompactionClaim::ResumePending
+        } else {
+            ContextCompactionClaim::Fresh
+        })
+    }
+
+    /// Finalizes the already-claimed compaction receipt. The compaction node
+    /// is independently sufficient to reconcile a crash between node commit
+    /// and this receipt update.
+    pub fn finalize_context_compaction_receipt(
+        &self,
+        command_id: &str,
+        response: &ContextCompactionReceiptResponse,
+    ) -> StoreResult<()> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        finalize_command_receipt(
+            &transaction,
+            command_id,
+            response.session_id.as_str(),
+            Some(response.run_id.as_str()),
+            Some(response.accepted_seq),
+            response,
+            now_ms()?,
+            "session-compact",
+        )?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(())
+    }
+
     /// Looks up a committed `session.create` response before filesystem
     /// validation. This ordering is intentional: after a successful create,
     /// a lost-response retry remains recoverable even if the workspace path
@@ -1183,20 +1278,45 @@ impl Store {
             now,
         )?;
 
+        let parent = latest_tree_head(
+            &transaction,
+            &command.session_id,
+            None,
+            command.agent_id.as_ref(),
+        )?;
+        let user_node = TreeNode {
+            node: NodeId::new(format!("node-{}", command.user_event_id)),
+            parent,
+            kind: NodeKind::UserTurn {
+                text: command.text.clone(),
+                attachments: command.attachments.clone(),
+            },
+        };
         let mut envelopes = if same_run_steer {
-            vec![unstamped_command_envelope(
-                command.user_event_id.clone(),
-                &command.session_id,
-                Some(command.run_id.clone()),
-                command.device_id.clone(),
-                self.worker_generation,
-                EventPayload::UserMessage {
-                    text: command.text.clone(),
-                    attachments: command.attachments.clone(),
-                    mode: command.mode,
-                },
-                PromptRender::Verbatim,
-            )?]
+            vec![
+                unstamped_command_envelope(
+                    command.user_event_id.clone(),
+                    &command.session_id,
+                    Some(command.run_id.clone()),
+                    command.device_id.clone(),
+                    self.worker_generation,
+                    EventPayload::UserMessage {
+                        text: command.text.clone(),
+                        attachments: command.attachments.clone(),
+                        mode: command.mode,
+                    },
+                    PromptRender::Verbatim,
+                )?,
+                unstamped_command_envelope(
+                    EventId::new(format!("tree-{}", command.user_event_id)),
+                    &command.session_id,
+                    Some(command.run_id.clone()),
+                    command.device_id.clone(),
+                    self.worker_generation,
+                    EventPayload::NodeCommitted(user_node),
+                    PromptRender::Omit,
+                )?,
+            ]
         } else {
             vec![
                 unstamped_command_envelope(
@@ -1220,6 +1340,15 @@ impl Store {
                         mode: command.mode,
                     },
                     PromptRender::Verbatim,
+                )?,
+                unstamped_command_envelope(
+                    EventId::new(format!("tree-{}", command.user_event_id)),
+                    &command.session_id,
+                    Some(command.run_id.clone()),
+                    command.device_id.clone(),
+                    self.worker_generation,
+                    EventPayload::NodeCommitted(user_node),
+                    PromptRender::Omit,
                 )?,
             ]
         };
@@ -2631,6 +2760,41 @@ fn latest_run_states(
     Ok(states)
 }
 
+fn latest_tree_head(
+    connection: &Connection,
+    session_id: &SessionId,
+    branch_id: Option<&haider_protocol::ids::BranchId>,
+    agent_id: Option<&AgentId>,
+) -> StoreResult<Option<NodeId>> {
+    let mut statement = connection
+        .prepare_cached(
+            "SELECT seq, envelope_json FROM events
+             WHERE session_id = ?1 ORDER BY seq DESC",
+        )
+        .map_err(map_sqlite_error)?;
+    let mut rows = statement
+        .query([session_id.as_str()])
+        .map_err(map_sqlite_error)?;
+    while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+        let seq: i64 = row.get(0).map_err(map_sqlite_error)?;
+        let json: String = row.get(1).map_err(map_sqlite_error)?;
+        let envelope: RawEnvelope = serde_json::from_str(&json).map_err(|error| {
+            corrupt(format!(
+                "invalid envelope JSON for session {session_id}, seq {seq}: {error}"
+            ))
+        })?;
+        if envelope.branch_id.as_ref() != branch_id || envelope.agent_id.as_ref() != agent_id {
+            continue;
+        }
+        if let Ok(EventPayload::NodeCommitted(node)) =
+            serde_json::from_value::<EventPayload>(envelope.payload)
+        {
+            return Ok(Some(node.node));
+        }
+    }
+    Ok(None)
+}
+
 fn unstamped_command_envelope(
     event_id: EventId,
     session_id: &SessionId,
@@ -3550,6 +3714,28 @@ fn validate_worker_run_transitions(
         let Some(run_id) = envelope.run_id.as_ref() else {
             continue;
         };
+        let payload =
+            serde_json::from_value::<EventPayload>(envelope.payload.clone()).map_err(|error| {
+                store_error(
+                    ErrorCode::InvalidArgument,
+                    format!("worker envelope payload is invalid: {error}"),
+                    false,
+                )
+            })?;
+        if !states.contains_key(run_id)
+            && matches!(
+                &payload,
+                EventPayload::Item(ItemEvent::Started {
+                    item: TurnItem::Extension { kind, .. },
+                    ..
+                }) if kind == COMPACTION_INTENT_EXTENSION_KIND
+            )
+        {
+            // A compaction intent is the accepted prefix of the daemon's
+            // internal job kind. It deliberately has no synthetic user row.
+            states.insert(run_id.clone(), (RunState::Compacting, 0));
+            continue;
+        }
         let Some((durable, _)) = states.get(run_id).cloned() else {
             return Err(store_error(
                 ErrorCode::RunNotActive,
@@ -3564,14 +3750,6 @@ fn validate_worker_run_transitions(
                 false,
             ));
         }
-        let payload =
-            serde_json::from_value::<EventPayload>(envelope.payload.clone()).map_err(|error| {
-                store_error(
-                    ErrorCode::InvalidArgument,
-                    format!("worker envelope payload is invalid: {error}"),
-                    false,
-                )
-            })?;
         if let EventPayload::RunState(next) = payload {
             if durable == RunState::Cancelling && next != RunState::Cancelled {
                 return Err(store_error(

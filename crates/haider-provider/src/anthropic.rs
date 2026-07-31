@@ -12,7 +12,9 @@ use serde::Deserialize;
 use tokio::sync::mpsc;
 
 use crate::origin::{FixedDnsResolver, FixedOriginGuard, SystemFixedDnsResolver};
-use crate::wire::{SseDecoder, WireApiError, provider_kind_name, request_json};
+use crate::wire::{
+    SseDecoder, WireApiError, is_anthropic_context_error, provider_kind_name, request_json,
+};
 use crate::{
     Provider, ProviderError, ProviderErrorKind, ProviderStream, ProviderStreamItem, TurnRequest,
 };
@@ -514,12 +516,16 @@ pub fn replay_anthropic_http_error(
 ) -> ProviderError {
     let parsed = serde_json::from_slice::<ErrorEnvelope>(body).ok();
     let body_kind = parsed.as_ref().map(|envelope| envelope.error.kind.as_str());
+    let context_exceeded = parsed.as_ref().is_some_and(|envelope| {
+        is_anthropic_context_error(&envelope.error.kind, &envelope.error.message)
+    });
     let kind = match status {
         401 => ProviderErrorKind::Authentication,
         403 => ProviderErrorKind::PermissionDenied,
         429 => ProviderErrorKind::RateLimited,
         529 => ProviderErrorKind::Overloaded,
         500..=599 => ProviderErrorKind::Transport,
+        _ if context_exceeded => ProviderErrorKind::ContextExceeded,
         _ => match body_kind {
             Some("authentication_error") => ProviderErrorKind::Authentication,
             Some("permission_error") => ProviderErrorKind::PermissionDenied,

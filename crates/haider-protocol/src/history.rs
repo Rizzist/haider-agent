@@ -3,9 +3,15 @@
 
 use crate::agent::ChildReport;
 use crate::ids::{AgentId, ArtifactRef, NodeId};
+use crate::provider::FinishReason;
 use crate::tool::AttachmentBlock;
 use crate::verify::VerifyVerdict;
 use serde::{Deserialize, Serialize};
+
+/// Typed extension item carrying [`CompactionIntent`] before summarization.
+pub const COMPACTION_INTENT_EXTENSION_KIND: &str = "context_compaction_intent_v1";
+/// Typed extension item marking a same-run MaxTokens continuation seam.
+pub const CONTINUATION_CHECKPOINT_EXTENSION_KIND: &str = "continuation_checkpoint_v1";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TreeNode {
@@ -73,6 +79,23 @@ pub enum CompactionResume {
     AutoMidTurn,
     /// Explicit /compact from idle — ends at idle.
     ManualIdle,
+}
+
+/// Durable plan written before private summarization starts. The final
+/// [`NodeKind::Compaction`] is the atomic projection switch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactionIntent {
+    pub operation_id: String,
+    pub covers_from: NodeId,
+    pub covers_to: NodeId,
+    pub resume_cause: CompactionResume,
+}
+
+/// Durable prompt-omitted seam for one same-run output continuation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContinuationCheckpoint {
+    pub reason: FinishReason,
+    pub request_index: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

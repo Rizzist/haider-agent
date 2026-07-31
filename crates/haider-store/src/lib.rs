@@ -24,7 +24,8 @@ pub use cas::FileCas;
 pub use event_store::{
     ACCOUNT_REMOVE_METHOD, ACCOUNT_SET_ACTIVE_METHOD, ACCOUNT_SET_DEFAULT_MODEL_METHOD,
     AcceptedTurn, AccountAddClaim, AccountAddReceiptResponse, AccountAddReceiptRow,
-    AccountRemoveReceiptRow, CachedModels, CancelledTurn, CommittedSeqRange, CreatedSession,
+    AccountRemoveReceiptRow, CachedModels, CancelledTurn, CommittedSeqRange,
+    ContextCompactionClaim, ContextCompactionReceiptResponse, CreatedSession,
     DelegationCreateOutcome, DelegationRecord, DelegationState, EventStore, LoginClaim,
     LoginReceiptFailure, LoginReceiptResponse, LoginReceiptRow, ManagementClaim,
     ManagementReceiptRow, MenuResolutionCommand, MenuResolutionOutcome, PROVIDER_CONFIGURE_METHOD,

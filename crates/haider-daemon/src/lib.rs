@@ -51,6 +51,8 @@
 mod accounts;
 mod config;
 mod connection;
+#[cfg(test)]
+mod context_core_tests;
 mod delegation;
 mod endpoint;
 mod error;

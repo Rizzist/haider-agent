@@ -656,17 +656,21 @@ pub(crate) struct WireApiError {
     #[serde(rename = "type")]
     pub(crate) kind: String,
     #[serde(rename = "message")]
-    pub(crate) _message: String,
+    pub(crate) message: String,
 }
 
 pub(crate) fn api_error(error: WireApiError) -> ProviderError {
-    let kind = match error.kind.as_str() {
-        "authentication_error" => ProviderErrorKind::Authentication,
-        "permission_error" => ProviderErrorKind::PermissionDenied,
-        "rate_limit_error" => ProviderErrorKind::RateLimited,
-        "overloaded_error" => ProviderErrorKind::Overloaded,
-        "api_error" | "timeout_error" => ProviderErrorKind::Transport,
-        _ => ProviderErrorKind::InvalidRequest,
+    let kind = if is_anthropic_context_error(&error.kind, &error.message) {
+        ProviderErrorKind::ContextExceeded
+    } else {
+        match error.kind.as_str() {
+            "authentication_error" => ProviderErrorKind::Authentication,
+            "permission_error" => ProviderErrorKind::PermissionDenied,
+            "rate_limit_error" => ProviderErrorKind::RateLimited,
+            "overloaded_error" => ProviderErrorKind::Overloaded,
+            "api_error" | "timeout_error" => ProviderErrorKind::Transport,
+            _ => ProviderErrorKind::InvalidRequest,
+        }
     };
     ProviderError::new(
         kind,
@@ -680,6 +684,7 @@ pub(crate) const fn provider_kind_name(kind: ProviderErrorKind) -> &'static str 
         ProviderErrorKind::PermissionDenied => "a permission error",
         ProviderErrorKind::RateLimited => "a rate-limit error",
         ProviderErrorKind::Overloaded => "an overloaded error",
+        ProviderErrorKind::ContextExceeded => "a context-window-exceeded error",
         ProviderErrorKind::InvalidRequest => "an invalid-request error",
         ProviderErrorKind::Transport => "a transport error",
         ProviderErrorKind::MalformedFrame => "a malformed-frame error",
@@ -692,12 +697,31 @@ fn normalize_stop_reason(reason: &str) -> Result<FinishReason, ProviderError> {
     match reason {
         "end_turn" | "stop_sequence" | "pause_turn" => Ok(FinishReason::EndTurn),
         "tool_use" => Ok(FinishReason::ToolUse),
-        "max_tokens" | "model_context_window_exceeded" => Ok(FinishReason::MaxTokens),
+        "max_tokens" => Ok(FinishReason::MaxTokens),
+        "model_context_window_exceeded" => Err(ProviderError::new(
+            ProviderErrorKind::ContextExceeded,
+            "Anthropic reported model_context_window_exceeded",
+        )),
         "refusal" => Ok(FinishReason::Refusal),
         _ => Err(malformed(format!(
             "Anthropic returned unknown stop_reason `{reason}`"
         ))),
     }
+}
+
+pub(crate) fn is_anthropic_context_error(kind: &str, message: &str) -> bool {
+    matches!(
+        kind,
+        "context_window_exceeded" | "model_context_window_exceeded" | "prompt_too_long"
+    ) || (kind == "invalid_request_error"
+        && [
+            "context window",
+            "prompt is too long",
+            "input is too long",
+            "too many tokens",
+        ]
+        .iter()
+        .any(|needle| message.to_ascii_lowercase().contains(needle)))
 }
 
 fn malformed(message: impl Into<String>) -> ProviderError {

@@ -139,6 +139,8 @@ pub const ERROR_CODE_REVISION_CONFLICT: &str = "revision_conflict";
 pub const FEATURE_SESSION_MUTATION_V1: &str = "session_mutation_v1";
 /// Daemon implements durable submit/cancel turn control.
 pub const FEATURE_TURN_CONTROL_V1: &str = "turn_control_v1";
+/// Daemon implements durable idle-only context compaction.
+pub const FEATURE_CONTEXT_COMPACTION_V1: &str = "context_compaction_v1";
 /// Daemon implements the durable `account.login_api` command (R7/R10).
 pub const FEATURE_ACCOUNT_LOGIN_API_V1: &str = "account_login_api_v1";
 /// Daemon implements connection-scoped `vault.stage` secret staging (R7).
@@ -739,6 +741,13 @@ pub enum RequestBody {
         worker_generation: u64,
         run_id: RunId,
     },
+    /// Runs one receipt-backed, idle-only immutable history compaction.
+    #[serde(rename = "session.compact")]
+    SessionCompact {
+        command_id: CommandId,
+        session_id: SessionId,
+        worker_generation: u64,
+    },
     /// Stages a raw secret in connection-scoped daemon memory and returns an
     /// opaque single-use reference (R7). Intentionally NON-durable: no
     /// command receipt may ever contain a secret. `stage_id` is an ephemeral
@@ -934,6 +943,13 @@ pub enum ResponseBody {
         status: CancelStatus,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         terminal_seq: Option<u64>,
+    },
+    #[serde(rename = "session.compact")]
+    SessionCompact {
+        session_id: SessionId,
+        run_id: RunId,
+        accepted_seq: u64,
+        worker_generation: u64,
     },
     /// Opaque staged-secret reference (R7): random, connection- and
     /// daemon-instance-scoped, single-use, and expired at

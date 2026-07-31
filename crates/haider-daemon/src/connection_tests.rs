@@ -26,6 +26,9 @@ fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> Qu
 /// MUTATION CHECK: remove `FEATURE_ACCOUNT_OAUTH_IMPORT_V1` from
 /// `welcome_features`. Expected runtime failure: the exact feature-set
 /// assertion reports that `account_oauth_import_v1` is missing.
+///
+/// MUTATION CHECK: remove `FEATURE_CONTEXT_COMPACTION_V1`. Expected runtime
+/// failure: clients cannot discover the served `session.compact` method.
 /// Verified by revert on 2026-07-30.
 #[test]
 fn welcome_features_pin_served_management_families() {
@@ -37,6 +40,7 @@ fn welcome_features_pin_served_management_families() {
             haider_rpc::FEATURE_ACCOUNT_OAUTH_IMPORT_V1.to_owned(),
             haider_rpc::FEATURE_ACCOUNT_OAUTH_PKCE_V1.to_owned(),
             FEATURE_ACCOUNT_ROTATION_V1.to_owned(),
+            FEATURE_CONTEXT_COMPACTION_V1.to_owned(),
             FEATURE_PROVIDER_CONFIGURE_V1.to_owned(),
             FEATURE_PROVIDER_MANAGEMENT_V1.to_owned(),
             FEATURE_PROVIDER_MODELS_V1.to_owned(),

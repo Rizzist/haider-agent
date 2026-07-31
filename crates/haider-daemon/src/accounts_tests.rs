@@ -10,7 +10,7 @@ use crate::provider_registry::ProviderProfileV1;
 use crate::session_hub::FrameSendError;
 use crate::worker::ProviderFactory as _;
 use haider_core::ProviderAttemptResolver as _;
-use haider_rpc::{ProviderApiFamilyWire, ProviderAuthRequirementWire};
+use haider_rpc::{ModelDetailWire, ProviderApiFamilyWire, ProviderAuthRequirementWire};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
@@ -278,7 +278,16 @@ async fn custom_chat_completions_profile_routes_with_profile_origin_and_legacy_f
         api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
         endpoint: Some("http://127.0.0.1:11434/v1".to_owned()),
         models: vec!["llama-fixture".to_owned()],
-        model_details: Vec::new(),
+        model_details: vec![
+            ModelDetailWire {
+                name: "llama-fixture".to_owned(),
+                context_window: Some(131_072),
+            },
+            ModelDetailWire {
+                name: "llama-other".to_owned(),
+                context_window: Some(65_536),
+            },
+        ],
         auth_methods: vec![AuthMethod::ApiKey],
         availability: haider_rpc::ProviderAvailabilityWire::Available,
         availability_reason: None,
@@ -330,6 +339,12 @@ async fn custom_chat_completions_profile_routes_with_profile_origin_and_legacy_f
         .expect("custom family dispatch");
     assert_eq!(resolved.provider_name, provider);
     assert_eq!(resolved.account_alias.as_deref(), Some(alias.as_str()));
+    assert_eq!(resolved.context_window, Some(131_072));
+    assert_eq!(
+        factory.model_context_window(provider, "not-in-the-catalog"),
+        None,
+        "context windows are exact provider/model catalog facts, never fallbacks"
+    );
 }
 
 /// MUTATION CHECK (review of record, W5b retrospective): weaken any component

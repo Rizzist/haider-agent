@@ -2,21 +2,26 @@
 
 use async_trait::async_trait;
 use haider_core::{
-    CommittedRange, HarnessActor, HarnessConfig, HarnessHandle, MemoryStore,
+    CommittedRange, ContextCompactor, HarnessActor, HarnessConfig, HarnessHandle, MemoryStore,
     ProviderAttemptDecision, ProviderAttemptResolver, ResolvedProviderAttempt, StoreHandle,
-    SubmitTurn, ToolDispatchResult, ToolDispatcher,
+    SubmitCommittedTurn, SubmitTurn, ToolDispatchResult, ToolDispatcher,
 };
 use haider_protocol::EventPayload;
 use haider_protocol::credential::{RotationCause, RotationEvent};
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::error::{ErrorCode, HaiderError};
-use haider_protocol::ids::{CredentialAlias, DeviceId, ItemId, SessionId};
+use haider_protocol::history::{
+    COMPACTION_INTENT_EXTENSION_KIND, CONTINUATION_CHECKPOINT_EXTENSION_KIND, CompactionIntent,
+    CompactionResume, ContinuationCheckpoint,
+};
+use haider_protocol::ids::{CredentialAlias, DeviceId, ItemId, NodeId, RunId, SessionId};
 use haider_protocol::item::{ItemEvent, ToolStatus, TurnItem};
 use haider_protocol::provider::{Block, CapabilityDoc, FinishReason, Usage, UsageSource};
 use haider_protocol::state::RunState;
 use haider_protocol::tool::BoundedResult;
 use haider_provider::{
-    FakeProvider, FakeStep, Provider, ProviderError, ProviderErrorKind, ProviderStream, TurnRequest,
+    FakeProvider, FakeStep, Message, Provider, ProviderError, ProviderErrorKind, ProviderStream,
+    TurnRequest,
 };
 use std::collections::HashSet;
 use std::future::pending;
@@ -47,9 +52,25 @@ fn typed(envelope: &RawEnvelope) -> EventPayload {
     serde_json::from_value(envelope.payload.clone()).expect("known payload")
 }
 
+fn completed_extension(envelope: &RawEnvelope, expected_kind: &str) -> bool {
+    matches!(
+        typed(envelope),
+        EventPayload::Item(ItemEvent::Completed {
+            item: TurnItem::Extension { kind, .. },
+            ..
+        }) if kind == expected_kind
+    )
+}
+
 fn normalize(mut payload: serde_json::Value) -> serde_json::Value {
     if payload["type"] == "item" {
         payload["item_id"] = serde_json::Value::String("<item>".into());
+    }
+    if payload["type"] == "node_committed" {
+        payload["node"] = serde_json::Value::String("<node>".into());
+        if payload.get("parent").is_some() {
+            payload["parent"] = serde_json::Value::String("<node>".into());
+        }
     }
     payload
 }
@@ -125,6 +146,15 @@ async fn full_turn_commits_exact_projected_sequence() {
             "attachments":[],
             "mode":"steer"
         }),
+        serde_json::json!({
+            "type":"node_committed",
+            "node":"<node>",
+            "kind":{
+                "kind":"user_turn",
+                "text":"do the work",
+                "attachments":[]
+            }
+        }),
         serde_json::json!({"type":"run_state","state":"thinking"}),
         serde_json::json!({"type":"run_state","state":"streaming"}),
         serde_json::json!({
@@ -144,6 +174,16 @@ async fn full_turn_commits_exact_projected_sequence() {
             "event":"completed",
             "item_id":"<item>",
             "item":{"item":"agent_message","text":"hello"}
+        }),
+        serde_json::json!({
+            "type":"node_committed",
+            "node":"<node>",
+            "parent":"<node>",
+            "kind":{
+                "kind":"assistant_commit",
+                "text":"hello",
+                "verdict":{"verdict":"not_applicable"}
+            }
         }),
         serde_json::json!({
             "type":"item",
@@ -178,6 +218,16 @@ async fn full_turn_commits_exact_projected_sequence() {
                 "status":"pending"
             }
         }),
+        serde_json::json!({
+            "type":"node_committed",
+            "node":"<node>",
+            "parent":"<node>",
+            "kind":{
+                "kind":"tool_exchange",
+                "tool":"inspect",
+                "summary":"tool call settled as Pending"
+            }
+        }),
         serde_json::to_value(EventPayload::Usage(usage)).expect("usage serializes"),
         serde_json::json!({"type":"run_state","state":"done"}),
     ];
@@ -193,6 +243,436 @@ async fn full_turn_commits_exact_projected_sequence() {
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].model, "fake-model");
     assert_eq!(requests[0].max_tokens, 4096);
+}
+
+/// MUTATION CHECK: treat MaxTokens as terminal or omit the hidden continue
+/// instruction. Expected runtime failure: only one request is observed, the
+/// partial assistant block/instruction is absent, or no durable seam exists.
+#[tokio::test]
+async fn max_tokens_continues_in_the_same_logical_run() {
+    let (handle, store, provider) = runtime(vec![
+        FakeStep::EmitText {
+            text: "partial answer".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::MaxTokens,
+        },
+        FakeStep::EmitText {
+            text: " completed".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]);
+
+    let outcome = handle
+        .submit_turn(SubmitTurn::new("write a long answer"))
+        .await
+        .expect("turn accepted")
+        .wait()
+        .await
+        .expect("turn outcome");
+    assert_eq!(outcome.state, RunState::Done);
+    assert_eq!(outcome.finish_reason, FinishReason::EndTurn);
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    let second_text = requests[1]
+        .messages
+        .iter()
+        .flat_map(|message| &message.blocks)
+        .filter_map(|block| match block {
+            Block::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(second_text.contains(&"partial answer"));
+    assert!(
+        second_text
+            .contains(&"Continue exactly where you stopped. Do not repeat completed content.")
+    );
+    let events = store.events(&SessionId::new(SESSION)).await;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                typed(event),
+                EventPayload::Item(ItemEvent::Completed {
+                    item: TurnItem::Extension { ref kind, .. },
+                    ..
+                }) if kind == CONTINUATION_CHECKPOINT_EXTENSION_KIND
+            ))
+            .count(),
+        1
+    );
+    let checkpoint = events
+        .iter()
+        .find_map(|event| match typed(event) {
+            EventPayload::Item(ItemEvent::Completed {
+                item: TurnItem::Extension { kind, data },
+                ..
+            }) if kind == CONTINUATION_CHECKPOINT_EXTENSION_KIND => {
+                serde_json::from_value::<ContinuationCheckpoint>(data).ok()
+            }
+            _ => None,
+        })
+        .expect("typed continuation checkpoint");
+    assert_eq!(checkpoint.reason, FinishReason::MaxTokens);
+    assert_eq!(checkpoint.request_index, 1);
+}
+
+/// MUTATION CHECK: remove the continuation cap. Expected runtime failure:
+/// this scripted provider reaches a fourth request or the run ends Done.
+#[tokio::test]
+async fn repeated_max_tokens_is_bounded_independently() {
+    let provider = Arc::new(FakeProvider::new(vec![
+        FakeStep::Finish {
+            reason: FinishReason::MaxTokens,
+        },
+        FakeStep::Finish {
+            reason: FinishReason::MaxTokens,
+        },
+        FakeStep::Finish {
+            reason: FinishReason::MaxTokens,
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let store = Arc::new(MemoryStore::new());
+    let mut bounded = config();
+    bounded.max_continuations_per_turn = 2;
+    let handle = HarnessActor::spawn(bounded, provider.clone(), store.clone());
+
+    let outcome = handle
+        .submit_turn(SubmitTurn::new("never-ending output"))
+        .await
+        .expect("turn accepted")
+        .wait()
+        .await
+        .expect("turn outcome");
+    assert_eq!(outcome.state, RunState::Errored);
+    assert_eq!(
+        outcome.error.expect("bounded error").code,
+        ErrorCode::LoopLimit
+    );
+    assert_eq!(provider.requests().len(), 3);
+    let events = store.events(&SessionId::new(SESSION)).await;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| completed_extension(event, CONTINUATION_CHECKPOINT_EXTENSION_KIND))
+            .count(),
+        2
+    );
+}
+
+#[derive(Debug, Default)]
+struct FakeContextCompactor {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl ContextCompactor for FakeContextCompactor {
+    async fn plan(
+        &self,
+        _run_id: &RunId,
+        resume_cause: CompactionResume,
+    ) -> Result<CompactionIntent, HaiderError> {
+        Ok(CompactionIntent {
+            operation_id: "forced-test-compaction".into(),
+            covers_from: NodeId::new("old-root"),
+            covers_to: NodeId::new("old-head"),
+            resume_cause,
+        })
+    }
+
+    async fn compact(
+        &self,
+        _run_id: &RunId,
+        _intent: &CompactionIntent,
+        covered_messages: Vec<Message>,
+    ) -> Result<Message, HaiderError> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(covered_messages, [Message::user_text("old history")]);
+        Ok(Message::user_text("compacted history"))
+    }
+}
+
+#[derive(Debug, Default)]
+struct ShrinkingContextCompactor {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl ContextCompactor for ShrinkingContextCompactor {
+    async fn plan(
+        &self,
+        _run_id: &RunId,
+        resume_cause: CompactionResume,
+    ) -> Result<CompactionIntent, HaiderError> {
+        Ok(CompactionIntent {
+            operation_id: "hard-fit-test-compaction".into(),
+            covers_from: NodeId::new("old-root"),
+            covers_to: NodeId::new("old-head"),
+            resume_cause,
+        })
+    }
+
+    async fn compact(
+        &self,
+        _run_id: &RunId,
+        _intent: &CompactionIntent,
+        covered_messages: Vec<Message>,
+    ) -> Result<Message, HaiderError> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(covered_messages.len(), 1);
+        Ok(Message::user_text("s"))
+    }
+}
+
+fn estimated_input_tokens(config: &HarnessConfig, messages: &[Message]) -> u64 {
+    let bytes = serde_json::to_vec(&(
+        messages,
+        &config.system_prompt,
+        &config.tools,
+        &config.attachments,
+    ))
+    .expect("estimate serializes")
+    .len();
+    u64::try_from(bytes).unwrap_or(u64::MAX).saturating_add(3) / 4
+}
+
+/// MUTATION CHECK: route ContextExceeded through generic retry or omit the
+/// one-shot guard. Expected runtime failure: no CompactionIntent is durable,
+/// the retry lacks the summary, or the double-overflow case makes >2 calls.
+#[tokio::test]
+async fn context_overflow_forces_one_compaction_and_only_one_retry() {
+    let compactor = Arc::new(FakeContextCompactor::default());
+    let success_provider = Arc::new(FakeProvider::new(vec![
+        FakeStep::Error {
+            kind: ProviderErrorKind::ContextExceeded,
+            message: "too much context".into(),
+            retry_after_ms: None,
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let success_store = Arc::new(MemoryStore::new());
+    let mut success_config = config();
+    success_config.context_compactor = Some(compactor.clone());
+    let success = HarnessActor::spawn(
+        success_config,
+        success_provider.clone(),
+        success_store.clone(),
+    );
+    let outcome = success
+        .submit_committed_turn(SubmitCommittedTurn {
+            run_id: RunId::new("forced-success"),
+            messages: vec![
+                Message::user_text("old history"),
+                Message::user_text("current"),
+            ],
+        })
+        .await
+        .expect("accepted forced-compaction run")
+        .wait()
+        .await
+        .expect("forced-compaction outcome");
+    assert_eq!(outcome.state, RunState::Done);
+    assert_eq!(success_provider.requests().len(), 2);
+    assert_eq!(compactor.calls.load(Ordering::Relaxed), 1);
+    assert!(
+        success_provider.requests()[1]
+            .messages
+            .contains(&Message::user_text("compacted history"))
+    );
+    assert!(
+        success_store
+            .events(&SessionId::new(SESSION))
+            .await
+            .iter()
+            .any(|event| completed_extension(event, COMPACTION_INTENT_EXTENSION_KIND))
+    );
+
+    let double_compactor = Arc::new(FakeContextCompactor::default());
+    let double_provider = Arc::new(FakeProvider::new(vec![
+        FakeStep::Error {
+            kind: ProviderErrorKind::ContextExceeded,
+            message: "first overflow".into(),
+            retry_after_ms: None,
+        },
+        FakeStep::Error {
+            kind: ProviderErrorKind::ContextExceeded,
+            message: "second overflow".into(),
+            retry_after_ms: None,
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let mut double_config = config();
+    double_config.context_compactor = Some(double_compactor.clone());
+    let double = HarnessActor::spawn(
+        double_config,
+        double_provider.clone(),
+        Arc::new(MemoryStore::new()),
+    );
+    let outcome = double
+        .submit_committed_turn(SubmitCommittedTurn {
+            run_id: RunId::new("forced-double"),
+            messages: vec![
+                Message::user_text("old history"),
+                Message::user_text("current"),
+            ],
+        })
+        .await
+        .expect("accepted double-overflow run")
+        .wait()
+        .await
+        .expect("double-overflow outcome");
+    assert_eq!(outcome.state, RunState::Errored);
+    let error = outcome.error.expect("typed repeated overflow");
+    assert_eq!(error.code, ErrorCode::ProviderError);
+    assert!(error.message.contains("ContextExceeded"));
+    assert_eq!(double_provider.requests().len(), 2);
+    assert_eq!(double_compactor.calls.load(Ordering::Relaxed), 1);
+}
+
+/// MUTATION CHECK: omit the pre-request hard-fit check or treat an unknown
+/// window as guessed. Expected runtime failure: the known-window request
+/// still contains the oversized prefix, or the unknown-window case compacts.
+#[tokio::test]
+async fn known_window_hard_fit_compacts_while_unknown_window_stays_disabled() {
+    let long_history = "old ".repeat(256);
+    let current = Message::user_text("current");
+
+    let known_compactor = Arc::new(ShrinkingContextCompactor::default());
+    let known_provider = Arc::new(FakeProvider::new(vec![FakeStep::Finish {
+        reason: FinishReason::EndTurn,
+    }]));
+    let mut known_config = config();
+    known_config.context_window = Some(128);
+    known_config.reserved_output_tokens = 16;
+    known_config.context_compactor = Some(known_compactor.clone());
+    let known = HarnessActor::spawn(
+        known_config,
+        known_provider.clone(),
+        Arc::new(MemoryStore::new()),
+    );
+    let outcome = known
+        .submit_committed_turn(SubmitCommittedTurn {
+            run_id: RunId::new("known-hard-fit"),
+            messages: vec![Message::user_text(long_history.clone()), current.clone()],
+        })
+        .await
+        .expect("known-window turn accepted")
+        .wait()
+        .await
+        .expect("known-window outcome");
+    assert_eq!(outcome.state, RunState::Done);
+    assert_eq!(known_compactor.calls.load(Ordering::Relaxed), 1);
+    assert_eq!(known_provider.requests().len(), 1);
+    assert!(
+        !known_provider.requests()[0]
+            .messages
+            .contains(&Message::user_text(long_history.clone()))
+    );
+
+    let unknown_compactor = Arc::new(ShrinkingContextCompactor::default());
+    let unknown_provider = Arc::new(FakeProvider::new(vec![FakeStep::Finish {
+        reason: FinishReason::EndTurn,
+    }]));
+    let mut unknown_config = config();
+    unknown_config.context_window = None;
+    unknown_config.reserved_output_tokens = u64::MAX;
+    unknown_config.context_compactor = Some(unknown_compactor.clone());
+    let unknown = HarnessActor::spawn(
+        unknown_config,
+        unknown_provider.clone(),
+        Arc::new(MemoryStore::new()),
+    );
+    let outcome = unknown
+        .submit_committed_turn(SubmitCommittedTurn {
+            run_id: RunId::new("unknown-hard-fit"),
+            messages: vec![Message::user_text(long_history.clone()), current],
+        })
+        .await
+        .expect("unknown-window turn accepted")
+        .wait()
+        .await
+        .expect("unknown-window outcome");
+    assert_eq!(outcome.state, RunState::Done);
+    assert_eq!(unknown_compactor.calls.load(Ordering::Relaxed), 0);
+    assert!(
+        unknown_provider.requests()[0]
+            .messages
+            .contains(&Message::user_text(long_history))
+    );
+}
+
+/// MUTATION CHECK: check hard-fit only at logical-turn start. Expected
+/// runtime failure: the second request carries the un-compacted prefix after
+/// MaxTokens grows the same-run continuation past the known input budget.
+#[tokio::test]
+async fn max_tokens_continuation_rechecks_hard_fit_and_compacts_first() {
+    let history = Message::user_text("history ".repeat(180));
+    let current = Message::user_text("current");
+    let partial = "p".repeat(320);
+    let instruction =
+        Message::user_text("Continue exactly where you stopped. Do not repeat completed content.");
+    let first_messages = vec![history.clone(), current.clone()];
+    let uncompact_second = vec![
+        history.clone(),
+        current.clone(),
+        Message::assistant(vec![Block::Text {
+            text: partial.clone(),
+        }]),
+        instruction.clone(),
+    ];
+    let compact_second = vec![
+        Message::user_text("s"),
+        current.clone(),
+        Message::assistant(vec![Block::Text {
+            text: partial.clone(),
+        }]),
+        instruction,
+    ];
+    let mut bounded = config();
+    bounded.reserved_output_tokens = 16;
+    let input_budget = estimated_input_tokens(&bounded, &first_messages)
+        .max(estimated_input_tokens(&bounded, &compact_second));
+    assert!(estimated_input_tokens(&bounded, &uncompact_second) > input_budget);
+    bounded.context_window = Some(input_budget + bounded.reserved_output_tokens);
+    let compactor = Arc::new(ShrinkingContextCompactor::default());
+    bounded.context_compactor = Some(compactor.clone());
+    let provider = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitText {
+            text: partial.clone(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::MaxTokens,
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let handle = HarnessActor::spawn(bounded, provider.clone(), Arc::new(MemoryStore::new()));
+    let outcome = handle
+        .submit_committed_turn(SubmitCommittedTurn {
+            run_id: RunId::new("max-tokens-hard-fit"),
+            messages: first_messages,
+        })
+        .await
+        .expect("continuation turn accepted")
+        .wait()
+        .await
+        .expect("continuation outcome");
+    assert_eq!(outcome.state, RunState::Done);
+    assert_eq!(compactor.calls.load(Ordering::Relaxed), 1);
+    assert_eq!(provider.requests().len(), 2);
+    assert_eq!(provider.requests()[1].messages, compact_second);
 }
 
 struct CompletingDispatcher;
@@ -1383,14 +1863,14 @@ async fn memory_store_allocates_and_reads_committed_sequences() {
         StoreHandle::latest_seq(store.as_ref(), &SessionId::new(SESSION))
             .await
             .expect("latest"),
-        5
+        6
     );
     let tail = StoreHandle::read(store.as_ref(), &SessionId::new(SESSION), 3, 10)
         .await
         .expect("read");
     assert_eq!(
         tail.iter().map(|event| event.seq).collect::<Vec<_>>(),
-        vec![4, 5]
+        vec![4, 5, 6]
     );
 }
 
