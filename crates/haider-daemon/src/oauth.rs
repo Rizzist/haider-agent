@@ -263,7 +263,21 @@ pub const SANCTIONED_PROVIDER_REGISTRATIONS: &[SanctionedOAuthRegistration] = &[
         authorization_endpoint: "https://claude.ai/oauth/authorize",
         token_endpoint: "https://console.anthropic.com/v1/oauth/token",
         client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
-        scopes: &["user:inference"],
+        // Claude Code 2.1.220's exact scope set, same order (W5g-7): the
+        // consent page derives its permission items from these, and the
+        // owner's parity ask is "identical to Claude Code". `user:inference`
+        // remains the one scope the turn path consumes; the rest are
+        // consented capability for later waves (sessions, connectors,
+        // uploads). Pre-W5g-7 single-scope grants fail the all-scopes
+        // token guard and need one re-login.
+        scopes: &[
+            "org:create_api_key",
+            "user:profile",
+            "user:inference",
+            "user:sessions:claude_code",
+            "user:mcp_servers",
+            "user:file_upload",
+        ],
         audience: "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
         resource: None,
         // The generic engine keeps its safest ephemeral numeric-loopback

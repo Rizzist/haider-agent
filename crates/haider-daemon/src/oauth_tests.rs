@@ -793,7 +793,19 @@ fn sanctioned_oauth_table_has_exact_owner_grants_and_precise_reasons() {
         "https://console.anthropic.com/v1/oauth/token"
     );
     assert_eq!(anthropic.client_id, "9d1c250a-e61b-44d9-88ed-5944d1962f5e");
-    assert_eq!(anthropic.scopes, &["user:inference"]);
+    // Claude Code 2.1.220 parity (W5g-7): the consent page derives its
+    // permission items from these, same set, same order.
+    assert_eq!(
+        anthropic.scopes,
+        &[
+            "org:create_api_key",
+            "user:profile",
+            "user:inference",
+            "user:sessions:claude_code",
+            "user:mcp_servers",
+            "user:file_upload",
+        ]
+    );
     assert_eq!(
         anthropic.authorization_code_encoding,
         OAuthTokenRequestEncoding::Json

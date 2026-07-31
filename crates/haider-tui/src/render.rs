@@ -747,16 +747,23 @@ fn render_launcher(
     // The rebuild skips exactly the mark block it emitted — when the head
     // was already the one-line text mark this is the identity, never an
     // eaten sanctum or rule.
-    let lines = if lines.len() > content_area.height as usize {
+    // Compaction removes head rows the recorded hit indices still count
+    // (W5g-7: on a 24-row terminal the 4-row banner collapses to 1, and
+    // every launcher hit rect sat exactly 3 rows below its painted row —
+    // the owner's "hover is off on the main menu"). The shift is a single
+    // scalar BY CONSTRUCTION: compaction only ever replaces the head
+    // block, and no hit row lives inside it.
+    let (lines, compact_shift) = if lines.len() > content_area.height as usize {
         let mut compact = vec![Line::default()];
         compact.extend(mark_lines_within(model, theme, content_area.width, 0));
+        let removed = (1 + mark_rows).saturating_sub(compact.len());
         compact.extend(lines.into_iter().skip(1 + mark_rows));
-        compact
+        (compact, removed)
     } else {
-        lines
+        (lines, 0)
     };
     let (middle, dropped) = centered(frame, content_area, lines);
-    let visible = |row: usize| row.checked_sub(dropped);
+    let visible = |row: usize| row.checked_sub(compact_shift)?.checked_sub(dropped);
     for (row, id) in sample_rows {
         if let Some(row) = visible(row) {
             hits.push((

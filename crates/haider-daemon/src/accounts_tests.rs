@@ -923,7 +923,16 @@ async fn auth_aware_factory_routes_sanctioned_oauth_descriptors_to_subscription_
                 ANTHROPIC_OAUTH_PROVIDER_NAME,
                 "https://claude.ai",
                 "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
-                &["user:inference"],
+                // The stored grant must cover EVERY configured scope
+                // (W5g-7 Claude Code parity set) or resolve refuses it.
+                &[
+                    "org:create_api_key",
+                    "user:profile",
+                    "user:inference",
+                    "user:sessions:claude_code",
+                    "user:mcp_servers",
+                    "user:file_upload",
+                ],
                 b"ANTHROPIC_FACTORY_ACCESS_SENTINEL_d716",
             )
             .encode()

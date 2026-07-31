@@ -274,11 +274,23 @@ pub async fn run_demo(
     let mut stream_open = true;
     // The last frame's clickable regions (render reports, mouse consumes).
     let mut hit_map: Vec<(ratatui::layout::Rect, crate::app::Hit)> = Vec::new();
+    // The last pointer cell, for post-draw hover settling (W5g-7).
+    let mut pointer: Option<(u16, u16)> = None;
 
     while !model.should_quit {
         tokio::select! {
             input = input_rx.recv() => match input {
-                Some(event) => dispatch_input(&mut model, &hit_map, event),
+                Some(event) => {
+                    match &event {
+                        // The pre-resize map describes a frame that no
+                        // longer exists — a queued Moved must not re-arm a
+                        // hover from dead geometry (W5g-7).
+                        Event::Resize(..) => hit_map.clear(),
+                        Event::Mouse(mouse) => pointer = Some((mouse.column, mouse.row)),
+                        _ => {}
+                    }
+                    dispatch_input(&mut model, &hit_map, event);
+                }
                 None => break,
             },
             tagged = envelope_rx.recv(), if stream_open => match tagged {
@@ -306,16 +318,11 @@ pub async fn run_demo(
             _ = frame_tick.tick(), if model.dirty => {
                 hit_map = draw(&mut terminal, &model)?;
                 model.dirty = false;
-                // The hover target may have vanished with the new frame
-                // (screen switch, shed region): drop it WITHOUT dirtying —
-                // the frame just painted reality (TUI3a item 6).
-                if model
-                    .hovered
-                    .as_ref()
-                    .is_some_and(|hovered| !hit_map.iter().any(|(_, hit)| hit == hovered))
-                {
-                    model.hovered = None;
-                }
+                // W5g-7: hover survives a redraw only while the pointer
+                // still resolves to it (subsumes the old identity-vanish
+                // cleanup, and also kills a highlight whose target MOVED
+                // under a stationary pointer).
+                settle_hover_after_draw(&mut model, &hit_map, pointer);
                 // Demo persistence (TUI4c-13b): a drawn frame means state
                 // changed — save here, coalesced to the frame cadence
                 // (hash-skipped when nothing persisted moved). This is the
@@ -571,6 +578,30 @@ pub fn dispatch_input(
 }
 
 /// The first hit-map entry containing the cell, WITH its rect (TUI5
+/// Post-draw hover consistency (W5g-7): a redraw can move every target
+/// under a STATIONARY pointer (session inserts, shell output, screen
+/// switches), and identity-only cleanup let the highlight follow the OLD
+/// target to its new row. If the freshly installed map no longer resolves
+/// the pointer to the hovered identity, the painted highlight is a lie —
+/// drop it and repaint. Never ADOPT the newly resolved target here:
+/// imposing pointer selection on every keyboard-driven redraw would steal
+/// palette/menu navigation from the keys. Real motion re-arms hover.
+pub fn settle_hover_after_draw(
+    model: &mut AppModel,
+    hit_map: &[(ratatui::layout::Rect, crate::app::Hit)],
+    pointer: Option<(u16, u16)>,
+) {
+    if model.hovered.is_none() {
+        return;
+    }
+    let resolved =
+        pointer.and_then(|(column, row)| hit_rect_at(hit_map, column, row).map(|(_, hit)| hit));
+    if resolved != model.hovered {
+        model.hovered = None;
+        model.dirty = true;
+    }
+}
+
 /// item 5: the composer press maps the click column against the rect's
 /// origin — the same first-match rule the `hit_at` closure applies).
 fn hit_rect_at(
@@ -2403,6 +2434,8 @@ pub async fn run_live(
     let mut anim_tick = tokio::time::interval(Duration::from_millis(ANIM_PHASE_MS));
     anim_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut hit_map: Vec<(ratatui::layout::Rect, crate::app::Hit)> = Vec::new();
+    // The last pointer cell, for post-draw hover settling (W5g-7).
+    let mut pointer: Option<(u16, u16)> = None;
 
     while !model.should_quit {
         // Issue whatever the driver asked for. `try_send` keeps the UI loop
@@ -2427,7 +2460,17 @@ pub async fn run_live(
         let deadline = driver.next_deadline();
         tokio::select! {
             input = input_rx.recv() => match input {
-                Some(event) => dispatch_input(&mut model, &hit_map, event),
+                Some(event) => {
+                    match &event {
+                        // The pre-resize map describes a frame that no
+                        // longer exists — a queued Moved must not re-arm a
+                        // hover from dead geometry (W5g-7).
+                        Event::Resize(..) => hit_map.clear(),
+                        Event::Mouse(mouse) => pointer = Some((mouse.column, mouse.row)),
+                        _ => {}
+                    }
+                    dispatch_input(&mut model, &hit_map, event);
+                }
                 None => break,
             },
             reply = link.replies.recv() => match reply {
@@ -2442,13 +2485,11 @@ pub async fn run_live(
             _ = frame_tick.tick(), if model.dirty => {
                 hit_map = draw(&mut terminal, &model)?;
                 model.dirty = false;
-                if model
-                    .hovered
-                    .as_ref()
-                    .is_some_and(|hovered| !hit_map.iter().any(|(_, hit)| hit == hovered))
-                {
-                    model.hovered = None;
-                }
+                // W5g-7: hover survives a redraw only while the pointer
+                // still resolves to it (subsumes identity-vanish cleanup,
+                // and kills a highlight whose target MOVED under a
+                // stationary pointer).
+                settle_hover_after_draw(&mut model, &hit_map, pointer);
             }
         }
         let pass = live_pass(&mut driver, &mut model, inbound, std::time::Instant::now());

@@ -460,3 +460,37 @@ fn thinking_beat_shows_the_transient_transcript_tail() {
     model.handle(key(KeyCode::Char('x')));
     assert_eq!(model.composer, "x");
 }
+
+/// MUTATION CHECK (W5g-7): drop `compact_shift` from the launcher's
+/// `visible` conversion (subtract only `dropped`). Expected runtime
+/// failure: on a 24-row terminal — where the 4-row banner compacts to
+/// one line — every launcher hit rect sits exactly 3 rows below its
+/// painted row, the owner's "hover is off on the main menu".
+#[test]
+fn launcher_row_hits_align_on_the_compact_banner_path() {
+    let model = launcher_model();
+    let (rows, hits, _) = draw(&model, 118, 24);
+    for name in ["billing-service", "cellular-pool-fix", "l1-remote-projects"] {
+        let rect = rect_for(
+            &hits,
+            Hit::AttachSession(common::session_named(&model, name)),
+        );
+        assert_eq!(
+            rect.y,
+            row_of(&rows, name),
+            "compact-path sample row {name} aligned"
+        );
+    }
+    for (row, name) in [
+        (haider_tui::app::LauncherRow::Aura, "Aura"),
+        (haider_tui::app::LauncherRow::Accounts, "Accounts"),
+        (haider_tui::app::LauncherRow::Peers, "Peers"),
+    ] {
+        let rect = rect_for(&hits, Hit::ExtraRow(row));
+        assert_eq!(
+            rect.y,
+            row_of(&rows, name),
+            "compact-path extra row {name} aligned"
+        );
+    }
+}
