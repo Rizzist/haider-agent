@@ -796,3 +796,216 @@ async fn missing_compaction_artifact_is_store_corruption() {
     .expect_err("missing summary must fail closed");
     assert_eq!(error.code, haider_protocol::error::ErrorCode::StoreCorrupt);
 }
+
+// ── The two laws the W7a rewrite DELETED, restored from a8418a0^ ──
+// (the daemond seam-sweep manifest caught the first by name; the second
+// had no manifest pin and vanished silently — both re-pinned here, and
+// the manifest coordinate now points at this file.)
+
+/// MUTATION CHECK (restored): reorder the compiled tool result before its
+/// completed call. Expected runtime failure: the position assertion — a
+/// provider rejects a tool result preceding its call.
+#[tokio::test]
+async fn tool_result_is_presented_after_its_completed_tool_call() {
+    let store = MemoryStore::new();
+    let session_id = SessionId::new("history-session");
+    let prior = RunId::new("prior-run");
+    let current = RunId::new("current-run");
+    let mut events = vec![
+        envelope(
+            &session_id,
+            &prior,
+            "prior-user",
+            EventPayload::UserMessage {
+                text: "read".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        ),
+        envelope(
+            &session_id,
+            &prior,
+            "prior-result",
+            EventPayload::ToolResult {
+                call_id: "call-1".into(),
+                result: BoundedResult {
+                    preview: "contents".into(),
+                    truncated: false,
+                    artifact: None,
+                    cursor: None,
+                },
+            },
+            PromptRender::Verbatim,
+        ),
+        envelope(
+            &session_id,
+            &prior,
+            "prior-call",
+            EventPayload::Item(ItemEvent::Completed {
+                item_id: ItemId::new("item-1"),
+                item: TurnItem::ToolCall {
+                    call_id: "call-1".into(),
+                    name: "fs_read".into(),
+                    args: serde_json::json!({"path":"note.txt"}),
+                    status: ToolStatus::Completed,
+                },
+            }),
+            PromptRender::Verbatim,
+        ),
+        envelope(
+            &session_id,
+            &prior,
+            "prior-done",
+            EventPayload::RunState(RunState::Done),
+            PromptRender::Omit,
+        ),
+        envelope(
+            &session_id,
+            &current,
+            "current-user",
+            EventPayload::UserMessage {
+                text: "continue".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        ),
+    ];
+    StoreHandle::append(&store, &mut events)
+        .await
+        .expect("append history");
+    let messages = PromptHistoryCompiler::compile(&store, &session_id, None, None, &current)
+        .await
+        .expect("compile");
+    let call = messages
+        .iter()
+        .position(|message| {
+            message.blocks.iter().any(
+                |block| matches!(block, Block::ToolCall { call_id, .. } if call_id == "call-1"),
+            )
+        })
+        .expect("tool call");
+    let result = messages
+        .iter()
+        .position(|message| message.tool_result_for("call-1").is_some())
+        .expect("tool result");
+    assert_eq!(result, call + 1);
+}
+
+/// Fable D2-5 pin (restored): only Done history in the requested
+/// branch/agent scope may reach the provider; prompt-marked partial
+/// output is still excluded.
+/// MUTATION CHECK: drop the scope filter (or the terminal-run gate) in
+/// the compiler. Expected runtime failure: the rendered text below gains
+/// "wrong branch"/"wrong agent"/"partial output".
+#[tokio::test]
+async fn branch_agent_and_nonterminal_history_are_excluded_structurally() {
+    use haider_protocol::ids::{AgentId, BranchId};
+    let store = MemoryStore::new();
+    let session_id = SessionId::new("scoped-history");
+    let branch = BranchId::new("branch-a");
+    let other_branch = BranchId::new("branch-b");
+    let agent = AgentId::new("agent-a");
+    let other_agent = AgentId::new("agent-b");
+    let matching = RunId::new("matching");
+    let wrong_branch = RunId::new("wrong-branch");
+    let wrong_agent = RunId::new("wrong-agent");
+    let interrupted = RunId::new("interrupted");
+    let current = RunId::new("current");
+    let scoped =
+        |mut raw: haider_protocol::envelope::RawEnvelope, branch: &BranchId, agent: &AgentId| {
+            raw.branch_id = Some(branch.clone());
+            raw.agent_id = Some(agent.clone());
+            raw
+        };
+    let user = |run: &RunId, id: &str, text: &str| {
+        envelope(
+            &session_id,
+            run,
+            id,
+            EventPayload::UserMessage {
+                text: text.into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        )
+    };
+    let done = |run: &RunId, id: &str| {
+        envelope(
+            &session_id,
+            run,
+            id,
+            EventPayload::RunState(RunState::Done),
+            PromptRender::Omit,
+        )
+    };
+    let mut events = vec![
+        scoped(
+            user(&matching, "matching-user", "matching"),
+            &branch,
+            &agent,
+        ),
+        scoped(done(&matching, "matching-done"), &branch, &agent),
+        scoped(
+            user(&wrong_branch, "wrong-branch-user", "wrong branch"),
+            &other_branch,
+            &agent,
+        ),
+        scoped(
+            done(&wrong_branch, "wrong-branch-done"),
+            &other_branch,
+            &agent,
+        ),
+        scoped(
+            user(&wrong_agent, "wrong-agent-user", "wrong agent"),
+            &branch,
+            &other_agent,
+        ),
+        scoped(
+            done(&wrong_agent, "wrong-agent-done"),
+            &branch,
+            &other_agent,
+        ),
+        scoped(
+            user(&interrupted, "interrupted-user", "partial"),
+            &branch,
+            &agent,
+        ),
+        scoped(
+            envelope(
+                &session_id,
+                &interrupted,
+                "interrupted-stream",
+                EventPayload::Item(ItemEvent::Completed {
+                    item_id: ItemId::new("partial-item"),
+                    item: TurnItem::AgentMessage {
+                        text: "partial output".into(),
+                    },
+                }),
+                PromptRender::Verbatim,
+            ),
+            &branch,
+            &agent,
+        ),
+        scoped(user(&current, "current-user", "current"), &branch, &agent),
+    ];
+    StoreHandle::append(&store, &mut events)
+        .await
+        .expect("append scoped history");
+
+    let messages =
+        PromptHistoryCompiler::compile(&store, &session_id, Some(&branch), Some(&agent), &current)
+            .await
+            .expect("compile");
+    let rendered = messages
+        .iter()
+        .flat_map(|message| &message.blocks)
+        .filter_map(|block| match block {
+            Block::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(rendered, vec!["matching", "current"]);
+}

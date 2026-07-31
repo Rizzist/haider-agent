@@ -5573,8 +5573,13 @@ fn scenario_13_mutation_seam_sweep_manifest_covers_each_load_bearing_boundary() 
         ),
         (
             "tool_result_is_presented_after_its_completed_tool_call",
-            "crates/haider-core/src/prompt_history.rs",
+            "crates/haider-core/tests/prompt_history_tests.rs",
             "provider-valid tool history reconstruction",
+        ),
+        (
+            "branch_agent_and_nonterminal_history_are_excluded_structurally",
+            "crates/haider-core/tests/prompt_history_tests.rs",
+            "prompt scope + terminal-run exclusion (Fable D2-5)",
         ),
         (
             "dropping_an_owned_stream_aborts_its_producer",
@@ -5665,7 +5670,7 @@ fn scenario_13_mutation_seam_sweep_manifest_covers_each_load_bearing_boundary() 
         .iter()
         .map(|(_, _, seam)| *seam)
         .collect::<std::collections::HashSet<_>>();
-    assert_eq!(sweep.len(), 28);
+    assert_eq!(sweep.len(), 29);
     assert_eq!(tests.len(), sweep.len());
     assert_eq!(seams.len(), sweep.len());
     let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
