@@ -45,6 +45,11 @@ use crate::session_hub::FrameSink;
 
 const CALLBACK_RESPONSE_LIMIT: usize = 8 * 1024;
 const TOKEN_RESPONSE_LIMIT: usize = 256 * 1024;
+/// Sweep budget for [`scrub_source_chunks`]: hyper's connection task releases
+/// its transient read-buffer reference within a few scheduler ticks of the
+/// response drop, so this bound is generous; it exists only so a chunk that
+/// never becomes exclusive is a bounded residual instead of a hang.
+const SCRUB_YIELD_BOUND: usize = 256;
 const IMPORT_FILE_LIMIT: u64 = 256 * 1024;
 const MIN_RANDOM_BYTES: usize = 32;
 const MAX_TOKEN_LIFETIME_SECS: u64 = 366 * 24 * 60 * 60;
@@ -2312,28 +2317,18 @@ async fn bounded_response(
     }
     // Exhaustion (or dropping an oversized/incomplete body) closes the
     // Connection: close transport and releases hyper's non-secret sibling
-    // slices. Every token-bearing Bytes allocation is now either mutable and
-    // scrubbed below or rejected before it can be parsed.
+    // slices. Exclusivity is EVENTUAL, not immediate: the connection task
+    // may hold its read-buffer reference for a few more scheduler ticks, so
+    // the scrub below waits for it instead of treating the race as an
+    // invariant breach.
     drop(response);
     let mut bytes = Zeroizing::new(Vec::with_capacity(source_len.min(TOKEN_RESPONSE_LIMIT)));
-    for chunk in source_chunks {
-        let mut chunk = match chunk.try_into_mut() {
-            Ok(chunk) => chunk,
-            Err(_) => {
-                // Returning would free an allocation containing token/error
-                // bytes without scrubbing it. Connection: close plus full
-                // body release makes normal network chunks exclusive; if
-                // that invariant is ever violated, process death is the only
-                // safe-Rust fail-closed action (Bytes offers no mutable
-                // access to shared backing storage).
-                std::process::abort();
-            }
-        };
-        if !oversized {
+    if !oversized {
+        for chunk in &source_chunks {
             bytes.extend_from_slice(chunk.as_ref());
         }
-        chunk.as_mut().zeroize();
     }
+    scrub_source_chunks(source_chunks).await;
     if declared_oversized || oversized {
         return Err(OAuthPublicError::new("token_response_oversized", false));
     }
@@ -2341,6 +2336,35 @@ async fn bounded_response(
         return Err(OAuthPublicError::new("token_endpoint_unavailable", true));
     }
     Ok(bytes)
+}
+
+/// Zeroize every token-bearing source chunk once its backing storage is
+/// exclusively owned. `Bytes::try_into_mut` fails while any sibling
+/// reference is alive — in practice hyper's connection task, which drops
+/// its read-buffer reference a few scheduler ticks after the response —
+/// so sweep with yields until every chunk scrubs. A chunk still shared at
+/// the bound drops unscrubbed and is reported as the residual count: a
+/// bounded in-process memory-hygiene residual, NEVER process death (the
+/// previous `std::process::abort` here traded every live session for a
+/// refcount race and killed the daemon under ordinary scheduler load).
+async fn scrub_source_chunks(mut pending: Vec<bytes::Bytes>) -> usize {
+    for _ in 0..SCRUB_YIELD_BOUND {
+        pending = pending
+            .into_iter()
+            .filter_map(|chunk| match chunk.try_into_mut() {
+                Ok(mut chunk) => {
+                    chunk.as_mut().zeroize();
+                    None
+                }
+                Err(chunk) => Some(chunk),
+            })
+            .collect();
+        if pending.is_empty() {
+            return 0;
+        }
+        tokio::task::yield_now().await;
+    }
+    pending.len()
 }
 
 async fn bounded_jwks_response(

@@ -3268,6 +3268,32 @@ fn token_response_source_chunks_are_exclusively_owned_and_scrubbed() {
     );
 }
 
+/// MUTATION CHECK: restore abort-on-shared in `scrub_source_chunks`
+/// (`Err(_) => std::process::abort()`). Expected runtime failure: this test
+/// binary dies SIGABRT on the held-clone segment below.
+#[tokio::test]
+async fn shared_source_chunk_is_scrubbed_late_or_left_bounded_never_process_death() {
+    // Exclusive chunks scrub on the first sweep.
+    let exclusive = vec![
+        bytes::Bytes::from(b"CHUNK_SECRET_A".to_vec()),
+        bytes::Bytes::from(b"CHUNK_SECRET_B".to_vec()),
+    ];
+    assert_eq!(scrub_source_chunks(exclusive).await, 0);
+    // A transiently shared chunk (production: hyper's connection task still
+    // holds its read-buffer reference) scrubs once the sibling drops.
+    let chunk = bytes::Bytes::from(b"CHUNK_SECRET_C".to_vec());
+    let sibling = chunk.clone();
+    let scrub = tokio::spawn(scrub_source_chunks(vec![chunk]));
+    tokio::task::yield_now().await;
+    drop(sibling);
+    assert_eq!(scrub.await.expect("scrub task"), 0);
+    // A chunk that never becomes exclusive is a bounded residual — the
+    // daemon survives (previously: std::process::abort).
+    let chunk = bytes::Bytes::from(b"CHUNK_SECRET_D".to_vec());
+    let _held = chunk.clone();
+    assert_eq!(scrub_source_chunks(vec![chunk]).await, 1);
+}
+
 #[tokio::test]
 async fn auth_aware_broker_keeps_api_keys_raw_and_never_treats_bundle_as_bearer() {
     let server = FakeOAuthServer::start(FakeMode::Success, false).await;
