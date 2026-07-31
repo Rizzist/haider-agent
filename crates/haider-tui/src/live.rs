@@ -204,6 +204,15 @@ pub enum LiveCommand {
         model: String,
         expected_revision: u64,
     },
+    /// `provider.configure` CREATE for a custom OpenAI-compatible provider
+    /// (W5g-4). Identity fields are fixed by the card: chat-completions
+    /// family, api-key auth, enabled, no seeded models (they discover).
+    ConfigureProvider {
+        command_id: CommandId,
+        provider: String,
+        origin: String,
+        expected_revision: u64,
+    },
 }
 
 impl LiveCommand {
@@ -218,6 +227,7 @@ impl LiveCommand {
             Self::LoginApi { command_id, .. } => Some(command_id),
             Self::AccountSetActive { command_id, .. } => Some(command_id),
             Self::SetDefaultModel { command_id, .. } => Some(command_id),
+            Self::ConfigureProvider { command_id, .. } => Some(command_id),
             Self::AccountAddOAuth { command_id, .. } => Some(command_id),
             Self::List { .. }
             | Self::Attach { .. }
@@ -374,6 +384,12 @@ pub enum LiveReply {
     },
     /// `account.set_default_model` committed.
     DefaultModelSet {
+        command_id: CommandId,
+        provider: haider_rpc::ProviderSummaryWire,
+        revision: u64,
+    },
+    /// `provider.configure` committed (W5g-4).
+    ProviderConfigured {
         command_id: CommandId,
         provider: haider_rpc::ProviderSummaryWire,
         revision: u64,
@@ -536,6 +552,8 @@ pub struct LiveDriver {
     pending_account_select: Option<(CommandId, String)>,
     /// The in-flight `account.set_default_model`: (command, provider).
     pending_default_model: Option<(CommandId, String)>,
+    /// The in-flight `provider.configure`: (command, card attempt).
+    pending_custom: Option<(CommandId, u64)>,
     /// The one OAuth add flight (W5e-1): the card's whole driver state.
     oauth_flight: Option<OAuthFlight>,
     /// Durable mutations awaiting a response, in issue order.
@@ -620,6 +638,7 @@ impl LiveDriver {
             login_started: None,
             pending_account_select: None,
             pending_default_model: None,
+            pending_custom: None,
             oauth_flight: None,
             outbox: Vec::new(),
             menus: HashMap::new(),
@@ -1156,6 +1175,25 @@ impl LiveDriver {
                 model.apply_default_model_set(provider, revision);
                 Vec::new()
             }
+            LiveReply::ProviderConfigured {
+                command_id,
+                provider,
+                revision,
+            } => {
+                self.retire(&command_id);
+                let Some((_, attempt)) = self
+                    .pending_custom
+                    .take_if(|(pending, _)| *pending == command_id)
+                else {
+                    return Vec::new();
+                };
+                // Upsert semantics — the created profile joins the list
+                // under the commit's revision.
+                model.providers.apply_models_refresh(provider, revision);
+                model.custom_add_committed(attempt);
+                model.dirty = true;
+                Vec::new()
+            }
             LiveReply::OAuthStarted {
                 attempt_id,
                 availability,
@@ -1472,6 +1510,26 @@ impl LiveDriver {
                     }
                     let refresh = code == haider_rpc::ERROR_CODE_REVISION_CONFLICT;
                     model.default_model_failed(&provider, &message, refresh);
+                    return Vec::new();
+                }
+                // A failed `provider.configure` returns the card to its
+                // editable fields with the public reason (W5g-4). A
+                // revision_conflict also refreshes the snapshot so the
+                // retry submits under fresh truth.
+                if let Some(id) = &command_id
+                    && self
+                        .pending_custom
+                        .as_ref()
+                        .is_some_and(|(pending, _)| pending == id)
+                    && let Some((_, attempt)) = self.pending_custom.take()
+                {
+                    if !retryable {
+                        self.retire(id);
+                    }
+                    model.custom_add_failed(attempt, &message);
+                    if code == haider_rpc::ERROR_CODE_REVISION_CONFLICT {
+                        return vec![self.enqueue(LiveCommand::ProviderList)];
+                    }
                     return Vec::new();
                 }
                 // A failed `account.set_active` clears its exact pending
@@ -1986,6 +2044,21 @@ impl LiveDriver {
                     command_id,
                     provider,
                     model,
+                    expected_revision,
+                })]
+            }
+            AppRequest::ProviderConfigure {
+                attempt,
+                name,
+                origin,
+                expected_revision,
+            } => {
+                let command_id = self.mint();
+                self.pending_custom = Some((command_id.clone(), attempt));
+                vec![self.enqueue(LiveCommand::ConfigureProvider {
+                    command_id,
+                    provider: name,
+                    origin,
                     expected_revision,
                 })]
             }

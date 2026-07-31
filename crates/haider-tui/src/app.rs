@@ -340,6 +340,42 @@ pub enum OAuthAddPhase {
     Failed { message: String },
 }
 
+/// Which custom-provider field owns the keystrokes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CustomField {
+    Name,
+    Origin,
+}
+
+/// Where the `+ Custom (OpenAI-compatible)` card is in its flow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CustomPhase {
+    /// Typing name/origin (also the retype state after a failure — the
+    /// error line renders above the still-editable fields).
+    Editing { error: Option<String> },
+    /// `provider.configure` is in flight.
+    Submitting,
+}
+
+/// The `+ Custom (OpenAI-compatible)` card (sim tui.js:3629-3682).
+///
+/// The DEMO card is the sim's verbatim MenuBox — info lines and a fixed
+/// `[1] add http://127.0.0.1:8000/v1 (demo)`. The EDITABLE name/origin
+/// fields are the live extension (report §4.4: "custom provider rows are
+/// created/edited through provider.configure" — the sim only fabricates).
+#[derive(Debug)]
+pub struct CustomProviderCard {
+    /// Provider id — doubles as the row name (`custom`, `local-llama`).
+    pub name: String,
+    /// OpenAI-compatible base URL (`http://127.0.0.1:8000/v1`).
+    pub origin: String,
+    pub focus: CustomField,
+    pub phase: CustomPhase,
+    /// Attempt identity (the card discipline): every driver reply must
+    /// correlate to it or die silently.
+    pub attempt: u64,
+}
+
 /// The `/providers` screen state (report §5.2). Same daemon-truth law as
 /// `/accounts`: a default-model change applies only on the correlated,
 /// revision-gated reply.
@@ -1334,6 +1370,15 @@ pub enum AppRequest {
     },
     /// Cancel the card's flow (`account.oauth_cancel` when one is bound).
     OAuthAddCancel { attempt: u64 },
+    /// Create a custom OpenAI-compatible provider (`provider.configure`,
+    /// W5g-4). Always a CREATE from the card: identity fields ride along
+    /// and the daemon rejects a collision with an existing profile.
+    ProviderConfigure {
+        attempt: u64,
+        name: String,
+        origin: String,
+        expected_revision: u64,
+    },
     /// Open a URL in the user's browser (runtime-owned effect; the demo
     /// flashes it instead). Carried for the OAuth authorize hop — the URL
     /// always originates from the daemon's sanctioned registration.
@@ -1863,6 +1908,10 @@ pub struct AppModel {
     pub oauth_add: Option<OAuthAddCard>,
     /// Monotonic attempt counter for OAuth add cards.
     pub oauth_attempt_seq: u64,
+    /// The open custom-provider card, if any (accounts screen overlay).
+    pub custom_add: Option<CustomProviderCard>,
+    /// Monotonic attempt counter for custom-provider cards.
+    pub custom_attempt_seq: u64,
 }
 
 impl Default for AppModel {
@@ -1941,6 +1990,8 @@ impl Default for AppModel {
             daemon_version: None,
             oauth_add: None,
             oauth_attempt_seq: 0,
+            custom_add: None,
+            custom_attempt_seq: 0,
         }
     }
 }
@@ -3673,7 +3724,7 @@ impl AppModel {
     /// §5.3: `<provider>` then the smallest free numeric suffix against the
     /// CURRENT rows (the daemon re-checks uniqueness at commit).
     fn open_oauth_add(&mut self, kind: AccountAddKind) {
-        if self.oauth_add.is_some() {
+        if self.oauth_add.is_some() || self.custom_add.is_some() {
             return;
         }
         let (provider, title) = match kind {
@@ -3863,11 +3914,225 @@ impl AppModel {
         self.dirty = true;
     }
 
+    /// Opens the `+ Custom (OpenAI-compatible)` card. The name prefills
+    /// with the smallest free `custom[-N]` against the provider registry;
+    /// the origin with the sim's demo URL (a real vLLM default).
+    fn open_custom_add(&mut self) {
+        if self.custom_add.is_some() || self.oauth_add.is_some() {
+            return;
+        }
+        let taken: Vec<AccountRow> = self
+            .providers
+            .providers
+            .iter()
+            .map(|summary| AccountRow {
+                alias: summary.provider.clone(),
+                provider: summary.provider.clone(),
+                method: haider_protocol::credential::AuthMethod::ApiKey,
+                identity: String::new(),
+                status: haider_protocol::credential::CredentialStatus::Ok,
+                selected: false,
+                base_url: None,
+            })
+            .collect();
+        self.custom_attempt_seq += 1;
+        self.accounts.message = None;
+        self.custom_add = Some(CustomProviderCard {
+            name: smallest_free_alias("custom", &taken),
+            origin: "http://127.0.0.1:8000/v1".to_owned(),
+            focus: CustomField::Name,
+            phase: CustomPhase::Editing { error: None },
+            attempt: self.custom_attempt_seq,
+        });
+        self.dirty = true;
+    }
+
+    fn cancel_custom_add(&mut self) {
+        if self.custom_add.take().is_some() {
+            self.dirty = true;
+        }
+    }
+
+    /// ⏎ on the live card: `provider.configure` under the CURRENT provider
+    /// revision (CAS — a stale snapshot is a typed conflict, never a
+    /// silent overwrite).
+    fn submit_custom_add(&mut self) {
+        let expected_revision = self.providers.revision.unwrap_or(0);
+        let Some(card) = self.custom_add.as_mut() else {
+            return;
+        };
+        if !matches!(card.phase, CustomPhase::Editing { .. }) {
+            return;
+        }
+        if !account_alias_ok(&card.name) {
+            card.focus = CustomField::Name;
+            self.dirty = true;
+            return;
+        }
+        if card.origin.trim().is_empty() {
+            card.focus = CustomField::Origin;
+            self.dirty = true;
+            return;
+        }
+        card.phase = CustomPhase::Submitting;
+        let attempt = card.attempt;
+        let name = card.name.clone();
+        let origin = card.origin.trim().to_owned();
+        self.requests.push(AppRequest::ProviderConfigure {
+            attempt,
+            name,
+            origin,
+            expected_revision,
+        });
+        self.dirty = true;
+    }
+
+    /// A failed `provider.configure`: back to editing with the public
+    /// reason above the still-filled fields.
+    pub fn custom_add_failed(&mut self, attempt: u64, message: &str) {
+        if let Some(card) = self.custom_add.as_mut()
+            && card.attempt == attempt
+        {
+            card.phase = CustomPhase::Editing {
+                error: Some(message.to_owned()),
+            };
+            self.dirty = true;
+        }
+    }
+
+    /// A committed `provider.configure`: close the card and chain straight
+    /// into the masked key card — the provider needs a credential before
+    /// it can serve anything (report §4.4: custom = base URL + key).
+    pub fn custom_add_committed(&mut self, attempt: u64) {
+        let Some(card) = self.custom_add.take_if(|card| card.attempt == attempt) else {
+            return;
+        };
+        self.accounts.message = Some(format!(
+            "✓ provider {} created · OpenAI-compatible — now add its key",
+            card.name
+        ));
+        self.open_login_card(&card.name, None);
+        self.dirty = true;
+    }
+
+    /// Keys on the custom-provider card. DEMO is the sim's verbatim key
+    /// map (`[1]` fabricate · `[2]`/esc cancel); LIVE edits fields (tab ·
+    /// ⏎ create · esc cancel — digits are name characters here).
+    fn handle_custom_card_key(&mut self, code: KeyCode) {
+        if self.mode.fabricates_locally() {
+            match code {
+                KeyCode::Esc | KeyCode::Char('2') => self.cancel_custom_add(),
+                KeyCode::Char('1') => self.confirm_custom_add_demo(),
+                _ => {}
+            }
+            return;
+        }
+        match code {
+            KeyCode::Esc => self.cancel_custom_add(),
+            KeyCode::Enter => self.submit_custom_add(),
+            KeyCode::Tab | KeyCode::BackTab => {
+                if let Some(card) = self.custom_add.as_mut()
+                    && matches!(card.phase, CustomPhase::Editing { .. })
+                {
+                    card.focus = match card.focus {
+                        CustomField::Name => CustomField::Origin,
+                        CustomField::Origin => CustomField::Name,
+                    };
+                    self.dirty = true;
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(card) = self.custom_add.as_mut()
+                    && matches!(card.phase, CustomPhase::Editing { .. })
+                {
+                    match card.focus {
+                        CustomField::Name => {
+                            card.name.pop();
+                        }
+                        CustomField::Origin => {
+                            card.origin.pop();
+                        }
+                    }
+                    self.dirty = true;
+                }
+            }
+            KeyCode::Char(c) => {
+                if let Some(card) = self.custom_add.as_mut()
+                    && matches!(card.phase, CustomPhase::Editing { .. })
+                {
+                    match card.focus {
+                        // The name is a provider id — alias grammar.
+                        CustomField::Name => {
+                            if let Some(c) = alias_char(c) {
+                                card.name.push(c);
+                                self.dirty = true;
+                            }
+                        }
+                        // The origin is a URL — any printable character.
+                        CustomField::Origin => {
+                            if !c.is_control() {
+                                card.origin.push(c);
+                                self.dirty = true;
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Sim confirmAuth's custom arm, verbatim (tui.js:2183-2207): the demo
+    /// fabricates `custom-N` · `local-N` on the fixed demo URL, selects
+    /// it, and closes the card with the sim's ✓ message.
+    fn confirm_custom_add_demo(&mut self) {
+        if self.custom_add.take().is_none() {
+            return;
+        }
+        let count = self
+            .accounts
+            .rows
+            .iter()
+            .filter(|row| row.provider.starts_with("custom-"))
+            .map(|row| row.provider.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            + 1;
+        let provider = format!("custom-{count}");
+        let alias = format!("local-{count}");
+        let base_url = "http://127.0.0.1:8000/v1";
+        // Sim hex(k): (0xa000 + k*7).toString(16).slice(-4).
+        let hex = format!("{:x}", 0xa000 + count * 7);
+        let identity = format!("{base_url} · sk-…{}", &hex[hex.len().saturating_sub(4)..]);
+        for row in &mut self.accounts.rows {
+            if row.provider == provider {
+                row.selected = false;
+            }
+        }
+        self.accounts.rows.push(AccountRow {
+            alias: alias.clone(),
+            provider: provider.clone(),
+            method: haider_protocol::credential::AuthMethod::ApiKey,
+            identity,
+            status: haider_protocol::credential::CredentialStatus::Ok,
+            selected: true,
+            base_url: Some(base_url.to_owned()),
+        });
+        self.accounts.message = Some(format!(
+            "✓ added {provider} · {alias} · api key · OpenAI-compatible — now active"
+        ));
+        self.dirty = true;
+    }
+
     /// Keys on the `/accounts` screen (no composer; the login card, when
     /// open, is total-modal and never reaches here).
     fn handle_accounts_key(&mut self, code: KeyCode) {
         if self.oauth_add.is_some() {
             self.handle_oauth_card_key(code);
+            return;
+        }
+        if self.custom_add.is_some() {
+            self.handle_custom_card_key(code);
             return;
         }
         match code {
@@ -5130,7 +5395,21 @@ impl AppModel {
                             self.dirty = true;
                         }
                     }
-                    AccountAddKind::HuggingFace | AccountAddKind::Custom => {
+                    // The custom card is the provider.configure front door
+                    // (W5g-4): demo shows the sim's fabrication card, live
+                    // shows the editable name/origin fields.
+                    AccountAddKind::Custom => {
+                        if self.mode.fabricates_locally()
+                            || self.daemon_serves(haider_rpc::FEATURE_PROVIDER_CONFIGURE_V1)
+                        {
+                            self.open_custom_add();
+                        } else {
+                            self.accounts.message =
+                                Some(self.stale_daemon_note("custom providers"));
+                            self.dirty = true;
+                        }
+                    }
+                    AccountAddKind::HuggingFace => {
                         self.flash = Some(
                             "· custom providers — /login lands them with W5e (provider.configure is live)"
                                 .to_owned(),

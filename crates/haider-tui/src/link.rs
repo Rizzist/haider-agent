@@ -589,6 +589,25 @@ pub fn request_body(command: LiveCommand) -> RequestBody {
             model,
             expected_revision,
         },
+        // W5g-4: the card CREATES — identity fields are fixed here, never
+        // typed. The origin string is data on the wire only; it is never
+        // interpolated into a shell or browser command (report §4.4).
+        LiveCommand::ConfigureProvider {
+            command_id,
+            provider,
+            origin,
+            expected_revision,
+        } => RequestBody::ProviderConfigure {
+            command_id,
+            provider,
+            api_family: Some(haider_rpc::ProviderApiFamilyWire::OpenAiChatCompletions),
+            origin: Some(origin),
+            auth_requirement: Some(haider_rpc::ProviderAuthRequirementWire::ApiKey),
+            enabled: true,
+            models: Vec::new(),
+            default_model: None,
+            expected_revision,
+        },
         LiveCommand::OAuthStart {
             provider,
             desired_alias,
@@ -738,6 +757,15 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
         ResponseBody::AccountSetDefaultModel { provider, revision } => {
             context.command_id.clone().map_or_else(Vec::new, |id| {
                 vec![LiveReply::DefaultModelSet {
+                    command_id: id,
+                    provider,
+                    revision,
+                }]
+            })
+        }
+        ResponseBody::ProviderConfigure { provider, revision } => {
+            context.command_id.clone().map_or_else(Vec::new, |id| {
+                vec![LiveReply::ProviderConfigured {
                     command_id: id,
                     provider,
                     revision,
