@@ -55,7 +55,7 @@ ACCEPTED by the lite endpoint), so the tool loop needed no change.
 ## Gate
 
 Workspace clippy `-D warnings` clean; TUI suite green; full per-crate
-gate `gate19.out`; ledger 1146 → 1150.
+gate `gate20.out` (gate19's one red was the OLD 5-row reachability pin colliding with the new cap; the pin now encodes the policy); ledger 1146 → 1150.
 
 ## Verdict
 
