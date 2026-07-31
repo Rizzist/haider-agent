@@ -534,6 +534,46 @@ async fn openai_jwks_private_dns_answer_is_rejected_before_key_use() {
     );
 }
 
+/// MUTATION CHECK (W5b.2a review P3): delete ONLY the
+/// `.dns_resolver(Arc::clone(&origin_guard))` line from the verifier's
+/// client (the full-guard removal is killed by the private-DNS test
+/// above). Expected runtime failure: the connection resolves through
+/// system DNS instead of the guard, the guard's connection count stays 0,
+/// and the count assertion below dies — the exact public-first DNS-rebind
+/// residual the P3 named.
+#[tokio::test]
+async fn openai_jwks_connection_resolves_through_the_pinned_guard() {
+    // TEST-NET-1 (RFC 5737): PUBLIC by classification, so the preflight
+    // accepts it — but reserved, so the connect fails without touching
+    // the real network. The verdict rides the COUNT, not the error.
+    let resolver = Arc::new(StubFixedResolver {
+        address: SocketAddr::from(([192, 0, 2, 1], 443)),
+        calls: AtomicUsize::new(0),
+    });
+    let verifier = OpenAiIdentityVerifier::new_for_test(OPENAI_JWKS_ENDPOINT, resolver);
+    // The exact error code is ENVIRONMENT-DEPENDENT — a clean network
+    // fails the connect (`identity_verifier_unavailable`), while a
+    // TLS-intercepting middlebox can serve a real JWKS and fail on the
+    // unknown kid instead. Both are failures; the verdict below rides the
+    // resolution COUNT, which the mutation zeroes in every environment.
+    verifier
+        .verify(
+            b"eyJhbGciOiJSUzI1NiIsImtpZCI6ImF1ZGl0LWtleSJ9.e30.AA",
+            OAuthIdentityExpectation {
+                issuer: "https://auth.openai.com",
+                audience: "audit-audience",
+                nonce: b"audit-nonce",
+            },
+        )
+        .await
+        .expect_err("a fabricated kid must never verify");
+    let guard = verifier.last_guard().expect("verify built a guard");
+    assert!(
+        guard.connection_resolution_count() >= 1,
+        "the CONNECTION must resolve through the pinned guard, not system DNS"
+    );
+}
+
 /// MUTATION CHECK: restore `response.bytes()` plus a post-read size check.
 /// The named timeout assertion fails while that reader waits for the rest of
 /// the deliberately unfinished oversized chunked response.

@@ -3,7 +3,8 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use tokio::sync::OnceCell;
@@ -35,7 +36,9 @@ pub struct FixedOriginGuard {
     port: u16,
     resolver: Arc<dyn FixedDnsResolver>,
     validated: OnceCell<Result<Arc<[SocketAddr]>, ProviderError>>,
-    #[cfg(test)]
+    /// Counts connection-time resolutions in EVERY build (not just tests):
+    /// downstream crates' integration pins read it to prove their client
+    /// is wired through the guard (W5b.2a review P3).
     connection_resolutions: AtomicUsize,
     #[cfg(test)]
     stall_connection_resolution: AtomicBool,
@@ -85,7 +88,6 @@ impl FixedOriginGuard {
             port: 443,
             resolver,
             validated: OnceCell::new(),
-            #[cfg(test)]
             connection_resolutions: AtomicUsize::new(0),
             #[cfg(test)]
             stall_connection_resolution: AtomicBool::new(false),
@@ -132,8 +134,13 @@ impl FixedOriginGuard {
             .store(true, Ordering::SeqCst);
     }
 
-    #[cfg(test)]
-    pub(crate) fn connection_resolution_count(&self) -> usize {
+    /// How many times the CONNECTION path asked this guard to resolve.
+    ///
+    /// Public so downstream integration pins can prove a client is
+    /// actually WIRED through the guard: a `.dns_resolver(…)`-only
+    /// removal leaves this at 0 while every preflight check stays green
+    /// (W5b.2a review P3).
+    pub fn connection_resolution_count(&self) -> usize {
         self.connection_resolutions.load(Ordering::SeqCst)
     }
 }
@@ -152,12 +159,10 @@ impl fmt::Debug for FixedOriginGuard {
 
 impl reqwest::dns::Resolve for FixedOriginGuard {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        self.connection_resolutions.fetch_add(1, Ordering::SeqCst);
         #[cfg(test)]
-        {
-            self.connection_resolutions.fetch_add(1, Ordering::SeqCst);
-            if self.stall_connection_resolution.load(Ordering::SeqCst) {
-                return Box::pin(std::future::pending());
-            }
+        if self.stall_connection_resolution.load(Ordering::SeqCst) {
+            return Box::pin(std::future::pending());
         }
         let requested = name.as_str();
         let result: Result<

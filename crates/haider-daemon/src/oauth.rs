@@ -322,6 +322,12 @@ const OPENAI_JWKS_HOST: &str = "auth.openai.com";
 struct OpenAiIdentityVerifier {
     jwks_endpoint: String,
     resolver: Arc<dyn FixedDnsResolver>,
+    /// The guard the LAST `verify` built — surfaced so the W5b.2a P3 pin
+    /// can prove the CONNECTION resolved through it (a
+    /// `.dns_resolver(…)`-only removal leaves its count at 0 while the
+    /// preflight stays green).
+    #[cfg(test)]
+    guard_probe: std::sync::Mutex<Option<Arc<FixedOriginGuard>>>,
 }
 
 impl OpenAiIdentityVerifier {
@@ -329,6 +335,8 @@ impl OpenAiIdentityVerifier {
         Self {
             jwks_endpoint: OPENAI_JWKS_ENDPOINT.to_owned(),
             resolver: Arc::new(SystemFixedDnsResolver),
+            #[cfg(test)]
+            guard_probe: std::sync::Mutex::new(None),
         }
     }
 
@@ -337,7 +345,13 @@ impl OpenAiIdentityVerifier {
         Self {
             jwks_endpoint: jwks_endpoint.into(),
             resolver,
+            guard_probe: std::sync::Mutex::new(None),
         }
+    }
+
+    #[cfg(test)]
+    fn last_guard(&self) -> Option<Arc<FixedOriginGuard>> {
+        self.guard_probe.lock().ok().and_then(|slot| slot.clone())
     }
 }
 
@@ -396,6 +410,10 @@ impl OAuthIdentityVerifier for OpenAiIdentityVerifier {
             )
             .map_err(|_| OAuthPublicError::new("identity_verifier_unavailable", true))?,
         );
+        #[cfg(test)]
+        if let Ok(mut slot) = self.guard_probe.lock() {
+            slot.replace(Arc::clone(&origin_guard));
+        }
         let client = reqwest::Client::builder()
             .no_proxy()
             .redirect(Policy::none())

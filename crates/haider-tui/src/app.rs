@@ -948,6 +948,53 @@ impl Default for AuraModel {
     }
 }
 
+/// Which of the login card's two fields owns the keystrokes.
+///
+/// §5.3: the alias is a visible, editable field, not a hidden
+/// auto-generated name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginFocus {
+    Alias,
+    Key,
+}
+
+/// The daemon's alias grammar (`normalize_account_alias`):
+/// `[a-z0-9][a-z0-9._-]{0,63}`. Checked client-side so the card can refuse
+/// a submit the daemon would bounce; the daemon remains the authority.
+#[must_use]
+pub fn account_alias_ok(alias: &str) -> bool {
+    let bytes = alias.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 64
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(byte))
+}
+
+/// A character's place in the alias grammar, as typed: uppercase folds to
+/// lowercase, anything outside `[a-z0-9._-]` is dropped at the keyboard.
+fn alias_char(c: char) -> Option<char> {
+    let c = c.to_ascii_lowercase();
+    (c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-')).then_some(c)
+}
+
+/// The smallest free alias on `base`: `base`, then `base-2`, `base-3`, …
+/// against the CURRENT management snapshot (§5.3). The daemon recanonizes
+/// and rechecks at commit, so a concurrent client losing this race gets a
+/// typed error, never a silent overwrite of intent.
+#[must_use]
+pub fn smallest_free_alias(base: &str, rows: &[AccountRow]) -> String {
+    let taken = |candidate: &str| rows.iter().any(|row| row.alias == candidate);
+    let mut candidate = base.to_owned();
+    let mut suffix = 1u32;
+    while taken(&candidate) {
+        suffix += 1;
+        candidate = format!("{base}-{suffix}");
+    }
+    candidate
+}
+
 /// The `/login <provider> api` masked key card (W3c3 M3 — report R10).
 ///
 /// SECRET HYGIENE is the whole point of this type existing instead of
@@ -965,8 +1012,13 @@ impl Default for AuraModel {
 pub struct LoginCard {
     /// Provider being logged into (`anthropic`).
     pub provider: String,
-    /// Optional display alias for the credential.
-    pub alias: Option<String>,
+    /// The visible, editable credential alias (§5.3) — prefilled with the
+    /// smallest free `«provider»-api[-N]`, or the slash command's token.
+    pub alias: String,
+    /// Which field the next keystroke lands in. The KEY by default: the
+    /// prefill makes the alias correct without a keystroke in the common
+    /// path.
+    pub focus: LoginFocus,
     /// The typed key. Never rendered, never persisted, never logged.
     secret: zeroize::Zeroizing<String>,
     pub stage: LoginStage,
@@ -1016,13 +1068,30 @@ impl std::fmt::Debug for LoginCard {
 
 impl LoginCard {
     #[must_use]
-    pub fn new(provider: String, alias: Option<String>, attempt: u64) -> Self {
+    pub fn new(provider: String, alias: String, attempt: u64) -> Self {
         Self {
             provider,
             alias,
+            focus: LoginFocus::Key,
             secret: zeroize::Zeroizing::new(String::new()),
             stage: LoginStage::Entry,
             attempt,
+        }
+    }
+
+    /// One typed character into the ALIAS field, grammar-filtered at the
+    /// keyboard (uppercase folds; illegal characters vanish).
+    pub fn alias_push(&mut self, c: char) {
+        if self.accepts_input()
+            && let Some(c) = alias_char(c)
+        {
+            self.alias.push(c);
+        }
+    }
+
+    pub fn alias_backspace(&mut self) {
+        if self.accepts_input() {
+            self.alias.pop();
         }
     }
 
@@ -2974,12 +3043,27 @@ impl AppModel {
                 // close method.
                 self.close_login_card();
             }
+            KeyCode::Tab | KeyCode::BackTab if card.accepts_input() => {
+                card.focus = match card.focus {
+                    LoginFocus::Alias => LoginFocus::Key,
+                    LoginFocus::Key => LoginFocus::Alias,
+                };
+                self.dirty = true;
+            }
             KeyCode::Enter => {
                 if !card.accepts_input() || card.is_empty() {
                     return;
                 }
+                // A submit the daemon would bounce on grammar is refused
+                // HERE, with the field to fix put under the cursor — the
+                // typed key survives (nothing was staged yet).
+                if !account_alias_ok(&card.alias) {
+                    card.focus = LoginFocus::Alias;
+                    self.dirty = true;
+                    return;
+                }
                 let provider = card.provider.clone();
-                let alias = card.alias.clone();
+                let alias = Some(card.alias.clone());
                 // TUI6.5 (review r5): every SUBMIT is a fresh stage
                 // issuance with a fresh identity — minting here is what
                 // permanently invalidates the previous issuance: its id
@@ -2999,8 +3083,27 @@ impl AppModel {
                     secret,
                 });
             }
-            KeyCode::Backspace => card.backspace(),
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => card.push(c),
+            KeyCode::Backspace => match card.focus {
+                LoginFocus::Alias => {
+                    card.alias_backspace();
+                    self.dirty = true;
+                }
+                LoginFocus::Key => card.backspace(),
+            },
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                match card.focus {
+                    // The focus split is a SECRECY boundary too: a key
+                    // pasted while the alias is focused must not leak into
+                    // a rendered field — alias input is grammar-filtered
+                    // and visible, the key is masked. Each field only ever
+                    // receives what the focus says it owns.
+                    LoginFocus::Alias => {
+                        card.alias_push(c);
+                        self.dirty = true;
+                    }
+                    LoginFocus::Key => card.push(c),
+                }
+            }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 // Same pairing as Esc (TUI6.2 fix 5).
                 self.close_login_card();
@@ -3035,6 +3138,15 @@ impl AppModel {
     fn open_login_card(&mut self, provider: &str, alias: Option<String>) {
         self.stash_draft();
         self.login_attempt_seq += 1;
+        // §5.3 prefill: the slash command's optional token wins (folded to
+        // the grammar's case); otherwise the smallest free
+        // `«provider»-api[-N]` against the current snapshot.
+        let alias = alias
+            .map(|token| token.trim().to_ascii_lowercase())
+            .filter(|token| account_alias_ok(token))
+            .unwrap_or_else(|| {
+                smallest_free_alias(&format!("{provider}-api"), &self.accounts.rows)
+            });
         self.login = Some(LoginCard::new(
             provider.to_owned(),
             alias,
@@ -3572,17 +3684,7 @@ impl AppModel {
             | AccountAddKind::HuggingFace
             | AccountAddKind::Custom => return,
         };
-        let alias = {
-            let taken =
-                |candidate: &str| self.accounts.rows.iter().any(|row| row.alias == candidate);
-            let mut candidate = provider.to_owned();
-            let mut suffix = 1u32;
-            while taken(&candidate) {
-                suffix += 1;
-                candidate = format!("{provider}-{suffix}");
-            }
-            candidate
-        };
+        let alias = smallest_free_alias(provider, &self.accounts.rows);
         self.oauth_attempt_seq += 1;
         let attempt = self.oauth_attempt_seq;
         self.accounts.message = None;
@@ -3664,10 +3766,41 @@ impl AppModel {
         let Some(card) = self.oauth_add.as_ref() else {
             return;
         };
+        // A FAILED card is the §5.3 collision-recovery surface: the alias
+        // becomes editable in place and ⏎ retries the whole flow under it
+        // with a FRESH attempt (the daemon rejected before consuming the
+        // ready reference, so nothing durable rode the dead one). Digits
+        // are legal alias characters here, so the `[1]`/`[2]` key map
+        // yields to typing: ⏎ retry · esc close.
+        if matches!(card.phase, OAuthAddPhase::Failed { .. }) {
+            match code {
+                KeyCode::Esc => self.cancel_oauth_add(),
+                KeyCode::Enter => self.retry_oauth_add(),
+                KeyCode::Backspace => {
+                    if let Some(card) = self.oauth_add.as_mut() {
+                        card.alias.pop();
+                        self.dirty = true;
+                    }
+                }
+                KeyCode::Char(c) => {
+                    if let Some(c) = alias_char(c)
+                        && let Some(card) = self.oauth_add.as_mut()
+                    {
+                        card.alias.push(c);
+                        self.dirty = true;
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
         match code {
             KeyCode::Esc | KeyCode::Char('2') => self.cancel_oauth_add(),
-            KeyCode::Char('1') => match &card.phase {
-                OAuthAddPhase::WaitingBrowser { url, .. } => {
+            KeyCode::Char('1') => {
+                // Only WaitingBrowser answers `[1]` — Failed never reaches
+                // here (the guard above owns it), and the other phases
+                // advertise no keys.
+                if let OAuthAddPhase::WaitingBrowser { url, .. } = &card.phase {
                     if self.mode.fabricates_locally() {
                         // Sim confirmAuth: the simulated authorize lands the
                         // account locally and selects it for its provider.
@@ -3700,11 +3833,34 @@ impl AppModel {
                         self.requests.push(AppRequest::OpenUrl { url: url.clone() });
                     }
                 }
-                OAuthAddPhase::Failed { .. } => self.cancel_oauth_add(),
-                _ => {}
-            },
+            }
             _ => {}
         }
+    }
+
+    /// ⏎ on a FAILED OAuth card: restart the flow under the (possibly
+    /// edited) alias. The attempt is re-minted — the failed issuance's id
+    /// is dead forever, so its late replies die at the identity gates.
+    fn retry_oauth_add(&mut self) {
+        let Some(card) = self.oauth_add.as_mut() else {
+            return;
+        };
+        if !matches!(card.phase, OAuthAddPhase::Failed { .. }) || !account_alias_ok(&card.alias) {
+            return;
+        }
+        self.oauth_attempt_seq += 1;
+        card.attempt = self.oauth_attempt_seq;
+        card.phase = OAuthAddPhase::Starting;
+        let provider = card.provider.clone();
+        let alias = card.alias.clone();
+        let attempt = card.attempt;
+        self.accounts.message = None;
+        self.requests.push(AppRequest::OAuthAddStart {
+            provider,
+            alias,
+            attempt,
+        });
+        self.dirty = true;
     }
 
     /// Keys on the `/accounts` screen (no composer; the login card, when

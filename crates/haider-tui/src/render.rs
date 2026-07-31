@@ -985,7 +985,17 @@ fn render_accounts(
             }
             crate::app::OAuthAddPhase::Failed { message } => {
                 footer_lines.push(Line::styled(format!("  ✗ {message}"), theme.err_style()));
-                footer_lines.push(Line::styled("  [2] close", theme.gold_style()));
+                // §5.3 collision recovery: the alias is editable in place
+                // and ⏎ retries the flow under it (digits are alias
+                // characters, so no `[1]`/`[2]` key map here).
+                footer_lines.push(Line::styled(
+                    format!("  alias ❯ {}▏", card.alias),
+                    theme.text_style(),
+                ));
+                footer_lines.push(Line::styled(
+                    "  ⏎ try again with this alias · esc close",
+                    theme.gold_style(),
+                ));
             }
         }
         footer_lines.push(Line::raw(""));
@@ -3183,8 +3193,8 @@ struct ComposerRowWindow {
     content: String,
 }
 
-/// Rows the masked login card claims: title · field · hint.
-const LOGIN_CARD_ROWS: u16 = 3;
+/// Rows the masked login card claims: title · alias · key · hint.
+const LOGIN_CARD_ROWS: u16 = 4;
 
 /// The masked `/login … api` card (W3c3 M3 — report R10).
 ///
@@ -3193,16 +3203,20 @@ const LOGIN_CARD_ROWS: u16 = 3;
 /// no drag-selection copy and no `⌃C` can either. The mask is also CAPPED,
 /// so a long key does not advertise its length across the terminal.
 fn login_lines(card: &crate::app::LoginCard, theme: &Theme, width: u16) -> Vec<Line<'static>> {
-    use crate::app::LoginStage;
+    use crate::app::{LoginFocus, LoginStage};
     const MASK_CAP: usize = 32;
     let inner = usize::from(width).saturating_sub(4).max(1);
-    let title = format!(
-        "  ⚿ {} · API key{}",
-        card.provider,
-        card.alias
-            .as_ref()
-            .map_or_else(String::new, |alias| format!(" · {alias}"))
+    let title = format!("  ⚿ {} · API key", card.provider);
+    // The caret marks the field the next keystroke lands in (§5.3: two
+    // fields, tab switches). A closed card carets neither.
+    let editing = card.accepts_input();
+    let caret = |focused: bool| if focused { "▏" } else { "" };
+    let alias_row = format!(
+        "  alias ❯ {}{}",
+        card.alias,
+        caret(editing && card.focus == LoginFocus::Alias)
     );
+    let key_caret = caret(editing && card.focus == LoginFocus::Key);
     let field = match &card.stage {
         // A failed card still shows its mask: it accepts the retype the
         // recovery text asks for (review P2-1).
@@ -3220,24 +3234,25 @@ fn login_lines(card: &crate::app::LoginCard, theme: &Theme, width: u16) -> Vec<L
             } else {
                 ""
             };
-            format!("  ❯ {mask}{more}▏")
+            format!("  key   ❯ {mask}{more}{key_caret}")
         }
-        LoginStage::Submitting => "  ❯ validating…".to_owned(),
+        LoginStage::Submitting => "  key   ❯ validating…".to_owned(),
         LoginStage::Failed(text) => format!("  ✗ {text}"),
-        LoginStage::Entry => "  ❯ ▏".to_owned(),
+        LoginStage::Entry => format!("  key   ❯ {key_caret}"),
         LoginStage::Done(identity) => format!("  ✓ signed in · {identity}"),
     };
     let hint = match &card.stage {
         LoginStage::Entry => {
-            "    the key is masked and never stored locally · ⏎ commit · esc cancel"
+            "    the key is masked and never stored · tab field · ⏎ commit · esc cancel"
         }
         LoginStage::Submitting => "    staging and validating with the provider…",
-        LoginStage::Failed(_) => "    ⏎ try again · esc cancel",
+        LoginStage::Failed(_) => "    ⏎ try again · tab field · esc cancel",
         LoginStage::Done(_) => "    esc closes",
     };
     let clip = |text: String| -> String { text.chars().take(inner + 2).collect() };
     vec![
         Line::styled(clip(title), theme.gold_style()),
+        Line::styled(clip(alias_row), theme.text_style()),
         Line::styled(clip(field), theme.text_style()),
         Line::styled(clip(hint.to_owned()), theme.dim_style()),
     ]
