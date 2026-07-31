@@ -270,7 +270,18 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
         input: ProviderConfigureInput,
     ) -> Result<(Vec<ProviderProfileV1>, ProviderProfileV1), HaiderError> {
         let discovered_models = self.discovered_slugs(&input.provider);
-        self.configured_profiles_with_inventory(input, &discovered_models)
+        // Discovery stays authoritative once it has run — but a BRAND-NEW
+        // provider has nothing discovered yet, and requiring a discovered
+        // default before the profile even exists is a chicken-and-egg no
+        // create can escape (found live, W5g-5). Until discovery speaks,
+        // the caller's STATED models are the inventory — the same rule the
+        // legacy replay path has always applied.
+        let inventory = if discovered_models.is_empty() {
+            normalized_models(input.models.clone())?
+        } else {
+            discovered_models
+        };
+        self.configured_profiles_with_inventory(input, &inventory)
     }
 
     fn configured_profiles_with_inventory(

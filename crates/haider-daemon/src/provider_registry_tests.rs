@@ -311,3 +311,46 @@ fn builtin_without_cached_models_is_unknown_not_available_with_guesses() {
         Some("provider model inventory is unavailable")
     );
 }
+
+/// MUTATION CHECK (W5g-5 live fix): revert `configured_profiles` to
+/// validating against the bare discovery cache (no stated-inventory
+/// fallback). Expected runtime failure: the one-shot enabled create below
+/// dies with "default model … is not in the configured model inventory" —
+/// the exact chicken-and-egg the live probe hit (a NEW provider can never
+/// have discovered models before it exists).
+#[test]
+fn a_new_provider_creates_one_shot_on_its_stated_inventory() {
+    let store = MemoryProviderStore::default();
+    // NOTHING discovered for this provider — the brand-new case.
+    let source = model_source([]);
+    let mut registry =
+        ProviderRegistry::new(store, Vec::new(), source).expect("empty provider registry");
+    let profile = registry
+        .configure(ProviderConfigureInput {
+            provider: "probe".to_owned(),
+            api_family: Some(ProviderApiFamilyWire::OpenAiChatCompletions),
+            origin: Some("http://127.0.0.1:18123/v1".to_owned()),
+            auth_requirement: Some(ProviderAuthRequirementWire::ApiKey),
+            enabled: true,
+            models: vec!["probe-model".to_owned()],
+            default_model: Some("probe-model".to_owned()),
+        })
+        .expect("a stated inventory carries the one-shot create");
+    assert_eq!(profile.default_model.as_deref(), Some("probe-model"));
+    assert!(profile.enabled);
+
+    // The stated inventory is a BOOTSTRAP, not a bypass: a default outside
+    // it still dies, discovery-authoritative law untouched.
+    let error = registry
+        .configure(ProviderConfigureInput {
+            provider: "probe2".to_owned(),
+            api_family: Some(ProviderApiFamilyWire::OpenAiChatCompletions),
+            origin: Some("http://127.0.0.1:18123/v1".to_owned()),
+            auth_requirement: Some(ProviderAuthRequirementWire::ApiKey),
+            enabled: true,
+            models: vec!["served".to_owned()],
+            default_model: Some("unserved".to_owned()),
+        })
+        .expect_err("a default outside the stated inventory still fails");
+    assert_eq!(error.code, ErrorCode::InvalidArgument);
+}

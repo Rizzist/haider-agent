@@ -287,3 +287,124 @@ fn a_stale_daemon_gets_the_note_not_the_card() {
         "the stale-daemon note explains why"
     );
 }
+
+/// MUTATION CHECK (W5g-5 live fix): drop the login-card block from
+/// `render_accounts`. Expected runtime failure: the chained key card is
+/// an INVISIBLE total-modal trap — open, eating every keystroke, drawn by
+/// no frame (the live probe's exact failure; the `+ … (API)` buttons had
+/// the same latent bug since W5d).
+#[test]
+fn the_chained_key_card_is_visible_on_the_accounts_screen() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let mut model = accounts_model();
+    model.mode = RuntimeMode::Live;
+    model
+        .daemon_features
+        .insert(haider_rpc::FEATURE_PROVIDER_CONFIGURE_V1.to_owned());
+    model.providers.apply_snapshot(Vec::new(), 7);
+    let mut driver = LiveDriver::new("test");
+    open_card(&mut model);
+    key(&mut model, KeyCode::Tab);
+    key(&mut model, KeyCode::Tab);
+    type_text(&mut model, "probe-model");
+    key(&mut model, KeyCode::Enter);
+    let pass = live_pass(&mut driver, &mut model, None, std::time::Instant::now());
+    let command_id = pass
+        .commands
+        .iter()
+        .find_map(|command| match command {
+            LiveCommand::ConfigureProvider { command_id, .. } => Some(command_id.clone()),
+            _ => None,
+        })
+        .expect("configure issued");
+    live_pass(
+        &mut driver,
+        &mut model,
+        Some(LiveReply::ProviderConfigured {
+            command_id,
+            provider: live_summary("custom"),
+            revision: 8,
+        }),
+        std::time::Instant::now(),
+    );
+    assert!(model.login.is_some(), "the key card chained");
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).expect("test terminal");
+    terminal
+        .draw(|frame| {
+            haider_tui::render::render(&model, frame);
+        })
+        .expect("draw");
+    let buffer = terminal.backend().buffer().clone();
+    let mut text = String::new();
+    for y in 0..buffer.area.height {
+        for x in 0..buffer.area.width {
+            text.push_str(buffer[(x, y)].symbol());
+        }
+        text.push('\n');
+    }
+    assert!(
+        text.contains("API key") && text.contains("alias ❯"),
+        "the key card renders on the accounts screen: {}",
+        text.lines().rev().take(10).collect::<Vec<_>>().join("\n")
+    );
+}
+
+/// MUTATION CHECK (W5g-5 live fix): restore the OAuth-only gate in the
+/// driver's `provider_model_refreshes`. Expected runtime failure: the
+/// selected API-KEY account below never asks for its catalog — the live
+/// probe's exact starvation (a custom provider's models can only come
+/// from its origin, and nothing else triggers that fetch).
+#[test]
+fn a_selected_api_key_account_triggers_model_discovery() {
+    let mut model = accounts_model();
+    model.mode = RuntimeMode::Live;
+    let mut driver = LiveDriver::new("test");
+    // The trigger runs on the ACCOUNTS reply path — feed the api-key
+    // account through it (a pre-seeded row would be replaced).
+    let descriptor = haider_protocol::credential::CredentialDescriptor {
+        alias: haider_protocol::ids::CredentialAlias::new("probe-api"),
+        provider: "custom-llama".to_owned(),
+        base_url: Some("http://127.0.0.1:18123/v1".to_owned()),
+        auth_method: AuthMethod::ApiKey,
+        identity: "sk-… probe".to_owned(),
+        status: haider_protocol::credential::CredentialStatus::Ok,
+        active: true,
+    };
+    let pass = live_pass(
+        &mut driver,
+        &mut model,
+        Some(LiveReply::Accounts {
+            descriptors: vec![descriptor],
+            revision: Some(2),
+        }),
+        std::time::Instant::now(),
+    );
+    let accounts_pass = pass;
+    let providers_pass = live_pass(
+        &mut driver,
+        &mut model,
+        Some(LiveReply::Providers {
+            providers: vec![live_summary("custom-llama")],
+            revision: 3,
+        }),
+        std::time::Instant::now(),
+    );
+    // The trigger fires on whichever snapshot lands the starving account
+    // first (dedup keeps it to ONE request per connection).
+    let asked = accounts_pass
+        .commands
+        .iter()
+        .chain(providers_pass.commands.iter())
+        .filter(|command| {
+            matches!(
+                command,
+                LiveCommand::RefreshProviderModels { provider } if provider == "custom-llama"
+            )
+        })
+        .count();
+    assert_eq!(asked, 1, "an api-key account's empty catalog asks ONCE");
+}

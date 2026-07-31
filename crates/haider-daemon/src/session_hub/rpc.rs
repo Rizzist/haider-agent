@@ -1505,12 +1505,30 @@ impl HubConnection {
 
         // D3-5: the dependency configuration is the ONE authority on
         // creatable providers. Production answers the built-in adapter set;
-        // "fake" exists only under injected test configurations.
+        // "fake" exists only under injected test configurations. Since
+        // W5g-5 an ENABLED custom chat-completions profile is creatable
+        // too — it exists only because a durable, validated
+        // `provider.configure` committed it, and the turn path routes it
+        // by family.
         let creatable = self.hub.creatable_providers()?;
-        if !creatable
+        let static_creatable = creatable
             .as_ref()
-            .is_some_and(|providers| providers.contains(provider.as_str()))
-        {
+            .is_some_and(|providers| providers.contains(provider.as_str()));
+        let custom_creatable = || {
+            self.hub.accounts().ok().flatten().is_some_and(|facade| {
+                facade.management.read().is_some_and(|view| {
+                    view.providers.iter().any(|profile| {
+                        profile.provider == provider
+                            && profile.enabled
+                            && matches!(
+                                profile.api_family,
+                                haider_rpc::ProviderApiFamilyWire::OpenAiChatCompletions
+                            )
+                    })
+                })
+            })
+        };
+        if !static_creatable && !custom_creatable() {
             return self.respond_error(
                 request_id,
                 ERROR_CODE_INVALID_ARGUMENT,

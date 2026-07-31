@@ -1839,7 +1839,11 @@ impl LiveDriver {
     fn provider_model_refreshes(&mut self, model: &AppModel) -> Vec<LiveCommand> {
         let mut commands = Vec::new();
         for row in &model.accounts.rows {
-            if !row.selected || row.method != haider_protocol::credential::AuthMethod::OAuth {
+            // Any SELECTED account whose provider has no catalog asks for
+            // one — OAuth subscriptions AND api-key accounts alike (W5g-5:
+            // a custom provider's models discover from its origin under
+            // its key, and nothing else would ever trigger that).
+            if !row.selected {
                 continue;
             }
             let has_models = model

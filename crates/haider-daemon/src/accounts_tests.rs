@@ -5050,3 +5050,50 @@ async fn reimport_over_a_retired_secret_restores_the_account() {
     actor.shutdown().await;
     store.close().await.expect("close");
 }
+
+/// MUTATION CHECK (W5g-5 live fix): make `custom_login_target` ignore the
+/// API family (return a target for any profile with an endpoint). Expected
+/// runtime failure: the builtin-responses row below yields a target, so a
+/// vendor login would validate against the wrong origin.
+#[test]
+fn custom_login_targets_only_chat_completions_profiles() {
+    let management = ManagementSnapshot::new(
+        1,
+        Vec::new(),
+        vec![
+            ProviderSummaryWire {
+                provider: "custom-llama".to_owned(),
+                api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
+                endpoint: Some("http://127.0.0.1:18123/v1".to_owned()),
+                models: vec!["llama3.1:8b".to_owned()],
+                model_details: Vec::new(),
+                auth_methods: Vec::new(),
+                availability: haider_rpc::ProviderAvailabilityWire::Available,
+                availability_reason: None,
+                default_model: Some("llama3.1:8b".to_owned()),
+                enabled: true,
+            },
+            ProviderSummaryWire {
+                provider: "openai".to_owned(),
+                api_family: ProviderApiFamilyWire::OpenAiResponses,
+                endpoint: Some("https://api.openai.com/v1/responses".to_owned()),
+                models: Vec::new(),
+                model_details: Vec::new(),
+                auth_methods: Vec::new(),
+                availability: haider_rpc::ProviderAvailabilityWire::Available,
+                availability_reason: None,
+                default_model: None,
+                enabled: true,
+            },
+        ],
+    );
+    let target = custom_login_target(Some(&management), "custom-llama")
+        .expect("chat-completions profile is a login target");
+    assert_eq!(target.0, "http://127.0.0.1:18123/v1");
+    assert_eq!(target.1.as_deref(), Some("llama3.1:8b"));
+    assert!(
+        custom_login_target(Some(&management), "openai").is_none(),
+        "a vendor-family profile NEVER validates against a stored origin"
+    );
+    assert!(custom_login_target(None, "custom-llama").is_none());
+}

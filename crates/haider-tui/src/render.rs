@@ -933,6 +933,16 @@ fn render_accounts(
     // accounts the flowed position sat awkwardly high). `footer_lines`
     // renders at area.bottom − its height; the list keeps the top.
     let mut footer_lines: Vec<Line<'_>> = Vec::new();
+    // The masked key card, when open on THIS screen — the `+ … (API)`
+    // buttons and the custom card's chain both land it here, and the
+    // composer band that usually hosts it does not exist on /accounts.
+    // Without this block the card is an INVISIBLE total-modal trap (the
+    // W5g-5 live probe found it: keys vanished into a card no frame
+    // drew).
+    if let Some(card) = model.login.as_ref() {
+        footer_lines.extend(login_lines(card, theme, area.width));
+        footer_lines.push(Line::raw(""));
+    }
     // The OAuth add card (W5e-1, sim authFlow MenuBox tui.js:3629-3682) —
     // rendered with the bottom chrome, above the add row.
     if let Some(card) = &model.oauth_add {

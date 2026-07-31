@@ -247,6 +247,71 @@ async fn validate_provider_api_key(
     }
 }
 
+/// A CUSTOM chat-completions profile's login target: its stored origin
+/// and declared default model (W5g-5). `None` for every other provider —
+/// the fixed validator set keeps its authority there.
+fn custom_login_target(
+    management: Option<&ManagementSnapshot>,
+    provider: &str,
+) -> Option<(String, Option<String>)> {
+    let view = management?.read()?;
+    let profile = view
+        .providers
+        .into_iter()
+        .find(|profile| profile.provider == provider)?;
+    if !matches!(
+        profile.api_family,
+        ProviderApiFamilyWire::OpenAiChatCompletions
+    ) {
+        return None;
+    }
+    // Builtins never carry this family, so family + endpoint identifies
+    // the custom rows without a provenance field on the wire.
+    let origin = profile.endpoint?;
+    Some((origin, profile.default_model))
+}
+
+/// The same 1-token validation turn, driven through
+/// [`OpenAiCompatibleProvider`] at a custom profile's STORED origin
+/// (W5g-5). The key authenticates against the server it will actually
+/// serve from — never a vendor endpoint.
+async fn validate_openai_compatible_key(
+    origin: &str,
+    provider: &str,
+    model: &str,
+    secret: &[u8],
+) -> Result<ValidatedIdentity, ValidationError> {
+    let staging = MemoryVault::default();
+    let alias = CredentialAlias::new("login-validation");
+    let handle = staging
+        .put(&alias, secret)
+        .and_then(|()| staging.resolve(&alias))
+        .map_err(|error| ValidationError {
+            kind: ValidationFailureKind::Unavailable,
+            message: format!("validation staging failed: {}", error.message),
+        })?;
+    let adapter =
+        OpenAiCompatibleProvider::new(handle, model, origin).map_err(map_provider_error)?;
+    let request = TurnRequest {
+        messages: vec![Message::user_text("ping")],
+        model: model.to_owned(),
+        max_tokens: 1,
+        system_prompt: None,
+        tools: Vec::new(),
+        attachments: Vec::new(),
+    };
+    let mut stream = adapter
+        .stream_turn(request)
+        .await
+        .map_err(map_provider_error)?;
+    match stream.recv().await {
+        Some(Ok(_)) | None => Ok(ValidatedIdentity {
+            identity: format!("{provider} api key · {origin}"),
+        }),
+        Some(Err(error)) => Err(map_provider_error(error)),
+    }
+}
+
 fn map_provider_error(error: haider_provider::ProviderError) -> ValidationError {
     let kind = match error.kind {
         ProviderErrorKind::Authentication => ValidationFailureKind::Unauthorized,
@@ -2925,7 +2990,10 @@ async fn handle_login(
         secret,
         route,
     } = job;
-    if !validator.supports(&provider) {
+    // A CUSTOM chat-completions profile validates against its OWN stored
+    // origin (W5g-5); everything else keeps the fixed validator set.
+    let custom_target = custom_login_target(management, &provider);
+    if !validator.supports(&provider) && custom_target.is_none() {
         respond_error(
             &route,
             ERROR_CODE_INVALID_ARGUMENT,
@@ -2946,7 +3014,15 @@ async fn handle_login(
     };
     let identity = LoginIdentity {
         provider: provider.clone(),
-        resolved_model: validation_model.unwrap_or_else(|| default_model.to_owned()),
+        // A custom profile's DECLARED default outranks the global one —
+        // validating a local server against the global (vendor) model id
+        // would 404 on every honest server.
+        resolved_model: validation_model.unwrap_or_else(|| {
+            custom_target
+                .as_ref()
+                .and_then(|(_, default)| default.clone())
+                .unwrap_or_else(|| default_model.to_owned())
+        }),
         display_alias: Some(selected_alias.clone()),
         physical_alias: selected_alias,
     };
@@ -3074,10 +3150,18 @@ async fn handle_login(
         },
     };
 
-    match validator
-        .validate(&provider, &identity.resolved_model, &secret)
-        .await
-    {
+    let validation = match &custom_target {
+        Some((origin, _)) => {
+            validate_openai_compatible_key(origin, &provider, &identity.resolved_model, &secret)
+                .await
+        }
+        None => {
+            validator
+                .validate(&provider, &identity.resolved_model, &secret)
+                .await
+        }
+    };
+    match validation {
         Ok(validated) => {
             // Keychain first (R10 step 9).
             if let Err(error) = vault.put(&alias, &secret) {
