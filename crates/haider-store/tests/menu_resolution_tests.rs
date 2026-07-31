@@ -122,6 +122,7 @@ fn create_typed_session(store: &Store, session_id: &SessionId) {
             provider: "fake".into(),
             model: "fake-v1".into(),
             max_tokens: 4096,
+            permission_overrides: None,
             system_prompt_version: "test-system-v1".into(),
             event_id: EventId::new(format!("created-{session_id}")),
             device_id: DeviceId::new("test-daemon"),

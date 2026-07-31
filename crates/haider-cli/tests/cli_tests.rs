@@ -1,36 +1,46 @@
 //! Black-box tests for the `haider` binary surface.
 #![allow(clippy::expect_used)] // tests may expect; the lint guards src/ only
 
-use async_trait::async_trait;
-use haider_core::{CommittedRange, HarnessConfig, MemoryStore, StoreHandle};
 use haider_protocol::EventPayload;
+use haider_protocol::effect::{AuthorizationVerdict, EffectPhase};
 use haider_protocol::envelope::RawEnvelope;
-use haider_protocol::error::{ErrorCode, HaiderError};
-use haider_protocol::ids::{DeviceId, SessionId};
+use haider_protocol::error::ErrorCode;
+use haider_protocol::ids::{RunId, SessionId};
 use haider_protocol::item::{ItemEvent, TurnItem};
-use haider_protocol::provider::FinishReason;
 use haider_protocol::state::RunState;
-use haider_provider::{FakeProvider, FakeStep, Provider};
 use std::io::Read;
 use std::ops::{Deref, DerefMut};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
-use tokio::time::timeout;
 
 #[allow(dead_code)]
 #[path = "../src/main.rs"]
 mod cli_main;
 
-use cli_main::{
-    ImportDispatch, ImportSource, exit_code_for_outcome, parse_import_dispatch, stream_jsonl_turn,
+use cli_main::run::{
+    EX_BLOCKED, EX_CANCELLED, EX_IOERR, EX_PROTOCOL, EX_PROVIDER, EX_SOFTWARE, EX_TIMEOUT,
+    EX_UNAVAILABLE, EX_USAGE, ProviderSelection, RunOptions, RunOutput, exit_code_for_error,
+    exit_code_for_result, parse_run_options, write_final,
 };
+use cli_main::{ImportDispatch, ImportSource, parse_import_dispatch};
+use haider_client::{
+    DisconnectReason, EnsureError, HeadlessBlockingReason, HeadlessFailureCode, HeadlessOutcome,
+    HeadlessPermissionDenial, HeadlessRunError, HeadlessRunFailure, HeadlessRunResult,
+};
+
+const DEFAULT_FAKE_SCRIPT: &str = concat!(
+    r#"[{"step":"emit_text","text":"fake response: hello"},{"step":"finish","reason":"end_turn"},"#,
+    r#"{"step":"emit_text","text":"fake response: hello"},{"step":"finish","reason":"end_turn"},"#,
+    r#"{"step":"emit_text","text":"fake response: hello"},{"step":"finish","reason":"end_turn"},"#,
+    r#"{"step":"emit_text","text":"fake response: hello"},{"step":"finish","reason":"end_turn"}]"#,
+);
 
 struct HaiderCommand {
     command: Command,
     _profile_root: tempfile::TempDir,
+    profile: PathBuf,
 }
 
 impl Deref for HaiderCommand {
@@ -48,12 +58,51 @@ impl DerefMut for HaiderCommand {
 }
 
 fn haider() -> HaiderCommand {
+    ensure_haiderd_built();
     let profile_root = tempfile::tempdir().expect("temporary CLI profile parent");
+    let profile = profile_root.path().join("profile");
     let mut command = Command::new(env!("CARGO_BIN_EXE_haider"));
-    command.env("HAIDER_PROFILE_DIR", profile_root.path().join("profile"));
+    command
+        .env("HAIDER_PROFILE_DIR", &profile)
+        .env("HAIDER_TEST_FAKE_PROVIDER", DEFAULT_FAKE_SCRIPT);
     HaiderCommand {
         command,
         _profile_root: profile_root,
+        profile,
+    }
+}
+
+impl Drop for HaiderCommand {
+    fn drop(&mut self) {
+        terminate_daemon(&self.profile);
+    }
+}
+
+fn ensure_haiderd_built() {
+    static BUILD: std::sync::Once = std::sync::Once::new();
+    BUILD.call_once(|| {
+        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        let status = Command::new(cargo)
+            .args(["build", "-p", "haider-daemond", "--bin", "haiderd"])
+            .status()
+            .expect("build haiderd for run tests");
+        assert!(status.success(), "haiderd build failed");
+    });
+}
+
+fn daemon_pid(profile: &Path) -> Option<u32> {
+    std::fs::read_to_string(profile.join("lock"))
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("pid="))?
+        .trim()
+        .parse()
+        .ok()
+}
+
+fn terminate_daemon(profile: &Path) {
+    if let Some(pid) = daemon_pid(profile) {
+        let _ = Command::new("kill").arg(pid.to_string()).status();
     }
 }
 
@@ -155,6 +204,22 @@ fn run_jsonl_is_lf_framed_and_every_line_is_a_raw_envelope() {
     assert_eq!(response.as_deref(), Some("fake response: hello"));
 }
 
+/// MUTATION CHECK: make print depend on a TTY/TERM, leak progress to stdout,
+/// omit the one trailing LF, or put the final response on stderr. Expected
+/// RUNTIME failure: redirected subprocess bytes differ from this exact split.
+#[test]
+fn run_default_print_is_exact_under_redirected_no_term_io() {
+    let out = haider()
+        .args(["run", "hello"])
+        .env_remove("TERM")
+        .stdin(Stdio::null())
+        .output()
+        .expect("binary runs");
+    assert!(out.status.success());
+    assert_eq!(out.stdout, b"fake response: hello\n");
+    assert!(out.stderr.is_empty());
+}
+
 #[test]
 fn run_jsonl_accepts_explicit_fake_provider_and_model() {
     let out = haider()
@@ -212,23 +277,33 @@ fn anthropic_missing_credential_exits_65_without_network_access() {
             "claude-sonnet-5",
             "hello",
         ])
+        .env_remove("HAIDER_TEST_FAKE_PROVIDER")
         .env_remove("HAIDER_ANTHROPIC_API_KEY")
         .output()
         .expect("binary runs");
 
     assert_eq!(out.status.code(), Some(65));
-    assert!(out.stdout.is_empty());
     assert!(String::from_utf8_lossy(&out.stderr).contains("HAIDER_ANTHROPIC_API_KEY"));
+    // W9b migration: provider resolution belongs to the daemon after durable
+    // acceptance, so JSONL exposes the resulting Errored audit trail instead
+    // of performing a second client-side credential preflight.
+    let envelopes = parse_jsonl(&out.stdout);
+    assert_eq!(
+        envelopes.last().map(typed),
+        Some(EventPayload::RunState(RunState::Errored))
+    );
 }
 
 #[test]
 fn sequential_cli_runs_use_profile_owned_worker_generations() {
+    ensure_haiderd_built();
     let profile_parent = tempfile::tempdir().expect("temporary CLI profile parent");
     let profile = profile_parent.path().join("profile");
     let run = |prompt: &str| {
         Command::new(env!("CARGO_BIN_EXE_haider"))
             .args(["run", "--jsonl", prompt])
             .env("HAIDER_PROFILE_DIR", &profile)
+            .env("HAIDER_TEST_FAKE_PROVIDER", DEFAULT_FAKE_SCRIPT)
             .output()
             .expect("binary runs")
     };
@@ -239,22 +314,34 @@ fn sequential_cli_runs_use_profile_owned_worker_generations() {
         "stderr: {}",
         String::from_utf8_lossy(&first_output.stderr)
     );
-    let second_output = run("restarted process");
-    assert!(
-        second_output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&second_output.stderr)
-    );
-
     let first = parse_jsonl(&first_output.stdout);
-    let second = parse_jsonl(&second_output.stdout);
     let first_generation = first[0].worker_generation;
-    let second_generation = second[0].worker_generation;
     assert!(
         first
             .iter()
             .all(|envelope| envelope.worker_generation == first_generation)
     );
+    terminate_daemon(&profile);
+    let resolved = haider_client::resolve_profile(&haider_client::ProfileEnv {
+        profile_dir: Some(profile.clone()),
+        home: None,
+        model: None,
+        xdg_runtime_dir: None,
+    })
+    .expect("resolve profile");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while resolved.endpoint_path.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    let second_output = run("restarted process");
+    terminate_daemon(&profile);
+    assert!(
+        second_output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&second_output.stderr)
+    );
+    let second = parse_jsonl(&second_output.stdout);
+    let second_generation = second[0].worker_generation;
     assert!(
         second
             .iter()
@@ -270,7 +357,10 @@ fn sequential_cli_runs_use_profile_owned_worker_generations() {
 fn run_jsonl_exits_65_when_fake_provider_errors() {
     let out = haider()
         .args(["run", "--jsonl", "hello"])
-        .env("HAIDER_FAKE_SCRIPT_JSON", r#"[{"step":"malformed_frame"}]"#)
+        .env(
+            "HAIDER_TEST_FAKE_PROVIDER",
+            r#"[{"step":"malformed_frame"}]"#,
+        )
         .output()
         .expect("binary runs");
     assert_eq!(out.status.code(), Some(65));
@@ -290,7 +380,7 @@ fn run_jsonl_cancelled_has_130_exit_and_terminal_envelope() {
     let out = haider()
         .args(["run", "--jsonl", "hello"])
         .env(
-            "HAIDER_FAKE_SCRIPT_JSON",
+            "HAIDER_TEST_FAKE_PROVIDER",
             r#"[{"step":"finish","reason":"cancelled"}]"#,
         )
         .output()
@@ -304,6 +394,150 @@ fn run_jsonl_cancelled_has_130_exit_and_terminal_envelope() {
     );
 }
 
+/// MUTATION CHECK: let the later Cancelled terminal overwrite a wall-clock
+/// timeout or emit a success object. Expected RUNTIME failure: exit is not
+/// 124 or the v1 outcome/error stop reporting timeout.
+#[test]
+fn run_timeout_emits_timeout_json_and_exits_124() {
+    let out = haider()
+        .args(["run", "hello", "--output", "json", "--timeout", "20ms"])
+        .env("HAIDER_TEST_FAKE_PROVIDER", r#"[{"step":"hang"}]"#)
+        .output()
+        .expect("binary runs");
+    assert_eq!(out.status.code(), Some(124));
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).expect("timeout JSON");
+    assert_eq!(value["schema"], "haider.run.v1");
+    assert_eq!(value["outcome"], "timeout");
+    assert!(value["response"].is_null());
+    assert_eq!(value["error"]["code"], "timeout");
+}
+
+/// MUTATION CHECK: invent an answer for a non-permission input menu or leave
+/// it parked forever. Expected RUNTIME failure: the bounded command does not
+/// return exit 77 with the typed input_required v1 object.
+#[test]
+fn run_nonpermission_input_cancels_and_exits_77() {
+    let script = r#"[
+        {"step":"emit_request_input","call_id":"ask","kind":"question","title":"Need input"},
+        {"step":"finish","reason":"tool_use"}
+    ]"#;
+    let out = haider()
+        .args(["run", "hello", "--output", "json"])
+        .env("HAIDER_TEST_FAKE_PROVIDER", script)
+        .output()
+        .expect("binary runs");
+    assert_eq!(out.status.code(), Some(77));
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).expect("blocked JSON");
+    assert_eq!(value["outcome"], "input_required");
+    assert_eq!(value["error"]["code"], "input_required");
+}
+
+/// MUTATION CHECK: silently approve the default Ask, fail to persist/apply
+/// `--allow-writes`, or forge `PreAuthorized(UserTyped)`. Expected RUNTIME
+/// failure: the default run writes, the flagged run still asks, or its durable
+/// authorization verdict is not ordinary Allow.
+#[test]
+fn run_write_and_exec_permission_flags_journal_ordinary_allow() {
+    let script = r#"[
+        {"step":"emit_tool_call","call_id":"write-1","name":"fs_write","args":{"path":"created.txt","content":"ok"}},
+        {"step":"finish","reason":"tool_use"},
+        {"step":"expect_tool_result","call_id":"write-1"},
+        {"step":"emit_text","text":"continued"},
+        {"step":"finish","reason":"end_turn"}
+    ]"#;
+
+    let denied_workspace = tempfile::tempdir().expect("denied workspace");
+    let denied = haider()
+        .current_dir(denied_workspace.path())
+        .args(["run", "write", "--output", "json"])
+        .env("HAIDER_TEST_FAKE_PROVIDER", script)
+        .output()
+        .expect("denied run");
+    assert!(denied.status.success());
+    assert!(!denied_workspace.path().join("created.txt").exists());
+    let denied_json: serde_json::Value =
+        serde_json::from_slice(&denied.stdout).expect("denied JSON");
+    assert_eq!(denied_json["outcome"], "done");
+    assert_eq!(
+        denied_json["permission_denials"].as_array().map(Vec::len),
+        Some(1)
+    );
+
+    let allowed_workspace = tempfile::tempdir().expect("allowed workspace");
+    let allowed = haider()
+        .current_dir(allowed_workspace.path())
+        .args(["run", "write", "--jsonl", "--allow-writes"])
+        .env("HAIDER_TEST_FAKE_PROVIDER", script)
+        .output()
+        .expect("allowed run");
+    assert!(allowed.status.success());
+    assert_eq!(
+        std::fs::read_to_string(allowed_workspace.path().join("created.txt"))
+            .expect("allowed file"),
+        "ok"
+    );
+    let envelopes = parse_jsonl(&allowed.stdout);
+    assert!(envelopes.iter().any(|envelope| matches!(
+        typed(envelope),
+        EventPayload::Effect(EffectPhase::Authorized {
+            verdict: AuthorizationVerdict::Allow,
+            ..
+        })
+    )));
+    assert!(!envelopes.iter().any(|envelope| matches!(
+        typed(envelope),
+        EventPayload::Effect(EffectPhase::Authorized {
+            verdict: AuthorizationVerdict::PreAuthorized { .. },
+            ..
+        })
+    )));
+
+    let exec_workspace = tempfile::tempdir().expect("exec workspace");
+    let exec_script = serde_json::json!([
+        {
+            "step": "emit_tool_call",
+            "call_id": "exec-1",
+            "name": "exec",
+            "args": {
+                "command": "printf ok > exec-created.txt",
+                "cwd": exec_workspace.path().to_str().expect("UTF-8 exec workspace")
+            }
+        },
+        {"step": "finish", "reason": "tool_use"},
+        {"step": "expect_tool_result", "call_id": "exec-1"},
+        {"step": "emit_text", "text": "continued"},
+        {"step": "finish", "reason": "end_turn"}
+    ])
+    .to_string();
+    let exec = haider()
+        .current_dir(exec_workspace.path())
+        .args(["run", "execute", "--jsonl", "--allow-exec"])
+        .env("HAIDER_TEST_FAKE_PROVIDER", &exec_script)
+        .output()
+        .expect("allowed exec run");
+    assert!(exec.status.success());
+    assert_eq!(
+        std::fs::read_to_string(exec_workspace.path().join("exec-created.txt"))
+            .expect("allowed exec file"),
+        "ok"
+    );
+    let exec_envelopes = parse_jsonl(&exec.stdout);
+    assert!(exec_envelopes.iter().any(|envelope| matches!(
+        typed(envelope),
+        EventPayload::Effect(EffectPhase::Authorized {
+            verdict: AuthorizationVerdict::Allow,
+            ..
+        })
+    )));
+    assert!(!exec_envelopes.iter().any(|envelope| matches!(
+        typed(envelope),
+        EventPayload::Effect(EffectPhase::Authorized {
+            verdict: AuthorizationVerdict::PreAuthorized { .. },
+            ..
+        })
+    )));
+}
+
 #[test]
 fn run_jsonl_replays_every_envelope_to_a_slow_pipe_consumer() {
     let mut steps: Vec<_> = (0..500)
@@ -314,7 +548,7 @@ fn run_jsonl_replays_every_envelope_to_a_slow_pipe_consumer() {
     let mut command = haider();
     let mut child = command
         .args(["run", "--jsonl", "backpressure"])
-        .env("HAIDER_FAKE_SCRIPT_JSON", script)
+        .env("HAIDER_TEST_FAKE_PROVIDER", script)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -374,42 +608,415 @@ fn run_jsonl_replays_every_envelope_to_a_slow_pipe_consumer() {
     );
 }
 
-#[tokio::test]
-async fn jsonl_store_failure_emits_errored_and_returns_nonzero_without_hanging() {
-    let provider: Arc<dyn Provider> = Arc::new(FakeProvider::new(vec![FakeStep::Finish {
-        reason: FinishReason::EndTurn,
-    }]));
-    // The first four appends reach Streaming. Failing the attempted Done
-    // append reproduces the former wait-forever path; the next append must
-    // commit Errored and the outcome must wake the JSONL runner.
-    let store: Arc<dyn StoreHandle> = Arc::new(FailOnceStore::new(5));
-    let config = HarnessConfig::for_session(
-        SessionId::new("cli-failing-store"),
-        DeviceId::new("cli-device"),
-        1,
-        9,
-    );
-    let mut output = Vec::new();
+/// MIGRATION ORACLE: the former in-process store injection pinned an
+/// Errored/StoreCorrupt JSONL terminal as nonzero 70 without a wait-forever
+/// path. The one-shot fault now lives at the daemon worker-store boundary, so
+/// this remains a real sibling-daemon CLI test without a second run authority.
+///
+/// MUTATION CHECK: remove the daemon fault/fallback, wait after the adjacent
+/// terminal, or map StoreCorrupt to success/provider failure. Expected RUNTIME
+/// failure: the five-second bound fires, exit 70 changes, or the final two raw
+/// envelopes are no longer RunFailed(StoreCorrupt) then Errored.
+#[test]
+fn jsonl_store_failure_emits_errored_and_returns_nonzero_without_hanging() {
+    let mut command = haider();
+    let mut child = command
+        .args(["run", "store failure", "--jsonl"])
+        .env("HAIDER_TEST_FAIL_NEXT_DONE_APPEND", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("binary starts");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll child") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            child.kill().expect("kill timed-out child");
+            let _ = child.wait();
+            panic!("store-failure run did not terminate");
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    let mut stdout = Vec::new();
+    child
+        .stdout
+        .take()
+        .expect("stdout")
+        .read_to_end(&mut stdout)
+        .expect("read stdout");
+    let mut stderr = Vec::new();
+    child
+        .stderr
+        .take()
+        .expect("stderr")
+        .read_to_end(&mut stderr)
+        .expect("read stderr");
 
-    let outcome = timeout(
-        Duration::from_secs(1),
-        stream_jsonl_turn("store failure", config, provider, store, &mut output),
-    )
-    .await
-    .expect("JSONL runner must not hang")
-    .expect("runner reports the turn outcome");
+    assert_eq!(status.code(), Some(i32::from(EX_SOFTWARE)));
+    let envelopes = parse_jsonl(&stdout);
+    let terminal = envelopes
+        .iter()
+        .rev()
+        .take(2)
+        .map(typed)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        terminal,
+        vec![
+            EventPayload::RunState(RunState::Errored),
+            EventPayload::RunFailed {
+                code: ErrorCode::StoreCorrupt,
+                message: "injected terminal append failure".into(),
+                retryable: false,
+            },
+        ]
+    );
+    assert!(
+        String::from_utf8_lossy(&stderr).contains("injected terminal append failure"),
+        "stderr: {}",
+        String::from_utf8_lossy(&stderr)
+    );
+}
 
-    assert_eq!(outcome.state, RunState::Errored);
+fn result(outcome: HeadlessOutcome, failure: Option<HeadlessRunFailure>) -> HeadlessRunResult {
+    HeadlessRunResult {
+        session_id: SessionId::new("session-json"),
+        run_id: RunId::new("run-json"),
+        outcome,
+        response: None,
+        usage: None,
+        permission_denials: Vec::new(),
+        failure,
+        terminal_seq: Some(9),
+    }
+}
+
+/// MUTATION CHECK: alter any stable exit mapping. Expected RUNTIME failure:
+/// the corresponding table row differs, including denied-then-Done,
+/// RunFailed provider codes, blocked input, timeout, cancel, transport, and
+/// pre-acceptance RPC/daemon failures.
+#[test]
+fn run_exit_codes_are_table_driven() {
+    let mut denied_done = result(HeadlessOutcome::Done, None);
+    denied_done
+        .permission_denials
+        .push(HeadlessPermissionDenial {
+            menu_id: "menu-1".into(),
+            effect_summary: "write file".into(),
+            notice: "permission_denied_by_headless_default".into(),
+        });
+    let terminal_cases = [
+        (denied_done, 0),
+        (
+            result(
+                HeadlessOutcome::Errored,
+                Some(HeadlessRunFailure {
+                    code: HeadlessFailureCode::Run(ErrorCode::ProviderError),
+                    message: "provider".into(),
+                    retryable: false,
+                }),
+            ),
+            EX_PROVIDER,
+        ),
+        (
+            result(
+                HeadlessOutcome::Errored,
+                Some(HeadlessRunFailure {
+                    code: HeadlessFailureCode::Run(ErrorCode::ProviderTimeout),
+                    message: "provider timeout".into(),
+                    retryable: true,
+                }),
+            ),
+            EX_PROVIDER,
+        ),
+        (result(HeadlessOutcome::Cancelled, None), EX_CANCELLED),
+        (result(HeadlessOutcome::Timeout, None), EX_TIMEOUT),
+        (
+            result(
+                HeadlessOutcome::InputRequired,
+                Some(HeadlessRunFailure {
+                    code: HeadlessFailureCode::Blocked(HeadlessBlockingReason::InputRequired),
+                    message: "input".into(),
+                    retryable: false,
+                }),
+            ),
+            EX_BLOCKED,
+        ),
+        (
+            result(
+                HeadlessOutcome::Errored,
+                Some(HeadlessRunFailure {
+                    code: HeadlessFailureCode::Run(ErrorCode::ProtocolMismatch),
+                    message: "protocol".into(),
+                    retryable: false,
+                }),
+            ),
+            EX_PROTOCOL,
+        ),
+        (
+            result(
+                HeadlessOutcome::Errored,
+                Some(HeadlessRunFailure {
+                    code: HeadlessFailureCode::Run(ErrorCode::PermissionDenied),
+                    message: "permission".into(),
+                    retryable: false,
+                }),
+            ),
+            EX_BLOCKED,
+        ),
+        (
+            result(
+                HeadlessOutcome::Errored,
+                Some(HeadlessRunFailure {
+                    code: HeadlessFailureCode::Run(ErrorCode::EffectUnknownOutcome),
+                    message: "unknown effect".into(),
+                    retryable: false,
+                }),
+            ),
+            EX_BLOCKED,
+        ),
+        (
+            result(
+                HeadlessOutcome::Errored,
+                Some(HeadlessRunFailure {
+                    code: HeadlessFailureCode::Internal,
+                    message: "internal".into(),
+                    retryable: false,
+                }),
+            ),
+            EX_SOFTWARE,
+        ),
+    ];
+    for (result, expected) in terminal_cases {
+        assert_eq!(exit_code_for_result(&result), expected, "{result:?}");
+    }
+
+    let pre_accept_cases = [
+        (
+            HeadlessRunError::Rpc {
+                stage: "session.create",
+                code: "credential_missing".into(),
+                message: "missing".into(),
+                retryable: false,
+            },
+            EX_PROVIDER,
+        ),
+        (
+            HeadlessRunError::Protocol {
+                stage: "session.create",
+                message: "wrong coordinates".into(),
+            },
+            EX_PROTOCOL,
+        ),
+        (
+            HeadlessRunError::Ensure(EnsureError::Spawn {
+                binary: PathBuf::from("haiderd"),
+                message: "missing".into(),
+            }),
+            EX_UNAVAILABLE,
+        ),
+        (
+            HeadlessRunError::Ensure(EnsureError::MissingFeatures {
+                missing: std::collections::BTreeSet::from([
+                    haider_rpc::FEATURE_SESSION_PERMISSION_OVERRIDES_V1.to_owned(),
+                ]),
+                daemon_version: "old".into(),
+            }),
+            EX_PROTOCOL,
+        ),
+        (
+            HeadlessRunError::Transport {
+                stage: "stream",
+                reason: DisconnectReason::PeerClosed,
+            },
+            EX_IOERR,
+        ),
+        (
+            HeadlessRunError::Rpc {
+                stage: "turn.submit",
+                code: "busy".into(),
+                message: "busy".into(),
+                retryable: true,
+            },
+            EX_SOFTWARE,
+        ),
+        (
+            HeadlessRunError::Rpc {
+                stage: "turn.submit",
+                code: "timeout_before_acceptance".into(),
+                message: "timeout".into(),
+                retryable: true,
+            },
+            EX_TIMEOUT,
+        ),
+    ];
+    for (error, expected) in pre_accept_cases {
+        assert_eq!(exit_code_for_error(&error), expected, "{error}");
+    }
+    assert_eq!(EX_USAGE, 2);
+}
+
+/// MUTATION CHECK: change the manual parser's default, timeout bounds, or
+/// flag propagation. Expected RUNTIME failure: one of these exact options or
+/// usage errors changes.
+#[test]
+fn run_parser_pins_outputs_timeouts_and_permission_flags() {
     assert_eq!(
-        outcome.error.as_ref().map(|error| error.code),
-        Some(ErrorCode::StoreCorrupt)
+        parse_run_options(&["hello".into()]),
+        Ok(RunOptions {
+            prompt: "hello".into(),
+            output: RunOutput::Print,
+            timeout: None,
+            allow_writes: false,
+            allow_exec: false,
+            provider: None,
+            model: None,
+        })
     );
-    assert_eq!(exit_code_for_outcome(&outcome), 70);
-    let envelopes = parse_jsonl(&output);
+    let parsed = parse_run_options(&[
+        "hello".into(),
+        "--output".into(),
+        "json".into(),
+        "--timeout".into(),
+        "1500ms".into(),
+        "--allow-writes".into(),
+        "--allow-exec".into(),
+        "--provider".into(),
+        "fake".into(),
+        "--model".into(),
+        "fixture".into(),
+    ])
+    .expect("full options");
+    assert_eq!(parsed.output, RunOutput::Json);
+    assert_eq!(parsed.timeout, Some(Duration::from_millis(1500)));
+    assert!(parsed.allow_writes && parsed.allow_exec);
+    assert_eq!(parsed.provider, Some(ProviderSelection::Fake));
+    assert_eq!(parsed.model.as_deref(), Some("fixture"));
     assert_eq!(
-        envelopes.last().map(typed),
-        Some(EventPayload::RunState(RunState::Errored))
+        parse_run_options(&["--jsonl".into(), "hello".into()])
+            .expect("legacy alias")
+            .output,
+        RunOutput::Jsonl
     );
+    for invalid in ["0s", "86400001ms", "1.5s", "forever"] {
+        assert!(
+            parse_run_options(&["hello".into(), "--timeout".into(), invalid.into()]).is_err(),
+            "{invalid} must be refused"
+        );
+    }
+}
+
+/// MUTATION CHECK: reorder/remove a v1 field, omit nulls, add ANSI, or stop
+/// writing exactly one LF after assistant text/JSON. Expected RUNTIME failure:
+/// the byte golden or the eight-key/null assertions change.
+#[test]
+fn print_and_json_outputs_pin_bytes_schema_and_nulls() {
+    let mut done = result(HeadlessOutcome::Done, None);
+    done.response = Some("final answer".into());
+    let mut print = Vec::new();
+    write_final(&mut print, RunOutput::Print, &done).expect("print");
+    assert_eq!(print, b"final answer\n");
+
+    let mut json = Vec::new();
+    write_final(&mut json, RunOutput::Json, &done).expect("json");
+    assert_eq!(
+        String::from_utf8(json.clone()).expect("utf8"),
+        "{\"schema\":\"haider.run.v1\",\"session_id\":\"session-json\",\"run_id\":\"run-json\",\"outcome\":\"done\",\"response\":\"final answer\",\"usage\":null,\"permission_denials\":[],\"error\":null}\n"
+    );
+    let value: serde_json::Value = serde_json::from_slice(&json).expect("v1 JSON");
+    assert_eq!(value.as_object().expect("object").len(), 8);
+    assert!(value["usage"].is_null());
+    assert!(value["error"].is_null());
+
+    done.permission_denials.push(HeadlessPermissionDenial {
+        menu_id: "menu-json".into(),
+        effect_summary: "run command".into(),
+        notice: "permission_denied_by_headless_default".into(),
+    });
+    let mut denied_json = Vec::new();
+    write_final(&mut denied_json, RunOutput::Json, &done).expect("denied JSON");
+    let denied: serde_json::Value = serde_json::from_slice(&denied_json).expect("denied object");
+    assert_eq!(denied["permission_denials"][0]["menu_id"], "menu-json");
+
+    for outcome in [
+        HeadlessOutcome::Errored,
+        HeadlessOutcome::Cancelled,
+        HeadlessOutcome::Timeout,
+        HeadlessOutcome::InputRequired,
+    ] {
+        let failure = (outcome != HeadlessOutcome::Cancelled).then(|| HeadlessRunFailure {
+            code: if outcome == HeadlessOutcome::InputRequired {
+                HeadlessFailureCode::Blocked(HeadlessBlockingReason::InputRequired)
+            } else if outcome == HeadlessOutcome::Timeout {
+                HeadlessFailureCode::Timeout
+            } else {
+                HeadlessFailureCode::Run(ErrorCode::Internal)
+            },
+            message: "failure".into(),
+            retryable: false,
+        });
+        let failed = result(outcome, failure);
+        let mut bytes = Vec::new();
+        write_final(&mut bytes, RunOutput::Json, &failed).expect("failure JSON");
+        let (outcome_name, error) = match outcome {
+            HeadlessOutcome::Errored => (
+                "errored",
+                r#"{"code":"internal","message":"failure","retryable":false}"#,
+            ),
+            HeadlessOutcome::Cancelled => ("cancelled", "null"),
+            HeadlessOutcome::Timeout => (
+                "timeout",
+                r#"{"code":"timeout","message":"failure","retryable":false}"#,
+            ),
+            HeadlessOutcome::InputRequired => (
+                "input_required",
+                r#"{"code":"input_required","message":"failure","retryable":false}"#,
+            ),
+            HeadlessOutcome::Done => unreachable!("Done is the success golden above"),
+        };
+        assert_eq!(
+            String::from_utf8(bytes.clone()).expect("failure utf8"),
+            format!(
+                "{{\"schema\":\"haider.run.v1\",\"session_id\":\"session-json\",\"run_id\":\"run-json\",\"outcome\":\"{outcome_name}\",\"response\":null,\"usage\":null,\"permission_denials\":[],\"error\":{error}}}\n"
+            )
+        );
+        let value: serde_json::Value = serde_json::from_slice(&bytes).expect("failure object");
+        assert_eq!(value.as_object().expect("object").len(), 8);
+        assert!(value["response"].is_null());
+        assert_eq!(
+            value["error"].is_null(),
+            outcome == HeadlessOutcome::Cancelled
+        );
+    }
+}
+
+struct BrokenWriter;
+
+impl std::io::Write for BrokenWriter {
+    fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "closed consumer",
+        ))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// MUTATION CHECK: swallow BrokenPipe or panic through print macros. Expected
+/// RUNTIME failure: the injected output fault is no longer classified as the
+/// deliberate exit-74 path.
+#[test]
+fn output_broken_pipe_is_a_typed_io_failure() {
+    let mut done = result(HeadlessOutcome::Done, None);
+    done.response = Some("answer".into());
+    let error = write_final(BrokenWriter, RunOutput::Print, &done).expect_err("broken pipe");
+    assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+    assert_eq!(EX_IOERR, 74);
 }
 
 fn parse_jsonl(output: &[u8]) -> Vec<RawEnvelope> {
@@ -422,50 +1029,6 @@ fn parse_jsonl(output: &[u8]) -> Vec<RawEnvelope> {
 
 fn typed(envelope: &RawEnvelope) -> EventPayload {
     serde_json::from_value(envelope.payload.clone()).expect("known payload")
-}
-
-struct FailOnceStore {
-    inner: MemoryStore,
-    fail_on_append: usize,
-    append_count: AtomicUsize,
-}
-
-impl FailOnceStore {
-    fn new(fail_on_append: usize) -> Self {
-        Self {
-            inner: MemoryStore::new(),
-            fail_on_append,
-            append_count: AtomicUsize::new(0),
-        }
-    }
-}
-
-#[async_trait]
-impl StoreHandle for FailOnceStore {
-    async fn append(&self, envelopes: &mut [RawEnvelope]) -> Result<CommittedRange, HaiderError> {
-        let append = self.append_count.fetch_add(1, Ordering::SeqCst) + 1;
-        if append == self.fail_on_append {
-            return Err(HaiderError::new(
-                ErrorCode::StoreCorrupt,
-                "injected append failure",
-                false,
-            ));
-        }
-        self.inner.append(envelopes).await
-    }
-
-    async fn read(
-        &self,
-        session_id: &SessionId,
-        since_seq: u64,
-        limit: usize,
-    ) -> Result<Vec<RawEnvelope>, HaiderError> {
-        self.inner.read(session_id, since_seq, limit).await
-    }
-
-    async fn latest_seq(&self, session_id: &SessionId) -> Result<u64, HaiderError> {
-        self.inner.latest_seq(session_id).await
-    }
 }
 
 #[test]

@@ -34,6 +34,10 @@ fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> Qu
 /// MUTATION CHECK: remove `FEATURE_SHELL_EXEC_V1` or
 /// `FEATURE_TOOL_INVENTORY_V1`. Expected runtime failure: the exact feature
 /// set no longer advertises one of the W8a RPC methods the daemon serves.
+///
+/// MUTATION CHECK: remove `FEATURE_SESSION_PERMISSION_OVERRIDES_V1`.
+/// Expected RUNTIME failure: headless clients cannot discover the durable
+/// allow-writes/allow-exec create seam.
 #[test]
 fn welcome_features_pin_served_management_families() {
     assert_eq!(
@@ -49,6 +53,7 @@ fn welcome_features_pin_served_management_families() {
             FEATURE_PROVIDER_MANAGEMENT_V1.to_owned(),
             FEATURE_PROVIDER_MODELS_V1.to_owned(),
             FEATURE_SESSION_MUTATION_V1.to_owned(),
+            FEATURE_SESSION_PERMISSION_OVERRIDES_V1.to_owned(),
             FEATURE_SHELL_EXEC_V1.to_owned(),
             FEATURE_TOOL_INVENTORY_V1.to_owned(),
             FEATURE_TURN_CONTROL_V1.to_owned(),

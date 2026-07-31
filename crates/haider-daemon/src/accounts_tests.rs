@@ -210,6 +210,7 @@ async fn production_account_factory_dispatches_openai_and_preserves_anthropic() 
         provider: provider.into(),
         model: model.into(),
         max_tokens: 64,
+        permission_overrides: None,
         system_prompt_version: None,
         created_at_ms: 1,
     };
@@ -332,6 +333,7 @@ async fn custom_chat_completions_profile_routes_with_profile_origin_and_legacy_f
             provider: provider.to_owned(),
             model: "llama-fixture".to_owned(),
             max_tokens: 64,
+            permission_overrides: None,
             system_prompt_version: None,
             created_at_ms: 1,
         })
@@ -696,6 +698,7 @@ async fn retryable_rotation_bookkeeping_failure_waits_instead_of_killing_the_tur
             provider: OPENAI_PROVIDER_NAME.into(),
             model: "gpt-test".into(),
             max_tokens: 64,
+            permission_overrides: None,
             system_prompt_version: None,
             created_at_ms: 1,
         },
@@ -820,6 +823,7 @@ async fn factory_uses_checked_resolver_and_durably_selects_one_limited_alternate
             provider: OPENAI_PROVIDER_NAME.into(),
             model: "gpt-test".into(),
             max_tokens: 64,
+            permission_overrides: None,
             system_prompt_version: None,
             created_at_ms: 1,
         })
@@ -1018,6 +1022,7 @@ async fn auth_aware_factory_routes_sanctioned_oauth_descriptors_to_subscription_
         provider: provider.into(),
         model: model.into(),
         max_tokens: 64,
+        permission_overrides: None,
         system_prompt_version: None,
         created_at_ms: 1,
     };

@@ -3524,16 +3524,14 @@ impl TurnToolFactory for BrokerToolFactory {
         )
         .map_err(tool_error)?;
         let mut policy = PermissionPolicy::default();
-        for entry in registered_tools() {
-            for class in entry.manifest.effects {
-                match entry.default {
-                    ToolPermissionDefault::Allow => policy.allow(class),
-                    ToolPermissionDefault::Ask => policy.ask(class),
-                    ToolPermissionDefault::Deny => {
-                        policy.deny(class, "denied by daemon default policy")
-                    }
-                    ToolPermissionDefault::NotApplicable => {}
+        for (class, default) in effective_permission_defaults(&context.metadata) {
+            match default {
+                ToolPermissionDefault::Allow => policy.allow(class),
+                ToolPermissionDefault::Ask => policy.ask(class),
+                ToolPermissionDefault::Deny => {
+                    policy.deny(class, "denied by daemon default policy")
                 }
+                ToolPermissionDefault::NotApplicable => {}
             }
         }
         for grant in durable_permissions.grants {
@@ -3560,6 +3558,27 @@ impl TurnToolFactory for BrokerToolFactory {
             deferred: Mutex::new(HashMap::new()),
         })))
     }
+}
+
+pub(crate) fn effective_permission_defaults(
+    metadata: &SessionMetadataV1,
+) -> Vec<(EffectClass, ToolPermissionDefault)> {
+    let overrides = metadata.permission_overrides.unwrap_or_default();
+    registered_tools()
+        .into_iter()
+        .flat_map(|entry| {
+            entry.manifest.effects.into_iter().map(move |class| {
+                let default = if (overrides.allow_writes && class == EffectClass::FsWrite)
+                    || (overrides.allow_exec && class == EffectClass::ProcessExec)
+                {
+                    ToolPermissionDefault::Allow
+                } else {
+                    entry.default
+                };
+                (class, default)
+            })
+        })
+        .collect()
 }
 
 struct BrokerToolDispatcher {

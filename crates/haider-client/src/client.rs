@@ -430,14 +430,25 @@ impl RpcClient {
     /// race to `outbound.send`, and the daemon then sees the attach first and
     /// rejects it at `max_attachments_per_connection` (review W3c3 P1-3).
     pub async fn begin_request(&self, body: RequestBody) -> Result<PendingResponse, ClientError> {
+        self.begin_correlated_frame(|request_id| WireFrame::Request { request_id, body })
+            .await
+    }
+
+    /// Registers correlation for a non-`Request` frame carrying an optional
+    /// `request_id`, writes it, and returns its response handle.
+    ///
+    /// `MenuAnswer` is the sole current caller. Keeping it on the same pending
+    /// map as ordinary requests makes response loss a reconnect cue instead
+    /// of treating successful socket enqueue as durable menu resolution.
+    pub(crate) async fn begin_correlated_frame(
+        &self,
+        build: impl FnOnce(RequestId) -> WireFrame,
+    ) -> Result<PendingResponse, ClientError> {
         let id = format!(
             "req-{}",
             self.shared.next_request.fetch_add(1, Ordering::Relaxed)
         );
-        let frame = WireFrame::Request {
-            request_id: RequestId::new(id.clone()),
-            body,
-        };
+        let frame = build(RequestId::new(id.clone()));
         // Sensitive encode path for EVERY outbound frame: `vault.stage`
         // bodies carry raw secrets, and uniform hygiene is cheaper than a
         // per-method split — the intermediate JSON body is scrubbed inside

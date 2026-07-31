@@ -3,6 +3,7 @@
 use haider_protocol::EventPayload;
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
 use haider_protocol::ids::{DeviceId, EventId, SessionId};
+use haider_protocol::session::SessionPermissionOverridesV1;
 use haider_protocol::state::SessionState;
 use haider_store::{EventStore, SessionCreateCommand, SessionCreateOutcome, Store};
 use serde_json::json;
@@ -19,6 +20,7 @@ fn command(command_id: &str, session_id: &str, event_id: &str) -> SessionCreateC
         provider: "fake".into(),
         model: "fake-v1".into(),
         max_tokens: 4096,
+        permission_overrides: None,
         system_prompt_version: "test-system-v1".into(),
         event_id: EventId::new(event_id),
         device_id: DeviceId::new("daemon-test"),
@@ -99,6 +101,50 @@ fn same_session_create_command_with_different_body_is_rejected() {
     assert_eq!(
         store.session_ids().expect("session ids"),
         [SessionId::new("session-1")]
+    );
+}
+
+/// MUTATION CHECK: omit the override from metadata persistence or from the
+/// canonical create digest/body. Expected RUNTIME failure: reopen loses the
+/// allow flags or a same-command request with different flags replays the old
+/// receipt instead of being rejected.
+#[test]
+fn session_create_persists_permission_overrides_and_binds_them_to_the_receipt() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let expected = SessionPermissionOverridesV1 {
+        allow_writes: true,
+        allow_exec: false,
+    };
+    {
+        let store = Store::open(root.path()).expect("open");
+        let mut create = command("create-overrides", "session-overrides", "created-overrides");
+        create.permission_overrides = Some(expected);
+        create.request_digest = "digest-with-overrides".into();
+        create.request_json = r#"{"cwd":"/tmp/work","max_tokens":4096,"model":"fake-v1","permission_overrides":{"allow_exec":false,"allow_writes":true},"provider":"fake"}"#.into();
+        let SessionCreateOutcome::Committed { created, .. } = store
+            .create_session(&create)
+            .expect("create with overrides")
+        else {
+            panic!("first create commits");
+        };
+        assert_eq!(created.metadata.permission_overrides, Some(expected));
+    }
+
+    let reopened = Store::open(root.path()).expect("reopen");
+    assert_eq!(
+        reopened
+            .session_metadata(&SessionId::new("session-overrides"))
+            .expect("metadata")
+            .and_then(|metadata| metadata.permission_overrides),
+        Some(expected)
+    );
+    let different_flags = command("create-overrides", "ignored", "ignored-event");
+    let error = reopened
+        .create_session(&different_flags)
+        .expect_err("same command with different override body must fail");
+    assert_eq!(
+        error.code,
+        haider_protocol::error::ErrorCode::InvalidArgument
     );
 }
 

@@ -8,7 +8,7 @@ use haider_protocol::effect::EffectClass;
 use haider_protocol::envelope::{PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION};
 use haider_protocol::ids::CredentialAlias;
 use haider_protocol::ids::{DeviceId, EventId, ItemId, MenuId, RunId, SessionId};
-use haider_protocol::session::SessionMetadataV1;
+use haider_protocol::session::{SessionMetadataV1, SessionPermissionOverridesV1};
 use haider_protocol::tool::{
     DispatchMode, ToolInventoryEntry, ToolInventorySnapshot, ToolManifest, ToolPermissionDefault,
 };
@@ -249,12 +249,13 @@ pub fn transcript() -> Vec<WireFrame> {
         WireFrame::Pong { nonce: 99 },
         WireFrame::Request {
             request_id: RequestId::new("request-create"),
-            body: RequestBody::SessionCreate {
+            body: RequestBody::SessionCreateWithPermissionOverrides {
                 command_id: CommandId::new("command-create"),
                 cwd: "/tmp/workspace".into(),
                 provider: "anthropic".into(),
                 model: "claude-test".into(),
                 max_tokens: 4096,
+                permission_overrides: None,
             },
         },
         WireFrame::Response {
@@ -268,6 +269,7 @@ pub fn transcript() -> Vec<WireFrame> {
                     provider: "anthropic".into(),
                     model: "claude-test".into(),
                     max_tokens: 4096,
+                    permission_overrides: None,
                     system_prompt_version: None,
                     created_at_ms: 1_753_500_040_000,
                 },
@@ -752,6 +754,22 @@ pub fn transcript() -> Vec<WireFrame> {
                     }],
                     remembered_grants: Vec::new(),
                 },
+            },
+        },
+        // W9b append-only create shape. The earlier create frame remains
+        // byte-identical because its absent optional field is omitted.
+        WireFrame::Request {
+            request_id: RequestId::new("request-create-overrides"),
+            body: RequestBody::SessionCreateWithPermissionOverrides {
+                command_id: CommandId::new("command-create-overrides"),
+                cwd: "/tmp/workspace".into(),
+                provider: "anthropic".into(),
+                model: "claude-test".into(),
+                max_tokens: 4096,
+                permission_overrides: Some(SessionPermissionOverridesV1 {
+                    allow_writes: true,
+                    allow_exec: true,
+                }),
             },
         },
     ]

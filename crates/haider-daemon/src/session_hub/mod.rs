@@ -104,10 +104,12 @@ use haider_core::{
     TurnAcceptCommand, TurnAcceptOutcome, TurnAdmissionDisposition, TurnCancelCommand,
     TurnCancelOutcome, TurnCancellationStatus,
 };
+use haider_protocol::EventPayload;
 use haider_protocol::envelope::{RawEnvelope, envelope_weight_bytes};
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::{DeviceId, EventId, MenuId, RunId, SessionId};
 use haider_protocol::menu::{AnswerVia, MenuAnswer as DurableMenuAnswer};
+use haider_protocol::state::RunState;
 use haider_rpc::{
     AttachMode, AttachState, AttachmentId, CancelStatus, Capability, CapabilitySet, CommandId,
     ERROR_CODE_ALREADY_RESOLVED, ERROR_CODE_BUSY, ERROR_CODE_CAPABILITY_DENIED,
@@ -120,7 +122,7 @@ use haider_rpc::{
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
@@ -1947,6 +1949,13 @@ impl StoreHandle for HubStoreHandle {
                 false,
             ));
         }
+        if inject_test_done_append_failure(envelopes) {
+            return Err(HaiderError::new(
+                ErrorCode::StoreCorrupt,
+                "injected terminal append failure",
+                false,
+            ));
+        }
         let actor = self
             .hub
             .existing_actor(&first.session_id)
@@ -1989,6 +1998,28 @@ impl StoreHandle for HubStoreHandle {
         self.ensure_session(session_id)?;
         self.hub.inner.store.latest_seq(session_id).await
     }
+}
+
+/// One-shot migration-oracle seam for the daemon-backed CLI test. It is
+/// inert unless the daemon is already running the explicit injected fake
+/// provider and the dedicated fault variable is set in that child process.
+fn inject_test_done_append_failure(envelopes: &[RawEnvelope]) -> bool {
+    static FAIL_NEXT_DONE: OnceLock<AtomicBool> = OnceLock::new();
+    let armed = FAIL_NEXT_DONE.get_or_init(|| {
+        AtomicBool::new(
+            std::env::var_os("HAIDER_TEST_FAKE_PROVIDER").is_some()
+                && std::env::var_os("HAIDER_TEST_FAIL_NEXT_DONE_APPEND").is_some(),
+        )
+    });
+    if !armed.load(Ordering::Acquire)
+        || !envelopes.iter().any(|envelope| {
+            serde_json::from_value::<EventPayload>(envelope.payload.clone())
+                .is_ok_and(|payload| payload == EventPayload::RunState(RunState::Done))
+        })
+    {
+        return false;
+    }
+    armed.swap(false, Ordering::AcqRel)
 }
 
 impl HubStoreHandle {

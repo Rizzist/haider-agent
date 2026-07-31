@@ -1,6 +1,6 @@
 //! Shared client seam for the Haider daemon (report §6.2, R8/R9).
 //!
-//! Three cooperating pieces, deliberately below both binaries:
+//! Four cooperating pieces, deliberately below both binaries:
 //!
 //! - [`profile`] — the ONE profile resolver `haider` and `haiderd` share
 //!   (store dir, profile id, runtime dir, endpoint path, release-owned
@@ -13,16 +13,24 @@
 //!   sibling `haiderd` only on missing/refused endpoint, handshake-poll to a
 //!   deadline, and report version/feature skew without ever killing a live
 //!   daemon.
+//! - [`headless`] — the reusable daemon-backed one-shot transaction used by
+//!   non-interactive clients.
 //!
 //! This crate owns no TUI, daemon lifecycle, or persistence.
 
 pub mod client;
+pub mod headless;
 pub mod profile;
 pub mod spawn;
 
 pub use client::{
     ClientConfig, ClientError, ConnectError, Connected, ConnectionState, DisconnectReason,
     PING_INTERVAL, PONG_DEADLINE, PendingResponse, RpcClient, connect,
+};
+pub use headless::{
+    DEFAULT_TERMINAL_GRACE, HeadlessBlockingReason, HeadlessEvent, HeadlessFailureCode,
+    HeadlessOutcome, HeadlessPermissionDenial, HeadlessRunError, HeadlessRunFailure,
+    HeadlessRunRequest, HeadlessRunResult, required_headless_features, run_headless,
 };
 pub use profile::{
     DEFAULT_MAX_TOKENS, DEFAULT_PROVIDER, MODEL_ENV, PACKAGED_DEFAULT_MODEL, PROFILE_CONFIG_FILE,

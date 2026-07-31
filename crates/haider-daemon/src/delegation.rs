@@ -133,6 +133,7 @@ impl DelegationHandle {
             "provider": coordinates.metadata.provider,
             "model": coordinates.metadata.model,
             "max_tokens": coordinates.metadata.max_tokens,
+            "permission_overrides": coordinates.metadata.permission_overrides,
             "delegation_agent": agent_id,
         }))
         .map_err(internal_serialization)?;
@@ -147,6 +148,7 @@ impl DelegationHandle {
                 provider: coordinates.metadata.provider.clone(),
                 model: coordinates.metadata.model.clone(),
                 max_tokens: coordinates.metadata.max_tokens,
+                permission_overrides: coordinates.metadata.permission_overrides,
                 system_prompt_version: crate::worker::SystemPromptBuilder::VERSION.into(),
                 event_id: EventId::new(format!("delegation-created-{identity}")),
                 device_id: self.hub.device_id(),

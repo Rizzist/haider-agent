@@ -25,6 +25,11 @@ mod negotiation;
 pub mod uds_codec;
 pub mod ws_codec;
 
+/// Domain types carried by the RPC frames. Re-exporting the existing public
+/// dependency lets transport clients reduce envelopes without adding a second
+/// direct workspace dependency.
+pub use haider_protocol;
+
 pub use codec::CodecError;
 pub use frame::{
     AccountAddMethod, AttachMode, AttachState, AttachmentId, CancelStatus, Capability,
@@ -39,10 +44,10 @@ pub use frame::{
     FEATURE_ACCOUNT_LOGIN_API_V1, FEATURE_ACCOUNT_MANAGEMENT_V1, FEATURE_ACCOUNT_OAUTH_IMPORT_V1,
     FEATURE_ACCOUNT_OAUTH_PKCE_V1, FEATURE_ACCOUNT_ROTATION_V1, FEATURE_CONTEXT_COMPACTION_V1,
     FEATURE_PROVIDER_CONFIGURE_V1, FEATURE_PROVIDER_MANAGEMENT_V1, FEATURE_PROVIDER_MODELS_V1,
-    FEATURE_SESSION_MUTATION_V1, FEATURE_SHELL_EXEC_V1, FEATURE_TOOL_INVENTORY_V1,
-    FEATURE_TURN_CONTROL_V1, FEATURE_VAULT_STAGE_V1, Hello, LifecyclePhase, MenuInput,
-    ModelDetailWire, OAuthAuthorizationWire, OAuthAvailabilityWire, OAuthFlowId,
-    OAuthFlowStatusWire, OAuthReadyRefWire, ProtocolError, ProviderActiveWire,
+    FEATURE_SESSION_MUTATION_V1, FEATURE_SESSION_PERMISSION_OVERRIDES_V1, FEATURE_SHELL_EXEC_V1,
+    FEATURE_TOOL_INVENTORY_V1, FEATURE_TURN_CONTROL_V1, FEATURE_VAULT_STAGE_V1, Hello,
+    LifecyclePhase, MenuInput, ModelDetailWire, OAuthAuthorizationWire, OAuthAvailabilityWire,
+    OAuthFlowId, OAuthFlowStatusWire, OAuthReadyRefWire, ProtocolError, ProviderActiveWire,
     ProviderApiFamilyWire, ProviderAuthRequirementWire, ProviderAvailabilityWire,
     ProviderDefaultWire, ProviderSummaryWire, RequestBody, RequestId, ResponseBody, SecretWire,
     SeqRange, SessionReadResult, SessionSummary, StagePurpose, SubmitDisposition,

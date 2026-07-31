@@ -83,6 +83,34 @@ impl HubConnection {
             );
         }
         match body {
+            RequestBody::SessionCreateWithPermissionOverrides {
+                command_id,
+                cwd,
+                provider,
+                model,
+                max_tokens,
+                permission_overrides,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.session_create(
+                    request_id,
+                    command_id,
+                    cwd,
+                    provider,
+                    model,
+                    max_tokens,
+                    permission_overrides,
+                )
+                .await
+            }
             RequestBody::SessionCreate {
                 command_id,
                 cwd,
@@ -99,8 +127,10 @@ impl HubConnection {
                         None,
                     );
                 }
-                self.session_create(request_id, command_id, cwd, provider, model, max_tokens)
-                    .await
+                self.session_create(
+                    request_id, command_id, cwd, provider, model, max_tokens, None,
+                )
+                .await
             }
             RequestBody::SessionList { cursor, limit } => {
                 if let Err(message) = authorize(&self.capabilities, Operation::View) {
@@ -1783,6 +1813,7 @@ impl HubConnection {
         provider: String,
         model: String,
         max_tokens: u64,
+        permission_overrides: Option<haider_protocol::session::SessionPermissionOverridesV1>,
     ) -> Result<(), SessionHubError> {
         if command_id.as_str().is_empty() {
             return self.respond_error(
@@ -1793,13 +1824,21 @@ impl HubConnection {
                 None,
             );
         }
-        let request_json = serde_json::to_string(&serde_json::json!({
+        let mut request_coordinates = serde_json::json!({
             "cwd": &cwd,
             "provider": &provider,
             "model": &model,
             "max_tokens": max_tokens,
-        }))
-        .map_err(|error| {
+        });
+        if let Some(overrides) = permission_overrides {
+            request_coordinates["permission_overrides"] =
+                serde_json::to_value(overrides).map_err(|error| {
+                    SessionHubError::Task(format!(
+                        "cannot encode session permission overrides: {error}"
+                    ))
+                })?;
+        }
+        let request_json = serde_json::to_string(&request_coordinates).map_err(|error| {
             SessionHubError::Task(format!("cannot encode session-create coordinates: {error}"))
         })?;
         let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
@@ -1891,6 +1930,7 @@ impl HubConnection {
             provider,
             model,
             max_tokens,
+            permission_overrides,
             system_prompt_version: crate::worker::SystemPromptBuilder::VERSION.into(),
             event_id: EventId::new(random_id("session-created")?),
             device_id: self.hub.inner.device_id.clone(),

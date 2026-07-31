@@ -3,7 +3,8 @@
 use crate::turn_recovery::{RecoveredWork, recover_interrupted_turns};
 use crate::worker::{
     BrokerToolFactory, PendingShellExec, RegisteredToolRoute, TurnToolFactory, defer_shell_handoff,
-    registered_tool_route, registered_tools, tool_inventory_snapshot,
+    effective_permission_defaults, registered_tool_route, registered_tools,
+    tool_inventory_snapshot,
 };
 use haider_core::{MemoryStore, SqliteStoreHandle, StoreHandle};
 use haider_protocol::EventPayload;
@@ -16,6 +17,7 @@ use haider_protocol::item::{ItemEvent, ToolStatus, TurnItem};
 use haider_protocol::menu::{
     AnswerVia, DecisionKind, Menu, MenuAnswer, MenuKind, MenuOption, MenuScope,
 };
+use haider_protocol::session::{SessionMetadataV1, SessionPermissionOverridesV1};
 use haider_protocol::state::RunState;
 use haider_protocol::tool::{RememberedGrantScope, ToolPermissionDefault};
 use haider_store::{AcceptedShellExec, EventStore, SessionCreateCommand, Store};
@@ -48,6 +50,65 @@ fn canonical_inventory_equals_advertised_dispatchable_set() {
         registered_tool_route("exec"),
         Some(RegisteredToolRoute::ProcessExec),
         "legacy history remains dispatchable without being advertised"
+    );
+}
+
+/// MUTATION CHECK: apply overrides before registry defaults, map exec to the
+/// wrong class, or synthesize a user-typed preauthorization. Expected
+/// RUNTIME failure: flagged classes are not ordinary policy `Allow`, or the
+/// unflagged W8a defaults stop being `Ask`.
+#[test]
+fn session_permission_overrides_replace_only_write_and_exec_ask_defaults() {
+    let metadata = |permission_overrides| SessionMetadataV1 {
+        cwd: "/tmp".into(),
+        provider: "fake".into(),
+        model: "fake-model".into(),
+        max_tokens: 4096,
+        permission_overrides,
+        system_prompt_version: None,
+        created_at_ms: 1,
+    };
+    let decision = |metadata: &SessionMetadataV1, class: EffectClass| {
+        effective_permission_defaults(metadata)
+            .into_iter()
+            .find_map(|(candidate, default)| (candidate == class).then_some(default))
+            .expect("registered effect class")
+    };
+
+    let baseline = metadata(None);
+    assert_eq!(
+        decision(&baseline, EffectClass::FsWrite),
+        ToolPermissionDefault::Ask
+    );
+    assert_eq!(
+        decision(&baseline, EffectClass::ProcessExec),
+        ToolPermissionDefault::Ask
+    );
+
+    let writes = metadata(Some(SessionPermissionOverridesV1 {
+        allow_writes: true,
+        allow_exec: false,
+    }));
+    assert_eq!(
+        decision(&writes, EffectClass::FsWrite),
+        ToolPermissionDefault::Allow
+    );
+    assert_eq!(
+        decision(&writes, EffectClass::ProcessExec),
+        ToolPermissionDefault::Ask
+    );
+
+    let exec = metadata(Some(SessionPermissionOverridesV1 {
+        allow_writes: false,
+        allow_exec: true,
+    }));
+    assert_eq!(
+        decision(&exec, EffectClass::FsWrite),
+        ToolPermissionDefault::Ask
+    );
+    assert_eq!(
+        decision(&exec, EffectClass::ProcessExec),
+        ToolPermissionDefault::Allow
     );
 }
 
@@ -230,6 +291,7 @@ fn create_durable_session(store: &Store, session_id: &SessionId) {
             provider: "fake".into(),
             model: "fake-v1".into(),
             max_tokens: 4096,
+            permission_overrides: None,
             system_prompt_version: "test-v1".into(),
             event_id: EventId::new(format!("created-{session_id}")),
             device_id: DeviceId::new("recovery-test"),

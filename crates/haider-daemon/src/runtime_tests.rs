@@ -143,6 +143,7 @@ async fn child_done_parent_wait_crash_recovers_the_same_logical_turn() {
             provider: "fake".into(),
             model: "fake-model".into(),
             max_tokens: 4096,
+            permission_overrides: None,
             system_prompt_version: "test-v1".into(),
             event_id: EventId::new(format!("created-{session_id}")),
             device_id: device_id.clone(),

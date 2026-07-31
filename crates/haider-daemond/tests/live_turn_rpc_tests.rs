@@ -35,7 +35,7 @@ use haider_protocol::ids::{DeviceId, EffectId, EventId, RunId, SessionId};
 use haider_protocol::item::{ItemDelta, ItemEvent, OutputStream, TurnItem};
 use haider_protocol::menu::{Menu, MenuAnswer};
 use haider_protocol::provider::{CapabilityDoc, FinishReason, Usage, UsageSource};
-use haider_protocol::session::SessionMetadataV1;
+use haider_protocol::session::{SessionMetadataV1, SessionPermissionOverridesV1};
 use haider_protocol::state::{RunState, SessionState};
 use haider_protocol::tool::ToolPermissionDefault;
 use haider_provider::{
@@ -46,8 +46,8 @@ use haider_rpc::{
     AttachMode, CancelStatus, Capability, CapabilitySet, ClientKind, CommandId,
     ERROR_CODE_ALREADY_RESOLVED, ERROR_CODE_BUSY, ERROR_CODE_CAPABILITY_DENIED,
     ERROR_CODE_INVALID_ARGUMENT, ERROR_CODE_UNSUPPORTED_SHELL_BUILTIN, FEATURE_SESSION_MUTATION_V1,
-    FEATURE_TURN_CONTROL_V1, RequestBody, RequestId, ResponseBody, SeqRange, SessionSummary,
-    WireFrame,
+    FEATURE_SESSION_PERMISSION_OVERRIDES_V1, FEATURE_TURN_CONTROL_V1, RequestBody, RequestId,
+    ResponseBody, SeqRange, SessionSummary, WireFrame,
 };
 use haider_store::{EventStore, Store};
 use haider_tools::{
@@ -4027,6 +4027,102 @@ async fn session_create_lost_response_retry_survives_removed_cwd_and_rejects_cha
     task.join().await.expect("daemon joins");
 }
 
+/// W9b additive create law: overrides are receipt-bound durable metadata.
+///
+/// MUTATION CHECK: omit `permission_overrides` from the canonical request,
+/// persisted metadata, or response. Expected RUNTIME failure: the same-command
+/// changed-flags request replays instead of conflicting, or list/reopen loses
+/// the exact override values.
+#[tokio::test]
+async fn session_create_permission_overrides_are_digest_bound_and_persisted() {
+    let root = test_root("w9b-create-overrides-");
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace");
+    let config = DaemonConfig::new(
+        "create-overrides",
+        root.path().join("store"),
+        root.path().join("runtime"),
+    );
+    let (dependencies, _fake) = fake_dependencies(Vec::new());
+    let task = ready_with_dependencies(&config, dependencies).await;
+    let mut client = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "w9b-test",
+        "override-client",
+        ClientKind::Headless,
+    )
+    .await;
+    let expected = SessionPermissionOverridesV1 {
+        allow_writes: true,
+        allow_exec: false,
+    };
+    let body = |overrides| RequestBody::SessionCreateWithPermissionOverrides {
+        command_id: CommandId::new("override-command"),
+        cwd: workspace.to_string_lossy().into_owned(),
+        provider: "fake".into(),
+        model: "fake-v1".into(),
+        max_tokens: 4096,
+        permission_overrides: overrides,
+    };
+
+    send_request(
+        &mut client,
+        &config,
+        "create-overrides",
+        body(Some(expected)),
+    )
+    .await;
+    let (session_id, metadata) = created_response(client.next().await);
+    assert_eq!(metadata.permission_overrides, Some(expected));
+
+    send_request(
+        &mut client,
+        &config,
+        "retry-overrides",
+        body(Some(expected)),
+    )
+    .await;
+    let (retried, retried_metadata) = created_response(client.next().await);
+    assert_eq!(retried, session_id);
+    assert_eq!(retried_metadata.permission_overrides, Some(expected));
+
+    send_request(&mut client, &config, "changed-overrides", body(None)).await;
+    assert!(matches!(
+        client.next().await,
+        WireFrame::Response {
+            body: ResponseBody::Error { ref code, .. },
+            ..
+        } if code == ERROR_CODE_INVALID_ARGUMENT
+    ));
+
+    send_request(
+        &mut client,
+        &config,
+        "list-overrides",
+        RequestBody::SessionList {
+            cursor: None,
+            limit: 10,
+        },
+    )
+    .await;
+    assert!(matches!(
+        client.next().await,
+        WireFrame::Response {
+            body: ResponseBody::SessionList { sessions, .. },
+            ..
+        } if sessions.iter().any(|session| {
+            session.session_id == session_id
+                && session.metadata.as_ref().is_some_and(|metadata| {
+                    metadata.permission_overrides == Some(expected)
+                })
+        })
+    ));
+
+    task.shutdown_handle().request("test complete");
+    task.join().await.expect("daemon joins");
+}
+
 /// Scenario 2 satellite — the R7 capability and feature-advertisement law:
 /// `session.create` requires Control, and the ready `Welcome` advertises
 /// exactly the additive methods this daemon implements.
@@ -4184,6 +4280,7 @@ async fn session_create_requires_control_and_ready_welcome_advertises_implemente
         raw.next().await,
         WireFrame::Welcome(haider_rpc::Welcome { features, .. })
             if features.contains(FEATURE_SESSION_MUTATION_V1)
+                && features.contains(FEATURE_SESSION_PERMISSION_OVERRIDES_V1)
                 && features.contains(FEATURE_TURN_CONTROL_V1)
     ));
 

@@ -28,7 +28,7 @@ use haider_protocol::ids::{
 };
 use haider_protocol::item::{ItemEvent, TurnItem};
 use haider_protocol::menu::{Menu, MenuAnswer, MenuKind};
-use haider_protocol::session::SessionMetadataV1;
+use haider_protocol::session::{SessionMetadataV1, SessionPermissionOverridesV1};
 use haider_protocol::state::{RunState, SessionState};
 use haider_protocol::tool::AttachmentBlock;
 use haider_protocol::{DeliveryMode, EventPayload};
@@ -101,6 +101,7 @@ pub struct SessionCreateCommand {
     pub provider: String,
     pub model: String,
     pub max_tokens: u64,
+    pub permission_overrides: Option<SessionPermissionOverridesV1>,
     pub system_prompt_version: String,
     pub event_id: EventId,
     pub device_id: DeviceId,
@@ -1123,6 +1124,7 @@ impl Store {
             model: command.model.clone(),
             max_tokens: command.max_tokens,
             system_prompt_version: Some(command.system_prompt_version.clone()),
+            permission_overrides: command.permission_overrides,
             created_at_ms,
         };
         let metadata_json = serde_json::to_string(&metadata).map_err(|error| {

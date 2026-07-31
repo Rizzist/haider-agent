@@ -6,7 +6,7 @@ use haider_protocol::DeliveryMode;
 use haider_protocol::context::ContextFootprint;
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::ids::{ItemId, MenuId, RunId, SessionId};
-use haider_protocol::session::SessionMetadataV1;
+use haider_protocol::session::{SessionMetadataV1, SessionPermissionOverridesV1};
 use haider_protocol::tool::{AttachmentBlock, ToolInventorySnapshot};
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -167,6 +167,8 @@ pub const FEATURE_ACCOUNT_ROTATION_V1: &str = "account_rotation_v1";
 pub const FEATURE_SHELL_EXEC_V1: &str = "shell_exec_v1";
 /// Daemon implements the canonical read-only tool inventory snapshot.
 pub const FEATURE_TOOL_INVENTORY_V1: &str = "tool_inventory_v1";
+/// Daemon persists and applies typed per-session write/exec permission overrides.
+pub const FEATURE_SESSION_PERMISSION_OVERRIDES_V1: &str = "session_permission_overrides_v1";
 
 /// Kind of client taking part in the handshake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -691,9 +693,26 @@ pub struct SessionReadResult {
 #[serde(tag = "method")]
 #[non_exhaustive]
 pub enum RequestBody {
+    /// Additive source-compatible form of `session.create`. The legacy Rust
+    /// variant below remains serializable for existing callers, while wire
+    /// decoding normalizes both old and new JSON into this variant.
+    #[serde(rename = "session.create")]
+    SessionCreateWithPermissionOverrides {
+        command_id: CommandId,
+        cwd: String,
+        provider: String,
+        model: String,
+        max_tokens: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        permission_overrides: Option<SessionPermissionOverridesV1>,
+    },
     /// Atomically creates typed session configuration, a `Created` event, and
     /// the durable command receipt that makes response-loss retries safe.
-    #[serde(rename = "session.create")]
+    ///
+    /// This encode-only compatibility variant keeps existing Rust callers
+    /// source-compatible. Decoders produce
+    /// [`Self::SessionCreateWithPermissionOverrides`] with `None`.
+    #[serde(rename = "session.create", skip_deserializing)]
     SessionCreate {
         command_id: CommandId,
         cwd: String,

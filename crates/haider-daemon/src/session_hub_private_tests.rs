@@ -220,6 +220,7 @@ fn create_command(session_id: &SessionId, suffix: &str) -> SessionCreateCommand 
         provider: "fake".into(),
         model: "fake-v1".into(),
         max_tokens: 4_096,
+        permission_overrides: None,
         system_prompt_version: "test-system-v1".into(),
         event_id: EventId::new(format!("created-{suffix}")),
         device_id: DeviceId::new("worker-law-test"),

@@ -7,6 +7,7 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use common::{TEST_FRAME_LIMIT, transcript};
+use haider_protocol::session::SessionPermissionOverridesV1;
 use haider_rpc::{
     CancelStatus, DEFAULT_FRAME_LIMIT, ERROR_CODE_ALREADY_RESOLVED, ERROR_CODE_BUSY,
     ERROR_CODE_CAPABILITY_DENIED, ERROR_CODE_CREDENTIAL_MISSING, ERROR_CODE_CURSOR_AHEAD,
@@ -161,6 +162,35 @@ fn additive_handshake_identity_fields_have_tolerant_decode_defaults() {
     assert!(profile_id.is_empty());
     assert!(daemon_version.is_empty());
     assert!(features.is_empty());
+}
+
+/// MUTATION CHECK: make `permission_overrides` required or default either
+/// boolean to true. Expected RUNTIME failure: the legacy create fails to
+/// decode or no longer normalizes to a fail-closed `None` override.
+#[test]
+fn legacy_session_create_defaults_permission_overrides_to_none() {
+    let json = r#"{"v":1,"kind":"request","request_id":"legacy-create","body":{"method":"session.create","command_id":"legacy-command","cwd":"/tmp","provider":"fake","model":"fake-model","max_tokens":4096}}"#;
+    let decoded = serde_json::from_str::<WireFrame>(json).expect("legacy create decodes");
+    assert_eq!(
+        decoded,
+        WireFrame::Request {
+            request_id: haider_rpc::RequestId::new("legacy-create"),
+            body: RequestBody::SessionCreateWithPermissionOverrides {
+                command_id: haider_rpc::CommandId::new("legacy-command"),
+                cwd: "/tmp".into(),
+                provider: "fake".into(),
+                model: "fake-model".into(),
+                max_tokens: 4096,
+                permission_overrides: None,
+            },
+        }
+    );
+
+    let overrides = SessionPermissionOverridesV1 {
+        allow_writes: true,
+        allow_exec: false,
+    };
+    assert!(!overrides.is_empty());
 }
 
 #[test]
@@ -350,7 +380,13 @@ fn session_create_ignores_unknown_additive_fields() {
         "future_policy":{"mode":"strict"}
     }"#;
     let body: RequestBody = serde_json::from_str(json).expect("known method with additive field");
-    assert!(matches!(body, RequestBody::SessionCreate { .. }));
+    assert!(matches!(
+        body,
+        RequestBody::SessionCreateWithPermissionOverrides {
+            permission_overrides: None,
+            ..
+        }
+    ));
 }
 
 /// R7 additive-field tolerance for the two turn mutation methods
