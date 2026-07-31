@@ -1152,14 +1152,23 @@ impl Store {
         }
         require_typed_session(&transaction, &command.session_id)?;
         let states = latest_run_states(&transaction, &command.session_id)?;
-        if states.contains_key(&command.run_id) {
+        let same_run_steer = states.get(&command.run_id).is_some_and(|(state, _)| {
+            command.mode == DeliveryMode::Steer
+                && !state.is_terminal()
+                && *state != RunState::Cancelling
+        });
+        if states.contains_key(&command.run_id) && !same_run_steer {
             return Err(corrupt("daemon-minted turn run id already exists"));
         }
         let has_active = states.values().any(|(state, _)| !state.is_terminal());
-        let disposition = if has_active {
-            // W3c1 deliberately degrades Steer to an explicitly queued turn
-            // until next-request-boundary injection exists. It never lies by
-            // returning `steer_pending` while implementing a fresh turn.
+        let disposition = if same_run_steer {
+            // W6c activates the reserved same-run steer shape: the durable
+            // user message commits here, then the manager delivers it to the
+            // active harness at its next provider-request boundary.
+            TurnAdmissionDisposition::SteerPending
+        } else if has_active {
+            // A newly minted run remains an explicitly queued turn. Only a
+            // same-run daemon steer may use `SteerPending`.
             TurnAdmissionDisposition::Queued
         } else {
             TurnAdmissionDisposition::Started
@@ -1174,17 +1183,8 @@ impl Store {
             now,
         )?;
 
-        let mut envelopes = vec![
-            unstamped_command_envelope(
-                command.queued_event_id.clone(),
-                &command.session_id,
-                Some(command.run_id.clone()),
-                command.device_id.clone(),
-                self.worker_generation,
-                EventPayload::RunState(RunState::Queued),
-                PromptRender::Omit,
-            )?,
-            unstamped_command_envelope(
+        let mut envelopes = if same_run_steer {
+            vec![unstamped_command_envelope(
                 command.user_event_id.clone(),
                 &command.session_id,
                 Some(command.run_id.clone()),
@@ -1196,8 +1196,33 @@ impl Store {
                     mode: command.mode,
                 },
                 PromptRender::Verbatim,
-            )?,
-        ];
+            )?]
+        } else {
+            vec![
+                unstamped_command_envelope(
+                    command.queued_event_id.clone(),
+                    &command.session_id,
+                    Some(command.run_id.clone()),
+                    command.device_id.clone(),
+                    self.worker_generation,
+                    EventPayload::RunState(RunState::Queued),
+                    PromptRender::Omit,
+                )?,
+                unstamped_command_envelope(
+                    command.user_event_id.clone(),
+                    &command.session_id,
+                    Some(command.run_id.clone()),
+                    command.device_id.clone(),
+                    self.worker_generation,
+                    EventPayload::UserMessage {
+                        text: command.text.clone(),
+                        attachments: command.attachments.clone(),
+                        mode: command.mode,
+                    },
+                    PromptRender::Verbatim,
+                )?,
+            ]
+        };
         if disposition == TurnAdmissionDisposition::Started {
             envelopes.push(unstamped_command_envelope(
                 command.active_event_id.clone(),
@@ -1213,7 +1238,11 @@ impl Store {
             envelope.agent_id = command.agent_id.clone();
         }
         append_transaction_envelopes(&transaction, &command.session_id, now, &mut envelopes)?;
-        let accepted_seq = envelopes[1].seq;
+        let accepted_seq = if same_run_steer {
+            envelopes[0].seq
+        } else {
+            envelopes[1].seq
+        };
         let accepted = AcceptedTurn {
             session_id: command.session_id.clone(),
             run_id: command.run_id.clone(),

@@ -7,7 +7,7 @@
 use crate::session_hub::SessionHub;
 use haider_core::{
     AcceptedTurn, CancelToken, DeferredTicket, DeferredToolResult, DelegationCreateOutcome,
-    DelegationRecord, DelegationState, SessionCreateCommand, TurnAcceptCommand,
+    DelegationRecord, DelegationState, SessionCreateCommand, TurnAcceptCommand, TurnCancelCommand,
 };
 use haider_protocol::DeliveryMode;
 use haider_protocol::agent::{
@@ -20,14 +20,22 @@ use haider_protocol::item::{ItemEvent, TurnItem};
 use haider_protocol::session::SessionMetadataV1;
 use haider_protocol::state::RunState;
 use haider_tools::SpawnSubagent;
-use std::time::Duration;
+use std::collections::VecDeque;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const CHILD_STALL_DEADLINE: Duration = Duration::from_secs(120);
+pub(crate) const RECURSION_DEPTH_LIMIT: u32 = 3;
+pub(crate) const RECURSION_LIMIT_MESSAGE: &str = "recursion depth limit";
+const STALL_NUDGE_TEXT: &str = "report your status or conclude";
+const STALL_REPORT_SUMMARY: &str =
+    "subagent stalled after one nudge and was cancelled without further progress";
 const MAX_REPORT_BYTES: usize = 16 * 1024;
 
 #[derive(Clone)]
 pub(crate) struct DelegationHandle {
     hub: SessionHub,
+    stall_deadline: Duration,
 }
 
 pub(crate) struct SpawnCoordinates {
@@ -46,7 +54,18 @@ pub(crate) struct EstablishedSpawn {
 
 impl DelegationHandle {
     pub(crate) fn new(hub: SessionHub) -> Self {
-        Self { hub }
+        Self {
+            hub,
+            stall_deadline: CHILD_STALL_DEADLINE,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_stall_deadline(hub: SessionHub, stall_deadline: Duration) -> Self {
+        Self {
+            hub,
+            stall_deadline,
+        }
     }
 
     /// Establishes child session, durable link, and accepted first turn. It
@@ -57,6 +76,12 @@ impl DelegationHandle {
         coordinates: SpawnCoordinates,
         request: SpawnSubagent,
     ) -> Result<EstablishedSpawn, HaiderError> {
+        let ancestry = self
+            .spawn_ancestry(
+                &coordinates.parent_session_id,
+                coordinates.parent_agent_id.as_ref(),
+            )
+            .await?;
         let identity = stable_digest(&[
             coordinates.parent_session_id.as_str(),
             coordinates.parent_run_id.as_str(),
@@ -81,11 +106,13 @@ impl DelegationHandle {
                     "fs_write".into(),
                     "fs_patch".into(),
                     "exec".into(),
+                    "spawn_subagent".into(),
                 ],
                 effect_ceiling: vec![
                     EffectClass::FsRead,
                     EffectClass::FsWrite,
                     EffectClass::ProcessExec,
+                    EffectClass::AgentSpawn,
                 ],
             },
             budget_tokens: Some(coordinates.metadata.max_tokens),
@@ -135,10 +162,8 @@ impl DelegationHandle {
             call_id: coordinates.call_id,
             tool_item_id: coordinates.tool_item_id,
             parent_agent_id: coordinates.parent_agent_id,
-            root_session_id: child_root_session(&self.hub, &coordinates.metadata, &manifest)
-                .await
-                .unwrap_or_else(|| child_session_id.clone()),
-            depth: 1,
+            root_session_id: ancestry.root_session_id,
+            depth: ancestry.depth,
             task: request.task.clone(),
             prompt: request.prompt.clone(),
             manifest: manifest.clone(),
@@ -188,6 +213,16 @@ impl DelegationHandle {
             },
             accepted,
         })
+    }
+
+    pub(crate) async fn validate_spawn_depth(
+        &self,
+        parent_session_id: &SessionId,
+        parent_agent_id: Option<&AgentId>,
+    ) -> Result<(), HaiderError> {
+        self.spawn_ancestry(parent_session_id, parent_agent_id)
+            .await
+            .map(|_| ())
     }
 
     pub(crate) async fn launch(&self, established: &EstablishedSpawn) -> Result<(), HaiderError> {
@@ -263,9 +298,27 @@ impl DelegationHandle {
                     truncated: completion.truncated,
                 });
             }
+            let progress = self.delegation_progress(&record).await?;
+            if !progress.input_required {
+                match progress.nudge {
+                    None if deadline_elapsed(progress.latest_at_ms, self.stall_deadline) => {
+                        self.nudge(&record).await?;
+                    }
+                    Some((_, nudge_at_ms))
+                        if deadline_elapsed(
+                            progress.latest_at_ms.max(nudge_at_ms),
+                            self.stall_deadline,
+                        ) =>
+                    {
+                        self.cancel_subtree(&record, CancelCause::Stall).await?;
+                    }
+                    _ => {}
+                }
+            }
             tokio::select! {
                 biased;
                 () = cancel.cancelled() => {
+                    self.cancel_subtree(&record, CancelCause::Parent).await?;
                     return Err(HaiderError::new(
                         ErrorCode::RunNotActive,
                         "parent cancelled while waiting for local child",
@@ -282,6 +335,13 @@ impl DelegationHandle {
             .mark_delegation_collected(ticket.manifest.agent.clone())
             .await
             .map(|_| ())
+    }
+
+    pub(crate) async fn cancel_ticket(&self, ticket: &DeferredTicket) -> Result<(), HaiderError> {
+        let Some(record) = self.hub.delegation(ticket.manifest.agent.clone()).await? else {
+            return Ok(());
+        };
+        self.cancel_subtree(&record, CancelCause::Parent).await
     }
 
     pub(crate) async fn agent_for_session(
@@ -351,7 +411,11 @@ impl DelegationHandle {
                 ChipState::Error,
             ),
             RunState::Cancelled => (
-                "subagent was cancelled before completing its report".into(),
+                if self.stall_cancel_requested(record).await? {
+                    STALL_REPORT_SUMMARY.into()
+                } else {
+                    "subagent was cancelled before completing its report".into()
+                },
                 ReportVerification::Red,
                 ChipState::Error,
             ),
@@ -369,19 +433,303 @@ impl DelegationHandle {
             truncated,
         }))
     }
+
+    async fn spawn_ancestry(
+        &self,
+        parent_session_id: &SessionId,
+        parent_agent_id: Option<&AgentId>,
+    ) -> Result<SpawnAncestry, HaiderError> {
+        let Some(parent_agent_id) = parent_agent_id else {
+            return Ok(SpawnAncestry {
+                root_session_id: parent_session_id.clone(),
+                depth: 1,
+            });
+        };
+        let parent = self
+            .hub
+            .delegation(parent_agent_id.clone())
+            .await?
+            .ok_or_else(|| {
+                HaiderError::new(
+                    ErrorCode::StoreCorrupt,
+                    "recursive spawn parent has no durable delegation",
+                    false,
+                )
+            })?;
+        if parent.child_session_id != *parent_session_id {
+            return Err(HaiderError::new(
+                ErrorCode::StoreCorrupt,
+                "recursive spawn parent does not own the calling session",
+                false,
+            ));
+        }
+        let depth = parent.depth.saturating_add(1);
+        if depth > RECURSION_DEPTH_LIMIT {
+            return Err(HaiderError::new(
+                ErrorCode::InvalidArgument,
+                RECURSION_LIMIT_MESSAGE,
+                false,
+            ));
+        }
+        Ok(SpawnAncestry {
+            root_session_id: parent.root_session_id,
+            depth,
+        })
+    }
+
+    async fn nudge(&self, record: &DelegationRecord) -> Result<(), HaiderError> {
+        let identity = record.agent_id.as_str();
+        let request_json = serde_json::to_string(&serde_json::json!({
+            "session_id": record.child_session_id,
+            "run_id": record.child_run_id,
+            "text": STALL_NUDGE_TEXT,
+            "mode": DeliveryMode::Steer,
+        }))
+        .map_err(internal_serialization)?;
+        let accepted = self
+            .hub
+            .accept_internal_turn(TurnAcceptCommand {
+                command_id: format!("delegation-stall-nudge-{identity}"),
+                request_digest: digest_bytes(request_json.as_bytes()),
+                request_json,
+                session_id: record.child_session_id.clone(),
+                worker_generation: self.hub.worker_generation(),
+                run_id: record.child_run_id.clone(),
+                agent_id: Some(record.agent_id.clone()),
+                text: STALL_NUDGE_TEXT.into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Steer,
+                queued_event_id: EventId::new(format!("delegation-nudge-queued-{identity}")),
+                user_event_id: EventId::new(format!("delegation-nudge-user-{identity}")),
+                active_event_id: EventId::new(format!("delegation-nudge-active-{identity}")),
+                device_id: self.hub.device_id(),
+            })
+            .await?;
+        if accepted.disposition != haider_core::TurnAdmissionDisposition::SteerPending {
+            return Err(HaiderError::new(
+                ErrorCode::StoreCorrupt,
+                "stall nudge did not bind to the active child run",
+                false,
+            ));
+        }
+        // The durable steer is the restart-safe decision. Delivery is a
+        // best-effort wake into the already-owned supervisor; if that wake
+        // loses to an exit, the grace deadline still advances to cancellation.
+        if let Err(error) = self
+            .hub
+            .submit_internal_nudge(accepted, STALL_NUDGE_TEXT.into())
+            .await
+        {
+            tracing::warn!(agent = %record.agent_id, ?error, "durable stall nudge wake was not delivered");
+        }
+        Ok(())
+    }
+
+    async fn delegation_progress(
+        &self,
+        record: &DelegationRecord,
+    ) -> Result<DelegationProgress, HaiderError> {
+        let direct = self.session_progress(record).await?;
+        let mut progress = DelegationProgress {
+            latest_at_ms: direct.latest_at_ms,
+            nudge: direct.nudge,
+            input_required: matches!(direct.state, Some(RunState::InputRequired { .. })),
+        };
+        if !matches!(
+            direct.state,
+            Some(RunState::Waiting {
+                reason: haider_protocol::state::WaitReason::LocalChild
+            })
+        ) {
+            return Ok(progress);
+        }
+
+        let mut pending = VecDeque::from(
+            self.hub
+                .delegations_for_parent_run(
+                    record.child_session_id.clone(),
+                    record.child_run_id.clone(),
+                )
+                .await?,
+        );
+        while let Some(descendant) = pending.pop_front() {
+            let child = self.session_progress(&descendant).await?;
+            progress.latest_at_ms = progress.latest_at_ms.max(child.latest_at_ms);
+            progress.input_required |= matches!(child.state, Some(RunState::InputRequired { .. }));
+            if matches!(
+                child.state,
+                Some(RunState::Waiting {
+                    reason: haider_protocol::state::WaitReason::LocalChild
+                })
+            ) {
+                pending.extend(
+                    self.hub
+                        .delegations_for_parent_run(
+                            descendant.child_session_id,
+                            descendant.child_run_id,
+                        )
+                        .await?,
+                );
+            }
+        }
+        Ok(progress)
+    }
+
+    async fn session_progress(
+        &self,
+        record: &DelegationRecord,
+    ) -> Result<SessionProgress, HaiderError> {
+        let mut cursor = 0;
+        let mut latest_at_ms = 0;
+        let mut state = None;
+        let mut nudge = None;
+        loop {
+            let page = self
+                .hub
+                .read_internal_session(&record.child_session_id, cursor, 256)
+                .await?;
+            if page.is_empty() {
+                break;
+            }
+            cursor = page.last().map_or(cursor, |envelope| envelope.seq);
+            for envelope in page {
+                latest_at_ms = latest_at_ms.max(envelope.committed_at_ms);
+                if envelope.run_id.as_ref() != Some(&record.child_run_id) {
+                    continue;
+                }
+                let Ok(payload) =
+                    serde_json::from_value::<haider_protocol::EventPayload>(envelope.payload)
+                else {
+                    continue;
+                };
+                match payload {
+                    haider_protocol::EventPayload::RunState(next) => state = Some(next),
+                    haider_protocol::EventPayload::UserMessage { text, mode, .. }
+                        if text == STALL_NUDGE_TEXT && mode == DeliveryMode::Steer =>
+                    {
+                        nudge = Some((envelope.seq, envelope.committed_at_ms));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(SessionProgress {
+            latest_at_ms,
+            state,
+            nudge,
+        })
+    }
+
+    async fn cancel_subtree(
+        &self,
+        record: &DelegationRecord,
+        cause: CancelCause,
+    ) -> Result<(), HaiderError> {
+        let mut pending = vec![record.clone()];
+        let mut subtree = Vec::new();
+        while let Some(current) = pending.pop() {
+            pending.extend(
+                self.hub
+                    .delegations_for_parent_run(
+                        current.child_session_id.clone(),
+                        current.child_run_id.clone(),
+                    )
+                    .await?,
+            );
+            subtree.push(current);
+        }
+        for current in subtree.into_iter().rev() {
+            let child_cause = if current.agent_id == record.agent_id {
+                cause
+            } else {
+                CancelCause::Ancestor
+            };
+            let command = self.cancellation_command(&current, child_cause)?;
+            self.hub.cancel_internal_turn(command).await?;
+        }
+        Ok(())
+    }
+
+    async fn stall_cancel_requested(&self, record: &DelegationRecord) -> Result<bool, HaiderError> {
+        let command = self.cancellation_command(record, CancelCause::Stall)?;
+        self.hub
+            .has_internal_cancel_receipt(
+                command.command_id,
+                command.request_digest,
+                command.request_json,
+            )
+            .await
+    }
+
+    fn cancellation_command(
+        &self,
+        record: &DelegationRecord,
+        cause: CancelCause,
+    ) -> Result<TurnCancelCommand, HaiderError> {
+        let reason = cause.name();
+        let request_json = serde_json::to_string(&serde_json::json!({
+            "session_id": record.child_session_id,
+            "run_id": record.child_run_id,
+            "reason": reason,
+        }))
+        .map_err(internal_serialization)?;
+        Ok(TurnCancelCommand {
+            command_id: format!("delegation-{reason}-cancel-{}", record.agent_id),
+            request_digest: digest_bytes(request_json.as_bytes()),
+            request_json,
+            session_id: record.child_session_id.clone(),
+            worker_generation: self.hub.worker_generation(),
+            run_id: record.child_run_id.clone(),
+            cancelling_event_id: EventId::new(format!(
+                "delegation-{reason}-cancelling-{}",
+                record.agent_id
+            )),
+            device_id: self.hub.device_id(),
+        })
+    }
 }
 
-async fn child_root_session(
-    _hub: &SessionHub,
-    _metadata: &SessionMetadataV1,
-    manifest: &AgentManifest,
-) -> Option<SessionId> {
-    manifest
-        .coordinates
-        .as_ref()
-        .and_then(|coordinates| coordinates.get("parent_session_id"))
-        .and_then(serde_json::Value::as_str)
-        .map(SessionId::new)
+struct SpawnAncestry {
+    root_session_id: SessionId,
+    depth: u32,
+}
+
+struct SessionProgress {
+    latest_at_ms: u64,
+    state: Option<RunState>,
+    nudge: Option<(u64, u64)>,
+}
+
+struct DelegationProgress {
+    latest_at_ms: u64,
+    nudge: Option<(u64, u64)>,
+    input_required: bool,
+}
+
+#[derive(Clone, Copy)]
+enum CancelCause {
+    Stall,
+    Parent,
+    Ancestor,
+}
+
+impl CancelCause {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Stall => "stall",
+            Self::Parent => "parent",
+            Self::Ancestor => "ancestor",
+        }
+    }
+}
+
+fn deadline_elapsed(committed_at_ms: u64, deadline: Duration) -> bool {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let committed_at_ms = u128::from(committed_at_ms);
+    now_ms.saturating_sub(committed_at_ms) >= deadline.as_millis()
 }
 
 fn stable_digest(parts: &[&str]) -> String {

@@ -14,6 +14,10 @@
 //!   `InputRequired` state and open menu) is reconstructed as a waiter — its
 //!   menu stays PENDING, and neither the provider request that produced it
 //!   nor any dispatched effect is ever repeated;
+//! - an active delegated child is left nonterminal for its recovered parent's
+//!   durable child-wait coordinator. W6c re-arms the progress deadline from
+//!   committed envelope time, delivers at most one steer, and then uses the
+//!   ordinary durable cancel path; provider/tool work is never redispatched;
 //! - every other nonterminal run terminalizes: open items close `Failed`, an
 //!   open menu closes `RecoveryInterrupted`, one sanitized retryable
 //!   `RunFailed` precedes `Errored`, and the session settles
@@ -205,6 +209,35 @@ pub(crate) async fn recover_interrupted_turns(
                 })));
                 continue;
             }
+            let supervised_by_waiting_parent = if state == RunState::Cancelling {
+                false
+            } else if let Some(delegation) = store
+                .delegation_for_child_session(session_id.clone())
+                .await?
+                .filter(|delegation| delegation.child_run_id == run_id)
+            {
+                matches!(
+                    latest_run_state(
+                        store,
+                        &delegation.parent_session_id,
+                        &delegation.parent_run_id,
+                    )
+                    .await?,
+                    Some(RunState::Waiting {
+                        reason: WaitReason::LocalChild
+                    })
+                )
+            } else {
+                false
+            };
+            if supervised_by_waiting_parent {
+                // The recovered parent ChildWait owns this child from here.
+                // Reissuing its interrupted provider/tool work would be
+                // unsafe; terminalizing it here would defeat durable stall
+                // supervision. It therefore remains parked until progress,
+                // nudge, or cancellation settles the delegation.
+                continue;
+            }
             terminalize_interrupted(
                 store,
                 device_id,
@@ -217,6 +250,32 @@ pub(crate) async fn recover_interrupted_turns(
         }
     }
     Ok(recovered)
+}
+
+async fn latest_run_state(
+    store: &SqliteStoreHandle,
+    session_id: &SessionId,
+    run_id: &RunId,
+) -> Result<Option<RunState>, HaiderError> {
+    let mut cursor = 0;
+    let mut state = None;
+    loop {
+        let page = store.read(session_id, cursor, PAGE_SIZE).await?;
+        if page.is_empty() {
+            return Ok(state);
+        }
+        cursor = page.last().map_or(cursor, |envelope| envelope.seq);
+        for envelope in page {
+            if envelope.run_id.as_ref() != Some(run_id) {
+                continue;
+            }
+            if let Ok(EventPayload::RunState(next)) =
+                serde_json::from_value::<EventPayload>(envelope.payload)
+            {
+                state = Some(next);
+            }
+        }
+    }
 }
 
 fn reduce(reductions: &mut HashMap<RunId, RunReduction>, envelope: RawEnvelope) {

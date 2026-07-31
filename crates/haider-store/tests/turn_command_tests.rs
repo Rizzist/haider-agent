@@ -84,6 +84,64 @@ fn submit_atomically_commits_receipt_and_runnable_prefix() {
     assert_eq!(store.latest_seq(&session_id).expect("head"), 4);
 }
 
+/// MUTATION CHECK: queue a fresh run or append a second `Queued` prefix for a
+/// same-run steer. Expected runtime failure: disposition is not
+/// `SteerPending`, or more than the one durable UserMessage is appended.
+#[test]
+fn same_run_steer_commits_one_message_without_minting_a_new_turn() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("store");
+    let session_id = SessionId::new("session-steer");
+    create(&store, &session_id);
+    store
+        .accept_turn(&submit(
+            &store,
+            "submit-steer-base",
+            &session_id,
+            "run-steer",
+        ))
+        .expect("base turn");
+
+    let command = TurnAcceptCommand {
+        command_id: "submit-steer-nudge".into(),
+        request_digest: "submit-steer-nudge-digest".into(),
+        request_json: r#"{"run_id":"run-steer","text":"report your status or conclude"}"#.into(),
+        session_id: session_id.clone(),
+        worker_generation: store.worker_generation(),
+        run_id: RunId::new("run-steer"),
+        agent_id: None,
+        text: "report your status or conclude".into(),
+        attachments: Vec::new(),
+        mode: DeliveryMode::Steer,
+        queued_event_id: EventId::new("unused-steer-queued"),
+        user_event_id: EventId::new("steer-user"),
+        active_event_id: EventId::new("unused-steer-active"),
+        device_id: DeviceId::new("test-daemon"),
+    };
+    let outcome = store.accept_turn(&command).expect("same-run steer");
+    let TurnAcceptOutcome::Committed {
+        accepted,
+        envelopes,
+    } = outcome
+    else {
+        panic!("first steer commits");
+    };
+    assert_eq!(accepted.disposition, TurnAdmissionDisposition::SteerPending);
+    assert_eq!(accepted.run_id, RunId::new("run-steer"));
+    assert_eq!(envelopes.len(), 1);
+    assert_eq!(accepted.accepted_seq, envelopes[0].seq);
+    assert!(matches!(
+        serde_json::from_value::<haider_protocol::EventPayload>(envelopes[0].payload.clone())
+            .expect("payload"),
+        haider_protocol::EventPayload::UserMessage { text, mode, .. }
+            if text == "report your status or conclude" && mode == DeliveryMode::Steer
+    ));
+    assert!(matches!(
+        store.accept_turn(&command).expect("steer replay"),
+        TurnAcceptOutcome::IdempotentReplay { .. }
+    ));
+}
+
 #[test]
 fn legacy_session_without_typed_metadata_is_rejected_before_acceptance() {
     let root = tempfile::tempdir().expect("tempdir");

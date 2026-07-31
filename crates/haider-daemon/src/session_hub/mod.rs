@@ -105,7 +105,7 @@ use haider_core::{
 };
 use haider_protocol::envelope::{RawEnvelope, envelope_weight_bytes};
 use haider_protocol::error::{ErrorCode, HaiderError};
-use haider_protocol::ids::{DeviceId, EventId, MenuId, SessionId};
+use haider_protocol::ids::{DeviceId, EventId, MenuId, RunId, SessionId};
 use haider_protocol::menu::{AnswerVia, MenuAnswer as DurableMenuAnswer};
 use haider_rpc::{
     AttachMode, AttachState, AttachmentId, CancelStatus, Capability, CapabilitySet, CommandId,
@@ -1028,6 +1028,58 @@ impl SessionHub {
             .await
     }
 
+    pub(crate) async fn submit_internal_nudge(
+        &self,
+        accepted: AcceptedTurn,
+        text: String,
+    ) -> Result<(), HaiderError> {
+        self.worker_manager()
+            .map_err(hub_error_as_store)?
+            .nudge(accepted.session_id, accepted.run_id, text)
+            .await
+    }
+
+    /// Receipt-backed daemon-internal cancellation used by delegation
+    /// supervision and subtree sweeps.
+    pub(crate) async fn cancel_internal_turn(
+        &self,
+        command: TurnCancelCommand,
+    ) -> Result<CancelledTurn, HaiderError> {
+        if let Some(cancelled) = self
+            .inner
+            .store
+            .turn_cancel_receipt(
+                command.command_id.clone(),
+                command.request_digest.clone(),
+                command.request_json.clone(),
+            )
+            .await?
+        {
+            return Ok(cancelled);
+        }
+        match self
+            .cancel_turn(command)
+            .await
+            .map_err(hub_error_as_store)?
+        {
+            TurnCancelOutcome::Committed { cancelled, .. }
+            | TurnCancelOutcome::IdempotentReplay { cancelled } => Ok(cancelled),
+        }
+    }
+
+    pub(crate) async fn has_internal_cancel_receipt(
+        &self,
+        command_id: String,
+        request_digest: String,
+        request_json: String,
+    ) -> Result<bool, HaiderError> {
+        self.inner
+            .store
+            .turn_cancel_receipt(command_id, request_digest, request_json)
+            .await
+            .map(|receipt| receipt.is_some())
+    }
+
     pub(crate) fn worker_generation(&self) -> u64 {
         self.inner.store.worker_generation()
     }
@@ -1057,6 +1109,17 @@ impl SessionHub {
         self.inner
             .store
             .delegation_for_child_session(session_id)
+            .await
+    }
+
+    pub(crate) async fn delegations_for_parent_run(
+        &self,
+        session_id: SessionId,
+        run_id: RunId,
+    ) -> Result<Vec<haider_core::DelegationRecord>, HaiderError> {
+        self.inner
+            .store
+            .delegations_for_parent_run(session_id, run_id)
             .await
     }
 

@@ -1158,6 +1158,57 @@ async fn hanging_provider_can_always_be_cancelled() {
     ));
 }
 
+/// MUTATION CHECK: defer `Nudge` as a fresh logical turn or omit the
+/// next-request-boundary drain. Expected runtime failure: the provider sees
+/// one request only, or its second request lacks the daemon steer text.
+#[tokio::test]
+async fn daemon_nudge_reaches_the_next_safe_provider_boundary_in_the_same_turn() {
+    let (handle, _store, provider) = runtime(vec![
+        FakeStep::Delay { ms: 30 },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+        FakeStep::EmitText {
+            text: "nudge acknowledged".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]);
+    let mut subscriber = handle.subscribe();
+    let turn = handle
+        .submit_turn(SubmitTurn::new("initial child work"))
+        .await
+        .expect("turn accepted");
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let event = subscriber.recv().await.expect("event");
+            if matches!(typed(&event), EventPayload::RunState(RunState::Streaming)) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("streaming state arrives");
+
+    handle
+        .nudge("report your status or conclude")
+        .expect("nudge accepted without blocking the actor");
+    let outcome = timeout(Duration::from_secs(1), turn.wait())
+        .await
+        .expect("nudged turn completes")
+        .expect("turn outcome");
+    assert_eq!(outcome.state, RunState::Done);
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].messages.iter().any(|message| {
+        message.blocks.iter().any(|block| {
+            matches!(block, Block::Text { text } if text == "report your status or conclude")
+        })
+    }));
+}
+
 #[tokio::test]
 async fn submit_flood_is_bounded_and_cannot_starve_provider_progress() {
     let provider = Arc::new(FairnessProvider::new());

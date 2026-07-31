@@ -352,6 +352,13 @@ pub trait ToolDispatcher: Send + Sync {
         Ok(())
     }
 
+    /// Cancels every child still owned by this turn. The actor invokes this
+    /// only on a real turn cancellation, never when a durable child-wait
+    /// checkpoint is quietly parked for restart.
+    async fn cancel_outstanding_deferred(&self) -> Result<(), HaiderError> {
+        Ok(())
+    }
+
     /// Drains process/finalizer ownership after the logical turn ends.
     async fn close(&self) -> Result<(), HaiderError> {
         Ok(())
@@ -475,6 +482,23 @@ impl HarnessHandle {
             .await
     }
 
+    /// Queues a daemon-authored steer for the active logical turn.
+    ///
+    /// Delivery is deliberately nonblocking: the actor records the text for
+    /// the next provider-request boundary, while a provider/tool that never
+    /// reaches such a boundary remains cancellable by its supervisor.
+    pub fn nudge(&self, text: impl Into<String>) -> Result<(), HaiderError> {
+        self.commands
+            .try_send(ActorCommand::Nudge { text: text.into() })
+            .map_err(|error| {
+                HaiderError::new(
+                    ErrorCode::Busy,
+                    format!("session actor could not accept nudge: {error}"),
+                    true,
+                )
+            })
+    }
+
     async fn submit(&self, request: TurnSubmission) -> Result<TurnHandle, HaiderError> {
         let (accepted, response) = oneshot::channel();
         self.commands
@@ -578,6 +602,9 @@ enum ActorCommand {
         answer: MenuAnswer,
         completed: oneshot::Sender<Result<(), HaiderError>>,
     },
+    Nudge {
+        text: String,
+    },
     Stop {
         completed: oneshot::Sender<()>,
     },
@@ -612,6 +639,7 @@ pub struct HarnessActor {
     next_item: u64,
     next_menu: u64,
     deferred_commands: VecDeque<ActorCommand>,
+    pending_nudges: Vec<String>,
 }
 
 impl HarnessActor {
@@ -662,6 +690,7 @@ impl HarnessActor {
                 next_item: 0,
                 next_menu: 0,
                 deferred_commands: VecDeque::new(),
+                pending_nudges: Vec::new(),
             },
             handle,
         )
@@ -704,6 +733,11 @@ impl HarnessActor {
                         "there is no open input menu",
                         false,
                     )));
+                }
+                ActorCommand::Nudge { .. } => {
+                    // The target turn crossed its terminal boundary before
+                    // this command was observed. Durable run state wins; a
+                    // stale nudge must not create a new logical turn.
                 }
                 ActorCommand::Stop { completed } => {
                     let _ = completed.send(());
@@ -916,6 +950,11 @@ impl HarnessActor {
         let mut completed_usage: Option<Usage> = None;
 
         'requests: loop {
+            messages.extend(
+                std::mem::take(&mut self.pending_nudges)
+                    .into_iter()
+                    .map(Message::user_text),
+            );
             if provider_attempt == 0 {
                 provider_request_count = provider_request_count.saturating_add(1);
             }
@@ -1413,6 +1452,14 @@ impl HarnessActor {
                             }
                             provider_attempt = 0;
                             messages.append(&mut tool_results);
+                            if let Err(error) = self.commit_state(&run_id, RunState::Thinking).await
+                            {
+                                return self.errored_state_outcome(&run_id, error).await;
+                            }
+                            continue 'requests;
+                        }
+                        if !self.pending_nudges.is_empty() {
+                            provider_attempt = 0;
                             if let Err(error) = self.commit_state(&run_id, RunState::Thinking).await
                             {
                                 return self.errored_state_outcome(&run_id, error).await;
@@ -1974,6 +2021,9 @@ impl HarnessActor {
                 MenuWake::Command(command @ ActorCommand::Submit { .. }) => {
                     self.defer_submit_or_reject(command);
                 }
+                MenuWake::Command(command @ ActorCommand::Nudge { .. }) => {
+                    self.service_command_without_menu(command);
+                }
                 MenuWake::Command(ActorCommand::AnswerMenu { completed, .. }) => {
                     let _ = completed.send(Err(HaiderError::new(
                         ErrorCode::PermissionDenied,
@@ -2194,6 +2244,10 @@ impl HarnessActor {
             let (answer, completed, already_committed) = match wake {
                 MenuWake::Command(command @ ActorCommand::Submit { .. }) => {
                     self.defer_submit_or_reject(command);
+                    continue;
+                }
+                MenuWake::Command(command @ ActorCommand::Nudge { .. }) => {
+                    self.service_command_without_menu(command);
                     continue;
                 }
                 MenuWake::Command(ActorCommand::AnswerMenu { answer, completed }) => {
@@ -2601,6 +2655,11 @@ impl HarnessActor {
         reasoning: &mut Option<TextAccumulator>,
         tools: &mut Vec<ToolAccumulator>,
     ) -> TurnOutcome {
+        if let Some(dispatcher) = self.dispatcher.as_ref()
+            && let Err(error) = dispatcher.cancel_outstanding_deferred().await
+        {
+            return errored_outcome(error);
+        }
         if let Err(error) = self
             .complete_open_items(run_id, message, reasoning, tools, ToolStatus::Cancelled)
             .await
@@ -2896,6 +2955,7 @@ impl HarnessActor {
     fn service_command_without_menu(&mut self, command: ActorCommand) {
         match command {
             command @ ActorCommand::Submit { .. } => self.defer_submit_or_reject(command),
+            ActorCommand::Nudge { text } => self.pending_nudges.push(text),
             ActorCommand::AnswerMenu { completed, .. } => {
                 let _ = completed.send(Err(HaiderError::new(
                     ErrorCode::MenuNotFound,

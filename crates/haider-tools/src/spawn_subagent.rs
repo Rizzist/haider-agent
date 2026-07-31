@@ -7,7 +7,7 @@ use serde_json::Value;
 const MAX_TASK_BYTES: usize = 80;
 const MAX_PROMPT_BYTES: usize = 32 * 1024;
 
-/// Validated arguments for the nonrecursive local-subagent tool.
+/// Validated arguments for the depth-capped local-subagent tool.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpawnSubagent {
     pub task: String,
@@ -58,7 +58,7 @@ impl EffectOperation for SpawnSubagent {
 pub fn spawn_subagent_manifest() -> ToolManifest {
     ToolManifest {
         name: "spawn_subagent".into(),
-        description: "Delegate one bounded task to a local nonrecursive child agent".into(),
+        description: "Delegate one bounded task to a depth-capped local child agent".into(),
         effects: vec![EffectClass::AgentSpawn],
         dispatch: DispatchMode::Deferred,
         input_schema: serde_json::json!({

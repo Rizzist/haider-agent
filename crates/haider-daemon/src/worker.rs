@@ -283,6 +283,12 @@ enum ManagerCommand {
     Recover {
         pending: Box<PendingTurn>,
     },
+    Nudge {
+        session_id: SessionId,
+        run_id: RunId,
+        text: String,
+        completed: oneshot::Sender<Result<(), HaiderError>>,
+    },
     Shutdown {
         completed: oneshot::Sender<Result<(), HaiderError>>,
     },
@@ -290,6 +296,11 @@ enum ManagerCommand {
 
 enum SupervisorCommand {
     Submit(Box<PendingTurn>),
+    Nudge {
+        run_id: RunId,
+        text: String,
+        completed: oneshot::Sender<Result<(), HaiderError>>,
+    },
     Shutdown,
 }
 
@@ -335,7 +346,9 @@ impl WorkerManager {
         mut dependencies: WorkerDependencies,
         inject_shutdown_error: bool,
     ) -> Self {
-        dependencies.delegation = Some(DelegationHandle::new(hub.clone()));
+        if dependencies.delegation.is_none() {
+            dependencies.delegation = Some(DelegationHandle::new(hub.clone()));
+        }
         let (commands, receiver) = mpsc::channel(MANAGER_CAPACITY);
         let handle = WorkerManagerHandle {
             commands,
@@ -427,6 +440,24 @@ impl WorkerManagerHandle {
                 })
                 .map_err(manager_try_send)?;
         }
+        response.await.map_err(|_| manager_stopped())?
+    }
+
+    pub(crate) async fn nudge(
+        &self,
+        session_id: SessionId,
+        run_id: RunId,
+        text: String,
+    ) -> Result<(), HaiderError> {
+        let (completed, response) = oneshot::channel();
+        self.commands
+            .try_send(ManagerCommand::Nudge {
+                session_id,
+                run_id,
+                text,
+                completed,
+            })
+            .map_err(manager_try_send)?;
         response.await.map_err(|_| manager_stopped())?
     }
 
@@ -580,6 +611,48 @@ async fn run_manager(
                             let _ = ready.send(result);
                         }
                     }
+                }
+            }
+            ManagerCommand::Nudge {
+                session_id,
+                run_id,
+                text,
+                completed,
+            } => {
+                let supervisor = match supervisor_for(
+                    &hub,
+                    &dependencies,
+                    &mut supervisors,
+                    &mut tasks,
+                    &mut task_sessions,
+                    &mut incarnations,
+                    session_id.clone(),
+                )
+                .await
+                {
+                    Ok(supervisor) => supervisor,
+                    Err(error) => {
+                        let _ = completed.send(Err(error));
+                        continue;
+                    }
+                };
+                if let Err(error) = supervisor.try_send(SupervisorCommand::Nudge {
+                    run_id,
+                    text,
+                    completed,
+                }) {
+                    let (completed, error) = match error {
+                        mpsc::error::TrySendError::Full(SupervisorCommand::Nudge {
+                            completed,
+                            ..
+                        }) => (completed, manager_busy("session supervisor queue is full")),
+                        mpsc::error::TrySendError::Closed(SupervisorCommand::Nudge {
+                            completed,
+                            ..
+                        }) => (completed, manager_stopped()),
+                        _ => unreachable!(),
+                    };
+                    let _ = completed.send(Err(error));
                 }
             }
             ManagerCommand::Shutdown { completed } => {
@@ -1066,17 +1139,34 @@ async fn run_supervisor(
                                 *pending,
                             ).await;
                         }
+                        Some(SupervisorCommand::Nudge { run_id, text, completed }) => {
+                            let result = if run_id == active_run {
+                                turn.harness.nudge(text)
+                            } else {
+                                Err(HaiderError::new(
+                                    ErrorCode::RunNotActive,
+                                    "daemon steer targeted a different active run",
+                                    false,
+                                ))
+                            };
+                            let _ = completed.send(result);
+                        }
                         Some(SupervisorCommand::Shutdown) | None => {
                             stopping = true;
-                            // P3-4 (park, don't cancel): a turn parked on
-                            // `request_input` is fully durable
-                            // (InputRequired + MenuOpened), and graceful
-                            // drain must preserve exactly what a crash
-                            // preserves. Unregister without cancel and let
-                            // next-generation recovery reconstruct the
-                            // checkpoint (scenario 10's path); every other
-                            // active turn is cancelled as before.
-                            if matches!(
+                            // P3-4/W6c (park, don't cancel): request-input and
+                            // local-child waits are durable checkpoints. An
+                            // active delegated child is also preserved: its
+                            // recovered parent re-arms supervision from the
+                            // last committed envelope instead of a graceful
+                            // restart silently becoming child cancellation.
+                            let delegated_child = match dependencies.delegation.as_ref() {
+                                Some(delegation) => delegation
+                                    .agent_for_session(lease.session_id())
+                                    .await
+                                    .is_ok_and(|agent| agent.is_some()),
+                                None => false,
+                            };
+                            if delegated_child || matches!(
                                 durable_run_state(&lease, &active_run).await,
                                 Some(RunState::InputRequired { .. })
                                     | Some(RunState::Waiting {
@@ -1281,6 +1371,13 @@ async fn run_supervisor(
                             None,
                             *pending,
                         ).await;
+                    }
+                    Some(SupervisorCommand::Nudge { completed, .. }) => {
+                        let _ = completed.send(Err(HaiderError::new(
+                            ErrorCode::RunNotActive,
+                            "daemon steer found no active run",
+                            false,
+                        )));
                     }
                     Some(SupervisorCommand::Shutdown) | None => {
                         stopping = true;
@@ -1637,12 +1734,12 @@ async fn durable_run_state(store: &HubStoreHandle, run_id: &RunId) -> Option<Run
     })
 }
 
-/// Parks a `request_input` checkpoint across a GRACEFUL drain (P3-4): stop
-/// the harness actor and close the broker WITHOUT cancelling, appending a
-/// terminal, or reconciling effects — the durable InputRequired + MenuOpened
-/// pair IS the checkpoint, and the next generation's recovery reconstructs
-/// it exactly as it would after a crash. The supervisor's exit unregisters
-/// the lease (registration removal without menu resolution).
+/// Parks a recoverable checkpoint/delegated child across a GRACEFUL drain:
+/// stop the harness actor and close the broker WITHOUT cancelling, appending
+/// a terminal, or reconciling effects. The next generation reconstructs a
+/// menu/child wait directly; an interrupted delegated child stays parked for
+/// its recovered parent's durable W6c supervision. The supervisor's exit
+/// unregisters the lease without changing run truth.
 async fn park_request_input_checkpoint(mut turn: ActiveTurn) {
     // Abort the harness actor FIRST — `HarnessHandle::stop` would drive the
     // core cancellation ladder (MenuClosed, item cancellation, Cancelling),
@@ -1786,9 +1883,10 @@ async fn start_turn(
     config.max_tokens = metadata.max_tokens;
     config.system_prompt = Some(SystemPromptBuilder::build(metadata));
     config.tools = dependencies.tool_factory.definitions();
-    if config.agent_id.is_some() {
-        config.tools.retain(|tool| tool.name != "spawn_subagent");
-    }
+    // W6c children retain the spawn tool. The coordinator derives their
+    // durable depth from the parent delegation and returns a typed tool
+    // result at the cap; hiding the tool would turn that recoverable model
+    // decision into provider-specific behavior.
     config.attachments = attachments;
     config.usage_account = resolved
         .account_alias
@@ -2274,6 +2372,7 @@ impl TurnToolFactory for BrokerToolFactory {
             metadata: context.metadata,
             parent_agent_id: context.agent_id,
             delegation: context.delegation,
+            deferred: Mutex::new(HashMap::new()),
         })))
     }
 }
@@ -2289,6 +2388,7 @@ struct BrokerToolDispatcher {
     metadata: SessionMetadataV1,
     parent_agent_id: Option<AgentId>,
     delegation: DelegationHandle,
+    deferred: Mutex<HashMap<AgentId, DeferredTicket>>,
 }
 
 #[async_trait]
@@ -2319,12 +2419,17 @@ impl ToolDispatcher for BrokerToolDispatcher {
         })?;
         let policy = self.policy.lock().await;
         if name == "spawn_subagent" {
-            if self.parent_agent_id.is_some() {
-                return Err(HaiderError::new(
-                    ErrorCode::PermissionDenied,
-                    "recursive subagent spawning is not enabled",
-                    false,
-                ));
+            if let Err(error) = self
+                .delegation
+                .validate_spawn_depth(&self.session_id, self.parent_agent_id.as_ref())
+                .await
+            {
+                if error.code == ErrorCode::InvalidArgument
+                    && error.message == crate::delegation::RECURSION_LIMIT_MESSAGE
+                {
+                    return Ok(ToolDispatchResult::Completed(recursion_limit_result()));
+                }
+                return Err(error);
             }
             let request = SpawnSubagent::from_tool_args(args).map_err(tool_error)?;
             let intent = match broker.begin_agent_spawn(&request, &policy).await {
@@ -2382,6 +2487,10 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     .record_launch_failure(&established.ticket, &error)
                     .await?;
             }
+            self.deferred.lock().await.insert(
+                established.ticket.manifest.agent.clone(),
+                established.ticket.clone(),
+            );
             return Ok(ToolDispatchResult::Deferred(established.ticket));
         }
         let result = match name {
@@ -2511,7 +2620,23 @@ impl ToolDispatcher for BrokerToolDispatcher {
     }
 
     async fn acknowledge_deferred(&self, ticket: &DeferredTicket) -> Result<(), HaiderError> {
-        self.delegation.acknowledge(ticket).await
+        self.delegation.acknowledge(ticket).await?;
+        self.deferred.lock().await.remove(&ticket.manifest.agent);
+        Ok(())
+    }
+
+    async fn cancel_outstanding_deferred(&self) -> Result<(), HaiderError> {
+        let tickets = self
+            .deferred
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for ticket in tickets {
+            self.delegation.cancel_ticket(&ticket).await?;
+        }
+        Ok(())
     }
 
     async fn resolve_approval(&self, menu: &Menu, answer: &MenuAnswer) -> Result<(), HaiderError> {
@@ -2660,6 +2785,23 @@ fn typed_tool_result(error: &haider_tools::ToolError) -> Option<BoundedResult> {
         artifact: None,
         cursor: None,
     })
+}
+
+fn recursion_limit_result() -> BoundedResult {
+    BoundedResult {
+        preview: serde_json::json!({
+            "status": "rejected",
+            "error": {
+                "kind": "recursion_depth_limit",
+                "message": crate::delegation::RECURSION_LIMIT_MESSAGE,
+                "limit": crate::delegation::RECURSION_DEPTH_LIMIT,
+            }
+        })
+        .to_string(),
+        truncated: false,
+        artifact: None,
+        cursor: None,
+    }
 }
 
 fn request_input_definition() -> ToolDefinition {
