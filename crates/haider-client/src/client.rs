@@ -275,6 +275,10 @@ struct Shared {
     /// reattach-by-cursor discipline recovers; see R9's cursor law).
     lost_events: AtomicU64,
     state: watch::Sender<ConnectionState>,
+    /// A writer death observed while the reader may still be draining
+    /// buffered peer frames. The READER promotes this to [`Self::fail`]
+    /// when its own end arrives, so undelivered final answers land first.
+    writer_failure: StdMutex<Option<DisconnectReason>>,
 }
 
 impl Shared {
@@ -285,6 +289,14 @@ impl Shared {
         match &*self.state.borrow() {
             ConnectionState::Disconnected(reason) => reason.clone(),
             ConnectionState::Connected => DisconnectReason::Closed,
+        }
+    }
+
+    /// Records a writer death WITHOUT flipping the connection state —
+    /// the reader drains buffered frames to EOF first (see `run_writer`).
+    fn defer_writer_failure(&self, reason: DisconnectReason) {
+        if let Ok(mut slot) = self.writer_failure.lock() {
+            slot.get_or_insert(reason);
         }
     }
 
@@ -334,6 +346,7 @@ impl RpcClient {
             next_request: AtomicU64::new(1),
             acked_pong: AtomicU64::new(0),
             lost_events: AtomicU64::new(0),
+            writer_failure: StdMutex::new(None),
             state,
         });
         // The daemon never accepts a frame larger than its own advertised
@@ -661,7 +674,15 @@ async fn run_writer(
                     break;
                 };
                 if let Err(error) = writer.write_all(&bytes).await {
-                    shared.fail(DisconnectReason::Io(error.to_string()));
+                    // W9b review fix: the read side may still hold
+                    // undelivered final answers (a daemon that answers and
+                    // then closes — crash after commit, or a graceful close
+                    // right after the last response; a heartbeat ping takes
+                    // the EPIPE first). Deferring the failure lets the
+                    // reader drain to EOF before pending waiters observe
+                    // the death; the pong deadline bounds the half-open
+                    // case where the peer never closes its side.
+                    shared.defer_writer_failure(DisconnectReason::Io(error.to_string()));
                     break;
                 }
                 // `bytes` (Zeroizing) drops here: the encoded frame —

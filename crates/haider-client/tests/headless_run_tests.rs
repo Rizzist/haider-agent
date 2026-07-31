@@ -58,6 +58,29 @@ impl Peer {
         }
     }
 
+    /// Like [`Self::next`], but a clean client close yields `None`
+    /// instead of a panic — for "nothing more arrives" assertions where
+    /// finishing (and closing) is legal.
+    async fn try_next(&mut self) -> Option<WireFrame> {
+        loop {
+            if let Some(frame) = self.queued.pop_front() {
+                if let WireFrame::Ping { nonce } = frame {
+                    self.write(&WireFrame::Pong { nonce }).await;
+                    continue;
+                }
+                return Some(frame);
+            }
+            let mut bytes = [0_u8; 8192];
+            let read = self.stream.read(&mut bytes).await.expect("peer read");
+            if read == 0 {
+                return None;
+            }
+            let batch = self.decoder.push(&bytes[..read]);
+            assert!(batch.error.is_none(), "peer decode: {:?}", batch.error);
+            self.queued.extend(batch.frames);
+        }
+    }
+
     async fn request(&mut self) -> (RequestId, RequestBody) {
         match self.next().await {
             WireFrame::Request { request_id, body } => (request_id, body),
@@ -740,13 +763,19 @@ async fn duplicate_and_gap_replay_is_lossless_under_output_backpressure() {
     assert_eq!(seqs, vec![1, 2, 3]);
 }
 
-/// MUTATION CHECK: wait only for `AttachCaughtUp` after the client's bounded
-/// event queue reports loss, or trust queued live frames after saturation.
-/// Expected RUNTIME failure: the runner hangs at the lost barrier, never
-/// reattaches from its fully-applied cursor, or omits a durable sequence.
+/// MUTATION CHECK: ignore the daemon's `Lagged` pressure signal, reattach
+/// from anything but the fully-applied cursor, or trust queued live frames
+/// across the recovery. Expected RUNTIME failure: the runner never
+/// reattaches, replays from the wrong sequence, or omits a durable
+/// sequence from the presentation stream.
 #[tokio::test]
-async fn saturated_client_event_channel_recovers_every_durable_sequence() {
-    const TERMINAL_SEQ: u64 = 320;
+async fn lagged_pressure_recovers_every_durable_sequence() {
+    // The runner's internal forwarding keeps pace with any externally
+    // paced blast (bounded backpressure, never silent loss), so channel
+    // saturation cannot be forced from outside — the daemon's OWN
+    // `Lagged` frame is the protocol's pressure signal and drives the
+    // same cursor recovery deterministically.
+    const TERMINAL_SEQ: u64 = 10;
 
     let (_root, profile) = profile();
     let peer = spawn_peer(&profile, |mut peer| async move {
@@ -764,19 +793,24 @@ async fn saturated_client_event_channel_recovers_every_durable_sequence() {
         )
         .await;
 
-        for seq in 1..=TERMINAL_SEQ {
-            let state = if seq == TERMINAL_SEQ {
-                RunState::Done
-            } else {
-                RunState::Thinking
-            };
+        for seq in 1..=5_u64 {
             send_event(
                 &mut peer,
                 &attachment_id,
-                envelope(&session_id, &run_id, seq, EventPayload::RunState(state)),
+                envelope(
+                    &session_id,
+                    &run_id,
+                    seq,
+                    EventPayload::RunState(RunState::Thinking),
+                ),
             )
             .await;
         }
+        peer.write(&WireFrame::Lagged {
+            attachment_id: attachment_id.clone(),
+            last_queued_seq: TERMINAL_SEQ,
+        })
+        .await;
 
         let (detach_request, detach) = peer.request().await;
         assert!(matches!(detach, RequestBody::SessionDetach { .. }));
@@ -796,8 +830,8 @@ async fn saturated_client_event_channel_recovers_every_durable_sequence() {
         else {
             panic!("expected cursor recovery attach");
         };
-        assert!(after_seq < TERMINAL_SEQ);
-        let replay_attachment = AttachmentId::new("saturated-replay");
+        assert_eq!(after_seq, 5, "reattach resumes at the fully-applied cursor");
+        let replay_attachment = AttachmentId::new("lagged-replay");
         peer.respond(
             attach_request,
             ResponseBody::SessionAttach {
@@ -812,12 +846,7 @@ async fn saturated_client_event_channel_recovers_every_durable_sequence() {
             },
         )
         .await;
-
-        // Let the attach loop discard already-queued frames from the detached
-        // lane, then page replay slowly enough that this recovery attempt is
-        // itself observable rather than another synthetic overload.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        for seq in after_seq.saturating_add(1)..=TERMINAL_SEQ {
+        for seq in (after_seq + 1)..=TERMINAL_SEQ {
             let state = if seq == TERMINAL_SEQ {
                 RunState::Done
             } else {
@@ -829,7 +858,6 @@ async fn saturated_client_event_channel_recovers_every_durable_sequence() {
                 envelope(&session_id, &run_id, seq, EventPayload::RunState(state)),
             )
             .await;
-            tokio::time::sleep(Duration::from_millis(1)).await;
         }
         peer.write(&WireFrame::AttachCaughtUp {
             attachment_id: replay_attachment,
@@ -838,8 +866,7 @@ async fn saturated_client_event_channel_recovers_every_durable_sequence() {
         .await;
     });
 
-    let (result, events) =
-        run_with_events(profile, request(None), 1, Duration::from_millis(120)).await;
+    let (result, events) = run_with_events(profile, request(None), 4, Duration::ZERO).await;
     peer.await.expect("peer");
     assert_eq!(result.outcome, HeadlessOutcome::Done);
     let seqs = events
@@ -1579,8 +1606,12 @@ async fn timeout_sends_one_cancel_and_remains_timeout_after_cancelled_terminal()
             ),
         )
         .await;
-        let second = tokio::time::timeout(Duration::from_millis(50), peer.next()).await;
-        assert!(second.is_err(), "timeout emitted a second command");
+        // A clean client close is legal here (the runner is done); only an
+        // actual second frame violates the one-cancel law.
+        match tokio::time::timeout(Duration::from_millis(50), peer.try_next()).await {
+            Err(_) | Ok(None) => {}
+            Ok(Some(frame)) => panic!("timeout emitted a second command: {frame:?}"),
+        }
     });
 
     let (result, _) = run_with_events(

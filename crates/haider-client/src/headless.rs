@@ -670,6 +670,11 @@ async fn run_headless_inner(
         let response = loop {
             let response_deadline = submit_timeout_grace.or(timeout_deadline);
             tokio::select! {
+                // W9b review fix: BIASED — a response that resolved in the
+                // same wake as the peer's close must win the tie, or an
+                // answers-then-closes daemon costs a spurious reconnect
+                // (and the test double's listener may be gone).
+                biased;
                 response = &mut wait => break response,
                 frame = connection.events.recv() => {
                     let Some(frame) = frame else {
@@ -817,7 +822,13 @@ async fn run_headless_inner(
         {
             break;
         }
-        if connection.client.lost_events() != connection.observed_lost_events {
+        if connection.client.lost_events() != connection.observed_lost_events
+            && connection.events.is_empty()
+        {
+            // W9b review fix: drain DELIVERED frames before recovering —
+            // losses observed mid-burst would otherwise abandon deliverable
+            // frames and turn bounded channel pressure into a spurious,
+            // scheduler-timed reconnect.
             let recovered = attach_for_run_before_deadline(
                 profile,
                 &ensure,

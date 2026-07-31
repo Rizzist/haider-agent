@@ -267,7 +267,11 @@ fn unknown_run_provider_is_usage_error() {
 
 #[test]
 fn anthropic_missing_credential_exits_65_without_network_access() {
+    // Hermetic profile: without this the test inherits the developer's
+    // real ~/.haider (real credentials would defeat the missing-key law).
+    let profile_parent = tempfile::tempdir().expect("temporary CLI profile parent");
     let out = haider()
+        .env("HAIDER_PROFILE_DIR", profile_parent.path().join("profile"))
         .args([
             "run",
             "--jsonl",

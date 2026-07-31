@@ -254,14 +254,55 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
                 && let Some(failure) = &result.failure
             {
                 eprintln!("haider: {}", failure.message);
+                if matches!(
+                    failure.code,
+                    HeadlessFailureCode::Run(ErrorCode::CredentialMissing)
+                ) {
+                    eprintln!(
+                        "haider: set HAIDER_ANTHROPIC_API_KEY, run `haider import codex`, or sign in from the TUI"
+                    );
+                }
             }
             ExitCode::from(exit_code_for_result(&result))
         }
         Err(error) => {
+            // The v1 object is the json contract for EVERY outcome — a
+            // pre-acceptance timeout or transport failure still emits one
+            // (null ids: no run was accepted), never a bare stderr line.
+            if options.output == RunOutput::Json
+                && let Err(io_error) = write_error_json(io::stdout().lock(), &error)
+            {
+                eprintln!("haider: stdout failed: {io_error}");
+                return ExitCode::from(EX_IOERR);
+            }
             eprintln!("haider: {error}");
             ExitCode::from(exit_code_for_error(&error))
         }
     }
+}
+
+/// The `haider.run.v1` object for a run that never produced a
+/// [`HeadlessRunResult`] — ids are null, the outcome is `timeout` only
+/// for the pre-acceptance wall-clock class, and the error carries the
+/// typed code.
+fn write_error_json(mut output: impl Write, error: &HeadlessRunError) -> io::Result<()> {
+    let (outcome, code, retryable) = match error {
+        HeadlessRunError::Rpc {
+            code, retryable, ..
+        } if code == "timeout_before_acceptance" => ("timeout", "timeout".to_owned(), *retryable),
+        HeadlessRunError::Rpc {
+            code, retryable, ..
+        } => ("errored", code.clone(), *retryable),
+        _ => ("errored", "internal".to_owned(), false),
+    };
+    let message = serde_json::to_string(&error.to_string()).map_err(io::Error::other)?;
+    let code = serde_json::to_string(&code).map_err(io::Error::other)?;
+    let line = format!(
+        "{{\"schema\":\"haider.run.v1\",\"session_id\":null,\"run_id\":null,\"outcome\":\"{outcome}\",\"response\":null,\"usage\":null,\"permission_denials\":[],\"error\":{{\"code\":{code},\"message\":{message},\"retryable\":{retryable}}}}}"
+    );
+    output.write_all(line.as_bytes())?;
+    output.write_all(b"\n")?;
+    output.flush()
 }
 
 fn adapt_events(output: RunOutput, mut events: mpsc::Receiver<HeadlessEvent>) -> io::Result<()> {
