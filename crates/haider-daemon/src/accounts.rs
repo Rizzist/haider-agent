@@ -54,8 +54,9 @@ use haider_provider::{
 use haider_rpc::{
     ERROR_CODE_BUSY, ERROR_CODE_CREDENTIAL_MISSING, ERROR_CODE_INVALID_ARGUMENT,
     ERROR_CODE_PERMISSION_DENIED, ERROR_CODE_PROVIDER_ERROR, ERROR_CODE_RESTAGE_REQUIRED,
-    ERROR_CODE_REVISION_CONFLICT, ERROR_CODE_UNAUTHORIZED, ErrorData, ProviderSummaryWire,
-    RequestId, ResponseBody, StagePurpose, WireFrame,
+    ERROR_CODE_REVISION_CONFLICT, ERROR_CODE_UNAUTHORIZED, ErrorData, ProviderApiFamilyWire,
+    ProviderAuthRequirementWire, ProviderSummaryWire, RequestId, ResponseBody, StagePurpose,
+    WireFrame,
 };
 use subtle::ConstantTimeEq as _;
 use tokio::sync::{mpsc, watch};
@@ -70,8 +71,8 @@ use crate::oauth::{
 };
 use crate::provider_registry::{
     CachedProviderModelSource, JsonProviderRegistryStore, ProductionProviderEndpointValidator,
-    ProviderConfigureInput, ProviderEndpointValidator, ProviderModelSourceLike, ProviderRegistry,
-    ProviderRegistryStoreLike, initial_provider_profiles,
+    ProviderConfigureInput, ProviderEndpointValidator, ProviderModelSourceLike, ProviderProvenance,
+    ProviderRegistry, ProviderRegistryStoreLike, initial_provider_profiles,
 };
 use crate::session_hub::FrameSink;
 
@@ -800,7 +801,7 @@ trait ProviderModelDiscoverer: Send + Sync {
     async fn discover(
         &self,
         source: CatalogSource,
-        access_token: &str,
+        access_token: Option<&str>,
         etag: Option<&str>,
     ) -> Result<DiscoveredCatalog, CatalogError>;
 }
@@ -812,7 +813,7 @@ impl ProviderModelDiscoverer for ProductionProviderModelDiscoverer {
     async fn discover(
         &self,
         source: CatalogSource,
-        access_token: &str,
+        access_token: Option<&str>,
         etag: Option<&str>,
     ) -> Result<DiscoveredCatalog, CatalogError> {
         discover_models(source, access_token, etag).await
@@ -1075,6 +1076,7 @@ async fn run_account_actor(
                 begin_provider_models_refresh(
                     &store,
                     &accounts,
+                    &providers,
                     broker.as_ref(),
                     &model_discoverer,
                     &commands,
@@ -1190,6 +1192,7 @@ async fn run_account_actor(
 async fn begin_provider_models_refresh(
     store: &SqliteStoreHandle,
     accounts: &AccountStore<Box<dyn StoreLike>>,
+    providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
     broker: Option<&CredentialBroker>,
     model_discoverer: &Arc<dyn ProviderModelDiscoverer>,
     commands: &mpsc::Sender<AccountCommand>,
@@ -1199,7 +1202,7 @@ async fn begin_provider_models_refresh(
     provider: String,
     completed: LoginRoute,
 ) {
-    let Some(source) = catalog_source(&provider) else {
+    let Some((source, auth_requirement)) = catalog_source(&provider, providers) else {
         respond_provider_models_unavailable(
             &completed,
             &provider,
@@ -1216,31 +1219,63 @@ async fn begin_provider_models_refresh(
         );
         return;
     }
-    let Some(descriptor) = accounts.active_for_provider(&provider).cloned() else {
-        respond_error(
-            &completed,
-            ERROR_CODE_CREDENTIAL_MISSING,
-            "provider has no active credential",
-            false,
-        );
-        return;
+    let expected_auth = match auth_requirement {
+        ProviderAuthRequirementWire::OAuth => Some(AuthMethod::OAuth),
+        ProviderAuthRequirementWire::ApiKey => Some(AuthMethod::ApiKey),
+        ProviderAuthRequirementWire::None => None,
+        ProviderAuthRequirementWire::Unknown => {
+            respond_provider_models_unavailable(
+                &completed,
+                &provider,
+                "provider model discovery has an unsupported authentication requirement",
+            );
+            return;
+        }
+        _ => {
+            respond_provider_models_unavailable(
+                &completed,
+                &provider,
+                "provider model discovery has an unsupported authentication requirement",
+            );
+            return;
+        }
     };
-    if descriptor.auth_method != AuthMethod::OAuth {
-        respond_provider_models_unavailable(
-            &completed,
-            &provider,
-            "provider model discovery requires an active OAuth credential",
-        );
-        return;
-    }
-    let Some(broker) = broker.cloned() else {
-        respond_error(
-            &completed,
-            ERROR_CODE_CREDENTIAL_MISSING,
-            "OAuth credential broker is unavailable",
-            true,
-        );
-        return;
+    let descriptor = if let Some(expected_auth) = expected_auth {
+        let Some(descriptor) = accounts.active_for_provider(&provider).cloned() else {
+            respond_error(
+                &completed,
+                ERROR_CODE_CREDENTIAL_MISSING,
+                "provider has no active credential",
+                false,
+            );
+            return;
+        };
+        if descriptor.auth_method != expected_auth {
+            let reason = if expected_auth == AuthMethod::OAuth {
+                "provider model discovery requires an active OAuth credential"
+            } else {
+                "provider model discovery requires an active API-key credential"
+            };
+            respond_provider_models_unavailable(&completed, &provider, reason);
+            return;
+        }
+        Some(descriptor)
+    } else {
+        None
+    };
+    let broker = if descriptor.is_some() {
+        let Some(broker) = broker.cloned() else {
+            let message = if expected_auth == Some(AuthMethod::OAuth) {
+                "OAuth credential broker is unavailable"
+            } else {
+                "credential broker is unavailable"
+            };
+            respond_error(&completed, ERROR_CODE_CREDENTIAL_MISSING, message, true);
+            return;
+        };
+        Some(broker)
+    } else {
+        None
     };
     let cached = match store.provider_models(provider.clone()).await {
         Ok(cached) => cached,
@@ -1261,26 +1296,39 @@ async fn begin_provider_models_refresh(
     let task_provider = provider.clone();
     let task_completed = completed.clone();
     let refresh_task = refresh_tasks.spawn(async move {
-        let result = match broker.resolve(&descriptor).await {
-            Ok(access_token) => {
-                let access_token =
-                    std::str::from_utf8(access_token.expose_secret()).map_err(|_| {
-                        HaiderError::new(
-                            ErrorCode::CredentialMissing,
-                            "OAuth access token is not valid UTF-8",
-                            false,
-                        )
-                    });
-                match access_token {
-                    Ok(access_token) => ProviderModelsRefreshResult::Discovery(
-                        model_discoverer
-                            .discover(source, access_token, etag.as_deref())
-                            .await,
-                    ),
-                    Err(error) => ProviderModelsRefreshResult::Credential(error),
+        let result = match (broker, descriptor) {
+            (Some(broker), Some(descriptor)) => match broker.resolve(&descriptor).await {
+                Ok(access_token) => {
+                    let access_token =
+                        std::str::from_utf8(access_token.expose_secret()).map_err(|_| {
+                            let message = if descriptor.auth_method == AuthMethod::OAuth {
+                                "OAuth access token is not valid UTF-8"
+                            } else {
+                                "API key is not valid UTF-8"
+                            };
+                            HaiderError::new(ErrorCode::CredentialMissing, message, false)
+                        });
+                    match access_token {
+                        Ok(access_token) => ProviderModelsRefreshResult::Discovery(
+                            model_discoverer
+                                .discover(source, Some(access_token), etag.as_deref())
+                                .await,
+                        ),
+                        Err(error) => ProviderModelsRefreshResult::Credential(error),
+                    }
                 }
-            }
-            Err(error) => ProviderModelsRefreshResult::Credential(error),
+                Err(error) => ProviderModelsRefreshResult::Credential(error),
+            },
+            (None, None) => ProviderModelsRefreshResult::Discovery(
+                model_discoverer
+                    .discover(source, None, etag.as_deref())
+                    .await,
+            ),
+            _ => ProviderModelsRefreshResult::Credential(HaiderError::new(
+                ErrorCode::Internal,
+                "model discovery credential state is inconsistent",
+                false,
+            )),
         };
         let _ = commands
             .send(AccountCommand::ProviderModelsRefreshCompleted {
@@ -1436,11 +1484,40 @@ async fn finish_provider_models_refresh(
     }
 }
 
-fn catalog_source(provider: &str) -> Option<CatalogSource> {
+fn catalog_source(
+    provider: &str,
+    providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+) -> Option<(CatalogSource, ProviderAuthRequirementWire)> {
     match provider {
-        OPENAI_OAUTH_PROVIDER_NAME => Some(CatalogSource::OpenAiSubscription),
-        ANTHROPIC_OAUTH_PROVIDER_NAME => Some(CatalogSource::AnthropicSubscription),
-        _ => None,
+        OPENAI_OAUTH_PROVIDER_NAME => Some((
+            CatalogSource::OpenAiSubscription,
+            ProviderAuthRequirementWire::OAuth,
+        )),
+        ANTHROPIC_OAUTH_PROVIDER_NAME => Some((
+            CatalogSource::AnthropicSubscription,
+            ProviderAuthRequirementWire::OAuth,
+        )),
+        _ => {
+            let profile = providers.get(provider)?;
+            if profile.provenance != ProviderProvenance::Custom
+                || !matches!(
+                    profile.api_family,
+                    ProviderApiFamilyWire::OpenAiChatCompletions
+                )
+                || !matches!(
+                    profile.auth_requirement,
+                    ProviderAuthRequirementWire::ApiKey | ProviderAuthRequirementWire::None
+                )
+            {
+                return None;
+            }
+            Some((
+                CatalogSource::OpenAiCompatible {
+                    origin: profile.base_url.clone()?,
+                },
+                profile.auth_requirement,
+            ))
+        }
     }
 }
 
@@ -4029,6 +4106,19 @@ pub trait AccountProviderBuilder: Send + Sync {
     ) -> Result<Arc<dyn Provider>, HaiderError> {
         self.build(&descriptor.provider, credential, model, &descriptor.alias)
     }
+
+    /// Profile-aware construction for API-family routing. Injected builders
+    /// remain source-compatible and may ignore registry metadata.
+    fn build_profile_descriptor(
+        &self,
+        profile: Option<&ProviderSummaryWire>,
+        descriptor: &CredentialDescriptor,
+        credential: haider_accounts::SecretHandle,
+        model: &str,
+    ) -> Result<Arc<dyn Provider>, HaiderError> {
+        let _ = profile;
+        self.build_descriptor(descriptor, credential, model)
+    }
 }
 
 /// Production builder for every account-backed adapter shipped in this lane.
@@ -4049,7 +4139,15 @@ impl AccountProviderBuilder for ProductionAccountBuilder {
         model: &str,
         alias: &CredentialAlias,
     ) -> Result<Arc<dyn Provider>, HaiderError> {
-        build_account_provider(provider, None, AuthMethod::ApiKey, credential, model, alias)
+        build_account_provider(
+            provider,
+            None,
+            None,
+            AuthMethod::ApiKey,
+            credential,
+            model,
+            alias,
+        )
     }
 
     fn build_descriptor(
@@ -4060,6 +4158,25 @@ impl AccountProviderBuilder for ProductionAccountBuilder {
     ) -> Result<Arc<dyn Provider>, HaiderError> {
         build_account_provider(
             &descriptor.provider,
+            None,
+            descriptor.base_url.as_deref(),
+            descriptor.auth_method,
+            credential,
+            model,
+            &descriptor.alias,
+        )
+    }
+
+    fn build_profile_descriptor(
+        &self,
+        profile: Option<&ProviderSummaryWire>,
+        descriptor: &CredentialDescriptor,
+        credential: haider_accounts::SecretHandle,
+        model: &str,
+    ) -> Result<Arc<dyn Provider>, HaiderError> {
+        build_account_provider(
+            &descriptor.provider,
+            profile,
             descriptor.base_url.as_deref(),
             descriptor.auth_method,
             credential,
@@ -4071,12 +4188,14 @@ impl AccountProviderBuilder for ProductionAccountBuilder {
 
 fn build_account_provider(
     provider: &str,
+    profile: Option<&ProviderSummaryWire>,
     base_url: Option<&str>,
     auth_method: AuthMethod,
     credential: haider_accounts::SecretHandle,
     model: &str,
     alias: &CredentialAlias,
 ) -> Result<Arc<dyn Provider>, HaiderError> {
+    let compatible_base_url = account_openai_compatible_base_url(provider, profile, base_url);
     let adapter: Arc<dyn Provider> = match (provider, auth_method) {
         (ANTHROPIC_PROVIDER_NAME, AuthMethod::ApiKey) => Arc::new(
             AnthropicProvider::new(credential, model)
@@ -4089,10 +4208,31 @@ fn build_account_provider(
                 .with_account(alias.clone()),
         ),
         (OPENAI_COMPATIBLE_PROVIDER_NAME, AuthMethod::ApiKey) => {
-            let base_url = base_url.ok_or_else(|| {
+            let base_url = compatible_base_url.ok_or_else(|| {
                 HaiderError::new(
                     ErrorCode::InvalidArgument,
                     "openai-compatible credential is missing base_url",
+                    false,
+                )
+            })?;
+            Arc::new(
+                OpenAiCompatibleProvider::new(credential, model, base_url)
+                    .map_err(|error| adapter_construction_error(provider, error))?
+                    .with_account(alias.clone()),
+            )
+        }
+        (_, AuthMethod::ApiKey)
+            if profile.is_some_and(|profile| {
+                matches!(
+                    profile.api_family,
+                    ProviderApiFamilyWire::OpenAiChatCompletions
+                )
+            }) =>
+        {
+            let base_url = compatible_base_url.ok_or_else(|| {
+                HaiderError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("provider {provider} profile is missing its base_url"),
                     false,
                 )
             })?;
@@ -4161,6 +4301,24 @@ fn build_account_provider(
     Ok(adapter)
 }
 
+fn account_openai_compatible_base_url<'a>(
+    provider: &str,
+    profile: Option<&'a ProviderSummaryWire>,
+    credential_base_url: Option<&'a str>,
+) -> Option<&'a str> {
+    if provider == OPENAI_COMPATIBLE_PROVIDER_NAME {
+        return credential_base_url;
+    }
+    profile
+        .filter(|profile| {
+            matches!(
+                profile.api_family,
+                ProviderApiFamilyWire::OpenAiChatCompletions
+            )
+        })
+        .and_then(|profile| profile.endpoint.as_deref().or(credential_base_url))
+}
+
 fn adapter_construction_error(
     provider: &str,
     error: haider_provider::ProviderError,
@@ -4175,6 +4333,7 @@ fn adapter_construction_error(
 #[derive(Clone)]
 pub(crate) struct AccountsProviderFactory {
     snapshot: AccountsSnapshot,
+    management: Option<ManagementSnapshot>,
     vault: VaultProvision,
     builder: Arc<dyn AccountProviderBuilder>,
     broker: Option<CredentialBroker>,
@@ -4204,6 +4363,7 @@ impl AccountsProviderFactory {
     ) -> Self {
         Self {
             snapshot,
+            management: None,
             vault,
             builder,
             broker: None,
@@ -4218,10 +4378,62 @@ impl AccountsProviderFactory {
     ) -> Self {
         Self {
             snapshot,
+            management: None,
             vault,
             builder,
             broker: Some(broker),
         }
+    }
+
+    pub(crate) fn new_with_management(
+        snapshot: AccountsSnapshot,
+        management: ManagementSnapshot,
+        vault: VaultProvision,
+        builder: Arc<dyn AccountProviderBuilder>,
+    ) -> Self {
+        Self {
+            snapshot,
+            management: Some(management),
+            vault,
+            builder,
+            broker: None,
+        }
+    }
+
+    pub(crate) fn with_broker_and_management(
+        snapshot: AccountsSnapshot,
+        management: ManagementSnapshot,
+        vault: VaultProvision,
+        builder: Arc<dyn AccountProviderBuilder>,
+        broker: CredentialBroker,
+    ) -> Self {
+        Self {
+            snapshot,
+            management: Some(management),
+            vault,
+            builder,
+            broker: Some(broker),
+        }
+    }
+
+    fn provider_profile(&self, provider: &str) -> Option<ProviderSummaryWire> {
+        self.management
+            .as_ref()?
+            .read()?
+            .providers
+            .into_iter()
+            .find(|profile| profile.provider == provider)
+    }
+
+    fn build_provider(
+        &self,
+        descriptor: &CredentialDescriptor,
+        credential: haider_accounts::SecretHandle,
+        model: &str,
+    ) -> Result<Arc<dyn Provider>, HaiderError> {
+        let profile = self.provider_profile(&descriptor.provider);
+        self.builder
+            .build_profile_descriptor(profile.as_ref(), descriptor, credential, model)
     }
 
     async fn resolve_account(
@@ -4338,9 +4550,7 @@ impl AccountsProviderFactory {
                 self.resolve_secret(&resolved.descriptor).await?
             }
         };
-        let provider =
-            self.builder
-                .build_descriptor(&resolved.descriptor, credential, &metadata.model)?;
+        let provider = self.build_provider(&resolved.descriptor, credential, &metadata.model)?;
         Ok((resolved, provider))
     }
 }
@@ -4413,7 +4623,7 @@ impl haider_core::ProviderAttemptResolver for AccountsAttemptResolver {
                     };
                     match broker.refresh_after_auth_failure(&current).await {
                         Ok(credential) => {
-                            let provider = self.factory.builder.build_descriptor(
+                            let provider = self.factory.build_provider(
                                 &current,
                                 credential,
                                 &self.metadata.model,
@@ -4476,11 +4686,9 @@ impl haider_core::ProviderAttemptResolver for AccountsAttemptResolver {
             return Ok(haider_core::ProviderAttemptDecision::Stop);
         };
         let credential = self.factory.resolve_secret(&resolved.descriptor).await?;
-        let provider = self.factory.builder.build_descriptor(
-            &resolved.descriptor,
-            credential,
-            &self.metadata.model,
-        )?;
+        let provider =
+            self.factory
+                .build_provider(&resolved.descriptor, credential, &self.metadata.model)?;
         Ok(haider_core::ProviderAttemptDecision::Rotate(
             haider_core::ResolvedProviderAttempt {
                 provider,

@@ -242,6 +242,88 @@ async fn production_account_factory_dispatches_openai_and_preserves_anthropic() 
     );
 }
 
+/// MUTATION CHECK (W5g-5b): remove the profile API-family dispatch arm from
+/// `build_account_provider`. Expected runtime failure: resolving
+/// `custom-llama` returns "no account-backed adapter" instead of constructing
+/// the compatible adapter from the stored profile origin.
+///
+/// MUTATION CHECK: prefer the credential descriptor's `base_url` over the
+/// profile endpoint. Expected runtime failure: construction rejects the
+/// descriptor's remote HTTP decoy rather than succeeding with the stored
+/// loopback profile origin. The fixed-name assertion also pins the legacy
+/// credential-owned fallback.
+#[tokio::test]
+async fn custom_chat_completions_profile_routes_with_profile_origin_and_legacy_fallback() {
+    let provider = "custom-llama";
+    let alias = CredentialAlias::new("custom-llama-key");
+    let descriptor = CredentialDescriptor {
+        alias: alias.clone(),
+        provider: provider.to_owned(),
+        base_url: Some("http://203.0.113.7/v1".to_owned()),
+        auth_method: AuthMethod::ApiKey,
+        identity: "custom fixture".to_owned(),
+        status: CredentialStatus::Ok,
+        active: true,
+    };
+    let summary = ProviderSummaryWire {
+        provider: provider.to_owned(),
+        api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
+        endpoint: Some("http://127.0.0.1:11434/v1".to_owned()),
+        models: vec!["llama-fixture".to_owned()],
+        model_details: Vec::new(),
+        auth_methods: vec![AuthMethod::ApiKey],
+        availability: haider_rpc::ProviderAvailabilityWire::Available,
+        availability_reason: None,
+        default_model: Some("llama-fixture".to_owned()),
+        enabled: true,
+    };
+    assert_eq!(
+        account_openai_compatible_base_url(
+            provider,
+            Some(&summary),
+            descriptor.base_url.as_deref()
+        ),
+        Some("http://127.0.0.1:11434/v1"),
+        "the registry profile origin outranks credential metadata"
+    );
+    assert_eq!(
+        account_openai_compatible_base_url(
+            OPENAI_COMPATIBLE_PROVIDER_NAME,
+            Some(&summary),
+            descriptor.base_url.as_deref()
+        ),
+        descriptor.base_url.as_deref(),
+        "the fixed-name legacy adapter remains credential-addressed"
+    );
+
+    let vault = Arc::new(MemoryVault::default());
+    vault
+        .put(&alias, b"custom-compatible-fixture-secret")
+        .expect("seed custom key");
+    let snapshot = Arc::new(StdMutex::new(vec![descriptor]));
+    let management =
+        ManagementSnapshot::new(0, snapshot.lock().expect("snapshot").clone(), vec![summary]);
+    let factory = AccountsProviderFactory::new_with_management(
+        snapshot,
+        management,
+        VaultProvision::Available(vault as Arc<dyn Vault>),
+        Arc::new(ProductionAccountBuilder),
+    );
+    let resolved = factory
+        .resolve_for_turn(&haider_protocol::session::SessionMetadataV1 {
+            cwd: "/tmp/custom-family-dispatch".to_owned(),
+            provider: provider.to_owned(),
+            model: "llama-fixture".to_owned(),
+            max_tokens: 64,
+            system_prompt_version: None,
+            created_at_ms: 1,
+        })
+        .await
+        .expect("custom family dispatch");
+    assert_eq!(resolved.provider_name, provider);
+    assert_eq!(resolved.account_alias.as_deref(), Some(alias.as_str()));
+}
+
 /// MUTATION CHECK (review of record, W5b retrospective): weaken any component
 /// of the generation/issuer/audience/resource/subject-hash fence in
 /// `apply_oauth_refresh`, `expire_oauth_refresh`, or `begin_oauth_refresh`.
@@ -940,6 +1022,7 @@ async fn auth_aware_factory_routes_sanctioned_oauth_descriptors_to_subscription_
         .expect("store crosswire key");
     let result = build_account_provider(
         OPENAI_OAUTH_PROVIDER_NAME,
+        None,
         None,
         AuthMethod::ApiKey,
         vault.resolve(&wrong_alias).expect("resolve crosswire key"),
@@ -3524,10 +3607,12 @@ impl crate::oauth::OAuthIdentityVerifier for UnusedIdentityVerifier {
     }
 }
 
+type ModelDiscoveryObservation = (CatalogSource, Option<String>, Option<String>);
+
 struct BlockingModelDiscoverer {
     started: tokio::sync::Notify,
     release: tokio::sync::Notify,
-    seen: StdMutex<Vec<(CatalogSource, String, Option<String>)>>,
+    seen: StdMutex<Vec<ModelDiscoveryObservation>>,
     results: StdMutex<std::collections::VecDeque<ModelDiscoveryFixture>>,
 }
 
@@ -3541,12 +3626,12 @@ impl ProviderModelDiscoverer for BlockingModelDiscoverer {
     async fn discover(
         &self,
         source: CatalogSource,
-        access_token: &str,
+        access_token: Option<&str>,
         etag: Option<&str>,
     ) -> Result<DiscoveredCatalog, CatalogError> {
         self.seen.lock().expect("seen lock").push((
             source,
-            access_token.to_owned(),
+            access_token.map(str::to_owned),
             etag.map(str::to_owned),
         ));
         self.started.notify_one();
@@ -3602,6 +3687,219 @@ fn refresh_oauth_bundle() -> haider_accounts::OAuthTokenBundleV1 {
         1,
     )
     .expect("model refresh bundle")
+}
+
+/// MUTATION CHECK (W5g-5b): drop the custom-profile arm from
+/// `catalog_source`. Expected runtime failure: the first refresh answers
+/// unavailable instead of publishing `custom-key-model` in its summary.
+///
+/// MUTATION CHECK: source custom discovery from the credential descriptor.
+/// Expected runtime failure: the fake observes the descriptor's decoy origin
+/// instead of the registry profile's stored origin.
+///
+/// MUTATION CHECK: always attach a bearer credential. Expected runtime
+/// failure: the no-auth profile's second discovery observation contains a
+/// token instead of `None`.
+#[tokio::test]
+async fn custom_provider_refresh_uses_stored_origin_and_publishes_discovered_slugs() {
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let key_provider = "custom-refresh-key";
+    let no_auth_provider = "custom-refresh-none";
+    let key_origin = "http://127.0.0.1:12401/v1";
+    let no_auth_origin = "https://no-auth-models.example.invalid/v1";
+    let profiles = vec![
+        ProviderProfileV1 {
+            provider_id: key_provider.to_owned(),
+            display_name: key_provider.to_owned(),
+            api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
+            base_url: Some(key_origin.to_owned()),
+            enabled: true,
+            auth_requirement: ProviderAuthRequirementWire::ApiKey,
+            configured_models: vec!["seed-key".to_owned()],
+            default_model: Some("seed-key".to_owned()),
+            provenance: ProviderProvenance::Custom,
+        },
+        ProviderProfileV1 {
+            provider_id: no_auth_provider.to_owned(),
+            display_name: no_auth_provider.to_owned(),
+            api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
+            base_url: Some(no_auth_origin.to_owned()),
+            enabled: true,
+            auth_requirement: ProviderAuthRequirementWire::None,
+            configured_models: vec!["seed-none".to_owned()],
+            default_model: Some("seed-none".to_owned()),
+            provenance: ProviderProvenance::Custom,
+        },
+    ];
+    let provider_store: Box<dyn ProviderRegistryStoreLike> =
+        Box::new(TestProviderStore(StdMutex::new(profiles)));
+    let providers = ProviderRegistry::new(
+        provider_store,
+        Vec::new(),
+        Arc::new(CachedProviderModelSource::default()),
+    )
+    .expect("custom provider registry");
+
+    let alias = CredentialAlias::new("custom-refresh-key");
+    let descriptor = CredentialDescriptor {
+        alias: alias.clone(),
+        provider: key_provider.to_owned(),
+        base_url: Some("http://203.0.113.7/descriptor-decoy".to_owned()),
+        auth_method: AuthMethod::ApiKey,
+        identity: "custom refresh key".to_owned(),
+        status: CredentialStatus::Ok,
+        active: true,
+    };
+    let mut accounts = memory_accounts();
+    accounts.add(descriptor).expect("custom descriptor");
+    let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(accounts.list().to_vec()));
+    let vault = Arc::new(MemoryVault::new());
+    vault
+        .put(&alias, b"CUSTOM_REFRESH_API_KEY_SENTINEL_5b")
+        .expect("seed custom API key");
+    let management = ManagementSnapshot::new(0, accounts.list().to_vec(), providers.summaries());
+    let discoverer = Arc::new(BlockingModelDiscoverer {
+        started: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+        seen: StdMutex::new(Vec::new()),
+        results: StdMutex::new(std::collections::VecDeque::from([
+            ModelDiscoveryFixture::Return(Ok(DiscoveredCatalog {
+                models: vec![haider_provider::DiscoveredModel {
+                    slug: "custom-key-model".to_owned(),
+                    display_name: "custom-key-model".to_owned(),
+                    context_window: None,
+                    description: None,
+                    default_effort: None,
+                    supported_efforts: Vec::new(),
+                    visible: true,
+                    priority: None,
+                }],
+                etag: None,
+            })),
+            ModelDiscoveryFixture::Return(Ok(DiscoveredCatalog {
+                models: vec![haider_provider::DiscoveredModel {
+                    slug: "custom-public-model".to_owned(),
+                    display_name: "custom-public-model".to_owned(),
+                    context_window: None,
+                    description: None,
+                    default_effort: None,
+                    supported_efforts: Vec::new(),
+                    visible: true,
+                    priority: None,
+                }],
+                etag: None,
+            })),
+        ])),
+    });
+    let discoverer_trait: Arc<dyn ProviderModelDiscoverer> = discoverer.clone();
+    let broker_vault = vault.clone() as Arc<dyn Vault>;
+    let broker_snapshot = Arc::clone(&snapshot);
+    let (mut actor, _broker) = start_account_actor_with_services(
+        AccountActorConfig {
+            store: store.clone(),
+            accounts,
+            vault: vault as Arc<dyn Vault>,
+            validator: Arc::new(ProviderCredentialValidator),
+            snapshot: Arc::clone(&snapshot),
+            management: Some(management),
+            profile_id: "custom-refresh".to_owned(),
+            default_model: "unused".to_owned(),
+            providers,
+            provider_endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
+            reserved_aliases: HashSet::new(),
+            refresh_fences: RefreshFenceRegistry::default(),
+        },
+        |commands| {
+            CredentialBroker::new(
+                broker_vault,
+                OAuthProviderCatalog::default(),
+                broker_snapshot,
+                commands,
+            )
+        },
+        discoverer_trait,
+    )
+    .expect("custom refresh actor");
+
+    let (key_sink, mut key_frames) = channel_sink();
+    actor
+        .commands()
+        .send(AccountCommand::RefreshProviderModels {
+            provider: key_provider.to_owned(),
+            completed: LoginRoute {
+                request_id: RequestId::new("custom-key-refresh"),
+                sink: key_sink,
+            },
+        })
+        .await
+        .expect("key refresh handoff");
+    tokio::time::timeout(Duration::from_secs(2), discoverer.started.notified())
+        .await
+        .expect("key discovery started");
+    discoverer.release.notify_one();
+    let key_frame = tokio::time::timeout(Duration::from_secs(2), key_frames.recv())
+        .await
+        .expect("key refresh deadline")
+        .expect("key refresh response");
+    match key_frame {
+        WireFrame::Response {
+            body: ResponseBody::ProviderModelsRefresh { provider, .. },
+            ..
+        } => assert_eq!(provider.models, vec!["custom-key-model"]),
+        other => panic!("unexpected key refresh response: {other:?}"),
+    }
+
+    let (none_sink, mut none_frames) = channel_sink();
+    actor
+        .commands()
+        .send(AccountCommand::RefreshProviderModels {
+            provider: no_auth_provider.to_owned(),
+            completed: LoginRoute {
+                request_id: RequestId::new("custom-none-refresh"),
+                sink: none_sink,
+            },
+        })
+        .await
+        .expect("no-auth refresh handoff");
+    tokio::time::timeout(Duration::from_secs(2), discoverer.started.notified())
+        .await
+        .expect("no-auth discovery started");
+    discoverer.release.notify_one();
+    let none_frame = tokio::time::timeout(Duration::from_secs(2), none_frames.recv())
+        .await
+        .expect("no-auth refresh deadline")
+        .expect("no-auth refresh response");
+    match none_frame {
+        WireFrame::Response {
+            body: ResponseBody::ProviderModelsRefresh { provider, .. },
+            ..
+        } => assert_eq!(provider.models, vec!["custom-public-model"]),
+        other => panic!("unexpected no-auth refresh response: {other:?}"),
+    }
+
+    assert_eq!(
+        discoverer.seen.lock().expect("seen").as_slice(),
+        [
+            (
+                CatalogSource::OpenAiCompatible {
+                    origin: key_origin.to_owned()
+                },
+                Some("CUSTOM_REFRESH_API_KEY_SENTINEL_5b".to_owned()),
+                None,
+            ),
+            (
+                CatalogSource::OpenAiCompatible {
+                    origin: no_auth_origin.to_owned()
+                },
+                None,
+                None,
+            ),
+        ],
+        "discovery uses only stored profile origins and the declared auth mode"
+    );
+    actor.shutdown().await;
+    store.close().await.expect("close");
 }
 
 /// Refresh HTTP is handed to an owned task, broker resolution exposes only
@@ -3776,7 +4074,7 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
         seen.first(),
         Some(&(
             CatalogSource::OpenAiSubscription,
-            "MODEL_REFRESH_ACCESS_SENTINEL_73c1".to_owned(),
+            Some("MODEL_REFRESH_ACCESS_SENTINEL_73c1".to_owned()),
             None,
         )),
         "discovery receives the broker-extracted access token, never the encoded bundle"

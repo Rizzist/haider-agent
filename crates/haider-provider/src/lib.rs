@@ -37,7 +37,8 @@ pub use anthropic::{
 };
 pub use catalog::{
     CatalogError, CatalogSource, DiscoveredCatalog, DiscoveredModel, catalog_request_url,
-    discover_models, discover_models_with_resolver, parse_catalog, pickable,
+    discover_models, discover_models_with_resolver, openai_compatible_catalog_endpoint,
+    parse_catalog, pickable,
 };
 pub use openai::{
     OPENAI_CODEX_RESPONSES_LITE_HEADER, OPENAI_CODEX_RESPONSES_LITE_VALUE,

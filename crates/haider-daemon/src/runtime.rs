@@ -337,19 +337,23 @@ async fn run_inner(
         .provider_factory
     {
         crate::worker::ProviderFactoryConfig::Accounts => match accounts_runtime.broker.clone() {
-            Some(broker) => {
-                std::sync::Arc::new(crate::accounts::AccountsProviderFactory::with_broker(
+            Some(broker) => std::sync::Arc::new(
+                crate::accounts::AccountsProviderFactory::with_broker_and_management(
                     std::sync::Arc::clone(&accounts_runtime.facade.snapshot),
+                    accounts_runtime.facade.management.clone(),
                     accounts_runtime.vault.clone(),
                     std::sync::Arc::new(crate::accounts::ProductionAccountBuilder),
                     broker,
-                ))
-            }
-            None => std::sync::Arc::new(crate::accounts::AccountsProviderFactory::new(
-                std::sync::Arc::clone(&accounts_runtime.facade.snapshot),
-                accounts_runtime.vault.clone(),
-                std::sync::Arc::new(crate::accounts::ProductionAccountBuilder),
-            )),
+                ),
+            ),
+            None => std::sync::Arc::new(
+                crate::accounts::AccountsProviderFactory::new_with_management(
+                    std::sync::Arc::clone(&accounts_runtime.facade.snapshot),
+                    accounts_runtime.facade.management.clone(),
+                    accounts_runtime.vault.clone(),
+                    std::sync::Arc::new(crate::accounts::ProductionAccountBuilder),
+                ),
+            ),
         },
         crate::worker::ProviderFactoryConfig::AccountsWith(builder) => {
             match accounts_runtime.broker.clone() {

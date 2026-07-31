@@ -94,12 +94,14 @@ impl std::fmt::Display for CatalogError {
 }
 
 /// Which provider family's discovery shape to speak.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CatalogSource {
     /// codex's ChatGPT-backend catalog.
     OpenAiSubscription,
     /// Anthropic's `/v1/models` under an OAuth bearer.
     AnthropicSubscription,
+    /// An OpenAI-compatible custom profile's stored API origin.
+    OpenAiCompatible { origin: String },
 }
 
 /// The final request URL for a source's model catalog.
@@ -115,14 +117,16 @@ pub fn catalog_request_url(source: CatalogSource, endpoint: &str) -> String {
         CatalogSource::OpenAiSubscription => {
             format!("{endpoint}?client_version={OPENAI_CODEX_MODELS_CLIENT_VERSION}")
         }
-        CatalogSource::AnthropicSubscription => endpoint.to_owned(),
+        CatalogSource::AnthropicSubscription | CatalogSource::OpenAiCompatible { .. } => {
+            endpoint.to_owned()
+        }
     }
 }
 
 impl CatalogSource {
     /// The exact endpoint discovery will request (and pin).
     #[must_use]
-    pub fn endpoint(self) -> String {
+    pub fn endpoint(&self) -> String {
         match self {
             Self::OpenAiSubscription => {
                 format!("{}/models", crate::OPENAI_SUBSCRIPTION_BASE_URL)
@@ -130,24 +134,70 @@ impl CatalogSource {
             Self::AnthropicSubscription => {
                 format!("{}/v1/models", crate::ANTHROPIC_OAUTH_BASE_URL)
             }
+            Self::OpenAiCompatible { origin } => {
+                format!("{}/models", origin.trim().trim_end_matches('/'))
+            }
         }
     }
 
-    fn trusted_host(self) -> &'static str {
+    fn trusted_host(&self) -> Option<&'static str> {
         match self {
-            Self::OpenAiSubscription => "chatgpt.com",
-            Self::AnthropicSubscription => "api.anthropic.com",
+            Self::OpenAiSubscription => Some("chatgpt.com"),
+            Self::AnthropicSubscription => Some("api.anthropic.com"),
+            Self::OpenAiCompatible { .. } => None,
         }
     }
 }
 
-/// Discovers a provider's model list with a subscription access token.
+/// Validates a custom profile origin and returns its exact model-list URL.
+///
+/// This discovery-time backstop runs before a request is built. Plain HTTP
+/// is accepted only for literal loopback addresses or `localhost`; remote
+/// profiles must use HTTPS.
+pub fn openai_compatible_catalog_endpoint(origin: &str) -> Result<String, CatalogError> {
+    let origin = origin.trim().trim_end_matches('/');
+    let parsed = reqwest::Url::parse(origin).map_err(|_| CatalogError::Unavailable {
+        reason: "custom model catalog origin is not a valid URL".to_owned(),
+    })?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(CatalogError::Unavailable {
+            reason: "custom model catalog origin must be an http(s) URL without credentials, query, or fragment"
+                .to_owned(),
+        });
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| CatalogError::Unavailable {
+            reason: "custom model catalog origin must include a host".to_owned(),
+        })?
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback());
+    if parsed.scheme() == "http" && !loopback {
+        return Err(CatalogError::Unavailable {
+            reason:
+                "custom remote model catalog origins must use HTTPS; HTTP is allowed only for loopback hosts"
+                    .to_owned(),
+        });
+    }
+    Ok(format!("{origin}/models"))
+}
+
+/// Discovers a provider's model list with an optional bearer credential.
 ///
 /// `etag` is the caller's cached validator; when the provider answers 304
 /// this returns [`CatalogError::NotModified`] and the cache stands.
 pub async fn discover_models(
     source: CatalogSource,
-    access_token: &str,
+    access_token: Option<&str>,
     etag: Option<&str>,
 ) -> Result<DiscoveredCatalog, CatalogError> {
     discover_models_with_resolver(source, access_token, etag, Arc::new(SystemFixedDnsResolver))
@@ -158,47 +208,62 @@ pub async fn discover_models(
 /// pins) can drive the exact production path.
 pub async fn discover_models_with_resolver(
     source: CatalogSource,
-    access_token: &str,
+    access_token: Option<&str>,
     etag: Option<&str>,
     resolver: Arc<dyn FixedDnsResolver>,
 ) -> Result<DiscoveredCatalog, CatalogError> {
-    let endpoint = source.endpoint();
-    let guard = Arc::new(
-        FixedOriginGuard::new(&endpoint, source.trusted_host(), resolver).map_err(|error| {
-            CatalogError::Unavailable {
-                reason: format!("model catalog origin is not usable: {}", error.message),
-            }
-        })?,
-    );
-    // The SSRF gate runs BEFORE the token can leave: resolve, validate the
-    // exact endpoint, pin the addresses.
-    guard
-        .validate_endpoint(&endpoint)
-        .await
-        .map_err(|error| CatalogError::Unavailable {
-            reason: format!("model catalog endpoint refused: {}", error.message),
-        })?;
-    let client = reqwest::Client::builder()
+    let (endpoint, guard) = match &source {
+        CatalogSource::OpenAiCompatible { origin } => {
+            (openai_compatible_catalog_endpoint(origin)?, None)
+        }
+        CatalogSource::OpenAiSubscription | CatalogSource::AnthropicSubscription => {
+            let endpoint = source.endpoint();
+            let Some(trusted_host) = source.trusted_host() else {
+                return Err(CatalogError::Unavailable {
+                    reason: "model catalog origin is not usable".to_owned(),
+                });
+            };
+            let guard = Arc::new(
+                FixedOriginGuard::new(&endpoint, trusted_host, resolver).map_err(|error| {
+                    CatalogError::Unavailable {
+                        reason: format!("model catalog origin is not usable: {}", error.message),
+                    }
+                })?,
+            );
+            // The SSRF gate runs BEFORE the token can leave: resolve, validate
+            // the exact endpoint, pin the addresses.
+            guard.validate_endpoint(&endpoint).await.map_err(|error| {
+                CatalogError::Unavailable {
+                    reason: format!("model catalog endpoint refused: {}", error.message),
+                }
+            })?;
+            (endpoint, Some(guard))
+        }
+    };
+    let mut client = reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(5))
-        .timeout(CATALOG_TIMEOUT)
-        .dns_resolver(Arc::clone(&guard))
-        .build()
-        .map_err(|_| CatalogError::Transport {
-            reason: "model catalog transport is unavailable".to_owned(),
-        })?;
+        .timeout(CATALOG_TIMEOUT);
+    if let Some(guard) = &guard {
+        client = client.dns_resolver(Arc::clone(guard));
+    }
+    let client = client.build().map_err(|_| CatalogError::Transport {
+        reason: "model catalog transport is unavailable".to_owned(),
+    })?;
 
-    let request_url = catalog_request_url(source, &endpoint);
+    let request_url = catalog_request_url(source.clone(), &endpoint);
     let mut request = client
         .get(&request_url)
-        .bearer_auth(access_token)
         .header(reqwest::header::CONNECTION, "close")
         .header(reqwest::header::ACCEPT, "application/json");
+    if let Some(access_token) = access_token {
+        request = request.bearer_auth(access_token);
+    }
     if let Some(etag) = etag {
         request = request.header(reqwest::header::IF_NONE_MATCH, etag);
     }
-    if source == CatalogSource::AnthropicSubscription {
+    if matches!(source, CatalogSource::AnthropicSubscription) {
         // The same beta surface the OAuth inference path already uses.
         request = request
             .header("anthropic-beta", crate::ANTHROPIC_OAUTH_BETA_VALUE)
@@ -276,8 +341,10 @@ pub fn parse_catalog(
     let entries = match source {
         // codex: `{ "models": [ … ] }`
         CatalogSource::OpenAiSubscription => value.get("models"),
-        // Anthropic: `{ "data": [ … ] }`
-        CatalogSource::AnthropicSubscription => value.get("data"),
+        // Anthropic and OpenAI-compatible: `{ "data": [ … ] }`
+        CatalogSource::AnthropicSubscription | CatalogSource::OpenAiCompatible { .. } => {
+            value.get("data")
+        }
     }
     .and_then(serde_json::Value::as_array)
     .ok_or_else(|| CatalogError::Unavailable {
@@ -286,6 +353,22 @@ pub fn parse_catalog(
 
     let mut models = Vec::new();
     for entry in entries {
+        if matches!(source, CatalogSource::OpenAiCompatible { .. }) {
+            let Some(slug) = entry.get("id").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            models.push(DiscoveredModel {
+                slug: slug.to_owned(),
+                display_name: slug.to_owned(),
+                context_window: None,
+                description: None,
+                default_effort: None,
+                supported_efforts: Vec::new(),
+                visible: true,
+                priority: None,
+            });
+            continue;
+        }
         // codex names it `slug`; Anthropic names it `id`.
         let Some(slug) = entry
             .get("slug")
@@ -320,7 +403,7 @@ pub fn parse_catalog(
                 .get("context_window")
                 .and_then(serde_json::Value::as_u64)
                 .filter(|window| *window > 0),
-            CatalogSource::AnthropicSubscription => None,
+            CatalogSource::AnthropicSubscription | CatalogSource::OpenAiCompatible { .. } => None,
         };
         models.push(DiscoveredModel {
             slug: slug.to_owned(),

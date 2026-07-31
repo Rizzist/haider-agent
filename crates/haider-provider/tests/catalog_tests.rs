@@ -7,7 +7,10 @@
 //! exists, only that whatever the provider names round-trips faithfully).
 #![allow(clippy::expect_used)]
 
-use haider_provider::{CatalogSource, DiscoveredModel, parse_catalog, pickable};
+use haider_provider::{
+    CatalogError, CatalogSource, DiscoveredModel, openai_compatible_catalog_endpoint,
+    parse_catalog, pickable,
+};
 
 fn codex_payload() -> serde_json::Value {
     serde_json::json!({
@@ -209,6 +212,118 @@ fn malformed_payloads_are_unavailable_not_substituted() {
     .expect("parses");
     assert_eq!(models.len(), 1);
     assert_eq!(models[0].slug, "real");
+}
+
+/// MUTATION CHECK (W5g-5b): reuse the vendor parser's metadata fields for an
+/// OpenAI-compatible catalog. Expected runtime failure: the injected display
+/// name, context window, effort ladder, visibility, or priority survives even
+/// though this discovery contract declares only `data[].id`.
+#[test]
+fn openai_compatible_ids_are_models_without_invented_metadata() {
+    let source = CatalogSource::OpenAiCompatible {
+        origin: "https://models.example.invalid/v1".to_owned(),
+    };
+    let models = parse_catalog(
+        source,
+        &serde_json::json!({
+            "object": "list",
+            "data": [{
+                "id": "custom-model-a",
+                "display_name": "Injected Label",
+                "context_window": 123_456,
+                "description": "Injected description",
+                "default_reasoning_level": "high",
+                "supported_reasoning_levels": ["high"],
+                "visibility": "hidden",
+                "priority": 1
+            }, {
+                "id": "custom-model-b"
+            }]
+        }),
+    )
+    .expect("OpenAI-compatible payload parses");
+    assert_eq!(
+        models,
+        vec![
+            DiscoveredModel {
+                slug: "custom-model-a".to_owned(),
+                display_name: "custom-model-a".to_owned(),
+                context_window: None,
+                description: None,
+                default_effort: None,
+                supported_efforts: Vec::new(),
+                visible: true,
+                priority: None,
+            },
+            DiscoveredModel {
+                slug: "custom-model-b".to_owned(),
+                display_name: "custom-model-b".to_owned(),
+                context_window: None,
+                description: None,
+                default_effort: None,
+                supported_efforts: Vec::new(),
+                visible: true,
+                priority: None,
+            },
+        ]
+    );
+}
+
+/// MUTATION CHECK (W5g-5b): substitute a built-in model when the custom
+/// response has no `data` array. Expected runtime failure: this malformed
+/// payload returns models instead of the runtime `Unavailable` error.
+#[test]
+fn malformed_openai_compatible_catalog_is_unavailable_not_substituted() {
+    let error = parse_catalog(
+        CatalogSource::OpenAiCompatible {
+            origin: "https://models.example.invalid/v1".to_owned(),
+        },
+        &serde_json::json!({"object": "list", "models": [{"id": "wrong-shape"}]}),
+    )
+    .expect_err("missing data array must be unavailable");
+    assert!(matches!(error, CatalogError::Unavailable { .. }));
+}
+
+/// MUTATION CHECK (W5g-5b): remove the loopback-only HTTP check before
+/// discovery. Expected runtime failure: the remote HTTP origin below becomes
+/// fetchable instead of failing validation before any network request.
+///
+/// MUTATION CHECK: allow URL userinfo or fragments. Expected runtime failure:
+/// either credential-bearing target below passes the discovery-time backstop.
+#[test]
+fn custom_catalog_origin_policy_rejects_remote_http_before_fetch() {
+    let error = openai_compatible_catalog_endpoint("http://203.0.113.7/v1")
+        .expect_err("remote HTTP must be refused before fetch");
+    assert!(matches!(error, CatalogError::Unavailable { .. }));
+    assert!(
+        openai_compatible_catalog_endpoint("https://user@example.invalid/v1").is_err(),
+        "userinfo must be refused before fetch"
+    );
+    assert!(
+        openai_compatible_catalog_endpoint("https://models.example.invalid/v1#fragment").is_err(),
+        "fragments must be refused before fetch"
+    );
+
+    assert_eq!(
+        openai_compatible_catalog_endpoint("https://models.example.invalid/v1")
+            .expect("remote HTTPS is allowed"),
+        "https://models.example.invalid/v1/models"
+    );
+    assert_eq!(
+        openai_compatible_catalog_endpoint("http://127.42.0.9:11434/v1/")
+            .expect("IPv4 loopback HTTP is allowed"),
+        "http://127.42.0.9:11434/v1/models"
+    );
+    assert_eq!(
+        openai_compatible_catalog_endpoint("http://[::1]:11434/v1")
+            .expect("IPv6 loopback HTTP is allowed"),
+        "http://[::1]:11434/v1/models"
+    );
+    assert_eq!(
+        openai_compatible_catalog_endpoint("http://localhost:11434/v1")
+            .expect("localhost HTTP is allowed"),
+        "http://localhost:11434/v1/models"
+    );
 }
 
 /// The endpoints are exactly the vendors' own — asserted so a refactor
