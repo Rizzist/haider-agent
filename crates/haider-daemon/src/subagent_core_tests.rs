@@ -596,9 +596,11 @@ async fn a_child_that_recovers_after_the_nudge_is_never_cancelled() {
         FakeStep::Finish {
             reason: FinishReason::ToolUse,
         },
-        // Silent past the 35ms deadline (the nudge fires mid-delay) but
-        // recovering INSIDE the post-nudge window — the whole point.
-        FakeStep::Delay { ms: 45 },
+        // Silent past the 35ms deadline AND across a 25ms poll tick (the
+        // supervision grid samples at 25/50/75…; a shorter silence falls
+        // between polls and the nudge never fires) — then recovering
+        // INSIDE the post-nudge window, which is the whole point.
+        FakeStep::Delay { ms: 65 },
     ];
     for index in 0..10 {
         script.push(FakeStep::EmitReasoning {
@@ -609,6 +611,15 @@ async fn a_child_that_recovers_after_the_nudge_is_never_cancelled() {
     script.extend([
         FakeStep::EmitText {
             text: "recovered child report".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+        // The nudge landed as a MID-RUN steer: the child's run continues
+        // with one more provider round to answer it before terminalizing
+        // (by design — a steered turn is the same logical run).
+        FakeStep::EmitText {
+            text: "status acknowledged — concluding".into(),
         },
         FakeStep::Finish {
             reason: FinishReason::EndTurn,
@@ -660,6 +671,18 @@ async fn a_child_that_recovers_after_the_nudge_is_never_cancelled() {
             .read(&child.child_session_id, 0, 1024)
             .await
             .expect("child events"),
+    );
+    assert_eq!(
+        child_payloads
+            .iter()
+            .filter(|payload| matches!(
+                payload,
+                EventPayload::UserMessage { text, .. }
+                    if text == "report your status or conclude"
+            ))
+            .count(),
+        1,
+        "the nudge DID fire — without it this pin proves nothing"
     );
     assert!(
         !child_payloads
