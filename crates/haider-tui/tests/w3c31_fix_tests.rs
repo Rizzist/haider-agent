@@ -934,21 +934,29 @@ fn live_mode_lists_and_reaches_the_cold_sessions_the_driver_tracks() {
             next_cursor: None,
         }),
     );
-    assert_eq!(model.sessions.len(), 5);
+    assert_eq!(model.sessions.len(), 5, "the DRIVER tracks all five");
 
+    // W5g-6 (owner ask): the launcher PAINTS at most LIVE_LAUNCHER_ROWS
+    // recents — /sessions lists the rest — but every painted row stays a
+    // hit target and digit-reachable.
     let targets: Vec<Hit> = launcher_hits(&model)
         .into_iter()
         .filter(|hit| matches!(hit, Hit::AttachSession(_)))
         .collect();
-    assert_eq!(targets.len(), 5, "every listed session is a hit target");
+    assert_eq!(
+        targets.len(),
+        haider_tui::app::LIVE_LAUNCHER_ROWS,
+        "every PAINTED row is a hit target"
+    );
 
-    // …and every one is digit-reachable. `upsert_live_session` inserts
-    // newest-first, so row 5 is the FIRST session listed.
-    model.handle(key(ratatui::crossterm::event::KeyCode::Char('5')));
+    // …and the last painted row answers to its digit.
+    // `upsert_live_session` inserts newest-first, so row 4 is the second
+    // session listed (index 1).
+    model.handle(key(ratatui::crossterm::event::KeyCode::Char('4')));
     assert_eq!(
         model.active_session.as_ref(),
-        Some(&sid(0)),
-        "the fifth row answers to its digit"
+        Some(&sid(1)),
+        "the last painted row answers to its digit"
     );
 }
 
