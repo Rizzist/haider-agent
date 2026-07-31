@@ -15,7 +15,7 @@ use haider_provider::{
     OPENAI_SUBSCRIPTION_RESPONSES_URL, pickable,
 };
 use haider_rpc::{
-    ProviderApiFamilyWire, ProviderAuthRequirementWire, ProviderAvailabilityWire,
+    ModelDetailWire, ProviderApiFamilyWire, ProviderAuthRequirementWire, ProviderAvailabilityWire,
     ProviderSummaryWire,
 };
 use serde::{Deserialize, Serialize};
@@ -436,19 +436,34 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
     }
 
     fn discovered_slugs(&self, provider: &str) -> Vec<String> {
+        self.discovered_details(provider)
+            .into_iter()
+            .map(|(slug, _context_window)| slug)
+            .collect()
+    }
+
+    fn discovered_details(&self, provider: &str) -> Vec<(String, Option<u64>)> {
         self.model_source
             .models(provider)
             .map(|models| {
                 pickable(&models)
                     .into_iter()
-                    .map(|model| model.slug)
+                    .map(|model| (model.slug, model.context_window))
                     .collect()
             })
             .unwrap_or_default()
     }
 
     fn summary_profile(&self, profile: &ProviderProfileV1) -> ProviderSummaryWire {
-        provider_summary(profile, self.discovered_slugs(&profile.provider_id))
+        let model_details = self
+            .discovered_details(&profile.provider_id)
+            .into_iter()
+            .map(|(name, context_window)| ModelDetailWire {
+                name,
+                context_window,
+            })
+            .collect();
+        provider_summary(profile, model_details)
     }
 }
 
@@ -475,8 +490,12 @@ pub(crate) fn initial_provider_profiles(
 
 fn provider_summary(
     profile: &ProviderProfileV1,
-    discovered_models: Vec<String>,
+    model_details: Vec<ModelDetailWire>,
 ) -> ProviderSummaryWire {
+    let discovered_models = model_details
+        .iter()
+        .map(|detail| detail.name.clone())
+        .collect::<Vec<_>>();
     let auth_methods = match profile.auth_requirement {
         ProviderAuthRequirementWire::ApiKey => vec![AuthMethod::ApiKey],
         ProviderAuthRequirementWire::OAuth => vec![AuthMethod::OAuth],
@@ -496,6 +515,7 @@ fn provider_summary(
         api_family: profile.api_family,
         endpoint: profile.base_url.clone(),
         models: discovered_models,
+        model_details,
         auth_methods,
         availability: if available {
             ProviderAvailabilityWire::Available

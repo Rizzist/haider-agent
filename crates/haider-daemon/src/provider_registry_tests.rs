@@ -26,9 +26,19 @@ impl ProviderRegistryStoreLike for MemoryProviderStore {
 }
 
 fn discovered(slug: &str, visible: bool, priority: Option<i64>) -> DiscoveredModel {
+    discovered_with_context(slug, visible, priority, None)
+}
+
+fn discovered_with_context(
+    slug: &str,
+    visible: bool,
+    priority: Option<i64>,
+    context_window: Option<u64>,
+) -> DiscoveredModel {
     DiscoveredModel {
         slug: slug.to_owned(),
         display_name: format!("Fixture {slug}"),
+        context_window,
         description: Some("provider-owned fixture".to_owned()),
         default_effort: None,
         supported_efforts: Vec::new(),
@@ -205,6 +215,73 @@ fn summaries_report_pickable_discovered_models_not_profile_literals() {
     assert_eq!(summary.models, vec!["frontier-a", "frontier-b"]);
     assert_eq!(summary.default_model.as_deref(), Some("frontier-a"));
     assert_eq!(summary.availability, ProviderAvailabilityWire::Available);
+}
+
+/// MUTATION CHECK: build `model_details` from raw or independently ordered
+/// discovered models instead of the pickable inventory used for `models`.
+/// Expected runtime failure: the hidden row appears or the exact ordered
+/// name/window alignment below differs.
+#[test]
+fn summaries_align_model_details_with_pickable_models_and_windows() {
+    let store = MemoryProviderStore::default();
+    store
+        .save(&[ProviderProfileV1 {
+            provider_id: "custom".to_owned(),
+            display_name: "Custom".to_owned(),
+            api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
+            base_url: Some("https://models.example.com".to_owned()),
+            enabled: true,
+            auth_requirement: ProviderAuthRequirementWire::ApiKey,
+            configured_models: Vec::new(),
+            default_model: Some("frontier-a".to_owned()),
+            provenance: ProviderProvenance::Custom,
+        }])
+        .expect("seed store");
+    let source = model_source([(
+        "custom",
+        vec![
+            discovered_with_context("frontier-b", true, Some(20), Some(200_000)),
+            discovered_with_context("hidden-provider-entry", false, Some(0), Some(999_000)),
+            discovered_with_context("frontier-a", true, Some(10), Some(100_000)),
+        ],
+    )]);
+    let registry = ProviderRegistry::new(store, Vec::new(), source).expect("registry");
+
+    let summary = registry.summaries().into_iter().next().expect("summary");
+    assert_eq!(summary.models, vec!["frontier-a", "frontier-b"]);
+    assert_eq!(
+        summary.model_details,
+        vec![
+            ModelDetailWire {
+                name: "frontier-a".to_owned(),
+                context_window: Some(100_000),
+            },
+            ModelDetailWire {
+                name: "frontier-b".to_owned(),
+                context_window: Some(200_000),
+            },
+        ]
+    );
+    assert_eq!(
+        summary.models,
+        summary
+            .model_details
+            .iter()
+            .map(|detail| detail.name.clone())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !summary
+            .models
+            .iter()
+            .any(|model| model == "hidden-provider-entry")
+    );
+    assert!(
+        !summary
+            .model_details
+            .iter()
+            .any(|detail| detail.name == "hidden-provider-entry")
+    );
 }
 
 /// An installed adapter without cache provenance is not a model inventory.

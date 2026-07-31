@@ -377,6 +377,13 @@ pub fn seed_provider_summaries() -> Vec<haider_rpc::ProviderSummaryWire> {
         api_family,
         endpoint: endpoint.map(str::to_owned),
         models: models.iter().map(|&model| model.to_owned()).collect(),
+        model_details: models
+            .iter()
+            .map(|&model| haider_rpc::ModelDetailWire {
+                name: model.to_owned(),
+                context_window: None,
+            })
+            .collect(),
         auth_methods: auth.to_vec(),
         availability,
         availability_reason: reason.map(str::to_owned),

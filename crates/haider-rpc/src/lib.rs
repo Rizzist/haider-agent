@@ -39,12 +39,13 @@ pub use frame::{
     FEATURE_ACCOUNT_MANAGEMENT_V1, FEATURE_ACCOUNT_OAUTH_IMPORT_V1, FEATURE_ACCOUNT_OAUTH_PKCE_V1,
     FEATURE_ACCOUNT_ROTATION_V1, FEATURE_PROVIDER_CONFIGURE_V1, FEATURE_PROVIDER_MANAGEMENT_V1,
     FEATURE_PROVIDER_MODELS_V1, FEATURE_SESSION_MUTATION_V1, FEATURE_TURN_CONTROL_V1,
-    FEATURE_VAULT_STAGE_V1, Hello, LifecyclePhase, MenuInput, OAuthAuthorizationWire,
-    OAuthAvailabilityWire, OAuthFlowId, OAuthFlowStatusWire, OAuthReadyRefWire, ProtocolError,
-    ProviderActiveWire, ProviderApiFamilyWire, ProviderAuthRequirementWire,
-    ProviderAvailabilityWire, ProviderDefaultWire, ProviderSummaryWire, RequestBody, RequestId,
-    ResponseBody, SecretWire, SeqRange, SessionReadResult, SessionSummary, StagePurpose,
-    SubmitDisposition, WIRE_PROTOCOL_VERSION, Welcome, WireFrame,
+    FEATURE_VAULT_STAGE_V1, Hello, LifecyclePhase, MenuInput, ModelDetailWire,
+    OAuthAuthorizationWire, OAuthAvailabilityWire, OAuthFlowId, OAuthFlowStatusWire,
+    OAuthReadyRefWire, ProtocolError, ProviderActiveWire, ProviderApiFamilyWire,
+    ProviderAuthRequirementWire, ProviderAvailabilityWire, ProviderDefaultWire,
+    ProviderSummaryWire, RequestBody, RequestId, ResponseBody, SecretWire, SeqRange,
+    SessionReadResult, SessionSummary, StagePurpose, SubmitDisposition, WIRE_PROTOCOL_VERSION,
+    Welcome, WireFrame,
 };
 pub use negotiation::{Negotiated, ServerRange, negotiate};
 

@@ -42,6 +42,13 @@ fn provider_summary(
         api_family: haider_rpc::ProviderApiFamilyWire::OpenAiResponses,
         endpoint: None,
         models: models.iter().map(|slug| (*slug).to_owned()).collect(),
+        model_details: models
+            .iter()
+            .map(|slug| haider_rpc::ModelDetailWire {
+                name: (*slug).to_owned(),
+                context_window: None,
+            })
+            .collect(),
         auth_methods: vec![AuthMethod::OAuth],
         availability: haider_rpc::ProviderAvailabilityWire::Available,
         availability_reason: None,

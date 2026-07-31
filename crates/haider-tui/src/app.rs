@@ -427,6 +427,23 @@ impl ProvidersState {
         self.revision = Some(revision);
         true
     }
+
+    /// The provider-DECLARED context window for `model`, when discovery
+    /// carried one (W5g-1). `None` means the provider declared nothing —
+    /// the caller keeps its current figure rather than inventing a number.
+    #[must_use]
+    pub fn declared_window(&self, provider: &str, model: &str) -> Option<u64> {
+        self.providers
+            .iter()
+            .find(|summary| summary.provider == provider)
+            .and_then(|summary| {
+                summary
+                    .model_details
+                    .iter()
+                    .find(|detail| detail.name == model)
+            })
+            .and_then(|detail| detail.context_window)
+    }
 }
 
 /// A chip's pending question (the amber `?` / recovery `⌁`).
@@ -3350,8 +3367,26 @@ impl AppModel {
         {
             self.identity.model_short = model;
         }
+        self.refresh_context_window();
         self.identity_pinned |= pin;
         self.dirty = true;
+    }
+
+    /// Re-derives the identity's context window from the discovered catalog
+    /// (W5g-1: real limits, never guessed). A provider-declared window
+    /// always wins; with none declared the current figure stands — seed
+    /// defaults remain honest fallbacks, not fabrications. Idempotent, so
+    /// catalog arrivals may call it even for a PINNED identity: the pin
+    /// protects the user's provider/model choice, not a stale number.
+    pub fn refresh_context_window(&mut self) {
+        if let Some(window) = self
+            .providers
+            .declared_window(&self.identity.provider, &self.identity.model_short)
+            && self.identity.context_window != window
+        {
+            self.identity.context_window = window;
+            self.dirty = true;
+        }
     }
 
     /// Daemon-truth identity bootstrap (W5f-2): until the user pins a
@@ -4137,6 +4172,7 @@ impl AppModel {
                 {
                     // The model is DISCOVERED, so selecting it is honest.
                     self.identity.model_short = slug.clone();
+                    self.refresh_context_window();
                     self.identity_pinned = true;
                     self.flash = Some(format!("· model → {slug}"));
                 } else {
@@ -4163,6 +4199,7 @@ impl AppModel {
                     .find(|(name, _)| name.eq_ignore_ascii_case(&requested))
                 {
                     self.identity.provider = name.clone();
+                    self.refresh_context_window();
                     self.identity_pinned = true;
                     self.flash = Some(format!("· provider → {name} · {health}"));
                 } else {

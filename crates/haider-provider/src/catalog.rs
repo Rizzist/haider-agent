@@ -48,6 +48,9 @@ pub struct DiscoveredModel {
     pub slug: String,
     /// Human label the provider supplies; falls back to the slug.
     pub display_name: String,
+    /// The provider's declared context window in tokens; `None` when the
+    /// provider does not declare one — never a guess.
+    pub context_window: Option<u64>,
     pub description: Option<String>,
     /// The provider's default reasoning effort, when it declares one.
     pub default_effort: Option<String>,
@@ -312,9 +315,17 @@ pub fn parse_catalog(
                     .collect()
             })
             .unwrap_or_default();
+        let context_window = match source {
+            CatalogSource::OpenAiSubscription => entry
+                .get("context_window")
+                .and_then(serde_json::Value::as_u64)
+                .filter(|window| *window > 0),
+            CatalogSource::AnthropicSubscription => None,
+        };
         models.push(DiscoveredModel {
             slug: slug.to_owned(),
             display_name,
+            context_window,
             description: entry
                 .get("description")
                 .and_then(serde_json::Value::as_str)

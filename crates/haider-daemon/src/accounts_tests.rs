@@ -69,6 +69,7 @@ fn test_provider_registry() -> ProviderRegistry<Box<dyn ProviderRegistryStoreLik
                 .map(|slug| haider_provider::DiscoveredModel {
                     slug: slug.to_owned(),
                     display_name: format!("Fixture {slug}"),
+                    context_window: None,
                     description: Some("provider-owned test fixture".to_owned()),
                     default_effort: None,
                     supported_efforts: Vec::new(),
@@ -3671,6 +3672,7 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
                 models: vec![haider_provider::DiscoveredModel {
                     slug: "frontier-refresh".to_owned(),
                     display_name: "Provider Refresh Fixture".to_owned(),
+                    context_window: None,
                     description: Some("provider-owned refresh provenance".to_owned()),
                     default_effort: Some("medium".to_owned()),
                     supported_efforts: vec!["low".to_owned(), "medium".to_owned()],

@@ -509,6 +509,14 @@ pub enum ProviderAvailabilityWire {
     Unknown,
 }
 
+/// Provider-declared metadata for one pickable model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelDetailWire {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+}
+
 /// One provider's read-only management projection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderSummaryWire {
@@ -518,6 +526,8 @@ pub struct ProviderSummaryWire {
     pub endpoint: Option<String>,
     #[serde(default)]
     pub models: Vec<String>,
+    #[serde(default)]
+    pub model_details: Vec<ModelDetailWire>,
     #[serde(default)]
     pub auth_methods: Vec<haider_protocol::credential::AuthMethod>,
     pub availability: ProviderAvailabilityWire,

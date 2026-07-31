@@ -21,6 +21,7 @@ fn provider_summary(provider: &str) -> haider_rpc::ProviderSummaryWire {
         api_family: haider_rpc::ProviderApiFamilyWire::Unknown,
         endpoint: None,
         models: Vec::new(),
+        model_details: Vec::new(),
         auth_methods: Vec::new(),
         availability: haider_rpc::ProviderAvailabilityWire::Unknown,
         availability_reason: None,

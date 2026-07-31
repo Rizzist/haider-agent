@@ -83,6 +83,72 @@ fn codex_shape_parses_with_its_effort_ladder() {
     assert!(first.description.is_some());
 }
 
+/// MUTATION CHECK: hardcode `context_window` to `None` in the codex parse
+/// arm. Expected runtime failure: the provider's declared token limit is
+/// missing below.
+#[test]
+fn codex_declared_context_window_is_preserved() {
+    let models = parse_catalog(
+        CatalogSource::OpenAiSubscription,
+        &serde_json::json!({
+            "models": [
+                {"slug": "declared", "context_window": 200_000},
+                {"slug": "largest-positive", "context_window": u64::MAX}
+            ]
+        }),
+    )
+    .expect("codex payload parses");
+    assert_eq!(models[0].context_window, Some(200_000));
+    assert_eq!(models[1].context_window, Some(u64::MAX));
+}
+
+/// MUTATION CHECK: substitute a numeric default when `context_window` is
+/// absent. Expected runtime failure: the missing provider declaration becomes
+/// a guessed value instead of `None`.
+#[test]
+fn absent_codex_context_window_stays_none() {
+    let models = parse_catalog(
+        CatalogSource::OpenAiSubscription,
+        &serde_json::json!({"models": [{"slug": "undeclared"}]}),
+    )
+    .expect("codex payload parses");
+    assert_eq!(models[0].context_window, None);
+}
+
+/// MUTATION CHECK: remove the positive-value filter from the codex parse arm.
+/// Expected runtime failure: the zero declaration survives instead of being
+/// treated as absent.
+#[test]
+fn zero_codex_context_window_is_absent() {
+    let models = parse_catalog(
+        CatalogSource::OpenAiSubscription,
+        &serde_json::json!({
+            "models": [
+                {"slug": "zero", "context_window": 0},
+                {"slug": "negative", "context_window": -1}
+            ]
+        }),
+    )
+    .expect("codex payload parses");
+    assert_eq!(models[0].context_window, None);
+    assert_eq!(models[1].context_window, None);
+}
+
+/// MUTATION CHECK: read `context_window` through a provider-agnostic parse
+/// path. Expected runtime failure: the injected Anthropic value appears even
+/// though Anthropic's catalog contract never declares context windows.
+#[test]
+fn anthropic_context_window_is_always_none() {
+    let models = parse_catalog(
+        CatalogSource::AnthropicSubscription,
+        &serde_json::json!({
+            "data": [{"id": "model-opus", "context_window": 200_000}]
+        }),
+    )
+    .expect("anthropic payload parses");
+    assert_eq!(models[0].context_window, None);
+}
+
 /// MUTATION CHECK: make `visible` unconditionally `true` (drop the
 /// `visibility == "list"` test). Expected runtime failure: the hidden model
 /// appears in `pickable` below.
@@ -174,6 +240,7 @@ fn display_name_falls_back_to_the_slug() {
         vec![DiscoveredModel {
             slug: "bare-slug".into(),
             display_name: "bare-slug".into(),
+            context_window: None,
             description: None,
             default_effort: None,
             supported_efforts: Vec::new(),

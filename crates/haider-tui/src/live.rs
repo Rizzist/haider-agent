@@ -1119,6 +1119,9 @@ impl LiveDriver {
                     // The provider snapshot may complete the bootstrap the
                     // account snapshot started (either order works).
                     model.bootstrap_identity_from_daemon();
+                    // A PINNED identity skips the bootstrap but still wants
+                    // its real declared window (W5g-1).
+                    model.refresh_context_window();
                     model.dirty = true;
                 }
                 // Providers may have arrived before accounts — re-check
@@ -1130,6 +1133,9 @@ impl LiveDriver {
                     // The catalog is here: NOW the bootstrap can adopt the
                     // provider's real default model (W5f-2d).
                     model.bootstrap_identity_from_daemon();
+                    // A PINNED identity skips the bootstrap but still wants
+                    // its real declared window (W5g-1).
+                    model.refresh_context_window();
                     model.dirty = true;
                 }
                 Vec::new()
