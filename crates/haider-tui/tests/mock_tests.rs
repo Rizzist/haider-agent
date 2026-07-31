@@ -53,6 +53,7 @@ fn demo_script_produces_the_expected_transcript() {
         .map(|entry| match entry {
             TranscriptEntry::User { .. } => "user",
             TranscriptEntry::Note { .. } => "note",
+            TranscriptEntry::Error { .. } => "error",
             TranscriptEntry::Shell { .. } => "shell",
             TranscriptEntry::Item(block) => match block.item {
                 TurnItem::AgentMessage { .. } => "agent",
@@ -70,6 +71,7 @@ fn demo_script_produces_the_expected_transcript() {
         TranscriptEntry::Item(block) => !block.streaming,
         TranscriptEntry::User { .. }
         | TranscriptEntry::Note { .. }
+        | TranscriptEntry::Error { .. }
         | TranscriptEntry::Shell { .. } => true,
     }));
     let todos = projection.todos().expect("plan ran");

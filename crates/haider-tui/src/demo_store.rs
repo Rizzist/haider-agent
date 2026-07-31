@@ -566,6 +566,11 @@ fn entry_to_dto(entry: &TranscriptEntry) -> EntryDto {
             spoken: block.spoken,
         },
         TranscriptEntry::Note { text } => EntryDto::Note { text: text.clone() },
+        // Demo persistence has no error rows (errors are live-envelope
+        // facts); a note keeps the text without a DTO schema change.
+        TranscriptEntry::Error { text } => EntryDto::Note {
+            text: format!("✗ {text}"),
+        },
         TranscriptEntry::Shell { cmd, out } => EntryDto::Shell {
             cmd: cmd.clone(),
             out: out.clone(),

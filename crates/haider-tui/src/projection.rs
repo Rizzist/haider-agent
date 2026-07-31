@@ -47,6 +47,10 @@ pub enum TranscriptEntry {
     /// A display-only UI note (sim `NoteRow`): auto-title, interrupt, and
     /// mid-turn echoes. The ONLY non-envelope entry source besides Shell.
     Note { text: String },
+    /// A failed run's PUBLIC reason (`EventPayload::RunFailed`, W5g-6).
+    /// The owner hit three silent ✗ ERRORED badges before this row
+    /// existed — the reason was always in the envelope, never on screen.
+    Error { text: String },
     /// A shell builtin run against the demo VFS (sim ShellRow,
     /// tui.js:3910-3918) — deliberately envelope-free: the sim bypasses
     /// the model/harness ("local, instant, no model turn").
@@ -366,10 +370,20 @@ impl SessionProjection {
             }),
             EventPayload::Item(event) => self.apply_item(event),
             EventPayload::Usage(usage) => self.usage = Some(usage.clone()),
+            // The failed run's PUBLIC reason joins the transcript (W5g-6):
+            // the envelope always carried it; only the badge ever showed.
+            EventPayload::RunFailed { code, message, .. } => {
+                let code = serde_json::to_value(code)
+                    .ok()
+                    .and_then(|value| value.as_str().map(str::to_owned))
+                    .unwrap_or_else(|| format!("{code:?}"));
+                self.entries.push(TranscriptEntry::Error {
+                    text: format!("{code} — {message}"),
+                });
+            }
             // Consumed by later waves (effects timeline, subagent tree, gate
             // panel, accounts). The projection stays tolerant of them now.
-            EventPayload::RunFailed { .. }
-            | EventPayload::Effect(_)
+            EventPayload::Effect(_)
             | EventPayload::ToolResult { .. }
             | EventPayload::NodeCommitted(_)
             | EventPayload::AgentSpawned(_)

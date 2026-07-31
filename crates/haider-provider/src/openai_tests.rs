@@ -835,3 +835,44 @@ fn api_key_payload_keeps_max_output_tokens_and_no_lite_fields() {
         "no all_turns context on the API-key path"
     );
 }
+
+/// MUTATION CHECK (W5g-6): encode assistant history as `input_text` (the
+/// pre-fix shape). Expected runtime failure: the assistant-content
+/// assertion below — and against the LIVE endpoint it is a hard 400
+/// ("Invalid value: 'input_text'. Supported values are: 'output_text' and
+/// 'refusal'", confirmed 2026-07-31), which ERRORED every turn after a
+/// session's first assistant reply.
+#[test]
+fn assistant_history_replays_as_output_text() {
+    let request = TurnRequest {
+        messages: vec![
+            crate::Message::user_text("hi"),
+            crate::Message::assistant(vec![crate::Block::Text {
+                text: "Hi! How can I help?".to_owned(),
+            }]),
+            crate::Message::user_text("say PONG"),
+        ],
+        model: "gpt-5.6-sol".to_owned(),
+        max_tokens: 30_000,
+        system_prompt: None,
+        tools: Vec::new(),
+        attachments: Vec::new(),
+    };
+    for lite in [true, false] {
+        let payload = responses_request_json(&request, lite).expect("payload");
+        let input = payload["input"].as_array().expect("input array");
+        let content_type = |index: usize| {
+            input[index]["content"][0]["type"]
+                .as_str()
+                .expect("content type")
+                .to_owned()
+        };
+        assert_eq!(content_type(0), "input_text", "user stays input_text");
+        assert_eq!(
+            content_type(1),
+            "output_text",
+            "assistant history is OUTPUT text (lite={lite}): {payload}"
+        );
+        assert_eq!(content_type(2), "input_text");
+    }
+}

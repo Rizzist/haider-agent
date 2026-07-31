@@ -2903,6 +2903,13 @@ fn render_aura(
                     Span::styled(text.as_str(), theme.dim_style()),
                 ]));
             }
+            TranscriptEntry::Error { text } => {
+                lines.push(Line::from(vec![
+                    Span::raw(" "),
+                    Span::styled("✗ ", theme.err_style()),
+                    Span::styled(text.as_str(), theme.err_style()),
+                ]));
+            }
             TranscriptEntry::Item(block) => {
                 if let TurnItem::AgentMessage { text } = &block.item {
                     lines.push(Line::default());
@@ -3866,6 +3873,15 @@ fn transcript_lines<'a>(
             lines.push(Line::from(vec![
                 Span::raw("   "),
                 Span::styled(text.as_str(), theme.dim_style()),
+            ]));
+        }
+        TranscriptEntry::Error { text } => {
+            // The failed run's public reason (W5g-6) — err ink, ✗ sigil.
+            lines.push(Line::default());
+            lines.push(Line::from(vec![
+                Span::raw(" "),
+                Span::styled("✗ ", theme.err_style()),
+                Span::styled(text.as_str(), theme.err_style()),
             ]));
         }
         TranscriptEntry::Shell { cmd, out } => {

@@ -47,6 +47,11 @@ pub fn render_plain(projection: &SessionProjection, window: u64) -> String {
                 out.push_str(text);
                 out.push('\n');
             }
+            TranscriptEntry::Error { text } => {
+                out.push_str("✗ ");
+                out.push_str(text);
+                out.push('\n');
+            }
             TranscriptEntry::Shell {
                 cmd,
                 out: shell_out,

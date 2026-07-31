@@ -696,6 +696,7 @@ impl ChipModel {
             },
             crate::projection::TranscriptEntry::User { text, .. } => text.clone(),
             crate::projection::TranscriptEntry::Note { text } => text.clone(),
+            crate::projection::TranscriptEntry::Error { text } => format!("✗ {text}"),
             crate::projection::TranscriptEntry::Shell { cmd, .. } => format!("$ {cmd}"),
         });
         match last {
@@ -5660,6 +5661,12 @@ impl AppModel {
     pub fn handle_resize(&mut self) {
         self.geometry_epoch
             .set(self.geometry_epoch.get().wrapping_add(1));
+        // A resize moves every target under a STATIONARY pointer: the old
+        // hovered Hit would repaint its highlight at the target's NEW row
+        // while the mouse sits somewhere else, and nothing corrects it
+        // until the mouse moves (owner report, W5g-6). Hover re-arms on
+        // the next real motion.
+        self.hovered = None;
         self.dirty = true;
     }
 
@@ -5727,9 +5734,11 @@ impl AppModel {
 /// generation allocator advances by exactly this on every reseed.
 pub const SEED_SESSION_COUNT: u64 = 3;
 
-/// How many launcher rows LIVE mode shows: the whole `1`-`9` digit span,
-/// so every row the launcher paints is also reachable from the keyboard.
-pub const LIVE_LAUNCHER_ROWS: usize = 9;
+/// How many launcher rows LIVE mode shows. Owner ask (2026-07-31): the
+/// nine-row digit span buried the launcher under old sessions — FOUR
+/// recents keep it scannable, `/sessions` lists the rest. Digits `1`-`4`
+/// still reach every painted row.
+pub const LIVE_LAUNCHER_ROWS: usize = 4;
 
 pub const VOICE_CARD_PREFIX: &str = "voice-card-";
 pub const TOOLS_CARD_PREFIX: &str = "tools-card-";

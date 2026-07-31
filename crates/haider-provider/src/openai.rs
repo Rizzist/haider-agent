@@ -1543,7 +1543,18 @@ fn responses_request_json(
         for block in &message.blocks {
             match block {
                 Block::Text { text } if message.role != MessageRole::Tool => {
-                    content.push(serde_json::json!({"type": "input_text", "text": text}));
+                    // The Responses API types message content BY ROLE:
+                    // assistant history must be `output_text` — replaying
+                    // it as `input_text` is a 400 ("Supported values are:
+                    // 'output_text' and 'refusal'", confirmed live
+                    // 2026-07-31), which poisoned EVERY session after its
+                    // first assistant reply (W5g-6).
+                    let content_type = if message.role == MessageRole::Assistant {
+                        "output_text"
+                    } else {
+                        "input_text"
+                    };
+                    content.push(serde_json::json!({"type": content_type, "text": text}));
                 }
                 Block::Text { .. } => {
                     return Err(invalid_request(
