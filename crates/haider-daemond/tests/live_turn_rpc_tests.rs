@@ -2052,7 +2052,22 @@ async fn worker_aware_drain_terminalizes_durable_queued_turns_before_store_close
     task.shutdown_handle().request("test drain");
     task.join().await.expect("daemon joins");
 
-    let store = Store::open(&config.store_dir).expect("inspect drained store");
+    // `task.join()` can return before the store's profile lock is fully
+    // released under gate load (StoreLocked is self-declared RETRYABLE) —
+    // bounded retry instead of a race flake (gate27 hygiene).
+    let store = {
+        let mut attempt = 0;
+        loop {
+            match Store::open(&config.store_dir) {
+                Ok(store) => break store,
+                Err(error) if error.retryable && attempt < 40 => {
+                    attempt += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                Err(error) => panic!("inspect drained store: {error:?}"),
+            }
+        }
+    };
     let envelopes = store.journal_replay(&session_id).expect("drained replay");
     assert!(
         payloads_for_run(&envelopes, &queued_run)
