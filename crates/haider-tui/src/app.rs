@@ -601,7 +601,9 @@ impl ChipModel {
             callsign: callsign.clone(),
             hon: roster.map_or("", |(_, hon, _)| *hon),
             full: roster.map_or(callsign, |(_, _, full)| (*full).to_owned()),
-            name: String::new(),
+            // The W6a manifest carries the delegated task as a persisted
+            // display label (research W6b checklist item 4).
+            name: manifest.task.clone(),
             model: manifest.model_profile.clone(),
             device,
             state: ChipDisplayState::Idle,
@@ -2194,10 +2196,14 @@ impl AppModel {
     #[must_use]
     pub fn status_badge(&self) -> (String, crate::projection::BadgeTone) {
         let badge = self.projection.badge();
-        if badge == "IDLE" {
-            let live = tree_live_count(&self.chips);
-            if live > 0 {
-                let plural = if live > 1 { "s" } else { "" };
+        let live = tree_live_count(&self.chips);
+        if live > 0 {
+            let plural = if live > 1 { "s" } else { "" };
+            // The durable W6a wait ("◔ WAITING · subagent") and the
+            // display-derived idle overlay both COUNT now — the daemon's
+            // authoritative state stays the badge's spine, the tree adds
+            // the number (research W6b checklist item 5).
+            if badge == "IDLE" || badge == "◔ WAITING · subagent" {
                 return (
                     format!("◔ WAITING · {live} subagent{plural}"),
                     crate::projection::BadgeTone::Restful,
