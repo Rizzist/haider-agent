@@ -12,6 +12,7 @@ mod ledger;
 mod process;
 mod request_input;
 mod shell;
+mod spawn_subagent;
 
 pub use broker::{
     AlwaysAllowRule, EffectBroker, EffectBrokerCloseError, EffectBrokerCloseReport,
@@ -33,6 +34,7 @@ pub use shell::{
     BuiltinResult, ComposerSubmission, EnvViewEntry, REDACTED_ENV_VALUE, ShellSession,
     UserProcessExec,
 };
+pub use spawn_subagent::{SpawnSubagent, spawn_subagent_manifest};
 
 /// Crate marker used by the workspace self-test.
 pub const CRATE_NAME: &str = "haider-tools";

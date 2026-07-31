@@ -6,14 +6,16 @@
 
 use crate::{CommittedRange, StoreHandle};
 use async_trait::async_trait;
+use haider_protocol::agent::ChildReport;
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::error::{ErrorCode, HaiderError};
-use haider_protocol::ids::{ArtifactRef, SessionId};
+use haider_protocol::ids::{AgentId, ArtifactRef, RunId, SessionId};
 use haider_protocol::session::SessionMetadataV1;
 use haider_store::{
-    AcceptedTurn, CancelledTurn, Cas, EventStore, MenuResolutionCommand, MenuResolutionOutcome,
-    ProfileLease, SessionCreateCommand, SessionCreateOutcome, Store, TurnAcceptCommand,
-    TurnAcceptOutcome, TurnCancelCommand, TurnCancelOutcome,
+    AcceptedTurn, CancelledTurn, Cas, DelegationCreateOutcome, DelegationRecord, EventStore,
+    MenuResolutionCommand, MenuResolutionOutcome, ProfileLease, SessionCreateCommand,
+    SessionCreateOutcome, Store, TurnAcceptCommand, TurnAcceptOutcome, TurnCancelCommand,
+    TurnCancelOutcome,
 };
 use haider_tools::{CasSink, ToolResult};
 use std::path::Path;
@@ -132,6 +134,74 @@ impl SqliteStoreHandle {
     ) -> Result<SessionCreateOutcome, HaiderError> {
         let owner = Arc::clone(&self.owner);
         run_blocking(move || owner.with_store(|store| store.create_session(&command))).await
+    }
+
+    pub async fn create_delegation(
+        &self,
+        record: DelegationRecord,
+    ) -> Result<DelegationCreateOutcome, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.create_delegation(&record))).await
+    }
+
+    pub async fn delegation(
+        &self,
+        agent: AgentId,
+    ) -> Result<Option<DelegationRecord>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.delegation(&agent))).await
+    }
+
+    pub async fn delegation_for_child_session(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<DelegationRecord>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| store.delegation_for_child_session(&session_id))
+        })
+        .await
+    }
+
+    pub async fn delegations_for_parent_run(
+        &self,
+        session_id: SessionId,
+        run_id: RunId,
+    ) -> Result<Vec<DelegationRecord>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| store.delegations_for_parent_run(&session_id, &run_id))
+        })
+        .await
+    }
+
+    pub async fn mark_delegation_running(
+        &self,
+        agent: AgentId,
+    ) -> Result<DelegationRecord, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.mark_delegation_running(&agent))).await
+    }
+
+    pub async fn record_delegation_report(
+        &self,
+        agent: AgentId,
+        report: ChildReport,
+    ) -> Result<DelegationRecord, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| store.record_delegation_report(&agent, &report))
+        })
+        .await
+    }
+
+    pub async fn mark_delegation_collected(
+        &self,
+        agent: AgentId,
+    ) -> Result<DelegationRecord, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.mark_delegation_collected(&agent)))
+            .await
     }
 
     /// Blocking-pool adapter for `Store::turn_accept_receipt` (R2 replay

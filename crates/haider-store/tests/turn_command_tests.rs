@@ -45,6 +45,7 @@ fn submit(
         session_id: session_id.clone(),
         worker_generation: store.worker_generation(),
         run_id: RunId::new(run_id),
+        agent_id: None,
         text: "hello".into(),
         attachments: Vec::new(),
         mode: DeliveryMode::Queue,

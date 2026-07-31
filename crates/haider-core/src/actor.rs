@@ -34,6 +34,7 @@ use crate::{StoreHandle, unix_time_ms};
 use async_trait::async_trait;
 use haider_protocol::DeliveryMode;
 use haider_protocol::EventPayload;
+use haider_protocol::agent::{AgentManifest, ChildReport, ChipState, ReportVerification};
 use haider_protocol::credential::RotationEvent;
 use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
@@ -217,12 +218,56 @@ pub struct SubmitCheckpointTurn {
     pub checkpoint: RequestInputCheckpoint,
 }
 
+/// Durable coordinates for one deferred spawn tool reconstructed after a
+/// daemon restart.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeferredToolCheckpoint {
+    pub ticket: DeferredTicket,
+    pub tool_item_id: ItemId,
+    pub call_id: String,
+    pub tool_name: String,
+    pub args: String,
+    pub report_emitted: bool,
+    pub child_result_emitted: bool,
+    pub tool_result_emitted: bool,
+    pub item_completed: bool,
+}
+
+/// Durable local-child wait resumed in the same logical turn.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChildWaitCheckpoint {
+    pub tools: Vec<DeferredToolCheckpoint>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubmitChildWaitTurn {
+    pub run_id: RunId,
+    pub messages: Vec<Message>,
+    pub checkpoint: ChildWaitCheckpoint,
+}
+
+/// Opaque dispatcher correlation for a durably established child.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DeferredTicket {
+    pub id: String,
+    pub manifest: AgentManifest,
+}
+
+/// Terminal child data returned to the parked parent.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeferredToolResult {
+    pub report: ChildReport,
+    pub chip: ChipState,
+    pub truncated: bool,
+}
+
 /// Port for general tool execution. `request_input` remains actor-owned
 /// because its durable waiter is part of the turn state machine.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ToolDispatchResult {
     Completed(BoundedResult),
     ApprovalRequired(Menu),
+    Deferred(DeferredTicket),
 }
 
 /// A provider/account replacement for the current logical turn.
@@ -283,6 +328,28 @@ pub trait ToolDispatcher: Send + Sync {
             "tool dispatcher does not support approval menus",
             false,
         ))
+    }
+
+    /// Waits for one previously established deferred child. Implementations
+    /// must return a terminal report for child success, failure, or
+    /// cancellation; cancellation of the parent is signalled separately by
+    /// `cancel`.
+    async fn collect_deferred(
+        &self,
+        _ticket: &DeferredTicket,
+        _cancel: &CancelToken,
+    ) -> Result<DeferredToolResult, HaiderError> {
+        Err(HaiderError::new(
+            ErrorCode::Internal,
+            "tool dispatcher does not support deferred collection",
+            false,
+        ))
+    }
+
+    /// Marks a delivered deferred result collected after the parent tool
+    /// result and item completion are durable.
+    async fn acknowledge_deferred(&self, _ticket: &DeferredTicket) -> Result<(), HaiderError> {
+        Ok(())
     }
 
     /// Drains process/finalizer ownership after the logical turn ends.
@@ -400,6 +467,14 @@ impl HarnessHandle {
             .await
     }
 
+    pub async fn submit_child_wait_turn(
+        &self,
+        request: SubmitChildWaitTurn,
+    ) -> Result<TurnHandle, HaiderError> {
+        self.submit(TurnSubmission::ChildWait(Box::new(request)))
+            .await
+    }
+
     async fn submit(&self, request: TurnSubmission) -> Result<TurnHandle, HaiderError> {
         let (accepted, response) = oneshot::channel();
         self.commands
@@ -512,6 +587,7 @@ enum TurnSubmission {
     Local(SubmitTurn),
     Committed(SubmitCommittedTurn),
     Checkpoint(Box<SubmitCheckpointTurn>),
+    ChildWait(Box<SubmitChildWaitTurn>),
 }
 
 enum MenuWake {
@@ -640,7 +716,7 @@ impl HarnessActor {
     /// Runs one turn to a terminal state. Every return path commits that
     /// terminal `RunState` (best effort) before reporting the outcome.
     async fn drive_turn(&mut self, submit: TurnSubmission, cancel: CancelToken) -> TurnOutcome {
-        let (run_id, mut messages, checkpoint) = match submit {
+        let (run_id, mut messages, checkpoint, child_wait) = match submit {
             TurnSubmission::Local(submit) => {
                 let run_id = self.next_run_id();
                 if let Err(error) = self.commit_state(&run_id, RunState::Queued).await {
@@ -660,18 +736,33 @@ impl HarnessActor {
                 {
                     return self.errored_state_outcome(&run_id, error).await;
                 }
-                (run_id, vec![Message::user_text(submit.text)], None)
+                (run_id, vec![Message::user_text(submit.text)], None, None)
             }
-            TurnSubmission::Committed(submit) => (submit.run_id, submit.messages, None),
+            TurnSubmission::Committed(submit) => (submit.run_id, submit.messages, None, None),
             TurnSubmission::Checkpoint(submit) => {
                 let submit = *submit;
-                (submit.run_id, submit.messages, Some(submit.checkpoint))
+                (
+                    submit.run_id,
+                    submit.messages,
+                    Some(submit.checkpoint),
+                    None,
+                )
+            }
+            TurnSubmission::ChildWait(submit) => {
+                let submit = *submit;
+                (
+                    submit.run_id,
+                    submit.messages,
+                    None,
+                    Some(submit.checkpoint),
+                )
             }
         };
 
         let mut message: Option<TextAccumulator> = None;
         let mut reasoning: Option<TextAccumulator> = None;
         let mut tools: Vec<ToolAccumulator> = Vec::new();
+        let mut deferred = Vec::<DeferredAccumulator>::new();
         if let Some(checkpoint) = checkpoint {
             tools.push(ToolAccumulator {
                 item_id: checkpoint.tool_item_id,
@@ -727,6 +818,79 @@ impl HarnessActor {
                         .await;
                 }
             }
+        }
+        if let Some(checkpoint) = child_wait {
+            let mut assistant_blocks = Vec::with_capacity(checkpoint.tools.len());
+            for checkpoint in checkpoint.tools {
+                tools.push(ToolAccumulator {
+                    item_id: checkpoint.tool_item_id,
+                    call_id: checkpoint.call_id.clone(),
+                    name: checkpoint.tool_name,
+                    args: checkpoint.args,
+                });
+                match provider_tool_block(&tools, &checkpoint.call_id) {
+                    Ok(block) => assistant_blocks.push(block),
+                    Err(error) => {
+                        return self
+                            .drive_error_outcome_with_items(
+                                &run_id,
+                                &mut message,
+                                &mut reasoning,
+                                &mut tools,
+                                error,
+                            )
+                            .await;
+                    }
+                }
+                deferred.push(DeferredAccumulator {
+                    call_id: checkpoint.call_id,
+                    ticket: checkpoint.ticket,
+                    report_emitted: checkpoint.report_emitted,
+                    child_result_emitted: checkpoint.child_result_emitted,
+                    tool_result_emitted: checkpoint.tool_result_emitted,
+                    item_completed: checkpoint.item_completed,
+                });
+            }
+            if let Err(error) = self
+                .commit_state(
+                    &run_id,
+                    RunState::Waiting {
+                        reason: WaitReason::LocalChild,
+                    },
+                )
+                .await
+            {
+                return self.errored_state_outcome(&run_id, error).await;
+            }
+            let results = match self
+                .settle_deferred_tools(&run_id, &mut tools, &mut deferred, &cancel)
+                .await
+            {
+                Ok(results) => results,
+                Err(DriveError::Cancelled) => {
+                    return self
+                        .cancelled_outcome_with_items(
+                            &run_id,
+                            &mut message,
+                            &mut reasoning,
+                            &mut tools,
+                        )
+                        .await;
+                }
+                Err(error) => {
+                    return self
+                        .drive_error_outcome_with_items(
+                            &run_id,
+                            &mut message,
+                            &mut reasoning,
+                            &mut tools,
+                            error,
+                        )
+                        .await;
+                }
+            };
+            messages.push(Message::assistant(assistant_blocks));
+            messages.extend(results);
         }
         if let Err(error) = self.commit_state(&run_id, RunState::Thinking).await {
             return self.errored_state_outcome(&run_id, error).await;
@@ -1068,8 +1232,14 @@ impl HarnessActor {
                         match provider_tool_block(&tools, &call_id) {
                             Ok(block) => {
                                 assistant_blocks.push(block);
-                                self.complete_tool(&run_id, &mut tools, &call_id, &cancel)
-                                    .await
+                                self.complete_tool(
+                                    &run_id,
+                                    &mut tools,
+                                    &mut deferred,
+                                    &call_id,
+                                    &cancel,
+                                )
+                                .await
                             }
                             Err(error) => Err(error),
                         }
@@ -1151,7 +1321,12 @@ impl HarnessActor {
                                 .await;
                         }
                         if let Err(error) = self
-                            .complete_all_tools(&run_id, &mut tools, ToolStatus::Pending)
+                            .complete_non_deferred_tools(
+                                &run_id,
+                                &mut tools,
+                                &deferred,
+                                ToolStatus::Pending,
+                            )
                             .await
                         {
                             return self
@@ -1177,6 +1352,46 @@ impl HarnessActor {
                         if !assistant_blocks.is_empty() {
                             messages
                                 .push(Message::assistant(std::mem::take(&mut assistant_blocks)));
+                        }
+                        if !deferred.is_empty() {
+                            if let Err(error) = self
+                                .commit_state(
+                                    &run_id,
+                                    RunState::Waiting {
+                                        reason: WaitReason::LocalChild,
+                                    },
+                                )
+                                .await
+                            {
+                                return self.errored_state_outcome(&run_id, error).await;
+                            }
+                            match self
+                                .settle_deferred_tools(&run_id, &mut tools, &mut deferred, &cancel)
+                                .await
+                            {
+                                Ok(mut results) => tool_results.append(&mut results),
+                                Err(DriveError::Cancelled) => {
+                                    return self
+                                        .cancelled_outcome_with_items(
+                                            &run_id,
+                                            &mut message,
+                                            &mut reasoning,
+                                            &mut tools,
+                                        )
+                                        .await;
+                                }
+                                Err(error) => {
+                                    return self
+                                        .drive_error_outcome_with_items(
+                                            &run_id,
+                                            &mut message,
+                                            &mut reasoning,
+                                            &mut tools,
+                                            error,
+                                        )
+                                        .await;
+                                }
+                            }
                         }
                         if !tool_results.is_empty() {
                             if let Some(usage) = request_usage.take() {
@@ -1546,6 +1761,7 @@ impl HarnessActor {
         &mut self,
         run_id: &RunId,
         tools: &mut Vec<ToolAccumulator>,
+        deferred: &mut Vec<DeferredAccumulator>,
         call_id: &str,
         cancel: &CancelToken,
     ) -> Result<Option<Message>, DriveError> {
@@ -1565,9 +1781,50 @@ impl HarnessActor {
             self.commit_state(run_id, RunState::RunningTool)
                 .await
                 .map_err(DriveError::Store)?;
-            let result = self
+            let outcome = self
                 .execute_general_tool(run_id, &tools[index], args, cancel, &dispatcher)
                 .await?;
+            let result = match outcome {
+                GeneralToolOutcome::Completed(result) => result,
+                GeneralToolOutcome::Deferred(ticket) => {
+                    self.commit_payload(
+                        run_id,
+                        EventPayload::AgentSpawned(ticket.manifest.clone()),
+                        prompt_omit_render(),
+                    )
+                    .await
+                    .map_err(DriveError::Store)?;
+                    self.commit_payload(
+                        run_id,
+                        EventPayload::AgentChipState {
+                            agent: ticket.manifest.agent.clone(),
+                            chip: ChipState::Thinking,
+                        },
+                        prompt_omit_render(),
+                    )
+                    .await
+                    .map_err(DriveError::Store)?;
+                    self.commit_closed_item(
+                        run_id,
+                        TurnItem::ChildSpawn {
+                            agent: ticket.manifest.agent.clone(),
+                        },
+                    )
+                    .await?;
+                    deferred.push(DeferredAccumulator {
+                        call_id: tools[index].call_id.clone(),
+                        ticket: *ticket,
+                        report_emitted: false,
+                        child_result_emitted: false,
+                        tool_result_emitted: false,
+                        item_completed: false,
+                    });
+                    self.commit_state(run_id, RunState::Streaming)
+                        .await
+                        .map_err(DriveError::Store)?;
+                    return Ok(None);
+                }
+            };
             let call_id = tools[index].call_id.clone();
             self.commit_payload(
                 run_id,
@@ -1604,7 +1861,7 @@ impl HarnessActor {
         args: serde_json::Value,
         cancel: &CancelToken,
         dispatcher: &Arc<dyn ToolDispatcher>,
-    ) -> Result<BoundedResult, DriveError> {
+    ) -> Result<GeneralToolOutcome, DriveError> {
         loop {
             let execution = dispatcher.execute(
                 run_id,
@@ -1632,7 +1889,12 @@ impl HarnessActor {
             };
             let result = result.map_err(DriveError::Store)?;
             match result {
-                ToolDispatchResult::Completed(result) => return Ok(result),
+                ToolDispatchResult::Completed(result) => {
+                    return Ok(GeneralToolOutcome::Completed(result));
+                }
+                ToolDispatchResult::Deferred(ticket) => {
+                    return Ok(GeneralToolOutcome::Deferred(Box::new(ticket)));
+                }
                 ToolDispatchResult::ApprovalRequired(menu) => {
                     self.commit_payload(
                         run_id,
@@ -1837,9 +2099,16 @@ impl HarnessActor {
             .await
             .map_err(DriveError::Store)?;
         let args = parse_tool_args(&tools[index])?;
-        let result = self
+        let outcome = self
             .execute_general_tool(run_id, &tools[index], args, cancel, &dispatcher)
             .await?;
+        let GeneralToolOutcome::Completed(result) = outcome else {
+            return Err(DriveError::Store(HaiderError::new(
+                ErrorCode::Internal,
+                "a recovered approval unexpectedly became deferred",
+                false,
+            )));
+        };
         let call_id = tools[index].call_id.clone();
         self.commit_payload(
             run_id,
@@ -2053,6 +2322,195 @@ impl HarnessActor {
             }
             return Ok(Message::tool_result(call_id, result, false));
         }
+    }
+
+    async fn settle_deferred_tools(
+        &mut self,
+        run_id: &RunId,
+        tools: &mut Vec<ToolAccumulator>,
+        deferred: &mut Vec<DeferredAccumulator>,
+        cancel: &CancelToken,
+    ) -> Result<Vec<Message>, DriveError> {
+        let Some(dispatcher) = self.dispatcher.as_ref().map(Arc::clone) else {
+            return Err(DriveError::Store(HaiderError::new(
+                ErrorCode::Internal,
+                "deferred child wait has no tool dispatcher",
+                false,
+            )));
+        };
+        let mut results = Vec::with_capacity(deferred.len());
+        while let Some(mut pending) = deferred.first().cloned() {
+            let completion = loop {
+                let collection = dispatcher.collect_deferred(&pending.ticket, cancel);
+                let wake = tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => return Err(DriveError::Cancelled),
+                    result = collection => Some(result),
+                    command = self.commands.recv() => {
+                        let Some(command) = command else {
+                            return Err(DriveError::Store(HaiderError::new(
+                                ErrorCode::Internal,
+                                "session actor command channel closed during child wait",
+                                true,
+                            )));
+                        };
+                        match command {
+                            ActorCommand::Stop { completed } => {
+                                cancel.cancel();
+                                let _ = completed.send(());
+                                return Err(DriveError::Cancelled);
+                            }
+                            other => self.service_command_without_menu(other),
+                        }
+                        None
+                    }
+                };
+                if let Some(result) = wake {
+                    break match result {
+                        Ok(completion) => completion,
+                        Err(error) => DeferredToolResult {
+                            report: ChildReport {
+                                agent: pending.ticket.manifest.agent.clone(),
+                                summary: sanitized_failure_message(&error.message),
+                                verified: ReportVerification::Red,
+                                workspace_revision: None,
+                            },
+                            chip: ChipState::Error,
+                            truncated: false,
+                        },
+                    };
+                }
+            };
+            let result = BoundedResult {
+                preview: completion.report.summary.clone(),
+                truncated: completion.truncated,
+                artifact: None,
+                cursor: None,
+            };
+            if !pending.report_emitted {
+                self.commit_payload(
+                    run_id,
+                    EventPayload::AgentReport(completion.report.clone()),
+                    prompt_omit_render(),
+                )
+                .await
+                .map_err(DriveError::Store)?;
+                pending.report_emitted = true;
+            }
+            self.commit_payload(
+                run_id,
+                EventPayload::AgentChipState {
+                    agent: completion.report.agent.clone(),
+                    chip: completion.chip,
+                },
+                prompt_omit_render(),
+            )
+            .await
+            .map_err(DriveError::Store)?;
+            if !pending.child_result_emitted {
+                self.commit_closed_item(
+                    run_id,
+                    TurnItem::ChildResult {
+                        report: completion.report.clone(),
+                    },
+                )
+                .await?;
+                pending.child_result_emitted = true;
+            }
+            if !pending.tool_result_emitted {
+                self.commit_payload(
+                    run_id,
+                    EventPayload::ToolResult {
+                        call_id: pending.call_id.clone(),
+                        result: result.clone(),
+                    },
+                    prompt_verbatim_render(),
+                )
+                .await
+                .map_err(DriveError::Store)?;
+                pending.tool_result_emitted = true;
+            }
+            let tool_index = tools
+                .iter()
+                .position(|tool| tool.call_id == pending.call_id)
+                .ok_or_else(|| {
+                    DriveError::Store(HaiderError::new(
+                        ErrorCode::StoreCorrupt,
+                        format!("deferred tool {} is missing", pending.call_id),
+                        false,
+                    ))
+                })?;
+            if !pending.item_completed {
+                self.commit_tool_completed(run_id, &tools[tool_index], ToolStatus::Completed)
+                    .await?;
+                pending.item_completed = true;
+            }
+            tools.remove(tool_index);
+            dispatcher
+                .acknowledge_deferred(&pending.ticket)
+                .await
+                .map_err(DriveError::Store)?;
+            results.push(Message::tool_result(
+                pending.call_id,
+                result.preview,
+                result.truncated,
+            ));
+            deferred.remove(0);
+        }
+        Ok(results)
+    }
+
+    async fn commit_closed_item(
+        &mut self,
+        run_id: &RunId,
+        item: TurnItem,
+    ) -> Result<(), DriveError> {
+        let item_id = self.next_item_id();
+        let mut envelopes = [
+            self.uncommitted_envelope(
+                run_id,
+                EventPayload::Item(ItemEvent::Started {
+                    item_id: item_id.clone(),
+                    item: item.clone(),
+                }),
+                prompt_verbatim_render(),
+            )
+            .map_err(DriveError::Store)?,
+            self.uncommitted_envelope(
+                run_id,
+                EventPayload::Item(ItemEvent::Completed { item_id, item }),
+                prompt_verbatim_render(),
+            )
+            .map_err(DriveError::Store)?,
+        ];
+        self.store
+            .append(&mut envelopes)
+            .await
+            .map_err(DriveError::Store)?;
+        for envelope in envelopes {
+            let _ = self.events.send(envelope);
+        }
+        Ok(())
+    }
+
+    /// Closes tools that are not parked deferred calls.
+    async fn complete_non_deferred_tools(
+        &mut self,
+        run_id: &RunId,
+        tools: &mut Vec<ToolAccumulator>,
+        deferred: &[DeferredAccumulator],
+        status: ToolStatus,
+    ) -> Result<(), DriveError> {
+        while let Some(index) = tools.iter().position(|tool| {
+            !deferred
+                .iter()
+                .any(|pending| pending.call_id == tool.call_id)
+        }) {
+            self.commit_tool_completed(run_id, &tools[index], status)
+                .await?;
+            tools.remove(index);
+        }
+        Ok(())
     }
 
     /// Closes every tool still open, in start order.
@@ -2494,6 +2952,21 @@ struct ToolAccumulator {
     call_id: String,
     name: String,
     args: String,
+}
+
+enum GeneralToolOutcome {
+    Completed(BoundedResult),
+    Deferred(Box<DeferredTicket>),
+}
+
+#[derive(Debug, Clone)]
+struct DeferredAccumulator {
+    call_id: String,
+    ticket: DeferredTicket,
+    report_emitted: bool,
+    child_result_emitted: bool,
+    tool_result_emitted: bool,
+    item_completed: bool,
 }
 
 fn parse_tool_args(tool: &ToolAccumulator) -> Result<serde_json::Value, DriveError> {

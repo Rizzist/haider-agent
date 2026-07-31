@@ -1320,6 +1320,7 @@ impl HubConnection {
             session_id: session_id.clone(),
             worker_generation,
             run_id: haider_protocol::ids::RunId::new(random_id("run")?),
+            agent_id: None,
             text,
             attachments,
             mode,

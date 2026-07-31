@@ -1,6 +1,7 @@
 {
   "agent": "a-child-1",
   "role": "subagent",
+  "task": "tests",
   "callsign": "Hasan",
   "model_profile": "gpt-5.6",
   "grant": {

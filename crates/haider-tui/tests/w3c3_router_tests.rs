@@ -94,6 +94,7 @@ fn manifest(agent: &str, parent: Option<&str>) -> AgentManifest {
     AgentManifest {
         agent: AgentId::new(agent),
         role: AgentRole::Subagent,
+        task: String::new(),
         callsign: Some("Ammar".to_owned()),
         model_profile: "fable-5".to_owned(),
         grant: Grant {

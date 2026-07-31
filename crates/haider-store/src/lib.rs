@@ -25,11 +25,12 @@ pub use event_store::{
     ACCOUNT_REMOVE_METHOD, ACCOUNT_SET_ACTIVE_METHOD, ACCOUNT_SET_DEFAULT_MODEL_METHOD,
     AcceptedTurn, AccountAddClaim, AccountAddReceiptResponse, AccountAddReceiptRow,
     AccountRemoveReceiptRow, CachedModels, CancelledTurn, CommittedSeqRange, CreatedSession,
-    EventStore, LoginClaim, LoginReceiptFailure, LoginReceiptResponse, LoginReceiptRow,
-    ManagementClaim, ManagementReceiptRow, MenuResolutionCommand, MenuResolutionOutcome,
-    PROVIDER_CONFIGURE_METHOD, ProfileLease, SessionCreateCommand, SessionCreateOutcome, Store,
-    TurnAcceptCommand, TurnAcceptOutcome, TurnAdmissionDisposition, TurnCancelCommand,
-    TurnCancelOutcome, TurnCancellationStatus,
+    DelegationCreateOutcome, DelegationRecord, DelegationState, EventStore, LoginClaim,
+    LoginReceiptFailure, LoginReceiptResponse, LoginReceiptRow, ManagementClaim,
+    ManagementReceiptRow, MenuResolutionCommand, MenuResolutionOutcome, PROVIDER_CONFIGURE_METHOD,
+    ProfileLease, SessionCreateCommand, SessionCreateOutcome, Store, TurnAcceptCommand,
+    TurnAcceptOutcome, TurnAdmissionDisposition, TurnCancelCommand, TurnCancelOutcome,
+    TurnCancellationStatus,
 };
 pub use haider_protocol::error::{ErrorCode, HaiderError};
 

@@ -22,14 +22,16 @@
 //! (`rescan_needed`); the durable `Queued`+`UserMessage` pair is the overflow
 //! buffer.
 
+use crate::delegation::{DelegationHandle, SpawnCoordinates};
 use crate::session_hub::{HubStoreHandle, SessionHub, SessionHubError};
 use crate::turn_recovery::{cancelled_resumption_payloads, failed_resumption_payloads};
 use async_trait::async_trait;
 use base64::Engine;
 use haider_core::{
-    AcceptedTurn, CancelToken, EventIdGenerator, HarnessActor, HarnessConfig,
-    PromptHistoryCompiler, RequestInputCheckpoint, StoreHandle, SubmitCheckpointTurn,
-    SubmitCommittedTurn, ToolDispatchResult, ToolDispatcher, TurnHandle, sanitized_failure_message,
+    AcceptedTurn, CancelToken, ChildWaitCheckpoint, DeferredTicket, DeferredToolResult,
+    EventIdGenerator, HarnessActor, HarnessConfig, PromptHistoryCompiler, RequestInputCheckpoint,
+    StoreHandle, SubmitCheckpointTurn, SubmitChildWaitTurn, SubmitCommittedTurn,
+    ToolDispatchResult, ToolDispatcher, TurnHandle, sanitized_failure_message,
 };
 use haider_protocol::EventPayload;
 use haider_protocol::effect::{
@@ -37,7 +39,9 @@ use haider_protocol::effect::{
 };
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
 use haider_protocol::error::{ErrorCode, HaiderError};
-use haider_protocol::ids::{DeviceId, EffectId, EventId, ItemId, MenuId, RunId, SessionId};
+use haider_protocol::ids::{
+    AgentId, DeviceId, EffectId, EventId, ItemId, MenuId, RunId, SessionId,
+};
 use haider_protocol::item::{ItemDelta, ItemEvent};
 use haider_protocol::menu::{DecisionKind, Menu, MenuAnswer, MenuKind};
 use haider_protocol::session::SessionMetadataV1;
@@ -48,7 +52,7 @@ use haider_provider::{Provider, ToolDefinition};
 use haider_tools::{
     CasSink, ChangeLedger, CommandOutputSink, EffectBroker, FsList, FsPatch, FsRead, FsSearch,
     FsWrite, JournalSink, PermissionPolicy, ProcessBounds, ProcessExec, ProcessResult,
-    ResultBounds, SessionGrant, ToolResult, TurnAttribution,
+    ResultBounds, SessionGrant, SpawnSubagent, ToolError, ToolResult, TurnAttribution,
 };
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::Path;
@@ -99,6 +103,8 @@ pub struct WorkerToolContext {
     pub run_id: RunId,
     pub device_id: DeviceId,
     pub event_ids: Arc<EventIdGenerator>,
+    pub(crate) delegation: DelegationHandle,
+    pub agent_id: Option<AgentId>,
 }
 
 /// Injectable tool/effect boundary (R4). Production uses the shipped broker;
@@ -191,6 +197,7 @@ impl Default for DaemonDependencies {
 pub(crate) struct WorkerDependencies {
     pub(crate) provider_factory: Arc<dyn ProviderFactory>,
     pub(crate) tool_factory: Arc<dyn TurnToolFactory>,
+    pub(crate) delegation: Option<DelegationHandle>,
 }
 
 impl WorkerDependencies {
@@ -201,6 +208,7 @@ impl WorkerDependencies {
         Self {
             provider_factory: Arc::new(UnconfiguredProviderFactory),
             tool_factory: Arc::new(BrokerToolFactory),
+            delegation: None,
         }
     }
 }
@@ -288,6 +296,7 @@ enum SupervisorCommand {
 struct PendingTurn {
     accepted: AcceptedTurn,
     checkpoint: Option<RequestInputCheckpoint>,
+    child_wait: Option<ChildWaitCheckpoint>,
     committed_answer: Option<haider_protocol::envelope::RawEnvelope>,
     recovery_ready: Option<oneshot::Sender<Result<(), HaiderError>>>,
     /// Recovery semantics outlive the pre-Ready acknowledgement. In
@@ -312,6 +321,7 @@ impl PendingTurn {
         Self {
             accepted,
             checkpoint: None,
+            child_wait: None,
             committed_answer: None,
             recovery_ready: None,
             recovering: false,
@@ -322,9 +332,10 @@ impl PendingTurn {
 impl WorkerManager {
     pub(crate) fn start(
         hub: SessionHub,
-        dependencies: WorkerDependencies,
+        mut dependencies: WorkerDependencies,
         inject_shutdown_error: bool,
     ) -> Self {
+        dependencies.delegation = Some(DelegationHandle::new(hub.clone()));
         let (commands, receiver) = mpsc::channel(MANAGER_CAPACITY);
         let handle = WorkerManagerHandle {
             commands,
@@ -437,6 +448,7 @@ impl WorkerManagerHandle {
         self.send_recovery(PendingTurn {
             accepted,
             checkpoint: Some(checkpoint),
+            child_wait: None,
             committed_answer,
             recovery_ready: Some(completed),
             recovering: true,
@@ -449,6 +461,24 @@ impl WorkerManagerHandle {
         self.send_recovery(PendingTurn {
             accepted,
             checkpoint: None,
+            child_wait: None,
+            committed_answer: None,
+            recovery_ready: Some(completed),
+            recovering: true,
+        })?;
+        response.await.map_err(|_| manager_stopped())?
+    }
+
+    pub(crate) async fn recover_child_wait(
+        &self,
+        accepted: AcceptedTurn,
+        child_wait: ChildWaitCheckpoint,
+    ) -> Result<(), HaiderError> {
+        let (completed, response) = oneshot::channel();
+        self.send_recovery(PendingTurn {
+            accepted,
+            checkpoint: None,
+            child_wait: Some(child_wait),
             committed_answer: None,
             recovery_ready: Some(completed),
             recovering: true,
@@ -641,7 +671,13 @@ async fn drain_accepted_without_handoff(hub: &SessionHub) -> Result<(), HaiderEr
             if state.is_terminal() {
                 continue;
             }
-            if matches!(state, RunState::InputRequired { .. }) {
+            if matches!(
+                state,
+                RunState::InputRequired { .. }
+                    | RunState::Waiting {
+                        reason: haider_protocol::state::WaitReason::LocalChild
+                    }
+            ) {
                 // P3-4 (park, don't cancel): a `request_input` checkpoint is
                 // durable, resumable state — the P2-6 sweep exists for
                 // accepted-WITHOUT-HANDOFF (Queued) runs, and must preserve
@@ -1043,6 +1079,9 @@ async fn run_supervisor(
                             if matches!(
                                 durable_run_state(&lease, &active_run).await,
                                 Some(RunState::InputRequired { .. })
+                                    | Some(RunState::Waiting {
+                                        reason: haider_protocol::state::WaitReason::LocalChild
+                                    })
                             ) {
                                 if let Some(parked) = active.take() {
                                     park_request_input_checkpoint(parked).await;
@@ -1298,7 +1337,7 @@ async fn admit_pending(
     active_run: Option<&RunId>,
     mut pending: PendingTurn,
 ) {
-    if pending.checkpoint.is_some() {
+    if pending.checkpoint.is_some() || pending.child_wait.is_some() {
         if queue.len() < SUPERVISOR_CAPACITY {
             queue.push_back(pending);
         } else if let Some(ready) = pending.recovery_ready.take() {
@@ -1681,6 +1720,7 @@ async fn start_turn(
     let PendingTurn {
         accepted,
         checkpoint,
+        child_wait,
         mut committed_answer,
         recovery_ready: _,
         recovering: _,
@@ -1696,10 +1736,23 @@ async fn start_turn(
             false,
         ));
     }
+    let delegation = dependencies.delegation.clone().ok_or_else(|| {
+        HaiderError::new(
+            ErrorCode::Internal,
+            "worker delegation coordinator is not installed",
+            false,
+        )
+    })?;
+    let agent_id = delegation.agent_for_session(lease.session_id()).await?;
     let prompt_compile_started = Instant::now();
-    let mut messages =
-        PromptHistoryCompiler::compile(lease, lease.session_id(), None, None, &accepted.run_id)
-            .await?;
+    let mut messages = PromptHistoryCompiler::compile(
+        lease,
+        lease.session_id(),
+        None,
+        agent_id.as_ref(),
+        &accepted.run_id,
+    )
+    .await?;
     tracing::trace!(
         target: "haider.worker",
         session_id = %lease.session_id(),
@@ -1717,6 +1770,8 @@ async fn start_turn(
             run_id: accepted.run_id.clone(),
             device_id: device_id.clone(),
             event_ids: Arc::clone(&event_ids),
+            delegation,
+            agent_id: agent_id.clone(),
         })
         .await?;
     let mut config = HarnessConfig::for_session(
@@ -1727,9 +1782,13 @@ async fn start_turn(
     )
     .with_event_ids(event_ids);
     config.model = resolved.model;
+    config.agent_id = agent_id;
     config.max_tokens = metadata.max_tokens;
     config.system_prompt = Some(SystemPromptBuilder::build(metadata));
     config.tools = dependencies.tool_factory.definitions();
+    if config.agent_id.is_some() {
+        config.tools.retain(|tool| tool.name != "spawn_subagent");
+    }
     config.attachments = attachments;
     config.usage_account = resolved
         .account_alias
@@ -1782,8 +1841,8 @@ async fn start_turn(
         harness.apply_committed_menu_event(answer)?;
     }
     let actor = AbortOnDropTask::new(tokio::spawn(actor.run()));
-    let submitted = match checkpoint {
-        Some(checkpoint) => {
+    let submitted = match (checkpoint, child_wait) {
+        (Some(checkpoint), None) => {
             harness
                 .submit_checkpoint_turn(SubmitCheckpointTurn {
                     run_id: accepted.run_id.clone(),
@@ -1792,7 +1851,16 @@ async fn start_turn(
                 })
                 .await
         }
-        None => {
+        (None, Some(checkpoint)) => {
+            harness
+                .submit_child_wait_turn(SubmitChildWaitTurn {
+                    run_id: accepted.run_id.clone(),
+                    messages,
+                    checkpoint,
+                })
+                .await
+        }
+        (None, None) => {
             harness
                 .submit_committed_turn(SubmitCommittedTurn {
                     run_id: accepted.run_id.clone(),
@@ -1800,6 +1868,11 @@ async fn start_turn(
                 })
                 .await
         }
+        (Some(_), Some(_)) => Err(HaiderError::new(
+            ErrorCode::StoreCorrupt,
+            "recovered turn contains two checkpoint kinds",
+            false,
+        )),
     };
     let handle = submitted?;
     Ok(active_turn(
@@ -2144,7 +2217,7 @@ mod manager_law_tests {
 
 // ───────────────── production broker-backed general tools ─────────────────
 
-struct BrokerToolFactory;
+pub(crate) struct BrokerToolFactory;
 
 #[async_trait]
 impl TurnToolFactory for BrokerToolFactory {
@@ -2157,6 +2230,7 @@ impl TurnToolFactory for BrokerToolFactory {
             fs_write_definition(),
             fs_patch_definition(),
             exec_definition(),
+            spawn_subagent_definition(),
         ]
     }
 
@@ -2178,6 +2252,7 @@ impl TurnToolFactory for BrokerToolFactory {
         policy.allow(EffectClass::FsRead);
         policy.ask(EffectClass::FsWrite);
         policy.ask(EffectClass::ProcessExec);
+        policy.allow(EffectClass::AgentSpawn);
         for grant in durable_permissions.grants {
             policy.allow_session_grant(grant).map_err(tool_error)?;
         }
@@ -2196,6 +2271,9 @@ impl TurnToolFactory for BrokerToolFactory {
             session_id,
             output,
             durable_permission_bindings: durable_permissions.bindings,
+            metadata: context.metadata,
+            parent_agent_id: context.agent_id,
+            delegation: context.delegation,
         })))
     }
 }
@@ -2208,6 +2286,9 @@ struct BrokerToolDispatcher {
     session_id: SessionId,
     output: HubCommandOutputContext,
     durable_permission_bindings: HashMap<MenuId, (EffectClass, String)>,
+    metadata: SessionMetadataV1,
+    parent_agent_id: Option<AgentId>,
+    delegation: DelegationHandle,
 }
 
 #[async_trait]
@@ -2228,8 +2309,8 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 false,
             ));
         }
-        let mut broker = self.broker.lock().await;
-        let broker = broker.as_mut().ok_or_else(|| {
+        let mut broker_guard = self.broker.lock().await;
+        let broker = broker_guard.as_mut().ok_or_else(|| {
             HaiderError::new(
                 ErrorCode::Internal,
                 "tool dispatcher is already closed",
@@ -2237,6 +2318,72 @@ impl ToolDispatcher for BrokerToolDispatcher {
             )
         })?;
         let policy = self.policy.lock().await;
+        if name == "spawn_subagent" {
+            if self.parent_agent_id.is_some() {
+                return Err(HaiderError::new(
+                    ErrorCode::PermissionDenied,
+                    "recursive subagent spawning is not enabled",
+                    false,
+                ));
+            }
+            let request = SpawnSubagent::from_tool_args(args).map_err(tool_error)?;
+            let intent = match broker.begin_agent_spawn(&request, &policy).await {
+                Ok(intent) => intent,
+                Err(ToolError::AuthorizationRequired { menu }) => {
+                    let menu = broker.permission_menu(&menu).cloned().ok_or_else(|| {
+                        HaiderError::new(
+                            ErrorCode::Internal,
+                            "broker authorization menu disappeared before publication",
+                            false,
+                        )
+                    })?;
+                    return Ok(ToolDispatchResult::ApprovalRequired(menu));
+                }
+                Err(error) => return Err(tool_error(error)),
+            };
+            let established = match self
+                .delegation
+                .establish(
+                    SpawnCoordinates {
+                        parent_session_id: self.session_id.clone(),
+                        parent_run_id: run_id.clone(),
+                        parent_agent_id: self.parent_agent_id.clone(),
+                        tool_item_id: item_id.clone(),
+                        call_id: call_id.to_owned(),
+                        metadata: self.metadata.clone(),
+                    },
+                    request,
+                )
+                .await
+            {
+                Ok(established) => established,
+                Err(error) => {
+                    let spawn_error = ToolError::Runtime {
+                        message: error.message.clone(),
+                    };
+                    broker
+                        .finish_agent_spawn(&intent, Err(spawn_error))
+                        .await
+                        .map_err(tool_error)?;
+                    return Err(error);
+                }
+            };
+            // The durable effect ends at establishment, before the child can
+            // start provider work. The manager submission below is therefore
+            // outside the broker effect lifetime.
+            broker
+                .finish_agent_spawn(&intent, Ok(()))
+                .await
+                .map_err(tool_error)?;
+            drop(policy);
+            drop(broker_guard);
+            if let Err(error) = self.delegation.launch(&established).await {
+                self.delegation
+                    .record_launch_failure(&established.ticket, &error)
+                    .await?;
+            }
+            return Ok(ToolDispatchResult::Deferred(established.ticket));
+        }
         let result = match name {
             "fs_read" => {
                 let path = required_string(&args, "path")?;
@@ -2353,6 +2500,18 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 None => Err(tool_error(error)),
             },
         }
+    }
+
+    async fn collect_deferred(
+        &self,
+        ticket: &DeferredTicket,
+        cancel: &CancelToken,
+    ) -> Result<DeferredToolResult, HaiderError> {
+        self.delegation.collect(ticket, cancel).await
+    }
+
+    async fn acknowledge_deferred(&self, ticket: &DeferredTicket) -> Result<(), HaiderError> {
+        self.delegation.acknowledge(ticket).await
     }
 
     async fn resolve_approval(&self, menu: &Menu, answer: &MenuAnswer) -> Result<(), HaiderError> {
@@ -2614,6 +2773,15 @@ fn exec_definition() -> ToolDefinition {
             "required": ["command"],
             "additionalProperties": false,
         }),
+    }
+}
+
+fn spawn_subagent_definition() -> ToolDefinition {
+    let manifest = haider_tools::spawn_subagent_manifest();
+    ToolDefinition {
+        name: manifest.name,
+        description: manifest.description,
+        input_schema: manifest.input_schema,
     }
 }
 

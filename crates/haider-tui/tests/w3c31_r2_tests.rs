@@ -456,6 +456,7 @@ fn live_subagent_steer_and_close_refuse_instead_of_destroying_the_text() {
     let manifest = AgentManifest {
         agent: AgentId::new("a1"),
         role: AgentRole::Subagent,
+        task: String::new(),
         callsign: Some("Ammar".to_owned()),
         model_profile: "fable-5".to_owned(),
         grant: Grant {

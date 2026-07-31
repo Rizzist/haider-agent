@@ -9,6 +9,11 @@ use serde::{Deserialize, Serialize};
 pub struct AgentManifest {
     pub agent: AgentId,
     pub role: AgentRole,
+    /// Short, persisted display label for the delegated task. This is
+    /// presentation metadata only; operational routing remains keyed by the
+    /// opaque [`AgentId`].
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub task: String,
     /// Display-only callsign (honour-roll or neutral roster). Never in logs,
     /// addresses, metrics, or failure strings (§5.1 dignity rules).
     #[serde(default, skip_serializing_if = "Option::is_none")]

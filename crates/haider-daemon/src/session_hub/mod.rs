@@ -962,6 +962,138 @@ impl SessionHub {
         self.inner.store.session_metadata(session_id).await
     }
 
+    /// Narrow daemon-internal session creation used by local delegation.
+    /// It preserves the same unfenced receipt preflight and actor-routed
+    /// transaction as the wire method without fabricating an RPC connection.
+    pub(crate) async fn create_internal_session(
+        &self,
+        command: SessionCreateCommand,
+    ) -> Result<CreatedSession, HaiderError> {
+        if let Some(created) = self
+            .inner
+            .store
+            .session_create_receipt(
+                command.command_id.clone(),
+                command.request_digest.clone(),
+                command.request_json.clone(),
+            )
+            .await?
+        {
+            return Ok(created);
+        }
+        match self
+            .create_session(command)
+            .await
+            .map_err(hub_error_as_store)?
+        {
+            SessionCreateOutcome::Committed { created, .. }
+            | SessionCreateOutcome::IdempotentReplay { created } => Ok(created),
+        }
+    }
+
+    /// Narrow daemon-internal turn acceptance used by local delegation.
+    pub(crate) async fn accept_internal_turn(
+        &self,
+        command: TurnAcceptCommand,
+    ) -> Result<AcceptedTurn, HaiderError> {
+        if let Some(accepted) = self
+            .inner
+            .store
+            .turn_accept_receipt(
+                command.command_id.clone(),
+                command.request_digest.clone(),
+                command.request_json.clone(),
+            )
+            .await?
+        {
+            return Ok(accepted);
+        }
+        match self
+            .accept_turn(command)
+            .await
+            .map_err(hub_error_as_store)?
+        {
+            TurnAcceptOutcome::Committed { accepted, .. }
+            | TurnAcceptOutcome::IdempotentReplay { accepted } => Ok(accepted),
+        }
+    }
+
+    pub(crate) async fn submit_internal_turn(
+        &self,
+        accepted: AcceptedTurn,
+    ) -> Result<(), HaiderError> {
+        self.worker_manager()
+            .map_err(hub_error_as_store)?
+            .submit(accepted)
+            .await
+    }
+
+    pub(crate) fn worker_generation(&self) -> u64 {
+        self.inner.store.worker_generation()
+    }
+
+    pub(crate) fn device_id(&self) -> DeviceId {
+        self.inner.device_id.clone()
+    }
+
+    pub(crate) async fn create_delegation(
+        &self,
+        record: haider_core::DelegationRecord,
+    ) -> Result<haider_core::DelegationCreateOutcome, HaiderError> {
+        self.inner.store.create_delegation(record).await
+    }
+
+    pub(crate) async fn delegation(
+        &self,
+        agent: haider_protocol::ids::AgentId,
+    ) -> Result<Option<haider_core::DelegationRecord>, HaiderError> {
+        self.inner.store.delegation(agent).await
+    }
+
+    pub(crate) async fn delegation_for_child_session(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<haider_core::DelegationRecord>, HaiderError> {
+        self.inner
+            .store
+            .delegation_for_child_session(session_id)
+            .await
+    }
+
+    pub(crate) async fn mark_delegation_running(
+        &self,
+        agent: haider_protocol::ids::AgentId,
+    ) -> Result<haider_core::DelegationRecord, HaiderError> {
+        self.inner.store.mark_delegation_running(agent).await
+    }
+
+    pub(crate) async fn record_delegation_report(
+        &self,
+        agent: haider_protocol::ids::AgentId,
+        report: haider_protocol::agent::ChildReport,
+    ) -> Result<haider_core::DelegationRecord, HaiderError> {
+        self.inner
+            .store
+            .record_delegation_report(agent, report)
+            .await
+    }
+
+    pub(crate) async fn mark_delegation_collected(
+        &self,
+        agent: haider_protocol::ids::AgentId,
+    ) -> Result<haider_core::DelegationRecord, HaiderError> {
+        self.inner.store.mark_delegation_collected(agent).await
+    }
+
+    pub(crate) async fn read_internal_session(
+        &self,
+        session_id: &SessionId,
+        since_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<RawEnvelope>, HaiderError> {
+        self.inner.store.read(session_id, since_seq, limit).await
+    }
+
     /// Opens one logical connection after handshake negotiation.
     ///
     /// W3c/W3d seam: every real client — CLI attach, TUI live-attach, web —

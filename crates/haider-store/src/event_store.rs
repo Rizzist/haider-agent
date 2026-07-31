@@ -16,12 +16,15 @@ use crate::cas::FileCas;
 use crate::migrations;
 use crate::profile_lock::ProfileLock;
 use crate::{Cas, StoreResult, now_ms, store_error, to_sqlite_integer};
+use haider_protocol::agent::{AgentManifest, ChildReport};
 use haider_protocol::credential::CredentialDescriptor;
 use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION, envelope_weight_bytes,
 };
 use haider_protocol::error::{ErrorCode, HaiderError};
-use haider_protocol::ids::{ArtifactRef, DeviceId, EventId, MenuId, RunId, SessionId};
+use haider_protocol::ids::{
+    AgentId, ArtifactRef, DeviceId, EventId, ItemId, MenuId, RunId, SessionId,
+};
 use haider_protocol::menu::{Menu, MenuAnswer, MenuKind};
 use haider_protocol::session::SessionMetadataV1;
 use haider_protocol::state::{RunState, SessionState};
@@ -110,6 +113,42 @@ pub struct CreatedSession {
     pub metadata: SessionMetadataV1,
 }
 
+/// Durable parent↔child relation. Callsigns/task are presentation fields;
+/// every operational coordinate is opaque and receipt-stable.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DelegationRecord {
+    pub agent_id: AgentId,
+    pub child_session_id: SessionId,
+    pub child_run_id: RunId,
+    pub parent_session_id: SessionId,
+    pub parent_run_id: RunId,
+    pub call_id: String,
+    pub tool_item_id: ItemId,
+    pub parent_agent_id: Option<AgentId>,
+    pub root_session_id: SessionId,
+    pub depth: u32,
+    pub task: String,
+    pub prompt: String,
+    pub manifest: AgentManifest,
+    pub state: DelegationState,
+    pub report: Option<ChildReport>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DelegationState {
+    Spawned,
+    Running,
+    Reported,
+    Collected,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum DelegationCreateOutcome {
+    Committed(DelegationRecord),
+    IdempotentReplay(DelegationRecord),
+}
+
 /// Result of the atomic session-creation transaction.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SessionCreateOutcome {
@@ -133,6 +172,7 @@ pub struct TurnAcceptCommand {
     pub session_id: SessionId,
     pub worker_generation: u64,
     pub run_id: RunId,
+    pub agent_id: Option<AgentId>,
     pub text: String,
     pub attachments: Vec<AttachmentBlock>,
     pub mode: DeliveryMode,
@@ -631,6 +671,234 @@ impl Store {
         }
     }
 
+    /// Inserts the durable delegation link exactly once. Replays with the
+    /// same opaque parent/run/call coordinates return the original row;
+    /// altered semantics are rejected rather than creating a sibling.
+    pub fn create_delegation(
+        &self,
+        record: &DelegationRecord,
+    ) -> StoreResult<DelegationCreateOutcome> {
+        validate_delegation(record)?;
+        let manifest_json = serde_json::to_string(&record.manifest).map_err(|error| {
+            store_error(
+                ErrorCode::InvalidArgument,
+                format!("cannot serialize delegation manifest: {error}"),
+                false,
+            )
+        })?;
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        if let Some(existing) = lookup_delegation_by_agent(&transaction, &record.agent_id)? {
+            require_same_delegation_identity(&existing, record)?;
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(DelegationCreateOutcome::IdempotentReplay(existing));
+        }
+        if let Some(existing) = lookup_delegation_by_parent_call(
+            &transaction,
+            &record.parent_session_id,
+            &record.parent_run_id,
+            &record.call_id,
+        )? {
+            require_same_delegation_identity(&existing, record)?;
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(DelegationCreateOutcome::IdempotentReplay(existing));
+        }
+        let now = now_ms()?;
+        transaction
+            .execute(
+                "INSERT INTO delegations(
+                    agent_id, child_session_id, child_run_id,
+                    parent_session_id, parent_run_id, call_id, tool_item_id,
+                    parent_agent_id, root_session_id, depth, task, prompt,
+                    manifest_json, state, report_json, created_at_ms, updated_at_ms
+                 ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                    ?13, 'spawned', NULL, ?14, ?14
+                 )",
+                params![
+                    record.agent_id.as_str(),
+                    record.child_session_id.as_str(),
+                    record.child_run_id.as_str(),
+                    record.parent_session_id.as_str(),
+                    record.parent_run_id.as_str(),
+                    &record.call_id,
+                    record.tool_item_id.as_str(),
+                    record.parent_agent_id.as_ref().map(AgentId::as_str),
+                    record.root_session_id.as_str(),
+                    i64::from(record.depth),
+                    &record.task,
+                    &record.prompt,
+                    manifest_json,
+                    to_sqlite_integer(now)?,
+                ],
+            )
+            .map_err(map_sqlite_error)?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        let mut committed = record.clone();
+        committed.state = DelegationState::Spawned;
+        committed.report = None;
+        Ok(DelegationCreateOutcome::Committed(committed))
+    }
+
+    pub fn delegation(&self, agent: &AgentId) -> StoreResult<Option<DelegationRecord>> {
+        let connection = self.connection()?;
+        lookup_delegation_by_agent(&connection, agent)
+    }
+
+    pub fn delegation_for_child_session(
+        &self,
+        session_id: &SessionId,
+    ) -> StoreResult<Option<DelegationRecord>> {
+        let connection = self.connection()?;
+        lookup_delegation_by_child_session(&connection, session_id)
+    }
+
+    pub fn delegations_for_parent_run(
+        &self,
+        session_id: &SessionId,
+        run_id: &RunId,
+    ) -> StoreResult<Vec<DelegationRecord>> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare_cached(&format!(
+                "{} WHERE parent_session_id = ?1 AND parent_run_id = ?2 ORDER BY created_at_ms, call_id",
+                delegation_select()
+            ))
+            .map_err(map_sqlite_error)?;
+        let rows = statement
+            .query_map(
+                params![session_id.as_str(), run_id.as_str()],
+                stored_delegation,
+            )
+            .map_err(map_sqlite_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_sqlite_error)?;
+        rows.into_iter().map(decode_delegation).collect()
+    }
+
+    pub fn mark_delegation_running(&self, agent: &AgentId) -> StoreResult<DelegationRecord> {
+        self.update_delegation(agent, DelegationState::Running, None)
+    }
+
+    pub fn record_delegation_report(
+        &self,
+        agent: &AgentId,
+        report: &ChildReport,
+    ) -> StoreResult<DelegationRecord> {
+        if report.agent != *agent {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "child report agent does not match delegation",
+                false,
+            ));
+        }
+        self.update_delegation(agent, DelegationState::Reported, Some(report))
+    }
+
+    pub fn mark_delegation_collected(&self, agent: &AgentId) -> StoreResult<DelegationRecord> {
+        self.update_delegation(agent, DelegationState::Collected, None)
+    }
+
+    fn update_delegation(
+        &self,
+        agent: &AgentId,
+        target: DelegationState,
+        report: Option<&ChildReport>,
+    ) -> StoreResult<DelegationRecord> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        let existing = lookup_delegation_by_agent(&transaction, agent)?.ok_or_else(|| {
+            store_error(
+                ErrorCode::SessionNotFound,
+                "delegation was not found",
+                false,
+            )
+        })?;
+        if existing.state == DelegationState::Collected
+            && matches!(
+                target,
+                DelegationState::Reported | DelegationState::Collected
+            )
+        {
+            if let (Some(requested), Some(committed)) = (report, existing.report.as_ref())
+                && requested != committed
+            {
+                return Err(store_error(
+                    ErrorCode::StoreCorrupt,
+                    "delegation already carries a different terminal report",
+                    false,
+                ));
+            }
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(existing);
+        }
+        if target == DelegationState::Running
+            && matches!(
+                existing.state,
+                DelegationState::Reported | DelegationState::Collected
+            )
+        {
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(existing);
+        }
+        let report_json = match (report, existing.report.as_ref()) {
+            (Some(report), Some(committed)) if report != committed => {
+                return Err(store_error(
+                    ErrorCode::StoreCorrupt,
+                    "delegation already carries a different terminal report",
+                    false,
+                ));
+            }
+            (Some(report), _) => Some(serde_json::to_string(report).map_err(|error| {
+                store_error(
+                    ErrorCode::InvalidArgument,
+                    format!("cannot serialize child report: {error}"),
+                    false,
+                )
+            })?),
+            (None, Some(committed)) => Some(serde_json::to_string(committed).map_err(|error| {
+                store_error(
+                    ErrorCode::Internal,
+                    format!("cannot preserve child report: {error}"),
+                    false,
+                )
+            })?),
+            (None, None) => None,
+        };
+        if target == DelegationState::Collected && report_json.is_none() {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "delegation cannot be collected before it reports",
+                false,
+            ));
+        }
+        transaction
+            .execute(
+                "UPDATE delegations SET state = ?2, report_json = ?3, updated_at_ms = ?4
+                 WHERE agent_id = ?1",
+                params![
+                    agent.as_str(),
+                    delegation_state_name(target),
+                    report_json,
+                    to_sqlite_integer(now_ms()?)?,
+                ],
+            )
+            .map_err(map_sqlite_error)?;
+        let updated = lookup_delegation_by_agent(&transaction, agent)?.ok_or_else(|| {
+            store_error(
+                ErrorCode::StoreCorrupt,
+                "updated delegation vanished",
+                false,
+            )
+        })?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(updated)
+    }
+
     /// Atomically appends a live worker batch after validating it against the
     /// transaction's durable run heads.
     ///
@@ -940,6 +1208,9 @@ impl Store {
                 EventPayload::SessionState(SessionState::ActiveRun),
                 PromptRender::Omit,
             )?);
+        }
+        for envelope in &mut envelopes {
+            envelope.agent_id = command.agent_id.clone();
         }
         append_transaction_envelopes(&transaction, &command.session_id, now, &mut envelopes)?;
         let accepted_seq = envelopes[1].seq;
@@ -3301,6 +3572,198 @@ impl Cas for Store {
 
     fn verify(&self, artifact: &ArtifactRef) -> bool {
         self.cas.verify(artifact)
+    }
+}
+
+struct StoredDelegation {
+    agent_id: String,
+    child_session_id: String,
+    child_run_id: String,
+    parent_session_id: String,
+    parent_run_id: String,
+    call_id: String,
+    tool_item_id: String,
+    parent_agent_id: Option<String>,
+    root_session_id: String,
+    depth: i64,
+    task: String,
+    prompt: String,
+    manifest_json: String,
+    state: String,
+    report_json: Option<String>,
+}
+
+fn delegation_select() -> &'static str {
+    "SELECT agent_id, child_session_id, child_run_id, parent_session_id,
+            parent_run_id, call_id, tool_item_id, parent_agent_id,
+            root_session_id, depth, task, prompt, manifest_json, state,
+            report_json
+     FROM delegations"
+}
+
+fn stored_delegation(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredDelegation> {
+    Ok(StoredDelegation {
+        agent_id: row.get(0)?,
+        child_session_id: row.get(1)?,
+        child_run_id: row.get(2)?,
+        parent_session_id: row.get(3)?,
+        parent_run_id: row.get(4)?,
+        call_id: row.get(5)?,
+        tool_item_id: row.get(6)?,
+        parent_agent_id: row.get(7)?,
+        root_session_id: row.get(8)?,
+        depth: row.get(9)?,
+        task: row.get(10)?,
+        prompt: row.get(11)?,
+        manifest_json: row.get(12)?,
+        state: row.get(13)?,
+        report_json: row.get(14)?,
+    })
+}
+
+fn decode_delegation(row: StoredDelegation) -> StoreResult<DelegationRecord> {
+    let manifest = serde_json::from_str(&row.manifest_json)
+        .map_err(|error| corrupt(format!("delegation manifest is corrupt: {error}")))?;
+    let report = row
+        .report_json
+        .map(|json| {
+            serde_json::from_str(&json)
+                .map_err(|error| corrupt(format!("delegation report is corrupt: {error}")))
+        })
+        .transpose()?;
+    let state = match row.state.as_str() {
+        "spawned" => DelegationState::Spawned,
+        "running" => DelegationState::Running,
+        "reported" => DelegationState::Reported,
+        "collected" => DelegationState::Collected,
+        other => return Err(corrupt(format!("unknown delegation state `{other}`"))),
+    };
+    let depth = u32::try_from(row.depth)
+        .map_err(|_| corrupt("delegation depth is negative or too large"))?;
+    Ok(DelegationRecord {
+        agent_id: AgentId::new(row.agent_id),
+        child_session_id: SessionId::new(row.child_session_id),
+        child_run_id: RunId::new(row.child_run_id),
+        parent_session_id: SessionId::new(row.parent_session_id),
+        parent_run_id: RunId::new(row.parent_run_id),
+        call_id: row.call_id,
+        tool_item_id: ItemId::new(row.tool_item_id),
+        parent_agent_id: row.parent_agent_id.map(AgentId::new),
+        root_session_id: SessionId::new(row.root_session_id),
+        depth,
+        task: row.task,
+        prompt: row.prompt,
+        manifest,
+        state,
+        report,
+    })
+}
+
+fn lookup_delegation_by_agent(
+    connection: &Connection,
+    agent: &AgentId,
+) -> StoreResult<Option<DelegationRecord>> {
+    let sql = format!("{} WHERE agent_id = ?1", delegation_select());
+    connection
+        .query_row(&sql, [agent.as_str()], stored_delegation)
+        .optional()
+        .map_err(map_sqlite_error)?
+        .map(decode_delegation)
+        .transpose()
+}
+
+fn lookup_delegation_by_child_session(
+    connection: &Connection,
+    session_id: &SessionId,
+) -> StoreResult<Option<DelegationRecord>> {
+    let sql = format!("{} WHERE child_session_id = ?1", delegation_select());
+    connection
+        .query_row(&sql, [session_id.as_str()], stored_delegation)
+        .optional()
+        .map_err(map_sqlite_error)?
+        .map(decode_delegation)
+        .transpose()
+}
+
+fn lookup_delegation_by_parent_call(
+    connection: &Connection,
+    session_id: &SessionId,
+    run_id: &RunId,
+    call_id: &str,
+) -> StoreResult<Option<DelegationRecord>> {
+    let sql = format!(
+        "{} WHERE parent_session_id = ?1 AND parent_run_id = ?2 AND call_id = ?3",
+        delegation_select()
+    );
+    connection
+        .query_row(
+            &sql,
+            params![session_id.as_str(), run_id.as_str(), call_id],
+            stored_delegation,
+        )
+        .optional()
+        .map_err(map_sqlite_error)?
+        .map(decode_delegation)
+        .transpose()
+}
+
+fn validate_delegation(record: &DelegationRecord) -> StoreResult<()> {
+    if record.depth == 0
+        || record.task.trim().is_empty()
+        || record.prompt.trim().is_empty()
+        || record.call_id.is_empty()
+        || record.manifest.agent != record.agent_id
+    {
+        return Err(store_error(
+            ErrorCode::InvalidArgument,
+            "delegation identity, task, prompt, call, and depth must be valid",
+            false,
+        ));
+    }
+    if record.state != DelegationState::Spawned || record.report.is_some() {
+        return Err(store_error(
+            ErrorCode::InvalidArgument,
+            "new delegation must begin spawned without a report",
+            false,
+        ));
+    }
+    Ok(())
+}
+
+fn require_same_delegation_identity(
+    existing: &DelegationRecord,
+    requested: &DelegationRecord,
+) -> StoreResult<()> {
+    let same = existing.agent_id == requested.agent_id
+        && existing.child_session_id == requested.child_session_id
+        && existing.child_run_id == requested.child_run_id
+        && existing.parent_session_id == requested.parent_session_id
+        && existing.parent_run_id == requested.parent_run_id
+        && existing.call_id == requested.call_id
+        && existing.tool_item_id == requested.tool_item_id
+        && existing.parent_agent_id == requested.parent_agent_id
+        && existing.root_session_id == requested.root_session_id
+        && existing.depth == requested.depth
+        && existing.task == requested.task
+        && existing.prompt == requested.prompt
+        && existing.manifest == requested.manifest;
+    if same {
+        Ok(())
+    } else {
+        Err(store_error(
+            ErrorCode::InvalidArgument,
+            "delegation receipt was replayed with different semantics",
+            false,
+        ))
+    }
+}
+
+fn delegation_state_name(state: DelegationState) -> &'static str {
+    match state {
+        DelegationState::Spawned => "spawned",
+        DelegationState::Running => "running",
+        DelegationState::Reported => "reported",
+        DelegationState::Collected => "collected",
     }
 }
 

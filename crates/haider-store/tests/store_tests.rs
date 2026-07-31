@@ -346,19 +346,19 @@ fn migrations_apply_fresh_and_are_idempotent_on_reopen() {
     let root = test_root();
     let database_path = {
         let store = must(Store::open(root.path()));
-        assert_eq!(must(store.schema_version()), 8);
+        assert_eq!(must(store.schema_version()), 9);
         store.database_path().to_path_buf()
     };
 
     let reopened = must(Store::open(root.path()));
-    assert_eq!(must(reopened.schema_version()), 8);
+    assert_eq!(must(reopened.schema_version()), 9);
     let connection = must(Connection::open(database_path));
     let registered: u32 = must(connection.query_row(
-        "SELECT COUNT(*) FROM schema_migrations WHERE version BETWEEN 1 AND 8",
+        "SELECT COUNT(*) FROM schema_migrations WHERE version BETWEEN 1 AND 9",
         [],
         |row| row.get(0),
     ));
-    assert_eq!(registered, 8);
+    assert_eq!(registered, 9);
     for table in [
         "sessions",
         "events",
@@ -368,6 +368,7 @@ fn migrations_apply_fresh_and_are_idempotent_on_reopen() {
         "command_receipts",
         "account_alias_reservations",
         "provider_models",
+        "delegations",
     ] {
         let count: u32 = must(connection.query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",

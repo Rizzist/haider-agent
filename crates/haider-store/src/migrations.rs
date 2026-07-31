@@ -14,7 +14,7 @@ use crate::{StoreResult, now_ms, store_error, to_sqlite_integer};
 use haider_protocol::error::{ErrorCode, HaiderError};
 use rusqlite::{Connection, TransactionBehavior, params};
 
-pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 8;
+pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 9;
 
 struct Migration {
     version: u32,
@@ -146,6 +146,37 @@ const MIGRATIONS: &[Migration] = &[
                 fetched_at_ms   INTEGER NOT NULL,
                 CHECK (fetched_at_ms >= 0)
             );
+        ",
+    },
+    Migration {
+        version: 9,
+        sql: "
+            CREATE TABLE delegations (
+                agent_id          TEXT PRIMARY KEY,
+                child_session_id  TEXT NOT NULL UNIQUE,
+                child_run_id      TEXT NOT NULL,
+                parent_session_id TEXT NOT NULL,
+                parent_run_id     TEXT NOT NULL,
+                call_id           TEXT NOT NULL,
+                tool_item_id      TEXT NOT NULL,
+                parent_agent_id   TEXT,
+                root_session_id   TEXT NOT NULL,
+                depth             INTEGER NOT NULL CHECK (depth >= 1),
+                task              TEXT NOT NULL,
+                prompt            TEXT NOT NULL,
+                manifest_json     TEXT NOT NULL,
+                state             TEXT NOT NULL
+                    CHECK (state IN ('spawned', 'running', 'reported', 'collected')),
+                report_json       TEXT,
+                created_at_ms     INTEGER NOT NULL,
+                updated_at_ms     INTEGER NOT NULL,
+                UNIQUE (parent_session_id, parent_run_id, call_id),
+                FOREIGN KEY (child_session_id) REFERENCES sessions(id),
+                FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
+            );
+
+            CREATE INDEX delegations_parent_run
+            ON delegations(parent_session_id, parent_run_id);
         ",
     },
 ];

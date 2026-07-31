@@ -234,6 +234,7 @@ fn accept_command(
         session_id: session_id.clone(),
         worker_generation: generation,
         run_id: run_id.clone(),
+        agent_id: None,
         text: "fixture turn".into(),
         attachments: Vec::new(),
         mode: haider_protocol::DeliveryMode::Queue,

@@ -28,17 +28,18 @@
 //! workers own those; the generation fence skips them).
 
 use haider_core::{
-    AcceptedTurn, RequestInputCheckpoint, SqliteStoreHandle, StoreHandle, TurnAdmissionDisposition,
+    AcceptedTurn, ChildWaitCheckpoint, DeferredTicket, DeferredToolCheckpoint,
+    RequestInputCheckpoint, SqliteStoreHandle, StoreHandle, TurnAdmissionDisposition,
 };
 use haider_protocol::EventPayload;
 use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
 };
 use haider_protocol::error::{ErrorCode, HaiderError};
-use haider_protocol::ids::{DeviceId, EventId, ItemId, MenuId, RunId, SessionId};
+use haider_protocol::ids::{AgentId, DeviceId, EventId, ItemId, MenuId, RunId, SessionId};
 use haider_protocol::item::{ItemDelta, ItemEvent, ToolStatus, TurnItem};
 use haider_protocol::menu::{Menu, MenuCloseReason};
-use haider_protocol::state::{RunState, SessionState};
+use haider_protocol::state::{RunState, SessionState, WaitReason};
 use std::collections::{HashMap, HashSet};
 
 const PAGE_SIZE: usize = 512;
@@ -46,6 +47,12 @@ const PAGE_SIZE: usize = 512;
 pub(crate) enum RecoveredWork {
     Queued(AcceptedTurn),
     Checkpoint(Box<RecoveredCheckpoint>),
+    ChildWait(Box<RecoveredChildWait>),
+}
+
+pub(crate) struct RecoveredChildWait {
+    pub(crate) accepted: AcceptedTurn,
+    pub(crate) checkpoint: ChildWaitCheckpoint,
 }
 
 pub(crate) struct RecoveredCheckpoint {
@@ -63,6 +70,17 @@ struct RunReduction {
     menu: Option<OpenMenu>,
     menu_answers: HashMap<MenuId, RawEnvelope>,
     tool_results: HashSet<String>,
+    tool_calls: HashMap<String, RecoveredToolCall>,
+    agent_reports: HashSet<AgentId>,
+    child_results: HashSet<AgentId>,
+}
+
+struct RecoveredToolCall {
+    item_id: ItemId,
+    name: String,
+    args: String,
+    started_seq: u64,
+    completed: bool,
 }
 
 struct OpenItem {
@@ -161,6 +179,32 @@ pub(crate) async fn recover_interrupted_turns(
                 })));
                 continue;
             }
+            if matches!(
+                state,
+                RunState::Waiting {
+                    reason: WaitReason::LocalChild
+                }
+            ) && let Some(checkpoint) =
+                pending_child_wait(store, &session_id, &run_id, &reduction).await?
+            {
+                let accepted_seq = reduction.user_seq.ok_or_else(|| {
+                    HaiderError::new(
+                        ErrorCode::StoreCorrupt,
+                        format!("child-wait run {run_id} has no user message"),
+                        false,
+                    )
+                })?;
+                recovered.push(RecoveredWork::ChildWait(Box::new(RecoveredChildWait {
+                    accepted: recovered_acceptance(
+                        &session_id,
+                        &run_id,
+                        accepted_seq,
+                        store.worker_generation(),
+                    ),
+                    checkpoint,
+                })));
+                continue;
+            }
             terminalize_interrupted(
                 store,
                 device_id,
@@ -190,6 +234,28 @@ fn reduce(reductions: &mut HashMap<RunId, RunReduction>, envelope: RawEnvelope) 
         }
         EventPayload::UserMessage { .. } => reduction.user_seq = Some(envelope.seq),
         EventPayload::Item(ItemEvent::Started { item_id, item }) => {
+            if let TurnItem::ToolCall {
+                call_id,
+                name,
+                args,
+                ..
+            } = &item
+            {
+                reduction.tool_calls.insert(
+                    call_id.clone(),
+                    RecoveredToolCall {
+                        item_id: item_id.clone(),
+                        name: name.clone(),
+                        args: if args == &serde_json::json!({}) {
+                            String::new()
+                        } else {
+                            args.to_string()
+                        },
+                        started_seq: envelope.seq,
+                        completed: false,
+                    },
+                );
+            }
             reduction.open_items.insert(
                 item_id,
                 OpenItem {
@@ -202,16 +268,49 @@ fn reduce(reductions: &mut HashMap<RunId, RunReduction>, envelope: RawEnvelope) 
         }
         EventPayload::Item(ItemEvent::Delta { item_id, delta }) => {
             if let Some(open) = reduction.open_items.get_mut(&item_id) {
-                match delta {
+                match &delta {
                     ItemDelta::Text { text } | ItemDelta::Reasoning { text } => {
-                        open.text.push_str(&text);
+                        open.text.push_str(text);
                     }
-                    ItemDelta::ToolArgs { fragment } => open.args.push_str(&fragment),
+                    ItemDelta::ToolArgs { fragment } => open.args.push_str(fragment),
                     ItemDelta::CommandOutput { .. } => {}
                 }
             }
+            if let ItemDelta::ToolArgs { fragment } = delta
+                && let Some(tool) = reduction
+                    .tool_calls
+                    .values_mut()
+                    .find(|tool| tool.item_id == item_id)
+            {
+                tool.args.push_str(&fragment);
+            }
         }
-        EventPayload::Item(ItemEvent::Completed { item_id, .. }) => {
+        EventPayload::Item(ItemEvent::Completed { item_id, item }) => {
+            if let TurnItem::ToolCall {
+                call_id,
+                name,
+                args,
+                ..
+            } = &item
+            {
+                let entry = reduction
+                    .tool_calls
+                    .entry(call_id.clone())
+                    .or_insert_with(|| RecoveredToolCall {
+                        item_id: item_id.clone(),
+                        name: name.clone(),
+                        args: args.to_string(),
+                        started_seq: envelope.seq,
+                        completed: true,
+                    });
+                entry.completed = true;
+                if entry.args.is_empty() {
+                    entry.args = args.to_string();
+                }
+            }
+            if let TurnItem::ChildResult { report } = &item {
+                reduction.child_results.insert(report.agent.clone());
+            }
             reduction.open_items.remove(&item_id);
         }
         EventPayload::MenuOpened(menu) => {
@@ -234,6 +333,9 @@ fn reduce(reductions: &mut HashMap<RunId, RunReduction>, envelope: RawEnvelope) 
         }
         EventPayload::ToolResult { call_id, .. } => {
             reduction.tool_results.insert(call_id);
+        }
+        EventPayload::AgentReport(report) => {
+            reduction.agent_reports.insert(report.agent);
         }
         _ => {}
     }
@@ -266,6 +368,61 @@ fn pending_checkpoint(reduction: &RunReduction) -> Option<RequestInputCheckpoint
             }
             _ => None,
         })
+}
+
+async fn pending_child_wait(
+    store: &SqliteStoreHandle,
+    session_id: &SessionId,
+    run_id: &RunId,
+    reduction: &RunReduction,
+) -> Result<Option<ChildWaitCheckpoint>, HaiderError> {
+    let delegations = store
+        .delegations_for_parent_run(session_id.clone(), run_id.clone())
+        .await?;
+    if delegations.is_empty() {
+        return Ok(None);
+    }
+    let mut checkpoints = Vec::with_capacity(delegations.len());
+    for delegation in delegations {
+        let tool = reduction
+            .tool_calls
+            .get(&delegation.call_id)
+            .filter(|tool| tool.item_id == delegation.tool_item_id)
+            .ok_or_else(|| {
+                HaiderError::new(
+                    ErrorCode::StoreCorrupt,
+                    format!(
+                        "delegation {} has no matching parent spawn tool",
+                        delegation.agent_id
+                    ),
+                    false,
+                )
+            })?;
+        checkpoints.push((
+            tool.started_seq,
+            DeferredToolCheckpoint {
+                ticket: DeferredTicket {
+                    id: delegation.agent_id.as_str().to_owned(),
+                    manifest: delegation.manifest,
+                },
+                tool_item_id: tool.item_id.clone(),
+                call_id: delegation.call_id.clone(),
+                tool_name: tool.name.clone(),
+                args: tool.args.clone(),
+                report_emitted: reduction.agent_reports.contains(&delegation.agent_id),
+                child_result_emitted: reduction.child_results.contains(&delegation.agent_id),
+                tool_result_emitted: reduction.tool_results.contains(&delegation.call_id),
+                item_completed: tool.completed,
+            },
+        ));
+    }
+    checkpoints.sort_by_key(|(started_seq, _)| *started_seq);
+    Ok(Some(ChildWaitCheckpoint {
+        tools: checkpoints
+            .into_iter()
+            .map(|(_, checkpoint)| checkpoint)
+            .collect(),
+    }))
 }
 
 fn recovered_acceptance(

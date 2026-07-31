@@ -51,6 +51,7 @@
 mod accounts;
 mod config;
 mod connection;
+mod delegation;
 mod endpoint;
 mod error;
 mod lifecycle;
@@ -59,6 +60,8 @@ mod profile_vault;
 mod provider_registry;
 mod runtime;
 mod session_hub;
+#[cfg(test)]
+mod subagent_core_tests;
 mod turn_recovery;
 mod worker;
 

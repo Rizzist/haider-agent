@@ -381,6 +381,7 @@ async fn run_inner(
     let worker_dependencies = crate::worker::WorkerDependencies {
         provider_factory,
         tool_factory: std::sync::Arc::clone(&dependencies.tool_factory),
+        delegation: None,
     };
     let worker_manager = WorkerManager::start(
         hub.clone(),
@@ -409,6 +410,11 @@ async fn run_inner(
                         recovered.checkpoint,
                         recovered.committed_answer,
                     )
+                    .await
+            }
+            RecoveredWork::ChildWait(recovered) => {
+                worker_handle
+                    .recover_child_wait(recovered.accepted, recovered.checkpoint)
                     .await
             }
         };

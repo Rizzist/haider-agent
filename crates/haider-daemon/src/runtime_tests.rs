@@ -111,6 +111,273 @@ async fn a_dropped_controller_is_not_a_second_signal() {
     assert_eq!(completed, Some(9));
 }
 
+/// MUTATION CHECK: remove the Waiting(LocalChild) recovery arm or its
+/// delegation/tool checkpoint reconstruction. Expected runtime failure: the
+/// parent is terminalized as Errored and no `RecoveredWork::ChildWait` is
+/// returned after the child has already committed Done.
+#[tokio::test]
+async fn child_done_parent_wait_crash_recovers_the_same_logical_turn() {
+    use crate::turn_recovery::{RecoveredWork, recover_interrupted_turns};
+    use haider_core::{
+        DelegationRecord, DelegationState, SessionCreateCommand, SqliteStoreHandle, StoreHandle,
+        TurnAcceptCommand,
+    };
+    use haider_protocol::DeliveryMode;
+    use haider_protocol::EventPayload;
+    use haider_protocol::agent::{AgentManifest, AgentRole, Grant, Placement};
+    use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
+    use haider_protocol::ids::{AgentId, DeviceId, EventId, ItemId, LeaseId, RunId, SessionId};
+    use haider_protocol::item::{ItemDelta, ItemEvent, ToolStatus, TurnItem};
+    use haider_protocol::state::{RunState, WaitReason};
+
+    fn create_command(session_id: &SessionId, device_id: &DeviceId) -> SessionCreateCommand {
+        SessionCreateCommand {
+            command_id: format!("create-{session_id}"),
+            request_digest: format!("digest-{session_id}"),
+            request_json: format!(r#"{{"session":"{session_id}"}}"#),
+            session_id: session_id.clone(),
+            cwd: std::env::current_dir()
+                .expect("cwd")
+                .to_string_lossy()
+                .into_owned(),
+            provider: "fake".into(),
+            model: "fake-model".into(),
+            max_tokens: 4096,
+            system_prompt_version: "test-v1".into(),
+            event_id: EventId::new(format!("created-{session_id}")),
+            device_id: device_id.clone(),
+        }
+    }
+
+    fn envelope(
+        generation: u64,
+        device_id: &DeviceId,
+        session_id: &SessionId,
+        run_id: &RunId,
+        suffix: &str,
+        payload: EventPayload,
+    ) -> haider_protocol::envelope::RawEnvelope {
+        EventEnvelope {
+            schema_version: SCHEMA_VERSION,
+            event_id: EventId::new(format!("crash-{suffix}")),
+            seq: 0,
+            session_id: session_id.clone(),
+            branch_id: None,
+            run_id: Some(run_id.clone()),
+            agent_id: None,
+            device_id: device_id.clone(),
+            authority_epoch: 0,
+            worker_generation: generation,
+            causation_id: None,
+            correlation_id: None,
+            committed_at_ms: 0,
+            render: RenderTargets {
+                ui: true,
+                durable: true,
+                prompt: PromptRender::Omit,
+            },
+            payload: serde_json::to_value(payload).expect("payload"),
+        }
+    }
+
+    let root = tempfile::tempdir().expect("temp profile");
+    let store = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("open generation one");
+    let generation = store.worker_generation();
+    let device_id = DeviceId::new("recovery-test-device");
+    let parent_session = SessionId::new("recovery-parent");
+    let child_session = SessionId::new("recovery-child");
+    let parent_run = RunId::new("recovery-parent-run");
+    let child_run = RunId::new("recovery-child-run");
+    let agent = AgentId::new("recovery-agent");
+    let tool_item = ItemId::new("recovery-tool-item");
+    store
+        .create_session(create_command(&parent_session, &device_id))
+        .await
+        .expect("create parent");
+    store
+        .create_session(create_command(&child_session, &device_id))
+        .await
+        .expect("create child");
+    store
+        .accept_turn(TurnAcceptCommand {
+            command_id: "accept-parent".into(),
+            request_digest: "accept-parent-digest".into(),
+            request_json: r#"{"turn":"parent"}"#.into(),
+            session_id: parent_session.clone(),
+            worker_generation: generation,
+            run_id: parent_run.clone(),
+            agent_id: None,
+            text: "delegate".into(),
+            attachments: Vec::new(),
+            mode: DeliveryMode::Steer,
+            queued_event_id: EventId::new("parent-queued"),
+            user_event_id: EventId::new("parent-user"),
+            active_event_id: EventId::new("parent-active"),
+            device_id: device_id.clone(),
+        })
+        .await
+        .expect("accept parent");
+    store
+        .accept_turn(TurnAcceptCommand {
+            command_id: "accept-child".into(),
+            request_digest: "accept-child-digest".into(),
+            request_json: r#"{"turn":"child"}"#.into(),
+            session_id: child_session.clone(),
+            worker_generation: generation,
+            run_id: child_run.clone(),
+            agent_id: Some(agent.clone()),
+            text: "child task".into(),
+            attachments: Vec::new(),
+            mode: DeliveryMode::Steer,
+            queued_event_id: EventId::new("child-queued"),
+            user_event_id: EventId::new("child-user"),
+            active_event_id: EventId::new("child-active"),
+            device_id: device_id.clone(),
+        })
+        .await
+        .expect("accept child");
+    let manifest = AgentManifest {
+        agent: agent.clone(),
+        role: AgentRole::Subagent,
+        task: "tests".into(),
+        callsign: Some("SUB-RECOVERY".into()),
+        model_profile: "fake-model".into(),
+        grant: Grant {
+            tools: Vec::new(),
+            effect_ceiling: Vec::new(),
+        },
+        budget_tokens: Some(4096),
+        placement: Placement::Local,
+        lease: LeaseId::new("recovery-lease"),
+        fencing_epoch: generation,
+        attempt: 0,
+        parent: None,
+        coordinates: None,
+    };
+    store
+        .create_delegation(DelegationRecord {
+            agent_id: agent.clone(),
+            child_session_id: child_session.clone(),
+            child_run_id: child_run.clone(),
+            parent_session_id: parent_session.clone(),
+            parent_run_id: parent_run.clone(),
+            call_id: "spawn-call".into(),
+            tool_item_id: tool_item.clone(),
+            parent_agent_id: None,
+            root_session_id: parent_session.clone(),
+            depth: 1,
+            task: "tests".into(),
+            prompt: "run tests".into(),
+            manifest: manifest.clone(),
+            state: DelegationState::Spawned,
+            report: None,
+        })
+        .await
+        .expect("create delegation");
+    store
+        .mark_delegation_running(agent.clone())
+        .await
+        .expect("mark child running");
+    let mut parent_events = vec![
+        envelope(
+            generation,
+            &device_id,
+            &parent_session,
+            &parent_run,
+            "tool-start",
+            EventPayload::Item(ItemEvent::Started {
+                item_id: tool_item.clone(),
+                item: TurnItem::ToolCall {
+                    call_id: "spawn-call".into(),
+                    name: "spawn_subagent".into(),
+                    args: serde_json::json!({}),
+                    status: ToolStatus::InProgress,
+                },
+            }),
+        ),
+        envelope(
+            generation,
+            &device_id,
+            &parent_session,
+            &parent_run,
+            "tool-args",
+            EventPayload::Item(ItemEvent::Delta {
+                item_id: tool_item.clone(),
+                delta: ItemDelta::ToolArgs {
+                    fragment: r#"{"task":"tests","prompt":"run tests"}"#.into(),
+                },
+            }),
+        ),
+        envelope(
+            generation,
+            &device_id,
+            &parent_session,
+            &parent_run,
+            "spawned",
+            EventPayload::AgentSpawned(manifest),
+        ),
+        envelope(
+            generation,
+            &device_id,
+            &parent_session,
+            &parent_run,
+            "waiting",
+            EventPayload::RunState(RunState::Waiting {
+                reason: WaitReason::LocalChild,
+            }),
+        ),
+    ];
+    StoreHandle::append(&store, &mut parent_events)
+        .await
+        .expect("append parent wait");
+    let mut child_done = [envelope(
+        generation,
+        &device_id,
+        &child_session,
+        &child_run,
+        "child-done",
+        EventPayload::RunState(RunState::Done),
+    )];
+    child_done[0].agent_id = Some(agent.clone());
+    StoreHandle::append(&store, &mut child_done)
+        .await
+        .expect("append child done");
+    store.close().await.expect("close generation one");
+
+    let recovered_store = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("open generation two");
+    let work = recover_interrupted_turns(&recovered_store, &device_id)
+        .await
+        .expect("recover turns");
+    let checkpoint = work
+        .into_iter()
+        .find_map(|work| match work {
+            RecoveredWork::ChildWait(recovered) => Some(recovered.checkpoint),
+            _ => None,
+        })
+        .expect("parent child wait recovered");
+    assert_eq!(checkpoint.tools.len(), 1);
+    assert_eq!(checkpoint.tools[0].call_id, "spawn-call");
+    assert_eq!(checkpoint.tools[0].ticket.manifest.agent, agent);
+    assert!(!checkpoint.tools[0].tool_result_emitted);
+    let parent_tail = recovered_store
+        .read(&parent_session, 0, 128)
+        .await
+        .expect("read recovered parent");
+    assert!(matches!(
+        parent_tail.last().map(|event| {
+            serde_json::from_value::<EventPayload>(event.payload.clone()).expect("payload")
+        }),
+        Some(EventPayload::RunState(RunState::Waiting {
+            reason: WaitReason::LocalChild
+        }))
+    ));
+    recovered_store.close().await.expect("close recovery store");
+}
+
 #[tokio::test]
 async fn work_finishing_inside_the_barrier_completes_normally() {
     let (_sender, mut shutdown) = shutdown_channel();

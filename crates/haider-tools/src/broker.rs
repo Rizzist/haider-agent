@@ -1100,6 +1100,27 @@ impl EffectBroker {
         self.journal_outcome(intent, EffectOutcome::Unknown).await
     }
 
+    /// Begins the short `AgentSpawn` effect. The caller must establish the
+    /// child session and durable delegation link, then immediately call
+    /// [`Self::finish_agent_spawn`]; child execution is not part of this
+    /// effect's lifetime.
+    pub async fn begin_agent_spawn(
+        &mut self,
+        operation: &crate::SpawnSubagent,
+        policy: &PermissionPolicy,
+    ) -> ToolResult<EffectIntent> {
+        self.begin(operation, policy).await
+    }
+
+    /// Terminalizes the short spawn effect after durable establishment.
+    pub async fn finish_agent_spawn(
+        &mut self,
+        intent: &EffectIntent,
+        result: ToolResult<()>,
+    ) -> ToolResult<()> {
+        self.finish(intent, result).await
+    }
+
     /// Runs intent → authorize for one operation and journals `Dispatched`
     /// iff the verdict is `Allow`. `Ask` and `Deny` become typed errors, so a
     /// tool built on `begin` cannot reach its side effect unauthorized.

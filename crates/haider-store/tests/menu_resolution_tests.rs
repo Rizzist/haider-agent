@@ -137,6 +137,7 @@ fn turn_command(store: &Store, session_id: &SessionId, command_id: &str) -> Turn
         session_id: session_id.clone(),
         worker_generation: store.worker_generation(),
         run_id: RunId::new(format!("run-{command_id}")),
+        agent_id: None,
         text: "global namespace".into(),
         attachments: Vec::new(),
         mode: DeliveryMode::Queue,

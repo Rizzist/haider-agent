@@ -462,6 +462,7 @@ fn golden_agent_family() {
         &AgentManifest {
             agent: AgentId::new("a-child-1"),
             role: AgentRole::Subagent,
+            task: "tests".into(),
             callsign: Some("Hasan".into()),
             model_profile: "gpt-5.6".into(),
             grant: Grant {
@@ -485,6 +486,31 @@ fn golden_agent_family() {
             verified: ReportVerification::Verified,
             workspace_revision: Some(WorkspaceRevision::new("blake3:r2")),
         },
+    );
+}
+
+/// MUTATION CHECK: remove the serde default from `AgentManifest::task`.
+/// Expected runtime failure: a pre-W6 manifest no longer decodes, breaking
+/// additive protocol compatibility with old durable journals and peers.
+#[test]
+fn pre_w6_agent_manifest_decodes_without_task_label() {
+    let old = serde_json::json!({
+        "agent": "old-child",
+        "role": "subagent",
+        "model_profile": "old-model",
+        "grant": {"tools": [], "effect_ceiling": []},
+        "placement": {"placement": "local"},
+        "lease": "old-lease",
+        "fencing_epoch": 1
+    });
+    let manifest: haider_protocol::agent::AgentManifest =
+        serde_json::from_value(old).expect("old manifest remains decodable");
+    assert!(manifest.task.is_empty());
+    assert!(
+        !serde_json::to_value(manifest)
+            .expect("serialize manifest")
+            .as_object()
+            .is_some_and(|object| object.contains_key("task"))
     );
 }
 
