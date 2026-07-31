@@ -73,3 +73,26 @@ the socket-bound tests codex's sandbox cannot run; full per-crate gate
 ## Verdict
 
 **SHIP** (merge to main, ships as v0.0.27 — custom providers WORK).
+
+## Post-release live-ops addendum (installed v0.0.27)
+
+Full battery on the SHIPPED build: custom-provider 6/6 (idempotent — the
+probe now uses a fixed `probefix` fixture; matching-identity configure is
+a safe update, the alias replaces), subscription turn 4/4, window truth
+272k, alias card 4/4.
+
+Two findings for the next lane:
+
+1. **Imported OAuth tokens do not refresh (W5g-6 candidate, REAL user
+   pain):** the codex-import token expired between releases and every
+   subscription turn ERRORED (badge only, no transcript reason) until a
+   manual `haider import codex`. The daemon holds the refresh token; it
+   should refresh at the broker seam like its own PKCE flows. The
+   error-surfacing gap (an expired credential reads as a silent ERRORED
+   badge) rides along.
+2. **The store JSONs are projections.** `accounts.json` file-surgery was
+   resurrected by sqlite login-receipt reconciliation at the next boot —
+   by design. Durable cleanup is `account.remove` over RPC (hello needs
+   `client_kind` + `capabilities_requested: [view, control]`). There is
+   no `provider.remove` method and no account-remove UI yet (§5 gap,
+   sim has none either).
