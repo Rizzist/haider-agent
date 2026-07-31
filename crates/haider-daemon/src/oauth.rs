@@ -563,6 +563,22 @@ impl fmt::Debug for OAuthProviderRegistration {
 }
 
 impl OAuthProviderRegistration {
+    /// Whether a grant must carry `scope` to pass VALIDATION (import,
+    /// stored bundle, token/refresh response).
+    ///
+    /// `scopes` is what OUR authorize REQUESTS — consent breadth (Claude
+    /// Code parity, W5g-7). A grant only needs the operation-critical
+    /// subset: a foreign import or an older refresh grant that can serve
+    /// inference must not be refused for missing consent-only scopes.
+    /// Every scope stays required by default; only Anthropic's
+    /// consent-only breadth relaxes.
+    fn validation_required(&self, scope: &str) -> bool {
+        if self.provider_id == haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME {
+            return scope == "user:inference";
+        }
+        true
+    }
+
     /// Constructs validated immutable metadata.
     ///
     /// Plain HTTP is accepted only for numeric loopback endpoints, which is
@@ -1055,6 +1071,7 @@ fn claude_import_bundle(
     if !registration
         .scopes
         .iter()
+        .filter(|scope| registration.validation_required(scope))
         .all(|scope| credentials.oauth.scopes.contains(scope))
     {
         return Err(invalid_import(path, "claude-code"));
@@ -2415,6 +2432,7 @@ async fn token_bundle_from_response(
     if !registration
         .scopes
         .iter()
+        .filter(|scope| registration.validation_required(scope))
         .all(|scope| scopes.contains(scope))
     {
         return Err(OAuthPublicError::new("scope_mismatch", false));
@@ -3326,6 +3344,7 @@ impl CredentialBroker {
             || !registration
                 .scopes
                 .iter()
+                .filter(|scope| registration.validation_required(scope))
                 .all(|scope| bundle.granted_scopes.contains(scope))
         {
             return Err(HaiderError::new(
@@ -3589,6 +3608,7 @@ fn refresh_bundle_from_response(
     if !registration
         .scopes
         .iter()
+        .filter(|scope| registration.validation_required(scope))
         .all(|scope| scopes.contains(scope))
     {
         return Err(OAuthPublicError::new("scope_mismatch", false));

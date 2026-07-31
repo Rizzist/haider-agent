@@ -4652,6 +4652,62 @@ async fn claude_code_import_honors_expiry_and_anthropic_registration() {
     store.close().await.expect("close");
 }
 
+/// MUTATION CHECK (W5g-7): make `validation_required` return `false` for
+/// `user:inference` too (validation demands nothing). Expected runtime
+/// failure: the inference-less grant below imports instead of being
+/// refused — a credential the turn path can never use.
+#[tokio::test(flavor = "current_thread")]
+async fn claude_code_import_without_inference_scope_is_refused() {
+    let fixture_dir = test_store_dir();
+    let source_path = fixture_dir.path().join("claude-credentials.json");
+    std::fs::write(
+        &source_path,
+        br#"{
+  "claudeAiOauth": {
+    "accessToken": "fake-claude-access-token-9",
+    "refreshToken": "fake-claude-refresh-token-9",
+    "expiresAt": 4102444800123,
+    "scopes": ["user:profile"],
+    "subscriptionType": "max"
+  }
+}"#,
+    )
+    .expect("write scopeless Claude fixture");
+    if run_oauth_import_env_child(
+        "accounts::accounts_tests::claude_code_import_without_inference_scope_is_refused",
+        &[("HAIDER_CLAUDE_CREDS_PATH", &source_path)],
+    ) {
+        return;
+    }
+
+    let store_dir = test_store_dir();
+    let store = open_store(store_dir.path()).await;
+    let vault = Arc::new(MemoryVault::new());
+    let (mut actor, snapshot, _management) = start_oauth_import_test_actor(
+        &store,
+        Arc::clone(&vault),
+        HashSet::new(),
+        RefreshFenceRegistry::default(),
+    );
+    let (sink, mut frames) = channel_sink();
+    send_oauth_import(&actor.commands(), sink, "import-claude-9", "claude-code").await;
+    match tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        .await
+        .expect("refusal deadline")
+        .expect("refusal response")
+    {
+        WireFrame::Response {
+            body: ResponseBody::Error { code, .. },
+            ..
+        } => assert_eq!(code, ERROR_CODE_INVALID_ARGUMENT),
+        other => panic!("an inference-less grant must be refused: {other:?}"),
+    }
+    assert_eq!(snapshot.lock().expect("snapshot").len(), 0, "nothing lands");
+
+    actor.shutdown().await;
+    store.close().await.expect("close");
+}
+
 /// MUTATION CHECK: downgrade a missing/malformed import into a partial
 /// commit. Expected runtime failure: either the descriptor snapshot, vault
 /// list, or management revision changes despite the path-naming error.
