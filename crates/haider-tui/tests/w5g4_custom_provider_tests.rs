@@ -117,6 +117,15 @@ fn the_live_card_edits_and_submits_under_the_snapshot_revision() {
         key(&mut model, KeyCode::Backspace);
     }
     type_text(&mut model, "11434/v1");
+    // An empty model REFUSES the submit — an enabled create without an
+    // inventory and default would bounce at the daemon (W5g-5).
+    key(&mut model, KeyCode::Enter);
+    {
+        let card = model.custom_add.as_ref().expect("card");
+        assert!(matches!(card.phase, CustomPhase::Editing { .. }));
+        assert_eq!(card.focus, CustomField::Model, "the missing field focuses");
+    }
+    type_text(&mut model, "llama3.1:8b");
     key(&mut model, KeyCode::Enter);
     assert!(matches!(
         model.custom_add.as_ref().expect("card").phase,
@@ -127,9 +136,10 @@ fn the_live_card_edits_and_submits_under_the_snapshot_revision() {
     assert!(
         pass.commands.iter().any(|command| matches!(
             command,
-            LiveCommand::ConfigureProvider { provider, origin, expected_revision, .. }
+            LiveCommand::ConfigureProvider { provider, origin, model, expected_revision, .. }
                 if provider == "custom-llama"
                     && origin == "http://127.0.0.1:11434/v1"
+                    && model == "llama3.1:8b"
                     && *expected_revision == 7
         )),
         "the configure rides the edited fields under the snapshot revision"
@@ -150,6 +160,9 @@ fn a_committed_configure_chains_into_the_key_card() {
     let mut driver = LiveDriver::new("test");
 
     open_card(&mut model);
+    key(&mut model, KeyCode::Tab);
+    key(&mut model, KeyCode::Tab);
+    type_text(&mut model, "llama3.1:8b");
     key(&mut model, KeyCode::Enter);
     let pass = live_pass(&mut driver, &mut model, None, std::time::Instant::now());
     let command_id = pass
@@ -199,6 +212,9 @@ fn a_failed_configure_reopens_the_fields_with_the_reason() {
     let mut driver = LiveDriver::new("test");
 
     open_card(&mut model);
+    key(&mut model, KeyCode::Tab);
+    key(&mut model, KeyCode::Tab);
+    type_text(&mut model, "llama3.1:8b");
     key(&mut model, KeyCode::Enter);
     let pass = live_pass(&mut driver, &mut model, None, std::time::Instant::now());
     let command_id = pass

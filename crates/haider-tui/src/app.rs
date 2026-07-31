@@ -345,6 +345,7 @@ pub enum OAuthAddPhase {
 pub enum CustomField {
     Name,
     Origin,
+    Model,
 }
 
 /// Where the `+ Custom (OpenAI-compatible)` card is in its flow.
@@ -369,6 +370,10 @@ pub struct CustomProviderCard {
     pub name: String,
     /// OpenAI-compatible base URL (`http://127.0.0.1:8000/v1`).
     pub origin: String,
+    /// The served model id, free-form (`llama3.1:8b`) — an enabled create
+    /// REQUIRES a model inventory and a default (daemon law, W5g-5), so
+    /// the card asks for the one the server actually serves.
+    pub model: String,
     pub focus: CustomField,
     pub phase: CustomPhase,
     /// Attempt identity (the card discipline): every driver reply must
@@ -1377,6 +1382,9 @@ pub enum AppRequest {
         attempt: u64,
         name: String,
         origin: String,
+        /// The served model id — seeds the inventory AND the default (an
+        /// enabled create requires both, daemon law).
+        model: String,
         expected_revision: u64,
     },
     /// Open a URL in the user's browser (runtime-owned effect; the demo
@@ -3940,6 +3948,7 @@ impl AppModel {
         self.custom_add = Some(CustomProviderCard {
             name: smallest_free_alias("custom", &taken),
             origin: "http://127.0.0.1:8000/v1".to_owned(),
+            model: String::new(),
             focus: CustomField::Name,
             phase: CustomPhase::Editing { error: None },
             attempt: self.custom_attempt_seq,
@@ -3974,14 +3983,23 @@ impl AppModel {
             self.dirty = true;
             return;
         }
+        // An ENABLED create requires a model inventory and a default
+        // (daemon law) — the card refuses to submit what would bounce.
+        if card.model.trim().is_empty() {
+            card.focus = CustomField::Model;
+            self.dirty = true;
+            return;
+        }
         card.phase = CustomPhase::Submitting;
         let attempt = card.attempt;
         let name = card.name.clone();
         let origin = card.origin.trim().to_owned();
+        let model = card.model.trim().to_owned();
         self.requests.push(AppRequest::ProviderConfigure {
             attempt,
             name,
             origin,
+            model,
             expected_revision,
         });
         self.dirty = true;
@@ -4030,13 +4048,26 @@ impl AppModel {
         match code {
             KeyCode::Esc => self.cancel_custom_add(),
             KeyCode::Enter => self.submit_custom_add(),
-            KeyCode::Tab | KeyCode::BackTab => {
+            KeyCode::Tab => {
                 if let Some(card) = self.custom_add.as_mut()
                     && matches!(card.phase, CustomPhase::Editing { .. })
                 {
                     card.focus = match card.focus {
                         CustomField::Name => CustomField::Origin,
+                        CustomField::Origin => CustomField::Model,
+                        CustomField::Model => CustomField::Name,
+                    };
+                    self.dirty = true;
+                }
+            }
+            KeyCode::BackTab => {
+                if let Some(card) = self.custom_add.as_mut()
+                    && matches!(card.phase, CustomPhase::Editing { .. })
+                {
+                    card.focus = match card.focus {
+                        CustomField::Name => CustomField::Model,
                         CustomField::Origin => CustomField::Name,
+                        CustomField::Model => CustomField::Origin,
                     };
                     self.dirty = true;
                 }
@@ -4051,6 +4082,9 @@ impl AppModel {
                         }
                         CustomField::Origin => {
                             card.origin.pop();
+                        }
+                        CustomField::Model => {
+                            card.model.pop();
                         }
                     }
                     self.dirty = true;
@@ -4068,10 +4102,17 @@ impl AppModel {
                                 self.dirty = true;
                             }
                         }
-                        // The origin is a URL — any printable character.
+                        // The origin is a URL, the model a free-form
+                        // server id (`llama3.1:8b`) — any printable.
                         CustomField::Origin => {
                             if !c.is_control() {
                                 card.origin.push(c);
+                                self.dirty = true;
+                            }
+                        }
+                        CustomField::Model => {
+                            if !c.is_control() {
+                                card.model.push(c);
                                 self.dirty = true;
                             }
                         }

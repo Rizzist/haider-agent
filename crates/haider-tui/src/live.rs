@@ -206,11 +206,14 @@ pub enum LiveCommand {
     },
     /// `provider.configure` CREATE for a custom OpenAI-compatible provider
     /// (W5g-4). Identity fields are fixed by the card: chat-completions
-    /// family, api-key auth, enabled, no seeded models (they discover).
+    /// family, api-key auth, enabled. The served model seeds the inventory
+    /// and the default in one stroke (an enabled create requires both —
+    /// daemon law, W5g-5).
     ConfigureProvider {
         command_id: CommandId,
         provider: String,
         origin: String,
+        model: String,
         expected_revision: u64,
     },
 }
@@ -2051,6 +2054,7 @@ impl LiveDriver {
                 attempt,
                 name,
                 origin,
+                model: served_model,
                 expected_revision,
             } => {
                 let command_id = self.mint();
@@ -2059,6 +2063,7 @@ impl LiveDriver {
                     command_id,
                     provider: name,
                     origin,
+                    model: served_model,
                     expected_revision,
                 })]
             }

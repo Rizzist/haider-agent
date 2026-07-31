@@ -1050,9 +1050,17 @@ fn render_accounts(
                 ),
                 theme.text_style(),
             ));
+            footer_lines.push(Line::styled(
+                format!(
+                    "  model  ❯ {}{}",
+                    card.model,
+                    caret(editing && card.focus == crate::app::CustomField::Model)
+                ),
+                theme.text_style(),
+            ));
             if editing {
                 footer_lines.push(Line::styled(
-                    "  models discover from /v1/models · the key is asked next",
+                    "  the model the server serves (e.g. llama3.1:8b) · the key is asked next",
                     theme.dim_style(),
                 ));
                 footer_lines.push(Line::styled(

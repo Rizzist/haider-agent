@@ -596,6 +596,7 @@ pub fn request_body(command: LiveCommand) -> RequestBody {
             command_id,
             provider,
             origin,
+            model,
             expected_revision,
         } => RequestBody::ProviderConfigure {
             command_id,
@@ -604,8 +605,8 @@ pub fn request_body(command: LiveCommand) -> RequestBody {
             origin: Some(origin),
             auth_requirement: Some(haider_rpc::ProviderAuthRequirementWire::ApiKey),
             enabled: true,
-            models: Vec::new(),
-            default_model: None,
+            models: vec![model.clone()],
+            default_model: Some(model),
             expected_revision,
         },
         LiveCommand::OAuthStart {
