@@ -577,6 +577,117 @@ async fn committed_child_progress_resets_the_stall_deadline() {
     store.close().await.expect("store close");
 }
 
+/// MUTATION CHECK (review round, W6c): make the post-nudge cancel window
+/// ignore committed progress (deadline from `nudge_at_ms` alone). Expected
+/// runtime failure: the recovering child below — silent long enough to
+/// draw the nudge, then steadily productive — is cancelled anyway, so the
+/// no-Cancelled assertion (and the child's own report reaching the
+/// parent) dies. A nudge is a question, not a sentence.
+#[tokio::test]
+async fn a_child_that_recovers_after_the_nudge_is_never_cancelled() {
+    let root = tempfile::tempdir().expect("temp profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let mut script = vec![
+        FakeStep::EmitToolCall {
+            call_id: "recover-spawn".into(),
+            name: "spawn_subagent".into(),
+            args: serde_json::json!({"task":"recover","prompt":"pause then work"}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        // Silent past the 35ms deadline (the nudge fires mid-delay) but
+        // recovering INSIDE the post-nudge window — the whole point.
+        FakeStep::Delay { ms: 45 },
+    ];
+    for index in 0..10 {
+        script.push(FakeStep::EmitReasoning {
+            text: format!("recovered-heartbeat-{index}"),
+        });
+        script.push(FakeStep::Delay { ms: 12 });
+    }
+    script.extend([
+        FakeStep::EmitText {
+            text: "recovered child report".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "recover-spawn".into(),
+        },
+        FakeStep::EmitText {
+            text: "parent merged the recovered report".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]);
+    let provider = Arc::new(FakeProvider::new(script));
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let delegation = DelegationHandle::with_stall_deadline(hub.clone(), Duration::from_millis(35));
+    let manager = WorkerManager::start(
+        hub.clone(),
+        WorkerDependencies {
+            provider_factory: Arc::new(FixedProviderFactory {
+                provider: provider.clone(),
+            }),
+            tool_factory: Arc::new(BrokerToolFactory),
+            delegation: Some(delegation),
+        },
+        false,
+    );
+    let manager_handle = manager.handle();
+    hub.install_worker_manager(manager_handle.clone())
+        .expect("install manager");
+    let parent_session = SessionId::new("w6c-recover-parent");
+    let parent_run = RunId::new("w6c-recover-parent-run");
+    let accepted = accept_parent(&hub, &parent_session, &parent_run, "w6c-recover").await;
+    manager_handle
+        .submit(accepted)
+        .await
+        .expect("submit parent");
+    wait_for_state(&store, &parent_session, |state| *state == RunState::Done).await;
+
+    let child = hub
+        .delegations_for_parent_run(parent_session.clone(), parent_run)
+        .await
+        .expect("delegations")
+        .pop()
+        .expect("child");
+    let child_payloads = typed_payloads(
+        &store
+            .read(&child.child_session_id, 0, 1024)
+            .await
+            .expect("child events"),
+    );
+    assert!(
+        !child_payloads
+            .iter()
+            .any(|payload| matches!(payload, EventPayload::RunState(RunState::Cancelled))),
+        "post-nudge progress averts the cancel"
+    );
+    let parent_payloads = typed_payloads(
+        &store
+            .read(&parent_session, 0, 1024)
+            .await
+            .expect("parent events"),
+    );
+    assert!(
+        parent_payloads.iter().any(|payload| matches!(
+            payload,
+            EventPayload::Item(haider_protocol::item::ItemEvent::Completed { item, .. })
+                if matches!(item, haider_protocol::item::TurnItem::AgentMessage { text }
+                    if text == "parent merged the recovered report")
+        )),
+        "the parent merges the child's OWN report, not a stall summary"
+    );
+
+    manager.shutdown().await.expect("manager shutdown");
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
+}
+
 /// MUTATION CHECK: remove the coordinator's cancellation sweep. Expected
 /// runtime failure: the parent reaches Cancelled while its child remains
 /// Streaming, tripping the child terminal-state wait below.
