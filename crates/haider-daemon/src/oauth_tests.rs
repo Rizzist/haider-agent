@@ -2156,6 +2156,9 @@ fn start_status_actor(
     tokio::spawn(async move {
         while let Some(command) = receiver.recv().await {
             match command {
+                crate::accounts::AccountCommand::BeginOAuthImportHeal { completed, .. } => {
+                    let _ = completed.send(Ok(crate::accounts::OAuthImportHealResult::NotImported));
+                }
                 crate::accounts::AccountCommand::BeginOAuthRefresh {
                     descriptor,
                     expected,
@@ -2423,6 +2426,10 @@ async fn concurrent_resolve_waits_for_rotated_descriptor_commit_or_fail_closed_d
         async move {
             while let Some(command) = receiver.recv().await {
                 match command {
+                    crate::accounts::AccountCommand::BeginOAuthImportHeal { completed, .. } => {
+                        let _ =
+                            completed.send(Ok(crate::accounts::OAuthImportHealResult::NotImported));
+                    }
                     crate::accounts::AccountCommand::BeginOAuthRefresh {
                         descriptor,
                         completed,
@@ -2528,38 +2535,37 @@ async fn concurrent_resolve_waits_for_rotated_descriptor_commit_or_fail_closed_d
     assert!(broker.shutdown().await);
 }
 
-// MUTATION CHECK (W5b.1c P3): remove ONLY `resolve`'s outer
-// `snapshot_allows_oauth` admission gate while leaving `resolve_oauth`'s
-// inner/pre-admitted commit gate intact. Expected failure: the inner gate
-// still rejects the expired descriptor, but only after this test observes an
-// unauthorized vault read. The outer gate is independently load-bearing for
-// reject-before-secret-read admission.
+// W5g-8 deliberately supersedes the old tombstone admission law: Expired is
+// now a healing hint, while removal/replacement remains fenced separately.
+// MUTATION CHECK: restore the old `snapshot_allows_oauth` fail-fast in
+// `resolve`. Expected runtime failure: the expired manual OAuth credential is
+// rejected before its existing refresh fallback can rotate the token.
 #[tokio::test]
-async fn outer_oauth_admission_rejects_expired_descriptor_before_vault_read() {
+async fn expired_oauth_admission_self_heals_through_refresh() {
     let server = FakeOAuthServer::start(FakeMode::Success, false).await;
     let vault = Arc::new(ResolveCountingVault::new());
-    let mut descriptor = oauth_descriptor_for_test();
-    descriptor.status = CredentialStatus::Expired;
+    let descriptor = oauth_descriptor_for_test();
+    // Natural expiry with a CLEAN snapshot: the refresh fallback is legal
+    // here. A snapshot-EXPIRED mark instead forbids replaying the
+    // rotating token (W5g-8 safety split; see
+    // forced_shutdown_never_retries_an_uncertain_refresh_on_successor).
     vault
         .put(
             &descriptor.alias,
-            &oauth_bundle_for_test(&server, now_ms().expect("clock").saturating_add(300_000))
+            &oauth_bundle_for_test(&server, now_ms().expect("clock").saturating_sub(1))
                 .encode()
                 .expect("encode"),
         )
         .expect("seed");
     let (broker, _, descriptor) = broker_for(&server, vault.clone(), descriptor);
 
-    let error = broker
+    let access = broker
         .resolve(&descriptor)
         .await
-        .expect_err("expired descriptor is rejected");
-    assert_eq!(error.code, ErrorCode::Unauthorized);
-    assert_eq!(
-        vault.resolves.load(Ordering::SeqCst),
-        0,
-        "outer admission must reject before reading OAuth secret material"
-    );
+        .expect("expired descriptor refreshes");
+    assert_eq!(access.expose_secret(), b"ACCESS_ROTATED_SENTINEL_3a19");
+    assert!(vault.resolves.load(Ordering::SeqCst) > 0);
+    assert_eq!(server.state.refresh_calls.load(Ordering::SeqCst), 1);
     assert!(broker.shutdown().await);
 }
 

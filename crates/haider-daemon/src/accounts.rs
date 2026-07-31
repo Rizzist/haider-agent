@@ -723,7 +723,7 @@ pub(crate) struct ProviderConfigureJob {
 }
 
 /// Account actor mailbox items.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub(crate) struct OAuthRefreshFence {
     pub(crate) fence_epoch: u64,
     pub(crate) generation: u64,
@@ -731,6 +731,13 @@ pub(crate) struct OAuthRefreshFence {
     pub(crate) audience: String,
     pub(crate) resource: Option<String>,
     pub(crate) subject_hash: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum OAuthImportHealResult {
+    NotImported,
+    RefreshFallback { source: String },
+    Committed { expected: OAuthRefreshFence },
 }
 
 pub(crate) enum AccountCommand {
@@ -755,6 +762,11 @@ pub(crate) enum AccountCommand {
         descriptor: CredentialDescriptor,
         expected: OAuthRefreshFence,
         completed: tokio::sync::oneshot::Sender<Result<bool, HaiderError>>,
+    },
+    BeginOAuthImportHeal {
+        descriptor: CredentialDescriptor,
+        expected: OAuthRefreshFence,
+        completed: tokio::sync::oneshot::Sender<Result<OAuthImportHealResult, HaiderError>>,
     },
     ApplyOAuthRefresh {
         descriptor: CredentialDescriptor,
@@ -1076,6 +1088,7 @@ async fn run_account_actor(
                     &reserved_aliases,
                     &refresh_fences,
                     *job,
+                    None,
                 )
                 .await;
             }
@@ -1186,6 +1199,25 @@ async fn run_account_actor(
                     &descriptor,
                     &expected,
                     &refresh_fences,
+                )
+                .await;
+                let _ = completed.send(result);
+            }
+            AccountCommand::BeginOAuthImportHeal {
+                descriptor,
+                expected,
+                completed,
+            } => {
+                let result = handle_oauth_import_heal(
+                    &store,
+                    &mut accounts,
+                    Arc::clone(&vault),
+                    &snapshot,
+                    management.as_ref(),
+                    &reserved_aliases,
+                    &refresh_fences,
+                    &descriptor,
+                    &expected,
                 )
                 .await;
                 let _ = completed.send(result);
@@ -3504,6 +3536,184 @@ async fn handle_oauth_add(
 
 const ACCOUNT_ADD_RECEIPT_METHOD: &str = "account.add";
 
+#[derive(Default)]
+struct OAuthImportHealSink {
+    result: StdMutex<Option<Result<CredentialDescriptor, HaiderError>>>,
+}
+
+impl OAuthImportHealSink {
+    fn take(&self) -> Option<Result<CredentialDescriptor, HaiderError>> {
+        self.result.lock().ok()?.take()
+    }
+}
+
+impl FrameSink for OAuthImportHealSink {
+    fn try_send(&self, frame: WireFrame) -> Result<(), crate::session_hub::FrameSendError> {
+        let result = match frame {
+            WireFrame::Response {
+                body: ResponseBody::AccountOAuthImport { descriptor, .. },
+                ..
+            } => Ok(descriptor),
+            WireFrame::Response {
+                body:
+                    ResponseBody::Error {
+                        message, retryable, ..
+                    },
+                ..
+            } => Err(HaiderError::new(
+                ErrorCode::ProviderError,
+                message,
+                retryable,
+            )),
+            _ => Err(HaiderError::new(
+                ErrorCode::Internal,
+                "OAuth self-heal import returned an unexpected response",
+                false,
+            )),
+        };
+        let mut slot = self
+            .result
+            .lock()
+            .map_err(|_| crate::session_hub::FrameSendError)?;
+        *slot = Some(result);
+        Ok(())
+    }
+}
+
+fn fresh_oauth_heal_command_id() -> Result<String, HaiderError> {
+    let mut random = [0_u8; 32];
+    getrandom::fill(&mut random).map_err(|_| {
+        HaiderError::new(
+            ErrorCode::Internal,
+            "cannot mint an OAuth self-heal command id",
+            true,
+        )
+    })?;
+    Ok(format!("oauth-heal-{}", blake3::hash(&random).to_hex()))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_oauth_import_heal(
+    store: &SqliteStoreHandle,
+    accounts: &mut AccountStore<Box<dyn StoreLike>>,
+    vault: Arc<dyn Vault>,
+    snapshot: &AccountsSnapshot,
+    management: Option<&ManagementSnapshot>,
+    reserved_aliases: &HashSet<String>,
+    refresh_fences: &RefreshFenceRegistry,
+    descriptor: &CredentialDescriptor,
+    expected: &OAuthRefreshFence,
+) -> Result<OAuthImportHealResult, HaiderError> {
+    if refresh_fences.current(&descriptor.alias) != expected.fence_epoch
+        || !accounts
+            .get(&descriptor.alias)
+            .is_some_and(|current| same_credential_identity(current, descriptor))
+    {
+        return Ok(OAuthImportHealResult::NotImported);
+    }
+    let receipts = store.account_add_receipts().await?;
+    let latest = latest_oauth_receipt_identities(&receipts);
+    let Some((_, OAuthReceiptIdentity::Import(identity))) = latest.get(descriptor.alias.as_str())
+    else {
+        return Ok(OAuthImportHealResult::NotImported);
+    };
+    if identity.alias != descriptor.alias.as_str() || identity.provider != descriptor.provider {
+        return Ok(OAuthImportHealResult::NotImported);
+    }
+    let spec = oauth_import_source_spec(&identity.source)?;
+    if spec.provider != descriptor.provider {
+        return Ok(OAuthImportHealResult::NotImported);
+    }
+    let source = identity.source.clone();
+    let vault_for_read = Arc::clone(&vault);
+    let alias_for_read = descriptor.alias.clone();
+    let current = tokio::task::spawn_blocking(move || vault_for_read.resolve(&alias_for_read))
+        .await
+        .map_err(|_| {
+            HaiderError::new(ErrorCode::ProviderError, "OAuth vault worker failed", true)
+        })??;
+    let current = haider_accounts::OAuthTokenBundleV1::decode(current.expose_secret())?;
+    if current.generation != expected.generation
+        || current.provider_id != descriptor.provider
+        || current.issuer != expected.issuer
+        || current.audience != expected.audience
+        || current.resource != expected.resource
+        || current.identity.subject_hash != expected.subject_hash
+        || current.identity.display_identity != descriptor.identity
+    {
+        return Ok(OAuthImportHealResult::NotImported);
+    }
+    let Some(generation) = current.generation.checked_add(1) else {
+        return Err(HaiderError::new(
+            ErrorCode::ProviderError,
+            "OAuth token generation is exhausted",
+            false,
+        ));
+    };
+    let source_for_read = source.clone();
+    let imported = match tokio::task::spawn_blocking(move || {
+        load_oauth_import_bundle(&source_for_read, generation)
+    })
+    .await
+    {
+        Ok(Ok(imported)) => imported,
+        Ok(Err(_)) | Err(_) => return Ok(OAuthImportHealResult::RefreshFallback { source }),
+    };
+    if bool::from(current.access_token().ct_eq(imported.access_token())) {
+        return Ok(OAuthImportHealResult::RefreshFallback { source });
+    }
+    let mut committed = OAuthRefreshFence {
+        fence_epoch: expected.fence_epoch,
+        generation: imported.generation,
+        issuer: imported.issuer.clone(),
+        audience: imported.audience.clone(),
+        resource: imported.resource.clone(),
+        subject_hash: imported.identity.subject_hash.clone(),
+    };
+    let command_id = fresh_oauth_heal_command_id()?;
+    let sink = Arc::new(OAuthImportHealSink::default());
+    let route_sink: Arc<dyn FrameSink> = sink.clone();
+    handle_oauth_import(
+        store,
+        accounts,
+        vault,
+        snapshot,
+        management,
+        reserved_aliases,
+        refresh_fences,
+        OAuthImportJob {
+            command_id: command_id.clone(),
+            source: source.clone(),
+            route: LoginRoute {
+                request_id: RequestId::new(command_id),
+                sink: route_sink,
+            },
+        },
+        Some(imported),
+    )
+    .await;
+    let committed_descriptor = sink.take().ok_or_else(|| {
+        HaiderError::new(
+            ErrorCode::Internal,
+            "OAuth self-heal import lost its completion",
+            false,
+        )
+    })??;
+    if committed_descriptor.alias != descriptor.alias
+        || committed_descriptor.provider != spec.provider
+    {
+        return Err(HaiderError::new(
+            ErrorCode::Internal,
+            "OAuth self-heal import committed an unexpected account",
+            false,
+        ));
+    }
+    committed.fence_epoch = refresh_fences.current(&committed_descriptor.alias);
+    Ok(OAuthImportHealResult::Committed {
+        expected: committed,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_oauth_import(
     store: &SqliteStoreHandle,
@@ -3514,6 +3724,7 @@ async fn handle_oauth_import(
     reserved_aliases: &HashSet<String>,
     refresh_fences: &RefreshFenceRegistry,
     job: OAuthImportJob,
+    preloaded_bundle: Option<haider_accounts::OAuthTokenBundleV1>,
 ) {
     let spec = match oauth_import_source_spec(&job.source) {
         Ok(spec) => spec,
@@ -3723,27 +3934,42 @@ async fn handle_oauth_import(
         None => 1,
     };
     let source = spec.source.to_owned();
-    let imported =
-        match tokio::task::spawn_blocking(move || load_oauth_import_bundle(&source, generation))
-            .await
-        {
-            Ok(Ok(bundle)) => bundle,
-            Ok(Err(error)) => {
-                respond_management_error(&job.route, &error);
-                return;
+    let imported = match preloaded_bundle {
+        Some(imported) if imported.generation == generation => imported,
+        Some(_) => {
+            respond_management_error(
+                &job.route,
+                &HaiderError::new(
+                    ErrorCode::ProviderError,
+                    "OAuth import generation changed before commit",
+                    true,
+                ),
+            );
+            return;
+        }
+        None => {
+            match tokio::task::spawn_blocking(move || load_oauth_import_bundle(&source, generation))
+                .await
+            {
+                Ok(Ok(bundle)) => bundle,
+                Ok(Err(error)) => {
+                    respond_management_error(&job.route, &error);
+                    return;
+                }
+                Err(_) => {
+                    respond_management_error(
+                        &job.route,
+                        &HaiderError::new(
+                            ErrorCode::ProviderError,
+                            "OAuth import file worker failed",
+                            true,
+                        ),
+                    );
+                    return;
+                }
             }
-            Err(_) => {
-                respond_management_error(
-                    &job.route,
-                    &HaiderError::new(
-                        ErrorCode::ProviderError,
-                        "OAuth import file worker failed",
-                        true,
-                    ),
-                );
-                return;
-            }
-        };
+        }
+    };
     if imported.provider_id != spec.provider {
         respond_management_error(
             &job.route,

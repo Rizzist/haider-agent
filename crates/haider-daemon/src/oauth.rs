@@ -56,6 +56,20 @@ const OAUTH_REFRESH_SKEW: Duration = Duration::from_secs(30);
 // bundle for one eager refresh on first resolution.
 const CODEX_IMPORT_FALLBACK_WINDOW: Duration = Duration::from_secs(15 * 60);
 
+#[cfg(test)]
+static OAUTH_IMPORT_READ_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn reset_oauth_import_read_count() {
+    OAUTH_IMPORT_READ_COUNT.store(0, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub(crate) fn oauth_import_read_count() -> usize {
+    OAUTH_IMPORT_READ_COUNT.load(Ordering::SeqCst)
+}
+
 struct OwnedTaskSet {
     sealed: AtomicBool,
     panicked: AtomicBool,
@@ -611,6 +625,17 @@ impl OAuthProviderRegistration {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_test_refresh_shape(
+        mut self,
+        encoding: OAuthTokenRequestEncoding,
+        includes_binding: bool,
+    ) -> Self {
+        self.refresh_encoding = encoding;
+        self.refresh_includes_binding = includes_binding;
+        self
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn new_with_identity(
         provider_id: impl Into<String>,
@@ -899,6 +924,8 @@ pub(crate) fn load_oauth_import_bundle(
 }
 
 fn read_oauth_import_file(path: &Path, source: &str) -> Result<Zeroizing<Vec<u8>>, HaiderError> {
+    #[cfg(test)]
+    OAUTH_IMPORT_READ_COUNT.fetch_add(1, Ordering::SeqCst);
     let file = std::fs::File::open(path).map_err(|error| {
         HaiderError::new(
             ErrorCode::CredentialMissing,
@@ -2670,8 +2697,14 @@ struct RefreshKey {
     fence_epoch: u64,
 }
 
+#[derive(Debug, Clone)]
+enum RefreshFlightOutcome {
+    Refreshed,
+    Imported(crate::accounts::OAuthRefreshFence),
+}
+
 struct RefreshFlight {
-    completed: Mutex<Option<Result<(), HaiderError>>>,
+    completed: Mutex<Option<Result<RefreshFlightOutcome, HaiderError>>>,
     notify: Notify,
 }
 
@@ -2683,14 +2716,14 @@ impl RefreshFlight {
         }
     }
 
-    fn finish(&self, result: Result<(), HaiderError>) {
+    fn finish(&self, result: Result<RefreshFlightOutcome, HaiderError>) {
         if let Ok(mut completed) = self.completed.lock() {
             *completed = Some(result);
         }
         self.notify.notify_waiters();
     }
 
-    async fn wait(&self) -> Result<(), HaiderError> {
+    async fn wait(&self) -> Result<RefreshFlightOutcome, HaiderError> {
         loop {
             let notified = self.notify.notified();
             if let Ok(completed) = self.completed.lock()
@@ -2745,6 +2778,13 @@ struct BrokerInner {
     panic_refresh_worker: AtomicBool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotOAuthState {
+    Current,
+    Expired,
+    Replaced,
+}
+
 /// Completes the public single-flight even if the worker unwinds before its
 /// normal `finish` call. `JoinSet` still records the panic for shutdown
 /// honesty; this guard is the immediate fail-closed wakeup for waiters.
@@ -2772,7 +2812,7 @@ impl RefreshWorkerCompletion {
         }
     }
 
-    fn finish(mut self, result: Result<(), HaiderError>) {
+    fn finish(mut self, result: Result<RefreshFlightOutcome, HaiderError>) {
         self.flight.finish(result);
         self.remove_registered_flight();
         self.armed = false;
@@ -2950,18 +2990,28 @@ impl CredentialBroker {
         }
         match descriptor.auth_method {
             AuthMethod::ApiKey => self.resolve_vault(&descriptor.alias).await,
-            AuthMethod::OAuth => {
-                if !Self::snapshot_allows_oauth(&self.inner, descriptor) {
+            AuthMethod::OAuth => match Self::snapshot_oauth_state(&self.inner, descriptor) {
+                SnapshotOAuthState::Current | SnapshotOAuthState::Expired => {
+                    self.resolve_oauth(descriptor, false).await
+                }
+                SnapshotOAuthState::Replaced => {
                     let Some(flight) = self.active_flight(descriptor) else {
                         return Err(expired_or_replaced(descriptor));
                     };
-                    flight.wait().await?;
-                    if !Self::snapshot_allows_oauth(&self.inner, descriptor) {
-                        return Err(expired_or_replaced(descriptor));
+                    match flight.wait().await? {
+                        RefreshFlightOutcome::Imported(expected) => {
+                            self.resolve_imported_bundle(descriptor, &expected).await
+                        }
+                        RefreshFlightOutcome::Refreshed
+                            if Self::snapshot_oauth_state(&self.inner, descriptor)
+                                != SnapshotOAuthState::Replaced =>
+                        {
+                            self.resolve_oauth(descriptor, false).await
+                        }
+                        RefreshFlightOutcome::Refreshed => Err(expired_or_replaced(descriptor)),
                     }
                 }
-                self.resolve_oauth(descriptor, false).await
-            }
+            },
         }
     }
 
@@ -3017,7 +3067,7 @@ impl CredentialBroker {
     ) -> Result<SecretHandle, HaiderError> {
         let fence = self.fence_for(&descriptor.alias);
         let expected_fence = fence.load(Ordering::Acquire);
-        let bundle = loop {
+        let (bundle, source_first, refresh_allowed) = loop {
             let stored = self.resolve_vault(&descriptor.alias).await?;
             let bundle = OAuthTokenBundleV1::decode(stored.expose_secret())?;
             if fence.load(Ordering::Acquire) != expected_fence {
@@ -3033,25 +3083,49 @@ impl CredentialBroker {
                 HaiderError::new(ErrorCode::Internal, "system clock is unavailable", true)
             })?;
             let skew_ms = duration_ms(self.inner.refresh_skew);
+            let snapshot_state = Self::snapshot_oauth_state(&self.inner, descriptor);
+            if matches!(
+                snapshot_state,
+                SnapshotOAuthState::Expired | SnapshotOAuthState::Replaced
+            ) && let Some(flight) = self.active_flight(descriptor)
+            {
+                match flight.wait().await? {
+                    RefreshFlightOutcome::Imported(expected) => {
+                        return self.resolve_imported_bundle(descriptor, &expected).await;
+                    }
+                    RefreshFlightOutcome::Refreshed
+                        if Self::snapshot_oauth_state(&self.inner, descriptor)
+                            == SnapshotOAuthState::Current =>
+                    {
+                        continue;
+                    }
+                    RefreshFlightOutcome::Refreshed => {
+                        return Err(expired_or_replaced(descriptor));
+                    }
+                }
+            }
+            let actually_expired = bundle.expires_at_unix_ms <= now;
             if force_refresh
                 || bundle.expires_at_unix_ms <= now.saturating_add(skew_ms)
                 || codex_import_fallback_refresh_candidate(&bundle, now)
+                || snapshot_state == SnapshotOAuthState::Expired
             {
-                break bundle;
+                // A snapshot-EXPIRED mark may record an UNCERTAIN refresh
+                // (forced shutdown mid-exchange): the rotating refresh
+                // token must never be replayed then. Source-first healing
+                // never touches that token, so it stays allowed; the
+                // refresh fallback is only for expiry we WITNESSED in
+                // this process (skew/force/plain expiry, never the mark).
+                break (
+                    bundle,
+                    actually_expired || snapshot_state == SnapshotOAuthState::Expired,
+                    snapshot_state != SnapshotOAuthState::Expired,
+                );
             }
-            if Self::snapshot_allows_oauth(&self.inner, descriptor) {
-                return Ok(bundle.access_token_handle());
-            }
-            // A rotated bundle can be physically present while its descriptor
-            // restoration is still pending. The active flight is the commit
-            // barrier: wait for its durable restoration/fail-close result,
-            // then re-read instead of publishing the early vault value.
-            let Some(flight) = self.active_flight(descriptor) else {
-                return Err(expired_or_replaced(descriptor));
-            };
-            flight.wait().await?;
-            if !Self::snapshot_allows_oauth(&self.inner, descriptor) {
-                return Err(expired_or_replaced(descriptor));
+            match snapshot_state {
+                SnapshotOAuthState::Current => return Ok(bundle.access_token_handle()),
+                SnapshotOAuthState::Expired => unreachable!("expired OAuth broke for healing"),
+                SnapshotOAuthState::Replaced => return Err(expired_or_replaced(descriptor)),
             }
         };
         let key = RefreshKey {
@@ -3104,19 +3178,27 @@ impl CredentialBroker {
                     if broker.panic_refresh_worker.swap(false, Ordering::AcqRel) {
                         panic!("injected OAuth refresh worker panic before completion");
                     }
-                    let result = Self::refresh(&broker, &descriptor, &bundle, expected_fence).await;
+                    let result = Self::heal_or_refresh(
+                        &broker,
+                        &descriptor,
+                        &bundle,
+                        expected_fence,
+                        source_first,
+                        refresh_allowed,
+                    )
+                    .await;
                     // All waiters observe the same effective outcome. A transient
                     // refresh failure may keep using an access token that has not
                     // actually expired.
                     let public_result = match result {
-                        Ok(_) => Ok(()),
+                        Ok(outcome) => Ok(outcome),
                         Err(error)
                             if !force_refresh
                                 && error.retryable
                                 && now_ms()
                                     .is_some_and(|current| bundle.expires_at_unix_ms > current) =>
                         {
-                            Ok(())
+                            Ok(RefreshFlightOutcome::Refreshed)
                         }
                         Err(error) => Err(error),
                     };
@@ -3127,7 +3209,10 @@ impl CredentialBroker {
                 registration.commit();
             }
         }
-        flight.wait().await?;
+        let outcome = flight.wait().await?;
+        if let RefreshFlightOutcome::Imported(expected) = outcome {
+            return self.resolve_imported_bundle(descriptor, &expected).await;
+        }
         if !Self::snapshot_allows_oauth(&self.inner, descriptor) {
             return Err(rotation_error(
                 descriptor,
@@ -3158,6 +3243,100 @@ impl CredentialBroker {
             ));
         }
         Ok(refreshed.access_token_handle())
+    }
+
+    async fn heal_or_refresh(
+        inner: &Arc<BrokerInner>,
+        descriptor: &CredentialDescriptor,
+        bundle: &OAuthTokenBundleV1,
+        expected_fence: u64,
+        source_first: bool,
+        refresh_allowed: bool,
+    ) -> Result<RefreshFlightOutcome, HaiderError> {
+        let mut refresh_descriptor = descriptor.clone();
+        if source_first {
+            refresh_descriptor.status = CredentialStatus::Ok;
+            let (completed, result) = oneshot::channel();
+            inner
+                .status_commands
+                .send(crate::accounts::AccountCommand::BeginOAuthImportHeal {
+                    descriptor: descriptor.clone(),
+                    expected: refresh_fence(bundle, expected_fence),
+                    completed,
+                })
+                .await
+                .map_err(|_| {
+                    HaiderError::new(
+                        ErrorCode::ProviderError,
+                        "OAuth account actor is unavailable before import self-heal",
+                        false,
+                    )
+                })?;
+            let healed = result.await.map_err(|_| {
+                HaiderError::new(
+                    ErrorCode::ProviderError,
+                    "OAuth import self-heal completion was lost",
+                    false,
+                )
+            })??;
+            match healed {
+                crate::accounts::OAuthImportHealResult::Committed { expected } => {
+                    return Ok(RefreshFlightOutcome::Imported(expected));
+                }
+                crate::accounts::OAuthImportHealResult::RefreshFallback { source } => {
+                    // Under an UNCERTAIN mark (forced shutdown mid-refresh)
+                    // the rotating refresh token must not be replayed — the
+                    // stale source cannot heal, so the account stays down
+                    // with its named remedy.
+                    if !refresh_allowed {
+                        return Err(imported_credential_expired(descriptor, &source));
+                    }
+                    return Self::refresh(inner, &refresh_descriptor, bundle, expected_fence)
+                        .await
+                        .map(|_| RefreshFlightOutcome::Refreshed)
+                        .map_err(|_| imported_credential_expired(descriptor, &source));
+                }
+                crate::accounts::OAuthImportHealResult::NotImported => {}
+            }
+        }
+        if !refresh_allowed {
+            // Not an import, mark possibly uncertain: the pre-heal law
+            // stands — refuse rather than risk a double-spent rotation.
+            return Err(expired_or_replaced(descriptor));
+        }
+        Self::refresh(inner, &refresh_descriptor, bundle, expected_fence)
+            .await
+            .map(|_| RefreshFlightOutcome::Refreshed)
+    }
+
+    async fn resolve_imported_bundle(
+        &self,
+        descriptor: &CredentialDescriptor,
+        expected: &crate::accounts::OAuthRefreshFence,
+    ) -> Result<SecretHandle, HaiderError> {
+        if self.fence_for(&descriptor.alias).load(Ordering::Acquire) != expected.fence_epoch {
+            return Err(stale_refresh());
+        }
+        let current = Self::current_oauth_descriptor(&self.inner, descriptor)
+            .ok_or_else(|| expired_or_replaced(descriptor))?;
+        let stored = self.resolve_vault(&descriptor.alias).await?;
+        let bundle = OAuthTokenBundleV1::decode(stored.expose_secret())?;
+        if bundle.generation != expected.generation
+            || bundle.issuer != expected.issuer
+            || bundle.audience != expected.audience
+            || bundle.resource != expected.resource
+            || bundle.identity.subject_hash != expected.subject_hash
+        {
+            return Err(stale_refresh());
+        }
+        self.validate_bundle(&current, &bundle)?;
+        if now_ms().is_none_or(|now| bundle.expires_at_unix_ms <= now) {
+            return Err(imported_credential_expired_for_provider(
+                descriptor,
+                &descriptor.provider,
+            ));
+        }
+        Ok(bundle.access_token_handle())
     }
 
     async fn refresh(
@@ -3361,15 +3540,47 @@ impl CredentialBroker {
     }
 
     fn snapshot_allows_oauth(inner: &BrokerInner, expected: &CredentialDescriptor) -> bool {
-        inner.snapshot.lock().is_ok_and(|descriptors| {
-            descriptors.iter().any(|current| {
-                current.alias == expected.alias
-                    && current.provider == expected.provider
-                    && current.base_url == expected.base_url
-                    && current.auth_method == expected.auth_method
-                    && current.identity == expected.identity
-                    && !matches!(&current.status, CredentialStatus::Expired)
+        Self::snapshot_oauth_state(inner, expected) == SnapshotOAuthState::Current
+    }
+
+    fn snapshot_oauth_state(
+        inner: &BrokerInner,
+        expected: &CredentialDescriptor,
+    ) -> SnapshotOAuthState {
+        inner
+            .snapshot
+            .lock()
+            .map_or(SnapshotOAuthState::Replaced, |descriptors| {
+                descriptors
+                    .iter()
+                    .find(|current| {
+                        current.alias == expected.alias
+                            && current.provider == expected.provider
+                            && current.base_url == expected.base_url
+                            && current.auth_method == expected.auth_method
+                            && current.identity == expected.identity
+                    })
+                    .map_or(SnapshotOAuthState::Replaced, |current| {
+                        if matches!(&current.status, CredentialStatus::Expired) {
+                            SnapshotOAuthState::Expired
+                        } else {
+                            SnapshotOAuthState::Current
+                        }
+                    })
             })
+    }
+
+    fn current_oauth_descriptor(
+        inner: &BrokerInner,
+        expected: &CredentialDescriptor,
+    ) -> Option<CredentialDescriptor> {
+        inner.snapshot.lock().ok()?.iter().find_map(|current| {
+            (current.alias == expected.alias
+                && current.provider == expected.provider
+                && current.base_url == expected.base_url
+                && current.auth_method == expected.auth_method
+                && !matches!(&current.status, CredentialStatus::Expired))
+            .then(|| current.clone())
         })
     }
 
@@ -3650,7 +3861,7 @@ fn rotation_error(
     descriptor: &CredentialDescriptor,
     trigger: haider_accounts::RotationTrigger,
     retryable: bool,
-    message: &'static str,
+    message: &str,
 ) -> HaiderError {
     let mut error = HaiderError::new(ErrorCode::Unauthorized, message, retryable);
     error.details = Some(serde_json::json!({
@@ -3667,6 +3878,30 @@ fn rotation_error(
         }
     }));
     error
+}
+
+fn imported_credential_expired(descriptor: &CredentialDescriptor, source: &str) -> HaiderError {
+    rotation_error(
+        descriptor,
+        haider_accounts::RotationTrigger::AuthExpired,
+        false,
+        &format!("credential expired — re-run `haider import {source}` or sign in again"),
+    )
+}
+
+fn imported_credential_expired_for_provider(
+    descriptor: &CredentialDescriptor,
+    provider: &str,
+) -> HaiderError {
+    match provider {
+        haider_provider::OPENAI_OAUTH_PROVIDER_NAME => {
+            imported_credential_expired(descriptor, "codex")
+        }
+        haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME => {
+            imported_credential_expired(descriptor, "claude-code")
+        }
+        _ => expired_or_replaced(descriptor),
+    }
 }
 
 fn expired_or_replaced(descriptor: &CredentialDescriptor) -> HaiderError {

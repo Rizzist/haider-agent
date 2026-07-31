@@ -11,6 +11,14 @@ use crate::session_hub::FrameSendError;
 use crate::worker::ProviderFactory as _;
 use haider_core::ProviderAttemptResolver as _;
 use haider_rpc::{ProviderApiFamilyWire, ProviderAuthRequirementWire};
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
+
+use crate::oauth::{
+    OAuthProviderRegistration, OAuthTokenRequestEncoding, oauth_import_read_count,
+    reset_oauth_import_read_count,
+};
 
 fn test_store_dir() -> tempfile::TempDir {
     tempfile::Builder::new()
@@ -1223,6 +1231,155 @@ const CLAUDE_IMPORT_FIXTURE: &[u8] = br#"{
   }
 }"#;
 
+#[derive(Clone, Copy)]
+enum ImportRefreshMode {
+    Success,
+    InvalidGrant,
+}
+
+struct ImportRefreshServer {
+    address: std::net::SocketAddr,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    gate: Option<Arc<Semaphore>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for ImportRefreshServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl ImportRefreshServer {
+    async fn start(mode: ImportRefreshMode, gated: bool) -> Self {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind import refresh server");
+        let address = listener.local_addr().expect("import refresh address");
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let gate = gated.then(|| Arc::new(Semaphore::new(0)));
+        let calls_for_task = Arc::clone(&calls);
+        let gate_for_task = gate.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let calls = Arc::clone(&calls_for_task);
+                let gate = gate_for_task.clone();
+                tokio::spawn(async move {
+                    serve_import_refresh(stream, mode, calls, gate).await;
+                });
+            }
+        });
+        Self {
+            address,
+            calls,
+            gate,
+            task,
+        }
+    }
+
+    fn catalog(&self) -> OAuthProviderCatalog {
+        import_refresh_catalog(&format!("http://{}/token", self.address))
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    async fn wait_for_calls(&self, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while self.calls() != expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("import refresh call count");
+    }
+
+    fn release(&self) {
+        if let Some(gate) = &self.gate {
+            gate.add_permits(8);
+        }
+    }
+}
+
+fn import_refresh_catalog(token_endpoint: &str) -> OAuthProviderCatalog {
+    let registration = OAuthProviderRegistration::new(
+        OPENAI_OAUTH_PROVIDER_NAME,
+        "https://auth.openai.com",
+        "http://127.0.0.1:1/authorize",
+        token_endpoint,
+        "app_EMoamEEZ73f0CkXaXp7hrann",
+        ["openid", "profile", "email", "offline_access"].map(str::to_owned),
+        "app_EMoamEEZ73f0CkXaXp7hrann",
+        None,
+        true,
+        Arc::new(UnusedIdentityVerifier),
+    )
+    .expect("import refresh registration")
+    .with_test_refresh_shape(OAuthTokenRequestEncoding::Json, false);
+    OAuthProviderCatalog::with_test_registrations([registration]).expect("import refresh catalog")
+}
+
+async fn serve_import_refresh(
+    mut stream: TcpStream,
+    mode: ImportRefreshMode,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    gate: Option<Arc<Semaphore>>,
+) {
+    let mut request = Vec::new();
+    loop {
+        let mut chunk = [0_u8; 1024];
+        let Ok(read) = stream.read(&mut chunk).await else {
+            return;
+        };
+        if read == 0 {
+            return;
+        }
+        request.extend_from_slice(&chunk[..read]);
+        let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
+            continue;
+        };
+        let headers = String::from_utf8_lossy(&request[..header_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("Content-Length:")
+                    .or_else(|| line.strip_prefix("content-length:"))
+            })
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        if request.len() >= header_end.saturating_add(4).saturating_add(content_length) {
+            break;
+        }
+    }
+    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    if let Some(gate) = gate {
+        gate.acquire()
+            .await
+            .expect("release gated import refresh")
+            .forget();
+    }
+    let (status, body) = match mode {
+        ImportRefreshMode::Success => (
+            "200 OK",
+            r#"{"access_token":"fake-refreshed-access-token","refresh_token":"fake-rotated-refresh-token","token_type":"Bearer","expires_in":3600,"scope":"openid profile email offline_access"}"#,
+        ),
+        ImportRefreshMode::InvalidGrant => (
+            "400 Bad Request",
+            r#"{"error":"invalid_grant","error_description":"expired fixture grant"}"#,
+        ),
+    };
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+    let _ = stream.shutdown().await;
+}
+
 fn start_oauth_import_test_actor(
     store: &SqliteStoreHandle,
     vault: Arc<MemoryVault>,
@@ -1248,6 +1405,53 @@ fn start_oauth_import_test_actor(
         refresh_fences,
     });
     (actor, snapshot, management)
+}
+
+fn start_oauth_import_heal_test_actor(
+    store: &SqliteStoreHandle,
+    vault: Arc<MemoryVault>,
+    catalog: OAuthProviderCatalog,
+) -> (
+    AccountActorHandle,
+    CredentialBroker,
+    AccountsSnapshot,
+    RefreshFenceRegistry,
+) {
+    let accounts = memory_accounts();
+    let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(Vec::new()));
+    let providers = test_provider_registry();
+    let management = ManagementSnapshot::new(0, Vec::new(), providers.summaries());
+    let refresh_fences = RefreshFenceRegistry::default();
+    let broker_vault = vault.clone() as Arc<dyn Vault>;
+    let broker_snapshot = Arc::clone(&snapshot);
+    let broker_fences = refresh_fences.clone();
+    let (actor, broker) = start_account_actor_with_broker(
+        AccountActorConfig {
+            store: store.clone(),
+            accounts,
+            vault: vault as Arc<dyn Vault>,
+            validator: Arc::new(ProviderCredentialValidator),
+            snapshot: Arc::clone(&snapshot),
+            management: Some(management),
+            profile_id: "oauth-import-heal-test".into(),
+            default_model: "unused".into(),
+            providers,
+            provider_endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
+            reserved_aliases: HashSet::new(),
+            refresh_fences: refresh_fences.clone(),
+        },
+        |commands| {
+            CredentialBroker::new_with_fences(
+                broker_vault,
+                catalog,
+                broker_snapshot,
+                commands,
+                broker_fences,
+            )
+        },
+    )
+    .expect("OAuth import heal actor");
+    (actor, broker, snapshot, refresh_fences)
 }
 
 /// Always reports the R10 "validation unavailable" arm — the retryable
@@ -4354,6 +4558,90 @@ async fn send_oauth_import(
         .expect("send OAuth import");
 }
 
+async fn import_codex_for_heal(actor: &AccountActorHandle) -> CredentialDescriptor {
+    let (sink, mut frames) = channel_sink();
+    send_oauth_import(&actor.commands(), sink, "import-codex-before-heal", "codex").await;
+    match tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        .await
+        .expect("initial Codex import deadline")
+        .expect("initial Codex import response")
+    {
+        WireFrame::Response {
+            body: ResponseBody::AccountOAuthImport { descriptor, .. },
+            ..
+        } => descriptor,
+        other => panic!("unexpected initial Codex import response: {other:?}"),
+    }
+}
+
+/// Ages the STORED bundle past its expiry WITHOUT marking the account:
+/// the natural-expiry precondition (snapshot Current), where the refresh
+/// fallback stays legal (W5g-8 safety split: a snapshot-EXPIRED mark may
+/// record an UNCERTAIN refresh, and under it the rotating token is never
+/// replayed).
+fn age_import_bundle(vault: &MemoryVault, descriptor: &CredentialDescriptor) {
+    let stored = vault.resolve(&descriptor.alias).expect("imported bundle");
+    let bundle = haider_accounts::OAuthTokenBundleV1::decode(stored.expose_secret())
+        .expect("decode imported bundle");
+    let aged = haider_accounts::OAuthTokenBundleV1::new(
+        bundle.provider_id.clone(),
+        bundle.issuer.clone(),
+        bundle.audience.clone(),
+        bundle.resource.clone(),
+        bundle.token_type.clone(),
+        zeroize::Zeroizing::new(bundle.access_token().to_vec()),
+        bundle
+            .refresh_token()
+            .map(|token| zeroize::Zeroizing::new(token.to_vec())),
+        1_600_000_000_000, // 2020 — thoroughly expired
+        bundle.refresh_expires_at_unix_ms,
+        bundle.granted_scopes.clone(),
+        bundle.identity.clone(),
+        bundle.generation,
+    )
+    .expect("aged bundle");
+    vault
+        .put(
+            &descriptor.alias,
+            &aged.encode().expect("encode aged bundle"),
+        )
+        .expect("store aged bundle");
+}
+
+async fn mark_import_expired(
+    actor: &AccountActorHandle,
+    vault: &MemoryVault,
+    refresh_fences: &RefreshFenceRegistry,
+    descriptor: &CredentialDescriptor,
+) {
+    let stored = vault.resolve(&descriptor.alias).expect("imported bundle");
+    let bundle = haider_accounts::OAuthTokenBundleV1::decode(stored.expose_secret())
+        .expect("decode imported bundle");
+    let (completed, result) = tokio::sync::oneshot::channel();
+    actor
+        .commands()
+        .send(AccountCommand::ExpireOAuthRefresh {
+            descriptor: descriptor.clone(),
+            expected: OAuthRefreshFence {
+                fence_epoch: refresh_fences.current(&descriptor.alias),
+                generation: bundle.generation,
+                issuer: bundle.issuer,
+                audience: bundle.audience,
+                resource: bundle.resource,
+                subject_hash: bundle.identity.subject_hash,
+            },
+            completed,
+        })
+        .await
+        .expect("mark imported credential expired");
+    assert!(
+        result
+            .await
+            .expect("expiration response")
+            .expect("expiration")
+    );
+}
+
 fn openai_import_test_bundle(
     access_token: &[u8],
     refresh_token: &[u8],
@@ -4380,6 +4668,205 @@ fn openai_import_test_bundle(
         generation,
     )
     .expect("OpenAI import test bundle")
+}
+
+/// MUTATION CHECK: restore the marked-expired short-circuit in
+/// `CredentialBroker::resolve`. Expected runtime failure: resolution returns
+/// `expired_or_replaced`, so the fresher source is neither receipt-committed
+/// nor returned.
+#[tokio::test(flavor = "current_thread")]
+async fn marked_expired_import_commits_a_fresher_source_and_resolves_it() {
+    let fixture_dir = test_store_dir();
+    let source_path = fixture_dir.path().join("codex-auth.json");
+    std::fs::write(&source_path, CODEX_IMPORT_FIXTURE_1).expect("write stale Codex fixture");
+    if run_oauth_import_env_child(
+        "accounts::accounts_tests::marked_expired_import_commits_a_fresher_source_and_resolves_it",
+        &[("HAIDER_CODEX_AUTH_PATH", &source_path)],
+    ) {
+        return;
+    }
+    let source_path = std::path::PathBuf::from(
+        std::env::var_os("HAIDER_CODEX_AUTH_PATH").expect("isolated Codex path"),
+    );
+    let store_dir = test_store_dir();
+    let store = open_store(store_dir.path()).await;
+    let vault = Arc::new(MemoryVault::new());
+    let (mut actor, broker, snapshot, refresh_fences) = start_oauth_import_heal_test_actor(
+        &store,
+        Arc::clone(&vault),
+        import_refresh_catalog("http://127.0.0.1:1/token"),
+    );
+    let descriptor = import_codex_for_heal(&actor).await;
+    mark_import_expired(&actor, vault.as_ref(), &refresh_fences, &descriptor).await;
+    std::fs::write(&source_path, CODEX_IMPORT_FIXTURE_2).expect("write fresh Codex fixture");
+    reset_oauth_import_read_count();
+
+    let access = broker
+        .resolve(&descriptor)
+        .await
+        .expect("fresher source self-heals");
+    assert_eq!(access.expose_secret(), b"fake-access-token-2");
+    assert_eq!(oauth_import_read_count(), 1);
+    let stored = vault.resolve(&descriptor.alias).expect("healed bundle");
+    let bundle = haider_accounts::OAuthTokenBundleV1::decode(stored.expose_secret())
+        .expect("decode healed bundle");
+    assert_eq!(bundle.generation, 2);
+    assert_eq!(bundle.access_token(), b"fake-access-token-2");
+    let receipts = store.account_add_receipts().await.expect("import receipts");
+    assert_eq!(receipts.len(), 2);
+    assert!(receipts.iter().any(|receipt| {
+        receipt.command_id.starts_with("oauth-heal-") && receipt.state == "committed"
+    }));
+    assert!(snapshot.lock().expect("snapshot")[0].status == CredentialStatus::Ok);
+
+    assert!(broker.shutdown().await);
+    actor.shutdown().await;
+    store.close().await.expect("close");
+}
+
+/// MUTATION CHECK: drop the own-refresh fallback after a same-token source
+/// read. Expected runtime failure: the marked credential remains expired and
+/// this resolve never returns the fake endpoint's rotated access token.
+#[tokio::test(flavor = "current_thread")]
+async fn stale_import_source_falls_back_to_refresh_and_persists_rotation() {
+    let fixture_dir = test_store_dir();
+    let source_path = fixture_dir.path().join("codex-auth.json");
+    std::fs::write(&source_path, CODEX_IMPORT_FIXTURE_1).expect("write stale Codex fixture");
+    if run_oauth_import_env_child(
+        "accounts::accounts_tests::stale_import_source_falls_back_to_refresh_and_persists_rotation",
+        &[("HAIDER_CODEX_AUTH_PATH", &source_path)],
+    ) {
+        return;
+    }
+    let server = ImportRefreshServer::start(ImportRefreshMode::Success, false).await;
+    let store_dir = test_store_dir();
+    let store = open_store(store_dir.path()).await;
+    let vault = Arc::new(MemoryVault::new());
+    let (mut actor, broker, snapshot, refresh_fences) =
+        start_oauth_import_heal_test_actor(&store, Arc::clone(&vault), server.catalog());
+    let descriptor = import_codex_for_heal(&actor).await;
+    let _ = &refresh_fences;
+    age_import_bundle(vault.as_ref(), &descriptor);
+    reset_oauth_import_read_count();
+
+    let access = broker
+        .resolve(&descriptor)
+        .await
+        .expect("stale source falls back to refresh");
+    assert_eq!(access.expose_secret(), b"fake-refreshed-access-token");
+    assert_eq!(oauth_import_read_count(), 1);
+    assert_eq!(server.calls(), 1);
+    let stored = vault.resolve(&descriptor.alias).expect("refreshed bundle");
+    let bundle = haider_accounts::OAuthTokenBundleV1::decode(stored.expose_secret())
+        .expect("decode refreshed bundle");
+    assert_eq!(bundle.generation, 2);
+    assert_eq!(
+        bundle.refresh_token(),
+        Some(b"fake-rotated-refresh-token".as_slice())
+    );
+    assert!(snapshot.lock().expect("snapshot")[0].status == CredentialStatus::Ok);
+
+    assert!(broker.shutdown().await);
+    actor.shutdown().await;
+    store.close().await.expect("close");
+}
+
+/// MUTATION CHECK: restore the generic refresh failure after both healing
+/// paths lose. Expected runtime failure: the exact named recovery taxonomy
+/// below becomes `OAuth refresh permanently failed`/`provider_error`.
+#[tokio::test(flavor = "current_thread")]
+async fn failed_import_healing_names_the_import_recovery_command() {
+    let fixture_dir = test_store_dir();
+    let source_path = fixture_dir.path().join("codex-auth.json");
+    std::fs::write(&source_path, CODEX_IMPORT_FIXTURE_1).expect("write stale Codex fixture");
+    if run_oauth_import_env_child(
+        "accounts::accounts_tests::failed_import_healing_names_the_import_recovery_command",
+        &[("HAIDER_CODEX_AUTH_PATH", &source_path)],
+    ) {
+        return;
+    }
+    let server = ImportRefreshServer::start(ImportRefreshMode::InvalidGrant, false).await;
+    let store_dir = test_store_dir();
+    let store = open_store(store_dir.path()).await;
+    let vault = Arc::new(MemoryVault::new());
+    let (mut actor, broker, _snapshot, refresh_fences) =
+        start_oauth_import_heal_test_actor(&store, Arc::clone(&vault), server.catalog());
+    let descriptor = import_codex_for_heal(&actor).await;
+    mark_import_expired(&actor, vault.as_ref(), &refresh_fences, &descriptor).await;
+    reset_oauth_import_read_count();
+
+    let error = broker
+        .resolve(&descriptor)
+        .await
+        .expect_err("both import healing paths lose");
+    assert_eq!(error.code, ErrorCode::Unauthorized);
+    assert_eq!(
+        error.message,
+        "credential expired — re-run `haider import codex` or sign in again"
+    );
+    assert_eq!(oauth_import_read_count(), 1);
+    // The MARK may record an UNCERTAIN refresh (forced shutdown
+    // mid-exchange): the rotating token is never replayed under it, so
+    // the endpoint is never touched (W5g-8 safety split).
+    assert_eq!(server.calls(), 0);
+
+    assert!(broker.shutdown().await);
+    actor.shutdown().await;
+    store.close().await.expect("close");
+}
+
+/// MUTATION CHECK: remove the refresh-key flight around source-first healing.
+/// Expected runtime failure: both concurrent resolves re-read the source and
+/// call the gated token endpoint, taking both counters above one.
+#[tokio::test(flavor = "current_thread")]
+async fn concurrent_import_healing_reads_source_and_refreshes_once() {
+    let fixture_dir = test_store_dir();
+    let source_path = fixture_dir.path().join("codex-auth.json");
+    std::fs::write(&source_path, CODEX_IMPORT_FIXTURE_1).expect("write stale Codex fixture");
+    if run_oauth_import_env_child(
+        "accounts::accounts_tests::concurrent_import_healing_reads_source_and_refreshes_once",
+        &[("HAIDER_CODEX_AUTH_PATH", &source_path)],
+    ) {
+        return;
+    }
+    let server = ImportRefreshServer::start(ImportRefreshMode::Success, true).await;
+    let store_dir = test_store_dir();
+    let store = open_store(store_dir.path()).await;
+    let vault = Arc::new(MemoryVault::new());
+    let (mut actor, broker, _snapshot, refresh_fences) =
+        start_oauth_import_heal_test_actor(&store, Arc::clone(&vault), server.catalog());
+    let descriptor = import_codex_for_heal(&actor).await;
+    let _ = &refresh_fences;
+    age_import_bundle(vault.as_ref(), &descriptor);
+    reset_oauth_import_read_count();
+
+    let first = tokio::spawn({
+        let broker = broker.clone();
+        let descriptor = descriptor.clone();
+        async move { broker.resolve(&descriptor).await }
+    });
+    let second = tokio::spawn({
+        let broker = broker.clone();
+        let descriptor = descriptor.clone();
+        async move { broker.resolve(&descriptor).await }
+    });
+    server.wait_for_calls(1).await;
+    assert_eq!(oauth_import_read_count(), 1);
+    assert_eq!(server.calls(), 1);
+    server.release();
+    for task in [first, second] {
+        let access = task
+            .await
+            .expect("resolve joins")
+            .expect("resolve succeeds");
+        assert_eq!(access.expose_secret(), b"fake-refreshed-access-token");
+    }
+    assert_eq!(oauth_import_read_count(), 1);
+    assert_eq!(server.calls(), 1);
+
+    assert!(broker.shutdown().await);
+    actor.shutdown().await;
+    store.close().await.expect("close");
 }
 
 /// MUTATION CHECK: let any historical import receipt prove source ownership.
