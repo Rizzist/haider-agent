@@ -347,6 +347,21 @@ pub struct ProcessExecution {
     finalizer: Option<FinalizerObserver>,
 }
 
+/// Cloneable cancellation capability for a live process execution.
+///
+/// It exposes only the existing supervised TERM → grace → KILL request; it
+/// cannot wait for, inspect, or forge a process result.
+#[derive(Clone)]
+pub struct ProcessCancelHandle {
+    cancel: watch::Sender<bool>,
+}
+
+impl ProcessCancelHandle {
+    pub fn cancel(&self) {
+        self.cancel.send_replace(true);
+    }
+}
+
 impl std::fmt::Debug for ProcessExecution {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -364,6 +379,12 @@ impl ProcessExecution {
 
     pub fn effect(&self) -> &EffectId {
         &self.effect
+    }
+
+    pub fn cancel_handle(&self) -> ProcessCancelHandle {
+        ProcessCancelHandle {
+            cancel: self.cancel.clone(),
+        }
     }
 
     /// Requests supervised TERM → grace → KILL cancellation.

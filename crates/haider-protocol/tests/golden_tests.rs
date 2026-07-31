@@ -13,6 +13,10 @@ use haider_protocol::menu::{
     AnswerVia, Menu, MenuAnswer, MenuCloseReason, MenuKind, MenuOption, MenuScope,
 };
 use haider_protocol::state::{RunState, SessionState, VerifyStep, WaitReason};
+use haider_protocol::tool::{
+    DispatchMode, RememberedGrantScope, RememberedSessionGrant, ToolInventoryEntry,
+    ToolInventorySnapshot, ToolManifest, ToolPermissionDefault,
+};
 use haider_protocol::verify::{Diagnostic, GateReport, Severity, VerifyVerdict};
 use serde::{Serialize, de::DeserializeOwned};
 use std::path::PathBuf;
@@ -64,6 +68,9 @@ fn envelope(payload: EventPayload) -> EventEnvelope<EventPayload> {
     }
 }
 
+/// MUTATION CHECK: replace `PermissionRequired` with `InputRequired` in the
+/// W8a fixture. Expected runtime failure: the canonical permission-state
+/// golden differs while the historical input-state fixture remains intact.
 #[test]
 fn golden_run_states() {
     golden(
@@ -83,6 +90,43 @@ fn golden_run_states() {
         "run_state_input_required",
         &RunState::InputRequired {
             menu: MenuId::new("m-1"),
+        },
+    );
+    golden(
+        "run_state_permission_required",
+        &RunState::PermissionRequired {
+            menu: MenuId::new("m-permission-1"),
+        },
+    );
+}
+
+/// MUTATION CHECK: fabricate an inventory entry or omit the remembered grant.
+/// Expected runtime failure: the additive read-contract fixture differs at
+/// runtime and no longer round-trips to the daemon snapshot shape.
+#[test]
+fn golden_tool_inventory_snapshot() {
+    golden(
+        "tool_inventory_snapshot",
+        &ToolInventorySnapshot {
+            tools: vec![ToolInventoryEntry {
+                manifest: ToolManifest {
+                    name: "process_exec".into(),
+                    description: "Run one command".into(),
+                    effects: vec![haider_protocol::effect::EffectClass::ProcessExec],
+                    dispatch: DispatchMode::Await,
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "required": ["command"]
+                    }),
+                },
+                default: ToolPermissionDefault::Ask,
+            }],
+            remembered_grants: vec![RememberedSessionGrant {
+                class: haider_protocol::effect::EffectClass::ProcessExec,
+                scope: RememberedGrantScope::CommandShape {
+                    args_digest: "blake3-command-shape".into(),
+                },
+            }],
         },
     );
 }

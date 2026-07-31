@@ -4,10 +4,14 @@ use std::collections::BTreeSet;
 
 use haider_protocol::DeliveryMode;
 use haider_protocol::credential::{AuthMethod, CredentialDescriptor, CredentialStatus};
+use haider_protocol::effect::EffectClass;
 use haider_protocol::envelope::{PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION};
 use haider_protocol::ids::CredentialAlias;
-use haider_protocol::ids::{DeviceId, EventId, MenuId, RunId, SessionId};
+use haider_protocol::ids::{DeviceId, EventId, ItemId, MenuId, RunId, SessionId};
 use haider_protocol::session::SessionMetadataV1;
+use haider_protocol::tool::{
+    DispatchMode, ToolInventoryEntry, ToolInventorySnapshot, ToolManifest, ToolPermissionDefault,
+};
 use haider_rpc::{
     AccountAddMethod, AttachMode, AttachState, AttachmentId, CancelStatus, Capability, ClientKind,
     CommandId, ERROR_CODE_ALREADY_RESOLVED, ERROR_CODE_CAPABILITY_DENIED, ERROR_CODE_CURSOR_AHEAD,
@@ -706,6 +710,50 @@ pub fn transcript() -> Vec<WireFrame> {
                 FEATURE_VAULT_STAGE_V1.to_owned(),
             ]),
         }),
+        WireFrame::Request {
+            request_id: RequestId::new("request-shell-exec"),
+            body: RequestBody::ShellExec {
+                command_id: CommandId::new("command-shell-1"),
+                session_id: SessionId::new("session-1"),
+                worker_generation: 7,
+                command: "printf 'exact bytes\\n'".into(),
+                cwd: Some("crates/haider-tools".into()),
+            },
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-shell-exec"),
+            body: ResponseBody::ShellExec {
+                session_id: SessionId::new("session-1"),
+                item_id: ItemId::new("shell-item-1"),
+                accepted_seq: 51,
+                worker_generation: 7,
+            },
+        },
+        WireFrame::Request {
+            request_id: RequestId::new("request-tools-inventory"),
+            body: RequestBody::ToolsInventory {
+                session_id: SessionId::new("session-1"),
+            },
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-tools-inventory"),
+            body: ResponseBody::ToolsInventory {
+                session_id: SessionId::new("session-1"),
+                inventory: ToolInventorySnapshot {
+                    tools: vec![ToolInventoryEntry {
+                        manifest: ToolManifest {
+                            name: "process_exec".into(),
+                            description: "Run one command".into(),
+                            effects: vec![EffectClass::ProcessExec],
+                            dispatch: DispatchMode::Await,
+                            input_schema: serde_json::json!({"type": "object"}),
+                        },
+                        default: ToolPermissionDefault::Ask,
+                    }],
+                    remembered_grants: Vec::new(),
+                },
+            },
+        },
     ]
 }
 

@@ -1,0 +1,374 @@
+#![allow(clippy::expect_used)]
+
+use crate::turn_recovery::{RecoveredWork, recover_interrupted_turns};
+use crate::worker::{
+    BrokerToolFactory, PendingShellExec, RegisteredToolRoute, TurnToolFactory, defer_shell_handoff,
+    registered_tool_route, registered_tools, tool_inventory_snapshot,
+};
+use haider_core::{MemoryStore, SqliteStoreHandle, StoreHandle};
+use haider_protocol::EventPayload;
+use haider_protocol::effect::{AuthorizationVerdict, EffectClass, EffectIntent, EffectPhase};
+use haider_protocol::envelope::{
+    EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
+};
+use haider_protocol::ids::{DeviceId, EffectId, EventId, ItemId, MenuId, RunId, SessionId};
+use haider_protocol::item::{ItemEvent, ToolStatus, TurnItem};
+use haider_protocol::menu::{
+    AnswerVia, DecisionKind, Menu, MenuAnswer, MenuKind, MenuOption, MenuScope,
+};
+use haider_protocol::state::RunState;
+use haider_protocol::tool::{RememberedGrantScope, ToolPermissionDefault};
+use haider_store::{AcceptedShellExec, EventStore, SessionCreateCommand, Store};
+use std::collections::VecDeque;
+
+/// MUTATION CHECK: advertise a name that has no typed registry route, or add
+/// legacy `exec` to the manifests. Expected runtime failure: advertised and
+/// dispatchable canonical sets differ, or the exact migration assertions fail.
+#[test]
+fn canonical_inventory_equals_advertised_dispatchable_set() {
+    let definitions = TurnToolFactory::definitions(&BrokerToolFactory);
+    let advertised = definitions
+        .iter()
+        .map(|definition| definition.name.as_str())
+        .collect::<Vec<_>>();
+    let registry = registered_tools();
+    let registered = registry
+        .iter()
+        .map(|entry| entry.manifest.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(advertised, registered);
+    assert!(advertised.contains(&"process_exec"));
+    assert!(!advertised.contains(&"exec"));
+    assert!(
+        advertised
+            .iter()
+            .all(|name| registered_tool_route(name).is_some())
+    );
+    assert_eq!(
+        registered_tool_route("exec"),
+        Some(RegisteredToolRoute::ProcessExec),
+        "legacy history remains dispatchable without being advertised"
+    );
+}
+
+fn pending_shell(run_id: &str) -> PendingShellExec {
+    PendingShellExec {
+        accepted: AcceptedShellExec {
+            session_id: SessionId::new("deferred-shell-session"),
+            run_id: RunId::new(run_id),
+            item_id: ItemId::new(format!("item-{run_id}")),
+            accepted_seq: 2,
+            worker_generation: 1,
+        },
+        command_id: format!("command-{run_id}"),
+        command: "printf deferred".into(),
+        cwd: None,
+    }
+}
+
+/// MUTATION CHECK: warn-and-drop a shell handoff received while the prior
+/// provider turn still has in-memory ownership. Expected runtime failure: the
+/// accepted run disappears instead of remaining owned for the next loop.
+#[test]
+fn terminal_turn_cleanup_race_defers_one_owned_shell_handoff() {
+    let mut deferred = VecDeque::new();
+    defer_shell_handoff(&mut deferred, pending_shell("shell-run"));
+    defer_shell_handoff(&mut deferred, pending_shell("shell-run"));
+    assert_eq!(deferred.len(), 1, "same receipt handoff is deduplicated");
+    assert_eq!(
+        deferred.pop_front().expect("owned handoff").accepted.run_id,
+        RunId::new("shell-run")
+    );
+}
+
+/// The tested ownership helper must remain wired into the active-turn
+/// production arm; otherwise an accepted handoff can regress to warn/drop
+/// while the helper-only law still passes.
+///
+/// MUTATION CHECK: replace the active arm's `defer_shell_handoff` call with a
+/// warning. Expected runtime failure: this source-level seam assertion fails.
+#[test]
+fn active_supervisor_shell_arm_uses_owned_deferred_handoff() {
+    let source = include_str!("worker.rs");
+    let arm = source
+        .split_once(
+            "Some(SupervisorCommand::ShellExec(pending)) => {\n                            // Store admission",
+        )
+        .map(|(_, tail)| tail)
+        .expect("active-turn shell arm remains identifiable");
+    let arm = arm
+        .split_once("Some(SupervisorCommand::Shutdown) | None => {")
+        .map(|(arm, _)| arm)
+        .expect("active-turn shell arm stays bounded by shutdown");
+    assert!(
+        arm.contains("defer_shell_handoff(&mut deferred_shell, *pending);"),
+        "active-turn shell handoff must retain ownership until cleanup"
+    );
+}
+
+fn envelope(session_id: &SessionId, event: &str, payload: EventPayload) -> RawEnvelope {
+    EventEnvelope {
+        schema_version: SCHEMA_VERSION,
+        event_id: EventId::new(event),
+        seq: 0,
+        session_id: session_id.clone(),
+        branch_id: None,
+        run_id: None,
+        agent_id: None,
+        device_id: DeviceId::new("inventory-test"),
+        authority_epoch: 0,
+        worker_generation: 1,
+        causation_id: None,
+        correlation_id: None,
+        committed_at_ms: 0,
+        render: RenderTargets {
+            ui: true,
+            durable: true,
+            prompt: PromptRender::Omit,
+        },
+        payload: serde_json::to_value(payload).expect("payload serializes"),
+    }
+}
+
+/// MUTATION CHECK: fabricate a snapshot row or stop projecting grants from
+/// durable effect/menu facts. Expected runtime failure: names/defaults cease
+/// matching the registry or the remembered class grant disappears at runtime.
+#[tokio::test]
+async fn inventory_snapshot_projects_registry_defaults_and_durable_grants() {
+    let store = MemoryStore::new();
+    let session_id = SessionId::new("inventory-session");
+    let effect = EffectId::new("effect-write");
+    let menu_id = MenuId::new("menu-write");
+    let menu = Menu {
+        id: menu_id.clone(),
+        kind: MenuKind::Permission {
+            effect_summary: "write a file".into(),
+        },
+        title: "Allow write?".into(),
+        body: vec!["Allows FsWrite for this session".into()],
+        options: vec![MenuOption {
+            key: "approve_for_session".into(),
+            label: "Allow for this session".into(),
+            detail: None,
+            decision: Some(DecisionKind::AllowAlways),
+        }],
+        blocking: true,
+        scope: MenuScope::Session,
+        origin: "inventory-test".into(),
+        ttl_ms: None,
+        timeout_option: None,
+    };
+    let answer = MenuAnswer {
+        menu: menu_id.clone(),
+        option_index: 0,
+        option_key: Some("approve_for_session".into()),
+        value: None,
+        via: AnswerVia::Rpc,
+    };
+    let mut events = [
+        envelope(
+            &session_id,
+            "intent",
+            EventPayload::Effect(EffectPhase::Intent(EffectIntent {
+                effect: effect.clone(),
+                class: EffectClass::FsWrite,
+                summary: "write a file".into(),
+                args_digest: "write-digest".into(),
+                workspace_revision: None,
+            })),
+        ),
+        envelope(
+            &session_id,
+            "authorized",
+            EventPayload::Effect(EffectPhase::Authorized {
+                effect,
+                verdict: AuthorizationVerdict::Ask {
+                    menu: menu_id.clone(),
+                },
+            }),
+        ),
+        envelope(&session_id, "menu-opened", EventPayload::MenuOpened(menu)),
+        envelope(
+            &session_id,
+            "menu-answered",
+            EventPayload::MenuAnswered(answer),
+        ),
+    ];
+    store
+        .append(&mut events)
+        .await
+        .expect("append durable facts");
+
+    let snapshot = tool_inventory_snapshot(&store, &session_id)
+        .await
+        .expect("inventory");
+    let registry = registered_tools();
+    assert_eq!(snapshot.tools.len(), registry.len());
+    for (projected, registered) in snapshot.tools.iter().zip(registry) {
+        assert_eq!(projected.manifest, registered.manifest);
+        assert_eq!(projected.default, registered.default);
+    }
+    assert!(snapshot.tools.iter().any(|entry| {
+        entry.manifest.name == "fs_write" && entry.default == ToolPermissionDefault::Ask
+    }));
+    assert_eq!(snapshot.remembered_grants.len(), 1);
+    assert_eq!(snapshot.remembered_grants[0].class, EffectClass::FsWrite);
+    assert_eq!(
+        snapshot.remembered_grants[0].scope,
+        RememberedGrantScope::Class
+    );
+}
+
+fn create_durable_session(store: &Store, session_id: &SessionId) {
+    store
+        .create_session(&SessionCreateCommand {
+            command_id: format!("create-{session_id}"),
+            request_digest: format!("create-digest-{session_id}"),
+            request_json: format!(r#"{{"cwd":"/tmp","session":"{session_id}"}}"#),
+            session_id: session_id.clone(),
+            cwd: "/tmp".into(),
+            provider: "fake".into(),
+            model: "fake-v1".into(),
+            max_tokens: 4096,
+            system_prompt_version: "test-v1".into(),
+            event_id: EventId::new(format!("created-{session_id}")),
+            device_id: DeviceId::new("recovery-test"),
+        })
+        .expect("create session");
+}
+
+fn append_permission_checkpoint(
+    store: &Store,
+    session_id: &SessionId,
+    run_id: &RunId,
+    state: RunState,
+) {
+    let menu_id = match &state {
+        RunState::InputRequired { menu } | RunState::PermissionRequired { menu } => menu.clone(),
+        other => panic!("checkpoint state required, got {other:?}"),
+    };
+    let menu = Menu {
+        id: menu_id,
+        kind: MenuKind::Permission {
+            effect_summary: "run exact command".into(),
+        },
+        title: "process_exec requests approval".into(),
+        body: vec!["exact command".into()],
+        options: vec![MenuOption {
+            key: "approve_once".into(),
+            label: "Allow once".into(),
+            detail: None,
+            decision: Some(DecisionKind::AllowOnce),
+        }],
+        blocking: true,
+        scope: MenuScope::Session,
+        origin: "recovery-test".into(),
+        ttl_ms: None,
+        timeout_option: None,
+    };
+    let generation = store.worker_generation();
+    let item_id = ItemId::new(format!("item-{run_id}"));
+    let mut events = [
+        EventEnvelope {
+            run_id: Some(run_id.clone()),
+            worker_generation: generation,
+            event_id: EventId::new(format!("user-{run_id}")),
+            payload: serde_json::to_value(EventPayload::UserMessage {
+                text: "run it".into(),
+                attachments: Vec::new(),
+                mode: haider_protocol::DeliveryMode::Queue,
+            })
+            .expect("user payload"),
+            ..envelope(session_id, "template-user", EventPayload::IdleDecayed)
+        },
+        EventEnvelope {
+            run_id: Some(run_id.clone()),
+            worker_generation: generation,
+            event_id: EventId::new(format!("item-{run_id}")),
+            payload: serde_json::to_value(EventPayload::Item(ItemEvent::Started {
+                item_id,
+                item: TurnItem::ToolCall {
+                    call_id: format!("call-{run_id}"),
+                    name: "exec".into(),
+                    args: serde_json::json!({"command":"printf old"}),
+                    status: ToolStatus::InProgress,
+                },
+            }))
+            .expect("item payload"),
+            ..envelope(session_id, "template-item", EventPayload::IdleDecayed)
+        },
+        EventEnvelope {
+            run_id: Some(run_id.clone()),
+            worker_generation: generation,
+            event_id: EventId::new(format!("menu-{run_id}")),
+            payload: serde_json::to_value(EventPayload::MenuOpened(menu)).expect("menu payload"),
+            ..envelope(session_id, "template-menu", EventPayload::IdleDecayed)
+        },
+        EventEnvelope {
+            run_id: Some(run_id.clone()),
+            worker_generation: generation,
+            event_id: EventId::new(format!("state-{run_id}")),
+            payload: serde_json::to_value(EventPayload::RunState(state)).expect("state payload"),
+            ..envelope(session_id, "template-state", EventPayload::IdleDecayed)
+        },
+    ];
+    store.append(&mut events).expect("append checkpoint");
+}
+
+/// MUTATION CHECK: accept only `PermissionRequired` or only historical
+/// `InputRequired + Permission`. Expected runtime failure: one checkpoint is
+/// terminalized instead of returning as a recovered waiter at runtime.
+#[tokio::test]
+async fn recovery_dual_reads_historical_and_canonical_permission_states() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("store");
+    let old_session = SessionId::new("old-permission-session");
+    let new_session = SessionId::new("new-permission-session");
+    create_durable_session(&store, &old_session);
+    create_durable_session(&store, &new_session);
+    append_permission_checkpoint(
+        &store,
+        &old_session,
+        &RunId::new("old-run"),
+        RunState::InputRequired {
+            menu: MenuId::new("old-menu"),
+        },
+    );
+    append_permission_checkpoint(
+        &store,
+        &new_session,
+        &RunId::new("new-run"),
+        RunState::PermissionRequired {
+            menu: MenuId::new("new-menu"),
+        },
+    );
+    drop(store);
+
+    let recovered = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("reopen store");
+    let work = recover_interrupted_turns(&recovered, &DeviceId::new("restart"))
+        .await
+        .expect("recover checkpoints");
+    let mut recovered_menus = work
+        .into_iter()
+        .filter_map(|work| match work {
+            RecoveredWork::Checkpoint(checkpoint) => Some(checkpoint.checkpoint.menu.id),
+            RecoveredWork::Queued(_) | RecoveredWork::ChildWait(_) => None,
+        })
+        .collect::<Vec<_>>();
+    recovered_menus.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    assert_eq!(
+        recovered_menus,
+        [MenuId::new("new-menu"), MenuId::new("old-menu")]
+    );
+    for session_id in [&old_session, &new_session] {
+        let events = recovered.read(session_id, 0, 64).await.expect("read");
+        assert!(!events.into_iter().any(|event| {
+            serde_json::from_value::<EventPayload>(event.payload).is_ok_and(
+                |payload| matches!(payload, EventPayload::RunState(state) if state.is_terminal()),
+            )
+        }));
+    }
+    recovered.close().await.expect("close store");
+}

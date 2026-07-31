@@ -24,7 +24,8 @@ use haider_daemon::{
 use haider_protocol::DeliveryMode;
 use haider_protocol::EventPayload;
 use haider_protocol::effect::{
-    AuthorizationVerdict, EffectClass, EffectIntent, EffectOutcome, EffectPhase,
+    AuthorizationSource, AuthorizationVerdict, EffectClass, EffectIntent, EffectOutcome,
+    EffectPhase,
 };
 use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
@@ -36,15 +37,17 @@ use haider_protocol::menu::{Menu, MenuAnswer};
 use haider_protocol::provider::{CapabilityDoc, FinishReason, Usage, UsageSource};
 use haider_protocol::session::SessionMetadataV1;
 use haider_protocol::state::{RunState, SessionState};
+use haider_protocol::tool::ToolPermissionDefault;
 use haider_provider::{
     FakeInputKind, FakeInputOption, FakeProvider, FakeStep, Provider, ProviderError,
     ProviderStream, ToolDefinition, TurnRequest,
 };
 use haider_rpc::{
     AttachMode, CancelStatus, Capability, CapabilitySet, ClientKind, CommandId,
-    ERROR_CODE_ALREADY_RESOLVED, ERROR_CODE_CAPABILITY_DENIED, ERROR_CODE_INVALID_ARGUMENT,
-    FEATURE_SESSION_MUTATION_V1, FEATURE_TURN_CONTROL_V1, RequestBody, RequestId, ResponseBody,
-    SeqRange, SessionSummary, WireFrame,
+    ERROR_CODE_ALREADY_RESOLVED, ERROR_CODE_BUSY, ERROR_CODE_CAPABILITY_DENIED,
+    ERROR_CODE_INVALID_ARGUMENT, ERROR_CODE_UNSUPPORTED_SHELL_BUILTIN, FEATURE_SESSION_MUTATION_V1,
+    FEATURE_TURN_CONTROL_V1, RequestBody, RequestId, ResponseBody, SeqRange, SessionSummary,
+    WireFrame,
 };
 use haider_store::{EventStore, Store};
 use haider_tools::{
@@ -2209,6 +2212,503 @@ async fn scenario_9_restart_resumes_only_queued_and_terminalizes_streaming() {
 
     second_task.shutdown_handle().request("test complete");
     second_task.join().await.expect("daemon joins");
+}
+
+/// W8a direct-shell law over the production UDS: the durable receipt is the
+/// admission boundary, direct user provenance reaches the one EffectBroker,
+/// and neither a provider turn nor a UserMessage is fabricated.
+///
+/// MUTATION CHECK: bypass `accept_shell_exec`, fence receipt lookup behind the
+/// current generation, route through a provider turn, or use model
+/// `process_exec` authorization. Expected runtime failure: the restart replay
+/// returns stale-generation, the exact-once file changes, or the zero-provider,
+/// no-UserMessage, or PreAuthorized(UserTyped) assertions below fail.
+#[tokio::test]
+async fn w8a_shell_exec_is_receipted_exactly_once_and_user_preauthorized() {
+    let root = test_root("w8a-shell-");
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace");
+    let config = DaemonConfig::new(
+        "w8a-shell",
+        root.path().join("store"),
+        root.path().join("runtime"),
+    );
+    let (dependencies, fake) = fake_dependencies(Vec::new());
+    let first_task = ready_with_dependencies(&config, dependencies.clone()).await;
+    let mut client = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "w8a-shell-test",
+        "shell-client",
+        ClientKind::Headless,
+    )
+    .await;
+    let (session_id, generation) = create_and_attach(&mut client, &config, &workspace).await;
+    let command = "printf 'once\\n' >> shell-count.txt; printf 'héllo\\n'";
+
+    send_request(
+        &mut client,
+        &config,
+        "shell-first",
+        RequestBody::ShellExec {
+            command_id: CommandId::new("shell-command"),
+            session_id: session_id.clone(),
+            worker_generation: generation,
+            command: command.into(),
+            cwd: None,
+        },
+    )
+    .await;
+    // Deliberately lose the original response. Acceptance and the worker
+    // handoff happen before the response send, so closing this socket leaves
+    // only the durable command receipt available to the retrying client.
+    drop(client);
+    tokio::time::timeout(support::DEADLINE, async {
+        loop {
+            if fs::read_to_string(workspace.join("shell-count.txt"))
+                .is_ok_and(|contents| contents == "once\n")
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("shell side effect becomes visible after response loss");
+    assert_eq!(
+        fs::read_to_string(workspace.join("shell-count.txt")).expect("shell side effect"),
+        "once\n"
+    );
+
+    let mut observer = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "w8a-shell-test",
+        "shell-terminal-observer",
+        ClientKind::Headless,
+    )
+    .await;
+    attach_existing(
+        &mut observer,
+        &config,
+        session_id.clone(),
+        0,
+        "shell-terminal-attach",
+    )
+    .await;
+    tokio::time::timeout(support::DEADLINE, async {
+        loop {
+            let durable = read_session(
+                &mut observer,
+                &config,
+                session_id.clone(),
+                "shell-terminal-read",
+            )
+            .await;
+            if durable.iter().any(|envelope| {
+                serde_json::from_value::<EventPayload>(envelope.payload.clone())
+                    .is_ok_and(|payload| matches!(payload, EventPayload::RunState(RunState::Done)))
+                    && envelope.run_id.is_some()
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("lost-response shell becomes durably terminal");
+    drop(observer);
+    first_task
+        .shutdown_handle()
+        .request("exercise receipt across restart");
+    first_task.join().await.expect("first daemon joins");
+
+    let task = ready_with_dependencies(&config, dependencies).await;
+    let mut client = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "w8a-shell-test",
+        "shell-replay-after-restart",
+        ClientKind::Headless,
+    )
+    .await;
+    attach_existing(
+        &mut client,
+        &config,
+        session_id.clone(),
+        0,
+        "shell-replay-attach",
+    )
+    .await;
+
+    // Identical old-generation bytes must hit receipt preflight after the
+    // restart, replay the original coordinates, and never re-execute.
+    send_request(
+        &mut client,
+        &config,
+        "shell-replay",
+        RequestBody::ShellExec {
+            command_id: CommandId::new("shell-command"),
+            session_id: session_id.clone(),
+            worker_generation: generation,
+            command: command.into(),
+            cwd: None,
+        },
+    )
+    .await;
+    let (item_id, accepted_seq) = match next_response(&mut client).await {
+        WireFrame::Response {
+            body:
+                ResponseBody::ShellExec {
+                    item_id,
+                    accepted_seq,
+                    worker_generation,
+                    ..
+                },
+            ..
+        } => {
+            assert_eq!(worker_generation, generation);
+            (item_id, accepted_seq)
+        }
+        other => panic!("expected shell receipt replay, got {other:?}"),
+    };
+    assert!(accepted_seq > 0);
+    assert_eq!(
+        fs::read_to_string(workspace.join("shell-count.txt")).expect("exactly once after restart"),
+        "once\n"
+    );
+
+    // Reusing the id with even one changed command byte is a receipt conflict.
+    send_request(
+        &mut client,
+        &config,
+        "shell-conflict",
+        RequestBody::ShellExec {
+            command_id: CommandId::new("shell-command"),
+            session_id: session_id.clone(),
+            worker_generation: generation,
+            command: format!("{command} "),
+            cwd: None,
+        },
+    )
+    .await;
+    assert!(matches!(
+        next_response(&mut client).await,
+        WireFrame::Response {
+            body: ResponseBody::Error { code, .. },
+            ..
+        } if code == ERROR_CODE_INVALID_ARGUMENT
+    ));
+
+    let durable = read_session(&mut client, &config, session_id.clone(), "shell-read").await;
+    let run_id = durable
+        .iter()
+        .find_map(|envelope| {
+            serde_json::from_value::<EventPayload>(envelope.payload.clone())
+                .is_ok_and(|payload| {
+                    matches!(
+                        payload,
+                        EventPayload::Item(ItemEvent::Started { item_id: ref started, .. })
+                            if started == &item_id
+                    )
+                })
+                .then(|| envelope.run_id.clone())
+                .flatten()
+        })
+        .expect("shell item has a durable run");
+    let payloads = payloads_for_run(&durable, &run_id).collect::<Vec<_>>();
+    assert_eq!(
+        payloads
+            .iter()
+            .filter(|payload| matches!(payload, EventPayload::UserMessage { .. }))
+            .count(),
+        0
+    );
+    assert_eq!(
+        payloads
+            .iter()
+            .filter(|payload| matches!(
+                payload,
+                EventPayload::Item(ItemEvent::Started {
+                    item: TurnItem::CommandExecution { call_id, command: stored, .. },
+                    ..
+                }) if call_id == "shell-command" && stored == command
+            ))
+            .count(),
+        1
+    );
+    let phases = payloads
+        .iter()
+        .filter_map(|payload| match payload {
+            EventPayload::Effect(phase) => Some(phase.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(phases.len(), 4);
+    let EffectPhase::Intent(intent) = &phases[0] else {
+        panic!("effect starts with Intent");
+    };
+    assert!(matches!(
+        &phases[1],
+        EffectPhase::Authorized {
+            effect,
+            verdict: AuthorizationVerdict::PreAuthorized {
+                source: AuthorizationSource::UserTyped,
+            },
+        } if effect == &intent.effect
+    ));
+    assert!(matches!(
+        &phases[2],
+        EffectPhase::Dispatched { effect } if effect == &intent.effect
+    ));
+    assert!(matches!(
+        &phases[3],
+        EffectPhase::Outcome {
+            effect,
+            outcome: EffectOutcome::Ok,
+        } if effect == &intent.effect
+    ));
+    let output = payloads
+        .iter()
+        .filter_map(|payload| match payload {
+            EventPayload::Item(ItemEvent::Delta {
+                delta:
+                    ItemDelta::CommandOutput {
+                        stream: OutputStream::Stdout,
+                        chunk_b64,
+                    },
+                ..
+            }) => Some(BASE64.decode(chunk_b64).expect("command output base64")),
+            _ => None,
+        })
+        .flatten()
+        .collect::<Vec<_>>();
+    assert_eq!(output, "héllo\n".as_bytes());
+    assert!(payloads.iter().any(|payload| matches!(
+        payload,
+        EventPayload::Item(ItemEvent::Completed {
+            item: TurnItem::CommandExecution {
+                call_id,
+                command: stored,
+                status: haider_protocol::item::ToolStatus::Completed,
+                exit_code: Some(0),
+            },
+            ..
+        }) if call_id == "shell-command" && stored == command
+    )));
+    assert_eq!(
+        payloads.last(),
+        Some(&EventPayload::RunState(RunState::Done))
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.join("shell-count.txt")).expect("exactly once ledger"),
+        "once\n"
+    );
+    assert!(fake.requests().is_empty());
+
+    send_request(
+        &mut client,
+        &config,
+        "inventory-after-shell",
+        RequestBody::ToolsInventory {
+            session_id: session_id.clone(),
+        },
+    )
+    .await;
+    match next_response(&mut client).await {
+        WireFrame::Response {
+            body: ResponseBody::ToolsInventory { inventory, .. },
+            ..
+        } => assert!(
+            inventory.remembered_grants.is_empty(),
+            "user preauthorization must not create a provider permission grant"
+        ),
+        other => panic!("expected post-shell inventory, got {other:?}"),
+    }
+
+    task.shutdown_handle().request("test complete");
+    task.join().await.expect("daemon joins");
+}
+
+/// MUTATION CHECK: let direct shell admission ignore active runs, advertise
+/// legacy `exec`, or treat `cd` as a client-local state mutation. Expected
+/// runtime failure: Busy, canonical inventory, or explicit builtin rejection
+/// below changes at the real RPC boundary.
+#[tokio::test]
+async fn w8a_shell_busy_builtin_rejection_and_inventory_are_typed() {
+    let root = test_root("w8a-shell-policy-");
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace");
+    let config = DaemonConfig::new(
+        "w8a-shell-policy",
+        root.path().join("store"),
+        root.path().join("runtime"),
+    );
+    let (dependencies, fake) = fake_dependencies(vec![FakeStep::Hang]);
+    let task = ready_with_dependencies(&config, dependencies).await;
+    let mut client = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "w8a-shell-policy-test",
+        "shell-policy-client",
+        ClientKind::Headless,
+    )
+    .await;
+    let (session_id, generation) = create_and_attach(&mut client, &config, &workspace).await;
+
+    send_request(
+        &mut client,
+        &config,
+        "inventory",
+        RequestBody::ToolsInventory {
+            session_id: session_id.clone(),
+        },
+    )
+    .await;
+    let inventory = match next_response(&mut client).await {
+        WireFrame::Response {
+            body: ResponseBody::ToolsInventory { inventory, .. },
+            ..
+        } => inventory,
+        other => panic!("expected tool inventory, got {other:?}"),
+    };
+    let names = inventory
+        .tools
+        .iter()
+        .map(|entry| entry.manifest.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        [
+            "request_input",
+            "fs_read",
+            "fs_list",
+            "fs_search",
+            "fs_write",
+            "fs_patch",
+            "process_exec",
+            "spawn_subagent",
+        ]
+    );
+    assert!(!names.contains(&"exec"));
+    assert!(inventory.remembered_grants.is_empty());
+    let process = inventory
+        .tools
+        .iter()
+        .find(|entry| entry.manifest.name == "process_exec")
+        .expect("canonical process tool");
+    assert_eq!(process.manifest.effects, [EffectClass::ProcessExec]);
+    assert_eq!(process.default, ToolPermissionDefault::Ask);
+    let reads = inventory
+        .tools
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.manifest.name.as_str(),
+                "fs_read" | "fs_list" | "fs_search"
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(reads.iter().all(|entry| {
+        entry.manifest.effects == [EffectClass::FsRead]
+            && entry.default == ToolPermissionDefault::Allow
+    }));
+
+    send_request(
+        &mut client,
+        &config,
+        "busy-turn",
+        submit_body(
+            "busy-turn-command",
+            session_id.clone(),
+            generation,
+            "remain active",
+        ),
+    )
+    .await;
+    let (active_run, _) = next_submit_response(&mut client).await;
+    loop {
+        if let WireFrame::Event { envelope, .. } = client.next().await
+            && envelope.run_id.as_ref() == Some(&active_run)
+            && serde_json::from_value::<EventPayload>(envelope.payload)
+                .is_ok_and(|payload| payload == EventPayload::RunState(RunState::Thinking))
+        {
+            break;
+        }
+    }
+    tokio::time::timeout(support::DEADLINE, async {
+        while fake.requests().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("hanging provider request begins");
+    assert_eq!(fake.requests().len(), 1);
+
+    send_request(
+        &mut client,
+        &config,
+        "shell-busy",
+        RequestBody::ShellExec {
+            command_id: CommandId::new("shell-busy-command"),
+            session_id: session_id.clone(),
+            worker_generation: generation,
+            command: "printf blocked".into(),
+            cwd: None,
+        },
+    )
+    .await;
+    assert!(matches!(
+        next_response(&mut client).await,
+        WireFrame::Response {
+            body: ResponseBody::Error { code, retryable: true, .. },
+            ..
+        } if code == ERROR_CODE_BUSY
+    ));
+
+    send_request(
+        &mut client,
+        &config,
+        "shell-cd",
+        RequestBody::ShellExec {
+            command_id: CommandId::new("shell-cd-command"),
+            session_id: session_id.clone(),
+            worker_generation: generation,
+            command: "cd nested".into(),
+            cwd: None,
+        },
+    )
+    .await;
+    assert!(matches!(
+        next_response(&mut client).await,
+        WireFrame::Response {
+            body: ResponseBody::Error { code, retryable: false, .. },
+            ..
+        } if code == ERROR_CODE_UNSUPPORTED_SHELL_BUILTIN
+    ));
+
+    send_request(
+        &mut client,
+        &config,
+        "busy-turn-cancel",
+        RequestBody::TurnCancel {
+            command_id: CommandId::new("busy-turn-cancel-command"),
+            session_id,
+            worker_generation: generation,
+            run_id: active_run,
+        },
+    )
+    .await;
+    assert!(matches!(
+        next_response(&mut client).await,
+        WireFrame::Response {
+            body: ResponseBody::TurnCancel { .. },
+            ..
+        }
+    ));
+
+    task.shutdown_handle().request("test complete");
+    task.join().await.expect("daemon joins");
 }
 
 /// Startup poison fixture (B2).

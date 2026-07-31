@@ -26,8 +26,9 @@ pub use filesystem::{
 pub use ledger::{ChangeLedger, ChangeLedgerSink, FsWriteRecord, TurnChanges};
 pub use process::{
     CommandOutputSink, NoopCommandOutputSink, PROCESS_OUTPUT_CHUNK_BYTES, ProcessBounds,
-    ProcessControl, ProcessControlAction, ProcessControlResult, ProcessExec, ProcessExecution,
-    ProcessLifecycleEvent, ProcessLimit, ProcessOutputChunk, ProcessResult, ProcessSignal,
+    ProcessCancelHandle, ProcessControl, ProcessControlAction, ProcessControlResult, ProcessExec,
+    ProcessExecution, ProcessLifecycleEvent, ProcessLimit, ProcessOutputChunk, ProcessResult,
+    ProcessSignal,
 };
 pub use request_input::{RequestInput, RequestInputAnswer, RequestInputKind, RequestInputOption};
 pub use shell::{

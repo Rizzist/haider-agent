@@ -2323,7 +2323,7 @@ impl HarnessActor {
                     .map_err(DriveError::Store)?;
                     self.commit_state(
                         run_id,
-                        RunState::InputRequired {
+                        RunState::PermissionRequired {
                             menu: menu.id.clone(),
                         },
                     )

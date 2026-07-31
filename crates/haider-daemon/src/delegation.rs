@@ -105,7 +105,7 @@ impl DelegationHandle {
                     "fs_search".into(),
                     "fs_write".into(),
                     "fs_patch".into(),
-                    "exec".into(),
+                    "process_exec".into(),
                     "spawn_subagent".into(),
                 ],
                 effect_ceiling: vec![
@@ -533,7 +533,10 @@ impl DelegationHandle {
         let mut progress = DelegationProgress {
             latest_at_ms: direct.latest_at_ms,
             nudge: direct.nudge,
-            input_required: matches!(direct.state, Some(RunState::InputRequired { .. })),
+            input_required: matches!(
+                direct.state,
+                Some(RunState::InputRequired { .. } | RunState::PermissionRequired { .. })
+            ),
         };
         if !matches!(
             direct.state,
@@ -555,7 +558,10 @@ impl DelegationHandle {
         while let Some(descendant) = pending.pop_front() {
             let child = self.session_progress(&descendant).await?;
             progress.latest_at_ms = progress.latest_at_ms.max(child.latest_at_ms);
-            progress.input_required |= matches!(child.state, Some(RunState::InputRequired { .. }));
+            progress.input_required |= matches!(
+                child.state,
+                Some(RunState::InputRequired { .. } | RunState::PermissionRequired { .. })
+            );
             if matches!(
                 child.state,
                 Some(RunState::Waiting {

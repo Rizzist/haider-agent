@@ -1,0 +1,34 @@
+{
+  "tools": [
+    {
+      "manifest": {
+        "name": "process_exec",
+        "description": "Run one command",
+        "effects": [
+          {
+            "class": "process_exec"
+          }
+        ],
+        "dispatch": "await",
+        "input_schema": {
+          "required": [
+            "command"
+          ],
+          "type": "object"
+        }
+      },
+      "default": "ask"
+    }
+  ],
+  "remembered_grants": [
+    {
+      "class": {
+        "class": "process_exec"
+      },
+      "scope": {
+        "scope": "command_shape",
+        "args_digest": "blake3-command-shape"
+      }
+    }
+  ]
+}

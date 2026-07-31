@@ -58,6 +58,8 @@ mod endpoint;
 mod error;
 mod lifecycle;
 mod oauth;
+#[cfg(test)]
+mod permissions_core_tests;
 mod profile_vault;
 mod provider_registry;
 mod runtime;

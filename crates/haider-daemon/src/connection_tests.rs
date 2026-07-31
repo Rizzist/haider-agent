@@ -30,6 +30,10 @@ fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> Qu
 /// MUTATION CHECK: remove `FEATURE_CONTEXT_COMPACTION_V1`. Expected runtime
 /// failure: clients cannot discover the served `session.compact` method.
 /// Verified by revert on 2026-07-30.
+///
+/// MUTATION CHECK: remove `FEATURE_SHELL_EXEC_V1` or
+/// `FEATURE_TOOL_INVENTORY_V1`. Expected runtime failure: the exact feature
+/// set no longer advertises one of the W8a RPC methods the daemon serves.
 #[test]
 fn welcome_features_pin_served_management_families() {
     assert_eq!(
@@ -45,6 +49,8 @@ fn welcome_features_pin_served_management_families() {
             FEATURE_PROVIDER_MANAGEMENT_V1.to_owned(),
             FEATURE_PROVIDER_MODELS_V1.to_owned(),
             FEATURE_SESSION_MUTATION_V1.to_owned(),
+            FEATURE_SHELL_EXEC_V1.to_owned(),
+            FEATURE_TOOL_INVENTORY_V1.to_owned(),
             FEATURE_TURN_CONTROL_V1.to_owned(),
             FEATURE_VAULT_STAGE_V1.to_owned(),
         ])

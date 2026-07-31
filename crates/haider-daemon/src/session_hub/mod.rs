@@ -98,9 +98,10 @@ use crate::worker::WorkerManagerHandle;
 use actor::run_session_actor;
 use async_trait::async_trait;
 use haider_core::{
-    AcceptedTurn, CancelledTurn, CreatedSession, HarnessHandle, MenuResolutionCommand,
-    MenuResolutionOutcome, SessionCreateCommand, SessionCreateOutcome, SqliteStoreHandle,
-    StoreHandle, TurnAcceptCommand, TurnAcceptOutcome, TurnAdmissionDisposition, TurnCancelCommand,
+    AcceptedShellExec, AcceptedTurn, CancelledTurn, CreatedSession, HarnessHandle,
+    MenuResolutionCommand, MenuResolutionOutcome, SessionCreateCommand, SessionCreateOutcome,
+    ShellExecAcceptCommand, ShellExecAcceptOutcome, SqliteStoreHandle, StoreHandle,
+    TurnAcceptCommand, TurnAcceptOutcome, TurnAdmissionDisposition, TurnCancelCommand,
     TurnCancelOutcome, TurnCancellationStatus,
 };
 use haider_protocol::envelope::{RawEnvelope, envelope_weight_bytes};
@@ -109,11 +110,12 @@ use haider_protocol::ids::{DeviceId, EventId, MenuId, RunId, SessionId};
 use haider_protocol::menu::{AnswerVia, MenuAnswer as DurableMenuAnswer};
 use haider_rpc::{
     AttachMode, AttachState, AttachmentId, CancelStatus, Capability, CapabilitySet, CommandId,
-    ERROR_CODE_ALREADY_RESOLVED, ERROR_CODE_CAPABILITY_DENIED, ERROR_CODE_CURSOR_AHEAD,
-    ERROR_CODE_DRAINING, ERROR_CODE_INVALID_ARGUMENT, ERROR_CODE_INVALID_CURSOR,
-    ERROR_CODE_NOT_FOUND, ERROR_CODE_OVERLOADED, ERROR_CODE_RUN_NOT_ACTIVE,
-    ERROR_CODE_STALE_GENERATION, ErrorData, MenuInput, ProtocolError, RequestBody, RequestId,
-    ResponseBody, SeqRange, SessionReadResult, SessionSummary, SubmitDisposition, WireFrame,
+    ERROR_CODE_ALREADY_RESOLVED, ERROR_CODE_BUSY, ERROR_CODE_CAPABILITY_DENIED,
+    ERROR_CODE_CURSOR_AHEAD, ERROR_CODE_DRAINING, ERROR_CODE_INVALID_ARGUMENT,
+    ERROR_CODE_INVALID_CURSOR, ERROR_CODE_NOT_FOUND, ERROR_CODE_OVERLOADED,
+    ERROR_CODE_RUN_NOT_ACTIVE, ERROR_CODE_STALE_GENERATION, ERROR_CODE_UNSUPPORTED_SHELL_BUILTIN,
+    ErrorData, MenuInput, ProtocolError, RequestBody, RequestId, ResponseBody, SeqRange,
+    SessionReadResult, SessionSummary, SubmitDisposition, WireFrame,
 };
 use std::collections::HashMap;
 use std::fmt;
@@ -724,6 +726,10 @@ enum ActorCommand {
         command: TurnAcceptCommand,
         completed: oneshot::Sender<Result<TurnAcceptOutcome, HaiderError>>,
     },
+    AcceptShellExec {
+        command: ShellExecAcceptCommand,
+        completed: oneshot::Sender<Result<ShellExecAcceptOutcome, HaiderError>>,
+    },
     CancelTurn {
         command: TurnCancelCommand,
         completed: oneshot::Sender<Result<TurnCancelOutcome, HaiderError>>,
@@ -1300,6 +1306,40 @@ impl SessionHub {
         actor
             .commands
             .send(ActorCommand::AcceptTurn { command, completed })
+            .await
+            .map_err(|_| SessionHubError::Closed)?;
+        result
+            .await
+            .map_err(|_| SessionHubError::Closed)?
+            .map_err(Into::into)
+    }
+
+    async fn shell_exec_receipt(
+        &self,
+        command_id: &CommandId,
+        request_digest: &str,
+        request_json: &str,
+    ) -> Result<Option<AcceptedShellExec>, SessionHubError> {
+        self.inner
+            .store
+            .shell_exec_receipt(
+                command_id.0.clone(),
+                request_digest.to_owned(),
+                request_json.to_owned(),
+            )
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn accept_shell_exec(
+        &self,
+        command: ShellExecAcceptCommand,
+    ) -> Result<ShellExecAcceptOutcome, SessionHubError> {
+        let actor = self.actor_for(command.session_id.clone()).await?;
+        let (completed, result) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::AcceptShellExec { command, completed })
             .await
             .map_err(|_| SessionHubError::Closed)?;
         result

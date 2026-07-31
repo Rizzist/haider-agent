@@ -4,12 +4,17 @@
 
 use super::*;
 use haider_protocol::EventPayload;
+use haider_protocol::effect::{
+    AuthorizationSource, AuthorizationVerdict, EffectOutcome, EffectPhase,
+};
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
 use haider_protocol::ids::{AgentId, BranchId, EventId, ItemId, MenuId, RunId};
 use haider_protocol::item::{ItemEvent, ToolStatus, TurnItem};
 use haider_protocol::menu::{Menu, MenuCloseReason, MenuKind, MenuOption, MenuScope};
 use haider_protocol::state::RunState;
-use haider_store::{SessionCreateCommand, TurnAcceptCommand};
+use haider_store::{
+    SessionCreateCommand, ShellExecAcceptCommand, ShellExecAcceptOutcome, TurnAcceptCommand,
+};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -497,6 +502,337 @@ async fn accepted_commit_then_shutdown_before_handoff_is_swept_terminal() {
             && serde_json::from_value::<EventPayload>(envelope.payload.clone())
                 .is_ok_and(|payload| payload == EventPayload::RunState(RunState::Cancelled))
     }));
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// Direct shell is still ordinary cancellable session work: a durable
+/// `turn.cancel` wake must drive the existing process supervisor, settle the
+/// four-phase effect, close the command item, and only then cross Cancelled.
+///
+/// MUTATION CHECK: await the shell process without observing cancellation,
+/// or append Cancelled before broker/effect settlement. Expected runtime
+/// failure: the deadline expires, the item stays open, or the ordered phase
+/// and terminal assertions below fail.
+#[tokio::test]
+async fn direct_shell_cancellation_supervises_process_and_closes_every_lifecycle() {
+    let root = tempfile::tempdir().expect("temp store");
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("workspace");
+    let store = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("store opens");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub opens");
+    let session_id = SessionId::new("direct-shell-cancel");
+    let run_id = RunId::new("direct-shell-cancel-run");
+    let item_id = ItemId::new("direct-shell-cancel-item");
+    let generation = store.worker_generation();
+    let mut create = create_command(&session_id, "direct-shell-cancel");
+    create.cwd = workspace.to_string_lossy().into_owned();
+    hub.create_session(create)
+        .await
+        .expect("typed session commits");
+    let accepted = match hub
+        .accept_shell_exec(ShellExecAcceptCommand {
+            command_id: "direct-shell-cancel-command".into(),
+            request_digest: "direct-shell-cancel-digest".into(),
+            request_json: r#"{"command":"printf started; sleep 30"}"#.into(),
+            session_id: session_id.clone(),
+            worker_generation: generation,
+            run_id: run_id.clone(),
+            item_id: item_id.clone(),
+            command: "printf started; sleep 30".into(),
+            running_event_id: EventId::new("direct-shell-cancel-running"),
+            item_event_id: EventId::new("direct-shell-cancel-started"),
+            active_event_id: EventId::new("direct-shell-cancel-active"),
+            device_id: DeviceId::new("worker-law-test"),
+        })
+        .await
+        .expect("shell acceptance commits")
+    {
+        ShellExecAcceptOutcome::Committed { accepted, .. }
+        | ShellExecAcceptOutcome::IdempotentReplay { accepted } => accepted,
+    };
+    let manager = crate::worker::WorkerManager::start(
+        hub.clone(),
+        crate::worker::WorkerDependencies::unconfigured_for_tests(),
+        false,
+    );
+    let handle = manager.handle();
+    handle
+        .shell_exec(
+            accepted,
+            "direct-shell-cancel-command".into(),
+            "printf started; sleep 30".into(),
+            None,
+        )
+        .await
+        .expect("shell handoff");
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let history = haider_core::StoreHandle::read(&store, &session_id, 0, 128)
+                .await
+                .expect("history reads");
+            if history.iter().any(|envelope| {
+                envelope.run_id.as_ref() == Some(&run_id)
+                    && serde_json::from_value::<EventPayload>(envelope.payload.clone()).is_ok_and(
+                        |payload| {
+                            matches!(
+                                payload,
+                                EventPayload::Effect(EffectPhase::Dispatched { .. })
+                            )
+                        },
+                    )
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("process crosses dispatched");
+
+    hub.cancel_turn(haider_store::TurnCancelCommand {
+        command_id: "cancel-direct-shell".into(),
+        request_digest: "cancel-direct-shell-digest".into(),
+        request_json: r#"{"run":"direct-shell-cancel-run"}"#.into(),
+        session_id: session_id.clone(),
+        worker_generation: generation,
+        run_id: run_id.clone(),
+        cancelling_event_id: EventId::new("direct-shell-cancelling"),
+        device_id: DeviceId::new("worker-law-test"),
+    })
+    .await
+    .expect("cancellation commits");
+
+    let history = tokio::time::timeout(std::time::Duration::from_secs(8), async {
+        loop {
+            let history = haider_core::StoreHandle::read(&store, &session_id, 0, 128)
+                .await
+                .expect("history reads");
+            if history.iter().any(|envelope| {
+                envelope.run_id.as_ref() == Some(&run_id)
+                    && serde_json::from_value::<EventPayload>(envelope.payload.clone())
+                        .is_ok_and(|payload| payload == EventPayload::RunState(RunState::Cancelled))
+            }) {
+                break history;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("shell cancellation settles");
+    let payloads = history
+        .iter()
+        .filter(|envelope| envelope.run_id.as_ref() == Some(&run_id))
+        .filter_map(|envelope| {
+            serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok()
+        })
+        .collect::<Vec<_>>();
+    let phases = payloads
+        .iter()
+        .filter_map(|payload| match payload {
+            EventPayload::Effect(phase) => Some(phase.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(phases.len(), 4);
+    let EffectPhase::Intent(intent) = &phases[0] else {
+        panic!("effect starts with Intent");
+    };
+    assert!(matches!(
+        &phases[1],
+        EffectPhase::Authorized {
+            effect,
+            verdict: AuthorizationVerdict::PreAuthorized {
+                source: AuthorizationSource::UserTyped,
+            },
+        } if effect == &intent.effect
+    ));
+    assert!(matches!(
+        &phases[2],
+        EffectPhase::Dispatched { effect } if effect == &intent.effect
+    ));
+    assert!(matches!(
+        &phases[3],
+        EffectPhase::Outcome {
+            effect,
+            outcome: EffectOutcome::Cancelled | EffectOutcome::CancelledEscalated { .. },
+        } if effect == &intent.effect
+    ));
+    let completed = payloads
+        .iter()
+        .position(|payload| {
+            matches!(
+                payload,
+                EventPayload::Item(ItemEvent::Completed {
+                    item_id: completed,
+                    item: TurnItem::CommandExecution {
+                        status: ToolStatus::Cancelled,
+                        ..
+                    },
+                }) if completed == &item_id
+            )
+        })
+        .expect("command item closes as Cancelled");
+    let terminal = payloads
+        .iter()
+        .position(|payload| *payload == EventPayload::RunState(RunState::Cancelled))
+        .expect("run terminal");
+    assert!(completed < terminal);
+    assert!(!payloads.contains(&EventPayload::RunState(RunState::Done)));
+
+    handle.begin_draining();
+    manager.shutdown().await.expect("manager drains");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// Graceful manager drain must wake an active direct shell without waiting
+/// for its queued `SupervisorCommand::Shutdown`. The same broker-owned
+/// TERM-to-KILL finalizer settles the effect and item before manager join.
+///
+/// MUTATION CHECK: remove the manager drain watch from `perform_shell_exec`
+/// or return before broker close. Expected runtime failure: shutdown exceeds
+/// the daemon's five-second drain budget or the durable lifecycle is open.
+#[tokio::test]
+async fn direct_shell_manager_drain_cancels_process_before_join() {
+    let root = tempfile::tempdir().expect("temp store");
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("workspace");
+    let store = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("store opens");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub opens");
+    let session_id = SessionId::new("direct-shell-drain");
+    let run_id = RunId::new("direct-shell-drain-run");
+    let item_id = ItemId::new("direct-shell-drain-item");
+    let generation = store.worker_generation();
+    let mut create = create_command(&session_id, "direct-shell-drain");
+    create.cwd = workspace.to_string_lossy().into_owned();
+    hub.create_session(create)
+        .await
+        .expect("typed session commits");
+    let accepted = match hub
+        .accept_shell_exec(ShellExecAcceptCommand {
+            command_id: "direct-shell-drain-command".into(),
+            request_digest: "direct-shell-drain-digest".into(),
+            request_json: r#"{"command":"printf started; sleep 30"}"#.into(),
+            session_id: session_id.clone(),
+            worker_generation: generation,
+            run_id: run_id.clone(),
+            item_id: item_id.clone(),
+            command: "printf started; sleep 30".into(),
+            running_event_id: EventId::new("direct-shell-drain-running"),
+            item_event_id: EventId::new("direct-shell-drain-started"),
+            active_event_id: EventId::new("direct-shell-drain-active"),
+            device_id: DeviceId::new("worker-law-test"),
+        })
+        .await
+        .expect("shell acceptance commits")
+    {
+        ShellExecAcceptOutcome::Committed { accepted, .. }
+        | ShellExecAcceptOutcome::IdempotentReplay { accepted } => accepted,
+    };
+    let manager = crate::worker::WorkerManager::start(
+        hub.clone(),
+        crate::worker::WorkerDependencies::unconfigured_for_tests(),
+        false,
+    );
+    manager
+        .handle()
+        .shell_exec(
+            accepted,
+            "direct-shell-drain-command".into(),
+            "printf started; sleep 30".into(),
+            None,
+        )
+        .await
+        .expect("shell handoff");
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let history = haider_core::StoreHandle::read(&store, &session_id, 0, 128)
+                .await
+                .expect("history reads");
+            if history.iter().any(|envelope| {
+                envelope.run_id.as_ref() == Some(&run_id)
+                    && serde_json::from_value::<EventPayload>(envelope.payload.clone()).is_ok_and(
+                        |payload| {
+                            matches!(
+                                payload,
+                                EventPayload::Effect(EffectPhase::Dispatched { .. })
+                            )
+                        },
+                    )
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("process crosses dispatched");
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), manager.shutdown())
+        .await
+        .expect("manager drain stays within daemon deadline")
+        .expect("manager drains");
+
+    let history = haider_core::StoreHandle::read(&store, &session_id, 0, 128)
+        .await
+        .expect("history reads after drain");
+    let payloads = history
+        .iter()
+        .filter(|envelope| envelope.run_id.as_ref() == Some(&run_id))
+        .filter_map(|envelope| {
+            serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok()
+        })
+        .collect::<Vec<_>>();
+    let phases = payloads
+        .iter()
+        .filter_map(|payload| match payload {
+            EventPayload::Effect(phase) => Some(phase),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(phases.len(), 4);
+    assert!(matches!(phases[0], EffectPhase::Intent(_)));
+    assert!(matches!(phases[1], EffectPhase::Authorized { .. }));
+    assert!(matches!(phases[2], EffectPhase::Dispatched { .. }));
+    assert!(matches!(
+        phases[3],
+        EffectPhase::Outcome {
+            outcome: EffectOutcome::Cancelled | EffectOutcome::CancelledEscalated { .. },
+            ..
+        }
+    ));
+    let cancelling = payloads
+        .iter()
+        .position(|payload| *payload == EventPayload::RunState(RunState::Cancelling))
+        .expect("drain first commits Cancelling");
+    let completed = payloads
+        .iter()
+        .position(|payload| {
+            matches!(
+                payload,
+                EventPayload::Item(ItemEvent::Completed {
+                    item_id: completed,
+                    item: TurnItem::CommandExecution {
+                        status: ToolStatus::Cancelled,
+                        ..
+                    },
+                }) if completed == &item_id
+            )
+        })
+        .expect("command item closes as Cancelled");
+    let terminal = payloads
+        .iter()
+        .position(|payload| *payload == EventPayload::RunState(RunState::Cancelled))
+        .expect("run terminal");
+    assert!(cancelling < completed && completed < terminal);
+
     hub.shutdown().await.expect("hub stops");
     store.close().await.expect("store closes");
 }

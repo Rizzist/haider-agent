@@ -137,6 +137,27 @@ pub(super) async fn run_session_actor(
                 }
                 let _ = completed.send(result);
             }
+            ActorCommand::AcceptShellExec { command, completed } => {
+                // The acceptance receipt and started command item commit in
+                // one transaction before publication or worker handoff.
+                let result = store.accept_shell_exec(command).await;
+                if let Ok(ShellExecAcceptOutcome::Committed { envelopes, .. }) = &result {
+                    if let Some(last) = envelopes.last() {
+                        head = last.seq;
+                        authority_epoch = last.authority_epoch;
+                    }
+                    observer.observe(HubObservation::Persisted {
+                        session_id: session_id.clone(),
+                        through_seq: head,
+                    });
+                    publish(&mut attachments, envelopes, catch_up_byte_budget, &metrics);
+                    observer.observe(HubObservation::Published {
+                        session_id: session_id.clone(),
+                        through_seq: head,
+                    });
+                }
+                let _ = completed.send(result);
+            }
             ActorCommand::CancelTurn { command, completed } => {
                 // PERSIST-BEFORE-WAKE (R5, authoritative statement): the
                 // durable `Cancelling` intent commits and publishes BEFORE the

@@ -12,10 +12,11 @@ use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::{AgentId, ArtifactRef, RunId, SessionId};
 use haider_protocol::session::SessionMetadataV1;
 use haider_store::{
-    AcceptedTurn, CancelledTurn, Cas, ContextCompactionClaim, ContextCompactionReceiptResponse,
-    DelegationCreateOutcome, DelegationRecord, EventStore, MenuResolutionCommand,
-    MenuResolutionOutcome, ProfileLease, SessionCreateCommand, SessionCreateOutcome, Store,
-    TurnAcceptCommand, TurnAcceptOutcome, TurnCancelCommand, TurnCancelOutcome,
+    AcceptedShellExec, AcceptedTurn, CancelledTurn, Cas, ContextCompactionClaim,
+    ContextCompactionReceiptResponse, DelegationCreateOutcome, DelegationRecord, EventStore,
+    MenuResolutionCommand, MenuResolutionOutcome, ProfileLease, SessionCreateCommand,
+    SessionCreateOutcome, ShellExecAcceptCommand, ShellExecAcceptOutcome, Store, TurnAcceptCommand,
+    TurnAcceptOutcome, TurnCancelCommand, TurnCancelOutcome,
 };
 use haider_tools::{CasSink, ToolResult};
 use std::path::Path;
@@ -229,6 +230,31 @@ impl SqliteStoreHandle {
     ) -> Result<TurnAcceptOutcome, HaiderError> {
         let owner = Arc::clone(&self.owner);
         run_blocking(move || owner.with_store(|store| store.accept_turn(&command))).await
+    }
+
+    /// Unfenced direct-shell receipt lookup for response-loss recovery.
+    pub async fn shell_exec_receipt(
+        &self,
+        command_id: String,
+        request_digest: String,
+        request_json: String,
+    ) -> Result<Option<AcceptedShellExec>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.shell_exec_receipt(&command_id, &request_digest, &request_json)
+            })
+        })
+        .await
+    }
+
+    /// Blocking-pool adapter for atomic direct-shell acceptance.
+    pub async fn accept_shell_exec(
+        &self,
+        command: ShellExecAcceptCommand,
+    ) -> Result<ShellExecAcceptOutcome, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.accept_shell_exec(&command))).await
     }
 
     /// Blocking-pool adapter for `Store::turn_cancel_receipt` (R2 replay

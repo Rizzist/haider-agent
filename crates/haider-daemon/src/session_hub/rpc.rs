@@ -275,6 +275,56 @@ impl HubConnection {
                 self.session_compact(request_id, command_id, session_id, worker_generation)
                     .await
             }
+            RequestBody::ShellExec {
+                command_id,
+                session_id,
+                worker_generation,
+                command,
+                cwd,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                if !self
+                    .hub
+                    .holds_control_attachment(&self.connection_id, &session_id)?
+                {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        "direct shell execution requires a control attachment to this session",
+                        false,
+                        None,
+                    );
+                }
+                self.shell_exec(
+                    request_id,
+                    command_id,
+                    session_id,
+                    worker_generation,
+                    command,
+                    cwd,
+                )
+                .await
+            }
+            RequestBody::ToolsInventory { session_id } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::View) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.tools_inventory(request_id, session_id).await
+            }
             RequestBody::VaultStage {
                 stage_id,
                 purpose,
@@ -1412,6 +1462,144 @@ impl HubConnection {
         self.respond_turn_accepted(request_id, accepted)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn shell_exec(
+        &self,
+        request_id: RequestId,
+        command_id: CommandId,
+        session_id: SessionId,
+        worker_generation: u64,
+        command: String,
+        cwd: Option<String>,
+    ) -> Result<(), SessionHubError> {
+        if command_id.as_str().is_empty() || command.trim().is_empty() || command.len() > 8_192 {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "shell command id and 1..=8192 UTF-8 command bytes are required",
+                false,
+                None,
+            );
+        }
+        let request_json = serde_json::to_string(&serde_json::json!({
+            "session_id": &session_id,
+            "worker_generation": worker_generation,
+            "command": &command,
+            "cwd": &cwd,
+        }))
+        .map_err(|error| {
+            SessionHubError::Task(format!("cannot encode shell-exec coordinates: {error}"))
+        })?;
+        let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
+        match self
+            .hub
+            .shell_exec_receipt(&command_id, &request_digest, &request_json)
+            .await
+        {
+            Ok(Some(accepted)) => {
+                if accepted.worker_generation == self.hub.inner.store.worker_generation()
+                    && let Err(error) = self
+                        .hub
+                        .worker_manager()?
+                        .shell_exec(accepted.clone(), command_id.0.clone(), command, cwd)
+                        .await
+                {
+                    return self.respond_shell_error(request_id, error);
+                }
+                return self.respond_shell_accepted(request_id, accepted);
+            }
+            Ok(None) => {}
+            Err(SessionHubError::Store(error)) => {
+                return self.respond_shell_error(request_id, error);
+            }
+            Err(error) => return Err(error),
+        }
+        let trimmed = command.trim();
+        if trimmed == "cd"
+            || trimmed
+                .strip_prefix("cd")
+                .is_some_and(|suffix| suffix.chars().next().is_some_and(char::is_whitespace))
+        {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_UNSUPPORTED_SHELL_BUILTIN,
+                "`!cd` is unsupported: daemon-owned persistent shell cwd is a later design",
+                false,
+                None,
+            );
+        }
+        if let Some(cwd) = cwd.as_deref()
+            && (cwd.is_empty() || std::path::Path::new(cwd).is_absolute())
+        {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "shell cwd must be a non-empty workspace-relative path",
+                false,
+                None,
+            );
+        }
+        let accepted = match self
+            .hub
+            .accept_shell_exec(ShellExecAcceptCommand {
+                command_id: command_id.0.clone(),
+                request_digest,
+                request_json,
+                session_id: session_id.clone(),
+                worker_generation,
+                run_id: RunId::new(random_id("shell-run")?),
+                item_id: haider_protocol::ids::ItemId::new(random_id("shell-item")?),
+                command: command.clone(),
+                running_event_id: EventId::new(random_id("shell-running")?),
+                item_event_id: EventId::new(random_id("shell-item-started")?),
+                active_event_id: EventId::new(random_id("shell-session-active")?),
+                device_id: self.hub.inner.device_id.clone(),
+            })
+            .await
+        {
+            Ok(ShellExecAcceptOutcome::Committed { accepted, .. })
+            | Ok(ShellExecAcceptOutcome::IdempotentReplay { accepted }) => accepted,
+            Err(SessionHubError::Store(error)) => {
+                return self.respond_shell_error(request_id, error);
+            }
+            Err(error) => return Err(error),
+        };
+        if let Err(error) = self
+            .hub
+            .worker_manager()?
+            .shell_exec(accepted.clone(), command_id.0, command, cwd)
+            .await
+        {
+            return self.respond_shell_error(request_id, error);
+        }
+        self.respond_shell_accepted(request_id, accepted)
+    }
+
+    async fn tools_inventory(
+        &self,
+        request_id: RequestId,
+        session_id: SessionId,
+    ) -> Result<(), SessionHubError> {
+        if self.hub.inner.store.latest_seq(&session_id).await? == 0 {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_NOT_FOUND,
+                "session was not found",
+                false,
+                None,
+            );
+        }
+        let inventory =
+            crate::worker::tool_inventory_snapshot(&self.hub.inner.store, &session_id).await?;
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::ToolsInventory {
+                session_id,
+                inventory,
+            },
+        })
+    }
+
     async fn session_compact(
         &self,
         request_id: RequestId,
@@ -1538,6 +1726,37 @@ impl HubConnection {
                 },
             },
         })
+    }
+
+    fn respond_shell_accepted(
+        &self,
+        request_id: RequestId,
+        accepted: AcceptedShellExec,
+    ) -> Result<(), SessionHubError> {
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::ShellExec {
+                session_id: accepted.session_id,
+                item_id: accepted.item_id,
+                accepted_seq: accepted.accepted_seq,
+                worker_generation: accepted.worker_generation,
+            },
+        })
+    }
+
+    fn respond_shell_error(
+        &self,
+        request_id: RequestId,
+        error: HaiderError,
+    ) -> Result<(), SessionHubError> {
+        let code = match error.code {
+            ErrorCode::SingleWriterViolation => ERROR_CODE_STALE_GENERATION,
+            ErrorCode::SessionNotFound => ERROR_CODE_NOT_FOUND,
+            ErrorCode::Busy => ERROR_CODE_BUSY,
+            ErrorCode::RunNotActive => ERROR_CODE_RUN_NOT_ACTIVE,
+            _ => ERROR_CODE_INVALID_ARGUMENT,
+        };
+        self.respond_error(request_id, code, &error.message, error.retryable, None)
     }
 
     fn respond_turn_error(

@@ -5,9 +5,9 @@ use std::collections::BTreeSet;
 use haider_protocol::DeliveryMode;
 use haider_protocol::context::ContextFootprint;
 use haider_protocol::envelope::RawEnvelope;
-use haider_protocol::ids::{MenuId, RunId, SessionId};
+use haider_protocol::ids::{ItemId, MenuId, RunId, SessionId};
 use haider_protocol::session::SessionMetadataV1;
-use haider_protocol::tool::AttachmentBlock;
+use haider_protocol::tool::{AttachmentBlock, ToolInventorySnapshot};
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -135,6 +135,9 @@ pub const ERROR_CODE_OAUTH_FLOW_NOT_FOUND: &str = "oauth_flow_not_found";
 /// Stable code for a management mutation fenced by a newer account/provider
 /// snapshot. Retrying after refreshing that snapshot is the intended recovery.
 pub const ERROR_CODE_REVISION_CONFLICT: &str = "revision_conflict";
+/// Stable rejection for a shell builtin whose durable daemon semantics are
+/// deliberately not implemented by this protocol slice.
+pub const ERROR_CODE_UNSUPPORTED_SHELL_BUILTIN: &str = "unsupported_shell_builtin";
 
 /// Daemon implements receipt-backed session creation and metadata.
 pub const FEATURE_SESSION_MUTATION_V1: &str = "session_mutation_v1";
@@ -160,6 +163,10 @@ pub const FEATURE_PROVIDER_CONFIGURE_V1: &str = "provider_configure_v1";
 pub const FEATURE_PROVIDER_MODELS_V1: &str = "provider_models_v1";
 /// Daemon implements live same-provider account rotation.
 pub const FEATURE_ACCOUNT_ROTATION_V1: &str = "account_rotation_v1";
+/// Daemon implements receipt-backed direct user shell execution.
+pub const FEATURE_SHELL_EXEC_V1: &str = "shell_exec_v1";
+/// Daemon implements the canonical read-only tool inventory snapshot.
+pub const FEATURE_TOOL_INVENTORY_V1: &str = "tool_inventory_v1";
 
 /// Kind of client taking part in the handshake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -753,6 +760,22 @@ pub enum RequestBody {
         session_id: SessionId,
         worker_generation: u64,
     },
+    /// Executes exact user-supplied shell program bytes on the session daemon.
+    /// The command creates no user message and no provider request. `cwd`, when
+    /// present, is workspace-relative and applies only to this invocation.
+    #[serde(rename = "shell.exec")]
+    ShellExec {
+        command_id: CommandId,
+        session_id: SessionId,
+        worker_generation: u64,
+        command: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
+    /// Reads canonical registered manifests/defaults plus grants reconstructed
+    /// from the target session's durable journal.
+    #[serde(rename = "tools.inventory")]
+    ToolsInventory { session_id: SessionId },
     /// Stages a raw secret in connection-scoped daemon memory and returns an
     /// opaque single-use reference (R7). Intentionally NON-durable: no
     /// command receipt may ever contain a secret. `stage_id` is an ephemeral
@@ -955,6 +978,20 @@ pub enum ResponseBody {
         run_id: RunId,
         accepted_seq: u64,
         worker_generation: u64,
+    },
+    /// Durable acceptance coordinates for one direct shell command. Terminal
+    /// status and byte output arrive through the ordinary item event stream.
+    #[serde(rename = "shell.exec")]
+    ShellExec {
+        session_id: SessionId,
+        item_id: ItemId,
+        accepted_seq: u64,
+        worker_generation: u64,
+    },
+    #[serde(rename = "tools.inventory")]
+    ToolsInventory {
+        session_id: SessionId,
+        inventory: ToolInventorySnapshot,
     },
     /// Opaque staged-secret reference (R7): random, connection- and
     /// daemon-instance-scoped, single-use, and expired at

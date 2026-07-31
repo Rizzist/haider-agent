@@ -50,6 +50,9 @@ fn hex_to_bytes(hex: &str) -> Vec<u8> {
         .collect()
 }
 
+/// MUTATION CHECK: remove either appended W8a shell/inventory frame from the
+/// transcript. Expected runtime failure: the compact WS and UDS golden byte
+/// arrays differ in length/content while every pre-W8 frame stays unchanged.
 #[test]
 fn compact_ws_bodies_and_length_prefixed_uds_streams_are_golden() {
     let expected_frames = transcript();

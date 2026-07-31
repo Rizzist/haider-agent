@@ -28,7 +28,7 @@ use crate::turn_recovery::{cancelled_resumption_payloads, failed_resumption_payl
 use async_trait::async_trait;
 use base64::Engine;
 use haider_core::{
-    AcceptedTurn, CancelToken, ChildWaitCheckpoint, ContextCompactionClaim,
+    AcceptedShellExec, AcceptedTurn, CancelToken, ChildWaitCheckpoint, ContextCompactionClaim,
     ContextCompactionReceiptResponse, ContextCompactor, DeferredTicket, DeferredToolResult,
     EventIdGenerator, HarnessActor, HarnessConfig, PromptHistoryCompiler, RequestInputCheckpoint,
     StoreHandle, SubmitCheckpointTurn, SubmitChildWaitTurn, SubmitCommittedTurn,
@@ -53,7 +53,10 @@ use haider_protocol::menu::{DecisionKind, Menu, MenuAnswer, MenuKind};
 use haider_protocol::provider::{FinishReason, StreamEvent};
 use haider_protocol::session::SessionMetadataV1;
 use haider_protocol::state::{RunState, SessionState};
-use haider_protocol::tool::BoundedResult;
+use haider_protocol::tool::{
+    BoundedResult, DispatchMode, RememberedGrantScope, RememberedSessionGrant, ToolInventoryEntry,
+    ToolInventorySnapshot, ToolManifest, ToolPermissionDefault,
+};
 use haider_provider::{
     ANTHROPIC_OAUTH_PROVIDER_NAME, ANTHROPIC_PROVIDER_NAME, Message, ResolvedAttachment,
 };
@@ -61,7 +64,8 @@ use haider_provider::{Provider, ToolDefinition, TurnRequest};
 use haider_tools::{
     CasSink, ChangeLedger, CommandOutputSink, EffectBroker, FsList, FsPatch, FsRead, FsSearch,
     FsWrite, JournalSink, PermissionPolicy, ProcessBounds, ProcessExec, ProcessResult,
-    ResultBounds, SessionGrant, SpawnSubagent, ToolError, ToolResult, TurnAttribution,
+    ResultBounds, SessionGrant, SessionGrantScope, ShellSession, SpawnSubagent, ToolError,
+    ToolResult, TurnAttribution,
 };
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::Path;
@@ -516,6 +520,7 @@ impl SystemPromptBuilder {
 pub(crate) struct WorkerManagerHandle {
     commands: mpsc::Sender<ManagerCommand>,
     admission: Arc<std::sync::Mutex<bool>>,
+    drain_wake: tokio::sync::watch::Sender<bool>,
 }
 
 /// Owner of every supervisor task (R1): one lazy supervisor per session,
@@ -548,6 +553,10 @@ enum ManagerCommand {
         worker_generation: u64,
         completed: oneshot::Sender<Result<AcceptedCompaction, HaiderError>>,
     },
+    ShellExec {
+        pending: Box<PendingShellExec>,
+        completed: oneshot::Sender<Result<(), HaiderError>>,
+    },
     Shutdown {
         completed: oneshot::Sender<Result<(), HaiderError>>,
     },
@@ -565,7 +574,29 @@ enum SupervisorCommand {
         worker_generation: u64,
         completed: oneshot::Sender<Result<AcceptedCompaction, HaiderError>>,
     },
+    ShellExec(Box<PendingShellExec>),
     Shutdown,
+}
+
+pub(crate) struct PendingShellExec {
+    pub(crate) accepted: AcceptedShellExec,
+    pub(crate) command_id: String,
+    pub(crate) command: String,
+    pub(crate) cwd: Option<String>,
+}
+
+/// Owns a shell handoff that raced a durably-terminal provider turn's
+/// in-memory cleanup. Same-receipt retries need no second queue slot.
+pub(crate) fn defer_shell_handoff(
+    deferred: &mut VecDeque<PendingShellExec>,
+    pending: PendingShellExec,
+) {
+    if !deferred
+        .iter()
+        .any(|queued| queued.accepted.run_id == pending.accepted.run_id)
+    {
+        deferred.push_back(pending);
+    }
 }
 
 struct PendingTurn {
@@ -614,11 +645,13 @@ impl WorkerManager {
             dependencies.delegation = Some(DelegationHandle::new(hub.clone()));
         }
         let (commands, receiver) = mpsc::channel(MANAGER_CAPACITY);
+        let (drain_wake, drain_wakes) = tokio::sync::watch::channel(false);
         let handle = WorkerManagerHandle {
             commands,
             admission: Arc::new(std::sync::Mutex::new(true)),
+            drain_wake,
         };
-        let task = tokio::spawn(run_manager(hub, dependencies, receiver));
+        let task = tokio::spawn(run_manager(hub, dependencies, receiver, drain_wakes));
         Self {
             handle,
             task: Some(task),
@@ -688,6 +721,7 @@ impl WorkerManagerHandle {
         if let Ok(mut open) = self.admission.lock() {
             *open = false;
         }
+        self.drain_wake.send_replace(true);
     }
 
     pub(crate) async fn submit(&self, accepted: AcceptedTurn) -> Result<(), HaiderError> {
@@ -737,6 +771,28 @@ impl WorkerManagerHandle {
                 session_id,
                 command_id,
                 worker_generation,
+                completed,
+            })
+            .map_err(manager_try_send)?;
+        response.await.map_err(|_| manager_stopped())?
+    }
+
+    pub(crate) async fn shell_exec(
+        &self,
+        accepted: AcceptedShellExec,
+        command_id: String,
+        command: String,
+        cwd: Option<String>,
+    ) -> Result<(), HaiderError> {
+        let (completed, response) = oneshot::channel();
+        self.commands
+            .try_send(ManagerCommand::ShellExec {
+                pending: Box::new(PendingShellExec {
+                    accepted,
+                    command_id,
+                    command,
+                    cwd,
+                }),
                 completed,
             })
             .map_err(manager_try_send)?;
@@ -804,6 +860,7 @@ async fn run_manager(
     hub: SessionHub,
     dependencies: WorkerDependencies,
     mut commands: mpsc::Receiver<ManagerCommand>,
+    drain_wakes: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut supervisors = HashMap::<SessionId, SupervisorSlot>::new();
     let mut incarnations = HashMap::<SessionId, u64>::new();
@@ -837,6 +894,7 @@ async fn run_manager(
                 let result = match supervisor_for(
                     &hub,
                     &dependencies,
+                    &drain_wakes,
                     &mut supervisors,
                     &mut tasks,
                     &mut task_sessions,
@@ -859,6 +917,7 @@ async fn run_manager(
                 match supervisor_for(
                     &hub,
                     &dependencies,
+                    &drain_wakes,
                     &mut supervisors,
                     &mut tasks,
                     &mut task_sessions,
@@ -904,6 +963,7 @@ async fn run_manager(
                 let supervisor = match supervisor_for(
                     &hub,
                     &dependencies,
+                    &drain_wakes,
                     &mut supervisors,
                     &mut tasks,
                     &mut task_sessions,
@@ -946,6 +1006,7 @@ async fn run_manager(
                 let supervisor = match supervisor_for(
                     &hub,
                     &dependencies,
+                    &drain_wakes,
                     &mut supervisors,
                     &mut tasks,
                     &mut task_sessions,
@@ -978,6 +1039,30 @@ async fn run_manager(
                     };
                     let _ = completed.send(Err(error));
                 }
+            }
+            ManagerCommand::ShellExec { pending, completed } => {
+                let supervisor = match supervisor_for(
+                    &hub,
+                    &dependencies,
+                    &drain_wakes,
+                    &mut supervisors,
+                    &mut tasks,
+                    &mut task_sessions,
+                    &mut incarnations,
+                    pending.accepted.session_id.clone(),
+                )
+                .await
+                {
+                    Ok(supervisor) => supervisor,
+                    Err(error) => {
+                        let _ = completed.send(Err(error));
+                        continue;
+                    }
+                };
+                let result = supervisor
+                    .try_send(SupervisorCommand::ShellExec(pending))
+                    .map_err(supervisor_try_send);
+                let _ = completed.send(result);
             }
             ManagerCommand::Shutdown { completed } => {
                 for supervisor in supervisors.values() {
@@ -1071,6 +1156,7 @@ async fn drain_accepted_without_handoff(hub: &SessionHub) -> Result<(), HaiderEr
             if matches!(
                 state,
                 RunState::InputRequired { .. }
+                    | RunState::PermissionRequired { .. }
                     | RunState::Waiting {
                         reason: haider_protocol::state::WaitReason::LocalChild
                     }
@@ -1207,9 +1293,11 @@ pub(crate) async fn terminalize_supervisor_exit(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn supervisor_for(
     hub: &SessionHub,
     dependencies: &WorkerDependencies,
+    drain_wakes: &tokio::sync::watch::Receiver<bool>,
     supervisors: &mut HashMap<SessionId, SupervisorSlot>,
     tasks: &mut JoinSet<SupervisorExit>,
     task_sessions: &mut HashMap<tokio::task::Id, SessionId>,
@@ -1244,6 +1332,7 @@ async fn supervisor_for(
         .or_insert(1);
     let task_session_id = session_id.clone();
     let supervisor_dependencies = dependencies.clone();
+    let supervisor_drain_wakes = (*drain_wakes).clone();
     let task = tasks.spawn(async move {
         let terminalize_nonterminal = run_supervisor(
             supervisor_dependencies,
@@ -1251,6 +1340,7 @@ async fn supervisor_for(
             lease,
             receiver,
             cancellation_wakes,
+            supervisor_drain_wakes,
             incarnation,
         )
         .await;
@@ -1312,6 +1402,7 @@ async fn run_supervisor(
     lease: HubStoreHandle,
     mut commands: mpsc::Receiver<SupervisorCommand>,
     mut cancellation_wakes: tokio::sync::watch::Receiver<u64>,
+    mut drain_wakes: tokio::sync::watch::Receiver<bool>,
     incarnation: u64,
 ) -> bool {
     let mut queue = VecDeque::<PendingTurn>::new();
@@ -1330,13 +1421,40 @@ async fn run_supervisor(
     )));
     let mut stopping = false;
     let mut rescan_needed = false;
+    let mut deferred_shell = VecDeque::<PendingShellExec>::new();
 
     loop {
         if active.is_none() && !stopping {
+            if let Some(pending) = deferred_shell.pop_front() {
+                if let Err(error) = perform_shell_exec(
+                    &metadata,
+                    &lease,
+                    &device_id,
+                    Arc::clone(&event_ids),
+                    pending,
+                    &mut cancellation_wakes,
+                    &mut drain_wakes,
+                )
+                .await
+                {
+                    tracing::error!(
+                        session_id = %lease.session_id(),
+                        ?error,
+                        "deferred direct shell execution failed before terminal settlement"
+                    );
+                    let _ = lease.unregister_worker().await;
+                    return true;
+                }
+                continue;
+            }
             if queue.is_empty() && rescan_needed {
                 rescan_needed = refill_queued_turns(&lease, &mut queue, None).await;
             }
-            while let Some(pending) = queue.pop_front() {
+            let direct_shell_owns_session = durable_runs(&lease).await.is_ok_and(|runs| {
+                runs.into_iter()
+                    .any(|(_, state, _)| state == RunState::RunningTool)
+            });
+            while !direct_shell_owns_session && let Some(pending) = queue.pop_front() {
                 let mut pending = pending;
                 let run_id = pending.accepted.run_id.clone();
                 let recovery_ready = pending.recovery_ready.take();
@@ -1482,6 +1600,15 @@ async fn run_supervisor(
                                 true,
                             )));
                         }
+                        Some(SupervisorCommand::ShellExec(pending)) => {
+                            // Store admission can observe the turn's durable
+                            // terminal a few instructions before this branch
+                            // reaps `ActiveTurn`. Preserve that accepted job
+                            // for the next loop instead of dropping its only
+                            // handoff. Receipt replays for the same run are
+                            // response-only duplicates and need one slot.
+                            defer_shell_handoff(&mut deferred_shell, *pending);
+                        }
                         Some(SupervisorCommand::Shutdown) | None => {
                             stopping = true;
                             // P3-4/W6c (park, don't cancel): request-input and
@@ -1499,7 +1626,10 @@ async fn run_supervisor(
                             };
                             if delegated_child || matches!(
                                 durable_run_state(&lease, &active_run).await,
-                                Some(RunState::InputRequired { .. })
+                                Some(
+                                    RunState::InputRequired { .. }
+                                    | RunState::PermissionRequired { .. },
+                                )
                                     | Some(RunState::Waiting {
                                         reason: haider_protocol::state::WaitReason::LocalChild
                                     })
@@ -1726,6 +1856,27 @@ async fn run_supervisor(
                         )
                         .await;
                         let _ = completed.send(result);
+                    }
+                    Some(SupervisorCommand::ShellExec(pending)) => {
+                        if let Err(error) = perform_shell_exec(
+                            &metadata,
+                            &lease,
+                            &device_id,
+                            Arc::clone(&event_ids),
+                            *pending,
+                            &mut cancellation_wakes,
+                            &mut drain_wakes,
+                        )
+                        .await
+                        {
+                            tracing::error!(
+                                session_id = %lease.session_id(),
+                                ?error,
+                                "direct shell execution failed before terminal settlement"
+                            );
+                            let _ = lease.unregister_worker().await;
+                            return true;
+                        }
                     }
                     Some(SupervisorCommand::Shutdown) | None => {
                         stopping = true;
@@ -2415,6 +2566,257 @@ async fn perform_manual_compaction(
     Ok(accepted)
 }
 
+async fn perform_shell_exec(
+    metadata: &SessionMetadataV1,
+    lease: &HubStoreHandle,
+    device_id: &DeviceId,
+    event_ids: Arc<EventIdGenerator>,
+    pending: PendingShellExec,
+    cancellation_wakes: &mut tokio::sync::watch::Receiver<u64>,
+    drain_wakes: &mut tokio::sync::watch::Receiver<bool>,
+) -> Result<(), HaiderError> {
+    let run_id = pending.accepted.run_id.clone();
+    let state = durable_run_state(lease, &run_id).await;
+    if state.as_ref().is_some_and(RunState::is_terminal) {
+        // A same-command receipt replay may hand the accepted job to the
+        // supervisor again. Terminal durable truth makes that a no-op.
+        return Ok(());
+    }
+    if state == Some(RunState::Cancelling) {
+        return cancel_shell_exec(lease, device_id, &event_ids, &run_id).await;
+    }
+    if state != Some(RunState::RunningTool) {
+        return Err(HaiderError::new(
+            ErrorCode::RunNotActive,
+            format!("direct shell run {run_id} is not durably running"),
+            false,
+        ));
+    }
+    if *drain_wakes.borrow() {
+        begin_shell_cancellation(lease, device_id, &event_ids, &run_id).await?;
+        return cancel_shell_exec(lease, device_id, &event_ids, &run_id).await;
+    }
+
+    let shell = match ShellSession::new(&metadata.cwd, Vec::new()) {
+        Ok(shell) => shell,
+        Err(error) => {
+            return fail_shell_exec(lease, device_id, &event_ids, &run_id, tool_error(error)).await;
+        }
+    };
+    let operation = match shell.prepare_user_process(
+        pending.command_id.clone(),
+        pending.command.clone(),
+        pending.cwd.as_deref().map(Path::new),
+    ) {
+        Ok(operation) => operation,
+        Err(error) => {
+            return fail_shell_exec(lease, device_id, &event_ids, &run_id, tool_error(error)).await;
+        }
+    };
+    let journal = HubJournalSink {
+        store: lease.clone(),
+        run_id: run_id.clone(),
+        device_id: device_id.clone(),
+        event_ids: Arc::clone(&event_ids),
+    };
+    let mut broker = match EffectBroker::new(
+        Box::new(journal),
+        &metadata.cwd,
+        lease.session_id().clone(),
+        lease.worker_generation(),
+    ) {
+        Ok(broker) => broker,
+        Err(error) => {
+            return fail_shell_exec(lease, device_id, &event_ids, &run_id, tool_error(error)).await;
+        }
+    };
+    let output = HubCommandOutputContext {
+        store: lease.clone(),
+        device_id: device_id.clone(),
+        event_ids: Arc::clone(&event_ids),
+    }
+    .sink(
+        run_id.clone(),
+        pending.accepted.item_id.clone(),
+        pending.command_id,
+    );
+    let execution = match broker
+        .process_exec_user(
+            &operation,
+            HubArtifactStore {
+                store: lease.clone(),
+            },
+            output,
+            ProcessBounds::default(),
+        )
+        .await
+    {
+        Ok(execution) => execution,
+        Err(error) => {
+            let error = tool_error(error);
+            let _ = broker.close().await;
+            return fail_shell_exec(lease, device_id, &event_ids, &run_id, error).await;
+        }
+    };
+    // Wait stays owned by the supervisor task so forced supervisor teardown
+    // drops `ProcessExecution` and cannot detach a child waiter. The cloned
+    // capability can request the same TERM → grace → KILL path while this
+    // future continues to own and observe the final process result.
+    let process_cancel = execution.cancel_handle();
+    let wait = execution.wait();
+    tokio::pin!(wait);
+    let mut cancellation_channel_open = true;
+    let mut drain_channel_open = true;
+    let result = loop {
+        tokio::select! {
+            biased;
+            changed = drain_wakes.changed(), if drain_channel_open => {
+                if changed.is_err() {
+                    drain_channel_open = false;
+                    continue;
+                }
+                let draining = *drain_wakes.borrow_and_update();
+                if draining {
+                    begin_shell_cancellation(lease, device_id, &event_ids, &run_id).await?;
+                    process_cancel.cancel();
+                    let _ = wait.await;
+                    if let Err(error) = broker.close().await {
+                        tracing::warn!(
+                            %run_id,
+                            ?error,
+                            "direct shell broker close reported an error during daemon drain"
+                        );
+                    }
+                    return cancel_shell_exec(lease, device_id, &event_ids, &run_id).await;
+                }
+            }
+            changed = cancellation_wakes.changed(), if cancellation_channel_open => {
+                if changed.is_err() {
+                    cancellation_channel_open = false;
+                    continue;
+                }
+                if durable_run_state(lease, &run_id).await == Some(RunState::Cancelling) {
+                    process_cancel.cancel();
+                    let _ = wait.await;
+                    if let Err(error) = broker.close().await {
+                        tracing::warn!(
+                            %run_id,
+                            ?error,
+                            "direct shell broker close reported an error during cancellation"
+                        );
+                    }
+                    return cancel_shell_exec(lease, device_id, &event_ids, &run_id).await;
+                }
+            }
+            result = &mut wait => {
+                break match result {
+                    Ok(result) => result,
+                    Err(error) => {
+                        let error = tool_error(error);
+                        let _ = broker.close().await;
+                        return fail_shell_exec(lease, device_id, &event_ids, &run_id, error).await;
+                    }
+                };
+            }
+        }
+    };
+    if let Err(error) = broker.close().await {
+        return fail_shell_exec(
+            lease,
+            device_id,
+            &event_ids,
+            &run_id,
+            HaiderError::new(
+                ErrorCode::EffectUnknownOutcome,
+                format!("direct shell broker close reported unfinished work: {error}"),
+                false,
+            ),
+        )
+        .await;
+    }
+    if durable_run_state(lease, &run_id).await == Some(RunState::Cancelling) {
+        return cancel_shell_exec(lease, device_id, &event_ids, &run_id).await;
+    }
+    let completed = append_payloads(
+        lease,
+        device_id,
+        &run_id,
+        &event_ids,
+        vec![
+            EventPayload::Item(ItemEvent::Completed {
+                item_id: pending.accepted.item_id,
+                item: result.completed_item(pending.command),
+            }),
+            EventPayload::RunState(RunState::Done),
+        ],
+    )
+    .await;
+    if let Err(error) = completed {
+        if durable_run_state(lease, &run_id).await == Some(RunState::Cancelling) {
+            return cancel_shell_exec(lease, device_id, &event_ids, &run_id).await;
+        }
+        return Err(error);
+    }
+    append_session_idle(lease, device_id, &event_ids, false).await
+}
+
+async fn begin_shell_cancellation(
+    lease: &HubStoreHandle,
+    device_id: &DeviceId,
+    event_ids: &EventIdGenerator,
+    run_id: &RunId,
+) -> Result<(), HaiderError> {
+    match durable_run_state(lease, run_id).await {
+        Some(RunState::RunningTool) => {
+            append_run_state(lease, device_id, run_id, event_ids, RunState::Cancelling).await
+        }
+        Some(RunState::Cancelling) | Some(RunState::Cancelled) => Ok(()),
+        Some(state) if state.is_terminal() => Ok(()),
+        state => Err(HaiderError::new(
+            ErrorCode::RunNotActive,
+            format!("direct shell run {run_id} cannot begin cancellation from {state:?}"),
+            false,
+        )),
+    }
+}
+
+async fn cancel_shell_exec(
+    lease: &HubStoreHandle,
+    device_id: &DeviceId,
+    event_ids: &EventIdGenerator,
+    run_id: &RunId,
+) -> Result<(), HaiderError> {
+    reconcile_unknown_effects(lease, device_id, run_id, event_ids).await?;
+    let mut payloads = cancelled_resumption_payloads(lease, lease.session_id(), run_id).await?;
+    payloads.retain(|payload| !matches!(payload, EventPayload::SessionState(_)));
+    append_payloads(lease, device_id, run_id, event_ids, payloads).await?;
+    append_session_idle(lease, device_id, event_ids, true).await
+}
+
+async fn fail_shell_exec(
+    lease: &HubStoreHandle,
+    device_id: &DeviceId,
+    event_ids: &EventIdGenerator,
+    run_id: &RunId,
+    error: HaiderError,
+) -> Result<(), HaiderError> {
+    if durable_run_state(lease, run_id).await == Some(RunState::Cancelling) {
+        return cancel_shell_exec(lease, device_id, event_ids, run_id).await;
+    }
+    reconcile_unknown_effects(lease, device_id, run_id, event_ids).await?;
+    let mut payloads =
+        failed_resumption_payloads(lease, lease.session_id(), run_id, &error).await?;
+    payloads.retain(|payload| !matches!(payload, EventPayload::SessionState(_)));
+    if let Err(append_error) = append_payloads(lease, device_id, run_id, event_ids, payloads).await
+    {
+        if durable_run_state(lease, run_id).await == Some(RunState::Cancelling) {
+            return cancel_shell_exec(lease, device_id, event_ids, run_id).await;
+        }
+        return Err(append_error);
+    }
+    append_session_idle(lease, device_id, event_ids, false).await
+}
+
 /// Assembles and starts one accepted turn: provider resolution (R6 pinning —
 /// this is the once-per-logical-turn call), committed-history compilation
 /// (R4), tool dispatcher creation, harness registration under the lease, and
@@ -2975,26 +3377,143 @@ mod manager_law_tests {
 
 pub(crate) struct BrokerToolFactory;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RegisteredToolRoute {
+    RequestInput,
+    FsRead,
+    FsList,
+    FsSearch,
+    FsWrite,
+    FsPatch,
+    ProcessExec,
+    SpawnSubagent,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RegisteredTool {
+    pub(crate) manifest: ToolManifest,
+    pub(crate) default: ToolPermissionDefault,
+    pub(crate) route: RegisteredToolRoute,
+}
+
+fn registered_tool(
+    definition: ToolDefinition,
+    effects: Vec<EffectClass>,
+    dispatch: DispatchMode,
+    default: ToolPermissionDefault,
+    route: RegisteredToolRoute,
+) -> RegisteredTool {
+    RegisteredTool {
+        manifest: ToolManifest {
+            name: definition.name,
+            description: definition.description,
+            effects,
+            dispatch,
+            input_schema: definition.input_schema,
+        },
+        default,
+        route,
+    }
+}
+
+/// The single daemon-owned public tool registry. Provider definitions,
+/// dispatcher routes, policy defaults, and inventory reads all project from
+/// these entries. Legacy aliases intentionally live only in
+/// `registered_tool_route` and can never be advertised.
+pub(crate) fn registered_tools() -> Vec<RegisteredTool> {
+    vec![
+        registered_tool(
+            request_input_definition(),
+            vec![],
+            DispatchMode::Await,
+            ToolPermissionDefault::NotApplicable,
+            RegisteredToolRoute::RequestInput,
+        ),
+        registered_tool(
+            tool_definition("fs_read", "Read a UTF-8 file", &["path"]),
+            vec![EffectClass::FsRead],
+            DispatchMode::Await,
+            ToolPermissionDefault::Allow,
+            RegisteredToolRoute::FsRead,
+        ),
+        registered_tool(
+            tool_definition("fs_list", "List a directory", &["path"]),
+            vec![EffectClass::FsRead],
+            DispatchMode::Await,
+            ToolPermissionDefault::Allow,
+            RegisteredToolRoute::FsList,
+        ),
+        registered_tool(
+            tool_definition("fs_search", "Search files for text", &["root", "query"]),
+            vec![EffectClass::FsRead],
+            DispatchMode::Await,
+            ToolPermissionDefault::Allow,
+            RegisteredToolRoute::FsSearch,
+        ),
+        registered_tool(
+            fs_write_definition(),
+            vec![EffectClass::FsWrite],
+            DispatchMode::Await,
+            ToolPermissionDefault::Ask,
+            RegisteredToolRoute::FsWrite,
+        ),
+        registered_tool(
+            fs_patch_definition(),
+            vec![EffectClass::FsWrite],
+            DispatchMode::Await,
+            ToolPermissionDefault::Ask,
+            RegisteredToolRoute::FsPatch,
+        ),
+        registered_tool(
+            process_exec_definition(),
+            vec![EffectClass::ProcessExec],
+            DispatchMode::Await,
+            ToolPermissionDefault::Ask,
+            RegisteredToolRoute::ProcessExec,
+        ),
+        {
+            let manifest = haider_tools::spawn_subagent_manifest();
+            RegisteredTool {
+                manifest,
+                default: ToolPermissionDefault::Allow,
+                route: RegisteredToolRoute::SpawnSubagent,
+            }
+        },
+    ]
+}
+
+pub(crate) fn registered_tool_route(name: &str) -> Option<RegisteredToolRoute> {
+    if name == "exec" {
+        return Some(RegisteredToolRoute::ProcessExec);
+    }
+    registered_tools()
+        .into_iter()
+        .find_map(|entry| (entry.manifest.name == name).then_some(entry.route))
+}
+
+fn provider_definition(manifest: ToolManifest) -> ToolDefinition {
+    ToolDefinition {
+        name: manifest.name,
+        description: manifest.description,
+        input_schema: manifest.input_schema,
+    }
+}
+
 #[async_trait]
 impl TurnToolFactory for BrokerToolFactory {
     fn definitions(&self) -> Vec<ToolDefinition> {
-        vec![
-            request_input_definition(),
-            tool_definition("fs_read", "Read a UTF-8 file", &["path"]),
-            tool_definition("fs_list", "List a directory", &["path"]),
-            tool_definition("fs_search", "Search files for text", &["root", "query"]),
-            fs_write_definition(),
-            fs_patch_definition(),
-            exec_definition(),
-            spawn_subagent_definition(),
-        ]
+        registered_tools()
+            .into_iter()
+            .map(|entry| provider_definition(entry.manifest))
+            .collect()
     }
 
     async fn create(
         &self,
         context: WorkerToolContext,
     ) -> Result<Option<Arc<dyn ToolDispatcher>>, HaiderError> {
-        let durable_permissions = durable_session_permission_state(&context.store).await?;
+        let durable_permissions =
+            durable_session_permission_state(&context.store, context.store.session_id()).await?;
         let session_id = context.store.session_id().clone();
         let journal = HubJournalSink::new(&context);
         let broker = EffectBroker::new(
@@ -3005,10 +3524,18 @@ impl TurnToolFactory for BrokerToolFactory {
         )
         .map_err(tool_error)?;
         let mut policy = PermissionPolicy::default();
-        policy.allow(EffectClass::FsRead);
-        policy.ask(EffectClass::FsWrite);
-        policy.ask(EffectClass::ProcessExec);
-        policy.allow(EffectClass::AgentSpawn);
+        for entry in registered_tools() {
+            for class in entry.manifest.effects {
+                match entry.default {
+                    ToolPermissionDefault::Allow => policy.allow(class),
+                    ToolPermissionDefault::Ask => policy.ask(class),
+                    ToolPermissionDefault::Deny => {
+                        policy.deny(class, "denied by daemon default policy")
+                    }
+                    ToolPermissionDefault::NotApplicable => {}
+                }
+            }
+        }
         for grant in durable_permissions.grants {
             policy.allow_session_grant(grant).map_err(tool_error)?;
         }
@@ -3076,7 +3603,14 @@ impl ToolDispatcher for BrokerToolDispatcher {
             )
         })?;
         let policy = self.policy.lock().await;
-        if name == "spawn_subagent" {
+        let route = registered_tool_route(name).ok_or_else(|| {
+            HaiderError::new(
+                ErrorCode::InvalidArgument,
+                format!("unsupported tool `{name}`"),
+                false,
+            )
+        })?;
+        if route == RegisteredToolRoute::SpawnSubagent {
             if let Err(error) = self
                 .delegation
                 .validate_spawn_depth(&self.session_id, self.parent_agent_id.as_ref())
@@ -3151,8 +3685,8 @@ impl ToolDispatcher for BrokerToolDispatcher {
             );
             return Ok(ToolDispatchResult::Deferred(established.ticket));
         }
-        let result = match name {
-            "fs_read" => {
+        let result = match route {
+            RegisteredToolRoute::FsRead => {
                 let path = required_string(&args, "path")?;
                 let mut cas = self.cas.lock().await;
                 broker
@@ -3164,7 +3698,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     )
                     .await
             }
-            "fs_list" => {
+            RegisteredToolRoute::FsList => {
                 let path = required_string(&args, "path")?;
                 let mut cas = self.cas.lock().await;
                 broker
@@ -3176,7 +3710,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     )
                     .await
             }
-            "fs_search" => {
+            RegisteredToolRoute::FsSearch => {
                 let root = required_string(&args, "root")?;
                 let query = required_string(&args, "query")?;
                 let mut cas = self.cas.lock().await;
@@ -3189,7 +3723,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     )
                     .await
             }
-            "exec" => {
+            RegisteredToolRoute::ProcessExec => {
                 let command = required_string(&args, "command")?;
                 let cwd = optional_string(&args, "cwd")?;
                 let mut operation = ProcessExec::new(call_id, command);
@@ -3208,7 +3742,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     Err(error) => Err(error),
                 }
             }
-            "fs_write" => {
+            RegisteredToolRoute::FsWrite => {
                 let path = required_string(&args, "path")?;
                 let content = required_string_allow_empty(&args, "content")?;
                 let attribution = TurnAttribution::new(self.session_id.clone(), run_id.clone());
@@ -3221,7 +3755,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     )
                     .await
             }
-            "fs_patch" => {
+            RegisteredToolRoute::FsPatch => {
                 let path = required_string(&args, "path")?;
                 let patch = args.get("patch").ok_or_else(|| {
                     HaiderError::new(
@@ -3242,10 +3776,10 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     )
                     .await
             }
-            _ => {
+            RegisteredToolRoute::RequestInput | RegisteredToolRoute::SpawnSubagent => {
                 return Err(HaiderError::new(
                     ErrorCode::InvalidArgument,
-                    format!("unsupported tool `{name}`"),
+                    format!("tool `{name}` is not dispatched by the general-tool match"),
                     false,
                 ));
             }
@@ -3350,7 +3884,8 @@ struct DurablePermissionState {
 }
 
 async fn durable_session_permission_state(
-    store: &HubStoreHandle,
+    store: &dyn StoreHandle,
+    session_id: &SessionId,
 ) -> Result<DurablePermissionState, HaiderError> {
     let mut cursor = 0;
     let mut intents = HashMap::<EffectId, EffectIntent>::new();
@@ -3358,7 +3893,7 @@ async fn durable_session_permission_state(
     let mut grants = Vec::new();
     let mut bindings = HashMap::new();
     loop {
-        let page = StoreHandle::read(store, store.session_id(), cursor, 256).await?;
+        let page = store.read(session_id, cursor, 256).await?;
         if page.is_empty() {
             return Ok(DurablePermissionState { grants, bindings });
         }
@@ -3407,6 +3942,37 @@ async fn durable_session_permission_state(
             }
         }
     }
+}
+
+pub(crate) async fn tool_inventory_snapshot(
+    store: &dyn StoreHandle,
+    session_id: &SessionId,
+) -> Result<ToolInventorySnapshot, HaiderError> {
+    let durable = durable_session_permission_state(store, session_id).await?;
+    let tools = registered_tools()
+        .into_iter()
+        .map(|entry| ToolInventoryEntry {
+            manifest: entry.manifest,
+            default: entry.default,
+        })
+        .collect();
+    let remembered_grants = durable
+        .grants
+        .into_iter()
+        .map(|grant| RememberedSessionGrant {
+            class: grant.class,
+            scope: match grant.scope {
+                SessionGrantScope::Class => RememberedGrantScope::Class,
+                SessionGrantScope::CommandShape { args_digest } => {
+                    RememberedGrantScope::CommandShape { args_digest }
+                }
+            },
+        })
+        .collect();
+    Ok(ToolInventorySnapshot {
+        tools,
+        remembered_grants,
+    })
 }
 
 fn selected_menu_option<'a>(
@@ -3551,9 +4117,9 @@ fn tool_definition(name: &str, description: &str, required: &[&str]) -> ToolDefi
     }
 }
 
-fn exec_definition() -> ToolDefinition {
+fn process_exec_definition() -> ToolDefinition {
     ToolDefinition {
-        name: "exec".into(),
+        name: "process_exec".into(),
         description: "Run one non-interactive shell command inside the session workspace".into(),
         input_schema: serde_json::json!({
             "type": "object",
@@ -3573,15 +4139,6 @@ fn exec_definition() -> ToolDefinition {
             "required": ["command"],
             "additionalProperties": false,
         }),
-    }
-}
-
-fn spawn_subagent_definition() -> ToolDefinition {
-    let manifest = haider_tools::spawn_subagent_manifest();
-    ToolDefinition {
-        name: manifest.name,
-        description: manifest.description,
-        input_schema: manifest.input_schema,
     }
 }
 

@@ -108,6 +108,47 @@ impl ShellSession {
         &self.cwd
     }
 
+    /// Prepares one daemon-received user command without trimming or
+    /// re-quoting its shell program. The caller-provided id becomes the
+    /// process call id, which binds output/item receipts to the durable RPC
+    /// command id. An optional cwd is workspace-relative and applies only to
+    /// this invocation; it does not mutate shell or session state.
+    pub fn prepare_user_process(
+        &self,
+        call_id: impl Into<String>,
+        command: impl Into<String>,
+        cwd: Option<&Path>,
+    ) -> ToolResult<UserProcessExec> {
+        let call_id = call_id.into();
+        let command = command.into();
+        if call_id.trim().is_empty() {
+            return Err(ToolError::invalid_argument(
+                "direct shell command id must not be empty",
+            ));
+        }
+        if command.trim().is_empty() {
+            return Err(ToolError::invalid_argument(
+                "direct shell command must not be empty",
+            ));
+        }
+        let cwd = match cwd {
+            Some(cwd) => {
+                if cwd.as_os_str().is_empty() || cwd.is_absolute() {
+                    return Err(ToolError::invalid_argument(
+                        "direct shell cwd must be a non-empty workspace-relative path",
+                    ));
+                }
+                self.workspace_root.join(cwd)
+            }
+            None => self.cwd.clone(),
+        };
+        Ok(UserProcessExec::new(
+            ProcessExec::new(call_id, command)
+                .with_cwd(cwd)
+                .with_env_allowlist(self.env_allowlist.clone()),
+        ))
+    }
+
     pub fn submit(&mut self, text: impl Into<String>) -> ToolResult<ComposerSubmission> {
         let text = text.into();
         let Some(escaped) = text.strip_prefix('!') else {

@@ -35,12 +35,13 @@ pub use actor::{
 pub use fake_store::MemoryStore;
 pub use haider_store::{
     ACCOUNT_REMOVE_METHOD, ACCOUNT_SET_ACTIVE_METHOD, ACCOUNT_SET_DEFAULT_MODEL_METHOD,
-    AcceptedTurn, AccountAddClaim, AccountAddReceiptResponse, AccountAddReceiptRow,
-    AccountRemoveReceiptRow, CachedModels, CancelledTurn, ContextCompactionClaim,
-    ContextCompactionReceiptResponse, CreatedSession, DelegationCreateOutcome, DelegationRecord,
-    DelegationState, LoginClaim, LoginReceiptFailure, LoginReceiptResponse, LoginReceiptRow,
-    ManagementClaim, ManagementReceiptRow, MenuResolutionCommand, MenuResolutionOutcome,
-    PROVIDER_CONFIGURE_METHOD, SessionCreateCommand, SessionCreateOutcome, TurnAcceptCommand,
+    AcceptedShellExec, AcceptedTurn, AccountAddClaim, AccountAddReceiptResponse,
+    AccountAddReceiptRow, AccountRemoveReceiptRow, CachedModels, CancelledTurn,
+    ContextCompactionClaim, ContextCompactionReceiptResponse, CreatedSession,
+    DelegationCreateOutcome, DelegationRecord, DelegationState, LoginClaim, LoginReceiptFailure,
+    LoginReceiptResponse, LoginReceiptRow, ManagementClaim, ManagementReceiptRow,
+    MenuResolutionCommand, MenuResolutionOutcome, PROVIDER_CONFIGURE_METHOD, SessionCreateCommand,
+    SessionCreateOutcome, ShellExecAcceptCommand, ShellExecAcceptOutcome, TurnAcceptCommand,
     TurnAcceptOutcome, TurnAdmissionDisposition, TurnCancelCommand, TurnCancelOutcome,
     TurnCancellationStatus,
 };

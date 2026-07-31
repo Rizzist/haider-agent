@@ -317,6 +317,47 @@ pub enum ContextCompactionClaim {
     Committed(Box<ContextCompactionReceiptResponse>),
 }
 
+/// Secret-free coordinates for atomically accepting a direct user shell
+/// command. The command bytes themselves live in the ordinary started item
+/// and in the canonical receipt request JSON, never in this response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellExecAcceptCommand {
+    pub command_id: String,
+    pub request_digest: String,
+    pub request_json: String,
+    pub session_id: SessionId,
+    pub worker_generation: u64,
+    pub run_id: RunId,
+    pub item_id: ItemId,
+    pub command: String,
+    pub running_event_id: EventId,
+    pub item_event_id: EventId,
+    pub active_event_id: EventId,
+    pub device_id: DeviceId,
+}
+
+/// Durable acceptance response for `shell.exec`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AcceptedShellExec {
+    pub session_id: SessionId,
+    pub run_id: RunId,
+    pub item_id: ItemId,
+    pub accepted_seq: u64,
+    pub worker_generation: u64,
+}
+
+/// Result of the atomic direct-shell acceptance transaction.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ShellExecAcceptOutcome {
+    Committed {
+        accepted: AcceptedShellExec,
+        envelopes: Vec<RawEnvelope>,
+    },
+    IdempotentReplay {
+        accepted: AcceptedShellExec,
+    },
+}
+
 /// Receipt claim for one W5 durable account/provider mutation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ManagementClaim<T> {
@@ -1199,6 +1240,149 @@ impl Store {
         validate_command_identity(command_id, request_digest, request_json)?;
         let connection = self.connection()?;
         lookup_turn_accept_receipt(&connection, command_id, request_digest, request_json)
+    }
+
+    /// Looks up a committed direct-shell acceptance before generation/busy
+    /// validation so response-loss replay survives daemon restart.
+    pub fn shell_exec_receipt(
+        &self,
+        command_id: &str,
+        request_digest: &str,
+        request_json: &str,
+    ) -> StoreResult<Option<AcceptedShellExec>> {
+        validate_command_identity(command_id, request_digest, request_json)?;
+        let connection = self.connection()?;
+        lookup_command_response(
+            &connection,
+            command_id,
+            "shell.exec",
+            request_digest,
+            request_json,
+            "shell-exec",
+        )
+    }
+
+    /// Atomically accepts a direct user shell command without creating a
+    /// `UserMessage`. The synthetic run owns the session before worker
+    /// handoff, so it cannot open a parallel side-effect lane beside a turn.
+    pub fn accept_shell_exec(
+        &self,
+        command: &ShellExecAcceptCommand,
+    ) -> StoreResult<ShellExecAcceptOutcome> {
+        validate_command_identity(
+            &command.command_id,
+            &command.request_digest,
+            &command.request_json,
+        )?;
+        if command.worker_generation != self.worker_generation {
+            return Err(stale_generation(
+                command.worker_generation,
+                self.worker_generation,
+            ));
+        }
+        if command.command.trim().is_empty() || command.command.len() > 8_192 {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "shell command must contain 1..=8192 UTF-8 bytes",
+                false,
+            ));
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        if let Some(accepted) = lookup_command_response(
+            &transaction,
+            &command.command_id,
+            "shell.exec",
+            &command.request_digest,
+            &command.request_json,
+            "shell-exec",
+        )? {
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(ShellExecAcceptOutcome::IdempotentReplay { accepted });
+        }
+        require_typed_session(&transaction, &command.session_id)?;
+        if latest_run_states(&transaction, &command.session_id)?
+            .values()
+            .any(|(state, _)| !state.is_terminal())
+        {
+            return Err(store_error(
+                ErrorCode::Busy,
+                "direct shell execution requires an idle session",
+                true,
+            ));
+        }
+        let now = now_ms()?;
+        claim_pending_receipt(
+            &transaction,
+            &command.command_id,
+            "shell.exec",
+            &command.request_digest,
+            &command.request_json,
+            now,
+        )?;
+        let started = TurnItem::CommandExecution {
+            call_id: command.command_id.clone(),
+            command: command.command.clone(),
+            status: haider_protocol::item::ToolStatus::InProgress,
+            exit_code: None,
+        };
+        let mut envelopes = vec![
+            unstamped_command_envelope(
+                command.running_event_id.clone(),
+                &command.session_id,
+                Some(command.run_id.clone()),
+                command.device_id.clone(),
+                self.worker_generation,
+                EventPayload::RunState(RunState::RunningTool),
+                PromptRender::Omit,
+            )?,
+            unstamped_command_envelope(
+                command.item_event_id.clone(),
+                &command.session_id,
+                Some(command.run_id.clone()),
+                command.device_id.clone(),
+                self.worker_generation,
+                EventPayload::Item(ItemEvent::Started {
+                    item_id: command.item_id.clone(),
+                    item: started,
+                }),
+                PromptRender::Omit,
+            )?,
+            unstamped_command_envelope(
+                command.active_event_id.clone(),
+                &command.session_id,
+                Some(command.run_id.clone()),
+                command.device_id.clone(),
+                self.worker_generation,
+                EventPayload::SessionState(SessionState::ActiveRun),
+                PromptRender::Omit,
+            )?,
+        ];
+        append_transaction_envelopes(&transaction, &command.session_id, now, &mut envelopes)?;
+        let accepted = AcceptedShellExec {
+            session_id: command.session_id.clone(),
+            run_id: command.run_id.clone(),
+            item_id: command.item_id.clone(),
+            accepted_seq: envelopes[1].seq,
+            worker_generation: self.worker_generation,
+        };
+        finalize_command_receipt(
+            &transaction,
+            &command.command_id,
+            command.session_id.as_str(),
+            Some(command.run_id.as_str()),
+            Some(accepted.accepted_seq),
+            &accepted,
+            now,
+            "shell-exec",
+        )?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(ShellExecAcceptOutcome::Committed {
+            accepted,
+            envelopes,
+        })
     }
 
     /// Atomically commits the submit receipt, `Queued`, `UserMessage`, and,

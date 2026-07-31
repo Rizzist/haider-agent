@@ -26,6 +26,58 @@ pub enum DispatchMode {
     Deferred,
 }
 
+/// Daemon policy applied when no durable session grant narrows the decision.
+///
+/// This is inventory data, not an approval credential. Clients may display it
+/// but must never use it to authorize an effect or synthesize a menu answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolPermissionDefault {
+    /// The tool has no brokered effect (for example `request_input`).
+    NotApplicable,
+    Allow,
+    Ask,
+    Deny,
+}
+
+/// One canonical registry entry projected for read-only clients.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolInventoryEntry {
+    pub manifest: ToolManifest,
+    pub default: ToolPermissionDefault,
+}
+
+/// Durable scope of a remembered permission grant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "scope", rename_all = "snake_case")]
+pub enum RememberedGrantScope {
+    /// All operations in the normalized effect class for this session.
+    Class,
+    /// Only one canonical process shape. The digest binds exact command
+    /// bytes, canonical cwd, and sorted environment-name allowlist.
+    CommandShape { args_digest: String },
+}
+
+/// Sanitized projection of one grant reconstructed from durable menu facts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RememberedSessionGrant {
+    pub class: EffectClass,
+    pub scope: RememberedGrantScope,
+}
+
+/// Read-only daemon inventory for a session.
+///
+/// The registered tools come from the same manifests used for provider
+/// advertisement. Remembered grants are reconstructed from that session's
+/// effect/menu journal; this snapshot cannot answer or create a menu.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolInventorySnapshot {
+    #[serde(default)]
+    pub tools: Vec<ToolInventoryEntry>,
+    #[serde(default)]
+    pub remembered_grants: Vec<RememberedSessionGrant>,
+}
+
 /// Every tool result is bounded: a preview the prompt can afford, plus refs.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BoundedResult {

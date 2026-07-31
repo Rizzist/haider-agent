@@ -11,7 +11,8 @@
 //!   error);
 //! - a run parked at a durable tool-menu checkpoint (an open `request_input`
 //!   or broker-approved mutating tool without its `ToolResult`, matching
-//!   `InputRequired` state and open menu) is reconstructed as a waiter — its
+//!   historical `InputRequired` or canonical `PermissionRequired` state and
+//!   open menu) is reconstructed as a waiter — its
 //!   menu stays PENDING, and neither the provider request that produced it
 //!   nor any dispatched effect is ever repeated;
 //! - an active delegated child is left nonterminal for its recovered parent's
@@ -42,7 +43,7 @@ use haider_protocol::envelope::{
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::{AgentId, DeviceId, EventId, ItemId, MenuId, RunId, SessionId};
 use haider_protocol::item::{ItemDelta, ItemEvent, ToolStatus, TurnItem};
-use haider_protocol::menu::{Menu, MenuCloseReason};
+use haider_protocol::menu::{Menu, MenuCloseReason, MenuKind};
 use haider_protocol::state::{RunState, SessionState, WaitReason};
 use std::collections::{HashMap, HashSet};
 
@@ -161,7 +162,7 @@ pub(crate) async fn recover_interrupted_turns(
                 continue;
             }
             if let Some(checkpoint) = pending_checkpoint(&reduction)
-                && matches!(&state, RunState::InputRequired { menu } if *menu == checkpoint.menu.id)
+                && checkpoint_state_matches(&state, &checkpoint)
             {
                 let committed_answer = reduction.menu_answers.get(&checkpoint.menu.id).cloned();
                 let accepted_seq = reduction.user_seq.ok_or_else(|| {
@@ -250,6 +251,21 @@ pub(crate) async fn recover_interrupted_turns(
         }
     }
     Ok(recovered)
+}
+
+fn checkpoint_state_matches(state: &RunState, checkpoint: &RequestInputCheckpoint) -> bool {
+    match state {
+        // Dual-read migration: old broker approvals and actor-owned input
+        // checkpoints both used InputRequired.
+        RunState::InputRequired { menu } => *menu == checkpoint.menu.id,
+        // New permission vocabulary is valid only for an actual committed
+        // permission menu; accepting another kind would hide corruption.
+        RunState::PermissionRequired { menu } => {
+            *menu == checkpoint.menu.id
+                && matches!(checkpoint.menu.kind, MenuKind::Permission { .. })
+        }
+        _ => false,
+    }
 }
 
 async fn latest_run_state(
