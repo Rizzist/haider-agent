@@ -64,7 +64,12 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
             };
             u16::from((area.height as usize) >= 1 + 4 + input_floor)
         }
-        Screen::Boot | Screen::Launcher | Screen::Accounts | Screen::Providers | Screen::Tree => 1,
+        Screen::Boot
+        | Screen::Launcher
+        | Screen::Accounts
+        | Screen::Providers
+        | Screen::Tree
+        | Screen::Tools => 1,
     };
     let [body, status] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(status_height)]).areas(area);
@@ -73,6 +78,7 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
         Screen::Launcher => render_launcher(model, theme, frame, body, &mut hits),
         Screen::Session => render_session(model, theme, frame, body, &mut hits),
         Screen::Tree => render_tree(model, theme, frame, body),
+        Screen::Tools => render_tools(model, theme, frame, body),
         Screen::Subagent => render_subagent(model, theme, frame, body, &mut hits),
         Screen::Aura => render_aura(model, theme, frame, body, &mut hits),
         Screen::Accounts => render_accounts(model, theme, frame, body, &mut hits),
@@ -2185,6 +2191,72 @@ fn render_tree(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rec
     lines.push(Line::raw(""));
     lines.push(Line::styled(
         "↑↓ select · esc/⏎ back — forks land with the branch wave",
+        theme.dim_style(),
+    ));
+    frame.render_widget(Paragraph::new(lines).style(theme.text_style()), area);
+}
+
+/// `/tools` live (W8b) — a read-only view of the daemon's canonical
+/// registry + remembered session grants (research §W8b-4). Committed
+/// snapshot only; while the read is in flight the screen says so —
+/// nothing is fabricated.
+fn render_tools(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rect) {
+    let mut lines = vec![
+        Line::styled("TOOLS — daemon inventory", theme.bright_style()),
+        Line::raw(""),
+    ];
+    match &model.tools_inventory {
+        None => lines.push(Line::styled(
+            "fetching the daemon's tool inventory…",
+            theme.dim_style(),
+        )),
+        Some(snapshot) => {
+            for entry in &snapshot.tools {
+                let effects = entry
+                    .manifest
+                    .effects
+                    .iter()
+                    .map(|effect| format!("{effect:?}").to_ascii_lowercase())
+                    .collect::<Vec<_>>()
+                    .join("+");
+                let effects = if effects.is_empty() {
+                    "none".to_owned()
+                } else {
+                    effects
+                };
+                lines.push(Line::from(vec![
+                    Span::styled("  ⚒ ", theme.dim_style()),
+                    Span::styled(entry.manifest.name.clone(), theme.maroon_style()),
+                    Span::styled(
+                        format!(
+                            " · {} · default {}",
+                            effects,
+                            format!("{:?}", entry.default).to_ascii_lowercase()
+                        ),
+                        theme.dim_style(),
+                    ),
+                ]));
+            }
+            lines.push(Line::raw(""));
+            if snapshot.remembered_grants.is_empty() {
+                lines.push(Line::styled(
+                    "no remembered session grants",
+                    theme.dim_style(),
+                ));
+            } else {
+                lines.push(Line::styled(
+                    "remembered session grants",
+                    theme.bright_style(),
+                ));
+                for grant in &snapshot.remembered_grants {
+                    lines.push(Line::styled(format!("  {grant:?}"), theme.dim_style()));
+                }
+            }
+        }
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "read-only — workspace cwd + bounded supervised process, not a sandbox · esc back",
         theme.dim_style(),
     ));
     frame.render_widget(Paragraph::new(lines).style(theme.text_style()), area);
@@ -4418,6 +4490,27 @@ fn item_lines<'a>(
                 spans.push(Span::styled(format!("  {meta}"), theme.faint_style()));
             }
             lines.push(Line::from(spans));
+            // W8b (research risk 10): a process tool's streamed output was
+            // durably RETAINED but never rendered — show the bounded tail
+            // exactly as a direct command row does, honesty markers
+            // included.
+            if !block.output_tail.is_empty() {
+                for line in block.output_text().lines() {
+                    lines.push(Line::styled(format!("    {line}"), theme.faint_style()));
+                }
+                if block.output_truncated {
+                    lines.push(Line::styled(
+                        "    ⋯ output above is a bounded tail — earlier output truncated",
+                        theme.dim_style(),
+                    ));
+                }
+                if block.output_decode_error {
+                    lines.push(Line::styled(
+                        "    ⚠ some output could not be decoded",
+                        theme.warn_style(),
+                    ));
+                }
+            }
         }
         TurnItem::CommandExecution {
             command,

@@ -109,6 +109,21 @@ pub enum LiveCommand {
         session: SessionId,
         worker_generation: u64,
     },
+    /// `shell.exec` — the W8b `!` escape: one exact user command for the
+    /// session daemon's workspace, receipt-backed and PreAuthorized
+    /// (UserTyped). Zero provider requests; the committed
+    /// `CommandExecution` events render the row.
+    ShellExec {
+        command_id: CommandId,
+        session: SessionId,
+        worker_generation: u64,
+        command: String,
+    },
+    /// `tools.inventory` — a READ of the daemon's canonical tool registry
+    /// + remembered session grants (W8b /tools). No durable identity.
+    ToolsInventory {
+        session: SessionId,
+    },
     /// Stage a raw secret in connection-scoped daemon memory (R7/R10).
     /// Deliberately NON-durable and NOT in the outbox: no command receipt
     /// may ever contain a secret, so a lost response is answered by
@@ -235,6 +250,7 @@ impl LiveCommand {
             | Self::Submit { command_id, .. }
             | Self::Cancel { command_id, .. }
             | Self::Compact { command_id, .. }
+            | Self::ShellExec { command_id, .. }
             | Self::Answer { command_id, .. } => Some(command_id),
             Self::LoginApi { command_id, .. } => Some(command_id),
             Self::AccountSetActive { command_id, .. } => Some(command_id),
@@ -250,6 +266,7 @@ impl LiveCommand {
             | Self::OAuthStart { .. }
             | Self::OAuthStatus { .. }
             | Self::OAuthCancel { .. }
+            | Self::ToolsInventory { .. }
             // A stage carries no durable identity BY DESIGN (see above).
             | Self::Stage { .. } => None,
         }
@@ -327,6 +344,16 @@ pub enum LiveReply {
     /// attachment stream like any other run.
     Compacted {
         command_id: CommandId,
+    },
+    /// `shell.exec` accepted; the `CommandExecution` events arrive on the
+    /// attachment stream.
+    ShellAccepted {
+        command_id: CommandId,
+    },
+    /// `tools.inventory` snapshot — daemon registry truth for /tools.
+    ToolsInventory {
+        session: SessionId,
+        snapshot: Box<haider_protocol::tool::ToolInventorySnapshot>,
     },
     /// One committed envelope for an attachment.
     Event {
@@ -1040,9 +1067,19 @@ impl LiveDriver {
                 self.generations.insert(session, worker_generation);
                 Vec::new()
             }
+            LiveReply::ToolsInventory { session, snapshot } => {
+                // Committed daemon truth for the ACTIVE session only — a
+                // stale reply for another session must not paint this one.
+                if model.active_session.as_ref() == Some(&session) {
+                    model.tools_inventory = Some(*snapshot);
+                    model.dirty = true;
+                }
+                Vec::new()
+            }
             LiveReply::Answered { command_id }
             | LiveReply::Cancelled { command_id }
-            | LiveReply::Compacted { command_id } => {
+            | LiveReply::Compacted { command_id }
+            | LiveReply::ShellAccepted { command_id } => {
                 self.retire(&command_id);
                 Vec::new()
             }
@@ -2126,6 +2163,28 @@ impl LiveDriver {
                     run_id,
                 })]
             }
+            AppRequest::ShellExec { command } => {
+                // W8b law 5/6: one durable daemon command, no UserMessage,
+                // no client-side spawn, no shell re-quoting — the exact
+                // bytes travel once.
+                let Some(session) = model.active_session.clone() else {
+                    return Vec::new();
+                };
+                let command_id = self.mint();
+                let worker_generation = self.generations.get(&session).copied().unwrap_or_default();
+                vec![self.enqueue(LiveCommand::ShellExec {
+                    command_id,
+                    session,
+                    worker_generation,
+                    command,
+                })]
+            }
+            AppRequest::ToolsRefresh => {
+                let Some(session) = model.active_session.clone() else {
+                    return Vec::new();
+                };
+                vec![self.enqueue(LiveCommand::ToolsInventory { session })]
+            }
             AppRequest::Compact => {
                 // W7b: receipt-backed idle-only `session.compact`. The
                 // daemon is the state authority — a busy worker answers
@@ -2281,6 +2340,8 @@ const fn command_session(command: &LiveCommand) -> Option<&SessionId> {
         LiveCommand::Submit { session, .. }
         | LiveCommand::Cancel { session, .. }
         | LiveCommand::Compact { session, .. }
+        | LiveCommand::ShellExec { session, .. }
+        | LiveCommand::ToolsInventory { session }
         | LiveCommand::Answer { session, .. } => Some(session),
         _ => None,
     }

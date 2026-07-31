@@ -20,6 +20,7 @@ use haider_tui::live::{LiveCommand, LiveDriver, LiveReply};
 use haider_tui::runtime::{ShellRequest, live_pass};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
+use ratatui::crossterm::event::KeyCode;
 
 mod common;
 use common::{key, launcher_model};
@@ -1011,9 +1012,11 @@ fn live_mode_opens_no_local_card_it_has_no_way_to_close() {
     // cannot close.
     //
     // MUTATION CHECK: delete the
-    // `"voice" | "tools" | "say" if !self.mode.fabricates_locally()` arm
-    // from `execute_slash` and the card appears, unanswerable.
-    for command in ["/voice", "/tools", "/say hello"] {
+    // `"voice" | "say" if !self.mode.fabricates_locally()` arm from
+    // `execute_slash` and the card appears, unanswerable. (`/tools` left
+    // this loop in W8b: it now performs a REAL daemon inventory read and
+    // opens a read-only SCREEN — still no card; see the W8b test below.)
+    for command in ["/voice", "/say hello"] {
         let mut model = live_model();
         let mut driver = LiveDriver::new("test");
         pass(
@@ -1045,6 +1048,98 @@ fn live_mode_opens_no_local_card_it_has_no_way_to_close() {
             "{command} promised the daemon nothing"
         );
     }
+}
+
+/// MUTATION CHECK: route live `/tools` back to `refuse_demo_only`.
+/// Expected runtime failure: the issued-command assertion below (no
+/// `tools.inventory` read reaches the daemon).
+#[test]
+fn live_tools_reads_the_daemon_inventory_and_opens_no_card() {
+    let mut model = live_model();
+    let mut driver = LiveDriver::new("test");
+    pass(
+        &mut driver,
+        &mut model,
+        Some(LiveReply::Listed {
+            sessions: vec![summary(0, 0)],
+            next_cursor: None,
+        }),
+    );
+    model.open_session(&sid(0));
+    model.screen = Screen::Session;
+    pass(&mut driver, &mut model, None);
+
+    common::run_slash(&mut model, "/tools");
+    assert!(
+        model.projection.open_menu().is_none(),
+        "no locally minted card (the D1-2 half of the law still holds)"
+    );
+    assert_eq!(model.screen, Screen::Tools, "the read-only screen opens");
+    let issued = pass(&mut driver, &mut model, None);
+    assert!(
+        issued
+            .iter()
+            .any(|command| matches!(command, LiveCommand::ToolsInventory { .. })),
+        "W8b: /tools promises exactly the daemon inventory read, got {issued:?}"
+    );
+}
+
+/// MUTATION CHECK: delete the leading-`!` arm from the composer submit
+/// path. Expected runtime failure: the text lands as a model turn (a
+/// Submit command) instead of a `shell.exec` — the matches below fail.
+#[test]
+fn live_bang_routes_one_exact_command_to_shell_exec_and_never_a_turn() {
+    let mut model = live_model();
+    let mut driver = LiveDriver::new("test");
+    pass(
+        &mut driver,
+        &mut model,
+        Some(LiveReply::Listed {
+            sessions: vec![summary(0, 0)],
+            next_cursor: None,
+        }),
+    );
+    model.open_session(&sid(0));
+    model.screen = Screen::Session;
+    pass(&mut driver, &mut model, None);
+
+    // Exactly one leading ! is stripped; the rest travels verbatim.
+    for c in "!!echo hi".chars() {
+        model.handle(common::key(KeyCode::Char(c)));
+    }
+    model.handle(common::key(KeyCode::Enter));
+    let issued = pass(&mut driver, &mut model, None);
+    assert!(
+        issued.iter().any(|command| matches!(
+            command,
+            LiveCommand::ShellExec { command, .. } if command == "!echo hi"
+        )),
+        "one ! stripped, the literal rest sent once: {issued:?}"
+    );
+    assert!(
+        !issued
+            .iter()
+            .any(|command| matches!(command, LiveCommand::Submit { .. })),
+        "a ! escape is never a provider turn"
+    );
+
+    // A bare `!` is a harmless validation flash — nothing is promised.
+    for c in "!".chars() {
+        model.handle(common::key(KeyCode::Char(c)));
+    }
+    model.handle(common::key(KeyCode::Enter));
+    assert!(
+        model
+            .flash
+            .as_deref()
+            .is_some_and(|flash| flash.contains("type a command")),
+        "got {:?}",
+        model.flash
+    );
+    assert!(
+        pass(&mut driver, &mut model, None).is_empty(),
+        "bare ! promises nothing"
+    );
 }
 
 #[test]

@@ -205,6 +205,9 @@ pub enum Screen {
     /// W7b port). Branch forks land with the branch wave; until then the
     /// view lists the main line's turns and compaction nodes.
     Tree,
+    /// `/tools` live (W8b) — a read-only view of the daemon's canonical
+    /// tool inventory + remembered session grants. Never a menu.
+    Tools,
     /// `/accounts` — the sim's harness-owned credential list
     /// (tui.js:3588-3688), backed by `account.list` in live mode.
     Accounts,
@@ -1319,6 +1322,12 @@ impl RuntimeMode {
 /// never performs IO).
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppRequest {
+    /// W8b: live `!` shell escape — one exact command for the SESSION
+    /// daemon's workspace (receipt-backed `shell.exec`; zero provider
+    /// requests). Never demo vocabulary.
+    ShellExec { command: String },
+    /// W8b: `/tools` live — read the daemon's canonical tool inventory.
+    ToolsRefresh,
     /// Run a respond() turn for user text. `voice` turns skip the script's
     /// UserMessage (the reducer already pushed the ◉ row); `title` asks the
     /// driver to schedule the 1.5 s auto-title micro-call, which names the
@@ -1801,6 +1810,9 @@ pub struct AppModel {
     pub token_panel: bool,
     /// `/tree` — selected row (sim treeSel).
     pub tree_sel: usize,
+    /// `/tools` live — the daemon's committed inventory snapshot
+    /// (None while the read is in flight; the screen says "fetching").
+    pub tools_inventory: Option<haider_protocol::tool::ToolInventorySnapshot>,
     /// Per-session voice pipeline (sim DEFAULT_VOICE — ships ON).
     pub voice: VoiceState,
     /// The ◉ talk hold is live (`◉ listening…` chip + status segment).
@@ -1989,6 +2001,7 @@ impl Default for AppModel {
             screen: Screen::Boot,
             token_panel: false,
             tree_sel: 0,
+            tools_inventory: None,
             theme: ThemeKey::Dawn,
             sanctum_tier: SanctumTier::default(),
             projection: SessionProjection::new(),
@@ -2223,6 +2236,7 @@ impl AppModel {
             Screen::Launcher => "haider — launcher".to_owned(),
             Screen::Accounts => "haider — accounts".to_owned(),
             Screen::Tree => "haider — session tree".to_owned(),
+            Screen::Tools => "haider — tools".to_owned(),
             Screen::Providers => "haider — providers".to_owned(),
             Screen::Session | Screen::Subagent | Screen::Aura => {
                 // Strip control characters: user text must never smuggle
@@ -2310,6 +2324,8 @@ impl AppModel {
             Screen::Accounts => self.accounts.pending_select.is_some(),
             // Tree: a static main-line view — nothing animates.
             Screen::Tree => false,
+            // Tools: a static read-only inventory — nothing animates.
+            Screen::Tools => false,
             Screen::Providers => self.providers.pending_default.is_some(),
             Screen::Session | Screen::Subagent => {
                 // `● thinking…` (tui.js:4458-4462) · the ⚒ running tool
@@ -2668,6 +2684,13 @@ impl AppModel {
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
+        if self.screen == Screen::Tools {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
+                self.screen = Screen::Session;
+                self.dirty = true;
+            }
+            return;
+        }
         if self.screen == Screen::Tree {
             match key.code {
                 KeyCode::Up => {
@@ -3084,6 +3107,29 @@ impl AppModel {
             if self.aura.state == AuraState::Idle {
                 self.aura_submit(text, false);
             }
+            return;
+        }
+        // W8b: the literal `!` escape (research Q3). LIVE only — the
+        // command runs on the SESSION daemon's workspace through the
+        // receipt-backed `shell.exec`, so it exists only where a session
+        // exists. Exactly ONE leading `!` is stripped; `!!x` sends the
+        // literal `!x`. Demo mode keeps the sim's six bare VFS commands
+        // and says so instead of faking a host shell.
+        if self.screen == Screen::Session
+            && let Some(stripped) = text.strip_prefix('!')
+        {
+            if self.mode.fabricates_locally() {
+                self.flash = Some(
+                    "· ! — live shell escape (the demo shell is bare ls · cd · pwd)".to_owned(),
+                );
+            } else if stripped.trim().is_empty() {
+                self.flash = Some("· ! — type a command".to_owned());
+            } else {
+                self.requests.push(AppRequest::ShellExec {
+                    command: stripped.to_owned(),
+                });
+            }
+            self.dirty = true;
             return;
         }
         // Shell builtins run against the VFS — local, instant, NO model
@@ -4466,7 +4512,20 @@ impl AppModel {
             // whole voice surface is local (engine names, a `/say` that
             // plays a canned turn), so live mode says so, exactly as
             // `/reset` does, rather than promising an RPC it never sends.
-            "voice" | "tools" | "say" if !self.mode.fabricates_locally() => {
+            "tools" if !self.mode.fabricates_locally() => {
+                // W8b: the LIVE inventory is a daemon READ (research
+                // §W8b-4) — no locally minted card, no fabricated
+                // registration. The screen renders the committed
+                // snapshot when the reply lands.
+                if self.screen == Screen::Session {
+                    self.tools_inventory = None;
+                    self.screen = Screen::Tools;
+                    self.requests.push(AppRequest::ToolsRefresh);
+                } else {
+                    self.flash = Some("· /tools — session only".to_owned());
+                }
+            }
+            "voice" | "say" if !self.mode.fabricates_locally() => {
                 self.flash = Some(format!(
                     "· /{name} — demo only; the live voice/tool surface lands after v0.0.12"
                 ));

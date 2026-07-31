@@ -556,6 +556,21 @@ pub fn request_body(command: LiveCommand) -> RequestBody {
             session_id: session,
             worker_generation,
         },
+        LiveCommand::ShellExec {
+            command_id,
+            session,
+            worker_generation,
+            command,
+        } => RequestBody::ShellExec {
+            command_id,
+            session_id: session,
+            worker_generation,
+            command,
+            cwd: None,
+        },
+        LiveCommand::ToolsInventory { session } => RequestBody::ToolsInventory {
+            session_id: session,
+        },
         LiveCommand::Stage {
             stage_id, secret, ..
         } => RequestBody::VaultStage {
@@ -718,6 +733,16 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
             .command_id
             .clone()
             .map_or_else(Vec::new, |id| vec![LiveReply::Compacted { command_id: id }]),
+        ResponseBody::ShellExec { .. } => context.command_id.clone().map_or_else(Vec::new, |id| {
+            vec![LiveReply::ShellAccepted { command_id: id }]
+        }),
+        ResponseBody::ToolsInventory {
+            session_id,
+            inventory,
+        } => vec![LiveReply::ToolsInventory {
+            session: session_id,
+            snapshot: Box::new(inventory),
+        }],
         ResponseBody::VaultStage {
             vault_reference, ..
         } => context

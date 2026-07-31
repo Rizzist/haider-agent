@@ -1251,7 +1251,11 @@ impl DemoDriver {
             AppRequest::CopySelection
             | AppRequest::CopyText(_)
             | AppRequest::Reattach { .. }
-            | AppRequest::CreateSession { .. } => {}
+            | AppRequest::CreateSession { .. }
+            // W8b live-only vocabulary: the reducer's demo gates flash
+            // instead of pushing these, so the demo driver never sees one.
+            | AppRequest::ShellExec { .. }
+            | AppRequest::ToolsRefresh => {}
             // `/accounts` (W5d): the demo world answers from the sim's seed
             // list, synchronously — through the SAME reducer seams as live
             // (apply_snapshot / apply_account_selected), so the
