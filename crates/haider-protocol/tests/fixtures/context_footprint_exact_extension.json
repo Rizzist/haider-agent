@@ -1,0 +1,15 @@
+{
+  "item": "extension",
+  "kind": "context_footprint_v1",
+  "data": {
+    "cached_input_tokens": 42000,
+    "context_window": 200000,
+    "estimated_turns_to_threshold": 1,
+    "input_tokens": 118000,
+    "output_tokens": 7000,
+    "reserved_output_tokens": 30000,
+    "soft_threshold_tokens": 170000,
+    "truth": "exact",
+    "used_tokens": 167000
+  }
+}

@@ -10,6 +10,7 @@ use haider_core::{
 };
 use haider_protocol::DeliveryMode;
 use haider_protocol::EventPayload;
+use haider_protocol::context::{ContextFootprint, ContextFootprintTruth};
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
 use haider_protocol::history::{
     COMPACTION_INTENT_EXTENSION_KIND, CompactionIntent, CompactionResume, NodeKind,
@@ -52,6 +53,11 @@ impl ProviderFactory for FixedProviderFactory {
 ///
 /// MUTATION CHECK: bypass the global command-receipt claim. Expected runtime
 /// failure: a turn-submit command id is accepted again for compaction.
+///
+/// MUTATION CHECK: omit the manual reset footprint, select a stale pre-turn
+/// snapshot, or account only summary text. Expected runtime failure: the
+/// latest footprint is not after the compaction node or does not exceed the
+/// node's summary-only token count with compiled request overhead included.
 #[tokio::test]
 async fn manual_compaction_command_replay_compacts_exactly_once() {
     let root = tempfile::tempdir().expect("temp profile");
@@ -175,17 +181,22 @@ async fn manual_compaction_command_replay_compacts_exactly_once() {
     assert_eq!(first, replay);
     assert_eq!(provider.requests().len(), 2);
 
-    let payloads = store
+    let journal = store
         .read(&session_id, 0, 512)
         .await
-        .expect("read compacted journal")
+        .expect("read compacted journal");
+    let payloads = journal
         .into_iter()
-        .filter_map(|event| serde_json::from_value::<EventPayload>(event.payload).ok())
+        .filter_map(|event| {
+            serde_json::from_value::<EventPayload>(event.payload)
+                .ok()
+                .map(|payload| (event.seq, payload))
+        })
         .collect::<Vec<_>>();
     assert_eq!(
         payloads
             .iter()
-            .filter(|payload| matches!(
+            .filter(|(_, payload)| matches!(
                 payload,
                 EventPayload::Item(ItemEvent::Completed {
                     item: TurnItem::Extension { kind, .. },
@@ -198,7 +209,7 @@ async fn manual_compaction_command_replay_compacts_exactly_once() {
     assert_eq!(
         payloads
             .iter()
-            .filter(|payload| matches!(
+            .filter(|(_, payload)| matches!(
                 payload,
                 EventPayload::NodeCommitted(node)
                     if matches!(node.kind, NodeKind::Compaction { .. })
@@ -206,6 +217,31 @@ async fn manual_compaction_command_replay_compacts_exactly_once() {
             .count(),
         1
     );
+    let (compaction_seq, summary_only_tokens) = payloads
+        .iter()
+        .find_map(|(seq, payload)| match payload {
+            EventPayload::NodeCommitted(node) => match &node.kind {
+                NodeKind::Compaction { tokens_after, .. } => Some((*seq, *tokens_after)),
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("manual compaction node");
+    let (reset_seq, reset) = payloads
+        .iter()
+        .filter_map(|(seq, payload)| match payload {
+            EventPayload::Item(ItemEvent::Completed { item, .. }) => {
+                ContextFootprint::from_extension_item(item).map(|footprint| (*seq, footprint))
+            }
+            _ => None,
+        })
+        .next_back()
+        .expect("manual compaction reset footprint");
+    assert!(reset_seq > compaction_seq);
+    assert_eq!(reset.truth, ContextFootprintTruth::Estimated);
+    assert_eq!(reset.context_window, Some(32_000));
+    assert!(reset.used_tokens > summary_only_tokens);
+    assert!(reset.used_tokens < 32_000);
 
     manager.shutdown().await.expect("manager shutdown");
     hub.shutdown().await.expect("hub shutdown");

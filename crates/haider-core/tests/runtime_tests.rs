@@ -7,8 +7,9 @@ use haider_core::{
     SubmitCommittedTurn, SubmitTurn, ToolDispatchResult, ToolDispatcher,
 };
 use haider_protocol::EventPayload;
+use haider_protocol::context::{ContextFootprint, ContextFootprintTruth};
 use haider_protocol::credential::{RotationCause, RotationEvent};
-use haider_protocol::envelope::RawEnvelope;
+use haider_protocol::envelope::{PromptRender, RawEnvelope};
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::history::{
     COMPACTION_INTENT_EXTENSION_KIND, CONTINUATION_CHECKPOINT_EXTENSION_KIND, CompactionIntent,
@@ -60,6 +61,15 @@ fn completed_extension(envelope: &RawEnvelope, expected_kind: &str) -> bool {
             ..
         }) if kind == expected_kind
     )
+}
+
+fn completed_footprint(envelope: &RawEnvelope) -> Option<ContextFootprint> {
+    match typed(envelope) {
+        EventPayload::Item(ItemEvent::Completed { item, .. }) => {
+            ContextFootprint::from_extension_item(&item)
+        }
+        _ => None,
+    }
 }
 
 fn normalize(mut payload: serde_json::Value) -> serde_json::Value {
@@ -443,6 +453,299 @@ fn estimated_input_tokens(config: &HarnessConfig, messages: &[Message]) -> u64 {
     u64::try_from(bytes).unwrap_or(u64::MAX).saturating_add(3) / 4
 }
 
+/// MUTATION CHECK: ignore the reserved output budget when deriving the soft
+/// threshold. Expected runtime failure: the 40k reserve case stays at 170k
+/// instead of moving down to 160k; the 30k meeting point is also pinned.
+#[test]
+fn soft_threshold_honors_eighty_five_percent_and_output_reserve() {
+    assert_eq!(
+        haider_core::context_soft_threshold_tokens(200_000, 30_000),
+        Some(170_000)
+    );
+    assert_eq!(
+        haider_core::context_soft_threshold_tokens(200_000, 40_000),
+        Some(160_000)
+    );
+    assert_eq!(
+        haider_core::context_soft_threshold_tokens(200_000, 200_000),
+        Some(0)
+    );
+}
+
+/// MUTATION CHECK: enable W7b policy without the advertised feature. Expected
+/// runtime failure: a request between the soft and hard lines compacts or
+/// emits a footprint even though `context_compaction_v1` is disabled.
+#[tokio::test]
+async fn soft_threshold_and_footprints_are_feature_gated() {
+    let history = Message::user_text("feature-gated ".repeat(200));
+    let current = Message::user_text("current");
+    let messages = vec![history.clone(), current];
+    let mut gated = config();
+    let used = estimated_input_tokens(&gated, &messages);
+    gated.context_window = Some(used.saturating_add(10));
+    gated.reserved_output_tokens = 1;
+    assert!(
+        used >= haider_core::context_soft_threshold_tokens(
+            gated.context_window.expect("known window"),
+            gated.reserved_output_tokens,
+        )
+        .expect("soft threshold")
+    );
+    let compactor = Arc::new(ShrinkingContextCompactor::default());
+    gated.context_compactor = Some(compactor.clone());
+    let provider = Arc::new(FakeProvider::new(vec![FakeStep::Finish {
+        reason: FinishReason::EndTurn,
+    }]));
+    let store = Arc::new(MemoryStore::new());
+    let handle = HarnessActor::spawn(gated, provider.clone(), store.clone());
+    let outcome = handle
+        .submit_committed_turn(SubmitCommittedTurn {
+            run_id: RunId::new("feature-gated-soft-threshold"),
+            messages,
+        })
+        .await
+        .expect("feature-gated turn accepted")
+        .wait()
+        .await
+        .expect("feature-gated turn outcome");
+    assert_eq!(outcome.state, RunState::Done);
+    assert_eq!(compactor.calls.load(Ordering::Relaxed), 0);
+    assert_eq!(provider.requests().len(), 1);
+    assert!(provider.requests()[0].messages.contains(&history));
+    assert!(
+        store
+            .events(&SessionId::new(SESSION))
+            .await
+            .iter()
+            .all(|event| completed_footprint(event).is_none())
+    );
+}
+
+/// MUTATION CHECK: drop the W7b threshold check, hide the W7a intent, move
+/// it after Compacting, or retain the stale pre-compaction footprint.
+/// Expected runtime failure: compaction disappears, event ordering/render
+/// changes, the provider sees the old prefix, or the reset does not shrink.
+#[tokio::test]
+async fn soft_threshold_preannounces_compacts_and_publishes_the_reset_before_provider() {
+    let history = "history ".repeat(100_000);
+    let compactor = Arc::new(ShrinkingContextCompactor::default());
+    let provider = Arc::new(FakeProvider::new(vec![FakeStep::Finish {
+        reason: FinishReason::EndTurn,
+    }]));
+    let store = Arc::new(MemoryStore::new());
+    let mut bounded = config();
+    bounded.context_window = Some(200_000);
+    bounded.reserved_output_tokens = 30_000;
+    bounded.context_compaction_v1 = true;
+    bounded.context_compactor = Some(compactor.clone());
+    let handle = HarnessActor::spawn(bounded, provider.clone(), store.clone());
+
+    let outcome = handle
+        .submit_committed_turn(SubmitCommittedTurn {
+            run_id: RunId::new("soft-threshold-order"),
+            messages: vec![
+                Message::user_text(history.clone()),
+                Message::user_text("current"),
+            ],
+        })
+        .await
+        .expect("threshold turn accepted")
+        .wait()
+        .await
+        .expect("threshold turn outcome");
+    assert_eq!(outcome.state, RunState::Done);
+    assert_eq!(compactor.calls.load(Ordering::Relaxed), 1);
+    assert_eq!(provider.requests().len(), 1);
+    assert!(
+        !provider.requests()[0]
+            .messages
+            .contains(&Message::user_text(history))
+    );
+
+    let events = store.events(&SessionId::new(SESSION)).await;
+    let footprints = events
+        .iter()
+        .filter_map(|event| completed_footprint(event).map(|footprint| (event.seq, footprint)))
+        .collect::<Vec<_>>();
+    assert_eq!(footprints.len(), 2);
+    let (before_seq, before) = &footprints[0];
+    let (after_seq, after) = &footprints[1];
+    assert_eq!(before.soft_threshold_tokens, Some(170_000));
+    assert_eq!(before.truth, ContextFootprintTruth::Estimated);
+    assert!(before.used_tokens >= 170_000);
+    assert!(after.used_tokens < before.used_tokens);
+    assert_eq!(after.truth, ContextFootprintTruth::Estimated);
+
+    let intent = events
+        .iter()
+        .find(|event| completed_extension(event, COMPACTION_INTENT_EXTENSION_KIND))
+        .expect("typed pre-announcement intent");
+    assert!(intent.render.ui);
+    assert_eq!(intent.render.prompt, PromptRender::Omit);
+    let compacting_seq = events
+        .iter()
+        .find_map(|event| match typed(event) {
+            EventPayload::RunState(RunState::Compacting) => Some(event.seq),
+            _ => None,
+        })
+        .expect("compacting state");
+    let streaming_seq = events
+        .iter()
+        .find_map(|event| match typed(event) {
+            EventPayload::RunState(RunState::Streaming) => Some(event.seq),
+            _ => None,
+        })
+        .expect("provider stream opened");
+    assert!(*before_seq < intent.seq);
+    assert!(intent.seq < compacting_seq);
+    assert!(compacting_seq < *after_seq);
+    assert!(*after_seq < streaming_seq);
+}
+
+/// MUTATION CHECK: substitute any default model window for `None`. Expected
+/// runtime failure: the oversized unknown-window request auto-compacts or its
+/// footprint fabricates a threshold/window.
+#[tokio::test]
+async fn unknown_window_publishes_an_estimate_but_never_auto_compacts() {
+    let history = "unknown ".repeat(100_000);
+    let compactor = Arc::new(ShrinkingContextCompactor::default());
+    let provider = Arc::new(FakeProvider::new(vec![FakeStep::Finish {
+        reason: FinishReason::EndTurn,
+    }]));
+    let store = Arc::new(MemoryStore::new());
+    let mut unknown = config();
+    unknown.context_window = None;
+    unknown.reserved_output_tokens = u64::MAX;
+    unknown.context_compaction_v1 = true;
+    unknown.context_compactor = Some(compactor.clone());
+    let handle = HarnessActor::spawn(unknown, provider.clone(), store.clone());
+
+    let outcome = handle
+        .submit_committed_turn(SubmitCommittedTurn {
+            run_id: RunId::new("unknown-soft-threshold"),
+            messages: vec![
+                Message::user_text(history.clone()),
+                Message::user_text("current"),
+            ],
+        })
+        .await
+        .expect("unknown-window turn accepted")
+        .wait()
+        .await
+        .expect("unknown-window outcome");
+    assert_eq!(outcome.state, RunState::Done);
+    assert_eq!(compactor.calls.load(Ordering::Relaxed), 0);
+    assert!(
+        provider.requests()[0]
+            .messages
+            .contains(&Message::user_text(history))
+    );
+    let footprint = store
+        .events(&SessionId::new(SESSION))
+        .await
+        .iter()
+        .find_map(completed_footprint)
+        .expect("estimated unknown-window footprint");
+    assert_eq!(footprint.context_window, None);
+    assert_eq!(footprint.soft_threshold_tokens, None);
+    assert_eq!(footprint.truth, ContextFootprintTruth::Estimated);
+}
+
+/// MUTATION CHECK: mark every footprint exact, derive occupancy from the
+/// cumulative Usage event, or add OpenAI cached input twice. Expected runtime
+/// failure: the reported/no-usage truth markers or normalized splits differ.
+#[tokio::test]
+async fn footprint_is_exact_only_for_request_local_provider_usage() {
+    let reported_store = Arc::new(MemoryStore::new());
+    let reported_provider = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitUsage {
+            usage: Usage {
+                input: 100,
+                output: 20,
+                reasoning: 5,
+                cached: 30,
+                source: UsageSource::ProviderReported,
+                account: None,
+                accounts: Vec::new(),
+            },
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let mut reported_config = config();
+    reported_config.context_window = Some(1_000);
+    reported_config.reserved_output_tokens = 100;
+    reported_config.context_compaction_v1 = true;
+    let reported = HarnessActor::spawn(reported_config, reported_provider, reported_store.clone());
+    reported
+        .submit_turn(SubmitTurn::new("measure"))
+        .await
+        .expect("reported turn")
+        .wait()
+        .await
+        .expect("reported outcome");
+    let reported_footprints = reported_store
+        .events(&SessionId::new(SESSION))
+        .await
+        .iter()
+        .filter_map(completed_footprint)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reported_footprints[0].truth,
+        ContextFootprintTruth::Estimated
+    );
+    let exact = reported_footprints.last().expect("exact request footprint");
+    assert_eq!(exact.truth, ContextFootprintTruth::Exact);
+    assert_eq!(exact.input_tokens, 70);
+    assert_eq!(exact.cached_input_tokens, 30);
+    assert_eq!(exact.output_tokens, 20);
+    assert_eq!(exact.used_tokens, 120);
+    assert_eq!(exact.estimated_turns_to_threshold, Some(37));
+
+    let estimated_store = Arc::new(MemoryStore::new());
+    let estimated_provider = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitUsage {
+            usage: Usage {
+                input: 900,
+                output: 80,
+                reasoning: 0,
+                cached: 40,
+                source: UsageSource::Estimated,
+                account: None,
+                accounts: Vec::new(),
+            },
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let mut estimated_config = config();
+    estimated_config.context_window = None;
+    estimated_config.context_compaction_v1 = true;
+    let estimated = HarnessActor::spawn(
+        estimated_config,
+        estimated_provider,
+        estimated_store.clone(),
+    );
+    estimated
+        .submit_turn(SubmitTurn::new("estimate"))
+        .await
+        .expect("estimated turn")
+        .wait()
+        .await
+        .expect("estimated outcome");
+    let last = estimated_store
+        .events(&SessionId::new(SESSION))
+        .await
+        .iter()
+        .filter_map(completed_footprint)
+        .next_back()
+        .expect("estimated request footprint");
+    assert_eq!(last.truth, ContextFootprintTruth::Estimated);
+    assert_ne!(last.used_tokens, 1_020);
+}
+
 /// MUTATION CHECK: route ContextExceeded through generic retry or omit the
 /// one-shot guard. Expected runtime failure: no CompactionIntent is durable,
 /// the retry lacks the summary, or the double-overflow case makes >2 calls.
@@ -675,6 +978,91 @@ async fn max_tokens_continuation_rechecks_hard_fit_and_compacts_first() {
     assert_eq!(provider.requests()[1].messages, compact_second);
 }
 
+/// MUTATION CHECK: let the reactive overflow one-shot guard suppress later
+/// proactive checks in the same logical turn. Expected runtime failure: the
+/// MaxTokens continuation crosses the soft line but invokes the compactor
+/// only once instead of immediately before both provider rounds.
+#[tokio::test]
+async fn proactive_compaction_can_repeat_after_continuation_growth() {
+    let history = Message::user_text("history ".repeat(1_000));
+    let current = Message::user_text("current");
+    let partial = "p".repeat(5_000);
+    let instruction =
+        Message::user_text("Continue exactly where you stopped. Do not repeat completed content.");
+    let initial_messages = vec![history, current.clone()];
+    let after_first_compaction = vec![Message::user_text("s"), current.clone()];
+    let continuation_messages = vec![
+        Message::user_text("s"),
+        current,
+        Message::assistant(vec![Block::Text {
+            text: partial.clone(),
+        }]),
+        instruction,
+    ];
+
+    let mut bounded = config();
+    bounded.reserved_output_tokens = 1;
+    let continuation_used = estimated_input_tokens(&bounded, &continuation_messages);
+    bounded.context_window = Some(continuation_used.saturating_add(100));
+    let soft_threshold = haider_core::context_soft_threshold_tokens(
+        bounded.context_window.expect("known window"),
+        bounded.reserved_output_tokens,
+    )
+    .expect("soft threshold");
+    assert!(estimated_input_tokens(&bounded, &initial_messages) >= soft_threshold);
+    assert!(estimated_input_tokens(&bounded, &after_first_compaction) < soft_threshold);
+    assert!(continuation_used >= soft_threshold);
+    assert!(
+        continuation_used
+            <= bounded
+                .context_window
+                .expect("known window")
+                .saturating_sub(bounded.reserved_output_tokens)
+    );
+
+    let compactor = Arc::new(ShrinkingContextCompactor::default());
+    bounded.context_compaction_v1 = true;
+    bounded.context_compactor = Some(compactor.clone());
+    let provider = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitText {
+            text: partial.clone(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::MaxTokens,
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let store = Arc::new(MemoryStore::new());
+    let handle = HarnessActor::spawn(bounded, provider.clone(), store.clone());
+    let outcome = handle
+        .submit_committed_turn(SubmitCommittedTurn {
+            run_id: RunId::new("repeat-proactive-compaction"),
+            messages: initial_messages,
+        })
+        .await
+        .expect("repeated proactive turn accepted")
+        .wait()
+        .await
+        .expect("repeated proactive outcome");
+
+    assert_eq!(outcome.state, RunState::Done);
+    assert_eq!(compactor.calls.load(Ordering::Relaxed), 2);
+    assert_eq!(provider.requests().len(), 2);
+    assert_eq!(provider.requests()[0].messages, after_first_compaction);
+    assert_eq!(provider.requests()[1].messages, continuation_messages);
+    assert_eq!(
+        store
+            .events(&SessionId::new(SESSION))
+            .await
+            .iter()
+            .filter_map(completed_footprint)
+            .count(),
+        4
+    );
+}
+
 struct CompletingDispatcher;
 
 #[async_trait]
@@ -695,6 +1083,115 @@ impl ToolDispatcher for CompletingDispatcher {
             cursor: None,
         }))
     }
+}
+
+struct LargeResultDispatcher {
+    preview: String,
+}
+
+#[async_trait]
+impl ToolDispatcher for LargeResultDispatcher {
+    async fn execute(
+        &self,
+        _run_id: &haider_protocol::ids::RunId,
+        _item_id: &haider_protocol::ids::ItemId,
+        _call_id: &str,
+        _name: &str,
+        _args: serde_json::Value,
+        _cancel: &haider_core::CancelToken,
+    ) -> Result<ToolDispatchResult, HaiderError> {
+        Ok(ToolDispatchResult::Completed(BoundedResult {
+            preview: self.preview.clone(),
+            truncated: false,
+            artifact: None,
+            cursor: None,
+        }))
+    }
+}
+
+/// MUTATION CHECK: run the soft check only at logical-turn start. Expected
+/// runtime failure: the tool-expanded second request retains the old prefix,
+/// no pre-request compaction occurs, or no reset footprint is published.
+#[tokio::test]
+async fn tool_round_crossing_soft_threshold_compacts_before_the_next_request() {
+    let history = Message::user_text("history ".repeat(800));
+    let current = Message::user_text("current");
+    let preview = "tool-result".repeat(160);
+    let first_messages = vec![history.clone(), current.clone()];
+    let second_messages = vec![
+        history.clone(),
+        current.clone(),
+        Message::assistant(vec![Block::ToolCall {
+            call_id: "threshold-tool".into(),
+            name: "inspect".into(),
+            args: serde_json::json!({}),
+        }]),
+        Message::tool_result("threshold-tool", preview.clone(), false),
+    ];
+    let mut bounded = config();
+    bounded.reserved_output_tokens = 1;
+    let first_used = estimated_input_tokens(&bounded, &first_messages);
+    let second_used = estimated_input_tokens(&bounded, &second_messages);
+    let desired_threshold = first_used.saturating_add(1);
+    let window = desired_threshold.saturating_mul(100).saturating_add(84) / 85;
+    bounded.context_window = Some(window);
+    bounded.context_compaction_v1 = true;
+    let threshold =
+        haider_core::context_soft_threshold_tokens(window, 1).expect("known-window threshold");
+    assert!(first_used < threshold);
+    assert!(second_used >= threshold);
+
+    let compactor = Arc::new(ShrinkingContextCompactor::default());
+    bounded.context_compactor = Some(compactor.clone());
+    let provider = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitToolCall {
+            call_id: "threshold-tool".into(),
+            name: "inspect".into(),
+            args: serde_json::json!({}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let store = Arc::new(MemoryStore::new());
+    let (actor, handle) = HarnessActor::new_with_dispatcher(
+        bounded,
+        provider.clone(),
+        store.clone(),
+        Some(Arc::new(LargeResultDispatcher { preview })),
+    );
+    let actor_task = tokio::spawn(actor.run());
+    let outcome = handle
+        .submit_committed_turn(SubmitCommittedTurn {
+            run_id: RunId::new("tool-soft-threshold"),
+            messages: first_messages,
+        })
+        .await
+        .expect("tool threshold turn accepted")
+        .wait()
+        .await
+        .expect("tool threshold outcome");
+    assert_eq!(outcome.state, RunState::Done);
+    assert_eq!(compactor.calls.load(Ordering::Relaxed), 1);
+    assert_eq!(provider.requests().len(), 2);
+    assert!(!provider.requests()[1].messages.contains(&history));
+
+    let footprints = store
+        .events(&SessionId::new(SESSION))
+        .await
+        .iter()
+        .filter_map(completed_footprint)
+        .collect::<Vec<_>>();
+    assert_eq!(footprints.len(), 3);
+    assert!(footprints[0].used_tokens < threshold);
+    assert!(footprints[1].used_tokens >= threshold);
+    assert!(footprints[2].used_tokens < footprints[1].used_tokens);
+
+    handle.stop().await.expect("actor stops");
+    actor_task.await.expect("actor joins");
 }
 
 #[tokio::test]

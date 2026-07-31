@@ -32,9 +32,11 @@ use haider_core::{
     ContextCompactionReceiptResponse, ContextCompactor, DeferredTicket, DeferredToolResult,
     EventIdGenerator, HarnessActor, HarnessConfig, PromptHistoryCompiler, RequestInputCheckpoint,
     StoreHandle, SubmitCheckpointTurn, SubmitChildWaitTurn, SubmitCommittedTurn,
-    ToolDispatchResult, ToolDispatcher, TurnHandle, sanitized_failure_message,
+    ToolDispatchResult, ToolDispatcher, TurnHandle, context_soft_threshold_tokens,
+    estimate_provider_request_input_tokens, sanitized_failure_message,
 };
 use haider_protocol::EventPayload;
+use haider_protocol::context::{ContextFootprint, ContextFootprintTruth};
 use haider_protocol::effect::{
     AuthorizationVerdict, EffectClass, EffectIntent, EffectOutcome, EffectPhase,
 };
@@ -52,7 +54,9 @@ use haider_protocol::provider::{FinishReason, StreamEvent};
 use haider_protocol::session::SessionMetadataV1;
 use haider_protocol::state::{RunState, SessionState};
 use haider_protocol::tool::BoundedResult;
-use haider_provider::{Message, ResolvedAttachment};
+use haider_provider::{
+    ANTHROPIC_OAUTH_PROVIDER_NAME, ANTHROPIC_PROVIDER_NAME, Message, ResolvedAttachment,
+};
 use haider_provider::{Provider, ToolDefinition, TurnRequest};
 use haider_tools::{
     CasSink, ChangeLedger, CommandOutputSink, EffectBroker, FsList, FsPatch, FsRead, FsSearch,
@@ -114,6 +118,10 @@ struct DaemonContextCompactor {
     provider: Arc<dyn Provider>,
     model: String,
     max_tokens: u64,
+    context_window: Option<u64>,
+    reserved_output_tokens: u64,
+    post_compaction_system_prompt: Option<String>,
+    post_compaction_tools: Vec<ToolDefinition>,
     attachments: Vec<ResolvedAttachment>,
     device_id: DeviceId,
     event_ids: Arc<EventIdGenerator>,
@@ -252,18 +260,59 @@ impl ContextCompactor for DaemonContextCompactor {
                 resume_cause: intent.resume_cause.clone(),
             },
         };
-        let payloads = vec![
+        let mut payloads = vec![
             EventPayload::Item(ItemEvent::Started {
                 item_id: item_id.clone(),
                 item: item.clone(),
             }),
             EventPayload::Item(ItemEvent::Completed { item_id, item }),
             EventPayload::NodeCommitted(node),
-            EventPayload::RunState(match intent.resume_cause {
-                CompactionResume::AutoMidTurn => RunState::Thinking,
-                CompactionResume::ManualIdle => RunState::Done,
-            }),
         ];
+        if intent.resume_cause == CompactionResume::ManualIdle {
+            let post_compaction_messages = [Message::user_text(summary.clone())];
+            let post_compaction_input = estimate_provider_request_input_tokens(
+                &post_compaction_messages,
+                &self.post_compaction_system_prompt,
+                &self.post_compaction_tools,
+                &[],
+            );
+            let footprint = ContextFootprint {
+                input_tokens: post_compaction_input,
+                output_tokens: 0,
+                cached_input_tokens: 0,
+                used_tokens: post_compaction_input,
+                context_window: self.context_window,
+                reserved_output_tokens: self.reserved_output_tokens,
+                soft_threshold_tokens: self.context_window.and_then(|window| {
+                    context_soft_threshold_tokens(window, self.reserved_output_tokens)
+                }),
+                estimated_turns_to_threshold: None,
+                truth: ContextFootprintTruth::Estimated,
+            };
+            let footprint_item = footprint.extension_item().map_err(|error| {
+                HaiderError::new(
+                    ErrorCode::Internal,
+                    format!("manual compaction footprint could not serialize: {error}"),
+                    false,
+                )
+            })?;
+            let footprint_item_id =
+                ItemId::new(format!("compaction-footprint-{}", intent.operation_id));
+            payloads.extend([
+                EventPayload::Item(ItemEvent::Started {
+                    item_id: footprint_item_id.clone(),
+                    item: footprint_item.clone(),
+                }),
+                EventPayload::Item(ItemEvent::Completed {
+                    item_id: footprint_item_id,
+                    item: footprint_item,
+                }),
+            ]);
+        }
+        payloads.push(EventPayload::RunState(match intent.resume_cause {
+            CompactionResume::AutoMidTurn => RunState::Thinking,
+            CompactionResume::ManualIdle => RunState::Done,
+        }));
         let mut envelopes = payloads
             .into_iter()
             .map(|payload| {
@@ -2333,6 +2382,10 @@ async fn perform_manual_compaction(
         provider: resolved.provider,
         model: resolved.model,
         max_tokens: metadata.max_tokens,
+        context_window: resolved.context_window,
+        reserved_output_tokens: metadata.max_tokens,
+        post_compaction_system_prompt: Some(SystemPromptBuilder::build(metadata)),
+        post_compaction_tools: dependencies.tool_factory.definitions(),
         attachments,
         device_id: device_id.clone(),
         event_ids: Arc::clone(&event_ids),
@@ -2450,6 +2503,11 @@ async fn start_turn(
         lease.worker_generation(),
     )
     .with_event_ids(Arc::clone(&event_ids));
+    config.cached_input_is_subset = !matches!(
+        resolved.provider_name.as_str(),
+        ANTHROPIC_PROVIDER_NAME | ANTHROPIC_OAUTH_PROVIDER_NAME
+    );
+    config.context_compaction_v1 = true;
     config.model = resolved.model;
     config.context_window = resolved.context_window;
     config.agent_id = agent_id;
@@ -2479,6 +2537,10 @@ async fn start_turn(
         provider: Arc::clone(&resolved.provider),
         model: config.model.clone(),
         max_tokens: config.max_tokens,
+        context_window: config.context_window,
+        reserved_output_tokens: config.reserved_output_tokens,
+        post_compaction_system_prompt: config.system_prompt.clone(),
+        post_compaction_tools: config.tools.clone(),
         attachments: config.attachments.clone(),
         device_id: device_id.clone(),
         event_ids: Arc::clone(&event_ids),

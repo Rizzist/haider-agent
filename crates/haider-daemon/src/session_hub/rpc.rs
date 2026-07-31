@@ -12,6 +12,44 @@
 //! transaction or one workspace `spawn_blocking`.
 
 use super::*;
+use haider_protocol::EventPayload;
+use haider_protocol::context::ContextFootprint;
+use haider_protocol::item::ItemEvent;
+
+async fn latest_context_footprint(
+    store: &dyn StoreHandle,
+    session_id: &SessionId,
+    through_seq: u64,
+) -> Result<Option<ContextFootprint>, HaiderError> {
+    let mut since_seq = 0;
+    let mut latest = None;
+    while since_seq < through_seq {
+        let page = store.read(session_id, since_seq, REPLAY_PAGE_SIZE).await?;
+        if page.is_empty() {
+            break;
+        }
+        let mut advanced = false;
+        for envelope in page {
+            if envelope.seq > through_seq {
+                return Ok(latest);
+            }
+            since_seq = envelope.seq;
+            advanced = true;
+            let Ok(EventPayload::Item(ItemEvent::Completed { item, .. })) =
+                serde_json::from_value::<EventPayload>(envelope.payload)
+            else {
+                continue;
+            };
+            if let Some(footprint) = ContextFootprint::from_extension_item(&item) {
+                latest = Some(footprint);
+            }
+        }
+        if !advanced {
+            break;
+        }
+    }
+    Ok(latest)
+}
 
 pub(super) fn filter_provider_summaries(
     providers: Vec<haider_rpc::ProviderSummaryWire>,
@@ -1786,6 +1824,8 @@ impl HubConnection {
             .into_iter()
             .take_while(|envelope| envelope.seq <= range.end_seq)
             .collect::<Vec<_>>();
+        let latest_context_footprint =
+            latest_context_footprint(&self.hub.inner.store, &session_id, head).await?;
         self.send(WireFrame::Response {
             request_id,
             body: ResponseBody::SessionRead {
@@ -1794,6 +1834,7 @@ impl HubConnection {
                     session_id,
                     range,
                     head_seq: head,
+                    latest_context_footprint,
                     envelopes,
                 },
             },

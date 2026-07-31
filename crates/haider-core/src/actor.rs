@@ -35,6 +35,7 @@ use async_trait::async_trait;
 use haider_protocol::DeliveryMode;
 use haider_protocol::EventPayload;
 use haider_protocol::agent::{AgentManifest, ChildReport, ChipState, ReportVerification};
+use haider_protocol::context::{ContextFootprint, ContextFootprintTruth};
 use haider_protocol::credential::RotationEvent;
 use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
@@ -92,6 +93,15 @@ pub struct HarnessConfig {
     pub context_window: Option<u64>,
     /// Daemon-validated space reserved for provider output on every request.
     pub reserved_output_tokens: u64,
+    /// Whether provider-reported cached input is already included in
+    /// `Usage.input`. OpenAI-style adapters report a subset; Anthropic-style
+    /// adapters report cache reads separately. The daemon pins this with the
+    /// provider so footprint splits never double-count cache hits.
+    pub cached_input_is_subset: bool,
+    /// Enables W7b proactive thresholding and durable footprint snapshots.
+    /// Daemons set this when serving `context_compaction_v1`; standalone
+    /// embeddings retain W7a hard-fit behavior unless they opt in.
+    pub context_compaction_v1: bool,
     /// Deterministic daemon-owned policy bound to every request in this actor.
     pub system_prompt: Option<String>,
     /// General tools the paired dispatcher can execute.
@@ -146,6 +156,8 @@ impl HarnessConfig {
             max_tokens: 4096,
             context_window: None,
             reserved_output_tokens: 4096,
+            cached_input_is_subset: true,
+            context_compaction_v1: false,
             system_prompt: None,
             tools: Vec::new(),
             attachments: Vec::new(),
@@ -1009,25 +1021,23 @@ impl HarnessActor {
                     .into_iter()
                     .map(Message::user_text),
             );
-            if let Err(error) = self
-                .enforce_context_hard_fit(
-                    &run_id,
-                    &mut messages,
-                    current_turn_start,
-                    &mut forced_compaction_used,
-                )
+            let request_projection_compacted = match self
+                .enforce_context_policy(&run_id, &mut messages, current_turn_start)
                 .await
             {
-                return self
-                    .drive_error_outcome_with_items(
-                        &run_id,
-                        &mut message,
-                        &mut reasoning,
-                        &mut tools,
-                        error,
-                    )
-                    .await;
-            }
+                Ok(compacted) => compacted,
+                Err(error) => {
+                    return self
+                        .drive_error_outcome_with_items(
+                            &run_id,
+                            &mut message,
+                            &mut reasoning,
+                            &mut tools,
+                            error,
+                        )
+                        .await;
+                }
+            };
             if provider_attempt == 0 {
                 provider_request_count = provider_request_count.saturating_add(1);
             }
@@ -1116,15 +1126,18 @@ impl HarnessActor {
                 match opened {
                     Ok(stream) => break stream,
                     Err(error) if error.kind == ProviderErrorKind::ContextExceeded => {
-                        if let Err(error) = self
-                            .force_context_compaction(
+                        let compacted = if request_projection_compacted {
+                            Err(repeated_context_overflow_after_compaction())
+                        } else {
+                            self.force_context_compaction(
                                 &run_id,
                                 &mut messages,
                                 current_turn_start,
                                 &mut forced_compaction_used,
                             )
                             .await
-                        {
+                        };
+                        if let Err(error) = compacted {
                             return self
                                 .drive_error_outcome_with_items(
                                     &run_id,
@@ -1270,15 +1283,18 @@ impl HarnessActor {
                         if error.kind == ProviderErrorKind::ContextExceeded
                             && !provider_content_seen =>
                     {
-                        if let Err(error) = self
-                            .force_context_compaction(
+                        let compacted = if request_projection_compacted {
+                            Err(repeated_context_overflow_after_compaction())
+                        } else {
+                            self.force_context_compaction(
                                 &run_id,
                                 &mut messages,
                                 current_turn_start,
                                 &mut forced_compaction_used,
                             )
                             .await
-                        {
+                        };
+                        if let Err(error) = compacted {
                             return self
                                 .drive_error_outcome_with_items(
                                     &run_id,
@@ -1419,17 +1435,28 @@ impl HarnessActor {
                                 source: usage.source,
                             }];
                         }
+                        let footprint =
+                            context_footprint_from_usage(&self.config, &usage, &messages);
                         request_usage = Some(usage.clone());
                         match cumulative_usage(completed_usage.as_ref(), &usage) {
-                            Ok(usage) => self
-                                .commit_payload(
-                                    &run_id,
-                                    EventPayload::Usage(usage),
-                                    prompt_omit_render(),
-                                )
+                            Ok(usage) => {
+                                async {
+                                    if self.config.context_compaction_v1 {
+                                        self.commit_context_footprint(&run_id, &footprint)
+                                            .await
+                                            .map_err(DriveError::Store)?;
+                                    }
+                                    self.commit_payload(
+                                        &run_id,
+                                        EventPayload::Usage(usage),
+                                        prompt_omit_render(),
+                                    )
+                                    .await
+                                    .map_err(DriveError::Store)?;
+                                    Ok(None)
+                                }
                                 .await
-                                .map(|_| None)
-                                .map_err(DriveError::Store),
+                            }
                             Err(error) => Err(error),
                         }
                     }
@@ -1858,11 +1885,20 @@ impl HarnessActor {
         forced_compaction_used: &mut bool,
     ) -> Result<(), DriveError> {
         if *forced_compaction_used {
-            return Err(DriveError::Provider(ProviderError::new(
-                ProviderErrorKind::ContextExceeded,
-                "provider context overflow repeated after forced compaction",
-            )));
+            return Err(repeated_context_overflow_after_compaction());
         }
+        self.perform_context_compaction(run_id, messages, current_turn_start)
+            .await?;
+        *forced_compaction_used = true;
+        Ok(())
+    }
+
+    async fn perform_context_compaction(
+        &mut self,
+        run_id: &RunId,
+        messages: &mut Vec<Message>,
+        current_turn_start: usize,
+    ) -> Result<(), DriveError> {
         if current_turn_start == 0 || current_turn_start > messages.len() {
             return Err(DriveError::Provider(ProviderError::new(
                 ProviderErrorKind::ContextExceeded,
@@ -1879,7 +1915,7 @@ impl HarnessActor {
             .plan(run_id, CompactionResume::AutoMidTurn)
             .await
             .map_err(DriveError::Store)?;
-        self.commit_hidden_extension_marker(
+        self.commit_ui_extension_marker(
             run_id,
             COMPACTION_INTENT_EXTENSION_KIND,
             serde_json::to_value(&intent).map_err(|error| {
@@ -1904,26 +1940,35 @@ impl HarnessActor {
             .map_err(DriveError::Store)?;
         messages.push(summary);
         messages.extend(suffix);
-        *forced_compaction_used = true;
+        // The daemon committed a new compaction node behind this actor's
+        // cached parent. Reload before the next current-run node is appended
+        // so later output descends from the projection switch.
+        self.tree_head = None;
+        self.tree_head_initialized = false;
         // The compactor atomically commits its final overlay/item together
         // with this resumed state; mirror that durable fact into the watch.
         self.state.send_replace(Some(RunState::Thinking));
         Ok(())
     }
 
-    /// Enforces the daemon-pinned hard-fit budget immediately before every
-    /// provider request. Unknown catalog windows deliberately disable this
-    /// proactive guard; provider-reported overflow can still force one
-    /// compaction through the same one-shot path.
-    async fn enforce_context_hard_fit(
+    /// Publishes request occupancy and enforces the daemon-pinned soft/hard
+    /// context policy immediately before every provider request. Unknown
+    /// catalog windows publish honest estimates but disable proactive
+    /// compaction; provider-reported overflow can still force recovery.
+    async fn enforce_context_policy(
         &mut self,
         run_id: &RunId,
         messages: &mut Vec<Message>,
         current_turn_start: usize,
-        forced_compaction_used: &mut bool,
-    ) -> Result<(), DriveError> {
+    ) -> Result<bool, DriveError> {
+        let before = estimated_context_footprint(&self.config, messages);
+        if self.config.context_compaction_v1 {
+            self.commit_context_footprint(run_id, &before)
+                .await
+                .map_err(DriveError::Store)?;
+        }
         let Some(window) = self.config.context_window else {
-            return Ok(());
+            return Ok(false);
         };
         let input_budget = window
             .checked_sub(self.config.reserved_output_tokens)
@@ -1933,21 +1978,40 @@ impl HarnessActor {
                     "reserved output budget leaves no provider input capacity",
                 ))
             })?;
-        if estimated_request_input_tokens(&self.config, messages) <= input_budget {
-            return Ok(());
+        let should_compact = if self.config.context_compaction_v1 {
+            let soft_threshold =
+                context_soft_threshold_tokens(window, self.config.reserved_output_tokens)
+                    .ok_or_else(|| {
+                        DriveError::Provider(ProviderError::new(
+                            ProviderErrorKind::ContextExceeded,
+                            "reserved output budget leaves no provider input capacity",
+                        ))
+                    })?;
+            before.used_tokens >= soft_threshold
+        } else {
+            before.used_tokens > input_budget
+        };
+        if !should_compact {
+            return Ok(false);
         }
-        self.force_context_compaction(run_id, messages, current_turn_start, forced_compaction_used)
+        self.perform_context_compaction(run_id, messages, current_turn_start)
             .await?;
-        let compacted = estimated_request_input_tokens(&self.config, messages);
-        if compacted > input_budget {
+        let after = estimated_context_footprint(&self.config, messages);
+        if self.config.context_compaction_v1 {
+            self.commit_context_footprint(run_id, &after)
+                .await
+                .map_err(DriveError::Store)?;
+        }
+        if after.used_tokens > input_budget {
             return Err(DriveError::Provider(ProviderError::new(
                 ProviderErrorKind::ContextExceeded,
                 format!(
-                    "compacted provider input estimate {compacted} exceeds budget {input_budget}"
+                    "compacted provider input estimate {} exceeds budget {input_budget}",
+                    after.used_tokens
                 ),
             )));
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Commits `Waiting { RateLimit | ProviderBackoff }`, sleeps, then
@@ -3217,12 +3281,50 @@ impl HarnessActor {
         kind: &str,
         data: serde_json::Value,
     ) -> Result<(), HaiderError> {
+        self.commit_extension_marker(run_id, kind, data, hidden_prompt_omit_render())
+            .await
+    }
+
+    async fn commit_ui_extension_marker(
+        &mut self,
+        run_id: &RunId,
+        kind: &str,
+        data: serde_json::Value,
+    ) -> Result<(), HaiderError> {
+        self.commit_extension_marker(run_id, kind, data, prompt_omit_render())
+            .await
+    }
+
+    async fn commit_context_footprint(
+        &mut self,
+        run_id: &RunId,
+        footprint: &ContextFootprint,
+    ) -> Result<(), HaiderError> {
+        let item = footprint.extension_item().map_err(|error| {
+            HaiderError::new(
+                ErrorCode::Internal,
+                format!("context footprint could not serialize: {error}"),
+                false,
+            )
+        })?;
+        let TurnItem::Extension { kind, data } = item else {
+            unreachable!("context footprint always uses the extension carrier");
+        };
+        self.commit_ui_extension_marker(run_id, &kind, data).await
+    }
+
+    async fn commit_extension_marker(
+        &mut self,
+        run_id: &RunId,
+        kind: &str,
+        data: serde_json::Value,
+        render: RenderTargets,
+    ) -> Result<(), HaiderError> {
         let item_id = self.next_item_id();
         let item = TurnItem::Extension {
             kind: kind.to_owned(),
             data,
         };
-        let render = hidden_prompt_omit_render();
         let mut envelopes = [
             self.uncommitted_envelope(
                 run_id,
@@ -3531,6 +3633,13 @@ fn provider_protocol_error(message: impl Into<String>) -> ProviderError {
     ProviderError::new(ProviderErrorKind::MalformedFrame, message)
 }
 
+fn repeated_context_overflow_after_compaction() -> DriveError {
+    DriveError::Provider(ProviderError::new(
+        ProviderErrorKind::ContextExceeded,
+        "provider context overflow repeated after compaction",
+    ))
+}
+
 fn loop_limit_error(count: usize, limit: usize) -> HaiderError {
     let mut error = HaiderError::new(
         ErrorCode::LoopLimit,
@@ -3657,18 +3766,110 @@ fn finalize_request_usage(
     Ok(())
 }
 
-/// Conservative provider-neutral estimate used only for the known-window
-/// hard-fit safety check. W7b may replace this with provider/tokenizer truth;
-/// it must remain separate from cumulative billing usage.
+/// Daemon/core context threshold policy. Wire clients consume the emitted
+/// threshold and must not recalculate it locally.
+#[must_use]
+pub fn context_soft_threshold_tokens(window: u64, reserved_output_tokens: u64) -> Option<u64> {
+    let hard_fit = window.checked_sub(reserved_output_tokens)?;
+    let eighty_five_percent =
+        u64::try_from(u128::from(window).saturating_mul(85) / 100).unwrap_or(u64::MAX);
+    Some(eighty_five_percent.min(hard_fit))
+}
+
+fn estimated_context_footprint(config: &HarnessConfig, messages: &[Message]) -> ContextFootprint {
+    context_footprint(
+        config,
+        estimated_request_input_tokens(config, messages),
+        0,
+        0,
+        ContextFootprintTruth::Estimated,
+    )
+}
+
+fn context_footprint_from_usage(
+    config: &HarnessConfig,
+    usage: &Usage,
+    messages: &[Message],
+) -> ContextFootprint {
+    if usage.source != haider_protocol::provider::UsageSource::ProviderReported {
+        return estimated_context_footprint(config, messages);
+    }
+    let input_tokens = if config.cached_input_is_subset {
+        let Some(uncached) = usage.input.checked_sub(usage.cached) else {
+            return estimated_context_footprint(config, messages);
+        };
+        uncached
+    } else {
+        usage.input
+    };
+    context_footprint(
+        config,
+        input_tokens,
+        usage.output,
+        usage.cached,
+        ContextFootprintTruth::Exact,
+    )
+}
+
+fn context_footprint(
+    config: &HarnessConfig,
+    input_tokens: u64,
+    output_tokens: u64,
+    cached_input_tokens: u64,
+    truth: ContextFootprintTruth,
+) -> ContextFootprint {
+    let used_tokens = input_tokens
+        .saturating_add(output_tokens)
+        .saturating_add(cached_input_tokens);
+    let soft_threshold_tokens = config
+        .context_window
+        .and_then(|window| context_soft_threshold_tokens(window, config.reserved_output_tokens));
+    let estimated_turns_to_threshold = soft_threshold_tokens.and_then(|threshold| {
+        if used_tokens >= threshold {
+            return Some(0);
+        }
+        (output_tokens > 0).then(|| {
+            let remaining = threshold.saturating_sub(used_tokens);
+            remaining.saturating_add(output_tokens.saturating_sub(1)) / output_tokens
+        })
+    });
+    ContextFootprint {
+        input_tokens,
+        output_tokens,
+        cached_input_tokens,
+        used_tokens,
+        context_window: config.context_window,
+        reserved_output_tokens: config.reserved_output_tokens,
+        soft_threshold_tokens,
+        estimated_turns_to_threshold,
+        truth,
+    }
+}
+
+/// Conservative provider-neutral compiled-request accounting used when no
+/// provider-reported request-local usage is available. It remains separate
+/// from cumulative billing usage.
 fn estimated_request_input_tokens(config: &HarnessConfig, messages: &[Message]) -> u64 {
-    let bytes = serde_json::to_vec(&(
+    estimate_provider_request_input_tokens(
         messages,
         &config.system_prompt,
         &config.tools,
         &config.attachments,
-    ))
-    .map(|encoded| u64::try_from(encoded.len()).unwrap_or(u64::MAX))
-    .unwrap_or(u64::MAX);
+    )
+}
+
+/// Deterministic accounting for the complete provider-bound request context.
+/// Daemon-owned idle operations use the same estimator as live actor rounds.
+#[must_use]
+pub fn estimate_provider_request_input_tokens(
+    messages: &[Message],
+    system_prompt: &Option<String>,
+    tools: &[ToolDefinition],
+    attachments: &[ResolvedAttachment],
+) -> u64 {
+    let bytes = serde_json::to_vec(&(messages, system_prompt, tools, attachments))
+        .map(|encoded| u64::try_from(encoded.len()).unwrap_or(u64::MAX))
+        .unwrap_or(u64::MAX);
     bytes.saturating_add(3) / 4
 }
 

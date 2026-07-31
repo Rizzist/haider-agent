@@ -134,6 +134,7 @@ pub fn transcript() -> Vec<WireFrame> {
                     range,
                     head_seq: 9,
                     metadata: None,
+                    latest_context_footprint: None,
                     envelopes: vec![raw_envelope(9)],
                 },
             },

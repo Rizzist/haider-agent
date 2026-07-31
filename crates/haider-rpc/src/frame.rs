@@ -3,6 +3,7 @@
 use std::collections::BTreeSet;
 
 use haider_protocol::DeliveryMode;
+use haider_protocol::context::ContextFootprint;
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::ids::{MenuId, RunId, SessionId};
 use haider_protocol::session::SessionMetadataV1;
@@ -666,6 +667,10 @@ pub struct SessionReadResult {
     /// [`SessionSummary::metadata`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<SessionMetadataV1>,
+    /// Latest durable request-local context snapshot at or before `head_seq`,
+    /// independent of the requested envelope range.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_context_footprint: Option<ContextFootprint>,
     #[serde(default)]
     pub envelopes: Vec<RawEnvelope>,
 }

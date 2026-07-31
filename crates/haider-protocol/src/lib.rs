@@ -11,6 +11,7 @@
 //! existing fields are never removed or re-typed within a schema version.
 
 pub mod agent;
+pub mod context;
 pub mod credential;
 pub mod effect;
 pub mod envelope;

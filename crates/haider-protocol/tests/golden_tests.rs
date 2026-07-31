@@ -454,6 +454,30 @@ fn golden_usage_account_tagged() {
     );
 }
 
+/// MUTATION CHECK: relabel an estimated footprint as exact, omit a token
+/// split, or change the additive extension kind. Expected runtime failure:
+/// the frozen durable-event fixture differs or no longer round-trips.
+#[test]
+fn golden_context_footprint_exact_extension() {
+    use haider_protocol::context::{ContextFootprint, ContextFootprintTruth};
+
+    let footprint = ContextFootprint {
+        input_tokens: 118_000,
+        output_tokens: 7_000,
+        cached_input_tokens: 42_000,
+        used_tokens: 167_000,
+        context_window: Some(200_000),
+        reserved_output_tokens: 30_000,
+        soft_threshold_tokens: Some(170_000),
+        estimated_turns_to_threshold: Some(1),
+        truth: ContextFootprintTruth::Exact,
+    };
+    golden(
+        "context_footprint_exact_extension",
+        &footprint.extension_item().expect("extension serializes"),
+    );
+}
+
 #[test]
 fn golden_agent_family() {
     use haider_protocol::agent::*;

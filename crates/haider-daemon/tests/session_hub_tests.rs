@@ -14,10 +14,12 @@ use haider_daemon::{
     SessionHub, SessionHubConfig, SessionHubObserver, SessionHubShutdownOutcome,
 };
 use haider_protocol::EventPayload;
+use haider_protocol::context::{ContextFootprint, ContextFootprintTruth};
 use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
 };
-use haider_protocol::ids::{DeviceId, EventId, MenuId, RunId, SessionId};
+use haider_protocol::ids::{DeviceId, EventId, ItemId, MenuId, RunId, SessionId};
+use haider_protocol::item::ItemEvent;
 use haider_protocol::menu::{Menu, MenuKind, MenuOption, MenuScope};
 use haider_protocol::provider::FinishReason;
 use haider_protocol::state::RunState;
@@ -90,6 +92,32 @@ fn menu_opening(session_id: &SessionId, menu_id: &MenuId, worker_generation: u64
         timeout_option: None,
     }))
     .expect("menu serializes");
+    envelope
+}
+
+fn footprint_envelope(
+    session_id: &SessionId,
+    event_id: &str,
+    worker_generation: u64,
+    used_tokens: u64,
+) -> RawEnvelope {
+    let mut envelope = envelope(session_id, event_id, worker_generation);
+    let footprint = ContextFootprint {
+        input_tokens: used_tokens,
+        output_tokens: 0,
+        cached_input_tokens: 0,
+        used_tokens,
+        context_window: Some(200_000),
+        reserved_output_tokens: 30_000,
+        soft_threshold_tokens: Some(170_000),
+        estimated_turns_to_threshold: None,
+        truth: ContextFootprintTruth::Estimated,
+    };
+    envelope.payload = serde_json::to_value(EventPayload::Item(ItemEvent::Completed {
+        item_id: ItemId::new(format!("item-{event_id}")),
+        item: footprint.extension_item().expect("footprint serializes"),
+    }))
+    .expect("footprint event serializes");
     envelope
 }
 
@@ -899,6 +927,65 @@ async fn list_uses_opaque_stable_order_cursor_and_read_does_not_subscribe() {
     assert!(
         sink.snapshot().is_empty(),
         "list/read created no subscription"
+    );
+
+    connection.close().await.expect("connection closes");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// MUTATION CHECK: derive the latest footprint only from the requested read
+/// range or stop at the first snapshot. Expected runtime failure: a narrow
+/// range returns None/12k instead of the head-fenced latest 18k snapshot.
+#[tokio::test]
+async fn session_read_exposes_latest_footprint_independent_of_requested_range() {
+    let (_root, store, hub) = open_hub(None, 8).await;
+    let session_id = SessionId::new("read-latest-footprint");
+    let generation = store.worker_generation();
+    append_one(&hub, &session_id, generation, "seed").await;
+    let mut events = vec![
+        footprint_envelope(&session_id, "footprint-old", generation, 12_000),
+        envelope(&session_id, "between-footprints", generation),
+        footprint_envelope(&session_id, "footprint-new", generation, 18_000),
+    ];
+    hub.append(&mut events).await.expect("footprints append");
+
+    let sink = Arc::new(CollectSink::default());
+    let connection = hub
+        .open_connection(
+            capabilities(),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection");
+    connection
+        .request(
+            RequestId::new("read-latest-footprint"),
+            RequestBody::SessionRead {
+                session_id,
+                range: SeqRange {
+                    start_seq: 1,
+                    end_seq: 1,
+                },
+            },
+        )
+        .await
+        .expect("session.read routes");
+    let WireFrame::Response {
+        body: ResponseBody::SessionRead { result },
+        ..
+    } = sink.next().await
+    else {
+        panic!("expected session.read response");
+    };
+    assert_eq!(result.envelopes.len(), 1);
+    assert_eq!(result.head_seq, 4);
+    assert_eq!(
+        result
+            .latest_context_footprint
+            .expect("latest footprint")
+            .used_tokens,
+        18_000
     );
 
     connection.close().await.expect("connection closes");
