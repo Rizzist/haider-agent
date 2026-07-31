@@ -45,7 +45,20 @@ Endpoint/redirect-shape differences vs Claude Code's flow were reported
 and deliberately NOT adopted — our loopback PKCE works end to end and
 the owner's ask was consent parity.
 
-## Mutations (reviewer-chosen, EXECUTED post-commit at 2b2c3e6)
+## Round 2 (W5g-7b) — gate21's catch: consent must not gate validation
+
+The scope expansion refused LEGITIMATE imports: a claude-code
+credentials file with an older/narrower grant failed the
+all-configured-scopes law at import — and the same law lived in the
+stored-bundle guard and BOTH token-response guards, so even a stored old
+grant would die at resolve or refresh. The split is now explicit:
+`scopes` is what OUR authorize REQUESTS (consent breadth);
+`validation_required` names the operation-critical subset a GRANT must
+carry — `user:inference` for Anthropic, everything for every other
+registration (OpenAI byte-identical). An inference-less grant is still
+refused (new pin, mutation-killed).
+
+## Mutations (reviewer-chosen, EXECUTED post-commit at 2b2c3e6 + 9182d6d)
 
 | # | Mutation | Result |
 |---|---|---|
@@ -53,14 +66,15 @@ the owner's ask was consent parity.
 | M2 | settle reverts to identity-vanish cleanup | KILLED (moved-target pin) |
 | M3 | settle ADOPTS the resolved target | KILLED (keyboard-theft pin) |
 | M4 | scopes back to `user:inference` alone | KILLED (registration pin + factory fixture guard) |
+| M5 | `validation_required` demands nothing for Anthropic | KILLED (inference-less-import refusal pin) |
 
 Live acceptance: at 80×24 (compaction active) clicking the PAINTED
 `⚿ Accounts` row opens `/accounts` on the installed build.
 
 ## Gate
 
-Workspace clippy `-D warnings` clean; full per-crate gate `gate21.out`;
-ledger 1150 → 1154.
+Workspace clippy `-D warnings` clean; full per-crate gate `gate22.out` (gate21's daemon red WAS the review working — the import-refusal finding above);
+ledger 1150 → 1155.
 
 ## Verdict
 
