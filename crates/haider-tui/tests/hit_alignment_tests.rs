@@ -219,10 +219,10 @@ fn palette_row_hits_align_and_click_runs_that_row() {
             .any(|(rect, h)| matches!(h, Hit::PaletteRow(_)) && rect.y == hint_y),
         "hint row carries no palette hit"
     );
-    // Clicking the /tree row runs /tree (honest wave flash) — the hit
-    // carries the VALUE it was rendered with.
+    // Clicking the /tree row runs /tree (W7b: the real tree screen) —
+    // the hit carries the VALUE it was rendered with.
     model.handle_hit(Hit::PaletteRow(items[1].clone()));
-    assert!(model.flash.as_deref().unwrap_or("").contains("/tree"));
+    assert_eq!(model.screen, haider_tui::app::Screen::Tree);
 }
 
 #[test]

@@ -407,7 +407,7 @@ fn stub_commands_flash_honestly_and_help_opens() {
     model.handle(AppEvent::Envelope(Box::new(EventPayload::HarnessStatus(
         HarnessStatus::Ready,
     ))));
-    for c in "/tree".chars() {
+    for c in "/fork".chars() {
         model.handle(key(KeyCode::Char(c)));
     }
     model.handle(key(KeyCode::Enter));
@@ -614,8 +614,9 @@ fn palette_enter_runs_the_highlighted_command() {
     // matches: theme, tree, tokens, tools — Down selects the second.
     model.handle(key(KeyCode::Down));
     model.handle(key(KeyCode::Enter));
-    assert!(
-        model.flash.as_deref().unwrap_or("").contains("/tree"),
+    assert_eq!(
+        model.screen,
+        Screen::Tree,
         "highlighted command ran, not the raw query: {:?}",
         model.flash
     );

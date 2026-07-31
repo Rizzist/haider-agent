@@ -64,7 +64,7 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
             };
             u16::from((area.height as usize) >= 1 + 4 + input_floor)
         }
-        Screen::Boot | Screen::Launcher | Screen::Accounts | Screen::Providers => 1,
+        Screen::Boot | Screen::Launcher | Screen::Accounts | Screen::Providers | Screen::Tree => 1,
     };
     let [body, status] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(status_height)]).areas(area);
@@ -72,6 +72,7 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
         Screen::Boot => render_boot(model, theme, frame, body),
         Screen::Launcher => render_launcher(model, theme, frame, body, &mut hits),
         Screen::Session => render_session(model, theme, frame, body, &mut hits),
+        Screen::Tree => render_tree(model, theme, frame, body),
         Screen::Subagent => render_subagent(model, theme, frame, body, &mut hits),
         Screen::Aura => render_aura(model, theme, frame, body, &mut hits),
         Screen::Accounts => render_accounts(model, theme, frame, body, &mut hits),
@@ -2016,6 +2017,177 @@ fn render_session(
     if subtree_height > 0 {
         render_subtree(model, theme, frame, subtree_area, false, hits);
     }
+    if model.token_panel {
+        render_token_panel(model, theme, frame, area, rule_area.y);
+    }
+}
+
+/// ⌃G / `/tokens` — context by model (sim tui.js:2946-2977), floated
+/// above the input band. Live rows carry the W7b footprint truth: an
+/// EXACT snapshot prints plain splits, an ESTIMATED one keeps the sim's
+/// `~` prefixes; with no snapshot yet the sim's fabricated 62/28/10
+/// split stands in (demo parity).
+fn render_token_panel(
+    model: &AppModel,
+    theme: &Theme,
+    frame: &mut Frame<'_>,
+    area: Rect,
+    input_top: u16,
+) {
+    struct PanelRow {
+        label: String,
+        tokens: u64,
+        window: u64,
+        detail: String,
+    }
+    let identity = &model.identity;
+    let main_label = format!("● {} · {}", identity.model_short, identity.provider);
+    let main = model.projection.latest_footprint().map_or_else(
+        || {
+            // Sim math (tui.js:2951-2953): fabricated splits + burn-rate
+            // turns estimate from the transcript's user rows.
+            let tokens = model.projection.context_tokens();
+            let window = identity.context_window;
+            let turns = u64::from(model.projection.user_row_count().max(1));
+            let burn = (tokens / turns).max(6000);
+            let to_threshold = (window.saturating_mul(85) / 100).saturating_sub(tokens);
+            let detail = format!(
+                "in ~{} · out ~{} · cached ~{} · ≈{} turns to auto-compaction",
+                fmt_tok(tokens.saturating_mul(62) / 100),
+                fmt_tok(tokens.saturating_mul(28) / 100),
+                fmt_tok(tokens.saturating_mul(10) / 100),
+                to_threshold.div_ceil(burn).max(1),
+            );
+            PanelRow {
+                label: main_label.clone(),
+                tokens,
+                window,
+                detail,
+            }
+        },
+        |footprint| {
+            let approx = match footprint.truth {
+                haider_protocol::context::ContextFootprintTruth::Exact => "",
+                haider_protocol::context::ContextFootprintTruth::Estimated => "~",
+            };
+            let mut detail = format!(
+                "in {approx}{} · out {approx}{} · cached {approx}{}",
+                fmt_tok(footprint.input_tokens),
+                fmt_tok(footprint.output_tokens),
+                fmt_tok(footprint.cached_input_tokens),
+            );
+            if let Some(turns) = footprint.estimated_turns_to_threshold {
+                detail.push_str(&format!(" · ≈{turns} turns to auto-compaction"));
+            }
+            PanelRow {
+                label: main_label.clone(),
+                tokens: footprint.used_tokens,
+                window: footprint.context_window.unwrap_or(identity.context_window),
+                detail,
+            }
+        },
+    );
+    let mut rows = vec![main];
+    for (_, chip) in crate::app::flatten_chips(&model.chips) {
+        let (tokens, window, detail) = chip.transcript.latest_footprint().map_or_else(
+            || (chip.tokens, identity.context_window, String::new()),
+            |footprint| {
+                (
+                    footprint.used_tokens,
+                    footprint.context_window.unwrap_or(identity.context_window),
+                    String::new(),
+                )
+            },
+        );
+        rows.push(PanelRow {
+            label: format!("└ {} · {}", chip.name, chip.model),
+            tokens,
+            window,
+            detail,
+        });
+    }
+    let mut lines = vec![Line::styled(
+        "context by model — ⌃G · /tokens · esc closes",
+        theme.dim_style(),
+    )];
+    for row in &rows {
+        #[allow(clippy::cast_precision_loss)]
+        let pct = if row.window == 0 {
+            0.0
+        } else {
+            row.tokens as f64 / row.window as f64
+        };
+        let mut text = format!(
+            "{}  {} {}%  {}/{}",
+            row.label,
+            meter_cells(pct, 12),
+            (pct.clamp(0.0, 1.0) * 100.0).round(),
+            fmt_tok(row.tokens),
+            fmt_tok(row.window),
+        );
+        if !row.detail.is_empty() {
+            text.push_str(" · ");
+            text.push_str(&row.detail);
+        }
+        lines.push(Line::styled(text, theme.text_style()));
+    }
+    let height = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
+    let width = area.width.saturating_sub(2).max(24);
+    let rect = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: input_top.saturating_sub(height).max(area.y),
+        width,
+        height: height.min(area.height),
+    };
+    frame.render_widget(ratatui::widgets::Clear, rect);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(ratatui::widgets::Borders::ALL)
+                .border_style(theme.frame_style())
+                .style(theme.text_style()),
+        ),
+        rect,
+    );
+}
+
+/// `/tree` — the session tree's main-line view (sim tui.js:3366-3430,
+/// W7b port). One branch row (● main), then a node row per user turn and
+/// per ⊟ compaction; forks land with the branch wave.
+fn render_tree(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rect) {
+    let name = model
+        .session_name
+        .as_deref()
+        .or(model.session_title.as_deref())
+        .unwrap_or("session");
+    let rows = crate::app::tree_rows(model);
+    let mut lines = vec![
+        Line::styled(
+            format!("SESSION TREE — {name} — main"),
+            theme.bright_style(),
+        ),
+        Line::raw(""),
+    ];
+    // Selection windows around `tree_sel` when the list outgrows the frame.
+    let budget = usize::from(area.height.saturating_sub(4)).max(1);
+    let first = model
+        .tree_sel
+        .saturating_sub(budget.saturating_sub(1))
+        .min(rows.len().saturating_sub(budget));
+    for (index, row) in rows.iter().enumerate().skip(first).take(budget) {
+        let style = if index == model.tree_sel {
+            theme.selection_style()
+        } else {
+            theme.text_style()
+        };
+        lines.push(Line::styled(row.clone(), style));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "↑↓ select · esc/⏎ back — forks land with the branch wave",
+        theme.dim_style(),
+    ));
+    frame.render_widget(Paragraph::new(lines).style(theme.text_style()), area);
 }
 
 /// Wrap a row in the shared hover band (sim `:hover { background: selBg }`),
@@ -3720,19 +3892,40 @@ fn render_status_bar(
     // The derived WAITING-on-subagents badge overlays plain IDLE (§2.6).
     let (badge, tone) = model.status_badge();
     let identity = &model.identity;
-    let tokens = model.projection.context_tokens();
+    // W7b meter truth: the durable occupancy snapshot beats the
+    // cumulative usage sum, and an ESTIMATED snapshot wears `~` so the
+    // meter never claims a precision it does not have.
+    let (tokens, window, approx) = model.projection.latest_footprint().map_or_else(
+        || {
+            (
+                model.projection.context_tokens(),
+                identity.context_window,
+                "",
+            )
+        },
+        |footprint| {
+            (
+                footprint.used_tokens,
+                footprint.context_window.unwrap_or(identity.context_window),
+                match footprint.truth {
+                    haider_protocol::context::ContextFootprintTruth::Exact => "",
+                    haider_protocol::context::ContextFootprintTruth::Estimated => "~",
+                },
+            )
+        },
+    );
     #[allow(clippy::cast_precision_loss)]
-    let pct = if identity.context_window == 0 {
+    let pct = if window == 0 {
         0.0
     } else {
-        tokens as f64 / identity.context_window as f64
+        tokens as f64 / window as f64
     };
     let meter = format!(
-        "{} tok · {} {}% of {}",
+        "{approx}{} tok · {} {}% of {}",
         fmt_tok(tokens),
         meter_cells(pct, METER_CELLS_DEFAULT),
         (pct.clamp(0.0, 1.0) * 100.0).round(),
-        fmt_tok(identity.context_window)
+        fmt_tok(window)
     );
 
     let mut left = vec![Span::styled(" ", theme.text_style())];

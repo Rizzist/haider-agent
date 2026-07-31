@@ -547,6 +547,15 @@ pub fn request_body(command: LiveCommand) -> RequestBody {
             worker_generation,
             run_id,
         },
+        LiveCommand::Compact {
+            command_id,
+            session,
+            worker_generation,
+        } => RequestBody::SessionCompact {
+            command_id,
+            session_id: session,
+            worker_generation,
+        },
         LiveCommand::Stage {
             stage_id, secret, ..
         } => RequestBody::VaultStage {
@@ -705,6 +714,10 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
             .command_id
             .clone()
             .map_or_else(Vec::new, |id| vec![LiveReply::Cancelled { command_id: id }]),
+        ResponseBody::SessionCompact { .. } => context
+            .command_id
+            .clone()
+            .map_or_else(Vec::new, |id| vec![LiveReply::Compacted { command_id: id }]),
         ResponseBody::VaultStage {
             vault_reference, ..
         } => context

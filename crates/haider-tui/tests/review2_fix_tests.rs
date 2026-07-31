@@ -229,8 +229,9 @@ fn stale_hits_activate_the_carried_value_or_drop() {
     // activates exactly the value that was on screen.
     model.handle(key(KeyCode::Backspace));
     model.handle_hit(tree_hit.clone());
-    assert!(
-        model.flash.as_deref().unwrap_or("").contains("/tree"),
+    assert_eq!(
+        model.screen,
+        haider_tui::app::Screen::Tree,
         "the clicked VALUE ran, not whatever drifted under its index"
     );
 
@@ -242,8 +243,9 @@ fn stale_hits_activate_the_carried_value_or_drop() {
     model.handle(key(KeyCode::Esc));
     assert!(!model.palette_open());
     model.handle_hit(tree_hit.clone());
-    assert!(
-        !model.flash.as_deref().unwrap_or("").contains("/tree"),
+    assert_ne!(
+        model.screen,
+        haider_tui::app::Screen::Tree,
         "click through a dismissed palette is dropped"
     );
 

@@ -323,7 +323,6 @@ fn the_driver_refuses_demo_vocabulary_aloud_and_unwinds_the_optimistic_state() {
     // no-op arm of `LiveDriver::handle_request` and every case below sees
     // `turn_active` stuck true with no flash.
     let cases: Vec<AppRequest> = vec![
-        AppRequest::Compact,
         AppRequest::Talk,
         AppRequest::ChipSubmit {
             agent: "a1".into(),
@@ -363,31 +362,33 @@ fn the_driver_refuses_demo_vocabulary_aloud_and_unwinds_the_optimistic_state() {
 }
 
 #[test]
-fn live_compact_refuses_before_it_fabricates() {
-    // VERIFIER P1-A, the named case: `/compact` set `turn_active = true`
-    // and handed the driver a request it discarded — the session sat
-    // mid-turn forever, with `/compact` itself answering "wait for the
-    // turn to end".
+fn live_compact_routes_to_the_daemon_and_fabricates_nothing() {
+    // VERIFIER P1-A, the named case, W7b evolution: `/compact` once set
+    // `turn_active = true` and handed the driver a request it discarded —
+    // the session sat mid-turn forever. Now the request ROUTES to the
+    // receipt-backed `session.compact`, and the anti-wedge half of the
+    // law is unchanged: nothing local is fabricated; the daemon's
+    // committed events own every state change.
     //
-    // MUTATION CHECK: remove the `!self.mode.fabricates_locally()` branch
-    // from the `"compact"` arm of `execute_slash` and `turn_active` below
-    // sticks true.
+    // MUTATION CHECK: fabricate `turn_active = true` in the live
+    // `"compact"` arm of `execute_slash` — the fabrication assertion
+    // below fails. Second mutation: drop the `AppRequest::Compact`
+    // routing arm from `LiveDriver` — the issued-command assertion fails.
     let mut model = live_model();
     let mut driver = LiveDriver::new("test");
     attached_session(&mut driver, &mut model);
     run_slash(&mut model, "/compact");
-    assert!(
-        model
-            .flash
-            .as_deref()
-            .is_some_and(|flash| flash.contains("demo only")),
-        "got {:?}",
-        model.flash
-    );
     assert!(!model.turn_active, "nothing was fabricated");
+    let issued = pass(&mut driver, &mut model, None);
     assert!(
-        pass(&mut driver, &mut model, None).is_empty(),
-        "nothing was promised to the daemon"
+        issued
+            .iter()
+            .any(|command| matches!(command, LiveCommand::Compact { .. })),
+        "W7b: idle /compact promises exactly `session.compact`, got {issued:?}"
+    );
+    assert!(
+        !model.turn_active,
+        "the daemon's events own every state change"
     );
 }
 

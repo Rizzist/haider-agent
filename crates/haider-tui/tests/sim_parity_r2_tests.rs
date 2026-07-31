@@ -591,17 +591,17 @@ fn help_carries_the_sim_menus_and_keys_explainers() {
 }
 
 #[test]
-fn ctrl_g_flashes_the_tokens_stub() {
+fn ctrl_g_toggles_the_token_panel_and_esc_closes_it() {
+    // W7b: the binding is REAL now (sim tui.js:2946). Toggle on, toggle
+    // off, and esc closes without touching the run.
     let mut model = session_model();
     model.handle(ctrl('g'));
-    assert!(
-        model
-            .flash
-            .as_deref()
-            .unwrap_or("")
-            .contains("/tokens — UI ready"),
-        "⌃G reserves the token-panel binding honestly"
-    );
+    assert!(model.token_panel, "⌃G opens the token panel");
+    model.handle(ctrl('g'));
+    assert!(!model.token_panel, "⌃G toggles it closed");
+    model.handle(ctrl('g'));
+    model.handle(key(KeyCode::Esc));
+    assert!(!model.token_panel, "esc closes the panel");
 }
 
 #[test]

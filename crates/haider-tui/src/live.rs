@@ -101,6 +101,14 @@ pub enum LiveCommand {
         worker_generation: u64,
         run_id: RunId,
     },
+    /// `session.compact` — receipt-backed, idle-only manual compaction
+    /// (W7b). The daemon's own journal events drive every visible state
+    /// change; the reply only retires the outbox entry.
+    Compact {
+        command_id: CommandId,
+        session: SessionId,
+        worker_generation: u64,
+    },
     /// Stage a raw secret in connection-scoped daemon memory (R7/R10).
     /// Deliberately NON-durable and NOT in the outbox: no command receipt
     /// may ever contain a secret, so a lost response is answered by
@@ -226,6 +234,7 @@ impl LiveCommand {
             Self::Create { command_id, .. }
             | Self::Submit { command_id, .. }
             | Self::Cancel { command_id, .. }
+            | Self::Compact { command_id, .. }
             | Self::Answer { command_id, .. } => Some(command_id),
             Self::LoginApi { command_id, .. } => Some(command_id),
             Self::AccountSetActive { command_id, .. } => Some(command_id),
@@ -312,6 +321,11 @@ pub enum LiveReply {
         identity: String,
     },
     Cancelled {
+        command_id: CommandId,
+    },
+    /// `session.compact` accepted; the compaction events arrive on the
+    /// attachment stream like any other run.
+    Compacted {
         command_id: CommandId,
     },
     /// One committed envelope for an attachment.
@@ -1026,7 +1040,9 @@ impl LiveDriver {
                 self.generations.insert(session, worker_generation);
                 Vec::new()
             }
-            LiveReply::Answered { command_id } | LiveReply::Cancelled { command_id } => {
+            LiveReply::Answered { command_id }
+            | LiveReply::Cancelled { command_id }
+            | LiveReply::Compacted { command_id } => {
                 self.retire(&command_id);
                 Vec::new()
             }
@@ -2110,6 +2126,22 @@ impl LiveDriver {
                     run_id,
                 })]
             }
+            AppRequest::Compact => {
+                // W7b: receipt-backed idle-only `session.compact`. The
+                // daemon is the state authority — a busy worker answers
+                // with a typed refusal that lands as a flash; nothing is
+                // fabricated locally (the P1-A law).
+                let Some(session) = model.active_session.clone() else {
+                    return Vec::new();
+                };
+                let command_id = self.mint();
+                let worker_generation = self.generations.get(&session).copied().unwrap_or_default();
+                vec![self.enqueue(LiveCommand::Compact {
+                    command_id,
+                    session,
+                    worker_generation,
+                })]
+            }
             // Runtime-owned effects: `live_pass` hands these BACK to the
             // shell (they need the terminal or the process), so reaching
             // here at all would be a routing bug, not a discard.
@@ -2123,8 +2155,7 @@ impl LiveDriver {
             // and no surface said so. If a future reducer path forgets its
             // gate, the user sees a flash instead of a dead UI, and the
             // pinned test sees a failure instead of silence.
-            AppRequest::Compact
-            | AppRequest::Talk
+            AppRequest::Talk
             | AppRequest::ChipSubmit { .. }
             | AppRequest::ChipClose { .. }
             | AppRequest::AuraSubmit { .. }
@@ -2235,7 +2266,6 @@ impl LiveDriver {
 /// `/compact` wedge a live session).
 const fn demo_only_label(request: &AppRequest) -> &'static str {
     match request {
-        AppRequest::Compact => "/compact",
         AppRequest::Talk => "push-to-talk",
         AppRequest::ChipSubmit { .. } => "steering a subagent",
         AppRequest::ChipClose { .. } => "closing a subagent",
@@ -2250,6 +2280,7 @@ const fn command_session(command: &LiveCommand) -> Option<&SessionId> {
     match command {
         LiveCommand::Submit { session, .. }
         | LiveCommand::Cancel { session, .. }
+        | LiveCommand::Compact { session, .. }
         | LiveCommand::Answer { session, .. } => Some(session),
         _ => None,
     }

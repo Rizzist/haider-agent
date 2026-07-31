@@ -201,6 +201,10 @@ pub enum Screen {
     Session,
     Subagent,
     Aura,
+    /// `/tree` — the session tree's main-line view (sim tui.js:3366-3430,
+    /// W7b port). Branch forks land with the branch wave; until then the
+    /// view lists the main line's turns and compaction nodes.
+    Tree,
     /// `/accounts` — the sim's harness-owned credential list
     /// (tui.js:3588-3688), backed by `account.list` in live mode.
     Accounts,
@@ -896,6 +900,55 @@ pub fn remove_chip(chips: &mut Vec<ChipModel>, agent: &str) -> bool {
 
 /// Depth-first flatten with depth (the SubTree rows).
 #[must_use]
+/// `/tree` rows (sim tui.js:3390-3421 vocabulary, main line only): the
+/// branch header, then one node per user turn (`├─ ❯`) and per ⊟
+/// compaction row already in the transcript.
+pub fn tree_rows(model: &AppModel) -> Vec<String> {
+    use crate::projection::TranscriptEntry;
+    let entries = model.projection.entries();
+    let turns = model.projection.user_row_count();
+    let tokens = model
+        .projection
+        .latest_footprint()
+        .map_or_else(|| model.projection.context_tokens(), |fp| fp.used_tokens);
+    let mut rows = vec![format!(
+        "● main · {turns} turn{} · {} tok",
+        if turns == 1 { "" } else { "s" },
+        crate::format::fmt_tok(tokens)
+    )];
+    for entry in entries {
+        match entry {
+            TranscriptEntry::User { text, .. } => {
+                let mut text = text.replace(['\n', '\r'], " ");
+                if text.chars().count() > 58 {
+                    text = text.chars().take(58).collect::<String>() + "…";
+                }
+                rows.push(format!("  ├─ ❯ {text}"));
+            }
+            TranscriptEntry::Item(block) => {
+                if let haider_protocol::item::TurnItem::ContextCompaction {
+                    tokens_before,
+                    tokens_after,
+                    ..
+                } = &block.item
+                {
+                    let detail = match (tokens_before, tokens_after) {
+                        (Some(before), Some(after)) => format!(
+                            "⊟ compacted {} → {}",
+                            crate::format::fmt_tok(*before),
+                            crate::format::fmt_tok(*after)
+                        ),
+                        _ => "⊟ context compacted".to_owned(),
+                    };
+                    rows.push(format!("  ├─ {detail}"));
+                }
+            }
+            _ => {}
+        }
+    }
+    rows
+}
+
 pub fn flatten_chips(chips: &[ChipModel]) -> Vec<(usize, &ChipModel)> {
     let mut rows = Vec::new();
     fn walk<'t>(chips: &'t [ChipModel], depth: usize, rows: &mut Vec<(usize, &'t ChipModel)>) {
@@ -1743,6 +1796,11 @@ pub struct AppModel {
     pub msg_queue: Vec<String>,
     /// `/queue turn` — mid-turn input queues instead of steering.
     pub queue_mode: bool,
+    /// ⌃G / `/tokens` context panel (sim tui.js:2946-2977) — session
+    /// surfaces only; esc closes.
+    pub token_panel: bool,
+    /// `/tree` — selected row (sim treeSel).
+    pub tree_sel: usize,
     /// Per-session voice pipeline (sim DEFAULT_VOICE — ships ON).
     pub voice: VoiceState,
     /// The ◉ talk hold is live (`◉ listening…` chip + status segment).
@@ -1929,6 +1987,8 @@ impl Default for AppModel {
     fn default() -> Self {
         Self {
             screen: Screen::Boot,
+            token_panel: false,
+            tree_sel: 0,
             theme: ThemeKey::Dawn,
             sanctum_tier: SanctumTier::default(),
             projection: SessionProjection::new(),
@@ -2162,6 +2222,7 @@ impl AppModel {
             Screen::Boot => "haider — starting".to_owned(),
             Screen::Launcher => "haider — launcher".to_owned(),
             Screen::Accounts => "haider — accounts".to_owned(),
+            Screen::Tree => "haider — session tree".to_owned(),
             Screen::Providers => "haider — providers".to_owned(),
             Screen::Session | Screen::Subagent | Screen::Aura => {
                 // Strip control characters: user text must never smuggle
@@ -2247,6 +2308,8 @@ impl AppModel {
             // Accounts: a static list — only an in-flight select animates
             // (the pending row's `…` beat).
             Screen::Accounts => self.accounts.pending_select.is_some(),
+            // Tree: a static main-line view — nothing animates.
+            Screen::Tree => false,
             Screen::Providers => self.providers.pending_default.is_some(),
             Screen::Session | Screen::Subagent => {
                 // `● thinking…` (tui.js:4458-4462) · the ⚒ running tool
@@ -2593,7 +2656,42 @@ impl AppModel {
         self.dirty = true;
     }
 
+    /// ⌃G / `/tokens` — context-by-model panel (sim tui.js:2946): session
+    /// surfaces only, a toggle, esc closes.
+    fn toggle_token_panel(&mut self) {
+        if matches!(self.screen, Screen::Session | Screen::Subagent) {
+            self.token_panel = !self.token_panel;
+        } else {
+            self.flash = Some("· /tokens — session only".to_owned());
+        }
+        self.dirty = true;
+    }
+
     fn handle_key(&mut self, key: KeyEvent) {
+        if self.screen == Screen::Tree {
+            match key.code {
+                KeyCode::Up => {
+                    self.tree_sel = self.tree_sel.saturating_sub(1);
+                    self.dirty = true;
+                }
+                KeyCode::Down => {
+                    let rows = tree_rows(self).len();
+                    self.tree_sel = (self.tree_sel + 1).min(rows.saturating_sub(1));
+                    self.dirty = true;
+                }
+                KeyCode::Esc | KeyCode::Enter => {
+                    self.screen = Screen::Session;
+                    self.dirty = true;
+                }
+                KeyCode::Char('f') => {
+                    self.flash = Some("· fork — lands with the branch wave".to_owned());
+                    self.dirty = true;
+                }
+                _ => {}
+            }
+            return;
+        }
+
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 // ⌃C is NAVIGATION (owner item 10): from any non-launcher
@@ -2611,11 +2709,8 @@ impl AppModel {
                 },
                 // Ctrl+T cycles the theme (demo stand-in for /theme).
                 KeyCode::Char('t') => self.cycle_theme(),
-                // ⌃G = the token panel (sim binding) — same honest stub.
-                KeyCode::Char('g') => {
-                    self.flash =
-                        Some("· /tokens — UI ready; lands with the daemon wave (W3)".to_owned());
-                }
+                // ⌃G = the token panel (sim tui.js binding).
+                KeyCode::Char('g') => self.toggle_token_panel(),
                 // TUI5 items 2+3 — readline editing keys, Claude Code
                 // parity: ⌃A/⌃E line edges, ⌃W word-back, ⌃K kill-to-end,
                 // ⌃U kill-to-start. Only while the composer actually owns
@@ -2783,6 +2878,13 @@ impl AppModel {
         }
         match key.code {
             KeyCode::Esc if self.screen == Screen::Session => {
+                if self.token_panel {
+                    // The panel eats the esc (sim: esc closes) — the turn
+                    // keeps running; interrupt needs a second esc.
+                    self.token_panel = false;
+                    self.dirty = true;
+                    return;
+                }
                 if self.turn_active {
                     // Esc mid-turn INTERRUPTS (sim, tui.js:2533-2539 +
                     // 1551-1567): the script stops, run → cancelled, badge
@@ -4495,17 +4597,36 @@ impl AppModel {
             }
             "quit" | "exit" => self.requests.push(AppRequest::Quit),
             "aura" => self.enter_aura(),
+            "tokens" => self.toggle_token_panel(),
+            "tree" => {
+                // W7b: the main-line tree view (sim tui.js:3366-3430).
+                if self.screen == Screen::Session {
+                    self.tree_sel = 0;
+                    self.screen = Screen::Tree;
+                    self.dirty = true;
+                } else {
+                    self.flash = Some("· /tree — session only".to_owned());
+                }
+            }
             "compact" => {
                 // Manual compaction (sim tui.js:1791-1806). Adapted gate:
                 // the sim's single-threaded state writes tolerate /compact
                 // mid-turn; the envelope demo refuses honestly instead of
                 // clobbering a live turn's run state.
                 if !self.mode.fabricates_locally() {
-                    // The compaction beat is the DEMO driver's; live mode
-                    // has no `context.compact` RPC yet, so setting
-                    // `turn_active` here parked the session mid-turn with
-                    // nothing able to clear it (W3c3.1 r2, P1-A).
-                    self.refuse_demo_only("/compact");
+                    // W7b: live /compact routes to the daemon's
+                    // receipt-backed idle-only `session.compact`. The
+                    // daemon's journal events drive every visible state
+                    // change — `turn_active` is NEVER fabricated here
+                    // (W3c3.1 r2, P1-A: that wedge parked a session
+                    // forever).
+                    if self.screen != Screen::Session {
+                        self.flash = Some("· /compact — session only".to_owned());
+                    } else if self.turn_active {
+                        self.flash = Some("· /compact — wait for the turn to end".to_owned());
+                    } else {
+                        self.requests.push(AppRequest::Compact);
+                    }
                 } else if self.screen != Screen::Session {
                     self.flash = Some("· /compact — session only".to_owned());
                 } else if self.turn_active {
@@ -4701,7 +4822,7 @@ impl AppModel {
             other => {
                 // Known stubs name their wave; typos say so (review r1 P2).
                 let wave = match other {
-                    "tree" | "fork" | "rename" | "tokens" => Some("the daemon wave (W3)"),
+                    "fork" | "rename" => Some("the daemon wave (W3)"),
                     "peers" => Some("the mesh wave (post-v0.1)"),
                     "hooks" | "update" => Some("the gates wave (W4)"),
                     _ => None,

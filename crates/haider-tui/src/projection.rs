@@ -195,6 +195,10 @@ pub struct SessionProjection {
     menu_owner: std::collections::HashMap<haider_protocol::ids::MenuId, MenuScopeOwner>,
     todos: Option<TodoPanel>,
     usage: Option<Usage>,
+    /// Latest durable context-occupancy snapshot (W7b), consumed from the
+    /// journal's `context_footprint_v1` extension items — never a
+    /// transcript row (one arrives per provider round).
+    latest_footprint: Option<haider_protocol::context::ContextFootprint>,
     /// A voice turn is live: blocks started now render ` · ♪ speaking`
     /// (demo-local — set by the driver's Voice beats, never an envelope).
     voice_live: bool,
@@ -395,6 +399,9 @@ impl SessionProjection {
     }
 
     fn apply_item(&mut self, event: &ItemEvent) {
+        if self.consume_context_extension(event) {
+            return;
+        }
         match event {
             ItemEvent::Started { item_id, item } => {
                 // Idempotency: a closed id never restarts, an open id never
@@ -700,6 +707,66 @@ impl SessionProjection {
     /// exact per-provider window accounting lands with the real adapters.
     /// Saturating: adversarial usage frames must not panic the meter.
     #[must_use]
+    /// W7b: context extensions are CONSUMED, never transcript rows. A
+    /// footprint snapshot feeds the meter and /tokens; the compaction
+    /// intent marker becomes the pre-announce note (sim tui.js:3922
+    /// vocabulary family). Returns true when the event was swallowed.
+    fn consume_context_extension(&mut self, event: &ItemEvent) -> bool {
+        let (item_id, item, completed) = match event {
+            ItemEvent::Started { item_id, item } => (item_id, item, false),
+            ItemEvent::Completed { item_id, item } => (item_id, item, true),
+            ItemEvent::Delta { .. } => return false,
+        };
+        let TurnItem::Extension { kind, .. } = item else {
+            return false;
+        };
+        let footprint = haider_protocol::context::ContextFootprint::from_extension_item(item);
+        let intent = kind == haider_protocol::history::COMPACTION_INTENT_EXTENSION_KIND;
+        if footprint.is_none() && !intent {
+            return false;
+        }
+        if !completed {
+            // The Started half of the marker batch: swallow without
+            // opening a streaming block.
+            return true;
+        }
+        if !self.finished_items.insert(item_id.clone()) {
+            self.duplicate_items += 1;
+            return true;
+        }
+        if let Some(footprint) = footprint {
+            self.latest_footprint = Some(footprint);
+            return true;
+        }
+        // Pre-announce (research §Q2: the sim's `· context at 85% —
+        // compacting` line): percent from the latest snapshot when the
+        // window is known; the honest count-free line otherwise.
+        let note = self
+            .latest_footprint
+            .as_ref()
+            .and_then(|footprint| {
+                let window = footprint.context_window?;
+                (window > 0).then(|| {
+                    format!(
+                        "· context at {}% — compacting (summary retained · originals stay in /tree)",
+                        footprint.used_tokens.saturating_mul(100) / window
+                    )
+                })
+            })
+            .unwrap_or_else(|| {
+                "· compacting — summary retained · originals stay in /tree".to_owned()
+            });
+        self.push_note(note);
+        true
+    }
+
+    /// Latest context-occupancy snapshot (W7b) — the meter and /tokens
+    /// truth source in live mode.
+    #[must_use]
+    pub fn latest_footprint(&self) -> Option<&haider_protocol::context::ContextFootprint> {
+        self.latest_footprint.as_ref()
+    }
+
     pub fn context_tokens(&self) -> u64 {
         self.usage.as_ref().map_or(0, |u| {
             u.input
