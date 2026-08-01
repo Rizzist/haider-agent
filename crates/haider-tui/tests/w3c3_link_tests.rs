@@ -954,3 +954,28 @@ fn models_refresh_error_maps_to_the_row_scoped_reply() {
         "got {replies:?}"
     );
 }
+
+/// MUTATION CHECK: drop the automode overrides from the session-create
+/// mapping. Expected RUNTIME failure: the assertion below (owner
+/// directive: the interactive surface never opens write/exec approval
+/// menus).
+#[test]
+fn tui_session_create_carries_automode_overrides() {
+    let body = request_body(LiveCommand::Create {
+        command_id: haider_rpc::CommandId::new("automode-create"),
+        cwd: "/tmp".into(),
+        provider: "fake".into(),
+        model: "fake-model".into(),
+        max_tokens: 4096,
+        first_text: "hi".into(),
+    });
+    match body {
+        haider_rpc::RequestBody::SessionCreateWithPermissionOverrides {
+            permission_overrides: Some(overrides),
+            ..
+        } => {
+            assert!(overrides.allow_writes && overrides.allow_exec);
+        }
+        other => panic!("create must carry automode overrides, got {other:?}"),
+    }
+}

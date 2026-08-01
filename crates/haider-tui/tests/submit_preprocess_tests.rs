@@ -593,3 +593,40 @@ fn status_bar_shows_q_turn_while_queue_mode_holds() {
             .any(|row| row.contains("fable-5 · anthropic · main · q:turn"))
     );
 }
+
+/// MUTATION CHECK: drop the zero-option ask interception from the
+/// composer submit. Expected RUNTIME failure: the typed answer becomes a
+/// model TURN instead of the menu answer (owner report: the resistor
+/// question was unanswerable).
+#[test]
+fn a_zero_option_ask_consumes_the_composer_text_as_its_answer() {
+    let mut model = session_model();
+    model.mode = haider_tui::app::RuntimeMode::Live;
+    model
+        .projection
+        .apply(&EventPayload::MenuOpened(haider_protocol::menu::Menu {
+            id: haider_protocol::ids::MenuId::new("ask-1"),
+            kind: haider_protocol::menu::MenuKind::Question,
+            title: "which board?".to_owned(),
+            body: vec![],
+            options: vec![],
+            blocking: true,
+            scope: haider_protocol::menu::MenuScope::Session,
+            origin: "request_input".to_owned(),
+            ttl_ms: None,
+            timeout_option: None,
+        }));
+    for c in "blinkyboard R1".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Enter));
+    let answer = model.outbox.pop().expect("the ask consumed the text");
+    assert_eq!(answer.answer.value.as_deref(), Some("blinkyboard R1"));
+    assert_eq!(answer.answer.option_index, 0);
+    assert!(answer.answer.option_key.is_none());
+    assert!(
+        model.requests.is_empty(),
+        "an ask answer is never a turn: {:?}",
+        model.requests
+    );
+}
