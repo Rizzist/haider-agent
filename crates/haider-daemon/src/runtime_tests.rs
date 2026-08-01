@@ -347,9 +347,22 @@ async fn child_done_parent_wait_crash_recovers_the_same_logical_turn() {
         .expect("append child done");
     store.close().await.expect("close generation one");
 
-    let recovered_store = SqliteStoreHandle::open(root.path())
-        .await
-        .expect("open generation two");
+    // `close()` can return before the profile lock fully releases under
+    // parallel test load (StoreLocked is self-declared RETRYABLE) —
+    // bounded retry instead of a race flake (gate27 hygiene precedent).
+    let recovered_store = {
+        let mut attempt = 0;
+        loop {
+            match SqliteStoreHandle::open(root.path()).await {
+                Ok(store) => break store,
+                Err(error) if error.retryable && attempt < 40 => {
+                    attempt += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                Err(error) => panic!("open generation two: {error:?}"),
+            }
+        }
+    };
     let work = recover_interrupted_turns(&recovered_store, &device_id)
         .await
         .expect("recover turns");
