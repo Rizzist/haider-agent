@@ -110,19 +110,17 @@ impl SessionState {
         crate::app::tree_live_count(&self.chips)
     }
 
-    /// Sim `sessionBusy` (tui.js:789-792): live chips OR a non-idle run
-    /// state. `IDLE_I` counts as busy there (only plain idle is excluded);
-    /// the projection's badge speaks the same vocabulary.
+    /// Sim `sessionBusy` (tui.js:789-792): live chips OR a non-terminal
+    /// run state.
     ///
-    /// `✗ ERRORED` is carved OUT (owner report, W5f-0): it is a TERMINAL
-    /// state the sim only ever held for 1.8s, so "non-idle badge → busy"
-    /// silently dressed a dead live turn as `running…` on the launcher —
-    /// forever, gold pulse and all.
+    /// TWO sim beats are carved out as TERMINAL (both owner reports):
+    /// `✗ ERRORED` (W5f-0 — the sim held it 1.8s; permanent here) and
+    /// `⏸ IDLE (i)` (the interrupt marker is history, not activity — the
+    /// old badge-string comparison against plain `IDLE` dressed every
+    /// visited-then-interrupted session as `running…` forever).
     #[must_use]
     pub fn busy(&self) -> bool {
-        self.live() > 0
-            || self.turn_active
-            || (self.projection.badge() != "IDLE" && !self.projection.run_errored())
+        self.live() > 0 || self.turn_active || !self.projection.settled()
     }
 
     /// The row's honest third state: the last turn DIED and nothing has

@@ -654,6 +654,20 @@ impl SessionProjection {
         }
     }
 
+    /// Terminal rest, idle(i) INCLUDED: no run, or the last run reached
+    /// Done/Cancelled/Errored. The interrupt marker is HISTORY, not
+    /// activity (owner report: a visited-then-left session wore
+    /// `running…` on the launcher forever because `⏸ IDLE (i)` failed a
+    /// string comparison against plain `IDLE`).
+    #[must_use]
+    pub fn settled(&self) -> bool {
+        !matches!(self.harness, Some(HarnessStatus::Starting { .. }))
+            && matches!(
+                &self.run,
+                None | Some(RunState::Done | RunState::Cancelled | RunState::Errored)
+            )
+    }
+
     fn idle_label(&self) -> String {
         if self.interrupted {
             "⏸ IDLE (i)".to_owned()

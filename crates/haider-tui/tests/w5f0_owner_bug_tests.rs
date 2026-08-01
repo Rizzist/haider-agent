@@ -211,3 +211,30 @@ fn the_sessions_listing_names_the_errored_state() {
         "and must not claim it runs: {listing:?}"
     );
 }
+
+/// Owner report (v0.0.38 era): a visited-then-interrupted session wore
+/// `running…` on the launcher forever — `⏸ IDLE (i)` failed the busy
+/// check's string comparison against plain `IDLE`. The interrupt marker
+/// is HISTORY, not activity.
+/// MUTATION CHECK: restore `badge() != "IDLE"` in `SessionState::busy`.
+/// Expected RUNTIME failure: the not-busy assertion below.
+#[test]
+fn an_interrupted_idle_session_is_not_busy_on_the_launcher() {
+    let mut entry = SessionState::neutral(SessionId::new("s-idle-i"), UiGeneration::SCRATCH);
+    entry.name = Some("session".to_owned());
+    entry.absorb_envelope(&EventPayload::UserMessage {
+        text: "hi".to_owned(),
+        attachments: Vec::new(),
+        mode: DeliveryMode::Steer,
+    });
+    assert!(
+        entry.busy(),
+        "a live turn IS busy — the fix must not eat it"
+    );
+    entry.absorb_envelope(&EventPayload::RunState(RunState::Cancelled));
+    assert_eq!(entry.projection.badge(), "⏸ IDLE (i)");
+    assert!(
+        !entry.busy(),
+        "idle(i) is TERMINAL rest — never `running…` on the launcher"
+    );
+}
