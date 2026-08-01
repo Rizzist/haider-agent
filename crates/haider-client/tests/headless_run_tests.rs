@@ -237,13 +237,13 @@ async fn respond_create_and_attach(
 
 async fn accept_submit(peer: &mut Peer, session_id: &SessionId) -> (RequestId, RunId) {
     let (request_id, submit) = peer.request().await;
-    let RequestBody::TurnSubmit {
+    let RequestBody::TurnSubmitWithBranch {
         session_id: submitted,
         worker_generation,
         ..
     } = submit
     else {
-        panic!("expected turn.submit after attach barrier");
+        panic!("expected turn.submit after attach barrier, got {submit:?}");
     };
     assert_eq!(&submitted, session_id);
     assert_eq!(worker_generation, 7);
@@ -609,7 +609,7 @@ async fn submit_response_loss_reconnects_buffers_replay_and_retries_same_command
         let mut first = accept_peer(&listener, handshake.clone()).await;
         let (session_id, _) = accept_create_and_attach(&mut first).await;
         let (_, submit) = first.request().await;
-        let RequestBody::TurnSubmit {
+        let RequestBody::TurnSubmitWithBranch {
             command_id: original_command,
             ..
         } = submit
@@ -675,7 +675,7 @@ async fn submit_response_loss_reconnects_buffers_replay_and_retries_same_command
             .await;
 
         let (retry_request, retry) = second.request().await;
-        let RequestBody::TurnSubmit {
+        let RequestBody::TurnSubmitWithBranch {
             command_id: retry_command,
             ..
         } = retry
@@ -756,7 +756,7 @@ async fn withheld_submit_response_is_recovered_and_durably_cancelled() {
         let mut first = accept_peer(&listener, handshake.clone()).await;
         let (session_id, _) = accept_create_and_attach(&mut first).await;
         let (_, submit) = first.request().await;
-        let RequestBody::TurnSubmit {
+        let RequestBody::TurnSubmitWithBranch {
             command_id: original_command,
             ..
         } = submit
@@ -797,7 +797,7 @@ async fn withheld_submit_response_is_recovered_and_durably_cancelled() {
             })
             .await;
         let (retry_request, retry) = second.request().await;
-        let RequestBody::TurnSubmit {
+        let RequestBody::TurnSubmitWithBranch {
             command_id: retry_command,
             ..
         } = retry
