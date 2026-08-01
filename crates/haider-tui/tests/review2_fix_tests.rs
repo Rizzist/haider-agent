@@ -162,8 +162,12 @@ async fn stale_idle_decay_never_lands_in_a_fresh_session() {
     drain(&mut driver, &mut model);
     assert!(model.projection.interrupted());
 
-    // Fresh session B within the window (esc to launcher, type, submit).
-    model.handle(key(KeyCode::Esc));
+    // Fresh session B within the window (⌃C to launcher — esc is
+    // session-scoped now (owner directive) — type, submit).
+    model.handle(AppEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+        KeyCode::Char('c'),
+        ratatui::crossterm::event::KeyModifiers::CONTROL,
+    )));
     for c in "start something new".chars() {
         model.handle(key(KeyCode::Char(c)));
     }

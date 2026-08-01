@@ -524,12 +524,21 @@ pub fn request_body(command: LiveCommand) -> RequestBody {
             model,
             max_tokens,
             ..
-        } => RequestBody::SessionCreate {
+        } => RequestBody::SessionCreateWithPermissionOverrides {
             command_id,
             cwd,
             provider,
             model,
             max_tokens,
+            // OWNER DIRECTIVE: the interactive surface runs in AUTO mode
+            // (like pi) — writes/exec never open approval menus. The W8
+            // machinery stays for request_input and future policy modes.
+            permission_overrides: Some(
+                haider_rpc::haider_protocol::session::SessionPermissionOverridesV1 {
+                    allow_writes: true,
+                    allow_exec: true,
+                },
+            ),
         },
         LiveCommand::Submit {
             command_id,

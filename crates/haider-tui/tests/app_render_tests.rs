@@ -177,12 +177,22 @@ fn reducer_handles_quit_composer_and_navigation() {
     assert_eq!(model.composer, "");
 
     assert_eq!(model.screen, Screen::Session);
-    // Esc mid-turn INTERRUPTS and stays (G40, sim parity); the next esc,
-    // now idle, walks back to the launcher.
+    // Esc mid-turn INTERRUPTS and stays; OWNER DIRECTIVE: esc is
+    // SESSION-SCOPED — the idle esc also stays (a hint names the real
+    // back affordances); ⌃C remains the keyboard walk-back.
     model.handle(key(KeyCode::Esc));
     assert_eq!(model.screen, Screen::Session, "mid-turn esc interrupts");
     assert!(model.projection.interrupted(), "idle (i) marker set");
     model.handle(key(KeyCode::Esc));
+    assert_eq!(model.screen, Screen::Session, "idle esc never navigates");
+    assert!(
+        model
+            .flash
+            .as_deref()
+            .is_some_and(|flash| flash.contains("← main")),
+        "the hint names the back affordance"
+    );
+    model.handle(ctrl('c'));
     assert_eq!(model.screen, Screen::Launcher);
     // TUI4c (directed): this transcript came from RAW envelopes — a
     // scratch surface with no session id — so leaving discarded it and
@@ -457,7 +467,10 @@ fn typed_text_starts_a_session_and_requests_a_turn() {
     assert_eq!(model.session_name.as_deref(), Some("refactor-the-parser"));
     assert_eq!(
         model.window_title(),
-        "haider — refactor-the-parser · this-mac"
+        format!(
+            "haider — refactor-the-parser · {}",
+            haider_tui::app::local_device_name()
+        )
     );
 }
 

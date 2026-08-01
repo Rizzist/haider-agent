@@ -374,13 +374,14 @@ async fn a_talk_hold_cancelled_by_esc_never_starts_a_session() {
     model.handle_hit(Hit::TalkChip);
     assert!(model.listening);
     drain(&mut driver, &mut model);
-    // Idle Esc walks back to the launcher — and cancels the hold.
+    // Idle Esc stays session-scoped (owner directive) — and still
+    // cancels the hold (P1-3's core law).
     model.handle(key(KeyCode::Esc));
-    assert_eq!(model.screen, Screen::Launcher);
+    assert_eq!(model.screen, Screen::Session, "esc never navigates");
     assert!(!model.listening, "Esc cancels the hold");
     let rows = model.projection.entries().len();
     pump_quiet(&mut driver, &mut rx, &mut model, 4_000).await;
-    assert_eq!(model.screen, Screen::Launcher, "no session was conjured");
+    assert_eq!(model.screen, Screen::Session, "no navigation was conjured");
     assert_eq!(model.projection.entries().len(), rows, "no canned turn ran");
     assert!(!model.projection.entries().iter().any(|entry| matches!(
         entry,

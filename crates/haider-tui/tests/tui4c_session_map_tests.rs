@@ -164,7 +164,11 @@ fn interrupt_marks_only_its_own_session_and_survives_a_round_trip() {
     model.handle(key(KeyCode::Esc)); // mid-turn esc = interrupt
     assert!(model.projection.interrupted(), "idle (i)");
     let first = model.active_session.clone().expect("attached");
-    model.handle(key(KeyCode::Esc)); // idle esc = leave
+    // ⌃C leaves (esc is session-scoped now — owner directive).
+    model.handle(AppEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+        KeyCode::Char('c'),
+        ratatui::crossterm::event::KeyModifiers::CONTROL,
+    )));
     assert_eq!(model.screen, Screen::Launcher);
 
     submit(&mut model, "second task here");

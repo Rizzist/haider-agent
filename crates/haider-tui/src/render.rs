@@ -1439,11 +1439,28 @@ fn render_session(
     let menu = if model.login.is_some() {
         None
     } else {
-        model.projection.open_menu()
+        // A zero-option ask never REPLACES the composer — the composer is
+        // its answer line (owner report: select-only chrome rendered an
+        // unanswerable question). Its title/body render above the input.
+        model
+            .projection
+            .open_menu()
+            .filter(|menu| !menu.options.is_empty())
     };
+    let ask_menu = if model.login.is_some() {
+        None
+    } else {
+        model
+            .projection
+            .open_menu()
+            .filter(|menu| menu.options.is_empty())
+    };
+    let ask_rows: u16 = ask_menu.map_or(0, |menu| {
+        u16::try_from(2 + menu.body.len()).unwrap_or(u16::MAX)
+    });
     let menu_wrapped_body_rows = menu.map_or(0, |m| wrapped_menu_body(m, area.width).len());
     let needed_input = menu.map_or_else(
-        || composer_height(model, area.width),
+        || composer_height(model, area.width).saturating_add(ask_rows),
         |m| u16::try_from(1 + menu_wrapped_body_rows + m.options.len() + 1).unwrap_or(u16::MAX),
     );
     // What the input may claim: everything beyond header(2) + header
@@ -2023,6 +2040,32 @@ fn render_session(
                 ));
             }
         }
+    } else if let Some(ask) = ask_menu.filter(|_| composer_area.height > ask_rows) {
+        let ask_area = Rect {
+            x: composer_area.x,
+            y: composer_area.y,
+            width: composer_area.width,
+            height: ask_rows.min(composer_area.height),
+        };
+        let mut ask_lines = vec![Line::from(vec![
+            Span::styled("? ", theme.warn_style()),
+            Span::styled(ask.title.clone(), theme.warn_style()),
+        ])];
+        for line in &ask.body {
+            ask_lines.push(Line::styled(line.clone(), theme.text_style()));
+        }
+        ask_lines.push(Line::styled(
+            "type your answer below · ⏎ answers · esc interrupts",
+            theme.dim_style(),
+        ));
+        frame.render_widget(Paragraph::new(ask_lines), ask_area);
+        let shifted = Rect {
+            x: composer_area.x,
+            y: composer_area.y + ask_area.height,
+            width: composer_area.width,
+            height: composer_area.height - ask_area.height,
+        };
+        render_composer(model, theme, frame, rule_area, shifted, hits);
     } else {
         render_composer(model, theme, frame, rule_area, composer_area, hits);
     }

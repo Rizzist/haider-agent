@@ -607,7 +607,7 @@ impl ChipModel {
             .iter()
             .find(|(name, _, _)| *name == callsign);
         let device = match &manifest.placement {
-            haider_protocol::agent::Placement::Local => "this-mac".to_owned(),
+            haider_protocol::agent::Placement::Local => local_device_name().to_owned(),
             haider_protocol::agent::Placement::Device { device } => device.as_str().to_owned(),
         };
         Self {
@@ -914,6 +914,23 @@ pub fn remove_chip(chips: &mut Vec<ChipModel>, agent: &str) -> bool {
 /// `/tree` rows (sim tui.js:3390-3421 vocabulary, main line only): the
 /// branch header, then one node per user turn (`├─ ❯`) and per ⊟
 /// compaction row already in the transcript.
+/// The short host name (uname nodename up to the first dot) — the sim's
+/// `this-mac` made real (owner ask). Cached; the placeholder survives
+/// only if the kernel offers nothing.
+pub fn local_device_name() -> &'static str {
+    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        let uname = rustix::system::uname();
+        let node = uname.nodename().to_string_lossy();
+        let short = node.split('.').next().unwrap_or("").trim().to_lowercase();
+        if short.is_empty() {
+            "this-mac".to_owned()
+        } else {
+            short
+        }
+    })
+}
+
 pub fn tree_rows(model: &AppModel) -> Vec<String> {
     use crate::projection::TranscriptEntry;
     let entries = model.projection.entries();
@@ -1764,7 +1781,7 @@ impl Default for IdentityLine {
             provider: "anthropic".to_owned(),
             model_short: "fable-5".to_owned(),
             account: "none · /login".to_owned(),
-            device: "this-mac".to_owned(),
+            device: local_device_name().to_owned(),
             context_window: 200_000,
         }
     }
@@ -2388,7 +2405,15 @@ impl AppModel {
         }
         // A menu REPLACES the composer, palette included — the session's
         // card on the session screen, the chip's question in its view.
-        if self.screen == Screen::Session && self.projection.open_menu().is_some() {
+        if self.screen == Screen::Session
+            && self
+                .projection
+                .open_menu()
+                .is_some_and(|menu| !menu.options.is_empty())
+        {
+            // A SELECT menu replaces the composer; a zero-option free-text
+            // ask KEEPS it — the composer is the answer line (owner
+            // report: the resistor question rendered unanswerable).
             return false;
         }
         !(self.screen == Screen::Subagent
@@ -2559,7 +2584,12 @@ impl AppModel {
                 }
                 // While a blocking menu replaces the composer, paste has no
                 // target (r2 P2).
-                if self.projection.open_menu().is_some() && self.screen == Screen::Session {
+                if self.screen == Screen::Session
+                    && self
+                        .projection
+                        .open_menu()
+                        .is_some_and(|menu| !menu.options.is_empty())
+                {
                     return;
                 }
                 // Sim thresholds measure the RAW clipboard — UTF-16 code
@@ -2824,8 +2854,14 @@ impl AppModel {
             self.handle_providers_key(key.code);
             return;
         }
-        // A blocking menu REPLACES the composer (sim §3 law).
-        if self.projection.open_menu().is_some() && self.screen == Screen::Session {
+        // A SELECT menu replaces the composer (sim §3 law); a zero-option
+        // free-text ask leaves the keys to the composer.
+        if self.screen == Screen::Session
+            && self
+                .projection
+                .open_menu()
+                .is_some_and(|menu| !menu.options.is_empty())
+        {
             self.handle_menu_key(key.code);
             return;
         }
@@ -2946,7 +2982,13 @@ impl AppModel {
                             .push_note("· interrupted — run → cancelled · idle (i)".to_owned());
                     }
                 } else {
-                    self.back_to_launcher();
+                    // OWNER DIRECTIVE: esc is SESSION-SCOPED — it
+                    // interrupts, cancels menus and a held talk (P1-3's
+                    // hold-cancel law survives the navigation change),
+                    // never navigates. Back is `← main` (and ⌃C).
+                    self.listening = false;
+                    self.flash = Some("· back — click ← main (or ⌃C)".to_owned());
+                    self.dirty = true;
                 }
             }
             KeyCode::Enter => self.submit_composer(),
@@ -3062,7 +3104,15 @@ impl AppModel {
         if self.screen == Screen::Boot || self.help_open {
             return false;
         }
-        if self.screen == Screen::Session && self.projection.open_menu().is_some() {
+        if self.screen == Screen::Session
+            && self
+                .projection
+                .open_menu()
+                .is_some_and(|menu| !menu.options.is_empty())
+        {
+            // A SELECT menu replaces the composer; a zero-option free-text
+            // ask KEEPS it — the composer is the answer line (owner
+            // report: the resistor question rendered unanswerable).
             return false;
         }
         !(self.screen == Screen::Subagent
@@ -3121,6 +3171,28 @@ impl AppModel {
             if self.aura.state == AuraState::Idle {
                 self.aura_submit(text, false);
             }
+            return;
+        }
+        // W6d (owner report): a zero-option Question/File menu is a
+        // free-text ask — the composer text IS the answer (value rides
+        // the wire's input; empty key + index 0 satisfy the option-less
+        // validation arm).
+        if self.screen == Screen::Session
+            && let Some(menu) = self.projection.open_menu()
+            && menu.options.is_empty()
+        {
+            let answer = MenuAnswer {
+                menu: menu.id.clone(),
+                option_key: None,
+                option_index: 0,
+                value: Some(text.clone()),
+                via: AnswerVia::Tui,
+            };
+            self.outbox.push(OutboundAnswer {
+                origin: self.ui_generation(),
+                answer,
+            });
+            self.dirty = true;
             return;
         }
         // W8b: the literal `!` escape (research Q3). LIVE only — the
@@ -5076,8 +5148,10 @@ impl AppModel {
             return;
         };
         let option_count = menu.options.len();
-        // Esc is SWALLOWED for blocking cards (sim menu law); non-blocking
-        // command cards (/voice, /tools) dismiss.
+        // OWNER DIRECTIVE (supersedes the sim's swallow law): esc on a
+        // blocking card INTERRUPTS the run — the daemon's cancellation
+        // closes the menu and the committed note lands in the transcript.
+        // Non-blocking command cards (/voice, /tools) still just dismiss.
         if code == KeyCode::Esc {
             if !menu.blocking {
                 let id = menu.id.clone();
@@ -5085,7 +5159,24 @@ impl AppModel {
                     menu: id,
                     reason: MenuCloseReason::Dismissed,
                 });
+                return;
             }
+            self.turn_active = false;
+            self.listening = false;
+            self.msg_queue.clear();
+            self.requests.push(AppRequest::Interrupt);
+            if self.mode.fabricates_locally() {
+                let id = menu.id.clone();
+                self.projection.apply(&EventPayload::MenuClosed {
+                    menu: id,
+                    reason: MenuCloseReason::Dismissed,
+                });
+                self.projection
+                    .apply(&EventPayload::RunState(RunState::Cancelled));
+                self.projection
+                    .push_note("· interrupted — menu cancelled · idle (i)".to_owned());
+            }
+            self.dirty = true;
             return;
         }
         match code {

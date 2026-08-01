@@ -276,7 +276,21 @@ pub fn apply_agent_payload(chips: &mut Vec<ChipModel>, payload: &EventPayload) {
             if crate::app::find_chip_mut(chips, manifest.agent.as_str()).is_some() {
                 return;
             }
-            let chip = ChipModel::from_manifest(manifest);
+            let mut chip = ChipModel::from_manifest(manifest);
+            if manifest.callsign.is_none() {
+                // W6d (owner ask): live children claim honor-roll
+                // callsigns exactly like the sim — deterministically from
+                // journal order (replay/reload re-derive the same name;
+                // the wire stays additive: a future daemon-minted
+                // callsign simply wins).
+                let index = crate::script::ROSTER_FIRST_CLAIM
+                    + crate::app::flatten_chips(chips).len() as u64;
+                let roster = crate::script::roster_at(index);
+                chip.ros = Some(roster.ros);
+                chip.callsign = roster.callsign;
+                chip.hon = roster.hon;
+                chip.full = roster.full;
+            }
             match manifest
                 .parent
                 .as_ref()

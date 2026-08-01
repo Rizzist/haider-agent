@@ -7,6 +7,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+rustix = { version = "1", features = ["system"] }
 haider-protocol = { path = "../haider-protocol" }
 haider-rpc = { path = "../haider-rpc" }
 haider-client = { path = "../haider-client" }

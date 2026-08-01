@@ -22,7 +22,7 @@ use haider_protocol::provider::{Block, CapabilityDoc, FinishReason};
 use haider_protocol::session::SessionMetadataV1;
 use haider_protocol::state::{RunState, WaitReason};
 use haider_provider::{
-    FakeProvider, FakeStep, Provider, ProviderError, ProviderStream, TurnRequest,
+    FakeInputKind, FakeProvider, FakeStep, Provider, ProviderError, ProviderStream, TurnRequest,
 };
 use haider_rpc::{
     AttachMode, Capability, CapabilitySet, ClientKind, CommandId, Hello, RequestBody, RequestId,
@@ -319,6 +319,22 @@ async fn production_spawn_effect_wait_and_report_chain_is_end_to_end() {
             || event.agent_id.as_ref() == Some(&spawned.agent)
     }));
 
+    // OWNER DIRECTIVE (W6d): delegation is AUTOMATIC — the child is
+    // created with writes+exec pre-allowed regardless of the parent's own
+    // overrides (the parent here carries None), so a child tool call can
+    // never park on a human.
+    // MUTATION CHECK: inherit the parent's overrides (or None) in
+    // `spawn_child`'s create — this assertion fails.
+    let child_metadata = store
+        .session_metadata(&delegation.child_session_id)
+        .await
+        .expect("child metadata read")
+        .expect("child metadata present");
+    let overrides = child_metadata
+        .permission_overrides
+        .expect("child overrides present");
+    assert!(overrides.allow_writes && overrides.allow_exec);
+
     manager.shutdown().await.expect("manager shutdown");
     hub.shutdown().await.expect("hub shutdown");
     store.close().await.expect("store close");
@@ -402,12 +418,12 @@ fn typed_payloads(events: &[haider_protocol::envelope::RawEnvelope]) -> Vec<Even
         .collect()
 }
 
-enum PermissionChildMode {
+enum ParkedChildMode {
     Complete,
     StallAfterApproval,
 }
 
-struct PermissionChildHarness {
+struct ParkedChildHarness {
     _root: tempfile::TempDir,
     store: SqliteStoreHandle,
     hub: SessionHub,
@@ -418,11 +434,11 @@ struct PermissionChildHarness {
     request_seq: u64,
 }
 
-async fn start_permission_child(
+async fn start_parked_child(
     label: &str,
-    mode: PermissionChildMode,
+    mode: ParkedChildMode,
     stall_deadline: Duration,
-) -> PermissionChildHarness {
+) -> ParkedChildHarness {
     let root = tempfile::tempdir().expect("temp profile");
     let store = SqliteStoreHandle::open(root.path()).await.expect("store");
     let mut script = vec![
@@ -434,20 +450,25 @@ async fn start_permission_child(
         FakeStep::Finish {
             reason: FinishReason::ToolUse,
         },
-        FakeStep::EmitToolCall {
-            call_id: format!("{label}-exec"),
-            name: "process_exec".into(),
-            args: serde_json::json!({"command":"printf w6d-approved"}),
+        // W6d owner directive: children are AUTO-ALLOWED for writes/exec —
+        // a permission park is unreachable. The parked-on-human laws ride
+        // the still-real `request_input` (InputRequired) park instead.
+        FakeStep::EmitRequestInput {
+            call_id: format!("{label}-ask"),
+            kind: FakeInputKind::Question,
+            title: "which value?".into(),
+            body: Vec::new(),
+            options: Vec::new(),
         },
         FakeStep::Finish {
             reason: FinishReason::ToolUse,
         },
         FakeStep::ExpectToolResult {
-            call_id: format!("{label}-exec"),
+            call_id: format!("{label}-ask"),
         },
     ];
     match mode {
-        PermissionChildMode::Complete => script.extend([
+        ParkedChildMode::Complete => script.extend([
             FakeStep::EmitText {
                 text: "child continued after permission".into(),
             },
@@ -455,7 +476,7 @@ async fn start_permission_child(
                 reason: FinishReason::EndTurn,
             },
         ]),
-        PermissionChildMode::StallAfterApproval => script.push(FakeStep::Hang),
+        ParkedChildMode::StallAfterApproval => script.push(FakeStep::Hang),
     }
     script.extend([
         FakeStep::ExpectToolResult {
@@ -508,7 +529,7 @@ async fn start_permission_child(
         .pop()
         .expect("permission child");
     wait_for_state(&store, &child.child_session_id, |state| {
-        matches!(state, RunState::PermissionRequired { .. })
+        matches!(state, RunState::InputRequired { .. })
     })
     .await;
     let events = store
@@ -521,10 +542,7 @@ async fn start_permission_child(
             let payload = serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok()?;
             match payload {
                 EventPayload::MenuOpened(menu)
-                    if matches!(
-                        menu.kind,
-                        haider_protocol::menu::MenuKind::Permission { .. }
-                    ) =>
+                    if matches!(menu.kind, haider_protocol::menu::MenuKind::Question) =>
                 {
                     Some((menu, envelope.seq))
                 }
@@ -532,7 +550,7 @@ async fn start_permission_child(
             }
         })
         .expect("permission menu and opening sequence");
-    PermissionChildHarness {
+    ParkedChildHarness {
         _root: root,
         store,
         hub,
@@ -683,7 +701,7 @@ impl UdsControlClient {
         }
     }
 
-    async fn approve_once(
+    async fn answer_question(
         &mut self,
         session_id: SessionId,
         menu_id: MenuId,
@@ -698,9 +716,13 @@ impl UdsControlClient {
             menu_id,
             request_seq,
             worker_generation,
-            option_key: "approve_once".into(),
+            // A zero-option Question menu: empty key, index 0, the typed
+            // text rides `input` (the store's option-less validation arm).
+            option_key: "".into(),
             option_index: 0,
-            input: None,
+            input: Some(haider_rpc::MenuInput::Text {
+                text: "w6d-answer".into(),
+            }),
         })
         .await;
         loop {
@@ -777,9 +799,9 @@ async fn wait_for_chip(
 /// the exact PermissionRequired chip for the delegated agent.
 #[tokio::test]
 async fn child_permission_park_is_visible_in_the_parent_chip_journal() {
-    let harness = start_permission_child(
+    let harness = start_parked_child(
         "permission-chip",
-        PermissionChildMode::Complete,
+        ParkedChildMode::Complete,
         Duration::from_secs(30),
     )
     .await;
@@ -787,7 +809,7 @@ async fn child_permission_park_is_visible_in_the_parent_chip_journal() {
         &harness.store,
         &harness.parent_session,
         &harness.child.agent_id,
-        ChipState::PermissionRequired,
+        ChipState::InputRequired,
     )
     .await;
 
@@ -802,9 +824,9 @@ async fn child_permission_park_is_visible_in_the_parent_chip_journal() {
 /// exactly one nudge and cancellation after unpark.
 #[tokio::test]
 async fn permission_park_pauses_stall_supervision_and_unpark_rearms_it() {
-    let harness = start_permission_child(
+    let harness = start_parked_child(
         "permission-stall",
-        PermissionChildMode::StallAfterApproval,
+        ParkedChildMode::StallAfterApproval,
         Duration::from_millis(35),
     )
     .await;
@@ -831,7 +853,7 @@ async fn permission_park_pauses_stall_supervision_and_unpark_rearms_it() {
         .attach_control(harness.child.child_session_id.clone())
         .await;
     control
-        .approve_once(
+        .answer_question(
             harness.child.child_session_id.clone(),
             harness.menu.id.clone(),
             harness.request_seq,
@@ -877,9 +899,9 @@ async fn permission_park_pauses_stall_supervision_and_unpark_rearms_it() {
 /// child never reaches Done, or the parent never collects the child's report.
 #[tokio::test]
 async fn control_attach_and_menu_answer_over_uds_complete_a_child_session() {
-    let harness = start_permission_child(
+    let harness = start_parked_child(
         "permission-uds",
-        PermissionChildMode::Complete,
+        ParkedChildMode::Complete,
         Duration::from_secs(30),
     )
     .await;
@@ -888,7 +910,7 @@ async fn control_attach_and_menu_answer_over_uds_complete_a_child_session() {
         .attach_control(harness.child.child_session_id.clone())
         .await;
     control
-        .approve_once(
+        .answer_question(
             harness.child.child_session_id.clone(),
             harness.menu.id.clone(),
             harness.request_seq,

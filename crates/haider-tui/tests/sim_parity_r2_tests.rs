@@ -110,10 +110,11 @@ fn esc_mid_turn_interrupts_and_stays_on_the_session() {
     model.handle(key(KeyCode::Char('x')));
     assert!(!model.projection.interrupted());
 
-    // Idle esc walks back to the launcher.
+    // OWNER DIRECTIVE: idle esc STAYS on the session (esc is
+    // session-scoped; back is the ← main chip / ⌃C).
     model.composer.clear();
     model.handle(key(KeyCode::Esc));
-    assert_eq!(model.screen, Screen::Launcher);
+    assert_eq!(model.screen, Screen::Session, "idle esc never navigates");
 }
 
 // ---- G16 + G26: wheel clamp + sticky origin line ----

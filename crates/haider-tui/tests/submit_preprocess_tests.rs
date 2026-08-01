@@ -538,9 +538,16 @@ fn esc_dismisses_non_blocking_cards_but_never_blocking_ones() {
             timeout_option: None,
         }));
     model.handle(key(KeyCode::Esc));
+    // OWNER DIRECTIVE (supersedes the sim swallow law): esc on a blocking
+    // card INTERRUPTS — the request goes to the daemon and the demo paints
+    // the cancellation locally (menu closed, run cancelled, note).
     assert!(
-        model.projection.open_menu().is_some(),
-        "blocking cards swallow esc"
+        model.projection.open_menu().is_none(),
+        "blocking-card esc interrupts and closes the card"
+    );
+    assert!(
+        model.projection.interrupted(),
+        "idle (i) after the interrupt"
     );
 }
 

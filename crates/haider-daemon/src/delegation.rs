@@ -139,14 +139,25 @@ impl DelegationHandle {
                 "parent_run_id": coordinates.parent_run_id,
                 "call_id": coordinates.call_id,
                 "tool_item_id": coordinates.tool_item_id,
+                // W6d: the chip view attaches to the child directly.
+                "child_session_id": child_session_id,
             })),
         };
+        // OWNER DIRECTIVE (W6d): delegation is AUTOMATIC — a child must
+        // never park on a human. Children are created with writes+exec
+        // pre-allowed through the W9b override seam (journaled as ordinary
+        // policy `Allow`); spawning a child is itself the standing
+        // permission. The parent's own surface keeps its Ask defaults.
+        let child_overrides = Some(haider_protocol::session::SessionPermissionOverridesV1 {
+            allow_writes: true,
+            allow_exec: true,
+        });
         let create_json = serde_json::to_string(&serde_json::json!({
             "cwd": coordinates.metadata.cwd,
             "provider": coordinates.metadata.provider,
             "model": coordinates.metadata.model,
             "max_tokens": coordinates.metadata.max_tokens,
-            "permission_overrides": coordinates.metadata.permission_overrides,
+            "permission_overrides": child_overrides,
             "delegation_agent": agent_id,
         }))
         .map_err(internal_serialization)?;
@@ -161,7 +172,7 @@ impl DelegationHandle {
                 provider: coordinates.metadata.provider.clone(),
                 model: coordinates.metadata.model.clone(),
                 max_tokens: coordinates.metadata.max_tokens,
-                permission_overrides: coordinates.metadata.permission_overrides,
+                permission_overrides: child_overrides,
                 system_prompt_version: crate::worker::SystemPromptBuilder::VERSION.into(),
                 event_id: EventId::new(format!("delegation-created-{identity}")),
                 device_id: self.hub.device_id(),

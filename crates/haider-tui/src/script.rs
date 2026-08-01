@@ -269,7 +269,7 @@ impl ChipDisplayState {
             ChipState::Streaming => Self::Streaming,
             ChipState::Tool => Self::Tool,
             ChipState::Waiting => Self::Waiting,
-            ChipState::InputRequired => Self::InputRequired,
+            ChipState::InputRequired | ChipState::PermissionRequired => Self::InputRequired,
             ChipState::Done | ChipState::Closed => Self::Done,
             ChipState::Error => Self::Error,
         }
