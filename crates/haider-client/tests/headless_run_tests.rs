@@ -5,9 +5,9 @@ use std::collections::{BTreeSet, VecDeque};
 use std::time::Duration;
 
 use haider_client::{
-    EnsureOptions, HeadlessBlockingReason, HeadlessEvent, HeadlessFailureCode, HeadlessOutcome,
-    HeadlessRunError, HeadlessRunRequest, ProfileEnv, ResolvedProfile, resolve_profile,
-    run_headless,
+    EnsureOptions, HeadlessBlockingReason, HeadlessEvent, HeadlessFailureCode,
+    HeadlessImageAttachment, HeadlessOutcome, HeadlessRunError, HeadlessRunRequest, ProfileEnv,
+    ResolvedProfile, resolve_profile, run_headless,
 };
 use haider_rpc::haider_protocol::EventPayload;
 use haider_rpc::haider_protocol::credential::{AuthMethod, CredentialDescriptor, CredentialStatus};
@@ -16,7 +16,7 @@ use haider_rpc::haider_protocol::envelope::{
 };
 use haider_rpc::haider_protocol::error::ErrorCode;
 use haider_rpc::haider_protocol::ids::{
-    CredentialAlias, DeviceId, EventId, ItemId, MenuId, RunId, SessionId,
+    ArtifactRef, CredentialAlias, DeviceId, EventId, ItemId, MenuId, RunId, SessionId,
 };
 use haider_rpc::haider_protocol::item::{ItemEvent, TurnItem};
 use haider_rpc::haider_protocol::menu::{
@@ -292,6 +292,7 @@ fn request(timeout: Option<Duration>) -> HeadlessRunRequest {
     HeadlessRunRequest {
         cwd: "/tmp".into(),
         prompt: "hello".into(),
+        attachments: Vec::new(),
         provider: Some("fake".into()),
         model: Some("fake-model".into()),
         max_tokens: 4096,
@@ -701,6 +702,155 @@ async fn submit_response_loss_reconnects_buffers_replay_and_retries_same_command
     peer.await.expect("peer");
     assert_eq!(result.outcome, HeadlessOutcome::Done);
     assert_eq!(result.terminal_seq, Some(2));
+    assert_eq!(events.len(), 2);
+}
+
+/// MUTATION CHECK: create the session before uploading, omit uploaded refs
+/// from submit, or mint a replacement submit after response loss. Expected
+/// RUNTIME failure: the peer observes the wrong ordering, attachment blocks,
+/// or durable command identity across the reconnect.
+#[tokio::test]
+async fn headless_attach_uploads_then_submits_with_durable_identity() {
+    let (_root, profile) = profile();
+    let listener = UnixListener::bind(&profile.endpoint_path).expect("bind reconnect peer");
+    let mut handshake = welcome(&profile);
+    handshake
+        .features
+        .insert(haider_rpc::FEATURE_ARTIFACT_PUT_V1.to_owned());
+    let image_bytes = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    let expected_ref = ArtifactRef::new(format!("blake3:{}", blake3::hash(&image_bytes).to_hex()));
+    let peer_ref = expected_ref.clone();
+    let peer = tokio::spawn(async move {
+        let mut first = accept_peer(&listener, handshake.clone()).await;
+        let (put_request, put) = first.request().await;
+        let RequestBody::ArtifactPut { data_base64 } = put else {
+            panic!("artifact.put must precede session.create, got {put:?}");
+        };
+        assert_eq!(data_base64, "iVBORw0KGgo=");
+        first
+            .respond(
+                put_request,
+                ResponseBody::ArtifactPut {
+                    artifact: peer_ref.clone(),
+                    bytes: 8,
+                },
+            )
+            .await;
+
+        let (session_id, _) = accept_create_and_attach(&mut first).await;
+        let (_, submit) = first.request().await;
+        let original_submit = submit.clone();
+        let RequestBody::TurnSubmitWithBranch {
+            command_id: original_command,
+            attachments: original_attachments,
+            ..
+        } = submit
+        else {
+            panic!("first connection expected submit");
+        };
+        assert_eq!(original_attachments.len(), 1);
+        assert_eq!(
+            original_attachments[0],
+            haider_rpc::haider_protocol::tool::AttachmentBlock::Image {
+                artifact: peer_ref.clone(),
+                mime: "image/png".into(),
+                width: None,
+                height: None,
+            }
+        );
+        drop(first);
+
+        let mut second = accept_peer(&listener, handshake).await;
+        let (attach_request, attach) = second.request().await;
+        assert!(matches!(
+            attach,
+            RequestBody::SessionAttach {
+                after_seq: 0,
+                mode: AttachMode::Control,
+                ..
+            }
+        ));
+        let attachment_id = AttachmentId::new("image-retry-attachment");
+        second
+            .respond(
+                attach_request,
+                ResponseBody::SessionAttach {
+                    attachment_id: attachment_id.clone(),
+                    attach_state: AttachState {
+                        session_id: session_id.clone(),
+                        requested_after_seq: 0,
+                        replay_through_seq: 2,
+                        worker_generation: 8,
+                        authority_epoch: 1,
+                    },
+                },
+            )
+            .await;
+        let run_id = RunId::new("image-response-lost-run");
+        send_event(
+            &mut second,
+            &attachment_id,
+            envelope(
+                &session_id,
+                &run_id,
+                1,
+                EventPayload::RunState(RunState::Queued),
+            ),
+        )
+        .await;
+        send_event(
+            &mut second,
+            &attachment_id,
+            envelope(
+                &session_id,
+                &run_id,
+                2,
+                EventPayload::RunState(RunState::Done),
+            ),
+        )
+        .await;
+        second
+            .write(&WireFrame::AttachCaughtUp {
+                attachment_id,
+                high_water_seq: 2,
+            })
+            .await;
+
+        let (retry_request, retry) = second.request().await;
+        assert_eq!(retry, original_submit, "retry must resend the whole body");
+        let RequestBody::TurnSubmitWithBranch {
+            command_id: retry_command,
+            attachments: retry_attachments,
+            ..
+        } = retry
+        else {
+            panic!("second connection expected submit retry");
+        };
+        assert_eq!(retry_command, original_command);
+        assert_eq!(retry_attachments, original_attachments);
+        second
+            .respond(
+                retry_request,
+                ResponseBody::TurnSubmit {
+                    session_id,
+                    run_id,
+                    accepted_seq: 1,
+                    worker_generation: 8,
+                    disposition: SubmitDisposition::Started,
+                },
+            )
+            .await;
+    });
+
+    let mut with_image = request(None);
+    with_image.attachments.push(HeadlessImageAttachment {
+        bytes: image_bytes,
+        mime: "image/png".into(),
+    });
+    let (result, events) = run_with_events(profile, with_image, 4, Duration::ZERO).await;
+    peer.await.expect("peer");
+    assert_eq!(result.outcome, HeadlessOutcome::Done);
+    assert_eq!(result.attachments, vec![expected_ref]);
     assert_eq!(events.len(), 2);
 }
 
@@ -2284,5 +2434,15 @@ fn override_feature_is_required_only_when_a_flag_is_present() {
             .cloned()
             .collect::<BTreeSet<_>>(),
         BTreeSet::from([haider_rpc::FEATURE_SESSION_PERMISSION_OVERRIDES_V1.to_owned()])
+    );
+    let attachments = haider_client::required_headless_features_with_attachments(
+        SessionPermissionOverridesV1::default(),
+    );
+    assert_eq!(
+        attachments
+            .difference(&no_flags)
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([haider_rpc::FEATURE_ARTIFACT_PUT_V1.to_owned()])
     );
 }

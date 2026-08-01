@@ -95,8 +95,8 @@ pub use runtime::{
 };
 pub use session_hub::{
     AdmissionTicket, FrameSendError, FrameSink, HubConnection, HubObservation, HubStoreHandle,
-    SendAdmission, SessionHub, SessionHubConfig, SessionHubError, SessionHubMetrics,
-    SessionHubObserver, SessionHubShutdownOutcome,
+    IMAGE_ATTACHMENT_MIME_ALLOWLIST, SendAdmission, SessionHub, SessionHubConfig, SessionHubError,
+    SessionHubMetrics, SessionHubObserver, SessionHubShutdownOutcome,
 };
 pub use worker::{
     DaemonDependencies, ProviderFactory, ProviderFactoryConfig, ResolvedTurnProvider,

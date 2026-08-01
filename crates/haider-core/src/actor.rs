@@ -3860,17 +3860,36 @@ fn estimated_request_input_tokens(config: &HarnessConfig, messages: &[Message]) 
 
 /// Deterministic accounting for the complete provider-bound request context.
 /// Daemon-owned idle operations use the same estimator as live actor rounds.
+/// Image bytes are intentionally excluded: providers tokenize vision inputs
+/// independently of their base64 transport encoding.
+pub const VISION_IMAGE_ESTIMATE_TOKENS: u64 = 1_600;
+
 #[must_use]
 pub fn estimate_provider_request_input_tokens(
     messages: &[Message],
     system_prompt: &Option<String>,
     tools: &[ToolDefinition],
-    attachments: &[ResolvedAttachment],
+    _attachments: &[ResolvedAttachment],
 ) -> u64 {
-    let bytes = serde_json::to_vec(&(messages, system_prompt, tools, attachments))
+    let bytes = serde_json::to_vec(&(messages, system_prompt, tools))
         .map(|encoded| u64::try_from(encoded.len()).unwrap_or(u64::MAX))
         .unwrap_or(u64::MAX);
-    bytes.saturating_add(3) / 4
+    let image_count = messages
+        .iter()
+        .flat_map(|message| &message.blocks)
+        .filter(|block| {
+            matches!(
+                block,
+                haider_protocol::provider::Block::Attachment(
+                    haider_protocol::tool::AttachmentBlock::Image { .. }
+                )
+            )
+        })
+        .count();
+    let image_tokens = u64::try_from(image_count)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(VISION_IMAGE_ESTIMATE_TOKENS);
+    (bytes.saturating_add(3) / 4).saturating_add(image_tokens)
 }
 
 #[cfg(test)]

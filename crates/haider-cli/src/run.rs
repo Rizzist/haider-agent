@@ -1,13 +1,15 @@
 //! Manual `haider run` parser and daemon-backed output adapter.
 
 use std::io::{self, Write};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
 use haider_client::{
     ConnectError, ERROR_CODE_NO_ACTIVE_ACCOUNT, ERROR_CODE_NO_DEFAULT_MODEL, EnsureError,
     EnsureOptions, HeadlessEvent, HeadlessFailureCode, HeadlessOutcome, HeadlessRunError,
-    HeadlessRunRequest, HeadlessRunResult, ProfileEnv, resolve_profile, run_headless,
+    HeadlessRunRequest, HeadlessRunResult, ProfileEnv, load_image_attachment, resolve_profile,
+    run_headless,
 };
 use haider_protocol::error::ErrorCode;
 use haider_protocol::session::SessionPermissionOverridesV1;
@@ -55,6 +57,7 @@ pub(crate) struct RunOptions {
     pub allow_exec: bool,
     pub provider: Option<ProviderSelection>,
     pub model: Option<String>,
+    pub attachments: Vec<PathBuf>,
 }
 
 pub(crate) fn parse_run_options(rest: &[String]) -> Result<RunOptions, String> {
@@ -65,6 +68,7 @@ pub(crate) fn parse_run_options(rest: &[String]) -> Result<RunOptions, String> {
     let mut allow_exec = false;
     let mut provider = None;
     let mut model = None;
+    let mut attachments = Vec::new();
     let mut prompt = None;
     let mut index = 0;
 
@@ -119,6 +123,16 @@ pub(crate) fn parse_run_options(rest: &[String]) -> Result<RunOptions, String> {
                 model = Some(value.clone());
             }
             "--model" => return Err("duplicate --model flag".into()),
+            "--attach" => {
+                index += 1;
+                let value = rest
+                    .get(index)
+                    .ok_or_else(|| "--attach requires an image path".to_owned())?;
+                if value.is_empty() {
+                    return Err("--attach requires a non-empty image path".into());
+                }
+                attachments.push(PathBuf::from(value));
+            }
             flag if flag.starts_with("--") => return Err(format!("unknown flag `{flag}`")),
             value if prompt.is_none() => prompt = Some(value.to_owned()),
             _ => return Err("exactly one prompt argument is required".into()),
@@ -141,6 +155,7 @@ pub(crate) fn parse_run_options(rest: &[String]) -> Result<RunOptions, String> {
         allow_exec,
         provider,
         model,
+        attachments,
     })
 }
 
@@ -208,9 +223,31 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
             return ExitCode::from(EX_SOFTWARE);
         }
     };
+    let mut attachments = Vec::with_capacity(options.attachments.len());
+    for path in &options.attachments {
+        match load_image_attachment(path) {
+            Ok(attachment) => attachments.push(attachment),
+            Err(error) => {
+                if options.output == RunOutput::Json
+                    && let Err(io_error) = write_error_json(
+                        io::stdout().lock(),
+                        &error,
+                        provider.as_deref(),
+                        model.as_deref(),
+                    )
+                {
+                    eprintln!("haider: stdout failed: {io_error}");
+                    return ExitCode::from(EX_IOERR);
+                }
+                eprintln!("haider: {error}");
+                return ExitCode::from(exit_code_for_error(&error));
+            }
+        }
+    }
     let request = HeadlessRunRequest {
         cwd,
         prompt: options.prompt.clone(),
+        attachments,
         provider: provider.clone(),
         model: model.clone(),
         max_tokens: profile.default_max_tokens,
@@ -301,6 +338,7 @@ fn write_error_json(
     model: Option<&str>,
 ) -> io::Result<()> {
     let (outcome, code, retryable) = match error {
+        HeadlessRunError::Attachment { code, .. } => ("errored", code.clone(), false),
         HeadlessRunError::Rpc {
             code, retryable, ..
         } if code == "timeout_before_acceptance" => ("timeout", "timeout".to_owned(), *retryable),
@@ -317,7 +355,7 @@ fn write_error_json(
     let provider = serde_json::to_string(&provider).map_err(io::Error::other)?;
     let model = serde_json::to_string(&model).map_err(io::Error::other)?;
     let line = format!(
-        "{{\"schema\":\"haider.run.v1\",\"session_id\":null,\"run_id\":null,\"provider\":{provider},\"model\":{model},\"outcome\":\"{outcome}\",\"response\":null,\"usage\":null,\"permission_denials\":[],\"error\":{{\"code\":{code},\"message\":{message},\"retryable\":{retryable}}}}}"
+        "{{\"schema\":\"haider.run.v1\",\"session_id\":null,\"run_id\":null,\"provider\":{provider},\"model\":{model},\"attachments\":{{\"count\":0,\"refs\":[]}},\"outcome\":\"{outcome}\",\"response\":null,\"usage\":null,\"permission_denials\":[],\"error\":{{\"code\":{code},\"message\":{message},\"retryable\":{retryable}}}}}"
     );
     output.write_all(line.as_bytes())?;
     output.write_all(b"\n")?;
@@ -369,6 +407,13 @@ fn run_json(result: &HeadlessRunResult) -> io::Result<String> {
     let run_id = serde_json::to_string(result.run_id.as_str()).map_err(io::Error::other)?;
     let provider = serde_json::to_string(&result.provider).map_err(io::Error::other)?;
     let model = serde_json::to_string(&result.model).map_err(io::Error::other)?;
+    let attachment_refs = result
+        .attachments
+        .iter()
+        .map(haider_protocol::ids::ArtifactRef::as_str)
+        .collect::<Vec<_>>();
+    let attachment_refs = serde_json::to_string(&attachment_refs).map_err(io::Error::other)?;
+    let attachment_count = result.attachments.len();
     let outcome = serde_json::to_string(&result.outcome).map_err(io::Error::other)?;
     let response = serde_json::to_string(&result.response).map_err(io::Error::other)?;
     let usage = serde_json::to_string(&result.usage).map_err(io::Error::other)?;
@@ -383,7 +428,7 @@ fn run_json(result: &HeadlessRunResult) -> io::Result<String> {
         None => "null".into(),
     };
     Ok(format!(
-        "{{\"schema\":\"haider.run.v1\",\"session_id\":{session_id},\"run_id\":{run_id},\"provider\":{provider},\"model\":{model},\"outcome\":{outcome},\"response\":{response},\"usage\":{usage},\"permission_denials\":{denials},\"error\":{error}}}"
+        "{{\"schema\":\"haider.run.v1\",\"session_id\":{session_id},\"run_id\":{run_id},\"provider\":{provider},\"model\":{model},\"attachments\":{{\"count\":{attachment_count},\"refs\":{attachment_refs}}},\"outcome\":{outcome},\"response\":{response},\"usage\":{usage},\"permission_denials\":{denials},\"error\":{error}}}"
     ))
 }
 
@@ -412,6 +457,8 @@ pub(crate) fn exit_code_for_result(result: &HeadlessRunResult) -> u8 {
 
 pub(crate) fn exit_code_for_error(error: &HeadlessRunError) -> u8 {
     match error {
+        HeadlessRunError::Attachment { code, .. } if code == "attachment_io" => EX_IOERR,
+        HeadlessRunError::Attachment { .. } => EX_USAGE,
         HeadlessRunError::Ensure(
             EnsureError::ProtocolMismatch(_)
             | EnsureError::MissingFeatures { .. }

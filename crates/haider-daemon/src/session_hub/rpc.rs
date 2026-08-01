@@ -12,9 +12,20 @@
 //! transaction or one workspace `spawn_blocking`.
 
 use super::*;
+use base64::Engine as _;
 use haider_protocol::EventPayload;
 use haider_protocol::context::ContextFootprint;
 use haider_protocol::item::ItemEvent;
+
+const MAX_ATTACHMENTS_PER_TURN: usize = 5;
+const MAX_ATTACHMENT_BYTES: usize = 5 * 1024 * 1024;
+const MAX_ATTACHMENT_BYTES_PER_TURN: usize = 16 * 1024 * 1024;
+
+struct AttachmentValidationFailure {
+    code: &'static str,
+    message: String,
+    data: Option<ErrorData>,
+}
 
 async fn latest_context_footprint(
     store: &dyn StoreHandle,
@@ -64,6 +75,79 @@ pub(super) fn filter_provider_summaries(
 // ─────────── connection RPC surface: list/read/attach/detach/menu ───────────
 
 impl HubConnection {
+    async fn artifact_put(
+        &self,
+        request_id: RequestId,
+        data_base64: String,
+    ) -> Result<(), SessionHubError> {
+        let decoded_len = match standard_base64_decoded_len(&data_base64) {
+            Ok(decoded_len) => decoded_len,
+            Err(message) => {
+                return self.respond_error(
+                    request_id,
+                    ERROR_CODE_INVALID_ARGUMENT,
+                    message,
+                    false,
+                    None,
+                );
+            }
+        };
+        if decoded_len > ARTIFACT_PUT_MAX_BYTES {
+            let actual_bytes = u64::try_from(decoded_len).unwrap_or(u64::MAX);
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_ARTIFACT_TOO_LARGE,
+                &format!(
+                    "artifact.put decodes to {actual_bytes} bytes; the hard limit is {ARTIFACT_PUT_MAX_BYTES}"
+                ),
+                false,
+                Some(ErrorData::ArtifactTooLarge {
+                    actual_bytes,
+                    max_bytes: ARTIFACT_PUT_MAX_BYTES as u64,
+                }),
+            );
+        }
+        let bytes = match base64::engine::general_purpose::STANDARD.decode(data_base64) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return self.respond_error(
+                    request_id,
+                    ERROR_CODE_INVALID_ARGUMENT,
+                    &format!("artifact.put data_base64 is invalid: {error}"),
+                    false,
+                    None,
+                );
+            }
+        };
+        if bytes.len() > ARTIFACT_PUT_MAX_BYTES {
+            let actual_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_ARTIFACT_TOO_LARGE,
+                &format!(
+                    "artifact.put decoded {actual_bytes} bytes; the hard limit is {ARTIFACT_PUT_MAX_BYTES}"
+                ),
+                false,
+                Some(ErrorData::ArtifactTooLarge {
+                    actual_bytes,
+                    max_bytes: ARTIFACT_PUT_MAX_BYTES as u64,
+                }),
+            );
+        }
+        let byte_count = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        let artifact = match self.hub.inner.store.put(bytes).await {
+            Ok(artifact) => artifact,
+            Err(error) => return self.respond_turn_error(request_id, error),
+        };
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::ArtifactPut {
+                artifact,
+                bytes: byte_count,
+            },
+        })
+    }
+
     /// Handles one request and enqueues its correlated response.
     pub async fn request(
         &self,
@@ -83,6 +167,18 @@ impl HubConnection {
             );
         }
         match body {
+            RequestBody::ArtifactPut { data_base64 } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.artifact_put(request_id, data_base64).await
+            }
             RequestBody::SessionCreateWithPermissionOverrides {
                 command_id,
                 cwd,
@@ -1729,6 +1825,18 @@ impl HubConnection {
             }
             Err(error) => return Err(error),
         }
+        match validate_turn_attachments(&self.hub.inner.store, &attachments).await {
+            Ok(()) => {}
+            Err(failure) => {
+                return self.respond_error(
+                    request_id,
+                    failure.code,
+                    &failure.message,
+                    false,
+                    failure.data,
+                );
+            }
+        }
         let command = TurnAcceptCommand {
             command_id: command_id.0,
             request_digest,
@@ -2093,6 +2201,7 @@ impl HubConnection {
             ErrorCode::SessionNotFound => ERROR_CODE_NOT_FOUND,
             ErrorCode::RunNotActive => ERROR_CODE_RUN_NOT_ACTIVE,
             ErrorCode::Busy => ERROR_CODE_OVERLOADED,
+            ErrorCode::VisionUnsupported => ERROR_CODE_VISION_UNSUPPORTED,
             _ => ERROR_CODE_INVALID_ARGUMENT,
         };
         self.respond_error(request_id, code, &error.message, error.retryable, None)
@@ -2706,6 +2815,112 @@ impl HubConnection {
         }
         self.hub.detach_connection(&self.connection_id).await
     }
+}
+
+fn standard_base64_decoded_len(encoded: &str) -> Result<usize, &'static str> {
+    let bytes = encoded.as_bytes();
+    if !bytes.len().is_multiple_of(4) {
+        return Err("artifact.put data_base64 must use padded RFC 4648 encoding");
+    }
+    let padding = bytes.iter().rev().take_while(|byte| **byte == b'=').count();
+    if padding > 2
+        || bytes[..bytes.len().saturating_sub(padding)]
+            .iter()
+            .any(|byte| !(byte.is_ascii_alphanumeric() || matches!(*byte, b'+' | b'/')))
+        || bytes[..bytes.len().saturating_sub(padding)].contains(&b'=')
+    {
+        return Err("artifact.put data_base64 is not standard RFC 4648 base64");
+    }
+    Ok(bytes.len() / 4 * 3 - padding)
+}
+
+async fn validate_turn_attachments(
+    store: &haider_core::SqliteStoreHandle,
+    attachments: &[haider_protocol::tool::AttachmentBlock],
+) -> Result<(), AttachmentValidationFailure> {
+    if attachments.len() > MAX_ATTACHMENTS_PER_TURN {
+        let actual_count = u32::try_from(attachments.len()).unwrap_or(u32::MAX);
+        return Err(AttachmentValidationFailure {
+            code: ERROR_CODE_TOO_MANY_ATTACHMENTS,
+            message: format!(
+                "turn carries {actual_count} attachments; the limit is {MAX_ATTACHMENTS_PER_TURN}"
+            ),
+            data: Some(ErrorData::TooManyAttachments {
+                actual_count,
+                max_count: MAX_ATTACHMENTS_PER_TURN as u32,
+            }),
+        });
+    }
+
+    let mut total_bytes = 0_usize;
+    for (index, attachment) in attachments.iter().enumerate() {
+        let index_u32 = u32::try_from(index).unwrap_or(u32::MAX);
+        let artifact = match attachment {
+            haider_protocol::tool::AttachmentBlock::Image { artifact, mime, .. } => {
+                if !IMAGE_ATTACHMENT_MIME_ALLOWLIST.contains(&mime.as_str()) {
+                    return Err(AttachmentValidationFailure {
+                        code: ERROR_CODE_ATTACHMENT_MIME_UNSUPPORTED,
+                        message: format!(
+                            "attachment {index} declares unsupported image MIME `{mime}`; use image/jpeg, image/png, image/gif, or image/webp"
+                        ),
+                        data: Some(ErrorData::AttachmentMimeUnsupported {
+                            index: index_u32,
+                            mime: mime.clone(),
+                        }),
+                    });
+                }
+                artifact
+            }
+            haider_protocol::tool::AttachmentBlock::PastedText { artifact, .. } => artifact,
+            haider_protocol::tool::AttachmentBlock::Skill { name, .. } => {
+                return Err(AttachmentValidationFailure {
+                    code: ERROR_CODE_INVALID_ARGUMENT,
+                    message: format!("skill attachment `{name}` is reserved but not yet supported"),
+                    data: None,
+                });
+            }
+        };
+        let bytes = store.get(artifact).await.map_err(|_| AttachmentValidationFailure {
+            code: ERROR_CODE_ATTACHMENT_NOT_FOUND,
+            message: format!(
+                "attachment {index} references unavailable or unverified artifact {artifact}; upload it with artifact.put and retry"
+            ),
+            data: Some(ErrorData::AttachmentNotFound {
+                index: index_u32,
+                artifact: artifact.clone(),
+            }),
+        })?;
+        if bytes.len() > MAX_ATTACHMENT_BYTES {
+            let actual_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+            return Err(AttachmentValidationFailure {
+                code: ERROR_CODE_ATTACHMENT_TOO_LARGE,
+                message: format!(
+                    "attachment {index} is {actual_bytes} bytes; the per-attachment limit is {MAX_ATTACHMENT_BYTES}"
+                ),
+                data: Some(ErrorData::AttachmentTooLarge {
+                    index: index_u32,
+                    artifact: artifact.clone(),
+                    actual_bytes,
+                    max_bytes: MAX_ATTACHMENT_BYTES as u64,
+                }),
+            });
+        }
+        total_bytes = total_bytes.saturating_add(bytes.len());
+        if total_bytes > MAX_ATTACHMENT_BYTES_PER_TURN {
+            let actual_bytes = u64::try_from(total_bytes).unwrap_or(u64::MAX);
+            return Err(AttachmentValidationFailure {
+                code: ERROR_CODE_ATTACHMENTS_TOO_LARGE,
+                message: format!(
+                    "turn attachments total {actual_bytes} bytes; the aggregate limit is {MAX_ATTACHMENT_BYTES_PER_TURN}"
+                ),
+                data: Some(ErrorData::AttachmentsTooLarge {
+                    actual_bytes,
+                    max_bytes: MAX_ATTACHMENT_BYTES_PER_TURN as u64,
+                }),
+            });
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]

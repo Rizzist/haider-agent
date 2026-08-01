@@ -112,13 +112,16 @@ use haider_protocol::ids::{BranchId, DeviceId, EventId, MenuId, RunId, SessionId
 use haider_protocol::menu::{AnswerVia, MenuAnswer as DurableMenuAnswer};
 use haider_protocol::state::RunState;
 use haider_rpc::{
-    AttachMode, AttachState, AttachmentId, CancelStatus, Capability, CapabilitySet, CommandId,
-    ERROR_CODE_ALREADY_RESOLVED, ERROR_CODE_BUSY, ERROR_CODE_CAPABILITY_DENIED,
-    ERROR_CODE_CURSOR_AHEAD, ERROR_CODE_DRAINING, ERROR_CODE_INVALID_ARGUMENT,
-    ERROR_CODE_INVALID_CURSOR, ERROR_CODE_NOT_FOUND, ERROR_CODE_OVERLOADED,
-    ERROR_CODE_RUN_NOT_ACTIVE, ERROR_CODE_STALE_GENERATION, ERROR_CODE_UNSUPPORTED_SHELL_BUILTIN,
-    ErrorData, MenuInput, ProtocolError, RequestBody, RequestId, ResponseBody, SeqRange,
-    SessionReadResult, SessionSummary, SubmitDisposition, WireFrame,
+    ARTIFACT_PUT_MAX_BYTES, AttachMode, AttachState, AttachmentId, CancelStatus, Capability,
+    CapabilitySet, CommandId, ERROR_CODE_ALREADY_RESOLVED, ERROR_CODE_ARTIFACT_TOO_LARGE,
+    ERROR_CODE_ATTACHMENT_MIME_UNSUPPORTED, ERROR_CODE_ATTACHMENT_NOT_FOUND,
+    ERROR_CODE_ATTACHMENT_TOO_LARGE, ERROR_CODE_ATTACHMENTS_TOO_LARGE, ERROR_CODE_BUSY,
+    ERROR_CODE_CAPABILITY_DENIED, ERROR_CODE_CURSOR_AHEAD, ERROR_CODE_DRAINING,
+    ERROR_CODE_INVALID_ARGUMENT, ERROR_CODE_INVALID_CURSOR, ERROR_CODE_NOT_FOUND,
+    ERROR_CODE_OVERLOADED, ERROR_CODE_RUN_NOT_ACTIVE, ERROR_CODE_STALE_GENERATION,
+    ERROR_CODE_TOO_MANY_ATTACHMENTS, ERROR_CODE_UNSUPPORTED_SHELL_BUILTIN,
+    ERROR_CODE_VISION_UNSUPPORTED, ErrorData, MenuInput, ProtocolError, RequestBody, RequestId,
+    ResponseBody, SeqRange, SessionReadResult, SessionSummary, SubmitDisposition, WireFrame,
 };
 use std::collections::HashMap;
 use std::fmt;
@@ -134,6 +137,10 @@ use replay::{ReplayCompletion, run_replay};
 const REPLAY_PAGE_SIZE: usize = 256;
 const MAX_LIST_PAGE: usize = 100;
 const MAX_READ_ENVELOPES: usize = 1_024;
+
+/// Exact image MIME declarations accepted on durable turn submission.
+pub const IMAGE_ATTACHMENT_MIME_ALLOWLIST: [&str; 4] =
+    ["image/jpeg", "image/png", "image/gif", "image/webp"];
 
 // ────────────────── configuration, sink seam, and observer ──────────────────
 

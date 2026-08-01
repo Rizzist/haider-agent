@@ -29,8 +29,8 @@ pub use actor::{
     ProviderAttemptDecision, ProviderAttemptResolver, RequestInputCheckpoint,
     ResolvedProviderAttempt, SubmitCheckpointTurn, SubmitChildWaitTurn, SubmitCommittedTurn,
     SubmitTurn, ToolDispatchResult, ToolDispatcher, TurnHandle, TurnOutcome,
-    context_soft_threshold_tokens, estimate_provider_request_input_tokens,
-    sanitized_failure_message,
+    VISION_IMAGE_ESTIMATE_TOKENS, context_soft_threshold_tokens,
+    estimate_provider_request_input_tokens, sanitized_failure_message,
 };
 pub use fake_store::MemoryStore;
 pub use haider_store::{

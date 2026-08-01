@@ -35,6 +35,7 @@ pub enum ErrorCode {
     // providers
     ProviderError,
     ProviderTimeout,
+    VisionUnsupported,
     // storage
     StoreCorrupt,
     StoreLocked,

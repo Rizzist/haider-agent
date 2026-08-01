@@ -52,7 +52,7 @@ use haider_protocol::ids::{
 use haider_protocol::item::{ItemDelta, ItemEvent, TurnItem};
 use haider_protocol::menu::{DecisionKind, Menu, MenuAnswer, MenuKind};
 use haider_protocol::project_instructions::ProjectInstructionsLoaded;
-use haider_protocol::provider::{FinishReason, StreamEvent};
+use haider_protocol::provider::{FeatureResolve, FinishReason, StreamEvent};
 use haider_protocol::session::SessionMetadataV1;
 use haider_protocol::state::{RunState, SessionState};
 use haider_protocol::tool::{
@@ -129,7 +129,6 @@ struct DaemonContextCompactor {
     reserved_output_tokens: u64,
     post_compaction_system_prompt: Option<String>,
     post_compaction_tools: Vec<ToolDefinition>,
-    attachments: Vec<ResolvedAttachment>,
     device_id: DeviceId,
     event_ids: Arc<EventIdGenerator>,
     agent_id: Option<AgentId>,
@@ -171,6 +170,16 @@ impl ContextCompactor for DaemonContextCompactor {
         intent: &CompactionIntent,
         mut covered_messages: Vec<Message>,
     ) -> Result<Message, HaiderError> {
+        for message in &mut covered_messages {
+            message.blocks.retain(|block| {
+                !matches!(
+                    block,
+                    haider_protocol::provider::Block::Attachment(
+                        haider_protocol::tool::AttachmentBlock::Image { .. }
+                    )
+                )
+            });
+        }
         covered_messages.push(Message::user_text(
             "Summarize the preceding conversation for lossless continuation. Preserve decisions, constraints, exact identifiers, unresolved work, and tool outcomes. Return only the summary.",
         ));
@@ -180,7 +189,7 @@ impl ContextCompactor for DaemonContextCompactor {
             max_tokens: self.max_tokens.min(4096),
             system_prompt: None,
             tools: Vec::new(),
-            attachments: self.attachments.clone(),
+            attachments: Vec::new(),
         };
         let mut stream = self.provider.stream_turn(request).await.map_err(|error| {
             HaiderError::new(
@@ -2637,7 +2646,7 @@ async fn perform_manual_compaction(
         agent_id.as_ref(),
     )
     .await?;
-    let attachments = resolve_prompt_attachments(lease, &mut messages).await?;
+    prepare_compaction_messages(lease, &mut messages).await?;
     let (run_id, accepted_seq, intent) = if let Some(existing) = existing {
         (existing.run_id, existing.accepted_seq, existing.intent)
     } else {
@@ -2708,7 +2717,6 @@ async fn perform_manual_compaction(
         reserved_output_tokens: metadata.max_tokens,
         post_compaction_system_prompt: Some(post_compaction_system_prompt),
         post_compaction_tools,
-        attachments,
         device_id: device_id.clone(),
         event_ids: Arc::clone(&event_ids),
         agent_id,
@@ -3082,6 +3090,26 @@ async fn start_turn(
         &accepted.run_id,
     )
     .await?;
+    if messages.iter().any(|message| {
+        message.blocks.iter().any(|block| {
+            matches!(
+                block,
+                haider_protocol::provider::Block::Attachment(
+                    haider_protocol::tool::AttachmentBlock::Image { .. }
+                )
+            )
+        })
+    }) && resolved.provider.capabilities().await.vision == FeatureResolve::Unsupported
+    {
+        return Err(HaiderError::new(
+            ErrorCode::VisionUnsupported,
+            format!(
+                "provider `{}` does not support image attachments",
+                resolved.provider_name
+            ),
+            false,
+        ));
+    }
     tracing::trace!(
         target: "haider.worker",
         session_id = %lease.session_id(),
@@ -3153,7 +3181,6 @@ async fn start_turn(
         reserved_output_tokens: config.reserved_output_tokens,
         post_compaction_system_prompt: config.system_prompt.clone(),
         post_compaction_tools: config.tools.clone(),
-        attachments: config.attachments.clone(),
         device_id: device_id.clone(),
         event_ids: Arc::clone(&event_ids),
         agent_id: config.agent_id.clone(),
@@ -3332,6 +3359,49 @@ async fn resolve_prompt_attachments(
         }
     }
     Ok(resolved)
+}
+
+async fn prepare_compaction_messages(
+    store: &HubStoreHandle,
+    messages: &mut [Message],
+) -> Result<(), HaiderError> {
+    for message in messages {
+        let mut index = 0;
+        while index < message.blocks.len() {
+            match message.blocks[index].clone() {
+                haider_protocol::provider::Block::Attachment(
+                    haider_protocol::tool::AttachmentBlock::Image { .. },
+                ) => {
+                    message.blocks.remove(index);
+                }
+                haider_protocol::provider::Block::Attachment(
+                    haider_protocol::tool::AttachmentBlock::PastedText { artifact, .. },
+                ) => {
+                    let bytes = store.get_artifact(artifact.clone()).await?;
+                    let text = String::from_utf8(bytes).map_err(|_| {
+                        HaiderError::new(
+                            ErrorCode::InvalidArgument,
+                            format!("pasted-text attachment {artifact} is not UTF-8"),
+                            false,
+                        )
+                    })?;
+                    message.blocks[index] = haider_protocol::provider::Block::Text { text };
+                    index += 1;
+                }
+                haider_protocol::provider::Block::Attachment(
+                    haider_protocol::tool::AttachmentBlock::Skill { name, .. },
+                ) => {
+                    return Err(HaiderError::new(
+                        ErrorCode::InvalidArgument,
+                        format!("skill attachment `{name}` is reserved but not yet supported"),
+                        false,
+                    ));
+                }
+                _ => index += 1,
+            }
+        }
+    }
+    Ok(())
 }
 
 fn active_turn(

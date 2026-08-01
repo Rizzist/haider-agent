@@ -15,7 +15,7 @@ use haider_protocol::ids::{ArtifactRef, DeviceId, EventId, ItemId, NodeId, RunId
 use haider_protocol::item::{ItemEvent, ToolStatus, TurnItem};
 use haider_protocol::provider::{Block, PROVIDER_OPAQUE_EXTENSION_KIND};
 use haider_protocol::state::RunState;
-use haider_protocol::tool::BoundedResult;
+use haider_protocol::tool::{AttachmentBlock, BoundedResult};
 use haider_protocol::verify::VerifyVerdict;
 use std::collections::HashMap;
 
@@ -377,6 +377,12 @@ async fn compaction_substitutes_summary_and_keeps_only_the_suffix() {
         .put(b"durable summary".to_vec())
         .await
         .expect("put durable summary");
+    let surviving_image = AttachmentBlock::Image {
+        artifact: ArtifactRef::new(format!("blake3:{}", "1".repeat(64))),
+        mime: "image/png".into(),
+        width: None,
+        height: None,
+    };
     let mut events = vec![
         envelope(
             &session_id,
@@ -448,7 +454,7 @@ async fn compaction_substitutes_summary_and_keeps_only_the_suffix() {
             "compacted-suffix-user",
             EventPayload::UserMessage {
                 text: "suffix user".into(),
-                attachments: Vec::new(),
+                attachments: vec![surviving_image.clone()],
                 mode: DeliveryMode::Queue,
             },
             PromptRender::Verbatim,
@@ -460,7 +466,7 @@ async fn compaction_substitutes_summary_and_keeps_only_the_suffix() {
             Some("compact-overlay"),
             NodeKind::UserTurn {
                 text: "suffix user".into(),
-                attachments: Vec::new(),
+                attachments: vec![surviving_image.clone()],
             },
         ),
         envelope(
@@ -554,6 +560,11 @@ async fn compaction_substitutes_summary_and_keeps_only_the_suffix() {
         text,
         ["durable summary", "suffix user", "suffix answer", "current"]
     );
+    assert!(first_compile.iter().any(|message| {
+        message.blocks.iter().any(|block| {
+            matches!(block, Block::Attachment(attachment) if attachment == &surviving_image)
+        })
+    }));
     assert_eq!(
         serde_json::to_vec(&first_compile).expect("serialize first compile"),
         serde_json::to_vec(&restarted_compile).expect("serialize restarted compile")
