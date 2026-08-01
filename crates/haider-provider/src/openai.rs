@@ -1482,6 +1482,13 @@ pub fn replay_openai_http_error(
             Some("insufficient_quota" | "permission_denied") => ProviderErrorKind::PermissionDenied,
             Some("rate_limit_exceeded" | "rate_limit_error") => ProviderErrorKind::RateLimited,
             Some("server_error" | "timeout") => ProviderErrorKind::Transport,
+            _ if parsed
+                .as_ref()
+                .and_then(|envelope| envelope.error.message.as_deref())
+                .is_some_and(|message| message.to_ascii_lowercase().contains("overloaded")) =>
+            {
+                ProviderErrorKind::Overloaded
+            }
             _ => ProviderErrorKind::InvalidRequest,
         },
     };
@@ -1551,6 +1558,17 @@ fn openai_stream_error(value: &serde_json::Value) -> ProviderError {
             | "input_too_large",
         ) => ProviderErrorKind::ContextExceeded,
         Some("server_error" | "timeout") => ProviderErrorKind::Transport,
+        // The codex backend returns overload under codes the arms above
+        // don't know — the prose is the only stable marker. Misclassifying
+        // it as InvalidRequest made a RETRYABLE condition error whole runs
+        // (nine journaled failures before daemon.log named the cause).
+        _ if error
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|message| message.to_ascii_lowercase().contains("overloaded")) =>
+        {
+            ProviderErrorKind::Overloaded
+        }
         _ => ProviderErrorKind::InvalidRequest,
     };
     // The JOURNALED message stays sanitized (the no-leak law: bodies can

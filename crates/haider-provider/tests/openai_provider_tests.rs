@@ -455,3 +455,29 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> T {
     let bytes = fs::read(path).expect("reads JSON fixture");
     serde_json::from_slice(&bytes).expect("parses JSON fixture")
 }
+
+/// MUTATION CHECK: drop the overload-prose fallback from the stream and
+/// HTTP classifiers. Expected RUNTIME failure: the assertions below —
+/// the codex backend's overload rides codes the typed arms don't know,
+/// and misclassifying it as InvalidRequest turns a RETRYABLE condition
+/// into a dead run (nine journaled failures before daemon.log named it).
+#[test]
+fn unknown_coded_overload_prose_classifies_retryable_overloaded() {
+    let body = br#"{"error":{"message":"Our servers are currently overloaded. Please try again later.","type":"upstream_saturated","code":"chatgpt_overload"}}"#;
+    let error = replay_openai_http_error(400, None, body);
+    assert_eq!(error.kind, ProviderErrorKind::Overloaded);
+    assert!(error.retryable);
+
+    let stream = replay_openai_responses_sse(
+        br#"event: response.failed
+data: {"type":"response.failed","response":{"error":{"message":"Our servers are currently overloaded. Please try again later.","code":"chatgpt_overload"}}}
+
+"#,
+    );
+    let failure = stream
+        .into_iter()
+        .find_map(|item| item.err())
+        .expect("stream error item");
+    assert_eq!(failure.kind, ProviderErrorKind::Overloaded);
+    assert!(failure.retryable);
+}
