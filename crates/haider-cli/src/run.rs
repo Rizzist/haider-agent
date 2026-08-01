@@ -5,9 +5,9 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use haider_client::{
-    ConnectError, EnsureError, EnsureOptions, HeadlessEvent, HeadlessFailureCode, HeadlessOutcome,
-    HeadlessRunError, HeadlessRunRequest, HeadlessRunResult, ProfileEnv, resolve_profile,
-    run_headless,
+    ConnectError, ERROR_CODE_NO_ACTIVE_ACCOUNT, ERROR_CODE_NO_DEFAULT_MODEL, EnsureError,
+    EnsureOptions, HeadlessEvent, HeadlessFailureCode, HeadlessOutcome, HeadlessRunError,
+    HeadlessRunRequest, HeadlessRunResult, ProfileEnv, resolve_profile, run_headless,
 };
 use haider_protocol::error::ErrorCode;
 use haider_protocol::session::SessionPermissionOverridesV1;
@@ -33,18 +33,16 @@ pub(crate) enum RunOutput {
     Jsonl,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ProviderSelection {
-    Fake,
-    Anthropic,
-}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProviderSelection(String);
 
 impl ProviderSelection {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Fake => "fake",
-            Self::Anthropic => haider_provider::ANTHROPIC_PROVIDER_NAME,
-        }
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    fn is_fake(&self) -> bool {
+        self.0 == "fake"
     }
 }
 
@@ -103,12 +101,11 @@ pub(crate) fn parse_run_options(rest: &[String]) -> Result<RunOptions, String> {
                 index += 1;
                 let value = rest
                     .get(index)
-                    .ok_or_else(|| "--provider requires fake|anthropic".to_owned())?;
-                provider = Some(match value.as_str() {
-                    "fake" => ProviderSelection::Fake,
-                    haider_provider::ANTHROPIC_PROVIDER_NAME => ProviderSelection::Anthropic,
-                    _ => return Err(format!("unknown provider `{value}`; use fake|anthropic")),
-                });
+                    .ok_or_else(|| "--provider requires a provider name".to_owned())?;
+                if value.is_empty() {
+                    return Err("--provider requires a non-empty provider name".into());
+                }
+                provider = Some(ProviderSelection(value.clone()));
             }
             "--provider" => return Err("duplicate --provider flag".into()),
             "--model" if model.is_none() => {
@@ -136,10 +133,6 @@ pub(crate) fn parse_run_options(rest: &[String]) -> Result<RunOptions, String> {
         (false, None) => RunOutput::Print,
     };
     let prompt = prompt.ok_or_else(|| "a prompt argument is required".to_owned())?;
-    if provider == Some(ProviderSelection::Anthropic) && model.is_none() {
-        return Err("--provider anthropic requires --model <id>".into());
-    }
-
     Ok(RunOptions {
         prompt,
         output,
@@ -194,16 +187,16 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
             return ExitCode::from(EX_PROTOCOL);
         }
     };
-    let provider = options.provider.map_or_else(
-        || profile.default_provider.clone(),
-        |value| value.as_str().into(),
-    );
-    let model = options.model.clone().unwrap_or_else(|| {
-        if options.provider == Some(ProviderSelection::Fake) {
-            "fake-model".into()
-        } else {
-            profile.default_model.clone()
-        }
+    let provider = options
+        .provider
+        .as_ref()
+        .map(|selection| selection.as_str().to_owned());
+    let model = options.model.clone().or_else(|| {
+        options
+            .provider
+            .as_ref()
+            .is_some_and(ProviderSelection::is_fake)
+            .then(|| "fake-model".into())
     });
     let cwd = match std::env::current_dir()
         .ok()
@@ -218,8 +211,8 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
     let request = HeadlessRunRequest {
         cwd,
         prompt: options.prompt.clone(),
-        provider,
-        model,
+        provider: provider.clone(),
+        model: model.clone(),
         max_tokens: profile.default_max_tokens,
         permission_overrides: SessionPermissionOverridesV1 {
             allow_writes: options.allow_writes,
@@ -270,12 +263,28 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
             // pre-acceptance timeout or transport failure still emits one
             // (null ids: no run was accepted), never a bare stderr line.
             if options.output == RunOutput::Json
-                && let Err(io_error) = write_error_json(io::stdout().lock(), &error)
+                && let Err(io_error) = write_error_json(
+                    io::stdout().lock(),
+                    &error,
+                    provider.as_deref(),
+                    model.as_deref(),
+                )
             {
                 eprintln!("haider: stdout failed: {io_error}");
                 return ExitCode::from(EX_IOERR);
             }
             eprintln!("haider: {error}");
+            if matches!(
+                &error,
+                HeadlessRunError::Bootstrap {
+                    code: ERROR_CODE_NO_ACTIVE_ACCOUNT,
+                    ..
+                }
+            ) {
+                eprintln!(
+                    "haider: remedy: sign in from the TUI or configure an active account, then retry"
+                );
+            }
             ExitCode::from(exit_code_for_error(&error))
         }
     }
@@ -285,7 +294,12 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
 /// [`HeadlessRunResult`] — ids are null, the outcome is `timeout` only
 /// for the pre-acceptance wall-clock class, and the error carries the
 /// typed code.
-fn write_error_json(mut output: impl Write, error: &HeadlessRunError) -> io::Result<()> {
+fn write_error_json(
+    mut output: impl Write,
+    error: &HeadlessRunError,
+    provider: Option<&str>,
+    model: Option<&str>,
+) -> io::Result<()> {
     let (outcome, code, retryable) = match error {
         HeadlessRunError::Rpc {
             code, retryable, ..
@@ -293,12 +307,17 @@ fn write_error_json(mut output: impl Write, error: &HeadlessRunError) -> io::Res
         HeadlessRunError::Rpc {
             code, retryable, ..
         } => ("errored", code.clone(), *retryable),
+        HeadlessRunError::Bootstrap {
+            code, retryable, ..
+        } => ("errored", (*code).to_owned(), *retryable),
         _ => ("errored", "internal".to_owned(), false),
     };
     let message = serde_json::to_string(&error.to_string()).map_err(io::Error::other)?;
     let code = serde_json::to_string(&code).map_err(io::Error::other)?;
+    let provider = serde_json::to_string(&provider).map_err(io::Error::other)?;
+    let model = serde_json::to_string(&model).map_err(io::Error::other)?;
     let line = format!(
-        "{{\"schema\":\"haider.run.v1\",\"session_id\":null,\"run_id\":null,\"outcome\":\"{outcome}\",\"response\":null,\"usage\":null,\"permission_denials\":[],\"error\":{{\"code\":{code},\"message\":{message},\"retryable\":{retryable}}}}}"
+        "{{\"schema\":\"haider.run.v1\",\"session_id\":null,\"run_id\":null,\"provider\":{provider},\"model\":{model},\"outcome\":\"{outcome}\",\"response\":null,\"usage\":null,\"permission_denials\":[],\"error\":{{\"code\":{code},\"message\":{message},\"retryable\":{retryable}}}}}"
     );
     output.write_all(line.as_bytes())?;
     output.write_all(b"\n")?;
@@ -348,6 +367,8 @@ pub(crate) fn write_final(
 fn run_json(result: &HeadlessRunResult) -> io::Result<String> {
     let session_id = serde_json::to_string(result.session_id.as_str()).map_err(io::Error::other)?;
     let run_id = serde_json::to_string(result.run_id.as_str()).map_err(io::Error::other)?;
+    let provider = serde_json::to_string(&result.provider).map_err(io::Error::other)?;
+    let model = serde_json::to_string(&result.model).map_err(io::Error::other)?;
     let outcome = serde_json::to_string(&result.outcome).map_err(io::Error::other)?;
     let response = serde_json::to_string(&result.response).map_err(io::Error::other)?;
     let usage = serde_json::to_string(&result.usage).map_err(io::Error::other)?;
@@ -362,7 +383,7 @@ fn run_json(result: &HeadlessRunResult) -> io::Result<String> {
         None => "null".into(),
     };
     Ok(format!(
-        "{{\"schema\":\"haider.run.v1\",\"session_id\":{session_id},\"run_id\":{run_id},\"outcome\":{outcome},\"response\":{response},\"usage\":{usage},\"permission_denials\":{denials},\"error\":{error}}}"
+        "{{\"schema\":\"haider.run.v1\",\"session_id\":{session_id},\"run_id\":{run_id},\"provider\":{provider},\"model\":{model},\"outcome\":{outcome},\"response\":{response},\"usage\":{usage},\"permission_denials\":{denials},\"error\":{error}}}"
     ))
 }
 
@@ -408,6 +429,11 @@ pub(crate) fn exit_code_for_error(error: &HeadlessRunError) -> u8 {
         ) => EX_UNAVAILABLE,
         HeadlessRunError::Transport { .. } => EX_IOERR,
         HeadlessRunError::Encode { .. } => EX_SOFTWARE,
+        HeadlessRunError::Bootstrap {
+            code: ERROR_CODE_NO_ACTIVE_ACCOUNT | ERROR_CODE_NO_DEFAULT_MODEL,
+            ..
+        } => EX_PROVIDER,
+        HeadlessRunError::Bootstrap { .. } => EX_SOFTWARE,
         HeadlessRunError::Rpc { code, .. } if code == "timeout_before_acceptance" => EX_TIMEOUT,
         HeadlessRunError::Rpc { code, .. }
             if matches!(

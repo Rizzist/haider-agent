@@ -171,7 +171,7 @@ fn unknown_import_source_is_rejected() {
 #[test]
 fn run_jsonl_is_lf_framed_and_every_line_is_a_raw_envelope() {
     let out = haider()
-        .args(["run", "--jsonl", "hello"])
+        .args(["run", "--provider", "fake", "--jsonl", "hello"])
         .output()
         .expect("binary runs");
     assert!(out.status.success());
@@ -210,7 +210,7 @@ fn run_jsonl_is_lf_framed_and_every_line_is_a_raw_envelope() {
 #[test]
 fn run_default_print_is_exact_under_redirected_no_term_io() {
     let out = haider()
-        .args(["run", "hello"])
+        .args(["run", "--provider", "fake", "hello"])
         .env_remove("TERM")
         .stdin(Stdio::null())
         .output()
@@ -243,26 +243,52 @@ fn run_jsonl_accepts_explicit_fake_provider_and_model() {
     );
 }
 
+/// MUTATION CHECK: restore the parser's closed provider allowlist or reject
+/// before session.create. Expected RUNTIME failure: the process returns usage
+/// 2 instead of the daemon's typed create refusal and protocol exit.
 #[test]
-fn anthropic_provider_requires_an_explicit_model() {
+fn unknown_run_provider_surfaces_daemon_create_refusal() {
     let out = haider()
-        .args(["run", "--jsonl", "--provider", "anthropic", "hello"])
+        .args([
+            "run",
+            "--output",
+            "json",
+            "--provider",
+            "unknown",
+            "--model",
+            "fixture-model",
+            "hello",
+        ])
         .output()
         .expect("binary runs");
 
-    assert_eq!(out.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("requires --model"));
+    assert_eq!(out.status.code(), Some(76));
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).expect("refusal JSON");
+    assert_eq!(value["error"]["code"], "invalid_argument");
+    assert_eq!(value["provider"], "unknown");
+    assert_eq!(value["model"], "fixture-model");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unsupported session provider"));
 }
 
+/// MUTATION CHECK: fall back to profile defaults when no provider flag is
+/// present. Expected RUNTIME failure: the fresh profile creates a fake session
+/// instead of returning typed no_active_account with an actionable remedy.
 #[test]
-fn unknown_run_provider_is_usage_error() {
+fn flagless_run_without_an_active_account_exits_65_with_remedy() {
     let out = haider()
-        .args(["run", "--jsonl", "--provider", "unknown", "hello"])
+        .args(["run", "hello", "--output", "json"])
         .output()
         .expect("binary runs");
 
-    assert_eq!(out.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("unknown provider"));
+    assert_eq!(out.status.code(), Some(65));
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).expect("error JSON");
+    assert_eq!(value["error"]["code"], "no_active_account");
+    assert!(value["provider"].is_null());
+    assert!(value["model"].is_null());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("no_active_account"));
+    assert!(stderr.contains("remedy:"));
+    assert!(stderr.contains("TUI"));
 }
 
 #[test]
@@ -318,7 +344,7 @@ fn sequential_cli_runs_use_profile_owned_worker_generations() {
     let profile = profile_parent.path().join("profile");
     let run = |prompt: &str| {
         Command::new(env!("CARGO_BIN_EXE_haider"))
-            .args(["run", "--jsonl", prompt])
+            .args(["run", "--provider", "fake", "--jsonl", prompt])
             .env("HAIDER_PROFILE_DIR", &profile)
             .env("HAIDER_TEST_FAKE_PROVIDER", DEFAULT_FAKE_SCRIPT)
             .output()
@@ -373,7 +399,7 @@ fn sequential_cli_runs_use_profile_owned_worker_generations() {
 #[test]
 fn run_jsonl_exits_65_when_fake_provider_errors() {
     let out = haider()
-        .args(["run", "--jsonl", "hello"])
+        .args(["run", "--provider", "fake", "--jsonl", "hello"])
         .env(
             "HAIDER_TEST_FAKE_PROVIDER",
             r#"[{"step":"malformed_frame"}]"#,
@@ -395,7 +421,7 @@ fn run_jsonl_exits_65_when_fake_provider_errors() {
 #[test]
 fn run_jsonl_cancelled_has_130_exit_and_terminal_envelope() {
     let out = haider()
-        .args(["run", "--jsonl", "hello"])
+        .args(["run", "--provider", "fake", "--jsonl", "hello"])
         .env(
             "HAIDER_TEST_FAKE_PROVIDER",
             r#"[{"step":"finish","reason":"cancelled"}]"#,
@@ -417,7 +443,16 @@ fn run_jsonl_cancelled_has_130_exit_and_terminal_envelope() {
 #[test]
 fn run_timeout_emits_timeout_json_and_exits_124() {
     let out = haider()
-        .args(["run", "hello", "--output", "json", "--timeout", "20ms"])
+        .args([
+            "run",
+            "--provider",
+            "fake",
+            "hello",
+            "--output",
+            "json",
+            "--timeout",
+            "20ms",
+        ])
         .env("HAIDER_TEST_FAKE_PROVIDER", r#"[{"step":"hang"}]"#)
         .output()
         .expect("binary runs");
@@ -439,7 +474,7 @@ fn run_nonpermission_input_cancels_and_exits_77() {
         {"step":"finish","reason":"tool_use"}
     ]"#;
     let out = haider()
-        .args(["run", "hello", "--output", "json"])
+        .args(["run", "--provider", "fake", "hello", "--output", "json"])
         .env("HAIDER_TEST_FAKE_PROVIDER", script)
         .output()
         .expect("binary runs");
@@ -466,7 +501,7 @@ fn run_write_and_exec_permission_flags_journal_ordinary_allow() {
     let denied_workspace = tempfile::tempdir().expect("denied workspace");
     let denied = haider()
         .current_dir(denied_workspace.path())
-        .args(["run", "write", "--output", "json"])
+        .args(["run", "--provider", "fake", "write", "--output", "json"])
         .env("HAIDER_TEST_FAKE_PROVIDER", script)
         .output()
         .expect("denied run");
@@ -483,7 +518,14 @@ fn run_write_and_exec_permission_flags_journal_ordinary_allow() {
     let allowed_workspace = tempfile::tempdir().expect("allowed workspace");
     let allowed = haider()
         .current_dir(allowed_workspace.path())
-        .args(["run", "write", "--jsonl", "--allow-writes"])
+        .args([
+            "run",
+            "--provider",
+            "fake",
+            "write",
+            "--jsonl",
+            "--allow-writes",
+        ])
         .env("HAIDER_TEST_FAKE_PROVIDER", script)
         .output()
         .expect("allowed run");
@@ -528,7 +570,14 @@ fn run_write_and_exec_permission_flags_journal_ordinary_allow() {
     .to_string();
     let exec = haider()
         .current_dir(exec_workspace.path())
-        .args(["run", "execute", "--jsonl", "--allow-exec"])
+        .args([
+            "run",
+            "--provider",
+            "fake",
+            "execute",
+            "--jsonl",
+            "--allow-exec",
+        ])
         .env("HAIDER_TEST_FAKE_PROVIDER", &exec_script)
         .output()
         .expect("allowed exec run");
@@ -564,7 +613,7 @@ fn run_jsonl_replays_every_envelope_to_a_slow_pipe_consumer() {
     let script = serde_json::to_string(&steps).expect("fixture serializes");
     let mut command = haider();
     let mut child = command
-        .args(["run", "--jsonl", "backpressure"])
+        .args(["run", "--provider", "fake", "--jsonl", "backpressure"])
         .env("HAIDER_TEST_FAKE_PROVIDER", script)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -641,7 +690,7 @@ fn run_jsonl_replays_every_envelope_to_a_slow_pipe_consumer() {
 fn jsonl_store_failure_emits_errored_and_returns_nonzero_without_hanging() {
     let mut command = haider();
     let mut child = command
-        .args(["run", "store failure", "--jsonl"])
+        .args(["run", "--provider", "fake", "store failure", "--jsonl"])
         .env("HAIDER_TEST_FAIL_NEXT_DONE_APPEND", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -706,6 +755,8 @@ fn result(outcome: HeadlessOutcome, failure: Option<HeadlessRunFailure>) -> Head
     HeadlessRunResult {
         session_id: SessionId::new("session-json"),
         run_id: RunId::new("run-json"),
+        provider: "fake".into(),
+        model: "fake-model".into(),
         outcome,
         response: None,
         usage: None,
@@ -873,6 +924,15 @@ fn run_exit_codes_are_table_driven() {
             },
             EX_TIMEOUT,
         ),
+        (
+            HeadlessRunError::Bootstrap {
+                stage: "account.list",
+                code: haider_client::ERROR_CODE_NO_ACTIVE_ACCOUNT,
+                message: "no active daemon account is configured".into(),
+                retryable: false,
+            },
+            EX_PROVIDER,
+        ),
     ];
     for (error, expected) in pre_accept_cases {
         assert_eq!(exit_code_for_error(&error), expected, "{error}");
@@ -914,8 +974,26 @@ fn run_parser_pins_outputs_timeouts_and_permission_flags() {
     assert_eq!(parsed.output, RunOutput::Json);
     assert_eq!(parsed.timeout, Some(Duration::from_millis(1500)));
     assert!(parsed.allow_writes && parsed.allow_exec);
-    assert_eq!(parsed.provider, Some(ProviderSelection::Fake));
+    assert_eq!(
+        parsed.provider.as_ref().map(ProviderSelection::as_str),
+        Some("fake")
+    );
     assert_eq!(parsed.model.as_deref(), Some("fixture"));
+    let open_provider =
+        parse_run_options(&["hello".into(), "--provider".into(), "openai-oauth".into()])
+            .expect("provider names are daemon-owned");
+    assert_eq!(
+        open_provider
+            .provider
+            .as_ref()
+            .map(ProviderSelection::as_str),
+        Some("openai-oauth")
+    );
+    assert!(open_provider.model.is_none());
+    assert!(
+        parse_run_options(&["hello".into(), "--provider".into(), "anthropic".into(),]).is_ok(),
+        "a provider's published default may supply the model"
+    );
     assert_eq!(
         parse_run_options(&["--jsonl".into(), "hello".into()])
             .expect("legacy alias")
@@ -932,7 +1010,7 @@ fn run_parser_pins_outputs_timeouts_and_permission_flags() {
 
 /// MUTATION CHECK: reorder/remove a v1 field, omit nulls, add ANSI, or stop
 /// writing exactly one LF after assistant text/JSON. Expected RUNTIME failure:
-/// the byte golden or the eight-key/null assertions change.
+/// the byte golden or the ten-key/null assertions change.
 #[test]
 fn print_and_json_outputs_pin_bytes_schema_and_nulls() {
     let mut done = result(HeadlessOutcome::Done, None);
@@ -945,10 +1023,12 @@ fn print_and_json_outputs_pin_bytes_schema_and_nulls() {
     write_final(&mut json, RunOutput::Json, &done).expect("json");
     assert_eq!(
         String::from_utf8(json.clone()).expect("utf8"),
-        "{\"schema\":\"haider.run.v1\",\"session_id\":\"session-json\",\"run_id\":\"run-json\",\"outcome\":\"done\",\"response\":\"final answer\",\"usage\":null,\"permission_denials\":[],\"error\":null}\n"
+        "{\"schema\":\"haider.run.v1\",\"session_id\":\"session-json\",\"run_id\":\"run-json\",\"provider\":\"fake\",\"model\":\"fake-model\",\"outcome\":\"done\",\"response\":\"final answer\",\"usage\":null,\"permission_denials\":[],\"error\":null}\n"
     );
     let value: serde_json::Value = serde_json::from_slice(&json).expect("v1 JSON");
-    assert_eq!(value.as_object().expect("object").len(), 8);
+    assert_eq!(value.as_object().expect("object").len(), 10);
+    assert_eq!(value["provider"], "fake");
+    assert_eq!(value["model"], "fake-model");
     assert!(value["usage"].is_null());
     assert!(value["error"].is_null());
 
@@ -1001,11 +1081,11 @@ fn print_and_json_outputs_pin_bytes_schema_and_nulls() {
         assert_eq!(
             String::from_utf8(bytes.clone()).expect("failure utf8"),
             format!(
-                "{{\"schema\":\"haider.run.v1\",\"session_id\":\"session-json\",\"run_id\":\"run-json\",\"outcome\":\"{outcome_name}\",\"response\":null,\"usage\":null,\"permission_denials\":[],\"error\":{error}}}\n"
+                "{{\"schema\":\"haider.run.v1\",\"session_id\":\"session-json\",\"run_id\":\"run-json\",\"provider\":\"fake\",\"model\":\"fake-model\",\"outcome\":\"{outcome_name}\",\"response\":null,\"usage\":null,\"permission_denials\":[],\"error\":{error}}}\n"
             )
         );
         let value: serde_json::Value = serde_json::from_slice(&bytes).expect("failure object");
-        assert_eq!(value.as_object().expect("object").len(), 8);
+        assert_eq!(value.as_object().expect("object").len(), 10);
         assert!(value["response"].is_null());
         assert_eq!(
             value["error"].is_null(),

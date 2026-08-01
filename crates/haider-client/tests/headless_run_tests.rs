@@ -10,11 +10,14 @@ use haider_client::{
     run_headless,
 };
 use haider_rpc::haider_protocol::EventPayload;
+use haider_rpc::haider_protocol::credential::{AuthMethod, CredentialDescriptor, CredentialStatus};
 use haider_rpc::haider_protocol::envelope::{
     PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
 };
 use haider_rpc::haider_protocol::error::ErrorCode;
-use haider_rpc::haider_protocol::ids::{DeviceId, EventId, ItemId, MenuId, RunId, SessionId};
+use haider_rpc::haider_protocol::ids::{
+    CredentialAlias, DeviceId, EventId, ItemId, MenuId, RunId, SessionId,
+};
 use haider_rpc::haider_protocol::item::{ItemEvent, TurnItem};
 use haider_rpc::haider_protocol::menu::{
     AnswerVia, DecisionKind, Menu, MenuAnswer, MenuKind, MenuOption, MenuScope,
@@ -23,8 +26,9 @@ use haider_rpc::haider_protocol::session::{SessionMetadataV1, SessionPermissionO
 use haider_rpc::haider_protocol::state::{RunState, WaitReason};
 use haider_rpc::{
     AttachMode, AttachState, AttachmentId, CancelStatus, Capability, CapabilitySet,
-    DEFAULT_FRAME_LIMIT, LifecyclePhase, RequestBody, RequestId, ResponseBody, SubmitDisposition,
-    WIRE_PROTOCOL_VERSION, Welcome, WireFrame, uds_codec,
+    DEFAULT_FRAME_LIMIT, LifecyclePhase, ProviderApiFamilyWire, ProviderAvailabilityWire,
+    ProviderDefaultWire, ProviderSummaryWire, RequestBody, RequestId, ResponseBody,
+    SubmitDisposition, WIRE_PROTOCOL_VERSION, Welcome, WireFrame, uds_codec,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -167,6 +171,15 @@ async fn accept_create_and_attach(peer: &mut Peer) -> (SessionId, AttachmentId) 
         panic!("headless runner must use additive session.create shape");
     };
     assert_eq!(permission_overrides, None);
+    respond_create_and_attach(peer, create_request, "fake", "fake-model").await
+}
+
+async fn respond_create_and_attach(
+    peer: &mut Peer,
+    create_request: RequestId,
+    provider: &str,
+    model: &str,
+) -> (SessionId, AttachmentId) {
     let session_id = SessionId::new("headless-session");
     peer.respond(
         create_request,
@@ -176,8 +189,8 @@ async fn accept_create_and_attach(peer: &mut Peer) -> (SessionId, AttachmentId) 
             worker_generation: 7,
             metadata: SessionMetadataV1 {
                 cwd: "/tmp".into(),
-                provider: "fake".into(),
-                model: "fake-model".into(),
+                provider: provider.into(),
+                model: model.into(),
                 max_tokens: 4096,
                 permission_overrides: None,
                 system_prompt_version: Some("test".into()),
@@ -279,8 +292,8 @@ fn request(timeout: Option<Duration>) -> HeadlessRunRequest {
     HeadlessRunRequest {
         cwd: "/tmp".into(),
         prompt: "hello".into(),
-        provider: "fake".into(),
-        model: "fake-model".into(),
+        provider: Some("fake".into()),
+        model: Some("fake-model".into()),
         max_tokens: 4096,
         permission_overrides: SessionPermissionOverridesV1::default(),
         timeout,
@@ -313,6 +326,206 @@ async fn run_with_events(
         .expect("headless result");
     let events = collector.await.expect("collector");
     (result, events)
+}
+
+fn active_account(provider: &str) -> CredentialDescriptor {
+    CredentialDescriptor {
+        alias: CredentialAlias::new("active-account"),
+        provider: provider.into(),
+        base_url: None,
+        auth_method: AuthMethod::OAuth,
+        identity: "active@example.com".into(),
+        status: CredentialStatus::Ok,
+        active: true,
+    }
+}
+
+fn provider_summary_fixture(
+    provider: &str,
+    default_model: Option<&str>,
+    models: &[&str],
+) -> ProviderSummaryWire {
+    ProviderSummaryWire {
+        provider: provider.into(),
+        api_family: ProviderApiFamilyWire::OpenAiResponses,
+        endpoint: Some("https://example.test/v1/responses".into()),
+        models: models.iter().map(|model| (*model).into()).collect(),
+        model_details: Vec::new(),
+        auth_methods: vec![AuthMethod::OAuth],
+        availability: ProviderAvailabilityWire::Available,
+        availability_reason: None,
+        default_model: default_model.map(Into::into),
+        enabled: true,
+    }
+}
+
+async fn serve_flagless_done(
+    peer: &mut Peer,
+    default_model: Option<&str>,
+    models: &[&str],
+    expected_model: &str,
+) {
+    let provider = "openai-oauth";
+    let (account_request, account_body) = peer.request().await;
+    assert_eq!(account_body, RequestBody::AccountList { provider: None });
+    peer.respond(
+        account_request,
+        ResponseBody::AccountList {
+            descriptors: vec![active_account(provider)],
+            revision: Some(4),
+            provider_active: Vec::new(),
+            // Deliberately misleading: bootstrap must consult provider.list's
+            // coherent provider summary, like the TUI, not this additive seam.
+            provider_defaults: vec![ProviderDefaultWire {
+                provider: provider.into(),
+                model: "wrong-account-list-default".into(),
+            }],
+        },
+    )
+    .await;
+
+    let (provider_request, provider_body) = peer.request().await;
+    assert_eq!(
+        provider_body,
+        RequestBody::ProviderList {
+            provider: Some(provider.into())
+        }
+    );
+    peer.respond(
+        provider_request,
+        ResponseBody::ProviderList {
+            providers: vec![provider_summary_fixture(provider, default_model, models)],
+            revision: 4,
+        },
+    )
+    .await;
+
+    let (create_request, create_body) = peer.request().await;
+    let RequestBody::SessionCreateWithPermissionOverrides {
+        provider: created_provider,
+        model: created_model,
+        permission_overrides,
+        ..
+    } = create_body
+    else {
+        panic!("bootstrap must be followed by session.create");
+    };
+    assert_eq!(created_provider, provider);
+    assert_eq!(created_model, expected_model);
+    assert_eq!(permission_overrides, None);
+    let (session_id, attachment_id) =
+        respond_create_and_attach(peer, create_request, provider, expected_model).await;
+    let (submit_request, run_id) = accept_submit(peer, &session_id).await;
+    peer.respond(
+        submit_request,
+        ResponseBody::TurnSubmit {
+            session_id: session_id.clone(),
+            run_id: run_id.clone(),
+            accepted_seq: 1,
+            worker_generation: 7,
+            disposition: SubmitDisposition::Started,
+        },
+    )
+    .await;
+    send_event(
+        peer,
+        &attachment_id,
+        envelope(
+            &session_id,
+            &run_id,
+            1,
+            EventPayload::RunState(RunState::Done),
+        ),
+    )
+    .await;
+}
+
+/// MUTATION CHECK: drop account.list, hardcode anthropic, consume the
+/// account.list default seam, or skip provider default resolution. Expected
+/// RUNTIME failure: peer request order or the pinned create body differs.
+#[tokio::test]
+async fn flagless_bootstrap_creates_on_active_provider_and_published_default_model() {
+    let (_root, profile) = profile();
+    let peer = spawn_peer(&profile, |mut peer| async move {
+        serve_flagless_done(
+            &mut peer,
+            Some("gpt-active-default"),
+            &["gpt-first", "gpt-active-default"],
+            "gpt-active-default",
+        )
+        .await;
+    });
+    let mut run = request(None);
+    run.provider = None;
+    run.model = None;
+
+    let (result, _events) = run_with_events(profile, run, 4, Duration::ZERO).await;
+    peer.await.expect("peer");
+    assert_eq!(result.provider, "openai-oauth");
+    assert_eq!(result.model, "gpt-active-default");
+    assert_eq!(result.outcome, HeadlessOutcome::Done);
+}
+
+/// MUTATION CHECK: require default_model instead of falling back to the first
+/// published slug. Expected RUNTIME failure: no create arrives with
+/// `gpt-first`, or the runner returns a typed bootstrap failure.
+#[tokio::test]
+async fn flagless_bootstrap_falls_back_to_first_published_model() {
+    let (_root, profile) = profile();
+    let peer = spawn_peer(&profile, |mut peer| async move {
+        serve_flagless_done(&mut peer, None, &["gpt-first", "gpt-second"], "gpt-first").await;
+    });
+    let mut run = request(None);
+    run.provider = None;
+    run.model = None;
+
+    let (result, _events) = run_with_events(profile, run, 4, Duration::ZERO).await;
+    peer.await.expect("peer");
+    assert_eq!(result.provider, "openai-oauth");
+    assert_eq!(result.model, "gpt-first");
+}
+
+/// MUTATION CHECK: fall back to profile defaults or continue to provider.list
+/// when account.list has nothing active. Expected RUNTIME failure: the exact
+/// typed no_active_account bootstrap error is not returned before create.
+#[tokio::test]
+async fn flagless_bootstrap_without_active_account_is_typed() {
+    let (_root, profile) = profile();
+    let peer = spawn_peer(&profile, |mut peer| async move {
+        let (request_id, body) = peer.request().await;
+        assert_eq!(body, RequestBody::AccountList { provider: None });
+        peer.respond(
+            request_id,
+            ResponseBody::AccountList {
+                descriptors: Vec::new(),
+                revision: Some(1),
+                provider_active: Vec::new(),
+                provider_defaults: Vec::new(),
+            },
+        )
+        .await;
+    });
+    let mut run = request(None);
+    run.provider = None;
+    run.model = None;
+    let (sender, _receiver) = mpsc::channel(1);
+    let error = tokio::time::timeout(
+        BOUND,
+        run_headless(&profile, EnsureOptions::default(), run, sender),
+    )
+    .await
+    .expect("runner bound")
+    .expect_err("no active account must refuse");
+    peer.await.expect("peer");
+    assert!(matches!(
+        error,
+        HeadlessRunError::Bootstrap {
+            stage: "account.list",
+            code: haider_client::ERROR_CODE_NO_ACTIVE_ACCOUNT,
+            retryable: false,
+            ..
+        }
+    ));
 }
 
 /// MUTATION CHECK: submit before Control attach or discard frames received

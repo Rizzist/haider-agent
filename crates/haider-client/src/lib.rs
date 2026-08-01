@@ -28,9 +28,10 @@ pub use client::{
     PING_INTERVAL, PONG_DEADLINE, PeerCredentials, PendingResponse, RpcClient, connect,
 };
 pub use headless::{
-    DEFAULT_TERMINAL_GRACE, HeadlessBlockingReason, HeadlessEvent, HeadlessFailureCode,
-    HeadlessOutcome, HeadlessPermissionDenial, HeadlessRunError, HeadlessRunFailure,
-    HeadlessRunRequest, HeadlessRunResult, required_headless_features, run_headless,
+    DEFAULT_TERMINAL_GRACE, ERROR_CODE_NO_ACTIVE_ACCOUNT, ERROR_CODE_NO_DEFAULT_MODEL,
+    HeadlessBlockingReason, HeadlessEvent, HeadlessFailureCode, HeadlessOutcome,
+    HeadlessPermissionDenial, HeadlessRunError, HeadlessRunFailure, HeadlessRunRequest,
+    HeadlessRunResult, required_headless_features, run_headless,
 };
 pub use profile::{
     DEFAULT_MAX_TOKENS, DEFAULT_PROVIDER, MODEL_ENV, PACKAGED_DEFAULT_MODEL, PROFILE_CONFIG_FILE,

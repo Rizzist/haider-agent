@@ -36,6 +36,11 @@ use crate::spawn::{EnsureError, EnsureOptions, ensure_daemon, required_live_feat
 /// terminal after timeout or blocked-input detection.
 pub const DEFAULT_TERMINAL_GRACE: Duration = Duration::from_secs(2);
 
+/// No daemon account descriptor is currently active for headless bootstrap.
+pub const ERROR_CODE_NO_ACTIVE_ACCOUNT: &str = "no_active_account";
+/// The selected provider publishes neither a default nor a fallback model.
+pub const ERROR_CODE_NO_DEFAULT_MODEL: &str = "no_default_model";
+
 const MAX_RECONNECTS: u8 = 3;
 const ATTACH_HEALTH_POLL: Duration = Duration::from_millis(10);
 static COMMAND_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -45,8 +50,10 @@ static COMMAND_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 pub struct HeadlessRunRequest {
     pub cwd: String,
     pub prompt: String,
-    pub provider: String,
-    pub model: String,
+    /// Explicit provider override. `None` follows the daemon's active account.
+    pub provider: Option<String>,
+    /// Explicit model override. `None` follows the selected provider summary.
+    pub model: Option<String>,
     pub max_tokens: u64,
     pub permission_overrides: SessionPermissionOverridesV1,
     pub timeout: Option<Duration>,
@@ -154,6 +161,8 @@ impl HeadlessFailureCode {
 pub struct HeadlessRunResult {
     pub session_id: SessionId,
     pub run_id: RunId,
+    pub provider: String,
+    pub model: String,
     pub outcome: HeadlessOutcome,
     pub response: Option<String>,
     pub usage: Option<Usage>,
@@ -177,6 +186,12 @@ pub enum HeadlessRunError {
     Rpc {
         stage: &'static str,
         code: String,
+        message: String,
+        retryable: bool,
+    },
+    Bootstrap {
+        stage: &'static str,
+        code: &'static str,
         message: String,
         retryable: bool,
     },
@@ -205,6 +220,15 @@ impl std::fmt::Display for HeadlessRunError {
                 message,
                 ..
             } => write!(formatter, "daemon rejected {stage} ({code}): {message}"),
+            Self::Bootstrap {
+                stage,
+                code,
+                message,
+                ..
+            } => write!(
+                formatter,
+                "headless bootstrap failed during {stage} ({code}): {message}"
+            ),
             Self::Protocol { stage, message } => {
                 write!(
                     formatter,
@@ -550,15 +574,6 @@ async fn run_headless_inner(
 ) -> Result<HeadlessRunResult, HeadlessRunError> {
     normalize_ensure_options(&mut ensure, request.permission_overrides);
     let timeout_deadline = request.timeout.map(|timeout| Instant::now() + timeout);
-    let create_body = RequestBody::SessionCreateWithPermissionOverrides {
-        command_id: CommandId::new(command_id("headless-create")),
-        cwd: request.cwd.clone(),
-        provider: request.provider.clone(),
-        model: request.model.clone(),
-        max_tokens: request.max_tokens,
-        permission_overrides: (!request.permission_overrides.is_empty())
-            .then_some(request.permission_overrides),
-    };
     let submit_command_id = CommandId::new(command_id("headless-submit"));
     let mut reconnects = ReconnectBudget::new();
     let mut connection = before_acceptance_deadline(
@@ -567,6 +582,28 @@ async fn run_headless_inner(
         HeadlessConnection::open(profile, ensure.clone()),
     )
     .await?;
+    let (provider, model) = before_acceptance_deadline(
+        timeout_deadline,
+        "identity bootstrap",
+        resolve_run_identity(
+            profile,
+            &ensure,
+            &mut connection,
+            &mut reconnects,
+            request.provider.clone(),
+            request.model.clone(),
+        ),
+    )
+    .await?;
+    let create_body = RequestBody::SessionCreateWithPermissionOverrides {
+        command_id: CommandId::new(command_id("headless-create")),
+        cwd: request.cwd.clone(),
+        provider: provider.clone(),
+        model: model.clone(),
+        max_tokens: request.max_tokens,
+        permission_overrides: (!request.permission_overrides.is_empty())
+            .then_some(request.permission_overrides),
+    };
 
     let (session_id, created_generation) =
         before_acceptance_deadline(timeout_deadline, "session.create", async {
@@ -965,7 +1002,149 @@ async fn run_headless_inner(
         }
     }
 
-    Ok(finalize(reducer, run_id, forced))
+    Ok(finalize(reducer, run_id, provider, model, forced))
+}
+
+async fn resolve_run_identity(
+    profile: &ResolvedProfile,
+    ensure: &EnsureOptions,
+    connection: &mut HeadlessConnection,
+    reconnects: &mut ReconnectBudget,
+    explicit_provider: Option<String>,
+    explicit_model: Option<String>,
+) -> Result<(String, String), HeadlessRunError> {
+    let provider_is_explicit = explicit_provider.is_some();
+    let provider = match explicit_provider {
+        Some(provider) => provider,
+        None => active_account_provider(profile, ensure, connection, reconnects).await?,
+    };
+    if let Some(model) = explicit_model {
+        return Ok((provider, model));
+    }
+
+    let summary = provider_summary(profile, ensure, connection, reconnects, &provider).await?;
+    match summary {
+        Some(summary) => summary
+            .default_model
+            .or_else(|| summary.models.into_iter().next())
+            .map(|model| (provider.clone(), model))
+            .ok_or_else(|| HeadlessRunError::Bootstrap {
+                stage: "provider.list",
+                code: ERROR_CODE_NO_DEFAULT_MODEL,
+                message: format!(
+                    "provider `{provider}` publishes neither a default model nor a model catalog"
+                ),
+                retryable: false,
+            }),
+        // An explicit unknown provider must reach session.create so the
+        // daemon remains the provider-name authority. Its provider check
+        // precedes the non-empty-model check, preserving the typed refusal.
+        None if provider_is_explicit => Ok((provider, String::new())),
+        None => Err(HeadlessRunError::Bootstrap {
+            stage: "provider.list",
+            code: ERROR_CODE_NO_DEFAULT_MODEL,
+            message: format!("active provider `{provider}` is absent from provider.list"),
+            retryable: false,
+        }),
+    }
+}
+
+async fn active_account_provider(
+    profile: &ResolvedProfile,
+    ensure: &EnsureOptions,
+    connection: &mut HeadlessConnection,
+    reconnects: &mut ReconnectBudget,
+) -> Result<String, HeadlessRunError> {
+    loop {
+        match connection
+            .client
+            .request(RequestBody::AccountList { provider: None })
+            .await
+        {
+            Ok(ResponseBody::AccountList { descriptors, .. }) => {
+                return descriptors
+                    .into_iter()
+                    .find(|descriptor| descriptor.active)
+                    .map(|descriptor| descriptor.provider)
+                    .ok_or_else(|| HeadlessRunError::Bootstrap {
+                        stage: "account.list",
+                        code: ERROR_CODE_NO_ACTIVE_ACCOUNT,
+                        message: "no active daemon account is configured".into(),
+                        retryable: false,
+                    });
+            }
+            Ok(ResponseBody::Error {
+                code,
+                message,
+                retryable,
+                ..
+            }) => return Err(rpc_error("account.list", code, message, retryable)),
+            Ok(_) => {
+                return Err(protocol_error(
+                    "account.list",
+                    "response method did not match request",
+                ));
+            }
+            Err(error) => {
+                reconnect_before_session(
+                    profile,
+                    ensure,
+                    connection,
+                    reconnects,
+                    "account.list",
+                    error,
+                )
+                .await?;
+            }
+        }
+    }
+}
+
+async fn provider_summary(
+    profile: &ResolvedProfile,
+    ensure: &EnsureOptions,
+    connection: &mut HeadlessConnection,
+    reconnects: &mut ReconnectBudget,
+    provider: &str,
+) -> Result<Option<haider_rpc::ProviderSummaryWire>, HeadlessRunError> {
+    loop {
+        match connection
+            .client
+            .request(RequestBody::ProviderList {
+                provider: Some(provider.to_owned()),
+            })
+            .await
+        {
+            Ok(ResponseBody::ProviderList { providers, .. }) => {
+                return Ok(providers
+                    .into_iter()
+                    .find(|summary| summary.provider == provider));
+            }
+            Ok(ResponseBody::Error {
+                code,
+                message,
+                retryable,
+                ..
+            }) => return Err(rpc_error("provider.list", code, message, retryable)),
+            Ok(_) => {
+                return Err(protocol_error(
+                    "provider.list",
+                    "response method did not match request",
+                ));
+            }
+            Err(error) => {
+                reconnect_before_session(
+                    profile,
+                    ensure,
+                    connection,
+                    reconnects,
+                    "provider.list",
+                    error,
+                )
+                .await?;
+            }
+        }
+    }
 }
 
 fn normalize_ensure_options(
@@ -1879,6 +2058,8 @@ fn cancellation_unconfirmed(stage: &'static str) -> HeadlessRunError {
 fn finalize(
     reducer: HeadlessReducer,
     run_id: RunId,
+    provider: String,
+    model: String,
     forced: Option<ForcedOutcome>,
 ) -> HeadlessRunResult {
     let (outcome, failure, terminal_seq) = match forced {
@@ -1924,6 +2105,8 @@ fn finalize(
     HeadlessRunResult {
         session_id: reducer.session_id,
         run_id,
+        provider,
+        model,
         outcome,
         response: reducer.response,
         usage: reducer.usage,
