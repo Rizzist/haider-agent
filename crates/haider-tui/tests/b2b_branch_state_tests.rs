@@ -759,12 +759,11 @@ fn menu_answers_and_compact_capture_the_branch_at_issuance() {
 fn main_branch_wire_bytes_stay_historical_and_branches_ride_the_decode_forms() {
     // Brief item 3: `None` encodes the LEGACY TurnSubmit/SessionCompact
     // forms — byte-identical to the pre-branch wire — while a captured
-    // branch encodes the branch-capable decode forms.
-    //
-    // MUTATION CHECK: encode `TurnSubmitWithBranch { branch_id: None }`
-    // for a main submit and the byte assertion below fails (the legacy
-    // JSON has no `branch_id` key… it also proves nothing changed for
-    // every daemon that predates B2a).
+    // branch encodes the branch-capable decode forms. The VARIANT is
+    // pinned as well as the bytes: `TurnSubmitWithBranch { branch_id:
+    // None }` happens to serialize identically (serde skips the `None`),
+    // so a byte check alone cannot see the encode-selection law drift
+    // away from the brief's letter (executed-mutation finding).
     let submit = |branch: Option<BranchId>| LiveCommand::Submit {
         command_id: CommandId::new("cmd-1"),
         session: sid(0),
@@ -773,6 +772,17 @@ fn main_branch_wire_bytes_stay_historical_and_branches_ride_the_decode_forms() {
         mode: haider_protocol::DeliveryMode::Steer,
         branch,
     };
+    assert!(
+        matches!(request_body(submit(None)), RequestBody::TurnSubmit { .. }),
+        "main submits ride the LEGACY variant, not a None-branch decode form"
+    );
+    assert!(
+        matches!(
+            request_body(submit(Some(bid("b-exp")))),
+            RequestBody::TurnSubmitWithBranch { .. }
+        ),
+        "captured branches ride the branch-capable decode form"
+    );
     let main = serde_json::to_value(request_body(submit(None))).expect("encodes");
     assert_eq!(
         main.get("method").and_then(|v| v.as_str()),
@@ -794,6 +804,13 @@ fn main_branch_wire_bytes_stay_historical_and_branches_ride_the_decode_forms() {
         worker_generation: 7,
         branch,
     };
+    assert!(
+        matches!(
+            request_body(compact(None)),
+            RequestBody::SessionCompact { .. }
+        ),
+        "main compaction rides the LEGACY variant"
+    );
     let main = serde_json::to_value(request_body(compact(None))).expect("encodes");
     assert!(
         main.get("branch_id").is_none(),
