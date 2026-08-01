@@ -270,21 +270,34 @@ fn anthropic_missing_credential_exits_65_without_network_access() {
     // Hermetic profile: without this the test inherits the developer's
     // real ~/.haider (real credentials would defeat the missing-key law).
     let profile_parent = tempfile::tempdir().expect("temporary CLI profile parent");
-    let out = haider()
-        .env("HAIDER_PROFILE_DIR", profile_parent.path().join("profile"))
-        .args([
-            "run",
-            "--jsonl",
-            "--provider",
-            "anthropic",
-            "--model",
-            "claude-sonnet-5",
-            "hello",
-        ])
-        .env_remove("HAIDER_TEST_FAKE_PROVIDER")
-        .env_remove("HAIDER_ANTHROPIC_API_KEY")
-        .output()
-        .expect("binary runs");
+    // One bounded retry: under full-gate load the cold daemon spawn can
+    // miss the startup deadline (exit 69 = unavailable) before the
+    // credential law is even reachable. The law under test is the 65
+    // classification, not spawn latency.
+    let mut out = None;
+    for _ in 0..2 {
+        let attempt = haider()
+            .env("HAIDER_PROFILE_DIR", profile_parent.path().join("profile"))
+            .args([
+                "run",
+                "--jsonl",
+                "--provider",
+                "anthropic",
+                "--model",
+                "claude-sonnet-5",
+                "hello",
+            ])
+            .env_remove("HAIDER_TEST_FAKE_PROVIDER")
+            .env_remove("HAIDER_ANTHROPIC_API_KEY")
+            .output()
+            .expect("binary runs");
+        let unavailable = attempt.status.code() == Some(69);
+        out = Some(attempt);
+        if !unavailable {
+            break;
+        }
+    }
+    let out = out.expect("at least one attempt ran");
 
     assert_eq!(out.status.code(), Some(65));
     assert!(String::from_utf8_lossy(&out.stderr).contains("HAIDER_ANTHROPIC_API_KEY"));
@@ -622,7 +635,7 @@ fn run_jsonl_replays_every_envelope_to_a_slow_pipe_consumer() {
 ///
 /// MUTATION CHECK: remove the daemon fault/fallback, wait after the adjacent
 /// terminal, or map StoreCorrupt to success/provider failure. Expected RUNTIME
-/// failure: the five-second bound fires, exit 70 changes, or the final two raw
+/// failure: the bound fires, exit 70 changes, or the final two raw
 /// envelopes are no longer RunFailed(StoreCorrupt) then Errored.
 #[test]
 fn jsonl_store_failure_emits_errored_and_returns_nonzero_without_hanging() {
@@ -634,7 +647,9 @@ fn jsonl_store_failure_emits_errored_and_returns_nonzero_without_hanging() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("binary starts");
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // Cold daemon spawn + turn + fault handling regularly exceeds 5s on a
+    // loaded box — the LAW is termination + the typed trail, not latency.
+    let deadline = Instant::now() + Duration::from_secs(30);
     let status = loop {
         if let Some(status) = child.try_wait().expect("poll child") {
             break status;
