@@ -540,25 +540,43 @@ pub fn request_body(command: LiveCommand) -> RequestBody {
                 },
             ),
         },
+        // B2b encode-selection law: a captured branch rides the
+        // branch-capable decode form; `None` keeps the LEGACY variant so
+        // main-branch wire bytes stay byte-for-byte historical.
         LiveCommand::Submit {
             command_id,
             session,
             worker_generation,
             text,
             mode,
-        } => RequestBody::TurnSubmit {
-            command_id,
-            session_id: session,
-            worker_generation,
-            text,
-            attachments: vec![],
-            mode,
+            branch,
+        } => match branch {
+            Some(branch_id) => RequestBody::TurnSubmitWithBranch {
+                command_id,
+                session_id: session,
+                worker_generation,
+                branch_id: Some(branch_id),
+                text,
+                attachments: vec![],
+                mode,
+            },
+            None => RequestBody::TurnSubmit {
+                command_id,
+                session_id: session,
+                worker_generation,
+                text,
+                attachments: vec![],
+                mode,
+            },
         },
         LiveCommand::Cancel {
             command_id,
             session,
             worker_generation,
             run_id,
+            // Client-side capture only: the wire cancel pins the run by
+            // `run_id`, which acceptance already branch-pinned.
+            branch: _,
         } => RequestBody::TurnCancel {
             command_id,
             session_id: session,
@@ -569,10 +587,36 @@ pub fn request_body(command: LiveCommand) -> RequestBody {
             command_id,
             session,
             worker_generation,
-        } => RequestBody::SessionCompact {
+            branch,
+        } => match branch {
+            Some(branch_id) => RequestBody::SessionCompactOnBranch {
+                command_id,
+                session_id: session,
+                worker_generation,
+                branch_id: Some(branch_id),
+            },
+            None => RequestBody::SessionCompact {
+                command_id,
+                session_id: session,
+                worker_generation,
+            },
+        },
+        LiveCommand::BranchCreate {
+            command_id,
+            session,
+            worker_generation,
+            source_branch,
+            fork_node_id,
+            fork_seq,
+            name,
+        } => RequestBody::BranchCreate {
             command_id,
             session_id: session,
             worker_generation,
+            source_branch_id: source_branch,
+            fork_node_id,
+            fork_seq,
+            name,
         },
         LiveCommand::ShellExec {
             command_id,
@@ -748,7 +792,16 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
                 model: context.model.clone(),
             }]
         }),
+        // The branch-pinned response shape carries the same driver facts as
+        // the legacy one — the branch pin is durable-receipt truth the
+        // driver already holds from its own captured command.
         ResponseBody::TurnSubmit {
+            session_id,
+            worker_generation,
+            disposition,
+            ..
+        }
+        | ResponseBody::TurnSubmitOnBranch {
             session_id,
             worker_generation,
             disposition,
@@ -765,10 +818,25 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
             .command_id
             .clone()
             .map_or_else(Vec::new, |id| vec![LiveReply::Cancelled { command_id: id }]),
-        ResponseBody::SessionCompact { .. } => context
-            .command_id
-            .clone()
-            .map_or_else(Vec::new, |id| vec![LiveReply::Compacted { command_id: id }]),
+        ResponseBody::SessionCompact { .. } | ResponseBody::SessionCompactOnBranch { .. } => {
+            context
+                .command_id
+                .clone()
+                .map_or_else(Vec::new, |id| vec![LiveReply::Compacted { command_id: id }])
+        }
+        ResponseBody::BranchCreate {
+            session_id,
+            branch_id,
+            name,
+            ..
+        } => context.command_id.clone().map_or_else(Vec::new, |id| {
+            vec![LiveReply::BranchForked {
+                command_id: id,
+                session: session_id,
+                branch_id,
+                name,
+            }]
+        }),
         ResponseBody::ShellExec { .. } => context.command_id.clone().map_or_else(Vec::new, |id| {
             vec![LiveReply::ShellAccepted { command_id: id }]
         }),

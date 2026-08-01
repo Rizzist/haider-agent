@@ -94,12 +94,20 @@ pub enum LiveCommand {
         worker_generation: u64,
         text: String,
         mode: DeliveryMode,
+        /// The branch captured at ISSUANCE (B2b): `Some` encodes the
+        /// branch-capable `turn.submit` decode form; `None` keeps the
+        /// legacy main-branch bytes byte-for-byte historical.
+        branch: Option<haider_protocol::ids::BranchId>,
     },
     Cancel {
         command_id: CommandId,
         session: SessionId,
         worker_generation: u64,
         run_id: RunId,
+        /// Captured at issuance (B2b). CLIENT-side identity only: the wire
+        /// `turn.cancel` pins the run by `run_id`, which is already
+        /// branch-pinned by its acceptance.
+        branch: Option<haider_protocol::ids::BranchId>,
     },
     /// `session.compact` — receipt-backed, idle-only manual compaction
     /// (W7b). The daemon's own journal events drive every visible state
@@ -108,6 +116,23 @@ pub enum LiveCommand {
         command_id: CommandId,
         session: SessionId,
         worker_generation: u64,
+        /// Captured at issuance (B2b): `Some` encodes the branch-capable
+        /// `session.compact` decode form; `None` the legacy bytes.
+        branch: Option<haider_protocol::ids::BranchId>,
+    },
+    /// `branch.create` — one durable named ref at EXACT committed
+    /// coordinates (B2b). Receipt-backed: a lost response retries under
+    /// the same command id and returns the original branch. The response
+    /// installs NOTHING locally — the daemon's `BranchCreated` journal
+    /// fact is the only materializer.
+    BranchCreate {
+        command_id: CommandId,
+        session: SessionId,
+        worker_generation: u64,
+        source_branch: Option<haider_protocol::ids::BranchId>,
+        fork_node_id: haider_protocol::ids::NodeId,
+        fork_seq: u64,
+        name: Option<String>,
     },
     /// `shell.exec` — the W8b `!` escape: one exact user command for the
     /// session daemon's workspace, receipt-backed and PreAuthorized
@@ -262,6 +287,7 @@ impl LiveCommand {
             | Self::Submit { command_id, .. }
             | Self::Cancel { command_id, .. }
             | Self::Compact { command_id, .. }
+            | Self::BranchCreate { command_id, .. }
             | Self::ShellExec { command_id, .. }
             | Self::AccountRemove { command_id, .. }
             | Self::ProviderRemove { command_id, .. }
@@ -358,6 +384,17 @@ pub enum LiveReply {
     /// attachment stream like any other run.
     Compacted {
         command_id: CommandId,
+    },
+    /// `branch.create` answered with the daemon's stable coordinates
+    /// (B2b). The receipt retires the outbox entry and ACTIVATES the
+    /// branch in the originating session once the `BranchCreated` journal
+    /// fact has installed it — it installs nothing itself (no live branch
+    /// before daemon truth).
+    BranchForked {
+        command_id: CommandId,
+        session: SessionId,
+        branch_id: haider_protocol::ids::BranchId,
+        name: String,
     },
     /// `shell.exec` accepted; the `CommandExecution` events arrive on the
     /// attachment stream.
@@ -1056,7 +1093,9 @@ impl LiveDriver {
                     .map(|pending| pending.command.clone())
                     .collect();
                 if let Some(text) = self.pending_first_turn.remove(&session) {
-                    commands.push(self.submit(model, &session, text));
+                    // A freshly created session's founding turn is always
+                    // legacy/main — no branch can exist before it.
+                    commands.push(self.submit(model, &session, text, None));
                 }
                 commands
             }
@@ -1175,6 +1214,38 @@ impl LiveDriver {
             | LiveReply::Compacted { command_id }
             | LiveReply::ShellAccepted { command_id } => {
                 self.retire(&command_id);
+                Vec::new()
+            }
+            LiveReply::BranchForked {
+                command_id,
+                session,
+                branch_id,
+                name,
+            } => {
+                self.retire(&command_id);
+                // Activation touches ONLY the originating session (law) and
+                // installs nothing: if the `BranchCreated` journal fact has
+                // already materialized the branch, switch to it now; if the
+                // receipt outran the event, ARM the activation and let the
+                // install itself take effect. A typed failure never reaches
+                // here, so topology stays untouched on refusal.
+                if model.active_session.as_ref() == Some(&session) {
+                    if model.branch_state.contains(&branch_id) {
+                        if model.switch_branch(Some(&branch_id)).is_some() {
+                            model.flash = Some(format!("· forked → {name}"));
+                        }
+                    } else {
+                        model.branch_state.arm_activation(branch_id);
+                    }
+                } else if let Some(slot) = model.sessions.iter_mut().find(|slot| slot.id == session)
+                {
+                    if slot.branch_state.contains(&branch_id) {
+                        slot.switch_branch(Some(&branch_id));
+                    } else {
+                        slot.branch_state.arm_activation(branch_id);
+                    }
+                }
+                model.dirty = true;
                 Vec::new()
             }
             LiveReply::Staged {
@@ -2124,8 +2195,11 @@ impl LiveDriver {
                     first_text: text,
                 })]
             }
-            AppRequest::SubmitText { text, .. } => match model.active_session.clone() {
-                Some(session) => vec![self.submit(model, &session, text)],
+            AppRequest::SubmitText { text, branch, .. } => match model.active_session.clone() {
+                // The branch was captured at ISSUANCE by the reducer — a
+                // switch between issuance and this drain must not retarget
+                // the turn (research risk 4).
+                Some(session) => vec![self.submit(model, &session, text, branch)],
                 None => Vec::new(),
             },
             AppRequest::LoginApi {
@@ -2268,7 +2342,7 @@ impl LiveDriver {
                 commands.extend(self.ensure_attached(model, &session));
                 commands
             }
-            AppRequest::Interrupt => {
+            AppRequest::Interrupt { branch } => {
                 // Esc cancels the run the COMMITTED stream says is running.
                 // With no such run there is nothing to cancel, and an
                 // invented run id would be a command the daemon can only
@@ -2286,6 +2360,7 @@ impl LiveDriver {
                     session,
                     worker_generation,
                     run_id,
+                    branch,
                 })]
             }
             AppRequest::ShellExec { command } => {
@@ -2330,7 +2405,7 @@ impl LiveDriver {
                     expected_revision,
                 })]
             }
-            AppRequest::Compact => {
+            AppRequest::Compact { branch } => {
                 // W7b: receipt-backed idle-only `session.compact`. The
                 // daemon is the state authority — a busy worker answers
                 // with a typed refusal that lands as a flash; nothing is
@@ -2344,6 +2419,31 @@ impl LiveDriver {
                     command_id,
                     session,
                     worker_generation,
+                    branch,
+                })]
+            }
+            AppRequest::BranchCreate {
+                session,
+                source_branch,
+                fork_node_id,
+                fork_seq,
+                name,
+            } => {
+                // B2b fork issuance: the reducer captured EXACT coordinates
+                // (session, source branch, node, seq) at issuance; this
+                // drain only adds the durable command identity and the
+                // session's worker generation. Nothing is installed until
+                // the daemon's `BranchCreated` fact arrives.
+                let command_id = self.mint();
+                let worker_generation = self.generations.get(&session).copied().unwrap_or_default();
+                vec![self.enqueue(LiveCommand::BranchCreate {
+                    command_id,
+                    session,
+                    worker_generation,
+                    source_branch,
+                    fork_node_id,
+                    fork_seq,
+                    name,
                 })]
             }
             // Runtime-owned effects: `live_pass` hands these BACK to the
@@ -2383,7 +2483,13 @@ impl LiveDriver {
         }
     }
 
-    fn submit(&mut self, model: &AppModel, session: &SessionId, text: String) -> LiveCommand {
+    fn submit(
+        &mut self,
+        model: &AppModel,
+        session: &SessionId,
+        text: String,
+        branch: Option<haider_protocol::ids::BranchId>,
+    ) -> LiveCommand {
         let command_id = self.mint();
         let worker_generation = self.generations.get(session).copied().unwrap_or_default();
         // `/queue turn` holds mid-turn input to the end of the turn;
@@ -2401,6 +2507,7 @@ impl LiveDriver {
             worker_generation,
             text,
             mode,
+            branch,
         })
     }
 
@@ -2485,6 +2592,7 @@ const fn command_session(command: &LiveCommand) -> Option<&SessionId> {
         LiveCommand::Submit { session, .. }
         | LiveCommand::Cancel { session, .. }
         | LiveCommand::Compact { session, .. }
+        | LiveCommand::BranchCreate { session, .. }
         | LiveCommand::ShellExec { session, .. }
         | LiveCommand::ToolsInventory { session }
         | LiveCommand::Answer { session, .. } => Some(session),

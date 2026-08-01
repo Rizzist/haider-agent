@@ -313,6 +313,7 @@ fn alt_and_shift_enter_insert_newlines_and_enter_submits() {
             text: "line one\nline two\nline three".to_owned(),
             voice: false,
             title: true,
+            branch: None,
         }]
     );
 }

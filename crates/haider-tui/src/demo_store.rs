@@ -488,7 +488,7 @@ pub fn snapshot(model: &AppModel) -> StateDto {
                     model_short: slot.model_short.clone(),
                     device: slot.device.clone(),
                     ago: slot.ago.clone(),
-                    branches: slot.branches,
+                    branches: slot.branches_offset,
                     turns_offset: slot.turns_offset,
                     projection: projection_to_dto(&model.projection),
                     chips: model.chips.iter().map(chip_to_dto).collect(),
@@ -508,7 +508,7 @@ pub fn snapshot(model: &AppModel) -> StateDto {
                     model_short: slot.model_short.clone(),
                     device: slot.device.clone(),
                     ago: slot.ago.clone(),
-                    branches: slot.branches,
+                    branches: slot.branches_offset,
                     turns_offset: slot.turns_offset,
                     projection: projection_to_dto(&slot.projection),
                     chips: slot.chips.iter().map(chip_to_dto).collect(),
@@ -678,7 +678,7 @@ pub fn hydrate(model: &mut AppModel, dto: StateDto) -> HydrateOutcome {
         entry.model_short = s.model_short;
         entry.device = s.device;
         entry.ago = s.ago;
-        entry.branches = s.branches;
+        entry.branches_offset = s.branches;
         entry.turns_offset = s.turns_offset;
         entry.projection = projection_from_dto(s.projection);
         entry.chips = s.chips.into_iter().map(chip_from_dto).collect();

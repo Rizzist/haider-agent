@@ -1031,7 +1031,11 @@ impl DemoDriver {
         // (or from the no-session scratch surface = 0).
         let active = model.ui_generation();
         match request {
-            AppRequest::SubmitText { text, voice, title } => {
+            // The captured branch is live-wire vocabulary: the demo world
+            // is single-branch, so the capture is always `None` here.
+            AppRequest::SubmitText {
+                text, voice, title, ..
+            } => {
                 self.turn_counter += 1;
                 // The branch is chosen — and the generic/roster counters
                 // advance — at DISPATCH, after the 750 ms think window, so
@@ -1087,7 +1091,7 @@ impl DemoDriver {
                     meters.clear();
                 }
             }
-            AppRequest::Interrupt => {
+            AppRequest::Interrupt { .. } => {
                 // Esc mid-turn cancels THIS session's turn (sim
                 // tui.js:1551-1567 touches only the run token, the queue and
                 // the note). Chip arms — and their PARKED continuations —
@@ -1109,7 +1113,7 @@ impl DemoDriver {
                     DemoEvent::Envelope(EventPayload::IdleDecayed),
                 );
             }
-            AppRequest::Compact => {
+            AppRequest::Compact { .. } => {
                 // Manual /compact (sim tui.js:1791-1806): before = current
                 // meter, after = 6% of the window — 1200 ms, then IDLE.
                 let before = self.tokens_total(active);
@@ -1256,6 +1260,9 @@ impl DemoDriver {
             // instead of pushing these, so the demo driver never sees one.
             | AppRequest::ShellExec { .. }
             | AppRequest::ToolsRefresh
+            // B2b live-only vocabulary: `/branch new` in demo mode flashes
+            // its honest stub upstream — branches are daemon truth.
+            | AppRequest::BranchCreate { .. }
             // W10b live-only mutations: the demo reducer removes locally.
             | AppRequest::AccountRemove { .. }
             | AppRequest::ProviderRemove { .. } => {}

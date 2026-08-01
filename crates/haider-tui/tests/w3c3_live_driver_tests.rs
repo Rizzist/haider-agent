@@ -306,6 +306,7 @@ fn a_reconnect_resends_the_outbox_under_the_same_durable_command_ids() {
             text: "do the thing".to_owned(),
             voice: false,
             title: false,
+            branch: None,
         },
     );
     let original = issued
@@ -715,7 +716,7 @@ fn esc_cancels_the_run_the_committed_stream_says_is_running_or_nothing() {
     // Nothing running: Esc issues nothing at all.
     assert!(
         driver
-            .handle_request(&mut model, AppRequest::Interrupt)
+            .handle_request(&mut model, AppRequest::Interrupt { branch: None })
             .is_empty(),
         "with no live run there is nothing to cancel"
     );
@@ -735,7 +736,7 @@ fn esc_cancels_the_run_the_committed_stream_says_is_running_or_nothing() {
             envelope: Box::new(running),
         },
     );
-    let commands = driver.handle_request(&mut model, AppRequest::Interrupt);
+    let commands = driver.handle_request(&mut model, AppRequest::Interrupt { branch: None });
     assert!(
         matches!(
             commands.first(),
@@ -763,7 +764,7 @@ fn esc_cancels_the_run_the_committed_stream_says_is_running_or_nothing() {
     );
     assert!(
         driver
-            .handle_request(&mut model, AppRequest::Interrupt)
+            .handle_request(&mut model, AppRequest::Interrupt { branch: None })
             .is_empty(),
         "a terminal run releases the cancel target"
     );
@@ -939,6 +940,7 @@ fn a_live_menu_answer_carries_the_exact_opening_sequence_and_generation() {
 
     model.outbox.push(OutboundAnswer {
         origin: model.ui_generation(),
+        branch: None,
         answer: MenuAnswer {
             menu: MenuId::new("live-card"),
             option_key: Some("yes".to_owned()),
@@ -976,6 +978,7 @@ fn a_live_menu_answer_carries_the_exact_opening_sequence_and_generation() {
     // reuse) and the equality below fails.
     model.outbox.push(OutboundAnswer {
         origin: model.ui_generation(),
+        branch: None,
         answer: MenuAnswer {
             menu: MenuId::new("live-card"),
             option_key: Some("yes".to_owned()),
@@ -1025,6 +1028,7 @@ fn an_answer_for_a_menu_this_connection_never_saw_open_is_not_invented() {
     attach_all(&mut driver, &mut model, 1);
     model.outbox.push(OutboundAnswer {
         origin: model.ui_generation(),
+        branch: None,
         answer: MenuAnswer {
             menu: MenuId::new("unseen"),
             option_key: Some("yes".to_owned()),

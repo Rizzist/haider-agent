@@ -632,8 +632,10 @@ fn render_launcher(
             .unwrap_or_default();
         let meta = format!(
             "{blurb} {} · {} {} · {} tok · {} · {} · {}",
-            if entry.branches > 1 {
-                format!("{} branches", entry.branches)
+            // DERIVED (B2b): the seed static plus daemon-installed named
+            // branches — the launcher aggregate counts all branches.
+            if entry.branches() > 1 {
+                format!("{} branches", entry.branches())
             } else {
                 "1 branch".to_owned()
             },

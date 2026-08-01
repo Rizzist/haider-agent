@@ -7,6 +7,7 @@
 
 pub mod app;
 pub mod boot;
+pub mod branch;
 pub mod browser;
 pub mod clipboard;
 pub mod commands;

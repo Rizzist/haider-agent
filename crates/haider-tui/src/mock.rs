@@ -687,7 +687,7 @@ pub fn seed_session_states(first_generation: u64) -> Vec<crate::session::Session
             entry.model_short = sample.model.to_owned();
             entry.device = sample.device.to_owned();
             entry.ago = sample.ago.to_owned();
-            entry.branches = sample.branches;
+            entry.branches_offset = sample.branches;
             for row in sample_seed(index) {
                 entry.projection.apply_seed_row(row);
             }

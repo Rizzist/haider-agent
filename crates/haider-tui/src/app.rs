@@ -1367,6 +1367,11 @@ pub enum AppRequest {
         text: String,
         voice: bool,
         title: bool,
+        /// The branch CAPTURED AT ISSUANCE (B2b, research risk 4): a
+        /// submit queued before a later `/branch` switch still lands on
+        /// the branch it was typed on — never re-read from mutable
+        /// active-branch state downstream. `None` = legacy/main.
+        branch: Option<haider_protocol::ids::BranchId>,
     },
     /// Cancel EVERY session's and every chip's arms and clear all demo
     /// token meters — a GLOBAL reset, not a polite stop (renamed from
@@ -1378,9 +1383,28 @@ pub enum AppRequest {
     ResetAllSessions,
     /// Esc mid-turn: stop the playing script; the reducer already settled
     /// the projection into idle(i) (sim interrupt, tui.js:1551-1567).
-    Interrupt,
-    /// Manual `/compact` (sim tui.js:1791-1806).
-    Compact,
+    /// `branch` is captured at issuance (B2b) — client-side identity; the
+    /// wire cancel pins the run by its `run_id`.
+    Interrupt {
+        branch: Option<haider_protocol::ids::BranchId>,
+    },
+    /// Manual `/compact` (sim tui.js:1791-1806). `branch` is captured at
+    /// issuance (B2b): a later switch cannot retarget the compaction.
+    Compact {
+        branch: Option<haider_protocol::ids::BranchId>,
+    },
+    /// `/branch new [name]` (B2b): fork the session at EXACT captured
+    /// coordinates — session, source branch, and the source's last
+    /// committed node/seq from the fork-coordinate tracker. Receipt
+    /// correlation installs nothing; the daemon's `BranchCreated` journal
+    /// fact is the only branch materializer.
+    BranchCreate {
+        session: haider_protocol::ids::SessionId,
+        source_branch: Option<haider_protocol::ids::BranchId>,
+        fork_node_id: haider_protocol::ids::NodeId,
+        fork_seq: u64,
+        name: Option<String>,
+    },
     /// A drag selection finished (owner item 9): the RUNTIME extracts the
     /// selected text from its last-drawn frame and copies it (pbcopy, then
     /// OSC 52 — see [`crate::clipboard`]). A request because the reducer
@@ -1666,6 +1690,12 @@ pub enum AccountAddKind {
 #[derive(Debug, Clone, PartialEq)]
 pub struct OutboundAnswer {
     pub origin: UiGeneration,
+    /// The branch DISPLAYED when the user answered, captured at issuance
+    /// (B2b): client-side identity only — the wire answer resolves at the
+    /// menu's committed opening coordinates, and the daemon derives the
+    /// menu's branch from its opening envelope. A `/branch` switch between
+    /// answer and drain can therefore never retarget it.
+    pub branch: Option<haider_protocol::ids::BranchId>,
     pub answer: MenuAnswer,
 }
 
@@ -1868,6 +1898,14 @@ pub struct AppModel {
     pub launcher_shellout: Option<(String, String)>,
     /// The session's subagent chip tree (§2 — demo-local).
     pub chips: Vec<ChipModel>,
+    /// The ATTACHED session's branch state (B2b m1): registry, active
+    /// selection, warm parked views and the fork-coordinate tracker.
+    /// `projection`/`chips` always hold the ACTIVE branch's surfaces plus
+    /// the session-global cursor; a branch switch swaps surfaces and
+    /// transplants the cursor through ONE authority
+    /// ([`Self::switch_branch`]), and the session checkout swaps this
+    /// struct whole (the A→B→A law).
+    pub branch_state: crate::branch::BranchState,
     /// The chip path the subagent screen is viewing (breadcrumb).
     pub view_path: Vec<String>,
     /// The SubTree header collapse toggle (`▾`/`▸ subagents`).
@@ -2056,6 +2094,7 @@ impl Default for AppModel {
             vfs: vfs_seed(),
             launcher_shellout: None,
             chips: Vec::new(),
+            branch_state: crate::branch::BranchState::default(),
             view_path: Vec::new(),
             subtree_collapsed: false,
             todos_collapsed: false,
@@ -2967,7 +3006,9 @@ impl AppModel {
                     self.turn_active = false;
                     self.listening = false;
                     self.msg_queue.clear();
-                    self.requests.push(AppRequest::Interrupt);
+                    self.requests.push(AppRequest::Interrupt {
+                        branch: self.branch_state.active().cloned(),
+                    });
                     // LIVE (W3c3.1 r2): the cancellation is the DAEMON's to
                     // commit. Painting `Cancelled` + the note here says the
                     // run ended before `turn.cancel` has even been sent —
@@ -3190,6 +3231,7 @@ impl AppModel {
             };
             self.outbox.push(OutboundAnswer {
                 origin: self.ui_generation(),
+                branch: self.branch_state.active().cloned(),
                 answer,
             });
             self.dirty = true;
@@ -3272,6 +3314,9 @@ impl AppModel {
                     text,
                     voice: false,
                     title: false,
+                    // Captured at issuance (B2b): a later switch cannot
+                    // retarget this mid-turn delivery.
+                    branch: self.branch_state.active().cloned(),
                 });
                 return;
             }
@@ -3324,6 +3369,7 @@ impl AppModel {
             text,
             voice: false,
             title,
+            branch: self.branch_state.active().cloned(),
         });
     }
 
@@ -3523,6 +3569,7 @@ impl AppModel {
                     text,
                     voice: true,
                     title: self.session_title.is_none(),
+                    branch: self.branch_state.active().cloned(),
                 }),
             }
             return;
@@ -3541,6 +3588,7 @@ impl AppModel {
             text,
             voice: true,
             title,
+            branch: self.branch_state.active().cloned(),
         });
     }
 
@@ -4664,6 +4712,7 @@ impl AppModel {
         };
         self.outbox.push(OutboundAnswer {
             origin: self.ui_generation(),
+            branch: self.branch_state.active().cloned(),
             answer: MenuAnswer {
                 menu: menu.id.clone(),
                 option_key: Some(option.key.clone()),
@@ -4933,7 +4982,11 @@ impl AppModel {
                     } else if self.turn_active {
                         self.flash = Some("· /compact — wait for the turn to end".to_owned());
                     } else {
-                        self.requests.push(AppRequest::Compact);
+                        self.requests.push(AppRequest::Compact {
+                            // Captured at issuance (B2b): compaction stays
+                            // on the branch the user asked from.
+                            branch: self.branch_state.active().cloned(),
+                        });
                     }
                 } else if self.screen != Screen::Session {
                     self.flash = Some("· /compact — session only".to_owned());
@@ -4941,7 +4994,9 @@ impl AppModel {
                     self.flash = Some("· /compact — wait for the turn to end".to_owned());
                 } else {
                     self.turn_active = true;
-                    self.requests.push(AppRequest::Compact);
+                    self.requests.push(AppRequest::Compact {
+                        branch: self.branch_state.active().cloned(),
+                    });
                 }
             }
             "queue" => {
@@ -5164,7 +5219,9 @@ impl AppModel {
             self.turn_active = false;
             self.listening = false;
             self.msg_queue.clear();
-            self.requests.push(AppRequest::Interrupt);
+            self.requests.push(AppRequest::Interrupt {
+                branch: self.branch_state.active().cloned(),
+            });
             if self.mode.fabricates_locally() {
                 let id = menu.id.clone();
                 self.projection.apply(&EventPayload::MenuClosed {
@@ -5216,6 +5273,7 @@ impl AppModel {
         };
         self.outbox.push(OutboundAnswer {
             origin: self.ui_generation(),
+            branch: self.branch_state.active().cloned(),
             answer,
         });
         self.menu_selection = 0;
@@ -5258,20 +5316,135 @@ impl AppModel {
     /// The ATTACHED session's half of [`Self::route_raw`]: the cursor lives
     /// on the checked-out projection, so it travels with checkout/checkin
     /// and no second cursor authority exists.
+    ///
+    /// B2b: the branch command-state hooks (fork-coordinate tracker, branch
+    /// registry) run for `Apply` AND `Skip` — they are command/topology
+    /// coordinates, not display state, so a `render.ui == false` envelope
+    /// records them while the display-never-mutates law keeps holding for
+    /// every display surface (both halves are pinned). Content then routes
+    /// type-first (aggregates session-global), then branch, then agent.
     fn absorb_raw_active(&mut self, envelope: &RawEnvelope) -> crate::projection::RawOutcome {
         use crate::projection::{Admission, RawOutcome};
         match self.projection.admit(envelope) {
             Admission::Duplicate => RawOutcome::Duplicate,
             Admission::Gap { after_seq } => RawOutcome::Gap { after_seq },
-            Admission::Skip => RawOutcome::Applied,
-            Admission::Apply => {
-                match serde_json::from_value::<EventPayload>(envelope.payload.clone()) {
-                    Ok(payload) => self.absorb_scoped(&payload, envelope.agent_id.as_ref()),
-                    Err(_) => self.projection.count_unknown_payload(),
+            admission @ (Admission::Skip | Admission::Apply) => {
+                let note = self.branch_state.note_admitted(envelope);
+                if let crate::branch::AdmittedNote::BranchInstalled(id) = &note {
+                    // The daemon's journal fact is the ONLY materializer;
+                    // if OUR fork's receipt already armed activation, the
+                    // install is the moment it takes effect.
+                    let id = id.clone();
+                    if self.branch_state.take_pending_activation(&id) {
+                        let name = self.switch_branch(Some(&id));
+                        if let Some(name) = name {
+                            self.flash = Some(format!("· forked → {name}"));
+                        }
+                    }
+                }
+                if matches!(note, crate::branch::AdmittedNote::Content)
+                    && admission == Admission::Apply
+                {
+                    match serde_json::from_value::<EventPayload>(envelope.payload.clone()) {
+                        Ok(payload) => self.route_admitted(
+                            &payload,
+                            envelope.branch_id.as_ref(),
+                            envelope.agent_id.as_ref(),
+                        ),
+                        Err(_) => self.projection.count_unknown_payload(),
+                    }
                 }
                 RawOutcome::Applied
             }
         }
+    }
+
+    /// Route one admitted content payload for the ATTACHED session:
+    /// aggregate session-scope types FIRST (risk 6 — even off a
+    /// branch-stamped envelope they land session-global), then branch
+    /// (outer), then agent. `SessionState::route_admitted` is the
+    /// background twin.
+    fn route_admitted(
+        &mut self,
+        payload: &EventPayload,
+        branch: Option<&haider_protocol::ids::BranchId>,
+        agent: Option<&haider_protocol::ids::AgentId>,
+    ) {
+        use crate::branch::BranchScope;
+        match self.branch_state.scope_of(payload, branch) {
+            BranchScope::Aggregate => {
+                self.branch_state.apply_aggregate_to_parked(payload);
+                // Type-first: straight to the session reducer — an
+                // aggregate never lands in a chip transcript.
+                self.handle_envelope(payload);
+            }
+            BranchScope::Active => self.absorb_scoped(payload, agent),
+            BranchScope::ParkedMain => {
+                self.note_parked_turn(payload);
+                if let Some(view) = self.branch_state.parked_main_mut() {
+                    crate::branch::absorb_into_view(view, payload, agent);
+                }
+            }
+            BranchScope::ParkedNamed(id) => {
+                self.note_parked_turn(payload);
+                if let Some(view) = self.branch_state.view_mut(&id) {
+                    crate::branch::absorb_into_view(view, payload, agent);
+                }
+            }
+            BranchScope::Orphan => self.branch_state.count_orphan(),
+        }
+    }
+
+    /// Session-wide run bookkeeping for INACTIVE-branch content (run
+    /// execution stays session-wide, research Q2): the busy state flips
+    /// here, the DISPLAY stays in the owning branch's warm view — no
+    /// screen flip, no menu reset, nothing painted.
+    fn note_parked_turn(&mut self, payload: &EventPayload) {
+        if let EventPayload::UserMessage { .. } = payload {
+            self.turn_active = true;
+        }
+        if let EventPayload::RunState(state) = payload
+            && state.is_terminal()
+        {
+            self.turn_active = false;
+            self.auto_resuming = false;
+        }
+    }
+
+    /// Switch the ATTACHED session's displayed branch — the ONE atomic
+    /// switch authority (risk 8): transcript, tokens/footprint, menus,
+    /// todos and chips swap as a unit, the session cursor transplants onto
+    /// the incoming projection, and the view chrome (scroll, menu
+    /// selection, subagent path) resets exactly as a session attach does.
+    /// Returns the displayed name on an actual switch (`"main"` for the
+    /// main branch), `None` when the target was unknown or already active.
+    pub fn switch_branch(
+        &mut self,
+        target: Option<&haider_protocol::ids::BranchId>,
+    ) -> Option<String> {
+        match self
+            .branch_state
+            .switch(target, &mut self.projection, &mut self.chips)
+        {
+            crate::branch::SwitchOutcome::Switched => {
+                self.menu_selection = 0;
+                self.view_path.clear();
+                self.scroll_back.set(0);
+                self.scroll_max.set(0);
+                self.sticky_suppressed = false;
+                self.dirty = true;
+                Some(self.branch_state.active_name().unwrap_or("main").to_owned())
+            }
+            crate::branch::SwitchOutcome::AlreadyActive
+            | crate::branch::SwitchOutcome::UnknownBranch => None,
+        }
+    }
+
+    /// The status bar's branch segment: the active branch's name, `"main"`
+    /// on the main branch.
+    #[must_use]
+    pub fn active_branch_name(&self) -> &str {
+        self.branch_state.active_name().unwrap_or("main")
     }
 
     /// The attached path's scope router — the same [`crate::session::classify`]
@@ -5415,6 +5588,7 @@ impl AppModel {
         // session, so their by-id origin can never match.
         self.outbox.clear();
         self.projection = SessionProjection::new();
+        self.branch_state = crate::branch::BranchState::default();
         self.session_title = None;
         self.session_name = None;
         self.turn_active = false;
@@ -5603,6 +5777,9 @@ impl AppModel {
         crate::session::sweep_closed_chips(&mut slot.chips);
         self.projection = std::mem::replace(&mut slot.projection, SessionProjection::new());
         self.chips = std::mem::take(&mut slot.chips);
+        // B2b: the branch registry/active/parked views travel as ONE unit
+        // with the session — the A→B→A checkout law.
+        self.branch_state = std::mem::take(&mut slot.branch_state);
         self.msg_queue = std::mem::take(&mut slot.msg_queue);
         self.queue_mode = slot.queue_mode;
         self.turn_active = slot.turn_active;
@@ -5644,6 +5821,7 @@ impl AppModel {
             let slot = &mut self.sessions[index];
             slot.projection = std::mem::replace(&mut self.projection, SessionProjection::new());
             slot.chips = std::mem::take(&mut self.chips);
+            slot.branch_state = std::mem::take(&mut self.branch_state);
             slot.msg_queue = std::mem::take(&mut self.msg_queue);
             slot.queue_mode = std::mem::take(&mut self.queue_mode);
             slot.turn_active = std::mem::take(&mut self.turn_active);
