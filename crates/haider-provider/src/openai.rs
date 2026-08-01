@@ -1493,6 +1493,15 @@ pub fn replay_openai_http_error(
     )
     .then(|| parse_retry_after(retry_after))
     .flatten();
+    if let Some(detail) = parsed
+        .as_ref()
+        .and_then(|envelope| envelope.error.message.as_deref())
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+    {
+        let bounded: String = detail.chars().take(200).collect();
+        eprintln!("openai http {status} error detail (log-only): {bounded}");
+    }
     ProviderError::new(
         kind,
         format!("OpenAI HTTP {status} returned {}", provider_kind_name(kind)),
@@ -1511,6 +1520,9 @@ struct OpenAiApiError {
     kind: Option<String>,
     #[serde(default)]
     code: Option<String>,
+    /// The API's public error prose — the diagnostic that names WHY.
+    #[serde(default)]
+    message: Option<String>,
 }
 
 fn openai_stream_error(value: &serde_json::Value) -> ProviderError {
@@ -1541,6 +1553,20 @@ fn openai_stream_error(value: &serde_json::Value) -> ProviderError {
         Some("server_error" | "timeout") => ProviderErrorKind::Transport,
         _ => ProviderErrorKind::InvalidRequest,
     };
+    // The JOURNALED message stays sanitized (the no-leak law: bodies can
+    // echo request content). The API's own prose — the diagnostic that
+    // names WHY — goes to the owner-local daemon log only (stderr →
+    // daemon.log), bounded. Nine sanitized invalid-request failures
+    // carried no cause anywhere; this is the middle path.
+    if let Some(detail) = error
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+    {
+        let bounded: String = detail.chars().take(200).collect();
+        eprintln!("openai stream error detail (log-only): {bounded}");
+    }
     ProviderError::new(
         provider_kind,
         format!(

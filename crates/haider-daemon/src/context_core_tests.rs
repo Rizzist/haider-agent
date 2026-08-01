@@ -70,6 +70,17 @@ async fn manual_compaction_command_replay_compacts_exactly_once() {
         FakeStep::Finish {
             reason: FinishReason::EndTurn,
         },
+        // The live codex responses-lite stream sends opaque reasoning
+        // fragments on EVERY turn — the summarizer must ignore them
+        // (probe autopsy: rejecting them failed 100% of live
+        // compactions on openai-oauth).
+        // MUTATION CHECK: reject ProviderOpaque in the summarizer loop —
+        // this test fails with "unsupported structured output"-era
+        // behavior.
+        FakeStep::EmitProviderOpaque {
+            provider: "openai".into(),
+            data: serde_json::json!({"reasoning": "opaque-frame"}),
+        },
         FakeStep::EmitText {
             text: "summary of durable history".into(),
         },

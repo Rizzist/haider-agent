@@ -210,14 +210,24 @@ impl ContextCompactor for DaemonContextCompactor {
                         false,
                     ));
                 }
-                StreamEvent::ProviderOpaque { .. }
-                | StreamEvent::RefusalDelta { .. }
-                | StreamEvent::ToolCallStart { .. }
+                // Provider bookkeeping, not structure: the codex
+                // responses-lite stream emits opaque reasoning fragments on
+                // EVERY turn — rejecting them made live summarization fail
+                // 100% on openai-oauth (probe autopsy, v0.0.42 battery).
+                StreamEvent::ProviderOpaque { .. } => {}
+                StreamEvent::RefusalDelta { .. } => {
+                    return Err(HaiderError::new(
+                        ErrorCode::ProviderError,
+                        "context summarization was refused by the provider",
+                        false,
+                    ));
+                }
+                StreamEvent::ToolCallStart { .. }
                 | StreamEvent::ToolCallArgsDelta { .. }
                 | StreamEvent::ToolCallEnd { .. } => {
                     return Err(HaiderError::new(
                         ErrorCode::ProviderError,
-                        "context summarization returned unsupported structured output",
+                        "context summarization returned tool calls",
                         false,
                     ));
                 }
