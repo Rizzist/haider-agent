@@ -10,9 +10,9 @@ use haider_protocol::credential::AuthMethod;
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_provider::{
     ANTHROPIC_API_URL, ANTHROPIC_OAUTH_BASE_URL, ANTHROPIC_OAUTH_PROVIDER_NAME,
-    ANTHROPIC_PROVIDER_NAME, DiscoveredModel, OPENAI_COMPATIBLE_PROVIDER_NAME,
-    OPENAI_OAUTH_PROVIDER_NAME, OPENAI_PROVIDER_NAME, OPENAI_RESPONSES_API_URL,
-    OPENAI_SUBSCRIPTION_RESPONSES_URL, pickable,
+    ANTHROPIC_PROVIDER_NAME, DiscoveredModel, KIMI_OAUTH_BASE_URL, KIMI_OAUTH_PROVIDER_NAME,
+    OPENAI_COMPATIBLE_PROVIDER_NAME, OPENAI_OAUTH_PROVIDER_NAME, OPENAI_PROVIDER_NAME,
+    OPENAI_RESPONSES_API_URL, OPENAI_SUBSCRIPTION_RESPONSES_URL, pickable,
 };
 use haider_rpc::{
     ModelDetailWire, ProviderApiFamilyWire, ProviderAuthRequirementWire, ProviderAvailabilityWire,
@@ -634,6 +634,13 @@ fn builtin_or_unknown(provider: &str, anthropic_default_model: &str) -> Provider
             None,
             ProviderAuthRequirementWire::ApiKey,
             false,
+            ProviderProvenance::BuiltIn,
+        ),
+        KIMI_OAUTH_PROVIDER_NAME => (
+            ProviderApiFamilyWire::OpenAiChatCompletions,
+            Some(KIMI_OAUTH_BASE_URL.to_owned()),
+            ProviderAuthRequirementWire::OAuth,
+            true,
             ProviderProvenance::BuiltIn,
         ),
         _ => (

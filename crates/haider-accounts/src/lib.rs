@@ -36,7 +36,7 @@ pub use keychain::{KEYCHAIN_SERVICE, KeychainVault};
 pub use oauth::{OAuthIdentityV1, OAuthTokenBundleV1};
 pub use resolver::{Resolver, RotationCallback, RotationDecision, RotationTrigger};
 pub use store::{ACCOUNTS_FILE_NAME, AccountStore, JsonFileStore, StoreLike};
-pub use vault::{MemoryVault, SecretHandle, Vault};
+pub use vault::{MemoryVault, SecretHandle, Vault, VaultRefreshLock};
 
 /// Crate marker used by the workspace self-test.
 pub const CRATE_NAME: &str = "haider-accounts";

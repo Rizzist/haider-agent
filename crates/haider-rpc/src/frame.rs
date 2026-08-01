@@ -175,6 +175,8 @@ pub const FEATURE_ACCOUNT_LOGIN_API_V1: &str = "account_login_api_v1";
 pub const FEATURE_VAULT_STAGE_V1: &str = "vault_stage_v1";
 /// Daemon implements loopback authorization-code/PKCE account flows.
 pub const FEATURE_ACCOUNT_OAUTH_PKCE_V1: &str = "account_oauth_pkce_v1";
+/// Daemon implements RFC 8628 device-code OAuth flows.
+pub const FEATURE_ACCOUNT_OAUTH_DEVICE_V1: &str = "account_oauth_device_v1";
 /// Daemon imports OAuth credentials from approved, daemon-local CLI stores.
 pub const FEATURE_ACCOUNT_OAUTH_IMPORT_V1: &str = "account_oauth_import_v1";
 /// Daemon implements durable `account.add` for an OAuth-ready reference.
@@ -601,6 +603,7 @@ pub struct ProviderDefaultWire {
 #[non_exhaustive]
 pub enum OAuthFlowStatusWire {
     WaitingBrowser,
+    WaitingDevice,
     Exchanging,
     Ready {
         oauth_reference: OAuthReadyRefWire,

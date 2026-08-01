@@ -36,6 +36,8 @@ use crate::{
 pub const OPENAI_PROVIDER_NAME: &str = "openai";
 pub const OPENAI_OAUTH_PROVIDER_NAME: &str = "openai-oauth";
 pub const OPENAI_COMPATIBLE_PROVIDER_NAME: &str = "openai-compatible";
+pub const KIMI_OAUTH_PROVIDER_NAME: &str = "kimi-oauth";
+pub const KIMI_OAUTH_BASE_URL: &str = "https://api.kimi.com/coding/v1";
 pub const OPENAI_RESPONSES_API_URL: &str = "https://api.openai.com/v1/responses";
 pub const OPENAI_SUBSCRIPTION_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 pub const OPENAI_SUBSCRIPTION_RESPONSES_URL: &str =
@@ -43,6 +45,7 @@ pub const OPENAI_SUBSCRIPTION_RESPONSES_URL: &str =
 pub const OPENAI_CODEX_RESPONSES_LITE_HEADER: &str = "x-openai-internal-codex-responses-lite";
 pub const OPENAI_CODEX_RESPONSES_LITE_VALUE: &str = "true";
 const OPENAI_SUBSCRIPTION_HOST: &str = "chatgpt.com";
+const KIMI_OAUTH_HOST: &str = "api.kimi.com";
 
 const STREAM_CAPACITY: usize = 32;
 const MODELS_BODY_LIMIT: usize = 1024 * 1024;
@@ -108,12 +111,54 @@ impl OpenAiHttp {
         endpoint: &str,
         resolver: Arc<dyn FixedDnsResolver>,
     ) -> Result<Self, ProviderError> {
-        let fixed_origin_guard = Arc::new(FixedOriginGuard::new(
+        Self::new_fixed_origin(
+            credential,
+            model,
             endpoint,
             OPENAI_SUBSCRIPTION_HOST,
             resolver,
+            true,
+        )
+    }
+
+    fn new_fixed_origin(
+        credential: SecretHandle,
+        model: impl Into<String>,
+        endpoint: &str,
+        trusted_host: &str,
+        resolver: Arc<dyn FixedDnsResolver>,
+        codex_responses_lite: bool,
+    ) -> Result<Self, ProviderError> {
+        Self::new_fixed_origins(
+            credential,
+            model,
+            &[endpoint],
+            trusted_host,
+            resolver,
+            codex_responses_lite,
+        )
+    }
+
+    fn new_fixed_origins(
+        credential: SecretHandle,
+        model: impl Into<String>,
+        endpoints: &[&str],
+        trusted_host: &str,
+        resolver: Arc<dyn FixedDnsResolver>,
+        codex_responses_lite: bool,
+    ) -> Result<Self, ProviderError> {
+        let fixed_origin_guard = Arc::new(FixedOriginGuard::new_allowing(
+            endpoints,
+            trusted_host,
+            resolver,
         )?);
-        Self::new_with_origin_guards(credential, model, None, Some(fixed_origin_guard), true)
+        Self::new_with_origin_guards(
+            credential,
+            model,
+            None,
+            Some(fixed_origin_guard),
+            codex_responses_lite,
+        )
     }
 
     fn new_with_origin_guards(
@@ -378,6 +423,35 @@ pub struct OpenAiCompatibleProvider {
     base_url: String,
     chat_url: String,
     models_url: String,
+    dialect: CompatibleDialect,
+    kimi_thinking: Option<KimiThinkingConfig>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompatibleDialect {
+    Generic,
+    KimiOAuth,
+}
+
+/// Kimi's opt-in `extra_body.thinking` request extension.
+///
+/// The Kimi adapter defaults to `None`, so thinking remains off and the
+/// generic OpenAI-compatible payload stays byte-identical.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct KimiThinkingConfig {
+    #[serde(rename = "type")]
+    pub thinking_type: KimiThinkingType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keep: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KimiThinkingType {
+    Enabled,
+    Disabled,
 }
 
 impl OpenAiCompatibleProvider {
@@ -414,7 +488,68 @@ impl OpenAiCompatibleProvider {
             base_url: endpoints.base_url,
             chat_url: endpoints.chat_url,
             models_url: endpoints.models_url,
+            dialect: CompatibleDialect::Generic,
+            kimi_thinking: None,
         })
+    }
+
+    /// Constructs the release-owned Kimi OAuth Chat Completions dialect.
+    pub fn new_kimi_subscription(
+        credential: SecretHandle,
+        model: impl Into<String>,
+        base_url: &str,
+    ) -> Result<Self, ProviderError> {
+        Self::new_kimi_subscription_with_dns_resolver(
+            credential,
+            model,
+            base_url,
+            Arc::new(SystemFixedDnsResolver),
+        )
+    }
+
+    fn new_kimi_subscription_with_dns_resolver(
+        credential: SecretHandle,
+        model: impl Into<String>,
+        base_url: &str,
+        resolver: Arc<dyn FixedDnsResolver>,
+    ) -> Result<Self, ProviderError> {
+        if base_url != KIMI_OAUTH_BASE_URL {
+            return Err(invalid_request(
+                "Kimi OAuth inference base URL is not sanctioned",
+            ));
+        }
+        let endpoints = compatible_endpoints(base_url)?;
+        let http = OpenAiHttp::new_fixed_origins(
+            credential,
+            model,
+            &[&endpoints.chat_url, &endpoints.models_url],
+            KIMI_OAUTH_HOST,
+            resolver,
+            false,
+        )?;
+        Ok(Self {
+            http,
+            base_url: endpoints.base_url,
+            chat_url: endpoints.chat_url,
+            models_url: endpoints.models_url,
+            dialect: CompatibleDialect::KimiOAuth,
+            kimi_thinking: None,
+        })
+    }
+
+    /// Enables or explicitly disables Kimi thinking passthrough. Generic
+    /// compatible adapters reject this provider-specific seam.
+    pub fn with_kimi_thinking(
+        mut self,
+        thinking: KimiThinkingConfig,
+    ) -> Result<Self, ProviderError> {
+        if self.dialect != CompatibleDialect::KimiOAuth {
+            return Err(invalid_request(
+                "Kimi thinking options require the Kimi OAuth adapter",
+            ));
+        }
+        self.kimi_thinking = Some(thinking);
+        Ok(self)
     }
 
     #[must_use]
@@ -443,7 +578,7 @@ impl OpenAiCompatibleProvider {
         request: &TurnRequest,
     ) -> Result<serde_json::Value, ProviderError> {
         self.http.validate_model(request)?;
-        chat_request_json(request)
+        chat_request_json(request, self.dialect, self.kimi_thinking.as_ref())
     }
 
     /// Probes `GET /v1/models` and derives only conservative capabilities from
@@ -456,7 +591,10 @@ impl OpenAiCompatibleProvider {
         }
         let body =
             read_body_bounded(response, MODELS_BODY_LIMIT, "OpenAI-compatible /v1/models").await?;
-        replay_openai_models_response(&self.http.model, &body)
+        match self.dialect {
+            CompatibleDialect::Generic => replay_openai_models_response(&self.http.model, &body),
+            CompatibleDialect::KimiOAuth => replay_kimi_models_response(&self.http.model, &body),
+        }
     }
 
     pub async fn capture_response(
@@ -479,13 +617,22 @@ impl OpenAiCompatibleProvider {
 #[async_trait]
 impl Provider for OpenAiCompatibleProvider {
     fn credential_surface(&self) -> crate::ProviderCredentialSurface {
-        crate::ProviderCredentialSurface::ApiKey
+        match self.dialect {
+            CompatibleDialect::Generic => crate::ProviderCredentialSurface::ApiKey,
+            CompatibleDialect::KimiOAuth => {
+                crate::ProviderCredentialSurface::OAuthSubscriptionBearer
+            }
+        }
     }
 
     async fn capabilities(&self) -> CapabilityDoc {
+        let provider = match self.dialect {
+            CompatibleDialect::Generic => OPENAI_COMPATIBLE_PROVIDER_NAME,
+            CompatibleDialect::KimiOAuth => KIMI_OAUTH_PROVIDER_NAME,
+        };
         self.probe_capabilities()
             .await
-            .unwrap_or_else(|_| unavailable_compatible_capabilities())
+            .unwrap_or_else(|_| unavailable_compatible_capabilities(provider))
     }
 
     async fn stream_turn(&self, request: TurnRequest) -> Result<ProviderStream, ProviderError> {
@@ -1446,6 +1593,42 @@ pub fn replay_openai_models_response(
     Ok(compatible_capabilities(model))
 }
 
+/// Replays Kimi's richer `/coding/v1/models` document into an honest
+/// capability document for the configured OpenAI-protocol model.
+pub fn replay_kimi_models_response(
+    model: &str,
+    body: &[u8],
+) -> Result<CapabilityDoc, ProviderError> {
+    let value: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|error| malformed(format!("Kimi models response is not valid JSON: {error}")))?;
+    let models = crate::parse_catalog(crate::CatalogSource::KimiOAuth, &value)
+        .map_err(|_| malformed("Kimi models response has no usable model array"))?;
+    let model = models
+        .into_iter()
+        .find(|entry| entry.slug == model)
+        .ok_or_else(|| invalid_request("Kimi does not advertise the configured model"))?;
+    let extensions = model
+        .extensions
+        .ok_or_else(|| malformed("Kimi model capability flags are missing"))?;
+    Ok(CapabilityDoc {
+        provider: KIMI_OAUTH_PROVIDER_NAME.into(),
+        // Kimi declares tool support, but not these stronger exact semantics.
+        parallel_tools: FeatureResolve::Unsupported,
+        streaming_tool_args: FeatureResolve::Unsupported,
+        vision: if extensions.supports_vision {
+            FeatureResolve::Native
+        } else {
+            FeatureResolve::Unsupported
+        },
+        thinking_visible: if extensions.supports_reasoning && extensions.supports_thinking_type {
+            FeatureResolve::Native
+        } else {
+            FeatureResolve::Unsupported
+        },
+        context_limit: model.context_window.unwrap_or(0),
+    })
+}
+
 /// Replays a captured non-success OpenAI-shaped HTTP response.
 #[must_use]
 pub fn replay_openai_http_error(
@@ -1799,7 +1982,11 @@ fn flush_response_message(
     }));
 }
 
-fn chat_request_json(request: &TurnRequest) -> Result<serde_json::Value, ProviderError> {
+fn chat_request_json(
+    request: &TurnRequest,
+    dialect: CompatibleDialect,
+    kimi_thinking: Option<&KimiThinkingConfig>,
+) -> Result<serde_json::Value, ProviderError> {
     let attachments = attachment_index(request)?;
     let mut messages = Vec::new();
     if let Some(system) = &request.system_prompt {
@@ -1943,16 +2130,32 @@ fn chat_request_json(request: &TurnRequest) -> Result<serde_json::Value, Provide
         .collect::<Vec<_>>();
     let mut payload = serde_json::json!({
         "model": request.model,
-        "max_tokens": request.max_tokens,
         "messages": messages,
         "stream": true,
         "stream_options": {"include_usage": true},
     });
+    let object = payload
+        .as_object_mut()
+        .ok_or_else(|| internal("Chat request payload was not an object"))?;
+    match dialect {
+        CompatibleDialect::Generic => {
+            object.insert("max_tokens".into(), serde_json::json!(request.max_tokens));
+        }
+        CompatibleDialect::KimiOAuth => {
+            object.insert(
+                "max_completion_tokens".into(),
+                serde_json::json!(request.max_tokens),
+            );
+            if let Some(thinking) = kimi_thinking {
+                // Kimi documents this as the OpenAI SDK's
+                // `extra_body={"thinking": ...}` seam. SDK extra-body fields
+                // are merged into the HTTP JSON, so the wire key is top-level.
+                object.insert("thinking".into(), serde_json::json!(thinking));
+            }
+        }
+    }
     if !tools.is_empty() {
-        payload
-            .as_object_mut()
-            .ok_or_else(|| internal("Chat request payload was not an object"))?
-            .insert("tools".into(), serde_json::Value::Array(tools));
+        object.insert("tools".into(), serde_json::Value::Array(tools));
     }
     Ok(payload)
 }
@@ -2027,9 +2230,9 @@ fn compatible_capabilities(_model: &str) -> CapabilityDoc {
     }
 }
 
-fn unavailable_compatible_capabilities() -> CapabilityDoc {
+fn unavailable_compatible_capabilities(provider: &str) -> CapabilityDoc {
     CapabilityDoc {
-        provider: OPENAI_COMPATIBLE_PROVIDER_NAME.into(),
+        provider: provider.into(),
         parallel_tools: FeatureResolve::Unsupported,
         streaming_tool_args: FeatureResolve::Unsupported,
         vision: FeatureResolve::Unsupported,

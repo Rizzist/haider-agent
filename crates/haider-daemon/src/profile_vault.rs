@@ -22,7 +22,7 @@
 
 use std::sync::Arc;
 
-use haider_accounts::{AccountsResult, SecretHandle, Vault};
+use haider_accounts::{AccountsResult, SecretHandle, Vault, VaultRefreshLock};
 use haider_protocol::error::ErrorCode;
 use haider_protocol::ids::CredentialAlias;
 
@@ -105,6 +105,13 @@ impl Vault for ProfileVault {
                 }
             })
             .collect())
+    }
+
+    fn try_refresh_lock(
+        &self,
+        alias: &CredentialAlias,
+    ) -> AccountsResult<Option<VaultRefreshLock>> {
+        self.inner.try_refresh_lock(&self.scoped(alias))
     }
 }
 

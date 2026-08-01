@@ -31,7 +31,7 @@ impl FixedDnsResolver for SystemFixedDnsResolver {
 
 /// Resolve-once guard that validates and pins a credential-bearing HTTPS origin.
 pub struct FixedOriginGuard {
-    endpoint: reqwest::Url,
+    endpoints: Box<[reqwest::Url]>,
     host: String,
     port: u16,
     resolver: Arc<dyn FixedDnsResolver>,
@@ -66,24 +66,27 @@ impl FixedOriginGuard {
         trusted_host: &str,
         resolver: Arc<dyn FixedDnsResolver>,
     ) -> Result<Self, ProviderError> {
-        let parsed = reqwest::Url::parse(endpoint)
-            .map_err(|_| invalid_origin("fixed inference endpoint is not a valid URL"))?;
-        if parsed.scheme() != "https"
-            || !parsed.username().is_empty()
-            || parsed.password().is_some()
-            || parsed.query().is_some()
-            || parsed.fragment().is_some()
-            || parsed
-                .host_str()
-                .is_none_or(|host| !host.eq_ignore_ascii_case(trusted_host))
-            || parsed.port_or_known_default() != Some(443)
-        {
-            return Err(invalid_origin(
-                "fixed inference endpoint is outside its trusted HTTPS origin",
-            ));
+        Self::new_allowing(&[endpoint], trusted_host, resolver)
+    }
+
+    /// Construct a guard for a small release-owned set of exact HTTPS
+    /// endpoints on one trusted host. This is used when one credential needs
+    /// both inference and provider-owned metadata without widening to the
+    /// whole origin.
+    pub(crate) fn new_allowing(
+        endpoints: &[&str],
+        trusted_host: &str,
+        resolver: Arc<dyn FixedDnsResolver>,
+    ) -> Result<Self, ProviderError> {
+        if endpoints.is_empty() {
+            return Err(invalid_origin("fixed inference endpoint set is empty"));
         }
+        let endpoints = endpoints
+            .iter()
+            .map(|endpoint| validate_fixed_endpoint(endpoint, trusted_host))
+            .collect::<Result<Box<[_]>, _>>()?;
         Ok(Self {
-            endpoint: parsed,
+            endpoints,
             host: trusted_host.to_owned(),
             port: 443,
             resolver,
@@ -98,7 +101,7 @@ impl FixedOriginGuard {
     pub async fn validate_endpoint(&self, endpoint: &str) -> Result<(), ProviderError> {
         let requested = reqwest::Url::parse(endpoint)
             .map_err(|_| invalid_origin("fixed inference endpoint is not a valid URL"))?;
-        if requested != self.endpoint {
+        if !self.endpoints.contains(&requested) {
             return Err(invalid_origin(
                 "credential-bearing request was redirected outside its fixed endpoint",
             ));
@@ -145,11 +148,34 @@ impl FixedOriginGuard {
     }
 }
 
+fn validate_fixed_endpoint(
+    endpoint: &str,
+    trusted_host: &str,
+) -> Result<reqwest::Url, ProviderError> {
+    let parsed = reqwest::Url::parse(endpoint)
+        .map_err(|_| invalid_origin("fixed inference endpoint is not a valid URL"))?;
+    if parsed.scheme() != "https"
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || parsed
+            .host_str()
+            .is_none_or(|host| !host.eq_ignore_ascii_case(trusted_host))
+        || parsed.port_or_known_default() != Some(443)
+    {
+        return Err(invalid_origin(
+            "fixed inference endpoint is outside its trusted HTTPS origin",
+        ));
+    }
+    Ok(parsed)
+}
+
 impl fmt::Debug for FixedOriginGuard {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("FixedOriginGuard")
-            .field("endpoint", &self.endpoint)
+            .field("endpoints", &self.endpoints)
             .field("host", &self.host)
             .field("port", &self.port)
             .field("validated", &self.validated.get().is_some())

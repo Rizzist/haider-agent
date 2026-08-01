@@ -18,10 +18,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use haider_accounts::{OAuthIdentityV1, OAuthTokenBundleV1};
-use haider_accounts::{SecretHandle, Vault};
+use haider_accounts::{SecretHandle, Vault, VaultRefreshLock};
 use haider_protocol::credential::{AuthMethod, CredentialDescriptor, CredentialStatus};
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::CredentialAlias;
+use haider_provider::Provider as _;
 use haider_provider::{FixedDnsResolver, FixedOriginGuard, SystemFixedDnsResolver};
 use haider_rpc::{
     ERROR_CODE_BUSY, OAuthAuthorizationWire, OAuthAvailabilityWire, OAuthFlowId,
@@ -56,6 +57,11 @@ const MAX_TOKEN_LIFETIME_SECS: u64 = 366 * 24 * 60 * 60;
 const CALLBACK_READ_TIMEOUT: Duration = Duration::from_secs(2);
 const TOKEN_TIMEOUT: Duration = Duration::from_secs(15);
 const OAUTH_REFRESH_SKEW: Duration = Duration::from_secs(30);
+const KIMI_REFRESH_REJECTED_TTL: Duration = Duration::from_secs(300);
+const KIMI_DEVICE_ALIAS: &str = "_kimi_oauth_device_id_v1";
+const KIMI_DEVICE_POLL_SLOW_DOWN: Duration = Duration::from_secs(5);
+const KIMI_REFRESH_BACKOFF_INITIAL: Duration = Duration::from_millis(250);
+const KIMI_REFRESH_MAX_ATTEMPTS: usize = 3;
 // Codex auth.json has no explicit expiry outside the access-token JWT. An
 // unparseable import is stamped this far ahead and marked inside its vault
 // bundle for one eager refresh on first resolution.
@@ -185,6 +191,27 @@ pub struct SanctionedOAuthRegistration {
     pub retain_refresh_on_omission: bool,
     pub identity_mode: OAuthIdentityMode,
     pub inference: OAuthInferenceRegistration,
+    pub flow_mode: OAuthFlowMode,
+    pub auth_header_set: OAuthAuthHeaderSet,
+    pub refresh_policy: OAuthRefreshPolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OAuthFlowMode {
+    AuthorizationCode,
+    DeviceCode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OAuthAuthHeaderSet {
+    Standard,
+    KimiMsh,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OAuthRefreshPolicy {
+    Conservative,
+    SerializedRotating,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -228,6 +255,7 @@ pub enum OAuthInferenceAuthMode {
 pub enum OAuthInferenceHeaderSet {
     OpenAiCodexResponsesLite,
     AnthropicOAuthBeta,
+    KimiOpenAiChatCompletions,
 }
 
 /// The only callback policy supported by the generic engine.
@@ -275,6 +303,9 @@ pub const SANCTIONED_PROVIDER_REGISTRATIONS: &[SanctionedOAuthRegistration] = &[
             auth_mode: OAuthInferenceAuthMode::Bearer,
             header_set: OAuthInferenceHeaderSet::OpenAiCodexResponsesLite,
         },
+        flow_mode: OAuthFlowMode::AuthorizationCode,
+        auth_header_set: OAuthAuthHeaderSet::Standard,
+        refresh_policy: OAuthRefreshPolicy::Conservative,
     },
     SanctionedOAuthRegistration {
         provider_id: haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME,
@@ -319,6 +350,39 @@ pub const SANCTIONED_PROVIDER_REGISTRATIONS: &[SanctionedOAuthRegistration] = &[
             auth_mode: OAuthInferenceAuthMode::Bearer,
             header_set: OAuthInferenceHeaderSet::AnthropicOAuthBeta,
         },
+        flow_mode: OAuthFlowMode::AuthorizationCode,
+        auth_header_set: OAuthAuthHeaderSet::Standard,
+        refresh_policy: OAuthRefreshPolicy::Conservative,
+    },
+    SanctionedOAuthRegistration {
+        provider_id: haider_provider::KIMI_OAUTH_PROVIDER_NAME,
+        issuer: "https://auth.kimi.com",
+        authorization_endpoint: "https://auth.kimi.com/api/oauth/device_authorization",
+        token_endpoint: "https://auth.kimi.com/api/oauth/token",
+        client_id: "17e5f671-d194-4dfb-9706-5516cb48c098",
+        scopes: &[],
+        audience: "17e5f671-d194-4dfb-9706-5516cb48c098",
+        resource: None,
+        redirect_policy: OAuthRedirectPolicy::EphemeralIpv4Loopback,
+        authorize_parameters: &[],
+        send_nonce_in_authorize: false,
+        send_audience_in_authorize: false,
+        authorization_code_encoding: OAuthTokenRequestEncoding::Form,
+        authorization_code_includes_state: false,
+        refresh_encoding: OAuthTokenRequestEncoding::Form,
+        refresh_includes_binding: false,
+        retain_refresh_on_omission: false,
+        identity_mode: OAuthIdentityMode::TokenEndpointGrant {
+            display_identity: "Kimi Code subscription",
+        },
+        inference: OAuthInferenceRegistration {
+            base_url: haider_provider::KIMI_OAUTH_BASE_URL,
+            auth_mode: OAuthInferenceAuthMode::Bearer,
+            header_set: OAuthInferenceHeaderSet::KimiOpenAiChatCompletions,
+        },
+        flow_mode: OAuthFlowMode::DeviceCode,
+        auth_header_set: OAuthAuthHeaderSet::KimiMsh,
+        refresh_policy: OAuthRefreshPolicy::SerializedRotating,
     },
 ];
 
@@ -509,11 +573,24 @@ impl OAuthIdentityVerifier for OpenAiIdentityVerifier {
 pub struct OAuthPublicError {
     pub code: &'static str,
     pub retryable: bool,
+    retryable_status: bool,
 }
 
 impl OAuthPublicError {
     pub const fn new(code: &'static str, retryable: bool) -> Self {
-        Self { code, retryable }
+        Self {
+            code,
+            retryable,
+            retryable_status: false,
+        }
+    }
+
+    const fn retryable_status() -> Self {
+        Self {
+            code: "token_endpoint_unavailable",
+            retryable: true,
+            retryable_status: true,
+        }
     }
 }
 
@@ -548,6 +625,9 @@ pub struct OAuthProviderRegistration {
     refresh_includes_binding: bool,
     retain_refresh_on_omission: bool,
     identity_mode: RuntimeIdentityMode,
+    flow_mode: OAuthFlowMode,
+    auth_header_set: OAuthAuthHeaderSet,
+    refresh_policy: OAuthRefreshPolicy,
 }
 
 #[derive(Clone)]
@@ -577,6 +657,9 @@ impl fmt::Debug for OAuthProviderRegistration {
                 &self.retain_refresh_on_omission,
             )
             .field("identity_mode", &"[IDENTITY VERIFIER]")
+            .field("flow_mode", &self.flow_mode)
+            .field("auth_header_set", &self.auth_header_set)
+            .field("refresh_policy", &self.refresh_policy)
             .finish()
     }
 }
@@ -641,6 +724,21 @@ impl OAuthProviderRegistration {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_test_device_flow(mut self) -> Self {
+        self.flow_mode = OAuthFlowMode::DeviceCode;
+        self.auth_header_set = OAuthAuthHeaderSet::KimiMsh;
+        self.refresh_policy = OAuthRefreshPolicy::SerializedRotating;
+        self.refresh_encoding = OAuthTokenRequestEncoding::Form;
+        self.refresh_includes_binding = false;
+        self.retain_refresh_on_omission = false;
+        self.scopes.clear();
+        self.identity_mode = RuntimeIdentityMode::TokenEndpointGrant {
+            display_identity: "Fake device subscription".to_owned(),
+        };
+        self
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn new_with_identity(
         provider_id: impl Into<String>,
@@ -671,7 +769,6 @@ impl OAuthProviderRegistration {
             || issuer.trim().is_empty()
             || client_id.trim().is_empty()
             || audience.trim().is_empty()
-            || scopes.is_empty()
             || scopes.iter().any(|scope| scope.trim().is_empty())
             || unique_scopes.len() != scopes.len()
         {
@@ -696,6 +793,9 @@ impl OAuthProviderRegistration {
             refresh_includes_binding: true,
             retain_refresh_on_omission,
             identity_mode,
+            flow_mode: OAuthFlowMode::AuthorizationCode,
+            auth_header_set: OAuthAuthHeaderSet::Standard,
+            refresh_policy: OAuthRefreshPolicy::Conservative,
         })
     }
 
@@ -774,6 +874,9 @@ impl Default for OAuthProviderCatalog {
                     metadata.authorization_code_includes_state;
                 registration.refresh_encoding = metadata.refresh_encoding;
                 registration.refresh_includes_binding = metadata.refresh_includes_binding;
+                registration.flow_mode = metadata.flow_mode;
+                registration.auth_header_set = metadata.auth_header_set;
+                registration.refresh_policy = metadata.refresh_policy;
                 Some((registration.provider_id.clone(), Arc::new(registration)))
             })
             .collect::<HashMap<_, _>>();
@@ -1232,6 +1335,7 @@ struct FlowOwner {
 
 enum InternalFlowStatus {
     WaitingBrowser,
+    WaitingDevice,
     Exchanging,
     Ready {
         reference: Zeroizing<String>,
@@ -1264,6 +1368,7 @@ struct CoordinatorInner {
     tasks: Weak<OwnedTaskSet>,
     next_flow: AtomicU64,
     client: reqwest::Client,
+    vault: Arc<dyn Vault>,
 }
 
 impl Drop for CoordinatorInner {
@@ -1286,10 +1391,25 @@ pub(crate) struct OAuthCoordinator {
 }
 
 impl OAuthCoordinator {
+    #[cfg(test)]
     pub(crate) fn new(
         instance_id: String,
         catalog: OAuthProviderCatalog,
         config: OAuthCoordinatorConfig,
+    ) -> Result<Self, OAuthPublicError> {
+        Self::new_with_vault(
+            instance_id,
+            catalog,
+            config,
+            Arc::new(haider_accounts::MemoryVault::default()),
+        )
+    }
+
+    pub(crate) fn new_with_vault(
+        instance_id: String,
+        catalog: OAuthProviderCatalog,
+        config: OAuthCoordinatorConfig,
+        vault: Arc<dyn Vault>,
     ) -> Result<Self, OAuthPublicError> {
         if config.max_flows == 0 || config.max_invalid_callbacks == 0 {
             return Err(OAuthPublicError::new("invalid_oauth_limits", false));
@@ -1313,6 +1433,7 @@ impl OAuthCoordinator {
             tasks: Arc::downgrade(&tasks),
             next_flow: AtomicU64::new(0),
             client,
+            vault,
         });
         let (starts, receiver) = mpsc::channel(config.max_flows);
         let shutdown = inner.shutdown.subscribe();
@@ -1644,6 +1765,10 @@ async fn begin_flow(inner: Arc<CoordinatorInner>, job: StartJob) {
         );
         return;
     }
+    if registration.flow_mode == OAuthFlowMode::DeviceCode {
+        begin_device_flow(inner, job, registration).await;
+        return;
+    }
     let listener = match TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await {
         Ok(listener) => listener,
         Err(_) => {
@@ -1833,6 +1958,530 @@ async fn begin_flow(inner: Arc<CoordinatorInner>, job: StartJob) {
     {
         flow.cancel.send_replace(true);
     }
+}
+
+#[derive(Deserialize)]
+struct DeviceAuthorizationResponse {
+    device_code: SecretJson,
+    user_code: SecretJson,
+    verification_uri_complete: SecretJson,
+    expires_in: u64,
+    #[serde(default = "default_device_poll_interval")]
+    interval: u64,
+}
+
+const fn default_device_poll_interval() -> u64 {
+    5
+}
+
+enum DeviceTokenPoll {
+    Tokens(Zeroizing<Vec<u8>>),
+    Pending,
+    SlowDown,
+    Expired,
+    Denied,
+    Retryable,
+}
+
+async fn begin_device_flow(
+    inner: Arc<CoordinatorInner>,
+    job: StartJob,
+    registration: Arc<OAuthProviderRegistration>,
+) {
+    let owner_connection = job.owner.connection_id.clone();
+    let device_id = match load_or_create_kimi_device_id(Arc::clone(&inner.vault)).await {
+        Ok(device_id) => device_id,
+        Err(error) => {
+            respond_public_error(&job.route, error);
+            return;
+        }
+    };
+    let authorization =
+        match request_device_authorization(&inner.client, &registration, &device_id).await {
+            Ok(authorization) => authorization,
+            Err(error) => {
+                respond_public_error(&job.route, error);
+                return;
+            }
+        };
+    if authorization.expires_in == 0
+        || authorization.expires_in > MAX_TOKEN_LIFETIME_SECS
+        || authorization.interval == 0
+        || authorization.user_code.0.is_empty()
+        || authorization.device_code.0.is_empty()
+    {
+        respond_public_error(
+            &job.route,
+            OAuthPublicError::new("invalid_device_authorization_response", false),
+        );
+        return;
+    }
+    let verification = match std::str::from_utf8(&authorization.verification_uri_complete.0)
+        .ok()
+        .and_then(|value| Url::parse(value).ok())
+        .filter(|url| same_origin(url, &registration.authorization_endpoint))
+    {
+        Some(verification) => verification,
+        None => {
+            respond_public_error(
+                &job.route,
+                OAuthPublicError::new("invalid_device_authorization_response", false),
+            );
+            return;
+        }
+    };
+    let authorization_url =
+        OAuthAuthorizationWire::from_zeroizing(Zeroizing::new(verification.as_str().to_owned()));
+    let flow_id = match random_id(
+        "oauth-flow",
+        inner.next_flow.fetch_add(1, Ordering::Relaxed),
+    ) {
+        Ok(flow_id) => OAuthFlowId::new(flow_id),
+        Err(error) => {
+            respond_public_error(&job.route, error);
+            return;
+        }
+    };
+    let server_ttl = Duration::from_secs(authorization.expires_in);
+    let flow_ttl = inner.config.flow_ttl.min(server_ttl);
+    let expires_at_ms = now_ms()
+        .unwrap_or(u64::MAX)
+        .saturating_add(duration_ms(flow_ttl));
+    let deadline = Instant::now()
+        .checked_add(flow_ttl)
+        .unwrap_or_else(Instant::now);
+    let (cancel, cancel_rx) = watch::channel(false);
+    let flow = FlowEntry {
+        owner: job.owner,
+        provider: job.provider,
+        desired_alias: job.desired_alias,
+        attempt_id: job.attempt_id,
+        deadline,
+        expires_at_ms,
+        status: InternalFlowStatus::WaitingDevice,
+        cancel,
+    };
+    if let Ok(mut flows) = inner.flows.lock() {
+        if !reserve_flow_capacity(&mut flows, inner.config.max_flows) {
+            respond_error(
+                &job.route,
+                ERROR_CODE_BUSY,
+                "OAuth flow capacity is full; retry after another flow finishes",
+                true,
+            );
+            return;
+        }
+        flows.insert(flow_id.as_str().to_owned(), flow);
+    } else {
+        respond_error(
+            &job.route,
+            "oauth_internal",
+            "OAuth coordinator is unavailable",
+            true,
+        );
+        return;
+    }
+    // Close the enqueue/disconnect race exactly as the loopback flow does.
+    // Cleanup may have run while device authorization was in flight.
+    if !connection_is_active(&inner, &owner_connection) {
+        if let Ok(mut flows) = inner.flows.lock()
+            && let Some(flow) = flows.remove(flow_id.as_str())
+        {
+            flow.cancel.send_replace(true);
+        }
+        return;
+    }
+    respond(
+        &job.route,
+        ResponseBody::AccountOAuthStart {
+            availability: inner.catalog.availability(&registration.provider_id, true),
+            flow_id: Some(flow_id.clone()),
+            authorization_url: Some(authorization_url),
+            provider_origin: Some(safe_url(&registration.authorization_endpoint)),
+            loopback_port: None,
+            expires_at_ms: Some(expires_at_ms),
+        },
+    );
+    let Some(tasks) = inner.tasks.upgrade() else {
+        set_terminal(
+            &inner,
+            &flow_id,
+            InternalFlowStatus::Failed("oauth_task_owner_unavailable"),
+        );
+        return;
+    };
+    let task_inner = Arc::clone(&inner);
+    if !tasks
+        .spawn(run_device_token_flow(
+            task_inner,
+            flow_id.clone(),
+            registration,
+            authorization.device_code.0,
+            device_id,
+            Duration::from_secs(authorization.interval),
+            flow_ttl,
+            cancel_rx,
+        ))
+        .await
+    {
+        set_terminal(
+            &inner,
+            &flow_id,
+            InternalFlowStatus::Failed("oauth_task_owner_unavailable"),
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_device_token_flow(
+    inner: Arc<CoordinatorInner>,
+    flow_id: OAuthFlowId,
+    registration: Arc<OAuthProviderRegistration>,
+    device_code: Zeroizing<Vec<u8>>,
+    device_id: SecretHandle,
+    mut interval: Duration,
+    flow_ttl: Duration,
+    mut cancel: watch::Receiver<bool>,
+) {
+    let deadline = tokio::time::sleep(flow_ttl);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            _ = &mut deadline => {
+                set_terminal(&inner, &flow_id, InternalFlowStatus::Expired);
+                return;
+            }
+            changed = cancel.changed() => {
+                if changed.is_err() || *cancel.borrow() {
+                    set_terminal(&inner, &flow_id, InternalFlowStatus::Cancelled);
+                    return;
+                }
+            }
+            () = tokio::time::sleep(interval) => {}
+        }
+        let poll = poll_device_token(&inner.client, &registration, &device_code, &device_id);
+        tokio::pin!(poll);
+        let result = tokio::select! {
+            _ = &mut deadline => {
+                set_terminal(&inner, &flow_id, InternalFlowStatus::Expired);
+                return;
+            }
+            changed = cancel.changed() => {
+                if changed.is_err() || *cancel.borrow() {
+                    set_terminal(&inner, &flow_id, InternalFlowStatus::Cancelled);
+                    return;
+                }
+                continue;
+            }
+            result = &mut poll => result,
+        };
+        match result {
+            Ok(DeviceTokenPoll::Pending | DeviceTokenPoll::Retryable) => {}
+            Ok(DeviceTokenPoll::SlowDown) => {
+                interval = interval.saturating_add(KIMI_DEVICE_POLL_SLOW_DOWN);
+            }
+            Ok(DeviceTokenPoll::Expired) => {
+                set_terminal(&inner, &flow_id, InternalFlowStatus::Expired);
+                return;
+            }
+            Ok(DeviceTokenPoll::Denied) => {
+                set_terminal(
+                    &inner,
+                    &flow_id,
+                    InternalFlowStatus::Failed("access_denied"),
+                );
+                return;
+            }
+            Ok(DeviceTokenPoll::Tokens(bytes)) => {
+                set_terminal(&inner, &flow_id, InternalFlowStatus::Exchanging);
+                match token_bundle_from_response(&registration, &bytes, &[], 1, None).await {
+                    Ok(bundle) => {
+                        if registration.provider_id == haider_provider::KIMI_OAUTH_PROVIDER_NAME
+                            && let Err(error) = validate_kimi_oauth_bundle(&bundle).await
+                        {
+                            set_terminal(&inner, &flow_id, InternalFlowStatus::Failed(error.code));
+                            return;
+                        }
+                        let reference = match random_id("oauth-ready", 0) {
+                            Ok(reference) => Zeroizing::new(reference),
+                            Err(error) => {
+                                set_terminal(
+                                    &inner,
+                                    &flow_id,
+                                    InternalFlowStatus::Failed(error.code),
+                                );
+                                return;
+                            }
+                        };
+                        set_terminal(
+                            &inner,
+                            &flow_id,
+                            InternalFlowStatus::Ready {
+                                reference,
+                                bundle: Box::new(bundle),
+                            },
+                        );
+                    }
+                    Err(error) => {
+                        set_terminal(&inner, &flow_id, InternalFlowStatus::Failed(error.code))
+                    }
+                }
+                return;
+            }
+            Err(error) => {
+                set_terminal(&inner, &flow_id, InternalFlowStatus::Failed(error.code));
+                return;
+            }
+        }
+    }
+}
+
+async fn validate_kimi_oauth_bundle(bundle: &OAuthTokenBundleV1) -> Result<(), OAuthPublicError> {
+    let adapter = haider_provider::OpenAiCompatibleProvider::new_kimi_subscription(
+        bundle.access_token_handle(),
+        "kimi-for-coding",
+        haider_provider::KIMI_OAUTH_BASE_URL,
+    )
+    .map_err(|_| OAuthPublicError::new("inference_validation_unavailable", true))?;
+    let request = haider_provider::TurnRequest {
+        messages: vec![haider_provider::Message::user_text("ping")],
+        model: "kimi-for-coding".to_owned(),
+        max_tokens: 1,
+        system_prompt: None,
+        tools: Vec::new(),
+        attachments: Vec::new(),
+    };
+    let mut stream = adapter
+        .stream_turn(request)
+        .await
+        .map_err(|error| match error.kind {
+            haider_provider::ProviderErrorKind::Authentication => {
+                OAuthPublicError::new("inference_validation_unauthorized", false)
+            }
+            haider_provider::ProviderErrorKind::PermissionDenied => {
+                OAuthPublicError::new("inference_validation_forbidden", false)
+            }
+            _ => OAuthPublicError::new("inference_validation_unavailable", true),
+        })?;
+    match stream.recv().await {
+        Some(Err(error)) => Err(match error.kind {
+            haider_provider::ProviderErrorKind::Authentication => {
+                OAuthPublicError::new("inference_validation_unauthorized", false)
+            }
+            haider_provider::ProviderErrorKind::PermissionDenied => {
+                OAuthPublicError::new("inference_validation_forbidden", false)
+            }
+            _ => OAuthPublicError::new("inference_validation_unavailable", true),
+        }),
+        Some(Ok(_)) | None => Ok(()),
+    }
+}
+
+async fn request_device_authorization(
+    client: &reqwest::Client,
+    registration: &OAuthProviderRegistration,
+    device_id: &SecretHandle,
+) -> Result<DeviceAuthorizationResponse, OAuthPublicError> {
+    let body = {
+        let mut encoded = url::form_urlencoded::Serializer::new(SecretFormBody::empty());
+        encoded.append_pair("client_id", &registration.client_id);
+        encoded.finish()
+    };
+    let request = client
+        .post(registration.authorization_endpoint.clone())
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            "application/x-www-form-urlencoded",
+        )
+        .header(reqwest::header::CONNECTION, "close")
+        .body(reqwest::Body::from(bytes::Bytes::from_owner(body)));
+    let response = apply_oauth_auth_headers(request, registration, Some(device_id))?
+        .send()
+        .await
+        .map_err(|_| OAuthPublicError::new("device_authorization_unavailable", true))?;
+    if response.status().is_redirection() {
+        return Err(OAuthPublicError::new("token_redirect_rejected", false));
+    }
+    let status = response.status();
+    let bytes = bounded_response(response).await?;
+    if !status.is_success() {
+        return Err(OAuthPublicError::new(
+            "device_authorization_failed",
+            status.as_u16() == 429 || status.is_server_error(),
+        ));
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|_| OAuthPublicError::new("invalid_device_authorization_response", false))
+}
+
+async fn poll_device_token(
+    client: &reqwest::Client,
+    registration: &OAuthProviderRegistration,
+    device_code: &[u8],
+    device_id: &SecretHandle,
+) -> Result<DeviceTokenPoll, OAuthPublicError> {
+    let device_code = std::str::from_utf8(device_code)
+        .map_err(|_| OAuthPublicError::new("invalid_device_code", false))?;
+    let body = {
+        let mut encoded = url::form_urlencoded::Serializer::new(SecretFormBody::empty());
+        encoded
+            .append_pair("grant_type", "urn:ietf:params:oauth:grant-type:device_code")
+            .append_pair("device_code", device_code)
+            .append_pair("client_id", &registration.client_id);
+        encoded.finish()
+    };
+    let request = client
+        .post(registration.token_endpoint.clone())
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            "application/x-www-form-urlencoded",
+        )
+        .header(reqwest::header::CONNECTION, "close")
+        .body(reqwest::Body::from(bytes::Bytes::from_owner(body)));
+    let response = apply_oauth_auth_headers(request, registration, Some(device_id))?
+        .send()
+        .await
+        .map_err(|_| OAuthPublicError::new("token_endpoint_unavailable", true))?;
+    if response.status().is_redirection() {
+        return Err(OAuthPublicError::new("token_redirect_rejected", false));
+    }
+    let status = response.status();
+    let bytes = bounded_response(response).await?;
+    if status.is_success() {
+        return Ok(DeviceTokenPoll::Tokens(bytes));
+    }
+    #[derive(Deserialize)]
+    struct DeviceErrorBody {
+        #[serde(default)]
+        error: Option<SecretJson>,
+    }
+    let error = serde_json::from_slice::<DeviceErrorBody>(&bytes)
+        .ok()
+        .and_then(|body| body.error);
+    let is = |name: &[u8]| {
+        error
+            .as_ref()
+            .is_some_and(|error| error.0.as_slice() == name)
+    };
+    if is(b"authorization_pending") {
+        Ok(DeviceTokenPoll::Pending)
+    } else if is(b"slow_down") {
+        Ok(DeviceTokenPoll::SlowDown)
+    } else if is(b"expired_token") {
+        Ok(DeviceTokenPoll::Expired)
+    } else if is(b"access_denied") {
+        Ok(DeviceTokenPoll::Denied)
+    } else if status.as_u16() == 429 || status.is_server_error() {
+        Ok(DeviceTokenPoll::Retryable)
+    } else {
+        Err(OAuthPublicError::new("token_exchange_failed", false))
+    }
+}
+
+fn apply_oauth_auth_headers(
+    mut request: reqwest::RequestBuilder,
+    registration: &OAuthProviderRegistration,
+    device_id: Option<&SecretHandle>,
+) -> Result<reqwest::RequestBuilder, OAuthPublicError> {
+    if registration.auth_header_set == OAuthAuthHeaderSet::Standard {
+        return Ok(request);
+    }
+    let device_id =
+        device_id.ok_or_else(|| OAuthPublicError::new("device_identity_unavailable", true))?;
+    let mut value = reqwest::header::HeaderValue::from_bytes(device_id.expose_secret())
+        .map_err(|_| OAuthPublicError::new("device_identity_invalid", false))?;
+    value.set_sensitive(true);
+    request = request
+        .header("X-Msh-Platform", "kimi_cli")
+        .header("X-Msh-Version", env!("CARGO_PKG_VERSION"))
+        .header("X-Msh-Device-Name", "haider-agent")
+        .header("X-Msh-Device-Model", std::env::consts::ARCH)
+        .header("X-Msh-Os-Version", std::env::consts::OS)
+        .header("X-Msh-Device-Id", value);
+    Ok(request)
+}
+
+async fn load_or_create_kimi_device_id(
+    vault: Arc<dyn Vault>,
+) -> Result<SecretHandle, OAuthPublicError> {
+    let alias = CredentialAlias::new(KIMI_DEVICE_ALIAS);
+    let lease = tokio::time::timeout(
+        TOKEN_TIMEOUT,
+        acquire_refresh_lock(Arc::clone(&vault), &alias),
+    )
+    .await
+    .map_err(|_| OAuthPublicError::new("device_identity_unavailable", true))?
+    .map_err(|_| OAuthPublicError::new("device_identity_unavailable", true))?;
+    let vault_for_read = Arc::clone(&vault);
+    let alias_for_read = alias.clone();
+    let resolved = tokio::task::spawn_blocking(move || vault_for_read.resolve(&alias_for_read))
+        .await
+        .map_err(|_| OAuthPublicError::new("device_identity_unavailable", true))?;
+    match resolved {
+        Ok(device_id) if valid_uuid_v4(device_id.expose_secret()) => {
+            drop(lease);
+            return Ok(device_id);
+        }
+        Ok(_) => return Err(OAuthPublicError::new("device_identity_invalid", false)),
+        Err(error) if error.code == ErrorCode::CredentialMissing => {}
+        Err(_) => return Err(OAuthPublicError::new("device_identity_unavailable", true)),
+    }
+    let mut random = [0_u8; 16];
+    getrandom::fill(&mut random)
+        .map_err(|_| OAuthPublicError::new("randomness_unavailable", true))?;
+    random[6] = (random[6] & 0x0f) | 0x40;
+    random[8] = (random[8] & 0x3f) | 0x80;
+    let device_id = Zeroizing::new(format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        random[0],
+        random[1],
+        random[2],
+        random[3],
+        random[4],
+        random[5],
+        random[6],
+        random[7],
+        random[8],
+        random[9],
+        random[10],
+        random[11],
+        random[12],
+        random[13],
+        random[14],
+        random[15]
+    ));
+    random.zeroize();
+    let vault_for_put = Arc::clone(&vault);
+    let alias_for_put = alias.clone();
+    let bytes_for_put = Zeroizing::new(device_id.as_bytes().to_vec());
+    tokio::task::spawn_blocking(move || vault_for_put.put(&alias_for_put, &bytes_for_put))
+        .await
+        .map_err(|_| OAuthPublicError::new("device_identity_unavailable", true))?
+        .map_err(|_| OAuthPublicError::new("device_identity_unavailable", true))?;
+    drop(lease);
+    tokio::task::spawn_blocking(move || vault.resolve(&alias))
+        .await
+        .map_err(|_| OAuthPublicError::new("device_identity_unavailable", true))?
+        .map_err(|_| OAuthPublicError::new("device_identity_unavailable", true))
+}
+
+fn valid_uuid_v4(value: &[u8]) -> bool {
+    value.len() == 36
+        && value.iter().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => *byte == b'-',
+            _ => byte.is_ascii_hexdigit(),
+        })
+        && value[14] == b'4'
+        && matches!(value[19].to_ascii_lowercase(), b'8' | b'9' | b'a' | b'b')
+}
+
+fn same_origin(left: &Url, right: &Url) -> bool {
+    left.scheme() == right.scheme()
+        && left.host_str() == right.host_str()
+        && left.port_or_known_default() == right.port_or_known_default()
+        && left.username().is_empty()
+        && left.password().is_none()
+        && left.fragment().is_none()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2408,13 +3057,15 @@ fn classify_token_error(status: u16, body: &[u8]) -> OAuthPublicError {
     let kind = serde_json::from_slice::<ErrorBody>(body)
         .ok()
         .and_then(|value| value.error);
-    if kind
-        .as_ref()
-        .is_some_and(|kind| kind.0.as_slice() == b"invalid_grant")
+    if status == 401
+        || status == 403
+        || kind
+            .as_ref()
+            .is_some_and(|kind| kind.0.as_slice() == b"invalid_grant")
     {
         OAuthPublicError::new("invalid_grant", false)
-    } else if status >= 500 {
-        OAuthPublicError::new("token_endpoint_unavailable", true)
+    } else if status == 429 || status >= 500 {
+        OAuthPublicError::retryable_status()
     } else {
         OAuthPublicError::new("token_exchange_failed", false)
     }
@@ -2544,9 +3195,12 @@ async fn token_bundle_from_response(
         None if registration.retain_refresh_on_omission => {
             prior_refresh.map(|token| Zeroizing::new(token.to_vec()))
         }
+        None if registration.refresh_policy == OAuthRefreshPolicy::SerializedRotating => {
+            return Err(OAuthPublicError::new("missing_refresh_token", false));
+        }
         None => None,
     };
-    OAuthTokenBundleV1::new(
+    let bundle = OAuthTokenBundleV1::new(
         registration.provider_id.clone(),
         registration.issuer.clone(),
         registration.audience.clone(),
@@ -2560,7 +3214,23 @@ async fn token_bundle_from_response(
         identity,
         generation,
     )
-    .map_err(|_| OAuthPublicError::new("invalid_token_response", false))
+    .map_err(|_| OAuthPublicError::new("invalid_token_response", false))?;
+    Ok(
+        if registration.refresh_policy == OAuthRefreshPolicy::SerializedRotating {
+            bundle.with_refresh_after(kimi_refresh_after(now, response.expires_in))
+        } else {
+            bundle
+        },
+    )
+}
+
+fn kimi_refresh_after(issued_at_unix_ms: u64, expires_in_secs: u64) -> u64 {
+    let threshold_secs = 300_u64.max(expires_in_secs / 2);
+    issued_at_unix_ms.saturating_add(
+        expires_in_secs
+            .saturating_sub(threshold_secs)
+            .saturating_mul(1000),
+    )
 }
 
 fn random_secret(length: usize) -> Result<Zeroizing<Vec<u8>>, OAuthPublicError> {
@@ -2635,6 +3305,7 @@ fn reserve_flow_capacity(flows: &mut HashMap<String, FlowEntry>, max_flows: usiz
 fn public_status(flow: &FlowEntry) -> OAuthFlowStatusWire {
     match &flow.status {
         InternalFlowStatus::WaitingBrowser => OAuthFlowStatusWire::WaitingBrowser,
+        InternalFlowStatus::WaitingDevice => OAuthFlowStatusWire::WaitingDevice,
         InternalFlowStatus::Exchanging => OAuthFlowStatusWire::Exchanging,
         InternalFlowStatus::Ready { reference, bundle } => OAuthFlowStatusWire::Ready {
             oauth_reference: OAuthReadyRefWire::new(reference.as_str()),
@@ -3036,7 +3707,7 @@ impl CredentialBroker {
             AuthMethod::ApiKey => self.resolve_vault(&descriptor.alias).await,
             AuthMethod::OAuth => match Self::snapshot_oauth_state(&self.inner, descriptor) {
                 SnapshotOAuthState::Current | SnapshotOAuthState::Expired => {
-                    self.resolve_oauth(descriptor, false).await
+                    self.resolve_oauth(descriptor, false, None).await
                 }
                 SnapshotOAuthState::Replaced => {
                     let Some(flight) = self.active_flight(descriptor) else {
@@ -3050,7 +3721,7 @@ impl CredentialBroker {
                             if Self::snapshot_oauth_state(&self.inner, descriptor)
                                 != SnapshotOAuthState::Replaced =>
                         {
-                            self.resolve_oauth(descriptor, false).await
+                            self.resolve_oauth(descriptor, false, None).await
                         }
                         RefreshFlightOutcome::Refreshed => Err(expired_or_replaced(descriptor)),
                     }
@@ -3062,9 +3733,13 @@ impl CredentialBroker {
     pub(crate) async fn refresh_after_auth_failure(
         &self,
         descriptor: &CredentialDescriptor,
+        failed_access_fingerprint: Option<[u8; 32]>,
     ) -> Result<SecretHandle, HaiderError> {
         match descriptor.auth_method {
-            AuthMethod::OAuth => self.resolve_oauth(descriptor, true).await,
+            AuthMethod::OAuth => {
+                self.resolve_oauth(descriptor, true, failed_access_fingerprint)
+                    .await
+            }
             AuthMethod::ApiKey => Err(rotation_error(
                 descriptor,
                 haider_accounts::RotationTrigger::AuthExpired,
@@ -3108,6 +3783,7 @@ impl CredentialBroker {
         &self,
         descriptor: &CredentialDescriptor,
         force_refresh: bool,
+        failed_access_fingerprint: Option<[u8; 32]>,
     ) -> Result<SecretHandle, HaiderError> {
         let fence = self.fence_for(&descriptor.alias);
         let expected_fence = fence.load(Ordering::Acquire);
@@ -3126,6 +3802,30 @@ impl CredentialBroker {
             let now = now_ms().ok_or_else(|| {
                 HaiderError::new(ErrorCode::Internal, "system clock is unavailable", true)
             })?;
+            if registration_is_serialized_rotating(&self.inner.catalog, &descriptor.provider)
+                && bundle
+                    .refresh_rejected_until_unix_ms
+                    .is_some_and(|until| now < until)
+            {
+                return Err(kimi_relogin_required(descriptor));
+            }
+            if force_refresh
+                && registration_is_serialized_rotating(&self.inner.catalog, &descriptor.provider)
+                && failed_access_fingerprint.is_some_and(|failed| {
+                    !bool::from(
+                        blake3::hash(bundle.access_token())
+                            .as_bytes()
+                            .ct_eq(&failed),
+                    )
+                })
+                && bundle.expires_at_unix_ms > now
+            {
+                // The 401 belongs to an older access generation. Another
+                // process already rotated and persisted before this broker
+                // entered; adopt the under-vault re-read instead of rotating
+                // the fresh generation again.
+                return Ok(bundle.access_token_handle());
+            }
             let skew_ms = duration_ms(self.inner.refresh_skew);
             let snapshot_state = Self::snapshot_oauth_state(&self.inner, descriptor);
             if matches!(
@@ -3149,8 +3849,16 @@ impl CredentialBroker {
                 }
             }
             let actually_expired = bundle.expires_at_unix_ms <= now;
+            let refresh_due =
+                if registration_is_serialized_rotating(&self.inner.catalog, &descriptor.provider) {
+                    bundle
+                        .refresh_after_unix_ms
+                        .is_none_or(|refresh_after| now >= refresh_after)
+                } else {
+                    bundle.expires_at_unix_ms <= now.saturating_add(skew_ms)
+                };
             if force_refresh
-                || bundle.expires_at_unix_ms <= now.saturating_add(skew_ms)
+                || refresh_due
                 || codex_import_fallback_refresh_candidate(&bundle, now)
                 || snapshot_state == SnapshotOAuthState::Expired
             {
@@ -3401,6 +4109,16 @@ impl CredentialBroker {
                 "OAuth registration is unavailable",
             ));
         };
+        if registration.refresh_policy == OAuthRefreshPolicy::SerializedRotating {
+            return Self::refresh_serialized_rotating(
+                inner,
+                descriptor,
+                bundle,
+                expected_fence,
+                registration,
+            )
+            .await;
+        }
         let Some(refresh_token) = bundle.refresh_token() else {
             let _ =
                 Self::mark_expired_if_current(inner, descriptor, bundle, expected_fence).await?;
@@ -3452,7 +4170,8 @@ impl CredentialBroker {
                 ));
             }
         }
-        let response = exchange_refresh_token(&inner.client, &registration, refresh_token).await;
+        let response =
+            exchange_refresh_token(&inner.client, &registration, refresh_token, None).await;
         let refreshed = match response {
             Ok(bytes) => refresh_bundle_from_response(&registration, &bytes, bundle),
             Err(error) if error.retryable => return Err(oauth_error(error)),
@@ -3539,12 +4258,225 @@ impl CredentialBroker {
         Ok(refreshed.access_token_handle())
     }
 
-    async fn resolve_vault(&self, alias: &CredentialAlias) -> Result<SecretHandle, HaiderError> {
-        let vault = Arc::clone(&self.inner.vault);
+    async fn refresh_serialized_rotating(
+        inner: &Arc<BrokerInner>,
+        descriptor: &CredentialDescriptor,
+        observed: &OAuthTokenBundleV1,
+        expected_fence: u64,
+        registration: Arc<OAuthProviderRegistration>,
+    ) -> Result<SecretHandle, HaiderError> {
+        let lease = acquire_broker_refresh_lock(inner, &descriptor.alias).await?;
+        if Self::fence_for_inner(inner, &descriptor.alias).load(Ordering::Acquire) != expected_fence
+        {
+            return Err(stale_refresh());
+        }
+        // The re-read is INSIDE the OS-lock critical section. A second daemon
+        // that waited for generation N's rotation adopts durable N+1 without
+        // ever replaying N's now-invalid refresh token.
+        let stored = Self::resolve_vault_inner(inner, &descriptor.alias).await?;
+        let current = OAuthTokenBundleV1::decode(stored.expose_secret())?;
+        validate_bundle_against(&registration, descriptor, &current)?;
+        let now = now_ms().ok_or_else(|| {
+            HaiderError::new(ErrorCode::Internal, "system clock is unavailable", true)
+        })?;
+        if current
+            .refresh_rejected_until_unix_ms
+            .is_some_and(|until| now < until)
+        {
+            return Err(kimi_relogin_required(descriptor));
+        }
+        let current_refresh = current.refresh_token();
+        let observed_refresh = observed.refresh_token();
+        let refresh_changed = current.generation != observed.generation
+            || match (current_refresh, observed_refresh) {
+                (Some(current), Some(observed)) => !bool::from(current.ct_eq(observed)),
+                (None, None) => false,
+                _ => true,
+            };
+        if refresh_changed {
+            if current.expires_at_unix_ms <= now {
+                return Err(kimi_relogin_required(descriptor));
+            }
+            drop(lease);
+            return Ok(current.access_token_handle());
+        }
+        let Some(refresh_token) = current_refresh else {
+            return Err(kimi_relogin_required(descriptor));
+        };
+        if current
+            .refresh_expires_at_unix_ms
+            .is_some_and(|expires_at| now >= expires_at)
+        {
+            return Err(kimi_relogin_required(descriptor));
+        }
+        let device_id = load_or_create_kimi_device_id(Arc::clone(&inner.vault))
+            .await
+            .map_err(oauth_error)?;
+        // A rotating refresh request is an irreversible external mutation.
+        // Persist permanent uncertainty BEFORE the request; every successful
+        // or explicitly retryable response below replaces this marker while
+        // still holding the physical-alias lease. A crash, cancellation, lost
+        // actor completion, malformed success, or ambiguous transport error
+        // therefore cannot replay the possibly spent token after restart.
+        let uncertain = OAuthTokenBundleV1::decode(stored.expose_secret())?
+            .with_refresh_rejected_until(u64::MAX);
+        Self::apply_serialized_bundle(
+            inner,
+            descriptor,
+            refresh_fence(&current, expected_fence),
+            uncertain.encode()?,
+            &descriptor.alias,
+        )
+        .await?;
+        let mut attempts = 0_usize;
+        let response = loop {
+            attempts = attempts.saturating_add(1);
+            let response = exchange_refresh_token(
+                &inner.client,
+                &registration,
+                refresh_token,
+                Some(&device_id),
+            )
+            .await;
+            let Some(delay) = response
+                .as_ref()
+                .err()
+                .and_then(|error| kimi_refresh_retry_delay(error, attempts))
+            else {
+                break response;
+            };
+            tokio::time::sleep(delay).await;
+            if inner.shutting_down.load(Ordering::Acquire) {
+                return Err(broker_stopped());
+            }
+        };
+        let bytes = match response {
+            Ok(bytes) => bytes,
+            Err(error) if error.retryable_status => {
+                // Explicit 429/5xx is the provider-declared retryable class.
+                // Restore the exact pre-request bundle before surfacing the
+                // retry, so a later bounded attempt is possible.
+                Self::apply_serialized_bundle(
+                    inner,
+                    descriptor,
+                    refresh_fence(&current, expected_fence),
+                    current.encode()?,
+                    &descriptor.alias,
+                )
+                .await?;
+                return Err(oauth_error(error));
+            }
+            Err(error) if error.retryable => {
+                // A transport failure is ambiguous: the server may have
+                // rotated before the response was lost. Keep permanent
+                // uncertainty and require a new login.
+                return Err(kimi_relogin_required(descriptor));
+            }
+            Err(_) => {
+                // Re-read once after a terminal rejection. This covers a
+                // winner that persisted between the caller's stale 401 and
+                // our serialized refresh attempt. Only the unchanged exact
+                // token is tombstoned.
+                let latest = Self::resolve_vault_inner(inner, &descriptor.alias).await?;
+                let latest = OAuthTokenBundleV1::decode(latest.expose_secret())?;
+                validate_bundle_against(&registration, descriptor, &latest)?;
+                let latest_changed = latest.generation != current.generation
+                    || match (latest.refresh_token(), current.refresh_token()) {
+                        (Some(latest), Some(current)) => !bool::from(latest.ct_eq(current)),
+                        (None, None) => false,
+                        _ => true,
+                    };
+                if latest_changed && latest.expires_at_unix_ms > now {
+                    drop(lease);
+                    return Ok(latest.access_token_handle());
+                }
+                let expected = refresh_fence(&current, expected_fence);
+                let tombstoned = current.with_refresh_rejected_until(
+                    now.saturating_add(duration_ms(KIMI_REFRESH_REJECTED_TTL)),
+                );
+                let encoded = tombstoned.encode()?;
+                Self::apply_serialized_bundle(
+                    inner,
+                    descriptor,
+                    expected,
+                    encoded,
+                    &descriptor.alias,
+                )
+                .await?;
+                drop(lease);
+                return Err(kimi_relogin_required(descriptor));
+            }
+        };
+        let refreshed = refresh_bundle_from_response(&registration, &bytes, &current)
+            .map_err(|_| kimi_relogin_required(descriptor))?;
+        let expected = refresh_fence(&current, expected_fence);
+        let access = refreshed.access_token_handle();
+        let encoded = refreshed.encode()?;
+        Self::apply_serialized_bundle(inner, descriptor, expected, encoded, &descriptor.alias)
+            .await?;
+        // Persist completed while the lease was held; access may escape only
+        // after this point.
+        drop(lease);
+        Ok(access)
+    }
+
+    async fn apply_serialized_bundle(
+        inner: &Arc<BrokerInner>,
+        descriptor: &CredentialDescriptor,
+        expected: crate::accounts::OAuthRefreshFence,
+        encoded_bundle: Zeroizing<Vec<u8>>,
+        alias: &CredentialAlias,
+    ) -> Result<(), HaiderError> {
+        let (completed, result) = oneshot::channel();
+        inner
+            .status_commands
+            .send(crate::accounts::AccountCommand::ApplyOAuthRefresh {
+                descriptor: descriptor.clone(),
+                expected,
+                encoded_bundle,
+                completed,
+            })
+            .await
+            .map_err(|_| {
+                HaiderError::new(
+                    ErrorCode::ProviderError,
+                    "OAuth account actor is unavailable after refresh",
+                    false,
+                )
+            })?;
+        match result.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(crate::accounts::RefreshApplyError::Stale)) => Err(stale_refresh()),
+            Ok(Err(crate::accounts::RefreshApplyError::Persist)) => {
+                Self::invalidate_inner(inner, alias);
+                Err(rotation_error(
+                    descriptor,
+                    haider_accounts::RotationTrigger::RefreshFailed,
+                    false,
+                    "OAuth refresh could not be durably persisted; sign in again",
+                ))
+            }
+            Err(_) => Err(HaiderError::new(
+                ErrorCode::ProviderError,
+                "OAuth refresh completion was lost",
+                false,
+            )),
+        }
+    }
+
+    async fn resolve_vault_inner(
+        inner: &Arc<BrokerInner>,
+        alias: &CredentialAlias,
+    ) -> Result<SecretHandle, HaiderError> {
+        let vault = Arc::clone(&inner.vault);
         let alias = alias.clone();
         tokio::task::spawn_blocking(move || vault.resolve(&alias))
             .await
             .map_err(|_| HaiderError::new(ErrorCode::ProviderError, "vault worker failed", true))?
+    }
+
+    async fn resolve_vault(&self, alias: &CredentialAlias) -> Result<SecretHandle, HaiderError> {
+        Self::resolve_vault_inner(&self.inner, alias).await
     }
 
     fn validate_bundle(
@@ -3559,24 +4491,7 @@ impl CredentialBroker {
                 false,
             ));
         };
-        if bundle.provider_id != descriptor.provider
-            || bundle.issuer != registration.issuer
-            || bundle.audience != registration.audience
-            || bundle.resource != registration.resource
-            || !bundle.token_type.eq_ignore_ascii_case("bearer")
-            || !registration
-                .scopes
-                .iter()
-                .filter(|scope| registration.validation_required(scope))
-                .all(|scope| bundle.granted_scopes.contains(scope))
-        {
-            return Err(HaiderError::new(
-                ErrorCode::Unauthorized,
-                "stored OAuth token bundle failed provider validation",
-                false,
-            ));
-        }
-        Ok(())
+        validate_bundle_against(&registration, descriptor, bundle)
     }
 
     fn fence_for(&self, alias: &CredentialAlias) -> Arc<AtomicU64> {
@@ -3712,6 +4627,94 @@ impl CredentialBroker {
     }
 }
 
+fn registration_is_serialized_rotating(catalog: &OAuthProviderCatalog, provider: &str) -> bool {
+    catalog.registration(provider).is_some_and(|registration| {
+        registration.refresh_policy == OAuthRefreshPolicy::SerializedRotating
+    })
+}
+
+fn kimi_refresh_retry_delay(error: &OAuthPublicError, attempts: usize) -> Option<Duration> {
+    (error.retryable_status && attempts < KIMI_REFRESH_MAX_ATTEMPTS).then(|| {
+        let exponent = u32::try_from(attempts.saturating_sub(1)).unwrap_or(u32::MAX);
+        KIMI_REFRESH_BACKOFF_INITIAL.saturating_mul(2_u32.saturating_pow(exponent))
+    })
+}
+
+fn validate_bundle_against(
+    registration: &OAuthProviderRegistration,
+    descriptor: &CredentialDescriptor,
+    bundle: &OAuthTokenBundleV1,
+) -> Result<(), HaiderError> {
+    if bundle.provider_id != descriptor.provider
+        || bundle.issuer != registration.issuer
+        || bundle.audience != registration.audience
+        || bundle.resource != registration.resource
+        || !bundle.token_type.eq_ignore_ascii_case("bearer")
+        || !registration
+            .scopes
+            .iter()
+            .filter(|scope| registration.validation_required(scope))
+            .all(|scope| bundle.granted_scopes.contains(scope))
+    {
+        return Err(HaiderError::new(
+            ErrorCode::Unauthorized,
+            "stored OAuth token bundle failed provider validation",
+            false,
+        ));
+    }
+    Ok(())
+}
+
+async fn acquire_refresh_lock(
+    vault: Arc<dyn Vault>,
+    alias: &CredentialAlias,
+) -> Result<VaultRefreshLock, HaiderError> {
+    loop {
+        let vault_for_lock = Arc::clone(&vault);
+        let alias_for_lock = alias.clone();
+        let lease =
+            tokio::task::spawn_blocking(move || vault_for_lock.try_refresh_lock(&alias_for_lock))
+                .await
+                .map_err(|_| {
+                    HaiderError::new(
+                        ErrorCode::ProviderError,
+                        "vault refresh-lock worker failed",
+                        true,
+                    )
+                })??;
+        if let Some(lease) = lease {
+            return Ok(lease);
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn acquire_broker_refresh_lock(
+    inner: &Arc<BrokerInner>,
+    alias: &CredentialAlias,
+) -> Result<VaultRefreshLock, HaiderError> {
+    loop {
+        if inner.shutting_down.load(Ordering::Acquire) {
+            return Err(broker_stopped());
+        }
+        let vault = Arc::clone(&inner.vault);
+        let alias_for_lock = alias.clone();
+        let lease = tokio::task::spawn_blocking(move || vault.try_refresh_lock(&alias_for_lock))
+            .await
+            .map_err(|_| {
+                HaiderError::new(
+                    ErrorCode::ProviderError,
+                    "vault refresh-lock worker failed",
+                    true,
+                )
+            })??;
+        if let Some(lease) = lease {
+            return Ok(lease);
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 fn refresh_fence(
     bundle: &OAuthTokenBundleV1,
     fence_epoch: u64,
@@ -3764,14 +4767,16 @@ async fn exchange_refresh_token(
     client: &reqwest::Client,
     registration: &OAuthProviderRegistration,
     refresh_token: &[u8],
+    device_id: Option<&SecretHandle>,
 ) -> Result<Zeroizing<Vec<u8>>, OAuthPublicError> {
     let body = refresh_token_request_body(registration, refresh_token)?;
     let content_type = body.content_type();
-    let response = client
+    let request = client
         .post(registration.token_endpoint.clone())
         .header(reqwest::header::CONTENT_TYPE, content_type)
         .header(reqwest::header::CONNECTION, "close")
-        .body(reqwest::Body::from(bytes::Bytes::from_owner(body)))
+        .body(reqwest::Body::from(bytes::Bytes::from_owner(body)));
+    let response = apply_oauth_auth_headers(request, registration, device_id)?
         .send()
         .await
         .map_err(|_| OAuthPublicError::new("token_endpoint_unavailable", true))?;
@@ -3880,7 +4885,7 @@ fn refresh_bundle_from_response(
         Some(seconds) => now.checked_add(seconds.saturating_mul(1000)),
         None => prior.refresh_expires_at_unix_ms,
     };
-    OAuthTokenBundleV1::new(
+    let bundle = OAuthTokenBundleV1::new(
         registration.provider_id.clone(),
         registration.issuer.clone(),
         prior.audience.clone(),
@@ -3898,7 +4903,14 @@ fn refresh_bundle_from_response(
             .checked_add(1)
             .ok_or_else(|| OAuthPublicError::new("invalid_token_response", false))?,
     )
-    .map_err(|_| OAuthPublicError::new("invalid_token_response", false))
+    .map_err(|_| OAuthPublicError::new("invalid_token_response", false))?;
+    Ok(
+        if registration.refresh_policy == OAuthRefreshPolicy::SerializedRotating {
+            bundle.with_refresh_after(kimi_refresh_after(now, response.expires_in))
+        } else {
+            bundle
+        },
+    )
 }
 
 fn rotation_error(
@@ -3921,6 +4933,27 @@ fn rotation_error(
             haider_protocol::credential::RotationCause::Manual => "manual",
         }
     }));
+    error
+}
+
+fn kimi_relogin_required(descriptor: &CredentialDescriptor) -> HaiderError {
+    let mut error = rotation_error(
+        descriptor,
+        haider_accounts::RotationTrigger::AuthExpired,
+        false,
+        "Kimi OAuth refresh was rejected; sign in again",
+    );
+    if let Some(details) = error
+        .details
+        .as_mut()
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        details.insert(
+            "kind".to_owned(),
+            serde_json::Value::String("oauth_relogin_required".to_owned()),
+        );
+        details.insert("relogin_required".to_owned(), serde_json::Value::Bool(true));
+    }
     error
 }
 

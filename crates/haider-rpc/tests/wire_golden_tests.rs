@@ -19,11 +19,11 @@ use haider_rpc::{
     ERROR_CODE_REVISION_CONFLICT, ERROR_CODE_RUN_NOT_ACTIVE, ERROR_CODE_STALE_GENERATION,
     ERROR_CODE_TOO_MANY_ATTACHMENTS, ERROR_CODE_UNAUTHORIZED, ERROR_CODE_VAULT_UNSUPPORTED,
     ERROR_CODE_VISION_UNSUPPORTED, ErrorData, FEATURE_ACCOUNT_LOGIN_API_V1,
-    FEATURE_ACCOUNT_MANAGEMENT_V1, FEATURE_ACCOUNT_OAUTH_PKCE_V1, FEATURE_ACCOUNT_ROTATION_V1,
-    FEATURE_PROVIDER_CONFIGURE_V1, FEATURE_PROVIDER_MANAGEMENT_V1, FEATURE_PROVIDER_MODELS_V1,
-    FEATURE_PROVIDER_REMOVE_V1, FEATURE_SESSION_MUTATION_V1, FEATURE_TURN_CONTROL_V1,
-    FEATURE_VAULT_STAGE_V1, Hello, RequestBody, ResponseBody, SubmitDisposition,
-    WIRE_PROTOCOL_VERSION, Welcome, WireFrame, uds_codec, ws_codec,
+    FEATURE_ACCOUNT_MANAGEMENT_V1, FEATURE_ACCOUNT_OAUTH_DEVICE_V1, FEATURE_ACCOUNT_OAUTH_PKCE_V1,
+    FEATURE_ACCOUNT_ROTATION_V1, FEATURE_PROVIDER_CONFIGURE_V1, FEATURE_PROVIDER_MANAGEMENT_V1,
+    FEATURE_PROVIDER_MODELS_V1, FEATURE_PROVIDER_REMOVE_V1, FEATURE_SESSION_MUTATION_V1,
+    FEATURE_TURN_CONTROL_V1, FEATURE_VAULT_STAGE_V1, Hello, RequestBody, ResponseBody,
+    SubmitDisposition, WIRE_PROTOCOL_VERSION, Welcome, WireFrame, uds_codec, ws_codec,
 };
 use serde::{Deserialize, Serialize};
 
@@ -870,6 +870,19 @@ fn oauth_methods_features_and_status_are_additive_unknown_tolerant() {
             .expect("unknown status");
     assert_eq!(future_status, haider_rpc::OAuthFlowStatusWire::Unknown);
 
+    #[derive(Debug, PartialEq, Eq, Deserialize)]
+    #[serde(tag = "status", rename_all = "snake_case")]
+    enum PreDeviceOAuthStatus {
+        WaitingBrowser,
+        Exchanging,
+        #[serde(other)]
+        Unknown,
+    }
+    let old_client_status: PreDeviceOAuthStatus =
+        serde_json::from_str(r#"{"status":"waiting_device"}"#)
+            .expect("pre-B6k client accepts the additive status");
+    assert_eq!(old_client_status, PreDeviceOAuthStatus::Unknown);
+
     let start: RequestBody = serde_json::from_str(
         r#"{"method":"account.oauth_start","provider":"fake","desired_alias":"work","attempt_id":"a","future":1}"#,
     )
@@ -894,12 +907,42 @@ fn oauth_methods_features_and_status_are_additive_unknown_tolerant() {
             haider_rpc::FEATURE_VAULT_STAGE_V1,
         ])
     );
+
+    let device_welcome = transcript()
+        .into_iter()
+        .find_map(|frame| match frame {
+            WireFrame::Welcome(welcome)
+                if welcome.features
+                    == std::collections::BTreeSet::from([
+                        FEATURE_ACCOUNT_OAUTH_DEVICE_V1.to_owned()
+                    ]) =>
+            {
+                Some(welcome)
+            }
+            _ => None,
+        })
+        .expect("device-flow feature Welcome");
+    assert_eq!(
+        serde_json::to_value(device_welcome).expect("device Welcome JSON")["features"],
+        serde_json::json!([FEATURE_ACCOUNT_OAUTH_DEVICE_V1])
+    );
+    assert!(transcript().into_iter().any(|frame| matches!(
+        frame,
+        WireFrame::Response {
+            body: ResponseBody::AccountOAuthStatus {
+                status: haider_rpc::OAuthFlowStatusWire::WaitingDevice,
+                ..
+            },
+            ..
+        }
+    )));
 }
 
 #[test]
 fn oauth_status_shapes_cannot_carry_callback_or_token_secrets() {
     for status in [
         haider_rpc::OAuthFlowStatusWire::WaitingBrowser,
+        haider_rpc::OAuthFlowStatusWire::WaitingDevice,
         haider_rpc::OAuthFlowStatusWire::Exchanging,
         haider_rpc::OAuthFlowStatusWire::Failed {
             public_code: "access_denied".into(),

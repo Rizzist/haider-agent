@@ -14,6 +14,7 @@ use crate::{AccountsResult, SecretHandle, accounts_error};
 
 const MAGIC: &[u8] = b"HAIDER_OAUTH_BUNDLE\x01";
 const REFRESH_ON_FIRST_USE_MARKER: &[u8] = b"HAIDER_IMPORT_REFRESH\x01";
+const LIFECYCLE_EXTENSION_MARKER: &[u8] = b"HAIDER_OAUTH_LIFECYCLE\x01";
 const MAX_BUNDLE_BYTES: usize = 256 * 1024;
 const MAX_FIELD_BYTES: usize = 64 * 1024;
 const MAX_SCOPES: usize = 128;
@@ -43,6 +44,12 @@ pub struct OAuthTokenBundleV1 {
     pub granted_scopes: Vec<String>,
     pub identity: OAuthIdentityV1,
     pub generation: u64,
+    /// Provider-computed turn-boundary threshold for proactive refresh.
+    /// `None` preserves the legacy fixed-skew policy.
+    pub refresh_after_unix_ms: Option<u64>,
+    /// Until this instant the exact stored rotating refresh credential is a
+    /// known terminal rejection and must surface re-login without replay.
+    pub refresh_rejected_until_unix_ms: Option<u64>,
     refresh_on_first_use: bool,
 }
 
@@ -68,6 +75,11 @@ impl fmt::Debug for OAuthTokenBundleV1 {
             .field("granted_scopes", &self.granted_scopes)
             .field("identity", &self.identity)
             .field("generation", &self.generation)
+            .field("refresh_after_unix_ms", &self.refresh_after_unix_ms)
+            .field(
+                "refresh_rejected_until_unix_ms",
+                &self.refresh_rejected_until_unix_ms,
+            )
             .finish()
     }
 }
@@ -101,6 +113,8 @@ impl OAuthTokenBundleV1 {
             granted_scopes,
             identity,
             generation,
+            refresh_after_unix_ms: None,
+            refresh_rejected_until_unix_ms: None,
             refresh_on_first_use: false,
         };
         bundle.validate()?;
@@ -151,7 +165,12 @@ impl OAuthTokenBundleV1 {
         }
         push_bytes(&mut out, self.identity.subject_hash.as_bytes())?;
         push_bytes(&mut out, self.identity.display_identity.as_bytes())?;
-        if self.refresh_on_first_use {
+        if self.refresh_after_unix_ms.is_some() || self.refresh_rejected_until_unix_ms.is_some() {
+            out.extend_from_slice(LIFECYCLE_EXTENSION_MARKER);
+            out.push(u8::from(self.refresh_on_first_use));
+            push_optional_u64(&mut out, self.refresh_after_unix_ms);
+            push_optional_u64(&mut out, self.refresh_rejected_until_unix_ms);
+        } else if self.refresh_on_first_use {
             out.extend_from_slice(REFRESH_ON_FIRST_USE_MARKER);
         }
         if out.len() > MAX_BUNDLE_BYTES {
@@ -194,13 +213,31 @@ impl OAuthTokenBundleV1 {
         }
         let subject_hash = reader.public_string()?;
         let display_identity = reader.public_string()?;
-        let refresh_on_first_use = if reader.is_empty() {
-            false
-        } else if reader.remaining == REFRESH_ON_FIRST_USE_MARKER {
-            true
-        } else {
-            return Err(invalid_bundle("OAuth token bundle has trailing bytes"));
-        };
+        let (refresh_on_first_use, refresh_after_unix_ms, refresh_rejected_until_unix_ms) =
+            if reader.is_empty() {
+                (false, None, None)
+            } else if reader.remaining == REFRESH_ON_FIRST_USE_MARKER {
+                (true, None, None)
+            } else if reader.remaining.starts_with(LIFECYCLE_EXTENSION_MARKER) {
+                reader.take(LIFECYCLE_EXTENSION_MARKER.len())?;
+                let refresh_on_first_use = match reader.byte()? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(invalid_bundle("OAuth lifecycle flags are invalid")),
+                };
+                let refresh_after_unix_ms = reader.optional_u64()?;
+                let refresh_rejected_until_unix_ms = reader.optional_u64()?;
+                if !reader.is_empty() {
+                    return Err(invalid_bundle("OAuth token bundle has trailing bytes"));
+                }
+                (
+                    refresh_on_first_use,
+                    refresh_after_unix_ms,
+                    refresh_rejected_until_unix_ms,
+                )
+            } else {
+                return Err(invalid_bundle("OAuth token bundle has trailing bytes"));
+            };
         let mut bundle = Self::new(
             provider_id,
             issuer,
@@ -219,6 +256,8 @@ impl OAuthTokenBundleV1 {
             generation,
         )?;
         bundle.refresh_on_first_use = refresh_on_first_use;
+        bundle.refresh_after_unix_ms = refresh_after_unix_ms;
+        bundle.refresh_rejected_until_unix_ms = refresh_rejected_until_unix_ms;
         Ok(bundle)
     }
 
@@ -253,6 +292,20 @@ impl OAuthTokenBundleV1 {
     #[must_use]
     pub fn refresh_on_first_use(&self) -> bool {
         self.refresh_on_first_use
+    }
+
+    /// Stores the exact provider-owned proactive refresh boundary.
+    #[must_use]
+    pub fn with_refresh_after(mut self, refresh_after_unix_ms: u64) -> Self {
+        self.refresh_after_unix_ms = Some(refresh_after_unix_ms);
+        self
+    }
+
+    /// Tombstones the exact stored rotating refresh credential until `until`.
+    #[must_use]
+    pub fn with_refresh_rejected_until(mut self, until: u64) -> Self {
+        self.refresh_rejected_until_unix_ms = Some(until);
+        self
     }
 
     fn validate(&self) -> AccountsResult<()> {

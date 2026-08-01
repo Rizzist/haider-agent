@@ -666,6 +666,8 @@ async fn metadata_origin_guard_prevents_credential_bearing_request() {
         base_url: endpoints.base_url,
         chat_url: endpoints.chat_url,
         models_url: endpoints.models_url,
+        dialect: CompatibleDialect::Generic,
+        kimi_thinking: None,
     };
     let capture = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.expect("proxy request");
@@ -833,6 +835,152 @@ fn api_key_payload_keeps_max_output_tokens_and_no_lite_fields() {
             .and_then(|reasoning| reasoning.get("context")),
         None,
         "no all_turns context on the API-key path"
+    );
+}
+
+/// MUTATION CHECK: route Kimi through the generic dialect, omit Bearer, or
+/// enable thinking by default. Expected RUNTIME failure: the request golden,
+/// header sensitivity, or opt-in extension assertion changes.
+#[test]
+fn kimi_requests_use_bearer_and_max_completion_tokens() {
+    let vault = MemoryVault::new();
+    let alias = CredentialAlias::new("kimi-payload-fixture");
+    vault
+        .put(&alias, b"KIMI_ACCESS_SENTINEL_2d47")
+        .expect("store Kimi bearer");
+    let credential = vault.resolve(&alias).expect("resolve Kimi bearer");
+    let provider = OpenAiCompatibleProvider::new_kimi_subscription(
+        credential,
+        "kimi-coding-a",
+        KIMI_OAUTH_BASE_URL,
+    )
+    .expect("construct Kimi adapter");
+    let request = TurnRequest {
+        messages: vec![crate::Message::user_text("hello")],
+        model: "kimi-coding-a".to_owned(),
+        max_tokens: 1,
+        system_prompt: None,
+        tools: Vec::new(),
+        attachments: Vec::new(),
+    };
+    let expected: serde_json::Value =
+        serde_json::from_str(include_str!("../tests/fixtures/openai/kimi_request.json"))
+            .expect("Kimi request fixture");
+    let payload = provider.request_payload(&request).expect("Kimi payload");
+    assert_eq!(payload, expected);
+    assert!(payload.get("max_tokens").is_none());
+    assert!(payload.get("thinking").is_none());
+    let authorization = provider
+        .http
+        .authorization_header()
+        .expect("Kimi authorization header");
+    assert_eq!(
+        authorization.as_bytes(),
+        b"Bearer KIMI_ACCESS_SENTINEL_2d47"
+    );
+    assert!(authorization.is_sensitive());
+
+    let thinking = provider
+        .with_kimi_thinking(KimiThinkingConfig {
+            thinking_type: KimiThinkingType::Enabled,
+            effort: Some("high".to_owned()),
+            keep: Some("all".to_owned()),
+        })
+        .expect("enable Kimi thinking");
+    let payload = thinking
+        .request_payload(&request)
+        .expect("Kimi thinking payload");
+    assert_eq!(payload["thinking"]["type"], "enabled");
+    assert_eq!(payload["thinking"]["effort"], "high");
+    assert_eq!(payload["thinking"]["keep"], "all");
+}
+
+/// MUTATION CHECK: infer Kimi features from the model slug or expose stronger
+/// tool semantics than the provider declares. Expected RUNTIME failure: the
+/// fixture-derived capability document changes below.
+#[test]
+fn kimi_capabilities_are_derived_only_from_catalog_flags() {
+    let capabilities = replay_kimi_models_response(
+        "kimi-coding-a",
+        include_bytes!("../tests/fixtures/catalog/kimi_models.json"),
+    )
+    .expect("Kimi capabilities");
+    assert_eq!(capabilities.provider, KIMI_OAUTH_PROVIDER_NAME);
+    assert_eq!(capabilities.context_limit, 262_144);
+    assert_eq!(capabilities.vision, FeatureResolve::Native);
+    assert_eq!(capabilities.thinking_visible, FeatureResolve::Native);
+    assert_eq!(capabilities.parallel_tools, FeatureResolve::Unsupported);
+    assert_eq!(
+        capabilities.streaming_tool_args,
+        FeatureResolve::Unsupported
+    );
+}
+
+/// MUTATION CHECK: pin Kimi's fixed-origin guard only to chat, widen it to
+/// the whole origin, or omit Bearer on model discovery. Expected RUNTIME
+/// failure: one required request is rejected, the unrelated path is accepted,
+/// or the credential-bearing headers/URLs differ.
+#[tokio::test]
+async fn kimi_fixed_origin_allows_exact_chat_and_models_endpoints() {
+    let vault = MemoryVault::new();
+    let alias = CredentialAlias::new("kimi-fixed-origin-fixture");
+    vault
+        .put(&alias, b"KIMI_FIXED_ACCESS_SENTINEL_981a")
+        .expect("store Kimi fixed bearer");
+    let resolver = Arc::new(StubDnsResolver::new([vec![SocketAddr::from((
+        [93, 184, 216, 34],
+        443,
+    ))]]));
+    let provider = OpenAiCompatibleProvider::new_kimi_subscription_with_dns_resolver(
+        vault.resolve(&alias).expect("resolve Kimi fixed bearer"),
+        "kimi-coding-a",
+        KIMI_OAUTH_BASE_URL,
+        resolver.clone(),
+    )
+    .expect("construct fixed Kimi adapter");
+
+    let chat = provider
+        .http
+        .post_json_request(&provider.chat_url, &serde_json::json!({"bounded": true}))
+        .await
+        .expect("exact chat endpoint");
+    assert_eq!(
+        chat.url().as_str(),
+        "https://api.kimi.com/coding/v1/chat/completions"
+    );
+    let models = provider
+        .http
+        .get_request(&provider.models_url)
+        .await
+        .expect("exact models endpoint");
+    assert_eq!(
+        models.url().as_str(),
+        "https://api.kimi.com/coding/v1/models"
+    );
+    let authorization = models
+        .headers()
+        .get(AUTHORIZATION)
+        .expect("models bearer header");
+    assert_eq!(
+        authorization.as_bytes(),
+        b"Bearer KIMI_FIXED_ACCESS_SENTINEL_981a"
+    );
+    assert!(authorization.is_sensitive());
+    let rejected = provider
+        .http
+        .get_request("https://api.kimi.com/coding/v1/usages")
+        .await
+        .expect_err("an unlisted same-origin path stays forbidden");
+    assert_eq!(rejected.kind, ProviderErrorKind::InvalidRequest);
+    assert_eq!(
+        resolver.calls(),
+        1,
+        "both exact endpoints share one DNS pin"
+    );
+
+    assert_eq!(
+        unavailable_compatible_capabilities(KIMI_OAUTH_PROVIDER_NAME).provider,
+        KIMI_OAUTH_PROVIDER_NAME
     );
 }
 
