@@ -29,3 +29,34 @@ Named turn/compaction responses use additive
 their historical tags and bytes, so the excluded `haider-tui` client continues
 to decode legacy traffic without source changes; the branch feature gate tells
 new clients when the additive response forms are available.
+
+## Review-of-record amendments (Fable, executed mutations)
+
+- **Lineage ceiling (row: "Drop named-ref lineage ceilings")**: the
+  `admits()` seq-ceiling conjunct is a REDUNDANT layer — dropping it
+  leaves the ENTIRE haider-core suite green (isolation run). The
+  load-bearing exclusion is the ancestry WALK plus per-owner fragment
+  attribution; truncating `ancestry_for_run` to its head node IS
+  runtime-killed by `nested_lineage_uses_every_owner_ceiling_and_
+  virgin_head`. The ceiling stays as hygiene, but no law rests on it.
+- **Branch-head parenting (row: "Parent branch turns from the
+  session-global last node")**: the original fixture was DEGENERATE —
+  it forked at the main head with main never advancing, so branch head
+  and main head coincided and the mutation survived. Fixed by
+  extending `branch_turns_parent_stamp_and_advance_only_the_selected_
+  head` with a second branch turn after main advances; mutation now
+  runtime-killed.
+- **Failed-start terminalization (gap found by mutation, no prior
+  observer)**: nulling the dispatch-loop `branch_id` local survived
+  both claimed row-16 observers — the local only feeds the FAILED/
+  CANCELLED start terminalization arms, which no test drove. New pin:
+  `failed_recovery_start_terminalizes_on_the_accepted_branch`
+  (runtime_tests) — a recovering branch run whose provider resolution
+  fails must terminalize `Errored` ON its branch. Mutation now
+  runtime-killed (terminalization never completes unstamped).
+- Executed-and-killed as claimed: branch.create receipt-replay
+  disable (`branch_create_receipt_replays_before_attachment_and_
+  generation_validation`), delegation `SpawnCoordinates` branch drop
+  (`established_spawn_captures_parent_branch_and_replays_one_child`;
+  note `delegation_parent_projection_is_pinned_to_the_spawn_branch`
+  builds its record directly and cannot see that conversion).
