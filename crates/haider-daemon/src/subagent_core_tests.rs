@@ -305,6 +305,9 @@ async fn production_spawn_effect_wait_and_report_chain_is_end_to_end() {
         })
         .expect("spawn manifest");
     assert_eq!(spawned.task, "tests");
+    // Owner ask: the wire carries NO neutral callsign — the TUI claims
+    // the honor roll (mutation: restore the SUB-hex mint → fails).
+    assert!(spawned.callsign.is_none());
     let delegation = hub
         .delegation(spawned.agent.clone())
         .await
