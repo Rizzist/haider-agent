@@ -4965,6 +4965,7 @@ impl AppModel {
                     self.flash = Some("· /tree — session only".to_owned());
                 }
             }
+            "branch" => self.branch_command(&remainder),
             "compact" => {
                 // Manual compaction (sim tui.js:1791-1806). Adapted gate:
                 // the sim's single-threaded state writes tolerate /compact
@@ -5264,6 +5265,28 @@ impl AppModel {
         let Some(option) = menu.options.get(self.menu_selection) else {
             return;
         };
+        // The `/branch` picker is REDUCER-LOCAL (B2b m2): its consequence
+        // is a display switch, so the reducer closes its own card and
+        // nothing rides the outbox — the D1-2 closable-card law holds in
+        // both modes.
+        if menu.id.as_str().starts_with(BRANCH_CARD_PREFIX) {
+            let menu_id = menu.id.clone();
+            let key = option.key.clone();
+            self.projection.apply(&EventPayload::MenuClosed {
+                menu: menu_id,
+                reason: MenuCloseReason::Dismissed,
+            });
+            self.menu_selection = 0;
+            let target = (key != "main").then(|| haider_protocol::ids::BranchId::new(key));
+            match self.switch_branch(target.as_ref()) {
+                Some(display) => self.flash = Some(format!("· branch → {display}")),
+                None => {
+                    self.flash = Some(format!("· already on {}", self.active_branch_name()));
+                }
+            }
+            self.dirty = true;
+            return;
+        }
         let answer = MenuAnswer {
             menu: menu.id.clone(),
             option_key: Some(option.key.clone()),
@@ -5445,6 +5468,128 @@ impl AppModel {
     #[must_use]
     pub fn active_branch_name(&self) -> &str {
         self.branch_state.active_name().unwrap_or("main")
+    }
+
+    /// The ATTACHED session's `busy()` twin (sim `sessionBusy` — the same
+    /// derivation `SessionState::busy` uses for background rows): live
+    /// subagents on ANY branch, a mid-turn engine, or an unsettled run.
+    #[must_use]
+    pub fn session_busy(&self) -> bool {
+        tree_live_count(&self.chips) + self.branch_state.parked_live() > 0
+            || self.turn_active
+            || !self.projection.settled()
+    }
+
+    /// `/branch` (B2b m2): bare opens the numbered picker, `new [name]`
+    /// forks at the active branch's last committed node, anything else
+    /// switches to the named branch. Owner menu/esc laws bind: the picker
+    /// is a numbered arrow-highlight card, esc is session-scoped, and
+    /// every refusal is an honest notice.
+    fn branch_command(&mut self, remainder: &str) {
+        if self.screen != Screen::Session {
+            self.flash = Some("· /branch — session only".to_owned());
+            self.dirty = true;
+            return;
+        }
+        // Feature gate (brief item 5): without the advertised branch
+        // feature nothing is fabricated — the honest stale-daemon notice
+        // names the fix. Demo mode answers everything locally and passes.
+        if !self.daemon_serves(haider_rpc::FEATURE_BRANCH_CREATE_V1) {
+            self.flash = Some(self.stale_daemon_note("branches"));
+            self.dirty = true;
+            return;
+        }
+        let request = remainder.trim();
+        match request.split_whitespace().next() {
+            None => self.open_branch_picker(),
+            Some("new") => {
+                let name = request.strip_prefix("new").unwrap_or("").trim();
+                self.branch_new((!name.is_empty()).then(|| name.to_owned()));
+            }
+            Some(_) => self.branch_switch_by_name(request),
+        }
+    }
+
+    /// The `/branch` picker — a numbered non-blocking card (arrow
+    /// highlight, digits/⏎ activate, esc dismisses — session-scoped esc
+    /// law). Its answer is REDUCER-LOCAL: switching a displayed branch is
+    /// display state, so the card closes itself and nothing rides the
+    /// outbox (the D1-2 law holds — this reducer can close every card it
+    /// opens).
+    fn open_branch_picker(&mut self) {
+        if self.projection.open_menu().is_some() {
+            self.flash = Some("· /branch — answer the open card first".to_owned());
+            self.dirty = true;
+            return;
+        }
+        self.card_seq += 1;
+        let card = branch_card(&self.branch_state, self.card_seq);
+        self.menu_selection = 0;
+        self.projection.apply(&EventPayload::MenuOpened(card));
+        self.dirty = true;
+    }
+
+    /// `/branch new [name]` — fork issuance at EXACT captured coordinates.
+    fn branch_new(&mut self, name: Option<String>) {
+        // Branches are daemon truth; the demo has no daemon to keep them.
+        if self.mode.fabricates_locally() {
+            self.flash = Some("· /branch new — live only; branches are daemon-owned".to_owned());
+            self.dirty = true;
+            return;
+        }
+        let Some(session) = self.active_session.clone() else {
+            self.flash = Some("· /branch new — no live session attached".to_owned());
+            self.dirty = true;
+            return;
+        };
+        // The busy() gate (brief item 5): forking a live turn would split
+        // ownership of its open menus/tools/children.
+        if self.session_busy() {
+            self.flash = Some("· /branch new — wait for the turn to end".to_owned());
+            self.dirty = true;
+            return;
+        }
+        let Some((fork_node_id, fork_seq)) = self.branch_state.fork_point().cloned() else {
+            self.flash = Some("· /branch new — nothing committed to fork from yet".to_owned());
+            self.dirty = true;
+            return;
+        };
+        self.requests.push(AppRequest::BranchCreate {
+            session,
+            source_branch: self.branch_state.active().cloned(),
+            fork_node_id,
+            fork_seq,
+            name,
+        });
+        // Honest: no local branch appears — the daemon's BranchCreated
+        // fact is what installs and activates it.
+        self.flash = Some("· forking — the branch lands when the daemon commits it".to_owned());
+        self.dirty = true;
+    }
+
+    /// `/branch <name>` — direct switch (reading another branch is always
+    /// allowed, running turn or not).
+    fn branch_switch_by_name(&mut self, name: &str) {
+        let target = if name == "main" {
+            None
+        } else if let Some(descriptor) = self.branch_state.find_by_name(name) {
+            Some(descriptor.branch_id.clone())
+        } else {
+            let names: Vec<&str> = std::iter::once("main")
+                .chain(self.branch_state.descriptors().map(|d| d.name.as_str()))
+                .collect();
+            self.flash = Some(format!(
+                "· no branch named “{name}” — {}",
+                names.join(" · ")
+            ));
+            self.dirty = true;
+            return;
+        };
+        match self.switch_branch(target.as_ref()) {
+            Some(display) => self.flash = Some(format!("· branch → {display}")),
+            None => self.flash = Some(format!("· already on {}", self.active_branch_name())),
+        }
+        self.dirty = true;
     }
 
     /// The attached path's scope router — the same [`crate::session::classify`]
@@ -6380,6 +6525,47 @@ pub const LIVE_LAUNCHER_ROWS: usize = 4;
 
 pub const VOICE_CARD_PREFIX: &str = "voice-card-";
 pub const TOOLS_CARD_PREFIX: &str = "tools-card-";
+/// The `/branch` picker's id prefix (B2b m2). Cards with this prefix are
+/// REDUCER-LOCAL: their answer switches the displayed branch and closes
+/// the card without touching the outbox.
+pub const BRANCH_CARD_PREFIX: &str = "branch-card-";
+
+/// The `/branch` picker (B2b m2): main plus every named branch, numbered,
+/// the ACTIVE one marked ● and the rest ○ (the sim's branch vocabulary,
+/// tui.js:3366-3427). Non-blocking Choice card; esc dismisses.
+#[must_use]
+pub fn branch_card(state: &crate::branch::BranchState, seq: u64) -> Menu {
+    let marker = |active: bool| if active { '●' } else { '○' };
+    let mut options = vec![card_option(
+        "main",
+        format!("{} main", marker(state.active().is_none())),
+    )];
+    for descriptor in state.descriptors() {
+        options.push(card_option(
+            descriptor.branch_id.as_str(),
+            format!(
+                "{} {}",
+                marker(state.active() == Some(&descriptor.branch_id)),
+                descriptor.name
+            ),
+        ));
+    }
+    Menu {
+        id: MenuId::new(format!("{BRANCH_CARD_PREFIX}{seq}")),
+        kind: MenuKind::Choice,
+        title: "branch — switch the displayed branch".to_owned(),
+        body: vec![
+            "switch   every branch stays warm — switching is instant, nothing rewinds".to_owned(),
+            "fork     /branch new [name] forks at the last committed node (idle only)".to_owned(),
+        ],
+        options,
+        blocking: false,
+        scope: MenuScope::Session,
+        origin: "branch".to_owned(),
+        ttl_ms: None,
+        timeout_option: None,
+    }
+}
 
 fn card_option(key: &str, label: String) -> MenuOption {
     MenuOption {
