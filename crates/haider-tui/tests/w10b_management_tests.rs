@@ -362,3 +362,40 @@ fn providers_screen_offers_account_add_and_jumps_to_accounts() {
     assert_eq!(model.screen, Screen::Accounts, "the add flow jumps home");
     assert!(model.oauth_add.is_some(), "and opens the card");
 }
+
+/// MUTATION CHECK: mint a neutral daemon callsign (`SUB-hex`) or drop the
+/// TUI roster claim. Expected RUNTIME failure: the chip wears no
+/// honor-roll name (owner ask: subagent names match the sim roster).
+#[test]
+fn live_chips_claim_roster_callsigns_when_the_wire_sends_none() {
+    let mut chips = Vec::new();
+    haider_tui::session::apply_agent_payload(
+        &mut chips,
+        &EventPayload::AgentSpawned(haider_protocol::agent::AgentManifest {
+            agent: haider_protocol::ids::AgentId::new("agent-roster-1"),
+            role: haider_protocol::agent::AgentRole::Subagent,
+            task: "first task".into(),
+            callsign: None,
+            model_profile: "gpt-5.6-sol".into(),
+            grant: haider_protocol::agent::Grant {
+                tools: Vec::new(),
+                effect_ceiling: Vec::new(),
+            },
+            budget_tokens: None,
+            placement: haider_protocol::agent::Placement::Local,
+            lease: haider_protocol::ids::LeaseId::new("lease-roster-1"),
+            fencing_epoch: 0,
+            attempt: 0,
+            parent: None,
+            coordinates: None,
+        }),
+    );
+    let chip = chips.first().expect("chip created");
+    assert!(!chip.callsign.is_empty(), "a roster callsign was claimed");
+    assert!(
+        !chip.callsign.starts_with("SUB-"),
+        "never the neutral hex: {}",
+        chip.callsign
+    );
+    assert!(!chip.hon.is_empty(), "the honorific pairs with the claim");
+}

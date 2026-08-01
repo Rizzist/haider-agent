@@ -406,9 +406,22 @@ async fn recovery_dual_reads_historical_and_canonical_permission_states() {
     );
     drop(store);
 
-    let recovered = SqliteStoreHandle::open(root.path())
-        .await
-        .expect("reopen store");
+    // Bounded StoreLocked retry: drop() can return before the profile
+    // lock fully releases under parallel suite load (gate27 hygiene
+    // precedent, third fixture in this class).
+    let recovered = {
+        let mut attempt = 0;
+        loop {
+            match SqliteStoreHandle::open(root.path()).await {
+                Ok(store) => break store,
+                Err(error) if error.retryable && attempt < 40 => {
+                    attempt += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                Err(error) => panic!("reopen store: {error:?}"),
+            }
+        }
+    };
     let work = recover_interrupted_turns(&recovered, &DeviceId::new("restart"))
         .await
         .expect("recover checkpoints");

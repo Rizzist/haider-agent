@@ -104,12 +104,14 @@ impl DelegationHandle {
         let child_session_id = SessionId::new(format!("session-child-{identity}"));
         let child_run_id = RunId::new(format!("run-child-{identity}"));
         let lease = LeaseId::new(format!("lease-child-{identity}"));
-        let callsign_suffix = identity.get(..8).unwrap_or(identity.as_str());
         let manifest = AgentManifest {
             agent: agent_id.clone(),
             role: AgentRole::Subagent,
             task: request.task.clone(),
-            callsign: Some(format!("SUB-{callsign_suffix}")),
+            // W6d (owner ask): no neutral SUB-hex — an ABSENT callsign
+            // lets the TUI claim the sim's honor-roll roster
+            // deterministically from journal order.
+            callsign: None,
             model_profile: coordinates.metadata.model.clone(),
             grant: Grant {
                 tools: vec![

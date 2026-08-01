@@ -824,10 +824,14 @@ async fn child_permission_park_is_visible_in_the_parent_chip_journal() {
 /// exactly one nudge and cancellation after unpark.
 #[tokio::test]
 async fn permission_park_pauses_stall_supervision_and_unpark_rearms_it() {
+    // 300ms: under parallel suite load the child's first round can
+    // exceed a 35ms stall deadline BEFORE the park commits — a legal
+    // pre-park nudge that the parked-silence law must not miss-read
+    // (5/5 standalone, flaky in-suite at 35ms).
     let harness = start_parked_child(
         "permission-stall",
         ParkedChildMode::StallAfterApproval,
-        Duration::from_millis(35),
+        Duration::from_millis(300),
     )
     .await;
     tokio::time::sleep(Duration::from_millis(160)).await;
