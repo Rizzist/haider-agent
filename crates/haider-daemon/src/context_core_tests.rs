@@ -6,18 +6,19 @@ use crate::worker::{
 };
 use async_trait::async_trait;
 use haider_core::{
-    PromptHistoryCompiler, SessionCreateCommand, SqliteStoreHandle, StoreHandle, TurnAcceptCommand,
+    BranchCreateCommand, PromptHistoryCompiler, SessionCreateCommand, SqliteStoreHandle,
+    StoreHandle, TurnAcceptCommand,
 };
 use haider_protocol::DeliveryMode;
 use haider_protocol::EventPayload;
 use haider_protocol::context::{ContextFootprint, ContextFootprintTruth};
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
 use haider_protocol::history::{
-    COMPACTION_INTENT_EXTENSION_KIND, CompactionIntent, CompactionResume, NodeKind,
+    COMPACTION_INTENT_EXTENSION_KIND, CompactionIntent, CompactionResume, NodeKind, TreeNode,
 };
-use haider_protocol::ids::{DeviceId, EventId, ItemId, NodeId, RunId, SessionId};
+use haider_protocol::ids::{BranchId, DeviceId, EventId, ItemId, NodeId, RunId, SessionId};
 use haider_protocol::item::{ItemEvent, TurnItem};
-use haider_protocol::provider::FinishReason;
+use haider_protocol::provider::{Block, FinishReason};
 use haider_protocol::session::SessionMetadataV1;
 use haider_protocol::state::RunState;
 use haider_provider::{FakeProvider, FakeStep, Provider};
@@ -26,6 +27,11 @@ use tokio::time::{Duration, timeout};
 
 struct FixedProviderFactory {
     provider: Arc<dyn Provider>,
+}
+
+struct FixedWindowProviderFactory {
+    provider: Arc<dyn Provider>,
+    context_window: u64,
 }
 
 #[async_trait]
@@ -45,6 +51,625 @@ impl ProviderFactory for FixedProviderFactory {
             attempt_resolver: None,
         })
     }
+}
+
+#[async_trait]
+impl ProviderFactory for FixedWindowProviderFactory {
+    async fn resolve_for_turn(
+        &self,
+        metadata: &SessionMetadataV1,
+    ) -> Result<ResolvedTurnProvider, haider_protocol::error::HaiderError> {
+        Ok(ResolvedTurnProvider {
+            provider: Arc::clone(&self.provider),
+            provider_name: metadata.provider.clone(),
+            model: metadata.model.clone(),
+            context_window: Some(self.context_window),
+            account_alias: None,
+            initial_rotation: None,
+            rotation_budget_consumed: false,
+            attempt_resolver: None,
+        })
+    }
+}
+
+/// MUTATION CHECK: leave the selected branch out of worker startup,
+/// `HarnessConfig`, or terminal sinks. Expected RUNTIME failure: at least one
+/// non-aggregate envelope for `branch-run` below is written on main.
+#[tokio::test]
+async fn accepted_branch_reaches_worker_history_items_nodes_and_terminal_state() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let session_id = SessionId::new("branch-worker-propagation");
+    let provider = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitText {
+            text: "main answer".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+        FakeStep::EmitToolCall {
+            call_id: "branch-exec".into(),
+            name: "process_exec".into(),
+            args: serde_json::json!({"command":"printf branch"}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "branch-exec".into(),
+        },
+        FakeStep::EmitText {
+            text: "branch answer".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+        FakeStep::EmitText {
+            text: "branch-only summary".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let manager = WorkerManager::start(
+        hub.clone(),
+        WorkerDependencies {
+            provider_factory: Arc::new(FixedProviderFactory {
+                provider: provider.clone(),
+            }),
+            tool_factory: Arc::new(BrokerToolFactory),
+            delegation: None,
+        },
+        false,
+    );
+    let handle = manager.handle();
+    hub.install_worker_manager(handle.clone())
+        .expect("install manager");
+    hub.create_internal_session(SessionCreateCommand {
+        command_id: "create-branch-worker".into(),
+        request_digest: "create-branch-worker-digest".into(),
+        request_json: r#"{"session":"branch-worker"}"#.into(),
+        session_id: session_id.clone(),
+        cwd: std::fs::canonicalize(std::env::current_dir().expect("cwd"))
+            .expect("canonical cwd")
+            .to_string_lossy()
+            .into_owned(),
+        provider: "fake".into(),
+        model: "fake-model".into(),
+        max_tokens: 4096,
+        permission_overrides: Some(haider_protocol::session::SessionPermissionOverridesV1 {
+            allow_writes: false,
+            allow_exec: true,
+        }),
+        system_prompt_version: crate::worker::SystemPromptBuilder::VERSION.into(),
+        event_id: EventId::new("created-branch-worker"),
+        device_id: DeviceId::new("branch-worker-device"),
+    })
+    .await
+    .expect("create session");
+    let main_run = RunId::new("main-run");
+    let main = hub
+        .accept_internal_turn(TurnAcceptCommand {
+            command_id: "submit-main-worker".into(),
+            request_digest: "submit-main-worker-digest".into(),
+            request_json: r#"{"turn":"main"}"#.into(),
+            session_id: session_id.clone(),
+            worker_generation: store.worker_generation(),
+            run_id: main_run.clone(),
+            agent_id: None,
+            branch_id: None,
+            text: "main history".into(),
+            attachments: Vec::new(),
+            mode: DeliveryMode::Queue,
+            queued_event_id: EventId::new("main-worker-queued"),
+            user_event_id: EventId::new("main-worker-user"),
+            active_event_id: EventId::new("main-worker-active"),
+            device_id: DeviceId::new("branch-worker-device"),
+        })
+        .await
+        .expect("accept main");
+    handle.submit(main).await.expect("submit main");
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let events = store.read(&session_id, 0, 256).await.expect("read");
+            if events.iter().any(|event| {
+                event.run_id.as_ref() == Some(&main_run)
+                    && matches!(
+                        serde_json::from_value::<EventPayload>(event.payload.clone()),
+                        Ok(EventPayload::RunState(RunState::Done))
+                    )
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("main completes");
+    let journal = store.read(&session_id, 0, 256).await.expect("read main");
+    let (fork_node, fork_seq) = journal
+        .iter()
+        .filter(|event| event.run_id.as_ref() == Some(&main_run))
+        .filter_map(|event| {
+            let EventPayload::NodeCommitted(node) =
+                serde_json::from_value(event.payload.clone()).ok()?
+            else {
+                return None;
+            };
+            Some((node.node, event.seq))
+        })
+        .next_back()
+        .expect("main terminal node");
+    let branch_id = BranchId::new("worker-branch");
+    let request_json = r#"{"fork":"main-terminal"}"#.to_owned();
+    store
+        .create_branch(BranchCreateCommand {
+            command_id: "create-worker-branch".into(),
+            request_digest: blake3::hash(request_json.as_bytes()).to_hex().to_string(),
+            request_json,
+            session_id: session_id.clone(),
+            worker_generation: store.worker_generation(),
+            branch_id: branch_id.clone(),
+            source_branch_id: None,
+            fork_node_id: fork_node.clone(),
+            fork_seq,
+            name: Some("Worker branch".into()),
+            event_id: EventId::new("created-worker-branch"),
+            device_id: DeviceId::new("branch-worker-device"),
+        })
+        .await
+        .expect("create branch");
+    let branch_run = RunId::new("branch-run");
+    let accepted = hub
+        .accept_internal_turn(TurnAcceptCommand {
+            command_id: "submit-branch-worker".into(),
+            request_digest: "submit-branch-worker-digest".into(),
+            request_json: r#"{"turn":"branch"}"#.into(),
+            session_id: session_id.clone(),
+            worker_generation: store.worker_generation(),
+            run_id: branch_run.clone(),
+            agent_id: None,
+            branch_id: Some(branch_id.clone()),
+            text: "branch history".into(),
+            attachments: Vec::new(),
+            mode: DeliveryMode::Queue,
+            queued_event_id: EventId::new("branch-worker-queued"),
+            user_event_id: EventId::new("branch-worker-user"),
+            active_event_id: EventId::new("branch-worker-active"),
+            device_id: DeviceId::new("branch-worker-device"),
+        })
+        .await
+        .expect("accept branch");
+    assert_eq!(accepted.branch_id, Some(branch_id.clone()));
+    handle.submit(accepted).await.expect("submit branch");
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let events = store.read(&session_id, 0, 512).await.expect("read");
+            if events.iter().any(|event| {
+                event.run_id.as_ref() == Some(&branch_run)
+                    && matches!(
+                        serde_json::from_value::<EventPayload>(event.payload.clone()),
+                        Ok(EventPayload::RunState(RunState::Done))
+                    )
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("branch completes");
+    let events = store.read(&session_id, 0, 512).await.expect("read branch");
+    let mut saw_user = false;
+    let mut saw_item = false;
+    let mut saw_node = false;
+    let mut saw_done = false;
+    let mut saw_effect = false;
+    let mut saw_tool_result = false;
+    for event in events
+        .iter()
+        .filter(|event| event.run_id.as_ref() == Some(&branch_run))
+    {
+        let payload = serde_json::from_value::<EventPayload>(event.payload.clone())
+            .expect("typed branch event");
+        if matches!(&payload, EventPayload::SessionState(_)) {
+            assert_eq!(event.branch_id, None);
+            continue;
+        }
+        assert_eq!(event.branch_id, Some(branch_id.clone()));
+        saw_user |= matches!(&payload, EventPayload::UserMessage { .. });
+        saw_item |= matches!(&payload, EventPayload::Item(_));
+        saw_node |= matches!(&payload, EventPayload::NodeCommitted(_));
+        saw_done |= matches!(&payload, EventPayload::RunState(RunState::Done));
+        saw_effect |= matches!(&payload, EventPayload::Effect(_));
+        saw_tool_result |= matches!(&payload, EventPayload::ToolResult { .. });
+    }
+    assert!(saw_user && saw_item && saw_node && saw_done && saw_effect && saw_tool_result);
+
+    // MUTATION CHECK: let pending-receipt journal fallback ignore branch, or
+    // fail to finalize a deterministically committed compaction node. Expected
+    // RUNTIME failure: this replay invokes the provider, returns main/sibling
+    // coordinates, or appends another compaction node.
+    let committed_command = "committed-branch-compaction";
+    let committed_request_json = serde_json::to_string(&serde_json::json!({
+        "session_id": &session_id,
+        "worker_generation": store.worker_generation(),
+        "branch_id": Some(&branch_id),
+    }))
+    .expect("serialize pending receipt request");
+    store
+        .claim_context_compaction_receipt(
+            committed_command.into(),
+            blake3::hash(committed_request_json.as_bytes())
+                .to_hex()
+                .to_string(),
+            committed_request_json,
+        )
+        .await
+        .expect("claim unfinished compaction receipt");
+    let branch_descriptor = StoreHandle::branch_lineage(&store, &session_id, Some(&branch_id))
+        .await
+        .expect("read branch lineage")
+        .pop()
+        .expect("selected branch descriptor");
+    let recovered_operation = format!("manual-{committed_command}");
+    let recovered_run = RunId::new(format!("manual-compact-{committed_command}"));
+    let recovered_artifact = store
+        .put(b"already committed branch summary".to_vec())
+        .await
+        .expect("put recovered summary");
+    let recovered_intent = CompactionIntent {
+        operation_id: recovered_operation.clone(),
+        covers_from: fork_node.clone(),
+        covers_to: branch_descriptor.head_node_id.clone(),
+        resume_cause: CompactionResume::ManualIdle,
+    };
+    let recovered_item = TurnItem::Extension {
+        kind: COMPACTION_INTENT_EXTENSION_KIND.into(),
+        data: serde_json::to_value(&recovered_intent).expect("serialize recovered intent"),
+    };
+    let recovered_envelope = |event_id: &str, payload: EventPayload| EventEnvelope {
+        schema_version: SCHEMA_VERSION,
+        event_id: EventId::new(event_id),
+        seq: 0,
+        session_id: session_id.clone(),
+        branch_id: Some(branch_id.clone()),
+        run_id: Some(recovered_run.clone()),
+        agent_id: None,
+        device_id: DeviceId::new("branch-worker-device"),
+        authority_epoch: 0,
+        worker_generation: store.worker_generation(),
+        causation_id: None,
+        correlation_id: None,
+        committed_at_ms: 0,
+        render: RenderTargets {
+            ui: false,
+            durable: true,
+            prompt: PromptRender::Omit,
+        },
+        payload: serde_json::to_value(payload).expect("recovered payload"),
+    };
+    let mut recovered_batch = vec![
+        recovered_envelope(
+            "committed-branch-intent",
+            EventPayload::Item(ItemEvent::Completed {
+                item_id: ItemId::new("committed-branch-intent-item"),
+                item: recovered_item,
+            }),
+        ),
+        recovered_envelope(
+            "committed-branch-node",
+            EventPayload::NodeCommitted(TreeNode {
+                node: NodeId::new(format!("compaction-node-{recovered_operation}")),
+                parent: Some(branch_descriptor.head_node_id),
+                kind: NodeKind::Compaction {
+                    covers_from: recovered_intent.covers_from.clone(),
+                    covers_to: recovered_intent.covers_to.clone(),
+                    summary_artifact: recovered_artifact,
+                    tokens_before: 100,
+                    tokens_after: 8,
+                    resume_cause: CompactionResume::ManualIdle,
+                },
+            }),
+        ),
+    ];
+    StoreHandle::append(&store, &mut recovered_batch)
+        .await
+        .expect("commit node before receipt finalization");
+    let requests_before_recovery = provider.requests().len();
+    let recovered_receipt = handle
+        .compact(
+            session_id.clone(),
+            committed_command.into(),
+            store.worker_generation(),
+            Some(branch_id.clone()),
+        )
+        .await
+        .expect("finalize committed branch compaction");
+    assert_eq!(recovered_receipt.run_id, recovered_run);
+    assert_eq!(recovered_receipt.accepted_seq, recovered_batch[0].seq);
+    assert_eq!(recovered_receipt.branch_id, Some(branch_id.clone()));
+    assert_eq!(provider.requests().len(), requests_before_recovery);
+    let recovered_replay = handle
+        .compact(
+            session_id.clone(),
+            committed_command.into(),
+            store.worker_generation(),
+            Some(branch_id.clone()),
+        )
+        .await
+        .expect("replay finalized branch compaction");
+    assert_eq!(recovered_replay, recovered_receipt);
+    assert_eq!(provider.requests().len(), requests_before_recovery);
+
+    let compacted = handle
+        .compact(
+            session_id.clone(),
+            "compact-worker-branch".into(),
+            store.worker_generation(),
+            Some(branch_id.clone()),
+        )
+        .await
+        .expect("compact selected branch");
+    assert_eq!(compacted.branch_id, Some(branch_id.clone()));
+    let after_compaction = store
+        .read(&session_id, 0, 768)
+        .await
+        .expect("read compaction");
+    assert!(after_compaction.iter().any(|event| {
+        event.run_id.as_ref() == Some(&compacted.run_id)
+            && event.branch_id.as_ref() == Some(&branch_id)
+            && matches!(
+                serde_json::from_value::<EventPayload>(event.payload.clone()),
+                Ok(EventPayload::NodeCommitted(ref node))
+                    if matches!(node.kind, NodeKind::Compaction { .. })
+            )
+    }));
+    let branch_prompt = PromptHistoryCompiler::compile_idle_with_artifacts(
+        &store,
+        &store,
+        &session_id,
+        Some(&branch_id),
+        None,
+    )
+    .await
+    .expect("compile compacted branch");
+    let main_prompt =
+        PromptHistoryCompiler::compile_idle_with_artifacts(&store, &store, &session_id, None, None)
+            .await
+            .expect("compile uncompacted main");
+    let prompt_text = |messages: &[haider_provider::Message]| {
+        messages
+            .iter()
+            .flat_map(|message| &message.blocks)
+            .filter_map(|block| match block {
+                Block::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert!(prompt_text(&branch_prompt).contains("branch-only summary"));
+    assert!(!prompt_text(&main_prompt).contains("branch-only summary"));
+    manager.shutdown().await.expect("manager shutdown");
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
+}
+
+/// MUTATION CHECK: hard-code automatic compaction planning or emission to
+/// main. Expected RUNTIME failure: the oversized branch turn either compacts
+/// the wrong scope or its summary/node is emitted without branch A.
+#[tokio::test]
+async fn automatic_compaction_plans_and_commits_on_the_accepted_branch() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let session_id = SessionId::new("auto-compaction-branch-session");
+    let source_run = RunId::new("auto-compaction-source-run");
+    let branch_run = RunId::new("auto-compaction-branch-run");
+    let branch_id = BranchId::new("auto-compaction-branch-a");
+    let provider = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitText {
+            text: "automatic branch summary".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+        FakeStep::EmitText {
+            text: "answer after automatic compaction".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let manager = WorkerManager::start(
+        hub.clone(),
+        WorkerDependencies {
+            provider_factory: Arc::new(FixedWindowProviderFactory {
+                provider: provider.clone(),
+                context_window: 12_000,
+            }),
+            tool_factory: Arc::new(BrokerToolFactory),
+            delegation: None,
+        },
+        false,
+    );
+    let handle = manager.handle();
+    hub.install_worker_manager(handle.clone())
+        .expect("install manager");
+    hub.create_internal_session(SessionCreateCommand {
+        command_id: "create-auto-compaction-branch".into(),
+        request_digest: "create-auto-compaction-branch-digest".into(),
+        request_json: r#"{"session":"auto-compaction-branch"}"#.into(),
+        session_id: session_id.clone(),
+        cwd: std::fs::canonicalize(std::env::current_dir().expect("cwd"))
+            .expect("canonical cwd")
+            .to_string_lossy()
+            .into_owned(),
+        provider: "fake".into(),
+        model: "fake-model".into(),
+        max_tokens: 64,
+        permission_overrides: None,
+        system_prompt_version: crate::worker::SystemPromptBuilder::VERSION.into(),
+        event_id: EventId::new("created-auto-compaction-branch"),
+        device_id: DeviceId::new("auto-compaction-device"),
+    })
+    .await
+    .expect("create session");
+    let large_source = "AUTO_BRANCH_SOURCE ".repeat(4_000);
+    hub.accept_internal_turn(TurnAcceptCommand {
+        command_id: "accept-auto-compaction-source".into(),
+        request_digest: "accept-auto-compaction-source-digest".into(),
+        request_json: r#"{"turn":"auto-compaction-source"}"#.into(),
+        session_id: session_id.clone(),
+        worker_generation: store.worker_generation(),
+        run_id: source_run.clone(),
+        agent_id: None,
+        branch_id: None,
+        text: large_source.clone(),
+        attachments: Vec::new(),
+        mode: DeliveryMode::Queue,
+        queued_event_id: EventId::new("auto-compaction-source-queued"),
+        user_event_id: EventId::new("auto-compaction-source-user"),
+        active_event_id: EventId::new("auto-compaction-source-active"),
+        device_id: DeviceId::new("auto-compaction-device"),
+    })
+    .await
+    .expect("accept source");
+    let mut source_done = [EventEnvelope {
+        schema_version: SCHEMA_VERSION,
+        event_id: EventId::new("auto-compaction-source-done"),
+        seq: 0,
+        session_id: session_id.clone(),
+        branch_id: None,
+        run_id: Some(source_run.clone()),
+        agent_id: None,
+        device_id: DeviceId::new("auto-compaction-device"),
+        authority_epoch: 0,
+        worker_generation: store.worker_generation(),
+        causation_id: None,
+        correlation_id: None,
+        committed_at_ms: 0,
+        render: RenderTargets {
+            ui: false,
+            durable: true,
+            prompt: PromptRender::Omit,
+        },
+        payload: serde_json::to_value(EventPayload::RunState(RunState::Done))
+            .expect("done payload"),
+    }];
+    hub.append(&mut source_done)
+        .await
+        .expect("terminalize source");
+    let source_events = store.read(&session_id, 0, 64).await.expect("source events");
+    let (fork_node, fork_seq) = source_events
+        .iter()
+        .find_map(|event| {
+            let EventPayload::NodeCommitted(node) =
+                serde_json::from_value::<EventPayload>(event.payload.clone()).ok()?
+            else {
+                return None;
+            };
+            (event.run_id.as_ref() == Some(&source_run)).then_some((node.node, event.seq))
+        })
+        .expect("source fork node");
+    let branch_request = r#"{"fork":"auto-compaction-source"}"#.to_owned();
+    store
+        .create_branch(BranchCreateCommand {
+            command_id: "create-auto-compaction-ref".into(),
+            request_digest: blake3::hash(branch_request.as_bytes()).to_hex().to_string(),
+            request_json: branch_request,
+            session_id: session_id.clone(),
+            worker_generation: store.worker_generation(),
+            branch_id: branch_id.clone(),
+            source_branch_id: None,
+            fork_node_id: fork_node,
+            fork_seq,
+            name: Some("Automatic compaction A".into()),
+            event_id: EventId::new("created-auto-compaction-ref"),
+            device_id: DeviceId::new("auto-compaction-device"),
+        })
+        .await
+        .expect("create branch");
+    let accepted = hub
+        .accept_internal_turn(TurnAcceptCommand {
+            command_id: "accept-auto-compaction-branch-turn".into(),
+            request_digest: "accept-auto-compaction-branch-turn-digest".into(),
+            request_json: r#"{"turn":"auto-compaction-branch"}"#.into(),
+            session_id: session_id.clone(),
+            worker_generation: store.worker_generation(),
+            run_id: branch_run.clone(),
+            agent_id: None,
+            branch_id: Some(branch_id.clone()),
+            text: "continue after the large source".into(),
+            attachments: Vec::new(),
+            mode: DeliveryMode::Queue,
+            queued_event_id: EventId::new("auto-compaction-branch-queued"),
+            user_event_id: EventId::new("auto-compaction-branch-user"),
+            active_event_id: EventId::new("auto-compaction-branch-active"),
+            device_id: DeviceId::new("auto-compaction-device"),
+        })
+        .await
+        .expect("accept branch turn");
+    handle.submit(accepted).await.expect("submit branch turn");
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let events = store.read(&session_id, 0, 256).await.expect("read events");
+            if events.iter().any(|event| {
+                event.run_id.as_ref() == Some(&branch_run)
+                    && serde_json::from_value::<EventPayload>(event.payload.clone()).is_ok_and(
+                        |payload| matches!(payload, EventPayload::RunState(RunState::Done)),
+                    )
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("branch turn completes");
+
+    let events = store.read(&session_id, 0, 256).await.expect("final events");
+    let compactions = events
+        .iter()
+        .filter_map(|event| {
+            let EventPayload::NodeCommitted(node) =
+                serde_json::from_value::<EventPayload>(event.payload.clone()).ok()?
+            else {
+                return None;
+            };
+            matches!(
+                node.kind,
+                NodeKind::Compaction {
+                    resume_cause: CompactionResume::AutoMidTurn,
+                    ..
+                }
+            )
+            .then_some(event)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(compactions.len(), 1);
+    assert_eq!(compactions[0].run_id, Some(branch_run));
+    assert_eq!(compactions[0].branch_id, Some(branch_id));
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    let resumed_text = requests[1]
+        .messages
+        .iter()
+        .flat_map(|message| &message.blocks)
+        .filter_map(|block| match block {
+            Block::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(resumed_text.contains("automatic branch summary"));
+    assert!(!resumed_text.contains("AUTO_BRANCH_SOURCE"));
+
+    manager.shutdown().await.expect("manager shutdown");
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
 }
 
 /// MUTATION CHECK: skip durable command lookup before manual compaction.
@@ -131,6 +756,7 @@ async fn manual_compaction_command_replay_compacts_exactly_once() {
             worker_generation: store.worker_generation(),
             run_id: haider_protocol::ids::RunId::new("before-manual-compaction"),
             agent_id: None,
+            branch_id: None,
             text: "build durable history".into(),
             attachments: Vec::new(),
             mode: DeliveryMode::Queue,
@@ -165,6 +791,7 @@ async fn manual_compaction_command_replay_compacts_exactly_once() {
             session_id.clone(),
             "submit-before-manual-compaction".into(),
             store.worker_generation(),
+            None,
         )
         .await
         .expect_err("turn command id cannot be reused for compaction");
@@ -179,6 +806,7 @@ async fn manual_compaction_command_replay_compacts_exactly_once() {
             session_id.clone(),
             "same-compact-command".into(),
             store.worker_generation(),
+            None,
         )
         .await
         .expect("first compaction");
@@ -187,6 +815,7 @@ async fn manual_compaction_command_replay_compacts_exactly_once() {
             session_id.clone(),
             "same-compact-command".into(),
             store.worker_generation(),
+            None,
         )
         .await
         .expect("compaction replay");
@@ -288,6 +917,7 @@ async fn manual_compaction_command_replay_compacts_exactly_once() {
             session_id,
             "same-compact-command".into(),
             first.worker_generation,
+            None,
         )
         .await
         .expect("cross-generation receipt replay");
@@ -348,6 +978,7 @@ async fn crash_after_compaction_intent_abandons_without_changing_the_prompt() {
             worker_generation: generation,
             run_id: source_run.clone(),
             agent_id: None,
+            branch_id: None,
             text: "history that must survive".into(),
             attachments: Vec::new(),
             mode: DeliveryMode::Steer,
@@ -359,12 +990,15 @@ async fn crash_after_compaction_intent_abandons_without_changing_the_prompt() {
         .await
         .expect("accept source");
 
-    let envelope = |event: &str, run_id: &RunId, payload: EventPayload| EventEnvelope {
+    let envelope = |event: &str,
+                    run_id: &RunId,
+                    branch_id: Option<&BranchId>,
+                    payload: EventPayload| EventEnvelope {
         schema_version: SCHEMA_VERSION,
         event_id: EventId::new(event),
         seq: 0,
         session_id: session_id.clone(),
-        branch_id: None,
+        branch_id: branch_id.cloned(),
         run_id: Some(run_id.clone()),
         agent_id: None,
         device_id: device_id.clone(),
@@ -383,12 +1017,46 @@ async fn crash_after_compaction_intent_abandons_without_changing_the_prompt() {
     let mut source_done = [envelope(
         "compaction-source-done",
         &source_run,
+        None,
         EventPayload::RunState(RunState::Done),
     )];
     StoreHandle::append(&store, &mut source_done)
         .await
         .expect("finish source history");
     let source_node = NodeId::new("node-compaction-source-user");
+    let source_seq = store
+        .read(&session_id, 0, 64)
+        .await
+        .expect("read source node")
+        .into_iter()
+        .find_map(|event| {
+            let EventPayload::NodeCommitted(node) =
+                serde_json::from_value::<EventPayload>(event.payload).ok()?
+            else {
+                return None;
+            };
+            (node.node == source_node).then_some(event.seq)
+        })
+        .expect("source node sequence");
+    let branch_id = BranchId::new("compaction-crash-branch");
+    let branch_request = r#"{"fork":"compaction-source"}"#.to_owned();
+    store
+        .create_branch(BranchCreateCommand {
+            command_id: "create-compaction-crash-branch".into(),
+            request_digest: blake3::hash(branch_request.as_bytes()).to_hex().to_string(),
+            request_json: branch_request,
+            session_id: session_id.clone(),
+            worker_generation: generation,
+            branch_id: branch_id.clone(),
+            source_branch_id: None,
+            fork_node_id: source_node.clone(),
+            fork_seq: source_seq,
+            name: None,
+            event_id: EventId::new("created-compaction-crash-branch"),
+            device_id: device_id.clone(),
+        })
+        .await
+        .expect("create crash branch");
     let intent = CompactionIntent {
         operation_id: "crashed-operation".into(),
         covers_from: source_node.clone(),
@@ -404,6 +1072,7 @@ async fn crash_after_compaction_intent_abandons_without_changing_the_prompt() {
         envelope(
             "crashed-intent-started",
             &compaction_run,
+            Some(&branch_id),
             EventPayload::Item(ItemEvent::Started {
                 item_id: item_id.clone(),
                 item: item.clone(),
@@ -412,11 +1081,13 @@ async fn crash_after_compaction_intent_abandons_without_changing_the_prompt() {
         envelope(
             "crashed-intent-completed",
             &compaction_run,
+            Some(&branch_id),
             EventPayload::Item(ItemEvent::Completed { item_id, item }),
         ),
         envelope(
             "crashed-compacting",
             &compaction_run,
+            Some(&branch_id),
             EventPayload::RunState(RunState::Compacting),
         ),
     ];
@@ -427,7 +1098,7 @@ async fn crash_after_compaction_intent_abandons_without_changing_the_prompt() {
         &store,
         &store,
         &session_id,
-        None,
+        Some(&branch_id),
         None,
         &source_run,
     )
@@ -450,7 +1121,7 @@ async fn crash_after_compaction_intent_abandons_without_changing_the_prompt() {
         &recovered,
         &recovered,
         &session_id,
-        None,
+        Some(&branch_id),
         None,
         &source_run,
     )
@@ -461,12 +1132,13 @@ async fn crash_after_compaction_intent_abandons_without_changing_the_prompt() {
         before
     );
 
-    let payloads = recovered
+    let recovered_events = recovered
         .read(&session_id, 0, 256)
         .await
-        .expect("read recovered journal")
-        .into_iter()
-        .filter_map(|event| serde_json::from_value::<EventPayload>(event.payload).ok())
+        .expect("read recovered journal");
+    let payloads = recovered_events
+        .iter()
+        .filter_map(|event| serde_json::from_value::<EventPayload>(event.payload.clone()).ok())
         .collect::<Vec<_>>();
     assert!(payloads.iter().any(|payload| matches!(
         payload,
@@ -484,5 +1156,19 @@ async fn crash_after_compaction_intent_abandons_without_changing_the_prompt() {
             .iter()
             .any(|payload| matches!(payload, EventPayload::RunState(RunState::Errored)))
     );
+    assert!(recovered_events.iter().any(|event| {
+        event.run_id.as_ref() == Some(&compaction_run)
+            && event.branch_id.as_ref() == Some(&branch_id)
+            && matches!(
+                serde_json::from_value::<EventPayload>(event.payload.clone()),
+                Ok(EventPayload::RunState(RunState::Errored))
+            )
+    }));
+    assert!(recovered_events.iter().all(|event| {
+        !matches!(
+            serde_json::from_value::<EventPayload>(event.payload.clone()),
+            Ok(EventPayload::SessionState(_))
+        ) || event.branch_id.is_none()
+    }));
     recovered.close().await.expect("close recovered store");
 }

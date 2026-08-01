@@ -6,10 +6,12 @@
 
 use crate::{CommittedRange, StoreHandle, unix_time_ms};
 use async_trait::async_trait;
+use haider_protocol::EventPayload;
+use haider_protocol::branch::{BranchCreated, BranchDescriptor};
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::error::{ErrorCode, HaiderError};
-use haider_protocol::ids::SessionId;
-use std::collections::HashMap;
+use haider_protocol::ids::{BranchId, SessionId};
+use std::collections::{HashMap, HashSet};
 use tokio::sync::Mutex;
 
 /// Ephemeral store used by tests and the offline self-test.
@@ -126,5 +128,72 @@ impl StoreHandle for MemoryStore {
             .get(session_id)
             .and_then(|journal| journal.last())
             .map_or(0, |envelope| envelope.seq))
+    }
+
+    async fn branch_lineage(
+        &self,
+        session_id: &SessionId,
+        branch_id: Option<&BranchId>,
+    ) -> Result<Vec<BranchDescriptor>, HaiderError> {
+        let Some(mut current) = branch_id.cloned() else {
+            return Ok(Vec::new());
+        };
+        let sessions = self.sessions.lock().await;
+        let journal = sessions
+            .get(session_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let mut descriptors = HashMap::<BranchId, BranchDescriptor>::new();
+        for envelope in journal {
+            if let Some(created) = BranchCreated::from_payload_value(&envelope.payload) {
+                descriptors.insert(created.branch.branch_id.clone(), created.branch);
+                continue;
+            }
+            let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone())
+            else {
+                continue;
+            };
+            match payload {
+                EventPayload::NodeCommitted(node)
+                    if envelope.agent_id.is_none() && envelope.branch_id.as_ref().is_some() =>
+                {
+                    if let Some(descriptor) = envelope
+                        .branch_id
+                        .as_ref()
+                        .and_then(|branch| descriptors.get_mut(branch))
+                    {
+                        descriptor.head_node_id = node.node;
+                        descriptor.head_seq = envelope.seq;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut reverse = Vec::new();
+        let mut seen = HashSet::new();
+        loop {
+            if !seen.insert(current.clone()) {
+                return Err(HaiderError::new(
+                    ErrorCode::StoreCorrupt,
+                    format!("branch registry contains a cycle at {current}"),
+                    false,
+                ));
+            }
+            let descriptor = descriptors.get(&current).cloned().ok_or_else(|| {
+                HaiderError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("branch {current} does not exist"),
+                    false,
+                )
+            })?;
+            let source = descriptor.source_branch_id.clone();
+            reverse.push(descriptor);
+            let Some(source) = source else {
+                break;
+            };
+            current = source;
+        }
+        reverse.reverse();
+        Ok(reverse)
     }
 }

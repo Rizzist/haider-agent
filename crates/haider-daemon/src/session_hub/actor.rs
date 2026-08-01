@@ -115,6 +115,30 @@ pub(super) async fn run_session_actor(
                 }
                 let _ = completed.send(result);
             }
+            ActorCommand::CreateBranch { command, completed } => {
+                // The registry row, BranchCreated fact, and R2 receipt are
+                // one transaction. Only the committed fact is publishable.
+                let result = store.create_branch(command).await;
+                if let Ok(BranchCreateOutcome::Committed { envelope, .. }) = &result {
+                    head = envelope.seq;
+                    authority_epoch = envelope.authority_epoch;
+                    observer.observe(HubObservation::Persisted {
+                        session_id: session_id.clone(),
+                        through_seq: head,
+                    });
+                    publish(
+                        &mut attachments,
+                        std::slice::from_ref(envelope.as_ref()),
+                        catch_up_byte_budget,
+                        &metrics,
+                    );
+                    observer.observe(HubObservation::Published {
+                        session_id: session_id.clone(),
+                        through_seq: head,
+                    });
+                }
+                let _ = completed.send(result);
+            }
             ActorCommand::AcceptTurn { command, completed } => {
                 // MUTATION CHECK: publishing before this durable transaction
                 // returns makes live clients observe an acceptance a restart

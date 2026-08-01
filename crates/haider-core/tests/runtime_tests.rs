@@ -7,6 +7,7 @@ use haider_core::{
     SubmitCommittedTurn, SubmitTurn, ToolDispatchResult, ToolDispatcher,
 };
 use haider_protocol::EventPayload;
+use haider_protocol::branch::BranchDescriptor;
 use haider_protocol::context::{ContextFootprint, ContextFootprintTruth};
 use haider_protocol::credential::{RotationCause, RotationEvent};
 use haider_protocol::envelope::{PromptRender, RawEnvelope};
@@ -15,7 +16,7 @@ use haider_protocol::history::{
     COMPACTION_INTENT_EXTENSION_KIND, CONTINUATION_CHECKPOINT_EXTENSION_KIND, CompactionIntent,
     CompactionResume, ContinuationCheckpoint,
 };
-use haider_protocol::ids::{CredentialAlias, DeviceId, ItemId, NodeId, RunId, SessionId};
+use haider_protocol::ids::{BranchId, CredentialAlias, DeviceId, ItemId, NodeId, RunId, SessionId};
 use haider_protocol::item::{ItemEvent, ToolStatus, TurnItem};
 use haider_protocol::provider::{Block, CapabilityDoc, FinishReason, Usage, UsageSource};
 use haider_protocol::state::RunState;
@@ -2443,6 +2444,14 @@ impl StoreHandle for BatchRecordingStore {
     async fn latest_seq(&self, session_id: &SessionId) -> Result<u64, HaiderError> {
         self.inner.latest_seq(session_id).await
     }
+
+    async fn branch_lineage(
+        &self,
+        session_id: &SessionId,
+        branch_id: Option<&BranchId>,
+    ) -> Result<Vec<BranchDescriptor>, HaiderError> {
+        self.inner.branch_lineage(session_id, branch_id).await
+    }
 }
 
 struct BlockingCompletedStore {
@@ -2487,6 +2496,14 @@ impl StoreHandle for BlockingCompletedStore {
 
     async fn latest_seq(&self, session_id: &SessionId) -> Result<u64, HaiderError> {
         self.inner.latest_seq(session_id).await
+    }
+
+    async fn branch_lineage(
+        &self,
+        session_id: &SessionId,
+        branch_id: Option<&BranchId>,
+    ) -> Result<Vec<BranchDescriptor>, HaiderError> {
+        self.inner.branch_lineage(session_id, branch_id).await
     }
 }
 

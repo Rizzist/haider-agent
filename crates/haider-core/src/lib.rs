@@ -36,11 +36,11 @@ pub use fake_store::MemoryStore;
 pub use haider_store::{
     ACCOUNT_REMOVE_METHOD, ACCOUNT_SET_ACTIVE_METHOD, ACCOUNT_SET_DEFAULT_MODEL_METHOD,
     AcceptedShellExec, AcceptedTurn, AccountAddClaim, AccountAddReceiptResponse,
-    AccountAddReceiptRow, AccountRemoveReceiptRow, CachedModels, CancelledTurn,
-    ContextCompactionClaim, ContextCompactionReceiptResponse, CreatedSession,
-    DelegationCreateOutcome, DelegationRecord, DelegationState, LoginClaim, LoginReceiptFailure,
-    LoginReceiptResponse, LoginReceiptRow, ManagementClaim, ManagementReceiptRow,
-    MenuResolutionCommand, MenuResolutionOutcome, PROVIDER_CONFIGURE_METHOD,
+    AccountAddReceiptRow, AccountRemoveReceiptRow, BranchCreateCommand, BranchCreateOutcome,
+    CachedModels, CancelledTurn, ContextCompactionClaim, ContextCompactionReceiptResponse,
+    CreatedBranch, CreatedSession, DelegationCreateOutcome, DelegationRecord, DelegationState,
+    LoginClaim, LoginReceiptFailure, LoginReceiptResponse, LoginReceiptRow, ManagementClaim,
+    ManagementReceiptRow, MenuResolutionCommand, MenuResolutionOutcome, PROVIDER_CONFIGURE_METHOD,
     PROVIDER_REMOVE_METHOD, SessionCreateCommand, SessionCreateOutcome, ShellExecAcceptCommand,
     ShellExecAcceptOutcome, TurnAcceptCommand, TurnAcceptOutcome, TurnAdmissionDisposition,
     TurnCancelCommand, TurnCancelOutcome, TurnCancellationStatus,
@@ -50,9 +50,10 @@ pub use recovery::{RecoveryReport, reconcile_dispatched_effects};
 pub use sqlite_store::SqliteStoreHandle;
 
 use async_trait::async_trait;
+use haider_protocol::branch::BranchDescriptor;
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::error::HaiderError;
-use haider_protocol::ids::SessionId;
+use haider_protocol::ids::{BranchId, SessionId};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Crate marker used by the workspace self-test.
@@ -81,6 +82,14 @@ pub trait StoreHandle: Send + Sync {
     ) -> Result<Vec<RawEnvelope>, HaiderError>;
 
     async fn latest_seq(&self, session_id: &SessionId) -> Result<u64, HaiderError>;
+
+    /// Resolves the durable named-ref registry from root to requested leaf.
+    /// The implicit legacy/main branch returns an empty concrete lineage.
+    async fn branch_lineage(
+        &self,
+        session_id: &SessionId,
+        branch_id: Option<&BranchId>,
+    ) -> Result<Vec<BranchDescriptor>, HaiderError>;
 }
 
 /// Wall-clock milliseconds since the Unix epoch, saturating at the extremes.

@@ -200,6 +200,78 @@ impl HubConnection {
                 }
                 self.session_detach(request_id, attachment_id).await
             }
+            RequestBody::BranchCreate {
+                command_id,
+                session_id,
+                worker_generation,
+                source_branch_id,
+                fork_node_id,
+                fork_seq,
+                name,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.branch_create(
+                    request_id,
+                    command_id,
+                    session_id,
+                    worker_generation,
+                    source_branch_id,
+                    fork_node_id,
+                    fork_seq,
+                    name,
+                )
+                .await
+            }
+            RequestBody::TurnSubmitWithBranch {
+                command_id,
+                session_id,
+                worker_generation,
+                branch_id,
+                text,
+                attachments,
+                mode,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                if !self
+                    .hub
+                    .holds_control_attachment(&self.connection_id, &session_id)?
+                {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        "turn submission requires a control attachment to this session",
+                        false,
+                        None,
+                    );
+                }
+                self.turn_submit(
+                    request_id,
+                    command_id,
+                    session_id,
+                    worker_generation,
+                    branch_id,
+                    text,
+                    attachments,
+                    mode,
+                )
+                .await
+            }
             RequestBody::TurnSubmit {
                 command_id,
                 session_id,
@@ -234,6 +306,7 @@ impl HubConnection {
                     command_id,
                     session_id,
                     worker_generation,
+                    None,
                     text,
                     attachments,
                     mode,
@@ -276,6 +349,42 @@ impl HubConnection {
                 )
                 .await
             }
+            RequestBody::SessionCompactOnBranch {
+                command_id,
+                session_id,
+                worker_generation,
+                branch_id,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                if !self
+                    .hub
+                    .holds_control_attachment(&self.connection_id, &session_id)?
+                {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        "context compaction requires a control attachment to this session",
+                        false,
+                        None,
+                    );
+                }
+                self.session_compact(
+                    request_id,
+                    command_id,
+                    session_id,
+                    worker_generation,
+                    branch_id,
+                )
+                .await
+            }
             RequestBody::SessionCompact {
                 command_id,
                 session_id,
@@ -302,7 +411,7 @@ impl HubConnection {
                         None,
                     );
                 }
-                self.session_compact(request_id, command_id, session_id, worker_generation)
+                self.session_compact(request_id, command_id, session_id, worker_generation, None)
                     .await
             }
             RequestBody::ShellExec {
@@ -1459,12 +1568,123 @@ impl HubConnection {
     }
 
     #[allow(clippy::too_many_arguments)]
+    async fn branch_create(
+        &self,
+        request_id: RequestId,
+        command_id: CommandId,
+        session_id: SessionId,
+        worker_generation: u64,
+        source_branch_id: Option<haider_protocol::ids::BranchId>,
+        fork_node_id: haider_protocol::ids::NodeId,
+        fork_seq: u64,
+        name: Option<String>,
+    ) -> Result<(), SessionHubError> {
+        if command_id.as_str().is_empty()
+            || fork_node_id.as_str().is_empty()
+            || fork_seq == 0
+            || name.as_ref().is_some_and(|name| name.trim().is_empty())
+        {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "branch command, fork node/sequence, and optional name must be valid",
+                false,
+                None,
+            );
+        }
+        let request_json = serde_json::to_string(&serde_json::json!({
+            "session_id": &session_id,
+            "worker_generation": worker_generation,
+            "source_branch_id": &source_branch_id,
+            "fork_node_id": &fork_node_id,
+            "fork_seq": fork_seq,
+            "name": &name,
+        }))
+        .map_err(|error| {
+            SessionHubError::Task(format!("cannot encode branch-create coordinates: {error}"))
+        })?;
+        let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
+
+        // Receipt replay precedes attachment, generation, and current-lineage
+        // validation so a lost response remains recoverable after restart.
+        match self
+            .hub
+            .branch_create_receipt(&command_id, &request_digest, &request_json)
+            .await
+        {
+            Ok(Some(created)) => return self.respond_branch_created(request_id, created),
+            Ok(None) => {}
+            Err(SessionHubError::Store(error)) => {
+                return self.respond_turn_error(request_id, error);
+            }
+            Err(error) => return Err(error),
+        }
+        if !self
+            .hub
+            .holds_control_attachment(&self.connection_id, &session_id)?
+        {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_CAPABILITY_DENIED,
+                "branch creation requires a control attachment to this session",
+                false,
+                None,
+            );
+        }
+
+        let command = BranchCreateCommand {
+            command_id: command_id.0,
+            request_digest,
+            request_json,
+            session_id,
+            worker_generation,
+            branch_id: haider_protocol::ids::BranchId::new(random_id("branch")?),
+            source_branch_id,
+            fork_node_id,
+            fork_seq,
+            name,
+            event_id: EventId::new(random_id("branch-created")?),
+            device_id: self.hub.inner.device_id.clone(),
+        };
+        let created = match self.hub.create_branch(command).await {
+            Ok(BranchCreateOutcome::Committed { created, .. })
+            | Ok(BranchCreateOutcome::IdempotentReplay { created }) => created,
+            Err(SessionHubError::Store(error)) => {
+                return self.respond_turn_error(request_id, error);
+            }
+            Err(error) => return Err(error),
+        };
+        self.respond_branch_created(request_id, created)
+    }
+
+    fn respond_branch_created(
+        &self,
+        request_id: RequestId,
+        created: CreatedBranch,
+    ) -> Result<(), SessionHubError> {
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::BranchCreate {
+                session_id: created.session_id,
+                branch_id: created.branch_id,
+                source_branch_id: created.source_branch_id,
+                fork_node_id: created.fork_node_id,
+                fork_seq: created.fork_seq,
+                created_seq: created.created_seq,
+                worker_generation: created.worker_generation,
+                name: created.name,
+            },
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn turn_submit(
         &self,
         request_id: RequestId,
         command_id: CommandId,
         session_id: SessionId,
         worker_generation: u64,
+        branch_id: Option<haider_protocol::ids::BranchId>,
         text: String,
         attachments: Vec<haider_protocol::tool::AttachmentBlock>,
         mode: haider_protocol::DeliveryMode,
@@ -1481,6 +1701,7 @@ impl HubConnection {
         let request_json = serde_json::to_string(&serde_json::json!({
             "session_id": &session_id,
             "worker_generation": worker_generation,
+            "branch_id": &branch_id,
             "text": &text,
             "attachments": &attachments,
             "mode": mode,
@@ -1516,6 +1737,7 @@ impl HubConnection {
             worker_generation,
             run_id: haider_protocol::ids::RunId::new(random_id("run")?),
             agent_id: None,
+            branch_id,
             text,
             attachments,
             mode,
@@ -1684,6 +1906,7 @@ impl HubConnection {
         command_id: CommandId,
         session_id: SessionId,
         worker_generation: u64,
+        branch_id: Option<BranchId>,
     ) -> Result<(), SessionHubError> {
         if command_id.as_str().is_empty() {
             return self.respond_error(
@@ -1697,21 +1920,34 @@ impl HubConnection {
         let accepted = match self
             .hub
             .worker_manager()?
-            .compact(session_id.clone(), command_id.0, worker_generation)
+            .compact(
+                session_id.clone(),
+                command_id.0,
+                worker_generation,
+                branch_id,
+            )
             .await
         {
             Ok(accepted) => accepted,
             Err(error) => return self.respond_turn_error(request_id, error),
         };
-        self.send(WireFrame::Response {
-            request_id,
-            body: ResponseBody::SessionCompact {
+        let body = if let Some(branch_id) = accepted.branch_id {
+            ResponseBody::SessionCompactOnBranch {
                 session_id,
                 run_id: accepted.run_id,
                 accepted_seq: accepted.accepted_seq,
                 worker_generation: accepted.worker_generation,
-            },
-        })
+                branch_id,
+            }
+        } else {
+            ResponseBody::SessionCompact {
+                session_id,
+                run_id: accepted.run_id,
+                accepted_seq: accepted.accepted_seq,
+                worker_generation: accepted.worker_generation,
+            }
+        };
+        self.send(WireFrame::Response { request_id, body })
     }
 
     async fn turn_cancel(
@@ -1790,20 +2026,30 @@ impl HubConnection {
         request_id: RequestId,
         accepted: AcceptedTurn,
     ) -> Result<(), SessionHubError> {
-        self.send(WireFrame::Response {
-            request_id,
-            body: ResponseBody::TurnSubmit {
+        let disposition = match accepted.disposition {
+            TurnAdmissionDisposition::Started => SubmitDisposition::Started,
+            TurnAdmissionDisposition::Queued => SubmitDisposition::Queued,
+            TurnAdmissionDisposition::SteerPending => SubmitDisposition::SteerPending,
+        };
+        let body = if let Some(branch_id) = accepted.branch_id {
+            ResponseBody::TurnSubmitOnBranch {
                 session_id: accepted.session_id,
                 run_id: accepted.run_id,
                 accepted_seq: accepted.accepted_seq,
                 worker_generation: accepted.worker_generation,
-                disposition: match accepted.disposition {
-                    TurnAdmissionDisposition::Started => SubmitDisposition::Started,
-                    TurnAdmissionDisposition::Queued => SubmitDisposition::Queued,
-                    TurnAdmissionDisposition::SteerPending => SubmitDisposition::SteerPending,
-                },
-            },
-        })
+                branch_id,
+                disposition,
+            }
+        } else {
+            ResponseBody::TurnSubmit {
+                session_id: accepted.session_id,
+                run_id: accepted.run_id,
+                accepted_seq: accepted.accepted_seq,
+                worker_generation: accepted.worker_generation,
+                disposition,
+            }
+        };
+        self.send(WireFrame::Response { request_id, body })
     }
 
     fn respond_shell_accepted(

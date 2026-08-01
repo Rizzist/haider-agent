@@ -210,6 +210,7 @@ async fn child_done_parent_wait_crash_recovers_the_same_logical_turn() {
             worker_generation: generation,
             run_id: parent_run.clone(),
             agent_id: None,
+            branch_id: None,
             text: "delegate".into(),
             attachments: Vec::new(),
             mode: DeliveryMode::Steer,
@@ -229,6 +230,7 @@ async fn child_done_parent_wait_crash_recovers_the_same_logical_turn() {
             worker_generation: generation,
             run_id: child_run.clone(),
             agent_id: Some(agent.clone()),
+            branch_id: None,
             text: "child task".into(),
             attachments: Vec::new(),
             mode: DeliveryMode::Steer,
@@ -264,6 +266,7 @@ async fn child_done_parent_wait_crash_recovers_the_same_logical_turn() {
             child_run_id: child_run.clone(),
             parent_session_id: parent_session.clone(),
             parent_run_id: parent_run.clone(),
+            parent_branch_id: None,
             call_id: "spawn-call".into(),
             tool_item_id: tool_item.clone(),
             parent_agent_id: None,
@@ -504,4 +507,630 @@ async fn an_always_reported_step_survives_a_breached_barrier() {
 
     assert!(matches!(reported, Some(DaemonError::Endpoint { .. })));
     assert!(forced, "an expired deadline still forces the outcome");
+}
+
+/// MUTATION CHECK: reconstruct `AcceptedTurn` with `branch_id: None`, compare
+/// aggregate `SessionState` scope before payload type, or emit recovery
+/// terminals through an unscoped envelope. Expected RUNTIME failure: recovery
+/// rejects the real acceptance-shaped aggregate or an A/B run moves to main.
+#[tokio::test]
+async fn restart_recovery_keeps_interleaved_runs_on_their_accepted_branches() {
+    use crate::session_hub::{SessionHub, SessionHubConfig};
+    use crate::turn_recovery::{RecoveredWork, recover_interrupted_turns};
+    use crate::worker::{
+        BrokerToolFactory, ProviderFactory, ResolvedTurnProvider, WorkerDependencies, WorkerManager,
+    };
+    use haider_core::{
+        BranchCreateCommand, SessionCreateCommand, SqliteStoreHandle, StoreHandle,
+        TurnAcceptCommand, TurnAcceptOutcome,
+    };
+    use haider_protocol::DeliveryMode;
+    use haider_protocol::EventPayload;
+    use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
+    use haider_protocol::ids::{BranchId, DeviceId, EventId, RunId, SessionId};
+    use haider_protocol::provider::FinishReason;
+    use haider_protocol::session::SessionMetadataV1;
+    use haider_protocol::state::{RunState, SessionState};
+    use haider_provider::{FakeProvider, FakeStep, Provider};
+    use std::sync::Arc;
+
+    struct RecoveryProviderFactory {
+        provider: Arc<dyn Provider>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProviderFactory for RecoveryProviderFactory {
+        async fn resolve_for_turn(
+            &self,
+            metadata: &SessionMetadataV1,
+        ) -> Result<ResolvedTurnProvider, haider_protocol::error::HaiderError> {
+            Ok(ResolvedTurnProvider {
+                provider: Arc::clone(&self.provider),
+                provider_name: metadata.provider.clone(),
+                model: metadata.model.clone(),
+                context_window: None,
+                account_alias: None,
+                initial_rotation: None,
+                rotation_budget_consumed: false,
+                attempt_resolver: None,
+            })
+        }
+    }
+
+    let root = tempfile::tempdir().expect("profile");
+    let session_id = SessionId::new("branch-recovery-session");
+    let device_id = DeviceId::new("branch-recovery-device");
+    let branch_a = BranchId::new("branch-a");
+    let branch_b = BranchId::new("branch-b");
+    let run_a = RunId::new("queued-a");
+    let run_b = RunId::new("queued-b");
+    let cancelling_b = RunId::new("cancelling-b");
+    let first = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("open first");
+    first
+        .create_session(SessionCreateCommand {
+            command_id: "create-branch-recovery".into(),
+            request_digest: "create-branch-recovery-digest".into(),
+            request_json: r#"{"session":"branch-recovery"}"#.into(),
+            session_id: session_id.clone(),
+            cwd: std::env::current_dir()
+                .expect("cwd")
+                .to_string_lossy()
+                .into_owned(),
+            provider: "fake".into(),
+            model: "fake-model".into(),
+            max_tokens: 4096,
+            permission_overrides: None,
+            system_prompt_version: crate::worker::SystemPromptBuilder::VERSION.into(),
+            event_id: EventId::new("created-branch-recovery"),
+            device_id: device_id.clone(),
+        })
+        .await
+        .expect("create session");
+    let generation = first.worker_generation();
+    let source_run = RunId::new("branch-recovery-source");
+    let TurnAcceptOutcome::Committed { .. } = first
+        .accept_turn(TurnAcceptCommand {
+            command_id: "accept-branch-recovery-source".into(),
+            request_digest: "accept-branch-recovery-source-digest".into(),
+            request_json: r#"{"turn":"branch-recovery-source"}"#.into(),
+            session_id: session_id.clone(),
+            worker_generation: generation,
+            run_id: source_run.clone(),
+            agent_id: None,
+            branch_id: None,
+            text: "stable recovery fork".into(),
+            attachments: Vec::new(),
+            mode: DeliveryMode::Queue,
+            queued_event_id: EventId::new("branch-recovery-source-queued"),
+            user_event_id: EventId::new("branch-recovery-source-user"),
+            active_event_id: EventId::new("branch-recovery-source-active"),
+            device_id: device_id.clone(),
+        })
+        .await
+        .expect("accept source")
+    else {
+        panic!("fresh source acceptance");
+    };
+    let mut source_done = [EventEnvelope {
+        schema_version: SCHEMA_VERSION,
+        event_id: EventId::new("branch-recovery-source-done"),
+        seq: 0,
+        session_id: session_id.clone(),
+        branch_id: None,
+        run_id: Some(source_run.clone()),
+        agent_id: None,
+        device_id: device_id.clone(),
+        authority_epoch: 0,
+        worker_generation: generation,
+        causation_id: None,
+        correlation_id: None,
+        committed_at_ms: 0,
+        render: RenderTargets {
+            ui: true,
+            durable: true,
+            prompt: PromptRender::Omit,
+        },
+        payload: serde_json::to_value(EventPayload::RunState(RunState::Done))
+            .expect("source done payload"),
+    }];
+    StoreHandle::append(&first, &mut source_done)
+        .await
+        .expect("finish source");
+    let source_events = StoreHandle::read(&first, &session_id, 0, 64)
+        .await
+        .expect("read source");
+    let (fork_node, fork_seq) = source_events
+        .iter()
+        .find_map(|event| {
+            let EventPayload::NodeCommitted(node) =
+                serde_json::from_value::<EventPayload>(event.payload.clone()).ok()?
+            else {
+                return None;
+            };
+            (event.run_id.as_ref() == Some(&source_run)).then_some((node.node, event.seq))
+        })
+        .expect("source node");
+    for (command_id, branch_id) in [
+        ("create-recovery-a", branch_a.clone()),
+        ("create-recovery-b", branch_b.clone()),
+    ] {
+        let request_json = serde_json::json!({"branch": branch_id}).to_string();
+        first
+            .create_branch(BranchCreateCommand {
+                command_id: command_id.into(),
+                request_digest: blake3::hash(request_json.as_bytes()).to_hex().to_string(),
+                request_json,
+                session_id: session_id.clone(),
+                worker_generation: generation,
+                branch_id,
+                source_branch_id: None,
+                fork_node_id: fork_node.clone(),
+                fork_seq,
+                name: None,
+                event_id: EventId::new(format!("event-{command_id}")),
+                device_id: device_id.clone(),
+            })
+            .await
+            .expect("create recovery branch");
+    }
+    let event = |id: &str, run_id: &RunId, branch_id: &BranchId, payload: EventPayload| {
+        let prompt = if matches!(&payload, EventPayload::UserMessage { .. }) {
+            PromptRender::Verbatim
+        } else {
+            PromptRender::Omit
+        };
+        EventEnvelope {
+            schema_version: SCHEMA_VERSION,
+            event_id: EventId::new(id),
+            seq: 0,
+            session_id: session_id.clone(),
+            branch_id: Some(branch_id.clone()),
+            run_id: Some(run_id.clone()),
+            agent_id: None,
+            device_id: device_id.clone(),
+            authority_epoch: 0,
+            worker_generation: generation,
+            causation_id: None,
+            correlation_id: None,
+            committed_at_ms: 0,
+            render: RenderTargets {
+                ui: true,
+                durable: true,
+                prompt,
+            },
+            payload: serde_json::to_value(payload).expect("payload"),
+        }
+    };
+    let user = |text: &str| EventPayload::UserMessage {
+        text: text.into(),
+        attachments: Vec::new(),
+        mode: DeliveryMode::Queue,
+    };
+    let mut aggregate_active = event(
+        "a-aggregate-active",
+        &run_a,
+        &branch_a,
+        EventPayload::SessionState(SessionState::ActiveRun),
+    );
+    aggregate_active.branch_id = None;
+    let mut accepted = vec![
+        event(
+            "a-queued",
+            &run_a,
+            &branch_a,
+            EventPayload::RunState(RunState::Queued),
+        ),
+        event("a-user", &run_a, &branch_a, user("A")),
+        aggregate_active,
+        event(
+            "b-queued",
+            &run_b,
+            &branch_b,
+            EventPayload::RunState(RunState::Queued),
+        ),
+        event("b-user", &run_b, &branch_b, user("B")),
+        event("cancel-user", &cancelling_b, &branch_b, user("cancel B")),
+        event(
+            "cancel-state",
+            &cancelling_b,
+            &branch_b,
+            EventPayload::RunState(RunState::Cancelling),
+        ),
+    ];
+    StoreHandle::append(&first, &mut accepted)
+        .await
+        .expect("append old-generation runs");
+    first.close().await.expect("close first");
+
+    let recovered = SqliteStoreHandle::open(root.path()).await.expect("reopen");
+    let work = recover_interrupted_turns(&recovered, &DeviceId::new("recovery-worker"))
+        .await
+        .expect("recover");
+    let queued = work
+        .into_iter()
+        .filter_map(|work| match work {
+            RecoveredWork::Queued(accepted) => Some(accepted),
+            RecoveredWork::Checkpoint(_) | RecoveredWork::ChildWait(_) => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        queued
+            .iter()
+            .filter_map(|accepted| accepted.branch_id.clone())
+            .collect::<Vec<_>>(),
+        vec![branch_a.clone(), branch_b.clone()]
+    );
+
+    let events = StoreHandle::read(&recovered, &session_id, 0, 256)
+        .await
+        .expect("read recovery journal");
+    assert!(events.iter().any(|envelope| {
+        envelope.run_id.as_ref() == Some(&cancelling_b)
+            && envelope.branch_id.as_ref() == Some(&branch_b)
+            && matches!(
+                serde_json::from_value::<EventPayload>(envelope.payload.clone()),
+                Ok(EventPayload::RunState(RunState::Cancelled))
+            )
+    }));
+    assert!(events.iter().all(|envelope| {
+        !matches!(
+            serde_json::from_value::<EventPayload>(envelope.payload.clone()),
+            Ok(EventPayload::SessionState(
+                SessionState::ActiveRun | SessionState::Idle { .. }
+            ))
+        ) || envelope.branch_id.is_none()
+    }));
+
+    let provider = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitText {
+            text: "recovered A".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+        FakeStep::EmitText {
+            text: "recovered B".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let hub = SessionHub::new(recovered.clone(), SessionHubConfig::default()).expect("hub");
+    let manager = WorkerManager::start(
+        hub.clone(),
+        WorkerDependencies {
+            provider_factory: Arc::new(RecoveryProviderFactory { provider }),
+            tool_factory: Arc::new(BrokerToolFactory),
+            delegation: None,
+        },
+        false,
+    );
+    let handle = manager.handle();
+    hub.install_worker_manager(handle.clone())
+        .expect("install manager");
+    for accepted in queued {
+        handle
+            .recover_queued(accepted)
+            .await
+            .expect("start recovered turn");
+    }
+    let recovery_completion = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let events = StoreHandle::read(&recovered, &session_id, 0, 512)
+                .await
+                .expect("read recovered workers");
+            let done = [(&run_a, &branch_a), (&run_b, &branch_b)].into_iter().all(
+                |(run_id, branch_id)| {
+                    events.iter().any(|event| {
+                        event.run_id.as_ref() == Some(run_id)
+                            && event.branch_id.as_ref() == Some(branch_id)
+                            && matches!(
+                                serde_json::from_value::<EventPayload>(event.payload.clone()),
+                                Ok(EventPayload::RunState(RunState::Done))
+                            )
+                    })
+                },
+            );
+            if done {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    if recovery_completion.is_err() {
+        let tail = StoreHandle::read(&recovered, &session_id, 0, 512)
+            .await
+            .expect("read failed recovery tail")
+            .into_iter()
+            .filter(|event| {
+                event.run_id.as_ref() == Some(&run_a) || event.run_id.as_ref() == Some(&run_b)
+            })
+            .map(|event| {
+                (
+                    event.seq,
+                    event.run_id,
+                    event.branch_id,
+                    serde_json::from_value::<EventPayload>(event.payload),
+                )
+            })
+            .collect::<Vec<_>>();
+        panic!("recovered workers did not finish: {tail:?}");
+    }
+    let started_events = StoreHandle::read(&recovered, &session_id, 0, 512)
+        .await
+        .expect("read completed recovery");
+    for (run_id, branch_id) in [(&run_a, &branch_a), (&run_b, &branch_b)] {
+        assert!(started_events.iter().any(|event| {
+            event.run_id.as_ref() == Some(run_id)
+                && event.branch_id.as_ref() == Some(branch_id)
+                && matches!(
+                    serde_json::from_value::<EventPayload>(event.payload.clone()),
+                    Ok(EventPayload::Item(_) | EventPayload::NodeCommitted(_))
+                )
+        }));
+    }
+    manager.shutdown().await.expect("manager shutdown");
+    hub.shutdown().await.expect("hub shutdown");
+    recovered.close().await.expect("close recovered");
+}
+
+/// MUTATION CHECK: drop the accepted branch from the worker dispatch loop's
+/// failed-start terminalization locals. Expected RUNTIME failure: a
+/// recovering branch run whose provider resolution fails terminalizes as
+/// `Errored` without its branch stamp.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_recovery_start_terminalizes_on_the_accepted_branch() {
+    use crate::session_hub::{SessionHub, SessionHubConfig};
+    use crate::turn_recovery::{RecoveredWork, recover_interrupted_turns};
+    use crate::worker::{
+        BrokerToolFactory, ProviderFactory, ResolvedTurnProvider, WorkerDependencies, WorkerManager,
+    };
+    use haider_core::{
+        BranchCreateCommand, SessionCreateCommand, SqliteStoreHandle, StoreHandle,
+        TurnAcceptCommand, TurnAcceptOutcome,
+    };
+    use haider_protocol::DeliveryMode;
+    use haider_protocol::EventPayload;
+    use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
+    use haider_protocol::error::{ErrorCode, HaiderError};
+    use haider_protocol::ids::{BranchId, DeviceId, EventId, RunId, SessionId};
+    use haider_protocol::session::SessionMetadataV1;
+    use haider_protocol::state::{RunState, SessionState};
+
+    struct FailingProviderFactory;
+
+    #[async_trait::async_trait]
+    impl ProviderFactory for FailingProviderFactory {
+        async fn resolve_for_turn(
+            &self,
+            _metadata: &SessionMetadataV1,
+        ) -> Result<ResolvedTurnProvider, HaiderError> {
+            Err(HaiderError::new(
+                ErrorCode::Internal,
+                "failed-start fixture refuses every provider resolution",
+                false,
+            ))
+        }
+    }
+
+    let root = tempfile::tempdir().expect("profile");
+    let session_id = SessionId::new("failed-start-branch-session");
+    let device_id = DeviceId::new("failed-start-branch-device");
+    let branch_id = BranchId::new("failed-start-branch");
+    let run_id = RunId::new("failed-start-run");
+    let first = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("open first");
+    first
+        .create_session(SessionCreateCommand {
+            command_id: "create-failed-start".into(),
+            request_digest: "create-failed-start-digest".into(),
+            request_json: r#"{"session":"failed-start"}"#.into(),
+            session_id: session_id.clone(),
+            cwd: std::env::current_dir()
+                .expect("cwd")
+                .to_string_lossy()
+                .into_owned(),
+            provider: "fake".into(),
+            model: "fake-model".into(),
+            max_tokens: 4096,
+            permission_overrides: None,
+            system_prompt_version: crate::worker::SystemPromptBuilder::VERSION.into(),
+            event_id: EventId::new("created-failed-start"),
+            device_id: device_id.clone(),
+        })
+        .await
+        .expect("create session");
+    let generation = first.worker_generation();
+    let source_run = RunId::new("failed-start-source");
+    let TurnAcceptOutcome::Committed { .. } = first
+        .accept_turn(TurnAcceptCommand {
+            command_id: "accept-failed-start-source".into(),
+            request_digest: "accept-failed-start-source-digest".into(),
+            request_json: r#"{"turn":"failed-start-source"}"#.into(),
+            session_id: session_id.clone(),
+            worker_generation: generation,
+            run_id: source_run.clone(),
+            agent_id: None,
+            branch_id: None,
+            text: "stable failed-start fork".into(),
+            attachments: Vec::new(),
+            mode: DeliveryMode::Queue,
+            queued_event_id: EventId::new("failed-start-source-queued"),
+            user_event_id: EventId::new("failed-start-source-user"),
+            active_event_id: EventId::new("failed-start-source-active"),
+            device_id: device_id.clone(),
+        })
+        .await
+        .expect("accept source")
+    else {
+        panic!("fresh source acceptance");
+    };
+    let stamp = |id: &str, run: &RunId, branch: Option<&BranchId>, payload: EventPayload| {
+        let prompt = if matches!(&payload, EventPayload::UserMessage { .. }) {
+            PromptRender::Verbatim
+        } else {
+            PromptRender::Omit
+        };
+        EventEnvelope {
+            schema_version: SCHEMA_VERSION,
+            event_id: EventId::new(id),
+            seq: 0,
+            session_id: session_id.clone(),
+            branch_id: branch.cloned(),
+            run_id: Some(run.clone()),
+            agent_id: None,
+            device_id: device_id.clone(),
+            authority_epoch: 0,
+            worker_generation: generation,
+            causation_id: None,
+            correlation_id: None,
+            committed_at_ms: 0,
+            render: RenderTargets {
+                ui: true,
+                durable: true,
+                prompt,
+            },
+            payload: serde_json::to_value(payload).expect("payload"),
+        }
+    };
+    let mut source_done = [stamp(
+        "failed-start-source-done",
+        &source_run,
+        None,
+        EventPayload::RunState(RunState::Done),
+    )];
+    StoreHandle::append(&first, &mut source_done)
+        .await
+        .expect("finish source");
+    let source_events = StoreHandle::read(&first, &session_id, 0, 64)
+        .await
+        .expect("read source");
+    let (fork_node, fork_seq) = source_events
+        .iter()
+        .find_map(|event| {
+            let EventPayload::NodeCommitted(node) =
+                serde_json::from_value::<EventPayload>(event.payload.clone()).ok()?
+            else {
+                return None;
+            };
+            (event.run_id.as_ref() == Some(&source_run)).then_some((node.node, event.seq))
+        })
+        .expect("source node");
+    let request_json = serde_json::json!({"branch": branch_id}).to_string();
+    first
+        .create_branch(BranchCreateCommand {
+            command_id: "create-failed-start-branch".into(),
+            request_digest: blake3::hash(request_json.as_bytes()).to_hex().to_string(),
+            request_json,
+            session_id: session_id.clone(),
+            worker_generation: generation,
+            branch_id: branch_id.clone(),
+            source_branch_id: None,
+            fork_node_id: fork_node,
+            fork_seq,
+            name: None,
+            event_id: EventId::new("event-create-failed-start-branch"),
+            device_id: device_id.clone(),
+        })
+        .await
+        .expect("create branch");
+    let mut aggregate_active = stamp(
+        "failed-start-aggregate-active",
+        &run_id,
+        None,
+        EventPayload::SessionState(SessionState::ActiveRun),
+    );
+    aggregate_active.branch_id = None;
+    let mut accepted = vec![
+        stamp(
+            "failed-start-queued",
+            &run_id,
+            Some(&branch_id),
+            EventPayload::RunState(RunState::Queued),
+        ),
+        stamp(
+            "failed-start-user",
+            &run_id,
+            Some(&branch_id),
+            EventPayload::UserMessage {
+                text: "branch run that cannot start".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+        ),
+        aggregate_active,
+    ];
+    StoreHandle::append(&first, &mut accepted)
+        .await
+        .expect("append old-generation run");
+    first.close().await.expect("close first");
+
+    let recovered = SqliteStoreHandle::open(root.path()).await.expect("reopen");
+    let work = recover_interrupted_turns(&recovered, &DeviceId::new("failed-start-worker"))
+        .await
+        .expect("recover");
+    let queued = work
+        .into_iter()
+        .filter_map(|work| match work {
+            RecoveredWork::Queued(accepted) => Some(accepted),
+            RecoveredWork::Checkpoint(_) | RecoveredWork::ChildWait(_) => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        queued
+            .iter()
+            .map(|accepted| accepted.branch_id.clone())
+            .collect::<Vec<_>>(),
+        vec![Some(branch_id.clone())]
+    );
+
+    let hub = SessionHub::new(recovered.clone(), SessionHubConfig::default()).expect("hub");
+    let manager = WorkerManager::start(
+        hub.clone(),
+        WorkerDependencies {
+            provider_factory: Arc::new(FailingProviderFactory),
+            tool_factory: Arc::new(BrokerToolFactory),
+            delegation: None,
+        },
+        false,
+    );
+    let handle = manager.handle();
+    hub.install_worker_manager(handle.clone())
+        .expect("install manager");
+    for accepted in queued {
+        handle
+            .recover_queued(accepted)
+            .await
+            .expect("queue recovered turn");
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let errored = loop {
+        let events = StoreHandle::read(&recovered, &session_id, 0, 256)
+            .await
+            .expect("read journal");
+        let errored = events.iter().find_map(|envelope| {
+            (envelope.run_id.as_ref() == Some(&run_id)
+                && matches!(
+                    serde_json::from_value::<EventPayload>(envelope.payload.clone()),
+                    Ok(EventPayload::RunState(RunState::Errored { .. }))
+                ))
+            .then(|| envelope.branch_id.clone())
+        });
+        if let Some(branch) = errored {
+            break branch;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "failed start never terminalized the branch run"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    assert_eq!(errored, Some(branch_id));
+    manager.shutdown().await.expect("manager shutdown");
+    hub.shutdown().await.expect("hub shutdown");
+    recovered.close().await.expect("close recovered");
 }

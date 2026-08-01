@@ -7,7 +7,7 @@ use haider_protocol::credential::{AuthMethod, CredentialDescriptor, CredentialSt
 use haider_protocol::effect::EffectClass;
 use haider_protocol::envelope::{PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION};
 use haider_protocol::ids::CredentialAlias;
-use haider_protocol::ids::{DeviceId, EventId, ItemId, MenuId, RunId, SessionId};
+use haider_protocol::ids::{BranchId, DeviceId, EventId, ItemId, MenuId, NodeId, RunId, SessionId};
 use haider_protocol::session::{SessionMetadataV1, SessionPermissionOverridesV1};
 use haider_protocol::tool::{
     DispatchMode, ToolInventoryEntry, ToolInventorySnapshot, ToolManifest, ToolPermissionDefault,
@@ -17,11 +17,11 @@ use haider_rpc::{
     CommandId, ERROR_CODE_ALREADY_RESOLVED, ERROR_CODE_CAPABILITY_DENIED, ERROR_CODE_CURSOR_AHEAD,
     ERROR_CODE_PROVIDER_REMOVE_REFUSED, ERROR_CODE_REVISION_CONFLICT, ErrorData,
     FEATURE_ACCOUNT_LOGIN_API_V1, FEATURE_ACCOUNT_MANAGEMENT_V1, FEATURE_ACCOUNT_OAUTH_PKCE_V1,
-    FEATURE_ACCOUNT_ROTATION_V1, FEATURE_PROVIDER_CONFIGURE_V1, FEATURE_PROVIDER_MANAGEMENT_V1,
-    FEATURE_PROVIDER_MODELS_V1, FEATURE_PROVIDER_REMOVE_V1, FEATURE_SESSION_MUTATION_V1,
-    FEATURE_TURN_CONTROL_V1, FEATURE_VAULT_STAGE_V1, Hello, LifecyclePhase, MenuInput,
-    ModelDetailWire, OAuthAuthorizationWire, OAuthAvailabilityWire, OAuthFlowId,
-    OAuthFlowStatusWire, OAuthReadyRefWire, ProtocolError, ProviderActiveWire,
+    FEATURE_ACCOUNT_ROTATION_V1, FEATURE_BRANCH_CREATE_V1, FEATURE_PROVIDER_CONFIGURE_V1,
+    FEATURE_PROVIDER_MANAGEMENT_V1, FEATURE_PROVIDER_MODELS_V1, FEATURE_PROVIDER_REMOVE_V1,
+    FEATURE_SESSION_MUTATION_V1, FEATURE_TURN_CONTROL_V1, FEATURE_VAULT_STAGE_V1, Hello,
+    LifecyclePhase, MenuInput, ModelDetailWire, OAuthAuthorizationWire, OAuthAvailabilityWire,
+    OAuthFlowId, OAuthFlowStatusWire, OAuthReadyRefWire, ProtocolError, ProviderActiveWire,
     ProviderApiFamilyWire, ProviderAuthRequirementWire, ProviderAvailabilityWire,
     ProviderDefaultWire, ProviderRemoveRefusalReasonWire, ProviderSummaryWire, RequestBody,
     RequestId, ResponseBody, SecretWire, SeqRange, SessionReadResult, SessionSummary, StagePurpose,
@@ -278,10 +278,11 @@ pub fn transcript() -> Vec<WireFrame> {
         },
         WireFrame::Request {
             request_id: RequestId::new("request-submit"),
-            body: RequestBody::TurnSubmit {
+            body: RequestBody::TurnSubmitWithBranch {
                 command_id: CommandId::new("command-submit"),
                 session_id: SessionId::new("session-created"),
                 worker_generation: 7,
+                branch_id: None,
                 text: "hello".into(),
                 attachments: Vec::new(),
                 mode: DeliveryMode::Queue,
@@ -801,6 +802,86 @@ pub fn transcript() -> Vec<WireFrame> {
                     allow_writes: true,
                     allow_exec: true,
                 }),
+            },
+        },
+        // B2a append-only branch shapes. Every earlier frame stays byte-for-
+        // byte frozen; main-branch request variants remain source compatible.
+        WireFrame::Welcome(Welcome {
+            protocol: 1,
+            instance_id: "instance-branches".into(),
+            daemon_generation: 9,
+            frame_limit: TEST_FRAME_LIMIT as u32,
+            profile_id: "profile-1".into(),
+            daemon_version: "0.0.13".into(),
+            lifecycle_phase: LifecyclePhase::Ready,
+            capabilities_granted: capabilities([Capability::View, Capability::Control]),
+            features: BTreeSet::from([FEATURE_BRANCH_CREATE_V1.to_owned()]),
+        }),
+        WireFrame::Request {
+            request_id: RequestId::new("request-branch-create"),
+            body: RequestBody::BranchCreate {
+                command_id: CommandId::new("command-branch-create"),
+                session_id: SessionId::new("session-1"),
+                worker_generation: 7,
+                source_branch_id: None,
+                fork_node_id: NodeId::new("node-fork-1"),
+                fork_seq: 41,
+                name: Some("Plan B".into()),
+            },
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-branch-create"),
+            body: ResponseBody::BranchCreate {
+                session_id: SessionId::new("session-1"),
+                branch_id: BranchId::new("branch-plan-b"),
+                source_branch_id: None,
+                fork_node_id: NodeId::new("node-fork-1"),
+                fork_seq: 41,
+                created_seq: 52,
+                worker_generation: 7,
+                name: "Plan B".into(),
+            },
+        },
+        WireFrame::Request {
+            request_id: RequestId::new("request-turn-on-branch"),
+            body: RequestBody::TurnSubmitWithBranch {
+                command_id: CommandId::new("command-turn-on-branch"),
+                session_id: SessionId::new("session-1"),
+                worker_generation: 7,
+                branch_id: Some(BranchId::new("branch-plan-b")),
+                text: "continue plan B".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-turn-on-branch"),
+            body: ResponseBody::TurnSubmitOnBranch {
+                session_id: SessionId::new("session-1"),
+                run_id: RunId::new("run-plan-b"),
+                accepted_seq: 53,
+                worker_generation: 7,
+                branch_id: BranchId::new("branch-plan-b"),
+                disposition: SubmitDisposition::Started,
+            },
+        },
+        WireFrame::Request {
+            request_id: RequestId::new("request-compact-on-branch"),
+            body: RequestBody::SessionCompactOnBranch {
+                command_id: CommandId::new("command-compact-on-branch"),
+                session_id: SessionId::new("session-1"),
+                worker_generation: 7,
+                branch_id: Some(BranchId::new("branch-plan-b")),
+            },
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-compact-on-branch"),
+            body: ResponseBody::SessionCompactOnBranch {
+                session_id: SessionId::new("session-1"),
+                run_id: RunId::new("manual-compact-plan-b"),
+                accepted_seq: 60,
+                worker_generation: 7,
+                branch_id: BranchId::new("branch-plan-b"),
             },
         },
     ]

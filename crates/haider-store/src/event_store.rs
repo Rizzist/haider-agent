@@ -17,6 +17,7 @@ use crate::migrations;
 use crate::profile_lock::ProfileLock;
 use crate::{Cas, StoreResult, now_ms, store_error, to_sqlite_integer};
 use haider_protocol::agent::{AgentManifest, ChildReport};
+use haider_protocol::branch::{BranchCreated, BranchDescriptor};
 use haider_protocol::credential::CredentialDescriptor;
 use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION, envelope_weight_bytes,
@@ -24,7 +25,7 @@ use haider_protocol::envelope::{
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::history::{COMPACTION_INTENT_EXTENSION_KIND, NodeKind, TreeNode};
 use haider_protocol::ids::{
-    AgentId, ArtifactRef, DeviceId, EventId, ItemId, MenuId, NodeId, RunId, SessionId,
+    AgentId, ArtifactRef, BranchId, DeviceId, EventId, ItemId, MenuId, NodeId, RunId, SessionId,
 };
 use haider_protocol::item::{ItemEvent, TurnItem};
 use haider_protocol::menu::{Menu, MenuAnswer, MenuKind};
@@ -36,7 +37,7 @@ use rusqlite::{
     Connection, Error as SqliteError, ErrorCode as SqliteErrorCode, OptionalExtension, Transaction,
     TransactionBehavior, params,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
@@ -125,6 +126,8 @@ pub struct DelegationRecord {
     pub child_run_id: RunId,
     pub parent_session_id: SessionId,
     pub parent_run_id: RunId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_branch_id: Option<BranchId>,
     pub call_id: String,
     pub tool_item_id: ItemId,
     pub parent_agent_id: Option<AgentId>,
@@ -166,6 +169,48 @@ pub enum SessionCreateOutcome {
     IdempotentReplay { created: CreatedSession },
 }
 
+/// Secret-free coordinates for one atomic named-branch creation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchCreateCommand {
+    pub command_id: String,
+    pub request_digest: String,
+    pub request_json: String,
+    pub session_id: SessionId,
+    pub worker_generation: u64,
+    pub branch_id: BranchId,
+    pub source_branch_id: Option<BranchId>,
+    pub fork_node_id: NodeId,
+    pub fork_seq: u64,
+    pub name: Option<String>,
+    pub event_id: EventId,
+    pub device_id: DeviceId,
+}
+
+/// Stable response stored in the committed `branch.create` receipt.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CreatedBranch {
+    pub session_id: SessionId,
+    pub branch_id: BranchId,
+    pub source_branch_id: Option<BranchId>,
+    pub fork_node_id: NodeId,
+    pub fork_seq: u64,
+    pub created_seq: u64,
+    pub worker_generation: u64,
+    pub name: String,
+}
+
+/// Result of the atomic branch registry/event/receipt transaction.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BranchCreateOutcome {
+    Committed {
+        created: CreatedBranch,
+        envelope: Box<RawEnvelope>,
+    },
+    IdempotentReplay {
+        created: CreatedBranch,
+    },
+}
+
 /// Secret-free coordinates for atomically accepting a live turn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnAcceptCommand {
@@ -176,6 +221,7 @@ pub struct TurnAcceptCommand {
     pub worker_generation: u64,
     pub run_id: RunId,
     pub agent_id: Option<AgentId>,
+    pub branch_id: Option<BranchId>,
     pub text: String,
     pub attachments: Vec<AttachmentBlock>,
     pub mode: DeliveryMode,
@@ -201,6 +247,8 @@ pub struct AcceptedTurn {
     pub run_id: RunId,
     pub accepted_seq: u64,
     pub worker_generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_id: Option<BranchId>,
     pub disposition: TurnAdmissionDisposition,
 }
 
@@ -310,6 +358,8 @@ pub struct ContextCompactionReceiptResponse {
     pub run_id: RunId,
     pub accepted_seq: u64,
     pub worker_generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_id: Option<BranchId>,
 }
 
 /// Claim result for one manual context-compaction command.
@@ -773,12 +823,13 @@ impl Store {
             .execute(
                 "INSERT INTO delegations(
                     agent_id, child_session_id, child_run_id,
-                    parent_session_id, parent_run_id, call_id, tool_item_id,
+                    parent_session_id, parent_run_id, parent_branch_id,
+                    call_id, tool_item_id,
                     parent_agent_id, root_session_id, depth, task, prompt,
                     manifest_json, state, report_json, created_at_ms, updated_at_ms
                  ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                    ?13, 'spawned', NULL, ?14, ?14
+                    ?13, ?14, 'spawned', NULL, ?15, ?15
                  )",
                 params![
                     record.agent_id.as_str(),
@@ -786,6 +837,7 @@ impl Store {
                     record.child_run_id.as_str(),
                     record.parent_session_id.as_str(),
                     record.parent_run_id.as_str(),
+                    record.parent_branch_id.as_ref().map(BranchId::as_str),
                     &record.call_id,
                     record.tool_item_id.as_str(),
                     record.parent_agent_id.as_ref().map(AgentId::as_str),
@@ -1232,6 +1284,238 @@ impl Store {
         })
     }
 
+    /// Looks up a committed `branch.create` response before mutable branch,
+    /// generation, or attachment validation (R2 response-loss replay).
+    pub fn branch_create_receipt(
+        &self,
+        command_id: &str,
+        request_digest: &str,
+        request_json: &str,
+    ) -> StoreResult<Option<CreatedBranch>> {
+        validate_command_identity(command_id, request_digest, request_json)?;
+        let connection = self.connection()?;
+        lookup_command_response(
+            &connection,
+            command_id,
+            "branch.create",
+            request_digest,
+            request_json,
+            "branch-create",
+        )
+    }
+
+    /// Atomically inserts a named ref, appends its topology fact, and
+    /// finalizes the command receipt. Any late failure rolls all three back.
+    pub fn create_branch(&self, command: &BranchCreateCommand) -> StoreResult<BranchCreateOutcome> {
+        validate_command_identity(
+            &command.command_id,
+            &command.request_digest,
+            &command.request_json,
+        )?;
+        if command.worker_generation != self.worker_generation {
+            return Err(stale_generation(
+                command.worker_generation,
+                self.worker_generation,
+            ));
+        }
+        if command.branch_id.as_str().is_empty()
+            || command.fork_node_id.as_str().is_empty()
+            || command.fork_seq == 0
+            || command
+                .source_branch_id
+                .as_ref()
+                .is_some_and(|branch| branch.as_str().is_empty())
+            || command
+                .name
+                .as_ref()
+                .is_some_and(|name| name.trim().is_empty())
+        {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "branch id, fork node/sequence, source branch, and optional name must be valid",
+                false,
+            ));
+        }
+
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        if let Some(created) = lookup_command_response(
+            &transaction,
+            &command.command_id,
+            "branch.create",
+            &command.request_digest,
+            &command.request_json,
+            "branch-create",
+        )? {
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(BranchCreateOutcome::IdempotentReplay { created });
+        }
+        require_typed_session(&transaction, &command.session_id)?;
+        if branch_descriptor(&transaction, &command.session_id, &command.branch_id)?.is_some() {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "daemon-minted branch id already exists",
+                false,
+            ));
+        }
+        validate_branch_fork(
+            &transaction,
+            &command.session_id,
+            command.source_branch_id.as_ref(),
+            &command.fork_node_id,
+            command.fork_seq,
+        )?;
+
+        let now = now_ms()?;
+        claim_pending_receipt(
+            &transaction,
+            &command.command_id,
+            "branch.create",
+            &command.request_digest,
+            &command.request_json,
+            now,
+        )?;
+        let latest: i64 = transaction
+            .query_row(
+                "SELECT COALESCE(MAX(seq), 0) FROM events WHERE session_id = ?1",
+                [command.session_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(map_sqlite_error)?;
+        let created_seq = u64::try_from(latest)
+            .map_err(|_| corrupt("database contains a negative event sequence"))?
+            .checked_add(1)
+            .ok_or_else(|| corrupt("event sequence space is exhausted"))?;
+        let name = command
+            .name
+            .clone()
+            .unwrap_or_else(|| command.branch_id.as_str().to_owned());
+        let descriptor = BranchDescriptor {
+            branch_id: command.branch_id.clone(),
+            name: name.clone(),
+            source_branch_id: command.source_branch_id.clone(),
+            fork_node_id: command.fork_node_id.clone(),
+            fork_seq: command.fork_seq,
+            created_seq,
+            created_at_ms: now,
+            head_node_id: command.fork_node_id.clone(),
+            head_seq: command.fork_seq,
+        };
+        let mut envelopes = vec![unstamped_raw_command_envelope(
+            command.event_id.clone(),
+            &command.session_id,
+            None,
+            None,
+            command.device_id.clone(),
+            self.worker_generation,
+            BranchCreated {
+                branch: descriptor.clone(),
+            }
+            .to_payload_value()
+            .map_err(|error| {
+                store_error(
+                    ErrorCode::InvalidArgument,
+                    format!("cannot serialize branch-created payload: {error}"),
+                    false,
+                )
+            })?,
+            PromptRender::Omit,
+        )?];
+        append_transaction_envelopes(&transaction, &command.session_id, now, &mut envelopes)?;
+        if envelopes[0].seq != created_seq {
+            return Err(corrupt(
+                "branch-created fact sequence changed during transaction",
+            ));
+        }
+        transaction
+            .execute(
+                "INSERT INTO branches(
+                    session_id, branch_id, display_name, source_branch_id,
+                    fork_node_id, fork_seq, created_seq, created_at_ms,
+                    head_node_id, head_seq
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    command.session_id.as_str(),
+                    command.branch_id.as_str(),
+                    &name,
+                    command.source_branch_id.as_ref().map(BranchId::as_str),
+                    command.fork_node_id.as_str(),
+                    to_sqlite_integer(command.fork_seq)?,
+                    to_sqlite_integer(created_seq)?,
+                    to_sqlite_integer(now)?,
+                    command.fork_node_id.as_str(),
+                    to_sqlite_integer(command.fork_seq)?,
+                ],
+            )
+            .map_err(map_sqlite_error)?;
+        let created = CreatedBranch {
+            session_id: command.session_id.clone(),
+            branch_id: command.branch_id.clone(),
+            source_branch_id: command.source_branch_id.clone(),
+            fork_node_id: command.fork_node_id.clone(),
+            fork_seq: command.fork_seq,
+            created_seq,
+            worker_generation: self.worker_generation,
+            name,
+        };
+        finalize_command_receipt(
+            &transaction,
+            &command.command_id,
+            command.session_id.as_str(),
+            None,
+            Some(created_seq),
+            &created,
+            now,
+            "branch-create",
+        )?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(BranchCreateOutcome::Committed {
+            created,
+            envelope: Box::new(envelopes.remove(0)),
+        })
+    }
+
+    /// Reads one current named-ref descriptor. `None` remains the implicit
+    /// legacy/main branch and therefore has no row.
+    pub fn branch(
+        &self,
+        session_id: &SessionId,
+        branch_id: &BranchId,
+    ) -> StoreResult<Option<BranchDescriptor>> {
+        let connection = self.connection()?;
+        branch_descriptor(&connection, session_id, branch_id)
+    }
+
+    /// Lists named refs in immutable creation order.
+    pub fn branches(&self, session_id: &SessionId) -> StoreResult<Vec<BranchDescriptor>> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare_cached(&format!(
+                "{} WHERE session_id = ?1 ORDER BY created_seq ASC",
+                branch_select()
+            ))
+            .map_err(map_sqlite_error)?;
+        let rows = statement
+            .query_map([session_id.as_str()], stored_branch)
+            .map_err(map_sqlite_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_sqlite_error)?;
+        rows.into_iter().map(decode_branch).collect()
+    }
+
+    /// Resolves concrete named-ref descriptors from root to leaf. The
+    /// implicit main branch contributes no concrete row.
+    pub fn branch_lineage(
+        &self,
+        session_id: &SessionId,
+        branch_id: Option<&BranchId>,
+    ) -> StoreResult<Vec<BranchDescriptor>> {
+        let connection = self.connection()?;
+        branch_lineage_descriptors(&connection, session_id, branch_id)
+    }
+
     /// Looks up a committed `turn.submit` response before any worker work.
     /// Obeys the R2 receipt-idempotency law stated on
     /// [`Self::session_create_receipt`].
@@ -1309,7 +1593,7 @@ impl Store {
         require_typed_session(&transaction, &command.session_id)?;
         if latest_run_states(&transaction, &command.session_id)?
             .values()
-            .any(|(state, _)| !state.is_terminal())
+            .any(|(state, _, _)| !state.is_terminal())
         {
             return Err(store_error(
                 ErrorCode::Busy,
@@ -1336,6 +1620,7 @@ impl Store {
             unstamped_command_envelope(
                 command.running_event_id.clone(),
                 &command.session_id,
+                None,
                 Some(command.run_id.clone()),
                 command.device_id.clone(),
                 self.worker_generation,
@@ -1345,6 +1630,7 @@ impl Store {
             unstamped_command_envelope(
                 command.item_event_id.clone(),
                 &command.session_id,
+                None,
                 Some(command.run_id.clone()),
                 command.device_id.clone(),
                 self.worker_generation,
@@ -1357,6 +1643,7 @@ impl Store {
             unstamped_command_envelope(
                 command.active_event_id.clone(),
                 &command.session_id,
+                None,
                 Some(command.run_id.clone()),
                 command.device_id.clone(),
                 self.worker_generation,
@@ -1434,16 +1721,56 @@ impl Store {
             return Ok(TurnAcceptOutcome::IdempotentReplay { accepted });
         }
         require_typed_session(&transaction, &command.session_id)?;
+        let named_branch = command
+            .branch_id
+            .as_ref()
+            .map(|branch_id| {
+                branch_descriptor(&transaction, &command.session_id, branch_id)?.ok_or_else(|| {
+                    store_error(
+                        ErrorCode::InvalidArgument,
+                        format!("branch {branch_id} does not exist"),
+                        false,
+                    )
+                })
+            })
+            .transpose()?;
         let states = latest_run_states(&transaction, &command.session_id)?;
-        let same_run_steer = states.get(&command.run_id).is_some_and(|(state, _)| {
-            command.mode == DeliveryMode::Steer
-                && !state.is_terminal()
-                && *state != RunState::Cancelling
-        });
+        let same_run_steer = states
+            .get(&command.run_id)
+            .is_some_and(|(state, _, branch_id)| {
+                command.mode == DeliveryMode::Steer
+                    && !state.is_terminal()
+                    && *state != RunState::Cancelling
+                    && branch_id == &command.branch_id
+            });
         if states.contains_key(&command.run_id) && !same_run_steer {
             return Err(corrupt("daemon-minted turn run id already exists"));
         }
-        let has_active = states.values().any(|(state, _)| !state.is_terminal());
+        if !same_run_steer
+            && command.branch_id.as_ref().is_some_and(|requested_branch| {
+                states.values().any(|(state, _, branch_id)| {
+                    !state.is_terminal() && branch_id.as_ref() == Some(requested_branch)
+                })
+            })
+        {
+            // Named refs have one mutable head. Accepting a second run on the
+            // same ref before the first reaches a terminal node would commit
+            // its user node ahead of the first run's later assistant nodes,
+            // leaving no honest immutable parent order. Cross-branch work may
+            // still queue behind the session's active worker.
+            return Err(store_error(
+                ErrorCode::Busy,
+                format!(
+                    "branch {} already has a nonterminal run",
+                    command
+                        .branch_id
+                        .as_ref()
+                        .map_or("<unknown>", BranchId::as_str)
+                ),
+                true,
+            ));
+        }
+        let has_active = states.values().any(|(state, _, _)| !state.is_terminal());
         let disposition = if same_run_steer {
             // W6c activates the reserved same-run steer shape: the durable
             // user message commits here, then the manager delivers it to the
@@ -1466,12 +1793,24 @@ impl Store {
             now,
         )?;
 
-        let parent = latest_tree_head(
-            &transaction,
-            &command.session_id,
-            None,
-            command.agent_id.as_ref(),
-        )?;
+        let parent = if command.agent_id.is_none() {
+            named_branch
+                .as_ref()
+                .map(|branch| branch.head_node_id.clone())
+                .or(latest_tree_head(
+                    &transaction,
+                    &command.session_id,
+                    None,
+                    None,
+                )?)
+        } else {
+            latest_tree_head(
+                &transaction,
+                &command.session_id,
+                command.branch_id.as_ref(),
+                command.agent_id.as_ref(),
+            )?
+        };
         let user_node = TreeNode {
             node: NodeId::new(format!("node-{}", command.user_event_id)),
             parent,
@@ -1485,6 +1824,7 @@ impl Store {
                 unstamped_command_envelope(
                     command.user_event_id.clone(),
                     &command.session_id,
+                    command.branch_id.clone(),
                     Some(command.run_id.clone()),
                     command.device_id.clone(),
                     self.worker_generation,
@@ -1498,6 +1838,7 @@ impl Store {
                 unstamped_command_envelope(
                     EventId::new(format!("tree-{}", command.user_event_id)),
                     &command.session_id,
+                    command.branch_id.clone(),
                     Some(command.run_id.clone()),
                     command.device_id.clone(),
                     self.worker_generation,
@@ -1510,6 +1851,7 @@ impl Store {
                 unstamped_command_envelope(
                     command.queued_event_id.clone(),
                     &command.session_id,
+                    command.branch_id.clone(),
                     Some(command.run_id.clone()),
                     command.device_id.clone(),
                     self.worker_generation,
@@ -1519,6 +1861,7 @@ impl Store {
                 unstamped_command_envelope(
                     command.user_event_id.clone(),
                     &command.session_id,
+                    command.branch_id.clone(),
                     Some(command.run_id.clone()),
                     command.device_id.clone(),
                     self.worker_generation,
@@ -1532,6 +1875,7 @@ impl Store {
                 unstamped_command_envelope(
                     EventId::new(format!("tree-{}", command.user_event_id)),
                     &command.session_id,
+                    command.branch_id.clone(),
                     Some(command.run_id.clone()),
                     command.device_id.clone(),
                     self.worker_generation,
@@ -1544,6 +1888,7 @@ impl Store {
             envelopes.push(unstamped_command_envelope(
                 command.active_event_id.clone(),
                 &command.session_id,
+                None,
                 Some(command.run_id.clone()),
                 command.device_id.clone(),
                 self.worker_generation,
@@ -1565,6 +1910,7 @@ impl Store {
             run_id: command.run_id.clone(),
             accepted_seq,
             worker_generation: self.worker_generation,
+            branch_id: command.branch_id.clone(),
             disposition,
         };
         finalize_command_receipt(
@@ -1633,7 +1979,7 @@ impl Store {
         }
         require_session(&transaction, &command.session_id)?;
         let states = latest_run_states(&transaction, &command.session_id)?;
-        let Some((state, state_seq)) = states.get(&command.run_id) else {
+        let Some((state, state_seq, branch_id)) = states.get(&command.run_id) else {
             return Err(store_error(
                 ErrorCode::RunNotActive,
                 format!(
@@ -1677,6 +2023,7 @@ impl Store {
             let mut envelopes = vec![unstamped_command_envelope(
                 command.cancelling_event_id.clone(),
                 &command.session_id,
+                branch_id.clone(),
                 Some(command.run_id.clone()),
                 command.device_id.clone(),
                 self.worker_generation,
@@ -2442,7 +2789,7 @@ impl Store {
             .map_err(map_sqlite_error)?;
         require_session(&transaction, &session_id)?;
         let states = latest_run_states(&transaction, &session_id)?;
-        if states.values().any(|(state, _)| !state.is_terminal()) {
+        if states.values().any(|(state, _, _)| !state.is_terminal()) {
             transaction.commit().map_err(map_sqlite_error)?;
             return Ok(false);
         }
@@ -2977,10 +3324,12 @@ fn require_typed_session(connection: &Connection, session_id: &SessionId) -> Sto
     Ok(())
 }
 
+type DurableRunHead = (RunState, u64, Option<BranchId>);
+
 fn latest_run_states(
     connection: &Connection,
     session_id: &SessionId,
-) -> StoreResult<HashMap<RunId, (RunState, u64)>> {
+) -> StoreResult<HashMap<RunId, DurableRunHead>> {
     let mut statement = connection
         .prepare_cached(
             "SELECT seq, envelope_json FROM events
@@ -3005,7 +3354,15 @@ fn latest_run_states(
         if let Ok(EventPayload::RunState(state)) =
             serde_json::from_value::<EventPayload>(envelope.payload)
         {
-            states.insert(run_id, (state, seq));
+            let branch_id = envelope.branch_id;
+            if let Some((_, _, accepted_branch)) = states.get(&run_id)
+                && accepted_branch != &branch_id
+            {
+                return Err(corrupt(format!(
+                    "run {run_id} crosses branch scopes in durable history"
+                )));
+            }
+            states.insert(run_id, (state, seq, branch_id));
         }
     }
     Ok(states)
@@ -3046,13 +3403,45 @@ fn latest_tree_head(
     Ok(None)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn unstamped_command_envelope(
     event_id: EventId,
     session_id: &SessionId,
+    branch_id: Option<BranchId>,
     run_id: Option<RunId>,
     device_id: DeviceId,
     worker_generation: u64,
     payload: EventPayload,
+    prompt: PromptRender,
+) -> StoreResult<RawEnvelope> {
+    let payload = serde_json::to_value(payload).map_err(|error| {
+        store_error(
+            ErrorCode::InvalidArgument,
+            format!("cannot serialize command envelope payload: {error}"),
+            false,
+        )
+    })?;
+    unstamped_raw_command_envelope(
+        event_id,
+        session_id,
+        branch_id,
+        run_id,
+        device_id,
+        worker_generation,
+        payload,
+        prompt,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn unstamped_raw_command_envelope(
+    event_id: EventId,
+    session_id: &SessionId,
+    branch_id: Option<BranchId>,
+    run_id: Option<RunId>,
+    device_id: DeviceId,
+    worker_generation: u64,
+    payload: serde_json::Value,
     prompt: PromptRender,
 ) -> StoreResult<RawEnvelope> {
     Ok(EventEnvelope {
@@ -3060,7 +3449,7 @@ fn unstamped_command_envelope(
         event_id,
         seq: 0,
         session_id: session_id.clone(),
-        branch_id: None,
+        branch_id,
         run_id,
         agent_id: None,
         device_id,
@@ -3074,13 +3463,7 @@ fn unstamped_command_envelope(
             durable: true,
             prompt,
         },
-        payload: serde_json::to_value(payload).map_err(|error| {
-            store_error(
-                ErrorCode::InvalidArgument,
-                format!("cannot serialize command envelope payload: {error}"),
-                false,
-            )
-        })?,
+        payload,
     })
 }
 
@@ -3131,6 +3514,8 @@ fn append_transaction_envelopes(
             ])
             .map_err(map_sqlite_error)?;
     }
+    drop(insert);
+    update_branch_heads(transaction, envelopes)?;
     Ok(())
 }
 
@@ -3944,6 +4329,7 @@ fn append_envelopes(
             stamped.push(envelope);
         }
     }
+    update_branch_heads(&transaction, &stamped)?;
     transaction.commit().map_err(map_sqlite_error)?;
     for (envelope, stamped) in envelopes.iter_mut().zip(stamped) {
         *envelope = stamped;
@@ -3984,16 +4370,28 @@ fn validate_worker_run_transitions(
         {
             // A compaction intent is the accepted prefix of the daemon's
             // internal job kind. It deliberately has no synthetic user row.
-            states.insert(run_id.clone(), (RunState::Compacting, 0));
+            states.insert(
+                run_id.clone(),
+                (RunState::Compacting, 0, envelope.branch_id.clone()),
+            );
             continue;
         }
-        let Some((durable, _)) = states.get(run_id).cloned() else {
+        let Some((durable, _, accepted_branch)) = states.get(run_id).cloned() else {
             return Err(store_error(
                 ErrorCode::RunNotActive,
                 format!("worker run {run_id} has no durable accepted state"),
                 false,
             ));
         };
+        if envelope.branch_id != accepted_branch
+            && !matches!(&payload, EventPayload::SessionState(_))
+        {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                format!("worker run {run_id} emitted on a different branch"),
+                false,
+            ));
+        }
         if durable.is_terminal() {
             return Err(store_error(
                 ErrorCode::RunNotActive,
@@ -4009,7 +4407,7 @@ fn validate_worker_run_transitions(
                     false,
                 ));
             }
-            states.insert(run_id.clone(), (next, 0));
+            states.insert(run_id.clone(), (next, 0, accepted_branch));
         }
     }
     Ok(())
@@ -4033,12 +4431,335 @@ impl Cas for Store {
     }
 }
 
+struct StoredBranch {
+    branch_id: String,
+    name: String,
+    source_branch_id: Option<String>,
+    fork_node_id: String,
+    fork_seq: i64,
+    created_seq: i64,
+    created_at_ms: i64,
+    head_node_id: String,
+    head_seq: i64,
+}
+
+fn branch_select() -> &'static str {
+    "SELECT branch_id, display_name, source_branch_id, fork_node_id,
+            fork_seq, created_seq, created_at_ms, head_node_id, head_seq
+     FROM branches"
+}
+
+fn stored_branch(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredBranch> {
+    Ok(StoredBranch {
+        branch_id: row.get(0)?,
+        name: row.get(1)?,
+        source_branch_id: row.get(2)?,
+        fork_node_id: row.get(3)?,
+        fork_seq: row.get(4)?,
+        created_seq: row.get(5)?,
+        created_at_ms: row.get(6)?,
+        head_node_id: row.get(7)?,
+        head_seq: row.get(8)?,
+    })
+}
+
+fn decode_branch(row: StoredBranch) -> StoreResult<BranchDescriptor> {
+    Ok(BranchDescriptor {
+        branch_id: BranchId::new(row.branch_id),
+        name: row.name,
+        source_branch_id: row.source_branch_id.map(BranchId::new),
+        fork_node_id: NodeId::new(row.fork_node_id),
+        fork_seq: sql_u64(row.fork_seq).map_err(map_sqlite_error)?,
+        created_seq: sql_u64(row.created_seq).map_err(map_sqlite_error)?,
+        created_at_ms: sql_u64(row.created_at_ms).map_err(map_sqlite_error)?,
+        head_node_id: NodeId::new(row.head_node_id),
+        head_seq: sql_u64(row.head_seq).map_err(map_sqlite_error)?,
+    })
+}
+
+fn branch_descriptor(
+    connection: &Connection,
+    session_id: &SessionId,
+    branch_id: &BranchId,
+) -> StoreResult<Option<BranchDescriptor>> {
+    let sql = format!(
+        "{} WHERE session_id = ?1 AND branch_id = ?2",
+        branch_select()
+    );
+    connection
+        .query_row(
+            &sql,
+            params![session_id.as_str(), branch_id.as_str()],
+            stored_branch,
+        )
+        .optional()
+        .map_err(map_sqlite_error)?
+        .map(decode_branch)
+        .transpose()
+}
+
+fn branch_lineage_descriptors(
+    connection: &Connection,
+    session_id: &SessionId,
+    branch_id: Option<&BranchId>,
+) -> StoreResult<Vec<BranchDescriptor>> {
+    let Some(mut current) = branch_id.cloned() else {
+        return Ok(Vec::new());
+    };
+    let mut reverse = Vec::new();
+    let mut seen = HashSet::new();
+    loop {
+        if !seen.insert(current.clone()) {
+            return Err(corrupt(format!(
+                "branch registry contains a lineage cycle at {current}"
+            )));
+        }
+        let descriptor = branch_descriptor(connection, session_id, &current)?.ok_or_else(|| {
+            store_error(
+                ErrorCode::InvalidArgument,
+                format!("branch {current} does not exist in session {session_id}"),
+                false,
+            )
+        })?;
+        let source = descriptor.source_branch_id.clone();
+        reverse.push(descriptor);
+        let Some(source) = source else {
+            break;
+        };
+        current = source;
+    }
+    reverse.reverse();
+    Ok(reverse)
+}
+
+fn branch_lineage_scopes(
+    connection: &Connection,
+    session_id: &SessionId,
+    branch_id: Option<&BranchId>,
+) -> StoreResult<HashMap<Option<BranchId>, u64>> {
+    let lineage = branch_lineage_descriptors(connection, session_id, branch_id)?;
+    let mut scopes = HashMap::new();
+    let mut ceiling = u64::MAX;
+    for descriptor in lineage.iter().rev() {
+        scopes.insert(Some(descriptor.branch_id.clone()), ceiling);
+        ceiling = ceiling.min(descriptor.fork_seq);
+    }
+    scopes.insert(None, ceiling);
+    Ok(scopes)
+}
+
+fn validate_branch_fork(
+    connection: &Connection,
+    session_id: &SessionId,
+    source_branch_id: Option<&BranchId>,
+    fork_node_id: &NodeId,
+    fork_seq: u64,
+) -> StoreResult<()> {
+    let scopes = branch_lineage_scopes(connection, session_id, source_branch_id)?;
+    let mut statement = connection
+        .prepare_cached(
+            "SELECT seq, envelope_json FROM events
+             WHERE session_id = ?1 ORDER BY seq ASC",
+        )
+        .map_err(map_sqlite_error)?;
+    let mut rows = statement
+        .query([session_id.as_str()])
+        .map_err(map_sqlite_error)?;
+    let mut nodes = HashMap::<NodeId, (TreeNode, u64, Option<RunId>, Option<BranchId>)>::new();
+    let mut run_states = HashMap::<RunId, RunState>::new();
+    let mut candidate = None;
+    while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+        let seq = sql_u64(row.get(0).map_err(map_sqlite_error)?).map_err(map_sqlite_error)?;
+        let json: String = row.get(1).map_err(map_sqlite_error)?;
+        let envelope: RawEnvelope = serde_json::from_str(&json).map_err(|error| {
+            corrupt(format!(
+                "invalid envelope JSON for session {session_id}, seq {seq}: {error}"
+            ))
+        })?;
+        let admitted = envelope.agent_id.is_none()
+            && scopes
+                .get(&envelope.branch_id)
+                .is_some_and(|ceiling| seq <= *ceiling);
+        if !admitted {
+            continue;
+        }
+        let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone()) else {
+            continue;
+        };
+        match payload {
+            EventPayload::NodeCommitted(node) => {
+                if nodes
+                    .insert(
+                        node.node.clone(),
+                        (
+                            node.clone(),
+                            seq,
+                            envelope.run_id.clone(),
+                            envelope.branch_id.clone(),
+                        ),
+                    )
+                    .is_some()
+                {
+                    return Err(corrupt(format!(
+                        "branch lineage contains duplicate node {}",
+                        node.node
+                    )));
+                }
+                if seq == fork_seq && node.node == *fork_node_id {
+                    candidate = Some((node, envelope.run_id));
+                }
+            }
+            EventPayload::RunState(state) => {
+                if let Some(run_id) = envelope.run_id {
+                    run_states.insert(run_id, state);
+                }
+            }
+            _ => {}
+        }
+    }
+    let (candidate_node, candidate_run) = candidate.ok_or_else(|| {
+        store_error(
+            ErrorCode::InvalidArgument,
+            "fork node and sequence do not name one admitted source-lineage node",
+            false,
+        )
+    })?;
+
+    let head = if let Some(source_branch_id) = source_branch_id {
+        let descriptor =
+            branch_descriptor(connection, session_id, source_branch_id)?.ok_or_else(|| {
+                store_error(
+                    ErrorCode::InvalidArgument,
+                    "source branch does not exist",
+                    false,
+                )
+            })?;
+        let record = nodes.get(&descriptor.head_node_id).ok_or_else(|| {
+            corrupt(format!(
+                "branch {} head node {} is outside its declared lineage",
+                descriptor.branch_id, descriptor.head_node_id
+            ))
+        })?;
+        if record.1 != descriptor.head_seq {
+            return Err(corrupt(format!(
+                "branch {} head node/sequence disagree",
+                descriptor.branch_id
+            )));
+        }
+        descriptor.head_node_id
+    } else {
+        nodes
+            .values()
+            .filter(|(_, _, _, branch_id)| branch_id.is_none())
+            .max_by_key(|(_, seq, _, _)| *seq)
+            .map(|(node, _, _, _)| node.node.clone())
+            .ok_or_else(|| {
+                store_error(
+                    ErrorCode::InvalidArgument,
+                    "legacy/main branch has no history node to fork",
+                    false,
+                )
+            })?
+    };
+
+    let mut current = head;
+    let mut seen = HashSet::new();
+    let mut on_ancestry = false;
+    loop {
+        if !seen.insert(current.clone()) {
+            return Err(corrupt(format!(
+                "history tree contains a cycle at {current}"
+            )));
+        }
+        let (node, seq, _, _) = nodes.get(&current).ok_or_else(|| {
+            corrupt(format!(
+                "history tree references missing lineage node {current}"
+            ))
+        })?;
+        if node.node == *fork_node_id && *seq == fork_seq {
+            on_ancestry = true;
+            break;
+        }
+        let Some(parent) = node.parent.clone() else {
+            break;
+        };
+        current = parent;
+    }
+    if !on_ancestry {
+        return Err(store_error(
+            ErrorCode::InvalidArgument,
+            "fork coordinate is not on the source branch's declared ancestry",
+            false,
+        ));
+    }
+
+    let idle_compaction = matches!(
+        candidate_node.kind,
+        NodeKind::Compaction {
+            resume_cause: haider_protocol::history::CompactionResume::ManualIdle,
+            ..
+        }
+    );
+    let terminal_turn = candidate_run
+        .as_ref()
+        .and_then(|run_id| run_states.get(run_id))
+        .is_some_and(RunState::is_terminal);
+    if !idle_compaction && !terminal_turn {
+        return Err(store_error(
+            ErrorCode::InvalidArgument,
+            "branches may fork only from terminal turns or idle compaction nodes",
+            false,
+        ));
+    }
+    Ok(())
+}
+
+fn update_branch_heads(
+    transaction: &Transaction<'_>,
+    envelopes: &[RawEnvelope],
+) -> StoreResult<()> {
+    for envelope in envelopes {
+        let Some(branch_id) = envelope.branch_id.as_ref() else {
+            continue;
+        };
+        if envelope.agent_id.is_some() {
+            continue;
+        }
+        let Ok(EventPayload::NodeCommitted(node)) =
+            serde_json::from_value::<EventPayload>(envelope.payload.clone())
+        else {
+            continue;
+        };
+        let updated = transaction
+            .execute(
+                "UPDATE branches SET head_node_id = ?3, head_seq = ?4
+                 WHERE session_id = ?1 AND branch_id = ?2",
+                params![
+                    envelope.session_id.as_str(),
+                    branch_id.as_str(),
+                    node.node.as_str(),
+                    to_sqlite_integer(envelope.seq)?,
+                ],
+            )
+            .map_err(map_sqlite_error)?;
+        if updated != 1 {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                format!("branch {branch_id} is not registered for node commit"),
+                false,
+            ));
+        }
+    }
+    Ok(())
+}
+
 struct StoredDelegation {
     agent_id: String,
     child_session_id: String,
     child_run_id: String,
     parent_session_id: String,
     parent_run_id: String,
+    parent_branch_id: Option<String>,
     call_id: String,
     tool_item_id: String,
     parent_agent_id: Option<String>,
@@ -4053,7 +4774,7 @@ struct StoredDelegation {
 
 fn delegation_select() -> &'static str {
     "SELECT agent_id, child_session_id, child_run_id, parent_session_id,
-            parent_run_id, call_id, tool_item_id, parent_agent_id,
+            parent_run_id, parent_branch_id, call_id, tool_item_id, parent_agent_id,
             root_session_id, depth, task, prompt, manifest_json, state,
             report_json
      FROM delegations"
@@ -4066,16 +4787,17 @@ fn stored_delegation(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredDelegati
         child_run_id: row.get(2)?,
         parent_session_id: row.get(3)?,
         parent_run_id: row.get(4)?,
-        call_id: row.get(5)?,
-        tool_item_id: row.get(6)?,
-        parent_agent_id: row.get(7)?,
-        root_session_id: row.get(8)?,
-        depth: row.get(9)?,
-        task: row.get(10)?,
-        prompt: row.get(11)?,
-        manifest_json: row.get(12)?,
-        state: row.get(13)?,
-        report_json: row.get(14)?,
+        parent_branch_id: row.get(5)?,
+        call_id: row.get(6)?,
+        tool_item_id: row.get(7)?,
+        parent_agent_id: row.get(8)?,
+        root_session_id: row.get(9)?,
+        depth: row.get(10)?,
+        task: row.get(11)?,
+        prompt: row.get(12)?,
+        manifest_json: row.get(13)?,
+        state: row.get(14)?,
+        report_json: row.get(15)?,
     })
 }
 
@@ -4104,6 +4826,7 @@ fn decode_delegation(row: StoredDelegation) -> StoreResult<DelegationRecord> {
         child_run_id: RunId::new(row.child_run_id),
         parent_session_id: SessionId::new(row.parent_session_id),
         parent_run_id: RunId::new(row.parent_run_id),
+        parent_branch_id: row.parent_branch_id.map(BranchId::new),
         call_id: row.call_id,
         tool_item_id: ItemId::new(row.tool_item_id),
         parent_agent_id: row.parent_agent_id.map(AgentId::new),
@@ -4197,6 +4920,7 @@ fn require_same_delegation_identity(
         && existing.child_run_id == requested.child_run_id
         && existing.parent_session_id == requested.parent_session_id
         && existing.parent_run_id == requested.parent_run_id
+        && existing.parent_branch_id == requested.parent_branch_id
         && existing.call_id == requested.call_id
         && existing.tool_item_id == requested.tool_item_id
         && existing.parent_agent_id == requested.parent_agent_id

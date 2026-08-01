@@ -4,6 +4,7 @@
 use crate::StoreHandle;
 use async_trait::async_trait;
 use haider_protocol::EventPayload;
+use haider_protocol::branch::{BranchCreated, BranchDescriptor};
 use haider_protocol::envelope::{PromptRender, RawEnvelope};
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::history::{CompactionIntent, CompactionResume, NodeKind, TreeNode};
@@ -95,7 +96,19 @@ impl PromptHistoryCompiler {
         current_run: &RunId,
     ) -> Result<Vec<Message>, HaiderError> {
         let envelopes = read_all(store, session_id).await?;
-        let tree = TreeProjection::build(&envelopes, branch_id, agent_id)?;
+        if legacy_journal_only(&envelopes, branch_id, agent_id) {
+            return render_journal(
+                &envelopes,
+                &envelopes,
+                branch_id,
+                agent_id,
+                Some(current_run),
+                true,
+            )
+            .map(|rendered| rendered.messages);
+        }
+        let lineage = ResolvedLineage::load(store, session_id, branch_id).await?;
+        let tree = TreeProjection::build(&envelopes, &lineage, agent_id)?;
         let Some(ancestry) = tree.ancestry_for_run(current_run)? else {
             // Upgrade compatibility: a session written before tree activation
             // keeps the exact journal projection until its first node exists.
@@ -113,7 +126,6 @@ impl PromptHistoryCompiler {
             &envelopes,
             &ancestry,
             artifacts,
-            branch_id,
             agent_id,
             Some(current_run),
         )
@@ -130,23 +142,18 @@ impl PromptHistoryCompiler {
         agent_id: Option<&AgentId>,
     ) -> Result<Vec<Message>, HaiderError> {
         let envelopes = read_all(store, session_id).await?;
-        let tree = TreeProjection::build(&envelopes, branch_id, agent_id)?;
-        let ancestry = tree.latest_ancestry()?.ok_or_else(|| {
-            HaiderError::new(
-                ErrorCode::InvalidArgument,
-                "there is no durable history to compact",
-                false,
-            )
-        })?;
-        compile_ancestry(
-            &envelopes,
-            &ancestry,
-            Some(artifacts),
-            branch_id,
-            agent_id,
-            None,
-        )
-        .await
+        let lineage = ResolvedLineage::load(store, session_id, branch_id).await?;
+        let tree = TreeProjection::build(&envelopes, &lineage, agent_id)?;
+        let ancestry = tree
+            .latest_ancestry(lineage.head.as_ref())?
+            .ok_or_else(|| {
+                HaiderError::new(
+                    ErrorCode::InvalidArgument,
+                    "there is no durable history to compact",
+                    false,
+                )
+            })?;
+        compile_ancestry(&envelopes, &ancestry, Some(artifacts), agent_id, None).await
     }
 
     /// Returns the latest committed tree head in one branch/agent scope.
@@ -158,15 +165,14 @@ impl PromptHistoryCompiler {
         agent_id: Option<&AgentId>,
     ) -> Result<Option<NodeId>, HaiderError> {
         let envelopes = read_all(store, session_id).await?;
-        Ok(envelopes.iter().rev().find_map(|envelope| {
-            if !scoped(envelope, branch_id, agent_id) {
-                return None;
-            }
-            match serde_json::from_value::<EventPayload>(envelope.payload.clone()) {
-                Ok(EventPayload::NodeCommitted(node)) => Some(node.node),
-                _ => None,
-            }
-        }))
+        if legacy_journal_only(&envelopes, branch_id, agent_id) {
+            return Ok(None);
+        }
+        let lineage = ResolvedLineage::load(store, session_id, branch_id).await?;
+        let tree = TreeProjection::build(&envelopes, &lineage, agent_id)?;
+        Ok(tree
+            .latest_ancestry(lineage.head.as_ref())?
+            .and_then(|ancestry| ancestry.last().map(|entry| entry.node.node.clone())))
     }
 
     /// Plans the largest safe prefix preceding `current_run`. The caller must
@@ -181,7 +187,8 @@ impl PromptHistoryCompiler {
         resume_cause: CompactionResume,
     ) -> Result<CompactionIntent, HaiderError> {
         let envelopes = read_all(store, session_id).await?;
-        let tree = TreeProjection::build(&envelopes, branch_id, agent_id)?;
+        let lineage = ResolvedLineage::load(store, session_id, branch_id).await?;
+        let tree = TreeProjection::build(&envelopes, &lineage, agent_id)?;
         let ancestry = tree.ancestry_for_run(current_run)?.ok_or_else(|| {
             corrupt(format!(
                 "cannot compact run {current_run} without a durable tree head"
@@ -215,14 +222,17 @@ impl PromptHistoryCompiler {
         operation_id: String,
     ) -> Result<CompactionIntent, HaiderError> {
         let envelopes = read_all(store, session_id).await?;
-        let tree = TreeProjection::build(&envelopes, branch_id, agent_id)?;
-        let ancestry = tree.latest_ancestry()?.ok_or_else(|| {
-            HaiderError::new(
-                ErrorCode::InvalidArgument,
-                "there is no durable history to compact",
-                false,
-            )
-        })?;
+        let lineage = ResolvedLineage::load(store, session_id, branch_id).await?;
+        let tree = TreeProjection::build(&envelopes, &lineage, agent_id)?;
+        let ancestry = tree
+            .latest_ancestry(lineage.head.as_ref())?
+            .ok_or_else(|| {
+                HaiderError::new(
+                    ErrorCode::InvalidArgument,
+                    "there is no durable history to compact",
+                    false,
+                )
+            })?;
         Ok(CompactionIntent {
             operation_id,
             covers_from: ancestry[0].node.node.clone(),
@@ -235,12 +245,106 @@ impl PromptHistoryCompiler {
     }
 }
 
+struct LineageScope {
+    branch_id: Option<BranchId>,
+    through_seq: u64,
+}
+
+struct ResolvedLineage {
+    scopes: Vec<LineageScope>,
+    head: Option<(NodeId, u64)>,
+}
+
+impl ResolvedLineage {
+    async fn load(
+        store: &dyn StoreHandle,
+        session_id: &SessionId,
+        branch_id: Option<&BranchId>,
+    ) -> Result<Self, HaiderError> {
+        let descriptors = store.branch_lineage(session_id, branch_id).await?;
+        let Some(requested) = branch_id else {
+            if !descriptors.is_empty() {
+                return Err(corrupt(
+                    "implicit main branch returned concrete lineage rows",
+                ));
+            }
+            return Ok(Self {
+                scopes: vec![LineageScope {
+                    branch_id: None,
+                    through_seq: u64::MAX,
+                }],
+                head: None,
+            });
+        };
+        let leaf = descriptors.last().ok_or_else(|| {
+            HaiderError::new(
+                ErrorCode::InvalidArgument,
+                format!("branch {requested} does not exist"),
+                false,
+            )
+        })?;
+        if leaf.branch_id != *requested {
+            return Err(corrupt(format!(
+                "branch lineage leaf {} does not match requested {requested}",
+                leaf.branch_id
+            )));
+        }
+        validate_descriptor_chain(&descriptors)?;
+        let mut scopes = Vec::with_capacity(descriptors.len() + 1);
+        let mut ceiling = u64::MAX;
+        let mut concrete = Vec::with_capacity(descriptors.len());
+        for descriptor in descriptors.iter().rev() {
+            concrete.push(LineageScope {
+                branch_id: Some(descriptor.branch_id.clone()),
+                through_seq: ceiling,
+            });
+            ceiling = ceiling.min(descriptor.fork_seq);
+        }
+        scopes.push(LineageScope {
+            branch_id: None,
+            through_seq: ceiling,
+        });
+        concrete.reverse();
+        scopes.extend(concrete);
+        Ok(Self {
+            scopes,
+            head: Some((leaf.head_node_id.clone(), leaf.head_seq)),
+        })
+    }
+
+    fn admits(&self, branch_id: Option<&BranchId>, seq: u64) -> bool {
+        self.scopes
+            .iter()
+            .any(|scope| scope.branch_id.as_ref() == branch_id && seq <= scope.through_seq)
+    }
+}
+
+fn validate_descriptor_chain(descriptors: &[BranchDescriptor]) -> Result<(), HaiderError> {
+    let mut expected_source: Option<&BranchId> = None;
+    let mut seen = HashSet::new();
+    for descriptor in descriptors {
+        if descriptor.source_branch_id.as_ref() != expected_source
+            || descriptor.fork_seq == 0
+            || descriptor.created_seq == 0
+            || descriptor.head_seq == 0
+            || descriptor.fork_node_id.as_str().is_empty()
+            || descriptor.head_node_id.as_str().is_empty()
+            || !seen.insert(descriptor.branch_id.clone())
+        {
+            return Err(corrupt("branch registry contains an invalid lineage chain"));
+        }
+        expected_source = Some(&descriptor.branch_id);
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 struct TreeEntry {
     node: TreeNode,
     seq: u64,
     fragment_after: u64,
     run_id: Option<RunId>,
+    owner_branch: Option<BranchId>,
 }
 
 struct TreeProjection {
@@ -251,14 +355,16 @@ struct TreeProjection {
 impl TreeProjection {
     fn build(
         envelopes: &[RawEnvelope],
-        branch_id: Option<&BranchId>,
+        lineage: &ResolvedLineage,
         agent_id: Option<&AgentId>,
     ) -> Result<Self, HaiderError> {
         let mut ordered = Vec::new();
         let mut by_id = HashMap::new();
-        let mut previous_node_seq = 0;
+        let mut previous_node_seq = HashMap::<Option<BranchId>, u64>::new();
         for envelope in envelopes {
-            if !scoped(envelope, branch_id, agent_id) {
+            if envelope.agent_id.as_ref() != agent_id
+                || !lineage.admits(envelope.branch_id.as_ref(), envelope.seq)
+            {
                 continue;
             }
             let Ok(EventPayload::NodeCommitted(node)) =
@@ -274,13 +380,16 @@ impl TreeProjection {
             }
             let index = ordered.len();
             by_id.insert(node.node.clone(), index);
+            let owner_branch = envelope.branch_id.clone();
+            let fragment_after = previous_node_seq.get(&owner_branch).copied().unwrap_or(0);
             ordered.push(TreeEntry {
                 node,
                 seq: envelope.seq,
-                fragment_after: previous_node_seq,
+                fragment_after,
                 run_id: envelope.run_id.clone(),
+                owner_branch: owner_branch.clone(),
             });
-            previous_node_seq = envelope.seq;
+            previous_node_seq.insert(owner_branch, envelope.seq);
         }
         Ok(Self { ordered, by_id })
     }
@@ -298,8 +407,23 @@ impl TreeProjection {
         self.ancestry_from(index).map(Some)
     }
 
-    fn latest_ancestry(&self) -> Result<Option<Vec<TreeEntry>>, HaiderError> {
-        let Some(index) = self.ordered.len().checked_sub(1) else {
+    fn latest_ancestry(
+        &self,
+        head: Option<&(NodeId, u64)>,
+    ) -> Result<Option<Vec<TreeEntry>>, HaiderError> {
+        let index = if let Some((head_node, head_seq)) = head {
+            let index = *self.by_id.get(head_node).ok_or_else(|| {
+                corrupt(format!("branch head references missing node {head_node}"))
+            })?;
+            if self.ordered[index].seq != *head_seq {
+                return Err(corrupt(format!(
+                    "branch head node {head_node} disagrees with sequence {head_seq}"
+                )));
+            }
+            index
+        } else if let Some(index) = self.ordered.len().checked_sub(1) {
+            index
+        } else {
             return Ok(None);
         };
         self.ancestry_from(index).map(Some)
@@ -448,7 +572,6 @@ async fn compile_ancestry(
     envelopes: &[RawEnvelope],
     ancestry: &[TreeEntry],
     artifacts: Option<&dyn ArtifactReader>,
-    branch_id: Option<&BranchId>,
     agent_id: Option<&AgentId>,
     current_run: Option<&RunId>,
 ) -> Result<Vec<Message>, HaiderError> {
@@ -456,18 +579,21 @@ async fn compile_ancestry(
     let mut messages = Vec::new();
     let mut current_user_seen = false;
     let mut verbatim = Vec::new();
+    let mut verbatim_owner = None::<Option<BranchId>>;
 
     for (index, entry) in ancestry.iter().enumerate() {
         if let Some(compaction) = plan.summary_at.get(&index) {
-            flush_verbatim(
-                &mut verbatim,
-                envelopes,
-                branch_id,
-                agent_id,
-                current_run,
-                &mut current_user_seen,
-                &mut messages,
-            )?;
+            if let Some(owner) = verbatim_owner.take() {
+                flush_verbatim(
+                    &mut verbatim,
+                    envelopes,
+                    owner.as_ref(),
+                    agent_id,
+                    current_run,
+                    &mut current_user_seen,
+                    &mut messages,
+                )?;
+            }
             let reader = artifacts.ok_or_else(|| {
                 corrupt(format!(
                     "compaction node {} requires artifact {} but no artifact reader was supplied",
@@ -495,26 +621,42 @@ async fn compile_ancestry(
         if plan.covered.contains(&index) || matches!(entry.node.kind, NodeKind::Compaction { .. }) {
             continue;
         }
+        if verbatim_owner.as_ref() != Some(&entry.owner_branch) {
+            if let Some(owner) = verbatim_owner.take() {
+                flush_verbatim(
+                    &mut verbatim,
+                    envelopes,
+                    owner.as_ref(),
+                    agent_id,
+                    current_run,
+                    &mut current_user_seen,
+                    &mut messages,
+                )?;
+            }
+            verbatim_owner = Some(entry.owner_branch.clone());
+        }
         verbatim.extend(
             envelopes
                 .iter()
                 .filter(|envelope| {
-                    scoped(envelope, branch_id, agent_id)
+                    scoped(envelope, entry.owner_branch.as_ref(), agent_id)
                         && envelope.seq > entry.fragment_after
                         && envelope.seq <= entry.seq
                 })
                 .cloned(),
         );
     }
-    flush_verbatim(
-        &mut verbatim,
-        envelopes,
-        branch_id,
-        agent_id,
-        current_run,
-        &mut current_user_seen,
-        &mut messages,
-    )?;
+    if let Some(owner) = verbatim_owner {
+        flush_verbatim(
+            &mut verbatim,
+            envelopes,
+            owner.as_ref(),
+            agent_id,
+            current_run,
+            &mut current_user_seen,
+            &mut messages,
+        )?;
+    }
     if let Some(current_run) = current_run
         && !current_user_seen
     {
@@ -675,6 +817,36 @@ async fn read_all(
         envelopes.extend(page);
     }
     Ok(envelopes)
+}
+
+fn legacy_journal_only(
+    envelopes: &[RawEnvelope],
+    branch_id: Option<&BranchId>,
+    agent_id: Option<&AgentId>,
+) -> bool {
+    let mut has_scoped_node = false;
+    let mut has_registry_fact = branch_id.is_none();
+    for envelope in envelopes {
+        if BranchCreated::from_payload_value(&envelope.payload)
+            .is_some_and(|created| Some(created.branch.branch_id) == branch_id.cloned())
+        {
+            has_registry_fact = true;
+            continue;
+        }
+        let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone()) else {
+            continue;
+        };
+        match payload {
+            EventPayload::NodeCommitted(_)
+                if envelope.branch_id.as_ref() == branch_id
+                    && envelope.agent_id.as_ref() == agent_id =>
+            {
+                has_scoped_node = true;
+            }
+            _ => {}
+        }
+    }
+    !has_scoped_node && !has_registry_fact
 }
 
 fn scoped(
