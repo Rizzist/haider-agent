@@ -927,3 +927,30 @@ fn deferred_loss_publishes_only_after_the_barrier_drains() {
         "the overflow arm defers; it must not publish mid-barrier"
     );
 }
+
+/// MUTATION CHECK: drop the models-provider context tag from the error
+/// mapping. Expected RUNTIME failure: a `provider.models_refresh` error
+/// maps to the generic `Failed` flash instead of the row-scoped reply
+/// (the owner's boot-time `provider_error` launcher flash).
+#[test]
+fn models_refresh_error_maps_to_the_row_scoped_reply() {
+    let context = CommandContext::of(&LiveCommand::RefreshProviderModels {
+        provider: "probefix".into(),
+    });
+    let replies = map_response(
+        &context,
+        haider_rpc::ResponseBody::Error {
+            code: "provider_error".into(),
+            message: "provider does not expose a subscription model catalog".into(),
+            retryable: false,
+            data: None,
+        },
+    );
+    assert!(
+        matches!(
+            replies.as_slice(),
+            [LiveReply::ModelsRefreshFailed { provider, .. }] if provider == "probefix"
+        ),
+        "got {replies:?}"
+    );
+}
