@@ -25,7 +25,7 @@ pub mod spawn;
 
 pub use client::{
     ClientConfig, ClientError, ConnectError, Connected, ConnectionState, DisconnectReason,
-    PING_INTERVAL, PONG_DEADLINE, PendingResponse, RpcClient, connect,
+    PING_INTERVAL, PONG_DEADLINE, PeerCredentials, PendingResponse, RpcClient, connect,
 };
 pub use headless::{
     DEFAULT_TERMINAL_GRACE, HeadlessBlockingReason, HeadlessEvent, HeadlessFailureCode,
@@ -39,7 +39,8 @@ pub use profile::{
 };
 pub use spawn::{
     DAEMON_LOG_FILE, EnsureError, EnsureOptions, EnsuredDaemon, RACE_LOSER_EXIT_CODE,
-    STARTUP_DEADLINE, ensure_daemon, required_live_features,
+    STARTUP_DEADLINE, ensure_daemon, required_live_features, signal_authenticated_peer,
+    spawn_daemon_retained,
 };
 
 /// Crate marker used by the workspace self-test.

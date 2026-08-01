@@ -189,6 +189,22 @@ impl std::error::Error for ClientError {}
 pub struct Connected {
     pub client: RpcClient,
     pub welcome: Welcome,
+    /// Kernel-authenticated credentials for the process serving this UDS.
+    ///
+    /// Update uses these credentials while retaining this connection: the
+    /// PID comes from the socket peer, never the profile lock's diagnostic
+    /// text. Platforms supported by Haider expose a PID; keeping it optional
+    /// makes an unavailable credential a typed update refusal rather than a
+    /// regression for ordinary RPC clients.
+    pub peer_credentials: PeerCredentials,
+}
+
+/// Kernel credentials captured from the connected Unix-domain peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerCredentials {
+    pub pid: Option<u32>,
+    pub uid: u32,
+    pub gid: u32,
 }
 
 /// Dials the endpoint and completes the `Hello`/`Welcome` handshake.
@@ -197,6 +213,21 @@ pub async fn connect(path: &Path, config: ClientConfig) -> Result<Connected, Con
         Ok(stream) => stream,
         Err(error) => return Err(classify_connect_error(error)),
     };
+    // Capture before `RpcClient::start` consumes the stream and splits it.
+    // The peer credentials are the update signal authority; the lock-file
+    // PID is deliberately never consulted.
+    let peer_credentials = stream
+        .peer_cred()
+        .map(|credentials| PeerCredentials {
+            pid: credentials.pid().and_then(|pid| u32::try_from(pid).ok()),
+            uid: credentials.uid(),
+            gid: credentials.gid(),
+        })
+        .unwrap_or(PeerCredentials {
+            pid: None,
+            uid: u32::MAX,
+            gid: u32::MAX,
+        });
     let hello = WireFrame::Hello(Hello {
         protocol_min: WIRE_PROTOCOL_VERSION,
         protocol_max: WIRE_PROTOCOL_VERSION,
@@ -247,7 +278,11 @@ pub async fn connect(path: &Path, config: ClientConfig) -> Result<Connected, Con
             Err(_) => return Err(ConnectError::HandshakeTimeout),
         };
     let client = RpcClient::start(stream, decoder, leftovers, &config, &welcome);
-    Ok(Connected { client, welcome })
+    Ok(Connected {
+        client,
+        welcome,
+        peer_credentials,
+    })
 }
 
 fn classify_connect_error(error: std::io::Error) -> ConnectError {

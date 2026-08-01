@@ -227,6 +227,44 @@ async fn responses_correlate_by_request_id_even_out_of_order() {
     assert_ne!(a, b);
 }
 
+/// MUTATION CHECK: capture peer credentials after `UnixStream::into_split`
+/// or substitute the profile lock's diagnostic PID. Expected RUNTIME
+/// failure: the retained kernel PID/UID no longer identify this fake server
+/// process exactly.
+#[tokio::test]
+async fn connect_retains_kernel_authenticated_peer_credentials() {
+    let dir = short_dir();
+    let probe = dir.path().join("peer-credentials-probe.sock");
+    match std::os::unix::net::UnixListener::bind(&probe) {
+        Ok(listener) => {
+            drop(listener);
+            std::fs::remove_file(&probe).expect("remove socket capability probe");
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+        Err(error) => panic!("bind socket capability probe: {error}"),
+    }
+    let endpoint = dir.path().join("peer-credentials.sock");
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let _daemon = spawn_fake_daemon(
+        &endpoint,
+        accepted,
+        HelloReply::Welcome(welcome(
+            "profile-x",
+            haider_client::required_live_features(),
+        )),
+        echo_serve,
+    );
+    let connected = connect(&endpoint, ClientConfig::default())
+        .await
+        .expect("connect fake daemon");
+    assert_eq!(connected.peer_credentials.pid, Some(std::process::id()));
+    assert_eq!(
+        connected.peer_credentials.uid,
+        haider_client::effective_uid()
+    );
+    connected.client.close();
+}
+
 // MUTATION CHECK: the R9 client heartbeat law — a ping unmatched for the
 // pong deadline declares the connection dead. Mutating the heartbeat's
 // deadline check (`>= pong_deadline` -> `false`, or skipping `fail`) must

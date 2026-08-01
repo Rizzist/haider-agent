@@ -16,6 +16,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 pub(crate) mod run;
+pub(crate) mod update;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const EX_SOFTWARE: u8 = 70;
@@ -49,6 +50,7 @@ async fn main() -> ExitCode {
         // door (bare `haider` on a TTY enters the live TUI instead).
         [command] if command == "--ready" => front_door(FrontDoor::Report).await,
         [command, rest @ ..] if command == "run" => run::run_command(rest).await,
+        [command, rest @ ..] if command == "update" => update::update_command(rest).await,
         [command, rest @ ..] if command == "tui" => tui_command(rest).await,
         [command, rest @ ..] if command == "import" => import_command(rest).await,
         [other, ..] => {
@@ -57,6 +59,7 @@ async fn main() -> ExitCode {
                  (supports: --version, self-test, run <prompt> \
                  [--output print|json|jsonl] [--timeout <dur>] \
                  [--allow-writes] [--allow-exec], \
+                 update [--check], \
                  tui [--theme dawn|ivory|dark], tui --demo [--plain], \
                  import [codex|claude-code], --ready)"
             );

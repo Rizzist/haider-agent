@@ -257,7 +257,9 @@ pub async fn ensure_daemon(
     loop {
         match try_attach(profile, &options).await {
             Attach::Ready(connected) => {
-                let Connected { client, welcome } = *connected;
+                let Connected {
+                    client, welcome, ..
+                } = *connected;
                 // Reap a still-running race-loser candidate before returning:
                 // its store-lock loss makes exit 75 imminent, and the parent
                 // process is long-running from W3c3 on — an unreaped child
@@ -394,4 +396,41 @@ fn spawn_daemon(
         binary,
         message: error.to_string(),
     })
+}
+
+/// Starts an explicitly named daemon sibling and returns the live child.
+///
+/// This update-only seam has the same exact profile arguments, owner-only
+/// log, and detached process group as ordinary auto-spawn, but retaining the
+/// child lets the updater stop and reap a candidate that fails its exact
+/// Welcome-version health check.
+///
+/// MUTATION SAFETY: this starts a daemon process and appends to the profile's
+/// owner-only daemon log. Runtime failures are returned as [`EnsureError`];
+/// callers must retain the child until health succeeds.
+pub fn spawn_daemon_retained(
+    profile: &ResolvedProfile,
+    binary: impl Into<PathBuf>,
+) -> Result<Child, EnsureError> {
+    let options = EnsureOptions {
+        daemon_binary: Some(binary.into()),
+        ..EnsureOptions::default()
+    };
+    let log_path = profile.store_dir.join(DAEMON_LOG_FILE);
+    spawn_daemon(profile, &options, &log_path)
+}
+
+/// Sends the one graceful termination signal to an authenticated UDS peer.
+///
+/// MUTATION SAFETY: this changes process state. The function performs one
+/// `SIGTERM` syscall and never retries; a runtime failure is returned to the
+/// caller so update cannot accidentally turn a timeout into a second signal.
+pub fn signal_authenticated_peer(pid: u32) -> std::io::Result<()> {
+    use rustix::process::{Pid, Signal, kill_process};
+
+    let raw = i32::try_from(pid)
+        .ok()
+        .and_then(Pid::from_raw)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid peer PID"))?;
+    kill_process(raw, Signal::TERM).map_err(std::io::Error::from)
 }

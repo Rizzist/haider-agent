@@ -47,7 +47,12 @@ const FAKE_PROVIDER_ENV: &str = "HAIDER_TEST_FAKE_PROVIDER";
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let config = match parse_args(std::env::args().skip(1)) {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if matches!(args.as_slice(), [argument] if argument == "--version") {
+        println!("haiderd {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
+    let config = match parse_args(args.into_iter()) {
         Ok(config) => config,
         Err(message) => {
             eprintln!("haiderd: {message}");
