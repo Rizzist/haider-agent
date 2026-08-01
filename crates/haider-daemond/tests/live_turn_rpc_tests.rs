@@ -31,13 +31,13 @@ use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
 };
 use haider_protocol::error::{ErrorCode, HaiderError};
-use haider_protocol::ids::{DeviceId, EffectId, EventId, RunId, SessionId};
+use haider_protocol::ids::{ArtifactRef, DeviceId, EffectId, EventId, RunId, SessionId};
 use haider_protocol::item::{ItemDelta, ItemEvent, OutputStream, TurnItem};
 use haider_protocol::menu::{Menu, MenuAnswer};
-use haider_protocol::provider::{CapabilityDoc, FinishReason, Usage, UsageSource};
+use haider_protocol::provider::{Block, CapabilityDoc, FinishReason, Usage, UsageSource};
 use haider_protocol::session::{SessionMetadataV1, SessionPermissionOverridesV1};
 use haider_protocol::state::{RunState, SessionState};
-use haider_protocol::tool::ToolPermissionDefault;
+use haider_protocol::tool::{AttachmentBlock, ToolPermissionDefault};
 use haider_provider::{
     FakeInputKind, FakeInputOption, FakeProvider, FakeStep, Provider, ProviderError,
     ProviderStream, ToolDefinition, TurnRequest,
@@ -354,6 +354,37 @@ fn submit_body(
     }
 }
 
+async fn upload_artifact(
+    client: &mut UdsClient,
+    config: &DaemonConfig,
+    request_id: &str,
+    bytes: &[u8],
+) -> ArtifactRef {
+    send_request(
+        client,
+        config,
+        request_id,
+        RequestBody::ArtifactPut {
+            data_base64: BASE64.encode(bytes),
+        },
+    )
+    .await;
+    match next_response(client).await {
+        WireFrame::Response {
+            body:
+                ResponseBody::ArtifactPut {
+                    artifact,
+                    bytes: stored,
+                },
+            ..
+        } => {
+            assert_eq!(stored, u64::try_from(bytes.len()).expect("fixture size"));
+            artifact
+        }
+        other => panic!("expected artifact.put response, got {other:?}"),
+    }
+}
+
 async fn next_submit_response(client: &mut UdsClient) -> (haider_protocol::ids::RunId, u64) {
     loop {
         if let WireFrame::Response {
@@ -629,6 +660,218 @@ async fn scenario_1_production_runtime_accepts_an_injected_fake_provider_factory
     let (dependencies, fake) = fake_dependencies(Vec::new());
     let task = ready_with_dependencies(&config, dependencies).await;
     assert!(fake.requests().is_empty());
+    task.shutdown_handle().request("test complete");
+    task.join().await.expect("daemon joins");
+}
+
+/// MUTATION CHECK: defer vision support checks until `stream_turn`, silently
+/// drop the image, or downgrade the error to provider_error. Expected RUNTIME
+/// failure: the fake records a request, or the durable failure is not the
+/// typed local `vision_unsupported` refusal naming the selected provider.
+#[tokio::test]
+async fn vision_unsupported_provider_refuses_locally_with_typed_error() {
+    let root = tempfile::Builder::new()
+        .prefix("b4av-")
+        .tempdir_in("/tmp")
+        .expect("short temporary root");
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace");
+    let config = DaemonConfig::new(
+        "b4a-vision-refusal",
+        root.path().join("store"),
+        root.path().join("runtime"),
+    );
+    let (dependencies, fake) = fake_dependencies(Vec::new());
+    let task = ready_with_dependencies(&config, dependencies).await;
+    let mut client = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "b4a-vision-client",
+        "b4a-vision-instance",
+        ClientKind::Cli,
+    )
+    .await;
+    let artifact = upload_artifact(
+        &mut client,
+        &config,
+        "put-vision-image",
+        &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a],
+    )
+    .await;
+    let (session_id, generation) = create_and_attach(&mut client, &config, &workspace).await;
+    send_request(
+        &mut client,
+        &config,
+        "submit-image",
+        RequestBody::TurnSubmit {
+            command_id: CommandId::new("submit-image-command"),
+            session_id,
+            worker_generation: generation,
+            text: "describe this image".into(),
+            attachments: vec![AttachmentBlock::Image {
+                artifact,
+                mime: "image/png".into(),
+                width: None,
+                height: None,
+            }],
+            mode: DeliveryMode::Queue,
+        },
+    )
+    .await;
+    let (run_id, _) = next_submit_response(&mut client).await;
+    let events = events_until_terminal(&mut client, &run_id).await;
+    assert!(events.iter().any(|(_, payload)| {
+        matches!(
+            payload,
+            EventPayload::RunFailed {
+                code: ErrorCode::VisionUnsupported,
+                message,
+                retryable: false,
+            } if message.contains("provider `fake`")
+        )
+    }));
+    assert!(
+        fake.requests().is_empty(),
+        "unsupported vision must be refused before provider spend"
+    );
+
+    task.shutdown_handle().request("test complete");
+    task.join().await.expect("daemon joins");
+}
+
+/// MUTATION CHECK: resolve image bytes into a summarization request, or let
+/// compaction erase the original attachment-bearing user fact. Expected
+/// RUNTIME failure: request two contains an image/base64 payload, or the
+/// durable post-compaction journal no longer carries the original CAS ref.
+#[tokio::test]
+async fn compaction_summary_request_carries_no_image_attachments() {
+    let root = tempfile::Builder::new()
+        .prefix("b4ac-")
+        .tempdir_in("/tmp")
+        .expect("short temporary root");
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace");
+    let config = DaemonConfig::new(
+        "b4a-compaction-images",
+        root.path().join("store"),
+        root.path().join("runtime"),
+    );
+    let fake = Arc::new(
+        FakeProvider::new(vec![
+            FakeStep::EmitText {
+                text: "image answer".into(),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::EndTurn,
+            },
+            FakeStep::EmitText {
+                text: "summary without image bytes".into(),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::EndTurn,
+            },
+        ])
+        .with_vision_native(),
+    );
+    let dependencies = DaemonDependencies {
+        provider_factory: ProviderFactoryConfig::Injected {
+            factory: Arc::new(FakeFactory { fake: fake.clone() }),
+            providers: std::collections::BTreeSet::from(["fake".to_owned()]),
+        },
+        ..DaemonDependencies::default()
+    };
+    let task = ready_with_dependencies(&config, dependencies).await;
+    let mut client = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "b4a-compaction-client",
+        "b4a-compaction-instance",
+        ClientKind::Cli,
+    )
+    .await;
+    let artifact = upload_artifact(
+        &mut client,
+        &config,
+        "put-compaction-image",
+        &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a],
+    )
+    .await;
+    let (session_id, generation) = create_and_attach(&mut client, &config, &workspace).await;
+    let image = AttachmentBlock::Image {
+        artifact: artifact.clone(),
+        mime: "image/png".into(),
+        width: None,
+        height: None,
+    };
+    send_request(
+        &mut client,
+        &config,
+        "submit-before-compaction",
+        RequestBody::TurnSubmit {
+            command_id: CommandId::new("submit-before-compaction-command"),
+            session_id: session_id.clone(),
+            worker_generation: generation,
+            text: "remember this image".into(),
+            attachments: vec![image.clone()],
+            mode: DeliveryMode::Queue,
+        },
+    )
+    .await;
+    let (run_id, _) = next_submit_response(&mut client).await;
+    let _ = events_until_terminal(&mut client, &run_id).await;
+    let _ = next_idle(&mut client).await;
+
+    send_request(
+        &mut client,
+        &config,
+        "compact-image-history",
+        RequestBody::SessionCompact {
+            command_id: CommandId::new("compact-image-history-command"),
+            session_id: session_id.clone(),
+            worker_generation: generation,
+        },
+    )
+    .await;
+    loop {
+        if matches!(
+            client.next().await,
+            WireFrame::Response {
+                body: ResponseBody::SessionCompact { .. },
+                ..
+            }
+        ) {
+            break;
+        }
+    }
+
+    let requests = fake.requests();
+    assert_eq!(requests.len(), 2);
+    let summary_request = &requests[1];
+    assert!(summary_request.attachments.is_empty());
+    assert!(summary_request.messages.iter().all(|message| {
+        message
+            .blocks
+            .iter()
+            .all(|block| !matches!(block, Block::Attachment(AttachmentBlock::Image { .. })))
+    }));
+
+    let journal = read_session(
+        &mut client,
+        &config,
+        session_id,
+        "read-after-image-compaction",
+    )
+    .await;
+    assert!(journal.iter().any(|envelope| {
+        serde_json::from_value::<EventPayload>(envelope.payload.clone()).is_ok_and(|payload| {
+            matches!(
+                payload,
+                EventPayload::UserMessage { attachments, .. }
+                    if attachments == vec![image.clone()]
+            )
+        })
+    }));
+
     task.shutdown_handle().request("test complete");
     task.join().await.expect("daemon joins");
 }

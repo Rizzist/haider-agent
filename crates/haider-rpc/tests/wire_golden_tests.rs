@@ -9,13 +9,16 @@ use std::path::PathBuf;
 use common::{TEST_FRAME_LIMIT, transcript};
 use haider_protocol::session::SessionPermissionOverridesV1;
 use haider_rpc::{
-    CancelStatus, DEFAULT_FRAME_LIMIT, ERROR_CODE_ALREADY_RESOLVED, ERROR_CODE_BUSY,
+    CancelStatus, DEFAULT_FRAME_LIMIT, ERROR_CODE_ALREADY_RESOLVED, ERROR_CODE_ARTIFACT_TOO_LARGE,
+    ERROR_CODE_ATTACHMENT_MIME_UNSUPPORTED, ERROR_CODE_ATTACHMENT_NOT_FOUND,
+    ERROR_CODE_ATTACHMENT_TOO_LARGE, ERROR_CODE_ATTACHMENTS_TOO_LARGE, ERROR_CODE_BUSY,
     ERROR_CODE_CAPABILITY_DENIED, ERROR_CODE_CREDENTIAL_MISSING, ERROR_CODE_CURSOR_AHEAD,
     ERROR_CODE_DRAINING, ERROR_CODE_INVALID_ARGUMENT, ERROR_CODE_INVALID_CURSOR,
     ERROR_CODE_NOT_FOUND, ERROR_CODE_OVERLOADED, ERROR_CODE_PERMISSION_DENIED,
     ERROR_CODE_PROVIDER_ERROR, ERROR_CODE_PROVIDER_REMOVE_REFUSED, ERROR_CODE_RESTAGE_REQUIRED,
     ERROR_CODE_REVISION_CONFLICT, ERROR_CODE_RUN_NOT_ACTIVE, ERROR_CODE_STALE_GENERATION,
-    ERROR_CODE_UNAUTHORIZED, ERROR_CODE_VAULT_UNSUPPORTED, FEATURE_ACCOUNT_LOGIN_API_V1,
+    ERROR_CODE_TOO_MANY_ATTACHMENTS, ERROR_CODE_UNAUTHORIZED, ERROR_CODE_VAULT_UNSUPPORTED,
+    ERROR_CODE_VISION_UNSUPPORTED, ErrorData, FEATURE_ACCOUNT_LOGIN_API_V1,
     FEATURE_ACCOUNT_MANAGEMENT_V1, FEATURE_ACCOUNT_OAUTH_PKCE_V1, FEATURE_ACCOUNT_ROTATION_V1,
     FEATURE_PROVIDER_CONFIGURE_V1, FEATURE_PROVIDER_MANAGEMENT_V1, FEATURE_PROVIDER_MODELS_V1,
     FEATURE_PROVIDER_REMOVE_V1, FEATURE_SESSION_MUTATION_V1, FEATURE_TURN_CONTROL_V1,
@@ -99,6 +102,24 @@ fn compact_ws_bodies_and_length_prefixed_uds_streams_are_golden() {
         );
         assert_eq!(batch.frames, vec![expected_frame]);
     }
+}
+
+/// MUTATION CHECK: charge a 5 MiB image as if the default frame carried raw
+/// bytes, or shrink the documented bound below the padded base64 envelope.
+/// Expected RUNTIME failure: encoding returns `FrameTooLarge` instead of a
+/// request that fits the already-negotiated default limit.
+#[test]
+fn five_mib_artifact_put_fits_the_default_negotiated_frame() {
+    let raw_bytes: usize = 5 * 1024 * 1024;
+    let padded_base64_bytes = raw_bytes.div_ceil(3) * 4;
+    let frame = WireFrame::Request {
+        request_id: haider_rpc::RequestId::new("five-mib-put"),
+        body: RequestBody::ArtifactPut {
+            data_base64: "A".repeat(padded_base64_bytes),
+        },
+    };
+    let encoded = ws_codec::encode(&frame, DEFAULT_FRAME_LIMIT).expect("5 MiB put fits");
+    assert!(encoded.len() < DEFAULT_FRAME_LIMIT);
 }
 
 #[test]
@@ -247,6 +268,68 @@ fn correlated_errors_pin_the_named_stable_codes() {
         value["body"]["code"],
         serde_json::Value::String(ERROR_CODE_CAPABILITY_DENIED.into())
     );
+}
+
+/// MUTATION CHECK: rename an attachment refusal or collapse its structured
+/// recovery coordinates into a generic error. Expected RUNTIME failure: the
+/// literal or tagged `ErrorData` kind no longer matches the public wire law.
+#[test]
+fn attachment_error_codes_and_data_are_typed_additively() {
+    assert_eq!(
+        [
+            ERROR_CODE_ARTIFACT_TOO_LARGE,
+            ERROR_CODE_ATTACHMENT_NOT_FOUND,
+            ERROR_CODE_ATTACHMENT_MIME_UNSUPPORTED,
+            ERROR_CODE_ATTACHMENT_TOO_LARGE,
+            ERROR_CODE_TOO_MANY_ATTACHMENTS,
+            ERROR_CODE_ATTACHMENTS_TOO_LARGE,
+            ERROR_CODE_VISION_UNSUPPORTED,
+        ],
+        [
+            "artifact_too_large",
+            "attachment_not_found",
+            "attachment_mime_unsupported",
+            "attachment_too_large",
+            "too_many_attachments",
+            "attachments_too_large",
+            "vision_unsupported",
+        ]
+    );
+    let tagged = [
+        (
+            ErrorData::AttachmentNotFound {
+                index: 1,
+                artifact: haider_rpc::haider_protocol::ids::ArtifactRef::new("blake3:missing"),
+            },
+            "attachment_not_found",
+        ),
+        (
+            ErrorData::AttachmentMimeUnsupported {
+                index: 2,
+                mime: "image/svg+xml".into(),
+            },
+            "attachment_mime_unsupported",
+        ),
+        (
+            ErrorData::TooManyAttachments {
+                actual_count: 6,
+                max_count: 5,
+            },
+            "too_many_attachments",
+        ),
+        (
+            ErrorData::VisionUnsupported {
+                provider: "fake".into(),
+            },
+            "vision_unsupported",
+        ),
+    ];
+    for (data, expected_kind) in tagged {
+        assert_eq!(
+            serde_json::to_value(data).expect("typed attachment error")["kind"],
+            expected_kind
+        );
+    }
 }
 
 /// The five W3c2 account/vault codes pinned as WIRE LITERALS: a client

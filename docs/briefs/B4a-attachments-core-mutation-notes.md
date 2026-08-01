@@ -1,0 +1,25 @@
+# B4a attachments-core mutation notes
+
+Every mutation below has a runtime observer. “Expected RUNTIME failure” means
+the named test fails by assertion, typed protocol error, or timeout; a
+compile-only failure is not the claimed evidence.
+
+| Production mutation | Runtime observer | Expected RUNTIME failure |
+|---|---|---|
+| Hash caller metadata instead of decoded bytes, bypass daemon-owned CAS ingress, or make a repeated put non-idempotent. | `haider-daemon/tests/session_hub_tests.rs::artifact_put_roundtrip_is_content_addressed_and_idempotent` | The returned verified ref/count, stored bytes, or second response differs. |
+| Remove the 8 MiB decoded ingress cap, 5 MiB item cap, five-item cap, or 16 MiB occurrence-counted turn cap. | `haider-daemon/tests/session_hub_tests.rs::oversized_put_and_oversized_turn_are_typed_errors` | One request succeeds, mutates the journal, or loses its stable typed error/data coordinates. |
+| Validate attachments after acceptance or treat a missing CAS object as a runnable turn. | `haider-daemon/tests/session_hub_tests.rs::dangling_ref_rejected_at_submit_not_at_run` | Submit advances the journal head or does not return `attachment_not_found`. |
+| Accept caller-declared image types outside jpeg/png/gif/webp. | `haider-daemon/tests/session_hub_tests.rs::mime_allowlist_enforced_at_acceptance` | SVG reaches durable acceptance instead of returning `attachment_mime_unsupported`. |
+| Move the unsupported-vision check after `stream_turn`, silently discard the image, or return a generic provider error. | `haider-daemond/tests/live_turn_rpc_tests.rs::vision_unsupported_provider_refuses_locally_with_typed_error` and `haider-provider/tests/fake_provider_tests.rs::fake_capabilities_are_explicit` | The fake records provider spend, the durable code is not `vision_unsupported`, the provider name is absent, or the fixture switch is not additive. |
+| Include resolved base64 in token accounting or remove the fixed 1,600-token image charge. | `haider-core/tests/runtime_tests.rs::image_footprint_uses_fixed_vision_estimate_not_base64_length` | Tiny and 5 MiB image estimates diverge or the fixed image delta moves outside the pinned bound. |
+| Carry images/resolved image bytes into the summarizer, or erase a surviving attachment-bearing ancestry node during substitution. | `haider-daemond/tests/live_turn_rpc_tests.rs::compaction_summary_request_carries_no_image_attachments` and `haider-core/tests/prompt_history_tests.rs::compaction_substitutes_summary_and_keeps_only_the_suffix` | The summary request contains an image/base64 attachment or the surviving suffix loses its original image ref. |
+| Upload after session creation, omit refs from the first immutable submit, or mint a replacement submit identity after response loss. | `haider-client/tests/headless_run_tests.rs::headless_attach_uploads_then_submits_with_durable_identity` | The fake peer observes wrong ordering, changed attachment blocks, or a different durable command id on retry. |
+| Trust filename extensions, omit repeatable `--attach`, or serialize raw bytes/omit landed refs in `haider.run.v1`. | `haider-cli/tests/cli_tests.rs::{run_parser_pins_outputs_timeouts_and_permission_flags,attach_loader_sniffs_image_magic_not_extensions,run_json_reports_attachments_additively,print_and_json_outputs_pin_bytes_schema_and_nulls}` | Parser paths, magic classification, exact additive JSON bytes, count, or refs differ. |
+| Make a 5 MiB padded upload exceed the existing default frame envelope, rename a typed attachment refusal, reorder prior transcript frames, or make additive methods fatal to an older reader. | `haider-rpc/tests/wire_golden_tests.rs::{five_mib_artifact_put_fits_the_default_negotiated_frame,attachment_error_codes_and_data_are_typed_additively,compact_ws_bodies_and_length_prefixed_uds_streams_are_golden,unknown_fields_and_future_method_discriminants_are_tolerated,unknown_top_level_frame_kind_is_tolerated}` | Encoding returns `FrameTooLarge`, a stable code/data tag changes, pre-B4a golden bytes move, or tolerant decode fails. |
+| Make additive B4a protocol vocabulary reject or normalize an unknown future event payload kind. | `haider-protocol/tests/golden_tests.rs::raw_envelope_tolerates_unknown_payload` and `haider-store/tests/store_tests.rs::raw_envelope_preserves_unknown_payload_kinds` | A raw reader cannot round-trip the unknown payload bytes unchanged. |
+| Add validation to only one `turn.submit` wire form or drop the accepted branch coordinate while adding attachments. | `haider-daemon/tests/session_hub_tests.rs::oversized_put_and_oversized_turn_are_typed_errors` and `haider-client/tests/headless_run_tests.rs::headless_attach_uploads_then_submits_with_durable_identity` | One encode/decode form bypasses the same typed caps or retry changes the immutable accepted body. |
+
+The end-to-end daemon/headless observers use real Unix sockets. In restricted
+macOS sandboxes that prohibit `bind(2)`, they compile but stop at socket setup;
+the same laws execute normally in the workspace/CI environment with UDS
+permission.

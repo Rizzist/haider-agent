@@ -329,3 +329,14 @@ progress so a daemon restart cannot reset or forget an armed deadline.
 |---|---|---|
 | `crates/haider-daemon/src/delegation.rs` (`session_progress`, `delegation_progress`) | Each 25 ms supervision poll rescans the direct child's run journal and, while recursively waiting, each reachable descendant journal. This keeps restart behavior derivable without a second mutable clock/projection. | Trigger: delegation supervision exceeds 1% of daemon CPU for 5 minutes, any supervised child reaches 3,000 envelopes, or p95 poll work exceeds 10 ms. DO-NOT-DO: replace journal truth with an in-memory deadline, persist a projection outside the event/delegation transaction, or let a parked human-required state consume stall time. |
 | `crates/haider-daemon/src/delegation.rs` (`load_chip_mirror`) | Recovery initializes idempotent chip mirroring by scanning the parent's journal once for deterministic projection event IDs and the last chip for the child. | Trigger: child-wait recovery p95 exceeds 50 ms or parent sessions commonly exceed 3,000 envelopes. DO-NOT-DO: generate random projection IDs, trust an uncommitted in-memory cursor, or store chip truth separately from the parent/child journals without transactional coupling. |
+
+## B4a attachments-core efficiency ledger (2026-08-01)
+
+B4a uploads content-addressed bytes before the immutable turn command so the
+first submit already carries stable refs. A transport loss or later submit
+refusal can therefore leave a valid but unreachable CAS object; duplicate
+uploads are naturally deduplicated by hash.
+
+| Where | Deferred optimization | Exact trigger / DO-NOT-DO |
+|---|---|---|
+| `crates/haider-daemon/src/session_hub/rpc.rs` (`artifact_put`), `crates/haider-client/src/headless.rs` (`upload_attachments`) | There is no reachability-based garbage collector for successfully uploaded artifacts that no durable event/tree node ultimately references. | Trigger: unreachable CAS objects exceed 1 GiB per profile or 5% of profile CAS bytes. DO-NOT-DO: delete an upload when submit fails or a client disconnects; the same content hash may already be referenced by another session, branch, node, or concurrent command. Any collector must derive reachability from durable profile truth before unlinking. |

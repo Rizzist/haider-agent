@@ -379,6 +379,7 @@ pub struct FakeProvider {
     script: Arc<Vec<FakeStep>>,
     next_step: Arc<Mutex<usize>>,
     requests: Arc<Mutex<Vec<TurnRequest>>>,
+    vision: FeatureResolve,
 }
 
 impl FakeProvider {
@@ -387,7 +388,15 @@ impl FakeProvider {
             script: Arc::new(script),
             next_step: Arc::new(Mutex::new(0)),
             requests: Arc::new(Mutex::new(Vec::new())),
+            vision: FeatureResolve::Unsupported,
         }
+    }
+
+    /// Additive fixture switch for tests that need a vision-capable provider.
+    #[must_use]
+    pub fn with_vision_native(mut self) -> Self {
+        self.vision = FeatureResolve::Native;
+        self
     }
 
     pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
@@ -418,7 +427,7 @@ impl Provider for FakeProvider {
             provider: "fake".into(),
             parallel_tools: FeatureResolve::Native,
             streaming_tool_args: FeatureResolve::Native,
-            vision: FeatureResolve::Unsupported,
+            vision: self.vision,
             thinking_visible: FeatureResolve::Native,
             context_limit: 1_000_000,
         }

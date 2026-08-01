@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use haider_protocol::DeliveryMode;
 use haider_protocol::context::ContextFootprint;
 use haider_protocol::envelope::RawEnvelope;
-use haider_protocol::ids::{BranchId, ItemId, MenuId, NodeId, RunId, SessionId};
+use haider_protocol::ids::{ArtifactRef, BranchId, ItemId, MenuId, NodeId, RunId, SessionId};
 use haider_protocol::session::{SessionMetadataV1, SessionPermissionOverridesV1};
 use haider_protocol::tool::{AttachmentBlock, ToolInventorySnapshot};
 use serde::de::Error as _;
@@ -23,6 +23,13 @@ pub const WIRE_PROTOCOL_VERSION: u32 = 1;
 ///
 /// W3b advertises its actual configured value in [`Welcome::frame_limit`].
 pub const DEFAULT_FRAME_LIMIT: usize = 8 * 1024 * 1024;
+
+/// Maximum decoded payload accepted by one `artifact.put` request.
+///
+/// The payload is base64 on the wire, so callers must also keep the encoded
+/// request within the negotiated frame limit. The default 8 MiB frame admits
+/// the attachment lane's maximum 5 MiB image in one request.
+pub const ARTIFACT_PUT_MAX_BYTES: usize = 8 * 1024 * 1024;
 
 const fn default_frame_limit_u32() -> u32 {
     DEFAULT_FRAME_LIMIT as u32
@@ -141,6 +148,20 @@ pub const ERROR_CODE_PROVIDER_REMOVE_REFUSED: &str = "provider_remove_refused";
 /// Stable rejection for a shell builtin whose durable daemon semantics are
 /// deliberately not implemented by this protocol slice.
 pub const ERROR_CODE_UNSUPPORTED_SHELL_BUILTIN: &str = "unsupported_shell_builtin";
+/// Stable rejection for an `artifact.put` payload above the decoded byte cap.
+pub const ERROR_CODE_ARTIFACT_TOO_LARGE: &str = "artifact_too_large";
+/// Stable rejection for a turn naming a CAS object that is absent or corrupt.
+pub const ERROR_CODE_ATTACHMENT_NOT_FOUND: &str = "attachment_not_found";
+/// Stable rejection for an image MIME outside the supported allowlist.
+pub const ERROR_CODE_ATTACHMENT_MIME_UNSUPPORTED: &str = "attachment_mime_unsupported";
+/// Stable rejection for one attachment above its per-object byte cap.
+pub const ERROR_CODE_ATTACHMENT_TOO_LARGE: &str = "attachment_too_large";
+/// Stable rejection for more attachment blocks than one turn may carry.
+pub const ERROR_CODE_TOO_MANY_ATTACHMENTS: &str = "too_many_attachments";
+/// Stable rejection for attachment bytes above the per-turn aggregate cap.
+pub const ERROR_CODE_ATTACHMENTS_TOO_LARGE: &str = "attachments_too_large";
+/// Stable local refusal when an image is submitted to a non-vision provider.
+pub const ERROR_CODE_VISION_UNSUPPORTED: &str = "vision_unsupported";
 
 /// Daemon implements receipt-backed session creation and metadata.
 pub const FEATURE_SESSION_MUTATION_V1: &str = "session_mutation_v1";
@@ -176,6 +197,8 @@ pub const FEATURE_TOOL_INVENTORY_V1: &str = "tool_inventory_v1";
 pub const FEATURE_SESSION_PERMISSION_OVERRIDES_V1: &str = "session_permission_overrides_v1";
 /// The daemon serves receipt-backed named branch creation and branch-scoped turns.
 pub const FEATURE_BRANCH_CREATE_V1: &str = "branch_create_v1";
+/// The daemon accepts receipt-free, content-addressed `artifact.put` uploads.
+pub const FEATURE_ARTIFACT_PUT_V1: &str = "artifact_put_v1";
 
 /// Kind of client taking part in the handshake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -700,6 +723,14 @@ pub struct SessionReadResult {
 #[serde(tag = "method")]
 #[non_exhaustive]
 pub enum RequestBody {
+    /// Receipt-free byte ingress into the daemon-owned content-addressed
+    /// store. Repeating the same decoded bytes is naturally idempotent.
+    #[serde(rename = "artifact.put")]
+    ArtifactPut {
+        /// RFC 4648 standard-alphabet base64, decoded before the hard byte
+        /// cap is applied and before the CAS address is computed.
+        data_base64: String,
+    },
     /// Additive source-compatible form of `session.create`. The legacy Rust
     /// variant below remains serializable for existing callers, while wire
     /// decoding normalizes both old and new JSON into this variant.
@@ -991,6 +1022,9 @@ pub enum RequestBody {
 #[serde(tag = "method")]
 #[non_exhaustive]
 pub enum ResponseBody {
+    /// Verified content address and decoded byte count for `artifact.put`.
+    #[serde(rename = "artifact.put")]
+    ArtifactPut { artifact: ArtifactRef, bytes: u64 },
     /// Durable acceptance coordinates of an atomic `session.create` (R2):
     /// a same-command retry receives this exact body from its receipt.
     #[serde(rename = "session.create")]
@@ -1262,6 +1296,25 @@ pub enum CancelStatus {
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ErrorData {
+    /// Decoded `artifact.put` bytes exceeded the hard request cap.
+    ArtifactTooLarge { actual_bytes: u64, max_bytes: u64 },
+    /// One attachment reference was absent from the verified CAS.
+    AttachmentNotFound { index: u32, artifact: ArtifactRef },
+    /// An image attachment declared a MIME outside the allowlist.
+    AttachmentMimeUnsupported { index: u32, mime: String },
+    /// One verified attachment exceeded its per-object cap.
+    AttachmentTooLarge {
+        index: u32,
+        artifact: ArtifactRef,
+        actual_bytes: u64,
+        max_bytes: u64,
+    },
+    /// A turn carried too many attachment blocks.
+    TooManyAttachments { actual_count: u32, max_count: u32 },
+    /// Verified attachment bytes exceeded the aggregate turn cap.
+    AttachmentsTooLarge { actual_bytes: u64, max_bytes: u64 },
+    /// The selected provider explicitly lacks native or emulated vision.
+    VisionUnsupported { provider: String },
     /// The client's `after_seq` is beyond the committed head
     /// ([`ERROR_CODE_CURSOR_AHEAD`]): reattach from a sequence at or below
     /// `head`.

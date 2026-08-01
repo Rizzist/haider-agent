@@ -5,6 +5,7 @@ use haider_core::{
     CommittedRange, ContextCompactor, HarnessActor, HarnessConfig, HarnessHandle, MemoryStore,
     ProviderAttemptDecision, ProviderAttemptResolver, ResolvedProviderAttempt, StoreHandle,
     SubmitCommittedTurn, SubmitTurn, ToolDispatchResult, ToolDispatcher,
+    VISION_IMAGE_ESTIMATE_TOKENS, estimate_provider_request_input_tokens,
 };
 use haider_protocol::EventPayload;
 use haider_protocol::branch::BranchDescriptor;
@@ -16,14 +17,16 @@ use haider_protocol::history::{
     COMPACTION_INTENT_EXTENSION_KIND, CONTINUATION_CHECKPOINT_EXTENSION_KIND, CompactionIntent,
     CompactionResume, ContinuationCheckpoint,
 };
-use haider_protocol::ids::{BranchId, CredentialAlias, DeviceId, ItemId, NodeId, RunId, SessionId};
+use haider_protocol::ids::{
+    ArtifactRef, BranchId, CredentialAlias, DeviceId, ItemId, NodeId, RunId, SessionId,
+};
 use haider_protocol::item::{ItemEvent, ToolStatus, TurnItem};
 use haider_protocol::provider::{Block, CapabilityDoc, FinishReason, Usage, UsageSource};
 use haider_protocol::state::RunState;
-use haider_protocol::tool::BoundedResult;
+use haider_protocol::tool::{AttachmentBlock, BoundedResult};
 use haider_provider::{
     FakeProvider, FakeStep, Message, Provider, ProviderError, ProviderErrorKind, ProviderStream,
-    TurnRequest,
+    ResolvedAttachment, TurnRequest,
 };
 use std::collections::HashSet;
 use std::future::pending;
@@ -443,15 +446,50 @@ impl ContextCompactor for ShrinkingContextCompactor {
 }
 
 fn estimated_input_tokens(config: &HarnessConfig, messages: &[Message]) -> u64 {
-    let bytes = serde_json::to_vec(&(
+    estimate_provider_request_input_tokens(
         messages,
         &config.system_prompt,
         &config.tools,
         &config.attachments,
-    ))
-    .expect("estimate serializes")
-    .len();
-    u64::try_from(bytes).unwrap_or(u64::MAX).saturating_add(3) / 4
+    )
+}
+
+/// MUTATION CHECK: serialize resolved image bytes into request-token
+/// accounting or remove the fixed vision charge. Expected RUNTIME failure:
+/// the tiny and 5 MiB payload estimates diverge, or the image delta is not
+/// the provider-neutral 1,600-token approximation.
+#[test]
+fn image_footprint_uses_fixed_vision_estimate_not_base64_length() {
+    let artifact = ArtifactRef::new("blake3:image");
+    let messages = vec![Message {
+        role: haider_provider::MessageRole::User,
+        blocks: vec![Block::Attachment(AttachmentBlock::Image {
+            artifact: artifact.clone(),
+            mime: "image/png".into(),
+            width: None,
+            height: None,
+        })],
+    }];
+    let without_image = vec![Message {
+        role: haider_provider::MessageRole::User,
+        blocks: Vec::new(),
+    }];
+    let tiny = vec![ResolvedAttachment {
+        artifact: artifact.clone(),
+        data_base64: "AA==".into(),
+    }];
+    let five_mib = vec![ResolvedAttachment {
+        artifact,
+        data_base64: "A".repeat((5_usize * 1024 * 1024).div_ceil(3) * 4),
+    }];
+
+    let tiny_estimate = estimate_provider_request_input_tokens(&messages, &None, &[], &tiny);
+    let large_estimate = estimate_provider_request_input_tokens(&messages, &None, &[], &five_mib);
+    let baseline = estimate_provider_request_input_tokens(&without_image, &None, &[], &[]);
+
+    assert_eq!(tiny_estimate, large_estimate);
+    assert!(tiny_estimate >= baseline + VISION_IMAGE_ESTIMATE_TOKENS);
+    assert!(tiny_estimate < baseline + VISION_IMAGE_ESTIMATE_TOKENS + 128);
 }
 
 /// MUTATION CHECK: ignore the reserved output budget when deriving the soft

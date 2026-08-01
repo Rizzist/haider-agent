@@ -5,7 +5,7 @@ use haider_protocol::EventPayload;
 use haider_protocol::effect::{AuthorizationVerdict, EffectPhase};
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::error::ErrorCode;
-use haider_protocol::ids::{RunId, SessionId};
+use haider_protocol::ids::{ArtifactRef, RunId, SessionId};
 use haider_protocol::item::{ItemEvent, TurnItem};
 use haider_protocol::state::RunState;
 use std::io::Read;
@@ -28,6 +28,7 @@ use cli_main::{ImportDispatch, ImportSource, parse_import_dispatch};
 use haider_client::{
     DisconnectReason, EnsureError, HeadlessBlockingReason, HeadlessFailureCode, HeadlessOutcome,
     HeadlessPermissionDenial, HeadlessRunError, HeadlessRunFailure, HeadlessRunResult,
+    load_image_attachment,
 };
 
 const DEFAULT_FAKE_SCRIPT: &str = concat!(
@@ -770,6 +771,7 @@ fn result(outcome: HeadlessOutcome, failure: Option<HeadlessRunFailure>) -> Head
         run_id: RunId::new("run-json"),
         provider: "fake".into(),
         model: "fake-model".into(),
+        attachments: Vec::new(),
         outcome,
         response: None,
         usage: None,
@@ -968,6 +970,7 @@ fn run_parser_pins_outputs_timeouts_and_permission_flags() {
             allow_exec: false,
             provider: None,
             model: None,
+            attachments: Vec::new(),
         })
     );
     let parsed = parse_run_options(&[
@@ -982,6 +985,10 @@ fn run_parser_pins_outputs_timeouts_and_permission_flags() {
         "fake".into(),
         "--model".into(),
         "fixture".into(),
+        "--attach".into(),
+        "/tmp/one.png".into(),
+        "--attach".into(),
+        "/tmp/two.gif".into(),
     ])
     .expect("full options");
     assert_eq!(parsed.output, RunOutput::Json);
@@ -992,6 +999,10 @@ fn run_parser_pins_outputs_timeouts_and_permission_flags() {
         Some("fake")
     );
     assert_eq!(parsed.model.as_deref(), Some("fixture"));
+    assert_eq!(
+        parsed.attachments,
+        vec![PathBuf::from("/tmp/one.png"), PathBuf::from("/tmp/two.gif")]
+    );
     let open_provider =
         parse_run_options(&["hello".into(), "--provider".into(), "openai-oauth".into()])
             .expect("provider names are daemon-owned");
@@ -1023,7 +1034,7 @@ fn run_parser_pins_outputs_timeouts_and_permission_flags() {
 
 /// MUTATION CHECK: reorder/remove a v1 field, omit nulls, add ANSI, or stop
 /// writing exactly one LF after assistant text/JSON. Expected RUNTIME failure:
-/// the byte golden or the ten-key/null assertions change.
+/// the byte golden or the eleven-key/null assertions change.
 #[test]
 fn print_and_json_outputs_pin_bytes_schema_and_nulls() {
     let mut done = result(HeadlessOutcome::Done, None);
@@ -1036,10 +1047,10 @@ fn print_and_json_outputs_pin_bytes_schema_and_nulls() {
     write_final(&mut json, RunOutput::Json, &done).expect("json");
     assert_eq!(
         String::from_utf8(json.clone()).expect("utf8"),
-        "{\"schema\":\"haider.run.v1\",\"session_id\":\"session-json\",\"run_id\":\"run-json\",\"provider\":\"fake\",\"model\":\"fake-model\",\"outcome\":\"done\",\"response\":\"final answer\",\"usage\":null,\"permission_denials\":[],\"error\":null}\n"
+        "{\"schema\":\"haider.run.v1\",\"session_id\":\"session-json\",\"run_id\":\"run-json\",\"provider\":\"fake\",\"model\":\"fake-model\",\"attachments\":{\"count\":0,\"refs\":[]},\"outcome\":\"done\",\"response\":\"final answer\",\"usage\":null,\"permission_denials\":[],\"error\":null}\n"
     );
     let value: serde_json::Value = serde_json::from_slice(&json).expect("v1 JSON");
-    assert_eq!(value.as_object().expect("object").len(), 10);
+    assert_eq!(value.as_object().expect("object").len(), 11);
     assert_eq!(value["provider"], "fake");
     assert_eq!(value["model"], "fake-model");
     assert!(value["usage"].is_null());
@@ -1094,17 +1105,77 @@ fn print_and_json_outputs_pin_bytes_schema_and_nulls() {
         assert_eq!(
             String::from_utf8(bytes.clone()).expect("failure utf8"),
             format!(
-                "{{\"schema\":\"haider.run.v1\",\"session_id\":\"session-json\",\"run_id\":\"run-json\",\"provider\":\"fake\",\"model\":\"fake-model\",\"outcome\":\"{outcome_name}\",\"response\":null,\"usage\":null,\"permission_denials\":[],\"error\":{error}}}\n"
+                "{{\"schema\":\"haider.run.v1\",\"session_id\":\"session-json\",\"run_id\":\"run-json\",\"provider\":\"fake\",\"model\":\"fake-model\",\"attachments\":{{\"count\":0,\"refs\":[]}},\"outcome\":\"{outcome_name}\",\"response\":null,\"usage\":null,\"permission_denials\":[],\"error\":{error}}}\n"
             )
         );
         let value: serde_json::Value = serde_json::from_slice(&bytes).expect("failure object");
-        assert_eq!(value.as_object().expect("object").len(), 10);
+        assert_eq!(value.as_object().expect("object").len(), 11);
         assert!(value["response"].is_null());
         assert_eq!(
             value["error"].is_null(),
             outcome == HeadlessOutcome::Cancelled
         );
     }
+}
+
+/// MUTATION CHECK: trust a filename extension instead of file magic or omit
+/// one supported image signature. Expected RUNTIME failure: a disguised PNG
+/// is refused, or the invalid `.png` payload is accepted.
+#[test]
+fn attach_loader_sniffs_image_magic_not_extensions() {
+    let directory = tempfile::tempdir().expect("attachment tempdir");
+    for (name, bytes, expected_mime) in [
+        ("jpeg.txt", vec![0xff, 0xd8, 0xff], "image/jpeg"),
+        (
+            "png.txt",
+            vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a],
+            "image/png",
+        ),
+        ("gif.txt", b"GIF89a".to_vec(), "image/gif"),
+        (
+            "webp.txt",
+            [b"RIFF".as_slice(), &[0, 0, 0, 0], b"WEBP".as_slice()].concat(),
+            "image/webp",
+        ),
+    ] {
+        let disguised = directory.path().join(name);
+        std::fs::write(&disguised, bytes).expect("write disguised image");
+        let loaded = load_image_attachment(&disguised).expect("magic identifies image");
+        assert_eq!(loaded.mime, expected_mime);
+    }
+
+    let false_extension = directory.path().join("not-an-image.png");
+    std::fs::write(&false_extension, b"plain text").expect("write invalid image");
+    let error = load_image_attachment(&false_extension).expect_err("extension is not trusted");
+    assert!(matches!(
+        error,
+        HeadlessRunError::Attachment { ref code, .. }
+            if code == "unsupported_attachment_type"
+    ));
+}
+
+/// MUTATION CHECK: omit landed artifact refs/count from the additive JSON
+/// result or serialize raw bytes. Expected RUNTIME failure: the exact
+/// attachment object no longer contains only the stable CAS identities.
+#[test]
+fn run_json_reports_attachments_additively() {
+    let mut attached = result(HeadlessOutcome::Done, None);
+    attached.attachments = vec![
+        ArtifactRef::new("blake3:first"),
+        ArtifactRef::new("blake3:second"),
+    ];
+    let mut bytes = Vec::new();
+    write_final(&mut bytes, RunOutput::Json, &attached).expect("attachment JSON");
+    assert_eq!(
+        String::from_utf8(bytes.clone()).expect("utf8"),
+        "{\"schema\":\"haider.run.v1\",\"session_id\":\"session-json\",\"run_id\":\"run-json\",\"provider\":\"fake\",\"model\":\"fake-model\",\"attachments\":{\"count\":2,\"refs\":[\"blake3:first\",\"blake3:second\"]},\"outcome\":\"done\",\"response\":null,\"usage\":null,\"permission_denials\":[],\"error\":null}\n"
+    );
+    let value: serde_json::Value = serde_json::from_slice(&bytes).expect("attachment object");
+    assert_eq!(value["attachments"]["count"], 2);
+    assert_eq!(
+        value["attachments"]["refs"],
+        serde_json::json!(["blake3:first", "blake3:second"])
+    );
 }
 
 struct BrokenWriter;

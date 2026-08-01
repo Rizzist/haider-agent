@@ -1,6 +1,8 @@
 #![allow(clippy::expect_used)]
 
-use haider_protocol::provider::{Block, FinishReason, StreamEvent, Usage, UsageSource};
+use haider_protocol::provider::{
+    Block, FeatureResolve, FinishReason, StreamEvent, Usage, UsageSource,
+};
 use haider_provider::{
     FakeProvider, FakeStep, Message, MessageRole, Provider, ProviderErrorKind, ProviderStream,
     TurnRequest,
@@ -123,6 +125,13 @@ async fn fake_capabilities_are_explicit() {
     let capabilities = FakeProvider::new(Vec::new()).capabilities().await;
     assert_eq!(capabilities.provider, "fake");
     assert_eq!(capabilities.context_limit, 1_000_000);
+    assert_eq!(capabilities.vision, FeatureResolve::Unsupported);
+
+    let vision = FakeProvider::new(Vec::new())
+        .with_vision_native()
+        .capabilities()
+        .await;
+    assert_eq!(vision.vision, FeatureResolve::Native);
 }
 
 #[tokio::test]

@@ -7,7 +7,9 @@ use haider_protocol::credential::{AuthMethod, CredentialDescriptor, CredentialSt
 use haider_protocol::effect::EffectClass;
 use haider_protocol::envelope::{PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION};
 use haider_protocol::ids::CredentialAlias;
-use haider_protocol::ids::{BranchId, DeviceId, EventId, ItemId, MenuId, NodeId, RunId, SessionId};
+use haider_protocol::ids::{
+    ArtifactRef, BranchId, DeviceId, EventId, ItemId, MenuId, NodeId, RunId, SessionId,
+};
 use haider_protocol::session::{SessionMetadataV1, SessionPermissionOverridesV1};
 use haider_protocol::tool::{
     DispatchMode, ToolInventoryEntry, ToolInventorySnapshot, ToolManifest, ToolPermissionDefault,
@@ -17,15 +19,16 @@ use haider_rpc::{
     CommandId, ERROR_CODE_ALREADY_RESOLVED, ERROR_CODE_CAPABILITY_DENIED, ERROR_CODE_CURSOR_AHEAD,
     ERROR_CODE_PROVIDER_REMOVE_REFUSED, ERROR_CODE_REVISION_CONFLICT, ErrorData,
     FEATURE_ACCOUNT_LOGIN_API_V1, FEATURE_ACCOUNT_MANAGEMENT_V1, FEATURE_ACCOUNT_OAUTH_PKCE_V1,
-    FEATURE_ACCOUNT_ROTATION_V1, FEATURE_BRANCH_CREATE_V1, FEATURE_PROVIDER_CONFIGURE_V1,
-    FEATURE_PROVIDER_MANAGEMENT_V1, FEATURE_PROVIDER_MODELS_V1, FEATURE_PROVIDER_REMOVE_V1,
-    FEATURE_SESSION_MUTATION_V1, FEATURE_TURN_CONTROL_V1, FEATURE_VAULT_STAGE_V1, Hello,
-    LifecyclePhase, MenuInput, ModelDetailWire, OAuthAuthorizationWire, OAuthAvailabilityWire,
-    OAuthFlowId, OAuthFlowStatusWire, OAuthReadyRefWire, ProtocolError, ProviderActiveWire,
-    ProviderApiFamilyWire, ProviderAuthRequirementWire, ProviderAvailabilityWire,
-    ProviderDefaultWire, ProviderRemoveRefusalReasonWire, ProviderSummaryWire, RequestBody,
-    RequestId, ResponseBody, SecretWire, SeqRange, SessionReadResult, SessionSummary, StagePurpose,
-    SubmitDisposition, Welcome, WireFrame,
+    FEATURE_ACCOUNT_ROTATION_V1, FEATURE_ARTIFACT_PUT_V1, FEATURE_BRANCH_CREATE_V1,
+    FEATURE_PROVIDER_CONFIGURE_V1, FEATURE_PROVIDER_MANAGEMENT_V1, FEATURE_PROVIDER_MODELS_V1,
+    FEATURE_PROVIDER_REMOVE_V1, FEATURE_SESSION_MUTATION_V1, FEATURE_TURN_CONTROL_V1,
+    FEATURE_VAULT_STAGE_V1, Hello, LifecyclePhase, MenuInput, ModelDetailWire,
+    OAuthAuthorizationWire, OAuthAvailabilityWire, OAuthFlowId, OAuthFlowStatusWire,
+    OAuthReadyRefWire, ProtocolError, ProviderActiveWire, ProviderApiFamilyWire,
+    ProviderAuthRequirementWire, ProviderAvailabilityWire, ProviderDefaultWire,
+    ProviderRemoveRefusalReasonWire, ProviderSummaryWire, RequestBody, RequestId, ResponseBody,
+    SecretWire, SeqRange, SessionReadResult, SessionSummary, StagePurpose, SubmitDisposition,
+    Welcome, WireFrame,
 };
 
 pub const TEST_FRAME_LIMIT: usize = 1024 * 1024;
@@ -882,6 +885,46 @@ pub fn transcript() -> Vec<WireFrame> {
                 accepted_seq: 60,
                 worker_generation: 7,
                 branch_id: BranchId::new("branch-plan-b"),
+            },
+        },
+        // B4a append-only byte-ingress shapes. The upload has no command id:
+        // identical bytes deduplicate by their verified content address.
+        WireFrame::Welcome(Welcome {
+            protocol: 1,
+            instance_id: "instance-artifacts".into(),
+            daemon_generation: 10,
+            frame_limit: TEST_FRAME_LIMIT as u32,
+            profile_id: "profile-1".into(),
+            daemon_version: "0.0.13".into(),
+            lifecycle_phase: LifecyclePhase::Ready,
+            capabilities_granted: capabilities([Capability::View, Capability::Control]),
+            features: BTreeSet::from([FEATURE_ARTIFACT_PUT_V1.to_owned()]),
+        }),
+        WireFrame::Request {
+            request_id: RequestId::new("request-artifact-put"),
+            body: RequestBody::ArtifactPut {
+                data_base64: "aGVsbG8=".into(),
+            },
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-artifact-put"),
+            body: ResponseBody::ArtifactPut {
+                artifact: ArtifactRef::new(
+                    "blake3:ea8f163db38682925e4491c5e58d4bb3506ef8c14eb78a86e908c5624a67200f",
+                ),
+                bytes: 5,
+            },
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-artifact-oversized"),
+            body: ResponseBody::Error {
+                code: "artifact_too_large".into(),
+                message: "decoded artifact exceeds the hard limit".into(),
+                retryable: false,
+                data: Some(ErrorData::ArtifactTooLarge {
+                    actual_bytes: 8_388_609,
+                    max_bytes: 8_388_608,
+                }),
             },
         },
     ]

@@ -7,22 +7,25 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::{Future, pending};
+use std::io::Read as _;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use haider_rpc::haider_protocol::EventPayload;
 use haider_rpc::haider_protocol::envelope::RawEnvelope;
 use haider_rpc::haider_protocol::error::ErrorCode;
-use haider_rpc::haider_protocol::ids::{MenuId, RunId, SessionId};
+use haider_rpc::haider_protocol::ids::{ArtifactRef, MenuId, RunId, SessionId};
 use haider_rpc::haider_protocol::item::{ItemEvent, TurnItem};
 use haider_rpc::haider_protocol::menu::{DecisionKind, MenuKind};
 use haider_rpc::haider_protocol::provider::Usage;
 use haider_rpc::haider_protocol::session::SessionPermissionOverridesV1;
 use haider_rpc::haider_protocol::state::RunState;
+use haider_rpc::haider_protocol::tool::AttachmentBlock;
 use haider_rpc::{
     AttachMode, AttachmentId, Capability, CapabilitySet, ClientKind, CommandId,
-    ERROR_CODE_ALREADY_RESOLVED, FEATURE_SESSION_PERMISSION_OVERRIDES_V1, RequestBody,
-    ResponseBody, WireFrame,
+    ERROR_CODE_ALREADY_RESOLVED, FEATURE_ARTIFACT_PUT_V1, FEATURE_SESSION_PERMISSION_OVERRIDES_V1,
+    RequestBody, ResponseBody, WireFrame,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -45,11 +48,72 @@ const MAX_RECONNECTS: u8 = 3;
 const ATTACH_HEALTH_POLL: Duration = Duration::from_millis(10);
 static COMMAND_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
+const MAX_HEADLESS_ATTACHMENTS: usize = 5;
+const MAX_HEADLESS_ATTACHMENT_BYTES: usize = 5 * 1024 * 1024;
+
+/// One magic-sniffed image ready for receipt-free daemon upload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadlessImageAttachment {
+    pub bytes: Vec<u8>,
+    pub mime: String,
+}
+
+/// Reads at most the accepted image size plus one byte and identifies the
+/// format from magic bytes rather than the path extension.
+pub fn load_image_attachment(path: &Path) -> Result<HeadlessImageAttachment, HeadlessRunError> {
+    let file = std::fs::File::open(path).map_err(|error| HeadlessRunError::Attachment {
+        code: "attachment_io".into(),
+        message: format!("cannot open attachment {}: {error}", path.display()),
+    })?;
+    let mut bytes = Vec::new();
+    file.take((MAX_HEADLESS_ATTACHMENT_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| HeadlessRunError::Attachment {
+            code: "attachment_io".into(),
+            message: format!("cannot read attachment {}: {error}", path.display()),
+        })?;
+    if bytes.len() > MAX_HEADLESS_ATTACHMENT_BYTES {
+        return Err(HeadlessRunError::Attachment {
+            code: "attachment_too_large".into(),
+            message: format!(
+                "attachment {} exceeds the 5 MiB per-attachment limit",
+                path.display()
+            ),
+        });
+    }
+    let mime = sniff_image_mime(&bytes).ok_or_else(|| HeadlessRunError::Attachment {
+        code: "unsupported_attachment_type".into(),
+        message: format!(
+            "attachment {} is not a JPEG, PNG, GIF, or WebP image",
+            path.display()
+        ),
+    })?;
+    Ok(HeadlessImageAttachment {
+        bytes,
+        mime: mime.into(),
+    })
+}
+
+fn sniff_image_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]) {
+        Some("image/png")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
 /// One daemon-backed run request.
 #[derive(Debug, Clone)]
 pub struct HeadlessRunRequest {
     pub cwd: String,
     pub prompt: String,
+    pub attachments: Vec<HeadlessImageAttachment>,
     /// Explicit provider override. `None` follows the daemon's active account.
     pub provider: Option<String>,
     /// Explicit model override. `None` follows the selected provider summary.
@@ -163,6 +227,7 @@ pub struct HeadlessRunResult {
     pub run_id: RunId,
     pub provider: String,
     pub model: String,
+    pub attachments: Vec<ArtifactRef>,
     pub outcome: HeadlessOutcome,
     pub response: Option<String>,
     pub usage: Option<Usage>,
@@ -174,6 +239,10 @@ pub struct HeadlessRunResult {
 /// Failure before a correlated final result could be produced.
 #[derive(Debug)]
 pub enum HeadlessRunError {
+    Attachment {
+        code: String,
+        message: String,
+    },
     Ensure(EnsureError),
     Transport {
         stage: &'static str,
@@ -204,6 +273,9 @@ pub enum HeadlessRunError {
 impl std::fmt::Display for HeadlessRunError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Attachment { code, message } => {
+                write!(formatter, "headless attachment failed ({code}): {message}")
+            }
             Self::Ensure(error) => write!(formatter, "{error}"),
             Self::Transport { stage, reason } => {
                 write!(
@@ -572,7 +644,20 @@ async fn run_headless_inner(
     request: HeadlessRunRequest,
     output: mpsc::UnboundedSender<HeadlessEvent>,
 ) -> Result<HeadlessRunResult, HeadlessRunError> {
-    normalize_ensure_options(&mut ensure, request.permission_overrides);
+    if request.attachments.len() > MAX_HEADLESS_ATTACHMENTS {
+        return Err(HeadlessRunError::Attachment {
+            code: "too_many_attachments".into(),
+            message: format!(
+                "headless run carries {} attachments; the limit is {MAX_HEADLESS_ATTACHMENTS}",
+                request.attachments.len()
+            ),
+        });
+    }
+    normalize_ensure_options(
+        &mut ensure,
+        request.permission_overrides,
+        !request.attachments.is_empty(),
+    );
     let timeout_deadline = request.timeout.map(|timeout| Instant::now() + timeout);
     let submit_command_id = CommandId::new(command_id("headless-submit"));
     let mut reconnects = ReconnectBudget::new();
@@ -592,6 +677,18 @@ async fn run_headless_inner(
             &mut reconnects,
             request.provider.clone(),
             request.model.clone(),
+        ),
+    )
+    .await?;
+    let (submit_attachments, attachment_refs) = before_acceptance_deadline(
+        timeout_deadline,
+        "artifact.put",
+        upload_attachments(
+            profile,
+            &ensure,
+            &mut connection,
+            &mut reconnects,
+            &request.attachments,
         ),
     )
     .await?;
@@ -678,7 +775,7 @@ async fn run_headless_inner(
         session_id: session_id.clone(),
         worker_generation: connection.worker_generation,
         text: request.prompt,
-        attachments: Vec::new(),
+        attachments: submit_attachments,
         mode: haider_rpc::haider_protocol::DeliveryMode::Queue,
     };
     let mut buffered = Vec::new();
@@ -1002,7 +1099,106 @@ async fn run_headless_inner(
         }
     }
 
-    Ok(finalize(reducer, run_id, provider, model, forced))
+    Ok(finalize(
+        reducer,
+        run_id,
+        provider,
+        model,
+        attachment_refs,
+        forced,
+    ))
+}
+
+async fn upload_attachments(
+    profile: &ResolvedProfile,
+    ensure: &EnsureOptions,
+    connection: &mut HeadlessConnection,
+    reconnects: &mut ReconnectBudget,
+    attachments: &[HeadlessImageAttachment],
+) -> Result<(Vec<AttachmentBlock>, Vec<ArtifactRef>), HeadlessRunError> {
+    let mut blocks = Vec::with_capacity(attachments.len());
+    let mut refs = Vec::with_capacity(attachments.len());
+    for attachment in attachments {
+        let expected = ArtifactRef::new(format!(
+            "blake3:{}",
+            blake3::hash(&attachment.bytes).to_hex()
+        ));
+        let body = RequestBody::ArtifactPut {
+            data_base64: encode_base64(&attachment.bytes),
+        };
+        loop {
+            match connection.client.request(body.clone()).await {
+                Ok(ResponseBody::ArtifactPut { artifact, bytes }) => {
+                    let expected_bytes = u64::try_from(attachment.bytes.len()).unwrap_or(u64::MAX);
+                    if artifact != expected || bytes != expected_bytes {
+                        return Err(protocol_error(
+                            "artifact.put",
+                            "response content address or byte count did not match the upload",
+                        ));
+                    }
+                    blocks.push(AttachmentBlock::Image {
+                        artifact: artifact.clone(),
+                        mime: attachment.mime.clone(),
+                        width: None,
+                        height: None,
+                    });
+                    refs.push(artifact);
+                    break;
+                }
+                Ok(ResponseBody::Error {
+                    code,
+                    message,
+                    retryable,
+                    ..
+                }) => return Err(rpc_error("artifact.put", code, message, retryable)),
+                Ok(_) => {
+                    return Err(protocol_error(
+                        "artifact.put",
+                        "response method did not match request",
+                    ));
+                }
+                Err(error) => {
+                    reconnect_before_session(
+                        profile,
+                        ensure,
+                        connection,
+                        reconnects,
+                        "artifact.put",
+                        error,
+                    )
+                    .await?;
+                }
+            }
+        }
+    }
+    Ok((blocks, refs))
+}
+
+fn encode_base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3).saturating_mul(4));
+    for chunk in bytes.chunks(3) {
+        let first = chunk[0];
+        let second = chunk.get(1).copied().unwrap_or(0);
+        let third = chunk.get(2).copied().unwrap_or(0);
+        encoded.push(char::from(ALPHABET[usize::from(first >> 2)]));
+        encoded.push(char::from(
+            ALPHABET[usize::from(((first & 0x03) << 4) | (second >> 4))],
+        ));
+        if chunk.len() > 1 {
+            encoded.push(char::from(
+                ALPHABET[usize::from(((second & 0x0f) << 2) | (third >> 6))],
+            ));
+        } else {
+            encoded.push('=');
+        }
+        if chunk.len() > 2 {
+            encoded.push(char::from(ALPHABET[usize::from(third & 0x3f)]));
+        } else {
+            encoded.push('=');
+        }
+    }
+    encoded
 }
 
 async fn resolve_run_identity(
@@ -1150,12 +1346,18 @@ async fn provider_summary(
 fn normalize_ensure_options(
     options: &mut EnsureOptions,
     permission_overrides: SessionPermissionOverridesV1,
+    has_attachments: bool,
 ) {
     options.required_features.extend(required_live_features());
     if !permission_overrides.is_empty() {
         options
             .required_features
             .insert(FEATURE_SESSION_PERMISSION_OVERRIDES_V1.to_owned());
+    }
+    if has_attachments {
+        options
+            .required_features
+            .insert(FEATURE_ARTIFACT_PUT_V1.to_owned());
     }
     options.client = ClientConfig {
         client_name: "haider-headless".into(),
@@ -2060,6 +2262,7 @@ fn finalize(
     run_id: RunId,
     provider: String,
     model: String,
+    attachments: Vec<ArtifactRef>,
     forced: Option<ForcedOutcome>,
 ) -> HeadlessRunResult {
     let (outcome, failure, terminal_seq) = match forced {
@@ -2107,6 +2310,7 @@ fn finalize(
         run_id,
         provider,
         model,
+        attachments,
         outcome,
         response: reducer.response,
         usage: reducer.usage,
@@ -2193,6 +2397,7 @@ fn error_code_name(code: ErrorCode) -> &'static str {
         ErrorCode::LoopLimit => "loop_limit",
         ErrorCode::ProviderError => "provider_error",
         ErrorCode::ProviderTimeout => "provider_timeout",
+        ErrorCode::VisionUnsupported => "vision_unsupported",
         ErrorCode::StoreCorrupt => "store_corrupt",
         ErrorCode::StoreLocked => "store_locked",
         ErrorCode::PermissionDenied => "permission_denied",
@@ -2212,5 +2417,15 @@ pub fn required_headless_features(
     if !permission_overrides.is_empty() {
         features.insert(FEATURE_SESSION_PERMISSION_OVERRIDES_V1.to_owned());
     }
+    features
+}
+
+/// Required daemon features for a headless run that will upload attachments.
+#[must_use]
+pub fn required_headless_features_with_attachments(
+    permission_overrides: SessionPermissionOverridesV1,
+) -> BTreeSet<String> {
+    let mut features = required_headless_features(permission_overrides);
+    features.insert(FEATURE_ARTIFACT_PUT_V1.to_owned());
     features
 }

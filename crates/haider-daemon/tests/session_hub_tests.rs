@@ -5,27 +5,34 @@
 
 #![allow(clippy::expect_used)]
 
+use base64::Engine as _;
 use haider_core::{
     HarnessActor, HarnessConfig, SqliteStoreHandle, StoreHandle, SubmitCommittedTurn,
 };
 use haider_daemon::ConnectionTransport;
 use haider_daemon::{
-    AdmissionTicket, FrameSendError, FrameSink, HubConnection, HubObservation, SendAdmission,
-    SessionHub, SessionHubConfig, SessionHubObserver, SessionHubShutdownOutcome,
+    AdmissionTicket, FrameSendError, FrameSink, HubConnection, HubObservation,
+    IMAGE_ATTACHMENT_MIME_ALLOWLIST, SendAdmission, SessionHub, SessionHubConfig,
+    SessionHubObserver, SessionHubShutdownOutcome,
 };
+use haider_protocol::DeliveryMode;
 use haider_protocol::EventPayload;
 use haider_protocol::context::{ContextFootprint, ContextFootprintTruth};
 use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
 };
-use haider_protocol::ids::{DeviceId, EventId, ItemId, MenuId, RunId, SessionId};
+use haider_protocol::ids::{ArtifactRef, DeviceId, EventId, ItemId, MenuId, RunId, SessionId};
 use haider_protocol::item::ItemEvent;
 use haider_protocol::menu::{Menu, MenuKind, MenuOption, MenuScope};
 use haider_protocol::provider::FinishReason;
 use haider_protocol::state::RunState;
+use haider_protocol::tool::AttachmentBlock;
 use haider_provider::{FakeInputKind, FakeInputOption, FakeProvider, FakeStep, Message};
 use haider_rpc::{
-    AttachMode, AttachmentId, Capability, CapabilitySet, CommandId, ErrorData, RequestBody,
+    ARTIFACT_PUT_MAX_BYTES, AttachMode, AttachmentId, Capability, CapabilitySet, CommandId,
+    ERROR_CODE_ARTIFACT_TOO_LARGE, ERROR_CODE_ATTACHMENT_MIME_UNSUPPORTED,
+    ERROR_CODE_ATTACHMENT_NOT_FOUND, ERROR_CODE_ATTACHMENT_TOO_LARGE,
+    ERROR_CODE_ATTACHMENTS_TOO_LARGE, ERROR_CODE_TOO_MANY_ATTACHMENTS, ErrorData, RequestBody,
     RequestId, ResponseBody, SeqRange, WireFrame,
 };
 use std::collections::VecDeque;
@@ -464,6 +471,392 @@ async fn append_one(
 
 fn capabilities() -> CapabilitySet {
     CapabilitySet::from([Capability::View, Capability::Control])
+}
+
+async fn upload_bytes(
+    connection: &HubConnection,
+    sink: &CollectSink,
+    request_id: &str,
+    bytes: &[u8],
+) -> ResponseBody {
+    connection
+        .request(
+            RequestId::new(request_id),
+            RequestBody::ArtifactPut {
+                data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+            },
+        )
+        .await
+        .expect("artifact.put routes");
+    let WireFrame::Response { body, .. } = sink.next().await else {
+        panic!("expected artifact.put response");
+    };
+    body
+}
+
+async fn attach_control_session(
+    hub: &SessionHub,
+    store: &SqliteStoreHandle,
+    connection: &HubConnection,
+    sink: &CollectSink,
+    session_id: &SessionId,
+) {
+    append_one(
+        hub,
+        session_id,
+        store.worker_generation(),
+        "attachment-validation-seed",
+    )
+    .await;
+    connection
+        .request(
+            RequestId::new("attachment-validation-attach"),
+            RequestBody::SessionAttach {
+                session_id: session_id.clone(),
+                after_seq: 0,
+                mode: AttachMode::Control,
+            },
+        )
+        .await
+        .expect("control attach routes");
+    assert!(matches!(
+        sink.next().await,
+        WireFrame::Response {
+            body: ResponseBody::SessionAttach { .. },
+            ..
+        }
+    ));
+    assert!(matches!(sink.next().await, WireFrame::Event { .. }));
+    assert!(matches!(
+        sink.next().await,
+        WireFrame::AttachCaughtUp {
+            high_water_seq: 1,
+            ..
+        }
+    ));
+}
+
+/// MUTATION CHECK: bypass daemon CAS ingress, return a caller-provided ref,
+/// or rewrite an existing object. Expected RUNTIME failure: the verified
+/// BLAKE3 ref/byte count differs, the stored bytes differ, or the second put
+/// does not return the identical content address.
+#[tokio::test]
+async fn artifact_put_roundtrip_is_content_addressed_and_idempotent() {
+    let (_root, store, hub) = open_hub(None, 8).await;
+    let sink = Arc::new(CollectSink::default());
+    let connection = hub
+        .open_connection(
+            capabilities(),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection");
+    let mut bytes = vec![0_u8; 5 * 1024 * 1024];
+    bytes[..8].copy_from_slice(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
+    let first = upload_bytes(&connection, &sink, "put-first", &bytes).await;
+    let second = upload_bytes(&connection, &sink, "put-second", &bytes).await;
+    let (
+        ResponseBody::ArtifactPut {
+            artifact: first_ref,
+            bytes: first_bytes,
+        },
+        ResponseBody::ArtifactPut {
+            artifact: second_ref,
+            bytes: second_bytes,
+        },
+    ) = (first, second)
+    else {
+        panic!("both uploads must succeed");
+    };
+    assert_eq!(first_ref, second_ref);
+    assert_eq!(first_bytes, bytes.len() as u64);
+    assert_eq!(second_bytes, bytes.len() as u64);
+    assert_eq!(
+        store.get(&first_ref).await.expect("verified CAS read"),
+        bytes
+    );
+
+    connection.close().await.expect("connection closes");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// MUTATION CHECK: remove the decoded put cap, the per-attachment cap, or
+/// the aggregate per-turn cap. Expected RUNTIME failure: one of the three
+/// requests succeeds or returns an untyped/general error instead of its
+/// stable code and structured limit coordinates.
+#[tokio::test]
+async fn oversized_put_and_oversized_turn_are_typed_errors() {
+    let (_root, store, hub) = open_hub(None, 8).await;
+    let sink = Arc::new(CollectSink::default());
+    let connection = hub
+        .open_connection(
+            capabilities(),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection");
+
+    let oversized = vec![0_u8; ARTIFACT_PUT_MAX_BYTES + 1];
+    assert!(matches!(
+        upload_bytes(&connection, &sink, "put-oversized", &oversized).await,
+        ResponseBody::Error {
+            ref code,
+            data: Some(ErrorData::ArtifactTooLarge { .. }),
+            ..
+        } if code == ERROR_CODE_ARTIFACT_TOO_LARGE
+    ));
+
+    let session_id = SessionId::new("attachment-size-validation");
+    attach_control_session(&hub, &store, &connection, &sink, &session_id).await;
+    let per_attachment = vec![b'x'; 5 * 1024 * 1024 + 1];
+    let ResponseBody::ArtifactPut {
+        artifact: oversized_ref,
+        ..
+    } = upload_bytes(&connection, &sink, "put-over-turn-limit", &per_attachment).await
+    else {
+        panic!("put below the 8 MiB ingress cap succeeds");
+    };
+    connection
+        .request(
+            RequestId::new("submit-over-attachment-limit"),
+            RequestBody::TurnSubmit {
+                command_id: CommandId::new("submit-over-attachment-limit"),
+                session_id: session_id.clone(),
+                worker_generation: store.worker_generation(),
+                text: "inspect paste".into(),
+                attachments: vec![AttachmentBlock::PastedText {
+                    artifact: oversized_ref,
+                    lines: 1,
+                }],
+                mode: DeliveryMode::Queue,
+            },
+        )
+        .await
+        .expect("oversized submit routes");
+    assert!(matches!(
+        sink.next().await,
+        WireFrame::Response {
+            body: ResponseBody::Error { ref code, data: Some(ErrorData::AttachmentTooLarge { .. }), .. },
+            ..
+        } if code == ERROR_CODE_ATTACHMENT_TOO_LARGE
+    ));
+
+    let exact_five = vec![b'y'; 5 * 1024 * 1024];
+    let ResponseBody::ArtifactPut {
+        artifact: five_ref, ..
+    } = upload_bytes(&connection, &sink, "put-five-mib", &exact_five).await
+    else {
+        panic!("5 MiB put succeeds");
+    };
+    connection
+        .request(
+            RequestId::new("submit-over-total-limit"),
+            RequestBody::TurnSubmitWithBranch {
+                command_id: CommandId::new("submit-over-total-limit"),
+                session_id: session_id.clone(),
+                worker_generation: store.worker_generation(),
+                branch_id: None,
+                text: "inspect repeated pastes".into(),
+                attachments: (0..4)
+                    .map(|_| AttachmentBlock::PastedText {
+                        artifact: five_ref.clone(),
+                        lines: 1,
+                    })
+                    .collect(),
+                mode: DeliveryMode::Queue,
+            },
+        )
+        .await
+        .expect("aggregate submit routes");
+    assert!(matches!(
+        sink.next().await,
+        WireFrame::Response {
+            body: ResponseBody::Error { ref code, data: Some(ErrorData::AttachmentsTooLarge { .. }), .. },
+            ..
+        } if code == ERROR_CODE_ATTACHMENTS_TOO_LARGE
+    ));
+    connection
+        .request(
+            RequestId::new("submit-too-many-attachments"),
+            RequestBody::TurnSubmit {
+                command_id: CommandId::new("submit-too-many-attachments"),
+                session_id: session_id.clone(),
+                worker_generation: store.worker_generation(),
+                text: "too many pastes".into(),
+                attachments: (0..6)
+                    .map(|_| AttachmentBlock::PastedText {
+                        artifact: five_ref.clone(),
+                        lines: 1,
+                    })
+                    .collect(),
+                mode: DeliveryMode::Queue,
+            },
+        )
+        .await
+        .expect("count-limited submit routes");
+    assert!(matches!(
+        sink.next().await,
+        WireFrame::Response {
+            body: ResponseBody::Error { ref code, data: Some(ErrorData::TooManyAttachments { .. }), .. },
+            ..
+        } if code == ERROR_CODE_TOO_MANY_ATTACHMENTS
+    ));
+    assert_eq!(store.latest_seq(&session_id).await.expect("head"), 1);
+
+    connection.close().await.expect("connection closes");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// MUTATION CHECK: defer artifact/mime checks until worker startup. Expected
+/// RUNTIME failure: either submit is durably accepted (head advances beyond
+/// one) or the correlated response loses the exact remediable error code.
+#[tokio::test]
+async fn dangling_ref_rejected_at_submit_not_at_run() {
+    let (_root, store, hub) = open_hub(None, 8).await;
+    let sink = Arc::new(CollectSink::default());
+    let connection = hub
+        .open_connection(
+            capabilities(),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection");
+    let session_id = SessionId::new("attachment-reference-validation");
+    attach_control_session(&hub, &store, &connection, &sink, &session_id).await;
+    let ResponseBody::ArtifactPut { artifact, .. } =
+        upload_bytes(&connection, &sink, "put-mime-fixture", b"image bytes").await
+    else {
+        panic!("mime fixture upload succeeds");
+    };
+
+    connection
+        .request(
+            RequestId::new("submit-bad-mime"),
+            RequestBody::TurnSubmit {
+                command_id: CommandId::new("submit-bad-mime"),
+                session_id: session_id.clone(),
+                worker_generation: store.worker_generation(),
+                text: "bad mime".into(),
+                attachments: vec![AttachmentBlock::Image {
+                    artifact,
+                    mime: "image/svg+xml".into(),
+                    width: None,
+                    height: None,
+                }],
+                mode: DeliveryMode::Queue,
+            },
+        )
+        .await
+        .expect("bad MIME submit routes");
+    assert!(matches!(
+        sink.next().await,
+        WireFrame::Response {
+            body: ResponseBody::Error { ref code, data: Some(ErrorData::AttachmentMimeUnsupported { .. }), .. },
+            ..
+        } if code == ERROR_CODE_ATTACHMENT_MIME_UNSUPPORTED
+    ));
+
+    let dangling = ArtifactRef::new(format!("blake3:{}", "0".repeat(64)));
+    connection
+        .request(
+            RequestId::new("submit-dangling"),
+            RequestBody::TurnSubmitWithBranch {
+                command_id: CommandId::new("submit-dangling"),
+                session_id: session_id.clone(),
+                worker_generation: store.worker_generation(),
+                branch_id: None,
+                text: "dangling image".into(),
+                attachments: vec![AttachmentBlock::Image {
+                    artifact: dangling.clone(),
+                    mime: "image/png".into(),
+                    width: None,
+                    height: None,
+                }],
+                mode: DeliveryMode::Queue,
+            },
+        )
+        .await
+        .expect("dangling submit routes");
+    assert!(matches!(
+        sink.next().await,
+        WireFrame::Response {
+            body: ResponseBody::Error {
+                ref code,
+                data: Some(ErrorData::AttachmentNotFound { artifact, .. }),
+                ..
+            },
+            ..
+        } if code == ERROR_CODE_ATTACHMENT_NOT_FOUND && artifact == dangling
+    ));
+    assert_eq!(store.latest_seq(&session_id).await.expect("head"), 1);
+
+    connection.close().await.expect("connection closes");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// MUTATION CHECK: accept an arbitrary caller-declared image MIME. Expected
+/// RUNTIME failure: SVG reaches durable acceptance instead of returning the
+/// exact typed allowlist refusal while the journal head remains unchanged.
+#[tokio::test]
+async fn mime_allowlist_enforced_at_acceptance() {
+    assert_eq!(
+        IMAGE_ATTACHMENT_MIME_ALLOWLIST,
+        ["image/jpeg", "image/png", "image/gif", "image/webp"]
+    );
+    let (_root, store, hub) = open_hub(None, 8).await;
+    let sink = Arc::new(CollectSink::default());
+    let connection = hub
+        .open_connection(
+            capabilities(),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection");
+    let session_id = SessionId::new("attachment-mime-validation");
+    attach_control_session(&hub, &store, &connection, &sink, &session_id).await;
+    let ResponseBody::ArtifactPut { artifact, .. } =
+        upload_bytes(&connection, &sink, "put-mime-only-fixture", b"image bytes").await
+    else {
+        panic!("mime fixture upload succeeds");
+    };
+    connection
+        .request(
+            RequestId::new("submit-mime-only"),
+            RequestBody::TurnSubmit {
+                command_id: CommandId::new("submit-mime-only"),
+                session_id: session_id.clone(),
+                worker_generation: store.worker_generation(),
+                text: "bad mime".into(),
+                attachments: vec![AttachmentBlock::Image {
+                    artifact,
+                    mime: "image/svg+xml".into(),
+                    width: None,
+                    height: None,
+                }],
+                mode: DeliveryMode::Queue,
+            },
+        )
+        .await
+        .expect("bad MIME submit routes");
+    assert!(matches!(
+        sink.next().await,
+        WireFrame::Response {
+            body: ResponseBody::Error {
+                ref code,
+                data: Some(ErrorData::AttachmentMimeUnsupported { .. }),
+                ..
+            },
+            ..
+        } if code == ERROR_CODE_ATTACHMENT_MIME_UNSUPPORTED
+    ));
+    assert_eq!(store.latest_seq(&session_id).await.expect("head"), 1);
+
+    connection.close().await.expect("connection closes");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
 }
 
 /// MUTATION CHECK: validate only persisted worker_generation and omit the

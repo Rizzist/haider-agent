@@ -58,7 +58,7 @@ async fn main() -> ExitCode {
                 "haider: unknown or incomplete command `{other}` \
                  (supports: --version, self-test, run <prompt> \
                  [--output print|json|jsonl] [--timeout <dur>] \
-                 [--allow-writes] [--allow-exec], \
+                 [--allow-writes] [--allow-exec] [--attach <path>]..., \
                  update [--check], \
                  tui [--theme dawn|ivory|dark], tui --demo [--plain], \
                  import [codex|claude-code], --ready)"
