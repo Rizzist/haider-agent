@@ -585,6 +585,35 @@ fn bad_checksums_stop_before_extraction_and_verification() {
     }
 }
 
+/// MUTATION CHECK: skip the archive-content digest comparison (a
+/// WELL-FORMED checksum naming the right asset whose hash simply does not
+/// match the downloaded bytes — the tampered/corrupted-transport case the
+/// parsing fixtures above cannot reach). Expected RUNTIME failure: staging
+/// succeeds, the verifier is called, or staging entries appear.
+#[test]
+fn wrong_content_digest_with_valid_checksum_refuses_before_extraction() {
+    let target = cli_main::update::discovery::compiled_target().expect("target");
+    let members = expected_members("9.0.0", target);
+    let install = install_fixture();
+    let before = pair_snapshot(install.path());
+    let wrong_digest_checksum = format!(
+        "{}  dist/haider-v9.0.0-{target}.tar.xz
+",
+        "0".repeat(64)
+    );
+    let (selection, mut transport) =
+        selection_and_transport(install.path(), &members, Some(wrong_digest_checksum));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let verifier = FakeVerifier {
+        failure: VerifyFailure::None,
+        calls: Arc::clone(&calls),
+    };
+    assert!(stage_release(&mut transport, &verifier, install.path(), &selection).is_err());
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(pair_snapshot(install.path()), before);
+    assert!(stage_entries(install.path()).is_empty());
+}
+
 /// MUTATION CHECK: allow traversal/absolute/link/device/duplicate/extra,
 /// missing, oversized, or non-executable archive members. Expected RUNTIME
 /// failure: one malformed table row yields a verified capability.
