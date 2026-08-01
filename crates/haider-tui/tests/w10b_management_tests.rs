@@ -229,3 +229,42 @@ fn demo_account_removal_stays_local() {
         model.requests
     );
 }
+
+/// MUTATION CHECK: drop the `push_custom_card_lines` call from the
+/// PROVIDERS renderer. Expected RUNTIME failure: the card opened from
+/// /providers is invisible (the live-probe bug this pins).
+#[test]
+fn cards_opened_from_providers_render_on_the_providers_screen() {
+    use haider_tui::render::render;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let mut model = live_model();
+    model
+        .daemon_features
+        .insert(haider_rpc::FEATURE_PROVIDER_CONFIGURE_V1.to_owned());
+    model.providers.apply_snapshot(Vec::new(), 1);
+    model.screen = Screen::Providers;
+    model.handle(key(KeyCode::Char('h')));
+    assert!(model.custom_add.is_some());
+
+    let backend = TestBackend::new(120, 40);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| {
+            render(&model, frame);
+        })
+        .expect("draw");
+    let buffer = terminal.backend().buffer().clone();
+    let mut text = String::new();
+    for y in 0..buffer.area.height {
+        for x in 0..buffer.area.width {
+            text.push_str(buffer[(x, y)].symbol());
+        }
+        text.push('\n');
+    }
+    assert!(
+        text.contains("router.huggingface.co"),
+        "the HF preset card is visible on /providers"
+    );
+}

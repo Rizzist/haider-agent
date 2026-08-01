@@ -808,6 +808,84 @@ fn render_launcher(
 /// groups (base URL on the group header) · rows with ●/○ + AUTH_LABEL +
 /// identity + status + "in use" · ONE global add row after all groups ·
 /// hints. The dot NEVER moves at render time — rows are daemon truth.
+/// The custom-provider card lines (add, edit, or the HF preset) —
+/// shared by the /accounts and /providers renderers (W10b: the card
+/// opens from either screen and must be VISIBLE from either).
+fn push_custom_card_lines<'a>(model: &'a AppModel, theme: &Theme, lines_out: &mut Vec<Line<'a>>) {
+    if let Some(card) = &model.custom_add {
+        lines_out.push(Line::from(vec![
+            Span::styled("◉ ", theme.gold_style()),
+            Span::styled(
+                "add a custom provider — OpenAI-compatible",
+                theme.warn_style(),
+            ),
+        ]));
+        if model.mode.fabricates_locally() {
+            for line in [
+                "  base URL + key — works with any OpenAI-compatible server",
+                "  vLLM · Ollama · LM Studio · LiteLLM · TGI · your own gateway",
+                "  capability probed from /v1/models · stored in the vault by alias",
+            ] {
+                lines_out.push(Line::styled(line, theme.dim_style()));
+            }
+            lines_out.push(Line::styled(
+                "  [1] add http://127.0.0.1:8000/v1 (demo) · [2] cancel",
+                theme.gold_style(),
+            ));
+            lines_out.push(Line::styled(
+                "  accounts.add over RPC — the ADE renders this same card",
+                theme.faint_style(),
+            ));
+        } else {
+            let editing = matches!(card.phase, crate::app::CustomPhase::Editing { .. });
+            if let crate::app::CustomPhase::Editing { error: Some(error) } = &card.phase {
+                lines_out.push(Line::styled(format!("  ✗ {error}"), theme.err_style()));
+            }
+            let caret = |focused: bool| if focused { "▏" } else { "" };
+            lines_out.push(Line::styled(
+                format!(
+                    "  name   ❯ {}{}",
+                    card.name,
+                    caret(editing && card.focus == crate::app::CustomField::Name)
+                ),
+                theme.text_style(),
+            ));
+            lines_out.push(Line::styled(
+                format!(
+                    "  origin ❯ {}{}",
+                    card.origin,
+                    caret(editing && card.focus == crate::app::CustomField::Origin)
+                ),
+                theme.text_style(),
+            ));
+            lines_out.push(Line::styled(
+                format!(
+                    "  model  ❯ {}{}",
+                    card.model,
+                    caret(editing && card.focus == crate::app::CustomField::Model)
+                ),
+                theme.text_style(),
+            ));
+            if editing {
+                lines_out.push(Line::styled(
+                    "  the model the server serves (e.g. llama3.1:8b) · the key is asked next",
+                    theme.dim_style(),
+                ));
+                lines_out.push(Line::styled(
+                    "  ⏎ create · tab field · esc cancel",
+                    theme.gold_style(),
+                ));
+            } else {
+                lines_out.push(Line::styled(
+                    "  committing the provider…",
+                    theme.pulse_ink(theme.gold, model.anim_phase),
+                ));
+            }
+        }
+        lines_out.push(Line::raw(""));
+    }
+}
+
 fn render_accounts(
     model: &AppModel,
     theme: &Theme,
@@ -1028,78 +1106,7 @@ fn render_accounts(
     // tui.js:3629-3682). Demo = the sim's verbatim fabrication card; live
     // = the editable name/origin fields (the provider.configure front
     // door).
-    if let Some(card) = &model.custom_add {
-        footer_lines.push(Line::from(vec![
-            Span::styled("◉ ", theme.gold_style()),
-            Span::styled(
-                "add a custom provider — OpenAI-compatible",
-                theme.warn_style(),
-            ),
-        ]));
-        if model.mode.fabricates_locally() {
-            for line in [
-                "  base URL + key — works with any OpenAI-compatible server",
-                "  vLLM · Ollama · LM Studio · LiteLLM · TGI · your own gateway",
-                "  capability probed from /v1/models · stored in the vault by alias",
-            ] {
-                footer_lines.push(Line::styled(line, theme.dim_style()));
-            }
-            footer_lines.push(Line::styled(
-                "  [1] add http://127.0.0.1:8000/v1 (demo) · [2] cancel",
-                theme.gold_style(),
-            ));
-            footer_lines.push(Line::styled(
-                "  accounts.add over RPC — the ADE renders this same card",
-                theme.faint_style(),
-            ));
-        } else {
-            let editing = matches!(card.phase, crate::app::CustomPhase::Editing { .. });
-            if let crate::app::CustomPhase::Editing { error: Some(error) } = &card.phase {
-                footer_lines.push(Line::styled(format!("  ✗ {error}"), theme.err_style()));
-            }
-            let caret = |focused: bool| if focused { "▏" } else { "" };
-            footer_lines.push(Line::styled(
-                format!(
-                    "  name   ❯ {}{}",
-                    card.name,
-                    caret(editing && card.focus == crate::app::CustomField::Name)
-                ),
-                theme.text_style(),
-            ));
-            footer_lines.push(Line::styled(
-                format!(
-                    "  origin ❯ {}{}",
-                    card.origin,
-                    caret(editing && card.focus == crate::app::CustomField::Origin)
-                ),
-                theme.text_style(),
-            ));
-            footer_lines.push(Line::styled(
-                format!(
-                    "  model  ❯ {}{}",
-                    card.model,
-                    caret(editing && card.focus == crate::app::CustomField::Model)
-                ),
-                theme.text_style(),
-            ));
-            if editing {
-                footer_lines.push(Line::styled(
-                    "  the model the server serves (e.g. llama3.1:8b) · the key is asked next",
-                    theme.dim_style(),
-                ));
-                footer_lines.push(Line::styled(
-                    "  ⏎ create · tab field · esc cancel",
-                    theme.gold_style(),
-                ));
-            } else {
-                footer_lines.push(Line::styled(
-                    "  committing the provider…",
-                    theme.pulse_ink(theme.gold, model.anim_phase),
-                ));
-            }
-        }
-        footer_lines.push(Line::raw(""));
-    }
+    push_custom_card_lines(model, theme, &mut footer_lines);
     for chunk in [
         [
             ("+ OpenAI (OAuth)", crate::app::AccountAddKind::OpenAiOAuth),
@@ -1225,6 +1232,7 @@ fn render_providers(
             theme.dim_style(),
         ),
     ]));
+    push_custom_card_lines(model, theme, &mut lines);
     if let Some(message) = &model.providers.message {
         lines.push(Line::styled(message.clone(), theme.gold_style()));
     }
