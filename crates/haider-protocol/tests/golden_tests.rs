@@ -14,6 +14,9 @@ use haider_protocol::ids::*;
 use haider_protocol::menu::{
     AnswerVia, Menu, MenuAnswer, MenuCloseReason, MenuKind, MenuOption, MenuScope,
 };
+use haider_protocol::project_instructions::{
+    ProjectInstructionFileFact, ProjectInstructionsEventPayload, ProjectInstructionsLoaded,
+};
 use haider_protocol::state::{RunState, SessionState, VerifyStep, WaitReason};
 use haider_protocol::tool::{
     DispatchMode, RememberedGrantScope, RememberedSessionGrant, ToolInventoryEntry,
@@ -170,6 +173,39 @@ fn golden_branch_created_fact() {
                 head_seq: 42,
             },
         }),
+    );
+}
+
+/// MUTATION CHECK: remove, rename, or reorder any project-instruction audit
+/// coordinate. Expected RUNTIME failure: the additive fact golden differs or
+/// no longer round-trips while remaining unknown to the core payload enum.
+#[test]
+fn golden_project_instructions_loaded_fact() {
+    let fact = ProjectInstructionsLoaded {
+        files: vec![
+            ProjectInstructionFileFact {
+                path: "/workspace/HAIDER.md".into(),
+                digest: "0123456789abcdef".repeat(4),
+                bytes: 34,
+                truncated: false,
+            },
+            ProjectInstructionFileFact {
+                path: "/workspace/crate/AGENTS.md".into(),
+                digest: "fedcba9876543210".repeat(4),
+                bytes: 49_152,
+                truncated: true,
+            },
+        ],
+    };
+    golden(
+        "project_instructions_loaded",
+        &ProjectInstructionsEventPayload::ProjectInstructionsLoaded(fact.clone()),
+    );
+    let value = fact.to_payload_value().expect("serialize additive fact");
+    assert!(serde_json::from_value::<EventPayload>(value.clone()).is_err());
+    assert_eq!(
+        ProjectInstructionsLoaded::from_payload_value(&value),
+        Some(fact)
     );
 }
 

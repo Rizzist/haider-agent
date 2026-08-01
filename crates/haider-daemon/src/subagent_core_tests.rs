@@ -682,7 +682,10 @@ async fn wait_for_state(
 fn typed_payloads(events: &[haider_protocol::envelope::RawEnvelope]) -> Vec<EventPayload> {
     events
         .iter()
-        .map(|event| serde_json::from_value(event.payload.clone()).expect("payload"))
+        // Raw journals may contain additive payload kinds introduced after
+        // this exhaustive core enum. Keep this helper scoped to the typed
+        // W6 payloads it is named for instead of rejecting forward facts.
+        .filter_map(|event| serde_json::from_value(event.payload.clone()).ok())
         .collect()
 }
 

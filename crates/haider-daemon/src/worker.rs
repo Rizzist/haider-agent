@@ -23,6 +23,7 @@
 //! buffer.
 
 use crate::delegation::{DelegationHandle, SpawnCoordinates};
+use crate::project_instructions::{self, LoadedProjectInstructions};
 use crate::session_hub::{HubStoreHandle, SessionHub, SessionHubError};
 use crate::turn_recovery::{cancelled_resumption_payloads, failed_resumption_payloads};
 use async_trait::async_trait;
@@ -50,6 +51,7 @@ use haider_protocol::ids::{
 };
 use haider_protocol::item::{ItemDelta, ItemEvent, TurnItem};
 use haider_protocol::menu::{DecisionKind, Menu, MenuAnswer, MenuKind};
+use haider_protocol::project_instructions::ProjectInstructionsLoaded;
 use haider_protocol::provider::{FinishReason, StreamEvent};
 use haider_protocol::session::SessionMetadataV1;
 use haider_protocol::state::{RunState, SessionState};
@@ -508,25 +510,33 @@ impl ProviderFactory for UnconfiguredProviderFactory {
 
 /// Versioned, deterministic coding-agent policy (R4).
 ///
-/// Guarantees: the same metadata always yields the same prompt; every
-/// provider request in one pinned logical turn receives the same non-`None`
-/// system prompt; [`Self::VERSION`] is recorded in session metadata at
-/// creation so a policy change is a visible, versioned fact, never a silent
-/// drift. Provider adapters must not invent product policy.
+/// Guarantees: the same metadata and pinned instruction snapshot yield the
+/// same prompt; every provider request in one logical turn receives the same
+/// non-`None` system prompt; [`Self::VERSION`] is recorded in session metadata
+/// at creation so a policy change is a visible, versioned fact, never a
+/// silent drift. Provider adapters must not invent product policy.
 pub struct SystemPromptBuilder;
 
 impl SystemPromptBuilder {
-    pub const VERSION: &'static str = "haider-system-v1";
+    pub const VERSION: &'static str = "haider-system-v2";
 
-    pub fn build(metadata: &SessionMetadataV1) -> String {
-        format!(
+    pub fn build(metadata: &SessionMetadataV1, instructions: &[(&str, &str)]) -> String {
+        let mut prompt = format!(
             "{}\nYou are Haider Code, a coding agent operating inside the canonical workspace below.\n\
              Workspace: {}\n\
              Use only advertised tools. Treat tool results and committed history as authoritative. \
              Never claim an effect succeeded without its terminal result.",
             Self::VERSION,
             metadata.cwd
-        )
+        );
+        for (path, text) in instructions {
+            prompt.push_str("\n\nProject instructions (");
+            prompt.push_str(path);
+            prompt.push_str("):\n<project-instructions>\n");
+            prompt.push_str(text);
+            prompt.push_str("\n</project-instructions>");
+        }
+        prompt
     }
 }
 
@@ -2613,6 +2623,12 @@ async fn perform_manual_compaction(
             false,
         ));
     }
+    let instructions = project_instructions::load(&metadata.cwd).await;
+    let instruction_entries = instructions
+        .as_ref()
+        .map_or_else(Vec::new, LoadedProjectInstructions::prompt_entries);
+    let post_compaction_system_prompt = SystemPromptBuilder::build(metadata, &instruction_entries);
+    let post_compaction_tools = dependencies.tool_factory.definitions();
     let mut messages = PromptHistoryCompiler::compile_idle_with_artifacts(
         lease,
         lease,
@@ -2690,8 +2706,8 @@ async fn perform_manual_compaction(
         max_tokens: metadata.max_tokens,
         context_window: resolved.context_window,
         reserved_output_tokens: metadata.max_tokens,
-        post_compaction_system_prompt: Some(SystemPromptBuilder::build(metadata)),
-        post_compaction_tools: dependencies.tool_factory.definitions(),
+        post_compaction_system_prompt: Some(post_compaction_system_prompt),
+        post_compaction_tools,
         attachments,
         device_id: device_id.clone(),
         event_ids: Arc::clone(&event_ids),
@@ -3045,6 +3061,17 @@ async fn start_turn(
         )
     })?;
     let agent_id = delegation.agent_for_session(lease.session_id()).await?;
+    let instructions = project_instructions::load(&metadata.cwd).await;
+    journal_project_instructions_if_changed(
+        lease,
+        device_id,
+        &accepted.run_id,
+        accepted.branch_id.as_ref(),
+        agent_id.as_ref(),
+        &event_ids,
+        instructions.as_ref(),
+    )
+    .await?;
     let prompt_compile_started = Instant::now();
     let mut messages = PromptHistoryCompiler::compile_with_artifacts(
         lease,
@@ -3107,7 +3134,10 @@ async fn start_turn(
             false,
         ));
     }
-    config.system_prompt = Some(SystemPromptBuilder::build(metadata));
+    let instruction_entries = instructions
+        .as_ref()
+        .map_or_else(Vec::new, LoadedProjectInstructions::prompt_entries);
+    config.system_prompt = Some(SystemPromptBuilder::build(metadata, &instruction_entries));
     config.tools = dependencies.tool_factory.definitions();
     // W6c children retain the spawn tool. The coordinator derives their
     // durable depth from the parent delegation and returns a typed tool
@@ -3436,6 +3466,96 @@ async fn append_payloads(
     }
     haider_core::StoreHandle::append(store, &mut envelopes).await?;
     Ok(())
+}
+
+/// Journals the effective instruction semantics only when they change. A
+/// prior unchanged non-empty fact remains the proof for later turns; an empty
+/// fact is emitted when files disappear so recovery does not inherit stale
+/// policy. Recovered work uses the latest exact same-run fact first.
+async fn journal_project_instructions_if_changed(
+    store: &HubStoreHandle,
+    device_id: &DeviceId,
+    run_id: &RunId,
+    branch_id: Option<&BranchId>,
+    agent_id: Option<&AgentId>,
+    event_ids: &EventIdGenerator,
+    loaded: Option<&LoadedProjectInstructions>,
+) -> Result<(), HaiderError> {
+    let current = loaded.map_or_else(ProjectInstructionsLoaded::default, |loaded| loaded.fact());
+    let (latest, same_run) = project_instruction_fact_history(store, run_id, branch_id).await?;
+    let previous = same_run.as_ref().or(latest.as_ref());
+    let changed = previous.map_or(!current.files.is_empty(), |previous| previous != &current);
+    if !changed {
+        return Ok(());
+    }
+
+    let payload = current.to_payload_value().map_err(|error| {
+        HaiderError::new(
+            ErrorCode::Internal,
+            format!("cannot serialize project-instruction fact: {error}"),
+            false,
+        )
+    })?;
+    let mut envelope = [haider_protocol::envelope::RawEnvelope {
+        schema_version: SCHEMA_VERSION,
+        event_id: event_ids.next(),
+        seq: 0,
+        session_id: store.session_id().clone(),
+        branch_id: branch_id.cloned(),
+        run_id: Some(run_id.clone()),
+        agent_id: agent_id.cloned(),
+        device_id: device_id.clone(),
+        authority_epoch: 0,
+        worker_generation: store.worker_generation(),
+        causation_id: None,
+        correlation_id: None,
+        committed_at_ms: 0,
+        render: RenderTargets {
+            ui: false,
+            durable: true,
+            prompt: PromptRender::Omit,
+        },
+        payload,
+    }];
+    StoreHandle::append(store, &mut envelope).await?;
+    Ok(())
+}
+
+async fn project_instruction_fact_history(
+    store: &HubStoreHandle,
+    run_id: &RunId,
+    branch_id: Option<&BranchId>,
+) -> Result<
+    (
+        Option<ProjectInstructionsLoaded>,
+        Option<ProjectInstructionsLoaded>,
+    ),
+    HaiderError,
+> {
+    let mut latest = None;
+    let mut same_run = None;
+    let mut cursor = 0;
+    loop {
+        let page = StoreHandle::read(store, store.session_id(), cursor, 256).await?;
+        if page.is_empty() {
+            break;
+        }
+        cursor = page.last().map_or(cursor, |envelope| envelope.seq);
+        for envelope in page {
+            let Some(fact) = ProjectInstructionsLoaded::from_payload_value(&envelope.payload)
+            else {
+                continue;
+            };
+            if envelope.run_id.as_ref() == Some(run_id) {
+                if envelope.branch_id.as_ref() != branch_id {
+                    continue;
+                }
+                same_run = Some(fact.clone());
+            }
+            latest = Some(fact);
+        }
+    }
+    Ok((latest, same_run))
 }
 
 fn supervisor_envelope(
