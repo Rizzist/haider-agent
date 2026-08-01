@@ -506,7 +506,7 @@ fn branch_turns_parent_stamp_and_advance_only_the_selected_head() {
         .expect("branch descriptor");
     assert_eq!(
         (descriptor.head_node_id, descriptor.head_seq),
-        (user_node, user_seq)
+        (user_node.clone(), user_seq)
     );
 
     let main = store
@@ -530,6 +530,53 @@ fn branch_turns_parent_stamp_and_advance_only_the_selected_head() {
         envelopes
             .iter()
             .all(|envelope| envelope.branch_id.is_none())
+    );
+
+    // Non-degenerate half: main has now advanced PAST the fork, so the branch
+    // head and the session-global main head name different nodes. A second
+    // branch turn must parent on the branch head, never main's latest node.
+    let mut branch_done = [raw(
+        &store,
+        &session_id,
+        Some(branch_id.clone()),
+        Some(branch_run.clone()),
+        "branch-turn-done".into(),
+        EventPayload::RunState(RunState::Done),
+    )];
+    store
+        .append_worker(&mut branch_done)
+        .expect("terminalize branch turn");
+    let TurnAcceptOutcome::Committed { envelopes, .. } = store
+        .accept_turn(&turn_command(
+            &store,
+            &session_id,
+            "branch-turn-2",
+            "branch-run-2",
+            Some(branch_id.clone()),
+        ))
+        .expect("accept second branch turn")
+    else {
+        panic!("second branch turn commits");
+    };
+    let (second_node, second_seq, second_parent) = envelopes
+        .iter()
+        .find_map(|envelope| {
+            let EventPayload::NodeCommitted(node) =
+                serde_json::from_value(envelope.payload.clone()).ok()?
+            else {
+                return None;
+            };
+            Some((node.node, envelope.seq, node.parent))
+        })
+        .expect("second branch user node");
+    assert_eq!(second_parent, Some(user_node));
+    let descriptor = store
+        .branch(&session_id, &branch_id)
+        .expect("branch lookup")
+        .expect("branch descriptor");
+    assert_eq!(
+        (descriptor.head_node_id, descriptor.head_seq),
+        (second_node, second_seq)
     );
 }
 
