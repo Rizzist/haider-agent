@@ -160,6 +160,7 @@ impl ProviderRegistryStoreLike for Box<dyn ProviderRegistryStoreLike> {
 pub(crate) trait ProviderModelSourceLike: Send + Sync {
     fn models(&self, provider: &str) -> Option<Vec<DiscoveredModel>>;
     fn replace(&self, provider: String, models: Vec<DiscoveredModel>);
+    fn remove(&self, provider: &str);
 }
 
 /// Typed, in-memory projection of the durable provider-model cache.
@@ -186,6 +187,13 @@ impl ProviderModelSourceLike for CachedProviderModelSource {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(provider, models);
+    }
+
+    fn remove(&self, provider: &str) {
+        self.models
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(provider);
     }
 }
 
@@ -263,6 +271,47 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
         input: ProviderConfigureInput,
     ) -> Result<(), HaiderError> {
         self.configured_profiles(input).map(|_| ())
+    }
+
+    pub(crate) fn remove_custom(&mut self, provider: &str) -> Result<(), HaiderError> {
+        let profile = self
+            .get(provider)
+            .ok_or_else(|| invalid(format!("provider `{provider}` is not registered")))?;
+        if !matches!(profile.provenance, ProviderProvenance::Custom) {
+            return Err(invalid(format!(
+                "provider `{provider}` is release-owned and cannot be removed"
+            )));
+        }
+        self.remove_profile(provider)
+    }
+
+    /// Reapplies an already-claimed removal after a crash. A missing profile
+    /// means the durable JSON mutation completed before receipt finalization.
+    pub(crate) fn reconcile_remove(&mut self, provider: &str) -> Result<(), HaiderError> {
+        match self.get(provider) {
+            None => {
+                self.model_source.remove(provider);
+                Ok(())
+            }
+            Some(profile) if matches!(profile.provenance, ProviderProvenance::Custom) => {
+                self.remove_profile(provider)
+            }
+            Some(_) => Err(HaiderError::new(
+                ErrorCode::StoreCorrupt,
+                format!("provider-remove receipt targets release-owned provider `{provider}`"),
+                false,
+            )),
+        }
+    }
+
+    fn remove_profile(&mut self, provider: &str) -> Result<(), HaiderError> {
+        let mut next = self.profiles.clone();
+        next.retain(|profile| profile.provider_id != provider);
+        validate_profiles(&next)?;
+        self.store.save(&next)?;
+        self.profiles = next;
+        self.model_source.remove(provider);
+        Ok(())
     }
 
     fn configured_profiles(

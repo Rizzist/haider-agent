@@ -15,16 +15,17 @@ use haider_protocol::tool::{
 use haider_rpc::{
     AccountAddMethod, AttachMode, AttachState, AttachmentId, CancelStatus, Capability, ClientKind,
     CommandId, ERROR_CODE_ALREADY_RESOLVED, ERROR_CODE_CAPABILITY_DENIED, ERROR_CODE_CURSOR_AHEAD,
-    ERROR_CODE_REVISION_CONFLICT, ErrorData, FEATURE_ACCOUNT_LOGIN_API_V1,
-    FEATURE_ACCOUNT_MANAGEMENT_V1, FEATURE_ACCOUNT_OAUTH_PKCE_V1, FEATURE_ACCOUNT_ROTATION_V1,
-    FEATURE_PROVIDER_CONFIGURE_V1, FEATURE_PROVIDER_MANAGEMENT_V1, FEATURE_PROVIDER_MODELS_V1,
-    FEATURE_SESSION_MUTATION_V1, FEATURE_TURN_CONTROL_V1, FEATURE_VAULT_STAGE_V1, Hello,
-    LifecyclePhase, MenuInput, ModelDetailWire, OAuthAuthorizationWire, OAuthAvailabilityWire,
-    OAuthFlowId, OAuthFlowStatusWire, OAuthReadyRefWire, ProtocolError, ProviderActiveWire,
+    ERROR_CODE_PROVIDER_REMOVE_REFUSED, ERROR_CODE_REVISION_CONFLICT, ErrorData,
+    FEATURE_ACCOUNT_LOGIN_API_V1, FEATURE_ACCOUNT_MANAGEMENT_V1, FEATURE_ACCOUNT_OAUTH_PKCE_V1,
+    FEATURE_ACCOUNT_ROTATION_V1, FEATURE_PROVIDER_CONFIGURE_V1, FEATURE_PROVIDER_MANAGEMENT_V1,
+    FEATURE_PROVIDER_MODELS_V1, FEATURE_PROVIDER_REMOVE_V1, FEATURE_SESSION_MUTATION_V1,
+    FEATURE_TURN_CONTROL_V1, FEATURE_VAULT_STAGE_V1, Hello, LifecyclePhase, MenuInput,
+    ModelDetailWire, OAuthAuthorizationWire, OAuthAvailabilityWire, OAuthFlowId,
+    OAuthFlowStatusWire, OAuthReadyRefWire, ProtocolError, ProviderActiveWire,
     ProviderApiFamilyWire, ProviderAuthRequirementWire, ProviderAvailabilityWire,
-    ProviderDefaultWire, ProviderSummaryWire, RequestBody, RequestId, ResponseBody, SecretWire,
-    SeqRange, SessionReadResult, SessionSummary, StagePurpose, SubmitDisposition, Welcome,
-    WireFrame,
+    ProviderDefaultWire, ProviderRemoveRefusalReasonWire, ProviderSummaryWire, RequestBody,
+    RequestId, ResponseBody, SecretWire, SeqRange, SessionReadResult, SessionSummary, StagePurpose,
+    SubmitDisposition, Welcome, WireFrame,
 };
 
 pub const TEST_FRAME_LIMIT: usize = 1024 * 1024;
@@ -634,6 +635,35 @@ pub fn transcript() -> Vec<WireFrame> {
             },
         },
         WireFrame::Request {
+            request_id: RequestId::new("request-provider-remove"),
+            body: RequestBody::ProviderRemove {
+                command_id: CommandId::new("command-provider-remove"),
+                provider: "local-lab".into(),
+                expected_revision: 11,
+            },
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-provider-remove"),
+            body: ResponseBody::ProviderRemove {
+                provider: "local-lab".into(),
+                revision: 12,
+            },
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-provider-remove-blocked"),
+            body: ResponseBody::Error {
+                code: ERROR_CODE_PROVIDER_REMOVE_REFUSED.into(),
+                message: "provider `local-lab` is referenced by credential aliases: lab-a, lab-b"
+                    .into(),
+                retryable: false,
+                data: Some(ErrorData::ProviderRemoveRefused {
+                    provider: "local-lab".into(),
+                    reason: ProviderRemoveRefusalReasonWire::BlockingAccounts,
+                    blocking_aliases: vec!["lab-a".into(), "lab-b".into()],
+                }),
+            },
+        },
+        WireFrame::Request {
             request_id: RequestId::new("request-provider-models-refresh"),
             body: RequestBody::ProviderModelsRefresh {
                 provider: "openai-oauth".into(),
@@ -707,6 +737,7 @@ pub fn transcript() -> Vec<WireFrame> {
                 FEATURE_PROVIDER_CONFIGURE_V1.to_owned(),
                 FEATURE_PROVIDER_MANAGEMENT_V1.to_owned(),
                 FEATURE_PROVIDER_MODELS_V1.to_owned(),
+                FEATURE_PROVIDER_REMOVE_V1.to_owned(),
                 FEATURE_SESSION_MUTATION_V1.to_owned(),
                 FEATURE_TURN_CONTROL_V1.to_owned(),
                 FEATURE_VAULT_STAGE_V1.to_owned(),

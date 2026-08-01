@@ -13,13 +13,14 @@ use haider_rpc::{
     ERROR_CODE_CAPABILITY_DENIED, ERROR_CODE_CREDENTIAL_MISSING, ERROR_CODE_CURSOR_AHEAD,
     ERROR_CODE_DRAINING, ERROR_CODE_INVALID_ARGUMENT, ERROR_CODE_INVALID_CURSOR,
     ERROR_CODE_NOT_FOUND, ERROR_CODE_OVERLOADED, ERROR_CODE_PERMISSION_DENIED,
-    ERROR_CODE_PROVIDER_ERROR, ERROR_CODE_RESTAGE_REQUIRED, ERROR_CODE_REVISION_CONFLICT,
-    ERROR_CODE_RUN_NOT_ACTIVE, ERROR_CODE_STALE_GENERATION, ERROR_CODE_UNAUTHORIZED,
-    ERROR_CODE_VAULT_UNSUPPORTED, FEATURE_ACCOUNT_LOGIN_API_V1, FEATURE_ACCOUNT_MANAGEMENT_V1,
-    FEATURE_ACCOUNT_OAUTH_PKCE_V1, FEATURE_ACCOUNT_ROTATION_V1, FEATURE_PROVIDER_CONFIGURE_V1,
-    FEATURE_PROVIDER_MANAGEMENT_V1, FEATURE_PROVIDER_MODELS_V1, FEATURE_SESSION_MUTATION_V1,
-    FEATURE_TURN_CONTROL_V1, FEATURE_VAULT_STAGE_V1, Hello, RequestBody, ResponseBody,
-    SubmitDisposition, WIRE_PROTOCOL_VERSION, Welcome, WireFrame, uds_codec, ws_codec,
+    ERROR_CODE_PROVIDER_ERROR, ERROR_CODE_PROVIDER_REMOVE_REFUSED, ERROR_CODE_RESTAGE_REQUIRED,
+    ERROR_CODE_REVISION_CONFLICT, ERROR_CODE_RUN_NOT_ACTIVE, ERROR_CODE_STALE_GENERATION,
+    ERROR_CODE_UNAUTHORIZED, ERROR_CODE_VAULT_UNSUPPORTED, FEATURE_ACCOUNT_LOGIN_API_V1,
+    FEATURE_ACCOUNT_MANAGEMENT_V1, FEATURE_ACCOUNT_OAUTH_PKCE_V1, FEATURE_ACCOUNT_ROTATION_V1,
+    FEATURE_PROVIDER_CONFIGURE_V1, FEATURE_PROVIDER_MANAGEMENT_V1, FEATURE_PROVIDER_MODELS_V1,
+    FEATURE_PROVIDER_REMOVE_V1, FEATURE_SESSION_MUTATION_V1, FEATURE_TURN_CONTROL_V1,
+    FEATURE_VAULT_STAGE_V1, Hello, RequestBody, ResponseBody, SubmitDisposition,
+    WIRE_PROTOCOL_VERSION, Welcome, WireFrame, uds_codec, ws_codec,
 };
 use serde::{Deserialize, Serialize};
 
@@ -962,6 +963,7 @@ fn provider_list_and_management_feature_families_are_golden() {
         "account.remove",
         "account.set_default_model",
         "provider.configure",
+        "provider.remove",
         "provider.models_refresh",
     ] {
         for kind in ["request", "response"] {
@@ -974,7 +976,7 @@ fn provider_list_and_management_feature_families_are_golden() {
     let welcome = transcript()
         .into_iter()
         .find_map(|frame| match frame {
-            WireFrame::Welcome(welcome) if welcome.features.len() == 10 => Some(welcome),
+            WireFrame::Welcome(welcome) if welcome.features.len() == 11 => Some(welcome),
             _ => None,
         })
         .expect("management-feature Welcome");
@@ -988,10 +990,46 @@ fn provider_list_and_management_feature_families_are_golden() {
             FEATURE_PROVIDER_CONFIGURE_V1,
             FEATURE_PROVIDER_MANAGEMENT_V1,
             FEATURE_PROVIDER_MODELS_V1,
+            FEATURE_PROVIDER_REMOVE_V1,
             FEATURE_SESSION_MUTATION_V1,
             FEATURE_TURN_CONTROL_V1,
             FEATURE_VAULT_STAGE_V1,
         ])
+    );
+}
+
+/// Provider-removal refusals carry a stable code plus structured reason and
+/// blocking aliases; clients never parse the human message.
+///
+/// MUTATION CHECK: drop `blocking_aliases` from the refusal data. Expected
+/// RUNTIME failure: the exact typed JSON below loses both blocking names.
+#[test]
+fn provider_remove_refusal_reason_and_aliases_are_golden() {
+    assert_eq!(
+        ERROR_CODE_PROVIDER_REMOVE_REFUSED,
+        "provider_remove_refused"
+    );
+    let frame = transcript()
+        .into_iter()
+        .find(|frame| {
+            matches!(
+                frame,
+                WireFrame::Response {
+                    body: ResponseBody::Error { code, .. },
+                    ..
+                } if code == ERROR_CODE_PROVIDER_REMOVE_REFUSED
+            )
+        })
+        .expect("provider-remove refusal golden");
+    let value = serde_json::to_value(frame).expect("provider-remove refusal JSON");
+    assert_eq!(
+        value["body"]["data"],
+        serde_json::json!({
+            "kind": "provider_remove_refused",
+            "provider": "local-lab",
+            "reason": "blocking_accounts",
+            "blocking_aliases": ["lab-a", "lab-b"]
+        })
     );
 }
 

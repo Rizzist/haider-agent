@@ -135,6 +135,9 @@ pub const ERROR_CODE_OAUTH_FLOW_NOT_FOUND: &str = "oauth_flow_not_found";
 /// Stable code for a management mutation fenced by a newer account/provider
 /// snapshot. Retrying after refreshing that snapshot is the intended recovery.
 pub const ERROR_CODE_REVISION_CONFLICT: &str = "revision_conflict";
+/// Stable refusal for `provider.remove` when the named profile is not a
+/// removable custom provider or credential descriptors still reference it.
+pub const ERROR_CODE_PROVIDER_REMOVE_REFUSED: &str = "provider_remove_refused";
 /// Stable rejection for a shell builtin whose durable daemon semantics are
 /// deliberately not implemented by this protocol slice.
 pub const ERROR_CODE_UNSUPPORTED_SHELL_BUILTIN: &str = "unsupported_shell_builtin";
@@ -159,6 +162,8 @@ pub const FEATURE_ACCOUNT_MANAGEMENT_V1: &str = "account_management_v1";
 pub const FEATURE_PROVIDER_MANAGEMENT_V1: &str = "provider_management_v1";
 /// Daemon implements durable `provider.configure`.
 pub const FEATURE_PROVIDER_CONFIGURE_V1: &str = "provider_configure_v1";
+/// Daemon implements durable custom-provider removal.
+pub const FEATURE_PROVIDER_REMOVE_V1: &str = "provider_remove_v1";
 /// Daemon implements provider-owned model discovery refresh.
 pub const FEATURE_PROVIDER_MODELS_V1: &str = "provider_models_v1";
 /// Daemon implements live same-provider account rotation.
@@ -929,6 +934,14 @@ pub enum RequestBody {
         default_model: Option<String>,
         expected_revision: u64,
     },
+    /// Durably removes one custom provider. Release-owned providers and
+    /// providers referenced by any credential descriptor are refused.
+    #[serde(rename = "provider.remove")]
+    ProviderRemove {
+        command_id: CommandId,
+        provider: String,
+        expected_revision: u64,
+    },
     /// Decode artifact for a method this crate does not know (tolerance
     /// discipline). W3b answers it with a protocol error, not a panic.
     #[serde(other)]
@@ -1111,6 +1124,8 @@ pub enum ResponseBody {
         provider: ProviderSummaryWire,
         revision: u64,
     },
+    #[serde(rename = "provider.remove")]
+    ProviderRemove { provider: String, revision: u64 },
     /// Successful durable menu resolution. The same-command retry receives
     /// the original sequence; a different command receives
     /// [`ERROR_CODE_ALREADY_RESOLVED`] instead.
@@ -1201,8 +1216,28 @@ pub enum ErrorData {
     },
     /// The provider did not serve a model catalog to the active credential.
     ProviderModelsUnavailable { provider: String, reason: String },
+    /// A custom-provider removal was refused. Blocking credential aliases are
+    /// carried as typed data so clients never need to parse the message.
+    ProviderRemoveRefused {
+        provider: String,
+        reason: ProviderRemoveRefusalReasonWire,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        blocking_aliases: Vec<String>,
+    },
     /// Decode artifact for a data kind this crate does not know (tolerance
     /// discipline).
+    #[serde(other)]
+    Unknown,
+}
+
+/// Machine-readable reason a `provider.remove` command was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ProviderRemoveRefusalReasonWire {
+    NotFound,
+    ReleaseOwned,
+    BlockingAccounts,
     #[serde(other)]
     Unknown,
 }

@@ -29,9 +29,9 @@ pub use event_store::{
     DelegationCreateOutcome, DelegationRecord, DelegationState, EventStore, LoginClaim,
     LoginReceiptFailure, LoginReceiptResponse, LoginReceiptRow, ManagementClaim,
     ManagementReceiptRow, MenuResolutionCommand, MenuResolutionOutcome, PROVIDER_CONFIGURE_METHOD,
-    ProfileLease, SessionCreateCommand, SessionCreateOutcome, ShellExecAcceptCommand,
-    ShellExecAcceptOutcome, Store, TurnAcceptCommand, TurnAcceptOutcome, TurnAdmissionDisposition,
-    TurnCancelCommand, TurnCancelOutcome, TurnCancellationStatus,
+    PROVIDER_REMOVE_METHOD, ProfileLease, SessionCreateCommand, SessionCreateOutcome,
+    ShellExecAcceptCommand, ShellExecAcceptOutcome, Store, TurnAcceptCommand, TurnAcceptOutcome,
+    TurnAdmissionDisposition, TurnCancelCommand, TurnCancelOutcome, TurnCancellationStatus,
 };
 pub use haider_protocol::error::{ErrorCode, HaiderError};
 

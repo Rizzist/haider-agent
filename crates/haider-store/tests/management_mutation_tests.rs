@@ -1,8 +1,10 @@
 #![allow(clippy::expect_used)]
 
 use haider_store::{
-    ACCOUNT_REMOVE_METHOD, ACCOUNT_SET_DEFAULT_MODEL_METHOD, ErrorCode, ManagementClaim, Store,
+    ACCOUNT_REMOVE_METHOD, ACCOUNT_SET_DEFAULT_MODEL_METHOD, ErrorCode, ManagementClaim,
+    PROVIDER_REMOVE_METHOD, Store,
 };
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -185,6 +187,104 @@ fn account_remove_reservation_survives_pending_and_releases_with_finalization() 
                 true,
             )
             .expect("committed remove replay"),
+        ManagementClaim::Committed { revision: 1, .. }
+    ));
+}
+
+/// Provider removal commits its receipt, revision, and discovered-model cache
+/// deletion in one transaction.
+///
+/// MUTATION CHECK: delete the `DELETE FROM provider_models` statement or move
+/// it outside the receipt transaction. Expected RUNTIME failure: the injected
+/// deletion fault no longer rolls the receipt/revision back, or the cache row
+/// remains readable after the successful retry.
+#[test]
+fn provider_remove_finalization_deletes_model_cache_and_replays() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("store");
+    let request = r#"{"expected_revision":0,"provider":"custom"}"#;
+    store
+        .put_provider_models("custom", r#"[{"slug":"model-a"}]"#, Some("etag-a"), 41)
+        .expect("seed provider cache");
+    assert!(matches!(
+        store
+            .management_claim_receipt::<PublicReceipt>(
+                "remove-provider-1",
+                PROVIDER_REMOVE_METHOD,
+                "remove-provider-digest",
+                request,
+                None,
+                Some(0),
+            )
+            .expect("claim provider removal"),
+        ManagementClaim::Fresh
+    ));
+    let connection = Connection::open(store.database_path()).expect("inspection connection");
+    connection
+        .execute_batch(
+            "CREATE TRIGGER reject_provider_remove_cache_delete
+             BEFORE DELETE ON provider_models
+             WHEN OLD.provider = 'custom'
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected provider cache delete failure');
+             END;",
+        )
+        .expect("install delete-failure trigger");
+    store
+        .finalize_provider_remove_receipt(
+            "remove-provider-1",
+            "custom",
+            &PublicReceipt {
+                value: "custom".into(),
+            },
+        )
+        .expect_err("cache deletion failure rolls back finalization");
+    assert_eq!(
+        store.management_revision().expect("rolled-back revision"),
+        0
+    );
+    assert!(
+        store
+            .provider_models("custom")
+            .expect("cache read")
+            .is_some()
+    );
+    assert_eq!(
+        store
+            .management_receipts(PROVIDER_REMOVE_METHOD)
+            .expect("pending receipt")[0]
+            .state,
+        "pending"
+    );
+    connection
+        .execute_batch("DROP TRIGGER reject_provider_remove_cache_delete;")
+        .expect("remove delete-failure trigger");
+    drop(connection);
+    assert_eq!(
+        store
+            .finalize_provider_remove_receipt(
+                "remove-provider-1",
+                "custom",
+                &PublicReceipt {
+                    value: "custom".into(),
+                },
+            )
+            .expect("finalize provider removal"),
+        1
+    );
+    assert_eq!(store.management_revision().expect("revision"), 1);
+    assert_eq!(store.provider_models("custom").expect("cache read"), None);
+    assert!(matches!(
+        store
+            .management_claim_receipt::<PublicReceipt>(
+                "remove-provider-1",
+                PROVIDER_REMOVE_METHOD,
+                "remove-provider-digest",
+                request,
+                None,
+                Some(0),
+            )
+            .expect("replay provider removal"),
         ManagementClaim::Committed { revision: 1, .. }
     ));
 }

@@ -38,6 +38,9 @@ fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> Qu
 /// MUTATION CHECK: remove `FEATURE_SESSION_PERMISSION_OVERRIDES_V1`.
 /// Expected RUNTIME failure: headless clients cannot discover the durable
 /// allow-writes/allow-exec create seam.
+///
+/// MUTATION CHECK: remove `FEATURE_PROVIDER_REMOVE_V1`. Expected RUNTIME
+/// failure: discovery omits the served durable provider removal method.
 #[test]
 fn welcome_features_pin_served_management_families() {
     assert_eq!(
@@ -52,6 +55,7 @@ fn welcome_features_pin_served_management_families() {
             FEATURE_PROVIDER_CONFIGURE_V1.to_owned(),
             FEATURE_PROVIDER_MANAGEMENT_V1.to_owned(),
             FEATURE_PROVIDER_MODELS_V1.to_owned(),
+            FEATURE_PROVIDER_REMOVE_V1.to_owned(),
             FEATURE_SESSION_MUTATION_V1.to_owned(),
             FEATURE_SESSION_PERMISSION_OVERRIDES_V1.to_owned(),
             FEATURE_SHELL_EXEC_V1.to_owned(),

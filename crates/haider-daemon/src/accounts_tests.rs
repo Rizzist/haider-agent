@@ -5623,6 +5623,396 @@ async fn reimport_over_a_retired_secret_restores_the_account() {
     store.close().await.expect("close");
 }
 
+fn removable_provider_profile(provider: &str) -> ProviderProfileV1 {
+    ProviderProfileV1 {
+        provider_id: provider.to_owned(),
+        display_name: provider.to_owned(),
+        api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
+        base_url: Some("https://custom.example.invalid".to_owned()),
+        enabled: true,
+        auth_requirement: ProviderAuthRequirementWire::ApiKey,
+        configured_models: vec!["custom-model".to_owned()],
+        default_model: Some("custom-model".to_owned()),
+        provenance: ProviderProvenance::Custom,
+    }
+}
+
+/// A committed custom-provider removal publishes the next registry revision,
+/// replays before all fresh validation, deletes the model cache, and remains
+/// authoritative over a stale provider JSON projection on restart.
+///
+/// MUTATION CHECK: skip `ProviderRegistry::remove_profile`'s durable save or
+/// the committed-remove arm in `reconcile_provider_receipts`. Expected RUNTIME
+/// failure: `custom-lab` remains in the live list or is resurrected after the
+/// stale projection is loaded during the simulated restart.
+///
+/// MUTATION CHECK: move provider-remove replay after revision/registry guards,
+/// accept a changed body for the same command id, or drop the revision CAS.
+/// Expected RUNTIME failure: the replay returns a conflict/not-found, the
+/// changed body succeeds, or the fresh stale command does not conflict.
+#[tokio::test]
+async fn provider_remove_commits_replays_fences_and_beats_restart_resurrection() {
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let older_configure = ProviderConfigureInput {
+        provider: "custom-lab".to_owned(),
+        api_family: None,
+        origin: None,
+        auth_requirement: None,
+        enabled: true,
+        models: vec!["custom-model".to_owned()],
+        default_model: Some("custom-model".to_owned()),
+    };
+    let older_identity = ProviderConfigureIdentity {
+        input: older_configure.clone(),
+        expected_revision: 0,
+    };
+    let (older_json, older_digest) =
+        command_json(&older_identity).expect("older configure identity");
+    assert!(matches!(
+        store
+            .management_claim_receipt::<ProviderReceipt>(
+                "older-pending-configure".to_owned(),
+                PROVIDER_CONFIGURE_METHOD.to_owned(),
+                older_digest,
+                older_json,
+                Some(serde_json::to_string(&older_configure).expect("older recovery JSON")),
+                Some(0),
+            )
+            .await
+            .expect("claim older configure"),
+        ManagementClaim::Fresh
+    ));
+    let model = haider_provider::DiscoveredModel {
+        slug: "custom-model".to_owned(),
+        display_name: "Custom Model".to_owned(),
+        context_window: Some(64_000),
+        description: None,
+        default_effort: None,
+        supported_efforts: Vec::new(),
+        visible: true,
+        priority: None,
+    };
+    store
+        .put_provider_models(
+            "custom-lab".to_owned(),
+            serde_json::to_string(&vec![model.clone()]).expect("model cache JSON"),
+            Some("custom-etag".to_owned()),
+            55,
+        )
+        .await
+        .expect("seed model cache");
+    let builtin_profiles = initial_provider_profiles(
+        &std::collections::BTreeSet::from([OPENAI_PROVIDER_NAME.to_owned()]),
+        "unused",
+    );
+    let custom = removable_provider_profile("custom-lab");
+    let mut initial = builtin_profiles.clone();
+    initial.push(custom.clone());
+    let source = Arc::new(CachedProviderModelSource::default());
+    source.replace("custom-lab".to_owned(), vec![model]);
+    let provider_store: Box<dyn ProviderRegistryStoreLike> =
+        Box::new(JsonProviderRegistryStore::new(dir.path()));
+    let providers = ProviderRegistry::new(provider_store, initial, source)
+        .expect("provider registry with custom profile");
+    let accounts = memory_accounts();
+    let management = ManagementSnapshot::new(0, Vec::new(), providers.summaries());
+    let mut actor = start_account_actor(AccountActorConfig {
+        store: store.clone(),
+        accounts,
+        vault: Arc::new(MemoryVault::new()),
+        validator: Arc::new(ProviderCredentialValidator),
+        snapshot: Arc::new(StdMutex::new(Vec::new())),
+        management: Some(management.clone()),
+        profile_id: "provider-remove".into(),
+        default_model: "unused".into(),
+        providers,
+        provider_endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
+        reserved_aliases: HashSet::new(),
+        refresh_fences: RefreshFenceRegistry::default(),
+    });
+    let commands = actor.commands();
+    let (sink, mut frames) = channel_sink();
+
+    commands
+        .send(AccountCommand::RemoveProvider(Box::new(
+            ProviderRemoveJob {
+                command_id: "remove-custom".to_owned(),
+                provider: "custom-lab".to_owned(),
+                expected_revision: 0,
+                route: LoginRoute {
+                    request_id: RequestId::new("remove-custom"),
+                    sink: Arc::clone(&sink),
+                },
+            },
+        )))
+        .await
+        .expect("send remove");
+    assert!(matches!(
+        frames.recv().await.expect("remove response"),
+        WireFrame::Response {
+            body: ResponseBody::ProviderRemove { provider, revision: 1 },
+            ..
+        } if provider == "custom-lab"
+    ));
+    let view = management.read().expect("management view");
+    assert_eq!(view.revision, 1);
+    assert!(
+        view.providers
+            .iter()
+            .all(|provider| provider.provider != "custom-lab")
+    );
+    drop(view);
+    assert!(
+        store
+            .provider_models("custom-lab".to_owned())
+            .await
+            .expect("cache read")
+            .is_none()
+    );
+
+    commands
+        .send(AccountCommand::RemoveProvider(Box::new(
+            ProviderRemoveJob {
+                command_id: "remove-custom".to_owned(),
+                provider: "different-provider".to_owned(),
+                expected_revision: 0,
+                route: LoginRoute {
+                    request_id: RequestId::new("changed-remove"),
+                    sink: Arc::clone(&sink),
+                },
+            },
+        )))
+        .await
+        .expect("send changed-body replay");
+    assert!(matches!(
+        frames.recv().await.expect("changed-body response"),
+        WireFrame::Response {
+            body: ResponseBody::Error { code, .. },
+            ..
+        } if code == ERROR_CODE_INVALID_ARGUMENT
+    ));
+    assert_eq!(
+        store
+            .advance_management_revision()
+            .await
+            .expect("later revision"),
+        2
+    );
+    commands
+        .send(AccountCommand::RemoveProvider(Box::new(
+            ProviderRemoveJob {
+                command_id: "remove-custom".to_owned(),
+                provider: "custom-lab".to_owned(),
+                expected_revision: 0,
+                route: LoginRoute {
+                    request_id: RequestId::new("replay-remove"),
+                    sink: Arc::clone(&sink),
+                },
+            },
+        )))
+        .await
+        .expect("send committed replay");
+    assert!(matches!(
+        frames.recv().await.expect("replay response"),
+        WireFrame::Response {
+            body: ResponseBody::ProviderRemove { provider, revision: 1 },
+            ..
+        } if provider == "custom-lab"
+    ));
+    commands
+        .send(AccountCommand::RemoveProvider(Box::new(
+            ProviderRemoveJob {
+                command_id: "stale-fresh-remove".to_owned(),
+                provider: "another-provider".to_owned(),
+                expected_revision: 0,
+                route: LoginRoute {
+                    request_id: RequestId::new("stale-fresh-remove"),
+                    sink,
+                },
+            },
+        )))
+        .await
+        .expect("send stale fresh command");
+    assert!(matches!(
+        frames.recv().await.expect("revision conflict response"),
+        WireFrame::Response {
+            body: ResponseBody::Error {
+                code,
+                data: Some(ErrorData::RevisionConflict {
+                    expected_revision: 0,
+                    current_revision: 2,
+                }),
+                ..
+            },
+            ..
+        } if code == ERROR_CODE_REVISION_CONFLICT
+    ));
+    actor.shutdown().await;
+
+    let stale_store = JsonProviderRegistryStore::new(dir.path());
+    let mut stale_profiles = builtin_profiles.clone();
+    stale_profiles.push(custom);
+    stale_store
+        .save(&stale_profiles)
+        .expect("plant stale provider projection");
+    let restarted_store: Box<dyn ProviderRegistryStoreLike> = Box::new(stale_store);
+    let mut restarted = ProviderRegistry::new(
+        restarted_store,
+        builtin_profiles,
+        Arc::new(CachedProviderModelSource::default()),
+    )
+    .expect("restart loads stale projection");
+    assert!(restarted.get("custom-lab").is_some());
+    reconcile_provider_receipts(&store, &mut restarted)
+        .await
+        .expect("removal receipt reconciles restart");
+    assert!(restarted.get("custom-lab").is_none());
+    store.close().await.expect("close store");
+}
+
+/// Builtin/factory profiles are release-owned, and custom providers remain
+/// intact while any credential descriptor names them. Refusal data carries
+/// every blocking alias in deterministic order.
+///
+/// MUTATION CHECK: drop either provenance guard or blocking-account guard in
+/// `handle_provider_remove`. Expected RUNTIME failure: one request succeeds,
+/// advances the revision, and removes a profile the assertions retain.
+#[tokio::test]
+async fn provider_remove_refuses_release_owned_and_account_referenced_profiles() {
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let mut initial = initial_provider_profiles(
+        &std::collections::BTreeSet::from([
+            OPENAI_PROVIDER_NAME.to_owned(),
+            "factory-provider".to_owned(),
+        ]),
+        "unused",
+    );
+    initial.push(removable_provider_profile("custom-in-use"));
+    let provider_store: Box<dyn ProviderRegistryStoreLike> = Box::new(TestProviderStore::default());
+    let providers = ProviderRegistry::new(
+        provider_store,
+        initial,
+        Arc::new(CachedProviderModelSource::default()),
+    )
+    .expect("provider registry");
+    let mut accounts = memory_accounts();
+    for (alias, active) in [("zeta-key", true), ("alpha-key", false)] {
+        accounts
+            .add(CredentialDescriptor {
+                alias: CredentialAlias::new(alias),
+                provider: "custom-in-use".to_owned(),
+                base_url: None,
+                auth_method: AuthMethod::ApiKey,
+                identity: "fixture".to_owned(),
+                status: CredentialStatus::Ok,
+                active,
+            })
+            .expect("blocking descriptor");
+    }
+    let management = ManagementSnapshot::new(0, accounts.list().to_vec(), providers.summaries());
+    let mut actor = start_account_actor(AccountActorConfig {
+        store: store.clone(),
+        accounts,
+        vault: Arc::new(MemoryVault::new()),
+        validator: Arc::new(ProviderCredentialValidator),
+        snapshot: Arc::new(StdMutex::new(Vec::new())),
+        management: Some(management.clone()),
+        profile_id: "provider-remove-refusals".into(),
+        default_model: "unused".into(),
+        providers,
+        provider_endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
+        reserved_aliases: HashSet::new(),
+        refresh_fences: RefreshFenceRegistry::default(),
+    });
+    let commands = actor.commands();
+    let (sink, mut frames) = channel_sink();
+
+    for (command_id, provider) in [
+        ("remove-builtin", OPENAI_PROVIDER_NAME),
+        ("remove-factory", "factory-provider"),
+    ] {
+        commands
+            .send(AccountCommand::RemoveProvider(Box::new(
+                ProviderRemoveJob {
+                    command_id: command_id.to_owned(),
+                    provider: provider.to_owned(),
+                    expected_revision: 0,
+                    route: LoginRoute {
+                        request_id: RequestId::new(command_id),
+                        sink: Arc::clone(&sink),
+                    },
+                },
+            )))
+            .await
+            .expect("send release-owned refusal");
+        assert!(matches!(
+            frames.recv().await.expect("release-owned response"),
+            WireFrame::Response {
+                body: ResponseBody::Error {
+                    code,
+                    data: Some(ErrorData::ProviderRemoveRefused {
+                        reason: ProviderRemoveRefusalReasonWire::ReleaseOwned,
+                        blocking_aliases,
+                        ..
+                    }),
+                    ..
+                },
+                ..
+            } if code == ERROR_CODE_PROVIDER_REMOVE_REFUSED && blocking_aliases.is_empty()
+        ));
+    }
+    commands
+        .send(AccountCommand::RemoveProvider(Box::new(
+            ProviderRemoveJob {
+                command_id: "remove-blocked-custom".to_owned(),
+                provider: "custom-in-use".to_owned(),
+                expected_revision: 0,
+                route: LoginRoute {
+                    request_id: RequestId::new("remove-blocked-custom"),
+                    sink,
+                },
+            },
+        )))
+        .await
+        .expect("send blocking-account refusal");
+    assert!(matches!(
+        frames.recv().await.expect("blocking response"),
+        WireFrame::Response {
+            body: ResponseBody::Error {
+                code,
+                data: Some(ErrorData::ProviderRemoveRefused {
+                    provider,
+                    reason: ProviderRemoveRefusalReasonWire::BlockingAccounts,
+                    blocking_aliases,
+                }),
+                ..
+            },
+            ..
+        } if code == ERROR_CODE_PROVIDER_REMOVE_REFUSED
+            && provider == "custom-in-use"
+            && blocking_aliases == ["alpha-key", "zeta-key"]
+    ));
+    let view = management.read().expect("management view");
+    assert_eq!(view.revision, 0);
+    assert!(
+        view.providers
+            .iter()
+            .any(|provider| provider.provider == "custom-in-use")
+    );
+    drop(view);
+    assert!(
+        store
+            .provider_management_receipts()
+            .await
+            .expect("receipts")
+            .is_empty()
+    );
+    actor.shutdown().await;
+    store.close().await.expect("close store");
+}
+
 /// MUTATION CHECK (W5g-5 live fix): make `custom_login_target` ignore the
 /// API family (return a target for any profile with an endpoint). Expected
 /// runtime failure: the builtin-responses row below yields a target, so a

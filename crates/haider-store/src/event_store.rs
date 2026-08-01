@@ -254,6 +254,7 @@ pub const ACCOUNT_SET_ACTIVE_METHOD: &str = "account.set_active";
 pub const ACCOUNT_REMOVE_METHOD: &str = "account.remove";
 pub const ACCOUNT_SET_DEFAULT_MODEL_METHOD: &str = "account.set_default_model";
 pub const PROVIDER_CONFIGURE_METHOD: &str = "provider.configure";
+pub const PROVIDER_REMOVE_METHOD: &str = "provider.remove";
 
 fn is_management_method(method: &str) -> bool {
     matches!(
@@ -264,6 +265,7 @@ fn is_management_method(method: &str) -> bool {
             | ACCOUNT_REMOVE_METHOD
             | ACCOUNT_SET_DEFAULT_MODEL_METHOD
             | PROVIDER_CONFIGURE_METHOD
+            | PROVIDER_REMOVE_METHOD
     )
 }
 
@@ -1978,6 +1980,7 @@ impl Store {
             ACCOUNT_SET_ACTIVE_METHOD
                 | ACCOUNT_SET_DEFAULT_MODEL_METHOD
                 | PROVIDER_CONFIGURE_METHOD
+                | PROVIDER_REMOVE_METHOD
         ) {
             return Err(store_error(
                 ErrorCode::InvalidArgument,
@@ -2210,6 +2213,39 @@ impl Store {
         Ok(revision)
     }
 
+    /// Finalizes provider removal, deletes its durable discovered-model cache,
+    /// and allocates the management revision in one SQLite transaction.
+    pub fn finalize_provider_remove_receipt<T: serde::Serialize>(
+        &self,
+        command_id: &str,
+        provider: &str,
+        response: &T,
+    ) -> StoreResult<u64> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        let revision = finalize_management_command_receipt(
+            &transaction,
+            command_id,
+            PROVIDER_REMOVE_METHOD,
+            "",
+            None,
+            None,
+            response,
+            now_ms()?,
+            "provider-remove",
+        )?;
+        transaction
+            .execute(
+                "DELETE FROM provider_models WHERE provider = ?1",
+                [provider],
+            )
+            .map_err(map_sqlite_error)?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(revision)
+    }
+
     pub fn management_receipts(&self, method: &str) -> StoreResult<Vec<ManagementReceiptRow>> {
         if !is_management_method(method) {
             return Err(store_error(
@@ -2230,6 +2266,35 @@ impl Store {
             .map_err(map_sqlite_error)?;
         statement
             .query_map([method], management_receipt_row)
+            .map_err(map_sqlite_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_sqlite_error)
+    }
+
+    /// All provider-profile mutation receipts in durable creation order.
+    /// Interleaving the method families is required so a later remove beats an
+    /// older pending configure without making removal a permanent tombstone.
+    pub fn provider_management_receipts(&self) -> StoreResult<Vec<ManagementReceiptRow>> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT command_id, method, state, request_json, recovery_json,
+                        response_json, final_revision
+                 FROM command_receipts
+                 WHERE method IN (?1, ?2, ?3)
+                   AND state IN ('pending', 'committed')
+                 ORDER BY created_at_ms, rowid",
+            )
+            .map_err(map_sqlite_error)?;
+        statement
+            .query_map(
+                params![
+                    ACCOUNT_SET_DEFAULT_MODEL_METHOD,
+                    PROVIDER_CONFIGURE_METHOD,
+                    PROVIDER_REMOVE_METHOD
+                ],
+                management_receipt_row,
+            )
             .map_err(map_sqlite_error)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(map_sqlite_error)

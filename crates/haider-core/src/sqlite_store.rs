@@ -489,12 +489,37 @@ impl SqliteStoreHandle {
         .await
     }
 
+    pub async fn finalize_provider_remove_receipt<T>(
+        &self,
+        command_id: String,
+        provider: String,
+        response: T,
+    ) -> Result<u64, HaiderError>
+    where
+        T: serde::Serialize + Send + 'static,
+    {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.finalize_provider_remove_receipt(&command_id, &provider, &response)
+            })
+        })
+        .await
+    }
+
     pub async fn management_receipts(
         &self,
         method: String,
     ) -> Result<Vec<haider_store::ManagementReceiptRow>, HaiderError> {
         let owner = Arc::clone(&self.owner);
         run_blocking(move || owner.with_store(|store| store.management_receipts(&method))).await
+    }
+
+    pub async fn provider_management_receipts(
+        &self,
+    ) -> Result<Vec<haider_store::ManagementReceiptRow>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(Store::provider_management_receipts)).await
     }
 
     pub async fn account_remove_receipts(

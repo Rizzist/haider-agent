@@ -605,6 +605,22 @@ impl HubConnection {
                     expected_revision,
                 )
             }
+            RequestBody::ProviderRemove {
+                command_id,
+                provider,
+                expected_revision,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.provider_remove(request_id, command_id, provider, expected_revision)
+            }
             // `Unknown` and any future method decode alike: a typed,
             // correlated rejection instead of a dropped request.
             _ => self.respond_error(
@@ -1258,6 +1274,38 @@ impl HubConnection {
                 crate::accounts::ProviderConfigureJob {
                     command_id: command_id.0,
                     input,
+                    expected_revision,
+                    route: crate::accounts::LoginRoute {
+                        request_id,
+                        sink: Arc::clone(&self.sink),
+                    },
+                },
+            )),
+        )
+    }
+
+    fn provider_remove(
+        &self,
+        request_id: RequestId,
+        command_id: CommandId,
+        provider: String,
+        expected_revision: u64,
+    ) -> Result<(), SessionHubError> {
+        if command_id.as_str().trim().is_empty() || provider.trim().is_empty() {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "provider-remove command id and provider must not be empty",
+                false,
+                None,
+            );
+        }
+        self.send_management_command(
+            request_id.clone(),
+            crate::accounts::AccountCommand::RemoveProvider(Box::new(
+                crate::accounts::ProviderRemoveJob {
+                    command_id: command_id.0,
+                    provider,
                     expected_revision,
                     route: crate::accounts::LoginRoute {
                         request_id,

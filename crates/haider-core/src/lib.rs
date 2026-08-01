@@ -40,10 +40,10 @@ pub use haider_store::{
     ContextCompactionClaim, ContextCompactionReceiptResponse, CreatedSession,
     DelegationCreateOutcome, DelegationRecord, DelegationState, LoginClaim, LoginReceiptFailure,
     LoginReceiptResponse, LoginReceiptRow, ManagementClaim, ManagementReceiptRow,
-    MenuResolutionCommand, MenuResolutionOutcome, PROVIDER_CONFIGURE_METHOD, SessionCreateCommand,
-    SessionCreateOutcome, ShellExecAcceptCommand, ShellExecAcceptOutcome, TurnAcceptCommand,
-    TurnAcceptOutcome, TurnAdmissionDisposition, TurnCancelCommand, TurnCancelOutcome,
-    TurnCancellationStatus,
+    MenuResolutionCommand, MenuResolutionOutcome, PROVIDER_CONFIGURE_METHOD,
+    PROVIDER_REMOVE_METHOD, SessionCreateCommand, SessionCreateOutcome, ShellExecAcceptCommand,
+    ShellExecAcceptOutcome, TurnAcceptCommand, TurnAcceptOutcome, TurnAdmissionDisposition,
+    TurnCancelCommand, TurnCancelOutcome, TurnCancellationStatus,
 };
 pub use prompt_history::{ArtifactReader, PromptHistoryCompiler};
 pub use recovery::{RecoveryReport, reconcile_dispatched_effects};

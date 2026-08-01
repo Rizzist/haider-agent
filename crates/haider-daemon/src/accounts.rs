@@ -37,7 +37,7 @@ use haider_core::SqliteStoreHandle;
 use haider_core::{
     ACCOUNT_REMOVE_METHOD, ACCOUNT_SET_ACTIVE_METHOD, ACCOUNT_SET_DEFAULT_MODEL_METHOD,
     AccountAddClaim, AccountAddReceiptResponse, LoginClaim, LoginReceiptFailure,
-    LoginReceiptResponse, ManagementClaim, PROVIDER_CONFIGURE_METHOD,
+    LoginReceiptResponse, ManagementClaim, PROVIDER_CONFIGURE_METHOD, PROVIDER_REMOVE_METHOD,
 };
 use haider_protocol::credential::{
     AuthMethod, CredentialDescriptor, CredentialStatus, RotationCause, RotationEvent,
@@ -53,10 +53,10 @@ use haider_provider::{
 };
 use haider_rpc::{
     ERROR_CODE_BUSY, ERROR_CODE_CREDENTIAL_MISSING, ERROR_CODE_INVALID_ARGUMENT,
-    ERROR_CODE_PERMISSION_DENIED, ERROR_CODE_PROVIDER_ERROR, ERROR_CODE_RESTAGE_REQUIRED,
-    ERROR_CODE_REVISION_CONFLICT, ERROR_CODE_UNAUTHORIZED, ErrorData, ProviderApiFamilyWire,
-    ProviderAuthRequirementWire, ProviderSummaryWire, RequestId, ResponseBody, StagePurpose,
-    WireFrame,
+    ERROR_CODE_PERMISSION_DENIED, ERROR_CODE_PROVIDER_ERROR, ERROR_CODE_PROVIDER_REMOVE_REFUSED,
+    ERROR_CODE_RESTAGE_REQUIRED, ERROR_CODE_REVISION_CONFLICT, ERROR_CODE_UNAUTHORIZED, ErrorData,
+    ProviderApiFamilyWire, ProviderAuthRequirementWire, ProviderRemoveRefusalReasonWire,
+    ProviderSummaryWire, RequestId, ResponseBody, StagePurpose, WireFrame,
 };
 use subtle::ConstantTimeEq as _;
 use tokio::sync::{mpsc, watch};
@@ -722,6 +722,13 @@ pub(crate) struct ProviderConfigureJob {
     pub route: LoginRoute,
 }
 
+pub(crate) struct ProviderRemoveJob {
+    pub command_id: String,
+    pub provider: String,
+    pub expected_revision: u64,
+    pub route: LoginRoute,
+}
+
 /// Account actor mailbox items.
 #[derive(Debug, Clone)]
 pub(crate) struct OAuthRefreshFence {
@@ -748,6 +755,7 @@ pub(crate) enum AccountCommand {
     Remove(Box<RemoveAccountJob>),
     SetDefaultModel(Box<SetDefaultModelJob>),
     ConfigureProvider(Box<ProviderConfigureJob>),
+    RemoveProvider(Box<ProviderRemoveJob>),
     RefreshProviderModels {
         provider: String,
         completed: LoginRoute,
@@ -1134,6 +1142,18 @@ async fn run_account_actor(
                     management.as_ref(),
                     &mut providers,
                     Arc::clone(&provider_endpoint_validator),
+                    *job,
+                )
+                .await;
+            }
+            AccountCommand::RemoveProvider(job) => {
+                let refresh_in_progress = refreshing_providers.contains(&job.provider);
+                handle_provider_remove(
+                    &store,
+                    &accounts,
+                    management.as_ref(),
+                    &mut providers,
+                    refresh_in_progress,
                     *job,
                 )
                 .await;
@@ -2207,9 +2227,20 @@ struct ProviderConfigureIdentity {
     expected_revision: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct ProviderRemoveIdentity {
+    provider: String,
+    expected_revision: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 struct ProviderReceipt {
     provider: ProviderSummaryWire,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct ProviderRemoveReceipt {
+    provider: String,
 }
 
 fn command_json<T: serde::Serialize>(value: &T) -> Result<(String, String), HaiderError> {
@@ -2259,6 +2290,54 @@ fn respond_management_error(route: &LoginRoute, error: &HaiderError) {
             data,
         },
     );
+}
+
+fn respond_provider_remove_refused(
+    route: &LoginRoute,
+    provider: &str,
+    reason: ProviderRemoveRefusalReasonWire,
+    blocking_aliases: Vec<String>,
+) {
+    let message = match reason {
+        ProviderRemoveRefusalReasonWire::NotFound => {
+            format!("provider `{provider}` is not registered")
+        }
+        ProviderRemoveRefusalReasonWire::ReleaseOwned => {
+            format!("provider `{provider}` is release-owned and cannot be removed")
+        }
+        ProviderRemoveRefusalReasonWire::BlockingAccounts => format!(
+            "provider `{provider}` is referenced by credential aliases: {}",
+            blocking_aliases.join(", ")
+        ),
+        _ => format!("provider `{provider}` cannot be removed"),
+    };
+    respond(
+        route,
+        ResponseBody::Error {
+            code: ERROR_CODE_PROVIDER_REMOVE_REFUSED.to_owned(),
+            message,
+            retryable: false,
+            data: Some(ErrorData::ProviderRemoveRefused {
+                provider: provider.to_owned(),
+                reason,
+                blocking_aliases,
+            }),
+        },
+    );
+}
+
+fn provider_blocking_aliases(
+    accounts: &AccountStore<Box<dyn StoreLike>>,
+    provider: &str,
+) -> Vec<String> {
+    let mut aliases = accounts
+        .list()
+        .iter()
+        .filter(|descriptor| descriptor.provider == provider)
+        .map(|descriptor| descriptor.alias.as_str().to_owned())
+        .collect::<Vec<_>>();
+    aliases.sort();
+    aliases
 }
 
 async fn check_expected_revision(
@@ -2992,6 +3071,173 @@ async fn handle_provider_configure(
     respond(
         &job.route,
         ResponseBody::ProviderConfigure {
+            provider: receipt.provider,
+            revision,
+        },
+    );
+}
+
+async fn handle_provider_remove(
+    store: &SqliteStoreHandle,
+    accounts: &AccountStore<Box<dyn StoreLike>>,
+    management: Option<&ManagementSnapshot>,
+    providers: &mut ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+    refresh_in_progress: bool,
+    job: ProviderRemoveJob,
+) {
+    let identity = ProviderRemoveIdentity {
+        provider: job.provider.clone(),
+        expected_revision: job.expected_revision,
+    };
+    let (request_json, request_digest) = match command_json(&identity) {
+        Ok(value) => value,
+        Err(error) => {
+            respond_management_error(&job.route, &error);
+            return;
+        }
+    };
+    let preflight = store
+        .management_receipt_preflight::<ProviderRemoveReceipt>(
+            job.command_id.clone(),
+            PROVIDER_REMOVE_METHOD.to_owned(),
+            request_digest.clone(),
+            request_json.clone(),
+        )
+        .await;
+    if matches!(&preflight, Ok(None))
+        && let Err(error) = check_expected_revision(store, job.expected_revision).await
+    {
+        respond_management_error(&job.route, &error);
+        return;
+    }
+    let resume_pending = match preflight {
+        Ok(Some(ManagementClaim::Committed { response, revision })) => {
+            respond(
+                &job.route,
+                ResponseBody::ProviderRemove {
+                    provider: response.provider,
+                    revision,
+                },
+            );
+            return;
+        }
+        Ok(Some(ManagementClaim::Fresh)) => unreachable!("preflight never returns Fresh"),
+        Ok(Some(ManagementClaim::ResumePending { .. })) => true,
+        Ok(None) => {
+            let Some(profile) = providers.get(&job.provider) else {
+                respond_provider_remove_refused(
+                    &job.route,
+                    &job.provider,
+                    ProviderRemoveRefusalReasonWire::NotFound,
+                    Vec::new(),
+                );
+                return;
+            };
+            if !matches!(profile.provenance, ProviderProvenance::Custom) {
+                respond_provider_remove_refused(
+                    &job.route,
+                    &job.provider,
+                    ProviderRemoveRefusalReasonWire::ReleaseOwned,
+                    Vec::new(),
+                );
+                return;
+            }
+            let blocking_aliases = provider_blocking_aliases(accounts, &job.provider);
+            if !blocking_aliases.is_empty() {
+                respond_provider_remove_refused(
+                    &job.route,
+                    &job.provider,
+                    ProviderRemoveRefusalReasonWire::BlockingAccounts,
+                    blocking_aliases,
+                );
+                return;
+            }
+            if refresh_in_progress {
+                respond_management_error(
+                    &job.route,
+                    &HaiderError::new(
+                        ErrorCode::Busy,
+                        format!(
+                            "provider `{}` has a model refresh in progress",
+                            job.provider
+                        ),
+                        true,
+                    ),
+                );
+                return;
+            }
+            false
+        }
+        Err(error) => {
+            respond_management_error(&job.route, &error);
+            return;
+        }
+    };
+    match store
+        .management_claim_receipt::<ProviderRemoveReceipt>(
+            job.command_id.clone(),
+            PROVIDER_REMOVE_METHOD.to_owned(),
+            request_digest,
+            request_json,
+            None,
+            Some(job.expected_revision),
+        )
+        .await
+    {
+        Ok(ManagementClaim::Committed { response, revision }) => {
+            respond(
+                &job.route,
+                ResponseBody::ProviderRemove {
+                    provider: response.provider,
+                    revision,
+                },
+            );
+            return;
+        }
+        Ok(ManagementClaim::Fresh | ManagementClaim::ResumePending { .. }) => {}
+        Err(error) => {
+            respond_management_error(&job.route, &error);
+            return;
+        }
+    }
+    let blocking_aliases = provider_blocking_aliases(accounts, &job.provider);
+    if !blocking_aliases.is_empty() {
+        respond_provider_remove_refused(
+            &job.route,
+            &job.provider,
+            ProviderRemoveRefusalReasonWire::BlockingAccounts,
+            blocking_aliases,
+        );
+        return;
+    }
+    let removed = if resume_pending {
+        providers.reconcile_remove(&job.provider)
+    } else {
+        providers.remove_custom(&job.provider)
+    };
+    if let Err(error) = removed {
+        respond_management_error(&job.route, &error);
+        return;
+    }
+    let receipt = ProviderRemoveReceipt {
+        provider: job.provider.clone(),
+    };
+    let revision = match store
+        .finalize_provider_remove_receipt(job.command_id, job.provider.clone(), receipt.clone())
+        .await
+    {
+        Ok(revision) => revision,
+        Err(error) => {
+            respond_management_error(&job.route, &error);
+            return;
+        }
+    };
+    if let Some(management) = management {
+        management.publish(revision, accounts.list().to_vec(), providers.summaries());
+    }
+    respond(
+        &job.route,
+        ResponseBody::ProviderRemove {
             provider: receipt.provider,
             revision,
         },
@@ -5387,17 +5633,73 @@ async fn reconcile_provider_receipts(
     store: &SqliteStoreHandle,
     providers: &mut ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
 ) -> Result<(), HaiderError> {
-    for method in [ACCOUNT_SET_DEFAULT_MODEL_METHOD, PROVIDER_CONFIGURE_METHOD] {
-        for row in store.management_receipts(method.to_owned()).await? {
-            if row.state == "committed" {
-                if row.final_revision.is_none() {
-                    store
-                        .ensure_committed_management_revision(row.command_id, method.to_owned())
-                        .await?;
-                }
-                continue;
+    let rows = store.provider_management_receipts().await?;
+    let mut latest_existence_mutation = HashMap::new();
+    for (index, row) in rows.iter().enumerate() {
+        let provider = match row.method.as_str() {
+            PROVIDER_CONFIGURE_METHOD => {
+                let identity: ProviderConfigureIdentity = serde_json::from_str(&row.request_json)
+                    .map_err(|error| {
+                    HaiderError::new(
+                        ErrorCode::StoreCorrupt,
+                        format!("provider-configure identity is invalid: {error}"),
+                        false,
+                    )
+                })?;
+                Some(identity.input.provider)
             }
-            let profile = if method == ACCOUNT_SET_DEFAULT_MODEL_METHOD {
+            PROVIDER_REMOVE_METHOD => {
+                let identity: ProviderRemoveIdentity = serde_json::from_str(&row.request_json)
+                    .map_err(|error| {
+                        HaiderError::new(
+                            ErrorCode::StoreCorrupt,
+                            format!("provider-remove identity is invalid: {error}"),
+                            false,
+                        )
+                    })?;
+                Some(identity.provider)
+            }
+            ACCOUNT_SET_DEFAULT_MODEL_METHOD => None,
+            _ => {
+                return Err(HaiderError::new(
+                    ErrorCode::StoreCorrupt,
+                    format!("unexpected provider management method `{}`", row.method),
+                    false,
+                ));
+            }
+        };
+        if let Some(provider) = provider {
+            latest_existence_mutation.insert(provider, index);
+        }
+    }
+
+    for (index, row) in rows.into_iter().enumerate() {
+        if row.state == "committed" {
+            if row.final_revision.is_none() {
+                store
+                    .ensure_committed_management_revision(
+                        row.command_id.clone(),
+                        row.method.clone(),
+                    )
+                    .await?;
+            }
+            if row.method == PROVIDER_REMOVE_METHOD {
+                let identity: ProviderRemoveIdentity = serde_json::from_str(&row.request_json)
+                    .map_err(|error| {
+                        HaiderError::new(
+                            ErrorCode::StoreCorrupt,
+                            format!("provider-remove identity is invalid: {error}"),
+                            false,
+                        )
+                    })?;
+                if latest_existence_mutation.get(&identity.provider) == Some(&index) {
+                    providers.reconcile_remove(&identity.provider)?;
+                }
+            }
+            continue;
+        }
+        let profile = match row.method.as_str() {
+            ACCOUNT_SET_DEFAULT_MODEL_METHOD => {
                 let identity: SetDefaultModelIdentity = serde_json::from_str(&row.request_json)
                     .map_err(|error| {
                         HaiderError::new(
@@ -5407,7 +5709,8 @@ async fn reconcile_provider_receipts(
                         )
                     })?;
                 providers.reconcile_set_default_model(&identity.provider, &identity.model)?
-            } else {
+            }
+            PROVIDER_CONFIGURE_METHOD => {
                 let input: ProviderConfigureInput = row
                     .recovery_json
                     .as_deref()
@@ -5420,22 +5723,54 @@ async fn reconcile_provider_receipts(
                         )
                     })?;
                 providers.reconcile_configure(input)?
-            };
-            let summary = providers.summary(&profile.provider_id).ok_or_else(|| {
-                HaiderError::new(
-                    ErrorCode::StoreCorrupt,
-                    "reconciled provider disappeared before receipt finalization",
-                    false,
-                )
-            })?;
-            store
-                .finalize_management_receipt(
-                    row.command_id,
-                    method.to_owned(),
-                    ProviderReceipt { provider: summary },
-                )
-                .await?;
-        }
+            }
+            PROVIDER_REMOVE_METHOD => {
+                let identity: ProviderRemoveIdentity = serde_json::from_str(&row.request_json)
+                    .map_err(|error| {
+                        HaiderError::new(
+                            ErrorCode::StoreCorrupt,
+                            format!("provider-remove identity is invalid: {error}"),
+                            false,
+                        )
+                    })?;
+                if latest_existence_mutation.get(&identity.provider) != Some(&index) {
+                    return Err(HaiderError::new(
+                        ErrorCode::StoreCorrupt,
+                        format!(
+                            "pending provider-remove `{}` was superseded by a later mutation",
+                            row.command_id
+                        ),
+                        false,
+                    ));
+                }
+                providers.reconcile_remove(&identity.provider)?;
+                store
+                    .finalize_provider_remove_receipt(
+                        row.command_id,
+                        identity.provider.clone(),
+                        ProviderRemoveReceipt {
+                            provider: identity.provider,
+                        },
+                    )
+                    .await?;
+                continue;
+            }
+            _ => unreachable!("provider receipt methods were validated above"),
+        };
+        let summary = providers.summary(&profile.provider_id).ok_or_else(|| {
+            HaiderError::new(
+                ErrorCode::StoreCorrupt,
+                "reconciled provider disappeared before receipt finalization",
+                false,
+            )
+        })?;
+        store
+            .finalize_management_receipt(
+                row.command_id,
+                row.method,
+                ProviderReceipt { provider: summary },
+            )
+            .await?;
     }
     Ok(())
 }

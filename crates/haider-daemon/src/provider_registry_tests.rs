@@ -354,3 +354,48 @@ fn a_new_provider_creates_one_shot_on_its_stated_inventory() {
         .expect_err("a default outside the stated inventory still fails");
     assert_eq!(error.code, ErrorCode::InvalidArgument);
 }
+
+/// Only custom profiles are removable, and successful removal clears the
+/// in-memory discovered inventory along with the persisted projection.
+///
+/// MUTATION CHECK: remove the provenance guard or the model-source deletion
+/// from `remove_custom`. Expected RUNTIME failure: a release-owned profile is
+/// removed or the custom provider's cached model remains readable.
+#[test]
+fn provider_registry_removes_only_custom_profiles_and_clears_models() {
+    let source = model_source([
+        ("custom", vec![discovered("custom-model", true, None)]),
+        ("openai", vec![discovered("builtin-model", true, None)]),
+    ]);
+    let mut registry = ProviderRegistry::new(
+        MemoryProviderStore::default(),
+        initial_provider_profiles(
+            &std::collections::BTreeSet::from([OPENAI_PROVIDER_NAME.to_owned()]),
+            "unused",
+        ),
+        source.clone(),
+    )
+    .expect("provider registry");
+    registry
+        .configure(ProviderConfigureInput {
+            provider: "custom".to_owned(),
+            api_family: Some(ProviderApiFamilyWire::OpenAiChatCompletions),
+            origin: Some("https://custom.example.invalid".to_owned()),
+            auth_requirement: Some(ProviderAuthRequirementWire::ApiKey),
+            enabled: true,
+            models: vec!["custom-model".to_owned()],
+            default_model: Some("custom-model".to_owned()),
+        })
+        .expect("create custom profile");
+
+    let builtin = registry
+        .remove_custom(OPENAI_PROVIDER_NAME)
+        .expect_err("release-owned profile must be refused");
+    assert_eq!(builtin.code, ErrorCode::InvalidArgument);
+    registry
+        .remove_custom("custom")
+        .expect("remove custom profile");
+    assert!(registry.get("custom").is_none());
+    assert!(source.models("custom").is_none());
+    assert!(registry.get(OPENAI_PROVIDER_NAME).is_some());
+}
