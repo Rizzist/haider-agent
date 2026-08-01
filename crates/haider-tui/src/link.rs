@@ -571,6 +571,24 @@ pub fn request_body(command: LiveCommand) -> RequestBody {
         LiveCommand::ToolsInventory { session } => RequestBody::ToolsInventory {
             session_id: session,
         },
+        LiveCommand::AccountRemove {
+            command_id,
+            alias,
+            expected_revision,
+        } => RequestBody::AccountRemove {
+            command_id,
+            alias,
+            expected_revision,
+        },
+        LiveCommand::ProviderRemove {
+            command_id,
+            provider,
+            expected_revision,
+        } => RequestBody::ProviderRemove {
+            command_id,
+            provider,
+            expected_revision,
+        },
         LiveCommand::Stage {
             stage_id, secret, ..
         } => RequestBody::VaultStage {
@@ -743,6 +761,29 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
             session: session_id,
             snapshot: Box::new(inventory),
         }],
+        ResponseBody::AccountRemove {
+            removed_alias,
+            replacement_active_alias,
+            revision,
+        } => context.command_id.clone().map_or_else(Vec::new, |id| {
+            vec![LiveReply::AccountRemoved {
+                command_id: id,
+                removed_alias: removed_alias.as_str().to_owned(),
+                replacement_active_alias: replacement_active_alias
+                    .as_ref()
+                    .map(|alias| alias.as_str().to_owned()),
+                revision,
+            }]
+        }),
+        ResponseBody::ProviderRemove { provider, revision } => {
+            context.command_id.clone().map_or_else(Vec::new, |id| {
+                vec![LiveReply::ProviderRemoved {
+                    command_id: id,
+                    provider,
+                    revision,
+                }]
+            })
+        }
         ResponseBody::VaultStage {
             vault_reference, ..
         } => context

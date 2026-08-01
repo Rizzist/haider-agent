@@ -69,7 +69,7 @@ fn providers_screen_renders_the_provisional_layout() {
     assert!(frame.contains("models: —"));
     // Custom/local rows render their endpoint truthfully.
     assert!(frame.contains("openai-compatible · http://127.0.0.1:8000/v1"));
-    assert!(frame.contains("click a model to make it the provider default"));
+    assert!(frame.contains("click a model to set the default"));
 }
 
 /// LAW — the default marker moves only on the correlated, revision-gated

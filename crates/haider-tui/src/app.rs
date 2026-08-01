@@ -270,6 +270,8 @@ pub struct AccountsState {
     /// In-flight `account.set_active` target. While `Some`, the rows do not
     /// move and further selects are refused (one at a time).
     pub pending_select: Option<String>,
+    /// W10b: an armed removal awaiting Enter (x armed it; esc disarms).
+    pub pending_remove: Option<String>,
     /// Keyboard highlight over the flattened selectable rows (W5
     /// accessibility extension — separately goldened).
     pub cursor: usize,
@@ -386,6 +388,10 @@ pub struct CustomProviderCard {
     /// Attempt identity (the card discipline): every driver reply must
     /// correlate to it or die silently.
     pub attempt: u64,
+    /// W10b: editing an EXISTING provider — identity fields (name, origin)
+    /// are locked; only the model line is typed (`provider.configure`
+    /// update semantics: supplied identity must match exactly).
+    pub edit: bool,
 }
 
 /// The `/providers` screen state (report §5.2). Same daemon-truth law as
@@ -399,6 +405,8 @@ pub struct ProvidersState {
     /// In-flight `account.set_default_model`: (provider, model).
     pub pending_default: Option<(String, String)>,
     pub cursor: usize,
+    /// W10b: an armed removal awaiting Enter (x armed it; esc disarms).
+    pub pending_remove: Option<String>,
 }
 
 impl ProvidersState {
@@ -1326,6 +1334,12 @@ pub enum AppRequest {
     /// daemon's workspace (receipt-backed `shell.exec`; zero provider
     /// requests). Never demo vocabulary.
     ShellExec { command: String },
+    /// W10b: durable account removal (receipt-backed `account.remove`).
+    AccountRemove { alias: String },
+    /// W10b: durable custom-provider removal (`provider.remove`) — the
+    /// daemon refuses builtins and account-referenced providers with
+    /// typed reasons; the client never pre-judges.
+    ProviderRemove { provider: String },
     /// W8b: `/tools` live — read the daemon's canonical tool inventory.
     ToolsRefresh,
     /// Run a respond() turn for user text. `voice` turns skip the script's
@@ -3866,8 +3880,57 @@ impl AppModel {
 
     /// Keys on the `/providers` screen.
     fn handle_providers_key(&mut self, code: KeyCode) {
+        if self.custom_add.is_some() {
+            self.handle_custom_card_key(code);
+            return;
+        }
         match code {
+            KeyCode::Esc if self.providers.pending_remove.is_some() => {
+                self.providers.pending_remove = None;
+                self.providers.message = None;
+                self.dirty = true;
+            }
             KeyCode::Esc => self.exit_providers(),
+            KeyCode::Char('x') => {
+                if let Some(provider) = self
+                    .providers
+                    .providers
+                    .get(self.providers.cursor)
+                    .map(|summary| summary.provider.clone())
+                {
+                    // The DAEMON refuses builtins/referenced providers with a
+                    // typed reason — the client arms without pre-judging.
+                    self.providers.message = Some(format!(
+                        "remove provider `{provider}`? enter confirms · esc cancels"
+                    ));
+                    self.providers.pending_remove = Some(provider);
+                    self.dirty = true;
+                }
+            }
+            KeyCode::Enter if self.providers.pending_remove.is_some() => {
+                let provider = self.providers.pending_remove.take().unwrap_or_default();
+                if self.mode.fabricates_locally() {
+                    self.providers.providers.retain(|s| s.provider != provider);
+                    self.providers.cursor = self
+                        .providers
+                        .cursor
+                        .min(self.providers.providers.len().saturating_sub(1));
+                    self.providers.message = Some(format!("removed `{provider}` (demo)"));
+                } else if self.daemon_serves(haider_rpc::FEATURE_PROVIDER_REMOVE_V1) {
+                    self.providers.message = Some(format!("removing `{provider}`…"));
+                    self.requests.push(AppRequest::ProviderRemove { provider });
+                } else {
+                    self.providers.message = Some(self.stale_daemon_note("provider removal"));
+                }
+                self.dirty = true;
+            }
+            KeyCode::Char('e') => {
+                if let Some(summary) = self.providers.providers.get(self.providers.cursor).cloned()
+                {
+                    self.open_custom_edit(&summary);
+                }
+            }
+            KeyCode::Char('h') => self.open_huggingface_preset(),
             KeyCode::Up => {
                 self.providers.cursor = self.providers.cursor.saturating_sub(1);
                 self.dirty = true;
@@ -4107,6 +4170,80 @@ impl AppModel {
             focus: CustomField::Name,
             phase: CustomPhase::Editing { error: None },
             attempt: self.custom_attempt_seq,
+            edit: false,
+        });
+        self.dirty = true;
+    }
+
+    /// W10b: the edit card — the SAME custom card prefilled from the
+    /// summary with identity locked; ⏎ re-configures mutable fields under
+    /// the current revision (the daemon refuses identity drift with a
+    /// typed reason — builtins included; the client never pre-judges).
+    fn open_custom_edit(&mut self, summary: &haider_rpc::ProviderSummaryWire) {
+        if self.custom_add.is_some() || self.oauth_add.is_some() {
+            return;
+        }
+        if !self.mode.fabricates_locally()
+            && !self.daemon_serves(haider_rpc::FEATURE_PROVIDER_CONFIGURE_V1)
+        {
+            self.providers.message = Some(self.stale_daemon_note("provider editing"));
+            self.dirty = true;
+            return;
+        }
+        self.custom_attempt_seq += 1;
+        self.custom_add = Some(CustomProviderCard {
+            name: summary.provider.clone(),
+            origin: summary.endpoint.clone().unwrap_or_default(),
+            model: summary
+                .default_model
+                .clone()
+                .or_else(|| summary.models.first().cloned())
+                .unwrap_or_default(),
+            focus: CustomField::Model,
+            phase: CustomPhase::Editing { error: None },
+            attempt: self.custom_attempt_seq,
+            edit: true,
+        });
+        self.dirty = true;
+    }
+
+    /// W10b: the HuggingFace preset — the custom card prefilled with the
+    /// HF router (openai-compatible); the user supplies the served model,
+    /// then the normal login flow adds the token.
+    fn open_huggingface_preset(&mut self) {
+        if self.custom_add.is_some() || self.oauth_add.is_some() {
+            return;
+        }
+        if !self.mode.fabricates_locally()
+            && !self.daemon_serves(haider_rpc::FEATURE_PROVIDER_CONFIGURE_V1)
+        {
+            self.providers.message = Some(self.stale_daemon_note("custom providers"));
+            self.dirty = true;
+            return;
+        }
+        let taken: Vec<AccountRow> = self
+            .providers
+            .providers
+            .iter()
+            .map(|summary| AccountRow {
+                alias: summary.provider.clone(),
+                provider: summary.provider.clone(),
+                method: haider_protocol::credential::AuthMethod::ApiKey,
+                identity: String::new(),
+                status: haider_protocol::credential::CredentialStatus::Ok,
+                selected: false,
+                base_url: None,
+            })
+            .collect();
+        self.custom_attempt_seq += 1;
+        self.custom_add = Some(CustomProviderCard {
+            name: smallest_free_alias("huggingface", &taken),
+            origin: "https://router.huggingface.co/v1".to_owned(),
+            model: String::new(),
+            focus: CustomField::Model,
+            phase: CustomPhase::Editing { error: None },
+            attempt: self.custom_attempt_seq,
+            edit: false,
         });
         self.dirty = true;
     }
@@ -4207,10 +4344,16 @@ impl AppModel {
                 if let Some(card) = self.custom_add.as_mut()
                     && matches!(card.phase, CustomPhase::Editing { .. })
                 {
-                    card.focus = match card.focus {
-                        CustomField::Name => CustomField::Origin,
-                        CustomField::Origin => CustomField::Model,
-                        CustomField::Model => CustomField::Name,
+                    card.focus = if card.edit {
+                        // Identity is locked in edit mode — only the model
+                        // line takes focus.
+                        CustomField::Model
+                    } else {
+                        match card.focus {
+                            CustomField::Name => CustomField::Origin,
+                            CustomField::Origin => CustomField::Model,
+                            CustomField::Model => CustomField::Name,
+                        }
                     };
                     self.dirty = true;
                 }
@@ -4332,7 +4475,41 @@ impl AppModel {
             return;
         }
         match code {
+            KeyCode::Esc if self.accounts.pending_remove.is_some() => {
+                self.accounts.pending_remove = None;
+                self.accounts.message = None;
+                self.dirty = true;
+            }
             KeyCode::Esc => self.exit_accounts(),
+            KeyCode::Char('x') => {
+                if let Some(alias) = self
+                    .accounts
+                    .rows
+                    .get(self.accounts.cursor)
+                    .map(|row| row.alias.clone())
+                {
+                    self.accounts.message = Some(format!(
+                        "remove account `{alias}`? enter confirms · esc cancels"
+                    ));
+                    self.accounts.pending_remove = Some(alias);
+                    self.dirty = true;
+                }
+            }
+            KeyCode::Enter if self.accounts.pending_remove.is_some() => {
+                let alias = self.accounts.pending_remove.take().unwrap_or_default();
+                if self.mode.fabricates_locally() {
+                    self.accounts.rows.retain(|row| row.alias != alias);
+                    self.accounts.cursor = self
+                        .accounts
+                        .cursor
+                        .min(self.accounts.rows.len().saturating_sub(1));
+                    self.accounts.message = Some(format!("removed `{alias}` (demo)"));
+                } else {
+                    self.accounts.message = Some(format!("removing `{alias}`…"));
+                    self.requests.push(AppRequest::AccountRemove { alias });
+                }
+                self.dirty = true;
+            }
             KeyCode::Up => {
                 self.accounts.cursor = self.accounts.cursor.saturating_sub(1);
                 self.dirty = true;
@@ -5638,10 +5815,7 @@ impl AppModel {
                         }
                     }
                     AccountAddKind::HuggingFace => {
-                        self.flash = Some(
-                            "· custom providers — /login lands them with W5e (provider.configure is live)"
-                                .to_owned(),
-                        );
+                        self.open_huggingface_preset();
                     }
                 }
             }

@@ -108,7 +108,7 @@ fn accounts_screen_renders_the_sim_hierarchy() {
     assert!(add > last_row, "the add row renders AFTER all groups");
     assert!(frame.contains("[+ Custom (OpenAI-compatible)]"));
     // Hints line.
-    assert!(frame.contains("click an account to make it active for its provider"));
+    assert!(frame.contains("click an account to make it active"));
 }
 
 /// LAW (report §5.1) — OPTIMISTIC SELECTION IS FORBIDDEN.

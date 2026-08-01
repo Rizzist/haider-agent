@@ -124,6 +124,18 @@ pub enum LiveCommand {
     ToolsInventory {
         session: SessionId,
     },
+    /// `account.remove` — durable, revision-fenced (W10b).
+    AccountRemove {
+        command_id: CommandId,
+        alias: String,
+        expected_revision: Option<u64>,
+    },
+    /// `provider.remove` — durable custom-provider removal (W10b).
+    ProviderRemove {
+        command_id: CommandId,
+        provider: String,
+        expected_revision: u64,
+    },
     /// Stage a raw secret in connection-scoped daemon memory (R7/R10).
     /// Deliberately NON-durable and NOT in the outbox: no command receipt
     /// may ever contain a secret, so a lost response is answered by
@@ -251,6 +263,8 @@ impl LiveCommand {
             | Self::Cancel { command_id, .. }
             | Self::Compact { command_id, .. }
             | Self::ShellExec { command_id, .. }
+            | Self::AccountRemove { command_id, .. }
+            | Self::ProviderRemove { command_id, .. }
             | Self::Answer { command_id, .. } => Some(command_id),
             Self::LoginApi { command_id, .. } => Some(command_id),
             Self::AccountSetActive { command_id, .. } => Some(command_id),
@@ -354,6 +368,19 @@ pub enum LiveReply {
     ToolsInventory {
         session: SessionId,
         snapshot: Box<haider_protocol::tool::ToolInventorySnapshot>,
+    },
+    /// `account.remove` committed.
+    AccountRemoved {
+        command_id: CommandId,
+        removed_alias: String,
+        replacement_active_alias: Option<String>,
+        revision: u64,
+    },
+    /// `provider.remove` committed.
+    ProviderRemoved {
+        command_id: CommandId,
+        provider: String,
+        revision: u64,
     },
     /// One committed envelope for an attachment.
     Event {
@@ -596,6 +623,10 @@ pub struct LiveDriver {
     pending_account_select: Option<(CommandId, String)>,
     /// The in-flight `account.set_default_model`: (command, provider).
     pending_default_model: Option<(CommandId, String)>,
+    /// W10b in-flight removals: (command, alias/provider) — failures
+    /// surface on the owning screen; successes come as typed replies.
+    pending_account_remove: Option<(CommandId, String)>,
+    pending_provider_remove: Option<(CommandId, String)>,
     /// The in-flight `provider.configure`: (command, card attempt).
     pending_custom: Option<(CommandId, u64)>,
     /// The one OAuth add flight (W5e-1): the card's whole driver state.
@@ -682,6 +713,8 @@ impl LiveDriver {
             login_started: None,
             pending_account_select: None,
             pending_default_model: None,
+            pending_account_remove: None,
+            pending_provider_remove: None,
             pending_custom: None,
             oauth_flight: None,
             outbox: Vec::new(),
@@ -1075,6 +1108,51 @@ impl LiveDriver {
                     model.dirty = true;
                 }
                 Vec::new()
+            }
+            LiveReply::AccountRemoved {
+                command_id,
+                removed_alias,
+                replacement_active_alias,
+                revision,
+            } => {
+                self.pending_account_remove = None;
+                self.retire(&command_id);
+                model.accounts.rows.retain(|row| row.alias != removed_alias);
+                model.accounts.cursor = model
+                    .accounts
+                    .cursor
+                    .min(model.accounts.rows.len().saturating_sub(1));
+                if let Some(active) = &replacement_active_alias {
+                    for row in &mut model.accounts.rows {
+                        row.selected = row.alias == *active;
+                    }
+                }
+                model.accounts.revision = Some(revision);
+                model.accounts.message = Some(match replacement_active_alias {
+                    Some(active) => {
+                        format!("removed `{removed_alias}` · active → `{active}`")
+                    }
+                    None => format!("removed `{removed_alias}`"),
+                });
+                model.dirty = true;
+                vec![LiveCommand::AccountList, LiveCommand::ProviderList]
+            }
+            LiveReply::ProviderRemoved {
+                command_id,
+                provider,
+                revision,
+            } => {
+                self.pending_provider_remove = None;
+                self.retire(&command_id);
+                model.providers.providers.retain(|s| s.provider != provider);
+                model.providers.cursor = model
+                    .providers
+                    .cursor
+                    .min(model.providers.providers.len().saturating_sub(1));
+                model.providers.revision = Some(revision);
+                model.providers.message = Some(format!("removed `{provider}`"));
+                model.dirty = true;
+                vec![LiveCommand::ProviderList]
             }
             LiveReply::Answered { command_id }
             | LiveReply::Cancelled { command_id }
@@ -1549,6 +1627,37 @@ impl LiveDriver {
                         self.retire(id);
                     }
                     model.oauth_add_failed(flight.attempt, &message);
+                    return Vec::new();
+                }
+                // W10b: a failed removal surfaces the daemon's typed
+                // reason on its screen (builtin refusal, blocking aliases,
+                // revision conflict) — the client never re-judges.
+                if let Some(id) = &command_id
+                    && self
+                        .pending_account_remove
+                        .as_ref()
+                        .is_some_and(|(pending, _)| pending == id)
+                    && let Some((_, alias)) = self.pending_account_remove.take()
+                {
+                    if !retryable {
+                        self.retire(id);
+                    }
+                    model.accounts.message = Some(format!("`{alias}` not removed — {message}"));
+                    model.dirty = true;
+                    return Vec::new();
+                }
+                if let Some(id) = &command_id
+                    && self
+                        .pending_provider_remove
+                        .as_ref()
+                        .is_some_and(|(pending, _)| pending == id)
+                    && let Some((_, provider)) = self.pending_provider_remove.take()
+                {
+                    if !retryable {
+                        self.retire(id);
+                    }
+                    model.providers.message = Some(format!("`{provider}` not removed — {message}"));
+                    model.dirty = true;
                     return Vec::new();
                 }
                 // A failed `account.set_default_model` releases its gate;
@@ -2184,6 +2293,26 @@ impl LiveDriver {
                     return Vec::new();
                 };
                 vec![self.enqueue(LiveCommand::ToolsInventory { session })]
+            }
+            AppRequest::AccountRemove { alias } => {
+                let command_id = self.mint();
+                let expected_revision = model.accounts.revision;
+                self.pending_account_remove = Some((command_id.clone(), alias.clone()));
+                vec![self.enqueue(LiveCommand::AccountRemove {
+                    command_id,
+                    alias,
+                    expected_revision,
+                })]
+            }
+            AppRequest::ProviderRemove { provider } => {
+                let command_id = self.mint();
+                let expected_revision = model.providers.revision.unwrap_or(0);
+                self.pending_provider_remove = Some((command_id.clone(), provider.clone()));
+                vec![self.enqueue(LiveCommand::ProviderRemove {
+                    command_id,
+                    provider,
+                    expected_revision,
+                })]
             }
             AppRequest::Compact => {
                 // W7b: receipt-backed idle-only `session.compact`. The

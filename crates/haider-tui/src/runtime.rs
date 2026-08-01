@@ -1255,7 +1255,10 @@ impl DemoDriver {
             // W8b live-only vocabulary: the reducer's demo gates flash
             // instead of pushing these, so the demo driver never sees one.
             | AppRequest::ShellExec { .. }
-            | AppRequest::ToolsRefresh => {}
+            | AppRequest::ToolsRefresh
+            // W10b live-only mutations: the demo reducer removes locally.
+            | AppRequest::AccountRemove { .. }
+            | AppRequest::ProviderRemove { .. } => {}
             // `/accounts` (W5d): the demo world answers from the sim's seed
             // list, synchronously — through the SAME reducer seams as live
             // (apply_snapshot / apply_account_selected), so the

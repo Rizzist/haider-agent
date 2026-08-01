@@ -1145,7 +1145,7 @@ fn render_accounts(
     }
     footer_lines.push(Line::raw(""));
     footer_lines.push(Line::styled(
-        "click an account to make it active for its provider · + adds via OAuth / API · esc back",
+        "click an account to make it active · + adds via OAuth / API · x removes · esc back",
         theme.faint_style(),
     ));
 
@@ -1363,7 +1363,7 @@ fn render_providers(
     }
 
     lines.push(Line::styled(
-        "click a model to make it the provider default · [accounts] switches credentials · esc back",
+        "click a model to set the default · e edits · x removes · h HuggingFace · esc back",
         theme.faint_style(),
     ));
 
