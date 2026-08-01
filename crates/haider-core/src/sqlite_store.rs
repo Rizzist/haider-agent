@@ -7,16 +7,17 @@
 use crate::{ArtifactReader, CommittedRange, StoreHandle};
 use async_trait::async_trait;
 use haider_protocol::agent::ChildReport;
+use haider_protocol::branch::BranchDescriptor;
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::error::{ErrorCode, HaiderError};
-use haider_protocol::ids::{AgentId, ArtifactRef, RunId, SessionId};
+use haider_protocol::ids::{AgentId, ArtifactRef, BranchId, RunId, SessionId};
 use haider_protocol::session::SessionMetadataV1;
 use haider_store::{
-    AcceptedShellExec, AcceptedTurn, CancelledTurn, Cas, ContextCompactionClaim,
-    ContextCompactionReceiptResponse, DelegationCreateOutcome, DelegationRecord, EventStore,
-    MenuResolutionCommand, MenuResolutionOutcome, ProfileLease, SessionCreateCommand,
-    SessionCreateOutcome, ShellExecAcceptCommand, ShellExecAcceptOutcome, Store, TurnAcceptCommand,
-    TurnAcceptOutcome, TurnCancelCommand, TurnCancelOutcome,
+    AcceptedShellExec, AcceptedTurn, BranchCreateCommand, BranchCreateOutcome, CancelledTurn, Cas,
+    ContextCompactionClaim, ContextCompactionReceiptResponse, DelegationCreateOutcome,
+    DelegationRecord, EventStore, MenuResolutionCommand, MenuResolutionOutcome, ProfileLease,
+    SessionCreateCommand, SessionCreateOutcome, ShellExecAcceptCommand, ShellExecAcceptOutcome,
+    Store, TurnAcceptCommand, TurnAcceptOutcome, TurnCancelCommand, TurnCancelOutcome,
 };
 use haider_tools::{CasSink, ToolResult};
 use std::path::Path;
@@ -135,6 +136,29 @@ impl SqliteStoreHandle {
     ) -> Result<SessionCreateOutcome, HaiderError> {
         let owner = Arc::clone(&self.owner);
         run_blocking(move || owner.with_store(|store| store.create_session(&command))).await
+    }
+
+    pub async fn branch_create_receipt(
+        &self,
+        command_id: String,
+        request_digest: String,
+        request_json: String,
+    ) -> Result<Option<haider_store::CreatedBranch>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.branch_create_receipt(&command_id, &request_digest, &request_json)
+            })
+        })
+        .await
+    }
+
+    pub async fn create_branch(
+        &self,
+        command: BranchCreateCommand,
+    ) -> Result<BranchCreateOutcome, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.create_branch(&command))).await
     }
 
     pub async fn create_delegation(
@@ -799,6 +823,20 @@ impl StoreHandle for SqliteStoreHandle {
         let owner = Arc::clone(&self.owner);
         let session_id = session_id.clone();
         run_blocking(move || owner.with_store(|store| store.latest_seq(&session_id))).await
+    }
+
+    async fn branch_lineage(
+        &self,
+        session_id: &SessionId,
+        branch_id: Option<&BranchId>,
+    ) -> Result<Vec<BranchDescriptor>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        let session_id = session_id.clone();
+        let branch_id = branch_id.cloned();
+        run_blocking(move || {
+            owner.with_store(|store| store.branch_lineage(&session_id, branch_id.as_ref()))
+        })
+        .await
     }
 }
 

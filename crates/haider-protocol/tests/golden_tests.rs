@@ -8,6 +8,7 @@
 
 use haider_protocol::EventPayload;
 use haider_protocol::agent::ChipState;
+use haider_protocol::branch::{BranchCreated, BranchDescriptor, BranchEventPayload};
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets};
 use haider_protocol::ids::*;
 use haider_protocol::menu::{
@@ -147,6 +148,28 @@ fn golden_session_idle_interrupted() {
     golden(
         "session_idle_interrupted",
         &SessionState::Idle { interrupted: true },
+    );
+}
+
+/// MUTATION CHECK: remove or rename any durable branch coordinate. Expected
+/// RUNTIME failure: the additive topology fact golden no longer round-trips.
+#[test]
+fn golden_branch_created_fact() {
+    golden(
+        "branch_created",
+        &BranchEventPayload::BranchCreated(BranchCreated {
+            branch: BranchDescriptor {
+                branch_id: BranchId::new("branch-plan-b"),
+                name: "Plan B".into(),
+                source_branch_id: Some(BranchId::new("branch-plan-a")),
+                fork_node_id: NodeId::new("node-fork-42"),
+                fork_seq: 42,
+                created_seq: 57,
+                created_at_ms: 1_753_500_000_057,
+                head_node_id: NodeId::new("node-fork-42"),
+                head_seq: 42,
+            },
+        }),
     );
 }
 

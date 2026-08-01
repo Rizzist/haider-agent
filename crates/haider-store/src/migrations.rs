@@ -14,7 +14,7 @@ use crate::{StoreResult, now_ms, store_error, to_sqlite_integer};
 use haider_protocol::error::{ErrorCode, HaiderError};
 use rusqlite::{Connection, TransactionBehavior, params};
 
-pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 9;
+pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 10;
 
 struct Migration {
     version: u32,
@@ -177,6 +177,36 @@ const MIGRATIONS: &[Migration] = &[
 
             CREATE INDEX delegations_parent_run
             ON delegations(parent_session_id, parent_run_id);
+        ",
+    },
+    Migration {
+        version: 10,
+        sql: "
+            CREATE TABLE branches (
+                session_id       TEXT NOT NULL,
+                branch_id        TEXT NOT NULL,
+                display_name     TEXT NOT NULL,
+                source_branch_id TEXT,
+                fork_node_id     TEXT NOT NULL,
+                fork_seq         INTEGER NOT NULL CHECK (fork_seq > 0),
+                created_seq      INTEGER NOT NULL CHECK (created_seq > 0),
+                created_at_ms    INTEGER NOT NULL CHECK (created_at_ms >= 0),
+                head_node_id     TEXT NOT NULL,
+                head_seq         INTEGER NOT NULL CHECK (head_seq > 0),
+                PRIMARY KEY (session_id, branch_id),
+                UNIQUE (session_id, created_seq),
+                FOREIGN KEY (session_id) REFERENCES sessions(id),
+                FOREIGN KEY (session_id, source_branch_id)
+                    REFERENCES branches(session_id, branch_id),
+                FOREIGN KEY (session_id, fork_seq) REFERENCES events(session_id, seq),
+                FOREIGN KEY (session_id, created_seq) REFERENCES events(session_id, seq),
+                FOREIGN KEY (session_id, head_seq) REFERENCES events(session_id, seq)
+            );
+
+            CREATE INDEX branches_source
+            ON branches(session_id, source_branch_id);
+
+            ALTER TABLE delegations ADD COLUMN parent_branch_id TEXT;
         ",
     },
 ];

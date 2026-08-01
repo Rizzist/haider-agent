@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use haider_protocol::DeliveryMode;
 use haider_protocol::context::ContextFootprint;
 use haider_protocol::envelope::RawEnvelope;
-use haider_protocol::ids::{ItemId, MenuId, RunId, SessionId};
+use haider_protocol::ids::{BranchId, ItemId, MenuId, NodeId, RunId, SessionId};
 use haider_protocol::session::{SessionMetadataV1, SessionPermissionOverridesV1};
 use haider_protocol::tool::{AttachmentBlock, ToolInventorySnapshot};
 use serde::de::Error as _;
@@ -174,6 +174,8 @@ pub const FEATURE_SHELL_EXEC_V1: &str = "shell_exec_v1";
 pub const FEATURE_TOOL_INVENTORY_V1: &str = "tool_inventory_v1";
 /// Daemon persists and applies typed per-session write/exec permission overrides.
 pub const FEATURE_SESSION_PERMISSION_OVERRIDES_V1: &str = "session_permission_overrides_v1";
+/// The daemon serves receipt-backed named branch creation and branch-scoped turns.
+pub const FEATURE_BRANCH_CREATE_V1: &str = "branch_create_v1";
 
 /// Kind of client taking part in the handshake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -758,8 +760,35 @@ pub enum RequestBody {
     /// authority or worker ownership.
     #[serde(rename = "session.detach")]
     SessionDetach { attachment_id: AttachmentId },
-    /// Durably accepts one turn before any provider work begins.
+    /// Atomically creates one durable named ref at an exact committed node.
+    #[serde(rename = "branch.create")]
+    BranchCreate {
+        command_id: CommandId,
+        session_id: SessionId,
+        worker_generation: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_branch_id: Option<BranchId>,
+        fork_node_id: NodeId,
+        fork_seq: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
+    /// Branch-capable decode form of `turn.submit`.
     #[serde(rename = "turn.submit")]
+    TurnSubmitWithBranch {
+        command_id: CommandId,
+        session_id: SessionId,
+        worker_generation: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch_id: Option<BranchId>,
+        text: String,
+        #[serde(default)]
+        attachments: Vec<AttachmentBlock>,
+        mode: DeliveryMode,
+    },
+    /// Encode-only source-compatible main-branch turn submission. Decoders
+    /// normalize both old and new JSON into [`Self::TurnSubmitWithBranch`].
+    #[serde(rename = "turn.submit", skip_deserializing)]
     TurnSubmit {
         command_id: CommandId,
         session_id: SessionId,
@@ -777,8 +806,17 @@ pub enum RequestBody {
         worker_generation: u64,
         run_id: RunId,
     },
-    /// Runs one receipt-backed, idle-only immutable history compaction.
+    /// Branch-capable decode form of `session.compact`.
     #[serde(rename = "session.compact")]
+    SessionCompactOnBranch {
+        command_id: CommandId,
+        session_id: SessionId,
+        worker_generation: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch_id: Option<BranchId>,
+    },
+    /// Encode-only source-compatible main-branch manual compaction.
+    #[serde(rename = "session.compact", skip_deserializing)]
     SessionCompact {
         command_id: CommandId,
         session_id: SessionId,
@@ -981,6 +1019,19 @@ pub enum ResponseBody {
     },
     #[serde(rename = "session.detach")]
     SessionDetach { attachment_id: AttachmentId },
+    /// Stable, secret-free coordinates of an atomic `branch.create` (R2).
+    #[serde(rename = "branch.create")]
+    BranchCreate {
+        session_id: SessionId,
+        branch_id: BranchId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_branch_id: Option<BranchId>,
+        fork_node_id: NodeId,
+        fork_seq: u64,
+        created_seq: u64,
+        worker_generation: u64,
+        name: String,
+    },
     /// Durable acceptance coordinates of `turn.submit` (R3): `run_id` and
     /// the `UserMessage` sequence committed by the acceptance transaction.
     /// Socket order relative to that transaction's events is NOT promised —
@@ -991,6 +1042,17 @@ pub enum ResponseBody {
         run_id: RunId,
         accepted_seq: u64,
         worker_generation: u64,
+        disposition: SubmitDisposition,
+    },
+    /// Branch-pinned acceptance coordinates. Main-branch responses retain
+    /// the legacy `turn.submit` shape byte-for-byte.
+    #[serde(rename = "turn.submit.on_branch")]
+    TurnSubmitOnBranch {
+        session_id: SessionId,
+        run_id: RunId,
+        accepted_seq: u64,
+        worker_generation: u64,
+        branch_id: BranchId,
         disposition: SubmitDisposition,
     },
     /// Outcome of durable cancellation intent (R5). `terminal_seq` is
@@ -1010,6 +1072,14 @@ pub enum ResponseBody {
         run_id: RunId,
         accepted_seq: u64,
         worker_generation: u64,
+    },
+    #[serde(rename = "session.compact.on_branch")]
+    SessionCompactOnBranch {
+        session_id: SessionId,
+        run_id: RunId,
+        accepted_seq: u64,
+        worker_generation: u64,
+        branch_id: BranchId,
     },
     /// Durable acceptance coordinates for one direct shell command. Terminal
     /// status and byte output arrive through the ordinary item event stream.

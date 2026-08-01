@@ -1,0 +1,14 @@
+{
+  "type": "branch_created",
+  "branch": {
+    "branch_id": "branch-plan-b",
+    "name": "Plan B",
+    "source_branch_id": "branch-plan-a",
+    "fork_node_id": "node-fork-42",
+    "fork_seq": 42,
+    "created_seq": 57,
+    "created_at_ms": 1753500000057,
+    "head_node_id": "node-fork-42",
+    "head_seq": 42
+  }
+}

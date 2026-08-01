@@ -46,7 +46,7 @@ use haider_protocol::history::{
     COMPACTION_INTENT_EXTENSION_KIND, CompactionIntent, CompactionResume, NodeKind, TreeNode,
 };
 use haider_protocol::ids::{
-    AgentId, DeviceId, EffectId, EventId, ItemId, MenuId, NodeId, RunId, SessionId,
+    AgentId, BranchId, DeviceId, EffectId, EventId, ItemId, MenuId, NodeId, RunId, SessionId,
 };
 use haider_protocol::item::{ItemDelta, ItemEvent, TurnItem};
 use haider_protocol::menu::{DecisionKind, Menu, MenuAnswer, MenuKind};
@@ -100,6 +100,7 @@ pub(crate) struct AcceptedCompaction {
     pub run_id: RunId,
     pub accepted_seq: u64,
     pub worker_generation: u64,
+    pub branch_id: Option<BranchId>,
 }
 
 /// Injectable, turn-scoped provider resolver (R6/R8): initial resolution
@@ -130,6 +131,7 @@ struct DaemonContextCompactor {
     device_id: DeviceId,
     event_ids: Arc<EventIdGenerator>,
     agent_id: Option<AgentId>,
+    branch_id: Option<BranchId>,
 }
 
 impl std::fmt::Debug for DaemonContextCompactor {
@@ -152,7 +154,7 @@ impl ContextCompactor for DaemonContextCompactor {
         PromptHistoryCompiler::plan_compaction(
             &self.store,
             self.store.session_id(),
-            None,
+            self.branch_id.as_ref(),
             self.agent_id.as_ref(),
             run_id,
             format!("compact-{}", self.event_ids.next()),
@@ -250,7 +252,7 @@ impl ContextCompactor for DaemonContextCompactor {
         let parent = PromptHistoryCompiler::latest_head(
             &self.store,
             self.store.session_id(),
-            None,
+            self.branch_id.as_ref(),
             self.agent_id.as_ref(),
         )
         .await?;
@@ -333,6 +335,7 @@ impl ContextCompactor for DaemonContextCompactor {
                 let mut envelope = supervisor_envelope(
                     &self.store,
                     &self.device_id,
+                    self.branch_id.clone(),
                     Some(run_id.clone()),
                     self.event_ids.next(),
                     payload,
@@ -368,6 +371,7 @@ pub struct WorkerToolContext {
     pub metadata: SessionMetadataV1,
     pub store: HubStoreHandle,
     pub run_id: RunId,
+    pub branch_id: Option<BranchId>,
     pub device_id: DeviceId,
     pub event_ids: Arc<EventIdGenerator>,
     pub(crate) delegation: DelegationHandle,
@@ -561,6 +565,7 @@ enum ManagerCommand {
         session_id: SessionId,
         command_id: String,
         worker_generation: u64,
+        branch_id: Option<BranchId>,
         completed: oneshot::Sender<Result<AcceptedCompaction, HaiderError>>,
     },
     ShellExec {
@@ -582,6 +587,7 @@ enum SupervisorCommand {
     Compact {
         command_id: String,
         worker_generation: u64,
+        branch_id: Option<BranchId>,
         completed: oneshot::Sender<Result<AcceptedCompaction, HaiderError>>,
     },
     ShellExec(Box<PendingShellExec>),
@@ -774,6 +780,7 @@ impl WorkerManagerHandle {
         session_id: SessionId,
         command_id: String,
         worker_generation: u64,
+        branch_id: Option<BranchId>,
     ) -> Result<AcceptedCompaction, HaiderError> {
         let (completed, response) = oneshot::channel();
         self.commands
@@ -781,6 +788,7 @@ impl WorkerManagerHandle {
                 session_id,
                 command_id,
                 worker_generation,
+                branch_id,
                 completed,
             })
             .map_err(manager_try_send)?;
@@ -1011,6 +1019,7 @@ async fn run_manager(
                 session_id,
                 command_id,
                 worker_generation,
+                branch_id,
                 completed,
             } => {
                 let supervisor = match supervisor_for(
@@ -1034,6 +1043,7 @@ async fn run_manager(
                 if let Err(error) = supervisor.try_send(SupervisorCommand::Compact {
                     command_id,
                     worker_generation,
+                    branch_id,
                     completed,
                 }) {
                     let (completed, error) = match error {
@@ -1105,6 +1115,7 @@ async fn terminalize_recovery_feed_failure(
     pending: PendingTurn,
     error: HaiderError,
 ) -> Result<(), HaiderError> {
+    let branch_id = pending.accepted.branch_id.clone();
     let run_id = pending.accepted.run_id;
     let session_id = pending.accepted.session_id;
     let lease = hub
@@ -1125,7 +1136,15 @@ async fn terminalize_recovery_feed_failure(
     ));
     let mut payloads = failed_resumption_payloads(&lease, &session_id, &run_id, &error).await?;
     payloads.retain(|payload| !matches!(payload, EventPayload::SessionState(_)));
-    append_payloads(&lease, &device_id, &run_id, &event_ids, payloads).await?;
+    append_payloads(
+        &lease,
+        &device_id,
+        &run_id,
+        branch_id.as_ref(),
+        &event_ids,
+        payloads,
+    )
+    .await?;
     append_session_idle(&lease, &device_id, &event_ids, true).await?;
     let _ = lease.unregister_worker().await;
     tracing::warn!(
@@ -1159,7 +1178,7 @@ async fn drain_accepted_without_handoff(hub: &SessionHub) -> Result<(), HaiderEr
             lease.worker_generation()
         ));
         let mut terminalized = false;
-        for (run_id, state, _) in durable_runs(&lease).await? {
+        for (run_id, state, _, branch_id) in durable_runs(&lease).await? {
             if state.is_terminal() {
                 continue;
             }
@@ -1183,15 +1202,25 @@ async fn drain_accepted_without_handoff(hub: &SessionHub) -> Result<(), HaiderEr
                     &lease,
                     &device_id,
                     &run_id,
+                    branch_id.as_ref(),
                     &event_ids,
                     RunState::Cancelling,
                 )
                 .await?;
             }
-            reconcile_unknown_effects(&lease, &device_id, &run_id, &event_ids).await?;
+            reconcile_unknown_effects(&lease, &device_id, &run_id, branch_id.as_ref(), &event_ids)
+                .await?;
             let mut payloads = cancelled_resumption_payloads(&lease, &session_id, &run_id).await?;
             payloads.retain(|payload| !matches!(payload, EventPayload::SessionState(_)));
-            append_payloads(&lease, &device_id, &run_id, &event_ids, payloads).await?;
+            append_payloads(
+                &lease,
+                &device_id,
+                &run_id,
+                branch_id.as_ref(),
+                &event_ids,
+                payloads,
+            )
+            .await?;
             terminalized = true;
         }
         if terminalized {
@@ -1274,17 +1303,26 @@ pub(crate) async fn terminalize_supervisor_exit(
     let runs = durable_runs(&lease)
         .await?
         .into_iter()
-        .filter(|(_, state, _)| !state.is_terminal())
+        .filter(|(_, state, _, _)| !state.is_terminal())
         .collect::<Vec<_>>();
-    for (run_id, state, _) in &runs {
+    for (run_id, state, _, branch_id) in &runs {
         // Panic can strand a dispatched effect regardless of the run state.
         // Reconcile before either cancellation-shaped or failure-shaped
         // terminalization; a reconciliation error fences every terminal.
-        reconcile_unknown_effects(&lease, &device_id, run_id, &event_ids).await?;
+        reconcile_unknown_effects(&lease, &device_id, run_id, branch_id.as_ref(), &event_ids)
+            .await?;
         if *state == RunState::Cancelling {
             let mut payloads = cancelled_resumption_payloads(&lease, session_id, run_id).await?;
             payloads.retain(|payload| !matches!(payload, EventPayload::SessionState(_)));
-            append_payloads(&lease, &device_id, run_id, &event_ids, payloads).await?;
+            append_payloads(
+                &lease,
+                &device_id,
+                run_id,
+                branch_id.as_ref(),
+                &event_ids,
+                payloads,
+            )
+            .await?;
             continue;
         }
         let error = HaiderError::new(
@@ -1294,7 +1332,15 @@ pub(crate) async fn terminalize_supervisor_exit(
         );
         let mut payloads = failed_resumption_payloads(&lease, session_id, run_id, &error).await?;
         payloads.retain(|payload| !matches!(payload, EventPayload::SessionState(_)));
-        append_payloads(&lease, &device_id, run_id, &event_ids, payloads).await?;
+        append_payloads(
+            &lease,
+            &device_id,
+            run_id,
+            branch_id.as_ref(),
+            &event_ids,
+            payloads,
+        )
+        .await?;
     }
     if !runs.is_empty() {
         append_session_idle(&lease, &device_id, &event_ids, true).await?;
@@ -1373,6 +1419,7 @@ async fn supervisor_for(
 
 struct ActiveTurn {
     run_id: RunId,
+    branch_id: Option<BranchId>,
     cancel: CancelToken,
     outcome: Pin<Box<dyn FutureTurn>>,
     harness: haider_core::HarnessHandle,
@@ -1462,11 +1509,12 @@ async fn run_supervisor(
             }
             let direct_shell_owns_session = durable_runs(&lease).await.is_ok_and(|runs| {
                 runs.into_iter()
-                    .any(|(_, state, _)| state == RunState::RunningTool)
+                    .any(|(_, state, _, _)| state == RunState::RunningTool)
             });
             while !direct_shell_owns_session && let Some(pending) = queue.pop_front() {
                 let mut pending = pending;
                 let run_id = pending.accepted.run_id.clone();
+                let branch_id = pending.accepted.branch_id.clone();
                 let recovery_ready = pending.recovery_ready.take();
                 let recovering = pending.recovering;
                 match start_turn(
@@ -1503,7 +1551,12 @@ async fn run_supervisor(
                                         !matches!(payload, EventPayload::SessionState(_))
                                     });
                                     match append_payloads(
-                                        &lease, &device_id, &run_id, &event_ids, payloads,
+                                        &lease,
+                                        &device_id,
+                                        &run_id,
+                                        branch_id.as_ref(),
+                                        &event_ids,
+                                        payloads,
                                     )
                                     .await
                                     {
@@ -1535,7 +1588,12 @@ async fn run_supervisor(
                                         !matches!(payload, EventPayload::SessionState(_))
                                     });
                                     match append_payloads(
-                                        &lease, &device_id, &run_id, &event_ids, payloads,
+                                        &lease,
+                                        &device_id,
+                                        &run_id,
+                                        branch_id.as_ref(),
+                                        &event_ids,
+                                        payloads,
                                     )
                                     .await
                                     {
@@ -1560,8 +1618,15 @@ async fn run_supervisor(
                                 let _ = ready.send(terminalized);
                             }
                         } else {
-                            let _ = append_failure(&lease, &device_id, &run_id, &event_ids, error)
-                                .await;
+                            let _ = append_failure(
+                                &lease,
+                                &device_id,
+                                &run_id,
+                                branch_id.as_ref(),
+                                &event_ids,
+                                error,
+                            )
+                            .await;
                             let _ =
                                 append_session_idle(&lease, &device_id, &event_ids, false).await;
                         }
@@ -1701,6 +1766,7 @@ async fn run_supervisor(
                                 &lease,
                                 &device_id,
                                 &finished.run_id,
+                                finished.branch_id.as_ref(),
                                 &event_ids,
                             )
                             .await
@@ -1729,6 +1795,7 @@ async fn run_supervisor(
                                         &lease,
                                         &device_id,
                                         &finished.run_id,
+                                        finished.branch_id.as_ref(),
                                         &event_ids,
                                         payloads,
                                     )
@@ -1763,6 +1830,7 @@ async fn run_supervisor(
                             &lease,
                             &device_id,
                             &finished.run_id,
+                            finished.branch_id.as_ref(),
                             &event_ids,
                         )
                         .await
@@ -1802,6 +1870,7 @@ async fn run_supervisor(
                                         &lease,
                                         &device_id,
                                         &finished.run_id,
+                                        finished.branch_id.as_ref(),
                                         &event_ids,
                                         payloads,
                                     )
@@ -1853,6 +1922,7 @@ async fn run_supervisor(
                     Some(SupervisorCommand::Compact {
                         command_id,
                         worker_generation,
+                        branch_id,
                         completed,
                     }) => {
                         let result = perform_manual_compaction(
@@ -1863,6 +1933,7 @@ async fn run_supervisor(
                             Arc::clone(&event_ids),
                             command_id,
                             worker_generation,
+                            branch_id,
                         )
                         .await;
                         let _ = completed.send(result);
@@ -1956,9 +2027,10 @@ async fn admit_pending(
         return;
     }
     let run_id = pending.accepted.run_id.clone();
+    let branch_id = pending.accepted.branch_id.clone();
     let state = durable_runs(store).await.ok().and_then(|runs| {
         runs.into_iter()
-            .find_map(|(candidate, state, _)| (candidate == run_id).then_some(state))
+            .find_map(|(candidate, state, _, _)| (candidate == run_id).then_some(state))
     });
     match state {
         Some(RunState::Queued) => {
@@ -1993,8 +2065,15 @@ async fn admit_pending(
                             payloads.retain(|payload| {
                                 !matches!(payload, EventPayload::SessionState(_))
                             });
-                            match append_payloads(store, device_id, &run_id, event_ids, payloads)
-                                .await
+                            match append_payloads(
+                                store,
+                                device_id,
+                                &run_id,
+                                branch_id.as_ref(),
+                                event_ids,
+                                payloads,
+                            )
+                            .await
                             {
                                 Ok(()) => {
                                     append_session_idle(store, device_id, event_ids, true).await
@@ -2019,7 +2098,15 @@ async fn admit_pending(
                     Ok(mut payloads) => {
                         payloads
                             .retain(|payload| !matches!(payload, EventPayload::SessionState(_)));
-                        match append_payloads(store, device_id, &run_id, event_ids, payloads).await
+                        match append_payloads(
+                            store,
+                            device_id,
+                            &run_id,
+                            branch_id.as_ref(),
+                            event_ids,
+                            payloads,
+                        )
+                        .await
                         {
                             Ok(()) => append_session_idle(store, device_id, event_ids, true).await,
                             Err(error) => Err(error),
@@ -2049,7 +2136,7 @@ async fn refill_queued_turns(
         return true;
     };
     let mut more = false;
-    for (run_id, state, accepted_seq) in runs {
+    for (run_id, state, accepted_seq, branch_id) in runs {
         if state != RunState::Queued
             || active_run == Some(&run_id)
             || queue
@@ -2070,6 +2157,7 @@ async fn refill_queued_turns(
             run_id,
             accepted_seq,
             worker_generation: store.worker_generation(),
+            branch_id,
             disposition: haider_core::TurnAdmissionDisposition::Queued,
         }));
     }
@@ -2088,7 +2176,7 @@ async fn reconcile_durable_cancellations(
     };
     let active_run = active.map(|(run_id, _)| run_id);
     let mut terminalized = Vec::new();
-    for (run_id, state, _) in runs {
+    for (run_id, state, _, branch_id) in runs {
         if state != RunState::Cancelling {
             continue;
         }
@@ -2098,9 +2186,16 @@ async fn reconcile_durable_cancellations(
             }
             continue;
         }
-        if append_run_state(store, device_id, &run_id, event_ids, RunState::Cancelled)
-            .await
-            .is_ok()
+        if append_run_state(
+            store,
+            device_id,
+            &run_id,
+            branch_id.as_ref(),
+            event_ids,
+            RunState::Cancelled,
+        )
+        .await
+        .is_ok()
         {
             terminalized.push(run_id);
         }
@@ -2118,9 +2213,9 @@ async fn reconcile_durable_cancellations(
 /// `docs/OPTIMIZATIONS.md` under W3c1.
 async fn durable_runs(
     store: &HubStoreHandle,
-) -> Result<Vec<(RunId, RunState, Option<u64>)>, HaiderError> {
+) -> Result<Vec<(RunId, RunState, Option<u64>, Option<BranchId>)>, HaiderError> {
     let mut cursor = 0;
-    let mut runs = HashMap::<RunId, (RunState, Option<u64>)>::new();
+    let mut runs = HashMap::<RunId, (RunState, Option<u64>, Option<BranchId>)>::new();
     loop {
         let page = StoreHandle::read(store, store.session_id(), cursor, 256).await?;
         if page.is_empty() {
@@ -2136,14 +2231,33 @@ async fn durable_runs(
             };
             match payload {
                 EventPayload::RunState(state) => {
-                    let accepted = runs.get(&run_id).and_then(|(_, seq)| *seq);
-                    runs.insert(run_id, (state, accepted));
+                    let (accepted, branch_id) = runs
+                        .get(&run_id)
+                        .map_or((None, envelope.branch_id.clone()), |(_, seq, branch_id)| {
+                            (*seq, branch_id.clone())
+                        });
+                    if branch_id != envelope.branch_id {
+                        return Err(HaiderError::new(
+                            ErrorCode::StoreCorrupt,
+                            format!("run {run_id} crosses branch scopes"),
+                            false,
+                        ));
+                    }
+                    runs.insert(run_id, (state, accepted, branch_id));
                 }
                 EventPayload::UserMessage { .. } => {
-                    let state = runs
-                        .get(&run_id)
-                        .map_or(RunState::Queued, |(state, _)| state.clone());
-                    runs.insert(run_id, (state, Some(envelope.seq)));
+                    let (state, branch_id) = runs.get(&run_id).map_or(
+                        (RunState::Queued, envelope.branch_id.clone()),
+                        |(state, _, branch_id)| (state.clone(), branch_id.clone()),
+                    );
+                    if branch_id != envelope.branch_id {
+                        return Err(HaiderError::new(
+                            ErrorCode::StoreCorrupt,
+                            format!("run {run_id} crosses branch scopes"),
+                            false,
+                        ));
+                    }
+                    runs.insert(run_id, (state, Some(envelope.seq), branch_id));
                 }
                 _ => {}
             }
@@ -2151,9 +2265,9 @@ async fn durable_runs(
     }
     let mut runs = runs
         .into_iter()
-        .map(|(run_id, (state, accepted))| (run_id, state, accepted))
+        .map(|(run_id, (state, accepted, branch_id))| (run_id, state, accepted, branch_id))
         .collect::<Vec<_>>();
-    runs.sort_by_key(|(_, _, accepted)| accepted.unwrap_or(u64::MAX));
+    runs.sort_by_key(|(_, _, accepted, _)| accepted.unwrap_or(u64::MAX));
     Ok(runs)
 }
 
@@ -2166,6 +2280,7 @@ async fn reconcile_unknown_effects(
     store: &HubStoreHandle,
     device_id: &DeviceId,
     run_id: &RunId,
+    branch_id: Option<&BranchId>,
     event_ids: &EventIdGenerator,
 ) -> Result<(), HaiderError> {
     let mut dispatched = HashSet::<EffectId>::new();
@@ -2179,6 +2294,7 @@ async fn reconcile_unknown_effects(
         cursor = page.last().map_or(cursor, |envelope| envelope.seq);
         for envelope in page {
             if envelope.run_id.as_ref() != Some(run_id)
+                || envelope.branch_id.as_ref() != branch_id
                 || envelope
                     .payload
                     .get("type")
@@ -2222,6 +2338,7 @@ async fn reconcile_unknown_effects(
         store,
         device_id,
         run_id,
+        branch_id,
         event_ids,
         pending
             .into_iter()
@@ -2239,7 +2356,7 @@ async fn reconcile_unknown_effects(
 async fn durable_run_state(store: &HubStoreHandle, run_id: &RunId) -> Option<RunState> {
     durable_runs(store).await.ok().and_then(|runs| {
         runs.into_iter()
-            .find_map(|(candidate, state, _)| (candidate == *run_id).then_some(state))
+            .find_map(|(candidate, state, _, _)| (candidate == *run_id).then_some(state))
     })
 }
 
@@ -2277,12 +2394,19 @@ async fn cancel_durable_queued_turns(
     active_run: Option<&RunId>,
 ) -> Option<RunId> {
     let mut last = None;
-    for (run_id, state, _) in durable_runs(store).await.unwrap_or_default() {
+    for (run_id, state, _, branch_id) in durable_runs(store).await.unwrap_or_default() {
         if active_run == Some(&run_id) || state != RunState::Queued {
             continue;
         }
-        if let Err(error) =
-            append_run_state(store, device_id, &run_id, event_ids, RunState::Cancelled).await
+        if let Err(error) = append_run_state(
+            store,
+            device_id,
+            &run_id,
+            branch_id.as_ref(),
+            event_ids,
+            RunState::Cancelled,
+        )
+        .await
         {
             tracing::warn!(%run_id, ?error, "queued turn could not be terminalized during drain");
         }
@@ -2305,12 +2429,14 @@ struct DurableCompactionReceipt {
     accepted_seq: u64,
     worker_generation: u64,
     intent: CompactionIntent,
+    branch_id: Option<BranchId>,
     committed: bool,
 }
 
 async fn find_compaction_receipt(
     store: &HubStoreHandle,
     command_id: &str,
+    branch_id: Option<&BranchId>,
 ) -> Result<Option<DurableCompactionReceipt>, HaiderError> {
     let operation_id = format!("manual-{command_id}");
     let node_id = format!("compaction-node-{operation_id}");
@@ -2324,6 +2450,9 @@ async fn find_compaction_receipt(
         }
         cursor = page.last().map_or(cursor, |envelope| envelope.seq);
         for envelope in page {
+            if envelope.branch_id.as_ref() != branch_id {
+                continue;
+            }
             let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload) else {
                 continue;
             };
@@ -2350,7 +2479,13 @@ async fn find_compaction_receipt(
                             false,
                         )
                     })?;
-                    receipt = Some((run_id, envelope.seq, envelope.worker_generation, intent));
+                    receipt = Some((
+                        run_id,
+                        envelope.seq,
+                        envelope.worker_generation,
+                        envelope.branch_id.clone(),
+                        intent,
+                    ));
                 }
                 EventPayload::NodeCommitted(node) if node.node.as_str() == node_id => {
                     committed = true;
@@ -2360,16 +2495,18 @@ async fn find_compaction_receipt(
         }
     }
     Ok(receipt.map(
-        |(run_id, accepted_seq, worker_generation, intent)| DurableCompactionReceipt {
+        |(run_id, accepted_seq, worker_generation, branch_id, intent)| DurableCompactionReceipt {
             run_id,
             accepted_seq,
             worker_generation,
             intent,
+            branch_id,
             committed,
         },
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn perform_manual_compaction(
     dependencies: &WorkerDependencies,
     metadata: &SessionMetadataV1,
@@ -2378,10 +2515,12 @@ async fn perform_manual_compaction(
     event_ids: Arc<EventIdGenerator>,
     command_id: String,
     worker_generation: u64,
+    branch_id: Option<BranchId>,
 ) -> Result<AcceptedCompaction, HaiderError> {
     let request_json = serde_json::to_string(&serde_json::json!({
         "session_id": lease.session_id(),
         "worker_generation": worker_generation,
+        "branch_id": branch_id,
     }))
     .map_err(|error| {
         HaiderError::new(
@@ -2402,12 +2541,13 @@ async fn perform_manual_compaction(
                 run_id: response.run_id,
                 accepted_seq: response.accepted_seq,
                 worker_generation: response.worker_generation,
+                branch_id: response.branch_id,
             });
         }
         ContextCompactionClaim::Fresh | ContextCompactionClaim::ResumePending => {}
     }
 
-    let existing = find_compaction_receipt(lease, &command_id).await?;
+    let existing = find_compaction_receipt(lease, &command_id, branch_id.as_ref()).await?;
     if let Some(receipt) = existing.as_ref()
         && receipt.committed
     {
@@ -2415,6 +2555,7 @@ async fn perform_manual_compaction(
             run_id: receipt.run_id.clone(),
             accepted_seq: receipt.accepted_seq,
             worker_generation: receipt.worker_generation,
+            branch_id: receipt.branch_id.clone(),
         };
         lease
             .finalize_context_compaction_receipt(
@@ -2424,6 +2565,7 @@ async fn perform_manual_compaction(
                     run_id: accepted.run_id.clone(),
                     accepted_seq: accepted.accepted_seq,
                     worker_generation: accepted.worker_generation,
+                    branch_id: accepted.branch_id.clone(),
                 },
             )
             .await?;
@@ -2443,7 +2585,7 @@ async fn perform_manual_compaction(
         && durable_runs(lease)
             .await?
             .iter()
-            .any(|(_, state, _)| !state.is_terminal())
+            .any(|(_, state, _, _)| !state.is_terminal())
     {
         return Err(HaiderError::new(
             ErrorCode::Busy,
@@ -2475,7 +2617,7 @@ async fn perform_manual_compaction(
         lease,
         lease,
         lease.session_id(),
-        None,
+        branch_id.as_ref(),
         agent_id.as_ref(),
     )
     .await?;
@@ -2487,7 +2629,7 @@ async fn perform_manual_compaction(
         let intent = PromptHistoryCompiler::plan_idle_compaction(
             lease,
             lease.session_id(),
-            None,
+            branch_id.as_ref(),
             agent_id.as_ref(),
             format!("manual-{command_id}"),
         )
@@ -2507,6 +2649,7 @@ async fn perform_manual_compaction(
             supervisor_envelope(
                 lease,
                 device_id,
+                branch_id.clone(),
                 Some(run_id.clone()),
                 event_ids.next(),
                 EventPayload::Item(ItemEvent::Started {
@@ -2517,6 +2660,7 @@ async fn perform_manual_compaction(
             supervisor_envelope(
                 lease,
                 device_id,
+                branch_id.clone(),
                 Some(run_id.clone()),
                 event_ids.next(),
                 EventPayload::Item(ItemEvent::Completed {
@@ -2527,6 +2671,7 @@ async fn perform_manual_compaction(
             supervisor_envelope(
                 lease,
                 device_id,
+                branch_id.clone(),
                 Some(run_id.clone()),
                 event_ids.next(),
                 EventPayload::RunState(RunState::Compacting),
@@ -2551,9 +2696,18 @@ async fn perform_manual_compaction(
         device_id: device_id.clone(),
         event_ids: Arc::clone(&event_ids),
         agent_id,
+        branch_id: branch_id.clone(),
     };
     if let Err(error) = compactor.compact(&run_id, &intent, messages).await {
-        append_failure(lease, device_id, &run_id, &event_ids, error.clone()).await?;
+        append_failure(
+            lease,
+            device_id,
+            &run_id,
+            branch_id.as_ref(),
+            &event_ids,
+            error.clone(),
+        )
+        .await?;
         return Err(error);
     }
     append_session_idle(lease, device_id, &event_ids, false).await?;
@@ -2561,6 +2715,7 @@ async fn perform_manual_compaction(
         run_id,
         accepted_seq,
         worker_generation,
+        branch_id: branch_id.clone(),
     };
     lease
         .finalize_context_compaction_receipt(
@@ -2570,6 +2725,7 @@ async fn perform_manual_compaction(
                 run_id: accepted.run_id.clone(),
                 accepted_seq: accepted.accepted_seq,
                 worker_generation: accepted.worker_generation,
+                branch_id: accepted.branch_id.clone(),
             },
         )
         .await?;
@@ -2626,6 +2782,7 @@ async fn perform_shell_exec(
     let journal = HubJournalSink {
         store: lease.clone(),
         run_id: run_id.clone(),
+        branch_id: None,
         device_id: device_id.clone(),
         event_ids: Arc::clone(&event_ids),
     };
@@ -2642,6 +2799,7 @@ async fn perform_shell_exec(
     };
     let output = HubCommandOutputContext {
         store: lease.clone(),
+        branch_id: None,
         device_id: device_id.clone(),
         event_ids: Arc::clone(&event_ids),
     }
@@ -2751,6 +2909,7 @@ async fn perform_shell_exec(
         lease,
         device_id,
         &run_id,
+        None,
         &event_ids,
         vec![
             EventPayload::Item(ItemEvent::Completed {
@@ -2778,7 +2937,15 @@ async fn begin_shell_cancellation(
 ) -> Result<(), HaiderError> {
     match durable_run_state(lease, run_id).await {
         Some(RunState::RunningTool) => {
-            append_run_state(lease, device_id, run_id, event_ids, RunState::Cancelling).await
+            append_run_state(
+                lease,
+                device_id,
+                run_id,
+                None,
+                event_ids,
+                RunState::Cancelling,
+            )
+            .await
         }
         Some(RunState::Cancelling) | Some(RunState::Cancelled) => Ok(()),
         Some(state) if state.is_terminal() => Ok(()),
@@ -2796,10 +2963,10 @@ async fn cancel_shell_exec(
     event_ids: &EventIdGenerator,
     run_id: &RunId,
 ) -> Result<(), HaiderError> {
-    reconcile_unknown_effects(lease, device_id, run_id, event_ids).await?;
+    reconcile_unknown_effects(lease, device_id, run_id, None, event_ids).await?;
     let mut payloads = cancelled_resumption_payloads(lease, lease.session_id(), run_id).await?;
     payloads.retain(|payload| !matches!(payload, EventPayload::SessionState(_)));
-    append_payloads(lease, device_id, run_id, event_ids, payloads).await?;
+    append_payloads(lease, device_id, run_id, None, event_ids, payloads).await?;
     append_session_idle(lease, device_id, event_ids, true).await
 }
 
@@ -2813,11 +2980,12 @@ async fn fail_shell_exec(
     if durable_run_state(lease, run_id).await == Some(RunState::Cancelling) {
         return cancel_shell_exec(lease, device_id, event_ids, run_id).await;
     }
-    reconcile_unknown_effects(lease, device_id, run_id, event_ids).await?;
+    reconcile_unknown_effects(lease, device_id, run_id, None, event_ids).await?;
     let mut payloads =
         failed_resumption_payloads(lease, lease.session_id(), run_id, &error).await?;
     payloads.retain(|payload| !matches!(payload, EventPayload::SessionState(_)));
-    if let Err(append_error) = append_payloads(lease, device_id, run_id, event_ids, payloads).await
+    if let Err(append_error) =
+        append_payloads(lease, device_id, run_id, None, event_ids, payloads).await
     {
         if durable_run_state(lease, run_id).await == Some(RunState::Cancelling) {
             return cancel_shell_exec(lease, device_id, event_ids, run_id).await;
@@ -2882,7 +3050,7 @@ async fn start_turn(
         lease,
         lease,
         lease.session_id(),
-        None,
+        accepted.branch_id.as_ref(),
         agent_id.as_ref(),
         &accepted.run_id,
     )
@@ -2902,6 +3070,7 @@ async fn start_turn(
             metadata: metadata.clone(),
             store: lease.clone(),
             run_id: accepted.run_id.clone(),
+            branch_id: accepted.branch_id.clone(),
             device_id: device_id.clone(),
             event_ids: Arc::clone(&event_ids),
             delegation,
@@ -2923,6 +3092,7 @@ async fn start_turn(
     config.model = resolved.model;
     config.context_window = resolved.context_window;
     config.agent_id = agent_id;
+    config.branch_id = accepted.branch_id.clone();
     config.max_tokens = metadata.max_tokens;
     config.reserved_output_tokens = metadata.max_tokens;
     if let Some(window) = config.context_window
@@ -2957,6 +3127,7 @@ async fn start_turn(
         device_id: device_id.clone(),
         event_ids: Arc::clone(&event_ids),
         agent_id: config.agent_id.clone(),
+        branch_id: accepted.branch_id.clone(),
     }));
     config.usage_account = resolved
         .account_alias
@@ -3003,7 +3174,9 @@ async fn start_turn(
     if committed_answer.is_none()
         && let Some(checkpoint) = checkpoint.as_ref()
     {
-        committed_answer = find_committed_menu_answer(lease, &checkpoint.menu.id).await?;
+        committed_answer =
+            find_committed_menu_answer(lease, accepted.branch_id.as_ref(), &checkpoint.menu.id)
+                .await?;
     }
     if let Some(answer) = committed_answer {
         harness.apply_committed_menu_event(answer)?;
@@ -3045,6 +3218,7 @@ async fn start_turn(
     let handle = submitted?;
     Ok(active_turn(
         accepted.run_id,
+        accepted.branch_id,
         harness,
         actor.into_inner(),
         dispatcher,
@@ -3054,6 +3228,7 @@ async fn start_turn(
 
 async fn find_committed_menu_answer(
     store: &HubStoreHandle,
+    branch_id: Option<&BranchId>,
     menu_id: &haider_protocol::ids::MenuId,
 ) -> Result<Option<haider_protocol::envelope::RawEnvelope>, HaiderError> {
     let mut cursor = 0;
@@ -3064,7 +3239,8 @@ async fn find_committed_menu_answer(
         }
         cursor = page.last().map_or(cursor, |envelope| envelope.seq);
         if let Some(answer) = page.into_iter().find(|envelope| {
-            serde_json::from_value::<EventPayload>(envelope.payload.clone()).is_ok_and(
+            envelope.branch_id.as_ref() == branch_id
+                && serde_json::from_value::<EventPayload>(envelope.payload.clone()).is_ok_and(
                 |payload| matches!(payload, EventPayload::MenuAnswered(answer) if answer.menu == *menu_id),
             )
         }) {
@@ -3130,6 +3306,7 @@ async fn resolve_prompt_attachments(
 
 fn active_turn(
     run_id: RunId,
+    branch_id: Option<BranchId>,
     harness: haider_core::HarnessHandle,
     actor: JoinHandle<()>,
     dispatcher: Option<Arc<dyn ToolDispatcher>>,
@@ -3138,6 +3315,7 @@ fn active_turn(
     let cancel = handle.cancel_token();
     ActiveTurn {
         run_id,
+        branch_id,
         cancel,
         outcome: Box::pin(handle.wait()),
         harness,
@@ -3173,6 +3351,7 @@ async fn append_failure(
     store: &HubStoreHandle,
     device_id: &DeviceId,
     run_id: &RunId,
+    branch_id: Option<&BranchId>,
     event_ids: &EventIdGenerator,
     error: HaiderError,
 ) -> Result<(), HaiderError> {
@@ -3180,6 +3359,7 @@ async fn append_failure(
         store,
         device_id,
         run_id,
+        branch_id,
         event_ids,
         vec![
             EventPayload::RunFailed {
@@ -3197,6 +3377,7 @@ async fn append_run_state(
     store: &HubStoreHandle,
     device_id: &DeviceId,
     run_id: &RunId,
+    branch_id: Option<&BranchId>,
     event_ids: &EventIdGenerator,
     state: RunState,
 ) -> Result<(), HaiderError> {
@@ -3204,6 +3385,7 @@ async fn append_run_state(
         store,
         device_id,
         run_id,
+        branch_id,
         event_ids,
         vec![EventPayload::RunState(state)],
     )
@@ -3224,6 +3406,7 @@ async fn append_session_idle(
         store,
         device_id,
         None,
+        None,
         event_ids.next(),
         EventPayload::SessionState(SessionState::Idle { interrupted }),
     )?;
@@ -3234,6 +3417,7 @@ async fn append_payloads(
     store: &HubStoreHandle,
     device_id: &DeviceId,
     run_id: &RunId,
+    branch_id: Option<&BranchId>,
     event_ids: &EventIdGenerator,
     payloads: Vec<EventPayload>,
 ) -> Result<(), HaiderError> {
@@ -3244,6 +3428,7 @@ async fn append_payloads(
         envelopes.push(supervisor_envelope(
             store,
             device_id,
+            branch_id.cloned(),
             payload_run_id,
             event_ids.next(),
             payload,
@@ -3256,6 +3441,7 @@ async fn append_payloads(
 fn supervisor_envelope(
     store: &HubStoreHandle,
     device_id: &DeviceId,
+    branch_id: Option<BranchId>,
     run_id: Option<RunId>,
     event_id: EventId,
     payload: EventPayload,
@@ -3265,7 +3451,11 @@ fn supervisor_envelope(
         event_id,
         seq: 0,
         session_id: store.session_id().clone(),
-        branch_id: None,
+        branch_id: if matches!(payload, EventPayload::SessionState(_)) {
+            None
+        } else {
+            branch_id
+        },
         run_id,
         agent_id: None,
         device_id: device_id.clone(),
@@ -3549,6 +3739,7 @@ impl TurnToolFactory for BrokerToolFactory {
         }
         let output = HubCommandOutputContext {
             store: context.store.clone(),
+            branch_id: context.branch_id.clone(),
             device_id: context.device_id.clone(),
             event_ids: Arc::clone(&context.event_ids),
         };
@@ -3560,6 +3751,7 @@ impl TurnToolFactory for BrokerToolFactory {
             }),
             ledger: ChangeLedger::new(),
             session_id,
+            branch_id: context.branch_id,
             output,
             durable_permission_bindings: durable_permissions.bindings,
             metadata: context.metadata,
@@ -3597,6 +3789,7 @@ struct BrokerToolDispatcher {
     cas: Mutex<HubArtifactStore>,
     ledger: ChangeLedger,
     session_id: SessionId,
+    branch_id: Option<BranchId>,
     output: HubCommandOutputContext,
     durable_permission_bindings: HashMap<MenuId, (EffectClass, String)>,
     metadata: SessionMetadataV1,
@@ -3673,6 +3866,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     SpawnCoordinates {
                         parent_session_id: self.session_id.clone(),
                         parent_run_id: run_id.clone(),
+                        parent_branch_id: self.branch_id.clone(),
                         parent_agent_id: self.parent_agent_id.clone(),
                         tool_item_id: item_id.clone(),
                         call_id: call_id.to_owned(),
@@ -4271,6 +4465,7 @@ impl CasSink for HubArtifactStore {
 #[derive(Clone)]
 struct HubCommandOutputContext {
     store: HubStoreHandle,
+    branch_id: Option<BranchId>,
     device_id: DeviceId,
     event_ids: Arc<EventIdGenerator>,
 }
@@ -4279,6 +4474,7 @@ impl HubCommandOutputContext {
     fn sink(&self, run_id: RunId, item_id: ItemId, call_id: String) -> HubCommandOutputSink {
         HubCommandOutputSink {
             store: self.store.clone(),
+            branch_id: self.branch_id.clone(),
             run_id,
             item_id,
             call_id,
@@ -4290,6 +4486,7 @@ impl HubCommandOutputContext {
 
 struct HubCommandOutputSink {
     store: HubStoreHandle,
+    branch_id: Option<BranchId>,
     run_id: RunId,
     item_id: ItemId,
     call_id: String,
@@ -4313,7 +4510,7 @@ impl CommandOutputSink for HubCommandOutputSink {
             event_id: self.event_ids.next(),
             seq: 0,
             session_id: self.store.session_id().clone(),
-            branch_id: None,
+            branch_id: self.branch_id.clone(),
             run_id: Some(self.run_id.clone()),
             agent_id: None,
             device_id: self.device_id.clone(),
@@ -4347,6 +4544,7 @@ impl CommandOutputSink for HubCommandOutputSink {
 struct HubJournalSink {
     store: HubStoreHandle,
     run_id: RunId,
+    branch_id: Option<BranchId>,
     device_id: DeviceId,
     event_ids: Arc<EventIdGenerator>,
 }
@@ -4356,6 +4554,7 @@ impl HubJournalSink {
         Self {
             store: context.store.clone(),
             run_id: context.run_id.clone(),
+            branch_id: context.branch_id.clone(),
             device_id: context.device_id.clone(),
             event_ids: Arc::clone(&context.event_ids),
         }
@@ -4370,7 +4569,7 @@ impl JournalSink for HubJournalSink {
             event_id: self.event_ids.next(),
             seq: 0,
             session_id: self.store.session_id().clone(),
-            branch_id: None,
+            branch_id: self.branch_id.clone(),
             run_id: Some(self.run_id.clone()),
             agent_id: None,
             device_id: self.device_id.clone(),

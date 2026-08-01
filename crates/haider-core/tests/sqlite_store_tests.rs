@@ -7,9 +7,10 @@ use haider_core::{
     TurnOutcome,
 };
 use haider_protocol::EventPayload;
+use haider_protocol::branch::BranchDescriptor;
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::error::{ErrorCode, HaiderError};
-use haider_protocol::ids::{DeviceId, SessionId};
+use haider_protocol::ids::{BranchId, DeviceId, SessionId};
 use haider_protocol::provider::FinishReason;
 use haider_protocol::state::RunState;
 use haider_provider::{FakeProvider, FakeStep};
@@ -382,5 +383,13 @@ impl StoreHandle for GatedStore {
 
     async fn latest_seq(&self, session_id: &SessionId) -> Result<u64, HaiderError> {
         self.inner.latest_seq(session_id).await
+    }
+
+    async fn branch_lineage(
+        &self,
+        session_id: &SessionId,
+        branch_id: Option<&BranchId>,
+    ) -> Result<Vec<BranchDescriptor>, HaiderError> {
+        self.inner.branch_lineage(session_id, branch_id).await
     }
 }

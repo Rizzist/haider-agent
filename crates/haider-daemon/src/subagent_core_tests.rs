@@ -1,21 +1,22 @@
 #![allow(clippy::expect_used)]
 
 use crate::connection::{ConnectionContext, DrainNotice, serve};
-use crate::delegation::DelegationHandle;
+use crate::delegation::{DelegationHandle, SpawnCoordinates};
 use crate::session_hub::{SessionHub, SessionHubConfig};
 use crate::worker::{
     BrokerToolFactory, ProviderFactory, ResolvedTurnProvider, WorkerDependencies, WorkerManager,
 };
 use async_trait::async_trait;
 use haider_core::{
-    SessionCreateCommand, SqliteStoreHandle, StoreHandle, TurnAcceptCommand,
+    BranchCreateCommand, SessionCreateCommand, SqliteStoreHandle, StoreHandle, TurnAcceptCommand,
     TurnAdmissionDisposition, TurnCancelCommand,
 };
 use haider_protocol::DeliveryMode;
 use haider_protocol::EventPayload;
 use haider_protocol::agent::ChipState;
 use haider_protocol::effect::{EffectOutcome, EffectPhase};
-use haider_protocol::ids::{DeviceId, EventId, MenuId, RunId, SessionId};
+use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
+use haider_protocol::ids::{BranchId, DeviceId, EventId, MenuId, RunId, SessionId};
 use haider_protocol::item::{ItemEvent, TurnItem};
 use haider_protocol::menu::Menu;
 use haider_protocol::provider::{Block, CapabilityDoc, FinishReason};
@@ -28,6 +29,7 @@ use haider_rpc::{
     AttachMode, Capability, CapabilitySet, ClientKind, CommandId, Hello, RequestBody, RequestId,
     ResponseBody, WIRE_PROTOCOL_VERSION, WireFrame, uds_codec,
 };
+use haider_tools::SpawnSubagent;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -36,6 +38,168 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::{mpsc, watch};
 use tokio::time::{Duration, timeout};
+
+/// MUTATION CHECK: hard-code parent chip projection to `branch_id: None` or
+/// omit `parent_branch_id` from the durable record. Expected RUNTIME failure:
+/// the late child chip below paints main instead of branch A.
+#[test]
+fn delegation_parent_projection_is_pinned_to_the_spawn_branch() {
+    use haider_core::{DelegationRecord, DelegationState};
+    use haider_protocol::agent::{AgentManifest, AgentRole, Grant, Placement};
+    use haider_protocol::ids::{AgentId, BranchId, ItemId, LeaseId};
+
+    let branch_id = BranchId::new("parent-branch-a");
+    let agent_id = AgentId::new("branch-child-agent");
+    let record = DelegationRecord {
+        agent_id: agent_id.clone(),
+        child_session_id: SessionId::new("branch-child-session"),
+        child_run_id: RunId::new("branch-child-run"),
+        parent_session_id: SessionId::new("branch-parent-session"),
+        parent_run_id: RunId::new("branch-parent-run"),
+        parent_branch_id: Some(branch_id.clone()),
+        call_id: "branch-spawn-call".into(),
+        tool_item_id: ItemId::new("branch-spawn-item"),
+        parent_agent_id: None,
+        root_session_id: SessionId::new("branch-parent-session"),
+        depth: 1,
+        task: "test branch pin".into(),
+        prompt: "report late".into(),
+        manifest: AgentManifest {
+            agent: agent_id.clone(),
+            role: AgentRole::Subagent,
+            task: "test branch pin".into(),
+            callsign: None,
+            model_profile: "fake-model".into(),
+            grant: Grant {
+                tools: Vec::new(),
+                effect_ceiling: Vec::new(),
+            },
+            budget_tokens: Some(64),
+            placement: Placement::Local,
+            lease: LeaseId::new("branch-child-lease"),
+            fencing_epoch: 1,
+            attempt: 0,
+            parent: None,
+            coordinates: None,
+        },
+        state: DelegationState::Running,
+        report: None,
+    };
+    let envelope = crate::delegation::chip_projection_envelope(
+        &record,
+        "late-chip-event",
+        EventId::new("child-cause"),
+        ChipState::Done,
+        DeviceId::new("branch-chip-device"),
+        7,
+    )
+    .expect("projection envelope");
+    assert_eq!(envelope.branch_id, Some(branch_id));
+    assert_eq!(envelope.run_id, Some(record.parent_run_id));
+    assert!(matches!(
+        serde_json::from_value::<EventPayload>(envelope.payload),
+        Ok(EventPayload::AgentChipState { agent, chip: ChipState::Done })
+            if agent == agent_id
+    ));
+}
+
+/// MUTATION CHECK: drop the parent branch while converting
+/// `SpawnCoordinates` into the durable record, or bypass spawn idempotency.
+/// Expected RUNTIME failure: replay loses branch A or creates a second child
+/// relation/run for the same parent tool call.
+#[tokio::test]
+async fn established_spawn_captures_parent_branch_and_replays_one_child() {
+    use haider_protocol::ids::{BranchId, ItemId};
+
+    let root = tempfile::tempdir().expect("temp profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let parent_session = SessionId::new("branch-spawn-parent");
+    let parent_run = RunId::new("branch-spawn-parent-run");
+    let parent_branch = BranchId::new("branch-spawn-a");
+    let cwd = std::fs::canonicalize(std::env::current_dir().expect("cwd"))
+        .expect("canonical cwd")
+        .to_string_lossy()
+        .into_owned();
+    hub.create_internal_session(SessionCreateCommand {
+        command_id: "create-branch-spawn-parent".into(),
+        request_digest: "create-branch-spawn-parent-digest".into(),
+        request_json: r#"{"session":"branch-spawn-parent"}"#.into(),
+        session_id: parent_session.clone(),
+        cwd: cwd.clone(),
+        provider: "fake".into(),
+        model: "fake-model".into(),
+        max_tokens: 4096,
+        permission_overrides: None,
+        system_prompt_version: crate::worker::SystemPromptBuilder::VERSION.into(),
+        event_id: EventId::new("created-branch-spawn-parent"),
+        device_id: DeviceId::new("branch-spawn-device"),
+    })
+    .await
+    .expect("create parent");
+    let metadata = SessionMetadataV1 {
+        cwd,
+        provider: "fake".into(),
+        model: "fake-model".into(),
+        max_tokens: 4096,
+        system_prompt_version: Some(crate::worker::SystemPromptBuilder::VERSION.into()),
+        permission_overrides: None,
+        created_at_ms: 1,
+    };
+    let coordinates = || SpawnCoordinates {
+        parent_session_id: parent_session.clone(),
+        parent_run_id: parent_run.clone(),
+        parent_branch_id: Some(parent_branch.clone()),
+        parent_agent_id: None,
+        tool_item_id: ItemId::new("branch-spawn-item"),
+        call_id: "branch-spawn-call".into(),
+        metadata: metadata.clone(),
+    };
+    let request = SpawnSubagent {
+        task: "test branch pin".into(),
+        prompt: "report after branch switch".into(),
+    };
+    let delegation = DelegationHandle::new(hub.clone());
+    let first = delegation
+        .establish(coordinates(), request.clone())
+        .await
+        .expect("establish child");
+    let replay = delegation
+        .establish(coordinates(), request)
+        .await
+        .expect("replay child establishment");
+    assert_eq!(first.ticket.id, replay.ticket.id);
+
+    let records = hub
+        .delegations_for_parent_run(parent_session, parent_run)
+        .await
+        .expect("parent delegations");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].parent_branch_id, Some(parent_branch));
+    let child_events = store
+        .read(&records[0].child_session_id, 0, 128)
+        .await
+        .expect("child events");
+    assert_eq!(
+        child_events
+            .iter()
+            .filter(|event| {
+                event.run_id.as_ref() == Some(&records[0].child_run_id)
+                    && serde_json::from_value::<EventPayload>(event.payload.clone())
+                        .is_ok_and(|payload| matches!(payload, EventPayload::UserMessage { .. }))
+            })
+            .count(),
+        1,
+        "replaying one spawn must not create a second live child turn"
+    );
+    assert!(
+        child_events
+            .iter()
+            .filter(|event| event.run_id.as_ref() == Some(&records[0].child_run_id))
+            .all(|event| event.branch_id.is_none()),
+        "the child session retains its own main branch"
+    );
+}
 
 struct InspectingProvider {
     inner: FakeProvider,
@@ -190,6 +354,92 @@ async fn production_spawn_effect_wait_and_report_chain_is_end_to_end() {
     })
     .await
     .expect("create parent");
+    let fork_run = RunId::new("w6a-parent-fork-run");
+    hub.accept_internal_turn(TurnAcceptCommand {
+        command_id: "submit-w6a-parent-fork".into(),
+        request_digest: "submit-w6a-parent-fork-digest".into(),
+        request_json: r#"{"turn":"w6a-parent-fork"}"#.into(),
+        session_id: parent_session.clone(),
+        worker_generation: store.worker_generation(),
+        run_id: fork_run.clone(),
+        agent_id: None,
+        branch_id: None,
+        text: "stable delegation fork".into(),
+        attachments: Vec::new(),
+        mode: DeliveryMode::Queue,
+        queued_event_id: EventId::new("w6a-parent-fork-queued"),
+        user_event_id: EventId::new("w6a-parent-fork-user"),
+        active_event_id: EventId::new("w6a-parent-fork-active"),
+        device_id: DeviceId::new("w6a-test-device"),
+    })
+    .await
+    .expect("accept delegation fork");
+    let mut fork_done = [EventEnvelope {
+        schema_version: SCHEMA_VERSION,
+        event_id: EventId::new("w6a-parent-fork-done"),
+        seq: 0,
+        session_id: parent_session.clone(),
+        branch_id: None,
+        run_id: Some(fork_run.clone()),
+        agent_id: None,
+        device_id: DeviceId::new("w6a-test-device"),
+        authority_epoch: 0,
+        worker_generation: store.worker_generation(),
+        causation_id: None,
+        correlation_id: None,
+        committed_at_ms: 0,
+        render: RenderTargets {
+            ui: true,
+            durable: true,
+            prompt: PromptRender::Omit,
+        },
+        payload: serde_json::to_value(EventPayload::RunState(RunState::Done))
+            .expect("fork done payload"),
+    }];
+    hub.append(&mut fork_done)
+        .await
+        .expect("terminalize delegation fork");
+    let fork_events = store
+        .read(&parent_session, 0, 64)
+        .await
+        .expect("fork events");
+    let (fork_node, fork_seq) = fork_events
+        .iter()
+        .find_map(|event| {
+            let EventPayload::NodeCommitted(node) =
+                serde_json::from_value::<EventPayload>(event.payload.clone()).ok()?
+            else {
+                return None;
+            };
+            (event.run_id.as_ref() == Some(&fork_run)).then_some((node.node, event.seq))
+        })
+        .expect("delegation fork node");
+    let branch_a = BranchId::new("w6a-parent-branch-a");
+    let branch_b = BranchId::new("w6a-parent-branch-b");
+    for (command_id, branch_id) in [
+        ("create-w6a-parent-a", branch_a.clone()),
+        ("create-w6a-parent-b", branch_b),
+    ] {
+        let request_json = serde_json::json!({"branch": branch_id}).to_string();
+        store
+            .create_branch(BranchCreateCommand {
+                command_id: command_id.into(),
+                request_digest: blake3::hash(request_json.as_bytes()).to_hex().to_string(),
+                request_json,
+                session_id: parent_session.clone(),
+                worker_generation: store.worker_generation(),
+                branch_id,
+                source_branch_id: None,
+                fork_node_id: fork_node.clone(),
+                fork_seq,
+                name: None,
+                event_id: EventId::new(format!("event-{command_id}")),
+                device_id: DeviceId::new("w6a-test-device"),
+            })
+            .await
+            .expect("create parent branch");
+    }
+    let parent_run = RunId::new("w6a-parent-run");
     let accepted = hub
         .accept_internal_turn(TurnAcceptCommand {
             command_id: "submit-w6a-parent".into(),
@@ -197,8 +447,9 @@ async fn production_spawn_effect_wait_and_report_chain_is_end_to_end() {
             request_json: r#"{"turn":"w6a-parent"}"#.into(),
             session_id: parent_session.clone(),
             worker_generation: store.worker_generation(),
-            run_id: haider_protocol::ids::RunId::new("w6a-parent-run"),
+            run_id: parent_run.clone(),
             agent_id: None,
+            branch_id: Some(branch_a.clone()),
             text: "delegate the tests".into(),
             attachments: Vec::new(),
             mode: DeliveryMode::Steer,
@@ -222,8 +473,10 @@ async fn production_spawn_effect_wait_and_report_chain_is_end_to_end() {
                 .await
                 .expect("read parent");
             if events.iter().any(|event| {
-                serde_json::from_value::<EventPayload>(event.payload.clone())
-                    .is_ok_and(|payload| matches!(payload, EventPayload::RunState(RunState::Done)))
+                event.run_id.as_ref() == Some(&parent_run)
+                    && serde_json::from_value::<EventPayload>(event.payload.clone()).is_ok_and(
+                        |payload| matches!(payload, EventPayload::RunState(RunState::Done)),
+                    )
             }) {
                 break;
             }
@@ -258,11 +511,22 @@ async fn production_spawn_effect_wait_and_report_chain_is_end_to_end() {
         })
     }));
     let parent_events = store.read(&parent_session, 0, 512).await.expect("parent");
+    for event in parent_events
+        .iter()
+        .filter(|event| event.run_id.as_ref() == Some(&parent_run))
+    {
+        if matches!(
+            serde_json::from_value::<EventPayload>(event.payload.clone()),
+            Ok(EventPayload::SessionState(_))
+        ) {
+            assert_eq!(event.branch_id, None);
+        } else {
+            assert_eq!(event.branch_id, Some(branch_a.clone()));
+        }
+    }
     let payloads = parent_events
         .iter()
-        .map(|event| {
-            serde_json::from_value::<EventPayload>(event.payload.clone()).expect("payload")
-        })
+        .filter_map(|event| serde_json::from_value::<EventPayload>(event.payload.clone()).ok())
         .collect::<Vec<_>>();
     let waiting = payloads
         .iter()
@@ -380,6 +644,7 @@ async fn accept_parent(
         worker_generation: hub.worker_generation(),
         run_id: run_id.clone(),
         agent_id: None,
+        branch_id: None,
         text: "delegate recursively".into(),
         attachments: Vec::new(),
         mode: DeliveryMode::Steer,

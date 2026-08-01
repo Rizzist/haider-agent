@@ -28,7 +28,7 @@ use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
 };
 use haider_protocol::error::{ErrorCode, HaiderError};
-use haider_protocol::ids::{AgentId, EventId, ItemId, LeaseId, RunId, SessionId};
+use haider_protocol::ids::{AgentId, BranchId, EventId, ItemId, LeaseId, RunId, SessionId};
 use haider_protocol::item::{ItemEvent, TurnItem};
 use haider_protocol::session::SessionMetadataV1;
 use haider_protocol::state::RunState;
@@ -54,6 +54,7 @@ pub(crate) struct DelegationHandle {
 pub(crate) struct SpawnCoordinates {
     pub(crate) parent_session_id: SessionId,
     pub(crate) parent_run_id: RunId,
+    pub(crate) parent_branch_id: Option<BranchId>,
     pub(crate) parent_agent_id: Option<AgentId>,
     pub(crate) tool_item_id: ItemId,
     pub(crate) call_id: String,
@@ -187,6 +188,7 @@ impl DelegationHandle {
             child_run_id: child_run_id.clone(),
             parent_session_id: coordinates.parent_session_id,
             parent_run_id: coordinates.parent_run_id,
+            parent_branch_id: coordinates.parent_branch_id,
             call_id: coordinates.call_id,
             tool_item_id: coordinates.tool_item_id,
             parent_agent_id: coordinates.parent_agent_id,
@@ -223,6 +225,7 @@ impl DelegationHandle {
                 request_json: turn_json,
                 session_id: record.child_session_id,
                 worker_generation: self.hub.worker_generation(),
+                branch_id: None,
                 run_id: record.child_run_id,
                 agent_id: Some(record.agent_id.clone()),
                 text: turn_text,
@@ -525,6 +528,7 @@ impl DelegationHandle {
                 request_json,
                 session_id: record.child_session_id.clone(),
                 worker_generation: self.hub.worker_generation(),
+                branch_id: None,
                 run_id: record.child_run_id.clone(),
                 agent_id: Some(record.agent_id.clone()),
                 text: STALL_NUDGE_TEXT.into(),
@@ -644,7 +648,9 @@ impl DelegationHandle {
                 {
                     projected_events.insert(envelope.event_id.as_str().to_owned());
                 }
-                if envelope.run_id.as_ref() != Some(&record.parent_run_id) {
+                if envelope.run_id.as_ref() != Some(&record.parent_run_id)
+                    || envelope.branch_id != record.parent_branch_id
+                {
                     continue;
                 }
                 if let Ok(haider_protocol::EventPayload::AgentChipState { agent, chip }) =
@@ -902,7 +908,7 @@ fn chip_for_run_state(state: &RunState) -> Option<ChipState> {
     }
 }
 
-fn chip_projection_envelope(
+pub(crate) fn chip_projection_envelope(
     record: &DelegationRecord,
     event_id: &str,
     causation_id: EventId,
@@ -920,7 +926,7 @@ fn chip_projection_envelope(
         event_id: EventId::new(event_id),
         seq: 0,
         session_id: record.parent_session_id.clone(),
-        branch_id: None,
+        branch_id: record.parent_branch_id.clone(),
         run_id: Some(record.parent_run_id.clone()),
         agent_id: record.parent_agent_id.clone(),
         device_id,

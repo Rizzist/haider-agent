@@ -41,6 +41,9 @@ fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> Qu
 ///
 /// MUTATION CHECK: remove `FEATURE_PROVIDER_REMOVE_V1`. Expected RUNTIME
 /// failure: discovery omits the served durable provider removal method.
+///
+/// MUTATION CHECK: remove `FEATURE_BRANCH_CREATE_V1`. Expected RUNTIME
+/// failure: clients cannot discover the served durable branch-create method.
 #[test]
 fn welcome_features_pin_served_management_families() {
     assert_eq!(
@@ -51,6 +54,7 @@ fn welcome_features_pin_served_management_families() {
             haider_rpc::FEATURE_ACCOUNT_OAUTH_IMPORT_V1.to_owned(),
             haider_rpc::FEATURE_ACCOUNT_OAUTH_PKCE_V1.to_owned(),
             FEATURE_ACCOUNT_ROTATION_V1.to_owned(),
+            haider_rpc::FEATURE_BRANCH_CREATE_V1.to_owned(),
             FEATURE_CONTEXT_COMPACTION_V1.to_owned(),
             FEATURE_PROVIDER_CONFIGURE_V1.to_owned(),
             FEATURE_PROVIDER_MANAGEMENT_V1.to_owned(),

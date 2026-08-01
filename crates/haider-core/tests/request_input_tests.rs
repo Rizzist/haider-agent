@@ -3,7 +3,7 @@
 use haider_core::{HarnessActor, HarnessConfig, MemoryStore, StoreHandle, SubmitTurn};
 use haider_protocol::EventPayload;
 use haider_protocol::error::ErrorCode;
-use haider_protocol::ids::{DeviceId, EventId, SessionId};
+use haider_protocol::ids::{BranchId, DeviceId, EventId, SessionId};
 use haider_protocol::item::{ItemEvent, ToolStatus, TurnItem};
 use haider_protocol::menu::{AnswerVia, MenuAnswer, MenuKind};
 use haider_protocol::provider::FinishReason;
@@ -31,6 +31,112 @@ fn actor(
     let provider = Arc::new(FakeProvider::new(script));
     let handle = HarnessActor::spawn(config, provider.clone(), store.clone());
     (handle, store, provider)
+}
+
+/// MUTATION CHECK: omit `HarnessConfig::branch_id` from menu/tool/item/run
+/// envelope construction. Expected RUNTIME failure: a request-input lifecycle
+/// event below lands on main instead of its accepted branch.
+#[tokio::test]
+async fn branch_scoped_request_input_keeps_every_interaction_on_its_branch() {
+    let branch_id = BranchId::new("request-input-branch");
+    let mut config = HarnessConfig::for_session(
+        SessionId::new(SESSION),
+        DeviceId::new("request-input-branch-device"),
+        7,
+        11,
+    );
+    config.branch_id = Some(branch_id.clone());
+    let store = Arc::new(MemoryStore::new());
+    let provider = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitRequestInput {
+            call_id: "branch-question".into(),
+            kind: FakeInputKind::Choice,
+            title: "Choose".into(),
+            body: Vec::new(),
+            options: vec![FakeInputOption {
+                key: "yes".into(),
+                label: "Yes".into(),
+                detail: None,
+            }],
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "branch-question".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let handle = HarnessActor::spawn(config, provider, store.clone());
+    let turn = handle
+        .submit_turn(SubmitTurn::new("ask on branch"))
+        .await
+        .expect("turn accepted");
+    let mut state = handle.state_receiver();
+    let parked = state
+        .wait_for(|state| matches!(state, Some(RunState::InputRequired { .. })))
+        .await
+        .expect("actor stays available")
+        .clone();
+    let RunState::InputRequired { menu } = parked.expect("input state") else {
+        panic!("wait predicate guarantees input state");
+    };
+    handle
+        .answer_menu(MenuAnswer {
+            menu,
+            option_key: Some("yes".into()),
+            option_index: 0,
+            value: None,
+            via: AnswerVia::Rpc,
+        })
+        .await
+        .expect("answer menu");
+    assert_eq!(
+        turn.wait().await.expect("turn completes").state,
+        RunState::Done
+    );
+    let events = store.events(&SessionId::new(SESSION)).await;
+    assert!(!events.is_empty());
+    assert!(
+        events
+            .iter()
+            .all(|event| event.branch_id.as_ref() == Some(&branch_id))
+    );
+    let payloads = events
+        .iter()
+        .map(|event| {
+            serde_json::from_value::<EventPayload>(event.payload.clone()).expect("typed payload")
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        payloads
+            .iter()
+            .any(|payload| matches!(payload, EventPayload::MenuOpened(_)))
+    );
+    assert!(
+        payloads
+            .iter()
+            .any(|payload| matches!(payload, EventPayload::MenuAnswered(_)))
+    );
+    assert!(payloads.iter().any(|payload| matches!(
+        payload,
+        EventPayload::Item(ItemEvent::Started {
+            item: TurnItem::ToolCall { .. },
+            ..
+        })
+    )));
+    assert!(
+        payloads
+            .iter()
+            .any(|payload| matches!(payload, EventPayload::ToolResult { .. }))
+    );
+    assert!(
+        payloads
+            .iter()
+            .any(|payload| matches!(payload, EventPayload::RunState(RunState::Done)))
+    );
 }
 
 #[tokio::test]

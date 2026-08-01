@@ -3,7 +3,9 @@
 use haider_protocol::agent::{
     AgentManifest, AgentRole, ChildReport, Grant, Placement, ReportVerification,
 };
-use haider_protocol::ids::{AgentId, DeviceId, EventId, ItemId, LeaseId, RunId, SessionId};
+use haider_protocol::ids::{
+    AgentId, BranchId, DeviceId, EventId, ItemId, LeaseId, RunId, SessionId,
+};
 use haider_store::{
     DelegationCreateOutcome, DelegationRecord, DelegationState, SessionCreateCommand, Store,
 };
@@ -38,6 +40,7 @@ fn record(parent: &SessionId, child: &SessionId) -> DelegationRecord {
         child_run_id: RunId::new("child-run"),
         parent_session_id: parent.clone(),
         parent_run_id: RunId::new("parent-run"),
+        parent_branch_id: None,
         call_id: "call-stable".into(),
         tool_item_id: ItemId::new("item-stable"),
         parent_agent_id: None,
@@ -148,4 +151,60 @@ fn report_slot_is_exact_once_and_collection_requires_it() {
         .expect("collect after report");
     assert_eq!(collected.state, DelegationState::Collected);
     assert_eq!(collected.report, Some(report));
+}
+
+/// MUTATION CHECK: remove the serde default from the additive parent branch
+/// coordinate. Expected RUNTIME failure: a pre-B2a durable delegation receipt
+/// can no longer be decoded after migration.
+#[test]
+fn legacy_delegation_receipt_defaults_parent_branch_to_main() {
+    let parent = SessionId::new("legacy-parent-branch");
+    let child = SessionId::new("legacy-child-main");
+    let record = record(&parent, &child);
+    let mut json = serde_json::to_value(record).expect("serialize delegation");
+    json.as_object_mut()
+        .expect("delegation object")
+        .remove("parent_branch_id");
+
+    let decoded: DelegationRecord =
+        serde_json::from_value(json).expect("decode pre-B2a delegation receipt");
+    assert_eq!(decoded.parent_branch_id, None);
+}
+
+/// MUTATION CHECK: omit the parent branch from the stored delegation JSON or
+/// from its replay query. Expected RUNTIME failure: restart loses the spawn
+/// branch and a late parent projection is retargeted to main.
+#[test]
+fn delegation_parent_branch_survives_durable_replay() {
+    let root = tempfile::tempdir().expect("temp profile");
+    let parent = SessionId::new("branch-parent-session");
+    let child = SessionId::new("branch-child-session");
+    let agent;
+    {
+        let store = Store::open(root.path()).expect("open store");
+        create_session(&store, &parent);
+        create_session(&store, &child);
+        let mut requested = record(&parent, &child);
+        requested.parent_branch_id = Some(BranchId::new("parent-branch-a"));
+        agent = requested.agent_id.clone();
+        store
+            .create_delegation(&requested)
+            .expect("create branch-pinned delegation");
+    }
+
+    let reopened = Store::open(root.path()).expect("reopen store");
+    let replayed = reopened
+        .delegation(&agent)
+        .expect("delegation lookup")
+        .expect("durable delegation");
+    assert_eq!(
+        replayed.parent_branch_id,
+        Some(BranchId::new("parent-branch-a"))
+    );
+    assert_eq!(
+        reopened
+            .delegations_for_parent_run(&parent, &RunId::new("parent-run"))
+            .expect("parent delegation replay"),
+        vec![replayed]
+    );
 }

@@ -409,7 +409,13 @@ fn turn_submit_and_cancel_ignore_unknown_additive_fields() {
         "future_priority":"high"
     }"#;
     let body: RequestBody = serde_json::from_str(submit).expect("submit with additive field");
-    assert!(matches!(body, RequestBody::TurnSubmit { .. }));
+    assert!(matches!(
+        body,
+        RequestBody::TurnSubmitWithBranch {
+            branch_id: None,
+            ..
+        }
+    ));
     let cancel = r#"{
         "method":"turn.cancel",
         "command_id":"cancel-1",

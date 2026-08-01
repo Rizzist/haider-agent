@@ -1009,4 +1009,686 @@ async fn branch_agent_and_nonterminal_history_are_excluded_structurally() {
         })
         .collect::<Vec<_>>();
     assert_eq!(rendered, vec!["matching", "current"]);
+
+    // B2a named-ref phase: preserve the exact W7a assertion above, then
+    // prove that a declared branch sees its source prefix only through the
+    // fork coordinate and renders each ancestor fragment under its owner.
+    use haider_protocol::branch::{BranchCreated, BranchDescriptor};
+    let tree_store = MemoryStore::new();
+    let tree_session = SessionId::new("named-lineage-history");
+    let source_run = RunId::new("source-prefix");
+    let source_suffix_run = RunId::new("source-suffix");
+    let matching = RunId::new("named-matching");
+    let interrupted = RunId::new("named-interrupted");
+    let wrong_agent = RunId::new("named-wrong-agent");
+    let sibling = RunId::new("named-sibling");
+    let current = RunId::new("named-current");
+    let source_node = NodeId::new("source-prefix-node");
+    let matching_node = NodeId::new("named-matching-node");
+    let interrupted_node = NodeId::new("named-interrupted-node");
+    let current_node = NodeId::new("named-current-node");
+    let tree_scoped = |mut raw: haider_protocol::envelope::RawEnvelope,
+                       branch: Option<&BranchId>,
+                       owner: &AgentId| {
+        raw.branch_id = branch.cloned();
+        raw.agent_id = Some(owner.clone());
+        raw
+    };
+    let tree_user = |run: &RunId, id: &str, text: &str| {
+        envelope(
+            &tree_session,
+            run,
+            id,
+            EventPayload::UserMessage {
+                text: text.into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        )
+    };
+    let tree_done = |run: &RunId, id: &str| {
+        envelope(
+            &tree_session,
+            run,
+            id,
+            EventPayload::RunState(RunState::Done),
+            PromptRender::Omit,
+        )
+    };
+    let tree_node = |run: &RunId, id: &str, parent: Option<&NodeId>| {
+        node(
+            &tree_session,
+            run,
+            id,
+            parent.map(NodeId::as_str),
+            NodeKind::UserTurn {
+                text: id.into(),
+                attachments: Vec::new(),
+            },
+        )
+    };
+    let mut tree_events = vec![
+        tree_scoped(
+            tree_user(&source_run, "source-user", "source prefix"),
+            None,
+            &agent,
+        ),
+        tree_scoped(
+            tree_node(&source_run, source_node.as_str(), None),
+            None,
+            &agent,
+        ),
+        tree_scoped(tree_done(&source_run, "source-done"), None, &agent),
+        tree_scoped(
+            tree_user(&source_suffix_run, "source-suffix-user", "source suffix"),
+            None,
+            &agent,
+        ),
+        tree_scoped(
+            tree_node(&source_suffix_run, "source-suffix-node", Some(&source_node)),
+            None,
+            &agent,
+        ),
+        tree_scoped(
+            tree_done(&source_suffix_run, "source-suffix-done"),
+            None,
+            &agent,
+        ),
+        tree_scoped(
+            tree_user(&matching, "named-matching-user", "branch matching"),
+            Some(&branch),
+            &agent,
+        ),
+        tree_scoped(
+            tree_node(&matching, matching_node.as_str(), Some(&source_node)),
+            Some(&branch),
+            &agent,
+        ),
+        tree_scoped(
+            tree_done(&matching, "named-matching-done"),
+            Some(&branch),
+            &agent,
+        ),
+        tree_scoped(
+            tree_user(&interrupted, "named-partial-user", "partial input"),
+            Some(&branch),
+            &agent,
+        ),
+        tree_scoped(
+            tree_node(
+                &interrupted,
+                interrupted_node.as_str(),
+                Some(&matching_node),
+            ),
+            Some(&branch),
+            &agent,
+        ),
+        tree_scoped(
+            envelope(
+                &tree_session,
+                &interrupted,
+                "named-partial-output",
+                EventPayload::Item(ItemEvent::Completed {
+                    item_id: ItemId::new("named-partial-item"),
+                    item: TurnItem::AgentMessage {
+                        text: "partial output".into(),
+                    },
+                }),
+                PromptRender::Verbatim,
+            ),
+            Some(&branch),
+            &agent,
+        ),
+        tree_scoped(
+            tree_user(&wrong_agent, "named-wrong-agent-user", "wrong agent"),
+            Some(&branch),
+            &other_agent,
+        ),
+        tree_scoped(
+            tree_node(&wrong_agent, "named-wrong-agent-node", Some(&matching_node)),
+            Some(&branch),
+            &other_agent,
+        ),
+        tree_scoped(
+            tree_done(&wrong_agent, "named-wrong-agent-done"),
+            Some(&branch),
+            &other_agent,
+        ),
+        tree_scoped(
+            tree_user(&sibling, "named-sibling-user", "sibling"),
+            Some(&other_branch),
+            &agent,
+        ),
+        tree_scoped(
+            tree_node(&sibling, "named-sibling-node", Some(&source_node)),
+            Some(&other_branch),
+            &agent,
+        ),
+        tree_scoped(
+            tree_done(&sibling, "named-sibling-done"),
+            Some(&other_branch),
+            &agent,
+        ),
+        tree_scoped(
+            tree_user(&current, "named-current-user", "branch current"),
+            Some(&branch),
+            &agent,
+        ),
+        tree_scoped(
+            tree_node(&current, current_node.as_str(), Some(&interrupted_node)),
+            Some(&branch),
+            &agent,
+        ),
+    ];
+    let created_seq = u64::try_from(tree_events.len() + 1).expect("created seq");
+    tree_events.push(EventEnvelope {
+        schema_version: SCHEMA_VERSION,
+        event_id: EventId::new("named-branch-created"),
+        seq: 0,
+        session_id: tree_session.clone(),
+        branch_id: None,
+        run_id: None,
+        agent_id: None,
+        device_id: DeviceId::new("opaque-history-test"),
+        authority_epoch: 0,
+        worker_generation: 1,
+        causation_id: None,
+        correlation_id: None,
+        committed_at_ms: 0,
+        render: RenderTargets {
+            ui: true,
+            durable: true,
+            prompt: PromptRender::Omit,
+        },
+        payload: BranchCreated {
+            branch: BranchDescriptor {
+                branch_id: branch.clone(),
+                name: "Plan A".into(),
+                source_branch_id: None,
+                fork_node_id: source_node,
+                fork_seq: 2,
+                created_seq,
+                created_at_ms: 1,
+                head_node_id: current_node,
+                head_seq: 20,
+            },
+        }
+        .to_payload_value()
+        .expect("branch payload"),
+    });
+    StoreHandle::append(&tree_store, &mut tree_events)
+        .await
+        .expect("append named lineage");
+    let named_messages = PromptHistoryCompiler::compile(
+        &tree_store,
+        &tree_session,
+        Some(&branch),
+        Some(&agent),
+        &current,
+    )
+    .await
+    .expect("compile named lineage");
+    let named_rendered = named_messages
+        .iter()
+        .flat_map(|message| &message.blocks)
+        .filter_map(|block| match block {
+            Block::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        named_rendered,
+        vec!["source prefix", "branch matching", "branch current"]
+    );
+}
+
+/// MUTATION CHECK: select compaction overlays by session order instead of the
+/// requested branch's immutable ancestry. Expected RUNTIME failure: the fork
+/// before the compaction renders `source summary`, or the fork after it
+/// resurrects `original prefix`/`original answer`.
+#[tokio::test]
+async fn named_forks_before_and_after_compaction_diverge() {
+    use haider_protocol::branch::{BranchCreated, BranchDescriptor};
+    use haider_protocol::ids::BranchId;
+
+    let store = MemoryStore::new();
+    let session_id = SessionId::new("branch-compaction-divergence");
+    let source_run = RunId::new("divergence-source");
+    let compaction_run = RunId::new("divergence-compaction");
+    let before_run = RunId::new("divergence-before");
+    let after_run = RunId::new("divergence-after");
+    let before_branch = BranchId::new("fork-before-compaction");
+    let after_branch = BranchId::new("fork-after-compaction");
+    let summary_artifact = ArtifactRef::new("summary-artifact");
+
+    let scoped = |mut raw: haider_protocol::envelope::RawEnvelope, branch_id: Option<&BranchId>| {
+        raw.branch_id = branch_id.cloned();
+        raw
+    };
+    let mut events = vec![
+        envelope(
+            &session_id,
+            &source_run,
+            "divergence-source-user",
+            EventPayload::UserMessage {
+                text: "original prefix".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        ),
+        node(
+            &session_id,
+            &source_run,
+            "divergence-n1",
+            None,
+            NodeKind::UserTurn {
+                text: "original prefix".into(),
+                attachments: Vec::new(),
+            },
+        ),
+        envelope(
+            &session_id,
+            &source_run,
+            "divergence-source-answer",
+            EventPayload::Item(ItemEvent::Completed {
+                item_id: ItemId::new("divergence-source-answer-item"),
+                item: TurnItem::AgentMessage {
+                    text: "original answer".into(),
+                },
+            }),
+            PromptRender::Verbatim,
+        ),
+        node(
+            &session_id,
+            &source_run,
+            "divergence-n2",
+            Some("divergence-n1"),
+            NodeKind::AssistantCommit {
+                text: "original answer".into(),
+                verdict: VerifyVerdict::NotApplicable,
+            },
+        ),
+        envelope(
+            &session_id,
+            &source_run,
+            "divergence-source-done",
+            EventPayload::RunState(RunState::Done),
+            PromptRender::Omit,
+        ),
+        node(
+            &session_id,
+            &compaction_run,
+            "divergence-summary-node",
+            Some("divergence-n2"),
+            NodeKind::Compaction {
+                covers_from: NodeId::new("divergence-n1"),
+                covers_to: NodeId::new("divergence-n2"),
+                summary_artifact: summary_artifact.clone(),
+                tokens_before: 100,
+                tokens_after: 8,
+                resume_cause: CompactionResume::ManualIdle,
+            },
+        ),
+        scoped(
+            envelope(
+                &session_id,
+                &before_run,
+                "divergence-before-user",
+                EventPayload::UserMessage {
+                    text: "before fork turn".into(),
+                    attachments: Vec::new(),
+                    mode: DeliveryMode::Queue,
+                },
+                PromptRender::Verbatim,
+            ),
+            Some(&before_branch),
+        ),
+        scoped(
+            node(
+                &session_id,
+                &before_run,
+                "divergence-before-node",
+                Some("divergence-n2"),
+                NodeKind::UserTurn {
+                    text: "before fork turn".into(),
+                    attachments: Vec::new(),
+                },
+            ),
+            Some(&before_branch),
+        ),
+        scoped(
+            envelope(
+                &session_id,
+                &after_run,
+                "divergence-after-user",
+                EventPayload::UserMessage {
+                    text: "after fork turn".into(),
+                    attachments: Vec::new(),
+                    mode: DeliveryMode::Queue,
+                },
+                PromptRender::Verbatim,
+            ),
+            Some(&after_branch),
+        ),
+        scoped(
+            node(
+                &session_id,
+                &after_run,
+                "divergence-after-node",
+                Some("divergence-summary-node"),
+                NodeKind::UserTurn {
+                    text: "after fork turn".into(),
+                    attachments: Vec::new(),
+                },
+            ),
+            Some(&after_branch),
+        ),
+    ];
+    for (event_id, descriptor) in [
+        (
+            "divergence-before-created",
+            BranchDescriptor {
+                branch_id: before_branch.clone(),
+                name: "Before compaction".into(),
+                source_branch_id: None,
+                fork_node_id: NodeId::new("divergence-n2"),
+                fork_seq: 4,
+                created_seq: 11,
+                created_at_ms: 1,
+                head_node_id: NodeId::new("divergence-before-node"),
+                head_seq: 8,
+            },
+        ),
+        (
+            "divergence-after-created",
+            BranchDescriptor {
+                branch_id: after_branch.clone(),
+                name: "After compaction".into(),
+                source_branch_id: None,
+                fork_node_id: NodeId::new("divergence-summary-node"),
+                fork_seq: 6,
+                created_seq: 12,
+                created_at_ms: 2,
+                head_node_id: NodeId::new("divergence-after-node"),
+                head_seq: 10,
+            },
+        ),
+    ] {
+        events.push(EventEnvelope {
+            schema_version: SCHEMA_VERSION,
+            event_id: EventId::new(event_id),
+            seq: 0,
+            session_id: session_id.clone(),
+            branch_id: None,
+            run_id: None,
+            agent_id: None,
+            device_id: DeviceId::new("divergence-device"),
+            authority_epoch: 0,
+            worker_generation: 1,
+            causation_id: None,
+            correlation_id: None,
+            committed_at_ms: 0,
+            render: RenderTargets {
+                ui: true,
+                durable: true,
+                prompt: PromptRender::Omit,
+            },
+            payload: BranchCreated { branch: descriptor }
+                .to_payload_value()
+                .expect("branch payload"),
+        });
+    }
+    StoreHandle::append(&store, &mut events)
+        .await
+        .expect("append divergence history");
+    let artifacts = TestArtifacts(HashMap::from([(
+        summary_artifact,
+        b"source summary".to_vec(),
+    )]));
+
+    let before = PromptHistoryCompiler::compile_with_artifacts(
+        &store,
+        &artifacts,
+        &session_id,
+        Some(&before_branch),
+        None,
+        &before_run,
+    )
+    .await
+    .expect("compile pre-compaction fork");
+    let after = PromptHistoryCompiler::compile_with_artifacts(
+        &store,
+        &artifacts,
+        &session_id,
+        Some(&after_branch),
+        None,
+        &after_run,
+    )
+    .await
+    .expect("compile post-compaction fork");
+    let text = |messages: &[haider_provider::Message]| {
+        messages
+            .iter()
+            .flat_map(|message| &message.blocks)
+            .filter_map(|block| match block {
+                Block::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        text(&before),
+        ["original prefix", "original answer", "before fork turn"]
+    );
+    assert_eq!(text(&after), ["source summary", "after fork turn"]);
+}
+
+/// MUTATION CHECK: flatten nested named refs to the leaf branch, reuse only
+/// the root fork ceiling, or derive a virgin branch head from later source
+/// traffic. Expected RUNTIME failure: B leaks either source suffix, or the
+/// virgin branch moves past its exact fork node.
+#[tokio::test]
+async fn nested_lineage_uses_every_owner_ceiling_and_virgin_head() {
+    use haider_protocol::branch::{BranchCreated, BranchDescriptor};
+    use haider_protocol::ids::BranchId;
+
+    let store = MemoryStore::new();
+    let session_id = SessionId::new("nested-lineage");
+    let main = RunId::new("nested-main");
+    let main_suffix = RunId::new("nested-main-suffix");
+    let branch_a_run = RunId::new("nested-a");
+    let branch_a_suffix = RunId::new("nested-a-suffix");
+    let branch_b_run = RunId::new("nested-b");
+    let branch_a = BranchId::new("nested-branch-a");
+    let branch_b = BranchId::new("nested-branch-b");
+    let virgin = BranchId::new("nested-virgin");
+    let scoped = |mut raw: haider_protocol::envelope::RawEnvelope, branch_id: Option<&BranchId>| {
+        raw.branch_id = branch_id.cloned();
+        raw
+    };
+    let user = |run: &RunId, id: &str, text: &str| {
+        envelope(
+            &session_id,
+            run,
+            id,
+            EventPayload::UserMessage {
+                text: text.into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        )
+    };
+    let done = |run: &RunId, id: &str| {
+        envelope(
+            &session_id,
+            run,
+            id,
+            EventPayload::RunState(RunState::Done),
+            PromptRender::Omit,
+        )
+    };
+    let user_node = |run: &RunId, id: &str, parent: Option<&str>| {
+        node(
+            &session_id,
+            run,
+            id,
+            parent,
+            NodeKind::UserTurn {
+                text: id.into(),
+                attachments: Vec::new(),
+            },
+        )
+    };
+    let mut events = vec![
+        user(&main, "nested-main-user", "main prefix"),
+        user_node(&main, "nested-main-node", None),
+        done(&main, "nested-main-done"),
+        user(&main_suffix, "nested-main-suffix-user", "main suffix"),
+        user_node(
+            &main_suffix,
+            "nested-main-suffix-node",
+            Some("nested-main-node"),
+        ),
+        done(&main_suffix, "nested-main-suffix-done"),
+        scoped(
+            user(&branch_a_run, "nested-a-user", "A prefix"),
+            Some(&branch_a),
+        ),
+        scoped(
+            user_node(&branch_a_run, "nested-a-node", Some("nested-main-node")),
+            Some(&branch_a),
+        ),
+        scoped(done(&branch_a_run, "nested-a-done"), Some(&branch_a)),
+        scoped(
+            user(&branch_a_suffix, "nested-a-suffix-user", "A suffix"),
+            Some(&branch_a),
+        ),
+        scoped(
+            user_node(
+                &branch_a_suffix,
+                "nested-a-suffix-node",
+                Some("nested-a-node"),
+            ),
+            Some(&branch_a),
+        ),
+        scoped(
+            done(&branch_a_suffix, "nested-a-suffix-done"),
+            Some(&branch_a),
+        ),
+        scoped(
+            user(&branch_b_run, "nested-b-user", "B current"),
+            Some(&branch_b),
+        ),
+        scoped(
+            user_node(&branch_b_run, "nested-b-node", Some("nested-a-node")),
+            Some(&branch_b),
+        ),
+    ];
+    for (event_id, descriptor) in [
+        (
+            "nested-a-created",
+            BranchDescriptor {
+                branch_id: branch_a.clone(),
+                name: "A".into(),
+                source_branch_id: None,
+                fork_node_id: NodeId::new("nested-main-node"),
+                fork_seq: 2,
+                created_seq: 15,
+                created_at_ms: 1,
+                head_node_id: NodeId::new("nested-a-suffix-node"),
+                head_seq: 11,
+            },
+        ),
+        (
+            "nested-b-created",
+            BranchDescriptor {
+                branch_id: branch_b.clone(),
+                name: "B".into(),
+                source_branch_id: Some(branch_a.clone()),
+                fork_node_id: NodeId::new("nested-a-node"),
+                fork_seq: 8,
+                created_seq: 16,
+                created_at_ms: 2,
+                head_node_id: NodeId::new("nested-b-node"),
+                head_seq: 14,
+            },
+        ),
+        (
+            "nested-virgin-created",
+            BranchDescriptor {
+                branch_id: virgin.clone(),
+                name: "Virgin".into(),
+                source_branch_id: None,
+                fork_node_id: NodeId::new("nested-main-node"),
+                fork_seq: 2,
+                created_seq: 17,
+                created_at_ms: 3,
+                head_node_id: NodeId::new("nested-main-node"),
+                head_seq: 2,
+            },
+        ),
+    ] {
+        events.push(EventEnvelope {
+            schema_version: SCHEMA_VERSION,
+            event_id: EventId::new(event_id),
+            seq: 0,
+            session_id: session_id.clone(),
+            branch_id: None,
+            run_id: None,
+            agent_id: None,
+            device_id: DeviceId::new("nested-device"),
+            authority_epoch: 0,
+            worker_generation: 1,
+            causation_id: None,
+            correlation_id: None,
+            committed_at_ms: 0,
+            render: RenderTargets {
+                ui: true,
+                durable: true,
+                prompt: PromptRender::Omit,
+            },
+            payload: BranchCreated { branch: descriptor }
+                .to_payload_value()
+                .expect("branch payload"),
+        });
+    }
+    StoreHandle::append(&store, &mut events)
+        .await
+        .expect("append nested lineage");
+
+    let nested =
+        PromptHistoryCompiler::compile(&store, &session_id, Some(&branch_b), None, &branch_b_run)
+            .await
+            .expect("compile nested branch");
+    let text = |messages: &[haider_provider::Message]| {
+        messages
+            .iter()
+            .flat_map(|message| &message.blocks)
+            .filter_map(|block| match block {
+                Block::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(text(&nested), ["main prefix", "A prefix", "B current"]);
+    assert_eq!(
+        PromptHistoryCompiler::latest_head(&store, &session_id, Some(&virgin), None)
+            .await
+            .expect("virgin latest head"),
+        Some(NodeId::new("nested-main-node"))
+    );
+    let virgin_prompt = PromptHistoryCompiler::compile_idle_with_artifacts(
+        &store,
+        &TestArtifacts(HashMap::new()),
+        &session_id,
+        Some(&virgin),
+        None,
+    )
+    .await
+    .expect("compile virgin fork");
+    assert_eq!(text(&virgin_prompt), ["main prefix"]);
 }

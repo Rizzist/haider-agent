@@ -12,7 +12,9 @@ use haider_protocol::effect::{AuthorizationVerdict, EffectClass, EffectIntent, E
 use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
 };
-use haider_protocol::ids::{DeviceId, EffectId, EventId, ItemId, MenuId, RunId, SessionId};
+use haider_protocol::ids::{
+    BranchId, DeviceId, EffectId, EventId, ItemId, MenuId, RunId, SessionId,
+};
 use haider_protocol::item::{ItemEvent, ToolStatus, TurnItem};
 use haider_protocol::menu::{
     AnswerVia, DecisionKind, Menu, MenuAnswer, MenuKind, MenuOption, MenuScope,
@@ -303,6 +305,7 @@ fn append_permission_checkpoint(
     store: &Store,
     session_id: &SessionId,
     run_id: &RunId,
+    branch_id: Option<BranchId>,
     state: RunState,
 ) {
     let menu_id = match &state {
@@ -374,6 +377,9 @@ fn append_permission_checkpoint(
             ..envelope(session_id, "template-state", EventPayload::IdleDecayed)
         },
     ];
+    for event in &mut events {
+        event.branch_id = branch_id.clone();
+    }
     store.append(&mut events).expect("append checkpoint");
 }
 
@@ -392,6 +398,7 @@ async fn recovery_dual_reads_historical_and_canonical_permission_states() {
         &store,
         &old_session,
         &RunId::new("old-run"),
+        None,
         RunState::InputRequired {
             menu: MenuId::new("old-menu"),
         },
@@ -400,6 +407,7 @@ async fn recovery_dual_reads_historical_and_canonical_permission_states() {
         &store,
         &new_session,
         &RunId::new("new-run"),
+        Some(BranchId::new("checkpoint-branch")),
         RunState::PermissionRequired {
             menu: MenuId::new("new-menu"),
         },
@@ -428,14 +436,22 @@ async fn recovery_dual_reads_historical_and_canonical_permission_states() {
     let mut recovered_menus = work
         .into_iter()
         .filter_map(|work| match work {
-            RecoveredWork::Checkpoint(checkpoint) => Some(checkpoint.checkpoint.menu.id),
+            RecoveredWork::Checkpoint(checkpoint) => {
+                Some((checkpoint.checkpoint.menu.id, checkpoint.accepted.branch_id))
+            }
             RecoveredWork::Queued(_) | RecoveredWork::ChildWait(_) => None,
         })
         .collect::<Vec<_>>();
-    recovered_menus.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    recovered_menus.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
     assert_eq!(
         recovered_menus,
-        [MenuId::new("new-menu"), MenuId::new("old-menu")]
+        [
+            (
+                MenuId::new("new-menu"),
+                Some(BranchId::new("checkpoint-branch"))
+            ),
+            (MenuId::new("old-menu"), None)
+        ]
     );
     for session_id in [&old_session, &new_session] {
         let events = recovered.read(session_id, 0, 64).await.expect("read");

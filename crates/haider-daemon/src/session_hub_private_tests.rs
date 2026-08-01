@@ -54,6 +54,186 @@ fn provider_list_filter_is_applied_to_the_owned_snapshot_projection() {
     );
 }
 
+/// MUTATION CHECK: move branch receipt lookup below control-attachment or
+/// generation validation. Expected RUNTIME failure: after restart, the lost
+/// response cannot be replayed without reattaching or using the new worker
+/// generation.
+#[tokio::test]
+async fn branch_create_receipt_replays_before_attachment_and_generation_validation() {
+    let root = tempfile::tempdir().expect("temp store");
+    let session_id = SessionId::new("branch-rpc-receipt-session");
+    let run_id = RunId::new("branch-rpc-fork-run");
+    let command_id = haider_rpc::CommandId::new("branch-rpc-command");
+    let request_id = haider_rpc::RequestId::new("branch-rpc-first");
+    let (request, original_response, original_generation) = {
+        let store = SqliteStoreHandle::open(root.path())
+            .await
+            .expect("store opens");
+        let original_generation = store.worker_generation();
+        let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub opens");
+        hub.create_internal_session(SessionCreateCommand {
+            command_id: "create-branch-rpc-session".into(),
+            request_digest: "create-branch-rpc-session-digest".into(),
+            request_json: r#"{"session":"branch-rpc-receipt"}"#.into(),
+            session_id: session_id.clone(),
+            cwd: std::fs::canonicalize(std::env::current_dir().expect("cwd"))
+                .expect("canonical cwd")
+                .to_string_lossy()
+                .into_owned(),
+            provider: "fake".into(),
+            model: "fake-model".into(),
+            max_tokens: 4096,
+            permission_overrides: None,
+            system_prompt_version: crate::worker::SystemPromptBuilder::VERSION.into(),
+            event_id: EventId::new("created-branch-rpc-session"),
+            device_id: DeviceId::new("branch-rpc-device"),
+        })
+        .await
+        .expect("create session");
+        hub.accept_internal_turn(TurnAcceptCommand {
+            command_id: "accept-branch-rpc-fork".into(),
+            request_digest: "accept-branch-rpc-fork-digest".into(),
+            request_json: r#"{"turn":"branch-rpc-fork"}"#.into(),
+            session_id: session_id.clone(),
+            worker_generation: original_generation,
+            run_id: run_id.clone(),
+            agent_id: None,
+            branch_id: None,
+            text: "stable fork point".into(),
+            attachments: Vec::new(),
+            mode: haider_protocol::DeliveryMode::Queue,
+            queued_event_id: EventId::new("branch-rpc-fork-queued"),
+            user_event_id: EventId::new("branch-rpc-fork-user"),
+            active_event_id: EventId::new("branch-rpc-fork-active"),
+            device_id: DeviceId::new("branch-rpc-device"),
+        })
+        .await
+        .expect("accept fork turn");
+        let mut done = [run_state_envelope(
+            &session_id,
+            &run_id,
+            original_generation,
+            "branch-rpc-fork-done",
+            RunState::Done,
+        )];
+        hub.append(&mut done).await.expect("terminalize fork turn");
+        let events = store
+            .read(&session_id, 0, 64)
+            .await
+            .expect("read fork node");
+        let (fork_node_id, fork_seq) = events
+            .iter()
+            .find_map(|event| {
+                let EventPayload::NodeCommitted(node) =
+                    serde_json::from_value::<EventPayload>(event.payload.clone()).ok()?
+                else {
+                    return None;
+                };
+                (event.run_id.as_ref() == Some(&run_id)).then_some((node.node, event.seq))
+            })
+            .expect("fork node");
+        let request = haider_rpc::RequestBody::BranchCreate {
+            command_id: command_id.clone(),
+            session_id: session_id.clone(),
+            worker_generation: original_generation,
+            source_branch_id: None,
+            fork_node_id,
+            fork_seq,
+            name: Some("Receipt branch".into()),
+        };
+
+        let sink = Arc::new(CapturingFrameSink::default());
+        let connection = hub
+            .open_connection(
+                std::collections::BTreeSet::from([
+                    haider_rpc::Capability::View,
+                    haider_rpc::Capability::Control,
+                ]),
+                sink.clone(),
+                crate::accounts::ConnectionTransport::LocalSameUid,
+            )
+            .expect("control connection");
+        connection
+            .request(
+                haider_rpc::RequestId::new("branch-rpc-attach"),
+                haider_rpc::RequestBody::SessionAttach {
+                    session_id: session_id.clone(),
+                    after_seq: 0,
+                    mode: haider_rpc::AttachMode::Control,
+                },
+            )
+            .await
+            .expect("attach control");
+        sink.0.lock().expect("frames").clear();
+        connection
+            .request(request_id, request.clone())
+            .await
+            .expect("create branch");
+        let response = sink
+            .0
+            .lock()
+            .expect("frames")
+            .iter()
+            .find_map(|frame| match frame {
+                WireFrame::Response {
+                    body: haider_rpc::ResponseBody::BranchCreate { .. },
+                    ..
+                } => Some(frame.clone()),
+                _ => None,
+            })
+            .expect("branch response");
+        drop(connection);
+        hub.shutdown().await.expect("hub stops");
+        store.close().await.expect("store closes");
+        (request, response, original_generation)
+    };
+
+    let reopened = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("reopen store");
+    assert_ne!(reopened.worker_generation(), original_generation);
+    let hub = SessionHub::new(reopened.clone(), SessionHubConfig::default()).expect("reopen hub");
+    let sink = Arc::new(CapturingFrameSink::default());
+    let connection = hub
+        .open_connection(
+            std::collections::BTreeSet::from([
+                haider_rpc::Capability::View,
+                haider_rpc::Capability::Control,
+            ]),
+            sink.clone(),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("unattached control connection");
+    connection
+        .request(haider_rpc::RequestId::new("branch-rpc-replay"), request)
+        .await
+        .expect("receipt replay");
+    let replay = sink
+        .0
+        .lock()
+        .expect("replay frames")
+        .iter()
+        .find_map(|frame| match frame {
+            WireFrame::Response {
+                body: haider_rpc::ResponseBody::BranchCreate { .. },
+                ..
+            } => Some(frame.clone()),
+            _ => None,
+        })
+        .expect("replayed branch response");
+    let WireFrame::Response { body: original, .. } = original_response else {
+        panic!("original branch response");
+    };
+    let WireFrame::Response { body: replayed, .. } = replay else {
+        panic!("replayed branch response");
+    };
+    assert_eq!(replayed, original);
+
+    drop(connection);
+    hub.shutdown().await.expect("reopened hub stops");
+    reopened.close().await.expect("reopened store closes");
+}
+
 #[derive(Default)]
 struct CapturingFrameSink(Mutex<Vec<WireFrame>>);
 
@@ -241,6 +421,7 @@ fn accept_command(
         worker_generation: generation,
         run_id: run_id.clone(),
         agent_id: None,
+        branch_id: None,
         text: "fixture turn".into(),
         attachments: Vec::new(),
         mode: haider_protocol::DeliveryMode::Queue,
@@ -1455,6 +1636,7 @@ async fn recovery_terminalization_never_settles_idle_while_another_run_is_active
         run_id: run_id.clone(),
         accepted_seq: seq,
         worker_generation: generation,
+        branch_id: None,
         disposition: haider_store::TurnAdmissionDisposition::Queued,
     };
     let manager = crate::worker::WorkerManager::start(

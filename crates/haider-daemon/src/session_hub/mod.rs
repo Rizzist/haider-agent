@@ -98,16 +98,17 @@ use crate::worker::WorkerManagerHandle;
 use actor::run_session_actor;
 use async_trait::async_trait;
 use haider_core::{
-    AcceptedShellExec, AcceptedTurn, CancelledTurn, CreatedSession, HarnessHandle,
-    MenuResolutionCommand, MenuResolutionOutcome, SessionCreateCommand, SessionCreateOutcome,
-    ShellExecAcceptCommand, ShellExecAcceptOutcome, SqliteStoreHandle, StoreHandle,
-    TurnAcceptCommand, TurnAcceptOutcome, TurnAdmissionDisposition, TurnCancelCommand,
-    TurnCancelOutcome, TurnCancellationStatus,
+    AcceptedShellExec, AcceptedTurn, BranchCreateCommand, BranchCreateOutcome, CancelledTurn,
+    CreatedBranch, CreatedSession, HarnessHandle, MenuResolutionCommand, MenuResolutionOutcome,
+    SessionCreateCommand, SessionCreateOutcome, ShellExecAcceptCommand, ShellExecAcceptOutcome,
+    SqliteStoreHandle, StoreHandle, TurnAcceptCommand, TurnAcceptOutcome, TurnAdmissionDisposition,
+    TurnCancelCommand, TurnCancelOutcome, TurnCancellationStatus,
 };
 use haider_protocol::EventPayload;
+use haider_protocol::branch::BranchDescriptor;
 use haider_protocol::envelope::{RawEnvelope, envelope_weight_bytes};
 use haider_protocol::error::{ErrorCode, HaiderError};
-use haider_protocol::ids::{DeviceId, EventId, MenuId, RunId, SessionId};
+use haider_protocol::ids::{BranchId, DeviceId, EventId, MenuId, RunId, SessionId};
 use haider_protocol::menu::{AnswerVia, MenuAnswer as DurableMenuAnswer};
 use haider_protocol::state::RunState;
 use haider_rpc::{
@@ -724,6 +725,10 @@ enum ActorCommand {
         command: SessionCreateCommand,
         completed: oneshot::Sender<Result<SessionCreateOutcome, HaiderError>>,
     },
+    CreateBranch {
+        command: BranchCreateCommand,
+        completed: oneshot::Sender<Result<BranchCreateOutcome, HaiderError>>,
+    },
     AcceptTurn {
         command: TurnAcceptCommand,
         completed: oneshot::Sender<Result<TurnAcceptOutcome, HaiderError>>,
@@ -1279,6 +1284,40 @@ impl SessionHub {
                 request_json.to_owned(),
             )
             .await
+            .map_err(Into::into)
+    }
+
+    async fn branch_create_receipt(
+        &self,
+        command_id: &CommandId,
+        request_digest: &str,
+        request_json: &str,
+    ) -> Result<Option<CreatedBranch>, SessionHubError> {
+        self.inner
+            .store
+            .branch_create_receipt(
+                command_id.0.clone(),
+                request_digest.to_owned(),
+                request_json.to_owned(),
+            )
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn create_branch(
+        &self,
+        command: BranchCreateCommand,
+    ) -> Result<BranchCreateOutcome, SessionHubError> {
+        let actor = self.actor_for(command.session_id.clone()).await?;
+        let (completed, result) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::CreateBranch { command, completed })
+            .await
+            .map_err(|_| SessionHubError::Closed)?;
+        result
+            .await
+            .map_err(|_| SessionHubError::Closed)?
             .map_err(Into::into)
     }
 
@@ -1997,6 +2036,15 @@ impl StoreHandle for HubStoreHandle {
     async fn latest_seq(&self, session_id: &SessionId) -> Result<u64, HaiderError> {
         self.ensure_session(session_id)?;
         self.hub.inner.store.latest_seq(session_id).await
+    }
+
+    async fn branch_lineage(
+        &self,
+        session_id: &SessionId,
+        branch_id: Option<&BranchId>,
+    ) -> Result<Vec<BranchDescriptor>, HaiderError> {
+        self.ensure_session(session_id)?;
+        StoreHandle::branch_lineage(&self.hub.inner.store, session_id, branch_id).await
     }
 }
 

@@ -41,7 +41,9 @@ use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
 };
 use haider_protocol::error::{ErrorCode, HaiderError};
-use haider_protocol::ids::{AgentId, DeviceId, EventId, ItemId, MenuId, RunId, SessionId};
+use haider_protocol::ids::{
+    AgentId, BranchId, DeviceId, EventId, ItemId, MenuId, RunId, SessionId,
+};
 use haider_protocol::item::{ItemDelta, ItemEvent, ToolStatus, TurnItem};
 use haider_protocol::menu::{Menu, MenuCloseReason, MenuKind};
 use haider_protocol::state::{RunState, SessionState, WaitReason};
@@ -68,6 +70,9 @@ pub(crate) struct RecoveredCheckpoint {
 
 #[derive(Default)]
 struct RunReduction {
+    branch_id: Option<BranchId>,
+    branch_observed: bool,
+    branch_mismatch: bool,
     state: Option<(RunState, u64)>,
     state_generation: u64,
     user_seq: Option<u64>,
@@ -125,6 +130,13 @@ pub(crate) async fn recover_interrupted_turns(
         runs.sort_by_key(|(_, reduction)| reduction.user_seq.unwrap_or(u64::MAX));
         let mut activated_recovered_queue = false;
         for (run_id, reduction) in runs {
+            if reduction.branch_mismatch {
+                return Err(HaiderError::new(
+                    ErrorCode::StoreCorrupt,
+                    format!("run {run_id} crosses branch scopes"),
+                    false,
+                ));
+            }
             let Some((state, _)) = reduction.state.clone() else {
                 continue;
             };
@@ -140,6 +152,7 @@ pub(crate) async fn recover_interrupted_turns(
                     device_id,
                     &session_id,
                     &run_id,
+                    reduction.branch_id.clone(),
                     reduction,
                     matches!(state, RunState::Cancelling),
                 )
@@ -157,6 +170,7 @@ pub(crate) async fn recover_interrupted_turns(
                         &run_id,
                         accepted_seq,
                         store.worker_generation(),
+                        reduction.branch_id.clone(),
                     )));
                 }
                 continue;
@@ -178,6 +192,7 @@ pub(crate) async fn recover_interrupted_turns(
                         &run_id,
                         accepted_seq,
                         store.worker_generation(),
+                        reduction.branch_id.clone(),
                     ),
                     checkpoint,
                     committed_answer,
@@ -205,6 +220,7 @@ pub(crate) async fn recover_interrupted_turns(
                         &run_id,
                         accepted_seq,
                         store.worker_generation(),
+                        reduction.branch_id.clone(),
                     ),
                     checkpoint,
                 })));
@@ -222,6 +238,7 @@ pub(crate) async fn recover_interrupted_turns(
                         store,
                         &delegation.parent_session_id,
                         &delegation.parent_run_id,
+                        delegation.parent_branch_id.as_ref(),
                     )
                     .await?,
                     Some(RunState::Waiting {
@@ -244,6 +261,7 @@ pub(crate) async fn recover_interrupted_turns(
                 device_id,
                 &session_id,
                 &run_id,
+                reduction.branch_id.clone(),
                 reduction,
                 matches!(state, RunState::Cancelling),
             )
@@ -272,6 +290,7 @@ async fn latest_run_state(
     store: &SqliteStoreHandle,
     session_id: &SessionId,
     run_id: &RunId,
+    branch_id: Option<&BranchId>,
 ) -> Result<Option<RunState>, HaiderError> {
     let mut cursor = 0;
     let mut state = None;
@@ -282,7 +301,8 @@ async fn latest_run_state(
         }
         cursor = page.last().map_or(cursor, |envelope| envelope.seq);
         for envelope in page {
-            if envelope.run_id.as_ref() != Some(run_id) {
+            if envelope.run_id.as_ref() != Some(run_id) || envelope.branch_id.as_ref() != branch_id
+            {
                 continue;
             }
             if let Ok(EventPayload::RunState(next)) =
@@ -301,7 +321,19 @@ fn reduce(reductions: &mut HashMap<RunId, RunReduction>, envelope: RawEnvelope) 
     let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone()) else {
         return;
     };
+    // SessionState is session-global even when it names the run that caused
+    // the aggregate transition. Route it by payload type before enforcing
+    // the immutable branch coordinate of run-scoped history.
+    if matches!(payload, EventPayload::SessionState(_)) {
+        return;
+    }
     let reduction = reductions.entry(run_id).or_default();
+    if reduction.branch_observed && reduction.branch_id != envelope.branch_id {
+        reduction.branch_mismatch = true;
+    } else if !reduction.branch_observed {
+        reduction.branch_id = envelope.branch_id.clone();
+        reduction.branch_observed = true;
+    }
     match payload {
         EventPayload::RunState(state) => {
             reduction.state = Some((state, envelope.seq));
@@ -459,6 +491,16 @@ async fn pending_child_wait(
     }
     let mut checkpoints = Vec::with_capacity(delegations.len());
     for delegation in delegations {
+        if delegation.parent_branch_id != reduction.branch_id {
+            return Err(HaiderError::new(
+                ErrorCode::StoreCorrupt,
+                format!(
+                    "delegation {} crosses parent branch scopes",
+                    delegation.agent_id
+                ),
+                false,
+            ));
+        }
         let tool = reduction
             .tool_calls
             .get(&delegation.call_id)
@@ -505,12 +547,14 @@ fn recovered_acceptance(
     run_id: &RunId,
     accepted_seq: u64,
     worker_generation: u64,
+    branch_id: Option<BranchId>,
 ) -> AcceptedTurn {
     AcceptedTurn {
         session_id: session_id.clone(),
         run_id: run_id.clone(),
         accepted_seq,
         worker_generation,
+        branch_id,
         disposition: TurnAdmissionDisposition::Started,
     }
 }
@@ -520,6 +564,7 @@ async fn terminalize_interrupted(
     device_id: &DeviceId,
     session_id: &SessionId,
     run_id: &RunId,
+    branch_id: Option<BranchId>,
     reduction: RunReduction,
     cancelling: bool,
 ) -> Result<(), HaiderError> {
@@ -535,6 +580,7 @@ async fn terminalize_interrupted(
         device_id,
         session_id,
         run_id,
+        branch_id.as_ref(),
         payloads,
     )?;
     store.append(&mut envelopes).await?;
@@ -594,6 +640,13 @@ async fn resumption_terminal_payloads(
         ),
         None => (true, ErrorCode::Internal, "run was cancelled".into(), false),
     };
+    if reduction.branch_mismatch {
+        return Err(HaiderError::new(
+            ErrorCode::StoreCorrupt,
+            format!("run {run_id} crosses branch scopes"),
+            false,
+        ));
+    }
     Ok(interrupted_terminal_payloads(
         reduction,
         cancelling,
@@ -692,6 +745,7 @@ async fn append_recovered_active(
         device_id,
         session_id,
         run_id,
+        None,
         vec![EventPayload::SessionState(SessionState::ActiveRun)],
     )?;
     store.append(&mut envelopes).await?;
@@ -703,6 +757,7 @@ fn recovery_envelopes(
     device_id: &DeviceId,
     session_id: &SessionId,
     run_id: &RunId,
+    branch_id: Option<&BranchId>,
     payloads: Vec<EventPayload>,
 ) -> Result<Vec<RawEnvelope>, HaiderError> {
     payloads
@@ -721,7 +776,7 @@ fn recovery_envelopes(
                 )),
                 seq: 0,
                 session_id: session_id.clone(),
-                branch_id: None,
+                branch_id: if is_session { None } else { branch_id.cloned() },
                 run_id: (!is_session).then(|| run_id.clone()),
                 agent_id: None,
                 device_id: device_id.clone(),
