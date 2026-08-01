@@ -1116,7 +1116,7 @@ async fn failed_recovery_start_terminalizes_on_the_accepted_branch() {
             (envelope.run_id.as_ref() == Some(&run_id)
                 && matches!(
                     serde_json::from_value::<EventPayload>(envelope.payload.clone()),
-                    Ok(EventPayload::RunState(RunState::Errored { .. }))
+                    Ok(EventPayload::RunState(RunState::Errored))
                 ))
             .then(|| envelope.branch_id.clone())
         });

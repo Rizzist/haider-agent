@@ -62,7 +62,13 @@ fn haider() -> HaiderCommand {
     let profile_root = tempfile::tempdir().expect("temporary CLI profile parent");
     let profile = profile_root.path().join("profile");
     let mut command = Command::new(env!("CARGO_BIN_EXE_haider"));
+    // Hermetic workspace: the daemon's project-instruction walk climbs to
+    // the filesystem root, so an inherited repo cwd would let the OWNER'S
+    // real ~/AGENTS.md into every test daemon's prompt and journal.
+    let workspace = profile_root.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace dir");
     command
+        .current_dir(&workspace)
         .env("HAIDER_PROFILE_DIR", &profile)
         .env("HAIDER_TEST_FAKE_PROVIDER", DEFAULT_FAKE_SCRIPT);
     HaiderCommand {
@@ -192,15 +198,17 @@ fn run_jsonl_is_lf_framed_and_every_line_is_a_raw_envelope() {
     );
     assert_eq!(
         envelopes.last().map(typed),
-        Some(EventPayload::RunState(RunState::Done))
+        Some(Some(EventPayload::RunState(RunState::Done)))
     );
-    let response = envelopes.iter().find_map(|envelope| match typed(envelope) {
-        EventPayload::Item(ItemEvent::Completed {
-            item: TurnItem::AgentMessage { text },
-            ..
-        }) => Some(text),
-        _ => None,
-    });
+    let response = envelopes
+        .iter()
+        .find_map(|envelope| match typed(envelope)? {
+            EventPayload::Item(ItemEvent::Completed {
+                item: TurnItem::AgentMessage { text },
+                ..
+            }) => Some(text),
+            _ => None,
+        });
     assert_eq!(response.as_deref(), Some("fake response: hello"));
 }
 
@@ -239,7 +247,7 @@ fn run_jsonl_accepts_explicit_fake_provider_and_model() {
     let envelopes = parse_jsonl(&out.stdout);
     assert_eq!(
         envelopes.last().map(typed),
-        Some(EventPayload::RunState(RunState::Done))
+        Some(Some(EventPayload::RunState(RunState::Done)))
     );
 }
 
@@ -333,7 +341,7 @@ fn anthropic_missing_credential_exits_65_without_network_access() {
     let envelopes = parse_jsonl(&out.stdout);
     assert_eq!(
         envelopes.last().map(typed),
-        Some(EventPayload::RunState(RunState::Errored))
+        Some(Some(EventPayload::RunState(RunState::Errored)))
     );
 }
 
@@ -414,7 +422,7 @@ fn run_jsonl_exits_65_when_fake_provider_errors() {
         .collect();
     assert_eq!(
         envelopes.last().map(typed),
-        Some(EventPayload::RunState(RunState::Errored))
+        Some(Some(EventPayload::RunState(RunState::Errored)))
     );
 }
 
@@ -433,7 +441,7 @@ fn run_jsonl_cancelled_has_130_exit_and_terminal_envelope() {
     let envelopes = parse_jsonl(&out.stdout);
     assert_eq!(
         envelopes.last().map(typed),
-        Some(EventPayload::RunState(RunState::Cancelled))
+        Some(Some(EventPayload::RunState(RunState::Cancelled)))
     );
 }
 
@@ -538,17 +546,17 @@ fn run_write_and_exec_permission_flags_journal_ordinary_allow() {
     let envelopes = parse_jsonl(&allowed.stdout);
     assert!(envelopes.iter().any(|envelope| matches!(
         typed(envelope),
-        EventPayload::Effect(EffectPhase::Authorized {
+        Some(EventPayload::Effect(EffectPhase::Authorized {
             verdict: AuthorizationVerdict::Allow,
             ..
-        })
+        }))
     )));
     assert!(!envelopes.iter().any(|envelope| matches!(
         typed(envelope),
-        EventPayload::Effect(EffectPhase::Authorized {
+        Some(EventPayload::Effect(EffectPhase::Authorized {
             verdict: AuthorizationVerdict::PreAuthorized { .. },
             ..
-        })
+        }))
     )));
 
     let exec_workspace = tempfile::tempdir().expect("exec workspace");
@@ -590,17 +598,17 @@ fn run_write_and_exec_permission_flags_journal_ordinary_allow() {
     let exec_envelopes = parse_jsonl(&exec.stdout);
     assert!(exec_envelopes.iter().any(|envelope| matches!(
         typed(envelope),
-        EventPayload::Effect(EffectPhase::Authorized {
+        Some(EventPayload::Effect(EffectPhase::Authorized {
             verdict: AuthorizationVerdict::Allow,
             ..
-        })
+        }))
     )));
     assert!(!exec_envelopes.iter().any(|envelope| matches!(
         typed(envelope),
-        EventPayload::Effect(EffectPhase::Authorized {
+        Some(EventPayload::Effect(EffectPhase::Authorized {
             verdict: AuthorizationVerdict::PreAuthorized { .. },
             ..
-        })
+        }))
     )));
 }
 
@@ -668,12 +676,17 @@ fn run_jsonl_replays_every_envelope_to_a_slow_pipe_consumer() {
     );
     let delta_count = envelopes
         .iter()
-        .filter(|envelope| matches!(typed(envelope), EventPayload::Item(ItemEvent::Delta { .. })))
+        .filter(|envelope| {
+            matches!(
+                typed(envelope),
+                Some(EventPayload::Item(ItemEvent::Delta { .. }))
+            )
+        })
         .count();
     assert_eq!(delta_count, 500);
     assert_eq!(
         envelopes.last().map(typed),
-        Some(EventPayload::RunState(RunState::Done))
+        Some(Some(EventPayload::RunState(RunState::Done)))
     );
 }
 
@@ -736,12 +749,12 @@ fn jsonl_store_failure_emits_errored_and_returns_nonzero_without_hanging() {
     assert_eq!(
         terminal,
         vec![
-            EventPayload::RunState(RunState::Errored),
-            EventPayload::RunFailed {
+            Some(EventPayload::RunState(RunState::Errored)),
+            Some(EventPayload::RunFailed {
                 code: ErrorCode::StoreCorrupt,
                 message: "injected terminal append failure".into(),
                 retryable: false,
-            },
+            }),
         ]
     );
     assert!(
@@ -1129,8 +1142,20 @@ fn parse_jsonl(output: &[u8]) -> Vec<RawEnvelope> {
         .collect()
 }
 
-fn typed(envelope: &RawEnvelope) -> EventPayload {
-    serde_json::from_value(envelope.payload.clone()).expect("known payload")
+/// Decodes a core payload, tolerating additive supplemental kinds (the
+/// journal's forward-compat law: unknown `kind`s are DATA, never errors —
+/// e.g. `project_instructions_loaded`). A payload without a string `kind`
+/// is still a hard frame violation.
+fn typed(envelope: &RawEnvelope) -> Option<EventPayload> {
+    assert!(
+        envelope
+            .payload
+            .get("type")
+            .is_some_and(|kind| kind.is_string()),
+        "payload frame lacks a string type tag: {}",
+        envelope.payload
+    );
+    serde_json::from_value(envelope.payload.clone()).ok()
 }
 
 #[test]

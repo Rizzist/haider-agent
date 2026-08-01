@@ -1,0 +1,17 @@
+{
+  "type": "project_instructions_loaded",
+  "files": [
+    {
+      "path": "/workspace/HAIDER.md",
+      "digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "bytes": 34,
+      "truncated": false
+    },
+    {
+      "path": "/workspace/crate/AGENTS.md",
+      "digest": "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+      "bytes": 49152,
+      "truncated": true
+    }
+  ]
+}

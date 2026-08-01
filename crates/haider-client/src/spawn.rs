@@ -392,6 +392,30 @@ fn spawn_daemon(
         // Detach from the launcher's terminal/process group so terminal
         // signals never reach the daemon and parent exit leaves it running.
         .process_group(0);
+    // The daemon outlives its launcher, so an accidentally inherited
+    // descriptor outlives the caller's expectations with it. macOS creates
+    // pipes without atomic CLOEXEC (`pipe()` then `fcntl`), a concurrent
+    // spawn on another thread can capture a sibling's descriptor inside that
+    // window, and `Command` demonstrably forwards non-CLOEXEC descriptors on
+    // this platform — a leaked pipe write end held by the long-lived daemon
+    // then starves the original reader of EOF forever. Close every
+    // descriptor above stderr between fork and exec so the daemon starts
+    // with exactly its three configured stdio descriptors (`close(2)` is
+    // async-signal-safe).
+    //
+    // SAFETY: the hook runs between fork and exec and calls only the
+    // async-signal-safe `close(2)`; no allocation, locking, or Rust runtime
+    // machinery is touched.
+    #[allow(unsafe_code)]
+    unsafe {
+        use std::os::unix::process::CommandExt as _;
+        command.pre_exec(|| {
+            for fd in 3..65_536i32 {
+                rustix::io::close(fd);
+            }
+            Ok(())
+        });
+    }
     command.spawn().map_err(|error| EnsureError::Spawn {
         binary,
         message: error.to_string(),

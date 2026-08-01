@@ -629,3 +629,65 @@ async fn request_after_observed_disconnect_resolves_with_the_typed_reason() {
         Ok(body) => panic!("expected the typed disconnect, got Ok({body:?})"),
     }
 }
+
+/// MUTATION CHECK: remove the `pre_exec` descriptor sweep from
+/// `spawn_daemon`. Expected RUNTIME failure: a non-CLOEXEC socket end
+/// planted at a high descriptor (the macOS `pipe()`+`fcntl` race shape)
+/// survives into the long-lived daemon, so the local end never sees EOF and
+/// the timed read below reports a leak instead of a clean close.
+#[test]
+fn spawned_daemon_inherits_no_descriptors_beyond_stdio() {
+    use haider_client::spawn::spawn_daemon_retained;
+    use std::io::Read;
+
+    let root = tempfile::tempdir().expect("profile root");
+    let store_dir = root.path().join("store");
+    std::fs::create_dir_all(&store_dir).expect("store dir");
+    let env = ProfileEnv {
+        profile_dir: Some(store_dir),
+        home: None,
+        model: None,
+        xdg_runtime_dir: None,
+    };
+    let profile = resolve_profile(&env).expect("resolve profile");
+
+    // Plant a deliberately non-CLOEXEC peer end at a high descriptor — the
+    // exact artifact the macOS pipe()+fcntl race leaves behind in a spawned
+    // launcher.
+    let (mut mine, theirs) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+    let planted = rustix::io::fcntl_dupfd_cloexec(&theirs, 333).expect("dup to high fd");
+    rustix::io::fcntl_setfd(&planted, rustix::io::FdFlags::empty()).expect("clear cloexec");
+    drop(theirs);
+
+    let binary =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/haiderd");
+    assert!(
+        binary.exists(),
+        "haiderd binary missing; build workspace binaries before the client suite"
+    );
+    let mut child = spawn_daemon_retained(&profile, &binary).expect("spawn daemon");
+    // The leak is only observable while the daemon LIVES: a dead daemon
+    // closes its inherited copy and fakes a clean EOF. Prove liveness first.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert!(
+        child.try_wait().expect("try_wait").is_none(),
+        "daemon candidate must stay alive for the descriptor-hygiene read"
+    );
+
+    // Drop every local copy of the peer end. If the daemon inherited the
+    // planted descriptor the pair stays open and the timed read never sees
+    // EOF; with the sweep in place the read completes with a clean close.
+    drop(planted);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut sink = [0u8; 1];
+        let _ = sender.send(mine.read(&mut sink));
+    });
+    let outcome = receiver.recv_timeout(std::time::Duration::from_secs(30));
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(
+        matches!(outcome, Ok(Ok(0))),
+        "daemon holds a leaked descriptor: {outcome:?}"
+    );
+}

@@ -29,6 +29,7 @@ use haider_protocol::ids::{
 };
 use haider_protocol::item::{ItemEvent, TurnItem};
 use haider_protocol::menu::{Menu, MenuAnswer, MenuKind};
+use haider_protocol::project_instructions::ProjectInstructionsLoaded;
 use haider_protocol::session::{SessionMetadataV1, SessionPermissionOverridesV1};
 use haider_protocol::state::{RunState, SessionState};
 use haider_protocol::tool::AttachmentBlock;
@@ -4348,24 +4349,45 @@ fn validate_worker_run_transitions(
 ) -> StoreResult<()> {
     let mut states = latest_run_states(transaction, session_id)?;
     for envelope in envelopes {
+        let supplemental_project_instructions =
+            ProjectInstructionsLoaded::from_payload_value(&envelope.payload).is_some();
         let Some(run_id) = envelope.run_id.as_ref() else {
+            if supplemental_project_instructions {
+                return Err(store_error(
+                    ErrorCode::InvalidArgument,
+                    "project-instruction worker fact has no logical-turn run id",
+                    false,
+                ));
+            }
             continue;
         };
-        let payload =
-            serde_json::from_value::<EventPayload>(envelope.payload.clone()).map_err(|error| {
-                store_error(
+        if supplemental_project_instructions
+            && (!envelope.render.durable || envelope.render.prompt != PromptRender::Omit)
+        {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "project-instruction worker fact must be durable and omitted from prompt replay",
+                false,
+            ));
+        }
+        let payload = match serde_json::from_value::<EventPayload>(envelope.payload.clone()) {
+            Ok(payload) => Some(payload),
+            Err(_) if supplemental_project_instructions => None,
+            Err(error) => {
+                return Err(store_error(
                     ErrorCode::InvalidArgument,
                     format!("worker envelope payload is invalid: {error}"),
                     false,
-                )
-            })?;
+                ));
+            }
+        };
         if !states.contains_key(run_id)
             && matches!(
                 &payload,
-                EventPayload::Item(ItemEvent::Started {
+                Some(EventPayload::Item(ItemEvent::Started {
                     item: TurnItem::Extension { kind, .. },
                     ..
-                }) if kind == COMPACTION_INTENT_EXTENSION_KIND
+                })) if kind == COMPACTION_INTENT_EXTENSION_KIND
             )
         {
             // A compaction intent is the accepted prefix of the daemon's
@@ -4384,7 +4406,7 @@ fn validate_worker_run_transitions(
             ));
         };
         if envelope.branch_id != accepted_branch
-            && !matches!(&payload, EventPayload::SessionState(_))
+            && !matches!(&payload, Some(EventPayload::SessionState(_)))
         {
             return Err(store_error(
                 ErrorCode::InvalidArgument,
@@ -4399,7 +4421,7 @@ fn validate_worker_run_transitions(
                 false,
             ));
         }
-        if let EventPayload::RunState(next) = payload {
+        if let Some(EventPayload::RunState(next)) = payload {
             if durable == RunState::Cancelling && next != RunState::Cancelled {
                 return Err(store_error(
                     ErrorCode::RunNotActive,

@@ -22,6 +22,7 @@ pub mod hook;
 pub mod ids;
 pub mod item;
 pub mod menu;
+pub mod project_instructions;
 pub mod provider;
 pub mod rpc;
 pub mod session;

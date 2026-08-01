@@ -61,6 +61,7 @@ mod oauth;
 #[cfg(test)]
 mod permissions_core_tests;
 mod profile_vault;
+mod project_instructions;
 mod provider_registry;
 mod runtime;
 mod session_hub;
@@ -68,6 +69,9 @@ mod session_hub;
 mod subagent_core_tests;
 mod turn_recovery;
 mod worker;
+
+#[cfg(test)]
+mod project_instructions_tests;
 
 pub use accounts::{
     AccountProviderBuilder, AccountsDependencies, AnthropicValidator, ConnectionTransport,
