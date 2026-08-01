@@ -7,6 +7,7 @@
 #![allow(clippy::expect_used)] // tests may expect; the lint guards src/ only
 
 use haider_protocol::EventPayload;
+use haider_protocol::agent::ChipState;
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets};
 use haider_protocol::ids::*;
 use haider_protocol::menu::{
@@ -98,6 +99,16 @@ fn golden_run_states() {
             menu: MenuId::new("m-permission-1"),
         },
     );
+}
+
+/// MUTATION CHECK: remove or rename the additive permission chip state.
+/// Expected RUNTIME failure: the exact JSON value no longer round-trips.
+#[test]
+fn permission_required_chip_state_is_an_additive_wire_value() {
+    let encoded = serde_json::to_string(&ChipState::PermissionRequired).expect("serialize chip");
+    assert_eq!(encoded, r#""permission_required""#);
+    let decoded: ChipState = serde_json::from_str(&encoded).expect("deserialize chip");
+    assert_eq!(decoded, ChipState::PermissionRequired);
 }
 
 /// MUTATION CHECK: fabricate an inventory entry or omit the remembered grant.

@@ -1,5 +1,6 @@
 #![allow(clippy::expect_used)]
 
+use crate::connection::{ConnectionContext, DrainNotice, serve};
 use crate::delegation::DelegationHandle;
 use crate::session_hub::{SessionHub, SessionHubConfig};
 use crate::worker::{
@@ -12,17 +13,28 @@ use haider_core::{
 };
 use haider_protocol::DeliveryMode;
 use haider_protocol::EventPayload;
+use haider_protocol::agent::ChipState;
 use haider_protocol::effect::{EffectOutcome, EffectPhase};
-use haider_protocol::ids::{DeviceId, EventId, RunId, SessionId};
+use haider_protocol::ids::{DeviceId, EventId, MenuId, RunId, SessionId};
 use haider_protocol::item::{ItemEvent, TurnItem};
+use haider_protocol::menu::Menu;
 use haider_protocol::provider::{Block, CapabilityDoc, FinishReason};
 use haider_protocol::session::SessionMetadataV1;
 use haider_protocol::state::{RunState, WaitReason};
 use haider_provider::{
     FakeProvider, FakeStep, Provider, ProviderError, ProviderStream, TurnRequest,
 };
+use haider_rpc::{
+    AttachMode, Capability, CapabilitySet, ClientKind, CommandId, Hello, RequestBody, RequestId,
+    ResponseBody, WIRE_PROTOCOL_VERSION, WireFrame, uds_codec,
+};
+use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UnixStream;
+use tokio::sync::{mpsc, watch};
 use tokio::time::{Duration, timeout};
 
 struct InspectingProvider {
@@ -388,6 +400,527 @@ fn typed_payloads(events: &[haider_protocol::envelope::RawEnvelope]) -> Vec<Even
         .iter()
         .map(|event| serde_json::from_value(event.payload.clone()).expect("payload"))
         .collect()
+}
+
+enum PermissionChildMode {
+    Complete,
+    StallAfterApproval,
+}
+
+struct PermissionChildHarness {
+    _root: tempfile::TempDir,
+    store: SqliteStoreHandle,
+    hub: SessionHub,
+    manager: WorkerManager,
+    parent_session: SessionId,
+    child: haider_core::DelegationRecord,
+    menu: Menu,
+    request_seq: u64,
+}
+
+async fn start_permission_child(
+    label: &str,
+    mode: PermissionChildMode,
+    stall_deadline: Duration,
+) -> PermissionChildHarness {
+    let root = tempfile::tempdir().expect("temp profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let mut script = vec![
+        FakeStep::EmitToolCall {
+            call_id: format!("{label}-spawn"),
+            name: "spawn_subagent".into(),
+            args: serde_json::json!({"task":"permission","prompt":"run one command"}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::EmitToolCall {
+            call_id: format!("{label}-exec"),
+            name: "process_exec".into(),
+            args: serde_json::json!({"command":"printf w6d-approved"}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: format!("{label}-exec"),
+        },
+    ];
+    match mode {
+        PermissionChildMode::Complete => script.extend([
+            FakeStep::EmitText {
+                text: "child continued after permission".into(),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::EndTurn,
+            },
+        ]),
+        PermissionChildMode::StallAfterApproval => script.push(FakeStep::Hang),
+    }
+    script.extend([
+        FakeStep::ExpectToolResult {
+            call_id: format!("{label}-spawn"),
+        },
+        FakeStep::EmitText {
+            text: "parent collected permission child".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]);
+    let provider = Arc::new(FakeProvider::new(script));
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let manager = WorkerManager::start(
+        hub.clone(),
+        WorkerDependencies {
+            provider_factory: Arc::new(FixedProviderFactory { provider }),
+            tool_factory: Arc::new(BrokerToolFactory),
+            delegation: Some(DelegationHandle::with_stall_deadline(
+                hub.clone(),
+                stall_deadline,
+            )),
+        },
+        false,
+    );
+    let manager_handle = manager.handle();
+    hub.install_worker_manager(manager_handle.clone())
+        .expect("install manager");
+    let parent_session = SessionId::new(format!("w6d-{label}-parent"));
+    let parent_run = RunId::new(format!("w6d-{label}-parent-run"));
+    let accepted = accept_parent(&hub, &parent_session, &parent_run, label).await;
+    manager_handle
+        .submit(accepted)
+        .await
+        .expect("submit permission parent");
+    wait_for_state(&store, &parent_session, |state| {
+        matches!(
+            state,
+            RunState::Waiting {
+                reason: WaitReason::LocalChild
+            }
+        )
+    })
+    .await;
+    let child = hub
+        .delegations_for_parent_run(parent_session.clone(), parent_run)
+        .await
+        .expect("permission delegation")
+        .pop()
+        .expect("permission child");
+    wait_for_state(&store, &child.child_session_id, |state| {
+        matches!(state, RunState::PermissionRequired { .. })
+    })
+    .await;
+    let events = store
+        .read(&child.child_session_id, 0, 1024)
+        .await
+        .expect("permission child events");
+    let permission_menu = events
+        .iter()
+        .find_map(|envelope| {
+            let payload = serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok()?;
+            match payload {
+                EventPayload::MenuOpened(menu)
+                    if matches!(
+                        menu.kind,
+                        haider_protocol::menu::MenuKind::Permission { .. }
+                    ) =>
+                {
+                    Some((menu, envelope.seq))
+                }
+                _ => None,
+            }
+        })
+        .expect("permission menu and opening sequence");
+    PermissionChildHarness {
+        _root: root,
+        store,
+        hub,
+        manager,
+        parent_session,
+        child,
+        menu: permission_menu.0,
+        request_seq: permission_menu.1,
+    }
+}
+
+struct UdsControlClient {
+    stream: UnixStream,
+    decoder: uds_codec::Decoder,
+    pending: VecDeque<WireFrame>,
+    drain_sender: watch::Sender<Option<DrainNotice>>,
+    serve_task: tokio::task::JoinHandle<()>,
+    writer_owner: tokio::task::JoinHandle<()>,
+}
+
+impl UdsControlClient {
+    async fn connect(hub: SessionHub) -> Self {
+        let (server, stream) = UnixStream::pair().expect("live UDS pair");
+        let (writers, mut writer_tasks) = mpsc::unbounded_channel();
+        let writer_owner = tokio::spawn(async move {
+            while let Some(task) = writer_tasks.recv().await {
+                let _ = task.await;
+            }
+        });
+        let context = ConnectionContext {
+            profile_id: "w6d-test-profile".into(),
+            instance_id: "w6d-test-instance".into(),
+            daemon_generation: hub.worker_generation(),
+            frame_limit: haider_rpc::DEFAULT_FRAME_LIMIT,
+            outbound_queue_capacity: 64,
+            outbound_queued_bytes: 4 * 1024 * 1024,
+            max_connections: 4,
+            handshake_timeout: Duration::from_secs(5),
+            writers,
+            owner_uid: rustix::process::geteuid().as_raw(),
+            hub,
+            endpoint_path: PathBuf::from("/tmp/w6d-child-control.sock"),
+        };
+        let (drain_sender, drain) = watch::channel(Option::<DrainNotice>::None);
+        let serve_task = tokio::spawn(async move {
+            let _ = serve(server, context, drain).await;
+        });
+        let mut client = Self {
+            stream,
+            decoder: uds_codec::Decoder::new(haider_rpc::DEFAULT_FRAME_LIMIT),
+            pending: VecDeque::new(),
+            drain_sender,
+            serve_task,
+            writer_owner,
+        };
+        client
+            .send(WireFrame::Hello(Hello {
+                protocol_min: WIRE_PROTOCOL_VERSION,
+                protocol_max: WIRE_PROTOCOL_VERSION,
+                client_name: "w6d-child-control".into(),
+                client_version: "test".into(),
+                client_instance_id: "w6d-child-control-1".into(),
+                client_kind: ClientKind::Cli,
+                capabilities_requested: CapabilitySet::from([
+                    Capability::View,
+                    Capability::Control,
+                ]),
+                max_receive_frame: u32::try_from(haider_rpc::DEFAULT_FRAME_LIMIT)
+                    .expect("test frame limit fits u32"),
+            }))
+            .await;
+        loop {
+            if matches!(client.next().await, WireFrame::Welcome(_)) {
+                break;
+            }
+        }
+        client
+    }
+
+    async fn send(&mut self, frame: WireFrame) {
+        let bytes =
+            uds_codec::encode(&frame, haider_rpc::DEFAULT_FRAME_LIMIT).expect("UDS frame encodes");
+        self.stream
+            .write_all(&bytes)
+            .await
+            .expect("UDS frame writes");
+    }
+
+    async fn next(&mut self) -> WireFrame {
+        if let Some(frame) = self.pending.pop_front() {
+            return frame;
+        }
+        let mut buffer = [0_u8; 8192];
+        loop {
+            let read = self
+                .stream
+                .read(&mut buffer)
+                .await
+                .expect("UDS frame reads");
+            assert_ne!(read, 0, "UDS server closed before the expected frame");
+            let batch = self.decoder.push(&buffer[..read]);
+            assert!(
+                batch.error.is_none(),
+                "UDS decoder error: {:?}",
+                batch.error
+            );
+            self.pending.extend(batch.frames);
+            if let Some(frame) = self.pending.pop_front() {
+                return frame;
+            }
+        }
+    }
+
+    async fn attach_control(&mut self, session_id: SessionId) {
+        let request_id = RequestId::new("w6d-child-attach");
+        self.send(WireFrame::Request {
+            request_id: request_id.clone(),
+            body: RequestBody::SessionAttach {
+                session_id,
+                after_seq: 0,
+                mode: AttachMode::Control,
+            },
+        })
+        .await;
+        let attachment_id = loop {
+            match self.next().await {
+                WireFrame::Response {
+                    request_id: observed,
+                    body: ResponseBody::SessionAttach { attachment_id, .. },
+                } if observed == request_id => break attachment_id,
+                WireFrame::Response {
+                    request_id: observed,
+                    body: ResponseBody::Error { code, message, .. },
+                } if observed == request_id => panic!("child attach failed: {code}: {message}"),
+                _ => {}
+            }
+        };
+        loop {
+            if matches!(
+                self.next().await,
+                WireFrame::AttachCaughtUp {
+                    attachment_id: observed,
+                    ..
+                } if observed == attachment_id
+            ) {
+                return;
+            }
+        }
+    }
+
+    async fn approve_once(
+        &mut self,
+        session_id: SessionId,
+        menu_id: MenuId,
+        request_seq: u64,
+        worker_generation: u64,
+    ) {
+        let request_id = RequestId::new("w6d-child-answer");
+        self.send(WireFrame::MenuAnswer {
+            request_id: Some(request_id.clone()),
+            command_id: CommandId::new("w6d-child-answer-command"),
+            session_id,
+            menu_id,
+            request_seq,
+            worker_generation,
+            option_key: "approve_once".into(),
+            option_index: 0,
+            input: None,
+        })
+        .await;
+        loop {
+            match self.next().await {
+                WireFrame::Response {
+                    request_id: observed,
+                    body: ResponseBody::MenuAnswer { .. },
+                } if observed == request_id => return,
+                WireFrame::Response {
+                    request_id: observed,
+                    body: ResponseBody::Error { code, message, .. },
+                } if observed == request_id => {
+                    panic!("child menu answer failed: {code}: {message}")
+                }
+                _ => {}
+            }
+        }
+    }
+
+    async fn close(self) {
+        let Self {
+            mut stream,
+            drain_sender,
+            serve_task,
+            writer_owner,
+            ..
+        } = self;
+        drop(drain_sender);
+        let _ = stream.shutdown().await;
+        drop(stream);
+        timeout(Duration::from_secs(5), serve_task)
+            .await
+            .expect("UDS serve task stops")
+            .expect("UDS serve task joins");
+        timeout(Duration::from_secs(5), writer_owner)
+            .await
+            .expect("UDS writer owner stops")
+            .expect("UDS writer owner joins");
+    }
+}
+
+async fn wait_for_chip(
+    store: &SqliteStoreHandle,
+    session_id: &SessionId,
+    agent: &haider_protocol::ids::AgentId,
+    expected: ChipState,
+) {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let payloads = typed_payloads(
+                &store
+                    .read(session_id, 0, 1024)
+                    .await
+                    .expect("read parent chips"),
+            );
+            if payloads.iter().any(|payload| {
+                matches!(
+                    payload,
+                    EventPayload::AgentChipState { agent: observed, chip }
+                        if observed == agent && *chip == expected
+                )
+            }) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("expected parent chip state");
+}
+
+/// MUTATION CHECK: drop the child's run-state mirror or map permission parks
+/// to Thinking. Expected RUNTIME failure: the parent journal never carries
+/// the exact PermissionRequired chip for the delegated agent.
+#[tokio::test]
+async fn child_permission_park_is_visible_in_the_parent_chip_journal() {
+    let harness = start_permission_child(
+        "permission-chip",
+        PermissionChildMode::Complete,
+        Duration::from_secs(30),
+    )
+    .await;
+    wait_for_chip(
+        &harness.store,
+        &harness.parent_session,
+        &harness.child.agent_id,
+        ChipState::PermissionRequired,
+    )
+    .await;
+
+    harness.manager.shutdown().await.expect("manager shutdown");
+    harness.hub.shutdown().await.expect("hub shutdown");
+    harness.store.close().await.expect("store close");
+}
+
+/// MUTATION CHECK: let the stall clock ignore a PermissionRequired park or
+/// leave supervision disabled after the park resolves. Expected RUNTIME
+/// failure: the child is nudged/cancelled before approval, or it never receives
+/// exactly one nudge and cancellation after unpark.
+#[tokio::test]
+async fn permission_park_pauses_stall_supervision_and_unpark_rearms_it() {
+    let harness = start_permission_child(
+        "permission-stall",
+        PermissionChildMode::StallAfterApproval,
+        Duration::from_millis(35),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(160)).await;
+    let parked_payloads = typed_payloads(
+        &harness
+            .store
+            .read(&harness.child.child_session_id, 0, 1024)
+            .await
+            .expect("parked child events"),
+    );
+    assert!(!parked_payloads.iter().any(|payload| matches!(
+        payload,
+        EventPayload::UserMessage { text, .. } if text == "report your status or conclude"
+    )));
+    assert!(
+        !parked_payloads
+            .iter()
+            .any(|payload| matches!(payload, EventPayload::RunState(RunState::Cancelled)))
+    );
+
+    let mut control = UdsControlClient::connect(harness.hub.clone()).await;
+    control
+        .attach_control(harness.child.child_session_id.clone())
+        .await;
+    control
+        .approve_once(
+            harness.child.child_session_id.clone(),
+            harness.menu.id.clone(),
+            harness.request_seq,
+            harness.store.worker_generation(),
+        )
+        .await;
+    wait_for_state(&harness.store, &harness.child.child_session_id, |state| {
+        *state == RunState::Cancelled
+    })
+    .await;
+    wait_for_state(&harness.store, &harness.parent_session, |state| {
+        *state == RunState::Done
+    })
+    .await;
+    let resumed_payloads = typed_payloads(
+        &harness
+            .store
+            .read(&harness.child.child_session_id, 0, 1024)
+            .await
+            .expect("resumed child events"),
+    );
+    assert_eq!(
+        resumed_payloads
+            .iter()
+            .filter(|payload| matches!(
+                payload,
+                EventPayload::UserMessage { text, .. }
+                    if text == "report your status or conclude"
+            ))
+            .count(),
+        1
+    );
+
+    control.close().await;
+    harness.manager.shutdown().await.expect("manager shutdown");
+    harness.hub.shutdown().await.expect("hub shutdown");
+    harness.store.close().await.expect("store close");
+}
+
+/// MUTATION CHECK: refuse Control attach to a normal child session, route the
+/// answer outside the live UDS menu CAS, or fail to wake the child's parked
+/// actor. Expected RUNTIME failure: attach/answer returns a typed error, the
+/// child never reaches Done, or the parent never collects the child's report.
+#[tokio::test]
+async fn control_attach_and_menu_answer_over_uds_complete_a_child_session() {
+    let harness = start_permission_child(
+        "permission-uds",
+        PermissionChildMode::Complete,
+        Duration::from_secs(30),
+    )
+    .await;
+    let mut control = UdsControlClient::connect(harness.hub.clone()).await;
+    control
+        .attach_control(harness.child.child_session_id.clone())
+        .await;
+    control
+        .approve_once(
+            harness.child.child_session_id.clone(),
+            harness.menu.id.clone(),
+            harness.request_seq,
+            harness.store.worker_generation(),
+        )
+        .await;
+    wait_for_state(&harness.store, &harness.child.child_session_id, |state| {
+        *state == RunState::Done
+    })
+    .await;
+    wait_for_state(&harness.store, &harness.parent_session, |state| {
+        *state == RunState::Done
+    })
+    .await;
+    let parent_payloads = typed_payloads(
+        &harness
+            .store
+            .read(&harness.parent_session, 0, 1024)
+            .await
+            .expect("parent collected events"),
+    );
+    assert!(parent_payloads.iter().any(|payload| matches!(
+        payload,
+        EventPayload::AgentReport(report)
+            if report.agent == harness.child.agent_id
+                && report.summary == "child continued after permission"
+    )));
+
+    control.close().await;
+    harness.manager.shutdown().await.expect("manager shutdown");
+    harness.hub.shutdown().await.expect("hub shutdown");
+    harness.store.close().await.expect("store close");
 }
 
 /// MUTATION CHECK: remove the nudge step or allow a second nudge. Expected

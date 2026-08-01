@@ -72,6 +72,7 @@ pub enum ChipState {
     Tool,
     Waiting,
     InputRequired,
+    PermissionRequired,
     Done,
     Error,
     Closed,

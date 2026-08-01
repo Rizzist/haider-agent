@@ -3,6 +3,16 @@
 //! This is the only cross-session authority reachable from a parent tool.
 //! It exposes typed spawn/collect operations, never a raw store or child
 //! session address.
+//!
+//! # Sequential spawn contract
+//!
+//! The codex responses-lite history contract admits one tool call per provider
+//! round and requires that call's result to remain paired with the call in the
+//! next request. A spawn round therefore parks in `Waiting(LocalChild)` until
+//! the coordinator has the child's report; only then does core journal the
+//! tool result and acknowledge collection. Do not "parallelize" this by
+//! acknowledging spawn before the report: that would advance provider history
+//! without the result paired to the call that created the child.
 
 use crate::session_hub::SessionHub;
 use haider_core::{
@@ -14,13 +24,16 @@ use haider_protocol::agent::{
     AgentManifest, AgentRole, ChildReport, ChipState, Grant, Placement, ReportVerification,
 };
 use haider_protocol::effect::EffectClass;
+use haider_protocol::envelope::{
+    EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
+};
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::{AgentId, EventId, ItemId, LeaseId, RunId, SessionId};
 use haider_protocol::item::{ItemEvent, TurnItem};
 use haider_protocol::session::SessionMetadataV1;
 use haider_protocol::state::RunState;
 use haider_tools::SpawnSubagent;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -258,6 +271,7 @@ impl DelegationHandle {
         ticket: &DeferredTicket,
         cancel: &CancelToken,
     ) -> Result<DeferredToolResult, HaiderError> {
+        let mut chip_mirror = self.load_chip_mirror(ticket).await?;
         loop {
             let record = self
                 .hub
@@ -270,6 +284,8 @@ impl DelegationHandle {
                         false,
                     )
                 })?;
+            self.mirror_child_chip_states(&record, &mut chip_mirror)
+                .await?;
             if let Some(report) = record.report {
                 let chip = if report.verified == ReportVerification::Red {
                     ChipState::Error
@@ -301,7 +317,7 @@ impl DelegationHandle {
                 });
             }
             let progress = self.delegation_progress(&record).await?;
-            if !progress.input_required {
+            if !progress.human_required {
                 match progress.nudge {
                     None if deadline_elapsed(progress.latest_at_ms, self.stall_deadline) => {
                         self.nudge(&record).await?;
@@ -535,7 +551,7 @@ impl DelegationHandle {
         let mut progress = DelegationProgress {
             latest_at_ms: direct.latest_at_ms,
             nudge: direct.nudge,
-            input_required: matches!(
+            human_required: matches!(
                 direct.state,
                 Some(RunState::InputRequired { .. } | RunState::PermissionRequired { .. })
             ),
@@ -560,7 +576,7 @@ impl DelegationHandle {
         while let Some(descendant) = pending.pop_front() {
             let child = self.session_progress(&descendant).await?;
             progress.latest_at_ms = progress.latest_at_ms.max(child.latest_at_ms);
-            progress.input_required |= matches!(
+            progress.human_required |= matches!(
                 child.state,
                 Some(RunState::InputRequired { .. } | RunState::PermissionRequired { .. })
             );
@@ -581,6 +597,115 @@ impl DelegationHandle {
             }
         }
         Ok(progress)
+    }
+
+    async fn load_chip_mirror(&self, ticket: &DeferredTicket) -> Result<ChipMirror, HaiderError> {
+        let record = self
+            .hub
+            .delegation(ticket.manifest.agent.clone())
+            .await?
+            .ok_or_else(|| {
+                HaiderError::new(
+                    ErrorCode::StoreCorrupt,
+                    "deferred ticket has no durable delegation",
+                    false,
+                )
+            })?;
+        let mut cursor = 0;
+        let mut projected_events = HashSet::new();
+        let mut last_chip = None;
+        loop {
+            let page = self
+                .hub
+                .read_internal_session(&record.parent_session_id, cursor, 256)
+                .await?;
+            if page.is_empty() {
+                break;
+            }
+            cursor = page.last().map_or(cursor, |envelope| envelope.seq);
+            for envelope in page {
+                if envelope
+                    .event_id
+                    .as_str()
+                    .starts_with(&format!("delegation-chip-{}-", record.agent_id.as_str()))
+                {
+                    projected_events.insert(envelope.event_id.as_str().to_owned());
+                }
+                if envelope.run_id.as_ref() != Some(&record.parent_run_id) {
+                    continue;
+                }
+                if let Ok(haider_protocol::EventPayload::AgentChipState { agent, chip }) =
+                    serde_json::from_value::<haider_protocol::EventPayload>(envelope.payload)
+                    && agent == record.agent_id
+                {
+                    last_chip = Some(chip);
+                }
+            }
+        }
+        Ok(ChipMirror {
+            child_cursor: 0,
+            projected_events,
+            last_chip,
+        })
+    }
+
+    async fn mirror_child_chip_states(
+        &self,
+        record: &DelegationRecord,
+        mirror: &mut ChipMirror,
+    ) -> Result<(), HaiderError> {
+        loop {
+            let page = self
+                .hub
+                .read_internal_session(&record.child_session_id, mirror.child_cursor, 256)
+                .await?;
+            if page.is_empty() {
+                return Ok(());
+            }
+            let next_cursor = page
+                .last()
+                .map_or(mirror.child_cursor, |envelope| envelope.seq);
+            let mut projections = Vec::new();
+            for envelope in page {
+                if envelope.run_id.as_ref() != Some(&record.child_run_id) {
+                    continue;
+                }
+                let Ok(haider_protocol::EventPayload::RunState(state)) =
+                    serde_json::from_value::<haider_protocol::EventPayload>(envelope.payload)
+                else {
+                    continue;
+                };
+                let Some(chip) = chip_for_run_state(&state) else {
+                    continue;
+                };
+                let event_id = format!(
+                    "delegation-chip-{}-{}",
+                    record.agent_id.as_str(),
+                    envelope.seq
+                );
+                if mirror.projected_events.contains(&event_id) {
+                    mirror.last_chip = Some(chip);
+                    continue;
+                }
+                if mirror.last_chip.as_ref() == Some(&chip) {
+                    continue;
+                }
+                projections.push(chip_projection_envelope(
+                    record,
+                    &event_id,
+                    envelope.event_id,
+                    chip.clone(),
+                    self.hub.device_id(),
+                    self.hub.worker_generation(),
+                )?);
+                mirror.projected_events.insert(event_id);
+                mirror.last_chip = Some(chip);
+            }
+            if !projections.is_empty() {
+                self.hub.append(&mut projections).await?;
+            }
+            mirror.child_cursor = next_cursor;
+        }
     }
 
     async fn session_progress(
@@ -711,7 +836,13 @@ struct SessionProgress {
 struct DelegationProgress {
     latest_at_ms: u64,
     nudge: Option<(u64, u64)>,
-    input_required: bool,
+    human_required: bool,
+}
+
+struct ChipMirror {
+    child_cursor: u64,
+    projected_events: HashSet<String>,
+    last_chip: Option<ChipState>,
 }
 
 #[derive(Clone, Copy)]
@@ -738,6 +869,60 @@ fn deadline_elapsed(committed_at_ms: u64, deadline: Duration) -> bool {
         .as_millis();
     let committed_at_ms = u128::from(committed_at_ms);
     now_ms.saturating_sub(committed_at_ms) >= deadline.as_millis()
+}
+
+fn chip_for_run_state(state: &RunState) -> Option<ChipState> {
+    match state {
+        RunState::Streaming => Some(ChipState::Streaming),
+        RunState::RunningTool => Some(ChipState::Tool),
+        RunState::InputRequired { .. } => Some(ChipState::InputRequired),
+        RunState::PermissionRequired { .. } => Some(ChipState::PermissionRequired),
+        RunState::Done | RunState::Errored | RunState::Cancelled => None,
+        RunState::Queued
+        | RunState::Thinking
+        | RunState::Waiting { .. }
+        | RunState::Compacting
+        | RunState::Verifying { .. }
+        | RunState::Concluding
+        | RunState::EffectOutcomeUnknown
+        | RunState::Cancelling => Some(ChipState::Thinking),
+    }
+}
+
+fn chip_projection_envelope(
+    record: &DelegationRecord,
+    event_id: &str,
+    causation_id: EventId,
+    chip: ChipState,
+    device_id: haider_protocol::ids::DeviceId,
+    worker_generation: u64,
+) -> Result<RawEnvelope, HaiderError> {
+    let payload = serde_json::to_value(haider_protocol::EventPayload::AgentChipState {
+        agent: record.agent_id.clone(),
+        chip,
+    })
+    .map_err(internal_serialization)?;
+    Ok(EventEnvelope {
+        schema_version: SCHEMA_VERSION,
+        event_id: EventId::new(event_id),
+        seq: 0,
+        session_id: record.parent_session_id.clone(),
+        branch_id: None,
+        run_id: Some(record.parent_run_id.clone()),
+        agent_id: record.parent_agent_id.clone(),
+        device_id,
+        authority_epoch: 0,
+        worker_generation,
+        causation_id: Some(causation_id),
+        correlation_id: None,
+        committed_at_ms: 0,
+        render: RenderTargets {
+            ui: true,
+            durable: true,
+            prompt: PromptRender::Omit,
+        },
+        payload,
+    })
 }
 
 fn stable_digest(parts: &[&str]) -> String {
