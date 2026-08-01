@@ -842,10 +842,15 @@ async fn dropping_process_execution_cancels_and_kills_the_child_group() {
     }
     drop(execution);
     tokio::time::sleep(Duration::from_millis(80)).await;
-    let stopped_size = fs::metadata(&heartbeat).expect("heartbeat metadata").len();
+    // Under gate load the kill can land before the child ever CREATES the
+    // heartbeat file — absence is the strongest form of "not running"
+    // (NotFound reads as size 0; a live child would create and grow it).
+    let heartbeat_len =
+        |path: &std::path::Path| fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+    let stopped_size = heartbeat_len(&heartbeat);
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(
-        fs::metadata(&heartbeat).expect("heartbeat metadata").len(),
+        heartbeat_len(&heartbeat),
         stopped_size,
         "dropped execution left the child group running"
     );
