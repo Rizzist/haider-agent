@@ -1709,12 +1709,9 @@ async fn begin_flow(inner: Arc<CoordinatorInner>, job: StartJob) {
     let state_b64 = Zeroizing::new(URL_SAFE_NO_PAD.encode(state.as_slice()));
     let nonce_b64 = Zeroizing::new(URL_SAFE_NO_PAD.encode(nonce.as_slice()));
     let callback_segment = Zeroizing::new(URL_SAFE_NO_PAD.encode(callback_random.as_slice()));
-    let callback_path = Zeroizing::new(format!("/oauth/callback/{}", callback_segment.as_str()));
-    let redirect_uri = Zeroizing::new(format!(
-        "http://127.0.0.1:{}{}",
-        bound.port(),
-        callback_path.as_str()
-    ));
+    let (path, uri) = compose_redirect(&job.provider, bound.port(), callback_segment.as_str());
+    let callback_path = Zeroizing::new(path);
+    let redirect_uri = Zeroizing::new(uri);
     let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier_b64.as_bytes()));
     let authorization_url = {
         let mut authorization = url::form_urlencoded::Serializer::new(SecretFormBody::new(
@@ -2365,6 +2362,29 @@ async fn scrub_source_chunks(mut pending: Vec<bytes::Bytes>) -> usize {
         tokio::task::yield_now().await;
     }
     pending.len()
+}
+
+/// The per-provider redirect shape. Claude Code parity (owner bug):
+/// Anthropic's client allowlist accepts ONLY
+/// `http://localhost:<port>/callback` — the hardened random path segment
+/// is rejected with "Redirect URI … not supported by client". CSRF stays
+/// covered by `state` + PKCE, and the per-flow PORT still discriminates
+/// flows; every other provider keeps the hardened random-path shape.
+pub(crate) fn compose_redirect(
+    provider: &str,
+    port: u16,
+    hardened_segment: &str,
+) -> (String, String) {
+    if provider == haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME {
+        (
+            "/callback".to_owned(),
+            format!("http://localhost:{port}/callback"),
+        )
+    } else {
+        let path = format!("/oauth/callback/{hardened_segment}");
+        let uri = format!("http://127.0.0.1:{port}{path}");
+        (path, uri)
+    }
 }
 
 async fn bounded_jwks_response(

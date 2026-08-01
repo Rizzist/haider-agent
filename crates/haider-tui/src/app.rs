@@ -5779,7 +5779,16 @@ impl AppModel {
             Hit::AccountRow(alias) if self.screen == Screen::Accounts => {
                 self.select_account(&alias);
             }
-            Hit::AccountAdd(kind) if self.screen == Screen::Accounts => {
+            Hit::AccountAdd(kind)
+                if matches!(self.screen, Screen::Accounts | Screen::Providers) =>
+            {
+                // From /providers the add flow lives on /accounts (the
+                // cards and their keyboard ownership are that screen's) —
+                // jump first, then open (owner ask: providers offers the
+                // same add options).
+                if self.screen == Screen::Providers {
+                    self.enter_accounts();
+                }
                 self.accounts.message = None;
                 match kind {
                     // API-key adds ride the existing masked LoginCard flow

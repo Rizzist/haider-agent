@@ -369,6 +369,12 @@ pub enum LiveReply {
         session: SessionId,
         snapshot: Box<haider_protocol::tool::ToolInventorySnapshot>,
     },
+    /// A `provider.models_refresh` failed — lands on the provider ROW
+    /// (availability reason), never the status-bar flash.
+    ModelsRefreshFailed {
+        provider: String,
+        message: String,
+    },
     /// `account.remove` committed.
     AccountRemoved {
         command_id: CommandId,
@@ -1107,6 +1113,16 @@ impl LiveDriver {
                     model.tools_inventory = Some(*snapshot);
                     model.dirty = true;
                 }
+                Vec::new()
+            }
+            LiveReply::ModelsRefreshFailed { provider, message } => {
+                for summary in &mut model.providers.providers {
+                    if summary.provider == provider {
+                        summary.availability = haider_rpc::ProviderAvailabilityWire::Unavailable;
+                        summary.availability_reason = Some(message.clone());
+                    }
+                }
+                model.dirty = true;
                 Vec::new()
             }
             LiveReply::AccountRemoved {

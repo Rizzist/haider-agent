@@ -574,7 +574,10 @@ fn run_jsonl_replays_every_envelope_to_a_slow_pipe_consumer() {
         bytes
     });
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // Cold daemon spawn + 500 provider rounds + drain on a loaded box
+    // regularly exceeds 5s — the LAW is termination + complete replay,
+    // not latency; the bound only guards a true wedge.
+    let deadline = Instant::now() + Duration::from_secs(30);
     let status = loop {
         if let Some(status) = child.try_wait().expect("poll child") {
             break status;

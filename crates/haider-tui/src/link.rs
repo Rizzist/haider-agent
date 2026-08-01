@@ -450,6 +450,11 @@ pub struct CommandContext {
     /// id, so without this a failure cannot be correlated back to the
     /// session it wedged (review P1-5).
     attach: Option<haider_protocol::ids::SessionId>,
+    /// The provider a `provider.models_refresh` was for — the request has
+    /// no durable id, and its failure must land on the PROVIDER ROW, not
+    /// the status-bar flash (owner bug: boot-time auto-refresh of a dead
+    /// probe provider flashed `provider_error` at the launcher).
+    models_provider: Option<String>,
 }
 
 impl CommandContext {
@@ -484,6 +489,10 @@ impl CommandContext {
                 _ => None,
             },
             oauth_attempt,
+            models_provider: match command {
+                LiveCommand::RefreshProviderModels { provider } => Some(provider.clone()),
+                _ => None,
+            },
             attach: match command {
                 LiveCommand::Attach { session, .. } => Some(session.clone()),
                 _ => None,
@@ -915,6 +924,12 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
                     return vec![LiveReply::OAuthStartFailed {
                         attempt_id,
                         code: code.clone(),
+                        message: message.clone(),
+                    }];
+                }
+                if let Some(provider) = context.models_provider.clone() {
+                    return vec![LiveReply::ModelsRefreshFailed {
+                        provider,
                         message: message.clone(),
                     }];
                 }

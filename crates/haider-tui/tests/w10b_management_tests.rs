@@ -268,3 +268,97 @@ fn cards_opened_from_providers_render_on_the_providers_screen() {
         "the HF preset card is visible on /providers"
     );
 }
+
+/// MUTATION CHECK: route a `provider.models_refresh` failure back to the
+/// generic flash (drop the models context tag). Expected RUNTIME failure:
+/// the flash assertion below (owner bug: boot-time auto-refresh of a dead
+/// probe provider flashed `provider_error` at the launcher).
+#[test]
+fn models_refresh_failure_lands_on_the_provider_row_never_the_flash() {
+    let mut model = live_model();
+    let mut driver = LiveDriver::new("test");
+    model
+        .providers
+        .apply_snapshot(vec![provider_summary("probefix")], 3);
+    model.flash = None;
+    pass(
+        &mut driver,
+        &mut model,
+        Some(LiveReply::ModelsRefreshFailed {
+            provider: "probefix".into(),
+            message: "provider does not expose a subscription model catalog".into(),
+        }),
+    );
+    assert!(
+        model.flash.is_none(),
+        "no status-bar flash: {:?}",
+        model.flash
+    );
+    let row = model
+        .providers
+        .providers
+        .iter()
+        .find(|summary| summary.provider == "probefix")
+        .expect("row");
+    assert_eq!(
+        row.availability,
+        haider_rpc::ProviderAvailabilityWire::Unavailable
+    );
+    assert!(
+        row.availability_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("subscription model catalog")),
+        "the reason lands on the ROW"
+    );
+}
+
+/// MUTATION CHECK: drop the providers-screen button row or the
+/// Providers-screen `Hit::AccountAdd` arm. Expected RUNTIME failure: the
+/// render or the jump-and-open assertion below (owner ask: /providers
+/// offers the same add options as /accounts).
+#[test]
+fn providers_screen_offers_account_add_and_jumps_to_accounts() {
+    use haider_tui::app::Hit;
+    use haider_tui::render::render;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let mut model = live_model();
+    model
+        .daemon_features
+        .insert(haider_rpc::FEATURE_ACCOUNT_OAUTH_PKCE_V1.to_owned());
+    model.providers.apply_snapshot(Vec::new(), 1);
+    model.screen = Screen::Providers;
+
+    let backend = TestBackend::new(130, 45);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    let mut hits = Vec::new();
+    terminal
+        .draw(|frame| {
+            hits = render(&model, frame);
+        })
+        .expect("draw");
+    let buffer = terminal.backend().buffer().clone();
+    let mut text = String::new();
+    for y in 0..buffer.area.height {
+        for x in 0..buffer.area.width {
+            text.push_str(buffer[(x, y)].symbol());
+        }
+        text.push('\n');
+    }
+    assert!(
+        text.contains("+ Anthropic (OAuth)") && text.contains("+ HuggingFace"),
+        "the add buttons render on /providers"
+    );
+    assert!(
+        hits.iter()
+            .any(|(_, hit)| matches!(hit, Hit::AccountAdd(_))),
+        "the buttons carry hit regions"
+    );
+
+    model.handle_hit(Hit::AccountAdd(
+        haider_tui::app::AccountAddKind::OpenAiOAuth,
+    ));
+    assert_eq!(model.screen, Screen::Accounts, "the add flow jumps home");
+    assert!(model.oauth_add.is_some(), "and opens the card");
+}

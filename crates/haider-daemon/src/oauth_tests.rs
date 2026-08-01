@@ -3561,3 +3561,20 @@ async fn late_refresh_failure_cannot_expire_a_newer_same_alias_generation() {
     assert_eq!(stored.generation, 9);
     assert_eq!(stored.access_token(), b"NEWER_ACCESS_AFTER_FAILURE_12a9");
 }
+
+/// MUTATION CHECK: collapse the per-provider redirect branch (every
+/// provider hardened, or every provider parity). Expected RUNTIME
+/// failure: one of the two exact shapes below.
+#[test]
+fn anthropic_redirect_is_claude_code_parity_and_others_stay_hardened() {
+    let (path, uri) = compose_redirect(
+        haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME,
+        58820,
+        "SEGMENT",
+    );
+    assert_eq!(path, "/callback");
+    assert_eq!(uri, "http://localhost:58820/callback");
+    let (path, uri) = compose_redirect("openai-oauth", 58820, "SEGMENT");
+    assert_eq!(path, "/oauth/callback/SEGMENT");
+    assert_eq!(uri, "http://127.0.0.1:58820/oauth/callback/SEGMENT");
+}

@@ -886,6 +886,60 @@ fn push_custom_card_lines<'a>(model: &'a AppModel, theme: &Theme, lines_out: &mu
     }
 }
 
+/// The account add-button rows (OAuth/API/HF/custom) with per-button
+/// relative hit rects — shared by /accounts and /providers (owner ask:
+/// providers should offer the SAME add options in place).
+fn push_account_add_buttons<'a>(
+    model: &'a AppModel,
+    theme: &Theme,
+    lines_out: &mut Vec<Line<'a>>,
+    rects_out: &mut Vec<(usize, u16, u16, Hit)>,
+) {
+    for chunk in [
+        [
+            ("+ OpenAI (OAuth)", crate::app::AccountAddKind::OpenAiOAuth),
+            (
+                "+ Anthropic (OAuth)",
+                crate::app::AccountAddKind::AnthropicOAuth,
+            ),
+            ("+ OpenAI (API)", crate::app::AccountAddKind::OpenAiApi),
+        ],
+        [
+            (
+                "+ Anthropic (API)",
+                crate::app::AccountAddKind::AnthropicApi,
+            ),
+            ("+ HuggingFace", crate::app::AccountAddKind::HuggingFace),
+            (
+                "+ Custom (OpenAI-compatible)",
+                crate::app::AccountAddKind::Custom,
+            ),
+        ],
+    ] {
+        // One hit per BUTTON: per-button column rects, hover-aware (owner
+        // ask): the hovered button renders on the hover band.
+        let mut spans: Vec<Span<'_>> = Vec::new();
+        let mut offset = 0u16;
+        for (label, kind) in chunk {
+            let hit = Hit::AccountAdd(kind);
+            let hovered = model.hovered.as_ref() == Some(&hit);
+            let width = label.chars().count() as u16 + 2;
+            rects_out.push((lines_out.len(), offset, width, hit));
+            spans.push(Span::styled(
+                format!("[{label}]"),
+                if hovered {
+                    theme.hover_style().patch(theme.gold_style())
+                } else {
+                    theme.gold_style()
+                },
+            ));
+            spans.push(Span::raw("  "));
+            offset += width + 2;
+        }
+        lines_out.push(Line::from(spans));
+    }
+}
+
 fn render_accounts(
     model: &AppModel,
     theme: &Theme,
@@ -1107,49 +1161,7 @@ fn render_accounts(
     // = the editable name/origin fields (the provider.configure front
     // door).
     push_custom_card_lines(model, theme, &mut footer_lines);
-    for chunk in [
-        [
-            ("+ OpenAI (OAuth)", crate::app::AccountAddKind::OpenAiOAuth),
-            (
-                "+ Anthropic (OAuth)",
-                crate::app::AccountAddKind::AnthropicOAuth,
-            ),
-            ("+ OpenAI (API)", crate::app::AccountAddKind::OpenAiApi),
-        ],
-        [
-            (
-                "+ Anthropic (API)",
-                crate::app::AccountAddKind::AnthropicApi,
-            ),
-            ("+ HuggingFace", crate::app::AccountAddKind::HuggingFace),
-            (
-                "+ Custom (OpenAI-compatible)",
-                crate::app::AccountAddKind::Custom,
-            ),
-        ],
-    ] {
-        // One hit per BUTTON: per-button column rects, hover-aware (owner
-        // ask): the hovered button renders on the hover band.
-        let mut spans: Vec<Span<'_>> = Vec::new();
-        let mut offset = 0u16;
-        for (label, kind) in chunk {
-            let hit = Hit::AccountAdd(kind);
-            let hovered = model.hovered.as_ref() == Some(&hit);
-            let width = label.chars().count() as u16 + 2;
-            add_button_rects.push((footer_lines.len(), offset, width, hit));
-            spans.push(Span::styled(
-                format!("[{label}]"),
-                if hovered {
-                    theme.hover_style().patch(theme.gold_style())
-                } else {
-                    theme.gold_style()
-                },
-            ));
-            spans.push(Span::raw("  "));
-            offset += width + 2;
-        }
-        footer_lines.push(Line::from(spans));
-    }
+    push_account_add_buttons(model, theme, &mut footer_lines, &mut add_button_rects);
     footer_lines.push(Line::raw(""));
     footer_lines.push(Line::styled(
         "click an account to make it active · + adds via OAuth / API · x removes · esc back",
@@ -1370,6 +1382,8 @@ fn render_providers(
         lines.push(Line::raw(""));
     }
 
+    lines.push(Line::raw(""));
+    push_account_add_buttons(model, theme, &mut lines, &mut chip_hits);
     lines.push(Line::styled(
         "click a model to set the default · e edits · x removes · h HuggingFace · esc back",
         theme.faint_style(),
