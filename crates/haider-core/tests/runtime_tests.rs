@@ -488,8 +488,11 @@ fn image_footprint_uses_fixed_vision_estimate_not_base64_length() {
     let baseline = estimate_provider_request_input_tokens(&without_image, &None, &[], &[]);
 
     assert_eq!(tiny_estimate, large_estimate);
-    assert!(tiny_estimate >= baseline + VISION_IMAGE_ESTIMATE_TOKENS);
-    assert!(tiny_estimate < baseline + VISION_IMAGE_ESTIMATE_TOKENS + 128);
+    // LITERAL charge, not the constant: a self-referential assertion would
+    // follow a mutated constant to zero and blind the footprint to images.
+    assert_eq!(VISION_IMAGE_ESTIMATE_TOKENS, 1_600);
+    assert!(tiny_estimate >= baseline + 1_600);
+    assert!(tiny_estimate < baseline + 1_600 + 128);
 }
 
 /// MUTATION CHECK: ignore the reserved output budget when deriving the soft
