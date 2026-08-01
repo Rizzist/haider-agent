@@ -28,6 +28,13 @@ pub const COMMANDS: &[CommandSpec] = &[
         "",
     ),
     session_cmd("fork", "Fork the session at the current point", ""),
+    // B2b: branches are daemon truth — the picker lists, a name switches,
+    // `new` forks at the active branch's last committed node.
+    session_cmd(
+        "branch",
+        "Branches — list and switch; `new` forks at the last committed node",
+        "[new|name]",
+    ),
     cmd("sessions", "List sessions — attach, or start fresh", ""),
     cmd(
         "aura",
@@ -304,6 +311,7 @@ pub const HELP_TEXT: &[&str] = &[
     "  /theme [name]      dawn · ivory · dark",
     "  /tree              session tree — main-line view, ⏎ opens forks, f forks at a node",
     "  /fork              fork the session at the current point",
+    "  /branch [new|name] branches — numbered picker · direct switch · new forks at the last committed node",
     "  /sessions          list + switch sessions",
     "  /aura              Aura Mode — a voice/orchestrator session (spawns sessions, never codes) — demo only",
     "  /peers             reachability ladder — enrolled peers · sponsored SSH nodes · shell targets",

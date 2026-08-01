@@ -374,7 +374,11 @@ fn interrupt_drops_the_held_queue() {
         model.msg_queue.is_empty(),
         "sim tui.js:1557: interrupt clears"
     );
-    assert!(model.requests.contains(&AppRequest::Interrupt));
+    assert!(
+        model
+            .requests
+            .contains(&AppRequest::Interrupt { branch: None })
+    );
 }
 
 // ---- /voice + /tools cards (sim tui.js:1824-1906) ----

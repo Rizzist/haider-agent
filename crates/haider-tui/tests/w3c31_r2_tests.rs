@@ -542,7 +542,7 @@ fn live_esc_mid_turn_paints_nothing_the_daemon_did_not_commit() {
             || model
                 .requests
                 .iter()
-                .all(|request| matches!(request, AppRequest::Interrupt)),
+                .all(|request| matches!(request, AppRequest::Interrupt { .. })),
         "Esc raised at most the Interrupt request"
     );
     // DEMO still paints the settled interrupt locally (the sim's beat).

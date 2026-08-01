@@ -98,6 +98,7 @@ async fn pump_until(
 fn answer_chip_menu(model: &mut AppModel, menu: &str, index: u32) {
     model.outbox.push(haider_tui::app::OutboundAnswer {
         origin: model.ui_generation(),
+        branch: None,
         answer: MenuAnswer {
             menu: haider_protocol::ids::MenuId::new(menu),
             option_key: None,

@@ -55,6 +55,12 @@ pub struct SessionState {
     pub dir: String,
     pub projection: SessionProjection,
     pub chips: Vec<ChipModel>,
+    /// This session's branch registry, active-branch selection, warm parked
+    /// views and fork-coordinate tracker (B2b m1). The `projection`/`chips`
+    /// fields above always hold the ACTIVE branch's surfaces — plus the
+    /// session-global replay cursor, which switching transplants rather
+    /// than duplicates (one cursor, research risk 3).
+    pub branch_state: crate::branch::BranchState,
     pub msg_queue: Vec<String>,
     pub queue_mode: bool,
     /// This session's turn engine is mid-turn (the per-session slice of
@@ -67,7 +73,11 @@ pub struct SessionState {
     pub model_short: String,
     pub device: String,
     pub ago: String,
-    pub branches: u32,
+    /// The seed's advertised branch count (main included) — a display
+    /// static exactly like [`Self::turns_offset`]. The LIVE branch count is
+    /// DERIVED by [`Self::branches`] from the registry, never stored (B2b
+    /// brief item 1: no scalar copy).
+    pub branches_offset: u32,
     /// The seed's advertised turn count minus its seed transcript's user
     /// rows, so a row displays `offset + live user rows` and seeds keep
     /// their sim metas while real turns still move the number.
@@ -89,6 +99,7 @@ impl SessionState {
             dir: String::new(),
             projection: SessionProjection::new(),
             chips: Vec::new(),
+            branch_state: crate::branch::BranchState::default(),
             msg_queue: Vec::new(),
             queue_mode: false,
             turn_active: false,
@@ -98,16 +109,28 @@ impl SessionState {
             model_short: String::new(),
             device: String::new(),
             ago: String::new(),
-            branches: 1,
+            branches_offset: 1,
             turns_offset: 0,
         }
     }
 
     /// Live subagents in this session's tree (sim `sessionLive`,
-    /// tui.js:325-329).
+    /// tui.js:325-329) — EVERY branch's, not only the displayed one: the
+    /// launcher aggregate counts all branches (B2b law), so an
+    /// inactive-branch child keeps the row hot without leaking its chip
+    /// into another branch's view.
     #[must_use]
     pub fn live(&self) -> usize {
-        crate::app::tree_live_count(&self.chips)
+        crate::app::tree_live_count(&self.chips) + self.branch_state.parked_live()
+    }
+
+    /// Branch count for the launcher row: the seed static (main included)
+    /// plus every DAEMON-installed named branch — derived, never a stored
+    /// copy of live branch state (B2b brief item 1).
+    #[must_use]
+    pub fn branches(&self) -> u32 {
+        self.branches_offset
+            .saturating_add(u32::try_from(self.branch_state.named_count()).unwrap_or(u32::MAX))
     }
 
     /// Sim `sessionBusy` (tui.js:789-792): live chips OR a non-terminal
@@ -144,6 +167,12 @@ impl SessionState {
     /// only then reduces. A gap stops reduction with the cursor unmoved so
     /// the caller can reattach after the last fully applied sequence BEFORE
     /// any later envelope mutates state.
+    ///
+    /// B2b: the branch command-state hooks (fork-coordinate tracker, branch
+    /// registry) run for `Apply` AND `Skip` — command coordinates are not
+    /// display state, so `render.ui == false` records them while still
+    /// painting nothing. Content then routes type-first (aggregates
+    /// session-global), then branch, then agent.
     pub fn absorb_raw(&mut self, envelope: &RawEnvelope) -> RawOutcome {
         if envelope.session_id != self.id {
             return RawOutcome::WrongSession;
@@ -151,15 +180,88 @@ impl SessionState {
         match self.projection.admit(envelope) {
             Admission::Duplicate => RawOutcome::Duplicate,
             Admission::Gap { after_seq } => RawOutcome::Gap { after_seq },
-            Admission::Skip => RawOutcome::Applied,
-            Admission::Apply => {
-                match serde_json::from_value::<EventPayload>(envelope.payload.clone()) {
-                    Ok(payload) => self.absorb_scoped(&payload, envelope.agent_id.as_ref()),
-                    Err(_) => self.projection.count_unknown_payload(),
+            admission @ (Admission::Skip | Admission::Apply) => {
+                let note = self.branch_state.note_admitted(envelope);
+                if let crate::branch::AdmittedNote::BranchInstalled(id) = &note {
+                    // The fork this session itself issued: the receipt is
+                    // already in and armed activation — the JOURNAL fact is
+                    // what installs and activates (daemon truth first).
+                    let id = id.clone();
+                    if self.branch_state.take_pending_activation(&id) {
+                        self.switch_branch(Some(&id));
+                    }
+                }
+                if matches!(note, crate::branch::AdmittedNote::Content)
+                    && admission == Admission::Apply
+                {
+                    match serde_json::from_value::<EventPayload>(envelope.payload.clone()) {
+                        Ok(payload) => self.route_admitted(
+                            &payload,
+                            envelope.branch_id.as_ref(),
+                            envelope.agent_id.as_ref(),
+                        ),
+                        Err(_) => self.projection.count_unknown_payload(),
+                    }
                 }
                 RawOutcome::Applied
             }
         }
+    }
+
+    /// Route one admitted content payload: aggregate session-scope types
+    /// FIRST (risk 6), then branch (outer), then agent — the background
+    /// half; `AppModel::route_admitted` is the attached twin.
+    fn route_admitted(
+        &mut self,
+        payload: &EventPayload,
+        branch: Option<&haider_protocol::ids::BranchId>,
+        agent: Option<&AgentId>,
+    ) {
+        use crate::branch::BranchScope;
+        match self.branch_state.scope_of(payload, branch) {
+            BranchScope::Aggregate => {
+                self.branch_state.apply_aggregate_to_parked(payload);
+                self.absorb_envelope(payload);
+            }
+            BranchScope::Active => self.absorb_scoped(payload, agent),
+            BranchScope::ParkedMain => {
+                self.note_parked_turn(payload);
+                if let Some(view) = self.branch_state.parked_main_mut() {
+                    crate::branch::absorb_into_view(view, payload, agent);
+                }
+            }
+            BranchScope::ParkedNamed(id) => {
+                self.note_parked_turn(payload);
+                if let Some(view) = self.branch_state.view_mut(&id) {
+                    crate::branch::absorb_into_view(view, payload, agent);
+                }
+            }
+            BranchScope::Orphan => self.branch_state.count_orphan(),
+        }
+    }
+
+    /// Session-wide run bookkeeping for INACTIVE-branch content: run
+    /// execution is session-wide (research Q2 keeps the sim's policy), so a
+    /// turn on any branch flips this session's busy state — its DISPLAY
+    /// stays in that branch's view.
+    fn note_parked_turn(&mut self, payload: &EventPayload) {
+        if let EventPayload::UserMessage { .. } = payload {
+            self.turn_active = true;
+        }
+        if let EventPayload::RunState(state) = payload
+            && state.is_terminal()
+        {
+            self.turn_active = false;
+            self.auto_resuming = false;
+        }
+    }
+
+    /// Switch this background session's displayed branch — the slot twin of
+    /// `AppModel::switch_branch` (no scroll/menu chrome to reset here).
+    pub fn switch_branch(&mut self, target: Option<&haider_protocol::ids::BranchId>) -> bool {
+        self.branch_state
+            .switch(target, &mut self.projection, &mut self.chips)
+            == crate::branch::SwitchOutcome::Switched
     }
 
     /// One admitted payload, routed by SCOPE (report R11 cut 2) — the

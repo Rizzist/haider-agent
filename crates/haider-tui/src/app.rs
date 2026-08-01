@@ -1367,6 +1367,11 @@ pub enum AppRequest {
         text: String,
         voice: bool,
         title: bool,
+        /// The branch CAPTURED AT ISSUANCE (B2b, research risk 4): a
+        /// submit queued before a later `/branch` switch still lands on
+        /// the branch it was typed on — never re-read from mutable
+        /// active-branch state downstream. `None` = legacy/main.
+        branch: Option<haider_protocol::ids::BranchId>,
     },
     /// Cancel EVERY session's and every chip's arms and clear all demo
     /// token meters — a GLOBAL reset, not a polite stop (renamed from
@@ -1378,9 +1383,28 @@ pub enum AppRequest {
     ResetAllSessions,
     /// Esc mid-turn: stop the playing script; the reducer already settled
     /// the projection into idle(i) (sim interrupt, tui.js:1551-1567).
-    Interrupt,
-    /// Manual `/compact` (sim tui.js:1791-1806).
-    Compact,
+    /// `branch` is captured at issuance (B2b) — client-side identity; the
+    /// wire cancel pins the run by its `run_id`.
+    Interrupt {
+        branch: Option<haider_protocol::ids::BranchId>,
+    },
+    /// Manual `/compact` (sim tui.js:1791-1806). `branch` is captured at
+    /// issuance (B2b): a later switch cannot retarget the compaction.
+    Compact {
+        branch: Option<haider_protocol::ids::BranchId>,
+    },
+    /// `/branch new [name]` (B2b): fork the session at EXACT captured
+    /// coordinates — session, source branch, and the source's last
+    /// committed node/seq from the fork-coordinate tracker. Receipt
+    /// correlation installs nothing; the daemon's `BranchCreated` journal
+    /// fact is the only branch materializer.
+    BranchCreate {
+        session: haider_protocol::ids::SessionId,
+        source_branch: Option<haider_protocol::ids::BranchId>,
+        fork_node_id: haider_protocol::ids::NodeId,
+        fork_seq: u64,
+        name: Option<String>,
+    },
     /// A drag selection finished (owner item 9): the RUNTIME extracts the
     /// selected text from its last-drawn frame and copies it (pbcopy, then
     /// OSC 52 — see [`crate::clipboard`]). A request because the reducer
@@ -1666,6 +1690,12 @@ pub enum AccountAddKind {
 #[derive(Debug, Clone, PartialEq)]
 pub struct OutboundAnswer {
     pub origin: UiGeneration,
+    /// The branch DISPLAYED when the user answered, captured at issuance
+    /// (B2b): client-side identity only — the wire answer resolves at the
+    /// menu's committed opening coordinates, and the daemon derives the
+    /// menu's branch from its opening envelope. A `/branch` switch between
+    /// answer and drain can therefore never retarget it.
+    pub branch: Option<haider_protocol::ids::BranchId>,
     pub answer: MenuAnswer,
 }
 
@@ -1868,6 +1898,14 @@ pub struct AppModel {
     pub launcher_shellout: Option<(String, String)>,
     /// The session's subagent chip tree (§2 — demo-local).
     pub chips: Vec<ChipModel>,
+    /// The ATTACHED session's branch state (B2b m1): registry, active
+    /// selection, warm parked views and the fork-coordinate tracker.
+    /// `projection`/`chips` always hold the ACTIVE branch's surfaces plus
+    /// the session-global cursor; a branch switch swaps surfaces and
+    /// transplants the cursor through ONE authority
+    /// ([`Self::switch_branch`]), and the session checkout swaps this
+    /// struct whole (the A→B→A law).
+    pub branch_state: crate::branch::BranchState,
     /// The chip path the subagent screen is viewing (breadcrumb).
     pub view_path: Vec<String>,
     /// The SubTree header collapse toggle (`▾`/`▸ subagents`).
@@ -2056,6 +2094,7 @@ impl Default for AppModel {
             vfs: vfs_seed(),
             launcher_shellout: None,
             chips: Vec::new(),
+            branch_state: crate::branch::BranchState::default(),
             view_path: Vec::new(),
             subtree_collapsed: false,
             todos_collapsed: false,
@@ -2967,7 +3006,9 @@ impl AppModel {
                     self.turn_active = false;
                     self.listening = false;
                     self.msg_queue.clear();
-                    self.requests.push(AppRequest::Interrupt);
+                    self.requests.push(AppRequest::Interrupt {
+                        branch: self.branch_state.active().cloned(),
+                    });
                     // LIVE (W3c3.1 r2): the cancellation is the DAEMON's to
                     // commit. Painting `Cancelled` + the note here says the
                     // run ended before `turn.cancel` has even been sent —
@@ -3190,6 +3231,7 @@ impl AppModel {
             };
             self.outbox.push(OutboundAnswer {
                 origin: self.ui_generation(),
+                branch: self.branch_state.active().cloned(),
                 answer,
             });
             self.dirty = true;
@@ -3272,6 +3314,9 @@ impl AppModel {
                     text,
                     voice: false,
                     title: false,
+                    // Captured at issuance (B2b): a later switch cannot
+                    // retarget this mid-turn delivery.
+                    branch: self.branch_state.active().cloned(),
                 });
                 return;
             }
@@ -3324,6 +3369,7 @@ impl AppModel {
             text,
             voice: false,
             title,
+            branch: self.branch_state.active().cloned(),
         });
     }
 
@@ -3523,6 +3569,7 @@ impl AppModel {
                     text,
                     voice: true,
                     title: self.session_title.is_none(),
+                    branch: self.branch_state.active().cloned(),
                 }),
             }
             return;
@@ -3541,6 +3588,7 @@ impl AppModel {
             text,
             voice: true,
             title,
+            branch: self.branch_state.active().cloned(),
         });
     }
 
@@ -4664,6 +4712,7 @@ impl AppModel {
         };
         self.outbox.push(OutboundAnswer {
             origin: self.ui_generation(),
+            branch: self.branch_state.active().cloned(),
             answer: MenuAnswer {
                 menu: menu.id.clone(),
                 option_key: Some(option.key.clone()),
@@ -4916,6 +4965,7 @@ impl AppModel {
                     self.flash = Some("· /tree — session only".to_owned());
                 }
             }
+            "branch" => self.branch_command(&remainder),
             "compact" => {
                 // Manual compaction (sim tui.js:1791-1806). Adapted gate:
                 // the sim's single-threaded state writes tolerate /compact
@@ -4933,7 +4983,11 @@ impl AppModel {
                     } else if self.turn_active {
                         self.flash = Some("· /compact — wait for the turn to end".to_owned());
                     } else {
-                        self.requests.push(AppRequest::Compact);
+                        self.requests.push(AppRequest::Compact {
+                            // Captured at issuance (B2b): compaction stays
+                            // on the branch the user asked from.
+                            branch: self.branch_state.active().cloned(),
+                        });
                     }
                 } else if self.screen != Screen::Session {
                     self.flash = Some("· /compact — session only".to_owned());
@@ -4941,7 +4995,9 @@ impl AppModel {
                     self.flash = Some("· /compact — wait for the turn to end".to_owned());
                 } else {
                     self.turn_active = true;
-                    self.requests.push(AppRequest::Compact);
+                    self.requests.push(AppRequest::Compact {
+                        branch: self.branch_state.active().cloned(),
+                    });
                 }
             }
             "queue" => {
@@ -5164,7 +5220,9 @@ impl AppModel {
             self.turn_active = false;
             self.listening = false;
             self.msg_queue.clear();
-            self.requests.push(AppRequest::Interrupt);
+            self.requests.push(AppRequest::Interrupt {
+                branch: self.branch_state.active().cloned(),
+            });
             if self.mode.fabricates_locally() {
                 let id = menu.id.clone();
                 self.projection.apply(&EventPayload::MenuClosed {
@@ -5207,6 +5265,28 @@ impl AppModel {
         let Some(option) = menu.options.get(self.menu_selection) else {
             return;
         };
+        // The `/branch` picker is REDUCER-LOCAL (B2b m2): its consequence
+        // is a display switch, so the reducer closes its own card and
+        // nothing rides the outbox — the D1-2 closable-card law holds in
+        // both modes.
+        if menu.id.as_str().starts_with(BRANCH_CARD_PREFIX) {
+            let menu_id = menu.id.clone();
+            let key = option.key.clone();
+            self.projection.apply(&EventPayload::MenuClosed {
+                menu: menu_id,
+                reason: MenuCloseReason::Dismissed,
+            });
+            self.menu_selection = 0;
+            let target = (key != "main").then(|| haider_protocol::ids::BranchId::new(key));
+            match self.switch_branch(target.as_ref()) {
+                Some(display) => self.flash = Some(format!("· branch → {display}")),
+                None => {
+                    self.flash = Some(format!("· already on {}", self.active_branch_name()));
+                }
+            }
+            self.dirty = true;
+            return;
+        }
         let answer = MenuAnswer {
             menu: menu.id.clone(),
             option_key: Some(option.key.clone()),
@@ -5216,6 +5296,7 @@ impl AppModel {
         };
         self.outbox.push(OutboundAnswer {
             origin: self.ui_generation(),
+            branch: self.branch_state.active().cloned(),
             answer,
         });
         self.menu_selection = 0;
@@ -5258,20 +5339,257 @@ impl AppModel {
     /// The ATTACHED session's half of [`Self::route_raw`]: the cursor lives
     /// on the checked-out projection, so it travels with checkout/checkin
     /// and no second cursor authority exists.
+    ///
+    /// B2b: the branch command-state hooks (fork-coordinate tracker, branch
+    /// registry) run for `Apply` AND `Skip` — they are command/topology
+    /// coordinates, not display state, so a `render.ui == false` envelope
+    /// records them while the display-never-mutates law keeps holding for
+    /// every display surface (both halves are pinned). Content then routes
+    /// type-first (aggregates session-global), then branch, then agent.
     fn absorb_raw_active(&mut self, envelope: &RawEnvelope) -> crate::projection::RawOutcome {
         use crate::projection::{Admission, RawOutcome};
         match self.projection.admit(envelope) {
             Admission::Duplicate => RawOutcome::Duplicate,
             Admission::Gap { after_seq } => RawOutcome::Gap { after_seq },
-            Admission::Skip => RawOutcome::Applied,
-            Admission::Apply => {
-                match serde_json::from_value::<EventPayload>(envelope.payload.clone()) {
-                    Ok(payload) => self.absorb_scoped(&payload, envelope.agent_id.as_ref()),
-                    Err(_) => self.projection.count_unknown_payload(),
+            admission @ (Admission::Skip | Admission::Apply) => {
+                let note = self.branch_state.note_admitted(envelope);
+                if let crate::branch::AdmittedNote::BranchInstalled(id) = &note {
+                    // The daemon's journal fact is the ONLY materializer;
+                    // if OUR fork's receipt already armed activation, the
+                    // install is the moment it takes effect.
+                    let id = id.clone();
+                    if self.branch_state.take_pending_activation(&id) {
+                        let name = self.switch_branch(Some(&id));
+                        if let Some(name) = name {
+                            self.flash = Some(format!("· forked → {name}"));
+                        }
+                    }
+                }
+                if matches!(note, crate::branch::AdmittedNote::Content)
+                    && admission == Admission::Apply
+                {
+                    match serde_json::from_value::<EventPayload>(envelope.payload.clone()) {
+                        Ok(payload) => self.route_admitted(
+                            &payload,
+                            envelope.branch_id.as_ref(),
+                            envelope.agent_id.as_ref(),
+                        ),
+                        Err(_) => self.projection.count_unknown_payload(),
+                    }
                 }
                 RawOutcome::Applied
             }
         }
+    }
+
+    /// Route one admitted content payload for the ATTACHED session:
+    /// aggregate session-scope types FIRST (risk 6 — even off a
+    /// branch-stamped envelope they land session-global), then branch
+    /// (outer), then agent. `SessionState::route_admitted` is the
+    /// background twin.
+    fn route_admitted(
+        &mut self,
+        payload: &EventPayload,
+        branch: Option<&haider_protocol::ids::BranchId>,
+        agent: Option<&haider_protocol::ids::AgentId>,
+    ) {
+        use crate::branch::BranchScope;
+        match self.branch_state.scope_of(payload, branch) {
+            BranchScope::Aggregate => {
+                self.branch_state.apply_aggregate_to_parked(payload);
+                // Type-first: straight to the session reducer — an
+                // aggregate never lands in a chip transcript.
+                self.handle_envelope(payload);
+            }
+            BranchScope::Active => self.absorb_scoped(payload, agent),
+            BranchScope::ParkedMain => {
+                self.note_parked_turn(payload);
+                if let Some(view) = self.branch_state.parked_main_mut() {
+                    crate::branch::absorb_into_view(view, payload, agent);
+                }
+            }
+            BranchScope::ParkedNamed(id) => {
+                self.note_parked_turn(payload);
+                if let Some(view) = self.branch_state.view_mut(&id) {
+                    crate::branch::absorb_into_view(view, payload, agent);
+                }
+            }
+            BranchScope::Orphan => self.branch_state.count_orphan(),
+        }
+    }
+
+    /// Session-wide run bookkeeping for INACTIVE-branch content (run
+    /// execution stays session-wide, research Q2): the busy state flips
+    /// here, the DISPLAY stays in the owning branch's warm view — no
+    /// screen flip, no menu reset, nothing painted.
+    fn note_parked_turn(&mut self, payload: &EventPayload) {
+        if let EventPayload::UserMessage { .. } = payload {
+            self.turn_active = true;
+        }
+        if let EventPayload::RunState(state) = payload
+            && state.is_terminal()
+        {
+            self.turn_active = false;
+            self.auto_resuming = false;
+        }
+    }
+
+    /// Switch the ATTACHED session's displayed branch — the ONE atomic
+    /// switch authority (risk 8): transcript, tokens/footprint, menus,
+    /// todos and chips swap as a unit, the session cursor transplants onto
+    /// the incoming projection, and the view chrome (scroll, menu
+    /// selection, subagent path) resets exactly as a session attach does.
+    /// Returns the displayed name on an actual switch (`"main"` for the
+    /// main branch), `None` when the target was unknown or already active.
+    pub fn switch_branch(
+        &mut self,
+        target: Option<&haider_protocol::ids::BranchId>,
+    ) -> Option<String> {
+        match self
+            .branch_state
+            .switch(target, &mut self.projection, &mut self.chips)
+        {
+            crate::branch::SwitchOutcome::Switched => {
+                self.menu_selection = 0;
+                self.view_path.clear();
+                self.scroll_back.set(0);
+                self.scroll_max.set(0);
+                self.sticky_suppressed = false;
+                self.dirty = true;
+                Some(self.branch_state.active_name().unwrap_or("main").to_owned())
+            }
+            crate::branch::SwitchOutcome::AlreadyActive
+            | crate::branch::SwitchOutcome::UnknownBranch => None,
+        }
+    }
+
+    /// The status bar's branch segment: the active branch's name, `"main"`
+    /// on the main branch.
+    #[must_use]
+    pub fn active_branch_name(&self) -> &str {
+        self.branch_state.active_name().unwrap_or("main")
+    }
+
+    /// The ATTACHED session's `busy()` twin (sim `sessionBusy` — the same
+    /// derivation `SessionState::busy` uses for background rows): live
+    /// subagents on ANY branch, a mid-turn engine, or an unsettled run.
+    #[must_use]
+    pub fn session_busy(&self) -> bool {
+        tree_live_count(&self.chips) + self.branch_state.parked_live() > 0
+            || self.turn_active
+            || !self.projection.settled()
+    }
+
+    /// `/branch` (B2b m2): bare opens the numbered picker, `new [name]`
+    /// forks at the active branch's last committed node, anything else
+    /// switches to the named branch. Owner menu/esc laws bind: the picker
+    /// is a numbered arrow-highlight card, esc is session-scoped, and
+    /// every refusal is an honest notice.
+    fn branch_command(&mut self, remainder: &str) {
+        if self.screen != Screen::Session {
+            self.flash = Some("· /branch — session only".to_owned());
+            self.dirty = true;
+            return;
+        }
+        // Feature gate (brief item 5): without the advertised branch
+        // feature nothing is fabricated — the honest stale-daemon notice
+        // names the fix. Demo mode answers everything locally and passes.
+        if !self.daemon_serves(haider_rpc::FEATURE_BRANCH_CREATE_V1) {
+            self.flash = Some(self.stale_daemon_note("branches"));
+            self.dirty = true;
+            return;
+        }
+        let request = remainder.trim();
+        match request.split_whitespace().next() {
+            None => self.open_branch_picker(),
+            Some("new") => {
+                let name = request.strip_prefix("new").unwrap_or("").trim();
+                self.branch_new((!name.is_empty()).then(|| name.to_owned()));
+            }
+            Some(_) => self.branch_switch_by_name(request),
+        }
+    }
+
+    /// The `/branch` picker — a numbered non-blocking card (arrow
+    /// highlight, digits/⏎ activate, esc dismisses — session-scoped esc
+    /// law). Its answer is REDUCER-LOCAL: switching a displayed branch is
+    /// display state, so the card closes itself and nothing rides the
+    /// outbox (the D1-2 law holds — this reducer can close every card it
+    /// opens).
+    fn open_branch_picker(&mut self) {
+        if self.projection.open_menu().is_some() {
+            self.flash = Some("· /branch — answer the open card first".to_owned());
+            self.dirty = true;
+            return;
+        }
+        self.card_seq += 1;
+        let card = branch_card(&self.branch_state, self.card_seq);
+        self.menu_selection = 0;
+        self.projection.apply(&EventPayload::MenuOpened(card));
+        self.dirty = true;
+    }
+
+    /// `/branch new [name]` — fork issuance at EXACT captured coordinates.
+    fn branch_new(&mut self, name: Option<String>) {
+        // Branches are daemon truth; the demo has no daemon to keep them.
+        if self.mode.fabricates_locally() {
+            self.flash = Some("· /branch new — live only; branches are daemon-owned".to_owned());
+            self.dirty = true;
+            return;
+        }
+        let Some(session) = self.active_session.clone() else {
+            self.flash = Some("· /branch new — no live session attached".to_owned());
+            self.dirty = true;
+            return;
+        };
+        // The busy() gate (brief item 5): forking a live turn would split
+        // ownership of its open menus/tools/children.
+        if self.session_busy() {
+            self.flash = Some("· /branch new — wait for the turn to end".to_owned());
+            self.dirty = true;
+            return;
+        }
+        let Some((fork_node_id, fork_seq)) = self.branch_state.fork_point().cloned() else {
+            self.flash = Some("· /branch new — nothing committed to fork from yet".to_owned());
+            self.dirty = true;
+            return;
+        };
+        self.requests.push(AppRequest::BranchCreate {
+            session,
+            source_branch: self.branch_state.active().cloned(),
+            fork_node_id,
+            fork_seq,
+            name,
+        });
+        // Honest: no local branch appears — the daemon's BranchCreated
+        // fact is what installs and activates it.
+        self.flash = Some("· forking — the branch lands when the daemon commits it".to_owned());
+        self.dirty = true;
+    }
+
+    /// `/branch <name>` — direct switch (reading another branch is always
+    /// allowed, running turn or not).
+    fn branch_switch_by_name(&mut self, name: &str) {
+        let target = if name == "main" {
+            None
+        } else if let Some(descriptor) = self.branch_state.find_by_name(name) {
+            Some(descriptor.branch_id.clone())
+        } else {
+            let names: Vec<&str> = std::iter::once("main")
+                .chain(self.branch_state.descriptors().map(|d| d.name.as_str()))
+                .collect();
+            self.flash = Some(format!(
+                "· no branch named “{name}” — {}",
+                names.join(" · ")
+            ));
+            self.dirty = true;
+            return;
+        };
+        match self.switch_branch(target.as_ref()) {
+            Some(display) => self.flash = Some(format!("· branch → {display}")),
+            None => self.flash = Some(format!("· already on {}", self.active_branch_name())),
+        }
+        self.dirty = true;
     }
 
     /// The attached path's scope router — the same [`crate::session::classify`]
@@ -5415,6 +5733,7 @@ impl AppModel {
         // session, so their by-id origin can never match.
         self.outbox.clear();
         self.projection = SessionProjection::new();
+        self.branch_state = crate::branch::BranchState::default();
         self.session_title = None;
         self.session_name = None;
         self.turn_active = false;
@@ -5603,6 +5922,9 @@ impl AppModel {
         crate::session::sweep_closed_chips(&mut slot.chips);
         self.projection = std::mem::replace(&mut slot.projection, SessionProjection::new());
         self.chips = std::mem::take(&mut slot.chips);
+        // B2b: the branch registry/active/parked views travel as ONE unit
+        // with the session — the A→B→A checkout law.
+        self.branch_state = std::mem::take(&mut slot.branch_state);
         self.msg_queue = std::mem::take(&mut slot.msg_queue);
         self.queue_mode = slot.queue_mode;
         self.turn_active = slot.turn_active;
@@ -5644,6 +5966,7 @@ impl AppModel {
             let slot = &mut self.sessions[index];
             slot.projection = std::mem::replace(&mut self.projection, SessionProjection::new());
             slot.chips = std::mem::take(&mut self.chips);
+            slot.branch_state = std::mem::take(&mut self.branch_state);
             slot.msg_queue = std::mem::take(&mut self.msg_queue);
             slot.queue_mode = std::mem::take(&mut self.queue_mode);
             slot.turn_active = std::mem::take(&mut self.turn_active);
@@ -6202,6 +6525,47 @@ pub const LIVE_LAUNCHER_ROWS: usize = 4;
 
 pub const VOICE_CARD_PREFIX: &str = "voice-card-";
 pub const TOOLS_CARD_PREFIX: &str = "tools-card-";
+/// The `/branch` picker's id prefix (B2b m2). Cards with this prefix are
+/// REDUCER-LOCAL: their answer switches the displayed branch and closes
+/// the card without touching the outbox.
+pub const BRANCH_CARD_PREFIX: &str = "branch-card-";
+
+/// The `/branch` picker (B2b m2): main plus every named branch, numbered,
+/// the ACTIVE one marked ● and the rest ○ (the sim's branch vocabulary,
+/// tui.js:3366-3427). Non-blocking Choice card; esc dismisses.
+#[must_use]
+pub fn branch_card(state: &crate::branch::BranchState, seq: u64) -> Menu {
+    let marker = |active: bool| if active { '●' } else { '○' };
+    let mut options = vec![card_option(
+        "main",
+        format!("{} main", marker(state.active().is_none())),
+    )];
+    for descriptor in state.descriptors() {
+        options.push(card_option(
+            descriptor.branch_id.as_str(),
+            format!(
+                "{} {}",
+                marker(state.active() == Some(&descriptor.branch_id)),
+                descriptor.name
+            ),
+        ));
+    }
+    Menu {
+        id: MenuId::new(format!("{BRANCH_CARD_PREFIX}{seq}")),
+        kind: MenuKind::Choice,
+        title: "branch — switch the displayed branch".to_owned(),
+        body: vec![
+            "switch   every branch stays warm — switching is instant, nothing rewinds".to_owned(),
+            "fork     /branch new [name] forks at the last committed node (idle only)".to_owned(),
+        ],
+        options,
+        blocking: false,
+        scope: MenuScope::Session,
+        origin: "branch".to_owned(),
+        ttl_ms: None,
+        timeout_option: None,
+    }
+}
 
 fn card_option(key: &str, label: String) -> MenuOption {
     MenuOption {

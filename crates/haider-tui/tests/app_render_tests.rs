@@ -458,6 +458,7 @@ fn typed_text_starts_a_session_and_requests_a_turn() {
             text: "refactor the parser".to_owned(),
             voice: false,
             title: true,
+            branch: None,
         }]
     );
     // Sim autoBlurb (G47) is the BLURB, applied by the 1.5 s callback; the

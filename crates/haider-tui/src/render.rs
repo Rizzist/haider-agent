@@ -632,8 +632,10 @@ fn render_launcher(
             .unwrap_or_default();
         let meta = format!(
             "{blurb} {} · {} {} · {} tok · {} · {} · {}",
-            if entry.branches > 1 {
-                format!("{} branches", entry.branches)
+            // DERIVED (B2b): the seed static plus daemon-installed named
+            // branches — the launcher aggregate counts all branches.
+            if entry.branches() > 1 {
+                format!("{} branches", entry.branches())
             } else {
                 "1 branch".to_owned()
             },
@@ -4087,11 +4089,13 @@ fn render_status_bar(
     };
     left.extend(chip_two_tone(badge, badge_chrome, badge_ink));
     // Sim `.mid`: model · provider, plus the branch name inside a session,
-    // plus ` · q:turn` while queue mode holds (tui.js:2840-2842).
+    // plus ` · q:turn` while queue mode holds (tui.js:2840-2842). B2b: the
+    // ACTIVE branch's name — "main" on the main branch, the daemon-named
+    // fork otherwise.
     let branch = if model.screen == Screen::Session {
-        " · main"
+        format!(" · {}", model.active_branch_name())
     } else {
-        ""
+        String::new()
     };
     let queue_tag = if model.queue_mode && model.screen == Screen::Session {
         " · q:turn"

@@ -655,6 +655,7 @@ fn request_body_round_trips_the_attachment_commands() {
             session: session(4),
             worker_generation: 9,
             run_id: haider_protocol::ids::RunId::new("run-1"),
+            branch: None,
         }),
         RequestBody::TurnCancel {
             command_id: CommandId::new("cmd-1"),
@@ -717,6 +718,7 @@ fn map_response_interprets_attach_outcomes_through_their_context() {
         worker_generation: 9,
         text: "hi".into(),
         mode: DeliveryMode::Steer,
+        branch: None,
     });
     assert_eq!(
         map_response(

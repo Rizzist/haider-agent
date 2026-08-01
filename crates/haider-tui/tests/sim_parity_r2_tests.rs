@@ -96,7 +96,7 @@ fn esc_mid_turn_interrupts_and_stays_on_the_session() {
     model.handle(key(KeyCode::Esc));
     assert_eq!(model.screen, Screen::Session, "interrupt stays put");
     assert!(!model.turn_active);
-    assert_eq!(model.requests, vec![AppRequest::Interrupt]);
+    assert_eq!(model.requests, vec![AppRequest::Interrupt { branch: None }]);
     assert!(model.projection.interrupted());
     let (rows, _, _) = draw(&model, 118, 34);
     assert!(rows.iter().any(|row| row.contains("⏸ IDLE (i)")), "badge");

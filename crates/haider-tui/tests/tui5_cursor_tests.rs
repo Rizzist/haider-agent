@@ -518,7 +518,11 @@ fn transcript_selection_keeps_tui4_key_meanings_exactly() {
     });
     model.handle(key(KeyCode::Esc));
     assert!(!model.turn_active, "Esc interrupts on the FIRST press");
-    assert!(model.requests.contains(&AppRequest::Interrupt));
+    assert!(
+        model
+            .requests
+            .contains(&AppRequest::Interrupt { branch: None })
+    );
     assert!(model.selection.is_none(), "…and the highlight cleared");
     // ⌃C with only a transcript selection navigates as in TUI4.
     model.selection = Some(haider_tui::select::Selection {
@@ -554,10 +558,18 @@ fn esc_clears_the_selection_before_any_other_esc_meaning() {
     model.handle(key(KeyCode::Esc));
     assert!(!model.composer.has_selection(), "esc deselects first");
     assert!(model.turn_active, "…and does NOT interrupt on that press");
-    assert!(!model.requests.contains(&AppRequest::Interrupt));
+    assert!(
+        !model
+            .requests
+            .contains(&AppRequest::Interrupt { branch: None })
+    );
     model.handle(key(KeyCode::Esc));
     assert!(!model.turn_active, "the NEXT esc interrupts as before");
-    assert!(model.requests.contains(&AppRequest::Interrupt));
+    assert!(
+        model
+            .requests
+            .contains(&AppRequest::Interrupt { branch: None })
+    );
 }
 
 #[test]
