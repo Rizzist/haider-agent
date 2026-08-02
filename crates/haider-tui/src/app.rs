@@ -930,14 +930,10 @@ pub fn remove_chip(chips: &mut Vec<ChipModel>, agent: &str) -> bool {
         .any(|chip| remove_chip(&mut chip.children, agent))
 }
 
-/// Depth-first flatten with depth (the SubTree rows).
-#[must_use]
-/// `/tree` rows (sim tui.js:3390-3421 vocabulary, main line only): the
-/// branch header, then one node per user turn (`├─ ❯`) and per ⊟
-/// compaction row already in the transcript.
 /// The short host name (uname nodename up to the first dot) — the sim's
 /// `this-mac` made real (owner ask). Cached; the placeholder survives
 /// only if the kernel offers nothing.
+#[must_use]
 pub fn local_device_name() -> &'static str {
     static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     NAME.get_or_init(|| {
@@ -952,50 +948,224 @@ pub fn local_device_name() -> &'static str {
     })
 }
 
-pub fn tree_rows(model: &AppModel) -> Vec<String> {
-    use crate::projection::TranscriptEntry;
-    let entries = model.projection.entries();
-    let turns = model.projection.user_row_count();
-    let tokens = model
-        .projection
+/// A render-resolved jump anchor (B2b-m3, research §Q3): the durable
+/// `{branch, node}` identity a tree node-row activation arms. The renderer
+/// resolves it — node → display entry → logical line → wrapped row — with
+/// its OWN width/prefix sums, in the same frame that paints the result.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingJump {
+    pub branch: Option<haider_protocol::ids::BranchId>,
+    pub node: haider_protocol::ids::NodeId,
+}
+
+/// One typed `/tree` row (B2b-m3, research §Q3: value-carrying coordinates
+/// — never a bare string or an ordinal). `Eq` matters twice: mouse hits
+/// carry the VALUE so a stale hit can never activate a replaced row, and
+/// key activation re-reads the freshly built rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TreeRow {
+    /// The VIEWED branch's header (sim `{type:"branch"}` row). `None` =
+    /// the root/main branch.
+    Branch {
+        branch: Option<haider_protocol::ids::BranchId>,
+        label: String,
+    },
+    /// One user/compaction node on the viewed branch. `coords` carries the
+    /// durable `{node_id, node_seq}` when the journal committed them
+    /// (live); demo entries have no node identity and carry `None`, so
+    /// `f`/jump refuse honestly instead of guessing.
+    Node {
+        branch: Option<haider_protocol::ids::BranchId>,
+        coords: Option<(haider_protocol::ids::NodeId, u64)>,
+        label: String,
+    },
+    /// A fork marker immediately under its EXACT fork node — ⏎ drills.
+    Fork {
+        branch: haider_protocol::ids::BranchId,
+        label: String,
+    },
+}
+
+impl TreeRow {
+    /// The rendered row text (styling is the renderer's).
+    #[must_use]
+    pub fn label(&self) -> &str {
+        match self {
+            Self::Branch { label, .. } | Self::Node { label, .. } | Self::Fork { label, .. } => {
+                label
+            }
+        }
+    }
+}
+
+/// The `/tree` screen's VIEWED branch, validated against the registry — an
+/// id the session never installed falls back to the root (sim: unknown
+/// treeBranchId → the root branch).
+#[must_use]
+pub fn tree_viewed(model: &AppModel) -> Option<haider_protocol::ids::BranchId> {
+    model
+        .tree_view
+        .as_ref()
+        .filter(|id| model.branch_state.contains(id))
+        .cloned()
+}
+
+/// Branch header vocabulary shared by the viewed-branch row and the fork
+/// markers: `{name} · N turns · X tok` from the branch's OWN surfaces.
+fn tree_branch_meta(projection: &SessionProjection) -> String {
+    let turns = projection.user_row_count();
+    let tokens = projection
         .latest_footprint()
-        .map_or_else(|| model.projection.context_tokens(), |fp| fp.used_tokens);
-    let mut rows = vec![format!(
-        "● main · {turns} turn{} · {} tok",
+        .map_or_else(|| projection.context_tokens(), |fp| fp.used_tokens);
+    format!(
+        "{turns} turn{} · {} tok",
         if turns == 1 { "" } else { "s" },
         crate::format::fmt_tok(tokens)
-    )];
-    for entry in entries {
-        match entry {
+    )
+}
+
+/// `/tree` rows for the VIEWED branch (sim treeRows, tui.js:2327-2337):
+/// the branch header, then one node row per user turn / ⊟ compaction in
+/// that branch's transcript, each fork marker IMMEDIATELY under its exact
+/// fork node. Markers whose fork node has no display row yet (an ancestry
+/// this view never materialized) trail at the end rather than being
+/// guessed under a nearby row.
+#[must_use]
+pub fn tree_rows(model: &AppModel) -> Vec<TreeRow> {
+    use crate::projection::TranscriptEntry;
+    let viewed = tree_viewed(model);
+    let Some(projection) = model.branch_projection(viewed.as_ref()) else {
+        return Vec::new();
+    };
+    let active = model.branch_state.active().cloned();
+    let name = viewed.as_ref().map_or("main", |id| {
+        model
+            .branch_state
+            .descriptor(id)
+            .map_or("?", |descriptor| descriptor.name.as_str())
+    });
+    // ● follows the session's ACTIVE branch (law) — the viewed branch may
+    // be another one entirely.
+    let dot = if viewed == active { "●" } else { "○" };
+    let mut label = format!("{dot} {name} · {}", tree_branch_meta(projection));
+    if viewed.is_some() {
+        label.push_str(" · esc up to parent");
+    }
+    let mut rows = vec![TreeRow::Branch {
+        branch: viewed.clone(),
+        label,
+    }];
+    // Fork markers for the viewed branch, keyed by their exact fork node.
+    let mut forks: Vec<&haider_protocol::branch::BranchDescriptor> = model
+        .branch_state
+        .descriptors()
+        .filter(|descriptor| descriptor.source_branch_id == viewed)
+        .collect();
+    let mut push_forks_at =
+        |rows: &mut Vec<TreeRow>, node: Option<&haider_protocol::ids::NodeId>| {
+            forks.retain(|descriptor| {
+                let here = node.is_some_and(|node| &descriptor.fork_node_id == node);
+                if here {
+                    let meta = model
+                        .branch_state
+                        .view(&descriptor.branch_id)
+                        .map_or_else(String::new, |view| {
+                            format!(" · {}", tree_branch_meta(&view.projection))
+                        });
+                    rows.push(TreeRow::Fork {
+                        branch: descriptor.branch_id.clone(),
+                        label: format!("  │   └⑂ {}{meta} · ⏎ open", descriptor.name),
+                    });
+                }
+                !here
+            });
+        };
+    for (index, entry) in projection.entries().iter().enumerate() {
+        let label = match entry {
             TranscriptEntry::User { text, .. } => {
                 let mut text = text.replace(['\n', '\r'], " ");
                 if text.chars().count() > 58 {
                     text = text.chars().take(58).collect::<String>() + "…";
                 }
-                rows.push(format!("  ├─ ❯ {text}"));
+                format!("  ├─ ❯ {text}")
             }
             TranscriptEntry::Item(block) => {
-                if let haider_protocol::item::TurnItem::ContextCompaction {
+                let haider_protocol::item::TurnItem::ContextCompaction {
                     tokens_before,
                     tokens_after,
                     ..
                 } = &block.item
-                {
-                    let detail = match (tokens_before, tokens_after) {
-                        (Some(before), Some(after)) => format!(
-                            "⊟ compacted {} → {}",
-                            crate::format::fmt_tok(*before),
-                            crate::format::fmt_tok(*after)
-                        ),
-                        _ => "⊟ context compacted".to_owned(),
-                    };
-                    rows.push(format!("  ├─ {detail}"));
-                }
+                else {
+                    continue;
+                };
+                let detail = match (tokens_before, tokens_after) {
+                    (Some(before), Some(after)) => format!(
+                        "⊟ compacted {} → {}",
+                        crate::format::fmt_tok(*before),
+                        crate::format::fmt_tok(*after)
+                    ),
+                    _ => "⊟ context compacted".to_owned(),
+                };
+                format!("  ├─ {detail}")
             }
-            _ => {}
-        }
+            _ => continue,
+        };
+        // The durable coordinates riding this display row, when the
+        // journal committed them (demo rows honestly carry none).
+        let coords = projection.node_of_entry(index).and_then(|node| {
+            model
+                .branch_state
+                .node_seq(node)
+                .map(|seq| (node.clone(), seq))
+        });
+        let node = projection.node_of_entry(index).cloned();
+        rows.push(TreeRow::Node {
+            branch: viewed.clone(),
+            coords,
+            label,
+        });
+        push_forks_at(&mut rows, node.as_ref());
+    }
+    // Unanchored markers trail honestly (never guessed under another row).
+    for descriptor in forks {
+        let meta = model
+            .branch_state
+            .view(&descriptor.branch_id)
+            .map_or_else(String::new, |view| {
+                format!(" · {}", tree_branch_meta(&view.projection))
+            });
+        rows.push(TreeRow::Fork {
+            branch: descriptor.branch_id.clone(),
+            label: format!("  │   └⑂ {}{meta} · ⏎ open", descriptor.name),
+        });
     }
     rows
+}
+
+/// The `/tree` breadcrumb: branch names root → viewed (sim treeCrumb,
+/// tui.js:2339-2345), cycle-guarded against a corrupt source chain.
+#[must_use]
+pub fn tree_crumb(model: &AppModel) -> Vec<String> {
+    let mut crumb = Vec::new();
+    let mut cursor = tree_viewed(model);
+    let mut hops = model.branch_state.named_count() + 1;
+    while hops > 0 {
+        hops -= 1;
+        match cursor {
+            None => {
+                crumb.insert(0, "main".to_owned());
+                break;
+            }
+            Some(id) => match model.branch_state.descriptor(&id) {
+                Some(descriptor) => {
+                    crumb.insert(0, descriptor.name.clone());
+                    cursor = descriptor.source_branch_id.clone();
+                }
+                None => break,
+            },
+        }
+    }
+    crumb
 }
 
 pub fn flatten_chips(chips: &[ChipModel]) -> Vec<(usize, &ChipModel)> {
@@ -1666,6 +1836,11 @@ pub enum Hit {
     /// producing prompt's first row at the viewport top (sim jumpToSticky:
     /// stay AT the prompt, tui.js:2637-2645).
     StickyJump(u16),
+    /// One `/tree` row, by VALUE (B2b-m3): the click validates the carried
+    /// row against the freshly built rows and selects it (sim
+    /// tui.js:3375-3377 onClick = setTreeSel) — a stale hit whose row was
+    /// replaced matches nothing and is dropped whole, never activated.
+    TreeRow(TreeRow),
     /// One composer text row (TUI5 item 5). Value-carrying like every
     /// hit: `start` is the ABSOLUTE byte offset (in the composer text) of
     /// the row's visible slice at render time, `content` the slice
@@ -1955,6 +2130,20 @@ pub struct AppModel {
     pub token_panel: bool,
     /// `/tree` — selected row (sim treeSel).
     pub tree_sel: usize,
+    /// `/tree` — the VIEWED branch (`None` = the root/main branch; sim
+    /// treeBranchId). Drill/breadcrumb/esc walk this; it never touches the
+    /// session's ACTIVE branch until a row is activated.
+    pub tree_view: Option<haider_protocol::ids::BranchId>,
+    /// The armed render-resolved jump (B2b-m3, research §Q3): set when a
+    /// tree NODE row is activated, resolved by the next session frame
+    /// against the renderer's own wrapped-row prefix sums — interior
+    /// mutability because RENDER resolves it (the `scroll_max`
+    /// discipline). Cleared
+    /// only when it lands: a node replay has not materialized keeps the
+    /// anchor armed rather than guessing another entry. Cross-screen
+    /// identity is `{branch, node}` — never an entry ordinal or a cached
+    /// wrapped-row offset (width/resize would invalidate those).
+    pub pending_jump: std::cell::RefCell<Option<PendingJump>>,
     /// `/tools` live — the daemon's committed inventory snapshot
     /// (None while the read is in flight; the screen says "fetching").
     pub tools_inventory: Option<haider_protocol::tool::ToolInventorySnapshot>,
@@ -2083,8 +2272,10 @@ pub struct AppModel {
     login_attempt_seq: u64,
     /// The sticky origin line is suppressed after a sticky jump until the
     /// next REAL wheel event (sim jumpToSticky, tui.js:2637-2657: the bar
-    /// must never cover the row it just revealed).
-    pub sticky_suppressed: bool,
+    /// must never cover the row it just revealed). A `Cell` since B2b-m3:
+    /// the render-resolved tree jump suppresses it from inside the frame
+    /// (same law — the sticky must not cover the revealed row).
+    pub sticky_suppressed: std::cell::Cell<bool>,
     /// The hit region under the mouse cursor (owner ask, TUI3a item 6).
     /// Value-carrying like clicks: a stale hover can never light up a
     /// different row than the one it was measured on. Render consults it
@@ -2154,6 +2345,8 @@ impl Default for AppModel {
             screen: Screen::Boot,
             token_panel: false,
             tree_sel: 0,
+            tree_view: None,
+            pending_jump: std::cell::RefCell::new(None),
             tools_inventory: None,
             theme: ThemeKey::Dawn,
             sanctum_tier: SanctumTier::default(),
@@ -2211,7 +2404,7 @@ impl Default for AppModel {
             scroll_max: std::cell::Cell::new(0),
             geometry_epoch: std::cell::Cell::new(0),
             login_attempt_seq: 0,
-            sticky_suppressed: false,
+            sticky_suppressed: std::cell::Cell::new(false),
             hovered: None,
             selection: None,
             mouse_down: None,
@@ -3032,23 +3225,37 @@ impl AppModel {
         }
         if self.screen == Screen::Tree {
             match key.code {
-                KeyCode::Up => {
+                KeyCode::Up | KeyCode::Char('k') => {
                     self.tree_sel = self.tree_sel.saturating_sub(1);
                     self.dirty = true;
                 }
-                KeyCode::Down => {
+                KeyCode::Down | KeyCode::Char('j') => {
                     let rows = tree_rows(self).len();
                     self.tree_sel = (self.tree_sel + 1).min(rows.saturating_sub(1));
                     self.dirty = true;
                 }
-                KeyCode::Esc | KeyCode::Enter => {
-                    self.screen = Screen::Session;
+                // esc is SESSION-SCOPED (owner law): inside the tree it
+                // walks UP the drill (sim tui.js:2508-2515) and closes the
+                // screen from the root — it never navigates the app.
+                KeyCode::Esc => {
+                    match tree_viewed(self) {
+                        Some(id) => {
+                            self.tree_view = self
+                                .branch_state
+                                .descriptor(&id)
+                                .and_then(|descriptor| descriptor.source_branch_id.clone());
+                            self.tree_sel = 0;
+                        }
+                        None => self.screen = Screen::Session,
+                    }
                     self.dirty = true;
                 }
-                KeyCode::Char('f') => {
-                    self.flash = Some("· fork — lands with the branch wave".to_owned());
-                    self.dirty = true;
+                KeyCode::Enter => {
+                    if let Some(row) = tree_rows(self).get(self.tree_sel).cloned() {
+                        self.activate_tree_row(row);
+                    }
                 }
+                KeyCode::Char('f') => self.tree_fork_selected(),
                 _ => {}
             }
             return;
@@ -5295,9 +5502,12 @@ impl AppModel {
             "aura" => self.enter_aura(),
             "tokens" => self.toggle_token_panel(),
             "tree" => {
-                // W7b: the main-line tree view (sim tui.js:3366-3430).
+                // B2b-m3: the tree screen (sim tui.js:3366-3430) — opens
+                // at the ROOT branch, not necessarily the active one (sim
+                // tui.js:1735-1741).
                 if self.screen == Screen::Session {
                     self.tree_sel = 0;
+                    self.tree_view = None;
                     self.screen = Screen::Tree;
                     self.dirty = true;
                 } else {
@@ -5703,6 +5913,12 @@ impl AppModel {
                         if let Some(name) = name {
                             self.flash = Some(format!("· forked → {name}"));
                         }
+                        // The tree's `f` completing returns to the session
+                        // (sim forkAtNode → setScreen("session")); any
+                        // other surface is never hijacked.
+                        if self.screen == Screen::Tree {
+                            self.screen = Screen::Session;
+                        }
                     }
                 }
                 if matches!(note, crate::branch::AdmittedNote::Content)
@@ -5794,7 +6010,11 @@ impl AppModel {
                 self.view_path.clear();
                 self.scroll_back.set(0);
                 self.scroll_max.set(0);
-                self.sticky_suppressed = false;
+                self.sticky_suppressed.set(false);
+                // A switch invalidates any armed jump anchor — the tree's
+                // node activation re-arms AFTER its own switch, so only a
+                // LATER switch can kill it (never the one that set it up).
+                *self.pending_jump.borrow_mut() = None;
                 self.dirty = true;
                 Some(self.branch_state.active_name().unwrap_or("main").to_owned())
             }
@@ -5808,6 +6028,24 @@ impl AppModel {
     #[must_use]
     pub fn active_branch_name(&self) -> &str {
         self.branch_state.active_name().unwrap_or("main")
+    }
+
+    /// The projection displaying `target`'s transcript, wherever it is
+    /// checked out (B2b-m3): the live fields for the ACTIVE branch, the
+    /// parked main slot, or a named branch's warm view. Read-only — the
+    /// tree screen reads every branch without disturbing any.
+    #[must_use]
+    pub fn branch_projection(
+        &self,
+        target: Option<&haider_protocol::ids::BranchId>,
+    ) -> Option<&SessionProjection> {
+        if self.branch_state.active() == target {
+            return Some(&self.projection);
+        }
+        match target {
+            None => self.branch_state.parked_main().map(|view| &view.projection),
+            Some(id) => self.branch_state.view(id).map(|view| &view.projection),
+        }
     }
 
     /// The ATTACHED session's `busy()` twin (sim `sessionBusy` — the same
@@ -5869,23 +6107,15 @@ impl AppModel {
         self.dirty = true;
     }
 
-    /// `/branch new [name]` — fork issuance at EXACT captured coordinates.
+    /// `/branch new [name]` — fork issuance at the active branch's last
+    /// committed node (the tracker's EXACT captured coordinates).
     fn branch_new(&mut self, name: Option<String>) {
-        // Branches are daemon truth; the demo has no daemon to keep them.
+        // Branches are daemon truth; the demo has no daemon to keep them —
+        // refused BEFORE the tracker read so the demo's answer names the
+        // real gap, not a missing coordinate (`issue_fork` re-checks for
+        // its other caller).
         if self.mode.fabricates_locally() {
             self.flash = Some("· /branch new — live only; branches are daemon-owned".to_owned());
-            self.dirty = true;
-            return;
-        }
-        let Some(session) = self.active_session.clone() else {
-            self.flash = Some("· /branch new — no live session attached".to_owned());
-            self.dirty = true;
-            return;
-        };
-        // The busy() gate (brief item 5): forking a live turn would split
-        // ownership of its open menus/tools/children.
-        if self.session_busy() {
-            self.flash = Some("· /branch new — wait for the turn to end".to_owned());
             self.dirty = true;
             return;
         }
@@ -5894,9 +6124,51 @@ impl AppModel {
             self.dirty = true;
             return;
         };
+        let source_branch = self.branch_state.active().cloned();
+        self.issue_fork("/branch new", source_branch, fork_node_id, fork_seq, name);
+    }
+
+    /// Fork issuance at EXACT coordinates — the ONE gate/dispatch shared by
+    /// `/branch new` (tracker coordinates) and the tree's `f` (the selected
+    /// row's `{node_id, node_seq}`). `what` names the asking surface in
+    /// each honest refusal. Nothing local is fabricated: the daemon's
+    /// `BranchCreated` fact is the only materializer.
+    fn issue_fork(
+        &mut self,
+        what: &str,
+        source_branch: Option<haider_protocol::ids::BranchId>,
+        fork_node_id: haider_protocol::ids::NodeId,
+        fork_seq: u64,
+        name: Option<String>,
+    ) {
+        self.dirty = true;
+        // Branches are daemon truth; the demo has no daemon to keep them.
+        if self.mode.fabricates_locally() {
+            self.flash = Some(format!("· {what} — live only; branches are daemon-owned"));
+            return;
+        }
+        // Feature gate (brief item 5): without the advertised branch
+        // feature nothing is fabricated — the honest stale-daemon notice
+        // names the fix. (`/branch` gates its whole grammar upstream; the
+        // tree's `f` reaches here directly, so the gate must live at the
+        // dispatch too.)
+        if !self.daemon_serves(haider_rpc::FEATURE_BRANCH_CREATE_V1) {
+            self.flash = Some(self.stale_daemon_note("branches"));
+            return;
+        }
+        let Some(session) = self.active_session.clone() else {
+            self.flash = Some(format!("· {what} — no live session attached"));
+            return;
+        };
+        // The busy() gate (brief item 5): forking a live turn would split
+        // ownership of its open menus/tools/children.
+        if self.session_busy() {
+            self.flash = Some(format!("· {what} — wait for the turn to end"));
+            return;
+        }
         self.requests.push(AppRequest::BranchCreate {
             session,
-            source_branch: self.branch_state.active().cloned(),
+            source_branch,
             fork_node_id,
             fork_seq,
             name,
@@ -5904,7 +6176,72 @@ impl AppModel {
         // Honest: no local branch appears — the daemon's BranchCreated
         // fact is what installs and activates it.
         self.flash = Some("· forking — the branch lands when the daemon commits it".to_owned());
-        self.dirty = true;
+    }
+
+    /// Activate one `/tree` row (⏎, or a click validated against the
+    /// FRESH rows — sim tui.js:2581-2591): a FORK marker drills into its
+    /// branch; a BRANCH header switches the session to it (the same atomic
+    /// [`Self::switch_branch`] swap every switch takes) and returns at its
+    /// normal tail; a NODE row switches and ARMS the render-resolved jump
+    /// onto that node's transcript entry.
+    fn activate_tree_row(&mut self, row: TreeRow) {
+        match row {
+            TreeRow::Fork { branch, .. } => {
+                if self.branch_state.contains(&branch) {
+                    self.tree_view = Some(branch);
+                    self.tree_sel = 0;
+                    self.dirty = true;
+                }
+            }
+            TreeRow::Branch { branch, .. } => {
+                self.switch_branch(branch.as_ref());
+                self.screen = Screen::Session;
+                self.dirty = true;
+            }
+            TreeRow::Node { branch, coords, .. } => {
+                self.switch_branch(branch.as_ref());
+                // Arm AFTER the switch (which clears any stale anchor):
+                // the next session frame resolves node → entry → wrapped
+                // row with ITS OWN width/prefix sums (research §Q3 — the
+                // sim's Enter never scrolled; production lands the
+                // promised jump). A coordinate-free demo row returns at
+                // the tail: without a durable node identity there is
+                // nothing honest to anchor.
+                if let Some((node, _)) = coords {
+                    *self.pending_jump.borrow_mut() = Some(PendingJump { branch, node });
+                }
+                self.screen = Screen::Session;
+                self.dirty = true;
+            }
+        }
+    }
+
+    /// `f` on the selected `/tree` row (sim tui.js:2593-2596): fork at the
+    /// row's EXACT committed coordinates — the VIEWED branch is the source,
+    /// the row's `{node_id, node_seq}` the fork point. Non-node rows do
+    /// nothing (sim parity); a node row without durable coordinates
+    /// refuses honestly instead of guessing one.
+    fn tree_fork_selected(&mut self) {
+        let Some(row) = tree_rows(self).get(self.tree_sel).cloned() else {
+            return;
+        };
+        let TreeRow::Node { branch, coords, .. } = row else {
+            return;
+        };
+        // The demo answer names the REAL gap (branches are daemon-owned)
+        // before the missing-coordinate one — demo rows never carry
+        // coordinates, so the order decides which truth the user hears.
+        if self.mode.fabricates_locally() {
+            self.flash = Some("· fork — live only; branches are daemon-owned".to_owned());
+            self.dirty = true;
+            return;
+        }
+        let Some((node, seq)) = coords else {
+            self.flash = Some("· fork — this row carries no committed node coordinates".to_owned());
+            self.dirty = true;
+            return;
+        };
+        self.issue_fork("fork", branch, node, seq, None);
     }
 
     /// `/branch <name>` — direct switch (reading another branch is always
@@ -6089,7 +6426,9 @@ impl AppModel {
         self.auto_resuming = false;
         self.scroll_back.set(0);
         self.scroll_max.set(0);
-        self.sticky_suppressed = false;
+        self.sticky_suppressed.set(false);
+        *self.pending_jump.borrow_mut() = None;
+        self.tree_view = None;
         self.requests.push(AppRequest::ResetAllSessions);
     }
 
@@ -6287,7 +6626,11 @@ impl AppModel {
         self.screen = Screen::Session;
         self.scroll_back.set(0);
         self.scroll_max.set(0);
-        self.sticky_suppressed = false;
+        self.sticky_suppressed.set(false);
+        // Screen chrome, not session state: a jump armed for the OLD
+        // session and its tree drill state die with the surface.
+        *self.pending_jump.borrow_mut() = None;
+        self.tree_view = None;
         // TUI5 item 9: the attached session's own draft comes live —
         // text, cursor, selection and input ring exactly as it left.
         self.restore_draft();
@@ -6328,7 +6671,9 @@ impl AppModel {
         self.menu_selection = 0;
         self.scroll_back.set(0);
         self.scroll_max.set(0);
-        self.sticky_suppressed = false;
+        self.sticky_suppressed.set(false);
+        *self.pending_jump.borrow_mut() = None;
+        self.tree_view = None;
     }
 
     /// Sim `newSession` (tui.js:1617-1650): a fresh id, a head claimed
@@ -6744,6 +7089,20 @@ impl AppModel {
                 self.aura.state = AuraState::Listening;
                 self.requests.push(AppRequest::AuraTalk);
             }
+            Hit::TreeRow(row) if self.screen == Screen::Tree => {
+                // Value-carrying + existence check (law: a stale hit on a
+                // replaced row must not activate): the click selects the
+                // row ONLY where the freshly built rows still contain the
+                // exact value the frame rendered. Activation stays on ⏎/f,
+                // the sim's single-click semantics (tui.js:3375-3377).
+                if let Some(index) = tree_rows(self)
+                    .iter()
+                    .position(|candidate| candidate == &row)
+                {
+                    self.tree_sel = index;
+                    self.dirty = true;
+                }
+            }
             Hit::StickyJump(scroll_back)
                 if matches!(self.screen, Screen::Session | Screen::Subagent) =>
             {
@@ -6753,7 +7112,7 @@ impl AppModel {
                 // revealed", tui.js:2637-2657). Surface-guarded like every
                 // other hit arm (Fable review D3-12).
                 self.scroll_back.set(scroll_back.min(self.scroll_max.get()));
-                self.sticky_suppressed = true;
+                self.sticky_suppressed.set(true);
             }
             // A hit whose owning surface is gone: dropped, never acted on.
             _ => {}
@@ -6781,7 +7140,7 @@ impl AppModel {
         self.dirty = true;
         // A real scroll lifts the post-jump sticky suppression (sim
         // onTranscriptScroll → computeSticky).
-        self.sticky_suppressed = false;
+        self.sticky_suppressed.set(false);
         let max = self.scroll_max.get();
         let current = self.scroll_back.get().min(max);
         let next = if up {

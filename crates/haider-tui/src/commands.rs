@@ -324,7 +324,7 @@ pub const HELP_TEXT: &[&str] = &[
     "  /provider [name]   anthropic · openai · gemini · kimi",
     "  /providers         provider registry — endpoints, models, defaults, health",
     "  /theme [name]      dawn · ivory · dark",
-    "  /tree              session tree — main-line view, ⏎ opens forks, f forks at a node",
+    "  /tree              session tree — every branch, ⏎ jump to a node / open a fork, f forks there",
     "  /fork              fork the session at the current point",
     "  /branch [new|name] branches — numbered picker · direct switch · new forks at the last committed node",
     "  /sessions          list + switch sessions",
