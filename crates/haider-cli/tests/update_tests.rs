@@ -1136,6 +1136,26 @@ fn transaction_refuses_concurrency_symlinks_and_read_only_layouts() {
     );
 }
 
+/// MUTATION CHECK: release the update lock by closing its descriptor instead
+/// of explicitly unlocking it. Expected RUNTIME failure: a surviving
+/// duplicate of the released descriptor (what fork/posix_spawn leaves in a
+/// concurrently spawned child between clone and exec) keeps the open file
+/// description's flock held, so an immediate re-acquire is refused as a
+/// concurrent update.
+#[test]
+fn reacquire_succeeds_while_a_stale_duplicate_of_the_released_lock_survives() {
+    let install = install_fixture();
+    let layout = InstallLayout::for_test(install.path().to_path_buf());
+    let first = PreparedTransaction::acquire(layout.clone()).expect("first lock");
+    let stale = first
+        .duplicate_lock_handle_for_test()
+        .expect("duplicate lock descriptor");
+    drop(first);
+    let second = PreparedTransaction::acquire(layout).expect("reacquire after explicit release");
+    drop(second);
+    drop(stale);
+}
+
 fn install_fixture() -> tempfile::TempDir {
     let install = tempfile::tempdir().expect("install fixture");
     write_executable(&install.path().join("haider"), b"old-cli");
