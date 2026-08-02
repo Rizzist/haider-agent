@@ -285,6 +285,22 @@ impl AppModel {
         self.mode.fabricates_locally() || self.daemon_features.contains(feature)
     }
 
+    /// Whether the connected daemon's provider registry lists `provider`
+    /// (B6b). Some adapters ship WITHOUT a feature bit (Gemini, B6a), so
+    /// `provider.list` truth is their capability signal: boot always issues
+    /// the list, so live mode holds a snapshot before the accounts screen
+    /// can be clicked. Demo answers from its own seed registry, so it is
+    /// always capable there — the same shape as [`Self::daemon_serves`].
+    #[must_use]
+    pub fn daemon_lists_provider(&self, provider: &str) -> bool {
+        self.mode.fabricates_locally()
+            || self
+                .providers
+                .providers
+                .iter()
+                .any(|summary| summary.provider == provider)
+    }
+
     /// The honest refusal for a method this daemon does not serve — names
     /// the stale daemon rather than letting the request fail obscurely.
     #[must_use]
@@ -1685,13 +1701,17 @@ pub enum Hit {
     ProviderAccounts,
 }
 
-/// The `/accounts` add-row buttons (sim order, tui.js:3621-3628).
+/// The `/accounts` add-row buttons (sim order, tui.js:3621-3628; B6b adds
+/// the two providers the sim never knew — Kimi's device-flow OAuth and the
+/// Gemini API key — between the sim rows and the HF/custom tail).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccountAddKind {
     OpenAiOAuth,
     AnthropicOAuth,
     OpenAiApi,
     AnthropicApi,
+    KimiOAuth,
+    GeminiApi,
     HuggingFace,
     Custom,
 }
@@ -4355,8 +4375,13 @@ impl AppModel {
         let (provider, title) = match kind {
             AccountAddKind::OpenAiOAuth => ("openai-oauth", "OpenAI — ChatGPT"),
             AccountAddKind::AnthropicOAuth => ("anthropic-oauth", "Anthropic — Claude"),
+            // B6b: the daemon's device flow rides the SAME oauth_start/
+            // status/add wire — only the provider id differs; the card is
+            // flow-agnostic by design.
+            AccountAddKind::KimiOAuth => ("kimi-oauth", "Kimi — Moonshot"),
             AccountAddKind::OpenAiApi
             | AccountAddKind::AnthropicApi
+            | AccountAddKind::GeminiApi
             | AccountAddKind::HuggingFace
             | AccountAddKind::Custom => return,
         };
@@ -4482,6 +4507,11 @@ impl AppModel {
                         // account locally and selects it for its provider.
                         let (provider, identity) = match card.provider.as_str() {
                             "openai-oauth" => ("openai", "you@work.com · ChatGPT"),
+                            // B6b: the openai/anthropic arms condense into
+                            // the SIM's seeded groups; kimi has no sim seed
+                            // group, so it lands under the daemon-truth
+                            // provider id.
+                            "kimi-oauth" => ("kimi-oauth", "you@kimi.com · Kimi Code"),
                             _ => ("anthropic", "you@me.com · Claude Max"),
                         };
                         let alias = card.alias.clone();
@@ -5152,6 +5182,15 @@ impl AppModel {
                         );
                     }
                     (provider, "api") => self.open_login_card(provider, alias),
+                    // B6b: `/login kimi oauth` mirrors the `+ Kimi (OAuth)`
+                    // button EXACTLY by routing through the same hit arm —
+                    // jump to /accounts first (the card renders and owns
+                    // keys there), then the arm's feature gate and card
+                    // open run unchanged. The daemon owns the device flow.
+                    ("kimi", "oauth") => {
+                        self.enter_accounts();
+                        self.handle_hit(Hit::AccountAdd(AccountAddKind::KimiOAuth));
+                    }
                     (_, "oauth") => {
                         self.flash = Some(
                             "· /login … oauth — UI ready; the loopback flow lands after v0.0.12"
@@ -6490,6 +6529,18 @@ impl AppModel {
                     // the provider).
                     AccountAddKind::OpenAiApi => self.open_login_card("openai", None),
                     AccountAddKind::AnthropicApi => self.open_login_card("anthropic", None),
+                    // B6b: the Gemini adapter (B6a) shipped with NO feature
+                    // bit, so provider-listing truth gates the button — a
+                    // daemon that does not list the provider would bounce
+                    // the eventual account.login_api obscurely.
+                    AccountAddKind::GeminiApi => {
+                        if self.daemon_lists_provider("gemini") {
+                            self.open_login_card("gemini", None);
+                        } else {
+                            self.accounts.message = Some(self.stale_daemon_note("Gemini accounts"));
+                            self.dirty = true;
+                        }
+                    }
                     // OAuth adds run the REAL loopback flow (W5e-1): the
                     // card drives account.oauth_start/status + account.add
                     // live, and the sim's simulated authorize in demo.
@@ -6500,6 +6551,18 @@ impl AppModel {
                             self.open_oauth_add(kind);
                         } else {
                             self.accounts.message = Some(self.stale_daemon_note("OAuth sign-in"));
+                            self.dirty = true;
+                        }
+                    }
+                    // B6b: Kimi rides the DEVICE flow — its own feature bit
+                    // (shipped beside the kimi-oauth builtin, v0.0.52), the
+                    // same §4.1 gate as the PKCE pair above.
+                    AccountAddKind::KimiOAuth => {
+                        if self.daemon_serves(haider_rpc::FEATURE_ACCOUNT_OAUTH_DEVICE_V1) {
+                            self.open_oauth_add(kind);
+                        } else {
+                            self.accounts.message =
+                                Some(self.stale_daemon_note("Kimi OAuth sign-in"));
                             self.dirty = true;
                         }
                     }

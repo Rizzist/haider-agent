@@ -70,7 +70,8 @@ fn add_row_is_bottom_anchored_even_when_empty() {
         .iter()
         .position(|row| row.contains("click an account to make it active"))
         .expect("hints rendered");
-    // Bottom block: buttons(2) + blank + hints, then the status row.
+    // Bottom block: buttons(3, since B6b) + blank + hints, then the
+    // status row.
     assert!(
         button_row >= rows.len() - 6,
         "add row must sit at the bottom (row {button_row} of {})",

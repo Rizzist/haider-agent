@@ -1321,6 +1321,9 @@ impl DemoDriver {
                 // (tui.js:3633): a canned loopback URL, `[1]` simulates.
                 let origin = match provider.as_str() {
                     "openai-oauth" => "auth.openai.com",
+                    // B6b: the kimi demo authorize points at the real
+                    // device-flow host (the daemon's sanctioned issuer).
+                    "kimi-oauth" => "auth.kimi.com",
                     _ => "claude.ai",
                 };
                 model.oauth_add_phase(

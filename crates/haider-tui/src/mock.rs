@@ -268,8 +268,12 @@ pub struct SampleSession {
 }
 
 /// The sim's seeded credential list (tui.js:146-154): 7 accounts across 5
-/// providers (openai ×2, anthropic ×2, google, local, huggingface) — the
+/// providers (openai ×2, anthropic ×2, gemini, local, huggingface) — the
 /// launcher's Accounts meta quotes both counts verbatim.
+///
+/// B6b documented divergence: the sim seeds the Gemini key under `google`;
+/// the adapter that actually landed (B6a) registers as `gemini` in
+/// provider.list, so the demo world wears the honest registry id.
 pub const SEED_ACCOUNTS: usize = 7;
 pub const SEED_ACCOUNT_PROVIDERS: usize = 5;
 /// The sim's seeded peer list minus the `shell` rung (tui.js:169-174):
@@ -332,7 +336,7 @@ pub fn seed_account_rows() -> Vec<crate::app::AccountRow> {
         ),
         row(
             "gemini-key",
-            "google",
+            "gemini",
             AuthMethod::ApiKey,
             "AIza…4b1",
             true,
@@ -413,16 +417,34 @@ pub fn seed_provider_summaries() -> Vec<haider_rpc::ProviderSummaryWire> {
             Some("claude-opus-5"),
             true,
         ),
+        // B6a landed the Gemini adapter: the demo registry serves what
+        // provider.list serves — a real family, endpoint, and inventory
+        // (the pre-B6a seed pinned "google · adapter not installed").
         summary(
-            "google",
-            ProviderApiFamilyWire::Unknown,
+            "gemini",
+            ProviderApiFamilyWire::GeminiGenerateContent,
+            Some("https://generativelanguage.googleapis.com/v1beta"),
+            &["gemini-3"],
+            &[AuthMethod::ApiKey],
+            ProviderAvailabilityWire::Available,
             None,
+            Some("gemini-3"),
+            true,
+        ),
+        // B6k landed kimi-oauth as a builtin. Signed out, its catalog is
+        // undiscovered — provider.list serves exactly this unavailable row
+        // (the reason string is the daemon's own), which keeps the demo's
+        // honest-unavailable rendering exercised.
+        summary(
+            "kimi-oauth",
+            ProviderApiFamilyWire::OpenAiChatCompletions,
+            Some("https://api.kimi.com/coding/v1"),
             &[],
-            &[],
+            &[AuthMethod::OAuth],
             ProviderAvailabilityWire::Unavailable,
-            Some("adapter not installed"),
+            Some("provider model inventory is unavailable"),
             None,
-            false,
+            true,
         ),
         summary(
             "local",

@@ -888,17 +888,20 @@ fn push_custom_card_lines<'a>(model: &'a AppModel, theme: &Theme, lines_out: &mu
     }
 }
 
-/// The account add-button rows (OAuth/API/HF/custom) with per-button
-/// relative hit rects — shared by /accounts and /providers (owner ask:
-/// providers should offer the SAME add options in place).
+/// The account add-button rows (OAuth/API/Kimi/Gemini/HF/custom) with
+/// per-button relative hit rects — shared by /accounts and /providers
+/// (owner ask: providers should offer the SAME add options in place).
+/// B6b: the two new providers slot between the sim rows and the HF/custom
+/// tail — OpenAI stays first, Custom stays last (sim button order,
+/// tui.js:3621-3628, preserved at the edges).
 fn push_account_add_buttons<'a>(
     model: &'a AppModel,
     theme: &Theme,
     lines_out: &mut Vec<Line<'a>>,
     rects_out: &mut Vec<(usize, u16, u16, Hit)>,
 ) {
-    for chunk in [
-        [
+    let rows: [&[(&str, crate::app::AccountAddKind)]; 3] = [
+        &[
             ("+ OpenAI (OAuth)", crate::app::AccountAddKind::OpenAiOAuth),
             (
                 "+ Anthropic (OAuth)",
@@ -906,23 +909,28 @@ fn push_account_add_buttons<'a>(
             ),
             ("+ OpenAI (API)", crate::app::AccountAddKind::OpenAiApi),
         ],
-        [
+        &[
             (
                 "+ Anthropic (API)",
                 crate::app::AccountAddKind::AnthropicApi,
             ),
+            ("+ Kimi (OAuth)", crate::app::AccountAddKind::KimiOAuth),
+            ("+ Gemini (API)", crate::app::AccountAddKind::GeminiApi),
+        ],
+        &[
             ("+ HuggingFace", crate::app::AccountAddKind::HuggingFace),
             (
                 "+ Custom (OpenAI-compatible)",
                 crate::app::AccountAddKind::Custom,
             ),
         ],
-    ] {
+    ];
+    for chunk in rows {
         // One hit per BUTTON: per-button column rects, hover-aware (owner
         // ask): the hovered button renders on the hover band.
         let mut spans: Vec<Span<'_>> = Vec::new();
         let mut offset = 0u16;
-        for (label, kind) in chunk {
+        for &(label, kind) in chunk {
             let hit = Hit::AccountAdd(kind);
             let hovered = model.hovered.as_ref() == Some(&hit);
             let width = label.chars().count() as u16 + 2;
@@ -1094,10 +1102,18 @@ fn render_accounts(
     // The OAuth add card (W5e-1, sim authFlow MenuBox tui.js:3629-3682) —
     // rendered with the bottom chrome, above the add row.
     if let Some(card) = &model.oauth_add {
+        // B6b: name the flow honestly — Kimi is a device-code grant, not a
+        // loopback PKCE exchange (the daemon owns both; the card only
+        // reports).
+        let flow = if card.provider == "kimi-oauth" {
+            "OAuth (device code)"
+        } else {
+            "OAuth (loopback PKCE)"
+        };
         footer_lines.push(Line::from(vec![
             Span::styled("◉ ", theme.gold_style()),
             Span::styled(
-                format!("authorize {} — OAuth (loopback PKCE)", card.title),
+                format!("authorize {} — {flow}", card.title),
                 theme.warn_style(),
             ),
         ]));
@@ -1294,6 +1310,9 @@ fn render_providers(
             haider_rpc::ProviderApiFamilyWire::AnthropicMessages => "messages",
             haider_rpc::ProviderApiFamilyWire::OpenAiResponses => "responses",
             haider_rpc::ProviderApiFamilyWire::OpenAiChatCompletions => "openai-compatible",
+            // B6a landed the adapter; without this arm the gemini row wears
+            // "unknown api" against a registry that KNOWS the family.
+            haider_rpc::ProviderApiFamilyWire::GeminiGenerateContent => "gemini",
             _ => "unknown api",
         };
         let endpoint = summary.endpoint.clone().unwrap_or_else(|| "—".to_owned());

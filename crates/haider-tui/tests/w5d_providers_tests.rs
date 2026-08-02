@@ -64,8 +64,15 @@ fn providers_screen_renders_the_provisional_layout() {
     assert!(frame.contains("responses · https://api.openai.com/v1"));
     assert!(frame.contains("models: gpt-5.6  gpt-5.6-codex*  o4-mini"));
     assert!(frame.contains("account: work-chatgpt · oauth · in use"));
-    // Unavailable built-in stays visible with its honest reason (§5.2).
-    assert!(frame.contains("google  ○ adapter not installed"));
+    // B6a flipped the old "google ○ adapter not installed" pin: the Gemini
+    // adapter IS installed now, and the registry serves it as a real row.
+    assert!(frame.contains("gemini  ● available"));
+    assert!(frame.contains("gemini · https://generativelanguage.googleapis.com/v1beta"));
+    assert!(frame.contains("models: gemini-3*"));
+    // Unavailable built-in stays visible with its honest reason (§5.2) —
+    // now the signed-out kimi-oauth builtin, wearing the daemon's own
+    // undiscovered-inventory reason.
+    assert!(frame.contains("kimi-oauth  ○ provider model inventory is unavailable"));
     assert!(frame.contains("models: —"));
     // Custom/local rows render their endpoint truthfully.
     assert!(frame.contains("openai-compatible · http://127.0.0.1:8000/v1"));
