@@ -487,13 +487,22 @@ fn pending_attachments_clear_on_submit_and_survive_branch_switch_capture() {
     assert!(model.switch_branch(Some(&bid("b-exp"))).is_some());
     assert_eq!(model.composer.attachments().len(), 1);
 
-    // ⌫ at the very start removes the NEWEST chip, nothing else.
+    // ⌫ at the very start removes the NEWEST chip — and ONLY at the
+    // start: mid-text it stays a text edit and the chips stay put.
     model.begin_attachment_upload(
         vec![9],
         haider_tui::composer::PendingKind::PastedText { lines: 9 },
         "[Pasted 9 lines]".to_owned(),
     );
     model.requests.clear();
+    model.handle(key(KeyCode::Char('x')));
+    model.handle(key(KeyCode::Backspace));
+    assert_eq!(model.composer, "", "mid-text ⌫ deleted the grapheme");
+    assert_eq!(
+        model.composer.attachments().len(),
+        2,
+        "mid-text ⌫ ate no chip"
+    );
     model.handle(key(KeyCode::Backspace));
     let labels: Vec<&str> = model
         .composer
@@ -590,6 +599,106 @@ fn pending_attachments_clear_on_submit_and_survive_branch_switch_capture() {
             "artifact": artifact.as_str(),
             "mime": "image/png",
         }])
+    );
+}
+
+// ---- capture: the reply completes the ISSUING draft -------------------
+
+/// MUTATION-DRIVEN (B4b executed-mutation round, survivor finding): a
+/// `complete_upload` that ignored the captured surface and wrote to the
+/// on-screen composer passed the entire suite — the reply always landed
+/// while the issuing surface was still displayed. This observer parks the
+/// issuing draft first: the reply must complete the chip on the draft
+/// that ISSUED the upload, not vanish against whatever is on screen.
+#[test]
+fn upload_reply_completes_the_issuing_draft_not_the_displayed_surface() {
+    let mut model = live_model();
+    let mut driver = LiveDriver::new("test");
+
+    model.handle(AppEvent::Paste(Pasted::new(
+        "p1\np2\np3\np4\np5".to_owned(),
+    )));
+    let issuing_surface = model.surface_key();
+    let commands = drain(&mut driver, &mut model);
+    let LiveCommand::ArtifactPut {
+        upload, surface, ..
+    } = commands
+        .iter()
+        .find(|command| matches!(command, LiveCommand::ArtifactPut { .. }))
+        .expect("the upload")
+        .clone()
+    else {
+        unreachable!()
+    };
+    assert_eq!(surface, issuing_surface);
+
+    // ⌃C walks back to the launcher — the issuing draft PARKS with its
+    // uploading chip; the launcher composer (no chips) is now on screen.
+    model.handle(AppEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+        KeyCode::Char('c'),
+        ratatui::crossterm::event::KeyModifiers::CONTROL,
+    )));
+    assert_eq!(model.screen, Screen::Launcher);
+    assert!(model.composer.attachments().is_empty());
+
+    // The verified address lands while the launcher is displayed…
+    let artifact = ArtifactRef::new(format!("blake3:{:0>64}", "parked"));
+    driver.apply(
+        &mut model,
+        LiveReply::ArtifactUploaded {
+            upload,
+            surface,
+            artifact: artifact.clone(),
+        },
+    );
+    assert!(
+        model.composer.attachments().is_empty(),
+        "the displayed launcher composer gained nothing"
+    );
+
+    // …and the ISSUING draft comes back with its chip READY.
+    model.open_session(&sid());
+    let chips = model.composer.attachments();
+    assert_eq!(chips.len(), 1);
+    assert_eq!(
+        chips[0].artifact.as_ref(),
+        Some(&artifact),
+        "the reply completed the issuing draft's chip"
+    );
+}
+
+// ---- disconnect: in-flight uploads die honestly -----------------------
+
+/// `artifact.put` is receipt-free: no reply survives a socket and nothing
+/// resends the bytes, so a disconnect must kill the uploading chip WITH a
+/// notice — a chip left "uploading" forever is a promise no reconnect can
+/// keep.
+#[test]
+fn disconnect_drops_uploading_chips_with_an_honest_notice() {
+    let mut model = live_model();
+    let mut driver = LiveDriver::new("test");
+
+    model.handle(AppEvent::Paste(Pasted::new(
+        "d1\nd2\nd3\nd4\nd5".to_owned(),
+    )));
+    drain(&mut driver, &mut model);
+    assert!(model.composer.has_uploading_attachment());
+
+    driver.apply(
+        &mut model,
+        LiveReply::Disconnected {
+            reason: "socket closed".to_owned(),
+        },
+    );
+    assert!(
+        model.composer.attachments().is_empty(),
+        "the in-flight chip died with the socket"
+    );
+    assert_eq!(
+        model.flash.as_deref(),
+        Some(
+            "· reconnecting — socket closed (1 in-flight attachment upload(s) dropped — /attach again)"
+        )
     );
 }
 
