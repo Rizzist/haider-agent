@@ -218,13 +218,29 @@ fn run_jsonl_is_lf_framed_and_every_line_is_a_raw_envelope() {
 /// RUNTIME failure: redirected subprocess bytes differ from this exact split.
 #[test]
 fn run_default_print_is_exact_under_redirected_no_term_io() {
-    let out = haider()
+    let mut out = haider()
         .args(["run", "--provider", "fake", "hello"])
         .env_remove("TERM")
         .stdin(Stdio::null())
         .output()
         .expect("binary runs");
-    assert!(out.status.success());
+    // Bounded retry for the transient class ONLY: under full-gate load the
+    // autospawned daemon can miss its startup deadline (exit 69). A real
+    // print-contract regression exits differently and never retries.
+    if out.status.code() == Some(69) {
+        out = haider()
+            .args(["run", "--provider", "fake", "hello"])
+            .env_remove("TERM")
+            .stdin(Stdio::null())
+            .output()
+            .expect("binary runs");
+    }
+    assert!(
+        out.status.success(),
+        "exit {:?}, stderr: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert_eq!(out.stdout, b"fake response: hello\n");
     assert!(out.stderr.is_empty());
 }

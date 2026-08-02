@@ -1,0 +1,11 @@
+[
+  {"result":"ok","value":{"event":"text_delta","text":"Answer: "}},
+  {"result":"ok","value":{"event":"provider_opaque","provider":"gemini","data":{"kind":"signed_part","part":{"text":"checking","thought":true,"thoughtSignature":"thought-signature-synthetic"}}}},
+  {"result":"ok","value":{"event":"reasoning_delta","text":"checking"}},
+  {"result":"ok","value":{"event":"provider_opaque","provider":"gemini","data":{"kind":"signed_part","call_id":"gemini-call-0000000000000000","part":{"functionCall":{"name":"get_weather","args":{"city":"Tehran"}},"thoughtSignature":"call-signature-synthetic"}}}},
+  {"result":"ok","value":{"event":"tool_call_start","call_id":"gemini-call-0000000000000000","name":"get_weather"}},
+  {"result":"ok","value":{"event":"tool_call_args_delta","call_id":"gemini-call-0000000000000000","args_fragment":"{\"city\":\"Tehran\"}"}},
+  {"result":"ok","value":{"event":"tool_call_end","call_id":"gemini-call-0000000000000000"}},
+  {"result":"ok","value":{"event":"usage_update","input":31,"output":9,"reasoning":4,"cached":3,"source":"provider_reported"}},
+  {"result":"ok","value":{"event":"finish","reason":"tool_use"}}
+]

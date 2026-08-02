@@ -1025,6 +1025,33 @@ fn management_reads_preserve_legacy_account_list_and_tolerate_future_providers()
     assert_eq!(availability, haider_rpc::ProviderAvailabilityWire::Unknown);
 }
 
+/// B6a adds Gemini's native family without changing the protocol version.
+///
+/// MUTATION CHECK: remove `#[serde(other)]` from the pre-B6a decoder below.
+/// Expected RUNTIME failure: the old-client decode rejects the new family
+/// instead of preserving the provider row with an unknown family.
+#[test]
+fn api_family_wire_addition_tolerated_by_older_clients() {
+    #[derive(Debug, PartialEq, Eq, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum PreB6aProviderApiFamilyWire {
+        AnthropicMessages,
+        OpenaiResponses,
+        OpenaiChatCompletions,
+        #[serde(other)]
+        Unknown,
+    }
+
+    let encoded = serde_json::to_string(&haider_rpc::ProviderApiFamilyWire::GeminiGenerateContent)
+        .expect("Gemini family encode");
+    assert_eq!(encoded, r#""gemini_generate_content""#);
+    assert_eq!(
+        serde_json::from_str::<PreB6aProviderApiFamilyWire>(&encoded)
+            .expect("pre-B6a tolerant decode"),
+        PreB6aProviderApiFamilyWire::Unknown
+    );
+}
+
 /// The account enums remain the original closed v1 vocabulary.
 ///
 /// MUTATION CHECK: add `#[serde(alias = "passkey")]` to

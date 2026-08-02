@@ -1,0 +1,4 @@
+data: {"candidates":[{"content":{"role":"model","parts":[{"text":"Answer: "},{"text":"checking","thought":true,"thoughtSignature":"thought-signature-synthetic"},{"functionCall":{"name":"get_weather","args":{"city":"Tehran"}},"thoughtSignature":"call-signature-synthetic"}]}}]}
+
+data: {"candidates":[{"content":{"role":"model","parts":[]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":31,"candidatesTokenCount":9,"thoughtsTokenCount":4,"cachedContentTokenCount":3,"totalTokenCount":44}}
+

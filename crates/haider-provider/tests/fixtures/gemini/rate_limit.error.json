@@ -1,0 +1,1 @@
+{"kind":"rate_limited","message":"Gemini HTTP 429 returned rate limit","retryable":true,"retry_after_ms":2250}

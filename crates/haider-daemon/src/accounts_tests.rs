@@ -145,15 +145,16 @@ fn oauth_bundle() -> haider_accounts::OAuthTokenBundleV1 {
     .expect("OAuth bundle")
 }
 
-// MUTATION CHECK (W5a provider dispatch): remove the `openai` arm from
-// `build_account_provider` (restoring the old Anthropic-only builder).
-// Expected failure: the OpenAI resolution below returns InvalidArgument
-// before its capability document can identify the native adapter.
+// MUTATION CHECK (W5a/B6a provider dispatch): remove either native API-key
+// arm from `build_account_provider`. Expected failure: OpenAI or Gemini
+// resolution returns InvalidArgument before capabilities identify the native
+// adapter.
 #[tokio::test]
-async fn production_account_factory_dispatches_openai_and_preserves_anthropic() {
+async fn production_account_factory_dispatches_native_api_key_providers() {
     let validator = ProviderCredentialValidator;
     assert!(validator.supports(ANTHROPIC_PROVIDER_NAME));
     assert!(validator.supports(OPENAI_PROVIDER_NAME));
+    assert!(validator.supports(GEMINI_PROVIDER_NAME));
     assert!(
         !validator.supports(OPENAI_COMPATIBLE_PROVIDER_NAME),
         "W5c must first carry base_url into compatible login validation"
@@ -162,12 +163,16 @@ async fn production_account_factory_dispatches_openai_and_preserves_anthropic() 
     let vault = Arc::new(MemoryVault::default());
     let anthropic_alias = CredentialAlias::new("anthropic-dispatch");
     let openai_alias = CredentialAlias::new("openai-dispatch");
+    let gemini_alias = CredentialAlias::new("gemini-dispatch");
     let compatible_alias = CredentialAlias::new("compatible-dispatch");
     vault
         .put(&anthropic_alias, b"anthropic-fixture-secret")
         .unwrap_or_else(|error| panic!("{error:?}"));
     vault
         .put(&openai_alias, b"openai-fixture-secret")
+        .unwrap_or_else(|error| panic!("{error:?}"));
+    vault
+        .put(&gemini_alias, b"gemini-fixture-secret")
         .unwrap_or_else(|error| panic!("{error:?}"));
     vault
         .put(&compatible_alias, b"compatible-fixture-secret")
@@ -188,6 +193,15 @@ async fn production_account_factory_dispatches_openai_and_preserves_anthropic() 
             base_url: None,
             auth_method: AuthMethod::ApiKey,
             identity: "openai fixture".into(),
+            status: CredentialStatus::Ok,
+            active: true,
+        },
+        CredentialDescriptor {
+            alias: gemini_alias.clone(),
+            provider: GEMINI_PROVIDER_NAME.into(),
+            base_url: None,
+            auth_method: AuthMethod::ApiKey,
+            identity: "gemini fixture".into(),
             status: CredentialStatus::Ok,
             active: true,
         },
@@ -224,6 +238,10 @@ async fn production_account_factory_dispatches_openai_and_preserves_anthropic() 
         .resolve_for_turn(&metadata(ANTHROPIC_PROVIDER_NAME, "claude-test"))
         .await
         .unwrap_or_else(|error| panic!("anthropic dispatch: {error:?}"));
+    let gemini = factory
+        .resolve_for_turn(&metadata(GEMINI_PROVIDER_NAME, "gemini-2.5-flash"))
+        .await
+        .unwrap_or_else(|error| panic!("gemini dispatch: {error:?}"));
     let compatible = factory
         .resolve_for_turn(&metadata(OPENAI_COMPATIBLE_PROVIDER_NAME, "llama-test"))
         .await
@@ -243,6 +261,11 @@ async fn production_account_factory_dispatches_openai_and_preserves_anthropic() 
         Some(anthropic_alias.as_str())
     );
     assert_eq!(
+        gemini.provider.capabilities().await.provider,
+        GEMINI_PROVIDER_NAME
+    );
+    assert_eq!(gemini.account_alias.as_deref(), Some(gemini_alias.as_str()));
+    assert_eq!(
         compatible.provider_name, OPENAI_COMPATIBLE_PROVIDER_NAME,
         "successful resolution pins the compatible dispatch arm"
     );
@@ -250,6 +273,33 @@ async fn production_account_factory_dispatches_openai_and_preserves_anthropic() 
         compatible.account_alias.as_deref(),
         Some(compatible_alias.as_str())
     );
+}
+
+/// The production validation path deliberately remains a real provider
+/// smoke: it creates the native Gemini adapter and sends the one-token ping
+/// built by `validate_provider_api_key`. It is ignored unless explicitly
+/// selected with a live key.
+///
+/// MUTATION CHECK: route Gemini through another adapter, raise max_tokens
+/// above one, or surface a provider body in validation errors. Expected
+/// RUNTIME failure: the live request shape/behavior changes or the key
+/// sentinel appears in the public error assertion.
+#[tokio::test]
+#[ignore = "live Gemini validator ping; requires HAIDER_LIVE_PROVIDER_TESTS=1"]
+async fn validator_ping_uses_real_adapter_and_stores_no_secret_in_errors() {
+    if std::env::var("HAIDER_LIVE_PROVIDER_TESTS").as_deref() != Ok("1") {
+        return;
+    }
+    let secret = std::env::var("HAIDER_GEMINI_API_KEY").expect("live Gemini API key");
+    let model =
+        std::env::var("HAIDER_GEMINI_MODEL").unwrap_or_else(|_| "gemini-2.5-flash".to_owned());
+    let result = ProviderCredentialValidator
+        .validate(GEMINI_PROVIDER_NAME, &model, secret.as_bytes())
+        .await;
+    if let Err(error) = &result {
+        assert!(!error.message.contains(&secret));
+    }
+    result.expect("live Gemini one-token validation ping");
 }
 
 /// MUTATION CHECK (W5g-5b): remove the profile API-family dispatch arm from
@@ -3966,6 +4016,17 @@ async fn custom_provider_refresh_uses_stored_origin_and_publishes_discovered_slu
             default_model: Some("seed-none".to_owned()),
             provenance: ProviderProvenance::Custom,
         },
+        ProviderProfileV1 {
+            provider_id: GEMINI_PROVIDER_NAME.to_owned(),
+            display_name: GEMINI_PROVIDER_NAME.to_owned(),
+            api_family: ProviderApiFamilyWire::GeminiGenerateContent,
+            base_url: Some(haider_provider::GEMINI_API_BASE_URL.to_owned()),
+            enabled: true,
+            auth_requirement: ProviderAuthRequirementWire::ApiKey,
+            configured_models: Vec::new(),
+            default_model: None,
+            provenance: ProviderProvenance::BuiltIn,
+        },
     ];
     let provider_store: Box<dyn ProviderRegistryStoreLike> =
         Box::new(TestProviderStore(StdMutex::new(profiles)));
@@ -3986,13 +4047,27 @@ async fn custom_provider_refresh_uses_stored_origin_and_publishes_discovered_slu
         status: CredentialStatus::Ok,
         active: true,
     };
+    let gemini_alias = CredentialAlias::new("gemini-refresh-key");
+    let gemini_descriptor = CredentialDescriptor {
+        alias: gemini_alias.clone(),
+        provider: GEMINI_PROVIDER_NAME.to_owned(),
+        base_url: None,
+        auth_method: AuthMethod::ApiKey,
+        identity: "Gemini refresh key".to_owned(),
+        status: CredentialStatus::Ok,
+        active: true,
+    };
     let mut accounts = memory_accounts();
     accounts.add(descriptor).expect("custom descriptor");
+    accounts.add(gemini_descriptor).expect("Gemini descriptor");
     let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(accounts.list().to_vec()));
     let vault = Arc::new(MemoryVault::new());
     vault
         .put(&alias, b"CUSTOM_REFRESH_API_KEY_SENTINEL_5b")
         .expect("seed custom API key");
+    vault
+        .put(&gemini_alias, b"GEMINI_REFRESH_API_KEY_SENTINEL_8c")
+        .expect("seed Gemini API key");
     let management = ManagementSnapshot::new(0, accounts.list().to_vec(), providers.summaries());
     let discoverer = Arc::new(BlockingModelDiscoverer {
         started: tokio::sync::Notify::new(),
@@ -4012,6 +4087,20 @@ async fn custom_provider_refresh_uses_stored_origin_and_publishes_discovered_slu
                     extensions: None,
                 }],
                 etag: None,
+            })),
+            ModelDiscoveryFixture::Return(Ok(DiscoveredCatalog {
+                models: vec![haider_provider::DiscoveredModel {
+                    slug: "gemini-2.5-flash".to_owned(),
+                    display_name: "Gemini 2.5 Flash".to_owned(),
+                    context_window: Some(1_048_576),
+                    description: None,
+                    default_effort: None,
+                    supported_efforts: Vec::new(),
+                    visible: true,
+                    priority: None,
+                    extensions: None,
+                }],
+                etag: Some(r#"W/"gemini-catalog""#.to_owned()),
             })),
             ModelDiscoveryFixture::Return(Ok(DiscoveredCatalog {
                 models: vec![haider_provider::DiscoveredModel {
@@ -4087,6 +4176,37 @@ async fn custom_provider_refresh_uses_stored_origin_and_publishes_discovered_slu
         other => panic!("unexpected key refresh response: {other:?}"),
     }
 
+    let (gemini_sink, mut gemini_frames) = channel_sink();
+    actor
+        .commands()
+        .send(AccountCommand::RefreshProviderModels {
+            provider: GEMINI_PROVIDER_NAME.to_owned(),
+            completed: LoginRoute {
+                request_id: RequestId::new("gemini-key-refresh"),
+                sink: gemini_sink,
+            },
+        })
+        .await
+        .expect("Gemini refresh handoff");
+    tokio::time::timeout(Duration::from_secs(2), discoverer.started.notified())
+        .await
+        .expect("Gemini discovery started");
+    discoverer.release.notify_one();
+    let gemini_frame = tokio::time::timeout(Duration::from_secs(2), gemini_frames.recv())
+        .await
+        .expect("Gemini refresh deadline")
+        .expect("Gemini refresh response");
+    match gemini_frame {
+        WireFrame::Response {
+            body: ResponseBody::ProviderModelsRefresh { provider, .. },
+            ..
+        } => {
+            assert_eq!(provider.models, vec!["gemini-2.5-flash"]);
+            assert_eq!(provider.model_details[0].context_window, Some(1_048_576));
+        }
+        other => panic!("unexpected Gemini refresh response: {other:?}"),
+    }
+
     let (none_sink, mut none_frames) = channel_sink();
     actor
         .commands()
@@ -4123,6 +4243,11 @@ async fn custom_provider_refresh_uses_stored_origin_and_publishes_discovered_slu
                     origin: key_origin.to_owned()
                 },
                 Some("CUSTOM_REFRESH_API_KEY_SENTINEL_5b".to_owned()),
+                None,
+            ),
+            (
+                CatalogSource::GeminiApiKey,
+                Some("GEMINI_REFRESH_API_KEY_SENTINEL_8c".to_owned()),
                 None,
             ),
             (

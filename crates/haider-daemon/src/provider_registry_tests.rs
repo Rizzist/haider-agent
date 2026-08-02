@@ -119,6 +119,42 @@ fn unknown_factory_provider_is_never_rendered_healthy() {
     assert_eq!(summary.default_model, None);
 }
 
+/// MUTATION CHECK: route Gemini through the compatible OpenAI family or
+/// bearer-auth metadata. Expected RUNTIME failure: the exact native family,
+/// fixed Google origin, or API-key requirement below differs.
+#[test]
+fn gemini_is_a_builtin_generate_content_api_key_provider() {
+    let source = model_source([(
+        GEMINI_PROVIDER_NAME,
+        vec![discovered_with_context(
+            "gemini-2.5-flash",
+            true,
+            None,
+            Some(1_048_576),
+        )],
+    )]);
+    let registry = ProviderRegistry::new(
+        MemoryProviderStore::default(),
+        initial_provider_profiles(
+            &std::collections::BTreeSet::from([GEMINI_PROVIDER_NAME.to_owned()]),
+            "unused",
+        ),
+        source,
+    )
+    .expect("Gemini registry");
+    let summary = registry
+        .summary(GEMINI_PROVIDER_NAME)
+        .expect("Gemini summary");
+    assert_eq!(
+        summary.api_family,
+        ProviderApiFamilyWire::GeminiGenerateContent
+    );
+    assert_eq!(summary.endpoint.as_deref(), Some(GEMINI_API_BASE_URL));
+    assert_eq!(summary.auth_methods, vec![AuthMethod::ApiKey]);
+    assert_eq!(summary.models, vec!["gemini-2.5-flash"]);
+    assert_eq!(summary.availability, ProviderAvailabilityWire::Available);
+}
+
 /// MUTATION CHECK: pass `configured_models` instead of `discovered_models` to
 /// `validated_default` in `ProviderRegistry::configured_profiles`. Expected
 /// runtime failure: the configured-but-undiscovered default is accepted

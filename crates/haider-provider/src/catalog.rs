@@ -29,6 +29,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::origin::{FixedDnsResolver, FixedOriginGuard, SystemFixedDnsResolver};
+use reqwest::header::HeaderValue;
 
 /// Hard cap on a discovery response body. The codex payload embeds
 /// per-model base instructions, so this is generous but still bounded.
@@ -118,6 +119,8 @@ pub enum CatalogSource {
     AnthropicSubscription,
     /// Kimi Code's nonstandard OAuth catalog.
     KimiOAuth,
+    /// Gemini's fixed model catalog authenticated by `x-goog-api-key`.
+    GeminiApiKey,
     /// An OpenAI-compatible custom profile's stored API origin.
     OpenAiCompatible { origin: String },
 }
@@ -137,6 +140,7 @@ pub fn catalog_request_url(source: CatalogSource, endpoint: &str) -> String {
         }
         CatalogSource::AnthropicSubscription
         | CatalogSource::KimiOAuth
+        | CatalogSource::GeminiApiKey
         | CatalogSource::OpenAiCompatible { .. } => endpoint.to_owned(),
     }
 }
@@ -153,6 +157,7 @@ impl CatalogSource {
                 format!("{}/v1/models", crate::ANTHROPIC_OAUTH_BASE_URL)
             }
             Self::KimiOAuth => format!("{}/models", crate::KIMI_OAUTH_BASE_URL),
+            Self::GeminiApiKey => crate::GEMINI_MODELS_URL.to_owned(),
             Self::OpenAiCompatible { origin } => {
                 format!("{}/models", origin.trim().trim_end_matches('/'))
             }
@@ -164,7 +169,26 @@ impl CatalogSource {
             Self::OpenAiSubscription => Some("chatgpt.com"),
             Self::AnthropicSubscription => Some("api.anthropic.com"),
             Self::KimiOAuth => Some("api.kimi.com"),
+            Self::GeminiApiKey => Some("generativelanguage.googleapis.com"),
             Self::OpenAiCompatible { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CatalogAuthMode {
+    Bearer,
+    XGoogApiKey,
+}
+
+impl CatalogSource {
+    fn auth_mode(&self) -> CatalogAuthMode {
+        match self {
+            Self::GeminiApiKey => CatalogAuthMode::XGoogApiKey,
+            Self::OpenAiSubscription
+            | Self::AnthropicSubscription
+            | Self::KimiOAuth
+            | Self::OpenAiCompatible { .. } => CatalogAuthMode::Bearer,
         }
     }
 }
@@ -238,7 +262,8 @@ pub async fn discover_models_with_resolver(
         }
         CatalogSource::OpenAiSubscription
         | CatalogSource::AnthropicSubscription
-        | CatalogSource::KimiOAuth => {
+        | CatalogSource::KimiOAuth
+        | CatalogSource::GeminiApiKey => {
             let endpoint = source.endpoint();
             let Some(trusted_host) = source.trusted_host() else {
                 return Err(CatalogError::Unavailable {
@@ -279,9 +304,7 @@ pub async fn discover_models_with_resolver(
         .get(&request_url)
         .header(reqwest::header::CONNECTION, "close")
         .header(reqwest::header::ACCEPT, "application/json");
-    if let Some(access_token) = access_token {
-        request = request.bearer_auth(access_token);
-    }
+    request = apply_catalog_credential(request, &source, access_token)?;
     if let Some(etag) = etag {
         request = request.header(reqwest::header::IF_NONE_MATCH, etag);
     }
@@ -362,7 +385,7 @@ pub fn parse_catalog(
 ) -> Result<Vec<DiscoveredModel>, CatalogError> {
     let entries = match source {
         // codex: `{ "models": [ … ] }`
-        CatalogSource::OpenAiSubscription => value.get("models"),
+        CatalogSource::OpenAiSubscription | CatalogSource::GeminiApiKey => value.get("models"),
         // Anthropic and OpenAI-compatible: `{ "data": [ … ] }`
         CatalogSource::AnthropicSubscription
         | CatalogSource::KimiOAuth
@@ -375,6 +398,31 @@ pub fn parse_catalog(
 
     let mut models = Vec::new();
     for entry in entries {
+        if matches!(source, CatalogSource::GeminiApiKey) {
+            let Some(slug) = entry
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|name| name.strip_prefix("models/").or(Some(name)))
+                .filter(|name| !name.is_empty())
+            else {
+                continue;
+            };
+            models.push(DiscoveredModel {
+                slug: slug.to_owned(),
+                display_name: slug.to_owned(),
+                context_window: entry
+                    .get("inputTokenLimit")
+                    .and_then(serde_json::Value::as_u64)
+                    .filter(|window| *window > 0),
+                description: None,
+                default_effort: None,
+                supported_efforts: Vec::new(),
+                visible: true,
+                priority: None,
+                extensions: None,
+            });
+            continue;
+        }
         if matches!(source, CatalogSource::OpenAiCompatible { .. }) {
             let Some(slug) = entry.get("id").and_then(serde_json::Value::as_str) else {
                 continue;
@@ -440,7 +488,9 @@ pub fn parse_catalog(
                 .get("context_length")
                 .and_then(serde_json::Value::as_u64)
                 .filter(|window| *window > 0),
-            CatalogSource::AnthropicSubscription | CatalogSource::OpenAiCompatible { .. } => None,
+            CatalogSource::AnthropicSubscription
+            | CatalogSource::GeminiApiKey
+            | CatalogSource::OpenAiCompatible { .. } => None,
         };
         let kimi_extensions =
             matches!(source, CatalogSource::KimiOAuth).then(|| DiscoveredModelExtensions {
@@ -505,6 +555,28 @@ pub fn parse_catalog(
         });
     }
     Ok(models)
+}
+
+pub(crate) fn apply_catalog_credential(
+    request: reqwest::RequestBuilder,
+    source: &CatalogSource,
+    credential: Option<&str>,
+) -> Result<reqwest::RequestBuilder, CatalogError> {
+    let Some(credential) = credential else {
+        return Ok(request);
+    };
+    match source.auth_mode() {
+        CatalogAuthMode::Bearer => Ok(request.bearer_auth(credential)),
+        CatalogAuthMode::XGoogApiKey => {
+            let mut value = HeaderValue::from_bytes(credential.as_bytes()).map_err(|_| {
+                CatalogError::Unavailable {
+                    reason: "model catalog credential is not a valid HTTP header value".to_owned(),
+                }
+            })?;
+            value.set_sensitive(true);
+            Ok(request.header("x-goog-api-key", value))
+        }
+    }
 }
 
 /// Picker order: provider priority first, then display name. Hidden models

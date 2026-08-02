@@ -1,0 +1,1 @@
+{"error":{"code":429,"message":"Synthetic quota exhaustion","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"2.250s"}]}}

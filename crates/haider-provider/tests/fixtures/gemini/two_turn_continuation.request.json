@@ -1,0 +1,9 @@
+{
+  "contents": [
+    {"role":"user","parts":[{"text":"What is the weather in Tehran?"}]},
+    {"role":"model","parts":[{"functionCall":{"name":"lookup_weather","args":{"city":"Tehran"}},"thoughtSignature":"two-turn-signature"}]},
+    {"role":"user","parts":[{"functionResponse":{"name":"lookup_weather","response":{"result":"sunny, 28 C","truncated":false}}}]}
+  ],
+  "generationConfig": {"maxOutputTokens":64},
+  "tools": [{"functionDeclarations":[{"name":"lookup_weather","description":"Look up weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}]}]
+}

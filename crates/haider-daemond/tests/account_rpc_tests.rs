@@ -163,9 +163,16 @@ struct AccountFixture {
 
 impl AccountFixture {
     fn new(script: Vec<Result<ValidatedIdentity, ValidationError>>) -> Self {
+        Self::for_provider("anthropic", script)
+    }
+
+    fn for_provider(
+        provider: &'static str,
+        script: Vec<Result<ValidatedIdentity, ValidationError>>,
+    ) -> Self {
         Self {
             vault: Arc::new(MemoryVault::default()),
-            validator: ScriptedValidator::new(script),
+            validator: ScriptedValidator::for_provider(provider, script),
             descriptors: Arc::new(SharedDescriptors::default()),
         }
     }
@@ -237,12 +244,22 @@ async fn stage_secret(client: &mut UdsClient, stage_id: &str, secret: &str) -> S
 }
 
 fn login_body(command: &str, reference: &str, alias: Option<&str>) -> RequestBody {
+    login_body_for_provider(command, "anthropic", reference, alias, None)
+}
+
+fn login_body_for_provider(
+    command: &str,
+    provider: &str,
+    reference: &str,
+    alias: Option<&str>,
+    validation_model: Option<&str>,
+) -> RequestBody {
     RequestBody::AccountLoginApi {
         command_id: CommandId::new(command),
-        provider: "anthropic".into(),
+        provider: provider.into(),
         alias: alias.map(str::to_owned),
         vault_reference: reference.into(),
-        validation_model: None,
+        validation_model: validation_model.map(str::to_owned),
     }
 }
 
@@ -813,6 +830,7 @@ async fn production_wire_path_advertises_builtin_providers_but_never_fake() {
         ("anthropic", "claude-test"),
         ("openai", "gpt-5-test"),
         ("openai-compatible", "llama-test"),
+        ("gemini", "gemini-2.5-flash"),
     ] {
         let accepted = request(
             &mut client,
@@ -831,6 +849,64 @@ async fn production_wire_path_advertises_builtin_providers_but_never_fake() {
             "{provider} must be creatable on the production path"
         );
     }
+
+    task.shutdown_handle().request("test complete");
+    let _ = task.join().await;
+}
+
+/// MUTATION CHECK: remove Gemini from validator support, the built-in
+/// registry, or the account-backed builder. Expected RUNTIME failure: login
+/// or session creation below returns an error instead of accepting the
+/// active Gemini API-key account.
+#[tokio::test]
+async fn session_create_accepts_gemini_when_account_active() {
+    let root = test_root("hacG");
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap_or_else(|error| panic!("workspace: {error}"));
+    let config = DaemonConfig::new("profile-gemini", root.path().join("store"), root.path());
+    let fixture = AccountFixture::for_provider("gemini", Vec::new());
+    let task = ready_with_dependencies(&config, fixture.dependencies()).await;
+    let mut client = control_client(&config).await;
+
+    let reference = stage_secret(
+        &mut client,
+        "stage-gemini",
+        "GEMINI_ACCOUNT_RPC_SENTINEL_71c4",
+    )
+    .await;
+    let descriptor = expect_descriptor(
+        request(
+            &mut client,
+            "req-gemini-login",
+            login_body_for_provider(
+                "command-gemini-login",
+                "gemini",
+                &reference,
+                Some("gemini-work"),
+                Some("gemini-2.5-flash"),
+            ),
+        )
+        .await,
+    );
+    assert_eq!(descriptor.provider, "gemini");
+    assert!(descriptor.active);
+
+    let created = request(
+        &mut client,
+        "req-gemini-create",
+        RequestBody::SessionCreate {
+            command_id: CommandId::new("command-gemini-create"),
+            cwd: workspace.display().to_string(),
+            provider: "gemini".into(),
+            model: "gemini-2.5-flash".into(),
+            max_tokens: 64,
+        },
+    )
+    .await;
+    assert!(
+        matches!(created, ResponseBody::SessionCreate { .. }),
+        "active Gemini account must be accepted by session.create: {created:?}"
+    );
 
     task.shutdown_handle().request("test complete");
     let _ = task.join().await;

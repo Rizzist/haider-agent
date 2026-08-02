@@ -522,6 +522,8 @@ pub enum ProviderApiFamilyWire {
     OpenAiResponses,
     #[serde(rename = "openai_chat_completions")]
     OpenAiChatCompletions,
+    #[serde(rename = "gemini_generate_content")]
+    GeminiGenerateContent,
     #[serde(other)]
     Unknown,
 }

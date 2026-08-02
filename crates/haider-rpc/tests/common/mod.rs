@@ -963,6 +963,30 @@ pub fn transcript() -> Vec<WireFrame> {
                 status: OAuthFlowStatusWire::WaitingDevice,
             },
         },
+        // B6a append-only native Gemini family. All prior frames remain
+        // byte-for-byte stable and an older tolerant client maps the family
+        // discriminant to Unknown.
+        WireFrame::Response {
+            request_id: RequestId::new("request-gemini-provider"),
+            body: ResponseBody::ProviderList {
+                providers: vec![ProviderSummaryWire {
+                    provider: "gemini".into(),
+                    api_family: ProviderApiFamilyWire::GeminiGenerateContent,
+                    endpoint: Some("https://generativelanguage.googleapis.com/v1beta".into()),
+                    models: vec!["gemini-2.5-flash".into()],
+                    model_details: vec![ModelDetailWire {
+                        name: "gemini-2.5-flash".into(),
+                        context_window: Some(1_048_576),
+                    }],
+                    auth_methods: vec![AuthMethod::ApiKey],
+                    availability: ProviderAvailabilityWire::Available,
+                    availability_reason: None,
+                    default_model: None,
+                    enabled: true,
+                }],
+                revision: 12,
+            },
+        },
     ]
 }
 

@@ -1,0 +1,44 @@
+# B6a Gemini provider mutation notes
+
+Every production mutation below has a runtime observer. “Expected RUNTIME
+failure” means the named test fails by assertion or typed error; a compile-only
+failure is not the claimed evidence.
+
+| Production mutation | Runtime observer | Expected RUNTIME failure |
+|---|---|---|
+| Encode a Gemini `functionResponse` with Haider's `call_id`, guess its name, or fail to coalesce the separately reconstructed signed part and canonical tool call. | `haider-provider/tests/gemini_provider_tests.rs::two_turn_tool_roundtrip_continuation_payload_is_stable` | The complete continuation payload differs from the golden, or its name-keyed `functionResponse` is not `lookup_weather`. |
+| Make synthesized call IDs random, restart them after prior Gemini calls, or emit fragmented/partial Gemini arguments. | `haider-provider/tests/gemini_provider_tests.rs::synthesized_call_ids_are_deterministic_and_replay_maps_to_names` and `haider-provider::gemini_tests::synthesized_call_ids_are_deterministic_and_accept_a_history_offset` | Replaying identical SSE changes IDs, the history offset collides, or the whole-arguments delta sequence differs. |
+| Drop or normalize a native `thoughtSignature`, duplicate its normalized call on replay, or accept another provider's opaque data. | `haider-provider/tests/gemini_provider_tests.rs::gemini_opaque_roundtrips_and_foreign_provider_opaque_is_rejected` | Exact native part equality/one-part cardinality fails or foreign opaque data is accepted. |
+| Stop using seven-byte incremental SSE/UTF-8 framing, mis-map thought text, tool calls, usage, or terminal reasons. | `haider-provider/tests/gemini_provider_tests.rs::gemini_stream_decodes_text_reasoning_toolcall_usage_finish` and `manifest_replays_every_declared_gemini_fixture_in_either_promotion_state` | The decoded `StreamEvent` sequence differs from a checked-in golden, including malformed and terminal fixtures. |
+| Retry automatically, change the 10/30/90-second transport bounds, inherit a proxy, permit redirects, widen the fixed origin, or construct a credential-bearing request after a private/special DNS answer. | `haider-provider::gemini_tests::{constructor_transport_config_disables_retries_and_pins_all_timeouts,gemini_credential_client_ignores_inherited_proxy_environment,private_or_special_dns_answers_fail_before_api_key_request_building,x_goog_api_key_is_sensitive_and_request_consumes_fixed_origin_guard}` | Exact transport policy changes, a proxy is inherited, the guard admits the hostile answer, or the request loses its sensitive `x-goog-api-key` header. |
+| Classify Gemini 429/400-context/503 responses generically, lose protobuf `RetryInfo`, read beyond the body cap, or expose provider prose through `ProviderError`. | `haider-provider/tests/gemini_provider_tests.rs::http_errors_classify_typed_without_leaking_bodies` and `haider-provider::gemini_tests::retry_info_protobuf_durations_are_millisecond_exact_and_bounded` | Error kind/retry delay differs or a sentinel from the bounded body appears in public error fields. |
+| Treat a prompt safety block as ordinary end-turn text or omit its refusal. | `haider-provider/tests/gemini_provider_tests.rs::manifest_replays_every_declared_gemini_fixture_in_either_promotion_state` (`safety`) | The fixture loses `RefusalDelta` or its terminal `Finish`. |
+| Send Gemini catalog credentials as Bearer, expose the header in formatting, change an existing source's auth bytes, parse names without stripping `models/`, or discard `inputTokenLimit`. | `haider-provider::catalog_tests::catalog_auth_mode_is_source_specific_and_existing_sources_are_identical` and `haider-provider/tests/catalog_tests.rs::catalog_parses_models_with_context_windows` | The exact headers differ, the sensitive bit is lost, or the catalog slug/context golden changes. |
+| Remove the vault-backed Gemini catalog source from account refresh, use a descriptor origin, or skip cached publication. | `haider-daemon::accounts::accounts_tests::custom_provider_refresh_uses_stored_origin_and_publishes_discovered_slugs` | The discoverer does not observe `CatalogSource::GeminiApiKey` with the active vault key, or the published model/window differs. |
+| Register Gemini as OpenAI-compatible, OAuth, disabled, or at a mutable endpoint. | `haider-daemon::provider_registry::provider_registry_tests::gemini_is_a_builtin_generate_content_api_key_provider` | Native family, fixed Google base, API-key auth, availability, or model inventory differs. |
+| Remove Gemini validator support, route account construction through another adapter, or lose account attribution. | `haider-daemon::accounts::accounts_tests::production_account_factory_dispatches_native_api_key_providers` and the live-gated `validator_ping_uses_real_adapter_and_stores_no_secret_in_errors` | Factory resolution fails/native capabilities differ, or the real one-token validation exposes a key in its public error. |
+| Remove Gemini from the production creatable set or reject an active Gemini account at session creation. | `haider-daemond/tests/account_rpc_tests.rs::{production_wire_path_advertises_builtin_providers_but_never_fake,session_create_accepts_gemini_when_account_active}` | `session.create` returns an error for the built-in or the staged-login acceptance path. |
+| Rename the native API-family string, bump the wire version, remove tolerant decoding, reorder an existing transcript frame, or omit the append-only Gemini provider frame. | `haider-rpc/tests/wire_golden_tests.rs::{api_family_wire_addition_tolerated_by_older_clients,compact_ws_bodies_and_length_prefixed_uds_streams_are_golden}` | The family no longer encodes as `gemini_generate_content`, a pre-B6a reader rejects it, or compact WS/UDS golden bytes differ. |
+
+The daemon acceptance laws and one pre-existing redirect test open Unix/TCP
+listeners. Restricted macOS sandboxes that prohibit `bind(2)` stop those tests
+at fixture setup with `Operation not permitted`; the tests compile there and
+execute normally in the workspace/CI runtime with local-listener permission.
+
+## Review-of-record amendments (Fable, executed mutations)
+
+- **Call-index continuation (poison-class law)**: the shipped two-turn
+  golden was DEGENERATE — one dense prior call makes `count ==
+  greatest+1`, so `Ok(count)` survived it. Fixed with the
+  request-aware replay seam (`replay_gemini_sse_for_request`) and
+  `sparse_history_call_index_continues_past_the_greatest_not_the_count`
+  (prior call at index 5 → next id must be …0006). Mutation now
+  runtime-killed. Third instance of the degenerate-equivalence class
+  this run.
+- **Foreign-opaque check inside `next_synthesized_call_index`**: ungating
+  it survives — it is a REDUNDANT layer; the load-bearing rejection is
+  the encoder's (pinned by
+  `gemini_opaque_roundtrips_and_foreign_provider_opaque_is_rejected`).
+  A foreign opaque reaching the index scanner either fails parse
+  (typed error) or at worst pollutes an index the encoder's rejection
+  makes unreachable. Kept as hygiene; no law rests on it.

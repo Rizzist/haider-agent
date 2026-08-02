@@ -46,10 +46,10 @@ use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::CredentialAlias;
 use haider_provider::{
     ANTHROPIC_OAUTH_PROVIDER_NAME, ANTHROPIC_PROVIDER_NAME, AnthropicProvider,
-    BUILTIN_PROVIDER_NAMES, CatalogError, CatalogSource, DiscoveredCatalog,
-    KIMI_OAUTH_PROVIDER_NAME, Message, OPENAI_COMPATIBLE_PROVIDER_NAME, OPENAI_OAUTH_PROVIDER_NAME,
-    OPENAI_PROVIDER_NAME, OpenAiCompatibleProvider, OpenAiProvider, Provider, ProviderErrorKind,
-    TurnRequest, discover_models,
+    BUILTIN_PROVIDER_NAMES, CatalogError, CatalogSource, DiscoveredCatalog, GEMINI_PROVIDER_NAME,
+    GeminiProvider, KIMI_OAUTH_PROVIDER_NAME, Message, OPENAI_COMPATIBLE_PROVIDER_NAME,
+    OPENAI_OAUTH_PROVIDER_NAME, OPENAI_PROVIDER_NAME, OpenAiCompatibleProvider, OpenAiProvider,
+    Provider, ProviderErrorKind, TurnRequest, discover_models,
 };
 use haider_rpc::{
     ERROR_CODE_BUSY, ERROR_CODE_CREDENTIAL_MISSING, ERROR_CODE_INVALID_ARGUMENT,
@@ -175,7 +175,10 @@ pub struct ProviderCredentialValidator;
 #[async_trait::async_trait]
 impl CredentialValidator for ProviderCredentialValidator {
     fn supports(&self, provider: &str) -> bool {
-        matches!(provider, ANTHROPIC_PROVIDER_NAME | OPENAI_PROVIDER_NAME)
+        matches!(
+            provider,
+            ANTHROPIC_PROVIDER_NAME | OPENAI_PROVIDER_NAME | GEMINI_PROVIDER_NAME
+        )
     }
 
     async fn validate(
@@ -217,6 +220,9 @@ async fn validate_provider_api_key(
         }
         OPENAI_PROVIDER_NAME => {
             Arc::new(OpenAiProvider::new(handle, model).map_err(map_provider_error)?)
+        }
+        GEMINI_PROVIDER_NAME => {
+            Arc::new(GeminiProvider::new(handle, model).map_err(map_provider_error)?)
         }
         _ => {
             return Err(ValidationError {
@@ -1617,6 +1623,10 @@ fn catalog_source(
         KIMI_OAUTH_PROVIDER_NAME => {
             Some((CatalogSource::KimiOAuth, ProviderAuthRequirementWire::OAuth))
         }
+        GEMINI_PROVIDER_NAME => Some((
+            CatalogSource::GeminiApiKey,
+            ProviderAuthRequirementWire::ApiKey,
+        )),
         _ => {
             let profile = providers.get(provider)?;
             if profile.provenance != ProviderProvenance::Custom
@@ -4763,6 +4773,11 @@ fn build_account_provider(
         ),
         (OPENAI_PROVIDER_NAME, AuthMethod::ApiKey) => Arc::new(
             OpenAiProvider::new(credential, model)
+                .map_err(|error| adapter_construction_error(provider, error))?
+                .with_account(alias.clone()),
+        ),
+        (GEMINI_PROVIDER_NAME, AuthMethod::ApiKey) => Arc::new(
+            GeminiProvider::new(credential, model)
                 .map_err(|error| adapter_construction_error(provider, error))?
                 .with_account(alias.clone()),
         ),
