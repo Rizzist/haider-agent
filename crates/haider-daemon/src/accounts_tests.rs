@@ -942,8 +942,10 @@ async fn factory_uses_checked_resolver_and_durably_selects_one_limited_alternate
 }
 
 /// MUTATION CHECK: dispatch either OAuth descriptor through its API-key arm,
-/// remove the sanctioned-provider match, or pass the encoded bundle to an
-/// adapter. The broker/factory resolution below fails before capabilities.
+/// remove the sanctioned-provider match, pass the encoded bundle to an
+/// adapter, or omit OpenAI from the access-fingerprint handoff used by C2's
+/// re-read-on-401 adoption. The broker/factory resolution below fails before
+/// capabilities or the literal OpenAI fingerprint assertion becomes `None`.
 /// Verified by revert on 2026-07-29.
 #[tokio::test]
 async fn auth_aware_factory_routes_sanctioned_oauth_descriptors_to_subscription_adapters() {
@@ -1078,6 +1080,19 @@ async fn auth_aware_factory_routes_sanctioned_oauth_descriptors_to_subscription_
         system_prompt_version: None,
         created_at_ms: 1,
     };
+    let (_, _, openai_access_fingerprint) = factory
+        .resolve_provider(&metadata(OPENAI_OAUTH_PROVIDER_NAME, "gpt-oauth"))
+        .await
+        .expect("OpenAI OAuth fingerprint handoff");
+    assert_eq!(
+        openai_access_fingerprint,
+        Some(*blake3::hash(b"OPENAI_FACTORY_ACCESS_SENTINEL_18a4").as_bytes())
+    );
+    let (_, _, anthropic_access_fingerprint) = factory
+        .resolve_provider(&metadata(ANTHROPIC_OAUTH_PROVIDER_NAME, "claude-oauth"))
+        .await
+        .expect("Anthropic conservative OAuth handoff");
+    assert_eq!(anthropic_access_fingerprint, None);
     let openai = factory
         .resolve_for_turn(&metadata(OPENAI_OAUTH_PROVIDER_NAME, "gpt-oauth"))
         .await
@@ -1312,6 +1327,7 @@ enum ImportRefreshMode {
 struct ImportRefreshServer {
     address: std::net::SocketAddr,
     calls: Arc<std::sync::atomic::AtomicUsize>,
+    refresh_token_fingerprints: Arc<StdMutex<Vec<[u8; 32]>>>,
     gate: Option<Arc<Semaphore>>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -1329,8 +1345,10 @@ impl ImportRefreshServer {
             .expect("bind import refresh server");
         let address = listener.local_addr().expect("import refresh address");
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let refresh_token_fingerprints = Arc::new(StdMutex::new(Vec::new()));
         let gate = gated.then(|| Arc::new(Semaphore::new(0)));
         let calls_for_task = Arc::clone(&calls);
+        let refresh_token_fingerprints_for_task = Arc::clone(&refresh_token_fingerprints);
         let gate_for_task = gate.clone();
         let task = tokio::spawn(async move {
             loop {
@@ -1338,15 +1356,18 @@ impl ImportRefreshServer {
                     return;
                 };
                 let calls = Arc::clone(&calls_for_task);
+                let refresh_token_fingerprints = Arc::clone(&refresh_token_fingerprints_for_task);
                 let gate = gate_for_task.clone();
                 tokio::spawn(async move {
-                    serve_import_refresh(stream, mode, calls, gate).await;
+                    serve_import_refresh(stream, mode, calls, refresh_token_fingerprints, gate)
+                        .await;
                 });
             }
         });
         Self {
             address,
             calls,
+            refresh_token_fingerprints,
             gate,
             task,
         }
@@ -1358,6 +1379,13 @@ impl ImportRefreshServer {
 
     fn calls(&self) -> usize {
         self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn refresh_token_fingerprints(&self) -> Vec<[u8; 32]> {
+        self.refresh_token_fingerprints
+            .lock()
+            .map(|fingerprints| fingerprints.clone())
+            .unwrap_or_default()
     }
 
     async fn wait_for_calls(&self, expected: usize) {
@@ -1399,10 +1427,11 @@ async fn serve_import_refresh(
     mut stream: TcpStream,
     mode: ImportRefreshMode,
     calls: Arc<std::sync::atomic::AtomicUsize>,
+    refresh_token_fingerprints: Arc<StdMutex<Vec<[u8; 32]>>>,
     gate: Option<Arc<Semaphore>>,
 ) {
     let mut request = Vec::new();
-    loop {
+    let body_start = loop {
         let mut chunk = [0_u8; 1024];
         let Ok(read) = stream.read(&mut chunk).await else {
             return;
@@ -1424,8 +1453,16 @@ async fn serve_import_refresh(
             .and_then(|value| value.trim().parse::<usize>().ok())
             .unwrap_or(0);
         if request.len() >= header_end.saturating_add(4).saturating_add(content_length) {
-            break;
+            break header_end.saturating_add(4);
         }
+    };
+    if let Ok(body) = serde_json::from_slice::<serde_json::Value>(&request[body_start..])
+        && let Some(refresh_token) = body
+            .get("refresh_token")
+            .and_then(serde_json::Value::as_str)
+        && let Ok(mut fingerprints) = refresh_token_fingerprints.lock()
+    {
+        fingerprints.push(*blake3::hash(refresh_token.as_bytes()).as_bytes());
     }
     calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     if let Some(gate) = gate {
@@ -4733,7 +4770,7 @@ fn age_import_bundle(vault: &MemoryVault, descriptor: &CredentialDescriptor) {
     let stored = vault.resolve(&descriptor.alias).expect("imported bundle");
     let bundle = haider_accounts::OAuthTokenBundleV1::decode(stored.expose_secret())
         .expect("decode imported bundle");
-    let aged = haider_accounts::OAuthTokenBundleV1::new(
+    let mut aged = haider_accounts::OAuthTokenBundleV1::new(
         bundle.provider_id.clone(),
         bundle.issuer.clone(),
         bundle.audience.clone(),
@@ -4750,6 +4787,9 @@ fn age_import_bundle(vault: &MemoryVault, descriptor: &CredentialDescriptor) {
         bundle.generation,
     )
     .expect("aged bundle");
+    if let Some(fingerprint) = bundle.import_source_access_fingerprint() {
+        aged = aged.with_import_source_access_fingerprint(fingerprint);
+    }
     vault
         .put(
             &descriptor.alias,
@@ -4875,15 +4915,20 @@ async fn marked_expired_import_commits_a_fresher_source_and_resolves_it() {
 }
 
 /// MUTATION CHECK: drop the own-refresh fallback after a same-token source
-/// read. Expected runtime failure: the marked credential remains expired and
-/// this resolve never returns the fake endpoint's rotated access token.
+/// read, fail to carry the import-source fingerprint through rotation, or
+/// treat the unchanged auth.json predecessor as fresher on the next due
+/// boundary, or erase import provenance when an actor observes that a winner
+/// already advanced the vault. Expected RUNTIME failure: resolution
+/// fails/returns generation one's access, a stale contender receives
+/// `NotImported`, the second endpoint call is absent, or its refresh-token
+/// fingerprint is generation one instead of the durable rotated token.
 #[tokio::test(flavor = "current_thread")]
-async fn stale_import_source_falls_back_to_refresh_and_persists_rotation() {
+async fn expired_imported_bundle_refreshes_instead_of_terminal_exit70() {
     let fixture_dir = test_store_dir();
     let source_path = fixture_dir.path().join("codex-auth.json");
     std::fs::write(&source_path, CODEX_IMPORT_FIXTURE_1).expect("write stale Codex fixture");
     if run_oauth_import_env_child(
-        "accounts::accounts_tests::stale_import_source_falls_back_to_refresh_and_persists_rotation",
+        "accounts::accounts_tests::expired_imported_bundle_refreshes_instead_of_terminal_exit70",
         &[("HAIDER_CODEX_AUTH_PATH", &source_path)],
     ) {
         return;
@@ -4895,7 +4940,12 @@ async fn stale_import_source_falls_back_to_refresh_and_persists_rotation() {
     let (mut actor, broker, snapshot, refresh_fences) =
         start_oauth_import_heal_test_actor(&store, Arc::clone(&vault), server.catalog());
     let descriptor = import_codex_for_heal(&actor).await;
-    let _ = &refresh_fences;
+    let observed_generation_one = vault
+        .resolve(&descriptor.alias)
+        .expect("generation-one import");
+    let observed_generation_one =
+        haider_accounts::OAuthTokenBundleV1::decode(observed_generation_one.expose_secret())
+            .expect("observed generation-one import");
     age_import_bundle(vault.as_ref(), &descriptor);
     reset_oauth_import_read_count();
 
@@ -4911,10 +4961,72 @@ async fn stale_import_source_falls_back_to_refresh_and_persists_rotation() {
         .expect("decode refreshed bundle");
     assert_eq!(bundle.generation, 2);
     assert_eq!(
+        bundle.import_source_access_fingerprint(),
+        Some(*blake3::hash(b"fake-access-token-1").as_bytes())
+    );
+    assert_eq!(
         bundle.refresh_token(),
         Some(b"fake-rotated-refresh-token".as_slice())
     );
     assert!(snapshot.lock().expect("snapshot")[0].status == CredentialStatus::Ok);
+
+    // Model the actor-mailbox race directly: a contender read generation one
+    // before the winner refreshed, but the actor handles its provenance probe
+    // only after generation two is durable. The receipt still proves this is
+    // a Codex import, so the broker must be routed to serialized adoption.
+    let (completed, result) = tokio::sync::oneshot::channel();
+    actor
+        .commands()
+        .send(AccountCommand::BeginOAuthImportHeal {
+            descriptor: descriptor.clone(),
+            expected: OAuthRefreshFence {
+                fence_epoch: refresh_fences.current(&descriptor.alias),
+                generation: observed_generation_one.generation,
+                issuer: observed_generation_one.issuer,
+                audience: observed_generation_one.audience,
+                resource: observed_generation_one.resource,
+                subject_hash: observed_generation_one.identity.subject_hash,
+            },
+            completed,
+        })
+        .await
+        .expect("send stale contender provenance probe");
+    assert!(matches!(
+        result.await.expect("stale contender completion").expect("probe"),
+        OAuthImportHealResult::RefreshFallback { source } if source == "codex"
+    ));
+
+    // auth.json intentionally remains generation one. The next lifecycle
+    // refresh must recognize it as the already-imported predecessor and use
+    // durable R2, never commit/replay A1/R1 over generation two.
+    age_import_bundle(vault.as_ref(), &descriptor);
+    let access = broker
+        .resolve(&descriptor)
+        .await
+        .expect("stale predecessor cannot roll back rotation");
+    assert_eq!(access.expose_secret(), b"fake-refreshed-access-token");
+    assert_eq!(oauth_import_read_count(), 2);
+    assert_eq!(server.calls(), 2);
+    assert_eq!(
+        server.refresh_token_fingerprints(),
+        [
+            *blake3::hash(b"fake-refresh-token-1").as_bytes(),
+            *blake3::hash(b"fake-rotated-refresh-token").as_bytes(),
+        ]
+    );
+    let stored = vault
+        .resolve(&descriptor.alias)
+        .and_then(|stored| haider_accounts::OAuthTokenBundleV1::decode(stored.expose_secret()))
+        .expect("second durable imported refresh");
+    assert_eq!(stored.generation, 3);
+    assert_eq!(
+        stored.import_source_access_fingerprint(),
+        Some(*blake3::hash(b"fake-access-token-1").as_bytes())
+    );
+    assert_eq!(
+        stored.refresh_token(),
+        Some(b"fake-rotated-refresh-token".as_slice())
+    );
 
     assert!(broker.shutdown().await);
     actor.shutdown().await;
@@ -5176,6 +5288,10 @@ async fn codex_import_commits_refreshable_bundle_and_secret_free_receipt() {
         Some(b"fake-refresh-token-1".as_slice())
     );
     assert_eq!(bundle.generation, 1);
+    assert_eq!(
+        bundle.import_source_access_fingerprint(),
+        Some(*blake3::hash(b"fake-access-token-1").as_bytes())
+    );
     assert!(
         bundle.refresh_on_first_use(),
         "fallback refresh marker was not retained in the vault bundle"
@@ -5279,6 +5395,10 @@ async fn claude_code_import_honors_expiry_and_anthropic_registration() {
     assert_eq!(bundle.audience, "9d1c250a-e61b-44d9-88ed-5944d1962f5e");
     assert_eq!(bundle.expires_at_unix_ms, 4_102_444_800_123);
     assert_eq!(bundle.access_token(), b"fake-claude-access-token-1");
+    assert_eq!(
+        bundle.import_source_access_fingerprint(),
+        Some(*blake3::hash(b"fake-claude-access-token-1").as_bytes())
+    );
     assert_eq!(
         bundle.refresh_token(),
         Some(b"fake-claude-refresh-token-1".as_slice())

@@ -1113,6 +1113,7 @@ fn codex_import_bundle(
 ) -> Result<OAuthTokenBundleV1, HaiderError> {
     let auth: CodexAuthFile =
         serde_json::from_slice(bytes).map_err(|error| malformed_import(path, "codex", &error))?;
+    let source_access_fingerprint = *blake3::hash(auth.tokens.access_token.0.as_slice()).as_bytes();
     let parsed_expiry = unverified_jwt_expiry_ms(auth.tokens.access_token.0.as_slice());
     let refresh_on_first_use = parsed_expiry.is_none();
     let expires_at_unix_ms = parsed_expiry
@@ -1169,6 +1170,7 @@ fn codex_import_bundle(
         generation,
     )
     .map_err(|_| invalid_import(path, "codex"))?;
+    let bundle = bundle.with_import_source_access_fingerprint(source_access_fingerprint);
     Ok(if refresh_on_first_use {
         bundle.with_refresh_on_first_use()
     } else {
@@ -1203,6 +1205,8 @@ fn claude_import_bundle(
 ) -> Result<OAuthTokenBundleV1, HaiderError> {
     let credentials: ClaudeCredentialsFile = serde_json::from_slice(bytes)
         .map_err(|error| malformed_import(path, "claude-code", &error))?;
+    let source_access_fingerprint =
+        *blake3::hash(credentials.oauth.access_token.0.as_slice()).as_bytes();
     if !registration
         .scopes
         .iter()
@@ -1231,6 +1235,7 @@ fn claude_import_bundle(
         identity,
         generation,
     )
+    .map(|bundle| bundle.with_import_source_access_fingerprint(source_access_fingerprint))
     .map_err(|_| invalid_import(path, "claude-code"))
 }
 
@@ -3418,6 +3423,12 @@ enum RefreshFlightOutcome {
     Imported(crate::accounts::OAuthRefreshFence),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SerializedRefreshRecovery {
+    SignInAgain,
+    ReimportCodex,
+}
+
 struct RefreshFlight {
     completed: Mutex<Option<Result<RefreshFlightOutcome, HaiderError>>>,
     notify: Notify,
@@ -3802,7 +3813,7 @@ impl CredentialBroker {
             let now = now_ms().ok_or_else(|| {
                 HaiderError::new(ErrorCode::Internal, "system clock is unavailable", true)
             })?;
-            let serialized_rotating =
+            let registration_serialized_rotating =
                 registration_is_serialized_rotating(&self.inner.catalog, &descriptor.provider);
             // An active rejection/uncertainty marker is NOT terminal at this
             // pre-lease read. A live concurrent refresher persists permanent
@@ -3814,12 +3825,12 @@ impl CredentialBroker {
             // rotated bundle or surfaces the typed re-login, and it never
             // replays a rejected token. Only that re-read may treat the
             // marker as terminal.
-            let rejection_marker_active = serialized_rotating
-                && bundle
-                    .refresh_rejected_until_unix_ms
-                    .is_some_and(|until| now < until);
+            let rejection_marker_active = bundle
+                .refresh_rejected_until_unix_ms
+                .is_some_and(|until| now < until);
             if force_refresh
-                && serialized_rotating
+                && (registration_serialized_rotating
+                    || descriptor.provider == haider_provider::OPENAI_OAUTH_PROVIDER_NAME)
                 && !rejection_marker_active
                 && failed_access_fingerprint.is_some_and(|failed| {
                     !bool::from(
@@ -3859,7 +3870,7 @@ impl CredentialBroker {
                 }
             }
             let actually_expired = bundle.expires_at_unix_ms <= now;
-            let refresh_due = if serialized_rotating {
+            let refresh_due = if registration_serialized_rotating {
                 // The marker forces the serialized path even when the access
                 // token is otherwise usable: an uncertain/rejected bundle must
                 // resolve through the lease, never straight from the vault.
@@ -3868,7 +3879,7 @@ impl CredentialBroker {
                         .refresh_after_unix_ms
                         .is_none_or(|refresh_after| now >= refresh_after)
             } else {
-                bundle.expires_at_unix_ms <= now.saturating_add(skew_ms)
+                rejection_marker_active || bundle.expires_at_unix_ms <= now.saturating_add(skew_ms)
             };
             if force_refresh
                 || refresh_due
@@ -3883,7 +3894,15 @@ impl CredentialBroker {
                 // this process (skew/force/plain expiry, never the mark).
                 break (
                     bundle,
-                    actually_expired || snapshot_state == SnapshotOAuthState::Expired,
+                    actually_expired
+                        || snapshot_state == SnapshotOAuthState::Expired
+                        // C2 decision: the OpenAI registration stays
+                        // Conservative so loopback-PKCE remains byte/behavior
+                        // compatible. Every OpenAI refresh boundary asks the
+                        // account actor for durable import provenance; only a
+                        // current Codex import receives rotating-token
+                        // serialization below.
+                        || descriptor.provider == haider_provider::OPENAI_OAUTH_PROVIDER_NAME,
                     snapshot_state != SnapshotOAuthState::Expired,
                 );
             }
@@ -4056,10 +4075,18 @@ impl CredentialBroker {
                     if !refresh_allowed {
                         return Err(imported_credential_expired(descriptor, &source));
                     }
-                    return Self::refresh(inner, &refresh_descriptor, bundle, expected_fence)
-                        .await
-                        .map(|_| RefreshFlightOutcome::Refreshed)
-                        .map_err(|_| imported_credential_expired(descriptor, &source));
+                    let imported_codex = source == "codex"
+                        && descriptor.provider == haider_provider::OPENAI_OAUTH_PROVIDER_NAME;
+                    return Self::refresh(
+                        inner,
+                        &refresh_descriptor,
+                        bundle,
+                        expected_fence,
+                        imported_codex,
+                    )
+                    .await
+                    .map(|_| RefreshFlightOutcome::Refreshed)
+                    .map_err(|error| imported_refresh_error(error, descriptor, &source));
                 }
                 crate::accounts::OAuthImportHealResult::NotImported => {}
             }
@@ -4069,7 +4096,7 @@ impl CredentialBroker {
             // stands — refuse rather than risk a double-spent rotation.
             return Err(expired_or_replaced(descriptor));
         }
-        Self::refresh(inner, &refresh_descriptor, bundle, expected_fence)
+        Self::refresh(inner, &refresh_descriptor, bundle, expected_fence, false)
             .await
             .map(|_| RefreshFlightOutcome::Refreshed)
     }
@@ -4109,6 +4136,7 @@ impl CredentialBroker {
         descriptor: &CredentialDescriptor,
         bundle: &OAuthTokenBundleV1,
         expected_fence: u64,
+        imported_codex: bool,
     ) -> Result<SecretHandle, HaiderError> {
         let fence = Self::fence_for_inner(inner, &descriptor.alias);
         if fence.load(Ordering::Acquire) != expected_fence {
@@ -4122,13 +4150,25 @@ impl CredentialBroker {
                 "OAuth registration is unavailable",
             ));
         };
-        if registration.refresh_policy == OAuthRefreshPolicy::SerializedRotating {
+        let active_serialized_marker = bundle
+            .refresh_rejected_until_unix_ms
+            .is_some_and(|until| now_ms().is_none_or(|now| now < until));
+        if registration.refresh_policy == OAuthRefreshPolicy::SerializedRotating
+            || imported_codex
+            || active_serialized_marker
+        {
+            let recovery = if imported_codex {
+                SerializedRefreshRecovery::ReimportCodex
+            } else {
+                SerializedRefreshRecovery::SignInAgain
+            };
             return Self::refresh_serialized_rotating(
                 inner,
                 descriptor,
                 bundle,
                 expected_fence,
                 registration,
+                recovery,
             )
             .await;
         }
@@ -4277,6 +4317,7 @@ impl CredentialBroker {
         observed: &OAuthTokenBundleV1,
         expected_fence: u64,
         registration: Arc<OAuthProviderRegistration>,
+        recovery: SerializedRefreshRecovery,
     ) -> Result<SecretHandle, HaiderError> {
         let lease = acquire_broker_refresh_lock(inner, &descriptor.alias).await?;
         if Self::fence_for_inner(inner, &descriptor.alias).load(Ordering::Acquire) != expected_fence
@@ -4296,7 +4337,7 @@ impl CredentialBroker {
             .refresh_rejected_until_unix_ms
             .is_some_and(|until| now < until)
         {
-            return Err(kimi_relogin_required(descriptor));
+            return Err(serialized_refresh_recovery_error(descriptor, recovery));
         }
         let current_refresh = current.refresh_token();
         let observed_refresh = observed.refresh_token();
@@ -4308,23 +4349,29 @@ impl CredentialBroker {
             };
         if refresh_changed {
             if current.expires_at_unix_ms <= now {
-                return Err(kimi_relogin_required(descriptor));
+                return Err(serialized_refresh_recovery_error(descriptor, recovery));
             }
             drop(lease);
             return Ok(current.access_token_handle());
         }
         let Some(refresh_token) = current_refresh else {
-            return Err(kimi_relogin_required(descriptor));
+            return Err(serialized_refresh_recovery_error(descriptor, recovery));
         };
         if current
             .refresh_expires_at_unix_ms
             .is_some_and(|expires_at| now >= expires_at)
         {
-            return Err(kimi_relogin_required(descriptor));
+            return Err(serialized_refresh_recovery_error(descriptor, recovery));
         }
-        let device_id = load_or_create_kimi_device_id(Arc::clone(&inner.vault))
-            .await
-            .map_err(oauth_error)?;
+        let device_id = if registration.auth_header_set == OAuthAuthHeaderSet::KimiMsh {
+            Some(
+                load_or_create_kimi_device_id(Arc::clone(&inner.vault))
+                    .await
+                    .map_err(oauth_error)?,
+            )
+        } else {
+            None
+        };
         // A rotating refresh request is an irreversible external mutation.
         // Persist permanent uncertainty BEFORE the request; every successful
         // or explicitly retryable response below replaces this marker while
@@ -4348,7 +4395,7 @@ impl CredentialBroker {
                 &inner.client,
                 &registration,
                 refresh_token,
-                Some(&device_id),
+                device_id.as_ref(),
             )
             .await;
             let Some(delay) = response
@@ -4383,7 +4430,7 @@ impl CredentialBroker {
                 // A transport failure is ambiguous: the server may have
                 // rotated before the response was lost. Keep permanent
                 // uncertainty and require a new login.
-                return Err(kimi_relogin_required(descriptor));
+                return Err(serialized_refresh_recovery_error(descriptor, recovery));
             }
             Err(_) => {
                 // Re-read once after a terminal rejection. This covers a
@@ -4417,11 +4464,11 @@ impl CredentialBroker {
                 )
                 .await?;
                 drop(lease);
-                return Err(kimi_relogin_required(descriptor));
+                return Err(serialized_refresh_recovery_error(descriptor, recovery));
             }
         };
         let refreshed = refresh_bundle_from_response(&registration, &bytes, &current)
-            .map_err(|_| kimi_relogin_required(descriptor))?;
+            .map_err(|_| serialized_refresh_recovery_error(descriptor, recovery))?;
         let expected = refresh_fence(&current, expected_fence);
         let access = refreshed.access_token_handle();
         let encoded = refreshed.encode()?;
@@ -4898,7 +4945,7 @@ fn refresh_bundle_from_response(
         Some(seconds) => now.checked_add(seconds.saturating_mul(1000)),
         None => prior.refresh_expires_at_unix_ms,
     };
-    let bundle = OAuthTokenBundleV1::new(
+    let mut bundle = OAuthTokenBundleV1::new(
         registration.provider_id.clone(),
         registration.issuer.clone(),
         prior.audience.clone(),
@@ -4917,6 +4964,9 @@ fn refresh_bundle_from_response(
             .ok_or_else(|| OAuthPublicError::new("invalid_token_response", false))?,
     )
     .map_err(|_| OAuthPublicError::new("invalid_token_response", false))?;
+    if let Some(fingerprint) = prior.import_source_access_fingerprint() {
+        bundle = bundle.with_import_source_access_fingerprint(fingerprint);
+    }
     Ok(
         if registration.refresh_policy == OAuthRefreshPolicy::SerializedRotating {
             bundle.with_refresh_after(kimi_refresh_after(now, response.expires_in))
@@ -4970,13 +5020,63 @@ fn kimi_relogin_required(descriptor: &CredentialDescriptor) -> HaiderError {
     error
 }
 
+fn serialized_refresh_recovery_error(
+    descriptor: &CredentialDescriptor,
+    recovery: SerializedRefreshRecovery,
+) -> HaiderError {
+    match recovery {
+        SerializedRefreshRecovery::SignInAgain => kimi_relogin_required(descriptor),
+        SerializedRefreshRecovery::ReimportCodex => {
+            imported_credential_expired(descriptor, "codex")
+        }
+    }
+}
+
 fn imported_credential_expired(descriptor: &CredentialDescriptor, source: &str) -> HaiderError {
-    rotation_error(
+    let mut error = rotation_error(
         descriptor,
         haider_accounts::RotationTrigger::AuthExpired,
         false,
         &format!("credential expired — re-run `haider import {source}` or sign in again"),
-    )
+    );
+    if let Some(details) = error
+        .details
+        .as_mut()
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        details.insert(
+            "kind".to_owned(),
+            serde_json::Value::String("oauth_relogin_required".to_owned()),
+        );
+        details.insert(
+            "reimport_required".to_owned(),
+            serde_json::Value::Bool(true),
+        );
+        details.insert(
+            "import_source".to_owned(),
+            serde_json::Value::String(source.to_owned()),
+        );
+    }
+    error
+}
+
+fn imported_refresh_error(
+    error: HaiderError,
+    descriptor: &CredentialDescriptor,
+    source: &str,
+) -> HaiderError {
+    if error.retryable
+        || error
+            .details
+            .as_ref()
+            .and_then(|details| details.get("kind"))
+            .and_then(serde_json::Value::as_str)
+            == Some("oauth_relogin_required")
+    {
+        error
+    } else {
+        imported_credential_expired(descriptor, source)
+    }
 }
 
 fn imported_credential_expired_for_provider(
