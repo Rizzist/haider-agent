@@ -125,9 +125,27 @@ fn validate_recoverable_binary(path: &Path, name: &str) -> Result<(), UpdateErro
     Ok(())
 }
 
+/// Exclusively flocked update-lock descriptor released by explicit unlock.
+///
+/// Dropping the `File` alone is not a reliable release: `flock` locks belong
+/// to the open file description, and fork/posix_spawn duplicates the whole
+/// descriptor table, so a concurrently spawned child between clone and exec
+/// keeps the description — and its lock — alive after this process closes its
+/// own descriptor (`O_CLOEXEC` only applies at exec). Explicit `LOCK_UN`
+/// releases the description's lock immediately regardless of surviving
+/// duplicates, so an immediate re-acquire cannot be spuriously refused as a
+/// concurrent update.
+struct UpdateLock(File);
+
+impl Drop for UpdateLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
 pub(crate) struct PreparedTransaction {
     layout: InstallLayout,
-    _lock: File,
+    _lock: UpdateLock,
 }
 
 impl PreparedTransaction {
@@ -175,12 +193,22 @@ impl PreparedTransaction {
                 return Err(UpdateError::io("lock update transaction", error));
             }
         }
+        let lock = UpdateLock(lock);
         recover_pending(&layout)?;
         layout.validate()?;
         Ok(Self {
             layout,
             _lock: lock,
         })
+    }
+
+    /// Returns a same-open-file-description duplicate of the held lock
+    /// descriptor, exactly what fork/posix_spawn leaves in a child's file
+    /// table between clone and exec.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub fn duplicate_lock_handle_for_test(&self) -> std::io::Result<File> {
+        self._lock.0.try_clone()
     }
 }
 
@@ -332,7 +360,7 @@ struct Marker {
 pub(crate) struct CommittedUpdate {
     layout: InstallLayout,
     marker: Marker,
-    _lock: File,
+    _lock: UpdateLock,
 }
 
 impl CommittedUpdate {

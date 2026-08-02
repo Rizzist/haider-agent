@@ -891,9 +891,22 @@ async fn manual_compaction_command_replay_compacts_exactly_once() {
     // Lost-response replay remains unfenced after a daemon generation
     // change and returns the original durable coordinates without invoking a
     // new summarizer.
-    let reopened = SqliteStoreHandle::open(root.path())
-        .await
-        .expect("reopen store");
+    // Bounded StoreLocked retry: drop() can return before the profile
+    // lock fully releases under parallel suite load (gate27 hygiene
+    // precedent, fourth fixture in this class).
+    let reopened = {
+        let mut attempt = 0;
+        loop {
+            match SqliteStoreHandle::open(root.path()).await {
+                Ok(store) => break store,
+                Err(error) if error.retryable && attempt < 40 => {
+                    attempt += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                Err(error) => panic!("reopen store: {error:?}"),
+            }
+        }
+    };
     let replay_provider = Arc::new(FakeProvider::new(Vec::new()));
     let replay_hub =
         SessionHub::new(reopened.clone(), SessionHubConfig::default()).expect("replay hub");
