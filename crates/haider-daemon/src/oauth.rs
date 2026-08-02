@@ -3802,15 +3802,25 @@ impl CredentialBroker {
             let now = now_ms().ok_or_else(|| {
                 HaiderError::new(ErrorCode::Internal, "system clock is unavailable", true)
             })?;
-            if registration_is_serialized_rotating(&self.inner.catalog, &descriptor.provider)
+            let serialized_rotating =
+                registration_is_serialized_rotating(&self.inner.catalog, &descriptor.provider);
+            // An active rejection/uncertainty marker is NOT terminal at this
+            // pre-lease read. A live concurrent refresher persists permanent
+            // uncertainty while it still holds the physical vault-alias lease
+            // and only then performs the rotating request, so the marker this
+            // broker just observed may be superseded by that refresher's
+            // durable rotation moments later. Route into the serialized
+            // refresh path instead: its under-lease re-read either adopts the
+            // rotated bundle or surfaces the typed re-login, and it never
+            // replays a rejected token. Only that re-read may treat the
+            // marker as terminal.
+            let rejection_marker_active = serialized_rotating
                 && bundle
                     .refresh_rejected_until_unix_ms
-                    .is_some_and(|until| now < until)
-            {
-                return Err(kimi_relogin_required(descriptor));
-            }
+                    .is_some_and(|until| now < until);
             if force_refresh
-                && registration_is_serialized_rotating(&self.inner.catalog, &descriptor.provider)
+                && serialized_rotating
+                && !rejection_marker_active
                 && failed_access_fingerprint.is_some_and(|failed| {
                     !bool::from(
                         blake3::hash(bundle.access_token())
@@ -3849,14 +3859,17 @@ impl CredentialBroker {
                 }
             }
             let actually_expired = bundle.expires_at_unix_ms <= now;
-            let refresh_due =
-                if registration_is_serialized_rotating(&self.inner.catalog, &descriptor.provider) {
-                    bundle
+            let refresh_due = if serialized_rotating {
+                // The marker forces the serialized path even when the access
+                // token is otherwise usable: an uncertain/rejected bundle must
+                // resolve through the lease, never straight from the vault.
+                rejection_marker_active
+                    || bundle
                         .refresh_after_unix_ms
                         .is_none_or(|refresh_after| now >= refresh_after)
-                } else {
-                    bundle.expires_at_unix_ms <= now.saturating_add(skew_ms)
-                };
+            } else {
+                bundle.expires_at_unix_ms <= now.saturating_add(skew_ms)
+            };
             if force_refresh
                 || refresh_due
                 || codex_import_fallback_refresh_candidate(&bundle, now)

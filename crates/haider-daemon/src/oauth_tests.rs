@@ -802,10 +802,28 @@ async fn started_flow(
     (flow_id, url.expose_authorization_url().to_owned(), port)
 }
 
+/// Await the device-flow start frame without ever parking the runtime on a
+/// bare `recv`: the paused-clock runner test drives real loopback I/O through
+/// [`drive_paused_io`], and an uninhibited park would auto-advance the frozen
+/// clock into the production client's connect/request timers while the
+/// device-authorization request is still on the wire.
 async fn started_device_flow(
     receiver: &mut mpsc::UnboundedReceiver<WireFrame>,
 ) -> (OAuthFlowId, String) {
-    let frame = receiver.recv().await.expect("device start response");
+    let mut received = None;
+    for _ in 0..2_000 {
+        match receiver.try_recv() {
+            Ok(frame) => {
+                received = Some(frame);
+                break;
+            }
+            Err(mpsc::error::TryRecvError::Empty) => drive_paused_io(1).await,
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                panic!("device start channel closed")
+            }
+        }
+    }
+    let frame = received.expect("device start response");
     let WireFrame::Response {
         body:
             ResponseBody::AccountOAuthStart {
@@ -2701,12 +2719,28 @@ async fn device_flow_polls_to_tokens_with_required_msh_headers() {
     }
 }
 
+/// Drive real loopback I/O under a `start_paused` clock. Awaiting a blocking
+/// worker inhibits paused-clock auto-advance (tokio pins the virtual clock
+/// while any blocking task is alive), so each iteration parks the runtime for
+/// ~1ms of REAL wall time: socket readiness is serviced, already-due virtual
+/// timers fire, and the production client's connect/request timers — armed at
+/// frozen-now + 5s/15s — can never fire spuriously. A bare park instead
+/// auto-advances straight into those timers while a request is on the wire,
+/// and a busy `yield_now` loop starves the driver of both I/O and timers.
+async fn drive_paused_io(iterations: usize) {
+    for _ in 0..iterations {
+        tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(1)))
+            .await
+            .expect("paused-clock I/O driver");
+    }
+}
+
 async fn wait_for_token_calls(server: &FakeOAuthServer, expected: usize) {
-    for _ in 0..256 {
+    for _ in 0..2_000 {
         if server.state.token_calls.load(Ordering::SeqCst) == expected {
             return;
         }
-        tokio::task::yield_now().await;
+        drive_paused_io(1).await;
     }
     assert_eq!(
         server.state.token_calls.load(Ordering::SeqCst),
@@ -2719,6 +2753,14 @@ async fn wait_for_token_calls(server: &FakeOAuthServer, expected: usize) {
 /// `authorization_pending`, ignore `slow_down`, or add less than five seconds
 /// to the next interval. Expected RUNTIME failure: the coordinator either
 /// never becomes ready or reaches the third poll before the six-second gate.
+///
+/// `start_paused` (rather than a mid-test `pause()`) is load-bearing twice
+/// over: the whole flow runs on one frozen clock so every interval below is
+/// exact, and the timer wheel's epoch coincides with the frozen base — a
+/// mid-test pause leaves a sub-millisecond fraction between them, and the
+/// wheel's round-up tick conversion then puts every whole-millisecond
+/// deadline one tick past every whole-millisecond advance, so the runner's
+/// interval sleeps never fire at their exact gates.
 #[tokio::test(start_paused = true)]
 async fn device_flow_runner_continues_and_honors_slow_down_interval() {
     let server = FakeOAuthServer::start(FakeMode::Success, false).await;
@@ -2735,29 +2777,47 @@ async fn device_flow_runner_continues_and_honors_slow_down_interval() {
         Some(OAuthFlowStatusWire::WaitingDevice)
     ));
 
-    tokio::task::yield_now().await;
+    // Let the runner spawn and arm its first interval sleep at the frozen
+    // instant, then hold every gate with drive_paused_io so poll responses
+    // are fully consumed (including the source-chunk scrub sweeps) and the
+    // next interval sleep is re-armed BEFORE the clock advances again.
+    drive_paused_io(10).await;
+    assert_eq!(server.state.token_calls.load(Ordering::SeqCst), 0);
     tokio::time::advance(Duration::from_millis(999)).await;
+    drive_paused_io(10).await;
     assert_eq!(server.state.token_calls.load(Ordering::SeqCst), 0);
     tokio::time::advance(Duration::from_millis(1)).await;
     wait_for_token_calls(&server, 1).await;
-    for _ in 0..8 {
-        tokio::task::yield_now().await;
-    }
+    drive_paused_io(20).await;
 
     tokio::time::advance(Duration::from_secs(1)).await;
     wait_for_token_calls(&server, 2).await;
-    for _ in 0..8 {
-        tokio::task::yield_now().await;
-    }
+    drive_paused_io(20).await;
     tokio::time::advance(Duration::from_millis(5_999)).await;
+    drive_paused_io(10).await;
     assert_eq!(server.state.token_calls.load(Ordering::SeqCst), 2);
     tokio::time::advance(Duration::from_millis(1)).await;
     wait_for_token_calls(&server, 3).await;
 
-    assert!(matches!(
-        wait_ready(&coordinator, &flow_id).await,
-        OAuthFlowStatusWire::Ready { .. }
-    ));
+    // wait_ready's bare yield loop would starve the paused-clock driver, so
+    // walk the flow to its terminal status with real parks instead.
+    let mut ready = false;
+    for _ in 0..2_000 {
+        let status = coordinator
+            .status("connection-1", &flow_id, "attempt-1")
+            .expect("owned flow");
+        match status {
+            OAuthFlowStatusWire::WaitingDevice | OAuthFlowStatusWire::Exchanging => {
+                drive_paused_io(1).await;
+            }
+            OAuthFlowStatusWire::Ready { .. } => {
+                ready = true;
+                break;
+            }
+            other => panic!("device flow ended in unexpected status: {other:?}"),
+        }
+    }
+    assert!(ready, "device flow never reached Ready");
     assert!(coordinator.shutdown().await);
 }
 
@@ -3886,9 +3946,11 @@ fn token_response_source_chunks_are_exclusively_owned_and_scrubbed() {
             && source
                 .matches("reqwest::header::CONNECTION, \"close\"")
                 .count()
-                // Three key-bearing transports must each close: authorization-code
-                // exchange, refresh, and the W5b.2a JWKS fetch.
-                == 3
+                // Five key-bearing transports must each close: authorization-code
+                // exchange, refresh, the W5b.2a JWKS fetch, and the B6k Kimi
+                // device-authorization and device-token-poll requests (both feed
+                // bounded_response, so their source chunks join the same scrub).
+                == 5
             && source.contains("chunk.as_mut().zeroize();"),
         "token and JWKS transports must close before every source chunk is mutable-owned and scrubbed"
     );
