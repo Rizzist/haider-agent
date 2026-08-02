@@ -1,0 +1,16 @@
+{
+  "schema": "haider.gemini-fixtures.v1",
+  "provisional": true,
+  "provenance": "Synthetic Gemini GenerateContent fixtures; promotable by tests/gemini_live_tests.rs.",
+  "fixtures": [
+    {"name":"combined","transport":"sse","status":200,"wire":"combined.sse","golden":"combined.events.json"},
+    {"name":"usage_metadata","transport":"sse","status":200,"wire":"usage_metadata.sse","golden":"usage_metadata.events.json"},
+    {"name":"max_tokens","transport":"sse","status":200,"wire":"max_tokens.sse","golden":"max_tokens.events.json"},
+    {"name":"finish_error","transport":"sse","status":200,"wire":"finish_error.sse","golden":"finish_error.events.json"},
+    {"name":"safety","transport":"sse","status":200,"wire":"safety.sse","golden":"safety.events.json"},
+    {"name":"malformed","transport":"sse","status":200,"wire":"malformed.sse","golden":"malformed.events.json"},
+    {"name":"rate_limit","transport":"http","status":429,"wire":"rate_limit.http.json","golden":"rate_limit.error.json"},
+    {"name":"context_exceeded","transport":"http","status":400,"wire":"context_exceeded.http.json","golden":"context_exceeded.error.json"},
+    {"name":"overloaded","transport":"http","status":503,"wire":"overloaded.http.json","golden":"overloaded.error.json"}
+  ]
+}

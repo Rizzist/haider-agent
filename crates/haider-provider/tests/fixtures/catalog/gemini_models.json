@@ -1,0 +1,25 @@
+{
+  "models": [
+    {
+      "name": "models/gemini-frontier-a",
+      "baseModelId": "gemini-frontier-a",
+      "displayName": "Gemini Frontier A",
+      "description": "Synthetic catalog row",
+      "inputTokenLimit": 1048576,
+      "outputTokenLimit": 65536,
+      "supportedGenerationMethods": ["generateContent"]
+    },
+    {
+      "name": "models/gemini-frontier-b",
+      "inputTokenLimit": 131072
+    },
+    {
+      "name": "models/zero-window",
+      "inputTokenLimit": 0
+    },
+    {
+      "displayName": "Missing resource name",
+      "inputTokenLimit": 999999
+    }
+  ]
+}

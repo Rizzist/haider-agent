@@ -345,6 +345,38 @@ fn endpoints_are_the_vendor_paths() {
         CatalogSource::KimiOAuth.endpoint(),
         "https://api.kimi.com/coding/v1/models"
     );
+    assert_eq!(
+        CatalogSource::GeminiApiKey.endpoint(),
+        "https://generativelanguage.googleapis.com/v1beta/models"
+    );
+}
+
+/// Gemini is the first catalog here whose provider-owned response carries
+/// real input windows under `models[]` and resource-prefixed names.
+#[test]
+fn catalog_parses_models_with_context_windows() {
+    let payload: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/catalog/gemini_models.json"))
+            .expect("Gemini models fixture");
+    let models =
+        parse_catalog(CatalogSource::GeminiApiKey, &payload).expect("Gemini catalog parses");
+    assert_eq!(
+        models
+            .iter()
+            .map(|model| (model.slug.as_str(), model.context_window))
+            .collect::<Vec<_>>(),
+        vec![
+            ("gemini-frontier-a", Some(1_048_576)),
+            ("gemini-frontier-b", Some(131_072)),
+            ("zero-window", None),
+        ]
+    );
+    assert!(models.iter().all(|model| {
+        model.display_name == model.slug
+            && model.description.is_none()
+            && model.extensions.is_none()
+            && model.visible
+    }));
 }
 
 /// MUTATION CHECK: parse Kimi through the generic compatible shape, retain

@@ -1,0 +1,4 @@
+[
+  {"result":"ok","value":{"event":"refusal_delta","text":"Gemini blocked the response for safety reasons."}},
+  {"result":"ok","value":{"event":"finish","reason":"refusal"}}
+]

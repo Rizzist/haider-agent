@@ -1,0 +1,5 @@
+[
+  {"result":"ok","value":{"event":"text_delta","text":"partial"}},
+  {"result":"ok","value":{"event":"usage_update","input":5,"output":7,"reasoning":0,"cached":0,"source":"provider_reported"}},
+  {"result":"ok","value":{"event":"finish","reason":"max_tokens"}}
+]

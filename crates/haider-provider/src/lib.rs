@@ -14,6 +14,11 @@ mod anthropic;
 #[cfg(test)]
 mod anthropic_tests;
 mod catalog;
+#[cfg(test)]
+mod catalog_tests;
+mod gemini;
+#[cfg(test)]
+mod gemini_tests;
 mod openai;
 mod origin;
 mod wire;
@@ -40,6 +45,10 @@ pub use catalog::{
     catalog_request_url, discover_models, discover_models_with_resolver,
     openai_compatible_catalog_endpoint, parse_catalog, pickable,
 };
+pub use gemini::{
+    GEMINI_API_BASE_URL, GEMINI_MODELS_URL, GEMINI_PROVIDER_NAME, GeminiCapture, GeminiProvider,
+    GeminiRetryPolicy, GeminiTransportConfig, replay_gemini_http_error, replay_gemini_sse,
+};
 pub use openai::{
     KIMI_OAUTH_BASE_URL, KIMI_OAUTH_PROVIDER_NAME, KimiThinkingConfig, KimiThinkingType,
     OPENAI_CODEX_RESPONSES_LITE_HEADER, OPENAI_CODEX_RESPONSES_LITE_VALUE,
@@ -53,13 +62,14 @@ pub use openai::{
 pub use origin::{FixedDnsResolver, FixedOriginGuard, SystemFixedDnsResolver};
 
 /// Provider classes backed by production account credentials in this release.
-pub const BUILTIN_PROVIDER_NAMES: [&str; 6] = [
+pub const BUILTIN_PROVIDER_NAMES: [&str; 7] = [
     ANTHROPIC_PROVIDER_NAME,
     ANTHROPIC_OAUTH_PROVIDER_NAME,
     OPENAI_PROVIDER_NAME,
     OPENAI_OAUTH_PROVIDER_NAME,
     OPENAI_COMPATIBLE_PROVIDER_NAME,
     KIMI_OAUTH_PROVIDER_NAME,
+    GEMINI_PROVIDER_NAME,
 ];
 
 /// Crate marker used by the workspace self-test.
