@@ -495,9 +495,36 @@ async fn stale_mutation_is_typed_and_requires_a_reread() {
         )
         .await
         .expect("fresh edit");
+
+    // The WRITE-over-existing gate is a SECOND enforcement point: an
+    // external change after the fresh edit must trip fs_write too, not
+    // only fs_edit (each gate needs its own observation — disabling one
+    // must not hide behind the other).
+    fs::write(
+        &path,
+        "external literal two
+",
+    )
+    .expect("external write two");
+    let stale_write = broker
+        .fs_write(
+            &FsWrite::new(
+                "stale.txt",
+                "overwrite attempt
+",
+            ),
+            &allow(EffectClass::FsWrite),
+            &turn,
+            &ledger,
+        )
+        .await;
+    assert!(
+        matches!(stale_write, Err(ToolError::StaleRead { .. })),
+        "stale write must be typed StaleRead, got {stale_write:?}"
+    );
     assert_eq!(
-        fs::read_to_string(&path).expect("read edited"),
-        "after reread\n"
+        fs::read_to_string(&path).expect("read after refused write"),
+        "external literal two\n"
     );
 }
 
