@@ -466,8 +466,7 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> T {
 /// and cannot see this.
 #[test]
 fn sparse_history_call_index_continues_past_the_greatest_not_the_count() {
-    let bytes =
-        fs::read(fixture_directory().join("two_turn_call.sse")).expect("fixture stream");
+    let bytes = fs::read(fixture_directory().join("two_turn_call.sse")).expect("fixture stream");
     let request = TurnRequest {
         messages: vec![
             Message::user_text("prior sparse turn"),
