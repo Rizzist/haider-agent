@@ -1148,7 +1148,6 @@ fn gemini_usage(
 }
 
 /// Replay captured data-only SSE through the same 7-byte incremental path.
-#[must_use]
 /// Replays a captured stream with the SAME call-index continuation the
 /// production path derives from the request history — the seam that makes
 /// sparse/replayed call indices testable (a dense one-call history is

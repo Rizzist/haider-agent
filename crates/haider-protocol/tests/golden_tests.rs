@@ -443,6 +443,7 @@ fn golden_effect_phases() {
         &EffectPhase::Outcome {
             effect: EffectId::new("ef-shell"),
             outcome: EffectOutcome::Cancelled,
+            freshness: None,
         },
     );
     golden(
@@ -452,6 +453,7 @@ fn golden_effect_phases() {
             outcome: EffectOutcome::CancelledEscalated {
                 note: "SIGKILL escalation failed".into(),
             },
+            freshness: None,
         },
     );
     golden(
@@ -459,6 +461,18 @@ fn golden_effect_phases() {
         &EffectPhase::Outcome {
             effect: EffectId::new("ef-1"),
             outcome: EffectOutcome::Unknown,
+            freshness: None,
+        },
+    );
+    golden(
+        "effect_outcome_ok_with_file_freshness",
+        &EffectPhase::Outcome {
+            effect: EffectId::new("ef-read"),
+            outcome: EffectOutcome::Ok,
+            freshness: Some(FileFreshness {
+                path: "src/lib.rs".into(),
+                digest: "blake3:fresh".into(),
+            }),
         },
     );
 }

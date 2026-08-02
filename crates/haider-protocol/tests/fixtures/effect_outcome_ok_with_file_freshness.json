@@ -1,0 +1,11 @@
+{
+  "phase": "outcome",
+  "effect": "ef-read",
+  "outcome": {
+    "outcome": "ok"
+  },
+  "freshness": {
+    "path": "src/lib.rs",
+    "digest": "blake3:fresh"
+  }
+}

@@ -3,12 +3,14 @@
 use crate::turn_recovery::{RecoveredWork, recover_interrupted_turns};
 use crate::worker::{
     BrokerToolFactory, PendingShellExec, RegisteredToolRoute, TurnToolFactory, defer_shell_handoff,
-    effective_permission_defaults, registered_tool_route, registered_tools,
-    tool_inventory_snapshot,
+    durable_session_tool_state, effective_permission_defaults, registered_tool_route,
+    registered_tools, tool_inventory_snapshot, typed_tool_result,
 };
 use haider_core::{MemoryStore, SqliteStoreHandle, StoreHandle};
 use haider_protocol::EventPayload;
-use haider_protocol::effect::{AuthorizationVerdict, EffectClass, EffectIntent, EffectPhase};
+use haider_protocol::effect::{
+    AuthorizationVerdict, EffectClass, EffectIntent, EffectOutcome, EffectPhase, FileFreshness,
+};
 use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
 };
@@ -23,7 +25,9 @@ use haider_protocol::session::{SessionMetadataV1, SessionPermissionOverridesV1};
 use haider_protocol::state::RunState;
 use haider_protocol::tool::{RememberedGrantScope, ToolPermissionDefault};
 use haider_store::{AcceptedShellExec, EventStore, SessionCreateCommand, Store};
+use haider_tools::{FsEditAnchorMismatch, ToolError};
 use std::collections::VecDeque;
+use std::path::PathBuf;
 
 /// MUTATION CHECK: advertise a name that has no typed registry route, or add
 /// legacy `exec` to the manifests. Expected runtime failure: advertised and
@@ -53,6 +57,36 @@ fn canonical_inventory_equals_advertised_dispatchable_set() {
         Some(RegisteredToolRoute::ProcessExec),
         "legacy history remains dispatchable without being advertised"
     );
+    assert_eq!(
+        registered_tool_route("fs_search"),
+        Some(RegisteredToolRoute::FsSearch)
+    );
+    assert_eq!(
+        registered_tool_route("fs_glob"),
+        Some(RegisteredToolRoute::FsGlob)
+    );
+    assert_eq!(
+        registered_tool_route("fs_edit"),
+        Some(RegisteredToolRoute::FsEdit)
+    );
+}
+
+/// MUTATION CHECK: drop any C1 registry entry or change its typed route.
+/// Expected RUNTIME failure: the literal manifest name has no matching route.
+#[test]
+fn advertised_equals_dispatchable_for_all_three_c1_tools() {
+    let registry = registered_tools();
+    for (name, route) in [
+        ("fs_search", RegisteredToolRoute::FsSearch),
+        ("fs_glob", RegisteredToolRoute::FsGlob),
+        ("fs_edit", RegisteredToolRoute::FsEdit),
+    ] {
+        assert!(
+            registry.iter().any(|entry| entry.manifest.name == name),
+            "{name} must be advertised"
+        );
+        assert_eq!(registered_tool_route(name), Some(route));
+    }
 }
 
 /// MUTATION CHECK: apply overrides before registry defaults, map exec to the
@@ -280,6 +314,111 @@ async fn inventory_snapshot_projects_registry_defaults_and_durable_grants() {
         snapshot.remembered_grants[0].scope,
         RememberedGrantScope::Class
     );
+}
+
+/// MUTATION CHECK: ignore terminal freshness or use first-write-wins during
+/// the durable scan. Expected RUNTIME failure: the literal latest digests are
+/// missing or the older digest survives.
+#[tokio::test]
+async fn durable_tool_state_reduces_latest_freshness_per_session() {
+    let store = MemoryStore::new();
+    let session_id = SessionId::new("freshness-session");
+    let mut events = [
+        envelope(
+            &session_id,
+            "fresh-old",
+            EventPayload::Effect(EffectPhase::Outcome {
+                effect: EffectId::new("read-old"),
+                outcome: EffectOutcome::Ok,
+                freshness: Some(FileFreshness {
+                    path: "src/lib.rs".into(),
+                    digest: "blake3:old-literal".into(),
+                }),
+            }),
+        ),
+        envelope(
+            &session_id,
+            "fresh-new",
+            EventPayload::Effect(EffectPhase::Outcome {
+                effect: EffectId::new("edit-new"),
+                outcome: EffectOutcome::Ok,
+                freshness: Some(FileFreshness {
+                    path: "src/lib.rs".into(),
+                    digest: "blake3:new-literal".into(),
+                }),
+            }),
+        ),
+        envelope(
+            &session_id,
+            "fresh-other",
+            EventPayload::Effect(EffectPhase::Outcome {
+                effect: EffectId::new("read-other"),
+                outcome: EffectOutcome::Ok,
+                freshness: Some(FileFreshness {
+                    path: "README.md".into(),
+                    digest: "blake3:readme-literal".into(),
+                }),
+            }),
+        ),
+    ];
+    store.append(&mut events).await.expect("append freshness");
+
+    let state = durable_session_tool_state(&store, &session_id)
+        .await
+        .expect("durable state");
+    assert_eq!(state.freshness.len(), 2);
+    assert_eq!(
+        state
+            .freshness
+            .get("src/lib.rs")
+            .expect("latest lib freshness")
+            .digest,
+        "blake3:new-literal"
+    );
+    assert_eq!(
+        state
+            .freshness
+            .get("README.md")
+            .expect("readme freshness")
+            .digest,
+        "blake3:readme-literal"
+    );
+}
+
+/// MUTATION CHECK: collapse C1 errors into invalid_argument/path_changed or
+/// omit the match count/remedy. Expected RUNTIME failure: one of the literal
+/// kind/details assertions fails.
+#[test]
+fn c1_freshness_and_anchor_errors_are_typed_for_the_model() {
+    let unread = typed_tool_result(&ToolError::UnreadFile {
+        path: PathBuf::from("unread.txt"),
+    })
+    .expect("typed unread result");
+    let unread: serde_json::Value = serde_json::from_str(&unread.preview).expect("unread JSON");
+    assert_eq!(unread["error"]["kind"], "unread_file");
+
+    let stale = typed_tool_result(&ToolError::StaleRead {
+        path: PathBuf::from("stale.txt"),
+        recorded_digest: "blake3:recorded-literal".into(),
+        current_digest: "blake3:current-literal".into(),
+    })
+    .expect("typed stale result");
+    let stale: serde_json::Value = serde_json::from_str(&stale.preview).expect("stale JSON");
+    assert_eq!(stale["error"]["kind"], "stale_read");
+    assert_eq!(
+        stale["error"]["details"]["remedy"],
+        "re-read before editing"
+    );
+
+    let anchor = typed_tool_result(&ToolError::EditAnchor(FsEditAnchorMismatch {
+        path: PathBuf::from("anchor.txt"),
+        matches: 7,
+        replace_all: false,
+    }))
+    .expect("typed anchor result");
+    let anchor: serde_json::Value = serde_json::from_str(&anchor.preview).expect("anchor JSON");
+    assert_eq!(anchor["error"]["kind"], "edit_anchor_count");
+    assert_eq!(anchor["error"]["details"]["matches"], 7);
 }
 
 fn create_durable_session(store: &Store, session_id: &SessionId) {

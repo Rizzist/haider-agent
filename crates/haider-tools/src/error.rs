@@ -22,6 +22,14 @@ pub struct FsPatchConflict {
     pub matches: usize,
 }
 
+/// An anchored edit could not identify the required number of occurrences.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FsEditAnchorMismatch {
+    pub path: PathBuf,
+    pub matches: usize,
+    pub replace_all: bool,
+}
+
 /// Typed failures at the tool boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolError {
@@ -47,6 +55,15 @@ pub enum ToolError {
         path: PathBuf,
         message: String,
     },
+    UnreadFile {
+        path: PathBuf,
+    },
+    StaleRead {
+        path: PathBuf,
+        recorded_digest: String,
+        current_digest: String,
+    },
+    EditAnchor(FsEditAnchorMismatch),
     Conflict(FsPatchConflict),
     Io {
         operation: &'static str,
@@ -144,6 +161,27 @@ impl std::fmt::Display for ToolError {
                 formatter,
                 "authorized path {} changed before access: {message}",
                 path.display()
+            ),
+            Self::UnreadFile { path } => write!(
+                formatter,
+                "refusing to mutate unread file {}; read it before editing",
+                path.display()
+            ),
+            Self::StaleRead { path, .. } => write!(
+                formatter,
+                "refusing to mutate stale file {}; re-read before editing",
+                path.display()
+            ),
+            Self::EditAnchor(conflict) if conflict.replace_all && conflict.matches == 0 => write!(
+                formatter,
+                "edit anchor for {} matched 0 locations; replace_all requires at least one match",
+                conflict.path.display()
+            ),
+            Self::EditAnchor(conflict) => write!(
+                formatter,
+                "edit anchor for {} matched {} locations; expected exactly 1",
+                conflict.path.display(),
+                conflict.matches
             ),
             Self::Conflict(conflict) if conflict.matches == 0 => write!(
                 formatter,

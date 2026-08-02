@@ -6,6 +6,14 @@
 //!   or write runs before a journaled `Allow` + `Dispatched`.
 //! - Read-class results are bounded: an oversized result keeps a UTF-8-safe
 //!   preview and freezes the complete payload in the CAS via [`CasSink`].
+//!   Search spools its complete match stream to a private temporary file while
+//!   retaining at most 200 matches / 8 KiB for the prompt; glob retains the
+//!   lexicographically first 500 paths and reports overflow honestly.
+//! - File freshness is session-scoped and advances only with a durably
+//!   journaled terminal outcome. `fs_read`, `fs_write`, and `fs_edit` attach
+//!   the exact BLAKE3 digest to that outcome. Existing-file writes and edits
+//!   compare it against the locked current snapshot, returning typed unread or
+//!   stale refusals before any replacement is prepared.
 //! - `fs_patch` proves its pre-image before writing (mismatch is a typed
 //!   [`FsPatchConflict`]) and records applied writes in the
 //!   [`crate::ChangeLedger`],
@@ -42,14 +50,15 @@
 
 use crate::broker::{EffectBroker, EffectOperation, PermissionPolicy};
 use crate::ledger::{ChangeLedgerSink, FsWriteRecord};
-use crate::{FsPatchConflict, ToolError, ToolResult};
+use crate::{FsEditAnchorMismatch, FsPatchConflict, ToolError, ToolResult};
 use async_trait::async_trait;
-use haider_protocol::effect::EffectClass;
+use haider_protocol::effect::{EffectClass, FileFreshness};
 use haider_protocol::ids::{ArtifactRef, RunId, SessionId};
 use haider_protocol::tool::BoundedResult;
 use rustix::fd::OwnedFd;
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use serde_json::{Value, json};
+use std::collections::{BinaryHeap, HashMap};
 use std::ffi::{CStr, OsStr, OsString};
 use std::fs;
 use std::io::{Read, Write};
@@ -155,6 +164,9 @@ impl EffectOperation for FsList {
 pub struct FsSearch {
     pub root: PathBuf,
     pub query: String,
+    pub glob: Option<String>,
+    pub case_mode: FsCaseMode,
+    pub mode: FsSearchMode,
 }
 
 impl FsSearch {
@@ -162,8 +174,44 @@ impl FsSearch {
         Self {
             root: root.into(),
             query: query.into(),
+            glob: None,
+            case_mode: FsCaseMode::Sensitive,
+            mode: FsSearchMode::Literal,
         }
     }
+
+    pub fn with_glob(mut self, glob: impl Into<String>) -> Self {
+        self.glob = Some(glob.into());
+        self
+    }
+
+    pub fn with_case_mode(mut self, case_mode: FsCaseMode) -> Self {
+        self.case_mode = case_mode;
+        self
+    }
+
+    pub fn with_mode(mut self, mode: FsSearchMode) -> Self {
+        self.mode = mode;
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FsCaseMode {
+    #[default]
+    Sensitive,
+    Insensitive,
+    Smart,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FsSearchMode {
+    #[default]
+    Literal,
+    /// Dependency-free wildcard matching: `*` matches any run and `?`
+    /// matches one scalar. This is the brief's documented simple-pattern
+    /// fallback; full regular expressions require a future dependency wave.
+    Simple,
 }
 
 impl EffectOperation for FsSearch {
@@ -177,6 +225,9 @@ impl EffectOperation for FsSearch {
 
     fn arguments(&self) -> ToolResult<Value> {
         Ok(json!({
+            "case": case_mode_argument(self.case_mode),
+            "glob": self.glob,
+            "mode": search_mode_argument(self.mode),
             "query": self.query,
             "root": path_argument(&self.root)?,
         }))
@@ -185,9 +236,121 @@ impl EffectOperation for FsSearch {
     fn canonical_arguments(&self, workspace_root: &Path) -> ToolResult<Value> {
         let root = resolve_workspace_path(workspace_root, &self.root, PathResolution::Existing)?;
         Ok(json!({
+            "case": case_mode_argument(self.case_mode),
+            "glob": self.glob,
+            "mode": search_mode_argument(self.mode),
             "query": self.query,
             "root": path_argument(&root)?,
         }))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FsGlob {
+    pub root: PathBuf,
+    pub pattern: String,
+}
+
+impl FsGlob {
+    pub fn new(root: impl Into<PathBuf>, pattern: impl Into<String>) -> Self {
+        Self {
+            root: root.into(),
+            pattern: pattern.into(),
+        }
+    }
+}
+
+impl EffectOperation for FsGlob {
+    fn effect_class(&self) -> EffectClass {
+        EffectClass::FsRead
+    }
+
+    fn summary(&self) -> String {
+        format!("glob {} for {:?}", self.root.display(), self.pattern)
+    }
+
+    fn arguments(&self) -> ToolResult<Value> {
+        Ok(json!({
+            "pattern": self.pattern,
+            "root": path_argument(&self.root)?,
+        }))
+    }
+
+    fn canonical_arguments(&self, workspace_root: &Path) -> ToolResult<Value> {
+        let root = resolve_workspace_path(workspace_root, &self.root, PathResolution::Existing)?;
+        Ok(json!({
+            "pattern": self.pattern,
+            "root": path_argument(&root)?,
+        }))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FsEdit {
+    pub path: PathBuf,
+    pub old_string: String,
+    pub new_string: String,
+    pub replace_all: bool,
+}
+
+impl FsEdit {
+    pub fn new(
+        path: impl Into<PathBuf>,
+        old_string: impl Into<String>,
+        new_string: impl Into<String>,
+    ) -> Self {
+        Self {
+            path: path.into(),
+            old_string: old_string.into(),
+            new_string: new_string.into(),
+            replace_all: false,
+        }
+    }
+
+    pub fn replace_all(mut self, replace_all: bool) -> Self {
+        self.replace_all = replace_all;
+        self
+    }
+}
+
+impl EffectOperation for FsEdit {
+    fn effect_class(&self) -> EffectClass {
+        EffectClass::FsWrite
+    }
+
+    fn summary(&self) -> String {
+        format!("edit {}", self.path.display())
+    }
+
+    fn arguments(&self) -> ToolResult<Value> {
+        Ok(json!({
+            "new_string": self.new_string,
+            "old_string": self.old_string,
+            "path": path_argument(&self.path)?,
+            "replace_all": self.replace_all,
+        }))
+    }
+
+    fn canonical_arguments(&self, workspace_root: &Path) -> ToolResult<Value> {
+        let path = resolve_workspace_path(workspace_root, &self.path, PathResolution::Existing)?;
+        Ok(json!({
+            "new_string": self.new_string,
+            "old_string": self.old_string,
+            "path": path_argument(&path)?,
+            "replace_all": self.replace_all,
+        }))
+    }
+
+    fn approval_preview(&self) -> Vec<String> {
+        vec![
+            format!("Target: {}", self.path.display()),
+            format!(
+                "Replace {} occurrence(s) of blake3:{} with {} UTF-8 bytes",
+                if self.replace_all { "all" } else { "one" },
+                blake3::hash(self.old_string.as_bytes()).to_hex(),
+                self.new_string.len()
+            ),
+        ]
     }
 }
 
@@ -327,10 +490,23 @@ impl EffectBroker {
         let relative = anchored_relative_path(self.workspace_root(), &operation.path)?;
         let display_path = operation.path.clone();
         let workspace_dir = self.duplicate_workspace_dir()?;
-        self.bounded_read(&operation, policy, cas, bounds, move || {
-            read_utf8_at(workspace_dir, &relative, &display_path)
-        })
-        .await
+        let freshness_path = relative_path_argument(&relative)?.to_owned();
+        let intent = self.begin(&operation, policy).await?;
+        let read =
+            run_blocking(move || read_utf8_at(workspace_dir, &relative, &display_path)).await;
+        let (result, freshness) = match read {
+            Ok(contents) => {
+                let digest = digest_bytes(contents.as_bytes());
+                let result = bounded(contents, bounds, cas).await;
+                let freshness = result.as_ref().ok().map(|_| FileFreshness {
+                    path: freshness_path,
+                    digest,
+                });
+                (result, freshness)
+            }
+            Err(error) => (Err(error), None),
+        };
+        self.finish_with_freshness(&intent, result, freshness).await
     }
 
     pub async fn fs_list<C>(
@@ -367,21 +543,65 @@ impl EffectBroker {
     where
         C: CasSink,
     {
-        let operation = FsSearch::new(
+        let requested_glob = operation.glob.clone();
+        let mut operation = FsSearch::new(
             resolve_workspace_path(
                 self.workspace_root(),
                 &operation.root,
                 PathResolution::Existing,
             )?,
             operation.query.clone(),
+        )
+        .with_case_mode(operation.case_mode)
+        .with_mode(operation.mode);
+        if let Some(glob) = requested_glob {
+            operation = operation.with_glob(glob);
+        }
+        let owned = operation.clone();
+        let relative = anchored_relative_path(self.workspace_root(), &operation.root)?;
+        let workspace_dir = self.duplicate_workspace_dir()?;
+        let intent = self.begin(&operation, policy).await?;
+        let result = run_blocking(move || {
+            search_files_at(workspace_dir, &relative, &owned, bounds.max_preview_bytes)
+        })
+        .await;
+        let result = match result {
+            Ok(matches) => bounded_search(matches, bounds, cas).await,
+            Err(error) => Err(error),
+        };
+        self.finish(&intent, result).await
+    }
+
+    pub async fn fs_glob<C>(
+        &mut self,
+        operation: &FsGlob,
+        policy: &PermissionPolicy,
+        cas: &mut C,
+        bounds: ResultBounds,
+    ) -> ToolResult<BoundedResult>
+    where
+        C: CasSink,
+    {
+        let operation = FsGlob::new(
+            resolve_workspace_path(
+                self.workspace_root(),
+                &operation.root,
+                PathResolution::Existing,
+            )?,
+            operation.pattern.clone(),
         );
         let owned = operation.clone();
         let relative = anchored_relative_path(self.workspace_root(), &operation.root)?;
         let workspace_dir = self.duplicate_workspace_dir()?;
-        self.bounded_read(&operation, policy, cas, bounds, move || {
-            search_files_at(workspace_dir, &relative, &owned)
-        })
-        .await
+        let intent = self.begin(&operation, policy).await?;
+        let result = run_blocking(move || glob_files_at(workspace_dir, &relative, &owned)).await;
+        let result = match result {
+            Ok(output) => {
+                bounded_with_truncation(output.contents, output.truncated, bounds, cas).await
+            }
+            Err(error) => Err(error),
+        };
+        self.finish(&intent, result).await
     }
 
     /// Shared read-class envelope: begin (intent → authorize → dispatched),
@@ -438,15 +658,23 @@ impl EffectBroker {
             (Ok(relative), Ok(workspace_dir)) => (relative, workspace_dir),
             (Err(error), _) | (_, Err(error)) => return self.finish(&intent, Err(error)).await,
         };
+        let freshness_path = match relative_path_argument(&relative) {
+            Ok(path) => path.to_owned(),
+            Err(error) => return self.finish(&intent, Err(error)).await,
+        };
+        let expected_digest = self.freshness_digest(&relative);
         let worker = tokio::task::spawn_blocking(move || {
             apply_write_and_record(
                 workspace_dir,
                 &relative,
                 &owned_operation,
-                &critical_ledger,
-                attribution,
-                effect,
-                summary,
+                MutationRecordContext {
+                    expected_digest: expected_digest.as_deref(),
+                    ledger: &critical_ledger,
+                    attribution,
+                    effect,
+                    summary,
+                },
             )
         });
         let worker_abort = worker.abort_handle();
@@ -454,14 +682,100 @@ impl EffectBroker {
         let finish = self.effect_finish(&intent);
         let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
         let finalizer_id = self.register_finalizer(async move {
-            let result = match worker.await {
-                Ok(outcome) => outcome.into_result(),
+            let (result, freshness) = match worker.await {
+                Ok(outcome) => outcome.into_result_with_freshness(freshness_path),
                 Err(error) if error.is_cancelled() => return None,
-                Err(error) => Err(ToolError::Runtime {
-                    message: format!("blocking filesystem worker failed: {error}"),
-                }),
+                Err(error) => (
+                    Err(ToolError::Runtime {
+                        message: format!("blocking filesystem worker failed: {error}"),
+                    }),
+                    None,
+                ),
             };
-            let result = finish.finish(result).await;
+            let result = finish.finish_with_freshness(result, freshness).await;
+            let error = result.as_ref().err().cloned();
+            let _ = result_sender.send(result);
+            error
+        });
+        match result_receiver.await {
+            Ok(result) => {
+                worker_cancel.disarm();
+                self.observe_finalizer(finalizer_id);
+                result
+            }
+            Err(error) => Err(ToolError::Runtime {
+                message: format!("filesystem outcome finalizer failed: {error}"),
+            }),
+        }
+    }
+
+    pub async fn fs_edit<L>(
+        &mut self,
+        operation: &FsEdit,
+        policy: &PermissionPolicy,
+        attribution: &TurnAttribution,
+        ledger: &L,
+    ) -> ToolResult<BoundedResult>
+    where
+        L: ChangeLedgerSink,
+    {
+        let operation = FsEdit {
+            path: resolve_workspace_path(
+                self.workspace_root(),
+                &operation.path,
+                PathResolution::Existing,
+            )?,
+            old_string: operation.old_string.clone(),
+            new_string: operation.new_string.clone(),
+            replace_all: operation.replace_all,
+        };
+        let intent = self.begin(&operation, policy).await?;
+        let relative = anchored_relative_path(self.workspace_root(), &operation.path);
+        let workspace_dir = self.duplicate_workspace_dir();
+        let owned_operation = operation.clone();
+        let critical_ledger = ledger.clone();
+        let attribution = attribution.clone();
+        let effect = intent.effect.clone();
+        let summary = intent.summary.clone();
+        let (relative, workspace_dir) = match (relative, workspace_dir) {
+            (Ok(relative), Ok(workspace_dir)) => (relative, workspace_dir),
+            (Err(error), _) | (_, Err(error)) => return self.finish(&intent, Err(error)).await,
+        };
+        let freshness_path = match relative_path_argument(&relative) {
+            Ok(path) => path.to_owned(),
+            Err(error) => return self.finish(&intent, Err(error)).await,
+        };
+        let expected_digest = self.freshness_digest(&relative);
+        let worker = tokio::task::spawn_blocking(move || {
+            apply_edit_and_record(
+                workspace_dir,
+                &relative,
+                &owned_operation,
+                MutationRecordContext {
+                    expected_digest: expected_digest.as_deref(),
+                    ledger: &critical_ledger,
+                    attribution,
+                    effect,
+                    summary,
+                },
+            )
+        });
+        let worker_abort = worker.abort_handle();
+        let mut worker_cancel = WorkerCancelGuard::new(worker_abort);
+        let finish = self.effect_finish(&intent);
+        let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
+        let finalizer_id = self.register_finalizer(async move {
+            let (result, freshness) = match worker.await {
+                Ok(outcome) => outcome.into_result_with_freshness(freshness_path),
+                Err(error) if error.is_cancelled() => return None,
+                Err(error) => (
+                    Err(ToolError::Runtime {
+                        message: format!("blocking filesystem worker failed: {error}"),
+                    }),
+                    None,
+                ),
+            };
+            let result = finish.finish_with_freshness(result, freshness).await;
             let error = result.as_ref().err().cloned();
             let _ = result_sender.send(result);
             error
@@ -595,9 +909,10 @@ fn read_utf8_at(
 }
 
 fn read_utf8_file(mut file: fs::File, display_path: &Path) -> ToolResult<String> {
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .map_err(|error| ToolError::io("read", display_path, error))?;
+    let bytes =
+        metadata_guarded_file_snapshot_with_reader(&mut file, display_path, |snapshot, buffer| {
+            snapshot.read_at(buffer, 0)
+        })?;
     String::from_utf8(bytes).map_err(|error| ToolError::InvalidArgument {
         message: format!("{} is not UTF-8 text: {error}", display_path.display()),
     })
@@ -631,30 +946,33 @@ fn search_files_at(
     workspace_dir: OwnedFd,
     relative: &Path,
     operation: &FsSearch,
-) -> ToolResult<String> {
+    max_preview_bytes: usize,
+) -> ToolResult<SearchOutput> {
     if operation.query.is_empty() {
         return Err(ToolError::invalid_argument(
             "fs_search query cannot be empty",
         ));
     }
     let directory = open_directory_at(workspace_dir, relative, "open for search", &operation.root)?;
-    let mut matches = Vec::new();
+    let mut matches = SearchCollector::new(max_preview_bytes)?;
     collect_search_matches_at(
         directory,
         Path::new(""),
+        relative,
         &operation.root,
-        &operation.query,
+        operation,
         &mut matches,
     )?;
-    Ok(join_lines(matches))
+    Ok(matches.finish())
 }
 
 fn collect_search_matches_at(
     directory: OwnedFd,
     relative: &Path,
+    workspace_prefix: &Path,
     display_root: &Path,
-    query: &str,
-    matches: &mut Vec<String>,
+    operation: &FsSearch,
+    matches: &mut SearchCollector,
 ) -> ToolResult<()> {
     let mut entries = rustix::fs::Dir::read_from(&directory)
         .map_err(|error| ToolError::io("list", display_root.join(relative), error))?;
@@ -684,9 +1002,24 @@ fn collect_search_matches_at(
                     "open search directory",
                     &entry_path,
                 )?;
-                collect_search_matches_at(child, &display_path, display_root, query, matches)?;
+                collect_search_matches_at(
+                    child,
+                    &display_path,
+                    workspace_prefix,
+                    display_root,
+                    operation,
+                    matches,
+                )?;
             }
             FileType::RegularFile => {
+                let match_path = path_argument(&display_path)?;
+                if operation
+                    .glob
+                    .as_deref()
+                    .is_some_and(|glob| !glob_matches(glob, match_path))
+                {
+                    continue;
+                }
                 let file = openat_nofollow(
                     &directory,
                     &name,
@@ -697,7 +1030,13 @@ fn collect_search_matches_at(
                 let opened = rustix::fs::fstat(&file)
                     .map_err(|error| ToolError::io("inspect", &entry_path, error))?;
                 if FileType::from_raw_mode(opened.st_mode) == FileType::RegularFile {
-                    collect_file_matches(file, &display_path, &entry_path, query, matches)?;
+                    collect_file_matches(
+                        file,
+                        &workspace_prefix.join(&display_path),
+                        &entry_path,
+                        operation,
+                        matches,
+                    )?;
                 }
             }
             _ => {}
@@ -710,8 +1049,8 @@ fn collect_file_matches(
     file: OwnedFd,
     display_path: &Path,
     entry_path: &Path,
-    query: &str,
-    matches: &mut Vec<String>,
+    operation: &FsSearch,
+    matches: &mut SearchCollector,
 ) -> ToolResult<()> {
     let mut bytes = Vec::new();
     fs::File::from(file)
@@ -721,11 +1060,309 @@ fn collect_file_matches(
         return Ok(());
     };
     for (index, line) in contents.lines().enumerate() {
-        if line.contains(query) {
-            matches.push(format!("{}:{}:{}", display_path.display(), index + 1, line));
+        if search_line_matches(line, operation) {
+            matches.push(format!("{}:{}:{}", display_path.display(), index + 1, line))?;
         }
     }
     Ok(())
+}
+
+const SEARCH_PREVIEW_MATCHES: usize = 200;
+const GLOB_ENTRY_LIMIT: usize = 500;
+
+struct SearchOutput {
+    preview: String,
+    match_count: usize,
+    total_bytes: usize,
+    complete: tempfile::NamedTempFile,
+}
+
+struct SearchCollector {
+    preview: String,
+    match_count: usize,
+    total_bytes: usize,
+    max_preview_bytes: usize,
+    preview_saturated: bool,
+    complete: tempfile::NamedTempFile,
+}
+
+impl SearchCollector {
+    fn new(max_preview_bytes: usize) -> ToolResult<Self> {
+        let complete = tempfile::NamedTempFile::new()
+            .map_err(|error| ToolError::io("create search result spool", "<search>", error))?;
+        Ok(Self {
+            preview: String::new(),
+            match_count: 0,
+            total_bytes: 0,
+            max_preview_bytes,
+            preview_saturated: false,
+            complete,
+        })
+    }
+
+    fn push(&mut self, line: String) -> ToolResult<()> {
+        self.complete
+            .write_all(line.as_bytes())
+            .and_then(|()| self.complete.write_all(b"\n"))
+            .map_err(|error| ToolError::io("write search result spool", "<search>", error))?;
+        self.total_bytes = self
+            .total_bytes
+            .saturating_add(line.len())
+            .saturating_add(1);
+        if self.match_count < SEARCH_PREVIEW_MATCHES
+            && self.preview.len() < self.max_preview_bytes
+            && !self.preview_saturated
+        {
+            let remaining = self.max_preview_bytes - self.preview.len();
+            self.preview.push_str(utf8_prefix(&line, remaining));
+            if line.len() < remaining {
+                self.preview.push('\n');
+            } else {
+                self.preview_saturated = true;
+            }
+        }
+        self.match_count = self.match_count.saturating_add(1);
+        Ok(())
+    }
+
+    fn finish(self) -> SearchOutput {
+        SearchOutput {
+            preview: self.preview,
+            match_count: self.match_count,
+            total_bytes: self.total_bytes,
+            complete: self.complete,
+        }
+    }
+}
+
+struct CappedOutput {
+    contents: String,
+    truncated: bool,
+}
+
+struct GlobCollector {
+    entries: BinaryHeap<String>,
+    truncated: bool,
+}
+
+impl GlobCollector {
+    fn new() -> Self {
+        Self {
+            entries: BinaryHeap::new(),
+            truncated: false,
+        }
+    }
+
+    fn push(&mut self, path: String) {
+        if self.entries.len() < GLOB_ENTRY_LIMIT {
+            self.entries.push(path);
+            return;
+        }
+        self.truncated = true;
+        if self
+            .entries
+            .peek()
+            .is_some_and(|largest| path.as_str() < largest.as_str())
+        {
+            self.entries.pop();
+            self.entries.push(path);
+        }
+    }
+}
+
+fn glob_files_at(
+    workspace_dir: OwnedFd,
+    relative: &Path,
+    operation: &FsGlob,
+) -> ToolResult<CappedOutput> {
+    if operation.pattern.is_empty() {
+        return Err(ToolError::invalid_argument(
+            "fs_glob pattern cannot be empty",
+        ));
+    }
+    let directory = open_directory_at(workspace_dir, relative, "open for glob", &operation.root)?;
+    let mut paths = GlobCollector::new();
+    collect_glob_paths_at(
+        directory,
+        Path::new(""),
+        relative,
+        &operation.root,
+        &operation.pattern,
+        &mut paths,
+    )?;
+    let truncated = paths.truncated;
+    Ok(CappedOutput {
+        contents: join_lines(paths.entries.into_sorted_vec()),
+        truncated,
+    })
+}
+
+fn collect_glob_paths_at(
+    directory: OwnedFd,
+    relative: &Path,
+    workspace_prefix: &Path,
+    display_root: &Path,
+    pattern: &str,
+    paths: &mut GlobCollector,
+) -> ToolResult<()> {
+    let mut entries = rustix::fs::Dir::read_from(&directory)
+        .map_err(|error| ToolError::io("list", display_root.join(relative), error))?;
+    let mut names = Vec::new();
+    while let Some(entry) = entries.read() {
+        let entry =
+            entry.map_err(|error| ToolError::io("list", display_root.join(relative), error))?;
+        if !is_dot_entry(entry.file_name()) {
+            names.push(OsString::from_vec(entry.file_name().to_bytes().to_vec()));
+        }
+    }
+    names.sort();
+
+    for name in names {
+        let child_relative = relative.join(&name);
+        let entry_path = display_root.join(&child_relative);
+        let metadata = rustix::fs::statat(&directory, &name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|error| anchored_io_error("inspect", &entry_path, error))?;
+        match FileType::from_raw_mode(metadata.st_mode) {
+            FileType::Symlink => {}
+            FileType::Directory => {
+                let child = openat_nofollow(
+                    &directory,
+                    &name,
+                    OFlags::RDONLY | OFlags::DIRECTORY,
+                    "open glob directory",
+                    &entry_path,
+                )?;
+                collect_glob_paths_at(
+                    child,
+                    &child_relative,
+                    workspace_prefix,
+                    display_root,
+                    pattern,
+                    paths,
+                )?;
+            }
+            FileType::RegularFile => {
+                let match_path = path_argument(&child_relative)?;
+                if glob_matches(pattern, match_path) {
+                    paths.push(
+                        relative_path_argument(&workspace_prefix.join(&child_relative))?.to_owned(),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn search_line_matches(line: &str, operation: &FsSearch) -> bool {
+    let case_sensitive = match operation.case_mode {
+        FsCaseMode::Sensitive => true,
+        FsCaseMode::Insensitive => false,
+        FsCaseMode::Smart => operation.query.chars().any(char::is_uppercase),
+    };
+    let (line, query) = if case_sensitive {
+        (line.to_owned(), operation.query.clone())
+    } else {
+        (line.to_lowercase(), operation.query.to_lowercase())
+    };
+    match operation.mode {
+        FsSearchMode::Literal => line.contains(&query),
+        FsSearchMode::Simple => wildcard_matches(&format!("*{query}*"), &line, false),
+    }
+}
+
+fn glob_matches(pattern: &str, text: &str) -> bool {
+    wildcard_matches(pattern, text, true)
+}
+
+fn wildcard_matches(pattern: &str, text: &str, slash_sensitive: bool) -> bool {
+    let pattern = pattern.chars().collect::<Vec<_>>();
+    let text = text.chars().collect::<Vec<_>>();
+    fn matches_from(
+        pattern: &[char],
+        text: &[char],
+        slash_sensitive: bool,
+        pattern_index: usize,
+        text_index: usize,
+        memo: &mut HashMap<(usize, usize), bool>,
+    ) -> bool {
+        if let Some(result) = memo.get(&(pattern_index, text_index)) {
+            return *result;
+        }
+        let result = match pattern.get(pattern_index) {
+            None => text_index == text.len(),
+            Some('*') => {
+                let double = pattern.get(pattern_index + 1) == Some(&'*');
+                let next_pattern = pattern_index + if double { 2 } else { 1 };
+                (double
+                    && pattern.get(next_pattern) == Some(&'/')
+                    && matches_from(
+                        pattern,
+                        text,
+                        slash_sensitive,
+                        next_pattern + 1,
+                        text_index,
+                        memo,
+                    ))
+                    || matches_from(
+                        pattern,
+                        text,
+                        slash_sensitive,
+                        next_pattern,
+                        text_index,
+                        memo,
+                    )
+                    || text.get(text_index).is_some_and(|character| {
+                        (double || !slash_sensitive || *character != '/')
+                            && matches_from(
+                                pattern,
+                                text,
+                                slash_sensitive,
+                                pattern_index,
+                                text_index + 1,
+                                memo,
+                            )
+                    })
+            }
+            Some('?') => text.get(text_index).is_some_and(|character| {
+                (!slash_sensitive || *character != '/')
+                    && matches_from(
+                        pattern,
+                        text,
+                        slash_sensitive,
+                        pattern_index + 1,
+                        text_index + 1,
+                        memo,
+                    )
+            }),
+            Some('\\') if pattern.get(pattern_index + 1).is_some() => {
+                text.get(text_index) == pattern.get(pattern_index + 1)
+                    && matches_from(
+                        pattern,
+                        text,
+                        slash_sensitive,
+                        pattern_index + 2,
+                        text_index + 1,
+                        memo,
+                    )
+            }
+            Some(expected) => {
+                text.get(text_index) == Some(expected)
+                    && matches_from(
+                        pattern,
+                        text,
+                        slash_sensitive,
+                        pattern_index + 1,
+                        text_index + 1,
+                        memo,
+                    )
+            }
+        };
+        memo.insert((pattern_index, text_index), result);
+        result
+    }
+    matches_from(&pattern, &text, slash_sensitive, 0, 0, &mut HashMap::new())
 }
 
 /// Replaces the unique occurrence of the pre-image. Missing or ambiguous
@@ -738,37 +1375,80 @@ struct AppliedPatch {
 }
 
 enum PatchWorkerOutcome {
-    Applied(BoundedResult),
+    Applied {
+        result: BoundedResult,
+        bytes_hash: String,
+    },
     ApplyFailed(ToolError),
-    LedgerFailed { error: ToolError, written: bool },
+    LedgerFailed {
+        error: ToolError,
+        written: bool,
+        bytes_hash: String,
+    },
 }
 
 impl PatchWorkerOutcome {
     fn into_result(self) -> ToolResult<BoundedResult> {
         match self {
-            Self::Applied(result) => Ok(result),
+            Self::Applied { result, .. } => Ok(result),
             Self::ApplyFailed(error) => Err(error),
-            Self::LedgerFailed { error, written } => {
+            Self::LedgerFailed { error, written, .. } => {
                 debug_assert!(written, "ledger failure must follow a successful rename");
                 Err(error)
             }
         }
     }
+
+    fn into_result_with_freshness(
+        self,
+        relative_path: String,
+    ) -> (ToolResult<BoundedResult>, Option<FileFreshness>) {
+        match self {
+            Self::Applied { result, bytes_hash } => (
+                Ok(result),
+                Some(FileFreshness {
+                    path: relative_path,
+                    digest: bytes_hash,
+                }),
+            ),
+            Self::ApplyFailed(error) => (Err(error), None),
+            Self::LedgerFailed {
+                error,
+                written,
+                bytes_hash,
+            } => {
+                debug_assert!(written, "ledger failure must follow a successful rename");
+                (
+                    Err(error),
+                    Some(FileFreshness {
+                        path: relative_path,
+                        digest: bytes_hash,
+                    }),
+                )
+            }
+        }
+    }
+}
+
+struct MutationRecordContext<'a, L> {
+    expected_digest: Option<&'a str>,
+    ledger: &'a L,
+    attribution: TurnAttribution,
+    effect: haider_protocol::ids::EffectId,
+    summary: String,
 }
 
 fn apply_write_and_record<L>(
     workspace_dir: OwnedFd,
     relative: &Path,
     operation: &FsWrite,
-    ledger: &L,
-    attribution: TurnAttribution,
-    effect: haider_protocol::ids::EffectId,
-    summary: String,
+    context: MutationRecordContext<'_, L>,
 ) -> PatchWorkerOutcome
 where
     L: ChangeLedgerSink,
 {
-    let applied = match apply_write_at(workspace_dir, relative, operation) {
+    let applied = match apply_write_at(workspace_dir, relative, operation, context.expected_digest)
+    {
         Ok(applied) => applied,
         Err(error) => return PatchWorkerOutcome::ApplyFailed(error),
     };
@@ -777,20 +1457,21 @@ where
         path,
         bytes_hash,
     } = applied;
-    match ledger.record_fs_write(
-        attribution.session,
-        attribution.turn,
+    match context.ledger.record_fs_write(
+        context.attribution.session,
+        context.attribution.turn,
         FsWriteRecord {
-            effect,
+            effect: context.effect,
             paths: vec![path],
-            summary,
-            bytes_hash,
+            summary: context.summary,
+            bytes_hash: bytes_hash.clone(),
         },
     ) {
-        Ok(()) => PatchWorkerOutcome::Applied(result),
+        Ok(()) => PatchWorkerOutcome::Applied { result, bytes_hash },
         Err(error) => PatchWorkerOutcome::LedgerFailed {
             error,
             written: true,
+            bytes_hash,
         },
     }
 }
@@ -799,6 +1480,7 @@ fn apply_write_at(
     workspace_dir: OwnedFd,
     relative: &Path,
     operation: &FsWrite,
+    expected_digest: Option<&str>,
 ) -> ToolResult<AppliedPatch> {
     let traversal_root = rustix::io::dup(&workspace_dir)
         .map_err(|error| ToolError::io("duplicate workspace root", &operation.path, error))?;
@@ -808,10 +1490,25 @@ fn apply_write_at(
     // so every cooperating Haider mutation of an existing target serializes.
     // A missing leaf is valid create semantics; any other lookup error stays
     // typed and no-follow.
-    let source = match rustix::fs::statat(&parent, &leaf, AtFlags::SYMLINK_NOFOLLOW) {
+    let mut source = match rustix::fs::statat(&parent, &leaf, AtFlags::SYMLINK_NOFOLLOW) {
         Ok(_) => {
-            let (source, metadata) = open_locked_current_at(&parent, &leaf, &operation.path)?;
-            Some((source, metadata))
+            let (mut source, metadata) = open_locked_current_at(&parent, &leaf, &operation.path)?;
+            let (source_bytes, _source_basis) =
+                file_snapshot(&parent, &mut source, &operation.path)?.parts();
+            let current_digest = digest_bytes(&source_bytes);
+            let Some(expected_digest) = expected_digest else {
+                return Err(ToolError::UnreadFile {
+                    path: operation.path.clone(),
+                });
+            };
+            if current_digest != expected_digest {
+                return Err(ToolError::StaleRead {
+                    path: operation.path.clone(),
+                    recorded_digest: expected_digest.to_owned(),
+                    current_digest,
+                });
+            }
+            Some((source, metadata, blake3::hash(&source_bytes)))
         }
         Err(rustix::io::Errno::NOENT) => None,
         Err(error) => {
@@ -827,7 +1524,7 @@ fn apply_write_at(
     let (temporary_name, temporary_fd) = create_patch_temporary(&parent, &operation.path)?;
     let mode = source
         .as_ref()
-        .map_or(0o644, |(_, metadata)| metadata.st_mode);
+        .map_or(0o644, |(_, metadata, _)| metadata.st_mode);
     if let Err(error) = write_patch_temporary(temporary_fd, mode, bytes, &operation.path) {
         remove_temporary(&parent, &temporary_name);
         return Err(error);
@@ -835,7 +1532,7 @@ fn apply_write_at(
     if let Err(error) = require_unchanged_target(
         &parent,
         &leaf,
-        source.as_ref().map(|(_, metadata)| metadata),
+        source.as_ref().map(|(_, metadata, _)| metadata),
         &operation.path,
     ) {
         remove_temporary(&parent, &temporary_name);
@@ -849,6 +1546,22 @@ fn apply_write_at(
                 return Err(error);
             }
         };
+    if let Some((source, _, source_hash)) = source.as_mut()
+        && let Err(error) =
+            require_unchanged_content(&parent, source, *source_hash, &operation.path)
+    {
+        remove_temporary(&parent, &temporary_name);
+        return Err(error);
+    }
+    if let Err(error) = require_unchanged_target(
+        &commit_parent,
+        &leaf,
+        source.as_ref().map(|(_, metadata, _)| metadata),
+        &operation.path,
+    ) {
+        remove_temporary(&parent, &temporary_name);
+        return Err(error);
+    }
     if let Err(error) = replace_temporary_at_commit(
         &commit_parent,
         &temporary_name,
@@ -866,6 +1579,159 @@ fn apply_write_at(
                 "wrote {} bytes to {}",
                 bytes.len(),
                 operation.path.display()
+            ),
+            truncated: false,
+            artifact: None,
+            cursor: None,
+        },
+        path: operation.path.clone(),
+        bytes_hash,
+    })
+}
+
+fn apply_edit_and_record<L>(
+    workspace_dir: OwnedFd,
+    relative: &Path,
+    operation: &FsEdit,
+    context: MutationRecordContext<'_, L>,
+) -> PatchWorkerOutcome
+where
+    L: ChangeLedgerSink,
+{
+    let applied = match apply_edit_at(workspace_dir, relative, operation, context.expected_digest) {
+        Ok(applied) => applied,
+        Err(error) => return PatchWorkerOutcome::ApplyFailed(error),
+    };
+    let AppliedPatch {
+        result,
+        path,
+        bytes_hash,
+    } = applied;
+    match context.ledger.record_fs_write(
+        context.attribution.session,
+        context.attribution.turn,
+        FsWriteRecord {
+            effect: context.effect,
+            paths: vec![path],
+            summary: context.summary,
+            bytes_hash: bytes_hash.clone(),
+        },
+    ) {
+        Ok(()) => PatchWorkerOutcome::Applied { result, bytes_hash },
+        Err(error) => PatchWorkerOutcome::LedgerFailed {
+            error,
+            written: true,
+            bytes_hash,
+        },
+    }
+}
+
+fn apply_edit_at(
+    workspace_dir: OwnedFd,
+    relative: &Path,
+    operation: &FsEdit,
+    expected_digest: Option<&str>,
+) -> ToolResult<AppliedPatch> {
+    if operation.old_string.is_empty() {
+        return Err(ToolError::invalid_argument(
+            "fs_edit old_string cannot be empty",
+        ));
+    }
+    let traversal_root = rustix::io::dup(&workspace_dir)
+        .map_err(|error| ToolError::io("duplicate workspace root", &operation.path, error))?;
+    let (parent, leaf) = open_parent_at(traversal_root, relative, &operation.path)?;
+    let (mut source, source_metadata) = open_locked_current_at(&parent, &leaf, &operation.path)?;
+    let (source_bytes, _source_basis) =
+        file_snapshot(&parent, &mut source, &operation.path)?.parts();
+    let current_digest = digest_bytes(&source_bytes);
+    let Some(expected_digest) = expected_digest else {
+        return Err(ToolError::UnreadFile {
+            path: operation.path.clone(),
+        });
+    };
+    if current_digest != expected_digest {
+        return Err(ToolError::StaleRead {
+            path: operation.path.clone(),
+            recorded_digest: expected_digest.to_owned(),
+            current_digest,
+        });
+    }
+    let source_hash = blake3::hash(&source_bytes);
+    let contents = String::from_utf8(source_bytes).map_err(|error| ToolError::InvalidArgument {
+        message: format!("{} is not UTF-8 text: {error}", operation.path.display()),
+    })?;
+    let matches = contents.match_indices(&operation.old_string).count();
+    if (!operation.replace_all && matches != 1) || (operation.replace_all && matches == 0) {
+        return Err(ToolError::EditAnchor(FsEditAnchorMismatch {
+            path: operation.path.clone(),
+            matches,
+            replace_all: operation.replace_all,
+        }));
+    }
+    let edited = if operation.replace_all {
+        contents.replace(&operation.old_string, &operation.new_string)
+    } else {
+        contents.replacen(&operation.old_string, &operation.new_string, 1)
+    };
+    let bytes = edited.as_bytes();
+    let bytes_hash = digest_bytes(bytes);
+    let (temporary_name, temporary_fd) = create_patch_temporary(&parent, &operation.path)?;
+    if let Err(error) = write_patch_temporary(
+        temporary_fd,
+        source_metadata.st_mode,
+        bytes,
+        &operation.path,
+    ) {
+        remove_temporary(&parent, &temporary_name);
+        return Err(error);
+    }
+    if let Err(error) =
+        require_unchanged_target(&parent, &leaf, Some(&source_metadata), &operation.path)
+    {
+        remove_temporary(&parent, &temporary_name);
+        return Err(error);
+    }
+    let commit_parent =
+        match revalidate_commit_parent(&workspace_dir, relative, &parent, &operation.path) {
+            Ok(parent) => parent,
+            Err(error) => {
+                remove_temporary(&parent, &temporary_name);
+                return Err(error);
+            }
+        };
+    if let Err(error) =
+        require_unchanged_content(&parent, &mut source, source_hash, &operation.path)
+    {
+        remove_temporary(&parent, &temporary_name);
+        return Err(error);
+    }
+    if let Err(error) = require_unchanged_target(
+        &commit_parent,
+        &leaf,
+        Some(&source_metadata),
+        &operation.path,
+    ) {
+        remove_temporary(&parent, &temporary_name);
+        return Err(error);
+    }
+    if let Err(error) = replace_temporary_at_commit(
+        &commit_parent,
+        &temporary_name,
+        &leaf,
+        &operation.path,
+        "replace edited file",
+    ) {
+        remove_temporary(&parent, &temporary_name);
+        return Err(error);
+    }
+    drop(source);
+    Ok(AppliedPatch {
+        result: BoundedResult {
+            preview: format!(
+                "edited {} ({} replacement{})",
+                operation.path.display(),
+                matches,
+                if matches == 1 { "" } else { "s" }
             ),
             truncated: false,
             artifact: None,
@@ -904,13 +1770,14 @@ where
             effect,
             paths: vec![path],
             summary,
-            bytes_hash,
+            bytes_hash: bytes_hash.clone(),
         },
     ) {
-        Ok(()) => PatchWorkerOutcome::Applied(result),
+        Ok(()) => PatchWorkerOutcome::Applied { result, bytes_hash },
         Err(error) => PatchWorkerOutcome::LedgerFailed {
             error,
             written: true,
+            bytes_hash,
         },
     }
 }
@@ -1675,6 +2542,66 @@ where
     })
 }
 
+async fn bounded_search<C>(
+    output: SearchOutput,
+    bounds: ResultBounds,
+    cas: &mut C,
+) -> ToolResult<BoundedResult>
+where
+    C: CasSink,
+{
+    let match_truncated = output.match_count > SEARCH_PREVIEW_MATCHES;
+    let byte_truncated = output.total_bytes > bounds.max_preview_bytes;
+    if !match_truncated && !byte_truncated {
+        return Ok(BoundedResult {
+            preview: output.preview,
+            truncated: false,
+            artifact: None,
+            cursor: None,
+        });
+    }
+    let artifact = cas.put_file(output.complete.path()).await?;
+    Ok(BoundedResult {
+        preview: output.preview,
+        truncated: true,
+        artifact: Some(artifact),
+        cursor: None,
+    })
+}
+
+async fn bounded_with_truncation<C>(
+    contents: String,
+    semantic_truncation: bool,
+    bounds: ResultBounds,
+    cas: &mut C,
+) -> ToolResult<BoundedResult>
+where
+    C: CasSink,
+{
+    if !semantic_truncation {
+        return bounded(contents, bounds, cas).await;
+    }
+    let artifact = if contents.len() > bounds.max_preview_bytes {
+        Some(cas.put(contents.as_bytes()).await?)
+    } else {
+        None
+    };
+    Ok(BoundedResult {
+        preview: utf8_prefix(&contents, bounds.max_preview_bytes).to_owned(),
+        truncated: true,
+        artifact,
+        cursor: None,
+    })
+}
+
+fn utf8_prefix(text: &str, max_bytes: usize) -> &str {
+    let mut end = max_bytes.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
 fn join_lines(lines: Vec<String>) -> String {
     if lines.is_empty() {
         String::new()
@@ -1706,6 +2633,29 @@ fn path_argument(path: &Path) -> ToolResult<&str> {
     path.to_str().ok_or_else(|| ToolError::InvalidArgument {
         message: format!("path is not valid UTF-8: {}", path.display()),
     })
+}
+
+fn relative_path_argument(path: &Path) -> ToolResult<&str> {
+    path_argument(path)
+}
+
+fn digest_bytes(bytes: &[u8]) -> String {
+    format!("blake3:{}", blake3::hash(bytes).to_hex())
+}
+
+fn case_mode_argument(mode: FsCaseMode) -> &'static str {
+    match mode {
+        FsCaseMode::Sensitive => "sensitive",
+        FsCaseMode::Insensitive => "insensitive",
+        FsCaseMode::Smart => "smart",
+    }
+}
+
+fn search_mode_argument(mode: FsSearchMode) -> &'static str {
+    match mode {
+        FsSearchMode::Literal => "literal",
+        FsSearchMode::Simple => "simple",
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

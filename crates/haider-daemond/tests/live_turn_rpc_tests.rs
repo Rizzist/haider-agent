@@ -2216,6 +2216,7 @@ async fn held_effect_reconciles_unknown_before_cancelled() {
             EventPayload::Effect(EffectPhase::Outcome {
                 effect: candidate,
                 outcome: EffectOutcome::Unknown,
+                ..
             }) if *candidate == effect
         )
     });
@@ -2709,6 +2710,7 @@ async fn w8a_shell_exec_is_receipted_exactly_once_and_user_preauthorized() {
         EffectPhase::Outcome {
             effect,
             outcome: EffectOutcome::Ok,
+            ..
         } if effect == &intent.effect
     ));
     let output = payloads
@@ -2827,8 +2829,10 @@ async fn w8a_shell_busy_builtin_rejection_and_inventory_are_typed() {
             "fs_read",
             "fs_list",
             "fs_search",
+            "fs_glob",
             "fs_write",
             "fs_patch",
+            "fs_edit",
             "process_exec",
             "spawn_subagent",
         ]
@@ -2848,7 +2852,7 @@ async fn w8a_shell_busy_builtin_rejection_and_inventory_are_typed() {
         .filter(|entry| {
             matches!(
                 entry.manifest.name.as_str(),
-                "fs_read" | "fs_list" | "fs_search"
+                "fs_read" | "fs_list" | "fs_search" | "fs_glob"
             )
         })
         .collect::<Vec<_>>();
@@ -3869,6 +3873,7 @@ async fn scenario_11_held_effect_becomes_unknown_after_restart_and_never_redispa
                 EventPayload::Effect(EffectPhase::Outcome {
                     effect: found,
                     outcome: EffectOutcome::Unknown,
+                    ..
                 }) if *found == effect
             ))
             .count(),
@@ -5977,6 +5982,7 @@ async fn w4a1_dispatched_real_fs_patch_restarts_as_unknown_without_redispatch() 
                 EventPayload::Effect(EffectPhase::Outcome {
                     effect,
                     outcome: EffectOutcome::Unknown,
+                    ..
                 }) if *effect == intents[0]
             ))
             .count(),
@@ -6126,6 +6132,7 @@ async fn w4a2_dispatched_exec_restarts_as_unknown_without_rerun() {
                 EventPayload::Effect(EffectPhase::Outcome {
                     effect,
                     outcome: EffectOutcome::Unknown,
+                    ..
                 }) if *effect == dispatched[0]
             ))
             .count(),
