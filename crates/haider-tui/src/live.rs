@@ -602,6 +602,12 @@ struct OAuthFlight {
     alias: String,
     flow: Option<haider_rpc::OAuthFlowId>,
     last_poll: Option<std::time::Instant>,
+    /// The authorize/verification URL `oauth_start` answered with — kept so
+    /// a later `WaitingDevice` status can render the device-honest "enter
+    /// the code at <url>" copy (the status wire itself carries no URL).
+    url: String,
+    /// The provider origin beside it (same source, same reason).
+    origin: String,
     /// The durable add command once READY fired (correlates its failure).
     add_command: Option<CommandId>,
 }
@@ -1508,6 +1514,8 @@ impl LiveDriver {
                 };
                 flight.flow = Some(flow_id);
                 flight.last_poll = Some(self.now);
+                flight.url = url.clone();
+                flight.origin = provider_origin.clone().unwrap_or_default();
                 let attempt = flight.attempt;
                 model.oauth_add_phase(
                     attempt,
@@ -1545,6 +1553,22 @@ impl LiveDriver {
                 let attempt = flight.attempt;
                 match status {
                     haider_rpc::OAuthFlowStatusWire::WaitingBrowser => Vec::new(),
+                    // B2b-m3 polish (c): the device grant reports its OWN
+                    // waiting phase — mapped to device-honest copy ("enter
+                    // the code at <verification url>"), never left to fall
+                    // through the tolerant arm while the card shows the
+                    // loopback's "your browser opened…" line. The reducer
+                    // ignores a no-op re-report (the 1.5 s poll).
+                    haider_rpc::OAuthFlowStatusWire::WaitingDevice => {
+                        model.oauth_add_phase(
+                            attempt,
+                            crate::app::OAuthAddPhase::WaitingDevice {
+                                url: flight.url.clone(),
+                                origin: flight.origin.clone(),
+                            },
+                        );
+                        Vec::new()
+                    }
                     haider_rpc::OAuthFlowStatusWire::Exchanging => {
                         model.oauth_add_phase(attempt, crate::app::OAuthAddPhase::Exchanging);
                         Vec::new()
@@ -2357,6 +2381,8 @@ impl LiveDriver {
                     alias: alias.clone(),
                     flow: None,
                     last_poll: None,
+                    url: String::new(),
+                    origin: String::new(),
                     add_command: None,
                 });
                 vec![LiveCommand::OAuthStart {

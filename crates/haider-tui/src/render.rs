@@ -77,7 +77,7 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
         Screen::Boot => render_boot(model, theme, frame, body),
         Screen::Launcher => render_launcher(model, theme, frame, body, &mut hits),
         Screen::Session => render_session(model, theme, frame, body, &mut hits),
-        Screen::Tree => render_tree(model, theme, frame, body),
+        Screen::Tree => render_tree(model, theme, frame, body, &mut hits),
         Screen::Tools => render_tools(model, theme, frame, body),
         Screen::Subagent => render_subagent(model, theme, frame, body, &mut hits),
         Screen::Aura => render_aura(model, theme, frame, body, &mut hits),
@@ -1145,6 +1145,30 @@ fn render_accounts(
                     theme.gold_style(),
                 )]));
             }
+            crate::app::OAuthAddPhase::WaitingDevice { url, .. } => {
+                // Device-honest copy (B2b-m3 polish c): a device grant has
+                // no loopback listening — the user enters the code at the
+                // verification URL and the daemon polls until approval.
+                footer_lines.push(Line::styled(
+                    format!(
+                        "  enter the code at {} — the daemon polls until you approve",
+                        if url.is_empty() {
+                            "the verification page"
+                        } else {
+                            url
+                        }
+                    ),
+                    theme.dim_style(),
+                ));
+                footer_lines.push(Line::styled(
+                    format!("  alias: {} · usage billed to the subscription", card.alias),
+                    theme.faint_style(),
+                ));
+                footer_lines.push(Line::from(vec![Span::styled(
+                    "  [1] open the link again · [2] cancel",
+                    theme.gold_style(),
+                )]));
+            }
             crate::app::OAuthAddPhase::Exchanging => {
                 footer_lines.push(Line::styled(
                     "  approved — exchanging the code…",
@@ -1800,10 +1824,17 @@ fn render_session(
     let mut lines: Vec<Line<'_>> = Vec::new();
     // Remember where each user prompt row lands (sticky origin line).
     let mut user_rows: Vec<(usize, &str)> = Vec::new();
+    // B2b-m3: every entry's starting LOGICAL line, for the render-resolved
+    // jump. A user row anchors its actual prompt line, not the preceding
+    // spacer — the sticky map's convention (research §Q3).
+    let mut entry_lines: Vec<usize> = Vec::with_capacity(model.projection.entries().len());
     for entry in model.projection.entries() {
         if let TranscriptEntry::User { text, .. } = entry {
             // transcript_lines pushes a spacer, then the prompt row.
             user_rows.push((lines.len() + 1, text.as_str()));
+            entry_lines.push(lines.len() + 1);
+        } else {
+            entry_lines.push(lines.len());
         }
         transcript_lines(
             &mut lines,
@@ -1838,6 +1869,34 @@ fn render_session(
     model
         .scroll_back
         .set(model.scroll_back.get().min(max_scroll));
+    // B2b-m3: resolve an armed tree jump IN THIS FRAME — node → display
+    // entry → logical line → wrapped row, every step through the
+    // renderer's OWN width and prefix sums (research §Q3: wrapped-row
+    // offsets are never cached, so a resize simply resolves against the
+    // new geometry). The anchor clears only when it LANDS.
+    // (A taken jump whose branch is no longer displayed stays dropped: it
+    // is never resolved against another branch's rows.)
+    if let Some(jump) = model.pending_jump.take()
+        && jump.branch.as_ref() == model.branch_state.active()
+    {
+        match model.projection.entry_of_node(&jump.node) {
+            Some(entry) => {
+                let line = entry_lines.get(entry).copied().unwrap_or(0);
+                let row = row_of_line.get(line).copied().unwrap_or(0);
+                // A near-tail target cannot be top-aligned without fake
+                // padding: clamp honestly and let it sit where the real
+                // rows put it.
+                let target_top = row.min(max_scroll);
+                model.scroll_back.set(max_scroll - target_top);
+                // The sticky must not cover the revealed row — same
+                // suppression as a sticky jump, until a real wheel.
+                model.sticky_suppressed.set(true);
+            }
+            // Replay has not materialized the node yet: keep the anchor
+            // armed for catch-up — never guess another entry.
+            None => *model.pending_jump.borrow_mut() = Some(jump),
+        }
+    }
     let scroll_back = model.scroll_back.get();
     let scroll = max_scroll - scroll_back;
     let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
@@ -1854,7 +1913,8 @@ fn render_session(
     // carries the scroll-back that puts the prompt's first row at the
     // viewport top; after a jump the sticky is SUPPRESSED until the next
     // real wheel so it never covers the row it just revealed.
-    if scroll_back > 0 && scroll > 0 && transcript_area.height > 0 && !model.sticky_suppressed {
+    if scroll_back > 0 && scroll > 0 && transcript_area.height > 0 && !model.sticky_suppressed.get()
+    {
         let sticky = user_rows.iter().rev().find(|(line_index, _)| {
             row_of_line
                 .get(*line_index)
@@ -2243,40 +2303,67 @@ fn render_token_panel(
     );
 }
 
-/// `/tree` — the session tree's main-line view (sim tui.js:3366-3430,
-/// W7b port). One branch row (● main), then a node row per user turn and
-/// per ⊟ compaction; forks land with the branch wave.
-fn render_tree(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rect) {
+/// `/tree` — the session tree (B2b-m3; sim tui.js:3366-3430). ONE branch
+/// at a time: the viewed branch's header (● follows the session's ACTIVE
+/// branch), a node row per user turn / ⊟ compaction, each fork marker
+/// immediately under its exact fork node, and the root→viewed breadcrumb
+/// in the head line. Hits carry the row VALUE (a stale hit on a replaced
+/// row matches nothing).
+fn render_tree(
+    model: &AppModel,
+    theme: &Theme,
+    frame: &mut Frame<'_>,
+    area: Rect,
+    hits: &mut Vec<(Rect, Hit)>,
+) {
     let name = model
         .session_name
         .as_deref()
         .or(model.session_title.as_deref())
         .unwrap_or("session");
     let rows = crate::app::tree_rows(model);
+    let crumb = crate::app::tree_crumb(model).join(" ▸ ");
+    let drilled = crate::app::tree_viewed(model).is_some();
     let mut lines = vec![
         Line::styled(
-            format!("SESSION TREE — {name} — main"),
+            format!("SESSION TREE — {name} — {crumb}"),
             theme.bright_style(),
         ),
         Line::raw(""),
     ];
     // Selection windows around `tree_sel` when the list outgrows the frame.
     let budget = usize::from(area.height.saturating_sub(4)).max(1);
-    let first = model
-        .tree_sel
+    let selected = model.tree_sel.min(rows.len().saturating_sub(1));
+    let first = selected
         .saturating_sub(budget.saturating_sub(1))
         .min(rows.len().saturating_sub(budget));
     for (index, row) in rows.iter().enumerate().skip(first).take(budget) {
-        let style = if index == model.tree_sel {
+        let hovered = model.hovered.as_ref() == Some(&Hit::TreeRow(row.clone()));
+        let style = if index == selected {
             theme.selection_style()
         } else {
-            theme.text_style()
+            match row {
+                crate::app::TreeRow::Branch { .. } => theme.bright_style(),
+                crate::app::TreeRow::Fork { .. } => theme.gold_style(),
+                crate::app::TreeRow::Node { .. } => theme.text_style(),
+            }
         };
-        lines.push(Line::styled(row.clone(), style));
+        let mut line = Line::styled(row.label().to_owned(), style);
+        if hovered && index != selected {
+            line = hover_band(line, true, area.width, theme);
+        }
+        hits.push((
+            row_rect(area, area.y, lines.len()),
+            Hit::TreeRow(row.clone()),
+        ));
+        lines.push(line);
     }
     lines.push(Line::raw(""));
     lines.push(Line::styled(
-        "↑↓ select · esc/⏎ back — forks land with the branch wave",
+        format!(
+            "↑↓ select · ⏎ jump / open fork · f fork at node · esc {}",
+            if drilled { "up to parent" } else { "back" }
+        ),
         theme.dim_style(),
     ));
     frame.render_widget(Paragraph::new(lines).style(theme.text_style()), area);

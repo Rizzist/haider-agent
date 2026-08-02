@@ -124,6 +124,11 @@ pub struct BranchState {
     /// coordinates, and a fork point inferred from display text would be a
     /// fabricated identity (research item 3).
     tracker: HashMap<Option<BranchId>, (NodeId, u64)>,
+    /// B2b-m3: EVERY committed node's envelope seq, by node id — the other
+    /// half of a tree row's `{node_id, node_seq}` coordinates (the display
+    /// anchor lives in the owning projection). First commit wins; command
+    /// state like the tracker, recorded for `Apply` AND `Skip`.
+    node_seqs: HashMap<NodeId, u64>,
     /// A fork receipt arrived before its `BranchCreated` fact: activate
     /// the branch the moment the journal installs it. Receipt correlation
     /// itself installs NOTHING (no live branch before daemon truth).
@@ -155,6 +160,9 @@ impl BranchState {
                         envelope.branch_id.clone(),
                         (NodeId::new(node), envelope.seq),
                     );
+                    self.node_seqs
+                        .entry(NodeId::new(node))
+                        .or_insert(envelope.seq);
                 }
                 AdmittedNote::Content
             }
@@ -268,6 +276,38 @@ impl BranchState {
             .iter_mut()
             .find(|view| &view.descriptor.branch_id == id)
             .map(|view| &mut view.surfaces)
+    }
+
+    /// The parked main view, read-only (the tree screen reads every
+    /// branch's surfaces without disturbing them).
+    #[must_use]
+    pub fn parked_main(&self) -> Option<&BranchSurfaces> {
+        self.parked_main.as_ref()
+    }
+
+    /// A named branch's parked surfaces, read-only.
+    #[must_use]
+    pub fn view(&self, id: &BranchId) -> Option<&BranchSurfaces> {
+        self.registry
+            .iter()
+            .find(|view| &view.descriptor.branch_id == id)
+            .map(|view| &view.surfaces)
+    }
+
+    /// A named branch's durable descriptor, by id.
+    #[must_use]
+    pub fn descriptor(&self, id: &BranchId) -> Option<&BranchDescriptor> {
+        self.registry
+            .iter()
+            .map(|view| &view.descriptor)
+            .find(|descriptor| &descriptor.branch_id == id)
+    }
+
+    /// A committed node's envelope seq (B2b-m3) — the exact `fork_seq` a
+    /// tree-row fork issues beside its node id.
+    #[must_use]
+    pub fn node_seq(&self, node: &NodeId) -> Option<u64> {
+        self.node_seqs.get(node).copied()
     }
 
     /// Consume a pending fork activation for `id`, if one is armed.

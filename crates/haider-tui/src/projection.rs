@@ -20,7 +20,7 @@ use base64::Engine as _;
 use haider_protocol::EventPayload;
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::history::{TodoItem, TodoState};
-use haider_protocol::ids::ItemId;
+use haider_protocol::ids::{ItemId, NodeId};
 use haider_protocol::item::{ItemDelta, ItemEvent, TurnItem};
 use haider_protocol::menu::Menu;
 use haider_protocol::provider::Usage;
@@ -199,6 +199,13 @@ pub struct SessionProjection {
     /// journal's `context_footprint_v1` extension items — never a
     /// transcript row (one arrives per provider round).
     latest_footprint: Option<haider_protocol::context::ContextFootprint>,
+    /// B2b-m3: the durable node → display-entry association, in commit
+    /// order — `(entry index, node id)`. Recorded when a `NodeCommitted`
+    /// applies (see [`Self::record_node_anchor`]); the `/tree` rows and the
+    /// render-resolved jump both look identities up here, never through
+    /// text matching. Stream-scoped like the cursor: `hydrate` starts it
+    /// empty (the demo store persists no nodes).
+    node_entries: Vec<(usize, NodeId)>,
     /// A voice turn is live: blocks started now render ` · ♪ speaking`
     /// (demo-local — set by the driver's Voice beats, never an envelope).
     voice_live: bool,
@@ -385,17 +392,83 @@ impl SessionProjection {
                     text: format!("{code} — {message}"),
                 });
             }
+            // B2b-m3: a committed node ANCHORS its display entry — never a
+            // transcript row of its own (the sim's tree reads entries; the
+            // node is the durable identity riding beside them).
+            EventPayload::NodeCommitted(node) => self.record_node_anchor(node),
             // Consumed by later waves (effects timeline, subagent tree, gate
             // panel, accounts). The projection stays tolerant of them now.
             EventPayload::Effect(_)
             | EventPayload::ToolResult { .. }
-            | EventPayload::NodeCommitted(_)
             | EventPayload::AgentSpawned(_)
             | EventPayload::AgentReport(_)
             | EventPayload::AgentChipState { .. }
             | EventPayload::GateReport(_)
             | EventPayload::Rotation(_) => {}
         }
+    }
+
+    /// B2b-m3: associate one committed node with the display entry it
+    /// stands for. The daemon commits a turn's `UserMessage` and its
+    /// `NodeCommitted` adjacently in ONE acceptance transaction (compaction
+    /// likewise: item completed, then node), so at the moment the node
+    /// event applies its display entry is the LAST matching entry — a
+    /// stream-order association inside the same atomic batch, never text
+    /// matching or cross-batch adjacency inference (research §Q3). A node
+    /// kind with no display row records NOTHING: an anchor is never
+    /// guessed, and an already-anchored entry is never re-bound.
+    fn record_node_anchor(&mut self, node: &haider_protocol::history::TreeNode) {
+        if self
+            .node_entries
+            .iter()
+            .any(|(_, known)| known == &node.node)
+        {
+            return; // replayed fact — one anchor, ever
+        }
+        let entry = match &node.kind {
+            haider_protocol::history::NodeKind::UserTurn { .. } => self
+                .entries
+                .iter()
+                .rposition(|entry| matches!(entry, TranscriptEntry::User { .. })),
+            haider_protocol::history::NodeKind::Compaction { .. } => {
+                self.entries.iter().rposition(|entry| {
+                    matches!(
+                        entry,
+                        TranscriptEntry::Item(block)
+                            if matches!(block.item, TurnItem::ContextCompaction { .. })
+                    )
+                })
+            }
+            _ => None,
+        };
+        if let Some(entry) = entry
+            && !self
+                .node_entries
+                .iter()
+                .any(|(anchored, _)| *anchored == entry)
+        {
+            self.node_entries.push((entry, node.node.clone()));
+        }
+    }
+
+    /// The display entry anchoring `node`, if this stream committed one
+    /// (B2b-m3 — the render-resolved jump looks up here; a missing anchor
+    /// keeps the pending jump armed, it never guesses another entry).
+    #[must_use]
+    pub fn entry_of_node(&self, node: &NodeId) -> Option<usize> {
+        self.node_entries
+            .iter()
+            .find(|(_, known)| known == node)
+            .map(|(entry, _)| *entry)
+    }
+
+    /// The node anchored at display entry `index` (the `/tree` typed rows).
+    #[must_use]
+    pub fn node_of_entry(&self, index: usize) -> Option<&NodeId> {
+        self.node_entries
+            .iter()
+            .find(|(entry, _)| *entry == index)
+            .map(|(_, node)| node)
     }
 
     fn apply_item(&mut self, event: &ItemEvent) {
