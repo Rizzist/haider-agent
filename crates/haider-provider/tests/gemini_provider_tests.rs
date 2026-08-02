@@ -457,3 +457,41 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> T {
     serde_json::from_slice(&fs::read(path).expect("reads JSON fixture"))
         .expect("parses JSON fixture")
 }
+
+/// MUTATION CHECK: return `count` instead of `greatest + 1` from
+/// `next_synthesized_call_index`. Expected RUNTIME failure: with a SPARSE
+/// history (one prior call at index 5) the next synthesized id collides
+/// into the dense range instead of continuing past the greatest replayed
+/// index — the dense one-call fixture is degenerate (`count == greatest+1`)
+/// and cannot see this.
+#[test]
+fn sparse_history_call_index_continues_past_the_greatest_not_the_count() {
+    let bytes =
+        fs::read(fixture_directory().join("two_turn_call.sse")).expect("fixture stream");
+    let request = TurnRequest {
+        messages: vec![
+            Message::user_text("prior sparse turn"),
+            Message::assistant(vec![Block::ToolCall {
+                call_id: "gemini-call-0000000000000005".into(),
+                name: "lookup_weather".into(),
+                args: serde_json::json!({"city": "Tehran"}),
+            }]),
+            Message::tool_result("gemini-call-0000000000000005", "sunny", false),
+        ],
+        model: "gemini-2.5-flash".into(),
+        max_tokens: 64,
+        system_prompt: None,
+        tools: vec![weather_tool()],
+        attachments: Vec::new(),
+    };
+    let items = haider_provider::replay_gemini_sse_for_request(&request, &bytes)
+        .expect("request-aware replay");
+    assert!(
+        items.iter().any(|item| matches!(
+            item,
+            Ok(StreamEvent::ToolCallStart { call_id, .. })
+                if call_id == "gemini-call-0000000000000006"
+        )),
+        "next synthesized id must be greatest+1 (…0006), never the count"
+    );
+}

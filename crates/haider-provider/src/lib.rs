@@ -47,7 +47,7 @@ pub use catalog::{
 };
 pub use gemini::{
     GEMINI_API_BASE_URL, GEMINI_MODELS_URL, GEMINI_PROVIDER_NAME, GeminiCapture, GeminiProvider,
-    GeminiRetryPolicy, GeminiTransportConfig, replay_gemini_http_error, replay_gemini_sse,
+    GeminiRetryPolicy, GeminiTransportConfig, replay_gemini_http_error, replay_gemini_sse, replay_gemini_sse_for_request,
 };
 pub use openai::{
     KIMI_OAUTH_BASE_URL, KIMI_OAUTH_PROVIDER_NAME, KimiThinkingConfig, KimiThinkingType,

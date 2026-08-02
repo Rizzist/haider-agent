@@ -1149,6 +1149,28 @@ fn gemini_usage(
 
 /// Replay captured data-only SSE through the same 7-byte incremental path.
 #[must_use]
+/// Replays a captured stream with the SAME call-index continuation the
+/// production path derives from the request history — the seam that makes
+/// sparse/replayed call indices testable (a dense one-call history is
+/// DEGENERATE: `count == greatest + 1` there, so only a sparse history can
+/// distinguish continuation from restart).
+pub fn replay_gemini_sse_for_request(
+    request: &TurnRequest,
+    bytes: &[u8],
+) -> Result<Vec<ProviderStreamItem>, ProviderError> {
+    let next_call_index = next_synthesized_call_index(request)?;
+    let mut decoder = GeminiDecoder::new(None, next_call_index);
+    let mut items = Vec::new();
+    for chunk in bytes.chunks(7) {
+        items.extend(decoder.push(chunk));
+        if decoder.terminal {
+            return Ok(items);
+        }
+    }
+    items.extend(decoder.finish());
+    Ok(items)
+}
+
 pub fn replay_gemini_sse(bytes: &[u8]) -> Vec<ProviderStreamItem> {
     let mut decoder = GeminiDecoder::new(None, 0);
     let mut items = Vec::new();
