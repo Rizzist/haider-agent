@@ -2234,9 +2234,10 @@ pub fn rendered_selection_text(
 pub fn attach_read_effects(model: &mut AppModel, path: &str) {
     match haider_client::load_image_attachment(std::path::Path::new(path)) {
         Ok(image) => {
-            let name = std::path::Path::new(path)
-                .file_name()
-                .map_or_else(|| path.to_owned(), |name| name.to_string_lossy().into_owned());
+            let name = std::path::Path::new(path).file_name().map_or_else(
+                || path.to_owned(),
+                |name| name.to_string_lossy().into_owned(),
+            );
             let kib = image.bytes.len().div_ceil(1024);
             model.begin_attachment_upload(
                 image.bytes,
