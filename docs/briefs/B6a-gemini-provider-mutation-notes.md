@@ -24,3 +24,21 @@ The daemon acceptance laws and one pre-existing redirect test open Unix/TCP
 listeners. Restricted macOS sandboxes that prohibit `bind(2)` stop those tests
 at fixture setup with `Operation not permitted`; the tests compile there and
 execute normally in the workspace/CI runtime with local-listener permission.
+
+## Review-of-record amendments (Fable, executed mutations)
+
+- **Call-index continuation (poison-class law)**: the shipped two-turn
+  golden was DEGENERATE — one dense prior call makes `count ==
+  greatest+1`, so `Ok(count)` survived it. Fixed with the
+  request-aware replay seam (`replay_gemini_sse_for_request`) and
+  `sparse_history_call_index_continues_past_the_greatest_not_the_count`
+  (prior call at index 5 → next id must be …0006). Mutation now
+  runtime-killed. Third instance of the degenerate-equivalence class
+  this run.
+- **Foreign-opaque check inside `next_synthesized_call_index`**: ungating
+  it survives — it is a REDUNDANT layer; the load-bearing rejection is
+  the encoder's (pinned by
+  `gemini_opaque_roundtrips_and_foreign_provider_opaque_is_rejected`).
+  A foreign opaque reaching the index scanner either fails parse
+  (typed error) or at worst pollutes an index the encoder's rejection
+  makes unreachable. Kept as hygiene; no law rests on it.
