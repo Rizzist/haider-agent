@@ -39,7 +39,7 @@ use haider_core::{
 use haider_protocol::EventPayload;
 use haider_protocol::context::{ContextFootprint, ContextFootprintTruth};
 use haider_protocol::effect::{
-    AuthorizationVerdict, EffectClass, EffectIntent, EffectOutcome, EffectPhase,
+    AuthorizationVerdict, EffectClass, EffectIntent, EffectOutcome, EffectPhase, FileFreshness,
 };
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
 use haider_protocol::error::{ErrorCode, HaiderError};
@@ -64,10 +64,10 @@ use haider_provider::{
 };
 use haider_provider::{Provider, ToolDefinition, TurnRequest};
 use haider_tools::{
-    CasSink, ChangeLedger, CommandOutputSink, EffectBroker, FsList, FsPatch, FsRead, FsSearch,
-    FsWrite, JournalSink, PermissionPolicy, ProcessBounds, ProcessExec, ProcessResult,
-    ResultBounds, SessionGrant, SessionGrantScope, ShellSession, SpawnSubagent, ToolError,
-    ToolResult, TurnAttribution,
+    CasSink, ChangeLedger, CommandOutputSink, EffectBroker, FsCaseMode, FsEdit, FsGlob, FsList,
+    FsPatch, FsRead, FsSearch, FsSearchMode, FsWrite, JournalSink, PermissionPolicy, ProcessBounds,
+    ProcessExec, ProcessResult, ResultBounds, SessionGrant, SessionGrantScope, ShellSession,
+    SpawnSubagent, ToolError, ToolResult, TurnAttribution,
 };
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::Path;
@@ -2365,6 +2365,7 @@ async fn reconcile_unknown_effects(
                 EventPayload::Effect(EffectPhase::Outcome {
                     effect,
                     outcome: EffectOutcome::Unknown,
+                    freshness: None,
                 })
             })
             .collect(),
@@ -3773,7 +3774,9 @@ pub(crate) enum RegisteredToolRoute {
     FsRead,
     FsList,
     FsSearch,
+    FsGlob,
     FsWrite,
+    FsEdit,
     FsPatch,
     ProcessExec,
     SpawnSubagent,
@@ -3834,11 +3837,18 @@ pub(crate) fn registered_tools() -> Vec<RegisteredTool> {
             RegisteredToolRoute::FsList,
         ),
         registered_tool(
-            tool_definition("fs_search", "Search files for text", &["root", "query"]),
+            fs_search_definition(),
             vec![EffectClass::FsRead],
             DispatchMode::Await,
             ToolPermissionDefault::Allow,
             RegisteredToolRoute::FsSearch,
+        ),
+        registered_tool(
+            fs_glob_definition(),
+            vec![EffectClass::FsRead],
+            DispatchMode::Await,
+            ToolPermissionDefault::Allow,
+            RegisteredToolRoute::FsGlob,
         ),
         registered_tool(
             fs_write_definition(),
@@ -3853,6 +3863,13 @@ pub(crate) fn registered_tools() -> Vec<RegisteredTool> {
             DispatchMode::Await,
             ToolPermissionDefault::Ask,
             RegisteredToolRoute::FsPatch,
+        ),
+        registered_tool(
+            fs_edit_definition(),
+            vec![EffectClass::FsWrite],
+            DispatchMode::Await,
+            ToolPermissionDefault::Ask,
+            RegisteredToolRoute::FsEdit,
         ),
         registered_tool(
             process_exec_definition(),
@@ -3903,16 +3920,19 @@ impl TurnToolFactory for BrokerToolFactory {
         context: WorkerToolContext,
     ) -> Result<Option<Arc<dyn ToolDispatcher>>, HaiderError> {
         let durable_permissions =
-            durable_session_permission_state(&context.store, context.store.session_id()).await?;
+            durable_session_tool_state(&context.store, context.store.session_id()).await?;
         let session_id = context.store.session_id().clone();
         let journal = HubJournalSink::new(&context);
-        let broker = EffectBroker::new(
+        let mut broker = EffectBroker::new(
             Box::new(journal),
             &context.metadata.cwd,
             context.store.session_id().clone(),
             context.store.worker_generation(),
         )
         .map_err(tool_error)?;
+        broker
+            .restore_freshness(durable_permissions.freshness.clone().into_values())
+            .map_err(tool_error)?;
         let mut policy = PermissionPolicy::default();
         for (class, default) in effective_permission_defaults(&context.metadata) {
             match default {
@@ -4124,12 +4144,60 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     .await
             }
             RegisteredToolRoute::FsSearch => {
-                let root = required_string(&args, "root")?;
-                let query = required_string(&args, "query")?;
+                let root = optional_string(&args, "path")?
+                    .or(optional_string(&args, "root")?)
+                    .unwrap_or_else(|| ".".into());
+                let query = optional_string(&args, "pattern")?
+                    .or(optional_string(&args, "query")?)
+                    .ok_or_else(|| {
+                        HaiderError::new(
+                            ErrorCode::InvalidArgument,
+                            "tool argument `pattern` must be a non-empty string",
+                            false,
+                        )
+                    })?;
+                let glob = optional_string(&args, "glob")?;
+                let case_mode = match optional_string(&args, "case")?.as_deref() {
+                    None | Some("sensitive") => FsCaseMode::Sensitive,
+                    Some("insensitive") => FsCaseMode::Insensitive,
+                    Some("smart") => FsCaseMode::Smart,
+                    Some(value) => {
+                        return Err(HaiderError::new(
+                            ErrorCode::InvalidArgument,
+                            format!("unsupported fs_search case mode `{value}`"),
+                            false,
+                        ));
+                    }
+                };
+                let mode = match optional_string(&args, "mode")?.as_deref() {
+                    None | Some("literal") => FsSearchMode::Literal,
+                    Some("simple") => FsSearchMode::Simple,
+                    Some(value) => {
+                        return Err(HaiderError::new(
+                            ErrorCode::InvalidArgument,
+                            format!("unsupported fs_search pattern mode `{value}`"),
+                            false,
+                        ));
+                    }
+                };
+                let mut operation = FsSearch::new(root, query)
+                    .with_case_mode(case_mode)
+                    .with_mode(mode);
+                if let Some(glob) = glob {
+                    operation = operation.with_glob(glob);
+                }
                 let mut cas = self.cas.lock().await;
                 broker
-                    .fs_search(
-                        &FsSearch::new(root, query),
+                    .fs_search(&operation, &policy, &mut *cas, ResultBounds::default())
+                    .await
+            }
+            RegisteredToolRoute::FsGlob => {
+                let root = optional_string(&args, "path")?.unwrap_or_else(|| ".".into());
+                let pattern = required_string(&args, "pattern")?;
+                let mut cas = self.cas.lock().await;
+                broker
+                    .fs_glob(
+                        &FsGlob::new(root, pattern),
                         &policy,
                         &mut *cas,
                         ResultBounds::default(),
@@ -4183,6 +4251,21 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 broker
                     .fs_patch(
                         &FsPatch::new(path, preimage, replacement),
+                        &policy,
+                        &attribution,
+                        &self.ledger,
+                    )
+                    .await
+            }
+            RegisteredToolRoute::FsEdit => {
+                let path = required_string(&args, "path")?;
+                let old_string = required_string(&args, "old_string")?;
+                let new_string = required_string_allow_empty(&args, "new_string")?;
+                let replace_all = optional_bool(&args, "replace_all")?.unwrap_or(false);
+                let attribution = TurnAttribution::new(self.session_id.clone(), run_id.clone());
+                broker
+                    .fs_edit(
+                        &FsEdit::new(path, old_string, new_string).replace_all(replace_all),
                         &policy,
                         &attribution,
                         &self.ledger,
@@ -4291,24 +4374,30 @@ impl ToolDispatcher for BrokerToolDispatcher {
     }
 }
 
-struct DurablePermissionState {
-    grants: Vec<SessionGrant>,
-    bindings: HashMap<MenuId, (EffectClass, String)>,
+pub(crate) struct DurableToolState {
+    pub(crate) grants: Vec<SessionGrant>,
+    pub(crate) bindings: HashMap<MenuId, (EffectClass, String)>,
+    pub(crate) freshness: HashMap<String, FileFreshness>,
 }
 
-async fn durable_session_permission_state(
+pub(crate) async fn durable_session_tool_state(
     store: &dyn StoreHandle,
     session_id: &SessionId,
-) -> Result<DurablePermissionState, HaiderError> {
+) -> Result<DurableToolState, HaiderError> {
     let mut cursor = 0;
     let mut intents = HashMap::<EffectId, EffectIntent>::new();
     let mut opened = HashMap::<MenuId, Menu>::new();
     let mut grants = Vec::new();
     let mut bindings = HashMap::new();
+    let mut freshness = HashMap::new();
     loop {
         let page = store.read(session_id, cursor, 256).await?;
         if page.is_empty() {
-            return Ok(DurablePermissionState { grants, bindings });
+            return Ok(DurableToolState {
+                grants,
+                bindings,
+                freshness,
+            });
         }
         cursor = page.last().map_or(cursor, |envelope| envelope.seq);
         for envelope in page {
@@ -4327,6 +4416,12 @@ async fn durable_session_permission_state(
                         continue;
                     };
                     bindings.insert(menu, (intent.class.clone(), intent.args_digest.clone()));
+                }
+                EventPayload::Effect(EffectPhase::Outcome {
+                    freshness: Some(record),
+                    ..
+                }) => {
+                    freshness.insert(record.path.clone(), record);
                 }
                 EventPayload::MenuOpened(menu)
                     if matches!(menu.kind, MenuKind::Permission { .. }) =>
@@ -4361,7 +4456,7 @@ pub(crate) async fn tool_inventory_snapshot(
     store: &dyn StoreHandle,
     session_id: &SessionId,
 ) -> Result<ToolInventorySnapshot, HaiderError> {
-    let durable = durable_session_permission_state(store, session_id).await?;
+    let durable = durable_session_tool_state(store, session_id).await?;
     let tools = registered_tools()
         .into_iter()
         .map(|entry| ToolInventoryEntry {
@@ -4400,28 +4495,74 @@ fn selected_menu_option<'a>(
     }
 }
 
-fn typed_tool_result(error: &haider_tools::ToolError) -> Option<BoundedResult> {
+pub(crate) fn typed_tool_result(error: &haider_tools::ToolError) -> Option<BoundedResult> {
+    if let haider_tools::ToolError::StaleRead {
+        recorded_digest,
+        current_digest,
+        ..
+    } = error
+    {
+        return Some(typed_error_result(
+            "rejected",
+            "stale_read",
+            error,
+            serde_json::json!({
+                "current_digest": current_digest,
+                "recorded_digest": recorded_digest,
+                "remedy": "re-read before editing",
+            }),
+        ));
+    }
+    if let haider_tools::ToolError::EditAnchor(conflict) = error {
+        return Some(typed_error_result(
+            "conflict",
+            "edit_anchor_count",
+            error,
+            serde_json::json!({
+                "matches": conflict.matches,
+                "replace_all": conflict.replace_all,
+            }),
+        ));
+    }
     let (status, kind) = match error {
         haider_tools::ToolError::PermissionDenied { .. } => ("denied", "permission_denied"),
         haider_tools::ToolError::WorkspaceBoundary { .. } => ("rejected", "workspace_boundary"),
         haider_tools::ToolError::PathChanged { .. } => ("rejected", "path_changed"),
+        haider_tools::ToolError::UnreadFile { .. } => ("rejected", "unread_file"),
         haider_tools::ToolError::Conflict(_) => ("conflict", "patch_conflict"),
         haider_tools::ToolError::InvalidArgument { .. } => ("rejected", "invalid_argument"),
         _ => return None,
     };
-    Some(BoundedResult {
-        preview: serde_json::json!({
-            "status": status,
-            "error": {
-                "kind": kind,
-                "message": error.to_string(),
-            }
-        })
-        .to_string(),
+    Some(typed_error_result(
+        status,
+        kind,
+        error,
+        serde_json::Value::Null,
+    ))
+}
+
+fn typed_error_result(
+    status: &str,
+    kind: &str,
+    error: &haider_tools::ToolError,
+    details: serde_json::Value,
+) -> BoundedResult {
+    let mut body = serde_json::json!({
+        "status": status,
+        "error": {
+            "kind": kind,
+            "message": error.to_string(),
+        }
+    });
+    if !details.is_null() {
+        body["error"]["details"] = details;
+    }
+    BoundedResult {
+        preview: body.to_string(),
         truncated: false,
         artifact: None,
         cursor: None,
-    })
+    }
 }
 
 fn recursion_limit_result() -> BoundedResult {
@@ -4471,6 +4612,61 @@ fn request_input_definition() -> ToolDefinition {
     }
 }
 
+fn fs_search_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "fs_search".into(),
+        description: "Search UTF-8 files by literal or simple wildcard pattern".into(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string", "minLength": 1},
+                "path": {"type": "string", "minLength": 1},
+                "glob": {"type": "string", "minLength": 1},
+                "case": {
+                    "type": "string",
+                    "enum": ["sensitive", "insensitive", "smart"]
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["literal", "simple"],
+                    "description": "simple supports dependency-free * and ? wildcards"
+                },
+                "query": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Legacy alias for pattern"
+                },
+                "root": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Legacy alias for path"
+                }
+            },
+            "anyOf": [
+                {"required": ["pattern"]},
+                {"required": ["query"]}
+            ],
+            "additionalProperties": false
+        }),
+    }
+}
+
+fn fs_glob_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "fs_glob".into(),
+        description: "List workspace files matching a bounded glob".into(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string", "minLength": 1},
+                "path": {"type": "string", "minLength": 1}
+            },
+            "required": ["pattern"],
+            "additionalProperties": false
+        }),
+    }
+}
+
 fn fs_write_definition() -> ToolDefinition {
     ToolDefinition {
         name: "fs_write".into(),
@@ -4508,6 +4704,25 @@ fn fs_patch_definition() -> ToolDefinition {
                 }
             },
             "required": ["path", "patch"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+fn fs_edit_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "fs_edit".into(),
+        description: "Replace one exact string anchor, or every occurrence, in a fresh UTF-8 file"
+            .into(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "minLength": 1},
+                "old_string": {"type": "string", "minLength": 1},
+                "new_string": {"type": "string"},
+                "replace_all": {"type": "boolean"}
+            },
+            "required": ["path", "old_string", "new_string"],
             "additionalProperties": false
         }),
     }
@@ -4600,6 +4815,19 @@ fn optional_string(args: &serde_json::Value, field: &str) -> Result<Option<Strin
                 false,
             )
         })
+}
+
+fn optional_bool(args: &serde_json::Value, field: &str) -> Result<Option<bool>, HaiderError> {
+    let Some(value) = args.get(field) else {
+        return Ok(None);
+    };
+    value.as_bool().map(Some).ok_or_else(|| {
+        HaiderError::new(
+            ErrorCode::InvalidArgument,
+            format!("tool argument `{field}` must be a boolean when provided"),
+            false,
+        )
+    })
 }
 
 fn process_result(result: ProcessResult) -> BoundedResult {

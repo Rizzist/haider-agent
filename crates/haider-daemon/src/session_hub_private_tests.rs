@@ -841,6 +841,7 @@ async fn direct_shell_cancellation_supervises_process_and_closes_every_lifecycle
         EffectPhase::Outcome {
             effect,
             outcome: EffectOutcome::Cancelled | EffectOutcome::CancelledEscalated { .. },
+            ..
         } if effect == &intent.effect
     ));
     let completed = payloads
@@ -1217,6 +1218,7 @@ async fn panic_exit_reconciles_dispatched_before_errored() {
                 EventPayload::Effect(haider_protocol::effect::EffectPhase::Outcome {
                     effect,
                     outcome: haider_protocol::effect::EffectOutcome::Unknown,
+                    ..
                 }) if *effect == effect_id
             )
         })

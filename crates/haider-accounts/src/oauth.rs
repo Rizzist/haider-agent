@@ -15,6 +15,7 @@ use crate::{AccountsResult, SecretHandle, accounts_error};
 const MAGIC: &[u8] = b"HAIDER_OAUTH_BUNDLE\x01";
 const REFRESH_ON_FIRST_USE_MARKER: &[u8] = b"HAIDER_IMPORT_REFRESH\x01";
 const LIFECYCLE_EXTENSION_MARKER: &[u8] = b"HAIDER_OAUTH_LIFECYCLE\x01";
+const IMPORT_SOURCE_FINGERPRINT_MARKER: &[u8] = b"HAIDER_OAUTH_IMPORT_SOURCE\x01";
 const MAX_BUNDLE_BYTES: usize = 256 * 1024;
 const MAX_FIELD_BYTES: usize = 64 * 1024;
 const MAX_SCOPES: usize = 128;
@@ -51,6 +52,7 @@ pub struct OAuthTokenBundleV1 {
     /// known terminal rejection and must surface re-login without replay.
     pub refresh_rejected_until_unix_ms: Option<u64>,
     refresh_on_first_use: bool,
+    import_source_access_fingerprint: Option<[u8; 32]>,
 }
 
 impl fmt::Debug for OAuthTokenBundleV1 {
@@ -79,6 +81,10 @@ impl fmt::Debug for OAuthTokenBundleV1 {
             .field(
                 "refresh_rejected_until_unix_ms",
                 &self.refresh_rejected_until_unix_ms,
+            )
+            .field(
+                "has_import_source_access_fingerprint",
+                &self.import_source_access_fingerprint.is_some(),
             )
             .finish()
     }
@@ -116,6 +122,7 @@ impl OAuthTokenBundleV1 {
             refresh_after_unix_ms: None,
             refresh_rejected_until_unix_ms: None,
             refresh_on_first_use: false,
+            import_source_access_fingerprint: None,
         };
         bundle.validate()?;
         Ok(bundle)
@@ -173,6 +180,10 @@ impl OAuthTokenBundleV1 {
         } else if self.refresh_on_first_use {
             out.extend_from_slice(REFRESH_ON_FIRST_USE_MARKER);
         }
+        if let Some(fingerprint) = self.import_source_access_fingerprint {
+            out.extend_from_slice(IMPORT_SOURCE_FINGERPRINT_MARKER);
+            out.extend_from_slice(&fingerprint);
+        }
         if out.len() > MAX_BUNDLE_BYTES {
             return Err(invalid_bundle("OAuth token bundle is oversized"));
         }
@@ -214,30 +225,41 @@ impl OAuthTokenBundleV1 {
         let subject_hash = reader.public_string()?;
         let display_identity = reader.public_string()?;
         let (refresh_on_first_use, refresh_after_unix_ms, refresh_rejected_until_unix_ms) =
-            if reader.is_empty() {
-                (false, None, None)
-            } else if reader.remaining == REFRESH_ON_FIRST_USE_MARKER {
-                (true, None, None)
-            } else if reader.remaining.starts_with(LIFECYCLE_EXTENSION_MARKER) {
+            if reader.remaining.starts_with(LIFECYCLE_EXTENSION_MARKER) {
                 reader.take(LIFECYCLE_EXTENSION_MARKER.len())?;
                 let refresh_on_first_use = match reader.byte()? {
                     0 => false,
                     1 => true,
                     _ => return Err(invalid_bundle("OAuth lifecycle flags are invalid")),
                 };
-                let refresh_after_unix_ms = reader.optional_u64()?;
-                let refresh_rejected_until_unix_ms = reader.optional_u64()?;
-                if !reader.is_empty() {
-                    return Err(invalid_bundle("OAuth token bundle has trailing bytes"));
-                }
                 (
                     refresh_on_first_use,
-                    refresh_after_unix_ms,
-                    refresh_rejected_until_unix_ms,
+                    reader.optional_u64()?,
+                    reader.optional_u64()?,
                 )
+            } else if reader.remaining.starts_with(REFRESH_ON_FIRST_USE_MARKER) {
+                reader.take(REFRESH_ON_FIRST_USE_MARKER.len())?;
+                (true, None, None)
             } else {
-                return Err(invalid_bundle("OAuth token bundle has trailing bytes"));
+                (false, None, None)
             };
+        let import_source_access_fingerprint = if reader
+            .remaining
+            .starts_with(IMPORT_SOURCE_FINGERPRINT_MARKER)
+        {
+            reader.take(IMPORT_SOURCE_FINGERPRINT_MARKER.len())?;
+            Some(
+                reader
+                    .take(32)?
+                    .try_into()
+                    .map_err(|_| invalid_bundle("OAuth import fingerprint is truncated"))?,
+            )
+        } else {
+            None
+        };
+        if !reader.is_empty() {
+            return Err(invalid_bundle("OAuth token bundle has trailing bytes"));
+        }
         let mut bundle = Self::new(
             provider_id,
             issuer,
@@ -258,6 +280,7 @@ impl OAuthTokenBundleV1 {
         bundle.refresh_on_first_use = refresh_on_first_use;
         bundle.refresh_after_unix_ms = refresh_after_unix_ms;
         bundle.refresh_rejected_until_unix_ms = refresh_rejected_until_unix_ms;
+        bundle.import_source_access_fingerprint = import_source_access_fingerprint;
         Ok(bundle)
     }
 
@@ -292,6 +315,20 @@ impl OAuthTokenBundleV1 {
     #[must_use]
     pub fn refresh_on_first_use(&self) -> bool {
         self.refresh_on_first_use
+    }
+
+    /// Records the last access-token generation read from an external import
+    /// source. Only the one-way fingerprint is stored; refresh responses carry
+    /// it forward so source-first healing can reject a stale source rollback.
+    #[must_use]
+    pub fn with_import_source_access_fingerprint(mut self, fingerprint: [u8; 32]) -> Self {
+        self.import_source_access_fingerprint = Some(fingerprint);
+        self
+    }
+
+    #[must_use]
+    pub fn import_source_access_fingerprint(&self) -> Option<[u8; 32]> {
+        self.import_source_access_fingerprint
     }
 
     /// Stores the exact provider-owned proactive refresh boundary.

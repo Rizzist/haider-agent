@@ -69,6 +69,7 @@ pub async fn reconcile_dispatched_effects(
             let payload = serde_json::to_value(EventPayload::Effect(EffectPhase::Outcome {
                 effect: effect.clone(),
                 outcome: EffectOutcome::Unknown,
+                freshness: None,
             }))
             .map_err(|error| {
                 HaiderError::new(

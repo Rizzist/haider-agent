@@ -19,9 +19,10 @@ pub use broker::{
     EffectOperation, JournalSink, PermissionPolicy, PolicyDecision, SessionGrant,
     SessionGrantScope,
 };
-pub use error::{FsPatchConflict, ToolError, ToolResult};
+pub use error::{FsEditAnchorMismatch, FsPatchConflict, ToolError, ToolResult};
 pub use filesystem::{
-    CasSink, FsList, FsPatch, FsRead, FsSearch, FsWrite, ResultBounds, TurnAttribution,
+    CasSink, FsCaseMode, FsEdit, FsGlob, FsList, FsPatch, FsRead, FsSearch, FsSearchMode, FsWrite,
+    ResultBounds, TurnAttribution,
 };
 pub use ledger::{ChangeLedger, ChangeLedgerSink, FsWriteRecord, TurnChanges};
 pub use process::{

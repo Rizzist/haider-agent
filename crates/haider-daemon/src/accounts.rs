@@ -3892,8 +3892,7 @@ async fn handle_oauth_import_heal(
             HaiderError::new(ErrorCode::ProviderError, "OAuth vault worker failed", true)
         })??;
     let current = haider_accounts::OAuthTokenBundleV1::decode(current.expose_secret())?;
-    if current.generation != expected.generation
-        || current.provider_id != descriptor.provider
+    if current.provider_id != descriptor.provider
         || current.issuer != expected.issuer
         || current.audience != expected.audience
         || current.resource != expected.resource
@@ -3901,6 +3900,15 @@ async fn handle_oauth_import_heal(
         || current.identity.display_identity != descriptor.identity
     {
         return Ok(OAuthImportHealResult::NotImported);
+    }
+    if current.generation != expected.generation {
+        // The receipt has already proved this physical alias is a Codex
+        // import. A contender may have read generation N before another
+        // daemon durably committed N+1, then reached this actor only after
+        // that commit. Preserve import provenance so the contender enters
+        // the serialized refresh path: its under-lease re-read adopts N+1
+        // instead of attempting a conservative refresh with stale N.
+        return Ok(OAuthImportHealResult::RefreshFallback { source });
     }
     let Some(generation) = current.generation.checked_add(1) else {
         return Err(HaiderError::new(
@@ -3919,6 +3927,18 @@ async fn handle_oauth_import_heal(
         Ok(Err(_)) | Err(_) => return Ok(OAuthImportHealResult::RefreshFallback { source }),
     };
     if bool::from(current.access_token().ct_eq(imported.access_token())) {
+        return Ok(OAuthImportHealResult::RefreshFallback { source });
+    }
+    let source_access_fingerprint = *blake3::hash(imported.access_token()).as_bytes();
+    if current.import_source_access_fingerprint() == Some(source_access_fingerprint)
+        || (current.import_source_access_fingerprint().is_none() && current.generation > 1)
+    {
+        // The external CLI may still hold the exact source generation Haider
+        // imported before its own broker refresh rotated the shared token.
+        // Never "heal" by writing that spent predecessor back over the
+        // durable successor. Historical generation>1 bundles without the C2
+        // fingerprint are directionally ambiguous, so they also fail safe to
+        // the serialized refresh path instead of risking rollback.
         return Ok(OAuthImportHealResult::RefreshFallback { source });
     }
     let mut committed = OAuthRefreshFence {
@@ -5159,8 +5179,10 @@ impl AccountsProviderFactory {
                 self.resolve_secret(&resolved.descriptor).await?
             }
         };
-        let oauth_access_fingerprint = (resolved.descriptor.provider == KIMI_OAUTH_PROVIDER_NAME
-            && resolved.descriptor.auth_method == AuthMethod::OAuth)
+        let oauth_access_fingerprint = (matches!(
+            resolved.descriptor.provider.as_str(),
+            KIMI_OAUTH_PROVIDER_NAME | OPENAI_OAUTH_PROVIDER_NAME
+        ) && resolved.descriptor.auth_method == AuthMethod::OAuth)
             .then(|| *blake3::hash(credential.expose_secret()).as_bytes());
         let provider = self.build_provider(&resolved.descriptor, credential, &metadata.model)?;
         Ok((resolved, provider, oauth_access_fingerprint))

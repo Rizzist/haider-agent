@@ -38,6 +38,10 @@
 //! - The journal sink never leaves the broker. Tests inspect a broker-owned,
 //!   read-only snapshot of successfully appended phases instead of recovering
 //!   or mutating the sink.
+//! - **Crash-consistent file freshness.** A terminal outcome may carry one
+//!   workspace-relative file digest. The shared broker state reduces it only
+//!   after the outcome append succeeds; daemon reconstruction replays those
+//!   same session-scoped outcomes before the next turn creates its dispatcher.
 
 use crate::process::ProcessRegistry;
 use crate::{ToolError, ToolResult};
@@ -45,7 +49,7 @@ use async_trait::async_trait;
 use haider_protocol::EventPayload;
 use haider_protocol::effect::{
     AuthorizationSource, AuthorizationVerdict, EffectClass, EffectIntent, EffectOutcome,
-    EffectPhase,
+    EffectPhase, FileFreshness,
 };
 use haider_protocol::ids::{EffectId, MenuId, SessionId, WorkspaceRevision};
 use haider_protocol::menu::{DecisionKind, Menu, MenuAnswer, MenuKind, MenuOption, MenuScope};
@@ -377,6 +381,7 @@ struct BrokerJournalState {
     lifecycles: HashMap<EffectId, LifecycleRecord>,
     journaled_phases: Vec<EffectPhase>,
     terminal_errors: HashMap<EffectId, ToolError>,
+    freshness: HashMap<PathBuf, String>,
 }
 
 /// Private intra-broker sharing lets a registered finalizer close a dispatched
@@ -395,6 +400,7 @@ impl BrokerJournal {
                 lifecycles: HashMap::new(),
                 journaled_phases: Vec::new(),
                 terminal_errors: HashMap::new(),
+                freshness: HashMap::new(),
             })),
         }
     }
@@ -413,12 +419,42 @@ impl BrokerJournal {
             .await
             .append(EventPayload::Effect(phase.clone()))
             .await?;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let EffectPhase::Outcome {
+            freshness: Some(freshness),
+            ..
+        } = &phase
+        {
+            state
+                .freshness
+                .insert(PathBuf::from(&freshness.path), freshness.digest.clone());
+        }
+        state.journaled_phases.push(phase);
+        Ok(())
+    }
+
+    fn restore_freshness(&self, freshness: impl IntoIterator<Item = FileFreshness>) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for record in freshness {
+            state
+                .freshness
+                .insert(PathBuf::from(record.path), record.digest);
+        }
+    }
+
+    fn freshness_digest(&self, path: &Path) -> Option<String> {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .journaled_phases
-            .push(phase);
-        Ok(())
+            .freshness
+            .get(path)
+            .cloned()
     }
 
     fn insert_intent(&self, intent: EffectIntent) {
@@ -607,6 +643,7 @@ impl BrokerJournal {
         &self,
         intent: &EffectIntent,
         result: ToolResult<T>,
+        freshness: Option<FileFreshness>,
     ) -> ToolResult<T> {
         let outcome = match &result {
             Ok(_) => EffectOutcome::Ok,
@@ -617,7 +654,7 @@ impl BrokerJournal {
         let Some(claim) = self.claim_terminal(intent)? else {
             return result;
         };
-        match claim.append(outcome).await {
+        match claim.append(outcome, freshness).await {
             Ok(()) => result,
             Err(error) => Err(error),
         }
@@ -647,11 +684,16 @@ impl TerminalClaim {
     /// Before the first poll, dropping this future is a pre-dispatch
     /// cancellation and re-arms the claim. Once polled, the sink append,
     /// lifecycle transition, and settlement remain one owned task unit.
-    async fn append(mut self, outcome: EffectOutcome) -> ToolResult<()> {
+    async fn append(
+        mut self,
+        outcome: EffectOutcome,
+        freshness: Option<FileFreshness>,
+    ) -> ToolResult<()> {
         self.dispatched = true;
         let phase = EffectPhase::Outcome {
             effect: self.effect.clone(),
             outcome,
+            freshness,
         };
         match self.journal.append_phase(phase).await {
             Ok(()) => {
@@ -698,14 +740,26 @@ impl FinalizerObserver {
 
 impl EffectFinish {
     pub(crate) async fn finish<T>(self, result: ToolResult<T>) -> ToolResult<T> {
-        self.journal.finish_in_finalizer(&self.intent, result).await
+        self.journal
+            .finish_in_finalizer(&self.intent, result, None)
+            .await
+    }
+
+    pub(crate) async fn finish_with_freshness<T>(
+        self,
+        result: ToolResult<T>,
+        freshness: Option<FileFreshness>,
+    ) -> ToolResult<T> {
+        self.journal
+            .finish_in_finalizer(&self.intent, result, freshness)
+            .await
     }
 
     pub(crate) async fn finish_outcome(self, outcome: EffectOutcome) -> ToolResult<()> {
         let Some(claim) = self.journal.claim_terminal(&self.intent)? else {
             return Ok(());
         };
-        claim.append(outcome).await
+        claim.append(outcome, None).await
     }
 }
 
@@ -814,6 +868,41 @@ impl EffectBroker {
         self.journal.journal_snapshot()
     }
 
+    /// Restores session-scoped freshness reduced from this session's durable
+    /// terminal effect outcomes. Paths are workspace-relative and are checked
+    /// before entering the broker-owned map.
+    pub fn restore_freshness(
+        &mut self,
+        freshness: impl IntoIterator<Item = FileFreshness>,
+    ) -> ToolResult<()> {
+        let mut checked = Vec::new();
+        for record in freshness {
+            let relative = PathBuf::from(&record.path);
+            if relative.as_os_str().is_empty()
+                || relative.is_absolute()
+                || relative.components().any(|component| {
+                    !matches!(
+                        component,
+                        std::path::Component::Normal(_) | std::path::Component::CurDir
+                    )
+                })
+            {
+                return Err(ToolError::WorkspaceBoundary {
+                    workspace_root: self.workspace_root.clone(),
+                    requested_path: relative,
+                    resolved_path: None,
+                });
+            }
+            checked.push(record);
+        }
+        self.journal.restore_freshness(checked);
+        Ok(())
+    }
+
+    pub(crate) fn freshness_digest(&self, relative_path: &Path) -> Option<String> {
+        self.journal.freshness_digest(relative_path)
+    }
+
     /// Drains finalizers, then reconciles unterminated dispatches to `Unknown`.
     ///
     /// Operation errors already returned by `fs_patch` are considered
@@ -841,7 +930,7 @@ impl EffectBroker {
             let Some(claim) = claim else {
                 continue;
             };
-            let (id, result) = self.register_terminal_append(claim, EffectOutcome::Unknown);
+            let (id, result) = self.register_terminal_append(claim, EffectOutcome::Unknown, None);
             match result.await {
                 Ok(Ok(())) => {
                     self.observe_finalizer(id);
@@ -1089,7 +1178,7 @@ impl EffectBroker {
         intent: &EffectIntent,
         outcome: EffectOutcome,
     ) -> ToolResult<()> {
-        self.dispatch_terminal(intent, outcome).await
+        self.dispatch_terminal(intent, outcome, None).await
     }
 
     /// Reconciles a dispatch/outcome recovery window explicitly.
@@ -1156,7 +1245,25 @@ impl EffectBroker {
                 error: error.to_string(),
             },
         };
-        match self.dispatch_terminal(intent, outcome).await {
+        match self.dispatch_terminal(intent, outcome, None).await {
+            Ok(()) => result,
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) async fn finish_with_freshness<T>(
+        &mut self,
+        intent: &EffectIntent,
+        result: ToolResult<T>,
+        freshness: Option<FileFreshness>,
+    ) -> ToolResult<T> {
+        let outcome = match &result {
+            Ok(_) => EffectOutcome::Ok,
+            Err(error) => EffectOutcome::Failed {
+                error: error.to_string(),
+            },
+        };
+        match self.dispatch_terminal(intent, outcome, freshness).await {
             Ok(()) => result,
             Err(error) => Err(error),
         }
@@ -1200,10 +1307,11 @@ impl EffectBroker {
         &mut self,
         claim: TerminalClaim,
         outcome: EffectOutcome,
+        freshness: Option<FileFreshness>,
     ) -> (u64, tokio::sync::oneshot::Receiver<ToolResult<()>>) {
         let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
         let id = self.register_finalizer(async move {
-            let result = claim.append(outcome).await;
+            let result = claim.append(outcome, freshness).await;
             let error = result.as_ref().err().cloned();
             let _ = result_sender.send(result);
             error
@@ -1215,11 +1323,12 @@ impl EffectBroker {
         &mut self,
         intent: &EffectIntent,
         outcome: EffectOutcome,
+        freshness: Option<FileFreshness>,
     ) -> ToolResult<()> {
         let Some(claim) = self.journal.claim_terminal(intent)? else {
             return Ok(());
         };
-        let (id, result) = self.register_terminal_append(claim, outcome);
+        let (id, result) = self.register_terminal_append(claim, outcome, freshness);
         match result.await {
             Ok(result) => {
                 self.observe_finalizer(id);

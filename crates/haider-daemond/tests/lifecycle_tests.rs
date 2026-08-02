@@ -371,6 +371,7 @@ fn unknown_outcomes(events: &[RawEnvelope], effect: &EffectId) -> usize {
                 EventPayload::Effect(EffectPhase::Outcome {
                     effect: found,
                     outcome: EffectOutcome::Unknown,
+                    ..
                 }) if found == effect
             )
         })
@@ -1802,6 +1803,7 @@ async fn reconcile_before_ready_marks_unknown_exactly_once_and_never_retries_eff
                 EventPayload::Effect(EffectPhase::Outcome {
                     effect: completed.clone(),
                     outcome: EffectOutcome::Ok,
+                    freshness: None,
                 }),
             ),
         ];

@@ -6,6 +6,14 @@
 use crate::ids::{EffectId, MenuId, WorkspaceRevision};
 use serde::{Deserialize, Serialize};
 
+/// Durable per-session knowledge of the exact bytes last observed or written
+/// for one workspace-relative file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileFreshness {
+    pub path: String,
+    pub digest: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "class", rename_all = "snake_case")]
 pub enum EffectClass {
@@ -75,6 +83,10 @@ pub enum EffectPhase {
     Outcome {
         effect: EffectId,
         outcome: EffectOutcome,
+        /// Atomically advances the session's file freshness state with the
+        /// terminal effect. `None` preserves the pre-C1 wire shape exactly.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        freshness: Option<FileFreshness>,
     },
 }
 

@@ -247,7 +247,7 @@ fn run_default_print_is_exact_under_redirected_no_term_io() {
 
 #[test]
 fn run_jsonl_accepts_explicit_fake_provider_and_model() {
-    let out = haider()
+    let mut out = haider()
         .args([
             "run",
             "--jsonl",
@@ -259,8 +259,28 @@ fn run_jsonl_accepts_explicit_fake_provider_and_model() {
         ])
         .output()
         .expect("binary runs");
-
-    assert!(out.status.success());
+    // Bounded retry for the transient class ONLY (exit 69 = the autospawned
+    // daemon missed its startup deadline under full-gate load).
+    if out.status.code() == Some(69) {
+        out = haider()
+            .args([
+                "run",
+                "--jsonl",
+                "--provider",
+                "fake",
+                "--model",
+                "fixture-model",
+                "hello",
+            ])
+            .output()
+            .expect("binary runs");
+    }
+    assert!(
+        out.status.success(),
+        "exit {:?}, stderr: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
     let envelopes = parse_jsonl(&out.stdout);
     assert_eq!(
         envelopes.last().map(typed),

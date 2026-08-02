@@ -43,6 +43,7 @@ enum FakeMode {
     Oversized,
     InvalidGrant,
     Transient,
+    AmbiguousTransport,
     ScopeMismatch,
     IssuerMismatch,
     AudienceMismatch,
@@ -73,6 +74,7 @@ struct FakeState {
     refresh_calls: AtomicUsize,
     saw_client_secret: AtomicBool,
     token_encodings: Mutex<Vec<(String, String)>>,
+    refresh_token_fingerprints: Mutex<Vec<[u8; 32]>>,
     msh_headers: Mutex<Vec<HashMap<String, String>>>,
     expect_refresh_binding: AtomicBool,
     expect_code_state: AtomicBool,
@@ -109,6 +111,7 @@ impl FakeOAuthServer {
             refresh_calls: AtomicUsize::new(0),
             saw_client_secret: AtomicBool::new(false),
             token_encodings: Mutex::new(Vec::new()),
+            refresh_token_fingerprints: Mutex::new(Vec::new()),
             msh_headers: Mutex::new(Vec::new()),
             expect_refresh_binding: AtomicBool::new(true),
             expect_code_state: AtomicBool::new(false),
@@ -315,6 +318,18 @@ async fn serve_fake_request(mut stream: TcpStream, state: Arc<FakeState>) {
     }
     if grant == "refresh_token" {
         state.refresh_calls.fetch_add(1, Ordering::SeqCst);
+        state
+            .refresh_token_fingerprints
+            .lock()
+            .expect("refresh token fingerprint lock")
+            .push(
+                *blake3::hash(
+                    fields
+                        .get("refresh_token")
+                        .map_or(&[][..], |token| token.as_bytes()),
+                )
+                .as_bytes(),
+            );
         if state.expect_refresh_binding.load(Ordering::SeqCst) {
             assert_eq!(fields.get("audience").map(String::as_str), Some(AUDIENCE));
             assert_eq!(
@@ -370,6 +385,12 @@ async fn serve_fake_request(mut stream: TcpStream, state: Arc<FakeState>) {
     }
     if state.mode == FakeMode::Transient {
         write_http(&mut stream, 503, &[], RAW_BODY_SENTINEL.as_bytes()).await;
+        return;
+    }
+    if state.mode == FakeMode::AmbiguousTransport {
+        // The endpoint consumed the request but closed before declaring an
+        // outcome. A rotating client must treat this as possibly spent and
+        // must never replay the token.
         return;
     }
     if grant == "authorization_code" {
@@ -1205,11 +1226,20 @@ async fn forced_401_reread_never_adopts_an_actively_marked_rotating_bundle() {
     assert!(broker.shutdown().await);
 }
 
+/// C2 DECISION: this pinned law is EXTENDED, not superseded. “One-use” is
+/// the import-only eager bootstrap marker, not a one-refresh lifetime budget.
+/// Durable receipt provenance selects serialized rotation for this first
+/// refresh and every later due/401 refresh, while the sanctioned OpenAI
+/// registration remains Conservative so ordinary loopback-PKCE is unchanged.
+///
 /// MUTATION CHECK 1: remove the imported-Codex branch from `resolve_oauth`.
 /// Expected runtime failure: the imported bundle returns its old access token
 /// without the refresh call asserted below. MUTATION CHECK 2: carry the
 /// import's one-use marker into `refreshed_bundle`. Expected runtime failure:
-/// the second resolution refreshes again. MUTATION CHECK 3: default ordinary
+/// the second resolution refreshes again. MUTATION CHECK 3: treat one-use as
+/// a lifetime refresh budget or drop receipt-scoped serialized refresh.
+/// Expected RUNTIME failure: the later genuinely expired imported generation
+/// does not perform the second POST. MUTATION CHECK 4: default ordinary
 /// bundles to the import marker. Expected runtime failure: the opaque
 /// loopback-PKCE bundle also refreshes instead of retaining the normal
 /// 30-second broker skew.
@@ -1218,6 +1248,11 @@ async fn codex_fallback_refresh_is_one_use_and_import_scoped_at_the_broker_call_
     let server = FakeOAuthServer::start(FakeMode::Success, false).await;
     let mut registration = server.registration(Arc::new(FakeIdentityVerifier));
     registration.provider_id = haider_provider::OPENAI_OAUTH_PROVIDER_NAME.to_owned();
+    assert_eq!(
+        registration.refresh_policy,
+        OAuthRefreshPolicy::Conservative,
+        "Codex serialization must remain import-scoped, never provider-wide"
+    );
     let catalog =
         OAuthProviderCatalog::with_test_registrations([registration.clone()]).expect("catalog");
     let before = now_ms().expect("clock");
@@ -1253,7 +1288,7 @@ async fn codex_fallback_refresh_is_one_use_and_import_scoped_at_the_broker_call_
         vault.clone(),
         catalog.clone(),
         Arc::clone(&imported_snapshot),
-        start_status_actor(&imported_snapshot, vault.clone()),
+        start_status_actor_with_import_source(&imported_snapshot, vault.clone(), Some("codex")),
         RefreshFenceRegistry::default(),
     )
     .expect("imported broker");
@@ -1275,6 +1310,48 @@ async fn codex_fallback_refresh_is_one_use_and_import_scoped_at_the_broker_call_
         server.state.refresh_calls.load(Ordering::SeqCst),
         1,
         "the import marker must clear after the first durable refresh"
+    );
+
+    let stored = vault
+        .resolve(&imported_descriptor.alias)
+        .and_then(|stored| OAuthTokenBundleV1::decode(stored.expose_secret()))
+        .expect("first refreshed import");
+    assert!(!stored.refresh_on_first_use());
+    let later_due = OAuthTokenBundleV1::new(
+        stored.provider_id.clone(),
+        stored.issuer.clone(),
+        stored.audience.clone(),
+        stored.resource.clone(),
+        stored.token_type.clone(),
+        Zeroizing::new(stored.access_token().to_vec()),
+        stored
+            .refresh_token()
+            .map(|token| Zeroizing::new(token.to_vec())),
+        now_ms().expect("clock").saturating_sub(1),
+        stored.refresh_expires_at_unix_ms,
+        stored.granted_scopes.clone(),
+        stored.identity.clone(),
+        stored.generation,
+    )
+    .expect("later-due import");
+    vault
+        .put(
+            &imported_descriptor.alias,
+            &later_due.encode().expect("encode later-due import"),
+        )
+        .expect("age refreshed import");
+    let later_refreshed = imported_broker
+        .resolve(&imported_descriptor)
+        .await
+        .expect("later imported lifecycle refresh");
+    assert_eq!(
+        later_refreshed.expose_secret(),
+        b"ACCESS_ROTATED_SENTINEL_3a19"
+    );
+    assert_eq!(
+        server.state.refresh_calls.load(Ordering::SeqCst),
+        2,
+        "consuming the eager marker must not disable later lifecycle refresh"
     );
     assert!(imported_broker.shutdown().await);
 
@@ -1329,7 +1406,7 @@ async fn codex_fallback_refresh_is_one_use_and_import_scoped_at_the_broker_call_
     assert_eq!(retained.expose_secret(), b"fake-pkce-access-token-1");
     assert_eq!(
         server.state.refresh_calls.load(Ordering::SeqCst),
-        1,
+        2,
         "opaque PKCE token must retain the normal refresh skew"
     );
     assert!(pkce_broker.shutdown().await);
@@ -2508,13 +2585,27 @@ fn start_status_actor(
     snapshot: &crate::accounts::AccountsSnapshot,
     vault: Arc<dyn Vault>,
 ) -> mpsc::Sender<crate::accounts::AccountCommand> {
+    start_status_actor_with_import_source(snapshot, vault, None)
+}
+
+fn start_status_actor_with_import_source(
+    snapshot: &crate::accounts::AccountsSnapshot,
+    vault: Arc<dyn Vault>,
+    import_source: Option<&'static str>,
+) -> mpsc::Sender<crate::accounts::AccountCommand> {
     let (sender, mut receiver) = mpsc::channel(16);
     let snapshot = Arc::clone(snapshot);
     tokio::spawn(async move {
         while let Some(command) = receiver.recv().await {
             match command {
                 crate::accounts::AccountCommand::BeginOAuthImportHeal { completed, .. } => {
-                    let _ = completed.send(Ok(crate::accounts::OAuthImportHealResult::NotImported));
+                    let result = import_source.map_or(
+                        crate::accounts::OAuthImportHealResult::NotImported,
+                        |source| crate::accounts::OAuthImportHealResult::RefreshFallback {
+                            source: source.to_owned(),
+                        },
+                    );
+                    let _ = completed.send(Ok(result));
                 }
                 crate::accounts::AccountCommand::BeginOAuthRefresh {
                     descriptor,
@@ -2703,6 +2794,61 @@ fn independent_serialized_broker(
         start_status_actor(&snapshot, vault),
     )
     .expect("serialized broker");
+    (broker, snapshot)
+}
+
+fn imported_codex_registration(server: &FakeOAuthServer) -> OAuthProviderRegistration {
+    let mut registration = server.registration(Arc::new(FakeIdentityVerifier));
+    registration.provider_id = haider_provider::OPENAI_OAUTH_PROVIDER_NAME.to_owned();
+    registration.with_test_refresh_shape(OAuthTokenRequestEncoding::Json, false)
+}
+
+fn imported_codex_descriptor() -> CredentialDescriptor {
+    let mut descriptor = oauth_descriptor_for_test();
+    descriptor.provider = haider_provider::OPENAI_OAUTH_PROVIDER_NAME.to_owned();
+    descriptor.alias = CredentialAlias::new("imported-codex-rotating");
+    descriptor
+}
+
+fn imported_codex_bundle_for_test(
+    server: &FakeOAuthServer,
+    expires_at_unix_ms: u64,
+) -> OAuthTokenBundleV1 {
+    let registration = imported_codex_registration(server);
+    OAuthTokenBundleV1::new(
+        registration.provider_id.clone(),
+        registration.issuer.clone(),
+        registration.audience.clone(),
+        registration.resource.clone(),
+        "Bearer".into(),
+        Zeroizing::new(b"ACCESS_OLD_SENTINEL_914d".to_vec()),
+        Some(Zeroizing::new(REFRESH_SENTINEL.as_bytes().to_vec())),
+        expires_at_unix_ms,
+        Some(expires_at_unix_ms.saturating_add(3_600_000)),
+        registration.scopes.clone(),
+        OAuthIdentityV1 {
+            subject_hash: "fake-subject-hash".into(),
+            display_identity: "person@example.invalid".into(),
+        },
+        1,
+    )
+    .expect("imported Codex bundle")
+}
+
+fn independent_imported_codex_broker(
+    server: &FakeOAuthServer,
+    vault: Arc<dyn Vault>,
+    descriptor: &CredentialDescriptor,
+) -> (CredentialBroker, crate::accounts::AccountsSnapshot) {
+    let snapshot = Arc::new(Mutex::new(vec![descriptor.clone()]));
+    let broker = CredentialBroker::new(
+        Arc::clone(&vault),
+        OAuthProviderCatalog::with_test_registrations([imported_codex_registration(server)])
+            .expect("imported Codex catalog"),
+        Arc::clone(&snapshot),
+        start_status_actor_with_import_source(&snapshot, vault, Some("codex")),
+    )
+    .expect("imported Codex broker");
     (broker, snapshot)
 }
 
@@ -2993,6 +3139,476 @@ async fn concurrent_refreshers_never_destroy_the_rotated_token() {
     );
     assert!(first.shutdown().await);
     assert!(second.shutdown().await);
+}
+
+/// MUTATION CHECK: route a receipt-confirmed Codex import through the
+/// conservative refresh path, remove the physical vault-alias lease, move
+/// the vault re-read before the lease, or release before durable Apply.
+/// Expected RUNTIME failure: the non-degenerate two-FileVault fixture sends
+/// generation one's refresh token twice, one contender fails instead of
+/// adopting generation two, or the durable rotated bundle differs.
+#[tokio::test]
+async fn concurrent_imported_refreshers_adopt_not_destroy() {
+    let server = FakeOAuthServer::start(FakeMode::Success, true).await;
+    server
+        .state
+        .expect_refresh_binding
+        .store(false, Ordering::SeqCst);
+    let directory = tempfile::tempdir().expect("temp imported vault");
+    let first_vault = Arc::new(haider_accounts::FileVault::new(directory.path()));
+    let second_vault = Arc::new(haider_accounts::FileVault::new(directory.path()));
+    let descriptor = imported_codex_descriptor();
+    let expired =
+        imported_codex_bundle_for_test(&server, now_ms().expect("clock").saturating_sub(1));
+    first_vault
+        .put(&descriptor.alias, &expired.encode().expect("encode seed"))
+        .expect("seed imported rotating bundle");
+    let (first, _) = independent_imported_codex_broker(
+        &server,
+        first_vault.clone() as Arc<dyn Vault>,
+        &descriptor,
+    );
+    let (second, _) = independent_imported_codex_broker(
+        &server,
+        second_vault.clone() as Arc<dyn Vault>,
+        &descriptor,
+    );
+
+    let first_resolve = {
+        let first = first.clone();
+        let descriptor = descriptor.clone();
+        tokio::spawn(async move { first.resolve(&descriptor).await })
+    };
+    wait_for_refresh_calls(&server, 1).await;
+    let second_resolve = {
+        let second = second.clone();
+        let descriptor = descriptor.clone();
+        tokio::spawn(async move { second.resolve(&descriptor).await })
+    };
+    tokio::task::yield_now().await;
+    server.release_refresh();
+
+    for resolved in [first_resolve, second_resolve] {
+        let access = resolved
+            .await
+            .expect("imported resolve joins")
+            .expect("imported resolve authorized");
+        assert_eq!(access.expose_secret(), b"ACCESS_ROTATED_SENTINEL_3a19");
+    }
+    assert_eq!(
+        server.state.refresh_calls.load(Ordering::SeqCst),
+        1,
+        "the rotated Codex refresh token must never be replayed"
+    );
+    assert_eq!(
+        *server
+            .state
+            .refresh_token_fingerprints
+            .lock()
+            .expect("refresh token fingerprints"),
+        [*blake3::hash(REFRESH_SENTINEL.as_bytes()).as_bytes()],
+        "only generation one's token may reach the endpoint, exactly once"
+    );
+    let stored = second_vault
+        .resolve(&descriptor.alias)
+        .and_then(|stored| OAuthTokenBundleV1::decode(stored.expose_secret()))
+        .expect("durable imported rotation");
+    assert_eq!(stored.generation, 2);
+    assert_eq!(
+        stored.refresh_token(),
+        Some(b"REFRESH_ROTATED_SENTINEL_8c21".as_slice())
+    );
+    assert_eq!(stored.refresh_rejected_until_unix_ms, None);
+    assert!(first.shutdown().await);
+    assert!(second.shutdown().await);
+}
+
+/// MUTATION CHECK: retain generation one's refresh token after a rotating
+/// response or build the next provider request from the stale observed
+/// bundle. Expected RUNTIME failure: the exact next refresh payload contains
+/// R1 instead of the returned R2 token.
+#[test]
+fn refresh_never_replays_a_rotated_token() {
+    const ROTATED_REFRESH: &str = "REFRESH_ROTATED_SENTINEL_8c21";
+    let registration = OAuthProviderCatalog::default()
+        .registration(haider_provider::OPENAI_OAUTH_PROVIDER_NAME)
+        .expect("OpenAI OAuth registration");
+    let prior = OAuthTokenBundleV1::new(
+        registration.provider_id.clone(),
+        registration.issuer.clone(),
+        registration.audience.clone(),
+        registration.resource.clone(),
+        "Bearer".into(),
+        Zeroizing::new(ACCESS_SENTINEL.as_bytes().to_vec()),
+        Some(Zeroizing::new(REFRESH_SENTINEL.as_bytes().to_vec())),
+        now_ms().expect("clock").saturating_sub(1),
+        None,
+        registration.scopes.clone(),
+        OAuthIdentityV1 {
+            subject_hash: "fake-subject-hash".into(),
+            display_identity: "person@example.invalid".into(),
+        },
+        1,
+    )
+    .expect("prior imported bundle");
+    let response = serde_json::json!({
+        "access_token": "ACCESS_ROTATED_SENTINEL_3a19",
+        "refresh_token": ROTATED_REFRESH,
+        "token_type": "Bearer",
+        "expires_in": 3600,
+        "scope": registration.scopes.join(" ")
+    })
+    .to_string();
+    let rotated = refresh_bundle_from_response(&registration, response.as_bytes(), &prior)
+        .expect("rotating response");
+    assert_eq!(rotated.generation, 2);
+    assert_eq!(rotated.refresh_token(), Some(ROTATED_REFRESH.as_bytes()));
+
+    let next_request = refresh_token_request_body(
+        &registration,
+        rotated.refresh_token().expect("rotated refresh token"),
+    )
+    .expect("next refresh request");
+    let next_request: serde_json::Value =
+        serde_json::from_slice(next_request.as_ref()).expect("JSON refresh payload");
+    assert_eq!(
+        next_request
+            .get("refresh_token")
+            .and_then(serde_json::Value::as_str),
+        Some(ROTATED_REFRESH)
+    );
+    assert_ne!(
+        next_request
+            .get("refresh_token")
+            .and_then(serde_json::Value::as_str),
+        Some(REFRESH_SENTINEL)
+    );
+}
+
+/// MUTATION CHECK: bypass the serialized runner's retry loop, retry fewer or
+/// more than three explicit 429/5xx responses, or leave the permanent
+/// uncertainty marker after the declared retry class is exhausted. Expected
+/// RUNTIME failure: POST count/fingerprints differ or the original bundle is
+/// not restored byte-for-byte before the retryable error escapes.
+#[tokio::test]
+async fn imported_refresh_retries_only_explicit_statuses_and_restores_bundle() {
+    let server = FakeOAuthServer::start(FakeMode::Transient, false).await;
+    server
+        .state
+        .expect_refresh_binding
+        .store(false, Ordering::SeqCst);
+    let descriptor = imported_codex_descriptor();
+    let vault = Arc::new(MemoryVault::new());
+    let expired =
+        imported_codex_bundle_for_test(&server, now_ms().expect("clock").saturating_sub(1));
+    let encoded = expired.encode().expect("encode retry seed");
+    vault
+        .put(&descriptor.alias, &encoded)
+        .expect("seed retryable import");
+    let (broker, _) =
+        independent_imported_codex_broker(&server, vault.clone() as Arc<dyn Vault>, &descriptor);
+
+    let error = broker
+        .resolve(&descriptor)
+        .await
+        .expect_err("exhausted explicit retry statuses remain retryable");
+    assert!(error.retryable);
+    assert_eq!(server.state.refresh_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        *server
+            .state
+            .refresh_token_fingerprints
+            .lock()
+            .expect("refresh token fingerprints"),
+        [*blake3::hash(REFRESH_SENTINEL.as_bytes()).as_bytes(); 3],
+        "only explicit retryable statuses may replay the same request, at the bounded count"
+    );
+    let restored = vault.resolve(&descriptor.alias).expect("restored import");
+    assert_eq!(
+        restored.expose_secret(),
+        encoded.as_slice(),
+        "the exact pre-request bundle must replace uncertainty before retry escapes"
+    );
+    assert!(broker.shutdown().await);
+}
+
+/// MUTATION CHECK: classify a response-less transport close as an explicit
+/// retryable status, clear permanent uncertainty, or let a successor daemon
+/// replay the possibly-spent token. Expected RUNTIME failure: more than one
+/// POST occurs, the marker differs from `u64::MAX`, or either broker omits the
+/// typed Codex re-import remedy.
+#[tokio::test]
+async fn imported_ambiguous_transport_never_replays_uncertain_token() {
+    let server = FakeOAuthServer::start(FakeMode::AmbiguousTransport, false).await;
+    server
+        .state
+        .expect_refresh_binding
+        .store(false, Ordering::SeqCst);
+    let directory = tempfile::tempdir().expect("temp ambiguous imported vault");
+    let first_vault = Arc::new(haider_accounts::FileVault::new(directory.path()));
+    let second_vault = Arc::new(haider_accounts::FileVault::new(directory.path()));
+    let descriptor = imported_codex_descriptor();
+    let expired =
+        imported_codex_bundle_for_test(&server, now_ms().expect("clock").saturating_sub(1));
+    first_vault
+        .put(&descriptor.alias, &expired.encode().expect("encode seed"))
+        .expect("seed ambiguous import");
+    let (first, _) = independent_imported_codex_broker(
+        &server,
+        first_vault.clone() as Arc<dyn Vault>,
+        &descriptor,
+    );
+    let first_error = first
+        .resolve(&descriptor)
+        .await
+        .expect_err("ambiguous transport requires Codex re-import");
+    assert_eq!(server.state.refresh_calls.load(Ordering::SeqCst), 1);
+    let uncertain = second_vault
+        .resolve(&descriptor.alias)
+        .and_then(|stored| OAuthTokenBundleV1::decode(stored.expose_secret()))
+        .expect("durable uncertain import");
+    assert_eq!(uncertain.refresh_rejected_until_unix_ms, Some(u64::MAX));
+
+    let (second, _) = independent_imported_codex_broker(
+        &server,
+        second_vault.clone() as Arc<dyn Vault>,
+        &descriptor,
+    );
+    let second_error = second
+        .resolve(&descriptor)
+        .await
+        .expect_err("successor refuses uncertain Codex refresh");
+    assert_eq!(
+        server.state.refresh_calls.load(Ordering::SeqCst),
+        1,
+        "a possibly-spent token must not be replayed after restart"
+    );
+    assert_eq!(
+        *server
+            .state
+            .refresh_token_fingerprints
+            .lock()
+            .expect("refresh token fingerprints"),
+        [*blake3::hash(REFRESH_SENTINEL.as_bytes()).as_bytes()]
+    );
+    for error in [&first_error, &second_error] {
+        assert_eq!(error.code, ErrorCode::Unauthorized);
+        assert!(!error.retryable);
+        assert_eq!(
+            error.message,
+            "credential expired — re-run `haider import codex` or sign in again"
+        );
+        assert_eq!(
+            error
+                .details
+                .as_ref()
+                .and_then(|details| details.get("reimport_required"))
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+    }
+    assert!(first.shutdown().await);
+    assert!(second.shutdown().await);
+}
+
+/// MUTATION CHECK: omit the imported-Codex rejection tombstone, replay a
+/// marked refresh token, return Kimi's generic login taxonomy, or include a
+/// token/response body in the error. Expected RUNTIME failure: the second
+/// independent broker performs another POST, the typed re-import fields or
+/// exact remedy differ, or a sentinel appears in formatted public errors.
+#[tokio::test]
+async fn terminal_invalid_grant_names_reimport_remedy_typed() {
+    let server = FakeOAuthServer::start(FakeMode::InvalidGrant, false).await;
+    server
+        .state
+        .expect_refresh_binding
+        .store(false, Ordering::SeqCst);
+    let directory = tempfile::tempdir().expect("temp imported vault");
+    let first_vault = Arc::new(haider_accounts::FileVault::new(directory.path()));
+    let second_vault = Arc::new(haider_accounts::FileVault::new(directory.path()));
+    let descriptor = imported_codex_descriptor();
+    let expired =
+        imported_codex_bundle_for_test(&server, now_ms().expect("clock").saturating_sub(1));
+    first_vault
+        .put(&descriptor.alias, &expired.encode().expect("encode seed"))
+        .expect("seed rejected imported bundle");
+    let (first, _) = independent_imported_codex_broker(
+        &server,
+        first_vault.clone() as Arc<dyn Vault>,
+        &descriptor,
+    );
+    let first_error = first
+        .resolve(&descriptor)
+        .await
+        .expect_err("invalid_grant requires Codex re-import");
+    let (second, _) = independent_imported_codex_broker(
+        &server,
+        second_vault.clone() as Arc<dyn Vault>,
+        &descriptor,
+    );
+    let second_error = second
+        .resolve(&descriptor)
+        .await
+        .expect_err("tombstoned Codex token requires re-import");
+
+    for error in [&first_error, &second_error] {
+        assert_eq!(error.code, ErrorCode::Unauthorized);
+        assert!(!error.retryable);
+        assert_eq!(
+            error.message,
+            "credential expired — re-run `haider import codex` or sign in again"
+        );
+        assert_eq!(
+            error
+                .details
+                .as_ref()
+                .and_then(|details| details.get("kind"))
+                .and_then(serde_json::Value::as_str),
+            Some("oauth_relogin_required")
+        );
+        assert_eq!(
+            error
+                .details
+                .as_ref()
+                .and_then(|details| details.get("reimport_required"))
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            error
+                .details
+                .as_ref()
+                .and_then(|details| details.get("import_source"))
+                .and_then(serde_json::Value::as_str),
+            Some("codex")
+        );
+    }
+    assert_eq!(
+        server.state.refresh_calls.load(Ordering::SeqCst),
+        1,
+        "a rejected imported refresh token must never be replayed"
+    );
+    let stored = second_vault
+        .resolve(&descriptor.alias)
+        .and_then(|stored| OAuthTokenBundleV1::decode(stored.expose_secret()))
+        .expect("tombstoned imported bundle");
+    assert!(
+        stored
+            .refresh_rejected_until_unix_ms
+            .is_some_and(|until| until > now_ms().expect("clock"))
+    );
+    let formatted = format!("{first_error:?}{second_error:?}");
+    for secret in [
+        RAW_ERROR_SENTINEL,
+        ACCESS_SENTINEL,
+        REFRESH_SENTINEL,
+        "ACCESS_ROTATED_SENTINEL_3a19",
+        "REFRESH_ROTATED_SENTINEL_8c21",
+    ] {
+        assert!(!formatted.contains(secret), "public error leaked {secret}");
+    }
+    assert!(first.shutdown().await);
+    assert!(second.shutdown().await);
+}
+
+/// MUTATION CHECK: omit OpenAI OAuth from stale-401 fingerprint adoption or
+/// compare the wrong access generation. Expected RUNTIME failure: the broker
+/// contacts the token endpoint instead of returning the already-durable
+/// generation-two access token.
+#[tokio::test]
+async fn imported_codex_401_adopts_new_vault_access_without_refresh_post() {
+    let descriptor = imported_codex_descriptor();
+    let registration = OAuthProviderRegistration::new(
+        haider_provider::OPENAI_OAUTH_PROVIDER_NAME,
+        "http://127.0.0.1:9",
+        "http://127.0.0.1:9/authorize",
+        "http://127.0.0.1:9/token",
+        "haider-public-fake",
+        ["openid", "inference", "profile"].map(str::to_owned),
+        AUDIENCE,
+        Some("fake-api-resource".into()),
+        true,
+        Arc::new(FakeIdentityVerifier),
+    )
+    .expect("offline imported Codex registration")
+    .with_test_refresh_shape(OAuthTokenRequestEncoding::Json, false);
+    let vault = Arc::new(MemoryVault::new());
+    let current = OAuthTokenBundleV1::new(
+        registration.provider_id.clone(),
+        registration.issuer.clone(),
+        registration.audience.clone(),
+        registration.resource.clone(),
+        "Bearer".into(),
+        Zeroizing::new(b"ACCESS_ROTATED_SENTINEL_3a19".to_vec()),
+        Some(Zeroizing::new(b"REFRESH_ROTATED_SENTINEL_8c21".to_vec())),
+        now_ms().expect("clock").saturating_add(600_000),
+        None,
+        registration.scopes.clone(),
+        OAuthIdentityV1 {
+            subject_hash: "fake-subject-hash".into(),
+            display_identity: descriptor.identity.clone(),
+        },
+        2,
+    )
+    .expect("already-rotated Codex bundle");
+    vault
+        .put(
+            &descriptor.alias,
+            &current.encode().expect("encode current"),
+        )
+        .expect("seed current Codex bundle");
+    let snapshot = Arc::new(Mutex::new(vec![descriptor.clone()]));
+    let broker = CredentialBroker::new(
+        vault.clone() as Arc<dyn Vault>,
+        OAuthProviderCatalog::with_test_registrations([registration])
+            .expect("offline imported Codex catalog"),
+        Arc::clone(&snapshot),
+        start_status_actor_with_import_source(&snapshot, vault as Arc<dyn Vault>, Some("codex")),
+    )
+    .expect("offline imported Codex broker");
+    let failed = *blake3::hash(b"ACCESS_OLD_SENTINEL_914d").as_bytes();
+    let adopted = broker
+        .refresh_after_auth_failure(&descriptor, Some(failed))
+        .await
+        .expect("adopt newer Codex access");
+    assert_eq!(adopted.expose_secret(), b"ACCESS_ROTATED_SENTINEL_3a19");
+    assert!(broker.shutdown().await);
+}
+
+/// MUTATION CHECK: require every imported OpenAI refresh response to rotate
+/// the refresh token, or clear the stored token when the response omits it.
+/// Expected RUNTIME failure: the otherwise-valid non-rotating response is
+/// rejected or the durable generation-two bundle loses generation one's
+/// refresh token.
+#[tokio::test]
+async fn imported_refresh_retains_token_when_response_does_not_rotate() {
+    let server = FakeOAuthServer::start(FakeMode::RefreshOmitTokenAndExpiry, false).await;
+    server
+        .state
+        .expect_refresh_binding
+        .store(false, Ordering::SeqCst);
+    let descriptor = imported_codex_descriptor();
+    let vault = Arc::new(MemoryVault::new());
+    let expired =
+        imported_codex_bundle_for_test(&server, now_ms().expect("clock").saturating_sub(1));
+    vault
+        .put(&descriptor.alias, &expired.encode().expect("encode seed"))
+        .expect("seed non-rotating import");
+    let (broker, _) =
+        independent_imported_codex_broker(&server, vault.clone() as Arc<dyn Vault>, &descriptor);
+    let access = broker
+        .resolve(&descriptor)
+        .await
+        .expect("non-rotating imported refresh");
+    assert_eq!(access.expose_secret(), b"ACCESS_ROTATED_SENTINEL_3a19");
+    let stored = vault
+        .resolve(&descriptor.alias)
+        .and_then(|stored| OAuthTokenBundleV1::decode(stored.expose_secret()))
+        .expect("durable non-rotating response");
+    assert_eq!(stored.generation, 2);
+    assert_eq!(stored.refresh_token(), Some(REFRESH_SENTINEL.as_bytes()));
+    assert_eq!(server.state.refresh_calls.load(Ordering::SeqCst), 1);
+    assert!(broker.shutdown().await);
 }
 
 /// MUTATION CHECK: omit the persisted rejection marker or check it only in

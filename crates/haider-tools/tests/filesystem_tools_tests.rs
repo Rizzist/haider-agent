@@ -1153,6 +1153,7 @@ async fn mixed_close_error_keeps_successful_reconciliations_visible() {
             EffectPhase::Outcome {
                 effect,
                 outcome: EffectOutcome::Unknown,
+                ..
             } if effect == &read_intent.effect
         )
     }));

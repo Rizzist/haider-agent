@@ -78,6 +78,7 @@ async fn startup_reconciliation_is_durable_and_idempotent() {
                 EventPayload::Effect(EffectPhase::Outcome {
                     effect: found,
                     outcome: EffectOutcome::Unknown,
+                    ..
                 }) if found == &effect
             )
         })
