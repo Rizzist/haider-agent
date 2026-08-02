@@ -35,6 +35,13 @@ pub const COMMANDS: &[CommandSpec] = &[
         "Branches — list and switch; `new` forks at the last committed node",
         "[new|name]",
     ),
+    // B4b registry extension (no sim counterpart): attachments are live
+    // daemon-CAS truth — demo and feature-ungated daemons refuse honestly.
+    session_cmd(
+        "attach",
+        "Attach an image — uploaded now, rides your next message",
+        "<path>",
+    ),
     cmd("sessions", "List sessions — attach, or start fresh", ""),
     cmd(
         "aura",

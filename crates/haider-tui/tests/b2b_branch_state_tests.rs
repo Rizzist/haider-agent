@@ -771,6 +771,7 @@ fn main_branch_wire_bytes_stay_historical_and_branches_ride_the_decode_forms() {
         text: "hi".to_owned(),
         mode: haider_protocol::DeliveryMode::Steer,
         branch,
+        attachments: vec![],
     };
     assert!(
         matches!(request_body(submit(None)), RequestBody::TurnSubmit { .. }),
@@ -848,6 +849,7 @@ fn branch_responses_map_to_their_driver_facts() {
         text: "hi".to_owned(),
         mode: haider_protocol::DeliveryMode::Steer,
         branch: Some(bid("b-exp")),
+        attachments: vec![],
     });
     assert_eq!(
         map_response(

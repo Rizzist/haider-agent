@@ -1263,6 +1263,11 @@ impl DemoDriver {
             // B2b live-only vocabulary: `/branch new` in demo mode flashes
             // its honest stub upstream — branches are daemon truth.
             | AppRequest::BranchCreate { .. }
+            // B4b live-only vocabulary: `/attach` and the real paste pill
+            // refuse honestly upstream in demo mode — attachments are
+            // daemon-CAS truth, and the read itself is shell-owned.
+            | AppRequest::AttachRead { .. }
+            | AppRequest::AttachUpload { .. }
             // W10b live-only mutations: the demo reducer removes locally.
             | AppRequest::AccountRemove { .. }
             | AppRequest::ProviderRemove { .. } => {}
@@ -2219,6 +2224,41 @@ pub fn rendered_selection_text(
 /// Success stays quiet — the OAuth card already narrates ("your browser
 /// opened …"). Failure must not strand the user behind copy that claims a
 /// browser opened: the URL lands on the clipboard and the flash says so.
+/// The `/attach` read effect (B4b) — the ONE filesystem touch in the
+/// attach pipeline, shell-owned like every other IO. Bounded read + magic
+/// sniff ride `haider-client`'s `load_image_attachment` (the SAME
+/// allowlist and 5 MiB cap `haider run --attach` enforces — jpeg/png/gif/
+/// webp by magic bytes, never by extension). Failure is an honest flash
+/// and NOTHING uploads; success chips the draft and issues the
+/// receipt-free upload through the model's one issuance seam.
+pub fn attach_read_effects(model: &mut AppModel, path: &str) {
+    match haider_client::load_image_attachment(std::path::Path::new(path)) {
+        Ok(image) => {
+            let name = std::path::Path::new(path).file_name().map_or_else(
+                || path.to_owned(),
+                |name| name.to_string_lossy().into_owned(),
+            );
+            let kib = image.bytes.len().div_ceil(1024);
+            model.begin_attachment_upload(
+                image.bytes,
+                crate::composer::PendingKind::Image { mime: image.mime },
+                format!("{name} · {kib} KB"),
+            );
+        }
+        Err(error) => {
+            // The client error's own wording names the reason (not an
+            // image / over the cap / unreadable); strip its headless
+            // framing down to the message.
+            let note = match error {
+                haider_client::HeadlessRunError::Attachment { message, .. } => message,
+                other => other.to_string(),
+            };
+            model.flash = Some(format!("· /attach — {note}"));
+            model.dirty = true;
+        }
+    }
+}
+
 pub fn open_url_effects(
     model: &mut AppModel,
     url: &str,
@@ -2300,6 +2340,10 @@ pub enum ShellRequest {
     CopyText(String),
     /// Open a URL in the user's browser (the OAuth authorize hop).
     OpenUrl(String),
+    /// Read + magic-sniff an `/attach` file (B4b — needs the filesystem).
+    /// The outcome re-enters through [`attach_read_effects`]: an honest
+    /// flash, or a chip + upload request on the model.
+    AttachRead(String),
     /// End the process.
     Quit,
 }
@@ -2355,6 +2399,7 @@ pub fn live_pass(
             AppRequest::CopySelection => shell.push(ShellRequest::CopySelection),
             AppRequest::CopyText(text) => shell.push(ShellRequest::CopyText(text)),
             AppRequest::OpenUrl { url } => shell.push(ShellRequest::OpenUrl(url)),
+            AppRequest::AttachRead { path } => shell.push(ShellRequest::AttachRead(path)),
             AppRequest::Quit => shell.push(ShellRequest::Quit),
             request => commands.extend(driver.handle_request(model, request)),
         }
@@ -2523,6 +2568,7 @@ pub async fn run_live(
                 ShellRequest::OpenUrl(url) => {
                     open_url_effects(&mut model, &url, &crate::browser::open_url);
                 }
+                ShellRequest::AttachRead(path) => attach_read_effects(&mut model, &path),
                 ShellRequest::Quit => model.should_quit = true,
             }
         }

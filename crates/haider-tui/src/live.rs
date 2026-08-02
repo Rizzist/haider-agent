@@ -98,6 +98,23 @@ pub enum LiveCommand {
         /// branch-capable `turn.submit` decode form; `None` keeps the
         /// legacy main-branch bytes byte-for-byte historical.
         branch: Option<haider_protocol::ids::BranchId>,
+        /// Ready attachment blocks captured at issuance (B4b). They ride
+        /// BOTH `turn.submit` wire forms; an empty vector keeps the
+        /// pre-B4 bytes historical (`attachments: []` is B4a's decode
+        /// default).
+        attachments: Vec<haider_protocol::tool::AttachmentBlock>,
+    },
+    /// `artifact.put` — receipt-free, content-addressed byte ingress
+    /// (B4b). Deliberately NO command id and never outboxed: repeating
+    /// the same bytes is naturally idempotent, and a socket loss simply
+    /// drops the flight (the driver sweeps its chip with an honest
+    /// notice instead of silently resending). `upload`/`surface` are
+    /// CLIENT-side correlation the link's request context carries back;
+    /// only `bytes` reaches the wire.
+    ArtifactPut {
+        upload: u64,
+        surface: crate::app::DraftKey,
+        bytes: crate::app::ArtifactBytes,
     },
     Cancel {
         command_id: CommandId,
@@ -308,7 +325,10 @@ impl LiveCommand {
             | Self::OAuthCancel { .. }
             | Self::ToolsInventory { .. }
             // A stage carries no durable identity BY DESIGN (see above).
-            | Self::Stage { .. } => None,
+            | Self::Stage { .. }
+            // Content-addressed and receipt-free BY DESIGN (B4b): the
+            // bytes are their own idempotency key.
+            | Self::ArtifactPut { .. } => None,
         }
     }
 }
@@ -346,6 +366,24 @@ pub enum LiveReply {
         session: SessionId,
         worker_generation: u64,
         disposition: SubmitDisposition,
+    },
+    /// `artifact.put` answered with the daemon's VERIFIED content address
+    /// (B4b). `upload`/`surface` are the client-side identity the link's
+    /// request context carried through (the wire is receipt-free), so the
+    /// chip completes on the ISSUING draft — never guessed from queue
+    /// position or the currently displayed surface.
+    ArtifactUploaded {
+        upload: u64,
+        surface: crate::app::DraftKey,
+        artifact: haider_protocol::ids::ArtifactRef,
+    },
+    /// `artifact.put` answered with a wire-level error (B4b): the chip
+    /// dies (submitting it would name bytes the CAS never accepted) and
+    /// the notice says so. Identity-carried like [`Self::ArtifactUploaded`].
+    ArtifactUploadFailed {
+        upload: u64,
+        surface: crate::app::DraftKey,
+        message: String,
     },
     Answered {
         command_id: CommandId,
@@ -1094,8 +1132,9 @@ impl LiveDriver {
                     .collect();
                 if let Some(text) = self.pending_first_turn.remove(&session) {
                     // A freshly created session's founding turn is always
-                    // legacy/main — no branch can exist before it.
-                    commands.push(self.submit(model, &session, text, None));
+                    // legacy/main — no branch (and no attachment chip)
+                    // can exist before it.
+                    commands.push(self.submit(model, &session, text, None, Vec::new()));
                 }
                 commands
             }
@@ -1143,6 +1182,29 @@ impl LiveDriver {
             } => {
                 self.retire(&command_id);
                 self.generations.insert(session, worker_generation);
+                Vec::new()
+            }
+            LiveReply::ArtifactUploaded {
+                upload,
+                surface,
+                artifact,
+            } => {
+                // The daemon's VERIFIED content address completes the chip
+                // on the ISSUING draft (B4b). A chip the user removed
+                // mid-flight stays removed — the reply dies silently (the
+                // CAS holds unreferenced bytes, nothing more).
+                model.complete_upload(surface, upload, artifact);
+                Vec::new()
+            }
+            LiveReply::ArtifactUploadFailed {
+                upload,
+                surface,
+                message,
+            } => {
+                if let Some(label) = model.fail_upload(surface, upload) {
+                    model.flash = Some(format!("· {label} — upload failed: {message}"));
+                    model.dirty = true;
+                }
                 Vec::new()
             }
             LiveReply::ToolsInventory { session, snapshot } => {
@@ -1866,7 +1928,18 @@ impl LiveDriver {
                 // No reply crosses a socket: retired ids awaiting silent
                 // consumption die with the connection (TUI6.4).
                 self.retired_logins.clear();
-                model.flash = Some(format!("· reconnecting — {reason}"));
+                // B4b: `artifact.put` is receipt-free — an in-flight
+                // upload's reply can never arrive and nothing resends it,
+                // so its chip dies HERE, named, instead of spinning
+                // "uploading" forever.
+                let dropped = model.drop_uploading_attachments();
+                model.flash = Some(if dropped > 0 {
+                    format!(
+                        "· reconnecting — {reason} ({dropped} in-flight attachment upload(s) dropped — /attach again)"
+                    )
+                } else {
+                    format!("· reconnecting — {reason}")
+                });
                 model.dirty = true;
                 Vec::new()
             }
@@ -2195,13 +2268,31 @@ impl LiveDriver {
                     first_text: text,
                 })]
             }
-            AppRequest::SubmitText { text, branch, .. } => match model.active_session.clone() {
-                // The branch was captured at ISSUANCE by the reducer — a
-                // switch between issuance and this drain must not retarget
-                // the turn (research risk 4).
-                Some(session) => vec![self.submit(model, &session, text, branch)],
+            AppRequest::SubmitText {
+                text,
+                branch,
+                attachments,
+                ..
+            } => match model.active_session.clone() {
+                // The branch AND the attachments were captured at ISSUANCE
+                // by the reducer — a switch (or a chip removal) between
+                // issuance and this drain must not retarget the turn
+                // (research risk 4; B4b extends the same law to blocks).
+                Some(session) => vec![self.submit(model, &session, text, branch, attachments)],
                 None => Vec::new(),
             },
+            // B4b: the receipt-free upload — no mint, no outbox (see the
+            // `LiveCommand::ArtifactPut` charter). The reducer already
+            // chipped the draft; only the reply mutates it further.
+            AppRequest::AttachUpload {
+                upload,
+                surface,
+                bytes,
+            } => vec![LiveCommand::ArtifactPut {
+                upload,
+                surface,
+                bytes,
+            }],
             AppRequest::LoginApi {
                 attempt,
                 provider,
@@ -2447,9 +2538,13 @@ impl LiveDriver {
                 })]
             }
             // Runtime-owned effects: `live_pass` hands these BACK to the
-            // shell (they need the terminal or the process), so reaching
-            // here at all would be a routing bug, not a discard.
-            AppRequest::CopySelection | AppRequest::CopyText(_) | AppRequest::Quit => Vec::new(),
+            // shell (they need the terminal, the process, or — for the
+            // B4b attach read — the filesystem), so reaching here at all
+            // would be a routing bug, not a discard.
+            AppRequest::CopySelection
+            | AppRequest::CopyText(_)
+            | AppRequest::AttachRead { .. }
+            | AppRequest::Quit => Vec::new(),
             // DEMO-ONLY VOCABULARY. The reducer refuses every one of these
             // upstream in live mode (`AppModel::refuse_demo_only`), so this
             // arm is unreachable by design — but it must never be a SILENT
@@ -2489,6 +2584,7 @@ impl LiveDriver {
         session: &SessionId,
         text: String,
         branch: Option<haider_protocol::ids::BranchId>,
+        attachments: Vec<haider_protocol::tool::AttachmentBlock>,
     ) -> LiveCommand {
         let command_id = self.mint();
         let worker_generation = self.generations.get(session).copied().unwrap_or_default();
@@ -2508,6 +2604,7 @@ impl LiveDriver {
             text,
             mode,
             branch,
+            attachments,
         })
     }
 

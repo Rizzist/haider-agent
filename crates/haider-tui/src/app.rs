@@ -1372,6 +1372,28 @@ pub enum AppRequest {
         /// the branch it was typed on — never re-read from mutable
         /// active-branch state downstream. `None` = legacy/main.
         branch: Option<haider_protocol::ids::BranchId>,
+        /// Ready attachment blocks taken from the draft at ISSUANCE (B4b)
+        /// — same capture law as `branch`: a later `/branch` switch or a
+        /// chip removal cannot retarget what this submit carries.
+        attachments: Vec<haider_protocol::tool::AttachmentBlock>,
+    },
+    /// `/attach <path>` (B4b): read + magic-sniff the file. Filesystem IO
+    /// is SHELL-owned (the reducer never performs IO), uniform with
+    /// [`Self::CopySelection`]: the runtime reads bounded bytes, then
+    /// either flashes the honest refusal or hands the bytes back through
+    /// [`AppModel::begin_attachment_upload`].
+    AttachRead { path: String },
+    /// Upload one attachment's bytes into the daemon CAS (B4b) — the
+    /// receipt-free `artifact.put` (content-addressed, naturally
+    /// idempotent; deliberately NO command id and never outboxed).
+    /// `upload`/`surface` are CLIENT-side identity only: the wire carries
+    /// the bytes, the link's request context carries these back so the
+    /// reply completes the chip on the ISSUING draft even after a
+    /// surface switch.
+    AttachUpload {
+        upload: u64,
+        surface: DraftKey,
+        bytes: ArtifactBytes,
     },
     /// Cancel EVERY session's and every chip's arms and clear all demo
     /// token meters — a GLOBAL reset, not a polite stop (renamed from
@@ -1734,6 +1756,39 @@ pub enum DraftKey {
     Aura,
 }
 
+/// Attachment bytes riding an [`AppRequest::AttachUpload`] /
+/// [`crate::live::LiveCommand::ArtifactPut`] (B4b). A plain `Vec<u8>`
+/// would print megabytes — or a pasted secret — through any derived
+/// `Debug` (the un-redacted `SecretWire` Debug was mutation-killed TWICE
+/// in W3c2; this type inherits the lesson instead of re-earning it).
+#[derive(Clone, PartialEq, Eq)]
+pub struct ArtifactBytes(Vec<u8>);
+
+impl ArtifactBytes {
+    #[must_use]
+    pub fn new(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for ArtifactBytes {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "ArtifactBytes(<{} bytes>)", self.0.len())
+    }
+}
+
+/// Client-side mirrors of B4a's daemon acceptance caps (≤5 attachments a
+/// turn, ≤5 MiB each): refusing HERE names the reason while the file is
+/// still in hand, instead of durably accepting a submit the daemon must
+/// bounce. The daemon stays the authority — these only pre-empt.
+pub const MAX_TURN_ATTACHMENTS: usize = 5;
+pub const MAX_ATTACHMENT_BYTES: usize = 5 * 1024 * 1024;
+
 /// Pasted text at the TUI ingress (TUI6.3 fix 2, review r3 finding 2).
 ///
 /// A paste is how API keys usually arrive, and the W3c2 `SecretWire`
@@ -1853,6 +1908,10 @@ pub struct AppModel {
     /// per-conversation drafts). Navigation swaps through here; nothing
     /// in it persists (item 8's DTO assertion covers it).
     pub drafts: std::collections::HashMap<DraftKey, crate::composer::Composer>,
+    /// Monotonic client-side correlation id for receipt-free attachment
+    /// uploads (B4b) — `artifact.put` has no command id, so this is what
+    /// the link's request context carries back to complete the chip.
+    pub upload_seq: u64,
     /// Session blurb (sim auto-title micro-call) — announced by the 1.5 s
     /// `· session titled` note; the HEADER shows [`Self::session_name`].
     pub session_title: Option<String>,
@@ -2078,6 +2137,7 @@ impl Default for AppModel {
             identity_pinned: false,
             composer: crate::composer::Composer::new(),
             drafts: std::collections::HashMap::new(),
+            upload_seq: 0,
             session_title: None,
             session_name: None,
             // The scratch surface's canonical head (the demo script's
@@ -2203,6 +2263,178 @@ impl AppModel {
             Some(_) => DraftKey::Session(self.ui_generation()),
             None => DraftKey::Launcher,
         }
+    }
+
+    // ---- Pending attachments (B4b) ----
+
+    /// The composer wearing `surface` RIGHT NOW: the live composer when
+    /// the surface is on screen, else its parked draft. `None` only for a
+    /// draft `/reset` purged — an upload reply for it dies silently.
+    fn composer_for_surface(
+        &mut self,
+        surface: DraftKey,
+    ) -> Option<&mut crate::composer::Composer> {
+        if self.surface_key() == surface {
+            Some(&mut self.composer)
+        } else {
+            self.drafts.get_mut(&surface)
+        }
+    }
+
+    /// Chip the active draft with one attachment and issue its
+    /// receipt-free upload. Callers hold the gates (session surface, live
+    /// mode, `artifact_put_v1`, the per-turn count and byte caps) — this
+    /// is the one issuance seam under them all.
+    pub fn begin_attachment_upload(
+        &mut self,
+        bytes: Vec<u8>,
+        kind: crate::composer::PendingKind,
+        label: String,
+    ) {
+        self.upload_seq += 1;
+        let upload = self.upload_seq;
+        self.composer
+            .push_attachment(crate::composer::PendingAttachment {
+                upload,
+                label,
+                kind,
+                artifact: None,
+            });
+        self.requests.push(AppRequest::AttachUpload {
+            upload,
+            surface: self.surface_key(),
+            bytes: ArtifactBytes::new(bytes),
+        });
+        self.dirty = true;
+    }
+
+    /// The daemon's verified content address landed: complete the chip on
+    /// the ISSUING surface's draft (captured at issuance — a surface
+    /// switch between upload and reply must not chip the wrong draft).
+    pub fn complete_upload(
+        &mut self,
+        surface: DraftKey,
+        upload: u64,
+        artifact: haider_protocol::ids::ArtifactRef,
+    ) -> bool {
+        let done = self
+            .composer_for_surface(surface)
+            .is_some_and(|composer| composer.complete_attachment(upload, artifact));
+        if done {
+            self.dirty = true;
+        }
+        done
+    }
+
+    /// An upload failed — remove its chip and return the label for the
+    /// honest notice (a dead chip must not survive to submit a ref the
+    /// CAS never accepted).
+    pub fn fail_upload(&mut self, surface: DraftKey, upload: u64) -> Option<String> {
+        let label = self
+            .composer_for_surface(surface)?
+            .fail_attachment(upload)?;
+        self.dirty = true;
+        Some(label)
+    }
+
+    /// Disconnect sweep: every in-flight upload died with the socket
+    /// (receipt-free — nothing resends it), on the live composer AND every
+    /// parked draft. Returns how many chips died, for the honest notice.
+    pub fn drop_uploading_attachments(&mut self) -> usize {
+        let mut dropped = self.composer.drop_uploading_attachments();
+        for draft in self.drafts.values_mut() {
+            dropped += draft.drop_uploading_attachments();
+        }
+        if dropped > 0 {
+            self.dirty = true;
+        }
+        dropped
+    }
+
+    /// `/attach <path>` (B4b): chip the draft with one image, uploaded
+    /// ahead of the submit. Every refusal is an honest notice; the read
+    /// itself is shell-owned ([`AppRequest::AttachRead`]).
+    fn attach_command(&mut self, remainder: &str) {
+        if self.screen != Screen::Session {
+            self.flash = Some("· /attach — session only".to_owned());
+            self.dirty = true;
+            return;
+        }
+        // Attachments are daemon CAS truth; the demo has no store to hold
+        // bytes, and a fabricated chip would claim content no submit could
+        // ever carry.
+        if self.mode.fabricates_locally() {
+            self.flash =
+                Some("· /attach — live only; attachments ride the daemon's store".to_owned());
+            self.dirty = true;
+            return;
+        }
+        // Feature gate: without `artifact.put` there is no byte ingress —
+        // the honest stale-daemon notice names the fix, nothing uploads.
+        if !self.daemon_serves(haider_rpc::FEATURE_ARTIFACT_PUT_V1) {
+            self.flash = Some(self.stale_daemon_note("attachments"));
+            self.dirty = true;
+            return;
+        }
+        let path = remainder.trim();
+        if path.is_empty() {
+            self.flash = Some("· /attach — give an image path".to_owned());
+            self.dirty = true;
+            return;
+        }
+        if self.composer.attachments().len() >= MAX_TURN_ATTACHMENTS {
+            self.flash = Some("· 5 attachments a turn — ⌫ at the start removes one".to_owned());
+            self.dirty = true;
+            return;
+        }
+        self.requests.push(AppRequest::AttachRead {
+            path: path.to_owned(),
+        });
+        self.dirty = true;
+    }
+
+    /// A paste over the sim's pill thresholds — B4b makes the pill REAL.
+    ///
+    /// DEMO keeps the sim's verbatim vocabulary (a literal pill token;
+    /// the sim's world is local by design). LIVE on a session surface
+    /// with `artifact_put_v1`, the content uploads as a `PastedText`
+    /// artifact (UTF-8, ref-based — tool.rs's intended composer-token
+    /// vocabulary) and the pill chip rides the next submit; the
+    /// zeroize-and-drop theater is dead. LIVE anywhere else — launcher,
+    /// aura, subagent, or an ungated daemon — the text lands LITERALLY:
+    /// an honest composer full of text beats a pill claiming content no
+    /// daemon holds.
+    fn big_paste(&mut self, text: &str, raw_lines: usize) {
+        if self.mode.fabricates_locally() {
+            self.composer
+                .insert_str(&format!("[Pasted {raw_lines} lines] "));
+            return;
+        }
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        if self.screen != Screen::Session {
+            self.composer.insert_str(&normalized);
+            return;
+        }
+        if !self.daemon_serves(haider_rpc::FEATURE_ARTIFACT_PUT_V1) {
+            self.flash = Some(self.stale_daemon_note("paste attachments"));
+            self.composer.insert_str(&normalized);
+            return;
+        }
+        if normalized.len() > MAX_ATTACHMENT_BYTES {
+            self.flash =
+                Some("· paste exceeds the 5 MiB attachment limit — not inserted".to_owned());
+            return;
+        }
+        if self.composer.attachments().len() >= MAX_TURN_ATTACHMENTS {
+            self.flash = Some("· 5 attachments a turn — ⌫ at the start removes one".to_owned());
+            return;
+        }
+        let lines = u32::try_from(raw_lines).unwrap_or(u32::MAX);
+        self.begin_attachment_upload(
+            normalized.into_bytes(),
+            crate::composer::PendingKind::PastedText { lines },
+            format!("[Pasted {raw_lines} lines]"),
+        );
     }
 
     /// Park the live composer under the CURRENT surface's key. Callers
@@ -2640,8 +2872,7 @@ impl AppModel {
                 // active selection, item 4) — both the pill token and the
                 // literal small-paste path.
                 if raw_lines > 3 || text.encode_utf16().count() > 300 {
-                    self.composer
-                        .insert_str(&format!("[Pasted {raw_lines} lines] "));
+                    self.big_paste(text, raw_lines);
                 } else {
                     self.composer
                         .insert_str(&text.replace("\r\n", "\n").replace('\r', "\n"));
@@ -3034,6 +3265,17 @@ impl AppModel {
             }
             KeyCode::Enter => self.submit_composer(),
             KeyCode::Backspace => {
+                // B4b chip law: ⌫ at the very START of the draft (no
+                // selection — nothing text-wise to delete there) removes
+                // the NEWEST attachment chip. A chip removed mid-upload
+                // stays removed: the late reply finds no chip and dies.
+                if self.composer.cursor() == 0
+                    && !self.composer.has_selection()
+                    && self.composer.remove_newest_attachment().is_some()
+                {
+                    self.dirty = true;
+                    return;
+                }
                 // TUI5 item 3: ⌫ deletes the grapheme BEFORE the cursor
                 // (or the active selection); ⌥⌫ deletes the word before
                 // (ESC-⌫ / kitty ALT — Claude Code binds both).
@@ -3181,6 +3423,21 @@ impl AppModel {
         // Slash submits take SILENTLY — execute_slash records the
         // canonical form (review P3-9, one entry per invocation).
         let is_slash = self.composer.text().trim().starts_with('/');
+        // B4b: a REAL turn must not ride while a chip's upload is still
+        // in flight — its block has no verified ref yet and a submit
+        // without it would silently shed the attachment. Refuse BEFORE
+        // the take (the draft survives); slash commands and menu answers
+        // consume no chips and pass.
+        if !is_slash
+            && self.screen == Screen::Session
+            && !self.mode.fabricates_locally()
+            && self.projection.open_menu().is_none()
+            && self.composer.has_uploading_attachment()
+        {
+            self.flash = Some("· attachment still uploading — a moment".to_owned());
+            self.dirty = true;
+            return;
+        }
         let text = if is_slash {
             self.composer.take_silent()
         } else {
@@ -3317,6 +3574,10 @@ impl AppModel {
                     // Captured at issuance (B2b): a later switch cannot
                     // retarget this mid-turn delivery.
                     branch: self.branch_state.active().cloned(),
+                    // Captured at issuance (B4b): the uploading gate above
+                    // guarantees every chip is ready; the take clears the
+                    // draft's chips — they ride THIS delivery.
+                    attachments: self.composer.take_ready_attachments(),
                 });
                 return;
             }
@@ -3370,6 +3631,9 @@ impl AppModel {
             voice: false,
             title,
             branch: self.branch_state.active().cloned(),
+            // B4b: ready chips ride the idle-session submit and the take
+            // clears them (demo drafts never hold chips — empty there).
+            attachments: self.composer.take_ready_attachments(),
         });
     }
 
@@ -3565,12 +3829,24 @@ impl AppModel {
         if !self.mode.fabricates_locally() {
             match self.screen {
                 Screen::Launcher => self.requests.push(AppRequest::CreateSession { text }),
-                _ => self.requests.push(AppRequest::SubmitText {
-                    text,
-                    voice: true,
-                    title: self.session_title.is_none(),
-                    branch: self.branch_state.active().cloned(),
-                }),
+                _ => {
+                    // B4b: a voice submit consumes READY chips only when
+                    // nothing is mid-upload — a split set would shed the
+                    // stragglers, so an in-flight chip parks the WHOLE
+                    // set for the next submit.
+                    let attachments = if self.composer.has_uploading_attachment() {
+                        Vec::new()
+                    } else {
+                        self.composer.take_ready_attachments()
+                    };
+                    self.requests.push(AppRequest::SubmitText {
+                        text,
+                        voice: true,
+                        title: self.session_title.is_none(),
+                        branch: self.branch_state.active().cloned(),
+                        attachments,
+                    });
+                }
             }
             return;
         }
@@ -3589,6 +3865,9 @@ impl AppModel {
             voice: true,
             title,
             branch: self.branch_state.active().cloned(),
+            // Demo world: chips cannot exist (the reducer refuses both
+            // attach paths upstream), so nothing rides.
+            attachments: Vec::new(),
         });
     }
 
@@ -4966,6 +5245,7 @@ impl AppModel {
                 }
             }
             "branch" => self.branch_command(&remainder),
+            "attach" => self.attach_command(&remainder),
             "compact" => {
                 // Manual compaction (sim tui.js:1791-1806). Adapted gate:
                 // the sim's single-threaded state writes tolerate /compact

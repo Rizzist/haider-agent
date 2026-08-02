@@ -459,6 +459,7 @@ fn typed_text_starts_a_session_and_requests_a_turn() {
             voice: false,
             title: true,
             branch: None,
+            attachments: vec![],
         }]
     );
     // Sim autoBlurb (G47) is the BLURB, applied by the 1.5 s callback; the

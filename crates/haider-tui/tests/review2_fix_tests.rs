@@ -314,6 +314,7 @@ fn alt_and_shift_enter_insert_newlines_and_enter_submits() {
             voice: false,
             title: true,
             branch: None,
+            attachments: vec![],
         }]
     );
 }
