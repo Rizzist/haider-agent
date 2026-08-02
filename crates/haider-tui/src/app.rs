@@ -357,6 +357,11 @@ pub enum OAuthAddPhase {
     Starting,
     /// The browser owns the authorize; the loopback waits.
     WaitingBrowser { url: String, origin: String },
+    /// B6b device-code grant (Kimi): NOTHING is listening on a loopback —
+    /// the user enters the code at the verification URL and the daemon
+    /// polls the token endpoint. Device-honest copy, never the
+    /// "your browser opened…" loopback line (B2b-m3 polish c).
+    WaitingDevice { url: String, origin: String },
     /// Callback consumed; the daemon is exchanging the code.
     Exchanging,
     /// `account.add` is committing the ready reference.
@@ -4416,10 +4421,13 @@ impl AppModel {
     }
 
     /// Driver-applied phase change, attempt-gated: a retired card's late
-    /// reply touches nothing (the login-card law).
+    /// reply touches nothing (the login-card law). A no-op phase (the
+    /// device flow's 1.5 s status poll re-reporting WaitingDevice) neither
+    /// rewrites nor re-dirties.
     pub fn oauth_add_phase(&mut self, attempt: u64, phase: OAuthAddPhase) {
         if let Some(card) = self.oauth_add.as_mut()
             && card.attempt == attempt
+            && card.phase != phase
         {
             card.phase = phase;
             self.dirty = true;
@@ -4498,10 +4506,13 @@ impl AppModel {
         match code {
             KeyCode::Esc | KeyCode::Char('2') => self.cancel_oauth_add(),
             KeyCode::Char('1') => {
-                // Only WaitingBrowser answers `[1]` — Failed never reaches
-                // here (the guard above owns it), and the other phases
-                // advertise no keys.
-                if let OAuthAddPhase::WaitingBrowser { url, .. } = &card.phase {
+                // Only the waiting phases answer `[1]` — Failed never
+                // reaches here (the guard above owns it), and the other
+                // phases advertise no keys. WaitingDevice re-opens the
+                // VERIFICATION url (the code-entry page), same affordance.
+                if let OAuthAddPhase::WaitingBrowser { url, .. }
+                | OAuthAddPhase::WaitingDevice { url, .. } = &card.phase
+                {
                     if self.mode.fabricates_locally() {
                         // Sim confirmAuth: the simulated authorize lands the
                         // account locally and selects it for its provider.
@@ -5182,20 +5193,30 @@ impl AppModel {
                         );
                     }
                     (provider, "api") => self.open_login_card(provider, alias),
-                    // B6b: `/login kimi oauth` mirrors the `+ Kimi (OAuth)`
-                    // button EXACTLY by routing through the same hit arm —
-                    // jump to /accounts first (the card renders and owns
-                    // keys there), then the arm's feature gate and card
-                    // open run unchanged. The daemon owns the device flow.
+                    // B6b/B2b-m3: every `/login <provider> oauth` mirrors
+                    // its account-add button EXACTLY by routing through the
+                    // same hit arm — jump to /accounts first (the card
+                    // renders and owns keys there), then the arm's feature
+                    // gate and card open run unchanged (mirror by
+                    // construction, never a second dispatch). The daemon
+                    // owns every flow: loopback PKCE for openai/anthropic,
+                    // the device-code grant for kimi.
+                    ("openai", "oauth") => {
+                        self.enter_accounts();
+                        self.handle_hit(Hit::AccountAdd(AccountAddKind::OpenAiOAuth));
+                    }
+                    ("anthropic", "oauth") => {
+                        self.enter_accounts();
+                        self.handle_hit(Hit::AccountAdd(AccountAddKind::AnthropicOAuth));
+                    }
                     ("kimi", "oauth") => {
                         self.enter_accounts();
                         self.handle_hit(Hit::AccountAdd(AccountAddKind::KimiOAuth));
                     }
-                    (_, "oauth") => {
-                        self.flash = Some(
-                            "· /login … oauth — UI ready; the loopback flow lands after v0.0.12"
-                                .to_owned(),
-                        );
+                    (provider, "oauth") => {
+                        self.flash = Some(format!(
+                            "· /login {provider} oauth — no OAuth flow for this provider; try /login {provider} api"
+                        ));
                     }
                     (provider, _) => {
                         self.flash =

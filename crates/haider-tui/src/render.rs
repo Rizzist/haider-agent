@@ -1145,6 +1145,30 @@ fn render_accounts(
                     theme.gold_style(),
                 )]));
             }
+            crate::app::OAuthAddPhase::WaitingDevice { url, .. } => {
+                // Device-honest copy (B2b-m3 polish c): a device grant has
+                // no loopback listening — the user enters the code at the
+                // verification URL and the daemon polls until approval.
+                footer_lines.push(Line::styled(
+                    format!(
+                        "  enter the code at {} — the daemon polls until you approve",
+                        if url.is_empty() {
+                            "the verification page"
+                        } else {
+                            url
+                        }
+                    ),
+                    theme.dim_style(),
+                ));
+                footer_lines.push(Line::styled(
+                    format!("  alias: {} · usage billed to the subscription", card.alias),
+                    theme.faint_style(),
+                ));
+                footer_lines.push(Line::from(vec![Span::styled(
+                    "  [1] open the link again · [2] cancel",
+                    theme.gold_style(),
+                )]));
+            }
             crate::app::OAuthAddPhase::Exchanging => {
                 footer_lines.push(Line::styled(
                     "  approved — exchanging the code…",

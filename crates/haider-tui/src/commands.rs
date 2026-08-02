@@ -181,16 +181,24 @@ pub fn has_arg_slots(name: &str) -> bool {
     matches!(name, "theme" | "login" | "model" | "provider" | "account")
 }
 
-/// `/login`'s two argument slots: provider, then method. The provider list
-/// is the set the daemon can actually validate against today; the method
-/// list is the wire's own (`api` executes, `oauth` is honest about landing
-/// later).
+/// `/login`'s two argument slots: provider, then method. Slot 0 names the
+/// REAL login roster — every provider whose add flow the account buttons run
+/// today (B6b); slot 1 is the wire's method pair, both executable since
+/// W5e-1 (loopback PKCE) and B6b (kimi's device grant).
 fn login_args(slot: usize, fragment: &str) -> Vec<PaletteItem> {
     let candidates: &[(&'static str, &'static str)] = match slot {
-        0 => &[("anthropic", "Anthropic — Claude models")],
+        0 => &[
+            ("anthropic", "Anthropic — Claude (oauth · api)"),
+            ("openai", "OpenAI — ChatGPT (oauth · api)"),
+            ("gemini", "Google — Gemini (api)"),
+            ("kimi", "Moonshot — Kimi (oauth, device code)"),
+        ],
         1 => &[
             ("api", "paste an API key (masked, stored in the OS vault)"),
-            ("oauth", "browser sign-in — lands after v0.0.12"),
+            (
+                "oauth",
+                "browser sign-in — loopback PKCE (device code for kimi)",
+            ),
         ],
         _ => &[],
     };
@@ -313,7 +321,7 @@ pub fn palette_items(query: &str, in_session: bool, slots: &DynamicSlots) -> Vec
 pub const HELP_TEXT: &[&str] = &[
     "commands",
     "  /model [name]      switch model — fable-5 · gpt-5.6 · gemini-3 · qwen3",
-    "  /provider [name]   anthropic · openai · google · local",
+    "  /provider [name]   anthropic · openai · gemini · kimi",
     "  /providers         provider registry — endpoints, models, defaults, health",
     "  /theme [name]      dawn · ivory · dark",
     "  /tree              session tree — main-line view, ⏎ opens forks, f forks at a node",
