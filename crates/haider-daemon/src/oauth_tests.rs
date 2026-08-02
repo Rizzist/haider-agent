@@ -1112,6 +1112,99 @@ async fn forced_401_reread_adopts_already_rotated_access_without_refresh_post() 
     assert!(broker.shutdown().await);
 }
 
+/// MUTATION CHECK: drop the `!rejection_marker_active` guard from the
+/// forced-401 fingerprint-adoption fast path in `resolve_oauth` (or serve the
+/// vault bundle directly whenever the failed fingerprint differs). Expected
+/// RUNTIME failure: the marked bundle's still-unexpired access token is
+/// returned instead of the typed re-login below. An ACTIVE rejection or
+/// uncertainty marker means no successful rotation ever replaced this bundle
+/// — a real rotation durably clears the marker under the alias lease — so
+/// its access token belongs to the rejected/uncertain generation and must
+/// only resolve through the serialized under-lease path.
+#[tokio::test]
+async fn forced_401_reread_never_adopts_an_actively_marked_rotating_bundle() {
+    let registration = OAuthProviderRegistration::new(
+        "fake-oauth",
+        "http://127.0.0.1:9",
+        "http://127.0.0.1:9/device_authorization",
+        "http://127.0.0.1:9/token",
+        "haider-public-fake",
+        ["openid".to_owned()],
+        AUDIENCE,
+        Some("fake-api-resource".into()),
+        true,
+        Arc::new(FakeIdentityVerifier),
+    )
+    .expect("offline registration")
+    .with_test_device_flow();
+    let descriptor = oauth_descriptor_for_test();
+    let vault = Arc::new(MemoryVault::new());
+    let now = now_ms().expect("clock");
+    let bundle = OAuthTokenBundleV1::new(
+        "fake-oauth".into(),
+        "http://127.0.0.1:9".into(),
+        AUDIENCE.into(),
+        Some("fake-api-resource".into()),
+        "Bearer".into(),
+        Zeroizing::new(b"tombstoned-generation-access".to_vec()),
+        Some(Zeroizing::new(b"tombstoned-generation-refresh".to_vec())),
+        now.saturating_add(600_000),
+        None,
+        Vec::new(),
+        OAuthIdentityV1 {
+            subject_hash: "subject-hash".into(),
+            display_identity: descriptor.identity.clone(),
+        },
+        2,
+    )
+    .expect("marked bundle")
+    // Refresh is NOT otherwise due: the active marker alone must force the
+    // serialized under-lease path instead of any vault fast path.
+    .with_refresh_after(now.saturating_add(300_000))
+    .with_refresh_rejected_until(now.saturating_add(300_000));
+    vault
+        .put(&descriptor.alias, &bundle.encode().expect("encode"))
+        .expect("store marked bundle");
+    let snapshot = Arc::new(Mutex::new(vec![descriptor.clone()]));
+    let broker = CredentialBroker::new(
+        vault.clone() as Arc<dyn Vault>,
+        OAuthProviderCatalog::with_test_registrations([registration]).expect("catalog"),
+        Arc::clone(&snapshot),
+        start_status_actor(&snapshot, vault.clone() as Arc<dyn Vault>),
+    )
+    .expect("broker");
+    // The 401 belongs to an older access generation, so the fingerprint
+    // DIFFERS from the marked bundle's access token — the exact shape the
+    // adoption fast path would otherwise serve straight from the vault.
+    let failed = *blake3::hash(b"superseded-access-generation").as_bytes();
+    let error = broker
+        .refresh_after_auth_failure(&descriptor, Some(failed))
+        .await
+        .expect_err("an actively marked bundle requires re-login, never direct adoption");
+    assert_eq!(error.code, ErrorCode::Unauthorized);
+    assert_eq!(
+        error
+            .details
+            .as_ref()
+            .and_then(|details| details.get("kind"))
+            .and_then(serde_json::Value::as_str),
+        Some("oauth_relogin_required")
+    );
+    // The under-lease path refuses without touching the marked bundle: the
+    // tombstone and generation are exactly as seeded, and the unreachable
+    // token endpoint proves no rotating request was attempted.
+    let stored = vault
+        .resolve(&descriptor.alias)
+        .and_then(|stored| OAuthTokenBundleV1::decode(stored.expose_secret()))
+        .expect("marked bundle remains durable");
+    assert_eq!(stored.generation, 2);
+    assert_eq!(
+        stored.refresh_rejected_until_unix_ms,
+        bundle.refresh_rejected_until_unix_ms
+    );
+    assert!(broker.shutdown().await);
+}
+
 /// MUTATION CHECK 1: remove the imported-Codex branch from `resolve_oauth`.
 /// Expected runtime failure: the imported bundle returns its old access token
 /// without the refresh call asserted below. MUTATION CHECK 2: carry the
