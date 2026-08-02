@@ -70,8 +70,16 @@ fn model_slot_follows_the_active_provider() {
     let offered = values(&palette_items("model ", true, &model.dynamic_slots()));
     assert_eq!(offered, vec!["claude-opus-5", "claude-sonnet-5"]);
 
-    // A provider with NO discovered models offers nothing — never a guess.
-    model.identity.provider = "google".to_owned();
+    // The installed Gemini adapter (B6a) serves its discovered inventory.
+    model.identity.provider = "gemini".to_owned();
+    assert_eq!(
+        values(&palette_items("model ", true, &model.dynamic_slots())),
+        vec!["gemini-3"]
+    );
+
+    // A provider with NO discovered models offers nothing — never a guess
+    // (kimi-oauth is signed out in the seed registry: empty inventory).
+    model.identity.provider = "kimi-oauth".to_owned();
     assert!(
         values(&palette_items("model ", true, &model.dynamic_slots())).is_empty(),
         "an undiscovered provider must offer no models"
@@ -85,8 +93,11 @@ fn provider_and_account_slots_are_daemon_truth() {
     let model = model_with_catalog();
     let providers = values(&palette_items("provider ", true, &model.dynamic_slots()));
     assert!(providers.contains(&"openai".to_owned()));
+    // B6a/B6k: provider.list now serves both new adapters — gemini as an
+    // installed row, kimi-oauth as the signed-out (unavailable) one.
+    assert!(providers.contains(&"gemini".to_owned()));
     assert!(
-        providers.contains(&"google".to_owned()),
+        providers.contains(&"kimi-oauth".to_owned()),
         "unavailable providers still listed"
     );
 

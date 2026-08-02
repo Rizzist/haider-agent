@@ -92,8 +92,10 @@ fn accounts_screen_renders_the_sim_hierarchy() {
     // Group headers in first-seen provider order.
     let openai = frame.find("openai").expect("openai group");
     let anthropic = frame.find("anthropic").expect("anthropic group");
-    let google = frame.find("google").expect("google group");
-    assert!(openai < anthropic && anthropic < google, "sim group order");
+    // B6b documented divergence: the sim's third group is `google`; the
+    // landed adapter's registry id is `gemini` (mock.rs seed note).
+    let gemini = frame.find("gemini").expect("gemini group");
+    assert!(openai < anthropic && anthropic < gemini, "sim group order");
     // The local group header carries its account's base URL.
     assert!(frame.contains("local · http://127.0.0.1:8000/v1"));
     // Selected vs sibling rows: dot + AUTH_LABEL + identity + status.
