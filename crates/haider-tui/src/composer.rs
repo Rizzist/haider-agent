@@ -27,6 +27,8 @@
 //! painted while the reducer keeps calling `line_up`/`line_down`
 //! untouched (the stays-put law).
 
+use haider_protocol::ids::ArtifactRef;
+use haider_protocol::tool::AttachmentBlock;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -34,6 +36,59 @@ use unicode_width::UnicodeWidthStr;
 /// Claude Code keeps a long per-project history; the demo's transient ring
 /// keeps the last 50 — enough for any session, never persisted.
 const HISTORY_CAP: usize = 50;
+
+/// What one pending attachment will become on the wire (B4b). The chip
+/// holds the half known at ISSUANCE (mime / line count); the daemon's
+/// verified content address arrives with the `artifact.put` reply and
+/// completes the [`AttachmentBlock`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingKind {
+    /// `/attach <path>` — a magic-sniffed image.
+    Image { mime: String },
+    /// The big-paste pill — UTF-8 pasted text stored by ref, never copied
+    /// into the tree (tool.rs's intended composer-token vocabulary).
+    PastedText { lines: u32 },
+}
+
+/// One attachment the draft will carry on its next submit (B4b).
+///
+/// It lives ON the composer so the draft stash/restore round trip parks
+/// and revives it with the text: a surface switch (or a `/branch` switch,
+/// which never swaps the session's draft) cannot lose a chip. `artifact`
+/// is `None` while the receipt-free upload is in flight; only the daemon's
+/// `artifact.put` reply — its VERIFIED content address — completes it
+/// (nothing local mints a ref the CAS cannot honor).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingAttachment {
+    /// Client-side correlation id: `artifact.put` is receipt-free (no
+    /// command id), so the link's request context carries this back.
+    pub upload: u64,
+    /// Chip label ("photo.png · 41 KB", "[Pasted 12 lines]").
+    pub label: String,
+    pub kind: PendingKind,
+    /// The daemon's verified CAS address, once the upload answers.
+    pub artifact: Option<ArtifactRef>,
+}
+
+impl PendingAttachment {
+    /// The wire block, once (and only once) the upload completed.
+    #[must_use]
+    pub fn ready_block(&self) -> Option<AttachmentBlock> {
+        let artifact = self.artifact.clone()?;
+        Some(match &self.kind {
+            PendingKind::Image { mime } => AttachmentBlock::Image {
+                artifact,
+                mime: mime.clone(),
+                width: None,
+                height: None,
+            },
+            PendingKind::PastedText { lines } => AttachmentBlock::PastedText {
+                artifact,
+                lines: *lines,
+            },
+        })
+    }
+}
 
 /// One surface's composer: draft text, cursor, selection anchor, the
 /// column-sticky state for vertical movement, and the submitted-input
@@ -84,6 +139,12 @@ pub struct Composer {
     /// read it). `0` is the headless degenerate (nothing has rendered):
     /// visual rows fall back to the logical lines.
     wrap_budget: std::cell::Cell<usize>,
+    /// Pending attachment chips (B4b) — refs the NEXT submit carries.
+    /// Deliberately untouched by [`Self::take_for_submit`] /
+    /// [`Self::take_silent`] / history browsing: a slash command or a
+    /// free-text menu answer consumes the TEXT, never the chips. Only
+    /// [`Self::take_ready_attachments`] (a real turn) drains them.
+    attachments: Vec<PendingAttachment>,
 }
 
 /// Text-equality against string literals: the pre-TUI5 test corpus (and
@@ -242,6 +303,82 @@ impl Composer {
         if self.history.len() > HISTORY_CAP {
             self.history.remove(0);
         }
+    }
+
+    // ---- Pending attachments (B4b) ----
+
+    #[must_use]
+    pub fn attachments(&self) -> &[PendingAttachment] {
+        &self.attachments
+    }
+
+    #[must_use]
+    pub fn has_attachments(&self) -> bool {
+        !self.attachments.is_empty()
+    }
+
+    /// Any chip whose upload has not answered yet — the submit gate.
+    #[must_use]
+    pub fn has_uploading_attachment(&self) -> bool {
+        self.attachments.iter().any(|chip| chip.artifact.is_none())
+    }
+
+    pub fn push_attachment(&mut self, chip: PendingAttachment) {
+        self.attachments.push(chip);
+    }
+
+    /// ⌫ at the very start of the draft removes the NEWEST chip (chip-UI
+    /// law). Returns its label for the caller's display truth.
+    pub fn remove_newest_attachment(&mut self) -> Option<String> {
+        self.attachments.pop().map(|chip| chip.label)
+    }
+
+    /// The daemon's verified content address landed for `upload`. A chip
+    /// the user already removed stays removed — the reply resurrects
+    /// nothing (the CAS keeps the orphan bytes; nothing references them).
+    pub fn complete_attachment(&mut self, upload: u64, artifact: ArtifactRef) -> bool {
+        match self
+            .attachments
+            .iter_mut()
+            .find(|chip| chip.upload == upload)
+        {
+            Some(chip) => {
+                chip.artifact = Some(artifact);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The upload for `upload` failed — the chip dies (a chip whose bytes
+    /// the CAS never accepted would submit a dangling ref). Returns the
+    /// label for the honest notice.
+    pub fn fail_attachment(&mut self, upload: u64) -> Option<String> {
+        let index = self
+            .attachments
+            .iter()
+            .position(|chip| chip.upload == upload)?;
+        Some(self.attachments.remove(index).label)
+    }
+
+    /// Drop every chip still awaiting its upload reply (the disconnect
+    /// sweep: `artifact.put` is receipt-free, so no reply survives a
+    /// socket). Returns how many died, for the honest notice.
+    pub fn drop_uploading_attachments(&mut self) -> usize {
+        let before = self.attachments.len();
+        self.attachments.retain(|chip| chip.artifact.is_some());
+        before - self.attachments.len()
+    }
+
+    /// Drain the chips into wire blocks for a REAL submit. Callers gate on
+    /// [`Self::has_uploading_attachment`] first, so by construction every
+    /// chip is ready; a not-yet-ready straggler is dropped rather than
+    /// submitted as a dangling ref.
+    pub fn take_ready_attachments(&mut self) -> Vec<AttachmentBlock> {
+        std::mem::take(&mut self.attachments)
+            .iter()
+            .filter_map(PendingAttachment::ready_block)
+            .collect()
     }
 
     // ---- Editing (item 3) ----

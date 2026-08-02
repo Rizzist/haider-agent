@@ -307,6 +307,7 @@ fn a_reconnect_resends_the_outbox_under_the_same_durable_command_ids() {
             voice: false,
             title: false,
             branch: None,
+            attachments: vec![],
         },
     );
     let original = issued

@@ -455,6 +455,11 @@ pub struct CommandContext {
     /// the status-bar flash (owner bug: boot-time auto-refresh of a dead
     /// probe provider flashed `provider_error` at the launcher).
     models_provider: Option<String>,
+    /// The `artifact.put` flight's client-side identity (B4b): the upload
+    /// id and the ISSUING draft's surface key. The wire is receipt-free,
+    /// so this context is the ONLY thing that can route the reply —
+    /// success or error — back to the chip it belongs to.
+    upload: Option<(u64, crate::app::DraftKey)>,
 }
 
 impl CommandContext {
@@ -495,6 +500,12 @@ impl CommandContext {
             },
             attach: match command {
                 LiveCommand::Attach { session, .. } => Some(session.clone()),
+                _ => None,
+            },
+            upload: match command {
+                LiveCommand::ArtifactPut {
+                    upload, surface, ..
+                } => Some((*upload, *surface)),
                 _ => None,
             },
         }
@@ -542,7 +553,10 @@ pub fn request_body(command: LiveCommand) -> RequestBody {
         },
         // B2b encode-selection law: a captured branch rides the
         // branch-capable decode form; `None` keeps the LEGACY variant so
-        // main-branch wire bytes stay byte-for-byte historical.
+        // main-branch wire bytes stay byte-for-byte historical. B4b: the
+        // captured attachment blocks ride BOTH forms — the branch capture
+        // law and the attachment capture law never trade against each
+        // other.
         LiveCommand::Submit {
             command_id,
             session,
@@ -550,6 +564,7 @@ pub fn request_body(command: LiveCommand) -> RequestBody {
             text,
             mode,
             branch,
+            attachments,
         } => match branch {
             Some(branch_id) => RequestBody::TurnSubmitWithBranch {
                 command_id,
@@ -557,7 +572,7 @@ pub fn request_body(command: LiveCommand) -> RequestBody {
                 worker_generation,
                 branch_id: Some(branch_id),
                 text,
-                attachments: vec![],
+                attachments,
                 mode,
             },
             None => RequestBody::TurnSubmit {
@@ -565,8 +580,18 @@ pub fn request_body(command: LiveCommand) -> RequestBody {
                 session_id: session,
                 worker_generation,
                 text,
-                attachments: vec![],
+                attachments,
                 mode,
+            },
+        },
+        // B4b: receipt-free byte ingress — RFC 4648 STANDARD alphabet,
+        // exactly what the daemon's `artifact.put` decodes before hashing.
+        // The client-side `upload`/`surface` identity never reaches the
+        // wire; [`CommandContext`] carries it to the reply.
+        LiveCommand::ArtifactPut { bytes, .. } => RequestBody::ArtifactPut {
+            data_base64: {
+                use base64::Engine as _;
+                base64::engine::general_purpose::STANDARD.encode(bytes.as_slice())
             },
         },
         LiveCommand::Cancel {
@@ -814,6 +839,18 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
                 disposition,
             }]
         }),
+        // B4b: the verified content address closes the upload flight —
+        // routed by the context's client-side identity (the wire body
+        // carries no correlation of its own).
+        ResponseBody::ArtifactPut { artifact, .. } => {
+            context.upload.map_or_else(Vec::new, |(upload, surface)| {
+                vec![LiveReply::ArtifactUploaded {
+                    upload,
+                    surface,
+                    artifact,
+                }]
+            })
+        }
         ResponseBody::TurnCancel { .. } => context
             .command_id
             .clone()
@@ -1007,6 +1044,17 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
                 if let Some(provider) = context.models_provider.clone() {
                     return vec![LiveReply::ModelsRefreshFailed {
                         provider,
+                        message: message.clone(),
+                    }];
+                }
+                // B4b: an `artifact.put` error is identity-tagged from
+                // this context, exactly as a stage's is — the request is
+                // receipt-free, so the generic `Failed` path could never
+                // find the chip whose upload died.
+                if let Some((upload, surface)) = context.upload {
+                    return vec![LiveReply::ArtifactUploadFailed {
+                        upload,
+                        surface,
                         message: message.clone(),
                     }];
                 }

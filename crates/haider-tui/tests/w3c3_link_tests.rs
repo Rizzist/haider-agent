@@ -719,6 +719,7 @@ fn map_response_interprets_attach_outcomes_through_their_context() {
         text: "hi".into(),
         mode: DeliveryMode::Steer,
         branch: None,
+        attachments: vec![],
     });
     assert_eq!(
         map_response(

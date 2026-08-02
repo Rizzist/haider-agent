@@ -3499,7 +3499,11 @@ fn composer_height(model: &AppModel, width: u16) -> u16 {
     let rows = crate::composer::wrap_rows(model.composer.text(), composer_text_budget(width))
         .len()
         .clamp(1, COMPOSER_MAX_ROWS);
-    u16::try_from(rows).unwrap_or(1)
+    // B4b: pending attachment chips claim ONE row above the text rows —
+    // height and paint (`render_composer`) share this same predicate, so
+    // the band's geometry can never disagree with what lands in it.
+    let chips = u16::from(model.composer.has_attachments());
+    u16::try_from(rows).unwrap_or(1).saturating_add(chips)
 }
 
 /// The gold rule + composer rows on the input ground (sim InputBar,
@@ -3547,6 +3551,22 @@ fn render_composer(
     // of the band — including rows the composer does not fill — is covered
     // edge to edge (owner item 2).
     frame.render_widget(Block::default().style(theme.input_style()), row_area);
+    // B4b: the pending-attachment chip row rides the TOP of the band
+    // (same predicate as `composer_height`, so the row it paints is the
+    // row the layout granted). The text rows — and their click windows —
+    // shift down by exactly the carved row.
+    let mut row_area = row_area;
+    if model.login.is_none() && model.composer.has_attachments() && row_area.height > 1 {
+        frame.render_widget(
+            Paragraph::new(attachment_chip_line(model, theme)).style(theme.input_style()),
+            Rect {
+                height: 1,
+                ..row_area
+            },
+        );
+        row_area.y += 1;
+        row_area.height -= 1;
+    }
     let (lines, chip_at, windows) = composer_lines(model, theme, row_area.width, row_area.height);
     frame.render_widget(
         Paragraph::new(Text::from(lines)).style(theme.input_style()),
@@ -3589,6 +3609,27 @@ fn render_composer(
             },
         ));
     }
+}
+
+/// The pending-attachment chip row (B4b): one bracket chip per draft
+/// attachment, `⋯` while its upload is in flight, a dim removal hint
+/// after. Display truth only — every chip here is a block the next
+/// submit really carries (or an upload really in flight), nothing more.
+fn attachment_chip_line(model: &AppModel, theme: &Theme) -> Line<'static> {
+    let mut spans = vec![Span::raw(" ".repeat(COMPOSER_PAD))];
+    for chip in model.composer.attachments() {
+        let suffix = if chip.artifact.is_none() { " ⋯" } else { "" };
+        spans.push(Span::styled(
+            format!("[⌁ {}{suffix}]", chip.label),
+            theme.gold_style(),
+        ));
+        spans.push(Span::raw(" "));
+    }
+    spans.push(Span::styled(
+        "· ⌫ at the start removes".to_owned(),
+        theme.dim_style(),
+    ));
+    Line::from(spans)
 }
 
 /// One composer text row's clickable window (TUI5 item 5): where its
