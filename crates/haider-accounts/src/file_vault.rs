@@ -18,12 +18,13 @@
 
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use haider_protocol::error::ErrorCode;
 use haider_protocol::ids::CredentialAlias;
 use zeroize::Zeroizing;
 
-use crate::vault::{SecretHandle, Vault};
+use crate::vault::{SecretHandle, Vault, VaultRefreshLock};
 use crate::{AccountsResult, accounts_error};
 
 /// Largest secret the vault will store or read back — matches the OAuth
@@ -32,6 +33,9 @@ use crate::{AccountsResult, accounts_error};
 const MAX_SECRET_BYTES: u64 = 512 * 1024;
 
 const VAULT_SUFFIX: &str = ".vault";
+const REFRESH_LOCK_SUFFIX: &str = ".refresh.lock";
+
+static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 /// File-per-alias vault rooted at a daemon-owned directory.
 pub struct FileVault {
@@ -50,6 +54,13 @@ impl FileVault {
     fn path_for(&self, alias: &CredentialAlias) -> PathBuf {
         self.root
             .join(format!("{}{VAULT_SUFFIX}", hex::encode(alias.as_str())))
+    }
+
+    fn refresh_lock_path_for(&self, alias: &CredentialAlias) -> PathBuf {
+        self.root.join(format!(
+            ".{}{REFRESH_LOCK_SUFFIX}",
+            hex::encode(alias.as_str())
+        ))
     }
 
     fn ensure_root(&self) -> AccountsResult<()> {
@@ -84,12 +95,13 @@ impl Vault for FileVault {
         // or the new one, never a torn file — and the temp name carries the
         // hex alias (public), never secret material.
         let temp = self.root.join(format!(
-            ".{}.tmp-{}",
+            ".{}.tmp-{}-{}",
             hex::encode(alias.as_str()),
-            std::process::id()
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed),
         ));
         let mut options = std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
+        options.write(true).create_new(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
@@ -103,7 +115,11 @@ impl Vault for FileVault {
                 .and_then(|()| file.sync_all())
                 .map_err(|error| io_error("write vault secret", &error))?;
             drop(file);
-            std::fs::rename(&temp, &target).map_err(|error| io_error("commit vault secret", &error))
+            std::fs::rename(&temp, &target)
+                .map_err(|error| io_error("commit vault secret", &error))?;
+            std::fs::File::open(&self.root)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|error| io_error("sync vault directory", &error))
         })();
         if result.is_err() {
             let _ = std::fs::remove_file(&temp);
@@ -161,6 +177,31 @@ impl Vault for FileVault {
         }
         aliases.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         Ok(aliases)
+    }
+
+    fn try_refresh_lock(
+        &self,
+        alias: &CredentialAlias,
+    ) -> AccountsResult<Option<VaultRefreshLock>> {
+        self.ensure_root()?;
+        let path = self.refresh_lock_path_for(alias);
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options
+            .open(path)
+            .map_err(|error| io_error("open vault refresh lock", &error))?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(VaultRefreshLock::new(move || drop(file)))),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(error)) => {
+                Err(io_error("acquire vault refresh lock", &error))
+            }
+        }
     }
 }
 

@@ -1,0 +1,32 @@
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "kimi-coding-a",
+      "display_name": "Kimi Coding A",
+      "description": "OpenAI-protocol coding model",
+      "context_length": 262144,
+      "protocol": "openai",
+      "supports_reasoning": true,
+      "supports_image_in": true,
+      "supports_tool_use": true,
+      "supports_thinking_type": true,
+      "think_efforts": ["low", "high"]
+    },
+    {
+      "id": "kimi-coding-text",
+      "context_length": 131072,
+      "protocol": "openai",
+      "supports_reasoning": false,
+      "supports_image_in": false,
+      "supports_tool_use": true,
+      "supports_thinking_type": false
+    },
+    {
+      "id": "kimi-anthropic-residual",
+      "context_length": 262144,
+      "protocol": "anthropic",
+      "supports_reasoning": true
+    }
+  ]
+}

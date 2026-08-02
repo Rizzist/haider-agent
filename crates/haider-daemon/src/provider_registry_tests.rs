@@ -44,6 +44,7 @@ fn discovered_with_context(
         supported_efforts: Vec::new(),
         visible,
         priority,
+        extensions: None,
     }
 }
 
@@ -310,6 +311,46 @@ fn builtin_without_cached_models_is_unknown_not_available_with_guesses() {
         summary.availability_reason.as_deref(),
         Some("provider model inventory is unavailable")
     );
+}
+
+/// MUTATION CHECK: register Kimi as a generic/custom provider, API-key
+/// provider, or Responses dialect. Expected RUNTIME failure: the release-owned
+/// registry projection below changes its fixed endpoint or auth/API family.
+#[test]
+fn kimi_oauth_is_a_builtin_chat_completions_subscription_provider() {
+    let source = model_source([(
+        KIMI_OAUTH_PROVIDER_NAME,
+        vec![discovered_with_context(
+            "kimi-coding-a",
+            true,
+            None,
+            Some(262_144),
+        )],
+    )]);
+    let registry = ProviderRegistry::new(
+        MemoryProviderStore::default(),
+        initial_provider_profiles(
+            &std::collections::BTreeSet::from([KIMI_OAUTH_PROVIDER_NAME.to_owned()]),
+            "unused",
+        ),
+        source,
+    )
+    .expect("Kimi provider registry");
+    let summary = registry
+        .summaries()
+        .into_iter()
+        .next()
+        .expect("Kimi summary");
+    assert_eq!(summary.provider, KIMI_OAUTH_PROVIDER_NAME);
+    assert_eq!(
+        summary.api_family,
+        ProviderApiFamilyWire::OpenAiChatCompletions
+    );
+    assert_eq!(summary.endpoint.as_deref(), Some(KIMI_OAUTH_BASE_URL));
+    assert_eq!(summary.auth_methods, vec![AuthMethod::OAuth]);
+    assert_eq!(summary.availability, ProviderAvailabilityWire::Available);
+    assert_eq!(summary.models, vec!["kimi-coding-a"]);
+    assert_eq!(summary.model_details[0].context_window, Some(262_144));
 }
 
 /// MUTATION CHECK (W5g-5 live fix): revert `configured_profiles` to

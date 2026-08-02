@@ -1,0 +1,19 @@
+{
+  "model": "kimi-coding-a",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "hello"
+        }
+      ]
+    }
+  ],
+  "max_completion_tokens": 1,
+  "stream": true,
+  "stream_options": {
+    "include_usage": true
+  }
+}

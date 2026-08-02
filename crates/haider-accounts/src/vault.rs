@@ -9,7 +9,8 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use haider_protocol::error::ErrorCode;
 use haider_protocol::ids::CredentialAlias;
@@ -22,6 +23,39 @@ use crate::{AccountsResult, accounts_error};
 /// Callers must opt in to secret access through [`Self::expose_secret`].
 pub struct SecretHandle {
     secret: Zeroizing<Box<[u8]>>,
+}
+
+/// Opaque exclusive lease for a vault alias's refresh-token rotation.
+///
+/// The lease contains no credential bytes and releases on drop. Production
+/// file vaults override [`Vault::try_refresh_lock`] with an OS file lock so
+/// independent daemon processes serialize the read-refresh-persist critical
+/// section. The default implementation is a process-local gate for injected
+/// test vaults and alternate vault implementations.
+pub struct VaultRefreshLock {
+    release: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl VaultRefreshLock {
+    pub(crate) fn new(release: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            release: Some(Box::new(release)),
+        }
+    }
+}
+
+impl fmt::Debug for VaultRefreshLock {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("VaultRefreshLock")
+    }
+}
+
+impl Drop for VaultRefreshLock {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            release();
+        }
+    }
 }
 
 impl SecretHandle {
@@ -73,6 +107,48 @@ pub trait Vault: Send + Sync {
 
     /// Lists stored aliases in stable lexical order.
     fn list(&self) -> AccountsResult<Vec<CredentialAlias>>;
+
+    /// Attempts to acquire the exclusive refresh-rotation lease for `alias`.
+    ///
+    /// `Ok(None)` means another refresher owns it. Implementations must not
+    /// block: the daemon retries with cancellable async backoff. The default
+    /// gate is process-local; durable vaults should override it with an OS
+    /// lock keyed by their physical alias.
+    fn try_refresh_lock(
+        &self,
+        alias: &CredentialAlias,
+    ) -> AccountsResult<Option<VaultRefreshLock>> {
+        try_local_refresh_lock(alias)
+    }
+}
+
+fn try_local_refresh_lock(alias: &CredentialAlias) -> AccountsResult<Option<VaultRefreshLock>> {
+    static LOCKS: OnceLock<Mutex<BTreeMap<String, Weak<AtomicBool>>>> = OnceLock::new();
+    let locks = LOCKS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let gate = {
+        let mut locks = locks.lock().map_err(|_| {
+            accounts_error(
+                ErrorCode::Internal,
+                "vault refresh-lock registry was poisoned",
+                false,
+            )
+        })?;
+        let gate = locks
+            .get(alias.as_str())
+            .and_then(Weak::upgrade)
+            .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+        locks.insert(alias.as_str().to_owned(), Arc::downgrade(&gate));
+        gate
+    };
+    if gate
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Ok(None);
+    }
+    Ok(Some(VaultRefreshLock::new(move || {
+        gate.store(false, Ordering::Release);
+    })))
 }
 
 /// Process-local vault for tests and deterministic harnesses.

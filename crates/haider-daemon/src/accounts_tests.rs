@@ -83,6 +83,7 @@ fn test_provider_registry() -> ProviderRegistry<Box<dyn ProviderRegistryStoreLik
                     supported_efforts: Vec::new(),
                     visible: true,
                     priority: None,
+                    extensions: None,
                 })
                 .collect(),
         );
@@ -702,6 +703,7 @@ async fn retryable_rotation_bookkeeping_failure_waits_instead_of_killing_the_tur
             system_prompt_version: None,
             created_at_ms: 1,
         },
+        None,
     );
 
     let decision = resolver
@@ -4007,6 +4009,7 @@ async fn custom_provider_refresh_uses_stored_origin_and_publishes_discovered_slu
                     supported_efforts: Vec::new(),
                     visible: true,
                     priority: None,
+                    extensions: None,
                 }],
                 etag: None,
             })),
@@ -4020,6 +4023,7 @@ async fn custom_provider_refresh_uses_stored_origin_and_publishes_discovered_slu
                     supported_efforts: Vec::new(),
                     visible: true,
                     priority: None,
+                    extensions: None,
                 }],
                 etag: None,
             })),
@@ -4209,6 +4213,7 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
                     supported_efforts: vec!["low".to_owned(), "medium".to_owned()],
                     visible: true,
                     priority: Some(7),
+                    extensions: None,
                 }],
                 etag: Some(r#"W/"refresh-etag""#.to_owned()),
             })),
@@ -5692,6 +5697,7 @@ async fn provider_remove_commits_replays_fences_and_beats_restart_resurrection()
         supported_efforts: Vec::new(),
         visible: true,
         priority: None,
+        extensions: None,
     };
     store
         .put_provider_models(

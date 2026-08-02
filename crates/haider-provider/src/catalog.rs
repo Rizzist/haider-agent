@@ -61,6 +61,22 @@ pub struct DiscoveredModel {
     pub visible: bool,
     /// Picker ordering hint; lower sorts first.
     pub priority: Option<i64>,
+    /// Provider-declared capability metadata that is richer than the common
+    /// catalog contract. Absent for existing sources so their serialized
+    /// cache rows stay byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extensions: Option<DiscoveredModelExtensions>,
+}
+
+/// Kimi's declared model flags, kept as provider-owned facts rather than
+/// inferred from a model name.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DiscoveredModelExtensions {
+    pub protocol: String,
+    pub supports_reasoning: bool,
+    pub supports_vision: bool,
+    pub supports_tool_use: bool,
+    pub supports_thinking_type: bool,
 }
 
 /// The result of one discovery attempt.
@@ -100,6 +116,8 @@ pub enum CatalogSource {
     OpenAiSubscription,
     /// Anthropic's `/v1/models` under an OAuth bearer.
     AnthropicSubscription,
+    /// Kimi Code's nonstandard OAuth catalog.
+    KimiOAuth,
     /// An OpenAI-compatible custom profile's stored API origin.
     OpenAiCompatible { origin: String },
 }
@@ -117,9 +135,9 @@ pub fn catalog_request_url(source: CatalogSource, endpoint: &str) -> String {
         CatalogSource::OpenAiSubscription => {
             format!("{endpoint}?client_version={OPENAI_CODEX_MODELS_CLIENT_VERSION}")
         }
-        CatalogSource::AnthropicSubscription | CatalogSource::OpenAiCompatible { .. } => {
-            endpoint.to_owned()
-        }
+        CatalogSource::AnthropicSubscription
+        | CatalogSource::KimiOAuth
+        | CatalogSource::OpenAiCompatible { .. } => endpoint.to_owned(),
     }
 }
 
@@ -134,6 +152,7 @@ impl CatalogSource {
             Self::AnthropicSubscription => {
                 format!("{}/v1/models", crate::ANTHROPIC_OAUTH_BASE_URL)
             }
+            Self::KimiOAuth => format!("{}/models", crate::KIMI_OAUTH_BASE_URL),
             Self::OpenAiCompatible { origin } => {
                 format!("{}/models", origin.trim().trim_end_matches('/'))
             }
@@ -144,6 +163,7 @@ impl CatalogSource {
         match self {
             Self::OpenAiSubscription => Some("chatgpt.com"),
             Self::AnthropicSubscription => Some("api.anthropic.com"),
+            Self::KimiOAuth => Some("api.kimi.com"),
             Self::OpenAiCompatible { .. } => None,
         }
     }
@@ -216,7 +236,9 @@ pub async fn discover_models_with_resolver(
         CatalogSource::OpenAiCompatible { origin } => {
             (openai_compatible_catalog_endpoint(origin)?, None)
         }
-        CatalogSource::OpenAiSubscription | CatalogSource::AnthropicSubscription => {
+        CatalogSource::OpenAiSubscription
+        | CatalogSource::AnthropicSubscription
+        | CatalogSource::KimiOAuth => {
             let endpoint = source.endpoint();
             let Some(trusted_host) = source.trusted_host() else {
                 return Err(CatalogError::Unavailable {
@@ -342,9 +364,9 @@ pub fn parse_catalog(
         // codex: `{ "models": [ … ] }`
         CatalogSource::OpenAiSubscription => value.get("models"),
         // Anthropic and OpenAI-compatible: `{ "data": [ … ] }`
-        CatalogSource::AnthropicSubscription | CatalogSource::OpenAiCompatible { .. } => {
-            value.get("data")
-        }
+        CatalogSource::AnthropicSubscription
+        | CatalogSource::KimiOAuth
+        | CatalogSource::OpenAiCompatible { .. } => value.get("data"),
     }
     .and_then(serde_json::Value::as_array)
     .ok_or_else(|| CatalogError::Unavailable {
@@ -366,7 +388,18 @@ pub fn parse_catalog(
                 supported_efforts: Vec::new(),
                 visible: true,
                 priority: None,
+                extensions: None,
             });
+            continue;
+        }
+        if matches!(source, CatalogSource::KimiOAuth)
+            && entry
+                .get("protocol")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|protocol| protocol.eq_ignore_ascii_case("anthropic"))
+        {
+            // Residual documented by B6k: the Anthropic Messages adapter is
+            // intentionally not wired for Kimi until a later catalog wave.
             continue;
         }
         // codex names it `slug`; Anthropic names it `id`.
@@ -403,7 +436,50 @@ pub fn parse_catalog(
                 .get("context_window")
                 .and_then(serde_json::Value::as_u64)
                 .filter(|window| *window > 0),
+            CatalogSource::KimiOAuth => entry
+                .get("context_length")
+                .and_then(serde_json::Value::as_u64)
+                .filter(|window| *window > 0),
             CatalogSource::AnthropicSubscription | CatalogSource::OpenAiCompatible { .. } => None,
+        };
+        let kimi_extensions =
+            matches!(source, CatalogSource::KimiOAuth).then(|| DiscoveredModelExtensions {
+                protocol: entry
+                    .get("protocol")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("openai")
+                    .to_owned(),
+                supports_reasoning: entry
+                    .get("supports_reasoning")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                supports_vision: entry
+                    .get("supports_image_in")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                supports_tool_use: entry
+                    .get("supports_tool_use")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                supports_thinking_type: entry
+                    .get("supports_thinking_type")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+            });
+        let supported_efforts = if matches!(source, CatalogSource::KimiOAuth) {
+            entry
+                .get("think_efforts")
+                .and_then(serde_json::Value::as_array)
+                .map(|efforts| {
+                    efforts
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            supported_efforts
         };
         models.push(DiscoveredModel {
             slug: slug.to_owned(),
@@ -425,6 +501,7 @@ pub fn parse_catalog(
                 .and_then(serde_json::Value::as_str)
                 .is_none_or(|visibility| visibility == "list"),
             priority: entry.get("priority").and_then(serde_json::Value::as_i64),
+            extensions: kimi_extensions,
         });
     }
     Ok(models)

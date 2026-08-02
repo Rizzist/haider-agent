@@ -46,10 +46,10 @@ use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::CredentialAlias;
 use haider_provider::{
     ANTHROPIC_OAUTH_PROVIDER_NAME, ANTHROPIC_PROVIDER_NAME, AnthropicProvider,
-    BUILTIN_PROVIDER_NAMES, CatalogError, CatalogSource, DiscoveredCatalog, Message,
-    OPENAI_COMPATIBLE_PROVIDER_NAME, OPENAI_OAUTH_PROVIDER_NAME, OPENAI_PROVIDER_NAME,
-    OpenAiCompatibleProvider, OpenAiProvider, Provider, ProviderErrorKind, TurnRequest,
-    discover_models,
+    BUILTIN_PROVIDER_NAMES, CatalogError, CatalogSource, DiscoveredCatalog,
+    KIMI_OAUTH_PROVIDER_NAME, Message, OPENAI_COMPATIBLE_PROVIDER_NAME, OPENAI_OAUTH_PROVIDER_NAME,
+    OPENAI_PROVIDER_NAME, OpenAiCompatibleProvider, OpenAiProvider, Provider, ProviderErrorKind,
+    TurnRequest, discover_models,
 };
 use haider_rpc::{
     ERROR_CODE_BUSY, ERROR_CODE_CREDENTIAL_MISSING, ERROR_CODE_INVALID_ARGUMENT,
@@ -1614,6 +1614,9 @@ fn catalog_source(
             CatalogSource::AnthropicSubscription,
             ProviderAuthRequirementWire::OAuth,
         )),
+        KIMI_OAUTH_PROVIDER_NAME => {
+            Some((CatalogSource::KimiOAuth, ProviderAuthRequirementWire::OAuth))
+        }
         _ => {
             let profile = providers.get(provider)?;
             if profile.provenance != ProviderProvenance::Custom
@@ -4844,6 +4847,33 @@ fn build_account_provider(
                     .with_account(alias.clone()),
             )
         }
+        (KIMI_OAUTH_PROVIDER_NAME, AuthMethod::OAuth) => {
+            let inference = sanctioned_inference(provider).ok_or_else(|| {
+                HaiderError::new(
+                    ErrorCode::Unauthorized,
+                    "Kimi OAuth registration is unavailable",
+                    false,
+                )
+            })?;
+            if inference.auth_mode != OAuthInferenceAuthMode::Bearer
+                || inference.header_set != OAuthInferenceHeaderSet::KimiOpenAiChatCompletions
+            {
+                return Err(HaiderError::new(
+                    ErrorCode::Unauthorized,
+                    "Kimi OAuth inference metadata is invalid",
+                    false,
+                ));
+            }
+            Arc::new(
+                OpenAiCompatibleProvider::new_kimi_subscription(
+                    credential,
+                    model,
+                    inference.base_url,
+                )
+                .map_err(|error| adapter_construction_error(provider, error))?
+                .with_account(alias.clone()),
+            )
+        }
         _ => {
             return Err(HaiderError::new(
                 ErrorCode::InvalidArgument,
@@ -5094,7 +5124,7 @@ impl AccountsProviderFactory {
     async fn resolve_provider(
         &self,
         metadata: &haider_protocol::session::SessionMetadataV1,
-    ) -> Result<(ResolvedAccount, Arc<dyn Provider>), HaiderError> {
+    ) -> Result<(ResolvedAccount, Arc<dyn Provider>, Option<[u8; 32]>), HaiderError> {
         let mut resolved = self.resolve_account(&metadata.provider, None).await?;
         let credential = match self.resolve_secret(&resolved.descriptor).await {
             Ok(credential) => credential,
@@ -5114,8 +5144,11 @@ impl AccountsProviderFactory {
                 self.resolve_secret(&resolved.descriptor).await?
             }
         };
+        let oauth_access_fingerprint = (resolved.descriptor.provider == KIMI_OAUTH_PROVIDER_NAME
+            && resolved.descriptor.auth_method == AuthMethod::OAuth)
+            .then(|| *blake3::hash(credential.expose_secret()).as_bytes());
         let provider = self.build_provider(&resolved.descriptor, credential, &metadata.model)?;
-        Ok((resolved, provider))
+        Ok((resolved, provider, oauth_access_fingerprint))
     }
 }
 
@@ -5123,17 +5156,20 @@ struct AccountsAttemptResolver {
     factory: AccountsProviderFactory,
     metadata: haider_protocol::session::SessionMetadataV1,
     auth_refresh_attempted: AtomicBool,
+    oauth_access_fingerprint: Option<[u8; 32]>,
 }
 
 impl AccountsAttemptResolver {
     fn new(
         factory: AccountsProviderFactory,
         metadata: haider_protocol::session::SessionMetadataV1,
+        oauth_access_fingerprint: Option<[u8; 32]>,
     ) -> Self {
         Self {
             factory,
             metadata,
             auth_refresh_attempted: AtomicBool::new(false),
+            oauth_access_fingerprint,
         }
     }
 
@@ -5185,7 +5221,10 @@ impl haider_core::ProviderAttemptResolver for AccountsAttemptResolver {
                     let Some(broker) = &self.factory.broker else {
                         return Ok(haider_core::ProviderAttemptDecision::Stop);
                     };
-                    match broker.refresh_after_auth_failure(&current).await {
+                    match broker
+                        .refresh_after_auth_failure(&current, self.oauth_access_fingerprint)
+                        .await
+                    {
                         Ok(credential) => {
                             let provider = self.factory.build_provider(
                                 &current,
@@ -5270,7 +5309,8 @@ impl crate::worker::ProviderFactory for AccountsProviderFactory {
         &self,
         metadata: &haider_protocol::session::SessionMetadataV1,
     ) -> Result<crate::worker::ResolvedTurnProvider, HaiderError> {
-        let (resolved, provider) = self.resolve_provider(metadata).await?;
+        let (resolved, provider, oauth_access_fingerprint) =
+            self.resolve_provider(metadata).await?;
         let rotation_budget_consumed = resolved.rotation.is_some();
         let context_window = self.model_context_window(&metadata.provider, &metadata.model);
         Ok(crate::worker::ResolvedTurnProvider {
@@ -5282,8 +5322,11 @@ impl crate::worker::ProviderFactory for AccountsProviderFactory {
             initial_rotation: resolved.rotation,
             rotation_budget_consumed,
             attempt_resolver: self.broker.as_ref().map(|_| {
-                Arc::new(AccountsAttemptResolver::new(self.clone(), metadata.clone()))
-                    as Arc<dyn haider_core::ProviderAttemptResolver>
+                Arc::new(AccountsAttemptResolver::new(
+                    self.clone(),
+                    metadata.clone(),
+                    oauth_access_fingerprint,
+                )) as Arc<dyn haider_core::ProviderAttemptResolver>
             }),
         })
     }
@@ -5930,10 +5973,11 @@ impl AccountsRuntime {
         };
         match &vault {
             VaultProvision::Available(scoped) => {
-                let oauth = OAuthCoordinator::new(
+                let oauth = OAuthCoordinator::new_with_vault(
                     instance_id.to_owned(),
                     dependencies.oauth_catalog.clone(),
                     dependencies.oauth_coordinator,
+                    Arc::clone(scoped),
                 )
                 .map_err(crate::oauth::oauth_error)?;
                 let (actor, broker) = start_account_actor_with_broker(actor_config, |commands| {

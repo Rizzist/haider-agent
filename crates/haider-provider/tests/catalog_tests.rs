@@ -254,6 +254,7 @@ fn openai_compatible_ids_are_models_without_invented_metadata() {
                 supported_efforts: Vec::new(),
                 visible: true,
                 priority: None,
+                extensions: None,
             },
             DiscoveredModel {
                 slug: "custom-model-b".to_owned(),
@@ -264,6 +265,7 @@ fn openai_compatible_ids_are_models_without_invented_metadata() {
                 supported_efforts: Vec::new(),
                 visible: true,
                 priority: None,
+                extensions: None,
             },
         ]
     );
@@ -339,6 +341,61 @@ fn endpoints_are_the_vendor_paths() {
         CatalogSource::AnthropicSubscription.endpoint(),
         "https://api.anthropic.com/v1/models"
     );
+    assert_eq!(
+        CatalogSource::KimiOAuth.endpoint(),
+        "https://api.kimi.com/coding/v1/models"
+    );
+}
+
+/// MUTATION CHECK: parse Kimi through the generic compatible shape, retain
+/// Anthropic-protocol rows, or guess capability flags. Expected RUNTIME
+/// failure: the provider fixture below changes its exact declared facts.
+#[test]
+fn models_catalog_parses_context_length_and_skips_anthropic_protocol() {
+    let payload: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/catalog/kimi_models.json"))
+            .expect("Kimi models fixture");
+    let models = parse_catalog(CatalogSource::KimiOAuth, &payload).expect("Kimi catalog parses");
+    assert_eq!(
+        models
+            .iter()
+            .map(|model| model.slug.as_str())
+            .collect::<Vec<_>>(),
+        vec!["kimi-coding-a", "kimi-coding-text"],
+        "Anthropic-protocol residuals are intentionally not wired in B6k"
+    );
+    let model = &models[0];
+    assert_eq!(model.display_name, "Kimi Coding A");
+    assert_eq!(model.context_window, Some(262_144));
+    assert_eq!(model.supported_efforts, ["low", "high"]);
+    let flags = model.extensions.as_ref().expect("Kimi flags");
+    assert_eq!(flags.protocol, "openai");
+    assert!(flags.supports_reasoning);
+    assert!(flags.supports_vision);
+    assert!(flags.supports_tool_use);
+    assert!(flags.supports_thinking_type);
+}
+
+/// MUTATION CHECK: serialize the new Kimi extension field as null on old
+/// catalog rows. Expected RUNTIME failure: the pinned pre-B6k cache row gains
+/// bytes and older persisted catalogs churn.
+#[test]
+fn legacy_catalog_rows_serialize_byte_identically() {
+    let row = DiscoveredModel {
+        slug: "legacy".into(),
+        display_name: "Legacy".into(),
+        context_window: None,
+        description: None,
+        default_effort: None,
+        supported_efforts: Vec::new(),
+        visible: true,
+        priority: None,
+        extensions: None,
+    };
+    assert_eq!(
+        serde_json::to_string(&row).expect("serialize legacy row"),
+        r#"{"slug":"legacy","display_name":"Legacy","context_window":null,"description":null,"default_effort":null,"supported_efforts":[],"visible":true,"priority":null}"#
+    );
 }
 
 /// The display fallback: a provider that names no display_name shows its
@@ -361,6 +418,7 @@ fn display_name_falls_back_to_the_slug() {
             supported_efforts: Vec::new(),
             visible: true,
             priority: None,
+            extensions: None,
         }]
     );
 }

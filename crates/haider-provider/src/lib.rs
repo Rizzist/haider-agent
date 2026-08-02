@@ -36,28 +36,30 @@ pub use anthropic::{
     replay_anthropic_http_error, replay_anthropic_sse,
 };
 pub use catalog::{
-    CatalogError, CatalogSource, DiscoveredCatalog, DiscoveredModel, catalog_request_url,
-    discover_models, discover_models_with_resolver, openai_compatible_catalog_endpoint,
-    parse_catalog, pickable,
+    CatalogError, CatalogSource, DiscoveredCatalog, DiscoveredModel, DiscoveredModelExtensions,
+    catalog_request_url, discover_models, discover_models_with_resolver,
+    openai_compatible_catalog_endpoint, parse_catalog, pickable,
 };
 pub use openai::{
+    KIMI_OAUTH_BASE_URL, KIMI_OAUTH_PROVIDER_NAME, KimiThinkingConfig, KimiThinkingType,
     OPENAI_CODEX_RESPONSES_LITE_HEADER, OPENAI_CODEX_RESPONSES_LITE_VALUE,
     OPENAI_COMPATIBLE_PROVIDER_NAME, OPENAI_OAUTH_PROVIDER_NAME, OPENAI_PROVIDER_NAME,
     OPENAI_RESPONSES_API_URL, OPENAI_SUBSCRIPTION_BASE_URL, OPENAI_SUBSCRIPTION_RESPONSES_URL,
     OpenAiCapture, OpenAiCompatibleProvider, OpenAiProvider, OpenAiRetryPolicy,
-    OpenAiTransportConfig, replay_openai_chat_sse, replay_openai_http_error,
-    replay_openai_models_response, replay_openai_responses_sse,
+    OpenAiTransportConfig, replay_kimi_models_response, replay_openai_chat_sse,
+    replay_openai_http_error, replay_openai_models_response, replay_openai_responses_sse,
     validate_openai_compatible_endpoint,
 };
 pub use origin::{FixedDnsResolver, FixedOriginGuard, SystemFixedDnsResolver};
 
 /// Provider classes backed by production account credentials in this release.
-pub const BUILTIN_PROVIDER_NAMES: [&str; 5] = [
+pub const BUILTIN_PROVIDER_NAMES: [&str; 6] = [
     ANTHROPIC_PROVIDER_NAME,
     ANTHROPIC_OAUTH_PROVIDER_NAME,
     OPENAI_PROVIDER_NAME,
     OPENAI_OAUTH_PROVIDER_NAME,
     OPENAI_COMPATIBLE_PROVIDER_NAME,
+    KIMI_OAUTH_PROVIDER_NAME,
 ];
 
 /// Crate marker used by the workspace self-test.

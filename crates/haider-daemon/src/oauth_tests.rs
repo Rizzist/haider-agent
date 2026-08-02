@@ -73,6 +73,7 @@ struct FakeState {
     refresh_calls: AtomicUsize,
     saw_client_secret: AtomicBool,
     token_encodings: Mutex<Vec<(String, String)>>,
+    msh_headers: Mutex<Vec<HashMap<String, String>>>,
     expect_refresh_binding: AtomicBool,
     expect_code_state: AtomicBool,
     verifiers: Mutex<Vec<String>>,
@@ -108,6 +109,7 @@ impl FakeOAuthServer {
             refresh_calls: AtomicUsize::new(0),
             saw_client_secret: AtomicBool::new(false),
             token_encodings: Mutex::new(Vec::new()),
+            msh_headers: Mutex::new(Vec::new()),
             expect_refresh_binding: AtomicBool::new(true),
             expect_code_state: AtomicBool::new(false),
             verifiers: Mutex::new(Vec::new()),
@@ -159,11 +161,43 @@ impl FakeOAuthServer {
 }
 
 async fn serve_fake_request(mut stream: TcpStream, state: Arc<FakeState>) {
-    let Some((method, target, authorization, content_type, body)) =
+    let Some((method, target, authorization, content_type, headers, body)) =
         read_http_request(&mut stream).await
     else {
         return;
     };
+    if target == "/device_authorization" || target == "/token" {
+        state
+            .msh_headers
+            .lock()
+            .expect("MSH header lock")
+            .push(headers);
+    }
+    if target == "/device_authorization" {
+        assert_eq!(method, "POST");
+        assert_eq!(
+            content_type.as_deref(),
+            Some("application/x-www-form-urlencoded")
+        );
+        let fields = url::form_urlencoded::parse(body.as_bytes())
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(fields.len(), 1);
+        assert_eq!(
+            fields.get("client_id").map(String::as_str),
+            Some("haider-public-fake")
+        );
+        let response = serde_json::json!({
+            "device_code": "DEVICE_CODE_SENTINEL_54bf",
+            "user_code": "ABCD-EFGH",
+            "verification_uri_complete": format!("{}/verify?user_code=ABCD-EFGH", state.issuer),
+            "expires_in": 60,
+            "interval": 1
+        })
+        .to_string();
+        write_http(&mut stream, 200, &[], response.as_bytes()).await;
+        return;
+    }
     if target.starts_with("/authorize") {
         let parsed = Url::parse(&format!("http://fake{target}")).expect("authorize URL");
         let params = parsed
@@ -231,7 +265,7 @@ async fn serve_fake_request(mut stream: TcpStream, state: Arc<FakeState>) {
         write_http(&mut stream, 404, &[], b"not found").await;
         return;
     }
-    state.token_calls.fetch_add(1, Ordering::SeqCst);
+    let token_call = state.token_calls.fetch_add(1, Ordering::SeqCst);
     let fields = if content_type.as_deref() == Some("application/json") {
         serde_json::from_str::<HashMap<String, String>>(&body).expect("JSON token request")
     } else {
@@ -245,6 +279,40 @@ async fn serve_fake_request(mut stream: TcpStream, state: Arc<FakeState>) {
         .lock()
         .expect("token encoding lock")
         .push((grant.to_owned(), content_type.clone().unwrap_or_default()));
+    if grant == "urn:ietf:params:oauth:grant-type:device_code" {
+        assert_eq!(fields.len(), 3);
+        assert_eq!(
+            fields.get("device_code").map(String::as_str),
+            Some("DEVICE_CODE_SENTINEL_54bf")
+        );
+        assert_eq!(
+            fields.get("client_id").map(String::as_str),
+            Some("haider-public-fake")
+        );
+        if token_call == 0 {
+            write_http(
+                &mut stream,
+                400,
+                &[],
+                br#"{"error":"authorization_pending"}"#,
+            )
+            .await;
+        } else if token_call == 1 {
+            write_http(&mut stream, 400, &[], br#"{"error":"slow_down"}"#).await;
+        } else {
+            let response = serde_json::json!({
+                "access_token": ACCESS_SENTINEL,
+                "refresh_token": REFRESH_SENTINEL,
+                "token_type": "Bearer",
+                "expires_in": 600,
+                "refresh_expires_in": 3600,
+                "scope": ""
+            })
+            .to_string();
+            write_http(&mut stream, 200, &[], response.as_bytes()).await;
+        }
+        return;
+    }
     if grant == "refresh_token" {
         state.refresh_calls.fetch_add(1, Ordering::SeqCst);
         if state.expect_refresh_binding.load(Ordering::SeqCst) {
@@ -426,7 +494,14 @@ async fn serve_fake_request(mut stream: TcpStream, state: Arc<FakeState>) {
 
 async fn read_http_request(
     stream: &mut TcpStream,
-) -> Option<(String, String, Option<String>, Option<String>, String)> {
+) -> Option<(
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    HashMap<String, String>,
+    String,
+)> {
     let mut bytes = Vec::new();
     let mut chunk = [0_u8; 1024];
     let header_end = loop {
@@ -466,6 +541,14 @@ async fn read_http_request(
         name.eq_ignore_ascii_case("content-type")
             .then(|| value.trim().to_ascii_lowercase())
     });
+    let header_map = headers
+        .split("\r\n")
+        .skip(1)
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            Some((name.to_ascii_lowercase(), value.trim().to_owned()))
+        })
+        .collect::<HashMap<_, _>>();
     while bytes.len() < header_end.saturating_add(content_length) {
         let count = stream.read(&mut chunk).await.ok()?;
         if count == 0 {
@@ -474,7 +557,14 @@ async fn read_http_request(
         bytes.extend_from_slice(&chunk[..count]);
     }
     let body = String::from_utf8(bytes[header_end..header_end + content_length].to_vec()).ok()?;
-    Some((method, target, authorization, content_type, body))
+    Some((
+        method,
+        target,
+        authorization,
+        content_type,
+        header_map,
+        body,
+    ))
 }
 
 async fn write_http(stream: &mut TcpStream, status: u16, headers: &[(&str, String)], body: &[u8]) {
@@ -712,6 +802,44 @@ async fn started_flow(
     (flow_id, url.expose_authorization_url().to_owned(), port)
 }
 
+/// Await the device-flow start frame without ever parking the runtime on a
+/// bare `recv`: the paused-clock runner test drives real loopback I/O through
+/// [`drive_paused_io`], and an uninhibited park would auto-advance the frozen
+/// clock into the production client's connect/request timers while the
+/// device-authorization request is still on the wire.
+async fn started_device_flow(
+    receiver: &mut mpsc::UnboundedReceiver<WireFrame>,
+) -> (OAuthFlowId, String) {
+    let mut received = None;
+    for _ in 0..2_000 {
+        match receiver.try_recv() {
+            Ok(frame) => {
+                received = Some(frame);
+                break;
+            }
+            Err(mpsc::error::TryRecvError::Empty) => drive_paused_io(1).await,
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                panic!("device start channel closed")
+            }
+        }
+    }
+    let frame = received.expect("device start response");
+    let WireFrame::Response {
+        body:
+            ResponseBody::AccountOAuthStart {
+                flow_id: Some(flow_id),
+                authorization_url: Some(url),
+                loopback_port: None,
+                ..
+            },
+        ..
+    } = frame
+    else {
+        panic!("unexpected device start response: {frame:?}");
+    };
+    (flow_id, url.expose_authorization_url().to_owned())
+}
+
 async fn wait_ready(coordinator: &OAuthCoordinator, flow_id: &OAuthFlowId) -> OAuthFlowStatusWire {
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
@@ -720,7 +848,9 @@ async fn wait_ready(coordinator: &OAuthCoordinator, flow_id: &OAuthFlowId) -> OA
                 .expect("owned flow");
             if !matches!(
                 status,
-                OAuthFlowStatusWire::WaitingBrowser | OAuthFlowStatusWire::Exchanging
+                OAuthFlowStatusWire::WaitingBrowser
+                    | OAuthFlowStatusWire::WaitingDevice
+                    | OAuthFlowStatusWire::Exchanging
             ) {
                 break status;
             }
@@ -736,7 +866,7 @@ async fn wait_ready(coordinator: &OAuthCoordinator, flow_id: &OAuthFlowId) -> OA
 /// Verified by revert on 2026-07-29.
 #[test]
 fn sanctioned_oauth_table_has_exact_owner_grants_and_precise_reasons() {
-    assert_eq!(SANCTIONED_PROVIDER_REGISTRATIONS.len(), 2);
+    assert_eq!(SANCTIONED_PROVIDER_REGISTRATIONS.len(), 3);
     let openai = SANCTIONED_PROVIDER_REGISTRATIONS
         .iter()
         .find(|registration| registration.provider_id == "openai-oauth")
@@ -825,8 +955,35 @@ fn sanctioned_oauth_table_has_exact_owner_grants_and_precise_reasons() {
         "oauth-2025-04-20"
     );
 
+    let kimi = SANCTIONED_PROVIDER_REGISTRATIONS
+        .iter()
+        .find(|registration| registration.provider_id == "kimi-oauth")
+        .expect("Kimi OAuth registration");
+    assert_eq!(kimi.issuer, "https://auth.kimi.com");
+    assert_eq!(
+        kimi.authorization_endpoint,
+        "https://auth.kimi.com/api/oauth/device_authorization"
+    );
+    assert_eq!(kimi.token_endpoint, "https://auth.kimi.com/api/oauth/token");
+    assert_eq!(kimi.client_id, "17e5f671-d194-4dfb-9706-5516cb48c098");
+    assert!(kimi.scopes.is_empty());
+    assert_eq!(kimi.flow_mode, OAuthFlowMode::DeviceCode);
+    assert_eq!(kimi.auth_header_set, OAuthAuthHeaderSet::KimiMsh);
+    assert_eq!(kimi.refresh_policy, OAuthRefreshPolicy::SerializedRotating);
+    assert_eq!(kimi.refresh_encoding, OAuthTokenRequestEncoding::Form);
+    assert!(!kimi.refresh_includes_binding);
+    assert!(!kimi.retain_refresh_on_omission);
+    assert_eq!(
+        kimi.inference,
+        OAuthInferenceRegistration {
+            base_url: "https://api.kimi.com/coding/v1",
+            auth_mode: OAuthInferenceAuthMode::Bearer,
+            header_set: OAuthInferenceHeaderSet::KimiOpenAiChatCompletions,
+        }
+    );
+
     let catalog = OAuthProviderCatalog::default();
-    for provider in ["openai-oauth", "anthropic-oauth"] {
+    for provider in ["openai-oauth", "anthropic-oauth", "kimi-oauth"] {
         assert_eq!(
             catalog.availability(provider, true),
             OAuthAvailabilityWire {
@@ -856,6 +1013,196 @@ fn sanctioned_oauth_table_has_exact_owner_grants_and_precise_reasons() {
             ),
         }
     );
+}
+
+/// MUTATION CHECK: make explicit 429/5xx responses terminal, retry an
+/// ambiguous transport error, or remove the three-attempt bound. Expected
+/// RUNTIME failure: the pure delay policy changes below.
+#[test]
+fn kimi_refresh_backoff_is_bounded_to_explicit_retryable_statuses() {
+    let status = classify_token_error(503, b"bounded fixture body");
+    assert_eq!(
+        kimi_refresh_retry_delay(&status, 1),
+        Some(Duration::from_millis(250))
+    );
+    assert_eq!(
+        kimi_refresh_retry_delay(&status, 2),
+        Some(Duration::from_millis(500))
+    );
+    assert_eq!(kimi_refresh_retry_delay(&status, 3), None);
+    assert_eq!(
+        kimi_refresh_retry_delay(
+            &OAuthPublicError::new("token_endpoint_unavailable", true),
+            1,
+        ),
+        None,
+        "an ambiguous transport failure must not replay a rotating token"
+    );
+    assert_eq!(
+        kimi_refresh_retry_delay(
+            &classify_token_error(401, br#"{"error":"invalid_grant"}"#),
+            1
+        ),
+        None
+    );
+}
+
+/// MUTATION CHECK: force a fresh rotation before comparing the access token
+/// that actually received the 401 with the under-vault re-read. Expected
+/// RUNTIME failure: this unreachable token endpoint is contacted instead of
+/// adopting the already-persisted access generation.
+#[tokio::test]
+async fn forced_401_reread_adopts_already_rotated_access_without_refresh_post() {
+    const CURRENT_ACCESS: &[u8] = b"already-rotated-access-generation";
+
+    let registration = OAuthProviderRegistration::new(
+        "fake-oauth",
+        "http://127.0.0.1:9",
+        "http://127.0.0.1:9/device_authorization",
+        "http://127.0.0.1:9/token",
+        "haider-public-fake",
+        ["openid".to_owned()],
+        AUDIENCE,
+        Some("fake-api-resource".into()),
+        true,
+        Arc::new(FakeIdentityVerifier),
+    )
+    .expect("offline registration")
+    .with_test_device_flow();
+    let descriptor = oauth_descriptor_for_test();
+    let vault = Arc::new(MemoryVault::new());
+    let bundle = OAuthTokenBundleV1::new(
+        "fake-oauth".into(),
+        "http://127.0.0.1:9".into(),
+        AUDIENCE.into(),
+        Some("fake-api-resource".into()),
+        "Bearer".into(),
+        Zeroizing::new(CURRENT_ACCESS.to_vec()),
+        Some(Zeroizing::new(
+            b"already-rotated-refresh-generation".to_vec(),
+        )),
+        now_ms().expect("clock").saturating_add(600_000),
+        None,
+        Vec::new(),
+        OAuthIdentityV1 {
+            subject_hash: "subject-hash".into(),
+            display_identity: descriptor.identity.clone(),
+        },
+        2,
+    )
+    .expect("already-rotated bundle")
+    .with_refresh_after(now_ms().expect("clock").saturating_add(300_000));
+    vault
+        .put(&descriptor.alias, &bundle.encode().expect("encode"))
+        .expect("store already-rotated bundle");
+    let snapshot = Arc::new(Mutex::new(vec![descriptor.clone()]));
+    let broker = CredentialBroker::new(
+        vault.clone() as Arc<dyn Vault>,
+        OAuthProviderCatalog::with_test_registrations([registration]).expect("catalog"),
+        Arc::clone(&snapshot),
+        start_status_actor(&snapshot, vault),
+    )
+    .expect("broker");
+    let failed = *blake3::hash(b"superseded-access-generation").as_bytes();
+    let adopted = broker
+        .refresh_after_auth_failure(&descriptor, Some(failed))
+        .await
+        .expect("adopt already-rotated access");
+    assert_eq!(adopted.expose_secret(), CURRENT_ACCESS);
+    assert!(broker.shutdown().await);
+}
+
+/// MUTATION CHECK: drop the `!rejection_marker_active` guard from the
+/// forced-401 fingerprint-adoption fast path in `resolve_oauth` (or serve the
+/// vault bundle directly whenever the failed fingerprint differs). Expected
+/// RUNTIME failure: the marked bundle's still-unexpired access token is
+/// returned instead of the typed re-login below. An ACTIVE rejection or
+/// uncertainty marker means no successful rotation ever replaced this bundle
+/// — a real rotation durably clears the marker under the alias lease — so
+/// its access token belongs to the rejected/uncertain generation and must
+/// only resolve through the serialized under-lease path.
+#[tokio::test]
+async fn forced_401_reread_never_adopts_an_actively_marked_rotating_bundle() {
+    let registration = OAuthProviderRegistration::new(
+        "fake-oauth",
+        "http://127.0.0.1:9",
+        "http://127.0.0.1:9/device_authorization",
+        "http://127.0.0.1:9/token",
+        "haider-public-fake",
+        ["openid".to_owned()],
+        AUDIENCE,
+        Some("fake-api-resource".into()),
+        true,
+        Arc::new(FakeIdentityVerifier),
+    )
+    .expect("offline registration")
+    .with_test_device_flow();
+    let descriptor = oauth_descriptor_for_test();
+    let vault = Arc::new(MemoryVault::new());
+    let now = now_ms().expect("clock");
+    let bundle = OAuthTokenBundleV1::new(
+        "fake-oauth".into(),
+        "http://127.0.0.1:9".into(),
+        AUDIENCE.into(),
+        Some("fake-api-resource".into()),
+        "Bearer".into(),
+        Zeroizing::new(b"tombstoned-generation-access".to_vec()),
+        Some(Zeroizing::new(b"tombstoned-generation-refresh".to_vec())),
+        now.saturating_add(600_000),
+        None,
+        Vec::new(),
+        OAuthIdentityV1 {
+            subject_hash: "subject-hash".into(),
+            display_identity: descriptor.identity.clone(),
+        },
+        2,
+    )
+    .expect("marked bundle")
+    // Refresh is NOT otherwise due: the active marker alone must force the
+    // serialized under-lease path instead of any vault fast path.
+    .with_refresh_after(now.saturating_add(300_000))
+    .with_refresh_rejected_until(now.saturating_add(300_000));
+    vault
+        .put(&descriptor.alias, &bundle.encode().expect("encode"))
+        .expect("store marked bundle");
+    let snapshot = Arc::new(Mutex::new(vec![descriptor.clone()]));
+    let broker = CredentialBroker::new(
+        vault.clone() as Arc<dyn Vault>,
+        OAuthProviderCatalog::with_test_registrations([registration]).expect("catalog"),
+        Arc::clone(&snapshot),
+        start_status_actor(&snapshot, vault.clone() as Arc<dyn Vault>),
+    )
+    .expect("broker");
+    // The 401 belongs to an older access generation, so the fingerprint
+    // DIFFERS from the marked bundle's access token — the exact shape the
+    // adoption fast path would otherwise serve straight from the vault.
+    let failed = *blake3::hash(b"superseded-access-generation").as_bytes();
+    let error = broker
+        .refresh_after_auth_failure(&descriptor, Some(failed))
+        .await
+        .expect_err("an actively marked bundle requires re-login, never direct adoption");
+    assert_eq!(error.code, ErrorCode::Unauthorized);
+    assert_eq!(
+        error
+            .details
+            .as_ref()
+            .and_then(|details| details.get("kind"))
+            .and_then(serde_json::Value::as_str),
+        Some("oauth_relogin_required")
+    );
+    // The under-lease path refuses without touching the marked bundle: the
+    // tombstone and generation are exactly as seeded, and the unreachable
+    // token endpoint proves no rotating request was attempted.
+    let stored = vault
+        .resolve(&descriptor.alias)
+        .and_then(|stored| OAuthTokenBundleV1::decode(stored.expose_secret()))
+        .expect("marked bundle remains durable");
+    assert_eq!(stored.generation, 2);
+    assert_eq!(
+        stored.refresh_rejected_until_unix_ms,
+        bundle.refresh_rejected_until_unix_ms
+    );
+    assert!(broker.shutdown().await);
 }
 
 /// MUTATION CHECK 1: remove the imported-Codex branch from `resolve_oauth`.
@@ -1164,9 +1511,14 @@ async fn openai_protocol_uses_extra_authorize_params_form_code_and_json_refresh(
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .expect("refresh client");
-    exchange_refresh_token(&client, &refresh_registration, REFRESH_SENTINEL.as_bytes())
-        .await
-        .expect("JSON refresh");
+    exchange_refresh_token(
+        &client,
+        &refresh_registration,
+        REFRESH_SENTINEL.as_bytes(),
+        None,
+    )
+    .await
+    .expect("JSON refresh");
     assert_eq!(
         *server
             .state
@@ -1222,9 +1574,14 @@ async fn anthropic_protocol_uses_json_code_with_state_and_json_refresh() {
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .expect("refresh client");
-    exchange_refresh_token(&client, &refresh_registration, REFRESH_SENTINEL.as_bytes())
-        .await
-        .expect("JSON refresh");
+    exchange_refresh_token(
+        &client,
+        &refresh_registration,
+        REFRESH_SENTINEL.as_bytes(),
+        None,
+    )
+    .await
+    .expect("JSON refresh");
     assert_eq!(
         *server
             .state
@@ -2326,6 +2683,237 @@ fn broker_for(
     (broker, snapshot, descriptor)
 }
 
+fn serialized_registration(server: &FakeOAuthServer) -> OAuthProviderRegistration {
+    server
+        .registration(Arc::new(FakeIdentityVerifier))
+        .with_test_device_flow()
+}
+
+fn independent_serialized_broker(
+    server: &FakeOAuthServer,
+    vault: Arc<dyn Vault>,
+    descriptor: &CredentialDescriptor,
+) -> (CredentialBroker, crate::accounts::AccountsSnapshot) {
+    let snapshot = Arc::new(Mutex::new(vec![descriptor.clone()]));
+    let broker = CredentialBroker::new(
+        Arc::clone(&vault),
+        OAuthProviderCatalog::with_test_registrations([serialized_registration(server)])
+            .expect("serialized catalog"),
+        Arc::clone(&snapshot),
+        start_status_actor(&snapshot, vault),
+    )
+    .expect("serialized broker");
+    (broker, snapshot)
+}
+
+/// MUTATION CHECK: remove a Kimi MSH header, add PKCE/client-secret fields,
+/// stop polling after `authorization_pending`, or omit the persisted refresh
+/// threshold. Expected RUNTIME failure: this fixture observes the wire shape,
+/// cannot reach tokens, or finds an immediately/late refreshed bundle.
+#[tokio::test]
+async fn device_flow_polls_to_tokens_with_required_msh_headers() {
+    const DEVICE_ID: &str = "123e4567-e89b-42d3-a456-426614174000";
+
+    let server = FakeOAuthServer::start(FakeMode::Success, false).await;
+    let mut registration = serialized_registration(&server);
+    registration.authorization_endpoint =
+        Url::parse(&format!("http://{}/device_authorization", server.address))
+            .expect("device authorization endpoint");
+    let vault = Arc::new(MemoryVault::new());
+    vault
+        .put(
+            &CredentialAlias::new(KIMI_DEVICE_ALIAS),
+            DEVICE_ID.as_bytes(),
+        )
+        .expect("seed stable device ID");
+    let device_id = load_or_create_kimi_device_id(vault as Arc<dyn Vault>)
+        .await
+        .expect("load stable device ID");
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(Policy::none())
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(2))
+        .build()
+        .expect("device fixture client");
+
+    let authorization = request_device_authorization(&client, &registration, &device_id)
+        .await
+        .expect("device authorization");
+    assert_eq!(authorization.user_code.0.as_slice(), b"ABCD-EFGH");
+    assert!(matches!(
+        poll_device_token(
+            &client,
+            &registration,
+            authorization.device_code.0.as_slice(),
+            &device_id,
+        )
+        .await
+        .expect("pending poll"),
+        DeviceTokenPoll::Pending
+    ));
+    assert!(matches!(
+        poll_device_token(
+            &client,
+            &registration,
+            authorization.device_code.0.as_slice(),
+            &device_id,
+        )
+        .await
+        .expect("slow-down poll"),
+        DeviceTokenPoll::SlowDown
+    ));
+    let DeviceTokenPoll::Tokens(bytes) = poll_device_token(
+        &client,
+        &registration,
+        authorization.device_code.0.as_slice(),
+        &device_id,
+    )
+    .await
+    .expect("successful poll") else {
+        panic!("third device poll must produce tokens");
+    };
+    let before = now_ms().expect("clock");
+    let bundle = token_bundle_from_response(&registration, &bytes, &[], 1, None)
+        .await
+        .expect("Kimi token bundle");
+    assert_eq!(bundle.access_token(), ACCESS_SENTINEL.as_bytes());
+    assert_eq!(bundle.refresh_token(), Some(REFRESH_SENTINEL.as_bytes()));
+    assert!(bundle.refresh_after_unix_ms.is_some_and(|refresh_after| {
+        refresh_after >= before.saturating_add(300_000)
+            && refresh_after <= before.saturating_add(301_000)
+    }));
+
+    let captured = server.state.msh_headers.lock().expect("MSH headers");
+    assert_eq!(
+        captured.len(),
+        4,
+        "authorization and all three polls are captured"
+    );
+    let expected = [
+        ("x-msh-platform", "kimi_cli"),
+        ("x-msh-version", env!("CARGO_PKG_VERSION")),
+        ("x-msh-device-name", "haider-agent"),
+        ("x-msh-device-model", std::env::consts::ARCH),
+        ("x-msh-os-version", std::env::consts::OS),
+        ("x-msh-device-id", DEVICE_ID),
+    ];
+    for headers in captured.iter() {
+        assert_eq!(
+            headers
+                .keys()
+                .filter(|name| name.starts_with("x-msh-"))
+                .count(),
+            expected.len()
+        );
+        for (name, value) in expected {
+            assert_eq!(headers.get(name).map(String::as_str), Some(value));
+        }
+    }
+}
+
+/// Drive real loopback I/O under a `start_paused` clock. Awaiting a blocking
+/// worker inhibits paused-clock auto-advance (tokio pins the virtual clock
+/// while any blocking task is alive), so each iteration parks the runtime for
+/// ~1ms of REAL wall time: socket readiness is serviced, already-due virtual
+/// timers fire, and the production client's connect/request timers — armed at
+/// frozen-now + 5s/15s — can never fire spuriously. A bare park instead
+/// auto-advances straight into those timers while a request is on the wire,
+/// and a busy `yield_now` loop starves the driver of both I/O and timers.
+async fn drive_paused_io(iterations: usize) {
+    for _ in 0..iterations {
+        tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(1)))
+            .await
+            .expect("paused-clock I/O driver");
+    }
+}
+
+async fn wait_for_token_calls(server: &FakeOAuthServer, expected: usize) {
+    for _ in 0..2_000 {
+        if server.state.token_calls.load(Ordering::SeqCst) == expected {
+            return;
+        }
+        drive_paused_io(1).await;
+    }
+    assert_eq!(
+        server.state.token_calls.load(Ordering::SeqCst),
+        expected,
+        "device token poll count did not converge"
+    );
+}
+
+/// MUTATION CHECK: stop the production device runner after
+/// `authorization_pending`, ignore `slow_down`, or add less than five seconds
+/// to the next interval. Expected RUNTIME failure: the coordinator either
+/// never becomes ready or reaches the third poll before the six-second gate.
+///
+/// `start_paused` (rather than a mid-test `pause()`) is load-bearing twice
+/// over: the whole flow runs on one frozen clock so every interval below is
+/// exact, and the timer wheel's epoch coincides with the frozen base — a
+/// mid-test pause leaves a sub-millisecond fraction between them, and the
+/// wheel's round-up tick conversion then puts every whole-millisecond
+/// deadline one tick past every whole-millisecond advance, so the runner's
+/// interval sleeps never fire at their exact gates.
+#[tokio::test(start_paused = true)]
+async fn device_flow_runner_continues_and_honors_slow_down_interval() {
+    let server = FakeOAuthServer::start(FakeMode::Success, false).await;
+    let mut registration = serialized_registration(&server);
+    registration.authorization_endpoint =
+        Url::parse(&format!("http://{}/device_authorization", server.address))
+            .expect("device authorization endpoint");
+    let (coordinator, mut receiver) =
+        coordinator_for_registration(registration, Duration::from_secs(30)).await;
+    let (flow_id, authorization_url) = started_device_flow(&mut receiver).await;
+    assert!(authorization_url.ends_with("/verify?user_code=ABCD-EFGH"));
+    assert!(matches!(
+        coordinator.status("connection-1", &flow_id, "attempt-1"),
+        Some(OAuthFlowStatusWire::WaitingDevice)
+    ));
+
+    // Let the runner spawn and arm its first interval sleep at the frozen
+    // instant, then hold every gate with drive_paused_io so poll responses
+    // are fully consumed (including the source-chunk scrub sweeps) and the
+    // next interval sleep is re-armed BEFORE the clock advances again.
+    drive_paused_io(10).await;
+    assert_eq!(server.state.token_calls.load(Ordering::SeqCst), 0);
+    tokio::time::advance(Duration::from_millis(999)).await;
+    drive_paused_io(10).await;
+    assert_eq!(server.state.token_calls.load(Ordering::SeqCst), 0);
+    tokio::time::advance(Duration::from_millis(1)).await;
+    wait_for_token_calls(&server, 1).await;
+    drive_paused_io(20).await;
+
+    tokio::time::advance(Duration::from_secs(1)).await;
+    wait_for_token_calls(&server, 2).await;
+    drive_paused_io(20).await;
+    tokio::time::advance(Duration::from_millis(5_999)).await;
+    drive_paused_io(10).await;
+    assert_eq!(server.state.token_calls.load(Ordering::SeqCst), 2);
+    tokio::time::advance(Duration::from_millis(1)).await;
+    wait_for_token_calls(&server, 3).await;
+
+    // wait_ready's bare yield loop would starve the paused-clock driver, so
+    // walk the flow to its terminal status with real parks instead.
+    let mut ready = false;
+    for _ in 0..2_000 {
+        let status = coordinator
+            .status("connection-1", &flow_id, "attempt-1")
+            .expect("owned flow");
+        match status {
+            OAuthFlowStatusWire::WaitingDevice | OAuthFlowStatusWire::Exchanging => {
+                drive_paused_io(1).await;
+            }
+            OAuthFlowStatusWire::Ready { .. } => {
+                ready = true;
+                break;
+            }
+            other => panic!("device flow ended in unexpected status: {other:?}"),
+        }
+    }
+    assert!(ready, "device flow never reached Ready");
+    assert!(coordinator.shutdown().await);
+}
+
 async fn wait_for_refresh_calls(server: &FakeOAuthServer, expected: usize) {
     tokio::time::timeout(Duration::from_secs(2), async {
         while server.state.refresh_calls.load(Ordering::SeqCst) != expected {
@@ -2334,6 +2922,193 @@ async fn wait_for_refresh_calls(server: &FakeOAuthServer, expected: usize) {
     })
     .await
     .expect("refresh call count");
+}
+
+/// MUTATION CHECK: remove the vault lease, release it before Apply, or remove
+/// the under-lease re-read. Expected RUNTIME failure: the fake rotating
+/// server observes a second use of generation one's refresh token, or one
+/// contender fails instead of adopting the durable generation two bundle.
+#[tokio::test]
+async fn concurrent_refreshers_never_destroy_the_rotated_token() {
+    let server = FakeOAuthServer::start(FakeMode::Success, true).await;
+    server
+        .state
+        .expect_refresh_binding
+        .store(false, Ordering::SeqCst);
+    let directory = tempfile::tempdir().expect("temp vault");
+    let first_vault = Arc::new(haider_accounts::FileVault::new(directory.path()));
+    let second_vault = Arc::new(haider_accounts::FileVault::new(directory.path()));
+    let descriptor = oauth_descriptor_for_test();
+    let expired = oauth_bundle_for_test(&server, now_ms().expect("clock").saturating_sub(1))
+        .with_refresh_after(0);
+    first_vault
+        .put(&descriptor.alias, &expired.encode().expect("encode seed"))
+        .expect("seed rotating bundle");
+    let (first, _) =
+        independent_serialized_broker(&server, first_vault.clone() as Arc<dyn Vault>, &descriptor);
+    let (second, _) =
+        independent_serialized_broker(&server, second_vault.clone() as Arc<dyn Vault>, &descriptor);
+    let first_resolve = {
+        let first = first.clone();
+        let descriptor = descriptor.clone();
+        tokio::spawn(async move { first.resolve(&descriptor).await })
+    };
+    wait_for_refresh_calls(&server, 1).await;
+    let second_resolve = {
+        let second = second.clone();
+        let descriptor = descriptor.clone();
+        tokio::spawn(async move { second.resolve(&descriptor).await })
+    };
+    tokio::task::yield_now().await;
+    server.release_refresh();
+    let first_access = first_resolve
+        .await
+        .expect("first join")
+        .expect("first authorized");
+    let second_access = second_resolve
+        .await
+        .expect("second join")
+        .expect("second authorized");
+    assert_eq!(
+        first_access.expose_secret(),
+        b"ACCESS_ROTATED_SENTINEL_3a19"
+    );
+    assert_eq!(
+        second_access.expose_secret(),
+        b"ACCESS_ROTATED_SENTINEL_3a19"
+    );
+    assert_eq!(
+        server.state.refresh_calls.load(Ordering::SeqCst),
+        1,
+        "the superseded rotating token must be submitted exactly once"
+    );
+    let stored = second_vault
+        .resolve(&descriptor.alias)
+        .and_then(|stored| OAuthTokenBundleV1::decode(stored.expose_secret()))
+        .expect("durable rotated bundle");
+    assert_eq!(stored.generation, 2);
+    assert_eq!(
+        stored.refresh_token(),
+        Some(b"REFRESH_ROTATED_SENTINEL_8c21".as_slice())
+    );
+    assert!(first.shutdown().await);
+    assert!(second.shutdown().await);
+}
+
+/// MUTATION CHECK: omit the persisted rejection marker or check it only in
+/// process memory. Expected RUNTIME failure: the second independent broker
+/// contacts the endpoint again or does not surface typed re-login details.
+#[tokio::test]
+async fn rejected_refresh_tombstones_and_surfaces_typed_relogin() {
+    let server = FakeOAuthServer::start(FakeMode::InvalidGrant, false).await;
+    server
+        .state
+        .expect_refresh_binding
+        .store(false, Ordering::SeqCst);
+    let directory = tempfile::tempdir().expect("temp vault");
+    let first_vault = Arc::new(haider_accounts::FileVault::new(directory.path()));
+    let second_vault = Arc::new(haider_accounts::FileVault::new(directory.path()));
+    let descriptor = oauth_descriptor_for_test();
+    let expired = oauth_bundle_for_test(&server, now_ms().expect("clock").saturating_sub(1))
+        .with_refresh_after(0);
+    first_vault
+        .put(&descriptor.alias, &expired.encode().expect("encode seed"))
+        .expect("seed rejected bundle");
+    let (first, _) =
+        independent_serialized_broker(&server, first_vault.clone() as Arc<dyn Vault>, &descriptor);
+    let first_error = first
+        .resolve(&descriptor)
+        .await
+        .expect_err("terminal rejection requires login");
+    assert_eq!(first_error.code, ErrorCode::Unauthorized);
+    assert_eq!(
+        first_error
+            .details
+            .as_ref()
+            .and_then(|details| details.get("kind"))
+            .and_then(serde_json::Value::as_str),
+        Some("oauth_relogin_required")
+    );
+    let (second, _) =
+        independent_serialized_broker(&server, second_vault.clone() as Arc<dyn Vault>, &descriptor);
+    let second_error = second
+        .resolve(&descriptor)
+        .await
+        .expect_err("tombstoned token requires login");
+    assert_eq!(second_error.code, ErrorCode::Unauthorized);
+    assert_eq!(
+        server.state.refresh_calls.load(Ordering::SeqCst),
+        1,
+        "a tombstoned refresh token must not be replayed"
+    );
+    let stored = second_vault
+        .resolve(&descriptor.alias)
+        .and_then(|stored| OAuthTokenBundleV1::decode(stored.expose_secret()))
+        .expect("tombstoned bundle");
+    assert!(
+        stored
+            .refresh_rejected_until_unix_ms
+            .is_some_and(|until| { until > now_ms().expect("clock") })
+    );
+    let errors = format!("{first_error:?}{second_error:?}");
+    assert!(!errors.contains(REFRESH_SENTINEL));
+    assert!(first.shutdown().await);
+    assert!(second.shutdown().await);
+}
+
+/// MUTATION CHECK: send the rotating request before persisting uncertainty or
+/// clear uncertainty when a success response is malformed. Expected RUNTIME
+/// failure: a successor replays the potentially spent refresh token instead
+/// of observing the permanent fail-closed marker.
+#[tokio::test]
+async fn malformed_rotating_success_never_leaves_the_old_token_replayable() {
+    let server = FakeOAuthServer::start(FakeMode::Malformed, false).await;
+    server
+        .state
+        .expect_refresh_binding
+        .store(false, Ordering::SeqCst);
+    let directory = tempfile::tempdir().expect("temp vault");
+    let first_vault = Arc::new(haider_accounts::FileVault::new(directory.path()));
+    let second_vault = Arc::new(haider_accounts::FileVault::new(directory.path()));
+    let descriptor = oauth_descriptor_for_test();
+    let expired = oauth_bundle_for_test(&server, now_ms().expect("clock").saturating_sub(1))
+        .with_refresh_after(0);
+    first_vault
+        .put(&descriptor.alias, &expired.encode().expect("encode seed"))
+        .expect("seed malformed-response bundle");
+    let (first, _) =
+        independent_serialized_broker(&server, first_vault.clone() as Arc<dyn Vault>, &descriptor);
+    let error = first
+        .resolve(&descriptor)
+        .await
+        .expect_err("malformed rotating success requires login");
+    assert_eq!(
+        error
+            .details
+            .as_ref()
+            .and_then(|details| details.get("kind"))
+            .and_then(serde_json::Value::as_str),
+        Some("oauth_relogin_required")
+    );
+    let stored = second_vault
+        .resolve(&descriptor.alias)
+        .and_then(|stored| OAuthTokenBundleV1::decode(stored.expose_secret()))
+        .expect("uncertain bundle remains durable");
+    assert_eq!(stored.refresh_rejected_until_unix_ms, Some(u64::MAX));
+
+    let (second, _) =
+        independent_serialized_broker(&server, second_vault as Arc<dyn Vault>, &descriptor);
+    second
+        .resolve(&descriptor)
+        .await
+        .expect_err("successor refuses the uncertain token");
+    assert_eq!(
+        server.state.refresh_calls.load(Ordering::SeqCst),
+        1,
+        "a potentially spent token is never replayed"
+    );
+    assert!(first.shutdown().await);
+    assert!(second.shutdown().await);
 }
 
 #[tokio::test]
@@ -2496,7 +3271,7 @@ async fn concurrent_resolve_waits_for_rotated_descriptor_commit_or_fail_closed_d
     let mut preadmitted_contender = tokio::spawn({
         let broker = broker.clone();
         let descriptor = descriptor.clone();
-        async move { broker.resolve_oauth(&descriptor, false).await }
+        async move { broker.resolve_oauth(&descriptor, false, None).await }
     });
     let mut public_contender = tokio::spawn({
         let broker = broker.clone();
@@ -3130,8 +3905,12 @@ async fn transient_refresh_fails_closed_for_leader_and_waiter_after_uncertain_re
     ));
 }
 
+/// MUTATION CHECK: propagate the bounded endpoint body, access token, or
+/// refresh token into the broker error. Expected RUNTIME failure: formatting
+/// the only externally observable failure below reveals a sentinel (OAuth
+/// refresh does not write a journal or log record).
 #[tokio::test]
-async fn expired_access_with_transient_refresh_returns_sanitized_retryable_error() {
+async fn no_secret_bytes_in_errors_journal_or_logs() {
     let server = FakeOAuthServer::start(FakeMode::Transient, false).await;
     let vault = Arc::new(ControlledVault::new(Arc::clone(&server.state)));
     let descriptor = oauth_descriptor_for_test();
@@ -3260,9 +4039,11 @@ fn token_response_source_chunks_are_exclusively_owned_and_scrubbed() {
             && source
                 .matches("reqwest::header::CONNECTION, \"close\"")
                 .count()
-                // Three key-bearing transports must each close: authorization-code
-                // exchange, refresh, and the W5b.2a JWKS fetch.
-                == 3
+                // Five key-bearing transports must each close: authorization-code
+                // exchange, refresh, the W5b.2a JWKS fetch, and the B6k Kimi
+                // device-authorization and device-token-poll requests (both feed
+                // bounded_response, so their source chunks join the same scrub).
+                == 5
             && source.contains("chunk.as_mut().zeroize();"),
         "token and JWKS transports must close before every source chunk is mutable-owned and scrubbed"
     );

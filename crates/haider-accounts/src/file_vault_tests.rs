@@ -148,3 +148,35 @@ fn list_ignores_non_vault_files() {
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].as_str(), "openai-oauth");
 }
+
+/// MUTATION CHECK: replace the file-backed lease with a per-instance or
+/// process-local gate. Expected RUNTIME failure: two independently opened
+/// vaults both enter the same rotating-refresh critical section.
+#[test]
+fn independent_file_vaults_share_the_refresh_rotation_lease() {
+    let root = temp_root();
+    let directory = root.path().join("vault");
+    let first = FileVault::new(&directory);
+    let second = FileVault::new(&directory);
+    let alias = CredentialAlias::new("kimi-oauth-work");
+
+    let lease = first
+        .try_refresh_lock(&alias)
+        .expect("first lock attempt")
+        .expect("first vault owns the lease");
+    assert!(
+        second
+            .try_refresh_lock(&alias)
+            .expect("contended lock attempt")
+            .is_none(),
+        "an independently opened vault must observe the same OS lease"
+    );
+    drop(lease);
+    assert!(
+        second
+            .try_refresh_lock(&alias)
+            .expect("released lock attempt")
+            .is_some(),
+        "dropping the lease releases it for another daemon"
+    );
+}
