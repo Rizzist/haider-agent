@@ -1,9 +1,10 @@
-//! Theme-token goldens: the blended values below were computed by hand from
-//! the sim's `rgba()` literals (`next-diffforge/src/pages/tui.js`, `THEMES`),
-//! so they are an oracle independent of `Rgb::over`'s arithmetic.
+//! Theme-registry goldens (UI-themes wave): key/name round-trips, the
+//! designed solid tokens, and hand-computed blend oracles independent of
+//! `Rgb::over`'s arithmetic. The contrast-floor laws live in
+//! `ui_themes_tests.rs`.
 #![allow(clippy::expect_used)]
 
-use haider_tui::theme::{DARK, DAWN, IVORY, Rgb, Theme, ThemeKey};
+use haider_tui::theme::{DARK, DESERT, LIGHT, OASIS, Rgb, Theme, ThemeChoice, ThemeKey};
 
 fn rgb(r: u8, g: u8, b: u8) -> Rgb {
     Rgb { r, g, b }
@@ -11,86 +12,178 @@ fn rgb(r: u8, g: u8, b: u8) -> Rgb {
 
 #[test]
 fn theme_keys_parse_and_roundtrip_in_menu_order() {
-    assert_eq!(ThemeKey::default(), ThemeKey::Dawn);
+    // Dark is the registry default AND the detection fallback (owner §3).
+    assert_eq!(ThemeKey::default(), ThemeKey::Dark);
     assert_eq!(
         ThemeKey::ALL,
-        [ThemeKey::Dawn, ThemeKey::Ivory, ThemeKey::Dark]
+        [
+            ThemeKey::Light,
+            ThemeKey::Dark,
+            ThemeKey::Desert,
+            ThemeKey::Oasis
+        ]
     );
     for key in ThemeKey::ALL {
         assert_eq!(ThemeKey::parse(key.name()), Some(key));
         assert_eq!(key.theme().key, key);
     }
-    assert_eq!(ThemeKey::parse("desert"), None);
-    assert_eq!(ThemeKey::parse("Dawn"), None, "names are lowercase-exact");
+    assert_eq!(ThemeKey::parse("Dark"), None, "names are lowercase-exact");
+    assert_eq!(
+        ThemeKey::parse("system"),
+        None,
+        "system is a CHOICE, not a key"
+    );
 }
 
 #[test]
-fn labels_match_the_sim() {
-    assert_eq!(DAWN.label, "Desert Dawn");
-    assert_eq!(IVORY.label, "Ivory Light");
-    assert_eq!(DARK.label, "Dark");
+fn legacy_sim_names_migrate_instead_of_resetting() {
+    // A persisted `dawn`/`ivory` from the sim era lands on its successor.
+    assert_eq!(ThemeKey::parse("dawn"), Some(ThemeKey::Desert));
+    assert_eq!(ThemeKey::parse("ivory"), Some(ThemeKey::Light));
+}
+
+#[test]
+fn theme_choice_parses_system_and_fixed_names() {
+    assert_eq!(ThemeChoice::default(), ThemeChoice::System);
+    assert_eq!(ThemeChoice::parse("system"), Some(ThemeChoice::System));
+    assert_eq!(
+        ThemeChoice::parse("oasis"),
+        Some(ThemeChoice::Fixed(ThemeKey::Oasis))
+    );
+    assert_eq!(ThemeChoice::parse("nope"), None);
+    assert_eq!(
+        ThemeChoice::MENU,
+        [
+            ThemeChoice::System,
+            ThemeChoice::Fixed(ThemeKey::Light),
+            ThemeChoice::Fixed(ThemeKey::Dark),
+            ThemeChoice::Fixed(ThemeKey::Desert),
+            ThemeChoice::Fixed(ThemeKey::Oasis),
+        ]
+    );
+    for choice in ThemeChoice::MENU {
+        assert_eq!(ThemeChoice::parse(choice.name()), Some(choice));
+    }
+    // Resolution: System follows detection; Fixed ignores it.
+    assert_eq!(
+        ThemeChoice::System.resolve(ThemeKey::Light),
+        ThemeKey::Light
+    );
+    assert_eq!(ThemeChoice::System.resolve(ThemeKey::Dark), ThemeKey::Dark);
+    assert_eq!(
+        ThemeChoice::Fixed(ThemeKey::Desert).resolve(ThemeKey::Dark),
+        ThemeKey::Desert
+    );
+}
+
+#[test]
+fn labels_and_families_match_the_design() {
+    let expected = [
+        (ThemeKey::Light, "Light", false),
+        (ThemeKey::Dark, "Dark", true),
+        (ThemeKey::Desert, "Desert", false),
+        // Oasis is the desert's NIGHT garden — a dark-family palette.
+        (ThemeKey::Oasis, "Oasis", true),
+    ];
+    for (key, label, dark) in expected {
+        assert_eq!(key.theme().label, label);
+        assert_eq!(key.theme().dark, dark, "{label} family");
+    }
 }
 
 #[test]
 fn hex_decodes_channels() {
-    assert_eq!(Rgb::hex(0xf3ead9), rgb(0xf3, 0xea, 0xd9));
+    assert_eq!(Rgb::hex(0xfaf6ee), rgb(0xfa, 0xf6, 0xee));
     assert_eq!(Rgb::hex(0x000000), rgb(0, 0, 0));
     assert_eq!(Rgb::hex(0xffffff), rgb(255, 255, 255));
 }
 
 #[test]
 fn over_blends_extremes_exactly() {
-    let base = Rgb::hex(0x14100a);
-    let ink = Rgb::hex(0xd4af37);
+    let base = Rgb::hex(0x120e08);
+    let ink = Rgb::hex(0xd9b544);
     assert_eq!(ink.over(base, 0), base, "alpha 0 keeps the ground");
     assert_eq!(ink.over(base, 1000), ink, "alpha 1 is the ink");
 }
 
 #[test]
-fn dawn_solid_tokens_match_the_sim_hexes() {
-    assert_eq!(DAWN.bg, Rgb::hex(0xf3ead9));
-    assert_eq!(DAWN.text, Rgb::hex(0x5f4a2e));
-    assert_eq!(DAWN.bright, Rgb::hex(0x3d2d18));
-    assert_eq!(DAWN.dim, Rgb::hex(0xa08a63));
-    assert_eq!(DAWN.faint, Rgb::hex(0xcdbd9a));
-    assert_eq!(DAWN.gold, Rgb::hex(0x9a6a08));
-    assert_eq!(DAWN.maroon, Rgb::hex(0x7c2d12));
-    assert_eq!(DAWN.ok, Rgb::hex(0x4c7a45));
-    assert_eq!(DAWN.warn, Rgb::hex(0xb45309));
-    assert_eq!(DAWN.err, Rgb::hex(0xb91c1c));
-    assert_eq!(DAWN.badge_fg, DAWN.bg);
+fn light_solid_tokens_match_the_design_hexes() {
+    assert_eq!(LIGHT.bg, Rgb::hex(0xfaf6ee));
+    assert_eq!(LIGHT.text, Rgb::hex(0x2e2a24));
+    assert_eq!(LIGHT.bright, Rgb::hex(0x14110c));
+    assert_eq!(LIGHT.dim, Rgb::hex(0x6e675c));
+    assert_eq!(LIGHT.faint, Rgb::hex(0xd8d1c2));
+    assert_eq!(LIGHT.gold, Rgb::hex(0x8a6508));
+    assert_eq!(LIGHT.maroon, Rgb::hex(0x7c2d12));
+    assert_eq!(LIGHT.badge_fg, LIGHT.bg);
 }
 
 #[test]
-fn dawn_blends_match_hand_computed_goldens() {
-    assert_eq!(DAWN.bar_bg, rgb(237, 225, 207)); // rgba(maroon, .05)
-    assert_eq!(DAWN.frame, rgb(210, 181, 161)); // rgba(maroon, .28)
-    assert_eq!(DAWN.gold_soft, rgb(231, 216, 188)); // rgba(gold, .14)
-    assert_eq!(DAWN.maroon_soft, rgb(233, 219, 201)); // rgba(maroon, .08)
-    assert_eq!(DAWN.input_bg, rgb(246, 240, 228)); // rgba(white, .28)
-    assert_eq!(DAWN.sel_bg, rgb(231, 215, 197)); // rgba(maroon, .10)
+fn desert_solid_tokens_match_the_design_hexes() {
+    assert_eq!(DESERT.bg, Rgb::hex(0xf0e4cc), "true sand, not cream");
+    assert_eq!(DESERT.gold, Rgb::hex(0x9c6202), "burnished amber");
+    assert_eq!(DESERT.maroon, Rgb::hex(0x7b2740), "dusk plum");
+    assert_eq!(DESERT.text, Rgb::hex(0x4d3a20));
+    assert_eq!(DESERT.badge_fg, DESERT.bg);
 }
 
 #[test]
-fn ivory_blends_match_hand_computed_goldens() {
-    assert_eq!(IVORY.bg, Rgb::hex(0xfbf9f3));
-    assert_eq!(IVORY.bar_bg, rgb(242, 240, 234)); // rgba(ink, .04)
-    assert_eq!(IVORY.frame, rgb(187, 184, 178)); // rgba(ink, .30)
-    assert_eq!(IVORY.gold_soft, rgb(237, 231, 215)); // rgba(gold, .12)
-    assert_eq!(IVORY.maroon_soft, rgb(243, 235, 227)); // rgba(maroon, .07)
-    assert_eq!(IVORY.input_bg, rgb(244, 241, 235)); // rgba(ink, .035)
-    assert_eq!(IVORY.sel_bg, rgb(234, 232, 226)); // rgba(ink, .08)
+fn dark_refresh_keeps_the_identity_hexes() {
+    assert_eq!(DARK.bg, Rgb::hex(0x120e08));
+    assert_eq!(DARK.gold, Rgb::hex(0xd9b544), "aged gold, lifted a step");
+    assert_eq!(DARK.maroon, Rgb::hex(0xe57a4a), "warmed ember");
+    assert_eq!(DARK.text, Rgb::hex(0xd6c7a4));
+    assert_eq!(
+        DARK.dim,
+        Rgb::hex(0x93856a),
+        "the sim-era 3.2:1 dim, re-contrasted"
+    );
+}
+
+#[test]
+fn oasis_solid_tokens_match_the_design_hexes() {
+    assert_eq!(OASIS.bg, Rgb::hex(0x0c1410), "palm-night green-black");
+    assert_eq!(OASIS.gold, Rgb::hex(0xd8b04c), "date gold");
+    assert_eq!(OASIS.text, Rgb::hex(0xb9cfc0), "moonlit spring");
+}
+
+// Hand-computed blend oracles (ink alpha‰ over bg, round half-up) — an
+// arithmetic witness independent of `Rgb::over`.
+
+#[test]
+fn light_blends_match_hand_computed_goldens() {
+    assert_eq!(LIGHT.bar_bg, rgb(241, 237, 229)); // ink 4.0% over paper
+    assert_eq!(LIGHT.frame, rgb(181, 177, 170)); // ink 30%
+    assert_eq!(LIGHT.gold_soft, rgb(238, 230, 213)); // gold 11%
+    assert_eq!(LIGHT.input_bg, rgb(241, 237, 229)); // ink 4.0%
+    assert_eq!(LIGHT.sel_bg, rgb(229, 225, 218)); // ink 9%
 }
 
 #[test]
 fn dark_blends_match_hand_computed_goldens() {
-    assert_eq!(DARK.bg, Rgb::hex(0x14100a));
-    assert_eq!(DARK.bar_bg, rgb(30, 24, 12)); // rgba(gold, .05)
-    assert_eq!(DARK.frame, rgb(70, 57, 22)); // rgba(gold, .26)
-    assert_eq!(DARK.gold_soft, rgb(43, 35, 15)); // rgba(gold, .12)
-    assert_eq!(DARK.maroon_soft, rgb(40, 26, 15)); // rgba(maroon, .10)
-    assert_eq!(DARK.input_bg, rgb(31, 27, 21)); // rgba(white, .045)
-    assert_eq!(DARK.sel_bg, rgb(39, 32, 15)); // rgba(gold, .10)
+    assert_eq!(DARK.bar_bg, rgb(28, 22, 11)); // gold 5%
+    assert_eq!(DARK.frame, rgb(70, 57, 24)); // gold 26%
+    assert_eq!(DARK.gold_soft, rgb(42, 34, 15)); // gold 12%
+    assert_eq!(DARK.input_bg, rgb(29, 25, 19)); // white 4.5%
+    assert_eq!(DARK.sel_bg, rgb(38, 31, 14)); // gold 10%
+}
+
+#[test]
+fn desert_blends_match_hand_computed_goldens() {
+    assert_eq!(DESERT.bar_bg, rgb(234, 219, 197)); // plum 5%
+    assert_eq!(DESERT.frame, rgb(207, 175, 165)); // plum 28%
+    assert_eq!(DESERT.gold_soft, rgb(228, 210, 176)); // amber 14%
+    assert_eq!(DESERT.input_bg, rgb(244, 236, 218)); // white 28%
+    assert_eq!(DESERT.sel_bg, rgb(228, 209, 190)); // plum 10%
+}
+
+#[test]
+fn oasis_blends_match_hand_computed_goldens() {
+    assert_eq!(OASIS.bar_bg, rgb(22, 28, 19)); // gold 5%
+    assert_eq!(OASIS.frame, rgb(65, 61, 32)); // gold 26%
+    assert_eq!(OASIS.gold_soft, rgb(36, 39, 23)); // gold 12%
+    assert_eq!(OASIS.input_bg, rgb(23, 31, 27)); // white 4.5%
+    assert_eq!(OASIS.sel_bg, rgb(32, 36, 22)); // gold 10%
 }
 
 #[test]

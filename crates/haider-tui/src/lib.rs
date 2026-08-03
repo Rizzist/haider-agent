@@ -2,7 +2,7 @@
 //!
 //! Visual spec: the `/tui` sim (next-diffforge) — panel-for-panel parity is
 //! the acceptance bar. Widgets never hardcode colors or labels; everything
-//! reads [`theme::Theme`] tokens and [`format`] helpers so the three themes
+//! reads [`theme::Theme`] tokens and [`format`] helpers so the four themes
 //! stay one identity. Tests live in `tests/` — never inline (workspace rule).
 
 pub mod app;
@@ -28,6 +28,7 @@ pub mod sanctum;
 pub mod script;
 pub mod select;
 pub mod session;
+pub mod settings;
 pub mod style;
 pub mod theme;
 pub mod wordmark;

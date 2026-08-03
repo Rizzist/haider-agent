@@ -9,7 +9,8 @@ use haider_tui::app::AppModel;
 use haider_tui::demo_store::DemoStore;
 use haider_tui::runtime::{detect_system_theme, run_demo, run_demo_plain, run_live};
 use haider_tui::sanctum::SanctumTier;
-use haider_tui::theme::ThemeKey;
+use haider_tui::settings::SettingsStore;
+use haider_tui::theme::ThemeChoice;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -71,7 +72,7 @@ async fn main() -> ExitCode {
                  events [--follow] [--no-spawn], \
                  hooks list [--json], hooks trust <digest>, hooks revoke <digest>, \
                  update [--check], \
-                 tui [--theme dawn|ivory|dark], tui --demo [--plain], \
+                 tui [--theme system|light|dark|desert|oasis], tui --demo [--plain], \
                  import [codex|claude-code], --ready)"
             );
             ExitCode::from(2)
@@ -296,7 +297,8 @@ fn front_door_exit_code(error: &haider_client::EnsureError) -> u8 {
     }
 }
 
-/// `haider tui --demo [--plain] [--theme dawn|ivory|dark]` — the scripted
+/// `haider tui --demo [--plain] [--theme system|light|dark|desert|oasis]`
+/// — the scripted
 /// demo drives every surface until the daemon lands (W3). `--plain` (or a
 /// non-TTY stdout, research rec 2) renders the final state as plain text
 /// instead of taking the terminal. `HAIDER_SHAHADA=translit` selects the
@@ -305,16 +307,16 @@ async fn tui_command(rest: &[String]) -> ExitCode {
     use std::io::IsTerminal;
     let mut demo = false;
     let mut plain = false;
-    let mut theme: Option<ThemeKey> = None;
+    let mut theme: Option<ThemeChoice> = None;
     let mut iter = rest.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--demo" => demo = true,
             "--plain" => plain = true,
-            "--theme" => match iter.next().and_then(|name| ThemeKey::parse(name)) {
+            "--theme" => match iter.next().and_then(|name| ThemeChoice::parse(name)) {
                 Some(key) => theme = Some(key),
                 None => {
-                    eprintln!("haider tui: --theme takes dawn|ivory|dark");
+                    eprintln!("haider tui: --theme takes system|light|dark|desert|oasis");
                     return ExitCode::from(2);
                 }
             },
@@ -360,8 +362,8 @@ async fn tui_command(rest: &[String]) -> ExitCode {
     }
     if !interactive {
         // The plain/CI oracle stays deterministic: no demo-store load, no
-        // save — persistence is an interactive-session affordance.
-        model.theme = theme.unwrap_or(ThemeKey::Dawn);
+        // save, no terminal probe — `system` resolves to the dark default.
+        model.apply_theme_choice(theme.unwrap_or_default());
         // Fallible write: `print!` panics on BrokenPipe (review r1 P2).
         // A closed pipe is a normal consumer choice → success; other write
         // failures are real I/O errors.
@@ -374,26 +376,30 @@ async fn tui_command(rest: &[String]) -> ExitCode {
         };
     }
     // TUI4c-13b: the DEMO state file (sim localStorage) — load before the
-    // theme decision so a persisted theme can win over system detection.
+    // theme decision so a pre-wave file's theme name can still migrate.
     // A missing/corrupt file or an unresolvable path simply keeps the
     // seeds; the demo never fails to start over persistence.
-    let mut theme_restored = false;
+    let mut legacy_theme = None;
     let store = DemoStore::default_path().map(|path| {
         let store = DemoStore::at(path);
         if let Some(dto) = store.load() {
-            theme_restored = haider_tui::demo_store::hydrate(&mut model, dto).theme_restored;
+            legacy_theme = haider_tui::demo_store::hydrate(&mut model, dto).legacy_theme;
         }
         store
     });
-    // Explicit --theme wins; then the persisted theme (sim: a known
-    // `data.themeName` restores); otherwise follow the system/terminal
-    // appearance (OSC 11 background luminance): dark ground -> Dark,
-    // light -> Dawn.
-    if let Some(key) = theme {
-        model.theme = key;
-    } else if !theme_restored {
-        model.theme = detect_system_theme();
-    }
+    // Theme CHOICE precedence (owner spec §3): explicit --theme, then the
+    // profile-dir settings file, then a pre-wave demo file's theme name
+    // (one-shot migration), then `system` — which resolves against the
+    // detected terminal appearance (OSC 11 / COLORFGBG, undetectable →
+    // dark), re-evaluated on every boot.
+    model.detected_system = detect_system_theme();
+    let settings_choice = SettingsStore::open_default().and_then(|store| store.load());
+    model.apply_theme_choice(
+        theme
+            .or(settings_choice)
+            .or(legacy_theme.map(ThemeChoice::Fixed))
+            .unwrap_or_default(),
+    );
     match run_demo(model, store).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -438,7 +444,13 @@ fn live_model(profile: &haider_client::ResolvedProfile) -> AppModel {
         model.sanctum_tier = SanctumTier::Translit;
     }
     apply_cwd(&mut model);
-    model.theme = detect_system_theme();
+    // Same choice ladder as the demo, minus the flag and the legacy demo
+    // file: settings file, else `system` against the boot-time detection.
+    model.detected_system = detect_system_theme();
+    let choice = SettingsStore::open_default()
+        .and_then(|store| store.load())
+        .unwrap_or_default();
+    model.apply_theme_choice(choice);
     model
 }
 

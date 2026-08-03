@@ -266,7 +266,7 @@ fn menu_option_hits_align_with_their_rows() {
 fn composer_carries_the_sim_signature() {
     let model = session_model();
     assert_eq!(model.screen, Screen::Session);
-    assert_eq!(model.theme, ThemeKey::Dawn);
+    assert_eq!(model.theme, ThemeKey::Dark);
     let theme = model.theme.theme();
     let (rows, _, terminal) = draw(&model, 118, 34);
     // Sim placeholder copy, verbatim (InputBar textarea, session variant).

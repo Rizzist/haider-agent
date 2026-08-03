@@ -1,7 +1,7 @@
 //! Theme→ratatui style bridge goldens.
 #![allow(clippy::expect_used)]
 
-use haider_tui::theme::{DAWN, Rgb, ThemeKey};
+use haider_tui::theme::{DESERT, Rgb, ThemeKey};
 use ratatui::style::{Color, Modifier};
 
 #[test]
@@ -58,9 +58,9 @@ fn badge_styles_follow_the_sim_state_vocabulary() {
 
 #[test]
 fn text_style_grounds_on_the_theme_bg() {
-    let style = DAWN.text_style();
-    assert_eq!(style.fg, Some(Color::Rgb(0x5f, 0x4a, 0x2e)));
-    assert_eq!(style.bg, Some(Color::Rgb(0xf3, 0xea, 0xd9)));
+    let style = DESERT.text_style();
+    assert_eq!(style.fg, Some(Color::Rgb(0x4d, 0x3a, 0x20)));
+    assert_eq!(style.bg, Some(Color::Rgb(0xf0, 0xe4, 0xcc)));
 }
 
 #[test]

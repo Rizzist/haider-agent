@@ -91,7 +91,7 @@ impl Theme {
     /// The composer's cursor CELL (TUI5 item 1): reverse-video against the
     /// input band — a gold block carrying the glyph under it in `badge_fg`
     /// (the theme bg, the same filled-badge contrast rule). Gold is the
-    /// accent on every theme, so the block reads on dawn AND dark; at
+    /// accent on every theme, so the block reads on light AND dark grounds; at
     /// end-of-text the cell is this style over a plain space. STEADY by
     /// law — no blink, no `animated()` term (zero-idle-wakeup).
     #[must_use]

@@ -252,37 +252,37 @@ fn theme_arg_slot_offers_completes_and_runs() {
         model.handle(key(KeyCode::Char(c)));
     }
     let labels: Vec<String> = model.palette_items().iter().map(|i| i.label()).collect();
-    assert_eq!(labels, ["dawn", "ivory", "dark"]);
+    assert_eq!(labels, ["system", "light", "dark", "desert", "oasis"]);
     let (rows, hits, _) = draw(&model, 118, 34);
-    assert!(rows.iter().any(|row| row.contains("Ivory Light")), "descs");
+    assert!(rows.iter().any(|row| row.contains("Oasis")), "descs");
     // Ghost offers the first slot value after the trailing space.
-    assert_eq!(model.ghost().as_deref(), Some("dawn"));
+    assert_eq!(model.ghost().as_deref(), Some("system"));
     // ⏎ on a highlighted arg row completes and RUNS.
     model.handle(key(KeyCode::Down));
     model.handle(key(KeyCode::Enter));
-    assert_eq!(model.theme, ThemeKey::Ivory, "/theme ivory executed");
-    // Click path: the "dark" arg row runs /theme dark — the hit carries
-    // the VALUE it was rendered with.
+    assert_eq!(model.theme, ThemeKey::Light, "/theme light executed");
+    // Click path: the "desert" arg row runs /theme desert — the hit
+    // carries the VALUE it was rendered with.
     for c in "/theme ".chars() {
         model.handle(key(KeyCode::Char(c)));
     }
-    let dark_hit = hits
+    let desert_hit = hits
         .iter()
         .find_map(|(_, h)| match h {
-            Hit::PaletteRow(item) if item.label() == "dark" => Some(h.clone()),
+            Hit::PaletteRow(item) if item.label() == "desert" => Some(h.clone()),
             _ => None,
         })
-        .expect("dark arg row hit");
-    model.handle_hit(dark_hit);
-    assert_eq!(model.theme, ThemeKey::Dark, "clicked arg row executed");
-    // Fragment filtering: /theme i → ivory only; tab completes in place.
-    for c in "/theme i".chars() {
+        .expect("desert arg row hit");
+    model.handle_hit(desert_hit);
+    assert_eq!(model.theme, ThemeKey::Desert, "clicked arg row executed");
+    // Fragment filtering: /theme o → oasis only; tab completes in place.
+    for c in "/theme o".chars() {
         model.handle(key(KeyCode::Char(c)));
     }
     let labels: Vec<String> = model.palette_items().iter().map(|i| i.label()).collect();
-    assert_eq!(labels, ["ivory"]);
+    assert_eq!(labels, ["oasis"]);
     model.handle(key(KeyCode::Tab));
-    assert_eq!(model.composer, "/theme ivory");
+    assert_eq!(model.composer, "/theme oasis");
 }
 
 // ---- G15: paste tokenization ----
@@ -633,40 +633,50 @@ fn palette_and_menu_selection_wrap_around() {
 }
 
 #[test]
-fn exact_theme_leads_to_its_slot_and_dismissed_bare_theme_cycles() {
+fn exact_theme_leads_to_its_slot_and_dismissed_bare_theme_opens_picker() {
     // Sim getSuggestions lead case (tui.js:243-247): the EXACT `/theme`
     // (no space) already shows the argument rows — ⏎ runs the highlighted
-    // arg, and the ghost offers ` dawn`.
+    // arg, and the ghost offers ` system`.
     let mut model = launcher_model();
-    assert_eq!(model.theme, ThemeKey::Dawn);
+    assert_eq!(model.theme, ThemeKey::Dark);
     for c in "/theme".chars() {
         model.handle(key(KeyCode::Char(c)));
     }
     let labels: Vec<String> = model.palette_items().iter().map(|i| i.label()).collect();
-    assert_eq!(labels, ["dawn", "ivory", "dark"], "lead arg rows");
-    assert_eq!(model.ghost().as_deref(), Some(" dawn"), "lead ghost");
+    assert_eq!(
+        labels,
+        ["system", "light", "dark", "desert", "oasis"],
+        "lead arg rows"
+    );
+    assert_eq!(model.ghost().as_deref(), Some(" system"), "lead ghost");
     model.handle(key(KeyCode::Enter));
-    assert_eq!(model.theme, ThemeKey::Dawn, "⏎ ran the highlighted arg");
+    assert_eq!(
+        model.theme_choice,
+        haider_tui::theme::ThemeChoice::System,
+        "⏎ ran the highlighted arg"
+    );
+    assert_eq!(model.theme, ThemeKey::Dark, "system resolves to detection");
     assert!(
         model
             .flash
             .as_deref()
             .unwrap_or("")
-            .contains("theme → Desert Dawn")
+            .contains("theme → system")
     );
 
-    // The blessed divergence survives only with the palette DISMISSED:
-    // bare /theme + esc + ⏎ cycles and lists (documented).
+    // UI-themes wave flip (owner spec §3, supersedes the sim-era cycle
+    // divergence): a DISMISSED bare /theme now opens the numbered
+    // arrow-highlight picker — the picker IS the listing.
     for c in "/theme".chars() {
         model.handle(key(KeyCode::Char(c)));
     }
     model.handle(key(KeyCode::Esc));
     assert!(!model.palette_open(), "esc dismissed the palette");
     model.handle(key(KeyCode::Enter));
-    assert_eq!(model.theme, ThemeKey::Ivory, "dismissed bare /theme cycles");
-    let flash = model.flash.as_deref().unwrap_or("");
-    assert!(flash.contains("theme → Ivory Light"));
-    assert!(flash.contains("themes — dawn · ivory · dark"));
+    assert!(
+        model.theme_picker.is_some(),
+        "dismissed bare /theme opens the picker"
+    );
 }
 
 // ---- r3 (review round 2 fixes): partial-fragment slot entry ----
@@ -684,5 +694,9 @@ fn enter_on_a_partial_arg_command_enters_its_slot() {
     assert_eq!(model.composer, "/theme ", "slot entered, nothing ran");
     assert_eq!(model.theme, before, "no theme change");
     let labels: Vec<String> = model.palette_items().iter().map(|i| i.label()).collect();
-    assert_eq!(labels, ["dawn", "ivory", "dark"], "slot rows now offered");
+    assert_eq!(
+        labels,
+        ["system", "light", "dark", "desert", "oasis"],
+        "slot rows now offered"
+    );
 }

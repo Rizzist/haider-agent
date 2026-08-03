@@ -8,7 +8,7 @@ use crate::mock::seed_session_states;
 use crate::projection::SessionProjection;
 use crate::sanctum::SanctumTier;
 use crate::script::{AuraState, ChipDisplayState, ChipPrefill, ChipSeed, TALK_PHRASE};
-use crate::theme::ThemeKey;
+use crate::theme::{ThemeChoice, ThemeKey};
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::ids::{MenuId, SessionId};
 use haider_protocol::menu::{
@@ -1821,6 +1821,9 @@ pub enum Hit {
         menu: MenuId,
         index: usize,
     },
+    /// One `/theme` picker row (model-local card): hover previews, click
+    /// commits. Carries the MENU index it was rendered for.
+    ThemeOption(usize),
     BackChip,
     TalkChip,
     HelpHint,
@@ -2067,6 +2070,18 @@ pub enum AppEvent {
     StreamEnded,
 }
 
+/// The `/theme` picker's overlay state (owner spec §3): the highlighted
+/// row and the choice to restore on esc. Moving the highlight PREVIEWS the
+/// theme instantly; ⏎ / a digit / a click commits (and the runtime
+/// persists); esc reverts to `prior`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThemePicker {
+    /// Index into [`ThemeChoice::MENU`].
+    pub selection: usize,
+    /// The committed choice on open — what esc restores.
+    pub prior: ThemeChoice,
+}
+
 /// Identity shown in the status bar and launcher info line. Real values come
 /// from config/accounts in later waves; the demo pins sim-parity defaults.
 #[derive(Debug, Clone)]
@@ -2108,7 +2123,23 @@ pub struct AppModel {
     /// fixtures set the field directly on purpose — they construct
     /// states, they do not transition.
     pub screen: Screen,
+    /// The RESOLVED rendering every frame draws with. Derived state: write
+    /// it through [`Self::apply_theme_choice`] (previews inside the open
+    /// picker are the one blessed direct writer).
     pub theme: ThemeKey,
+    /// How the theme is chosen (owner spec §3): `system` (default, follows
+    /// the detected terminal appearance) or a fixed key. TUI-local display
+    /// state — the runtime persists changes to the profile-dir settings
+    /// file; nothing rides the wire.
+    pub theme_choice: ThemeChoice,
+    /// The terminal appearance detected ONCE pre-UI (OSC 11 / COLORFGBG,
+    /// undetectable → dark). What `system` resolves against; re-evaluated
+    /// only on the next boot.
+    pub detected_system: ThemeKey,
+    /// The `/theme` picker overlay (owner menu law: numbered rows, arrow
+    /// highlight). MODEL-LOCAL — deliberately not a projection card so it
+    /// can never ride a session checkout or block a daemon menu.
+    pub theme_picker: Option<ThemePicker>,
     pub sanctum_tier: SanctumTier,
     pub projection: SessionProjection,
     pub identity: IdentityLine,
@@ -2375,7 +2406,13 @@ impl Default for AppModel {
             tree_view: None,
             pending_jump: std::cell::RefCell::new(None),
             tools_inventory: None,
-            theme: ThemeKey::Dawn,
+            // Dark is the registry default AND the detection fallback
+            // (owner spec §3); main.rs resolves the persisted choice and
+            // the detected appearance over this before the first frame.
+            theme: ThemeKey::default(),
+            theme_choice: ThemeChoice::default(),
+            detected_system: ThemeKey::default(),
+            theme_picker: None,
             sanctum_tier: SanctumTier::default(),
             projection: SessionProjection::new(),
             identity: IdentityLine::default(),
@@ -3354,6 +3391,21 @@ impl AppModel {
                 self.help_open = false;
             }
             return;
+        }
+        // The `/theme` picker owns the keys while it is showing. A daemon
+        // card or a navigation away from its surfaces outranks it: the
+        // picker then closes (reverting any preview) and the key proceeds
+        // to its normal owner — local chrome never shadows a live ask.
+        if self.theme_picker.is_some() {
+            let menu_owns = self.screen == Screen::Session && self.projection.open_menu().is_some();
+            if !menu_owns && matches!(self.screen, Screen::Launcher | Screen::Session) {
+                self.handle_theme_picker_key(key.code);
+                return;
+            }
+            if let Some(picker) = self.theme_picker.take() {
+                self.theme = picker.prior.resolve(self.detected_system);
+                self.dirty = true;
+            }
         }
         // Subagent view (§2.10): esc ALWAYS walks back to the session (the
         // parent is not blocked); the chip's question menu replaces the
@@ -5524,26 +5576,21 @@ impl AppModel {
                 ));
             }
             "theme" => match arg.as_deref() {
-                Some(name) => match ThemeKey::parse(name) {
-                    Some(key) => {
-                        self.theme = key;
-                        self.flash = Some(format!("· theme → {}", key.theme().label));
+                Some(name) => match ThemeChoice::parse(name) {
+                    Some(choice) => {
+                        self.apply_theme_choice(choice);
+                        self.flash = Some(self.theme_flash());
                     }
                     None => {
-                        self.flash =
-                            Some(format!("· unknown theme “{name}” — dawn · ivory · dark"));
+                        self.flash = Some(format!(
+                            "· unknown theme “{name}” — system · light · dark · desert · oasis"
+                        ));
                     }
                 },
-                None => {
-                    // Documented divergence: the sim only LISTS the themes
-                    // on a bare /theme (tui.js:1729-1733); in a TUI cycling
-                    // is the better default — cycle, name the result, and
-                    // still list the choices.
-                    self.cycle_theme();
-                    if let Some(flash) = &mut self.flash {
-                        flash.push_str(" · themes — dawn · ivory · dark");
-                    }
-                }
+                // Owner spec §3: bare /theme opens the numbered
+                // arrow-highlight picker (supersedes the sim-era cycle
+                // divergence — the picker IS the listing now).
+                None => self.open_theme_picker(),
             },
             "clear" | "back" => {
                 // Sim tui.js:1950-1958: /clear DETACHES (activeId = null)
@@ -7138,6 +7185,11 @@ impl AppModel {
             }
             // Dismissed/replaced palettes drop the click.
             Hit::PaletteRow(item) if self.palette_open() => self.activate_palette_item(item),
+            // A `/theme` picker row: click commits (the hover already
+            // previewed it). A stale hit after the picker closed drops.
+            Hit::ThemeOption(index) if self.theme_picker.is_some() => {
+                self.commit_theme_row(index);
+            }
             Hit::MenuOption { menu, index } => {
                 // Only the SAME menu the row was rendered for may answer —
                 // and on the subagent screen that menu is the CHIP's card,
@@ -7417,15 +7469,118 @@ impl AppModel {
                     self.menu_selection = index;
                 }
             }
+            // Hover moves the `/theme` picker's highlight — and with it
+            // the live PREVIEW (the picker's whole point).
+            Some(Hit::ThemeOption(index)) if self.theme_picker.is_some() => {
+                self.preview_theme_row(index);
+            }
             _ => {}
         }
     }
 
+    /// ⌃T: cycle the FIXED themes (a quick toggle beside the `/theme`
+    /// picker). Each step is a committed choice — the runtime persists it.
     fn cycle_theme(&mut self) {
         let keys = ThemeKey::ALL;
         let index = keys.iter().position(|k| *k == self.theme).unwrap_or(0);
-        self.theme = keys[(index + 1) % keys.len()];
+        self.apply_theme_choice(ThemeChoice::Fixed(keys[(index + 1) % keys.len()]));
         self.flash = Some(format!("· theme → {}", self.theme.theme().label));
+    }
+
+    /// Apply a COMMITTED theme choice: resolve against the boot-time
+    /// detection and re-ground the frame. The runtime watches
+    /// `theme_choice` and persists changes to the profile-dir settings
+    /// file (owner spec §3: TUI-local display state, never daemon truth).
+    pub fn apply_theme_choice(&mut self, choice: ThemeChoice) {
+        self.theme_choice = choice;
+        self.theme = choice.resolve(self.detected_system);
+        self.dirty = true;
+    }
+
+    /// The flash for a committed choice — `system` names what it resolved
+    /// to right now so the choice is never opaque.
+    fn theme_flash(&self) -> String {
+        match self.theme_choice {
+            ThemeChoice::System => format!(
+                "· theme → system · follows the terminal (now {})",
+                self.theme.theme().label
+            ),
+            ThemeChoice::Fixed(key) => format!("· theme → {}", key.theme().label),
+        }
+    }
+
+    /// Bare `/theme` (owner menu law): the numbered arrow-highlight picker,
+    /// opening on the composer surfaces that can render it. A daemon card
+    /// outranks it — local chrome never sits on a live ask.
+    fn open_theme_picker(&mut self) {
+        self.dirty = true;
+        if !matches!(self.screen, Screen::Launcher | Screen::Session) {
+            self.flash = Some(
+                "· /theme — pick by name here: /theme system · light · dark · desert · oasis"
+                    .to_owned(),
+            );
+            return;
+        }
+        if self.screen == Screen::Session && self.projection.open_menu().is_some() {
+            self.flash = Some("· /theme — answer the open card first".to_owned());
+            return;
+        }
+        let selection = ThemeChoice::MENU
+            .iter()
+            .position(|choice| *choice == self.theme_choice)
+            .unwrap_or(0);
+        self.theme_picker = Some(ThemePicker {
+            selection,
+            prior: self.theme_choice,
+        });
+    }
+
+    /// Picker keys: ↑↓ move AND PREVIEW instantly (owner: "applies
+    /// instantly"), digits/⏎ commit, esc reverts to the choice on open —
+    /// the session-scoped esc law: the innermost surface answers first.
+    fn handle_theme_picker_key(&mut self, code: KeyCode) {
+        let Some(picker) = self.theme_picker else {
+            return;
+        };
+        let count = ThemeChoice::MENU.len();
+        self.dirty = true;
+        match code {
+            KeyCode::Esc => {
+                self.theme = picker.prior.resolve(self.detected_system);
+                self.theme_picker = None;
+            }
+            KeyCode::Up => self.preview_theme_row((picker.selection + count - 1) % count),
+            KeyCode::Down => self.preview_theme_row((picker.selection + 1) % count),
+            KeyCode::Char(c @ '1'..='9') => {
+                let index = (c as usize) - ('1' as usize);
+                if index < count {
+                    self.commit_theme_row(index);
+                }
+            }
+            KeyCode::Enter => self.commit_theme_row(picker.selection),
+            _ => {}
+        }
+    }
+
+    /// Move the highlight and preview: the resolved theme flips with the
+    /// row; the committed choice (and persistence) wait for a commit.
+    fn preview_theme_row(&mut self, index: usize) {
+        if index < ThemeChoice::MENU.len()
+            && let Some(picker) = &mut self.theme_picker
+        {
+            picker.selection = index;
+            self.theme = ThemeChoice::MENU[index].resolve(self.detected_system);
+            self.dirty = true;
+        }
+    }
+
+    fn commit_theme_row(&mut self, index: usize) {
+        if index >= ThemeChoice::MENU.len() {
+            return;
+        }
+        self.theme_picker = None;
+        self.apply_theme_choice(ThemeChoice::MENU[index]);
+        self.flash = Some(self.theme_flash());
     }
 }
 

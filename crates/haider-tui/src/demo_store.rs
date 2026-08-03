@@ -604,12 +604,16 @@ fn chip_to_dto(chip: &ChipModel) -> ChipDto {
 
 // ------------------------------------------------------------- hydration ----
 
-/// What [`hydrate`] restored, for the caller's precedence decisions (an
-/// explicit `--theme` flag beats a persisted theme; a persisted theme beats
-/// system detection).
+/// What [`hydrate`] surfaced, for the caller's precedence decisions.
+///
+/// UI-themes wave: the theme moved OUT of the demo store — the profile-dir
+/// settings file (`crate::settings`) is the one persistence authority, so
+/// hydrate no longer writes `model.theme`. A pre-wave file's theme name is
+/// surfaced as `legacy_theme` so main.rs can migrate it once (flag >
+/// settings file > this legacy name > system detection).
 #[derive(Debug, Clone, Copy)]
 pub struct HydrateOutcome {
-    pub theme_restored: bool,
+    pub legacy_theme: Option<crate::theme::ThemeKey>,
 }
 
 /// Guards 2-5 of the sim's load (tui.js:706-745), in order, against a
@@ -696,13 +700,10 @@ pub fn hydrate(model: &mut AppModel, dto: StateDto) -> HydrateOutcome {
     model
         .roster
         .store(next, std::sync::atomic::Ordering::SeqCst);
-    let theme_restored = match ThemeKey::parse(&dto.theme) {
-        Some(key) => {
-            model.theme = key;
-            true
-        }
-        None => false,
-    };
+    // The theme single is SURFACED, never applied (UI-themes wave: the
+    // settings file owns theme persistence; guard 5's known-name check
+    // survives as the parse).
+    let legacy_theme = ThemeKey::parse(&dto.theme);
     let mut vfs = crate::app::vfs_seed();
     vfs.extend(dto.vfs);
     model.vfs = vfs;
@@ -721,7 +722,7 @@ pub fn hydrate(model: &mut AppModel, dto: StateDto) -> HydrateOutcome {
         };
     }
     model.dirty = true;
-    HydrateOutcome { theme_restored }
+    HydrateOutcome { legacy_theme }
 }
 
 fn walk_ros(chips: &[ChipDto], next: &mut u64) {

@@ -78,34 +78,43 @@ fn session_model() -> AppModel {
 // ---- Item 1: the composer band, exact white-blend, no stray tints ----
 
 #[test]
-fn composer_band_is_the_exact_sim_blend_in_all_three_themes() {
-    // Hand-computed sim blends (inputBg over bg, round half-up):
-    //   dawn : white 28.0% over #f3ead9 → (246, 240, 228)
-    //   ivory: ink   3.5% over #fbf9f3 → (244, 241, 235)
-    //   dark : white  4.5% over #14100a → ( 31,  27,  21)
+fn composer_band_is_the_exact_designed_blend_in_every_theme() {
+    // Hand-computed design blends (inputBg over bg, round half-up):
+    //   light : ink   4.0% over #faf6ee → (241, 237, 229)
+    //   dark  : white 4.5% over #120e08 → ( 29,  25,  19)
+    //   desert: white 28.0% over #f0e4cc → (244, 236, 218)
+    //   oasis : white 4.5% over #0c1410 → ( 23,  31,  27)
     let expected = [
         (
-            ThemeKey::Dawn,
+            ThemeKey::Light,
             Rgb {
-                r: 246,
-                g: 240,
-                b: 228,
-            },
-        ),
-        (
-            ThemeKey::Ivory,
-            Rgb {
-                r: 244,
-                g: 241,
-                b: 235,
+                r: 241,
+                g: 237,
+                b: 229,
             },
         ),
         (
             ThemeKey::Dark,
             Rgb {
-                r: 31,
-                g: 27,
-                b: 21,
+                r: 29,
+                g: 25,
+                b: 19,
+            },
+        ),
+        (
+            ThemeKey::Desert,
+            Rgb {
+                r: 244,
+                g: 236,
+                b: 218,
+            },
+        ),
+        (
+            ThemeKey::Oasis,
+            Rgb {
+                r: 23,
+                g: 31,
+                b: 27,
             },
         ),
     ];
@@ -212,37 +221,42 @@ fn launcher_recent_rows_share_one_left_column_without_digits() {
 
 #[test]
 fn launcher_typography_uses_exact_theme_inks() {
+    // UI-themes wave flip: the launcher wears the compact HEADER BAND now
+    // (session-header typography, no back chip) — the old centred
+    // shahada/rule/wordmark stack lives on in the boot splash alone.
     let model = launcher_model();
     let theme = model.theme.theme();
     let (rows, _, terminal) = draw(&model, 118, 34);
     let buffer = terminal.backend().buffer();
-    // Mark: BOLD maroon (#7c2d12 on dawn).
-    // TUI4 item 4: the mark is half-block art at this width.
-    let mark_y = row_of(&rows, &haider_tui::mark::banner_rows()[2]);
-    let mark_x = col_of(&rows[mark_y as usize], "█");
-    let mark = &buffer[(mark_x, mark_y)];
-    assert_eq!(mark.fg, Color::Rgb(0x7c, 0x2d, 0x12));
+    // The compact mark: BOLD maroon header art spanning both band lines.
+    let header_art = haider_tui::mark::header_rows();
+    assert!(rows[0].contains(header_art[0].trim_end()), "mark line 1");
+    assert!(rows[1].contains(header_art[1].trim_end()), "mark line 2");
+    let mark_x = col_of(&rows[0], "█");
+    let mark = &buffer[(mark_x, 0)];
+    assert_eq!(mark.fg, Color::from(theme.maroon));
     assert!(mark.modifier.contains(Modifier::BOLD));
-    // Shahada: gold (#9a6a08 on dawn), NOT bold.
-    let shahada_y = row_of(&rows, "لا إله إلا الله");
-    let shahada_x = col_of(&rows[shahada_y as usize], "لا");
-    let shahada = &buffer[(shahada_x, shahada_y)];
-    assert_eq!(shahada.fg, Color::Rgb(0x9a, 0x6a, 0x08));
-    assert!(!shahada.modifier.contains(Modifier::BOLD));
-    // The dignity rule: gold at HALF strength over the ground.
-    let rule_y = row_of(&rows, "────────────────");
-    let rule_x = col_of(&rows[rule_y as usize], "─");
-    assert_eq!(buffer[(rule_x, rule_y)].fg, Color::from(theme.gold_half));
-    // Wordmark bright.
-    let word_y = row_of(&rows, "H A I D E R");
-    let word_x = col_of(&rows[word_y as usize], "H");
-    assert_eq!(buffer[(word_x, word_y)].fg, Color::Rgb(0x3d, 0x2d, 0x18));
-    // Info line: labels DIM, values BRIGHT.
+    // Product mark: BOLD gold `haider`, dim version/moniker beside it.
+    let product_x = col_of(&rows[0], "haider v");
+    let product = &buffer[(product_x, 0)];
+    assert_eq!(product.fg, Color::from(theme.gold));
+    assert!(product.modifier.contains(Modifier::BOLD));
+    let version_x = col_of(&rows[0], "the lion");
+    assert_eq!(buffer[(version_x, 0)].fg, Color::from(theme.dim));
+    // Device name: BRIGHT (the header contract: wordmark · version · device).
+    let device_x = col_of(&rows[0], &model.identity.device);
+    assert_eq!(buffer[(device_x, 0)].fg, Color::from(theme.bright));
+    // Header line 2 — identity info: labels DIM, values BRIGHT.
     let info_y = row_of(&rows, "provider anthropic");
+    assert_eq!(info_y, 1, "info lives on header line 2");
     let label_x = col_of(&rows[info_y as usize], "provider");
     let value_x = col_of(&rows[info_y as usize], "anthropic");
     assert_eq!(buffer[(label_x, info_y)].fg, Color::from(theme.dim));
     assert_eq!(buffer[(value_x, info_y)].fg, Color::from(theme.bright));
+    // The band closes with a frame rule.
+    let rule_y = info_y + 1;
+    let rule_x = col_of(&rows[rule_y as usize], "─");
+    assert_eq!(buffer[(rule_x, rule_y)].fg, Color::from(theme.frame));
     // Aura row name: gold.
     let aura_y = row_of(&rows, "◉ Aura");
     let aura_x = col_of(&rows[aura_y as usize], "Aura");

@@ -616,13 +616,17 @@ async fn answering_a_hydrated_card_lands_the_stale_menu_note() {
 
 #[test]
 fn guarded_singles_restore_theme_vfs_dir_and_voice() {
-    // MUTATION CHECK: restore the theme unguarded (`model.theme` from any
-    // string) and the unknown-theme case below would need a panic or a
-    // default-clobber to satisfy — either way this test fails.
+    // MUTATION CHECK: surface the theme unguarded (any string → a key)
+    // and the unknown-theme case below fails.
+    //
+    // UI-themes wave flip: the theme single is SURFACED as legacy_theme
+    // for main.rs's one-shot migration, never applied — the profile-dir
+    // settings file owns theme persistence now (owner spec §3), so
+    // hydrate must leave `model.theme` alone in BOTH cases.
     let mut model = launcher_model();
     submit(&mut model, "some session");
     submit(&mut model, "/clear");
-    model.theme = ThemeKey::Dark;
+    model.theme = ThemeKey::Desert;
     model.launcher_dir = "~/dev/elsewhere".to_owned();
     model.voice.enabled = false;
     model
@@ -636,8 +640,12 @@ fn guarded_singles_restore_theme_vfs_dir_and_voice() {
     dto.vfs.remove("~/dev");
     let mut hydrated = launcher_model();
     let outcome = hydrate(&mut hydrated, dto);
-    assert!(outcome.theme_restored);
-    assert_eq!(hydrated.theme, ThemeKey::Dark);
+    assert_eq!(outcome.legacy_theme, Some(ThemeKey::Desert));
+    assert_eq!(
+        hydrated.theme,
+        ThemeKey::Dark,
+        "hydrate surfaces the legacy theme, never applies it"
+    );
     assert_eq!(hydrated.launcher_dir, "~/dev/elsewhere");
     assert!(!hydrated.voice.enabled);
     assert!(
@@ -649,15 +657,15 @@ fn guarded_singles_restore_theme_vfs_dir_and_voice() {
         "vfs is merged OVER the seed — missing seed keys heal"
     );
 
-    // Unknown theme name → the single stays guarded (seed default kept).
+    // Unknown theme name → the single stays guarded (nothing surfaced).
     let mut dto: StateDto =
         serde_json::from_str(&serde_json::to_string(&snapshot(&model)).expect("serialize"))
             .expect("parse");
     dto.theme = "neon".to_owned();
     let mut hydrated = launcher_model();
     let outcome = hydrate(&mut hydrated, dto);
-    assert!(!outcome.theme_restored);
-    assert_eq!(hydrated.theme, ThemeKey::Dawn, "unknown theme → default");
+    assert_eq!(outcome.legacy_theme, None);
+    assert_eq!(hydrated.theme, ThemeKey::Dark, "unknown theme → default");
 }
 
 // ---- The dump_screens-equivalence check: seeds in, seeds out ----
