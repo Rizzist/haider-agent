@@ -44,6 +44,9 @@ fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> Qu
 ///
 /// MUTATION CHECK: remove `FEATURE_BRANCH_CREATE_V1`. Expected RUNTIME
 /// failure: clients cannot discover the served durable branch-create method.
+///
+/// MUTATION CHECK: remove `FEATURE_SESSION_OBSERVE_V1`. Expected RUNTIME
+/// failure: scriptable clients cannot discover the served state digest.
 #[test]
 fn welcome_features_pin_served_management_families() {
     assert_eq!(
@@ -63,6 +66,7 @@ fn welcome_features_pin_served_management_families() {
             FEATURE_PROVIDER_MODELS_V1.to_owned(),
             FEATURE_PROVIDER_REMOVE_V1.to_owned(),
             FEATURE_SESSION_MUTATION_V1.to_owned(),
+            haider_rpc::FEATURE_SESSION_OBSERVE_V1.to_owned(),
             FEATURE_SESSION_PERMISSION_OVERRIDES_V1.to_owned(),
             FEATURE_SHELL_EXEC_V1.to_owned(),
             FEATURE_TOOL_INVENTORY_V1.to_owned(),

@@ -14,8 +14,12 @@
 use super::*;
 use base64::Engine as _;
 use haider_protocol::EventPayload;
+use haider_protocol::agent::ChipState;
 use haider_protocol::context::ContextFootprint;
 use haider_protocol::item::ItemEvent;
+use haider_protocol::menu::MenuKind;
+use haider_protocol::state::RunState;
+use std::collections::{BTreeMap, VecDeque};
 
 const MAX_ATTACHMENTS_PER_TURN: usize = 5;
 const MAX_ATTACHMENT_BYTES: usize = 5 * 1024 * 1024;
@@ -70,6 +74,303 @@ pub(super) fn filter_provider_summaries(
         .into_iter()
         .filter(|summary| provider.is_none_or(|provider| summary.provider == provider))
         .collect()
+}
+
+#[derive(Debug)]
+struct ObservedRun {
+    state: RunState,
+    seq: u64,
+    branch_id: Option<BranchId>,
+}
+
+struct ObserveProjection {
+    event_limit: usize,
+    event_kinds: VecDeque<String>,
+    title: Option<String>,
+    runs: HashMap<RunId, ObservedRun>,
+    menus: BTreeMap<String, haider_rpc::ObserveMenuWire>,
+    subagents: BTreeMap<String, haider_rpc::ObserveSubagentWire>,
+    footprint: Option<ContextFootprint>,
+    main_head_node_id: Option<haider_protocol::ids::NodeId>,
+    main_head_seq: u64,
+    branches: HashMap<haider_protocol::ids::BranchId, haider_protocol::branch::BranchDescriptor>,
+    updated_at_ms: u64,
+}
+
+impl ObserveProjection {
+    fn new(event_limit: usize) -> Self {
+        Self {
+            event_limit,
+            event_kinds: VecDeque::with_capacity(event_limit),
+            title: None,
+            runs: HashMap::new(),
+            menus: BTreeMap::new(),
+            subagents: BTreeMap::new(),
+            footprint: None,
+            main_head_node_id: None,
+            main_head_seq: 0,
+            branches: HashMap::new(),
+            updated_at_ms: 0,
+        }
+    }
+
+    fn apply(&mut self, envelope: haider_protocol::envelope::RawEnvelope) {
+        self.updated_at_ms = self.updated_at_ms.max(envelope.committed_at_ms);
+        if let Some(kind) = envelope
+            .payload
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            && self.event_limit > 0
+        {
+            if self.event_kinds.len() == self.event_limit {
+                self.event_kinds.pop_front();
+            }
+            self.event_kinds.push_back(kind.to_owned());
+        }
+        let seq = envelope.seq;
+        let branch_id = envelope.branch_id;
+        let run_id = envelope.run_id;
+        if let Some(created) =
+            haider_protocol::branch::BranchCreated::from_payload_value(&envelope.payload)
+        {
+            self.branches
+                .insert(created.branch.branch_id.clone(), created.branch);
+            return;
+        }
+        let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload) else {
+            return;
+        };
+        match payload {
+            EventPayload::UserMessage { text, .. } if self.title.is_none() => {
+                self.title = Some(observe_title(&text));
+            }
+            EventPayload::RunState(state) => {
+                if let Some(run_id) = run_id {
+                    self.runs.insert(
+                        run_id,
+                        ObservedRun {
+                            state,
+                            seq,
+                            branch_id,
+                        },
+                    );
+                }
+            }
+            EventPayload::MenuOpened(menu) => {
+                let permission_description = match &menu.kind {
+                    MenuKind::Permission { effect_summary } => Some(effect_summary.clone()),
+                    _ => None,
+                };
+                self.menus.insert(
+                    menu.id.as_str().to_owned(),
+                    haider_rpc::ObserveMenuWire {
+                        kind: observe_menu_kind(&menu.kind).into(),
+                        title: menu.title,
+                        permission_description,
+                    },
+                );
+            }
+            EventPayload::MenuAnswered(answer) => {
+                self.menus.remove(answer.menu.as_str());
+            }
+            EventPayload::MenuClosed { menu, .. } => {
+                self.menus.remove(menu.as_str());
+            }
+            EventPayload::AgentSpawned(manifest) => {
+                self.subagents.insert(
+                    manifest.agent.as_str().to_owned(),
+                    haider_rpc::ObserveSubagentWire {
+                        agent_id: manifest.agent,
+                        callsign: manifest.callsign,
+                        task: manifest.task,
+                        state: "thinking".into(),
+                    },
+                );
+            }
+            EventPayload::AgentChipState { agent, chip } => {
+                let state = observe_chip_state(chip).to_owned();
+                self.subagents
+                    .entry(agent.as_str().to_owned())
+                    .and_modify(|subagent| subagent.state.clone_from(&state))
+                    .or_insert(haider_rpc::ObserveSubagentWire {
+                        agent_id: agent,
+                        callsign: None,
+                        task: String::new(),
+                        state,
+                    });
+            }
+            EventPayload::AgentReport(report) => {
+                if let Some(subagent) = self.subagents.get_mut(report.agent.as_str()) {
+                    subagent.state = match report.verified {
+                        haider_protocol::agent::ReportVerification::Red => "error",
+                        _ => "done",
+                    }
+                    .into();
+                }
+            }
+            EventPayload::Item(ItemEvent::Completed { item, .. }) => {
+                if let Some(footprint) = ContextFootprint::from_extension_item(&item) {
+                    self.footprint = Some(footprint);
+                }
+            }
+            EventPayload::NodeCommitted(node) => {
+                if let Some(branch_id) = branch_id {
+                    if let Some(branch) = self.branches.get_mut(&branch_id) {
+                        branch.head_node_id = node.node;
+                        branch.head_seq = seq;
+                    }
+                } else {
+                    self.main_head_node_id = Some(node.node);
+                    self.main_head_seq = seq;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn finish(
+        self,
+        session_id: SessionId,
+        head_seq: u64,
+        worker_generation: u64,
+        metadata: Option<haider_protocol::session::SessionMetadataV1>,
+    ) -> haider_rpc::SessionObserveDigest {
+        let selected = select_observed_run(&self.runs);
+        let run_state = selected.map_or(haider_rpc::ObserveRunStateWire::Idle, |run| {
+            observe_run_state(&run.state)
+        });
+        let active_branch_id = selected.and_then(|run| run.branch_id.clone());
+        let title = self.title.unwrap_or_else(|| {
+            metadata
+                .as_ref()
+                .and_then(|metadata| {
+                    std::path::Path::new(&metadata.cwd)
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .map(ToOwned::to_owned)
+                })
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| session_id.as_str().to_owned())
+        });
+        // Branch-created facts and branch node commits come from the same
+        // sealed journal prefix as every other observation field. Avoid a
+        // mutable registry read that could race ahead of `head_seq`.
+        let mut branches = self.branches.into_values().collect::<Vec<_>>();
+        branches.sort_by_key(|branch| branch.created_seq);
+        haider_rpc::SessionObserveDigest {
+            session_id,
+            head_seq,
+            worker_generation,
+            metadata,
+            title,
+            run_state,
+            active_branch_id,
+            branches,
+            main_head_node_id: self.main_head_node_id,
+            main_head_seq: self.main_head_seq,
+            latest_context_footprint: self.footprint,
+            pending_menus: self.menus.into_values().collect(),
+            subagents: self.subagents.into_values().collect(),
+            updated_at_ms: self.updated_at_ms,
+            last_event_kinds: self.event_kinds.into_iter().collect(),
+        }
+    }
+}
+
+fn select_observed_run(runs: &HashMap<RunId, ObservedRun>) -> Option<&ObservedRun> {
+    let predicates: [fn(&RunState) -> bool; 4] = [
+        |state| matches!(state, RunState::PermissionRequired { .. }),
+        |state| matches!(state, RunState::InputRequired { .. }),
+        |state| !state.is_terminal() && !matches!(state, RunState::Queued),
+        |state| matches!(state, RunState::Queued),
+    ];
+    for predicate in predicates {
+        if let Some(run) = runs
+            .values()
+            .filter(|run| predicate(&run.state))
+            .max_by_key(|run| run.seq)
+        {
+            return Some(run);
+        }
+    }
+    runs.values().max_by_key(|run| run.seq)
+}
+
+fn observe_run_state(state: &RunState) -> haider_rpc::ObserveRunStateWire {
+    match state {
+        RunState::PermissionRequired { .. } => haider_rpc::ObserveRunStateWire::ParkedPermission,
+        RunState::InputRequired { .. } => haider_rpc::ObserveRunStateWire::ParkedInput,
+        RunState::Errored => haider_rpc::ObserveRunStateWire::Errored,
+        RunState::Cancelled => haider_rpc::ObserveRunStateWire::Cancelled,
+        RunState::Done => haider_rpc::ObserveRunStateWire::Idle,
+        RunState::Queued
+        | RunState::Thinking
+        | RunState::Streaming
+        | RunState::RunningTool
+        | RunState::Waiting { .. }
+        | RunState::Compacting
+        | RunState::Verifying { .. }
+        | RunState::Concluding
+        | RunState::EffectOutcomeUnknown
+        | RunState::Cancelling => haider_rpc::ObserveRunStateWire::Running,
+    }
+}
+
+fn observe_menu_kind(kind: &MenuKind) -> &'static str {
+    match kind {
+        MenuKind::Permission { .. } => "permission",
+        MenuKind::Recovery { .. } => "recovery",
+        MenuKind::Exhausted => "exhausted",
+        MenuKind::TrustHook => "trust_hook",
+        MenuKind::Update => "update",
+        MenuKind::Question => "question",
+        MenuKind::Choice => "choice",
+        MenuKind::Secret => "secret",
+        MenuKind::File => "file",
+        MenuKind::Conflict => "conflict",
+    }
+}
+
+fn observe_chip_state(state: ChipState) -> &'static str {
+    match state {
+        ChipState::Idle => "idle",
+        ChipState::Thinking => "thinking",
+        ChipState::Streaming => "streaming",
+        ChipState::Tool => "tool",
+        ChipState::Waiting => "waiting",
+        ChipState::InputRequired => "input_required",
+        ChipState::PermissionRequired => "permission_required",
+        ChipState::Done => "done",
+        ChipState::Error => "error",
+        ChipState::Closed => "closed",
+    }
+}
+
+fn observe_title(text: &str) -> String {
+    let body = if text.starts_with('/') {
+        text.split_whitespace()
+            .skip(1)
+            .collect::<Vec<_>>()
+            .join(" ")
+    } else {
+        text.to_owned()
+    };
+    let joined = body
+        .split_whitespace()
+        .take(7)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let truncated = if joined.chars().count() > 46 {
+        let cut = joined.chars().take(46).collect::<String>();
+        format!("{}…", cut.trim_end())
+    } else {
+        joined
+    };
+    let mut chars = truncated.chars();
+    chars.next().map_or_else(
+        || "New session".to_owned(),
+        |first| first.to_uppercase().collect::<String>() + chars.as_str(),
+    )
 }
 
 // ─────────── connection RPC surface: list/read/attach/detach/menu ───────────
@@ -251,6 +552,22 @@ impl HubConnection {
                     );
                 }
                 self.session_read(request_id, session_id, range).await
+            }
+            RequestBody::SessionObserve {
+                session_id,
+                last_event_limit,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::View) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.session_observe(request_id, session_id, last_event_limit)
+                    .await
             }
             RequestBody::SessionAttach {
                 session_id,
@@ -2500,6 +2817,65 @@ impl HubConnection {
                     envelopes,
                 },
             },
+        })
+    }
+
+    async fn session_observe(
+        &self,
+        request_id: RequestId,
+        session_id: SessionId,
+        last_event_limit: u32,
+    ) -> Result<(), SessionHubError> {
+        const MAX_EVENT_KINDS: usize = 100;
+
+        let head = self.hub.inner.store.latest_seq(&session_id).await?;
+        if head == 0 {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_NOT_FOUND,
+                "session was not found",
+                false,
+                None,
+            );
+        }
+        let event_limit = usize::try_from(last_event_limit)
+            .unwrap_or(usize::MAX)
+            .min(MAX_EVENT_KINDS);
+        let metadata = self.hub.inner.store.session_metadata(&session_id).await?;
+        let mut projection = ObserveProjection::new(event_limit);
+        let mut cursor = 0;
+        while cursor < head {
+            let page = self
+                .hub
+                .inner
+                .store
+                .read(&session_id, cursor, REPLAY_PAGE_SIZE)
+                .await?;
+            if page.is_empty() {
+                break;
+            }
+            let mut advanced = false;
+            for envelope in page {
+                if envelope.seq > head {
+                    break;
+                }
+                cursor = envelope.seq;
+                advanced = true;
+                projection.apply(envelope);
+            }
+            if !advanced {
+                break;
+            }
+        }
+        let digest = projection.finish(
+            session_id,
+            head,
+            self.hub.inner.store.worker_generation(),
+            metadata,
+        );
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::SessionObserve { digest },
         })
     }
 

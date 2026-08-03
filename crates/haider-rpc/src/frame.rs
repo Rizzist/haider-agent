@@ -3,6 +3,7 @@
 use std::collections::BTreeSet;
 
 use haider_protocol::DeliveryMode;
+use haider_protocol::branch::BranchDescriptor;
 use haider_protocol::context::ContextFootprint;
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::ids::{ArtifactRef, BranchId, ItemId, MenuId, NodeId, RunId, SessionId};
@@ -197,6 +198,8 @@ pub const FEATURE_SHELL_EXEC_V1: &str = "shell_exec_v1";
 pub const FEATURE_TOOL_INVENTORY_V1: &str = "tool_inventory_v1";
 /// Daemon persists and applies typed per-session write/exec permission overrides.
 pub const FEATURE_SESSION_PERMISSION_OVERRIDES_V1: &str = "session_permission_overrides_v1";
+/// Daemon implements the read-only, journal-derived session observation digest.
+pub const FEATURE_SESSION_OBSERVE_V1: &str = "session_observe_v1";
 /// The daemon serves receipt-backed named branch creation and branch-scoped turns.
 pub const FEATURE_BRANCH_CREATE_V1: &str = "branch_create_v1";
 /// The daemon accepts receipt-free, content-addressed `artifact.put` uploads.
@@ -719,6 +722,76 @@ pub struct SessionReadResult {
     pub envelopes: Vec<RawEnvelope>,
 }
 
+/// Stable coarse state used by non-interactive observation clients.
+///
+/// This intentionally does not expose every internal run phase. The six
+/// values are the automation contract; a newer daemon value remains
+/// decodable by an older client as `unknown`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ObserveRunStateWire {
+    Idle,
+    Running,
+    ParkedPermission,
+    ParkedInput,
+    Errored,
+    Cancelled,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Secret-free projection of one currently answerable menu.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObserveMenuWire {
+    pub kind: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_description: Option<String>,
+}
+
+/// Daemon-persisted subagent identity and chip state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObserveSubagentWire {
+    pub agent_id: haider_protocol::ids::AgentId,
+    /// Only a callsign persisted by the daemon is exposed. Clients must not
+    /// synthesize a TUI roster identity here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub callsign: Option<String>,
+    pub task: String,
+    pub state: String,
+}
+
+/// One read-only digest reduced from committed daemon truth.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionObserveDigest {
+    pub session_id: SessionId,
+    pub head_seq: u64,
+    pub worker_generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<SessionMetadataV1>,
+    pub title: String,
+    pub run_state: ObserveRunStateWire,
+    /// `None` names the implicit main branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_branch_id: Option<BranchId>,
+    /// Named branches. Main is implicit and is added by observation clients.
+    #[serde(default)]
+    pub branches: Vec<BranchDescriptor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub main_head_node_id: Option<NodeId>,
+    pub main_head_seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_context_footprint: Option<ContextFootprint>,
+    #[serde(default)]
+    pub pending_menus: Vec<ObserveMenuWire>,
+    #[serde(default)]
+    pub subagents: Vec<ObserveSubagentWire>,
+    pub updated_at_ms: u64,
+    #[serde(default)]
+    pub last_event_kinds: Vec<String>,
+}
+
 /// v0.1 request method bodies.
 ///
 /// The internally tagged method object keeps each operation visibly named and
@@ -782,6 +855,14 @@ pub enum RequestBody {
     SessionRead {
         session_id: SessionId,
         range: SeqRange,
+    },
+    /// Returns a bounded, secret-free state digest derived from the committed
+    /// journal. `last_event_limit` affects only the trailing kind names.
+    #[serde(rename = "session.observe")]
+    SessionObserve {
+        session_id: SessionId,
+        #[serde(default)]
+        last_event_limit: u32,
     },
     /// The only operation that begins event delivery. `after_seq` is the
     /// greatest sequence the client has fully applied (zero for complete
@@ -1051,6 +1132,8 @@ pub enum ResponseBody {
     },
     #[serde(rename = "session.read")]
     SessionRead { result: SessionReadResult },
+    #[serde(rename = "session.observe")]
+    SessionObserve { digest: SessionObserveDigest },
     #[serde(rename = "session.attach")]
     SessionAttach {
         attachment_id: AttachmentId,

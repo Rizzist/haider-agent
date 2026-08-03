@@ -24,11 +24,11 @@ use haider_rpc::{
     FEATURE_PROVIDER_MODELS_V1, FEATURE_PROVIDER_REMOVE_V1, FEATURE_SESSION_MUTATION_V1,
     FEATURE_TURN_CONTROL_V1, FEATURE_VAULT_STAGE_V1, Hello, LifecyclePhase, MenuInput,
     ModelDetailWire, OAuthAuthorizationWire, OAuthAvailabilityWire, OAuthFlowId,
-    OAuthFlowStatusWire, OAuthReadyRefWire, ProtocolError, ProviderActiveWire,
+    OAuthFlowStatusWire, OAuthReadyRefWire, ObserveRunStateWire, ProtocolError, ProviderActiveWire,
     ProviderApiFamilyWire, ProviderAuthRequirementWire, ProviderAvailabilityWire,
     ProviderDefaultWire, ProviderRemoveRefusalReasonWire, ProviderSummaryWire, RequestBody,
-    RequestId, ResponseBody, SecretWire, SeqRange, SessionReadResult, SessionSummary, StagePurpose,
-    SubmitDisposition, Welcome, WireFrame,
+    RequestId, ResponseBody, SecretWire, SeqRange, SessionObserveDigest, SessionReadResult,
+    SessionSummary, StagePurpose, SubmitDisposition, Welcome, WireFrame,
 };
 
 pub const TEST_FRAME_LIMIT: usize = 1024 * 1024;
@@ -214,7 +214,7 @@ pub fn transcript() -> Vec<WireFrame> {
         WireFrame::MenuAnswer {
             request_id: Some(RequestId::new("request-menu-1")),
             command_id: CommandId::new("command-1"),
-            session_id,
+            session_id: session_id.clone(),
             menu_id: MenuId::new("menu-1"),
             request_seq: 8,
             worker_generation: 7,
@@ -985,6 +985,37 @@ pub fn transcript() -> Vec<WireFrame> {
                     enabled: true,
                 }],
                 revision: 12,
+            },
+        },
+        // H1 append-only observation frames. Every preceding frame remains
+        // byte-for-byte stable for older transcript consumers.
+        WireFrame::Request {
+            request_id: RequestId::new("request-observe"),
+            body: RequestBody::SessionObserve {
+                session_id: session_id.clone(),
+                last_event_limit: 20,
+            },
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-observe"),
+            body: ResponseBody::SessionObserve {
+                digest: SessionObserveDigest {
+                    session_id: SessionId::new("session-1"),
+                    head_seq: 9,
+                    worker_generation: 7,
+                    metadata: None,
+                    title: "Observe the durable session".into(),
+                    run_state: ObserveRunStateWire::ParkedInput,
+                    active_branch_id: None,
+                    branches: Vec::new(),
+                    main_head_node_id: None,
+                    main_head_seq: 0,
+                    latest_context_footprint: None,
+                    pending_menus: Vec::new(),
+                    subagents: Vec::new(),
+                    updated_at_ms: 1_753_500_000_009,
+                    last_event_kinds: vec!["run_state".into(), "menu_opened".into()],
+                },
             },
         },
     ]

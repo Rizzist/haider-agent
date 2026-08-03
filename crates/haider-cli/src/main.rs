@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
+pub(crate) mod observe;
 pub(crate) mod run;
 pub(crate) mod update;
 
@@ -50,6 +51,10 @@ async fn main() -> ExitCode {
         // door (bare `haider` on a TTY enters the live TUI instead).
         [command] if command == "--ready" => front_door(FrontDoor::Report).await,
         [command, rest @ ..] if command == "run" => run::run_command(rest).await,
+        [command, rest @ ..] if command == "status" => observe::status_command(rest).await,
+        [command, rest @ ..] if command == "sessions" => observe::sessions_command(rest).await,
+        [command, rest @ ..] if command == "session" => observe::session_command(rest).await,
+        [command, rest @ ..] if command == "events" => observe::events_command(rest).await,
         [command, rest @ ..] if command == "update" => update::update_command(rest).await,
         [command, rest @ ..] if command == "tui" => tui_command(rest).await,
         [command, rest @ ..] if command == "import" => import_command(rest).await,
@@ -59,6 +64,9 @@ async fn main() -> ExitCode {
                  (supports: --version, self-test, run <prompt> \
                  [--output print|json|jsonl] [--timeout <dur>] \
                  [--allow-writes] [--allow-exec] [--attach <path>]..., \
+                 status [--json] [--no-spawn], sessions [--json] [--no-spawn], \
+                 session <id> [--json|--watch] [--no-spawn], \
+                 events [--follow] [--no-spawn], \
                  update [--check], \
                  tui [--theme dawn|ivory|dark], tui --demo [--plain], \
                  import [codex|claude-code], --ready)"

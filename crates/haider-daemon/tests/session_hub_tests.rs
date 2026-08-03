@@ -17,11 +17,14 @@ use haider_daemon::{
 };
 use haider_protocol::DeliveryMode;
 use haider_protocol::EventPayload;
+use haider_protocol::branch::{BranchCreated, BranchDescriptor};
 use haider_protocol::context::{ContextFootprint, ContextFootprintTruth};
 use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
 };
-use haider_protocol::ids::{ArtifactRef, DeviceId, EventId, ItemId, MenuId, RunId, SessionId};
+use haider_protocol::ids::{
+    ArtifactRef, BranchId, DeviceId, EventId, ItemId, MenuId, NodeId, RunId, SessionId,
+};
 use haider_protocol::item::ItemEvent;
 use haider_protocol::menu::{Menu, MenuKind, MenuOption, MenuScope};
 use haider_protocol::provider::FinishReason;
@@ -32,8 +35,8 @@ use haider_rpc::{
     ARTIFACT_PUT_MAX_BYTES, AttachMode, AttachmentId, Capability, CapabilitySet, CommandId,
     ERROR_CODE_ARTIFACT_TOO_LARGE, ERROR_CODE_ATTACHMENT_MIME_UNSUPPORTED,
     ERROR_CODE_ATTACHMENT_NOT_FOUND, ERROR_CODE_ATTACHMENT_TOO_LARGE,
-    ERROR_CODE_ATTACHMENTS_TOO_LARGE, ERROR_CODE_TOO_MANY_ATTACHMENTS, ErrorData, RequestBody,
-    RequestId, ResponseBody, SeqRange, WireFrame,
+    ERROR_CODE_ATTACHMENTS_TOO_LARGE, ERROR_CODE_TOO_MANY_ATTACHMENTS, ErrorData,
+    ObserveRunStateWire, RequestBody, RequestId, ResponseBody, SeqRange, WireFrame,
 };
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1380,6 +1383,225 @@ async fn session_read_exposes_latest_footprint_independent_of_requested_range() 
             .used_tokens,
         18_000
     );
+
+    connection.close().await.expect("connection closes");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// MUTATION CHECK: collapse both parked run states to one generic blocked
+/// value, or serialize whole menu/event payloads into the digest. Expected
+/// RUNTIME failure: the simultaneous fixtures cease to report distinct
+/// `parked_permission`/`parked_input`, a newer queued branch displaces the
+/// executing branch, or a literal vault/OAuth sentinel appears in JSON.
+#[tokio::test]
+async fn session_observe_distinguishes_parked_states_and_never_leaks_secret_material() {
+    const VAULT_SENTINEL: &str = "sk-vault-observe-sentinel-7a4e";
+    const OAUTH_SENTINEL: &str = "oauth-refresh-observe-sentinel-4c91";
+
+    let (_root, store, hub) = open_hub(None, 8).await;
+    let generation = store.worker_generation();
+    let permission_session = SessionId::new("observe-permission");
+    let input_session = SessionId::new("observe-input");
+    let active_session = SessionId::new("observe-active-versus-queued");
+    append_one(&hub, &permission_session, generation, "permission-seed").await;
+    append_one(&hub, &input_session, generation, "input-seed").await;
+    append_one(&hub, &active_session, generation, "active-seed").await;
+
+    let permission_menu_id = MenuId::new("permission-menu");
+    let mut permission_menu = menu_opening(&permission_session, &permission_menu_id, generation);
+    permission_menu.event_id = EventId::new("permission-menu-opened");
+    permission_menu.run_id = Some(RunId::new("permission-run"));
+    permission_menu.payload = serde_json::to_value(EventPayload::MenuOpened(Menu {
+        id: permission_menu_id.clone(),
+        kind: MenuKind::Permission {
+            effect_summary: "write src/lib.rs".into(),
+        },
+        title: "Allow write?".into(),
+        body: vec![VAULT_SENTINEL.into()],
+        options: vec![MenuOption {
+            key: VAULT_SENTINEL.into(),
+            label: VAULT_SENTINEL.into(),
+            detail: Some(VAULT_SENTINEL.into()),
+            decision: None,
+        }],
+        blocking: true,
+        scope: MenuScope::Session,
+        origin: "observe-test".into(),
+        ttl_ms: None,
+        timeout_option: None,
+    }))
+    .expect("permission menu serializes");
+    let mut permission_state = envelope(&permission_session, "permission-state", generation);
+    permission_state.run_id = Some(RunId::new("permission-run"));
+    permission_state.payload =
+        serde_json::to_value(EventPayload::RunState(RunState::PermissionRequired {
+            menu: permission_menu_id,
+        }))
+        .expect("permission state serializes");
+
+    let input_menu_id = MenuId::new("input-menu");
+    let mut input_menu = menu_opening(&input_session, &input_menu_id, generation);
+    input_menu.event_id = EventId::new("input-menu-opened");
+    input_menu.run_id = Some(RunId::new("input-run"));
+    input_menu.payload = serde_json::to_value(EventPayload::MenuOpened(Menu {
+        id: input_menu_id.clone(),
+        kind: MenuKind::Secret,
+        title: "Credential required".into(),
+        body: vec![OAUTH_SENTINEL.into()],
+        options: vec![MenuOption {
+            key: OAUTH_SENTINEL.into(),
+            label: OAUTH_SENTINEL.into(),
+            detail: Some(OAUTH_SENTINEL.into()),
+            decision: None,
+        }],
+        blocking: true,
+        scope: MenuScope::Session,
+        origin: "oauth".into(),
+        ttl_ms: None,
+        timeout_option: None,
+    }))
+    .expect("input menu serializes");
+    let mut input_state = envelope(&input_session, "input-state", generation);
+    input_state.run_id = Some(RunId::new("input-run"));
+    input_state.payload = serde_json::to_value(EventPayload::RunState(RunState::InputRequired {
+        menu: input_menu_id,
+    }))
+    .expect("input state serializes");
+    let mut opaque_oauth = envelope(&input_session, "opaque-oauth", generation);
+    opaque_oauth.payload = serde_json::json!({
+        "type": "future_oauth_token_event",
+        "access_token": OAUTH_SENTINEL,
+        "refresh_token": VAULT_SENTINEL,
+    });
+
+    let branch_fact = |event_id: &str, branch_id: &str, name: &str, created_seq: u64| {
+        let mut fact = envelope(&active_session, event_id, generation);
+        fact.payload = BranchCreated {
+            branch: BranchDescriptor {
+                branch_id: BranchId::new(branch_id),
+                name: name.into(),
+                source_branch_id: None,
+                fork_node_id: NodeId::new("active-main-node"),
+                fork_seq: 1,
+                created_seq,
+                created_at_ms: 1_800_000_000_000 + created_seq,
+                head_node_id: NodeId::new("active-main-node"),
+                head_seq: 1,
+            },
+        }
+        .to_payload_value()
+        .expect("branch fact serializes");
+        fact
+    };
+    let executing_branch = branch_fact(
+        "executing-branch-created",
+        "branch-executing",
+        "executing",
+        2,
+    );
+    let queued_branch = branch_fact("queued-branch-created", "branch-queued", "queued", 3);
+    let mut active_state = envelope(&active_session, "active-state", generation);
+    active_state.branch_id = Some(BranchId::new("branch-executing"));
+    active_state.run_id = Some(RunId::new("run-executing"));
+    active_state.payload = serde_json::to_value(EventPayload::RunState(RunState::Thinking))
+        .expect("active state serializes");
+    let mut queued_state = envelope(&active_session, "queued-state", generation);
+    queued_state.branch_id = Some(BranchId::new("branch-queued"));
+    queued_state.run_id = Some(RunId::new("run-queued"));
+    queued_state.payload = serde_json::to_value(EventPayload::RunState(RunState::Queued))
+        .expect("queued state serializes");
+
+    hub.append(&mut [permission_menu, permission_state])
+        .await
+        .expect("permission fixture commits");
+    hub.append(&mut [input_menu, input_state, opaque_oauth])
+        .await
+        .expect("input fixture commits");
+    hub.append(&mut [executing_branch, queued_branch, active_state, queued_state])
+        .await
+        .expect("active/queued fixture commits");
+
+    let sink = Arc::new(CollectSink::default());
+    let connection = hub
+        .open_connection(
+            capabilities(),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection");
+    for (request, session_id) in [
+        ("observe-permission", permission_session),
+        ("observe-input", input_session),
+        ("observe-active", active_session),
+    ] {
+        connection
+            .request(
+                RequestId::new(request),
+                RequestBody::SessionObserve {
+                    session_id,
+                    last_event_limit: 20,
+                },
+            )
+            .await
+            .expect("session.observe routes");
+    }
+    let mut digests = Vec::new();
+    for _ in 0..3 {
+        let WireFrame::Response {
+            body: ResponseBody::SessionObserve { digest },
+            ..
+        } = sink.next().await
+        else {
+            panic!("expected session.observe response");
+        };
+        digests.push(digest);
+    }
+    let permission = digests
+        .iter()
+        .find(|digest| digest.session_id.as_str() == "observe-permission")
+        .expect("permission digest");
+    let input = digests
+        .iter()
+        .find(|digest| digest.session_id.as_str() == "observe-input")
+        .expect("input digest");
+    let active = digests
+        .iter()
+        .find(|digest| digest.session_id.as_str() == "observe-active-versus-queued")
+        .expect("active digest");
+    assert_eq!(permission.run_state, ObserveRunStateWire::ParkedPermission);
+    assert_eq!(input.run_state, ObserveRunStateWire::ParkedInput);
+    assert_eq!(
+        permission.pending_menus[0]
+            .permission_description
+            .as_deref(),
+        Some("write src/lib.rs")
+    );
+    assert_eq!(input.pending_menus[0].kind, "secret");
+    assert!(
+        input
+            .last_event_kinds
+            .contains(&"future_oauth_token_event".to_owned())
+    );
+    assert_eq!(active.run_state, ObserveRunStateWire::Running);
+    assert_eq!(
+        active.active_branch_id.as_ref().map(BranchId::as_str),
+        Some("branch-executing")
+    );
+    assert_eq!(
+        active
+            .branches
+            .iter()
+            .map(|branch| branch.name.as_str())
+            .collect::<Vec<_>>(),
+        ["executing", "queued"]
+    );
+    assert!(active.branches.iter().all(|branch| {
+        branch.created_seq <= active.head_seq && branch.head_seq <= active.head_seq
+    }));
+    let json = serde_json::to_string(&digests).expect("digests serialize");
+    assert!(!json.contains(VAULT_SENTINEL));
+    assert!(!json.contains(OAUTH_SENTINEL));
 
     connection.close().await.expect("connection closes");
     hub.shutdown().await.expect("hub stops");

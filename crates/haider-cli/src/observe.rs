@@ -1,0 +1,859 @@
+//! Scriptable `haider.observe.v1` snapshots and raw-envelope streams.
+
+use std::io::{self, Write};
+use std::process::ExitCode;
+
+use haider_client::{
+    ConnectError, EnsureError, ObserveClient, ObserveError, ProfileEnv, ResolvedProfile,
+    observe_stream_all, observe_stream_session, resolve_profile,
+};
+use haider_protocol::context::ContextFootprintTruth;
+use haider_protocol::ids::SessionId;
+use haider_rpc::{ObserveRunStateWire, SessionObserveDigest};
+use serde_json::{Value, json};
+use tokio::sync::mpsc;
+
+use super::run::{
+    EX_BLOCKED, EX_IOERR, EX_PROTOCOL, EX_PROVIDER, EX_SOFTWARE, EX_TIMEOUT, EX_UNAVAILABLE,
+    EX_USAGE,
+};
+use super::update::{UpdateAvailability, check_update_availability};
+
+const OBSERVE_SCHEMA: &str = "haider.observe.v1";
+const LAST_EVENT_LIMIT: u32 = 20;
+
+const STREAM_HELP: &str = "Streams are LF-framed raw event envelopes. Event payload kinds and fields are additive; consumers must tolerate unknown kinds and fields.";
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SnapshotOptions {
+    pub json: bool,
+    pub no_spawn: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SessionOptions {
+    pub session_id: String,
+    pub json: bool,
+    pub watch: bool,
+    pub no_spawn: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct EventsOptions {
+    pub follow: bool,
+    pub no_spawn: bool,
+}
+
+pub(crate) enum Parsed<T> {
+    Run(T),
+    Help,
+}
+
+pub(crate) struct StatusDocument {
+    pub schema: &'static str,
+    pub kind: &'static str,
+    pub daemon: DaemonView,
+    pub update: UpdateView,
+    pub features: Vec<String>,
+    pub account: Option<AccountView>,
+    pub session_count: usize,
+    pub profile_path: String,
+}
+
+pub(crate) struct DaemonView {
+    pub version: String,
+    pub generation: u64,
+}
+
+pub(crate) struct UpdateView {
+    pub status: &'static str,
+    pub current_version: String,
+    pub latest_version: Option<String>,
+    pub error: Option<&'static str>,
+}
+
+pub(crate) struct AccountView {
+    pub provider: String,
+    pub alias: String,
+}
+
+pub(crate) struct SessionsDocument {
+    pub schema: &'static str,
+    pub kind: &'static str,
+    pub sessions: Vec<SessionSummaryView>,
+}
+
+pub(crate) struct SessionDocument {
+    pub schema: &'static str,
+    pub kind: &'static str,
+    pub session: SessionDepthView,
+}
+
+pub(crate) struct SessionSummaryView {
+    pub id: String,
+    pub title: String,
+    pub run_state: &'static str,
+    pub active_branch: String,
+    pub branches: Vec<String>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub footprint: Option<FootprintView>,
+    pub subagent_count: usize,
+    pub updated_at: u64,
+}
+
+pub(crate) struct SessionDepthView {
+    pub summary: SessionSummaryView,
+    pub pending_menus: Vec<haider_rpc::ObserveMenuWire>,
+    pub parked_permissions: Vec<String>,
+    pub subagents: Vec<SubagentView>,
+    pub branch_heads: Vec<BranchView>,
+    pub last_event_kinds: Vec<String>,
+}
+
+pub(crate) struct FootprintView {
+    pub truth: &'static str,
+    pub tokens: u64,
+}
+
+pub(crate) struct SubagentView {
+    pub id: String,
+    pub callsign: Option<String>,
+    pub task: String,
+    pub state: String,
+}
+
+pub(crate) struct BranchView {
+    pub id: Option<String>,
+    pub name: String,
+    pub head_node_id: Option<String>,
+    pub head_seq: u64,
+}
+
+pub(crate) trait ObserveJson {
+    fn json(&self) -> Value;
+}
+
+impl ObserveJson for StatusDocument {
+    fn json(&self) -> Value {
+        json!({
+            "schema": self.schema,
+            "kind": self.kind,
+            "daemon": {
+                "version": self.daemon.version,
+                "generation": self.daemon.generation,
+            },
+            "update": {
+                "status": self.update.status,
+                "current_version": self.update.current_version,
+                "latest_version": self.update.latest_version,
+                "error": self.update.error,
+            },
+            "features": self.features,
+            "account": self.account.as_ref().map(|account| json!({
+                "provider": account.provider,
+                "alias": account.alias,
+            })),
+            "session_count": self.session_count,
+            "profile_path": self.profile_path,
+        })
+    }
+}
+
+impl ObserveJson for SessionsDocument {
+    fn json(&self) -> Value {
+        json!({
+            "schema": self.schema,
+            "kind": self.kind,
+            "sessions": self.sessions.iter().map(SessionSummaryView::json).collect::<Vec<_>>(),
+        })
+    }
+}
+
+impl ObserveJson for SessionDocument {
+    fn json(&self) -> Value {
+        json!({
+            "schema": self.schema,
+            "kind": self.kind,
+            "session": self.session.json(),
+        })
+    }
+}
+
+impl ObserveJson for SessionSummaryView {
+    fn json(&self) -> Value {
+        json!({
+            "id": self.id,
+            "title": self.title,
+            "run_state": self.run_state,
+            "active_branch": self.active_branch,
+            "branches": self.branches,
+            "provider": self.provider,
+            "model": self.model,
+            "footprint": self.footprint.as_ref().map(|footprint| json!({
+                "truth": footprint.truth,
+                "tokens": footprint.tokens,
+            })),
+            "subagent_count": self.subagent_count,
+            "updated_at": self.updated_at,
+        })
+    }
+}
+
+impl ObserveJson for SessionDepthView {
+    fn json(&self) -> Value {
+        let mut object = self.summary.json().as_object().cloned().unwrap_or_default();
+        object.insert(
+            "pending_menus".into(),
+            Value::Array(
+                self.pending_menus
+                    .iter()
+                    .map(|menu| {
+                        json!({
+                            "kind": menu.kind,
+                            "title": menu.title,
+                            "permission_description": menu.permission_description,
+                        })
+                    })
+                    .collect(),
+            ),
+        );
+        object.insert("parked_permissions".into(), json!(self.parked_permissions));
+        object.insert(
+            "subagents".into(),
+            Value::Array(
+                self.subagents
+                    .iter()
+                    .map(|subagent| {
+                        json!({
+                            "id": subagent.id,
+                            "callsign": subagent.callsign,
+                            "task": subagent.task,
+                            "state": subagent.state,
+                        })
+                    })
+                    .collect(),
+            ),
+        );
+        object.insert(
+            "branch_heads".into(),
+            Value::Array(
+                self.branch_heads
+                    .iter()
+                    .map(|branch| {
+                        json!({
+                            "id": branch.id,
+                            "name": branch.name,
+                            "head_node_id": branch.head_node_id,
+                            "head_seq": branch.head_seq,
+                        })
+                    })
+                    .collect(),
+            ),
+        );
+        object.insert("last_event_kinds".into(), json!(self.last_event_kinds));
+        Value::Object(object)
+    }
+}
+
+pub(crate) fn parse_snapshot_options(
+    rest: &[String],
+    command: &str,
+) -> Result<Parsed<SnapshotOptions>, String> {
+    let mut options = SnapshotOptions::default();
+    for flag in rest {
+        match flag.as_str() {
+            "--json" if !options.json => options.json = true,
+            "--no-spawn" if !options.no_spawn => options.no_spawn = true,
+            "--help" | "-h" if rest.len() == 1 => return Ok(Parsed::Help),
+            "--json" | "--no-spawn" => return Err(format!("duplicate {flag} flag")),
+            _ => return Err(format!("usage: haider {command} [--json] [--no-spawn]")),
+        }
+    }
+    Ok(Parsed::Run(options))
+}
+
+pub(crate) fn parse_session_options(rest: &[String]) -> Result<Parsed<SessionOptions>, String> {
+    if matches!(rest, [flag] if matches!(flag.as_str(), "--help" | "-h")) {
+        return Ok(Parsed::Help);
+    }
+    let mut session_id = None;
+    let mut json = false;
+    let mut watch = false;
+    let mut no_spawn = false;
+    for value in rest {
+        match value.as_str() {
+            "--json" if !json => json = true,
+            "--watch" if !watch => watch = true,
+            "--no-spawn" if !no_spawn => no_spawn = true,
+            "--json" | "--watch" | "--no-spawn" => {
+                return Err(format!("duplicate {value} flag"));
+            }
+            flag if flag.starts_with('-') => return Err(format!("unknown flag `{flag}`")),
+            id if session_id.is_none() && !id.is_empty() => session_id = Some(id.to_owned()),
+            _ => return Err("usage: haider session <id> [--json|--watch] [--no-spawn]".into()),
+        }
+    }
+    if json && watch {
+        return Err("--json and --watch are mutually exclusive; watch is raw JSONL".into());
+    }
+    Ok(Parsed::Run(SessionOptions {
+        session_id: session_id
+            .ok_or_else(|| "usage: haider session <id> [--json|--watch] [--no-spawn]".to_owned())?,
+        json,
+        watch,
+        no_spawn,
+    }))
+}
+
+pub(crate) fn parse_events_options(rest: &[String]) -> Result<Parsed<EventsOptions>, String> {
+    if matches!(rest, [flag] if matches!(flag.as_str(), "--help" | "-h")) {
+        return Ok(Parsed::Help);
+    }
+    let mut options = EventsOptions::default();
+    for flag in rest {
+        match flag.as_str() {
+            "--follow" if !options.follow => options.follow = true,
+            "--no-spawn" if !options.no_spawn => options.no_spawn = true,
+            "--follow" | "--no-spawn" => return Err(format!("duplicate {flag} flag")),
+            _ => return Err("usage: haider events [--follow] [--no-spawn]".into()),
+        }
+    }
+    Ok(Parsed::Run(options))
+}
+
+pub(crate) async fn status_command(rest: &[String]) -> ExitCode {
+    let options = match parse_snapshot_options(rest, "status") {
+        Ok(Parsed::Run(options)) => options,
+        Ok(Parsed::Help) => return write_help("usage: haider status [--json] [--no-spawn]"),
+        Err(error) => return usage("status", &error),
+    };
+    let profile = match profile() {
+        Ok(profile) => profile,
+        Err(code) => return code,
+    };
+    let observer = match ObserveClient::connect(&profile, !options.no_spawn).await {
+        Ok(observer) => observer,
+        Err(error) => return observe_failure("status", &error),
+    };
+    let account = match observer.active_account().await {
+        Ok(account) => account.map(|descriptor| AccountView {
+            provider: descriptor.provider,
+            alias: descriptor.alias.as_str().to_owned(),
+        }),
+        Err(error) => {
+            observer.close();
+            return observe_failure("status", &error);
+        }
+    };
+    let session_count = match observer.session_ids().await {
+        Ok(sessions) => sessions.len(),
+        Err(error) => {
+            observer.close();
+            return observe_failure("status", &error);
+        }
+    };
+    let welcome = observer.welcome().clone();
+    observer.close();
+    let update = update_view(check_update_availability());
+    let document = StatusDocument {
+        schema: OBSERVE_SCHEMA,
+        kind: "status",
+        daemon: DaemonView {
+            version: welcome.daemon_version,
+            generation: welcome.daemon_generation,
+        },
+        update,
+        features: welcome.features.into_iter().collect(),
+        account,
+        session_count,
+        profile_path: profile.store_dir.display().to_string(),
+    };
+    if options.json {
+        write_document(&document)
+    } else {
+        write_status_human(&document)
+    }
+}
+
+pub(crate) async fn sessions_command(rest: &[String]) -> ExitCode {
+    let options = match parse_snapshot_options(rest, "sessions") {
+        Ok(Parsed::Run(options)) => options,
+        Ok(Parsed::Help) => return write_help("usage: haider sessions [--json] [--no-spawn]"),
+        Err(error) => return usage("sessions", &error),
+    };
+    let profile = match profile() {
+        Ok(profile) => profile,
+        Err(code) => return code,
+    };
+    let observer = match ObserveClient::connect(&profile, !options.no_spawn).await {
+        Ok(observer) => observer,
+        Err(error) => return observe_failure("sessions", &error),
+    };
+    let digests = observer.sessions(0).await;
+    observer.close();
+    let digests = match digests {
+        Ok(digests) => digests,
+        Err(error) => return observe_failure("sessions", &error),
+    };
+    let document = SessionsDocument {
+        schema: OBSERVE_SCHEMA,
+        kind: "sessions",
+        sessions: digests.into_iter().map(summary_view).collect(),
+    };
+    if options.json {
+        write_document(&document)
+    } else {
+        write_sessions_human(&document)
+    }
+}
+
+pub(crate) async fn session_command(rest: &[String]) -> ExitCode {
+    let options = match parse_session_options(rest) {
+        Ok(Parsed::Run(options)) => options,
+        Ok(Parsed::Help) => {
+            return write_help(&format!(
+                "usage: haider session <id> [--json|--watch] [--no-spawn]\n{STREAM_HELP}"
+            ));
+        }
+        Err(error) => return usage("session", &error),
+    };
+    let profile = match profile() {
+        Ok(profile) => profile,
+        Err(code) => return code,
+    };
+    if options.watch {
+        return stream_session(&profile, &options).await;
+    }
+    let observer = match ObserveClient::connect(&profile, !options.no_spawn).await {
+        Ok(observer) => observer,
+        Err(error) => return observe_failure("session", &error),
+    };
+    let digest = observer
+        .session(SessionId::new(options.session_id), LAST_EVENT_LIMIT)
+        .await;
+    observer.close();
+    let digest = match digest {
+        Ok(digest) => digest,
+        Err(error) => return observe_failure("session", &error),
+    };
+    let document = SessionDocument {
+        schema: OBSERVE_SCHEMA,
+        kind: "session",
+        session: depth_view(digest),
+    };
+    if options.json {
+        write_document(&document)
+    } else {
+        write_session_human(&document)
+    }
+}
+
+pub(crate) async fn events_command(rest: &[String]) -> ExitCode {
+    let options = match parse_events_options(rest) {
+        Ok(Parsed::Run(options)) => options,
+        Ok(Parsed::Help) => {
+            return write_help(&format!(
+                "usage: haider events [--follow] [--no-spawn]\n{STREAM_HELP}"
+            ));
+        }
+        Err(error) => return usage("events", &error),
+    };
+    let profile = match profile() {
+        Ok(profile) => profile,
+        Err(code) => return code,
+    };
+    stream_all(&profile, options).await
+}
+
+async fn stream_session(profile: &ResolvedProfile, options: &SessionOptions) -> ExitCode {
+    let (sender, receiver) = mpsc::unbounded_channel();
+    let adapter = tokio::task::spawn_blocking(move || write_envelopes(receiver));
+    let result = observe_stream_session(
+        profile,
+        !options.no_spawn,
+        SessionId::new(options.session_id.clone()),
+        true,
+        sender,
+    )
+    .await;
+    finish_stream("session", result, adapter).await
+}
+
+async fn stream_all(profile: &ResolvedProfile, options: EventsOptions) -> ExitCode {
+    let (sender, receiver) = mpsc::unbounded_channel();
+    let adapter = tokio::task::spawn_blocking(move || write_envelopes(receiver));
+    let result = observe_stream_all(profile, !options.no_spawn, options.follow, sender).await;
+    finish_stream("events", result, adapter).await
+}
+
+async fn finish_stream(
+    command: &str,
+    result: Result<(), ObserveError>,
+    adapter: tokio::task::JoinHandle<io::Result<()>>,
+) -> ExitCode {
+    match adapter.await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            eprintln!("haider {command}: stdout failed: {error}");
+            return ExitCode::from(EX_IOERR);
+        }
+        Err(error) => {
+            eprintln!("haider {command}: output adapter failed: {error}");
+            return ExitCode::from(EX_SOFTWARE);
+        }
+    }
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => observe_failure(command, &error),
+    }
+}
+
+fn write_envelopes(
+    mut receiver: mpsc::UnboundedReceiver<haider_protocol::envelope::RawEnvelope>,
+) -> io::Result<()> {
+    let stdout = io::stdout();
+    let mut output = io::BufWriter::new(stdout.lock());
+    while let Some(envelope) = receiver.blocking_recv() {
+        write_raw_envelope_jsonl(&mut output, &envelope)?;
+    }
+    Ok(())
+}
+
+/// Writes exactly one raw envelope followed by one LF. No observation wrapper
+/// is permitted on the streaming contract.
+pub(crate) fn write_raw_envelope_jsonl(
+    mut output: impl Write,
+    envelope: &haider_protocol::envelope::RawEnvelope,
+) -> io::Result<()> {
+    serde_json::to_writer(&mut output, envelope).map_err(io::Error::other)?;
+    output.write_all(b"\n")?;
+    output.flush()
+}
+
+fn profile() -> Result<ResolvedProfile, ExitCode> {
+    resolve_profile(&ProfileEnv::capture()).map_err(|error| {
+        eprintln!("haider: {error}");
+        ExitCode::from(EX_PROTOCOL)
+    })
+}
+
+fn update_view(result: Result<UpdateAvailability, super::update::UpdateError>) -> UpdateView {
+    match result {
+        Ok(UpdateAvailability::Current { version }) => UpdateView {
+            status: "current",
+            current_version: version,
+            latest_version: None,
+            error: None,
+        },
+        Ok(UpdateAvailability::Available { current, latest }) => UpdateView {
+            status: "available",
+            current_version: current,
+            latest_version: Some(latest),
+            error: None,
+        },
+        Err(_) => UpdateView {
+            status: "unknown",
+            current_version: super::VERSION.to_owned(),
+            latest_version: None,
+            error: Some("unavailable"),
+        },
+    }
+}
+
+pub(crate) fn summary_view(digest: SessionObserveDigest) -> SessionSummaryView {
+    let branches = std::iter::once("main".to_owned())
+        .chain(
+            digest
+                .branches
+                .iter()
+                .map(|branch| branch.branch_id.as_str().to_owned()),
+        )
+        .collect();
+    SessionSummaryView {
+        id: digest.session_id.as_str().to_owned(),
+        title: digest.title,
+        run_state: run_state_name(digest.run_state),
+        active_branch: digest
+            .active_branch_id
+            .as_ref()
+            .map_or_else(|| "main".to_owned(), |branch| branch.as_str().to_owned()),
+        branches,
+        provider: digest
+            .metadata
+            .as_ref()
+            .map(|metadata| metadata.provider.clone()),
+        model: digest
+            .metadata
+            .as_ref()
+            .map(|metadata| metadata.model.clone()),
+        footprint: digest
+            .latest_context_footprint
+            .map(|footprint| FootprintView {
+                truth: match footprint.truth {
+                    ContextFootprintTruth::Exact => "exact",
+                    ContextFootprintTruth::Estimated => "estimated",
+                },
+                tokens: footprint.used_tokens,
+            }),
+        subagent_count: digest.subagents.len(),
+        updated_at: digest.updated_at_ms,
+    }
+}
+
+pub(crate) fn depth_view(digest: SessionObserveDigest) -> SessionDepthView {
+    let branch_heads = std::iter::once(BranchView {
+        id: None,
+        name: "main".into(),
+        head_node_id: digest
+            .main_head_node_id
+            .as_ref()
+            .map(|node| node.as_str().to_owned()),
+        head_seq: digest.main_head_seq,
+    })
+    .chain(digest.branches.iter().map(|branch| BranchView {
+        id: Some(branch.branch_id.as_str().to_owned()),
+        name: branch.name.clone(),
+        head_node_id: Some(branch.head_node_id.as_str().to_owned()),
+        head_seq: branch.head_seq,
+    }))
+    .collect();
+    let parked_permissions = digest
+        .pending_menus
+        .iter()
+        .filter_map(|menu| menu.permission_description.clone())
+        .collect();
+    let subagents = digest
+        .subagents
+        .iter()
+        .map(|subagent| SubagentView {
+            id: subagent.agent_id.as_str().to_owned(),
+            callsign: subagent.callsign.clone(),
+            task: subagent.task.clone(),
+            state: subagent.state.clone(),
+        })
+        .collect();
+    let pending_menus = digest.pending_menus.clone();
+    let last_event_kinds = digest.last_event_kinds.clone();
+    SessionDepthView {
+        summary: summary_view(digest),
+        pending_menus,
+        parked_permissions,
+        subagents,
+        branch_heads,
+        last_event_kinds,
+    }
+}
+
+fn run_state_name(state: ObserveRunStateWire) -> &'static str {
+    match state {
+        ObserveRunStateWire::Idle => "idle",
+        ObserveRunStateWire::Running => "running",
+        ObserveRunStateWire::ParkedPermission => "parked_permission",
+        ObserveRunStateWire::ParkedInput => "parked_input",
+        ObserveRunStateWire::Errored => "errored",
+        ObserveRunStateWire::Cancelled => "cancelled",
+        ObserveRunStateWire::Unknown => "unknown",
+        _ => "unknown",
+    }
+}
+
+fn write_document(document: &impl ObserveJson) -> ExitCode {
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    if let Err(error) = serde_json::to_writer(&mut output, &document.json())
+        .map_err(io::Error::other)
+        .and_then(|()| output.write_all(b"\n"))
+        .and_then(|()| output.flush())
+    {
+        eprintln!("haider: stdout failed: {error}");
+        return ExitCode::from(EX_IOERR);
+    }
+    ExitCode::SUCCESS
+}
+
+fn write_status_human(document: &StatusDocument) -> ExitCode {
+    let account = document.account.as_ref().map_or_else(
+        || "none".to_owned(),
+        |account| format!("{} ({})", account.alias, account.provider),
+    );
+    let update = document.update.latest_version.as_ref().map_or_else(
+        || document.update.status.to_owned(),
+        |version| format!("available ({version})"),
+    );
+    write_human(format!(
+        "daemon {} (generation {})\nupdate: {update}\naccount: {account}\nsessions: {}\nprofile: {}\nfeatures: {}\n",
+        document.daemon.version,
+        document.daemon.generation,
+        document.session_count,
+        document.profile_path,
+        document.features.join(", ")
+    ))
+}
+
+fn write_sessions_human(document: &SessionsDocument) -> ExitCode {
+    write_human(sessions_human_text(document))
+}
+
+pub(crate) fn sessions_human_text(document: &SessionsDocument) -> String {
+    let mut text = String::new();
+    for session in &document.sessions {
+        let footprint = session.footprint.as_ref().map_or_else(
+            || "unknown".to_owned(),
+            |footprint| format!("{}:{}", footprint.truth, footprint.tokens),
+        );
+        text.push_str(&format!(
+            "{}  {}  branch={} [{}]  {}/{}  footprint={}  subagents={}  updated_at={}  {}\n",
+            session.id,
+            session.run_state,
+            session.active_branch,
+            session.branches.join(","),
+            session.provider.as_deref().unwrap_or("unknown"),
+            session.model.as_deref().unwrap_or("unknown"),
+            footprint,
+            session.subagent_count,
+            session.updated_at,
+            session.title.replace('\n', " ")
+        ));
+    }
+    text
+}
+
+fn write_session_human(document: &SessionDocument) -> ExitCode {
+    write_human(session_human_text(document))
+}
+
+pub(crate) fn session_human_text(document: &SessionDocument) -> String {
+    let session = &document.session;
+    let footprint = session.summary.footprint.as_ref().map_or_else(
+        || "unknown".to_owned(),
+        |footprint| format!("{} {} tokens", footprint.truth, footprint.tokens),
+    );
+    let mut text = format!(
+        "{} — {}\nstate: {}\nbranch: {}\nprovider/model: {}/{}\nfootprint: {footprint}\nsubagents: {}\nupdated_at: {}\n",
+        session.summary.id,
+        session.summary.title.replace('\n', " "),
+        session.summary.run_state,
+        session.summary.active_branch,
+        session.summary.provider.as_deref().unwrap_or("unknown"),
+        session.summary.model.as_deref().unwrap_or("unknown"),
+        session.summary.subagent_count,
+        session.summary.updated_at,
+    );
+    for menu in &session.pending_menus {
+        let description = menu
+            .permission_description
+            .as_deref()
+            .map_or_else(String::new, |description| format!(" — {description}"));
+        text.push_str(&format!(
+            "menu: {} — {}{description}\n",
+            menu.kind,
+            menu.title.replace('\n', " ")
+        ));
+    }
+    for subagent in &session.subagents {
+        text.push_str(&format!(
+            "subagent: {} ({}) — {} — {}\n",
+            subagent.callsign.as_deref().unwrap_or(&subagent.id),
+            subagent.id,
+            subagent.state,
+            subagent.task.replace('\n', " ")
+        ));
+    }
+    for branch in &session.branch_heads {
+        text.push_str(&format!("branch: {} @ {}\n", branch.name, branch.head_seq));
+    }
+    if !session.last_event_kinds.is_empty() {
+        text.push_str(&format!(
+            "events: {}\n",
+            session.last_event_kinds.join(", ")
+        ));
+    }
+    text
+}
+
+fn write_human(text: String) -> ExitCode {
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    if let Err(error) = output
+        .write_all(text.as_bytes())
+        .and_then(|()| output.flush())
+    {
+        eprintln!("haider: stdout failed: {error}");
+        ExitCode::from(EX_IOERR)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+fn write_help(text: &str) -> ExitCode {
+    write_human(format!("{text}\n"))
+}
+
+fn usage(command: &str, error: &str) -> ExitCode {
+    eprintln!("haider {command}: {error}");
+    ExitCode::from(EX_USAGE)
+}
+
+fn observe_failure(command: &str, error: &ObserveError) -> ExitCode {
+    eprintln!("haider {command}: {error}");
+    ExitCode::from(exit_code_for_observe_error(error))
+}
+
+pub(crate) fn exit_code_for_observe_error(error: &ObserveError) -> u8 {
+    match error {
+        ObserveError::NoDaemon(_) | ObserveError::NotReady(_) => EX_UNAVAILABLE,
+        ObserveError::Ensure(
+            EnsureError::ProtocolMismatch(_)
+            | EnsureError::MissingFeatures { .. }
+            | EnsureError::ProfileMismatch { .. },
+        )
+        | ObserveError::ProfileMismatch { .. }
+        | ObserveError::MissingFeature(_)
+        | ObserveError::Protocol(_) => EX_PROTOCOL,
+        ObserveError::Ensure(EnsureError::Connect(
+            ConnectError::Rejected(_) | ConnectError::Frame(_) | ConnectError::UnexpectedFrame,
+        ))
+        | ObserveError::Connect(
+            ConnectError::Rejected(_) | ConnectError::Frame(_) | ConnectError::UnexpectedFrame,
+        ) => EX_PROTOCOL,
+        ObserveError::Ensure(
+            EnsureError::Connect(_)
+            | EnsureError::Spawn { .. }
+            | EnsureError::DaemonExited { .. }
+            | EnsureError::StartupTimeout { .. },
+        )
+        | ObserveError::Connect(_) => EX_UNAVAILABLE,
+        ObserveError::Client(haider_client::ClientError::Disconnected(_))
+        | ObserveError::OutputClosed => EX_IOERR,
+        ObserveError::Client(haider_client::ClientError::Encode(_))
+        | ObserveError::StreamTask(_) => EX_SOFTWARE,
+        ObserveError::Rpc { code, .. } if code == "timeout_before_acceptance" => EX_TIMEOUT,
+        ObserveError::Rpc { code, .. }
+            if matches!(
+                code.as_str(),
+                "provider_error"
+                    | "provider_timeout"
+                    | "credential_missing"
+                    | "credential_limited"
+                    | "unauthorized"
+            ) =>
+        {
+            EX_PROVIDER
+        }
+        ObserveError::Rpc { code, .. }
+            if matches!(code.as_str(), "permission_denied" | "input_required") =>
+        {
+            EX_BLOCKED
+        }
+        ObserveError::Rpc { code, .. }
+            if matches!(
+                code.as_str(),
+                "protocol_mismatch" | "unknown_method" | "invalid_argument"
+            ) =>
+        {
+            EX_PROTOCOL
+        }
+        ObserveError::Rpc { .. } => EX_SOFTWARE,
+    }
+}
