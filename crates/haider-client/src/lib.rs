@@ -20,6 +20,7 @@
 
 pub mod client;
 pub mod headless;
+pub mod observe;
 pub mod profile;
 pub mod spawn;
 
@@ -32,8 +33,10 @@ pub use headless::{
     HeadlessBlockingReason, HeadlessEvent, HeadlessFailureCode, HeadlessImageAttachment,
     HeadlessOutcome, HeadlessPermissionDenial, HeadlessRunError, HeadlessRunFailure,
     HeadlessRunRequest, HeadlessRunResult, load_image_attachment, required_headless_features,
-    required_headless_features_with_attachments, run_headless,
+    required_headless_features_with_attachments, required_headless_features_with_hook_trust,
+    run_headless,
 };
+pub use observe::{ObserveClient, ObserveError, observe_stream_all, observe_stream_session};
 pub use profile::{
     DEFAULT_MAX_TOKENS, DEFAULT_PROVIDER, MODEL_ENV, PACKAGED_DEFAULT_MODEL, PROFILE_CONFIG_FILE,
     PROFILE_DIR_ENV, ProfileEnv, ProfileError, ResolvedProfile, effective_uid, endpoint_path_for,

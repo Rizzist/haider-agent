@@ -1,0 +1,1616 @@
+#![allow(clippy::expect_used)]
+
+use super::{
+    CapturedBytes, HookDefinition, HookEngine, HookKind, HookMatcher, HookService, HookSource,
+    HookTrustPolicy, MatchEvent, classify, discover, hook_digest, make_output,
+    next_subscriber_backoff, run_command,
+};
+use crate::session_hub::{SessionHub, SessionHubConfig};
+use haider_core::{SessionCreateCommand, SqliteStoreHandle, StoreHandle};
+use haider_protocol::EventPayload;
+use haider_protocol::effect::{AuthorizationVerdict, EffectClass, EffectIntent, EffectPhase};
+use haider_protocol::envelope::{
+    EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
+};
+use haider_protocol::hook::{
+    HookEventPayload, HookRuntimeKind, HookSubscription, HookSubscriptionState,
+};
+use haider_protocol::ids::{DeviceId, EffectId, EventId, MenuId, RunId, SessionId};
+use haider_protocol::menu::{AnswerVia, DecisionKind, Menu, MenuKind, MenuOption, MenuScope};
+use haider_protocol::state::RunState;
+use haider_rpc::CommandId;
+use haider_tools::{EffectBroker, JournalSink, PermissionPolicy, ProcessExec, ToolResult};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+fn canonical(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).expect("canonical path")
+}
+
+fn write_profile_policy(profile: &Path, policy: &str) {
+    std::fs::write(
+        profile.join("hooks.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schema": "haider.hooks.v1",
+            "policy": policy,
+            "hooks": {},
+        }))
+        .expect("profile hooks JSON"),
+    )
+    .expect("write profile hooks");
+}
+
+fn write_hook(
+    workspace: &Path,
+    name: &str,
+    event: &str,
+    command: &str,
+    timeout_ms: u64,
+    decision: bool,
+    kind: &str,
+) {
+    let matcher = if decision {
+        serde_json::json!({"event": event, "parked_kind": "permission"})
+    } else {
+        serde_json::json!({"event": event})
+    };
+    std::fs::write(
+        workspace.join("hooks.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schema": "haider.hooks.v1",
+            "hooks": {
+                name: {
+                    "matcher": matcher,
+                    "kind": kind,
+                    "command": command,
+                    "timeout_ms": timeout_ms,
+                    "decision": decision,
+                }
+            }
+        }))
+        .expect("workspace hooks JSON"),
+    )
+    .expect("write workspace hooks");
+}
+
+fn raw_event(
+    session_id: &SessionId,
+    run_id: &RunId,
+    generation: u64,
+    id: &str,
+    payload: EventPayload,
+) -> RawEnvelope {
+    EventEnvelope {
+        schema_version: SCHEMA_VERSION,
+        event_id: EventId::new(id),
+        seq: 0,
+        session_id: session_id.clone(),
+        branch_id: None,
+        run_id: Some(run_id.clone()),
+        agent_id: None,
+        device_id: DeviceId::new("hooks-test-device"),
+        authority_epoch: 0,
+        worker_generation: generation,
+        causation_id: None,
+        correlation_id: None,
+        committed_at_ms: 0,
+        render: RenderTargets {
+            ui: true,
+            durable: true,
+            prompt: PromptRender::Omit,
+        },
+        payload: serde_json::to_value(payload).expect("payload"),
+    }
+}
+
+fn raw_hook_event(
+    session_id: &SessionId,
+    run_id: &RunId,
+    generation: u64,
+    id: &str,
+    payload: HookEventPayload,
+) -> RawEnvelope {
+    EventEnvelope {
+        schema_version: SCHEMA_VERSION,
+        event_id: EventId::new(id),
+        seq: 0,
+        session_id: session_id.clone(),
+        branch_id: None,
+        run_id: Some(run_id.clone()),
+        agent_id: None,
+        device_id: DeviceId::new("hooks-test-device"),
+        authority_epoch: 0,
+        worker_generation: generation,
+        causation_id: None,
+        correlation_id: None,
+        committed_at_ms: 0,
+        render: RenderTargets {
+            ui: false,
+            durable: true,
+            prompt: PromptRender::Omit,
+        },
+        payload: payload.to_payload_value().expect("hook payload"),
+    }
+}
+
+fn permission_menu(options: Vec<MenuOption>) -> Menu {
+    Menu {
+        id: MenuId::new("hook-permission-menu"),
+        kind: MenuKind::Permission {
+            effect_summary: "run exact hook test command".into(),
+        },
+        title: "Allow command?".into(),
+        body: vec!["exact effect bytes".into()],
+        options,
+        blocking: true,
+        scope: MenuScope::Session,
+        origin: "process_exec".into(),
+        ttl_ms: None,
+        timeout_option: None,
+    }
+}
+
+struct BrokerJournal;
+
+#[async_trait::async_trait]
+impl JournalSink for BrokerJournal {
+    async fn append(&mut self, _payload: EventPayload) -> ToolResult<()> {
+        Ok(())
+    }
+}
+
+async fn broker_permission_menu(workspace: &Path) -> Menu {
+    let mut broker = EffectBroker::new_at(
+        Box::new(BrokerJournal),
+        workspace,
+        SessionId::new("hooks-test-session"),
+        41,
+        1_700_000_000_000,
+    )
+    .expect("effect broker");
+    let operation = ProcessExec::new("hook-ask-fixture", "printf exact");
+    let intent = broker
+        .normalize(&operation)
+        .await
+        .expect("normalize effect");
+    let mut policy = PermissionPolicy::default();
+    policy.ask(EffectClass::ProcessExec);
+    let AuthorizationVerdict::Ask { menu } = broker
+        .authorize(&intent, &policy)
+        .await
+        .expect("broker ask")
+    else {
+        panic!("fixture policy must ask");
+    };
+    broker
+        .permission_menu(&menu)
+        .expect("broker permission menu")
+        .clone()
+}
+
+struct EngineFixture {
+    _workspace_guard: tempfile::TempDir,
+    _profile_guard: tempfile::TempDir,
+    workspace: PathBuf,
+    store: SqliteStoreHandle,
+    hub: SessionHub,
+    service: HookService,
+    engine: HookEngine,
+    session_id: SessionId,
+    run_id: RunId,
+}
+
+impl EngineFixture {
+    async fn start(command: &str, timeout_ms: u64, decision: bool, kind: &str) -> Self {
+        Self::start_with_trust(command, timeout_ms, decision, kind, true).await
+    }
+
+    async fn start_untrusted(command: &str, timeout_ms: u64) -> Self {
+        Self::start_with_trust(command, timeout_ms, false, "exec", false).await
+    }
+
+    async fn start_with_trust(
+        command: &str,
+        timeout_ms: u64,
+        decision: bool,
+        kind: &str,
+        trust: bool,
+    ) -> Self {
+        let workspace_guard = tempfile::tempdir().expect("workspace");
+        let profile_guard = tempfile::tempdir().expect("profile");
+        let workspace = canonical(workspace_guard.path());
+        let profile = canonical(profile_guard.path());
+        write_profile_policy(&profile, "per_digest");
+        write_hook(
+            &workspace,
+            "test_hook",
+            if decision {
+                "run_parked"
+            } else {
+                "run_started"
+            },
+            command,
+            timeout_ms,
+            decision,
+            kind,
+        );
+        let store = SqliteStoreHandle::open(&profile).await.expect("store");
+        let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+        let (service, engine) = HookEngine::start(profile.clone(), store.clone(), hub.clone())
+            .await
+            .expect("hook engine");
+        hub.install_hooks(service.clone()).expect("install hooks");
+        let session_id = SessionId::new("hooks-test-session");
+        let run_id = RunId::new("hooks-test-run");
+        hub.create_internal_session(SessionCreateCommand {
+            command_id: "create-hooks-test".into(),
+            request_digest: "create-hooks-test-digest".into(),
+            request_json: r#"{"session":"hooks-test"}"#.into(),
+            session_id: session_id.clone(),
+            cwd: workspace.to_str().expect("UTF-8 workspace").to_owned(),
+            provider: "fake".into(),
+            model: "fake-model".into(),
+            max_tokens: 4096,
+            permission_overrides: None,
+            system_prompt_version: "hooks-test-v1".into(),
+            event_id: EventId::new("hooks-test-created"),
+            device_id: DeviceId::new("hooks-test-device"),
+        })
+        .await
+        .expect("create session");
+        if trust {
+            let (_, hooks) = service.list(workspace.clone()).await.expect("list hooks");
+            let digest = hooks.first().expect("discovered hook").digest.clone();
+            service
+                .apply_trust(CommandId::new("trust-hooks-test"), digest, true)
+                .await
+                .expect("trust hook");
+        }
+        Self {
+            _workspace_guard: workspace_guard,
+            _profile_guard: profile_guard,
+            workspace,
+            store,
+            hub,
+            service,
+            engine,
+            session_id,
+            run_id,
+        }
+    }
+
+    async fn append_permission(&self, menu: Menu) {
+        let generation = self.store.worker_generation();
+        let effect = EffectId::new("hooks-test-effect");
+        let mut events = [
+            raw_event(
+                &self.session_id,
+                &self.run_id,
+                generation,
+                "hooks-test-intent",
+                EventPayload::Effect(EffectPhase::Intent(EffectIntent {
+                    effect: effect.clone(),
+                    class: EffectClass::ProcessExec,
+                    summary: "run exact hook test command".into(),
+                    args_digest: "exact-hook-test-args".into(),
+                    workspace_revision: None,
+                })),
+            ),
+            raw_event(
+                &self.session_id,
+                &self.run_id,
+                generation,
+                "hooks-test-authorized",
+                EventPayload::Effect(EffectPhase::Authorized {
+                    effect,
+                    verdict: AuthorizationVerdict::Ask {
+                        menu: menu.id.clone(),
+                    },
+                }),
+            ),
+            raw_event(
+                &self.session_id,
+                &self.run_id,
+                generation,
+                "hooks-test-menu-opened",
+                EventPayload::MenuOpened(menu.clone()),
+            ),
+            raw_event(
+                &self.session_id,
+                &self.run_id,
+                generation,
+                "hooks-test-permission-required",
+                EventPayload::RunState(RunState::PermissionRequired { menu: menu.id }),
+            ),
+        ];
+        self.hub
+            .append(&mut events)
+            .await
+            .expect("append permission");
+    }
+
+    async fn events(&self) -> Vec<RawEnvelope> {
+        self.store
+            .read(&self.session_id, 0, 256)
+            .await
+            .expect("read hook events")
+    }
+
+    async fn close(self) {
+        self.engine.shutdown().await;
+        self.hub.shutdown().await.expect("hub shutdown");
+        self.store.close().await.expect("store close");
+    }
+}
+
+/// MUTATION CHECK: execute an unpinned hook or suppress the refusal notice.
+/// Expected RUNTIME failure: the marker appears or no durable honest notice
+/// names the untrusted reason.
+#[tokio::test]
+async fn untrusted_hook_never_executes_and_notices_honestly() {
+    let marker_dir = tempfile::tempdir().expect("marker dir");
+    let marker = marker_dir.path().join("untrusted-fired");
+    let command = format!("printf forbidden > '{}'", marker.display());
+    let fixture = EngineFixture::start_untrusted(&command, 1_000).await;
+    let mut event = [raw_event(
+        &fixture.session_id,
+        &fixture.run_id,
+        fixture.store.worker_generation(),
+        "untrusted-thinking",
+        EventPayload::RunState(RunState::Thinking),
+    )];
+    fixture.hub.append(&mut event).await.expect("commit fact");
+    let events = wait_for(&fixture, |events| {
+        events.iter().any(|event| {
+            matches!(
+                HookEventPayload::from_payload_value(event.payload.clone()),
+                Ok(HookEventPayload::HookNotice(ref notice))
+                    if notice.reason == "hook is untrusted and was not executed"
+            )
+        })
+    })
+    .await;
+    assert!(!marker.exists());
+    assert!(events.iter().any(|event| {
+        matches!(
+            HookEventPayload::from_payload_value(event.payload.clone()),
+            Ok(HookEventPayload::HookNotice(ref notice))
+                if notice.hook.as_deref() == Some("test_hook")
+        )
+    }));
+    fixture.close().await;
+}
+
+/// MUTATION CHECK: deduplicate refusal notices without the hook digest.
+/// Expected RUNTIME failure: editing one still-untrusted hook suppresses the
+/// second honest refusal and leaves only the stale digest in the journal.
+#[tokio::test]
+async fn untrusted_notice_dedup_is_digest_sensitive() {
+    let fixture = EngineFixture::start_untrusted("printf first", 1_000).await;
+    let mut first = [raw_event(
+        &fixture.session_id,
+        &fixture.run_id,
+        fixture.store.worker_generation(),
+        "untrusted-first-thinking",
+        EventPayload::RunState(RunState::Thinking),
+    )];
+    fixture.hub.append(&mut first).await.expect("first fact");
+    let first_events = wait_for(&fixture, |events| {
+        events.iter().any(|event| {
+            matches!(
+                HookEventPayload::from_payload_value(event.payload.clone()),
+                Ok(HookEventPayload::HookNotice(_))
+            )
+        })
+    })
+    .await;
+    let first_digest = first_events
+        .iter()
+        .filter_map(|event| HookEventPayload::from_payload_value(event.payload.clone()).ok())
+        .find_map(|payload| match payload {
+            HookEventPayload::HookNotice(notice) => notice.digest,
+            _ => None,
+        })
+        .expect("first digest");
+    write_hook(
+        &fixture.workspace,
+        "test_hook",
+        "run_started",
+        "printf second",
+        1_000,
+        false,
+        "exec",
+    );
+    let mut second = [raw_event(
+        &fixture.session_id,
+        &fixture.run_id,
+        fixture.store.worker_generation(),
+        "untrusted-second-thinking",
+        EventPayload::RunState(RunState::Thinking),
+    )];
+    fixture.hub.append(&mut second).await.expect("second fact");
+    let events = wait_for(&fixture, |events| {
+        events
+            .iter()
+            .filter_map(|event| HookEventPayload::from_payload_value(event.payload.clone()).ok())
+            .filter(|payload| matches!(payload, HookEventPayload::HookNotice(_)))
+            .count()
+            >= 2
+    })
+    .await;
+    let digests = events
+        .iter()
+        .filter_map(|event| HookEventPayload::from_payload_value(event.payload.clone()).ok())
+        .filter_map(|payload| match payload {
+            HookEventPayload::HookNotice(notice) => notice.digest,
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(digests.iter().any(|digest| digest == &first_digest));
+    assert!(digests.iter().any(|digest| digest != &first_digest));
+    fixture.close().await;
+}
+
+async fn wait_for(
+    fixture: &EngineFixture,
+    predicate: impl Fn(&[RawEnvelope]) -> bool,
+) -> Vec<RawEnvelope> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let events = fixture.events().await;
+            if predicate(&events) {
+                break events;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("hook result deadline")
+}
+
+/// MUTATION CHECK: hash parsed JSON or omit the command bytes. Expected
+/// RUNTIME failure: the literal digest no longer matches raw-file+command.
+#[test]
+fn digest_is_raw_hooks_bytes_followed_by_command_bytes() {
+    let bytes = br#"{"schema":"haider.hooks.v1","hooks":{}}"#;
+    let command = "printf exact";
+    let mut expected = blake3::Hasher::new();
+    expected.update(bytes);
+    expected.update(command.as_bytes());
+    assert_eq!(
+        hook_digest(bytes, command),
+        expected.finalize().to_hex().to_string()
+    );
+}
+
+/// MUTATION CHECK: reserve a name only after successful decoding. Expected
+/// RUNTIME failure: the valid parent hook unexpectedly replaces the malformed
+/// nearest entry and becomes executable.
+#[test]
+fn nearest_malformed_named_entry_reserves_the_parent_name() {
+    let root = tempfile::tempdir().expect("root");
+    let profile = tempfile::tempdir().expect("profile");
+    let child = root.path().join("child");
+    std::fs::create_dir(&child).expect("child");
+    write_profile_policy(profile.path(), "per_digest");
+    std::fs::write(
+        root.path().join("hooks.json"),
+        r#"{"schema":"haider.hooks.v1","hooks":{"same":{"matcher":{"event":"run_started"},"kind":"exec","command":"printf parent"}}}"#,
+    )
+    .expect("parent hooks");
+    std::fs::write(
+        child.join("hooks.json"),
+        r#"{"schema":"haider.hooks.v1","hooks":{"same":{"matcher":{"event":"run_started"},"kind":"exec","command":""},"child":{"matcher":{"event":"run_started"},"kind":"exec","command":"printf child"}}}"#,
+    )
+    .expect("child hooks");
+    let discovery = discover(&canonical(&child), &canonical(profile.path())).expect("discover");
+    assert!(!discovery.hooks.contains_key("same"));
+    assert_eq!(
+        discovery.hooks.get("child").expect("child hook").command,
+        "printf child"
+    );
+    assert!(
+        discovery
+            .notices
+            .iter()
+            .any(|notice| notice.hook.as_deref() == Some("same"))
+    );
+}
+
+/// MUTATION CHECK: treat a missing/non-object hooks field as an empty valid
+/// document. Expected RUNTIME failure: discovery returns no honest notice for
+/// the malformed schema document.
+#[test]
+fn malformed_hooks_container_produces_an_honest_notice() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let profile = tempfile::tempdir().expect("profile");
+    write_profile_policy(profile.path(), "per_digest");
+    std::fs::write(
+        workspace.path().join("hooks.json"),
+        r#"{"schema":"haider.hooks.v1","hooks":[]}"#,
+    )
+    .expect("malformed hooks");
+    let discovery =
+        discover(&canonical(workspace.path()), &canonical(profile.path())).expect("discover");
+    assert!(
+        discovery
+            .notices
+            .iter()
+            .any(|notice| { notice.reason.contains("field `hooks` must be an object") })
+    );
+}
+
+/// MUTATION CHECK: omit canonical workspace cwd from subscriber identity.
+/// Expected RUNTIME failure: one profile/ancestor subscriber key is reused by
+/// two workspaces even though each process must run in its own cwd.
+#[test]
+fn subscriber_identity_is_scoped_to_workspace_cwd() {
+    let first = tempfile::tempdir().expect("first workspace");
+    let second = tempfile::tempdir().expect("second workspace");
+    let mut first_definition = standalone_definition(&canonical(first.path()), "cat".into());
+    let mut second_definition = standalone_definition(&canonical(second.path()), "cat".into());
+    let shared_source = PathBuf::from("/profile/hooks.json");
+    first_definition.source_path = shared_source.clone();
+    second_definition.source_path = shared_source;
+    assert_ne!(
+        first_definition.subscriber_key(),
+        second_definition.subscriber_key()
+    );
+}
+
+/// MUTATION CHECK: apply provider filters only to session metadata. Expected
+/// RUNTIME failure: account_expired(openai) fails to match in a session whose
+/// ordinary provider metadata is different.
+#[test]
+fn matcher_filters_use_fact_specific_provider_outcome_and_parked_kind() {
+    let session_id = SessionId::new("matcher-session");
+    let run_id = RunId::new("matcher-run");
+    let account = raw_hook_event(
+        &session_id,
+        &run_id,
+        1,
+        "matcher-account-expired",
+        HookEventPayload::AccountExpired {
+            provider: "openai".into(),
+            alias: "primary".into(),
+        },
+    );
+    let account_facts = classify(&account).expect("account facts");
+    assert!(
+        HookMatcher {
+            event: MatchEvent::AccountExpired,
+            session: Some("matcher-session".into()),
+            provider: Some("openai".into()),
+            outcome: None,
+            parked_kind: None,
+        }
+        .matches(&account, "different-session-provider", &account_facts)
+    );
+
+    let finished = raw_event(
+        &session_id,
+        &run_id,
+        1,
+        "matcher-finished",
+        EventPayload::RunState(RunState::Errored),
+    );
+    let finished_facts = classify(&finished).expect("finished facts");
+    assert!(
+        HookMatcher {
+            event: MatchEvent::RunFinished,
+            session: None,
+            provider: None,
+            outcome: Some("errored".into()),
+            parked_kind: None,
+        }
+        .matches(&finished, "fake", &finished_facts)
+    );
+
+    let parked = raw_event(
+        &session_id,
+        &run_id,
+        1,
+        "matcher-parked",
+        EventPayload::RunState(RunState::InputRequired {
+            menu: MenuId::new("input-menu"),
+        }),
+    );
+    let parked_facts = classify(&parked).expect("parked facts");
+    assert!(
+        HookMatcher {
+            event: MatchEvent::RunParked,
+            session: None,
+            provider: None,
+            outcome: None,
+            parked_kind: Some("input".into()),
+        }
+        .matches(&parked, "fake", &parked_facts)
+    );
+}
+
+/// MUTATION CHECK: resolve `allow` to an always-grant or bypass the menu CAS.
+/// Expected RUNTIME failure: the answer is absent, has the wrong provenance,
+/// or does not select the committed AllowOnce option.
+#[tokio::test]
+async fn decision_hook_allow_uses_existing_menu_cas_and_allow_once_only() {
+    let fixture = EngineFixture::start("printf allow", 1_000, true, "exec").await;
+    fixture
+        .append_permission(broker_permission_menu(&fixture.workspace).await)
+        .await;
+    let events = wait_for(&fixture, |events| {
+        events.iter().any(|event| {
+            matches!(
+                serde_json::from_value::<EventPayload>(event.payload.clone()),
+                Ok(EventPayload::MenuAnswered(_))
+            )
+        })
+    })
+    .await;
+    let answer = events
+        .iter()
+        .find_map(|event| {
+            match serde_json::from_value::<EventPayload>(event.payload.clone()).ok()? {
+                EventPayload::MenuAnswered(answer) => Some(answer),
+                _ => None,
+            }
+        })
+        .expect("hook menu answer");
+    assert_eq!(answer.option_key.as_deref(), Some("approve_once"));
+    assert_eq!(answer.option_index, 0);
+    assert_eq!(answer.via, AnswerVia::Hook);
+    fixture.close().await;
+}
+
+/// MUTATION CHECK: map deny to an allow/persistent option or accept arbitrary
+/// stdout as a decision. Expected RUNTIME failure: deny does not select the
+/// committed RejectOnce option, or malformed output resolves the second menu.
+#[tokio::test]
+async fn decision_deny_is_reject_once_and_malformed_output_falls_through() {
+    let deny = EngineFixture::start("printf deny", 1_000, true, "exec").await;
+    deny.append_permission(broker_permission_menu(&deny.workspace).await)
+        .await;
+    let events = wait_for(&deny, |events| {
+        events.iter().any(|event| {
+            matches!(
+                serde_json::from_value::<EventPayload>(event.payload.clone()),
+                Ok(EventPayload::MenuAnswered(_))
+            )
+        })
+    })
+    .await;
+    let answer = events
+        .iter()
+        .find_map(
+            |event| match serde_json::from_value(event.payload.clone()).ok()? {
+                EventPayload::MenuAnswered(answer) => Some(answer),
+                _ => None,
+            },
+        )
+        .expect("deny answer");
+    assert_eq!(answer.option_key.as_deref(), Some("deny"));
+    assert_eq!(answer.option_index, 2);
+    assert_eq!(answer.via, AnswerVia::Hook);
+    deny.close().await;
+
+    let malformed = EngineFixture::start("printf maybe", 1_000, true, "exec").await;
+    malformed
+        .append_permission(broker_permission_menu(&malformed.workspace).await)
+        .await;
+    let events = wait_for(&malformed, |events| {
+        events.iter().any(|event| {
+            matches!(
+                HookEventPayload::from_payload_value(event.payload.clone()),
+                Ok(HookEventPayload::HookFired(_))
+            )
+        })
+    })
+    .await;
+    assert!(!events.iter().any(|event| {
+        matches!(
+            serde_json::from_value::<EventPayload>(event.payload.clone()),
+            Ok(EventPayload::MenuAnswered(_))
+        )
+    }));
+    malformed.close().await;
+}
+
+/// MUTATION CHECK: treat allow as permission to choose AllowAlways when the
+/// committed Ask did not offer AllowOnce. Expected RUNTIME failure: a menu
+/// answer appears even though the hook cannot grant that scope.
+#[tokio::test]
+async fn decision_hook_cannot_exceed_committed_ask_scope() {
+    let fixture = EngineFixture::start("printf allow", 1_000, true, "exec").await;
+    fixture
+        .append_permission(permission_menu(vec![MenuOption {
+            key: "allow_always".into(),
+            label: "Always allow".into(),
+            detail: None,
+            decision: Some(DecisionKind::AllowAlways),
+        }]))
+        .await;
+    let events = wait_for(&fixture, |events| {
+        events.iter().any(|event| {
+            HookEventPayload::from_payload_value(event.payload.clone())
+                .is_ok_and(|payload| matches!(payload, HookEventPayload::HookFired(_)))
+        })
+    })
+    .await;
+    assert!(!events.iter().any(|event| {
+        matches!(
+            serde_json::from_value::<EventPayload>(event.payload.clone()),
+            Ok(EventPayload::MenuAnswered(_))
+        )
+    }));
+    let fired = events
+        .iter()
+        .find_map(|event| HookEventPayload::from_payload_value(event.payload.clone()).ok())
+        .and_then(|payload| match payload {
+            HookEventPayload::HookFired(fired) => Some(fired),
+            _ => None,
+        })
+        .expect("hook fired fact");
+    assert!(!fired.decision_applied);
+    fixture.close().await;
+}
+
+async fn durable_ask_bytes_without_hooks(workspace: &Path, menu: Menu) -> Vec<u8> {
+    let profile = tempfile::tempdir().expect("baseline profile");
+    let store = SqliteStoreHandle::open(profile.path())
+        .await
+        .expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let session_id = SessionId::new("hooks-test-session");
+    hub.create_internal_session(SessionCreateCommand {
+        command_id: "create-hooks-test".into(),
+        request_digest: "create-hooks-test-digest".into(),
+        request_json: r#"{"session":"hooks-test"}"#.into(),
+        session_id: session_id.clone(),
+        cwd: workspace.to_str().expect("UTF-8").to_owned(),
+        provider: "fake".into(),
+        model: "fake-model".into(),
+        max_tokens: 4096,
+        permission_overrides: None,
+        system_prompt_version: "hooks-test-v1".into(),
+        event_id: EventId::new("hooks-test-created"),
+        device_id: DeviceId::new("hooks-test-device"),
+    })
+    .await
+    .expect("create");
+    let run_id = RunId::new("hooks-test-run");
+    let mut opening = [raw_event(
+        &session_id,
+        &run_id,
+        store.worker_generation(),
+        "hooks-test-menu-opened",
+        EventPayload::MenuOpened(menu),
+    )];
+    hub.append(&mut opening)
+        .await
+        .expect("append baseline menu");
+    let bytes = serde_json::to_vec(&opening[0].payload).expect("baseline bytes");
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
+    bytes
+}
+
+/// MUTATION CHECK: answer after timeout, pre-transform the Ask for hooks, or
+/// use a degenerate hook that never could allow. Expected RUNTIME failure:
+/// an answer appears, the exact MenuOpened payload bytes differ from the
+/// no-hook journal, or the paired allow fixture above ceases to resolve.
+#[tokio::test]
+async fn decision_timeout_falls_through_to_byte_identical_ask() {
+    let fixture = EngineFixture::start("sleep 1; printf allow", 20, true, "exec").await;
+    let baseline = durable_ask_bytes_without_hooks(
+        &fixture.workspace,
+        broker_permission_menu(&fixture.workspace).await,
+    )
+    .await;
+    fixture
+        .append_permission(broker_permission_menu(&fixture.workspace).await)
+        .await;
+    let events = wait_for(&fixture, |events| {
+        events.iter().any(|event| {
+            HookEventPayload::from_payload_value(event.payload.clone()).is_ok_and(|payload| {
+                matches!(payload, HookEventPayload::HookFired(ref fired) if fired.timed_out)
+            })
+        })
+    })
+    .await;
+    assert!(!events.iter().any(|event| {
+        matches!(
+            serde_json::from_value::<EventPayload>(event.payload.clone()),
+            Ok(EventPayload::MenuAnswered(_))
+        )
+    }));
+    let ask = events
+        .iter()
+        .find(|event| {
+            matches!(
+                serde_json::from_value::<EventPayload>(event.payload.clone()),
+                Ok(EventPayload::MenuOpened(_))
+            )
+        })
+        .expect("durable Ask");
+    assert_eq!(
+        serde_json::to_vec(&ask.payload).expect("ask bytes"),
+        baseline
+    );
+    fixture.close().await;
+}
+
+/// MUTATION CHECK: dispatch before commit or call the hook observer on an
+/// append error. Expected RUNTIME failure: the marker is created by the
+/// deliberately rejected envelope.
+#[tokio::test]
+async fn matcher_fires_only_after_commit() {
+    let marker_dir = tempfile::tempdir().expect("marker dir");
+    let marker = marker_dir.path().join("fired");
+    let command = format!("printf fired > '{}'", marker.display());
+    let fixture = EngineFixture::start(&command, 1_000, false, "exec").await;
+    let mut seed = [raw_event(
+        &fixture.session_id,
+        &fixture.run_id,
+        fixture.store.worker_generation(),
+        "duplicate-hook-event",
+        EventPayload::IdleDecayed,
+    )];
+    fixture
+        .hub
+        .append(&mut seed)
+        .await
+        .expect("seed duplicate id");
+    let mut rejected = [raw_event(
+        &fixture.session_id,
+        &fixture.run_id,
+        fixture.store.worker_generation(),
+        "duplicate-hook-event",
+        EventPayload::RunState(RunState::Thinking),
+    )];
+    assert!(fixture.hub.append(&mut rejected).await.is_err());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!marker.exists());
+    let mut committed = [raw_event(
+        &fixture.session_id,
+        &fixture.run_id,
+        fixture.store.worker_generation(),
+        "committed-thinking",
+        EventPayload::RunState(RunState::Thinking),
+    )];
+    fixture
+        .hub
+        .append(&mut committed)
+        .await
+        .expect("commit fact");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !marker.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("hook marker");
+    fixture.close().await;
+}
+
+/// MUTATION CHECK: omit the transaction-coupled hook outbox or acknowledge a
+/// fact before its hook work completes. Expected RUNTIME failure: the
+/// committed pre-crash RunStarted fact survives but never creates the marker
+/// when the hook engine starts after the simulated crash boundary.
+#[tokio::test]
+async fn committed_fact_survives_crash_before_publish_and_fires_on_recovery() {
+    let profile_guard = tempfile::tempdir().expect("profile");
+    let workspace_guard = tempfile::tempdir().expect("workspace");
+    let marker_guard = tempfile::tempdir().expect("marker");
+    let profile = canonical(profile_guard.path());
+    let workspace = canonical(workspace_guard.path());
+    let marker = marker_guard.path().join("recovered-fired");
+    write_profile_policy(&profile, "per_digest");
+    write_hook(
+        &workspace,
+        "recovery_hook",
+        "run_started",
+        &format!("printf recovered > '{}'", marker.display()),
+        1_000,
+        false,
+        "exec",
+    );
+    let session_id = SessionId::new("hooks-recovery-session");
+    let run_id = RunId::new("hooks-recovery-run");
+
+    let store = SqliteStoreHandle::open(&profile).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let (service, engine) = HookEngine::start(profile.clone(), store.clone(), hub.clone())
+        .await
+        .expect("engine");
+    hub.install_hooks(service.clone()).expect("install");
+    hub.create_internal_session(SessionCreateCommand {
+        command_id: "create-hooks-recovery".into(),
+        request_digest: "create-hooks-recovery-digest".into(),
+        request_json: r#"{"session":"hooks-recovery"}"#.into(),
+        session_id: session_id.clone(),
+        cwd: workspace.to_str().expect("UTF-8").to_owned(),
+        provider: "fake".into(),
+        model: "fake-model".into(),
+        max_tokens: 4096,
+        permission_overrides: None,
+        system_prompt_version: "hooks-test-v1".into(),
+        event_id: EventId::new("hooks-recovery-created"),
+        device_id: DeviceId::new("hooks-test-device"),
+    })
+    .await
+    .expect("create");
+    let digest = service.list(workspace.clone()).await.expect("list").1[0]
+        .digest
+        .clone();
+    service
+        .apply_trust(CommandId::new("trust-hooks-recovery"), digest, true)
+        .await
+        .expect("trust");
+    engine.shutdown().await;
+    hub.shutdown().await.expect("hub shutdown");
+    drop(service);
+
+    let mut survived = [raw_event(
+        &session_id,
+        &run_id,
+        store.worker_generation(),
+        "hooks-recovery-thinking",
+        EventPayload::RunState(RunState::Thinking),
+    )];
+    store
+        .append(&mut survived)
+        .await
+        .expect("commit without live observer");
+    assert!(!marker.exists());
+    store.close().await.expect("close crashed generation");
+
+    let store = SqliteStoreHandle::open(&profile)
+        .await
+        .expect("reopen store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("reopen hub");
+    let (service, engine) = HookEngine::start(profile, store.clone(), hub.clone())
+        .await
+        .expect("recovery engine");
+    hub.install_hooks(service).expect("reinstall");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !marker.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("recovered hook marker");
+    engine.shutdown().await;
+    hub.shutdown().await.expect("reopen hub shutdown");
+    store.close().await.expect("reopen store close");
+}
+
+/// MUTATION CHECK: hydrate only profile trust receipts and ignore the durable
+/// HookRunTrust fact. Expected RUNTIME failure: the unpinned hook cannot run
+/// after restart even though the run-scoped authority and RunStarted fact
+/// committed in the same pre-crash batch.
+#[tokio::test]
+async fn run_scoped_hook_trust_is_reduced_before_recovery_dispatch() {
+    let profile_guard = tempfile::tempdir().expect("profile");
+    let workspace_guard = tempfile::tempdir().expect("workspace");
+    let marker_guard = tempfile::tempdir().expect("marker");
+    let profile = canonical(profile_guard.path());
+    let workspace = canonical(workspace_guard.path());
+    let marker = marker_guard.path().join("run-trust-fired");
+    write_profile_policy(&profile, "per_digest");
+    write_hook(
+        &workspace,
+        "run_trust_hook",
+        "run_started",
+        &format!("printf scoped > '{}'", marker.display()),
+        1_000,
+        false,
+        "exec",
+    );
+    let session_id = SessionId::new("hooks-run-trust-session");
+    let run_id = RunId::new("hooks-run-trust-run");
+    let store = SqliteStoreHandle::open(&profile).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    hub.create_internal_session(SessionCreateCommand {
+        command_id: "create-hooks-run-trust".into(),
+        request_digest: "create-hooks-run-trust-digest".into(),
+        request_json: r#"{"session":"hooks-run-trust"}"#.into(),
+        session_id: session_id.clone(),
+        cwd: workspace.to_str().expect("UTF-8").to_owned(),
+        provider: "fake".into(),
+        model: "fake-model".into(),
+        max_tokens: 4096,
+        permission_overrides: None,
+        system_prompt_version: "hooks-test-v1".into(),
+        event_id: EventId::new("hooks-run-trust-created"),
+        device_id: DeviceId::new("hooks-test-device"),
+    })
+    .await
+    .expect("create");
+    hub.shutdown().await.expect("hub shutdown");
+    let generation = store.worker_generation();
+    let mut committed = [
+        raw_hook_event(
+            &session_id,
+            &run_id,
+            generation,
+            "hooks-run-trust-authority",
+            HookEventPayload::HookRunTrust { enabled: true },
+        ),
+        raw_event(
+            &session_id,
+            &run_id,
+            generation,
+            "hooks-run-trust-thinking",
+            EventPayload::RunState(RunState::Thinking),
+        ),
+    ];
+    store
+        .append(&mut committed)
+        .await
+        .expect("atomic run trust and fact");
+    store
+        .complete_hook_dispatch(&session_id, committed[0].seq)
+        .await
+        .expect("authority was handled before crash");
+    let mut terminal = [raw_event(
+        &session_id,
+        &run_id,
+        generation,
+        "hooks-run-trust-done",
+        EventPayload::RunState(RunState::Done),
+    )];
+    store.append(&mut terminal).await.expect("commit terminal");
+    store
+        .complete_hook_dispatch(&session_id, terminal[0].seq)
+        .await
+        .expect("terminal was handled before crash");
+    store.close().await.expect("close crashed generation");
+
+    let store = SqliteStoreHandle::open(&profile)
+        .await
+        .expect("reopen store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("reopen hub");
+    let (service, engine) = HookEngine::start(profile, store.clone(), hub.clone())
+        .await
+        .expect("engine");
+    hub.install_hooks(service).expect("install");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !marker.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("run trust recovery marker");
+    engine.shutdown().await;
+    hub.shutdown().await.expect("reopen hub shutdown");
+    store.close().await.expect("reopen store close");
+}
+
+/// MUTATION CHECK: trust by hook name/path or skip the pre-spawn digest
+/// re-check. Expected RUNTIME failure: an edited command executes under the
+/// old pin instead of producing an honest untrusted notice.
+#[tokio::test]
+async fn digest_change_revokes_trust_before_fire() {
+    let marker_dir = tempfile::tempdir().expect("marker dir");
+    let marker = marker_dir.path().join("changed-fired");
+    let fixture = EngineFixture::start("printf original", 1_000, false, "exec").await;
+    write_hook(
+        &fixture.workspace,
+        "test_hook",
+        "run_started",
+        &format!("printf changed > '{}'", marker.display()),
+        1_000,
+        false,
+        "exec",
+    );
+    let mut event = [raw_event(
+        &fixture.session_id,
+        &fixture.run_id,
+        fixture.store.worker_generation(),
+        "digest-changed-thinking",
+        EventPayload::RunState(RunState::Thinking),
+    )];
+    fixture.hub.append(&mut event).await.expect("commit fact");
+    let events = wait_for(&fixture, |events| {
+        events.iter().any(|event| {
+            matches!(
+                HookEventPayload::from_payload_value(event.payload.clone()),
+                Ok(HookEventPayload::HookNotice(ref notice))
+                    if notice.reason.contains("untrusted")
+            )
+        })
+    })
+    .await;
+    assert!(!marker.exists());
+    assert!(events.iter().any(|event| {
+        matches!(
+            HookEventPayload::from_payload_value(event.payload.clone()),
+            Ok(HookEventPayload::HookNotice(_))
+        )
+    }));
+    fixture.close().await;
+}
+
+/// MUTATION CHECK: implement trust_workspace as a mutable path/name allowlist
+/// or keep its first digest only in memory. Expected RUNTIME failure: editing
+/// the command remains trusted now or becomes trusted after daemon reopen.
+#[tokio::test]
+async fn trust_workspace_pins_its_first_digest_across_restart() {
+    let profile_guard = tempfile::tempdir().expect("profile");
+    let workspace_guard = tempfile::tempdir().expect("workspace");
+    let profile = canonical(profile_guard.path());
+    let workspace = canonical(workspace_guard.path());
+    write_profile_policy(&profile, "trust_workspace");
+    write_hook(
+        &workspace,
+        "workspace_hook",
+        "run_started",
+        "printf original",
+        1_000,
+        false,
+        "exec",
+    );
+    let store = SqliteStoreHandle::open(&profile).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let (service, engine) = HookEngine::start(profile.clone(), store.clone(), hub.clone())
+        .await
+        .expect("engine");
+    hub.install_hooks(service.clone()).expect("install");
+    assert!(
+        service.list(workspace.clone()).await.expect("list").1[0].trusted,
+        "first workspace digest is policy-pinned"
+    );
+    write_hook(
+        &workspace,
+        "workspace_hook",
+        "run_started",
+        "printf changed",
+        1_000,
+        false,
+        "exec",
+    );
+    assert!(
+        !service
+            .list(workspace.clone())
+            .await
+            .expect("changed list")
+            .1[0]
+            .trusted,
+        "changed digest is revoked"
+    );
+    engine.shutdown().await;
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
+
+    let store = SqliteStoreHandle::open(&profile)
+        .await
+        .expect("reopen store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("reopen hub");
+    let (service, engine) = HookEngine::start(profile.clone(), store.clone(), hub.clone())
+        .await
+        .expect("reopen engine");
+    hub.install_hooks(service.clone()).expect("reinstall");
+    assert!(
+        !service.list(workspace).await.expect("reopen list").1[0].trusted,
+        "restart must not bless the edited digest"
+    );
+    engine.shutdown().await;
+    hub.shutdown().await.expect("reopen hub shutdown");
+    store.close().await.expect("reopen store close");
+}
+
+fn standalone_definition(workspace: &Path, command: String) -> HookDefinition {
+    HookDefinition {
+        name: "standalone".into(),
+        matcher: HookMatcher {
+            event: MatchEvent::RunStarted,
+            session: None,
+            provider: None,
+            outcome: None,
+            parked_kind: None,
+        },
+        kind: HookKind::Exec,
+        command,
+        timeout: Duration::from_secs(5),
+        decision: false,
+        digest: "0".repeat(64),
+        source_path: workspace.join("hooks.json"),
+        source: HookSource::Workspace,
+        workspace_cwd: workspace.to_path_buf(),
+    }
+}
+
+/// MUTATION CHECK: remove the fd sweep or inherit the parent environment.
+/// Expected RUNTIME failure: the live hook observes descriptor 333, HOME, or
+/// another non-allowlisted variable.
+#[tokio::test]
+async fn hook_spawn_is_live_but_inherits_no_descriptors_or_secret_environment() {
+    let sentinel = "H2_VAULT_SENTINEL_7d3930b1";
+    let child = std::process::Command::new(std::env::current_exe().expect("current test binary"))
+        .args([
+            "--exact",
+            "hooks::tests::hook_secret_child_probe",
+            "--nocapture",
+        ])
+        .env("HAIDER_HOOK_VAULT_SENTINEL", sentinel)
+        .status()
+        .expect("run isolated secret probe");
+    assert!(child.success(), "isolated secret probe failed: {child}");
+
+    let profile = tempfile::tempdir().expect("profile");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let workspace = canonical(workspace.path());
+    let store = SqliteStoreHandle::open(profile.path())
+        .await
+        .expect("store");
+    let (mine, theirs) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+    let planted = rustix::io::fcntl_dupfd_cloexec(&theirs, 333).expect("plant high fd");
+    rustix::io::fcntl_setfd(&planted, rustix::io::FdFlags::empty()).expect("clear CLOEXEC");
+    drop(theirs);
+    let raw_fd = std::os::fd::AsRawFd::as_raw_fd(&planted);
+    let command = format!(
+        "if kill -0 $$ && [ ! -e /dev/fd/{raw_fd} ]; then printf alive-clean; else printf leaked; fi; printf '\\n'; env"
+    );
+    let result = run_command(
+        &standalone_definition(&workspace, command),
+        b"{}",
+        &store,
+        tokio::sync::watch::channel(false).1,
+    )
+    .await;
+    assert_eq!(result.exit_code, Some(0));
+    let mut lines = result.stdout.preview.lines();
+    assert_eq!(lines.next(), Some("alive-clean"));
+    for line in lines {
+        let name = line.split_once('=').map_or(line, |(name, _)| name);
+        assert!(
+            [
+                "PATH", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "PWD", "SHLVL", "_"
+            ]
+            .contains(&name),
+            "unexpected inherited environment variable {name}"
+        );
+    }
+    assert!(
+        !result
+            .stdout
+            .preview
+            .lines()
+            .any(|line| line.starts_with("HOME="))
+    );
+    drop(planted);
+    drop(mine);
+    store.close().await.expect("store close");
+}
+
+/// Isolated child half of the secret-byte fixture above. Running this test in
+/// the ordinary suite is a no-op; the parent re-executes it with a planted
+/// vault sentinel so no process-global environment mutation is required.
+#[test]
+fn hook_secret_child_probe() {
+    let Ok(sentinel) = std::env::var("HAIDER_HOOK_VAULT_SENTINEL") else {
+        return;
+    };
+    let runtime = tokio::runtime::Runtime::new().expect("probe runtime");
+    runtime.block_on(async {
+        let profile = tempfile::tempdir().expect("profile");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let workspace = canonical(workspace.path());
+        let store = SqliteStoreHandle::open(profile.path())
+            .await
+            .expect("store");
+        let result = run_command(
+            &standalone_definition(&workspace, "env".into()),
+            b"{}",
+            &store,
+            tokio::sync::watch::channel(false).1,
+        )
+        .await;
+        assert_eq!(result.exit_code, Some(0));
+        assert!(!result.stdout.preview.contains(&sentinel));
+        assert!(
+            !result
+                .stdout
+                .preview
+                .contains("HAIDER_HOOK_VAULT_SENTINEL=")
+        );
+        store.close().await.expect("store close");
+    });
+}
+
+/// MUTATION CHECK: retain unbounded output, omit the CAS spill, replace the
+/// retained bytes, or fail to journal the bounded result. Expected RUNTIME
+/// failure: the durable HookFired fields, exact artifact, or preview cap
+/// differs from the asserted values.
+#[tokio::test]
+async fn exec_output_is_bounded_and_overflow_is_in_cas() {
+    let fixture = EngineFixture::start("yes x | head -c 600000", 2_000, false, "exec").await;
+    let mut event = [raw_event(
+        &fixture.session_id,
+        &fixture.run_id,
+        fixture.store.worker_generation(),
+        "bounded-output-thinking",
+        EventPayload::RunState(RunState::Thinking),
+    )];
+    fixture.hub.append(&mut event).await.expect("commit fact");
+    let events = wait_for(&fixture, |events| {
+        events.iter().any(|event| {
+            matches!(
+                HookEventPayload::from_payload_value(event.payload.clone()),
+                Ok(HookEventPayload::HookFired(ref fired))
+                    if fired.observed_seq == event.seq.saturating_sub(1)
+            )
+        })
+    })
+    .await;
+    let fired = events
+        .iter()
+        .filter_map(|event| HookEventPayload::from_payload_value(event.payload.clone()).ok())
+        .find_map(|payload| match payload {
+            HookEventPayload::HookFired(fired) if fired.hook == "test_hook" => Some(fired),
+            _ => None,
+        })
+        .expect("durable HookFired");
+    assert!(fired.stdout.truncated);
+    assert_eq!(fired.stdout.bytes, 512 * 1024);
+    assert!(fired.stdout.preview.len() <= 8 * 1024);
+    let artifact = fired.stdout.artifact.expect("CAS overflow");
+    let retained = fixture.store.get(&artifact).await.expect("CAS bytes");
+    assert_eq!(retained, b"x\n".repeat(256 * 1024));
+    fixture.close().await;
+}
+
+/// MUTATION CHECK: bound raw preview bytes before lossy UTF-8 conversion but
+/// forget that replacement characters expand. Expected RUNTIME failure: the
+/// invalid-byte preview exceeds 8192 UTF-8 bytes or its exact raw bytes are
+/// not retained in CAS.
+#[tokio::test]
+async fn invalid_utf8_preview_stays_within_the_byte_cap() {
+    let profile = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(profile.path())
+        .await
+        .expect("store");
+    let raw = vec![0xff; 8 * 1024];
+    let output = make_output(
+        &store,
+        CapturedBytes {
+            bytes: raw.clone(),
+            truncated: false,
+        },
+    )
+    .await;
+    assert!(output.preview.len() <= 8 * 1024);
+    assert!(output.truncated);
+    let artifact = output.artifact.expect("expanded preview CAS spill");
+    assert_eq!(store.get(&artifact).await.expect("raw CAS bytes"), raw);
+    store.close().await.expect("store close");
+}
+
+/// MUTATION CHECK: remove exponential growth or exceed the 5s cap. Expected
+/// RUNTIME failure: the first two restart-scheduled facts are not 200/400ms
+/// or any durable schedule exceeds the literal upper bound.
+#[tokio::test]
+async fn subscribe_restart_backoff_is_exponential_and_bounded() {
+    let fixture = EngineFixture::start("exit 7", 1_000, false, "subscribe").await;
+    let mut event = [raw_event(
+        &fixture.session_id,
+        &fixture.run_id,
+        fixture.store.worker_generation(),
+        "subscriber-thinking",
+        EventPayload::RunState(RunState::Thinking),
+    )];
+    fixture.hub.append(&mut event).await.expect("commit fact");
+    let events = wait_for(&fixture, |events| {
+        events
+            .iter()
+            .filter_map(|event| {
+                let HookEventPayload::HookSubscription(subscription) =
+                    HookEventPayload::from_payload_value(event.payload.clone()).ok()?
+                else {
+                    return None;
+                };
+                (subscription.state == HookSubscriptionState::RestartScheduled)
+                    .then_some(subscription)
+            })
+            .count()
+            >= 2
+    })
+    .await;
+    let schedules = events
+        .iter()
+        .filter_map(|event| {
+            let HookEventPayload::HookSubscription(subscription) =
+                HookEventPayload::from_payload_value(event.payload.clone()).ok()?
+            else {
+                return None;
+            };
+            (subscription.state == HookSubscriptionState::RestartScheduled).then_some(subscription)
+        })
+        .collect::<Vec<HookSubscription>>();
+    assert_eq!(schedules[0].backoff_ms, Some(200));
+    assert_eq!(schedules[1].backoff_ms, Some(400));
+    assert!(
+        schedules
+            .iter()
+            .all(|schedule| schedule.backoff_ms.is_some_and(|delay| delay <= 5_000))
+    );
+    fixture.close().await;
+}
+
+/// MUTATION CHECK: remove or raise the literal 5000-ms cap. Expected RUNTIME
+/// failure: the extracted schedule no longer reaches 5000 and stays there on
+/// the next restart.
+#[test]
+fn subscribe_restart_schedule_reaches_and_holds_the_five_second_cap() {
+    let mut delay = Duration::from_millis(200);
+    let mut schedule = vec![delay.as_millis()];
+    for _ in 0..6 {
+        delay = next_subscriber_backoff(delay);
+        schedule.push(delay.as_millis());
+    }
+    assert_eq!(schedule, vec![200, 400, 800, 1_600, 3_200, 5_000, 5_000]);
+}
+
+/// MUTATION CHECK: kill only the subscriber shell or rely on Child drop.
+/// Expected RUNTIME failure: the background process-group member writes its
+/// delayed marker after the digest is revoked.
+#[tokio::test]
+async fn subscribe_revoke_kills_the_entire_process_group() {
+    let marker_guard = tempfile::tempdir().expect("marker");
+    let ready = marker_guard.path().join("ready");
+    let survived = marker_guard.path().join("survived");
+    let command = format!(
+        "printf ready > '{}'; (sleep 1; printf survived > '{}') & cat >/dev/null",
+        ready.display(),
+        survived.display()
+    );
+    let fixture = EngineFixture::start(&command, 2_000, false, "subscribe").await;
+    let mut event = [raw_event(
+        &fixture.session_id,
+        &fixture.run_id,
+        fixture.store.worker_generation(),
+        "subscriber-revoke-thinking",
+        EventPayload::RunState(RunState::Thinking),
+    )];
+    fixture.hub.append(&mut event).await.expect("commit fact");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !ready.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("subscriber readiness");
+    let digest = fixture
+        .service
+        .list(fixture.workspace.clone())
+        .await
+        .expect("list")
+        .1[0]
+        .digest
+        .clone();
+    fixture
+        .service
+        .apply_trust(CommandId::new("revoke-live-subscriber"), digest, false)
+        .await
+        .expect("revoke");
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    assert!(!survived.exists(), "subscriber descendant survived revoke");
+    fixture.close().await;
+}
+
+/// MUTATION CHECK: silently ignore subscribe hooks under --trust-hooks or
+/// let their process live beyond the authorized run. Expected RUNTIME
+/// failure: no subscriber starts, or its delayed child writes after Done.
+#[tokio::test]
+async fn run_scoped_trust_authorizes_subscribe_only_for_that_run() {
+    let marker_guard = tempfile::tempdir().expect("marker");
+    let ready = marker_guard.path().join("ready");
+    let survived = marker_guard.path().join("survived");
+    let command = format!(
+        "printf ready > '{}'; (sleep 1; printf survived > '{}') & cat >/dev/null",
+        ready.display(),
+        survived.display()
+    );
+    let fixture = EngineFixture::start_with_trust(&command, 2_000, false, "subscribe", false).await;
+    let generation = fixture.store.worker_generation();
+    let mut started = [
+        raw_hook_event(
+            &fixture.session_id,
+            &fixture.run_id,
+            generation,
+            "subscriber-run-trust",
+            HookEventPayload::HookRunTrust { enabled: true },
+        ),
+        raw_event(
+            &fixture.session_id,
+            &fixture.run_id,
+            generation,
+            "subscriber-run-thinking",
+            EventPayload::RunState(RunState::Thinking),
+        ),
+    ];
+    fixture.hub.append(&mut started).await.expect("start run");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !ready.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("run subscriber readiness");
+    let mut done = [raw_event(
+        &fixture.session_id,
+        &fixture.run_id,
+        generation,
+        "subscriber-run-done",
+        EventPayload::RunState(RunState::Done),
+    )];
+    fixture.hub.append(&mut done).await.expect("finish run");
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    assert!(!survived.exists(), "run-scoped subscriber outlived run");
+    fixture.close().await;
+}
+
+/// Keep these private variants visibly exercised by the separate test module.
+#[test]
+fn hook_runtime_and_policy_literals_are_stable() {
+    assert_eq!(HookRuntimeKind::Decision, HookRuntimeKind::Decision);
+    assert_eq!(HookTrustPolicy::TrustNone.as_str(), "trust_none");
+    assert_eq!(HookTrustPolicy::PerDigest.as_str(), "per_digest");
+    assert_eq!(HookTrustPolicy::TrustWorkspace.as_str(), "trust_workspace");
+}
+
+/// MUTATION CHECK: drop the digest-match half of `definition_current` (keep
+/// only `is_trusted`). Expected RUNTIME failure: with TWO pinned digests, a
+/// hook file swapped between match and fire re-verifies as current even
+/// though the matched definition and the fire-time definition differ — the
+/// wrong (albeit trusted) command would run for the matched event.
+#[tokio::test]
+async fn fire_time_reverification_refuses_a_swapped_pinned_definition() {
+    let fixture = EngineFixture::start("printf first", 1_000, false, "exec").await;
+    let profile_root = fixture._profile_guard.path().to_path_buf();
+    let matched = crate::hooks::discover_async(fixture.workspace.clone(), profile_root.clone())
+        .await
+        .expect("discover matched")
+        .hooks
+        .get("test_hook")
+        .cloned()
+        .expect("matched definition");
+
+    // Swap the file to a DIFFERENT command and pin the new digest too —
+    // both definitions are individually trusted.
+    write_hook(
+        &fixture.workspace,
+        "test_hook",
+        "run_started",
+        "printf second",
+        1_000,
+        false,
+        "exec",
+    );
+    let swapped = crate::hooks::discover_async(fixture.workspace.clone(), profile_root)
+        .await
+        .expect("discover swapped")
+        .hooks
+        .get("test_hook")
+        .cloned()
+        .expect("swapped definition");
+    fixture
+        .service
+        .apply_trust(
+            CommandId::new("trust-swap-pin"),
+            swapped.digest.clone(),
+            true,
+        )
+        .await
+        .expect("pin swapped digest");
+    assert_ne!(matched.digest, swapped.digest);
+
+    // The MATCHED (pre-swap) definition must fail fire-time
+    // re-verification even though both digests are pinned.
+    assert!(
+        !crate::hooks::definition_current(&fixture.service, &matched, false).await,
+        "a swapped definition must not re-verify as current"
+    );
+    // The swapped definition itself is honestly current.
+    assert!(crate::hooks::definition_current(&fixture.service, &swapped, false).await);
+    fixture.close().await;
+}

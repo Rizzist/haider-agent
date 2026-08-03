@@ -511,6 +511,45 @@ fn turn_submit_and_cancel_ignore_unknown_additive_fields() {
     assert!(matches!(body, RequestBody::TurnCancel { .. }));
 }
 
+/// MUTATION CHECK: serialize run-scoped trust as an ordinary turn (changing
+/// old receipt bytes) or drop the additive hooks RPC methods. Expected RUNTIME
+/// failure: one of these exact discriminants/coordinates changes.
+#[test]
+fn hooks_rpc_and_run_scoped_trust_shapes_round_trip_exactly() {
+    let submit = RequestBody::TurnSubmitWithHookTrust {
+        command_id: haider_rpc::CommandId::new("submit-hooks-1"),
+        session_id: haider_protocol::ids::SessionId::new("session-hooks-1"),
+        worker_generation: 7,
+        branch_id: None,
+        text: "run with hooks".into(),
+        attachments: Vec::new(),
+        mode: haider_protocol::DeliveryMode::Queue,
+    };
+    let value = serde_json::to_value(&submit).expect("encode trusted submit");
+    assert_eq!(value["method"], "turn.submit_with_hook_trust");
+    assert!(value.get("branch_id").is_none());
+    assert_eq!(
+        serde_json::from_value::<RequestBody>(value).expect("decode trusted submit"),
+        submit
+    );
+
+    let list = RequestBody::HooksList {
+        cwd: "/workspace".into(),
+    };
+    let value = serde_json::to_value(&list).expect("encode hooks list");
+    assert_eq!(
+        value,
+        serde_json::json!({
+            "method": "hooks.list",
+            "cwd": "/workspace"
+        })
+    );
+    assert_eq!(
+        serde_json::from_value::<RequestBody>(value).expect("decode hooks list"),
+        list
+    );
+}
+
 /// MUTATION CHECK: remove the additive `ResponseBody::MenuAnswer` variant or
 /// rename its method/coordinate. Expected failure: the exact success shape
 /// below no longer round-trips.
@@ -801,6 +840,50 @@ fn account_methods_decode_as_unknown_for_older_readers() {
             body: ResponseBody::Unknown,
         }
     );
+}
+
+/// MUTATION CHECK: make response methods closed instead of mapping an unknown
+/// method to `Unknown`. Expected RUNTIME failure: the simulated pre-H1 client
+/// can no longer decode a newer `session.observe`-family response additively.
+#[test]
+fn observe_methods_preserve_older_client_unknown_method_tolerance() {
+    #[allow(dead_code)]
+    #[derive(Deserialize)]
+    #[serde(tag = "kind", rename_all = "snake_case")]
+    enum PreH1Frame {
+        Response {
+            request_id: String,
+            body: PreH1ResponseBody,
+        },
+        #[serde(other)]
+        Unknown,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Deserialize)]
+    #[serde(tag = "method")]
+    enum PreH1ResponseBody {
+        #[serde(rename = "session.list")]
+        SessionList,
+        #[serde(other)]
+        Unknown,
+    }
+
+    let frame = transcript()
+        .last()
+        .cloned()
+        .expect("H1 observe response appended to transcript");
+    let encoded = serde_json::to_string(&frame).expect("current observe response serializes");
+    assert!(encoded.contains(r#""method":"session.observe""#));
+    let decoded: PreH1Frame =
+        serde_json::from_str(&encoded).expect("pre-H1 reader tolerates actual observe response");
+    assert!(matches!(
+        decoded,
+        PreH1Frame::Response {
+            request_id,
+            body: PreH1ResponseBody::Unknown,
+        } if request_id == "request-observe"
+    ));
 }
 
 /// MUTATION CHECK: deriving `Debug` for either sensitive OAuth wire type

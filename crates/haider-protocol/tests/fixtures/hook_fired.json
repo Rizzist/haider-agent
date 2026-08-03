@@ -1,0 +1,20 @@
+{
+  "type": "hook_fired",
+  "hook": "notify",
+  "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "kind": "exec",
+  "observed_seq": 41,
+  "exit_code": 0,
+  "timed_out": false,
+  "stdout": {
+    "preview": "done\n",
+    "bytes": 5,
+    "truncated": false
+  },
+  "stderr": {
+    "preview": "",
+    "bytes": 0,
+    "truncated": false
+  },
+  "decision_applied": false
+}

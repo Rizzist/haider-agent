@@ -1,8 +1,128 @@
-//! Hook decisions and startup gates (§8) — frozen now so E4 (W4) is not a
-//! schema-affecting patch (review finding: lane-closing changes are the
-//! expensive kind).
+//! Hook configuration vocabulary, additive journal facts, and startup gates.
+//!
+//! Hook runtime facts intentionally do not enter the closed [`crate::EventPayload`]
+//! enum. They use their own tagged union and ride [`crate::envelope::RawEnvelope`]
+//! as additive payload kinds, so every pre-H2 typed reducer continues to
+//! tolerate them as unknown facts.
 
+use crate::ids::ArtifactRef;
 use serde::{Deserialize, Serialize};
+
+pub const HOOKS_CONFIG_SCHEMA: &str = "haider.hooks.v1";
+pub const HOOKS_LIST_SCHEMA: &str = "haider.observe.v1";
+
+/// Additive hook-engine facts written to the session journal.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum HookEventPayload {
+    HookNotice(HookNotice),
+    HookFired(HookFired),
+    HookSubscription(HookSubscription),
+    /// Profile/global producers may project update truth into a session.
+    UpdateAvailable {
+        version: String,
+    },
+    /// Profile/global producers may project account expiry into a session.
+    AccountExpired {
+        provider: String,
+        alias: String,
+    },
+    /// Run-scoped, durable authority created only by `haider run
+    /// --trust-hooks`; it never changes the profile trust set.
+    HookRunTrust {
+        enabled: bool,
+    },
+}
+
+impl HookEventPayload {
+    pub fn to_payload_value(&self) -> Result<serde_json::Value, serde_json::Error> {
+        serde_json::to_value(self)
+    }
+
+    pub fn from_payload_value(value: serde_json::Value) -> Result<Self, serde_json::Error> {
+        serde_json::from_value(value)
+    }
+
+    pub fn is_engine_fact(value: &serde_json::Value) -> bool {
+        matches!(
+            value.get("type").and_then(serde_json::Value::as_str),
+            Some("hook_notice" | "hook_fired" | "hook_subscription")
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HookNotice {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+    pub source: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookRuntimeKind {
+    Exec,
+    Subscribe,
+    Decision,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HookFired {
+    pub hook: String,
+    pub digest: String,
+    pub kind: HookRuntimeKind,
+    pub observed_seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    pub timed_out: bool,
+    pub stdout: HookOutput,
+    pub stderr: HookOutput,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposed_decision: Option<HookDecisionKind>,
+    /// `true` only when the menu CAS committed this hook's answer. A proposal
+    /// that lost to another surface is never represented as authority.
+    pub decision_applied: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HookOutput {
+    pub preview: String,
+    pub bytes: u64,
+    pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<ArtifactRef>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookDecisionKind {
+    Allow,
+    Deny,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HookSubscription {
+    pub hook: String,
+    pub digest: String,
+    pub state: HookSubscriptionState,
+    pub restart_attempt: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backoff_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookSubscriptionState {
+    Started,
+    Exited,
+    RestartScheduled,
+    Stopped,
+}
 
 /// A policy gate's decision on one operation. Durable — hooks are not re-run
 /// during replay (§8).

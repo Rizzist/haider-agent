@@ -5,7 +5,6 @@
 #[path = "../src/main.rs"]
 mod cli_main;
 
-use cli_main::update::UpdateError;
 use cli_main::update::discovery::{
     CurlTransport, DiscoveryOutcome, ReleaseSelection, ReleaseSource, SemVersion, UpdateTransport,
     discover,
@@ -16,6 +15,7 @@ use cli_main::update::transaction::{
     CommitBoundary, FaultInjector, InstallLayout, InstalledPairVerifier, NoFaults,
     PreparedTransaction, TransactionPhase, commit_pair, marker_path,
 };
+use cli_main::update::{UpdateAvailability, UpdateError, check_update_availability_with};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Write};
@@ -121,6 +121,42 @@ fn discovery_includes_prereleases_orders_semver_and_selects_both_targets() {
         assert_eq!(transport.get_calls, 1);
         assert_eq!(transport.download_calls, 0);
     }
+}
+
+/// MUTATION CHECK: route status availability through staging, transaction
+/// acquisition, or download instead of the W9 list-only gate. Expected
+/// RUNTIME failure: `download_calls` becomes nonzero or one of the literal
+/// lock/marker/stage paths appears in the watched install directory.
+#[test]
+fn status_reports_update_availability_without_mutating() {
+    let target = "aarch64-apple-darwin";
+    let mut transport = discovery_transport(vec![release_json("v9.8.7", &[target])]);
+    let install = tempfile::tempdir().expect("watched install directory");
+    let availability = check_update_availability_with(&mut transport, &source(), "1.2.3", target)
+        .expect("status discovery");
+    assert_eq!(
+        availability,
+        UpdateAvailability::Available {
+            current: "1.2.3".into(),
+            latest: "9.8.7".into(),
+        }
+    );
+    assert_eq!(transport.get_calls, 1);
+    assert_eq!(transport.download_calls, 0);
+    assert!(stage_entries(install.path()).is_empty());
+    assert!(!install.path().join(".haider-update.lock").exists());
+    assert!(
+        !install
+            .path()
+            .join(".haider-update-transaction.json")
+            .exists()
+    );
+    assert_eq!(
+        std::fs::read_dir(install.path())
+            .expect("read watched directory")
+            .count(),
+        0
+    );
 }
 
 /// MUTATION CHECK: let an equal release reach download/staging. Expected

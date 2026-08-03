@@ -24,6 +24,13 @@ pub(crate) struct UpdateOptions {
     pub check: bool,
 }
 
+/// Read-only W9 release-discovery result consumed by `haider status`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UpdateAvailability {
+    Current { version: String },
+    Available { current: String, latest: String },
+}
+
 pub(crate) fn parse_update_options(rest: &[String]) -> Result<UpdateOptions, UpdateError> {
     match rest {
         [] => Ok(UpdateOptions { check: false }),
@@ -106,7 +113,7 @@ async fn run_update(options: UpdateOptions) -> Result<String, UpdateError> {
     let source = ReleaseSource::production()?;
     let target = compiled_target()?;
     let mut transport = CurlTransport::from_environment();
-    let outcome = discover(&mut transport, &source, super::VERSION, target)?;
+    let outcome = discover_update_with(&mut transport, &source, super::VERSION, target)?;
     let selection = match outcome {
         DiscoveryOutcome::Current(version) => {
             return Ok(format!("haider {version} is current"));
@@ -145,6 +152,41 @@ async fn run_update(options: UpdateOptions) -> Result<String, UpdateError> {
     )?;
     restart_committed(&mut committed, incumbent, &profile).await?;
     Ok(format!("updated haider to {}", selection.version))
+}
+
+/// Performs only W9's list-and-SemVer gate. This function never calls the
+/// download, staging, install-layout, transaction, profile, or restart paths.
+pub(crate) fn check_update_availability() -> Result<UpdateAvailability, UpdateError> {
+    let source = ReleaseSource::production()?;
+    let target = compiled_target()?;
+    let mut transport = CurlTransport::from_environment();
+    check_update_availability_with(&mut transport, &source, super::VERSION, target)
+}
+
+pub(crate) fn check_update_availability_with<T: discovery::UpdateTransport>(
+    transport: &mut T,
+    source: &ReleaseSource,
+    current: &str,
+    target: &str,
+) -> Result<UpdateAvailability, UpdateError> {
+    match discover_update_with(transport, source, current, target)? {
+        DiscoveryOutcome::Current(version) => Ok(UpdateAvailability::Current {
+            version: version.to_string(),
+        }),
+        DiscoveryOutcome::Update(selection) => Ok(UpdateAvailability::Available {
+            current: current.to_owned(),
+            latest: selection.version.to_string(),
+        }),
+    }
+}
+
+fn discover_update_with<T: discovery::UpdateTransport>(
+    transport: &mut T,
+    source: &ReleaseSource,
+    current: &str,
+    target: &str,
+) -> Result<DiscoveryOutcome, UpdateError> {
+    discover(transport, source, current, target)
 }
 
 /// Builds the immutable, fully verified staging capability before entering

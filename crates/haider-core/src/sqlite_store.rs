@@ -15,9 +15,10 @@ use haider_protocol::session::SessionMetadataV1;
 use haider_store::{
     AcceptedShellExec, AcceptedTurn, BranchCreateCommand, BranchCreateOutcome, CancelledTurn, Cas,
     ContextCompactionClaim, ContextCompactionReceiptResponse, DelegationCreateOutcome,
-    DelegationRecord, EventStore, MenuResolutionCommand, MenuResolutionOutcome, ProfileLease,
-    SessionCreateCommand, SessionCreateOutcome, ShellExecAcceptCommand, ShellExecAcceptOutcome,
-    Store, TurnAcceptCommand, TurnAcceptOutcome, TurnCancelCommand, TurnCancelOutcome,
+    DelegationRecord, EventStore, HookTrustChange, HookTrustCommand, MenuResolutionCommand,
+    MenuResolutionOutcome, ProfileLease, SessionCreateCommand, SessionCreateOutcome,
+    ShellExecAcceptCommand, ShellExecAcceptOutcome, Store, TurnAcceptCommand, TurnAcceptOutcome,
+    TurnCancelCommand, TurnCancelOutcome,
 };
 use haider_tools::{CasSink, ToolResult};
 use std::path::Path;
@@ -736,6 +737,45 @@ impl SqliteStoreHandle {
     ) -> Result<MenuResolutionOutcome, HaiderError> {
         let owner = Arc::clone(&self.owner);
         run_blocking(move || owner.with_store(|store| store.resolve_menu(&command))).await
+    }
+
+    /// Applies one receipt-backed hook trust mutation on the blocking pool.
+    pub async fn apply_hook_trust_command(
+        &self,
+        command: HookTrustCommand,
+    ) -> Result<HookTrustChange, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.apply_hook_trust_command(&command)))
+            .await
+    }
+
+    /// Reads committed hook trust mutations in durable commit order.
+    pub async fn hook_trust_changes(&self) -> Result<Vec<HookTrustChange>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(Store::hook_trust_changes)).await
+    }
+
+    /// Loads durable hook-dispatch work left by committed journal appends.
+    pub async fn pending_hook_dispatches(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<RawEnvelope>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.pending_hook_dispatches(limit))).await
+    }
+
+    /// Idempotently acknowledges one committed hook-dispatch outbox row.
+    pub async fn complete_hook_dispatch(
+        &self,
+        session_id: &SessionId,
+        seq: u64,
+    ) -> Result<(), HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        let session_id = session_id.clone();
+        run_blocking(move || {
+            owner.with_store(|store| store.complete_hook_dispatch(&session_id, seq))
+        })
+        .await
     }
 
     /// Checkpoints committed WAL pages before orderly close.

@@ -10,6 +10,7 @@ use haider_protocol::EventPayload;
 use haider_protocol::agent::ChipState;
 use haider_protocol::branch::{BranchCreated, BranchDescriptor, BranchEventPayload};
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets};
+use haider_protocol::hook::{HookEventPayload, HookFired, HookOutput, HookRuntimeKind};
 use haider_protocol::ids::*;
 use haider_protocol::menu::{
     AnswerVia, Menu, MenuAnswer, MenuCloseReason, MenuKind, MenuOption, MenuScope,
@@ -46,6 +47,19 @@ fn golden<T: Serialize + DeserializeOwned + PartialEq + std::fmt::Debug>(name: &
         "fixture drift in {name}: schema change requires the freeze process"
     );
     let back: T = serde_json::from_str(&expected).expect("round-trip");
+    assert_eq!(&back, value, "round-trip mismatch in {name}");
+}
+
+fn additive_golden<T: Serialize + DeserializeOwned + PartialEq + std::fmt::Debug>(
+    name: &str,
+    value: &T,
+) {
+    let serialized = serde_json::to_string_pretty(value).expect("serialize");
+    let expected = std::fs::read_to_string(fixture_path(name))
+        .unwrap_or_else(|_| panic!("missing additive fixture {name}"));
+    let expected = expected.strip_suffix('\n').unwrap_or(&expected);
+    assert_eq!(serialized, expected, "additive fixture drift in {name}");
+    let back: T = serde_json::from_str(expected).expect("round-trip additive fixture");
     assert_eq!(&back, value, "round-trip mismatch in {name}");
 }
 
@@ -254,6 +268,60 @@ fn golden_menu_permission() {
         &EventPayload::MenuClosed {
             menu: MenuId::new("m-perm-1"),
             reason: MenuCloseReason::Cancelled,
+        },
+    );
+}
+
+/// MUTATION CHECK: fold hook facts into the closed EventPayload enum or rename
+/// their additive kind. Expected RUNTIME failure: the independent golden
+/// changes or an older typed reducer unexpectedly accepts the hook payload.
+#[test]
+fn golden_additive_hook_fired_fact_and_unknown_kind_tolerance() {
+    let fact = HookEventPayload::HookFired(HookFired {
+        hook: "notify".into(),
+        digest: "a".repeat(64),
+        kind: HookRuntimeKind::Exec,
+        observed_seq: 41,
+        exit_code: Some(0),
+        timed_out: false,
+        stdout: HookOutput {
+            preview: "done\n".into(),
+            bytes: 5,
+            truncated: false,
+            artifact: None,
+        },
+        stderr: HookOutput {
+            preview: String::new(),
+            bytes: 0,
+            truncated: false,
+            artifact: None,
+        },
+        proposed_decision: None,
+        decision_applied: false,
+    });
+    additive_golden("hook_fired", &fact);
+    let raw = fact.to_payload_value().expect("hook payload");
+    assert!(serde_json::from_value::<EventPayload>(raw.clone()).is_err());
+    let mut envelope =
+        serde_json::to_value(envelope(EventPayload::IdleDecayed)).expect("envelope value");
+    envelope["payload"] = raw.clone();
+    let decoded: haider_protocol::envelope::RawEnvelope =
+        serde_json::from_value(envelope).expect("raw envelope tolerates additive kind");
+    assert_eq!(decoded.payload, raw);
+}
+
+/// MUTATION CHECK: erase hook provenance or reuse RPC provenance. Expected
+/// RUNTIME failure: the exact answer-authority golden changes.
+#[test]
+fn golden_hook_menu_answer_authority() {
+    additive_golden(
+        "menu_answer_hook",
+        &MenuAnswer {
+            menu: MenuId::new("m-perm-hook"),
+            option_key: Some("allow_once".into()),
+            option_index: 0,
+            value: None,
+            via: AnswerVia::Hook,
         },
     );
 }

@@ -24,6 +24,7 @@ use haider_protocol::envelope::{
 };
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::history::{COMPACTION_INTENT_EXTENSION_KIND, NodeKind, TreeNode};
+use haider_protocol::hook::HookEventPayload;
 use haider_protocol::ids::{
     AgentId, ArtifactRef, BranchId, DeviceId, EventId, ItemId, MenuId, NodeId, RunId, SessionId,
 };
@@ -304,6 +305,8 @@ pub const ACCOUNT_REMOVE_METHOD: &str = "account.remove";
 pub const ACCOUNT_SET_DEFAULT_MODEL_METHOD: &str = "account.set_default_model";
 pub const PROVIDER_CONFIGURE_METHOD: &str = "provider.configure";
 pub const PROVIDER_REMOVE_METHOD: &str = "provider.remove";
+pub const HOOKS_TRUST_METHOD: &str = "hooks.trust";
+pub const HOOKS_REVOKE_METHOD: &str = "hooks.revoke";
 
 fn is_management_method(method: &str) -> bool {
     matches!(
@@ -316,6 +319,28 @@ fn is_management_method(method: &str) -> bool {
             | PROVIDER_CONFIGURE_METHOD
             | PROVIDER_REMOVE_METHOD
     )
+}
+
+/// Secret-free semantic input for one receipted hook trust mutation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookTrustCommand {
+    pub command_id: String,
+    pub request_digest: String,
+    pub request_json: String,
+    pub digest: String,
+    pub trusted: bool,
+    /// Present only for the automatic first-digest pin created by the
+    /// `trust_workspace` profile policy.
+    pub workspace: Option<String>,
+}
+
+/// Stable response persisted in a hook trust/revoke command receipt.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HookTrustChange {
+    pub digest: String,
+    pub trusted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
 }
 
 /// Committed login response persisted in the receipt: the descriptor only —
@@ -1245,6 +1270,7 @@ impl Store {
                 ],
             )
             .map_err(map_sqlite_error)?;
+        enqueue_hook_dispatch(&transaction, &envelope)?;
 
         let created = CreatedSession {
             session_id: command.session_id.clone(),
@@ -1897,6 +1923,34 @@ impl Store {
                 PromptRender::Omit,
             )?);
         }
+        let trust_hooks = serde_json::from_str::<serde_json::Value>(&command.request_json)
+            .ok()
+            .and_then(|request| {
+                request
+                    .get("trust_hooks")
+                    .and_then(serde_json::Value::as_bool)
+            })
+            .unwrap_or(false);
+        if trust_hooks {
+            envelopes.push(unstamped_raw_command_envelope(
+                EventId::new(format!("hook-trust-{}", command.queued_event_id)),
+                &command.session_id,
+                command.branch_id.clone(),
+                Some(command.run_id.clone()),
+                command.device_id.clone(),
+                self.worker_generation,
+                HookEventPayload::HookRunTrust { enabled: true }
+                    .to_payload_value()
+                    .map_err(|error| {
+                        store_error(
+                            ErrorCode::InvalidArgument,
+                            format!("cannot serialize hook run trust fact: {error}"),
+                            false,
+                        )
+                    })?,
+                PromptRender::Omit,
+            )?);
+        }
         for envelope in &mut envelopes {
             envelope.agent_id = command.agent_id.clone();
         }
@@ -2352,6 +2406,147 @@ impl Store {
         )?;
         transaction.commit().map_err(map_sqlite_error)?;
         Ok(claim)
+    }
+
+    /// Atomically applies one digest-pinned hook trust mutation and commits
+    /// its R2 response in the same transaction. There is no external side
+    /// effect and therefore no durable pending recovery state.
+    pub fn apply_hook_trust_command(
+        &self,
+        command: &HookTrustCommand,
+    ) -> StoreResult<HookTrustChange> {
+        validate_command_identity(
+            &command.command_id,
+            &command.request_digest,
+            &command.request_json,
+        )?;
+        let method = if command.trusted {
+            HOOKS_TRUST_METHOD
+        } else {
+            HOOKS_REVOKE_METHOD
+        };
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        if let Some(response) = lookup_command_response::<HookTrustChange>(
+            &transaction,
+            &command.command_id,
+            method,
+            &command.request_digest,
+            &command.request_json,
+            "hook trust mutation",
+        )? {
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(response);
+        }
+        claim_pending_receipt(
+            &transaction,
+            &command.command_id,
+            method,
+            &command.request_digest,
+            &command.request_json,
+            now_ms()?,
+        )?;
+        let response = HookTrustChange {
+            digest: command.digest.clone(),
+            trusted: command.trusted,
+            workspace: command.workspace.clone(),
+        };
+        finalize_command_receipt(
+            &transaction,
+            &command.command_id,
+            "",
+            None,
+            None,
+            &response,
+            now_ms()?,
+            "hook trust mutation",
+        )?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(response)
+    }
+
+    /// Reduces committed hook trust/revoke receipts in commit order. A later
+    /// row for the same digest wins; unrelated management revisions are not
+    /// touched by this separate trust domain.
+    pub fn hook_trust_changes(&self) -> StoreResult<Vec<HookTrustChange>> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT response_json FROM command_receipts
+                 WHERE state = 'committed' AND method IN (?1, ?2)
+                 ORDER BY updated_at_ms, rowid",
+            )
+            .map_err(map_sqlite_error)?;
+        statement
+            .query_map(params![HOOKS_TRUST_METHOD, HOOKS_REVOKE_METHOD], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(map_sqlite_error)?
+            .map(|json| {
+                let json = json.map_err(map_sqlite_error)?;
+                serde_json::from_str(&json).map_err(|error| {
+                    corrupt(format!("committed hook trust response is invalid: {error}"))
+                })
+            })
+            .collect()
+    }
+
+    /// Reads committed facts whose post-commit hook dispatch has not yet
+    /// completed. The outbox row is inserted in the same transaction as the
+    /// event, so recovery can distinguish durable truth from an accepted but
+    /// uncommitted attempt without relying on live publication.
+    pub fn pending_hook_dispatches(&self, limit: usize) -> StoreResult<Vec<RawEnvelope>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let connection = self.connection()?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut statement = connection
+            .prepare_cached(
+                "SELECT e.session_id, e.seq, e.envelope_json
+                 FROM hook_dispatch_outbox AS o
+                 JOIN events AS e
+                   ON e.session_id = o.session_id AND e.seq = o.seq
+                 ORDER BY e.committed_at_ms ASC, e.session_id ASC, e.seq ASC
+                 LIMIT ?1",
+            )
+            .map_err(map_sqlite_error)?;
+        let mut rows = statement.query([limit]).map_err(map_sqlite_error)?;
+        let mut envelopes = Vec::new();
+        while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+            let session_id: String = row.get(0).map_err(map_sqlite_error)?;
+            let seq: i64 = row.get(1).map_err(map_sqlite_error)?;
+            let envelope_json: String = row.get(2).map_err(map_sqlite_error)?;
+            let envelope: RawEnvelope = serde_json::from_str(&envelope_json).map_err(|error| {
+                corrupt(format!(
+                    "invalid hook-outbox envelope JSON for session {session_id}, seq {seq}: {error}"
+                ))
+            })?;
+            let stored_seq = u64::try_from(seq)
+                .map_err(|_| corrupt("hook outbox contains a negative event sequence"))?;
+            if envelope.session_id.as_str() != session_id || envelope.seq != stored_seq {
+                return Err(corrupt(
+                    "hook outbox coordinates disagree with the authoritative envelope",
+                ));
+            }
+            envelopes.push(envelope);
+        }
+        Ok(envelopes)
+    }
+
+    /// Idempotently acknowledges one recovered/live hook-dispatch row after
+    /// all matching hooks have handled the committed envelope.
+    pub fn complete_hook_dispatch(&self, session_id: &SessionId, seq: u64) -> StoreResult<()> {
+        let connection = self.connection()?;
+        connection
+            .execute(
+                "DELETE FROM hook_dispatch_outbox WHERE session_id = ?1 AND seq = ?2",
+                params![session_id.as_str(), to_sqlite_integer(seq)?],
+            )
+            .map_err(map_sqlite_error)?;
+        Ok(())
     }
 
     /// Read-only replay/pending preflight used before server-derived resource
@@ -3514,6 +3709,7 @@ fn append_transaction_envelopes(
                 to_sqlite_integer(committed_at_ms)?,
             ])
             .map_err(map_sqlite_error)?;
+        enqueue_hook_dispatch(transaction, envelope)?;
     }
     drop(insert);
     update_branch_heads(transaction, envelopes)?;
@@ -3910,6 +4106,7 @@ fn resolve_menu_transaction(
             ],
         )
         .map_err(map_sqlite_error)?;
+    enqueue_hook_dispatch(transaction, &envelope)?;
     transaction
         .execute(
             "INSERT INTO menu_resolutions(
@@ -3931,6 +4128,25 @@ fn resolve_menu_transaction(
     Ok(MenuResolutionOutcome::Committed {
         envelope: Box::new(envelope),
     })
+}
+
+/// Adds one non-engine fact to the durable post-commit hook outbox inside the
+/// event's own transaction. Hook lifecycle/result facts are deliberately not
+/// recursive inputs; run trust and profile update/account facts are inputs.
+fn enqueue_hook_dispatch(transaction: &Transaction<'_>, envelope: &RawEnvelope) -> StoreResult<()> {
+    if HookEventPayload::is_engine_fact(&envelope.payload) {
+        return Ok(());
+    }
+    transaction
+        .execute(
+            "INSERT INTO hook_dispatch_outbox(session_id, seq) VALUES (?1, ?2)",
+            params![
+                envelope.session_id.as_str(),
+                to_sqlite_integer(envelope.seq)?
+            ],
+        )
+        .map_err(map_sqlite_error)?;
+    Ok(())
 }
 
 fn resolution_by_command(
@@ -4327,6 +4543,7 @@ fn append_envelopes(
                     committed_at_sql,
                 ])
                 .map_err(map_sqlite_error)?;
+            enqueue_hook_dispatch(&transaction, &envelope)?;
             stamped.push(envelope);
         }
     }
