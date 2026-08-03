@@ -166,6 +166,23 @@ pub enum LiveCommand {
     ToolsInventory {
         session: SessionId,
     },
+    /// `hooks.list` — a READ of the daemon's hook discovery for one
+    /// workspace (H4 /hooks). No durable identity; the cwd was captured at
+    /// issuance by the reducer.
+    HooksList {
+        cwd: String,
+    },
+    /// `hooks.trust` / `hooks.revoke` — a receipted digest pin or
+    /// revocation (H3's R2 pattern). DURABLE: a lost response retries under
+    /// the same command id and replays the same committed change. The
+    /// response installs NOTHING locally — the driver chains a fresh
+    /// `hooks.list` and daemon truth moves the rows.
+    HooksTrust {
+        command_id: CommandId,
+        digest: String,
+        /// `true` encodes `hooks.trust`, `false` `hooks.revoke`.
+        trusted: bool,
+    },
     /// `account.remove` — durable, revision-fenced (W10b).
     AccountRemove {
         command_id: CommandId,
@@ -309,6 +326,7 @@ impl LiveCommand {
             | Self::AccountRemove { command_id, .. }
             | Self::ProviderRemove { command_id, .. }
             | Self::Answer { command_id, .. } => Some(command_id),
+            Self::HooksTrust { command_id, .. } => Some(command_id),
             Self::LoginApi { command_id, .. } => Some(command_id),
             Self::AccountSetActive { command_id, .. } => Some(command_id),
             Self::SetDefaultModel { command_id, .. } => Some(command_id),
@@ -324,6 +342,7 @@ impl LiveCommand {
             | Self::OAuthStatus { .. }
             | Self::OAuthCancel { .. }
             | Self::ToolsInventory { .. }
+            | Self::HooksList { .. }
             // A stage carries no durable identity BY DESIGN (see above).
             | Self::Stage { .. }
             // Content-addressed and receipt-free BY DESIGN (B4b): the
@@ -443,6 +462,26 @@ pub enum LiveReply {
     ToolsInventory {
         session: SessionId,
         snapshot: Box<haider_protocol::tool::ToolInventorySnapshot>,
+    },
+    /// `hooks.list` answered — discovery truth for /hooks (H4).
+    Hooks {
+        policy: String,
+        hooks: Vec<haider_rpc::HookSummaryWire>,
+    },
+    /// `hooks.list` FAILED. Identity-tagged from the link's request context
+    /// because the read carries no durable command id (the oauth_start /
+    /// stage precedent): the failure lands on the hooks screen, not a
+    /// launcher flash.
+    HooksListFailed {
+        message: String,
+    },
+    /// `hooks.trust` / `hooks.revoke` committed: the daemon's receipt. It
+    /// retires the outbox entry and chains a fresh `hooks.list` — the rows
+    /// themselves move only on daemon truth (the branch discipline).
+    HookTrustChanged {
+        command_id: CommandId,
+        digest: String,
+        trusted: bool,
     },
     /// A `provider.models_refresh` failed — lands on the provider ROW
     /// (availability reason), never the status-bar flash.
@@ -716,6 +755,12 @@ pub struct LiveDriver {
     pending_provider_remove: Option<(CommandId, String)>,
     /// The in-flight `provider.configure`: (command, card attempt).
     pending_custom: Option<(CommandId, u64)>,
+    /// The in-flight `hooks.trust`/`hooks.revoke`: (command, digest) — a
+    /// failure surfaces on the hooks screen and releases its gate (H4).
+    pending_hook_trust: Option<(CommandId, String)>,
+    /// The cwd the last `hooks.list` was issued for — what a trust receipt
+    /// chains its refresh against (captured at issuance by the reducer).
+    hooks_cwd: Option<String>,
     /// The one OAuth add flight (W5e-1): the card's whole driver state.
     oauth_flight: Option<OAuthFlight>,
     /// Durable mutations awaiting a response, in issue order.
@@ -803,6 +848,8 @@ impl LiveDriver {
             pending_account_remove: None,
             pending_provider_remove: None,
             pending_custom: None,
+            pending_hook_trust: None,
+            hooks_cwd: None,
             oauth_flight: None,
             outbox: Vec::new(),
             menus: HashMap::new(),
@@ -1221,6 +1268,41 @@ impl LiveDriver {
                     model.dirty = true;
                 }
                 Vec::new()
+            }
+            LiveReply::Hooks { policy, hooks } => {
+                // The ONLY writer of the /hooks rows (H4): daemon
+                // discovery truth, trusted rows pinning the trust baseline.
+                model.hooks.apply_snapshot(policy, hooks);
+                model.dirty = true;
+                Vec::new()
+            }
+            LiveReply::HooksListFailed { message } => {
+                model.hooks.list_failed(&message);
+                model.dirty = true;
+                Vec::new()
+            }
+            LiveReply::HookTrustChanged {
+                command_id,
+                digest,
+                trusted,
+            } => {
+                // The receipt retires the gate and INSTALLS NOTHING — the
+                // chained `hooks.list` is what moves the rows (the branch
+                // discipline: no local truth before daemon truth).
+                self.retire(&command_id);
+                if self
+                    .pending_hook_trust
+                    .as_ref()
+                    .is_some_and(|(pending, _)| pending == &command_id)
+                {
+                    self.pending_hook_trust = None;
+                }
+                model.hooks.note_receipt(&digest, trusted);
+                model.dirty = true;
+                match self.hooks_cwd.clone() {
+                    Some(cwd) => vec![LiveCommand::HooksList { cwd }],
+                    None => Vec::new(),
+                }
             }
             LiveReply::ModelsRefreshFailed { provider, message } => {
                 for summary in &mut model.providers.providers {
@@ -1870,6 +1952,23 @@ impl LiveDriver {
                     }
                     return Vec::new();
                 }
+                // A failed hook trust/revoke lands its typed reason on the
+                // hooks screen and releases the one-at-a-time gate (H4).
+                // Nothing moved locally, so nothing rolls back.
+                if let Some(id) = &command_id
+                    && self
+                        .pending_hook_trust
+                        .as_ref()
+                        .is_some_and(|(pending, _)| pending == id)
+                    && let Some((_, digest)) = self.pending_hook_trust.take()
+                {
+                    if !retryable {
+                        self.retire(id);
+                    }
+                    model.hooks.trust_failed(&digest, &message);
+                    model.dirty = true;
+                    return Vec::new();
+                }
                 // A failed `account.set_active` clears its exact pending
                 // row (W5d) — the model's rows never moved, so this is
                 // gate-release + honest message, no rollback.
@@ -2501,6 +2600,22 @@ impl LiveDriver {
                     return Vec::new();
                 };
                 vec![self.enqueue(LiveCommand::ToolsInventory { session })]
+            }
+            AppRequest::HooksRefresh { cwd } => {
+                // A read — never outboxed; the cwd is remembered so a
+                // trust receipt can chain its refresh at the same
+                // coordinates.
+                self.hooks_cwd = Some(cwd.clone());
+                vec![LiveCommand::HooksList { cwd }]
+            }
+            AppRequest::HooksTrust { digest, trusted } => {
+                let command_id = self.mint();
+                self.pending_hook_trust = Some((command_id.clone(), digest.clone()));
+                vec![self.enqueue(LiveCommand::HooksTrust {
+                    command_id,
+                    digest,
+                    trusted,
+                })]
             }
             AppRequest::AccountRemove { alias } => {
                 let command_id = self.mint();

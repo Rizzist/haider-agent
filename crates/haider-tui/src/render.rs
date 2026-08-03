@@ -69,7 +69,8 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
         | Screen::Accounts
         | Screen::Providers
         | Screen::Tree
-        | Screen::Tools => 1,
+        | Screen::Tools
+        | Screen::Hooks => 1,
     };
     let [body, status] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(status_height)]).areas(area);
@@ -83,6 +84,7 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
         Screen::Aura => render_aura(model, theme, frame, body, &mut hits),
         Screen::Accounts => render_accounts(model, theme, frame, body, &mut hits),
         Screen::Providers => render_providers(model, theme, frame, body, &mut hits),
+        Screen::Hooks => render_hooks(model, theme, frame, body, &mut hits),
     }
     if model.help_open {
         render_help(theme, frame, body);
@@ -2435,6 +2437,191 @@ fn render_tools(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Re
     frame.render_widget(Paragraph::new(lines).style(theme.text_style()), area);
 }
 
+/// `/hooks` (H4) — the daemon's hook discovery + digest trust for the
+/// active session's workspace, and the session's journaled firings in the
+/// lower half (newest first, bounded). Committed daemon truth ONLY: the
+/// in-flight read says so, the demo says it has no engine, and the trust
+/// column moves on list snapshots, never on clicks.
+fn render_hooks(
+    model: &AppModel,
+    theme: &Theme,
+    frame: &mut Frame<'_>,
+    area: Rect,
+    hits: &mut Vec<(Rect, Hit)>,
+) {
+    let hooks = &model.hooks;
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            "HOOKS",
+            theme
+                .bright_style()
+                .add_modifier(ratatui::style::Modifier::BOLD),
+        ),
+        Span::styled(
+            match &hooks.policy {
+                Some(policy) => format!(" — workspace + profile · policy {policy}"),
+                None => " — workspace + profile".to_owned(),
+            },
+            theme.dim_style(),
+        ),
+    ])];
+    if let Some(message) = &hooks.message {
+        lines.push(Line::styled(message.clone(), theme.gold_style()));
+    }
+    lines.push(Line::raw(""));
+    match &hooks.rows {
+        None => {
+            if hooks.message.is_none() {
+                lines.push(Line::styled(
+                    "fetching the daemon's hook discovery…",
+                    theme.dim_style(),
+                ));
+            }
+        }
+        Some(rows) if rows.is_empty() => {
+            lines.push(Line::styled(
+                if model.mode.fabricates_locally() {
+                    "  no hooks in the demo — live mode lists the daemon's discovery"
+                } else {
+                    "  no hooks discovered — hooks.json at the workspace root, \
+                     or the profile's hooks.json"
+                },
+                theme.dim_style(),
+            ));
+        }
+        Some(rows) => {
+            let selected = hooks.cursor.min(rows.len().saturating_sub(1));
+            for (index, row) in rows.iter().enumerate() {
+                let glyph = hooks.glyph(row);
+                let glyph_style = match glyph {
+                    crate::hooks::TrustGlyph::Trusted => theme.gold_style(),
+                    crate::hooks::TrustGlyph::Untrusted => theme.dim_style(),
+                    crate::hooks::TrustGlyph::RevokedByEdit => theme.warn_style(),
+                };
+                let is_selected = index == selected;
+                let cursor = if is_selected { "❯" } else { " " };
+                let decision = if row.decision { " · decision" } else { "" };
+                let mut spans = vec![
+                    Span::styled(format!(" {cursor} "), theme.gold_style()),
+                    Span::styled(
+                        format!("{}. ", index + 1),
+                        if is_selected {
+                            theme.bright_style()
+                        } else {
+                            theme.dim_style()
+                        },
+                    ),
+                    Span::styled(format!("{} ", glyph.glyph()), glyph_style),
+                    Span::styled(
+                        row.name.clone(),
+                        theme
+                            .bright_style()
+                            .add_modifier(ratatui::style::Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!(
+                            " · {}:{}{decision} · {} · {}",
+                            row.kind,
+                            row.event,
+                            crate::hooks::short_digest(&row.digest),
+                            glyph.label(),
+                        ),
+                        theme.dim_style(),
+                    ),
+                ];
+                if hooks.pending.as_deref() == Some(row.digest.as_str()) {
+                    // In-flight receipt feedback WITHOUT moving the trust
+                    // column (forbidden optimism — the accounts law).
+                    spans.push(Span::styled(
+                        " …",
+                        theme.pulse_ink(theme.gold, model.anim_phase),
+                    ));
+                }
+                let hovered = model.hovered.as_ref() == Some(&Hit::HookRow(row.digest.clone()));
+                let mut line = Line::from(spans);
+                if is_selected {
+                    let pad = (area.width as usize).saturating_sub(line.width());
+                    if pad > 0 {
+                        line.push_span(Span::raw(" ".repeat(pad)));
+                    }
+                    line = line.style(theme.selection_style());
+                } else if hovered {
+                    line = hover_band(line, true, area.width, theme);
+                }
+                hits.push((
+                    row_rect(area, area.y, lines.len()),
+                    Hit::HookRow(row.digest.clone()),
+                ));
+                lines.push(line);
+            }
+        }
+    }
+    // Recent firings — the session's journaled hook facts, newest first,
+    // bounded by the RENDER cap (the store keeps a deeper tail).
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "recent firings — newest first",
+        theme.bright_style(),
+    ));
+    if model.hook_facts.is_empty() {
+        lines.push(Line::styled("  none this session", theme.dim_style()));
+    } else {
+        for entry in model
+            .hook_facts
+            .recent()
+            .take(crate::hooks::FIRING_ROWS_MAX)
+        {
+            lines.push(Line::styled(
+                format!("  {}", entry.line()),
+                theme.dim_style(),
+            ));
+        }
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "↑↓ select · 1-9 pick · ⏎ trust / revoke · esc back",
+        theme.dim_style(),
+    ));
+    frame.render_widget(Paragraph::new(lines).style(theme.text_style()), area);
+    // The trust/revoke confirmation card — an overlay the session-scoped
+    // esc law closes (esc cancels the CARD, never the screen).
+    if let Some(confirm) = &hooks.confirm {
+        let action = if confirm.grant { "trust" } else { "revoke" };
+        let card_lines = vec![
+            Line::styled(
+                format!("{action} hook `{}`?", confirm.name),
+                theme.bright_style(),
+            ),
+            Line::styled(
+                format!("digest {}", crate::hooks::short_digest(&confirm.digest)),
+                theme.dim_style(),
+            ),
+            Line::styled("⏎ confirm · esc cancel", theme.faint_style()),
+        ];
+        let height = u16::try_from(card_lines.len() + 2).unwrap_or(u16::MAX);
+        let width = area.width.saturating_sub(4).max(24);
+        let rect = Rect {
+            x: area.x + (area.width.saturating_sub(width)) / 2,
+            y: area
+                .y
+                .saturating_add(area.height.saturating_sub(height + 1))
+                .max(area.y),
+            width,
+            height: height.min(area.height),
+        };
+        frame.render_widget(ratatui::widgets::Clear, rect);
+        frame.render_widget(
+            Paragraph::new(card_lines).block(
+                Block::default()
+                    .borders(ratatui::widgets::Borders::ALL)
+                    .border_style(theme.frame_style())
+                    .style(theme.text_style()),
+            ),
+            rect,
+        );
+    }
+}
+
 /// Wrap a row in the shared hover band (sim `:hover { background: selBg }`),
 /// padding it to the full region width so the band reads as one strip.
 fn hover_band<'a>(mut line: Line<'a>, hovered: bool, width: u16, theme: &Theme) -> Line<'a> {
@@ -4269,6 +4456,22 @@ fn render_status_bar(
     } else if model.voice.enabled {
         left.extend(chip_two_tone(
             format!("◉ voice · {}", model.voice.bar_label()),
+            theme.frame_style(),
+            theme.gold_style(),
+        ));
+    }
+    // H4: the decision-hook chip — visible exactly while the CURRENT run's
+    // permission was answered by a decision hook (journaled fact → chip;
+    // a proposal the menu CAS did not apply never lights it). Session
+    // surfaces only: the chip is that session's automation, not the
+    // launcher's.
+    if matches!(
+        model.screen,
+        Screen::Session | Screen::Subagent | Screen::Hooks | Screen::Tree | Screen::Tools
+    ) && model.hook_facts.decision_chip()
+    {
+        left.extend(chip_two_tone(
+            "⚙ hook·decided".to_owned(),
             theme.frame_style(),
             theme.gold_style(),
         ));

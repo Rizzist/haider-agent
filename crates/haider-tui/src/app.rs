@@ -215,6 +215,10 @@ pub enum Screen {
     /// screen: this layout is owner-directed, provisional until the
     /// v0.0.15 install-probe sign-off.
     Providers,
+    /// `/hooks` (H4) — the daemon's hook discovery + digest trust for the
+    /// active session's workspace, plus the session's journaled hook
+    /// firings. Live-only truth: demo renders a sim-honest empty state.
+    Hooks,
 }
 
 /// Sim `AUTH_LABEL` (tui.js:145): the badge text per auth method.
@@ -1550,6 +1554,16 @@ pub enum AppRequest {
     ProviderRemove { provider: String },
     /// W8b: `/tools` live — read the daemon's canonical tool inventory.
     ToolsRefresh,
+    /// `/hooks` live (H4): read the daemon's hook discovery for `cwd` —
+    /// workspace + profile truth. The cwd is CAPTURED AT ISSUANCE (the B2b
+    /// capture law): a later screen or session switch cannot retarget the
+    /// listing.
+    HooksRefresh { cwd: String },
+    /// A trust (`trusted == true`) or revoke (`false`) for one digest —
+    /// receipted daemon commands (H3's R2 pattern). The receipt installs
+    /// NOTHING locally: the driver chains a fresh `hooks.list` and daemon
+    /// truth moves the rows (the branch discipline).
+    HooksTrust { digest: String, trusted: bool },
     /// Run a respond() turn for user text. `voice` turns skip the script's
     /// UserMessage (the reducer already pushed the ◉ row); `title` asks the
     /// driver to schedule the 1.5 s auto-title micro-call, which names the
@@ -1879,6 +1893,10 @@ pub enum Hit {
     },
     /// The `/providers` row's `[accounts]` navigation chip.
     ProviderAccounts,
+    /// One `/hooks` row, by its DIGEST (value-carrying: a stale rect can
+    /// only ever select the hook it was measured on — a refresh that
+    /// replaced the digest matches nothing and the click is dropped).
+    HookRow(String),
 }
 
 /// The `/accounts` add-row buttons (sim order, tui.js:3621-3628; B6b adds
@@ -2337,6 +2355,15 @@ pub struct AppModel {
     pub custom_add: Option<CustomProviderCard>,
     /// Monotonic attempt counter for custom-provider cards.
     pub custom_attempt_seq: u64,
+    /// `/hooks` screen state (H4): the `hooks.list` snapshot, cursor,
+    /// confirmation card and in-flight receipt gate. APP-level like
+    /// `tools_inventory` — the listing is workspace truth, not session
+    /// display state.
+    pub hooks: crate::hooks::HooksScreenState,
+    /// The ATTACHED session's journaled hook facts + decision-chip state
+    /// (H4). Checked in/out with the session exactly like `branch_state`
+    /// (the A→B→A law).
+    pub hook_facts: crate::hooks::HookFactsLog,
 }
 
 impl Default for AppModel {
@@ -2424,6 +2451,8 @@ impl Default for AppModel {
             oauth_attempt_seq: 0,
             custom_add: None,
             custom_attempt_seq: 0,
+            hooks: crate::hooks::HooksScreenState::default(),
+            hook_facts: crate::hooks::HookFactsLog::default(),
         }
     }
 }
@@ -2758,6 +2787,7 @@ impl AppModel {
             Screen::Tree => "haider — session tree".to_owned(),
             Screen::Tools => "haider — tools".to_owned(),
             Screen::Providers => "haider — providers".to_owned(),
+            Screen::Hooks => "haider — hooks".to_owned(),
             Screen::Session | Screen::Subagent | Screen::Aura => {
                 // Strip control characters: user text must never smuggle
                 // escape sequences into OSC 2 (review r1 P1).
@@ -2847,6 +2877,9 @@ impl AppModel {
             // Tools: a static read-only inventory — nothing animates.
             Screen::Tools => false,
             Screen::Providers => self.providers.pending_default.is_some(),
+            // Hooks: only an in-flight trust receipt animates (the pending
+            // row's `…` beat, the accounts pattern).
+            Screen::Hooks => self.hooks.pending.is_some(),
             Screen::Session | Screen::Subagent => {
                 // `● thinking…` (tui.js:4458-4462) · the ⚒ running tool
                 // glyph (tui.js:4524-4530) · the processing todo's box
@@ -3221,6 +3254,10 @@ impl AppModel {
                 self.screen = Screen::Session;
                 self.dirty = true;
             }
+            return;
+        }
+        if self.screen == Screen::Hooks {
+            self.handle_hooks_key(key.code);
             return;
         }
         if self.screen == Screen::Tree {
@@ -5182,6 +5219,137 @@ impl AppModel {
         }
     }
 
+    /// THE ONE DOOR into `/hooks` (H4). Session-scoped like `/tools`; the
+    /// live path is feature-gated BEFORE anything opens (the B2b lesson —
+    /// an ungated daemon fabricates nothing, the honest stale-daemon note
+    /// names the fix), and the demo path opens a sim-honest EMPTY state
+    /// that refuses trust actions.
+    fn enter_hooks(&mut self) {
+        self.dirty = true;
+        if self.screen != Screen::Session {
+            self.flash = Some("· /hooks — session only".to_owned());
+            return;
+        }
+        if self.mode.fabricates_locally() {
+            self.hooks.open_demo();
+            // Same-key screen write (the Tools/Tree precedent): the hooks
+            // screen shares the session's surface key, so no draft moves.
+            self.screen = Screen::Hooks;
+            return;
+        }
+        if !self.daemon_serves(haider_rpc::FEATURE_HOOKS_V1) {
+            self.flash = Some(self.stale_daemon_note("hooks"));
+            return;
+        }
+        self.hooks.open_live();
+        self.screen = Screen::Hooks;
+        // The cwd is CAPTURED AT ISSUANCE (the B2b capture law): the
+        // listing is for the workspace this process runs in — the same
+        // absolute directory `session.create` carried.
+        self.requests.push(AppRequest::HooksRefresh {
+            cwd: self.cwd.clone(),
+        });
+    }
+
+    /// Keys on the `/hooks` screen. The confirmation card is total while
+    /// open: esc cancels the CARD (session-scoped esc law — it never
+    /// navigates), ⏎ dispatches; without a card the rows follow the owner
+    /// menu law (arrow highlight, digits pick, ⏎ opens the card) and esc
+    /// walks back to the session.
+    fn handle_hooks_key(&mut self, code: KeyCode) {
+        if self.hooks.confirm.is_some() {
+            match code {
+                KeyCode::Esc => {
+                    self.hooks.confirm = None;
+                    self.dirty = true;
+                }
+                KeyCode::Enter => self.dispatch_hook_trust(),
+                _ => {}
+            }
+            return;
+        }
+        match code {
+            KeyCode::Esc => {
+                self.screen = Screen::Session;
+                self.dirty = true;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.hooks.cursor = self.hooks.cursor.saturating_sub(1);
+                self.dirty = true;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let rows = self.hooks.rows.as_ref().map_or(0, Vec::len);
+                self.hooks.cursor = (self.hooks.cursor + 1).min(rows.saturating_sub(1));
+                self.dirty = true;
+            }
+            KeyCode::Char(c @ '1'..='9') => {
+                let index = (c as usize) - ('1' as usize);
+                let rows = self.hooks.rows.as_ref().map_or(0, Vec::len);
+                if index < rows {
+                    self.hooks.cursor = index;
+                    self.open_hook_confirm();
+                    self.dirty = true;
+                }
+            }
+            KeyCode::Enter => {
+                self.open_hook_confirm();
+                self.dirty = true;
+            }
+            _ => {}
+        }
+    }
+
+    /// Open the trust/revoke confirmation card for the highlighted row.
+    /// The card CAPTURES the digest (value-carrying law); a trusted row
+    /// offers revoke, an untrusted or revoked-by-edit row offers trust.
+    fn open_hook_confirm(&mut self) {
+        if self.hooks.pending.is_some() {
+            self.hooks.message =
+                Some("· one trust action at a time — waiting for the daemon".to_owned());
+            return;
+        }
+        let Some(row) = self
+            .hooks
+            .rows
+            .as_ref()
+            .and_then(|rows| rows.get(self.hooks.cursor))
+        else {
+            return;
+        };
+        self.hooks.confirm = Some(crate::hooks::TrustConfirm {
+            digest: row.digest.clone(),
+            name: row.name.clone(),
+            grant: !row.trusted,
+        });
+    }
+
+    /// ⏎ on the confirmation card: dispatch the receipted command. NOTHING
+    /// is installed locally — the daemon's receipt retires the gate and a
+    /// fresh `hooks.list` moves the rows (the branch discipline). Demo mode
+    /// refuses honestly: trust is daemon-owned and the demo has no daemon.
+    fn dispatch_hook_trust(&mut self) {
+        self.dirty = true;
+        let Some(confirm) = self.hooks.confirm.take() else {
+            return;
+        };
+        if self.mode.fabricates_locally() {
+            self.hooks.message =
+                Some("· hook trust is live-only — the demo installs nothing".to_owned());
+            return;
+        }
+        if self.hooks.pending.is_some() {
+            self.hooks.message =
+                Some("· one trust action at a time — waiting for the daemon".to_owned());
+            return;
+        }
+        self.hooks.pending = Some(confirm.digest.clone());
+        self.hooks.message = None;
+        self.requests.push(AppRequest::HooksTrust {
+            digest: confirm.digest,
+            trusted: confirm.grant,
+        });
+    }
+
     /// Chip close lifecycle flags (§2.5) — the DRIVER owns the 5 s removal
     /// timer and the resume check; returns whether the chip WAS live
     /// (closing the last live child discharges the wait).
@@ -5652,6 +5820,7 @@ impl AppModel {
             }
             "accounts" => self.enter_accounts(),
             "providers" => self.enter_providers(),
+            "hooks" => self.enter_hooks(),
             // W5e-3: choose from the DISCOVERED catalog. Both are
             // feature-gated BEFORE shipping this time (the W5e-1b lesson).
             "model" => {
@@ -5738,7 +5907,7 @@ impl AppModel {
                 let wave = match other {
                     "fork" | "rename" => Some("the daemon wave (W3)"),
                     "peers" => Some("the mesh wave (post-v0.1)"),
-                    "hooks" | "update" => Some("the gates wave (W4)"),
+                    "update" => Some("the gates wave (W4)"),
                     _ => None,
                 };
                 self.flash = Some(match wave {
@@ -5903,6 +6072,11 @@ impl AppModel {
             Admission::Gap { after_seq } => RawOutcome::Gap { after_seq },
             admission @ (Admission::Skip | Admission::Apply) => {
                 let note = self.branch_state.note_admitted(envelope);
+                // H4: hook-engine facts are `render.ui == false` journal
+                // truth — recorded for Apply AND Skip like the branch
+                // registry (they surface only on `/hooks` and the decision
+                // chip; every transcript surface keeps the display gate).
+                self.hook_facts.note_envelope(envelope);
                 if let crate::branch::AdmittedNote::BranchInstalled(id) = &note {
                     // The daemon's journal fact is the ONLY materializer;
                     // if OUR fork's receipt already armed activation, the
@@ -6411,6 +6585,7 @@ impl AppModel {
         self.outbox.clear();
         self.projection = SessionProjection::new();
         self.branch_state = crate::branch::BranchState::default();
+        self.hook_facts = crate::hooks::HookFactsLog::default();
         self.session_title = None;
         self.session_name = None;
         self.turn_active = false;
@@ -6604,6 +6779,9 @@ impl AppModel {
         // B2b: the branch registry/active/parked views travel as ONE unit
         // with the session — the A→B→A checkout law.
         self.branch_state = std::mem::take(&mut slot.branch_state);
+        // H4: the journaled hook facts + decision-chip state travel the
+        // same way.
+        self.hook_facts = std::mem::take(&mut slot.hook_facts);
         self.msg_queue = std::mem::take(&mut slot.msg_queue);
         self.queue_mode = slot.queue_mode;
         self.turn_active = slot.turn_active;
@@ -6650,6 +6828,7 @@ impl AppModel {
             slot.projection = std::mem::replace(&mut self.projection, SessionProjection::new());
             slot.chips = std::mem::take(&mut self.chips);
             slot.branch_state = std::mem::take(&mut self.branch_state);
+            slot.hook_facts = std::mem::take(&mut self.hook_facts);
             slot.msg_queue = std::mem::take(&mut self.msg_queue);
             slot.queue_mode = std::mem::take(&mut self.queue_mode);
             slot.turn_active = std::mem::take(&mut self.turn_active);
@@ -7100,6 +7279,22 @@ impl AppModel {
                     .position(|candidate| candidate == &row)
                 {
                     self.tree_sel = index;
+                    self.dirty = true;
+                }
+            }
+            Hit::HookRow(digest) if self.screen == Screen::Hooks => {
+                // Value-carrying + existence check (the TreeRow law): the
+                // click selects — and opens the confirmation card for —
+                // ONLY a row still wearing the exact digest the frame
+                // rendered; a refresh that replaced it drops the click.
+                if let Some(index) = self
+                    .hooks
+                    .rows
+                    .as_ref()
+                    .and_then(|rows| rows.iter().position(|row| row.digest == digest))
+                {
+                    self.hooks.cursor = index;
+                    self.open_hook_confirm();
                     self.dirty = true;
                 }
             }

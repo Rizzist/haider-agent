@@ -460,6 +460,10 @@ pub struct CommandContext {
     /// so this context is the ONLY thing that can route the reply —
     /// success or error — back to the chip it belongs to.
     upload: Option<(u64, crate::app::DraftKey)>,
+    /// This request was a `hooks.list` read (H4). The read carries no
+    /// durable id, so its ERROR reply is identity-tagged from here — the
+    /// failure lands on the hooks screen, never an uncorrelated flash.
+    hooks_list: bool,
 }
 
 impl CommandContext {
@@ -508,6 +512,7 @@ impl CommandContext {
                 } => Some((*upload, *surface)),
                 _ => None,
             },
+            hooks_list: matches!(command, LiveCommand::HooksList { .. }),
         }
     }
 }
@@ -658,6 +663,21 @@ pub fn request_body(command: LiveCommand) -> RequestBody {
         LiveCommand::ToolsInventory { session } => RequestBody::ToolsInventory {
             session_id: session,
         },
+        LiveCommand::HooksList { cwd } => RequestBody::HooksList { cwd },
+        // The trusted flag is COMMAND SELECTION, not wire data: `true` is
+        // the `hooks.trust` method, `false` `hooks.revoke` — both carry
+        // only the receipt id and the digest (H3's wire shapes).
+        LiveCommand::HooksTrust {
+            command_id,
+            digest,
+            trusted,
+        } => {
+            if trusted {
+                RequestBody::HooksTrust { command_id, digest }
+            } else {
+                RequestBody::HooksRevoke { command_id, digest }
+            }
+        }
         LiveCommand::AccountRemove {
             command_id,
             alias,
@@ -884,6 +904,19 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
             session: session_id,
             snapshot: Box::new(inventory),
         }],
+        ResponseBody::HooksList { policy, hooks } => vec![LiveReply::Hooks { policy, hooks }],
+        // Both trust receipts carry the same driver fact — which METHOD
+        // answered is already encoded in the committed `trusted` flag.
+        ResponseBody::HooksTrust { digest, trusted }
+        | ResponseBody::HooksRevoke { digest, trusted } => {
+            context.command_id.clone().map_or_else(Vec::new, |id| {
+                vec![LiveReply::HookTrustChanged {
+                    command_id: id,
+                    digest,
+                    trusted,
+                }]
+            })
+        }
         ResponseBody::AccountRemove {
             removed_alias,
             replacement_active_alias,
@@ -1044,6 +1077,14 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
                 if let Some(provider) = context.models_provider.clone() {
                     return vec![LiveReply::ModelsRefreshFailed {
                         provider,
+                        message: message.clone(),
+                    }];
+                }
+                // H4: a `hooks.list` error is identity-tagged the same way
+                // — the read has no durable id, and its failure belongs on
+                // the hooks screen, not an uncorrelated flash.
+                if context.hooks_list {
+                    return vec![LiveReply::HooksListFailed {
                         message: message.clone(),
                     }];
                 }
