@@ -18,6 +18,10 @@ pub fn key(code: KeyCode) -> AppEvent {
 
 pub fn launcher_model() -> AppModel {
     let mut model = AppModel::new();
+    // Deterministic device: header-band pins ellipsize at narrow widths,
+    // so the real hostname makes them host-dependent (two CI failures in
+    // this class — release-61 and release-62).
+    model.identity.device = "test-lion-box".to_owned();
     model.handle(AppEvent::Envelope(Box::new(EventPayload::HarnessStatus(
         HarnessStatus::Ready,
     ))));
