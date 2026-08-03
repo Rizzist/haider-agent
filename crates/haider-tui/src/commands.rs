@@ -182,7 +182,23 @@ pub const PALETTE_MAX_ROWS: usize = 8;
 pub fn has_arg_slots(name: &str) -> bool {
     // W5e-3 adds the three DISCOVERED slots. `/model` and `/provider` are
     // session-scoped commands; `/account` works anywhere.
-    matches!(name, "theme" | "login" | "model" | "provider" | "account")
+    //
+    // `/theme` is deliberately ABSENT (ui-themes-fix, live probe): the
+    // picker is bare /theme's argument experience, so ⏎ on the `/theme`
+    // row must RUN it — the exact-match lead jump used to hijack that ⏎
+    // onto the highlighted `system` arg row, and the picker never opened
+    // in the natural typed flow. Typed fragments (`/theme li…`) still
+    // complete through the argument-position arm in `palette_items`.
+    matches!(name, "login" | "model" | "provider" | "account")
+}
+
+/// Commands whose argument slot TAB can open (`/theme ` completions
+/// included): a superset of [`has_arg_slots`]. Tab is an explicit "give
+/// me the slot" gesture, so `/theme` keeps its completions here while ⏎
+/// runs it (and opens the picker).
+#[must_use]
+pub fn offers_arg_completions(name: &str) -> bool {
+    name == "theme" || has_arg_slots(name)
 }
 
 /// `/login`'s two argument slots: provider, then method. Slot 0 names the

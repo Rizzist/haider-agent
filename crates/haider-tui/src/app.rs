@@ -2140,6 +2140,12 @@ pub struct AppModel {
     /// highlight). MODEL-LOCAL — deliberately not a projection card so it
     /// can never ride a session checkout or block a daemon menu.
     pub theme_picker: Option<ThemePicker>,
+    /// COMMIT counter for the theme choice (ui-themes-fix): bumped by
+    /// every user commit — picker ⏎/digit/click, `/theme <name>`, ⌃T —
+    /// and never by boot resolution or previews. The runtime's
+    /// persistence authority keys on THIS, so re-affirming the boot
+    /// default still writes the settings file (the live probe's gap).
+    pub theme_commits: u64,
     pub sanctum_tier: SanctumTier,
     pub projection: SessionProjection,
     pub identity: IdentityLine,
@@ -2413,6 +2419,7 @@ impl Default for AppModel {
             theme_choice: ThemeChoice::default(),
             detected_system: ThemeKey::default(),
             theme_picker: None,
+            theme_commits: 0,
             sanctum_tier: SanctumTier::default(),
             projection: SessionProjection::new(),
             identity: IdentityLine::default(),
@@ -3397,8 +3404,18 @@ impl AppModel {
         // picker then closes (reverting any preview) and the key proceeds
         // to its normal owner — local chrome never shadows a live ask.
         if self.theme_picker.is_some() {
-            let menu_owns = self.screen == Screen::Session && self.projection.open_menu().is_some();
-            if !menu_owns && matches!(self.screen, Screen::Launcher | Screen::Session) {
+            let menu_owns = (self.screen == Screen::Session
+                && self.projection.open_menu().is_some())
+                || (self.screen == Screen::Subagent
+                    && self
+                        .viewed_chip()
+                        .is_some_and(|chip| chip.question_menu().is_some()));
+            if !menu_owns
+                && matches!(
+                    self.screen,
+                    Screen::Launcher | Screen::Session | Screen::Aura | Screen::Subagent
+                )
+            {
                 self.handle_theme_picker_key(key.code);
                 return;
             }
@@ -3500,11 +3517,13 @@ impl AppModel {
                         .cloned()
                     {
                         Some(PaletteItem::Cmd(spec)) => {
-                            self.composer.set_text(if has_arg_slots(spec.name) {
-                                format!("/{} ", spec.name)
-                            } else {
-                                format!("/{}", spec.name)
-                            });
+                            self.composer.set_text(
+                                if crate::commands::offers_arg_completions(spec.name) {
+                                    format!("/{} ", spec.name)
+                                } else {
+                                    format!("/{}", spec.name)
+                                },
+                            );
                         }
                         Some(PaletteItem::Arg { cmd, value, .. }) => {
                             self.composer.set_text(format!("/{cmd} {value}"));
@@ -5578,7 +5597,7 @@ impl AppModel {
             "theme" => match arg.as_deref() {
                 Some(name) => match ThemeChoice::parse(name) {
                     Some(choice) => {
-                        self.apply_theme_choice(choice);
+                        self.commit_theme_choice(choice);
                         self.flash = Some(self.theme_flash());
                     }
                     None => {
@@ -7483,18 +7502,27 @@ impl AppModel {
     fn cycle_theme(&mut self) {
         let keys = ThemeKey::ALL;
         let index = keys.iter().position(|k| *k == self.theme).unwrap_or(0);
-        self.apply_theme_choice(ThemeChoice::Fixed(keys[(index + 1) % keys.len()]));
+        self.commit_theme_choice(ThemeChoice::Fixed(keys[(index + 1) % keys.len()]));
         self.flash = Some(format!("· theme → {}", self.theme.theme().label));
     }
 
-    /// Apply a COMMITTED theme choice: resolve against the boot-time
-    /// detection and re-ground the frame. The runtime watches
-    /// `theme_choice` and persists changes to the profile-dir settings
-    /// file (owner spec §3: TUI-local display state, never daemon truth).
+    /// Apply a theme choice WITHOUT committing it: resolve against the
+    /// boot-time detection and re-ground the frame. Boot resolution uses
+    /// this directly; user actions go through [`Self::commit_theme_choice`].
     pub fn apply_theme_choice(&mut self, choice: ThemeChoice) {
         self.theme_choice = choice;
         self.theme = choice.resolve(self.detected_system);
         self.dirty = true;
+    }
+
+    /// A USER commit of the theme choice (picker ⏎/digit/click, `/theme
+    /// <name>`, ⌃T): apply and bump the commit counter the runtime's
+    /// persistence authority watches. Re-committing the current choice
+    /// still counts — the settings file must land even when the pick
+    /// matches the boot default (ui-themes-fix, live probe).
+    pub fn commit_theme_choice(&mut self, choice: ThemeChoice) {
+        self.apply_theme_choice(choice);
+        self.theme_commits = self.theme_commits.wrapping_add(1);
     }
 
     /// The flash for a committed choice — `system` names what it resolved
@@ -7509,12 +7537,17 @@ impl AppModel {
         }
     }
 
-    /// Bare `/theme` (owner menu law): the numbered arrow-highlight picker,
-    /// opening on the composer surfaces that can render it. A daemon card
-    /// outranks it — local chrome never sits on a live ask.
+    /// Bare `/theme` (owner menu law): the numbered arrow-highlight
+    /// picker, opening on EVERY composer surface — launcher, session,
+    /// aura, subagent — through this ONE authority (ui-themes-fix: the
+    /// launcher is the owner's primary surface). A daemon card outranks
+    /// it — local chrome never sits on a live ask.
     fn open_theme_picker(&mut self) {
         self.dirty = true;
-        if !matches!(self.screen, Screen::Launcher | Screen::Session) {
+        if !matches!(
+            self.screen,
+            Screen::Launcher | Screen::Session | Screen::Aura | Screen::Subagent
+        ) {
             self.flash = Some(
                 "· /theme — pick by name here: /theme system · light · dark · desert · oasis"
                     .to_owned(),
@@ -7522,6 +7555,14 @@ impl AppModel {
             return;
         }
         if self.screen == Screen::Session && self.projection.open_menu().is_some() {
+            self.flash = Some("· /theme — answer the open card first".to_owned());
+            return;
+        }
+        if self.screen == Screen::Subagent
+            && self
+                .viewed_chip()
+                .is_some_and(|chip| chip.question_menu().is_some())
+        {
             self.flash = Some("· /theme — answer the open card first".to_owned());
             return;
         }
@@ -7579,7 +7620,7 @@ impl AppModel {
             return;
         }
         self.theme_picker = None;
-        self.apply_theme_choice(ThemeChoice::MENU[index]);
+        self.commit_theme_choice(ThemeChoice::MENU[index]);
         self.flash = Some(self.theme_flash());
     }
 }

@@ -411,3 +411,110 @@ fn system_theme_follows_detection_fallback_dark() {
         ThemeKey::Dark
     );
 }
+
+// ---- ui-themes-fix: the live probe's surface + persistence gaps ----
+
+/// The NATURAL typed flow — `/theme` then ⏎ with the palette open, no
+/// dismissal. This is exactly what the live probe typed at the launcher
+/// and what the exact-match lead jump used to hijack onto the `system`
+/// arg row.
+fn type_theme_enter(model: &mut AppModel) {
+    for c in "/theme".chars() {
+        model.handle(common::key(ratatui::crossterm::event::KeyCode::Char(c)));
+    }
+    model.handle(common::key(ratatui::crossterm::event::KeyCode::Enter));
+}
+
+/// Non-degenerate picker check: the ROWS render in the frame, not just a
+/// state flag.
+fn assert_picker_rows(model: &AppModel, surface: &str) {
+    assert!(
+        model.theme_picker.is_some(),
+        "{surface}: /theme + ⏎ must open the picker"
+    );
+    let (rows, hits, _) = draw(model, 100, 30);
+    for needle in ["1. ● system", "3. ○ dark", "5. ○ oasis"] {
+        assert!(
+            rows.iter().any(|row| row.contains(needle)),
+            "{surface}: picker row {needle:?} not RENDERED:\n{}",
+            rows.join("\n")
+        );
+    }
+    assert!(
+        hits.iter().any(|(_, hit)| *hit == Hit::ThemeOption(0)),
+        "{surface}: picker rows must be clickable"
+    );
+}
+
+#[test]
+fn theme_picker_opens_on_every_composer_surface() {
+    // Launcher — the owner's primary surface (many terminals open).
+    let mut model = launcher_model();
+    type_theme_enter(&mut model);
+    assert_picker_rows(&model, "launcher");
+
+    // Session.
+    let mut model = launcher_model();
+    common::hit_session_named(&mut model, "billing-service");
+    assert_eq!(model.screen, Screen::Session);
+    type_theme_enter(&mut model);
+    assert_picker_rows(&model, "session");
+
+    // Aura — its composer runs the same slash dispatch.
+    let mut model = launcher_model();
+    model.handle_hit(Hit::ExtraRow(haider_tui::app::LauncherRow::Aura));
+    assert_eq!(model.screen, Screen::Aura);
+    type_theme_enter(&mut model);
+    assert_picker_rows(&model, "aura");
+
+    // Subagent — the chip view's composer, when no question card owns it.
+    let mut model = launcher_model();
+    common::hit_session_named(&mut model, "l1-remote-projects");
+    let agent = model.chips[0].agent.clone();
+    model.handle_hit(Hit::ChipRow(agent));
+    assert_eq!(model.screen, Screen::Subagent);
+    type_theme_enter(&mut model);
+    assert_picker_rows(&model, "subagent");
+}
+
+#[test]
+fn theme_commit_persists_from_the_launcher_flow() {
+    use haider_tui::runtime::sync_theme_persistence;
+    use haider_tui::settings::SettingsStore;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("tui-settings.json");
+    let mut settings = Some(SettingsStore::at(path.clone()));
+
+    // Boot: resolution applies the default choice WITHOUT committing —
+    // the runtime sees zero commits and writes nothing.
+    let mut model = launcher_model();
+    let mut seen = model.theme_commits;
+    sync_theme_persistence(&model, &mut seen, &mut settings);
+    assert!(!path.exists(), "boot resolution never writes the file");
+
+    // Preview inside the open picker: still no commit, still no file.
+    type_theme_enter(&mut model);
+    model.handle(common::key(ratatui::crossterm::event::KeyCode::Down));
+    sync_theme_persistence(&model, &mut seen, &mut settings);
+    assert!(!path.exists(), "previews never write the file");
+
+    // Commit `system` — the boot DEFAULT — from the launcher picker (the
+    // live probe's exact flow: no choice diff, yet the file must land).
+    model.handle(common::key(ratatui::crossterm::event::KeyCode::Char('1')));
+    assert_eq!(model.theme_choice, ThemeChoice::System);
+    sync_theme_persistence(&model, &mut seen, &mut settings);
+    assert_eq!(
+        SettingsStore::at(path.clone()).load(),
+        Some(ThemeChoice::System),
+        "a commit that re-affirms the boot default still persists"
+    );
+
+    // And a different commit updates it.
+    type_theme_enter(&mut model);
+    model.handle(common::key(ratatui::crossterm::event::KeyCode::Char('4')));
+    sync_theme_persistence(&model, &mut seen, &mut settings);
+    assert_eq!(
+        SettingsStore::at(path).load(),
+        Some(ThemeChoice::Fixed(ThemeKey::Desert))
+    );
+}
