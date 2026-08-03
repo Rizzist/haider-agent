@@ -16,7 +16,10 @@ screen).
    filters (session, provider, run outcome, parked kind). Cover at
    minimum: session created, run started/parked(permission|input)/
    finished(outcome), subagent spawned/reported, compaction completed,
-   update available, account expired. Matching happens on the
+   update available, account expired. Additively, `user_message`
+   matches the canonical committed `UserMessage` acceptance fact and
+   accepts optional `mode` (`queue|steer`) and `has_attachments`
+   filters. Matching happens on the
    daemon's committed envelope stream — after commit, never before
    (hooks OBSERVE truth; decision hooks are the one exception below).
 3. **Exec hooks**: spawn with the event JSON on stdin, workspace cwd,
@@ -24,9 +27,16 @@ screen).
    C1-era pre-exec fd sweep, bounded stdout/stderr (CAS overflow),
    hard timeout (default 30s, per-hook cap 300s), exit code + bounded
    output journaled as a hook-fired fact (additive kind).
+   A `user_message` event is a sanitized `haider.hooks.v1` additive
+   projection carrying session/run/branch, delivery mode, UTF-8 text
+   bounded to 32 KiB plus `truncated`, and attachment metadata only:
+   count and `{mime, bytes, artifact}` per attachment. `bytes` is the
+   length and `artifact` is the BLAKE3 digest; resolved bytes are never
+   serialized.
 4. **Subscribe hooks**: one long-running process per hook, restarted
    with backoff on exit, receiving LF-framed envelopes matching its
-   matcher; same hygiene; lifecycle journaled.
+   matcher; `user_message` uses the same sanitized bytes as exec;
+   same hygiene; lifecycle journaled.
 5. **Decision hooks (permission gate)**: for run-parked(permission)
    matchers with decision:true, the hook receives the pending effect
    description and may answer allow/deny on stdout within its
@@ -44,6 +54,12 @@ screen).
    `--trust-hooks` on headless runs (scopes to that run only). All
    trust changes are receipted commands (R2 pattern).
 
+`UserMessage` parity is deliberately fact-based, not surface-based. TUI,
+RPC, headless, and voice all converge on the same turn-acceptance transaction;
+surface identity never enters the committed fact. Therefore one accepted
+message yields exactly one hook event, and equivalent submissions have
+identical JSON semantics across all four surfaces.
+
 ## Laws (minimum)
 
 - untrusted_hook_never_executes_and_notices_honestly.
@@ -60,6 +76,12 @@ screen).
 - matcher_fires_only_after_commit (crash between accept and commit →
   no fire on recovery replay unless the fact survived).
 - hooks_facts_are_additive (goldens; unknown-kind tolerance).
+- user_message_hook_fires_for_headless_and_rpc_submissions_identically
+  (black-box production headless client + direct RPC, one durable fire per
+  session, byte-identical event JSON apart from opaque ids).
+- text_bounded_with_truncated_flag.
+- attachment_metadata_never_carries_bytes.
+- matcher_filters_respected.
 
 Standing lane laws: tests never inline; mutation-notes with RUNTIME
 failures (literals, non-degenerate fixtures, no self-referential

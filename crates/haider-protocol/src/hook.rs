@@ -5,11 +5,47 @@
 //! as additive payload kinds, so every pre-H2 typed reducer continues to
 //! tolerate them as unknown facts.
 
-use crate::ids::ArtifactRef;
+use crate::DeliveryMode;
+use crate::ids::{ArtifactRef, BranchId, RunId, SessionId};
 use serde::{Deserialize, Serialize};
 
 pub const HOOKS_CONFIG_SCHEMA: &str = "haider.hooks.v1";
 pub const HOOKS_LIST_SCHEMA: &str = "haider.observe.v1";
+
+/// Sanitized stdin/JSONL projection for hook facts that cannot safely expose
+/// their journal payload verbatim. Ordinary hook events remain raw envelopes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum HookInput {
+    /// One canonical committed user-message acceptance, independent of the
+    /// TUI, RPC, headless, or voice surface that submitted it.
+    UserMessage {
+        session: SessionId,
+        run: RunId,
+        branch: Option<BranchId>,
+        mode: DeliveryMode,
+        text: String,
+        truncated: bool,
+        attachments: HookAttachmentSet,
+    },
+}
+
+/// Metadata-only attachment inventory for one hook input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HookAttachmentSet {
+    pub count: u32,
+    pub items: Vec<HookAttachmentMetadata>,
+}
+
+/// Safe attachment coordinates. `bytes` is a length; resolved artifact bytes
+/// are never part of hook input JSON.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HookAttachmentMetadata {
+    pub mime: String,
+    pub bytes: u64,
+    /// The immutable BLAKE3 artifact digest, never artifact contents.
+    pub artifact: ArtifactRef,
+}
 
 /// Additive hook-engine facts written to the session journal.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

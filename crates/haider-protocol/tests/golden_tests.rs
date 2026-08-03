@@ -10,7 +10,10 @@ use haider_protocol::EventPayload;
 use haider_protocol::agent::ChipState;
 use haider_protocol::branch::{BranchCreated, BranchDescriptor, BranchEventPayload};
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets};
-use haider_protocol::hook::{HookEventPayload, HookFired, HookOutput, HookRuntimeKind};
+use haider_protocol::hook::{
+    HookAttachmentMetadata, HookAttachmentSet, HookEventPayload, HookFired, HookInput, HookOutput,
+    HookRuntimeKind,
+};
 use haider_protocol::ids::*;
 use haider_protocol::menu::{
     AnswerVia, Menu, MenuAnswer, MenuCloseReason, MenuKind, MenuOption, MenuScope,
@@ -868,6 +871,34 @@ fn golden_user_message_queue_mode() {
             text: "then document it".into(),
             attachments: vec![],
             mode: haider_protocol::DeliveryMode::Queue,
+        },
+    );
+}
+
+/// MUTATION CHECK: expose a surface tag/resolved attachment bytes, rename a
+/// coordinate, or omit the count/truncation contract. Expected RUNTIME failure:
+/// the additive hook-input golden differs byte-for-byte.
+#[test]
+fn golden_user_message_hook_event_projection() {
+    additive_golden(
+        "hook_user_message_event",
+        &HookInput::UserMessage {
+            session: SessionId::new("s-billing"),
+            run: RunId::new("r-7"),
+            branch: Some(BranchId::new("b-main")),
+            mode: haider_protocol::DeliveryMode::Queue,
+            text: "then document it".into(),
+            truncated: false,
+            attachments: HookAttachmentSet {
+                count: 1,
+                items: vec![HookAttachmentMetadata {
+                    mime: "image/png".into(),
+                    bytes: 8,
+                    artifact: ArtifactRef::new(
+                        "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    ),
+                }],
+            },
         },
     );
 }

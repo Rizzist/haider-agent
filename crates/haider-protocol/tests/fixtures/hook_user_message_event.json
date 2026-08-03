@@ -1,0 +1,19 @@
+{
+  "event": "user_message",
+  "session": "s-billing",
+  "run": "r-7",
+  "branch": "b-main",
+  "mode": "queue",
+  "text": "then document it",
+  "truncated": false,
+  "attachments": {
+    "count": 1,
+    "items": [
+      {
+        "mime": "image/png",
+        "bytes": 8,
+        "artifact": "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    ]
+  }
+}
