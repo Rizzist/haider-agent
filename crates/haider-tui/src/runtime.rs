@@ -1260,6 +1260,11 @@ impl DemoDriver {
             // instead of pushing these, so the demo driver never sees one.
             | AppRequest::ShellExec { .. }
             | AppRequest::ToolsRefresh
+            // H4 live-only vocabulary: `/hooks` in demo opens its
+            // sim-honest empty state and refuses trust locally — neither
+            // request is ever pushed.
+            | AppRequest::HooksRefresh { .. }
+            | AppRequest::HooksTrust { .. }
             // B2b live-only vocabulary: `/branch new` in demo mode flashes
             // its honest stub upstream — branches are daemon truth.
             | AppRequest::BranchCreate { .. }

@@ -336,7 +336,7 @@ pub const HELP_TEXT: &[&str] = &[
     "  /clear · /back     back to the main screen; typing there starts a fresh session",
     "  /compact           compact context now",
     "  /tokens            token panel — context by model (also ⌃G)",
-    "  /hooks             trust third-party hooks — FULL-SCREEN startup gate (not a session card)",
+    "  /hooks             hooks screen — daemon-discovered hooks · digest trust/revoke · recent firings",
     "  /voice             enable voice · pick STT / TTS providers (menu card) — demo only",
     "  /say <words>       speak a turn once voice is on (simulated STT) — demo only",
     "  /tools             core + custom tools · register with a dispatch mode (menu card) — demo only",

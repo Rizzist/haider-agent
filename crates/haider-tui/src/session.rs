@@ -61,6 +61,9 @@ pub struct SessionState {
     /// session-global replay cursor, which switching transplants rather
     /// than duplicates (one cursor, research risk 3).
     pub branch_state: crate::branch::BranchState,
+    /// This session's journaled hook facts + decision-chip state (H4) —
+    /// checked in/out with the session exactly like [`Self::branch_state`].
+    pub hook_facts: crate::hooks::HookFactsLog,
     pub msg_queue: Vec<String>,
     pub queue_mode: bool,
     /// This session's turn engine is mid-turn (the per-session slice of
@@ -100,6 +103,7 @@ impl SessionState {
             projection: SessionProjection::new(),
             chips: Vec::new(),
             branch_state: crate::branch::BranchState::default(),
+            hook_facts: crate::hooks::HookFactsLog::default(),
             msg_queue: Vec::new(),
             queue_mode: false,
             turn_active: false,
@@ -182,6 +186,10 @@ impl SessionState {
             Admission::Gap { after_seq } => RawOutcome::Gap { after_seq },
             admission @ (Admission::Skip | Admission::Apply) => {
                 let note = self.branch_state.note_admitted(envelope);
+                // H4: hook facts are recorded for Apply AND Skip in the
+                // background too — the attached twin does the same, so a
+                // later checkout carries the decision chip and firings.
+                self.hook_facts.note_envelope(envelope);
                 if let crate::branch::AdmittedNote::BranchInstalled(id) = &note {
                     // The fork this session itself issued: the receipt is
                     // already in and armed activation — the JOURNAL fact is
