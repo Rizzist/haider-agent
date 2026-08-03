@@ -83,6 +83,10 @@ fn launcher_shows_header_band_identity_and_composer() {
     // splash alone. Flip rationale: this test used to pin the centered
     // sanctum launcher.
     let mut model = AppModel::new();
+    // Deterministic device: the header line span-ellipsizes at narrow
+    // widths, so a long CI-runner hostname would push the real device off
+    // the band and turn this pin host-dependent (release-61 CI failure).
+    model.identity.device = "test-lion-box".to_owned();
     model.handle(AppEvent::Envelope(Box::new(EventPayload::HarnessStatus(
         HarnessStatus::Ready,
     ))));
