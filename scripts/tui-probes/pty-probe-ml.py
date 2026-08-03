@@ -21,7 +21,7 @@ import probelib
 cols, rows = int(sys.argv[1]), int(sys.argv[2])
 binary = sys.argv[3] if len(sys.argv) > 3 else "/usr/local/bin/haider"
 
-GOLD_BG = b"48;2;154;106;8"  # dawn cursor-cell ground (pty-probe-cursor)
+GOLD_BG = b"48;2;217;181;68"  # dark cursor-cell ground (pty-probe-cursor)
 
 pid, fd = probelib.spawn(cols, rows, binary)
 sink = [b""]

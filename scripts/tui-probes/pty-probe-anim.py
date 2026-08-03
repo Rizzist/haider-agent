@@ -51,9 +51,9 @@ probelib.drain_quiet(fd, sink)
 child_clean = probelib.reap(pid)
 out = sink[0]
 
-# Desert Dawn inks (theme.rs): gold #9a6a08, maroon #7c2d12.
-gold = b"154;106;8" in window
-maroon = b"124;45;18" in window
+# Dark-theme shimmer inks (theme.rs DARK): gold #d9b544, ember #e57a4a.
+gold = b"217;181;68" in window
+maroon = b"229;122;74" in window
 # One cursor-hide per drawn frame: ~10 phase flips fit the 6s window; a
 # storm that redraws every frame tick is an order of magnitude over.
 flips = window.count(b"\x1b[?25l")

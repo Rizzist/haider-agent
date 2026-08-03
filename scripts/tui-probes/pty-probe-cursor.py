@@ -5,13 +5,13 @@ Drives the installed binary with the actual key encodings a terminal
 sends and asserts the SCREEN (via forced full repaints):
 
 - type-in-middle: "helo" + ESC[D (←) + "l" → "hello", with the CURSOR
-  CELL (gold ground, 48;2;154;106;8 on dawn) present IN the composer's
+  CELL (gold ground, 48;2;217;181;68 on dark) present IN the composer's
   row segment — scoped to the row because the Active status badge is
   also gold-filled;
 - word movement both encodings: ESC b (⌥b, what most mac terminals send)
   and ESC[1;3D (CSI ⌥←) — "one two" → "one Xtwo";
 - kills: ESC[F (End) + ⌃U empties the line back to the placeholder;
-- selection: ESC[1;2D (⇧←) ×2 paints the selBg band (231;215;197 dawn)
+- selection: ESC[1;2D (⇧←) ×2 paints the selBg band (38;31;14 dark)
   in the composer row; ⌃C COPIES (OSC 52 with base64("me") = bWU= in the
   stream, the honest flash on screen) instead of navigating;
 - history: ESC[A (↑) recalls the submitted "hello", typing extends it to
@@ -33,8 +33,8 @@ import probelib
 cols, rows = int(sys.argv[1]), int(sys.argv[2])
 binary = sys.argv[3] if len(sys.argv) > 3 else "/usr/local/bin/haider"
 
-GOLD_BG = b"48;2;154;106;8"  # dawn cursor-cell ground
-SEL_BG = b"48;2;231;215;197"  # dawn selBg (maroon @0.1 over sand)
+GOLD_BG = b"48;2;217;181;68"  # dark cursor-cell ground (theme.rs DARK gold)
+SEL_BG = b"48;2;38;31;14"  # dark selBg (gold @0.1 over ground)
 
 # The cursor/selection cells SPLIT styled words with SGR runs mid-word
 # ("hell" + SGR + "o"), so TEXT assertions strip ANSI first; COLOR
