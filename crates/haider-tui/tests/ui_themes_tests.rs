@@ -328,7 +328,7 @@ fn theme_picker_lists_and_switches_instantly() {
     assert_eq!(model.theme_choice, ThemeChoice::Fixed(ThemeKey::Desert));
     // A click commits like a digit (value-carrying hit).
     common::run_slash(&mut model, "/theme");
-    model.handle_hit(Hit::ThemeOption(4));
+    model.handle_hit(Hit::ThemeOption(5));
     assert!(model.theme_picker.is_none());
     assert_eq!(model.theme_choice, ThemeChoice::Fixed(ThemeKey::Oasis));
     assert_eq!(model.theme, ThemeKey::Oasis);
