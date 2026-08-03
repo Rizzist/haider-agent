@@ -442,17 +442,41 @@ fn sequential_cli_runs_use_profile_owned_worker_generations() {
     );
 }
 
+/// Runs `haider` with ONE bounded retry when the autospawned daemon misses
+/// its startup deadline under full-gate load (exit 69) — the transient
+/// class only; real failures surface with stderr on the caller's assert.
+fn haider_with_boot_retry(args: &[&str], envs: &[(&str, &str)]) -> std::process::Output {
+    let run = || {
+        let mut command = haider();
+        command.args(args);
+        for (key, value) in envs {
+            command.env(key, value);
+        }
+        command.output().expect("binary runs")
+    };
+    let out = run();
+    if out.status.code() == Some(69) {
+        run()
+    } else {
+        out
+    }
+}
+
 #[test]
 fn run_jsonl_exits_65_when_fake_provider_errors() {
-    let out = haider()
-        .args(["run", "--provider", "fake", "--jsonl", "hello"])
-        .env(
+    let out = haider_with_boot_retry(
+        &["run", "--provider", "fake", "--jsonl", "hello"],
+        &[(
             "HAIDER_TEST_FAKE_PROVIDER",
             r#"[{"step":"malformed_frame"}]"#,
-        )
-        .output()
-        .expect("binary runs");
-    assert_eq!(out.status.code(), Some(65));
+        )],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(65),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let text = String::from_utf8(out.stdout).expect("utf8");
     let envelopes: Vec<RawEnvelope> = text
         .lines()
@@ -466,15 +490,19 @@ fn run_jsonl_exits_65_when_fake_provider_errors() {
 
 #[test]
 fn run_jsonl_cancelled_has_130_exit_and_terminal_envelope() {
-    let out = haider()
-        .args(["run", "--provider", "fake", "--jsonl", "hello"])
-        .env(
+    let out = haider_with_boot_retry(
+        &["run", "--provider", "fake", "--jsonl", "hello"],
+        &[(
             "HAIDER_TEST_FAKE_PROVIDER",
             r#"[{"step":"finish","reason":"cancelled"}]"#,
-        )
-        .output()
-        .expect("binary runs");
-    assert_eq!(out.status.code(), Some(130));
+        )],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(130),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(out.stderr.is_empty());
     let envelopes = parse_jsonl(&out.stdout);
     assert_eq!(
