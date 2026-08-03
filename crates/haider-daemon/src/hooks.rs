@@ -1330,7 +1330,8 @@ fn strict_decision(result: &HookProcessResult) -> Option<HookDecisionKind> {
     }
 }
 
-async fn definition_current(
+/// pub(crate) for the fire-time re-verification law tests.
+pub(crate) async fn definition_current(
     service: &HookService,
     definition: &HookDefinition,
     run_override: bool,
@@ -1786,7 +1787,10 @@ async fn write_jsonl(
     stdin.write_all(&bytes).await
 }
 
-async fn discover_async(cwd: PathBuf, profile_root: PathBuf) -> Result<Discovery, String> {
+pub(crate) async fn discover_async(
+    cwd: PathBuf,
+    profile_root: PathBuf,
+) -> Result<Discovery, String> {
     tokio::task::spawn_blocking(move || discover(&cwd, &profile_root))
         .await
         .map_err(|error| format!("hook discovery task stopped: {error}"))?

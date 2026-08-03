@@ -1557,3 +1557,60 @@ fn hook_runtime_and_policy_literals_are_stable() {
     assert_eq!(HookTrustPolicy::PerDigest.as_str(), "per_digest");
     assert_eq!(HookTrustPolicy::TrustWorkspace.as_str(), "trust_workspace");
 }
+
+/// MUTATION CHECK: drop the digest-match half of `definition_current` (keep
+/// only `is_trusted`). Expected RUNTIME failure: with TWO pinned digests, a
+/// hook file swapped between match and fire re-verifies as current even
+/// though the matched definition and the fire-time definition differ — the
+/// wrong (albeit trusted) command would run for the matched event.
+#[tokio::test]
+async fn fire_time_reverification_refuses_a_swapped_pinned_definition() {
+    let fixture = EngineFixture::start("printf first", 1_000, false, "exec").await;
+    let profile_root = fixture._profile_guard.path().to_path_buf();
+    let matched = crate::hooks::discover_async(fixture.workspace.clone(), profile_root.clone())
+        .await
+        .expect("discover matched")
+        .hooks
+        .get("test_hook")
+        .cloned()
+        .expect("matched definition");
+
+    // Swap the file to a DIFFERENT command and pin the new digest too —
+    // both definitions are individually trusted.
+    write_hook(
+        &fixture.workspace,
+        "test_hook",
+        "run_started",
+        "printf second",
+        1_000,
+        false,
+        "exec",
+    );
+    let swapped = crate::hooks::discover_async(fixture.workspace.clone(), profile_root)
+        .await
+        .expect("discover swapped")
+        .hooks
+        .get("test_hook")
+        .cloned()
+        .expect("swapped definition");
+    fixture
+        .service
+        .apply_trust(
+            CommandId::new("trust-swap-pin"),
+            swapped.digest.clone(),
+            true,
+        )
+        .await
+        .expect("pin swapped digest");
+    assert_ne!(matched.digest, swapped.digest);
+
+    // The MATCHED (pre-swap) definition must fail fire-time
+    // re-verification even though both digests are pinned.
+    assert!(
+        !crate::hooks::definition_current(&fixture.service, &matched, false).await,
+        "a swapped definition must not re-verify as current"
+    );
+    // The swapped definition itself is honestly current.
+    assert!(crate::hooks::definition_current(&fixture.service, &swapped, false).await);
+    fixture.close().await;
+}
