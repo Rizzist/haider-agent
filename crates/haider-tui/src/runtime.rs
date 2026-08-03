@@ -113,6 +113,26 @@ pub fn resolve_system_theme(osc: Option<termbg::Theme>, colorfgbg: Option<&str>)
     }
 }
 
+/// The ONE persistence authority for the theme choice (ui-themes-fix):
+/// both runtime loops call this every beat. It keys on the model's COMMIT
+/// counter — not on a choice diff — so a commit that re-affirms the boot
+/// default still writes the settings file (the live probe found no file
+/// after exactly that flow). Previews and boot resolution bump nothing
+/// and therefore never write.
+pub fn sync_theme_persistence(
+    model: &crate::app::AppModel,
+    seen_commits: &mut u64,
+    settings: &mut Option<crate::settings::SettingsStore>,
+) {
+    if model.theme_commits == *seen_commits {
+        return;
+    }
+    *seen_commits = model.theme_commits;
+    if let Some(store) = settings.as_mut() {
+        store.save_if_changed(model.theme_choice);
+    }
+}
+
 /// Parse the `COLORFGBG` convention (`"<fg>;<bg>"`, sometimes
 /// `"<fg>;default;<bg>"`): the LAST field is the background's 16-color
 /// index — 0-6 and 8 are dark grounds, 7 and 15 light. Anything else
@@ -243,10 +263,10 @@ pub async fn run_demo(
     sync_window_title(&model.window_title());
     let mut active_theme = model.theme;
     // Owner spec §3: the theme CHOICE is TUI-local display state — persist
-    // committed changes to the profile-dir settings file. Previews inside
+    // every user COMMIT to the profile-dir settings file. Previews inside
     // the open picker move only the resolved theme, so they never write.
     let mut settings = crate::settings::SettingsStore::open_default();
-    let mut active_choice = model.theme_choice;
+    let mut seen_theme_commits = model.theme_commits;
     let mut active_title = model.window_title();
 
     // Query the terminal for a graphics protocol and build the wordmark image
@@ -413,12 +433,7 @@ pub async fn run_demo(
             }
         }
         // Theme cycled: re-sync the emulator background.
-        if model.theme_choice != active_choice {
-            active_choice = model.theme_choice;
-            if let Some(store) = settings.as_mut() {
-                store.save_if_changed(active_choice);
-            }
-        }
+        sync_theme_persistence(&model, &mut seen_theme_commits, &mut settings);
         if model.theme != active_theme {
             active_theme = model.theme;
             sync_terminal_bg(active_theme);
@@ -2509,10 +2524,10 @@ pub async fn run_live(
     sync_window_title(&model.window_title());
     let mut active_theme = model.theme;
     // Owner spec §3: the theme CHOICE is TUI-local display state — persist
-    // committed changes to the profile-dir settings file. Previews inside
+    // every user COMMIT to the profile-dir settings file. Previews inside
     // the open picker move only the resolved theme, so they never write.
     let mut settings = crate::settings::SettingsStore::open_default();
-    let mut active_choice = model.theme_choice;
+    let mut seen_theme_commits = model.theme_commits;
     let mut active_title = model.window_title();
 
     // Graphics wordmark query — after raw mode, before the input pump (see the
@@ -2629,12 +2644,7 @@ pub async fn run_live(
                 ShellRequest::Quit => model.should_quit = true,
             }
         }
-        if model.theme_choice != active_choice {
-            active_choice = model.theme_choice;
-            if let Some(store) = settings.as_mut() {
-                store.save_if_changed(active_choice);
-            }
-        }
+        sync_theme_persistence(&model, &mut seen_theme_commits, &mut settings);
         if model.theme != active_theme {
             active_theme = model.theme;
             sync_terminal_bg(active_theme);

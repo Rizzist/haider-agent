@@ -633,49 +633,55 @@ fn palette_and_menu_selection_wrap_around() {
 }
 
 #[test]
-fn exact_theme_leads_to_its_slot_and_dismissed_bare_theme_opens_picker() {
-    // Sim getSuggestions lead case (tui.js:243-247): the EXACT `/theme`
-    // (no space) already shows the argument rows — ⏎ runs the highlighted
-    // arg, and the ghost offers ` system`.
+fn exact_theme_enter_opens_the_picker_not_the_arg_slot() {
+    // ui-themes-fix (live probe): the exact-match lead jump used to put
+    // the ARG rows under ⏎ — `/theme` + enter silently ran the
+    // highlighted `system` row and the picker never opened in the
+    // NATURAL typed flow. `/theme` left `has_arg_slots`, so ⏎ on its
+    // command row now RUNS it and the picker opens; tab still offers the
+    // slot completions (`offers_arg_completions`).
     let mut model = launcher_model();
     assert_eq!(model.theme, ThemeKey::Dark);
     for c in "/theme".chars() {
         model.handle(key(KeyCode::Char(c)));
     }
     let labels: Vec<String> = model.palette_items().iter().map(|i| i.label()).collect();
-    assert_eq!(
-        labels,
-        ["system", "light", "dark", "desert", "oasis"],
-        "lead arg rows"
-    );
-    assert_eq!(model.ghost().as_deref(), Some(" system"), "lead ghost");
+    assert_eq!(labels, ["/theme"], "the command row, not a slot hijack");
     model.handle(key(KeyCode::Enter));
+    assert!(
+        model.theme_picker.is_some(),
+        "⏎ on /theme opens the picker (the probe's gap)"
+    );
     assert_eq!(
         model.theme_choice,
         haider_tui::theme::ThemeChoice::System,
-        "⏎ ran the highlighted arg"
+        "nothing committed by merely opening"
     );
-    assert_eq!(model.theme, ThemeKey::Dark, "system resolves to detection");
-    assert!(
-        model
-            .flash
-            .as_deref()
-            .unwrap_or("")
-            .contains("theme → system")
-    );
+    model.handle(key(KeyCode::Esc));
 
-    // UI-themes wave flip (owner spec §3, supersedes the sim-era cycle
-    // divergence): a DISMISSED bare /theme now opens the numbered
-    // arrow-highlight picker — the picker IS the listing.
+    // Tab still opens the slot: typed-name completion survives the fix.
     for c in "/theme".chars() {
         model.handle(key(KeyCode::Char(c)));
     }
+    model.handle(key(KeyCode::Tab));
+    assert_eq!(model.composer, "/theme ", "tab enters the slot");
+    let labels: Vec<String> = model.palette_items().iter().map(|i| i.label()).collect();
+    assert_eq!(
+        labels,
+        ["system", "light", "dark", "desert", "oasis"],
+        "slot rows after the space"
+    );
+
+    // The dismissed-palette path converges on the same picker: trim the
+    // slot space back to bare `/theme`, dismiss, ⏎.
+    model.handle(key(KeyCode::Backspace));
+    assert_eq!(model.composer, "/theme");
     model.handle(key(KeyCode::Esc));
     assert!(!model.palette_open(), "esc dismissed the palette");
     model.handle(key(KeyCode::Enter));
     assert!(
         model.theme_picker.is_some(),
-        "dismissed bare /theme opens the picker"
+        "dismissed bare /theme opens the picker too"
     );
 }
 
@@ -684,19 +690,19 @@ fn exact_theme_leads_to_its_slot_and_dismissed_bare_theme_opens_picker() {
 #[test]
 fn enter_on_a_partial_arg_command_enters_its_slot() {
     // Sim acceptSuggestion: ⏎ on a command row that takes args ENTERS the
-    // slot instead of executing (tui.js:2722-2734).
+    // slot instead of executing (tui.js:2722-2734). Re-targeted from
+    // /theme to /login (ui-themes-fix): /theme's ⏎ now RUNS — the picker
+    // IS its argument experience — so /login carries this law.
     let mut model = launcher_model();
-    let before = model.theme;
-    for c in "/th".chars() {
+    for c in "/logi".chars() {
         model.handle(key(KeyCode::Char(c)));
     }
     model.handle(key(KeyCode::Enter));
-    assert_eq!(model.composer, "/theme ", "slot entered, nothing ran");
-    assert_eq!(model.theme, before, "no theme change");
+    assert_eq!(model.composer, "/login ", "slot entered, nothing ran");
     let labels: Vec<String> = model.palette_items().iter().map(|i| i.label()).collect();
     assert_eq!(
         labels,
-        ["system", "light", "dark", "desert", "oasis"],
+        ["anthropic", "openai", "gemini", "kimi"],
         "slot rows now offered"
     );
 }

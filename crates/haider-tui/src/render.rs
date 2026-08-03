@@ -3267,6 +3267,8 @@ fn render_subagent(
                 ));
             }
         }
+    } else if theme_picker_showing(model) {
+        render_theme_picker(model, theme, frame, rule_area, composer_area, hits);
     } else {
         render_composer(model, theme, frame, rule_area, composer_area, hits);
     }
@@ -3643,7 +3645,11 @@ fn render_aura(
         transcript_area,
     );
 
-    render_composer(model, theme, frame, rule_area, composer_area, hits);
+    if theme_picker_showing(model) {
+        render_theme_picker(model, theme, frame, rule_area, composer_area, hits);
+    } else {
+        render_composer(model, theme, frame, rule_area, composer_area, hits);
+    }
     if band_rule_h > 0 {
         frame.render_widget(
             Paragraph::new(Line::styled(
@@ -3820,9 +3826,16 @@ const THEME_PICKER_ROWS: u16 = 8;
 /// ask branches outrank it — local chrome never sits on a live ask).
 fn theme_picker_showing(model: &AppModel) -> bool {
     model.theme_picker.is_some()
-        && matches!(model.screen, Screen::Launcher | Screen::Session)
+        && matches!(
+            model.screen,
+            Screen::Launcher | Screen::Session | Screen::Aura | Screen::Subagent
+        )
         && model.projection.open_menu().is_none()
         && model.login.is_none()
+        && !(model.screen == Screen::Subagent
+            && model
+                .viewed_chip()
+                .is_some_and(|chip| chip.question_menu().is_some()))
 }
 
 /// The `/theme` picker (owner spec §3): a numbered arrow-highlight card in
