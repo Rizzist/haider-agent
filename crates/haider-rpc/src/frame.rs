@@ -204,6 +204,8 @@ pub const FEATURE_SESSION_OBSERVE_V1: &str = "session_observe_v1";
 pub const FEATURE_BRANCH_CREATE_V1: &str = "branch_create_v1";
 /// The daemon accepts receipt-free, content-addressed `artifact.put` uploads.
 pub const FEATURE_ARTIFACT_PUT_V1: &str = "artifact_put_v1";
+/// Daemon-owned hook discovery, execution, decision answers, and trust receipts.
+pub const FEATURE_HOOKS_V1: &str = "hooks_v1";
 
 /// Kind of client taking part in the handshake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -792,6 +794,19 @@ pub struct SessionObserveDigest {
     pub last_event_kinds: Vec<String>,
 }
 
+/// Secret-free projection of one effective hook definition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HookSummaryWire {
+    pub name: String,
+    pub digest: String,
+    pub source: String,
+    pub kind: String,
+    pub event: String,
+    pub trusted: bool,
+    pub decision: bool,
+    pub timeout_ms: u64,
+}
+
 /// v0.1 request method bodies.
 ///
 /// The internally tagged method object keeps each operation visibly named and
@@ -864,6 +879,21 @@ pub enum RequestBody {
         #[serde(default)]
         last_event_limit: u32,
     },
+    /// Discovers the effective hooks for one canonicalizable workspace.
+    #[serde(rename = "hooks.list")]
+    HooksList { cwd: String },
+    /// Receipt-backed digest pin.
+    #[serde(rename = "hooks.trust")]
+    HooksTrust {
+        command_id: CommandId,
+        digest: String,
+    },
+    /// Receipt-backed digest revocation.
+    #[serde(rename = "hooks.revoke")]
+    HooksRevoke {
+        command_id: CommandId,
+        digest: String,
+    },
     /// The only operation that begins event delivery. `after_seq` is the
     /// greatest sequence the client has fully applied (zero for complete
     /// history); the daemon replays strictly after it.
@@ -910,6 +940,21 @@ pub enum RequestBody {
         command_id: CommandId,
         session_id: SessionId,
         worker_generation: u64,
+        text: String,
+        #[serde(default)]
+        attachments: Vec<AttachmentBlock>,
+        mode: DeliveryMode,
+    },
+    /// Additive headless submission carrying a run-scoped hook trust grant.
+    /// The distinct method preserves source compatibility for older Rust
+    /// callers while keeping omission on ordinary submissions byte-stable.
+    #[serde(rename = "turn.submit_with_hook_trust")]
+    TurnSubmitWithHookTrust {
+        command_id: CommandId,
+        session_id: SessionId,
+        worker_generation: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch_id: Option<BranchId>,
         text: String,
         #[serde(default)]
         attachments: Vec<AttachmentBlock>,
@@ -1134,6 +1179,16 @@ pub enum ResponseBody {
     SessionRead { result: SessionReadResult },
     #[serde(rename = "session.observe")]
     SessionObserve { digest: SessionObserveDigest },
+    #[serde(rename = "hooks.list")]
+    HooksList {
+        policy: String,
+        #[serde(default)]
+        hooks: Vec<HookSummaryWire>,
+    },
+    #[serde(rename = "hooks.trust")]
+    HooksTrust { digest: String, trusted: bool },
+    #[serde(rename = "hooks.revoke")]
+    HooksRevoke { digest: String, trusted: bool },
     #[serde(rename = "session.attach")]
     SessionAttach {
         attachment_id: AttachmentId,

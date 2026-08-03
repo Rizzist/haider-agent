@@ -123,6 +123,10 @@ pub enum AnswerVia {
     Tui,
     Gui,
     Rpc,
+    /// Daemon-owned decision hook. Hook answers still pass through the
+    /// ordinary committed menu compare-and-set; this is provenance, not a
+    /// second authorization path.
+    Hook,
     Voice,
     Timeout,
 }

@@ -14,7 +14,7 @@ use crate::{StoreResult, now_ms, store_error, to_sqlite_integer};
 use haider_protocol::error::{ErrorCode, HaiderError};
 use rusqlite::{Connection, TransactionBehavior, params};
 
-pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 10;
+pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 11;
 
 struct Migration {
     version: u32,
@@ -207,6 +207,17 @@ const MIGRATIONS: &[Migration] = &[
             ON branches(session_id, source_branch_id);
 
             ALTER TABLE delegations ADD COLUMN parent_branch_id TEXT;
+        ",
+    },
+    Migration {
+        version: 11,
+        sql: "
+            CREATE TABLE hook_dispatch_outbox (
+                session_id TEXT NOT NULL,
+                seq        INTEGER NOT NULL CHECK (seq > 0),
+                PRIMARY KEY (session_id, seq),
+                FOREIGN KEY (session_id, seq) REFERENCES events(session_id, seq)
+            );
         ",
     },
 ];

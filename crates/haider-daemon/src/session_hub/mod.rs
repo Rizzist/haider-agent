@@ -524,6 +524,7 @@ struct HubInner {
     worker_manager: Mutex<Option<WorkerManagerHandle>>,
     accounts: Mutex<Option<crate::accounts::AccountsFacade>>,
     creatable_providers: Mutex<Option<std::collections::BTreeSet<String>>>,
+    hooks: Arc<Mutex<Option<crate::hooks::WeakHookService>>>,
 }
 
 #[derive(Default)]
@@ -902,6 +903,7 @@ impl SessionHub {
                 worker_manager: Mutex::new(None),
                 accounts: Mutex::new(None),
                 creatable_providers: Mutex::new(None),
+                hooks: Arc::new(Mutex::new(None)),
             }),
         })
     }
@@ -918,6 +920,26 @@ impl SessionHub {
         }
         *installed = Some(manager);
         Ok(())
+    }
+
+    pub(crate) fn install_hooks(
+        &self,
+        hooks: crate::hooks::HookService,
+    ) -> Result<(), SessionHubError> {
+        let mut installed = lock(&self.inner.hooks)?;
+        if installed.is_some() {
+            return Err(SessionHubError::Task(
+                "hook service is already installed".into(),
+            ));
+        }
+        *installed = Some(hooks.downgrade());
+        Ok(())
+    }
+
+    pub(crate) fn hooks(&self) -> Result<Option<crate::hooks::HookService>, SessionHubError> {
+        Ok(lock(&self.inner.hooks)?
+            .as_ref()
+            .and_then(crate::hooks::WeakHookService::upgrade))
     }
 
     /// Installs the account facade (actor route + descriptor snapshot),
@@ -1430,6 +1452,27 @@ impl SessionHub {
             .map_err(Into::into)
     }
 
+    /// Internal decision-hook route into the exact same actor/store menu CAS
+    /// used by wire answers. This bypasses only connection capability checks;
+    /// committed-menu identity, generation fencing, option validation, and
+    /// first-winner arbitration remain unchanged.
+    pub(crate) async fn resolve_hook_menu(
+        &self,
+        command: MenuResolutionCommand,
+    ) -> Result<MenuResolutionOutcome, HaiderError> {
+        let actor = self
+            .actor_for(command.session_id.clone())
+            .await
+            .map_err(hub_error_as_store)?;
+        let (completed, result) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::MenuAnswer { command, completed })
+            .await
+            .map_err(|_| hub_closed_store_error())?;
+        result.await.map_err(|_| hub_closed_store_error())?
+    }
+
     /// Mints and installs a same-process worker lease in actor order (R1).
     ///
     /// Installation REPLACES any current lease in the same serialized actor
@@ -1579,6 +1622,7 @@ impl SessionHub {
             self.inner.store.clone(),
             Arc::clone(&self.inner.observer),
             Arc::clone(&self.inner.metrics),
+            Arc::clone(&self.inner.hooks),
             Arc::clone(&self.inner.force_stop),
             receiver,
         ));

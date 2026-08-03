@@ -327,6 +327,12 @@ async fn run_inner(
     );
 
     let hub = SessionHub::new(store.clone(), config.session_hub).map_err(DaemonError::from)?;
+    let (hook_service, hook_engine) =
+        crate::hooks::HookEngine::start(config.store_dir.clone(), store.clone(), hub.clone())
+            .await
+            .map_err(DaemonError::from)?;
+    hub.install_hooks(hook_service).map_err(DaemonError::from)?;
+    let mut hook_engine = Some(hook_engine);
     // D3-5 whitelist unification + the production factory swap: the ONE
     // provider authority is the dependency configuration. `Accounts` (the
     // default) resolves per logical turn from the daemon-owned account
@@ -429,6 +435,9 @@ async fn run_inner(
             if let Some(actor) = account_actor.as_mut() {
                 actor.force_and_join().await;
             }
+            if let Some(engine) = hook_engine.take() {
+                engine.shutdown().await;
+            }
             let _ = hub.shutdown().await;
             let _ = store.close().await;
             return Err(error.into());
@@ -446,6 +455,9 @@ async fn run_inner(
             }
             if let Some(actor) = account_actor.as_mut() {
                 actor.force_and_join().await;
+            }
+            if let Some(engine) = hook_engine.take() {
+                engine.shutdown().await;
             }
             let _ = hub.shutdown().await;
             let _ = store.flush().await;
@@ -503,6 +515,7 @@ async fn run_inner(
         if let Some(actor) = account_actor {
             actor.crash();
         }
+        drop(hook_engine.take());
         let _ = hub.shutdown().await;
         drop(context);
         drop(hub);
@@ -608,6 +621,13 @@ async fn run_inner(
         // until the actor has observed the force fence, tombstoned any
         // rotated bundle, dropped its zeroizing bytes, and joined.
         actor.force_and_join().await;
+    }
+    if let Some(engine) = hook_engine.take()
+        && bounded_finalization(engine.shutdown(), barrier_deadline, &mut shutdown)
+            .await
+            .is_none()
+    {
+        forced = true;
     }
     let hub_shutdown = bounded_finalization(hub.shutdown(), barrier_deadline, &mut shutdown).await;
     let hub_error = match hub_shutdown {

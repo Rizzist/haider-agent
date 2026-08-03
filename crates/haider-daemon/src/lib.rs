@@ -56,6 +56,7 @@ mod context_core_tests;
 mod delegation;
 mod endpoint;
 mod error;
+mod hooks;
 mod lifecycle;
 mod oauth;
 #[cfg(test)]

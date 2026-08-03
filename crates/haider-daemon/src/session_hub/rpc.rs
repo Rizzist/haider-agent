@@ -569,6 +569,43 @@ impl HubConnection {
                 self.session_observe(request_id, session_id, last_event_limit)
                     .await
             }
+            RequestBody::HooksList { cwd } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::View) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.hooks_list(request_id, cwd).await
+            }
+            RequestBody::HooksTrust { command_id, digest } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.hooks_trust(request_id, command_id, digest, true).await
+            }
+            RequestBody::HooksRevoke { command_id, digest } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.hooks_trust(request_id, command_id, digest, false)
+                    .await
+            }
             RequestBody::SessionAttach {
                 session_id,
                 after_seq,
@@ -682,6 +719,7 @@ impl HubConnection {
                     text,
                     attachments,
                     mode,
+                    false,
                 )
                 .await
             }
@@ -723,6 +761,50 @@ impl HubConnection {
                     text,
                     attachments,
                     mode,
+                    false,
+                )
+                .await
+            }
+            RequestBody::TurnSubmitWithHookTrust {
+                command_id,
+                session_id,
+                worker_generation,
+                branch_id,
+                text,
+                attachments,
+                mode,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                if !self
+                    .hub
+                    .holds_control_attachment(&self.connection_id, &session_id)?
+                {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        "turn submission requires a control attachment to this session",
+                        false,
+                        None,
+                    );
+                }
+                self.turn_submit(
+                    request_id,
+                    command_id,
+                    session_id,
+                    worker_generation,
+                    branch_id,
+                    text,
+                    attachments,
+                    mode,
+                    true,
                 )
                 .await
             }
@@ -2101,6 +2183,7 @@ impl HubConnection {
         text: String,
         attachments: Vec<haider_protocol::tool::AttachmentBlock>,
         mode: haider_protocol::DeliveryMode,
+        trust_hooks: bool,
     ) -> Result<(), SessionHubError> {
         if command_id.as_str().is_empty() || text.trim().is_empty() {
             return self.respond_error(
@@ -2111,15 +2194,23 @@ impl HubConnection {
                 None,
             );
         }
-        let request_json = serde_json::to_string(&serde_json::json!({
+        let mut request_value = serde_json::json!({
             "session_id": &session_id,
             "worker_generation": worker_generation,
             "branch_id": &branch_id,
             "text": &text,
             "attachments": &attachments,
             "mode": mode,
-        }))
-        .map_err(|error| {
+        });
+        if trust_hooks {
+            let Some(request) = request_value.as_object_mut() else {
+                return Err(SessionHubError::Task(
+                    "turn-submit coordinates did not encode as an object".into(),
+                ));
+            };
+            request.insert("trust_hooks".into(), serde_json::Value::Bool(true));
+        }
+        let request_json = serde_json::to_string(&request_value).map_err(|error| {
             SessionHubError::Task(format!("cannot encode turn-submit coordinates: {error}"))
         })?;
         let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
@@ -2951,6 +3042,75 @@ impl HubConnection {
         }
         self.hub
             .spawn_replay(registration, after_seq, Arc::clone(&self.sink))
+    }
+
+    async fn hooks_list(&self, request_id: RequestId, cwd: String) -> Result<(), SessionHubError> {
+        let Some(hooks) = self.hub.hooks()? else {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "hook service is unavailable",
+                false,
+                None,
+            );
+        };
+        match hooks.list(std::path::PathBuf::from(cwd)).await {
+            Ok((policy, hooks)) => self.send(WireFrame::Response {
+                request_id,
+                body: ResponseBody::HooksList {
+                    policy: policy.as_str().to_owned(),
+                    hooks,
+                },
+            }),
+            Err(message) => self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                &message,
+                false,
+                None,
+            ),
+        }
+    }
+
+    async fn hooks_trust(
+        &self,
+        request_id: RequestId,
+        command_id: CommandId,
+        digest: String,
+        trusted: bool,
+    ) -> Result<(), SessionHubError> {
+        let Some(hooks) = self.hub.hooks()? else {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "hook service is unavailable",
+                false,
+                None,
+            );
+        };
+        match hooks.apply_trust(command_id, digest, trusted).await {
+            Ok(change) => self.send(WireFrame::Response {
+                request_id,
+                body: if trusted {
+                    ResponseBody::HooksTrust {
+                        digest: change.digest,
+                        trusted: change.trusted,
+                    }
+                } else {
+                    ResponseBody::HooksRevoke {
+                        digest: change.digest,
+                        trusted: change.trusted,
+                    }
+                },
+            }),
+            Err(error) => self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                &error.message,
+                error.retryable,
+                None,
+            ),
+        }
     }
 
     async fn session_detach(

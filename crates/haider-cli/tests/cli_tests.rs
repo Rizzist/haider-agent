@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 #[path = "../src/main.rs"]
 mod cli_main;
 
+use cli_main::hooks::{HooksCommand, parse_hooks_command};
 use cli_main::run::{
     EX_BLOCKED, EX_CANCELLED, EX_IOERR, EX_PROTOCOL, EX_PROVIDER, EX_SOFTWARE, EX_TIMEOUT,
     EX_UNAVAILABLE, EX_USAGE, ProviderSelection, RunOptions, RunOutput, exit_code_for_error,
@@ -1004,6 +1005,7 @@ fn run_parser_pins_outputs_timeouts_and_permission_flags() {
             timeout: None,
             allow_writes: false,
             allow_exec: false,
+            trust_hooks: false,
             provider: None,
             model: None,
             attachments: Vec::new(),
@@ -1017,6 +1019,7 @@ fn run_parser_pins_outputs_timeouts_and_permission_flags() {
         "1500ms".into(),
         "--allow-writes".into(),
         "--allow-exec".into(),
+        "--trust-hooks".into(),
         "--provider".into(),
         "fake".into(),
         "--model".into(),
@@ -1029,7 +1032,7 @@ fn run_parser_pins_outputs_timeouts_and_permission_flags() {
     .expect("full options");
     assert_eq!(parsed.output, RunOutput::Json);
     assert_eq!(parsed.timeout, Some(Duration::from_millis(1500)));
-    assert!(parsed.allow_writes && parsed.allow_exec);
+    assert!(parsed.allow_writes && parsed.allow_exec && parsed.trust_hooks);
     assert_eq!(
         parsed.provider.as_ref().map(ProviderSelection::as_str),
         Some("fake")
@@ -1066,6 +1069,33 @@ fn run_parser_pins_outputs_timeouts_and_permission_flags() {
             "{invalid} must be refused"
         );
     }
+}
+
+/// MUTATION CHECK: loosen the hooks grammar or drop the machine-readable list
+/// flag. Expected RUNTIME failure: an exact dispatch below changes.
+#[test]
+fn hooks_parser_pins_list_trust_and_revoke_grammar() {
+    assert_eq!(
+        parse_hooks_command(&["list".into()]),
+        Ok(HooksCommand::List { json: false })
+    );
+    assert_eq!(
+        parse_hooks_command(&["list".into(), "--json".into()]),
+        Ok(HooksCommand::List { json: true })
+    );
+    assert_eq!(
+        parse_hooks_command(&["trust".into(), "a".repeat(64)]),
+        Ok(HooksCommand::Trust {
+            digest: "a".repeat(64)
+        })
+    );
+    assert_eq!(
+        parse_hooks_command(&["revoke".into(), "b".repeat(64)]),
+        Ok(HooksCommand::Revoke {
+            digest: "b".repeat(64)
+        })
+    );
+    assert!(parse_hooks_command(&["list".into(), "--yaml".into()]).is_err());
 }
 
 /// MUTATION CHECK: reorder/remove a v1 field, omit nulls, add ANSI, or stop

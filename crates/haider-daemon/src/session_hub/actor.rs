@@ -41,6 +41,7 @@ pub(super) async fn run_session_actor(
     store: SqliteStoreHandle,
     observer: Arc<dyn SessionHubObserver>,
     metrics: Arc<HubMetrics>,
+    hooks: Arc<Mutex<Option<crate::hooks::WeakHookService>>>,
     force_stop: Arc<AtomicBool>,
     mut commands: mpsc::Receiver<ActorCommand>,
 ) {
@@ -78,7 +79,13 @@ pub(super) async fn run_session_actor(
                             session_id: session_id.clone(),
                             through_seq: head,
                         });
-                        publish(&mut attachments, &envelopes, catch_up_byte_budget, &metrics);
+                        publish(
+                            &mut attachments,
+                            &envelopes,
+                            catch_up_byte_budget,
+                            &metrics,
+                            &hooks,
+                        );
                         observer.observe(HubObservation::Published {
                             session_id: session_id.clone(),
                             through_seq: head,
@@ -107,6 +114,7 @@ pub(super) async fn run_session_actor(
                         std::slice::from_ref(envelope.as_ref()),
                         catch_up_byte_budget,
                         &metrics,
+                        &hooks,
                     );
                     observer.observe(HubObservation::Published {
                         session_id: session_id.clone(),
@@ -131,6 +139,7 @@ pub(super) async fn run_session_actor(
                         std::slice::from_ref(envelope.as_ref()),
                         catch_up_byte_budget,
                         &metrics,
+                        &hooks,
                     );
                     observer.observe(HubObservation::Published {
                         session_id: session_id.clone(),
@@ -153,7 +162,13 @@ pub(super) async fn run_session_actor(
                         session_id: session_id.clone(),
                         through_seq: head,
                     });
-                    publish(&mut attachments, envelopes, catch_up_byte_budget, &metrics);
+                    publish(
+                        &mut attachments,
+                        envelopes,
+                        catch_up_byte_budget,
+                        &metrics,
+                        &hooks,
+                    );
                     observer.observe(HubObservation::Published {
                         session_id: session_id.clone(),
                         through_seq: head,
@@ -174,7 +189,13 @@ pub(super) async fn run_session_actor(
                         session_id: session_id.clone(),
                         through_seq: head,
                     });
-                    publish(&mut attachments, envelopes, catch_up_byte_budget, &metrics);
+                    publish(
+                        &mut attachments,
+                        envelopes,
+                        catch_up_byte_budget,
+                        &metrics,
+                        &hooks,
+                    );
                     observer.observe(HubObservation::Published {
                         session_id: session_id.clone(),
                         through_seq: head,
@@ -207,6 +228,7 @@ pub(super) async fn run_session_actor(
                         std::slice::from_ref(envelope.as_ref()),
                         catch_up_byte_budget,
                         &metrics,
+                        &hooks,
                     );
                     observer.observe(HubObservation::Published {
                         session_id: session_id.clone(),
@@ -267,7 +289,13 @@ pub(super) async fn run_session_actor(
                             session_id: session_id.clone(),
                             through_seq: head,
                         });
-                        publish(&mut attachments, &envelopes, catch_up_byte_budget, &metrics);
+                        publish(
+                            &mut attachments,
+                            &envelopes,
+                            catch_up_byte_budget,
+                            &metrics,
+                            &hooks,
+                        );
                         observer.observe(HubObservation::Published {
                             session_id: session_id.clone(),
                             through_seq: head,
@@ -306,6 +334,7 @@ pub(super) async fn run_session_actor(
                         std::slice::from_ref(envelope),
                         catch_up_byte_budget,
                         &metrics,
+                        &hooks,
                     );
                     observer.observe(HubObservation::Published {
                         session_id: session_id.clone(),
@@ -413,6 +442,7 @@ pub(super) async fn run_session_actor(
                         std::slice::from_ref(envelope.as_ref()),
                         catch_up_byte_budget,
                         &metrics,
+                        &hooks,
                     );
                     observer.observe(HubObservation::Published {
                         session_id: session_id.clone(),
@@ -516,7 +546,15 @@ fn publish(
     envelopes: &[RawEnvelope],
     byte_budget: usize,
     metrics: &HubMetrics,
+    hooks: &Arc<Mutex<Option<crate::hooks::WeakHookService>>>,
 ) {
+    if let Ok(installed) = hooks.lock()
+        && let Some(hooks) = installed
+            .as_ref()
+            .and_then(crate::hooks::WeakHookService::upgrade)
+    {
+        hooks.observe_committed(envelopes);
+    }
     // Weighed once per envelope, not once per attachment.
     let weights = envelopes
         .iter()

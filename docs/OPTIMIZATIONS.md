@@ -356,3 +356,16 @@ uploads are naturally deduplicated by hash.
 | Where | Deferred optimization | Exact trigger / DO-NOT-DO |
 |---|---|---|
 | `crates/haider-daemon/src/session_hub/rpc.rs` (`artifact_put`), `crates/haider-client/src/headless.rs` (`upload_attachments`) | There is no reachability-based garbage collector for successfully uploaded artifacts that no durable event/tree node ultimately references. | Trigger: unreachable CAS objects exceed 1 GiB per profile or 5% of profile CAS bytes. DO-NOT-DO: delete an upload when submit fails or a client disconnects; the same content hash may already be referenced by another session, branch, node, or concurrent command. Any collector must derive reachability from durable profile truth before unlinking. |
+
+## H2+H3 hook-engine efficiency ledger (2026-08-03)
+
+Hook matching deliberately re-runs the descriptor-relative discovery walk and
+digest/trust check at dispatch time. That repeated proof closes edit-between-
+grant-and-fire; it is not a cache omission to “fix” without preserving the
+same filesystem identity and raw-byte proof.
+
+| Where | Deferred optimization | Exact trigger / DO-NOT-DO |
+|---|---|---|
+| `crates/haider-daemon/src/hooks.rs` (`discover_async`, `definition_current`) | Every classifiable committed fact discovers configuration, and every spawned exec/decision re-discovers immediately before spawn. | Trigger: hook discovery exceeds 1% daemon CPU for 5 minutes, p95 exceeds 10 ms, or a workspace has more than 64 configured hooks. A cache must be keyed by canonical directory/file device+inode plus raw-byte digest and must still revalidate before spawn. DO-NOT-DO: cache parsed commands by path/name alone, follow symlinks, or let a watcher notification become authority. |
+| `crates/haider-daemon/src/hooks.rs` (`EngineMessage::Committed`), `crates/haider-store/src/event_store.rs` (`hook_dispatch_outbox`) | The transaction-coupled outbox is the recovery authority, but the actor-to-engine wake lane still carries unbounded cloned envelopes so hooks never block session publication; sustained hook slowness can therefore consume memory even though no durable fact can be lost. | Trigger: the wake queue exceeds 10,000 envelopes or 64 MiB for 30 seconds. Coalesce wakes and rescan the existing outbox in bounded pages. DO-NOT-DO: remove the same-transaction outbox row, acknowledge before every matching hook/subscriber has handled the fact, block commit publication, or silently drop a fact without leaving its outbox row pending. |
+| `crates/haider-daemon/src/hooks.rs` (`hydrate_engine_state`) | Startup reduces every session journal to reconstruct pending permission joins and run-scoped trust before draining the outbox; cost is linear in total retained envelopes. | Trigger: hook-engine startup hydration exceeds 250 ms p95 or any profile exceeds 100,000 envelopes. Add transactionally maintained decision/run-trust projections with migration backfill and corruption checks. DO-NOT-DO: trust an in-memory cursor, hydrate only outbox rows (permission context may precede them), or persist projection updates outside the event transaction. |

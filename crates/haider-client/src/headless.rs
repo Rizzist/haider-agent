@@ -5,6 +5,10 @@
 //! forwarding spool decouples that control plane from the caller's bounded
 //! [`HeadlessEvent`] stream; presentation owns only delivery and formatting.
 
+#[cfg(test)]
+#[path = "headless_tests.rs"]
+mod tests;
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::{Future, pending};
 use std::io::Read as _;
@@ -120,6 +124,9 @@ pub struct HeadlessRunRequest {
     pub model: Option<String>,
     pub max_tokens: u64,
     pub permission_overrides: SessionPermissionOverridesV1,
+    /// Trust discovered hooks for this run only. The daemon journals the
+    /// grant in the same atomic acceptance transaction as the turn.
+    pub trust_hooks: bool,
     pub timeout: Option<Duration>,
     pub terminal_grace: Duration,
 }
@@ -319,6 +326,36 @@ struct HeadlessConnection {
     attachment_id: Option<AttachmentId>,
     worker_generation: u64,
     observed_lost_events: u64,
+}
+
+fn headless_submit_body(
+    trust_hooks: bool,
+    command_id: CommandId,
+    session_id: SessionId,
+    worker_generation: u64,
+    text: String,
+    attachments: Vec<AttachmentBlock>,
+) -> RequestBody {
+    if trust_hooks {
+        RequestBody::TurnSubmitWithHookTrust {
+            command_id,
+            session_id,
+            worker_generation,
+            branch_id: None,
+            text,
+            attachments,
+            mode: haider_rpc::haider_protocol::DeliveryMode::Queue,
+        }
+    } else {
+        RequestBody::TurnSubmit {
+            command_id,
+            session_id,
+            worker_generation,
+            text,
+            attachments,
+            mode: haider_rpc::haider_protocol::DeliveryMode::Queue,
+        }
+    }
 }
 
 impl HeadlessConnection {
@@ -657,6 +694,7 @@ async fn run_headless_inner(
         &mut ensure,
         request.permission_overrides,
         !request.attachments.is_empty(),
+        request.trust_hooks,
     );
     let timeout_deadline = request.timeout.map(|timeout| Instant::now() + timeout);
     let submit_command_id = CommandId::new(command_id("headless-submit"));
@@ -770,14 +808,14 @@ async fn run_headless_inner(
     // This body is immutable across response-loss retries. In particular, its
     // original generation remains part of the durable command identity even if
     // reconnecting observes a newer worker generation.
-    let submit_body = RequestBody::TurnSubmit {
-        command_id: submit_command_id,
-        session_id: session_id.clone(),
-        worker_generation: connection.worker_generation,
-        text: request.prompt,
-        attachments: submit_attachments,
-        mode: haider_rpc::haider_protocol::DeliveryMode::Queue,
-    };
+    let submit_body = headless_submit_body(
+        request.trust_hooks,
+        submit_command_id,
+        session_id.clone(),
+        connection.worker_generation,
+        request.prompt,
+        submit_attachments,
+    );
     let mut buffered = Vec::new();
     let mut submit_timeout_grace = None;
     let run_id = loop {
@@ -1347,6 +1385,7 @@ fn normalize_ensure_options(
     options: &mut EnsureOptions,
     permission_overrides: SessionPermissionOverridesV1,
     has_attachments: bool,
+    trust_hooks: bool,
 ) {
     options.required_features.extend(required_live_features());
     if !permission_overrides.is_empty() {
@@ -1358,6 +1397,11 @@ fn normalize_ensure_options(
         options
             .required_features
             .insert(FEATURE_ARTIFACT_PUT_V1.to_owned());
+    }
+    if trust_hooks {
+        options
+            .required_features
+            .insert(haider_rpc::FEATURE_HOOKS_V1.to_owned());
     }
     options.client = ClientConfig {
         client_name: "haider-headless".into(),
@@ -2427,5 +2471,15 @@ pub fn required_headless_features_with_attachments(
 ) -> BTreeSet<String> {
     let mut features = required_headless_features(permission_overrides);
     features.insert(FEATURE_ARTIFACT_PUT_V1.to_owned());
+    features
+}
+
+/// Required daemon features for an explicitly hook-trusted headless run.
+#[must_use]
+pub fn required_headless_features_with_hook_trust(
+    permission_overrides: SessionPermissionOverridesV1,
+) -> BTreeSet<String> {
+    let mut features = required_headless_features(permission_overrides);
+    features.insert(haider_rpc::FEATURE_HOOKS_V1.to_owned());
     features
 }

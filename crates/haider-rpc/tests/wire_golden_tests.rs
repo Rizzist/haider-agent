@@ -511,6 +511,45 @@ fn turn_submit_and_cancel_ignore_unknown_additive_fields() {
     assert!(matches!(body, RequestBody::TurnCancel { .. }));
 }
 
+/// MUTATION CHECK: serialize run-scoped trust as an ordinary turn (changing
+/// old receipt bytes) or drop the additive hooks RPC methods. Expected RUNTIME
+/// failure: one of these exact discriminants/coordinates changes.
+#[test]
+fn hooks_rpc_and_run_scoped_trust_shapes_round_trip_exactly() {
+    let submit = RequestBody::TurnSubmitWithHookTrust {
+        command_id: haider_rpc::CommandId::new("submit-hooks-1"),
+        session_id: haider_protocol::ids::SessionId::new("session-hooks-1"),
+        worker_generation: 7,
+        branch_id: None,
+        text: "run with hooks".into(),
+        attachments: Vec::new(),
+        mode: haider_protocol::DeliveryMode::Queue,
+    };
+    let value = serde_json::to_value(&submit).expect("encode trusted submit");
+    assert_eq!(value["method"], "turn.submit_with_hook_trust");
+    assert!(value.get("branch_id").is_none());
+    assert_eq!(
+        serde_json::from_value::<RequestBody>(value).expect("decode trusted submit"),
+        submit
+    );
+
+    let list = RequestBody::HooksList {
+        cwd: "/workspace".into(),
+    };
+    let value = serde_json::to_value(&list).expect("encode hooks list");
+    assert_eq!(
+        value,
+        serde_json::json!({
+            "method": "hooks.list",
+            "cwd": "/workspace"
+        })
+    );
+    assert_eq!(
+        serde_json::from_value::<RequestBody>(value).expect("decode hooks list"),
+        list
+    );
+}
+
 /// MUTATION CHECK: remove the additive `ResponseBody::MenuAnswer` variant or
 /// rename its method/coordinate. Expected failure: the exact success shape
 /// below no longer round-trips.

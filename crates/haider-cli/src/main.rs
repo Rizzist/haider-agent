@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
+pub(crate) mod hooks;
 pub(crate) mod observe;
 pub(crate) mod run;
 pub(crate) mod update;
@@ -55,6 +56,7 @@ async fn main() -> ExitCode {
         [command, rest @ ..] if command == "sessions" => observe::sessions_command(rest).await,
         [command, rest @ ..] if command == "session" => observe::session_command(rest).await,
         [command, rest @ ..] if command == "events" => observe::events_command(rest).await,
+        [command, rest @ ..] if command == "hooks" => hooks::hooks_command(rest).await,
         [command, rest @ ..] if command == "update" => update::update_command(rest).await,
         [command, rest @ ..] if command == "tui" => tui_command(rest).await,
         [command, rest @ ..] if command == "import" => import_command(rest).await,
@@ -63,10 +65,11 @@ async fn main() -> ExitCode {
                 "haider: unknown or incomplete command `{other}` \
                  (supports: --version, self-test, run <prompt> \
                  [--output print|json|jsonl] [--timeout <dur>] \
-                 [--allow-writes] [--allow-exec] [--attach <path>]..., \
+                 [--allow-writes] [--allow-exec] [--trust-hooks] [--attach <path>]..., \
                  status [--json] [--no-spawn], sessions [--json] [--no-spawn], \
                  session <id> [--json|--watch] [--no-spawn], \
                  events [--follow] [--no-spawn], \
+                 hooks list [--json], hooks trust <digest>, hooks revoke <digest>, \
                  update [--check], \
                  tui [--theme dawn|ivory|dark], tui --demo [--plain], \
                  import [codex|claude-code], --ready)"

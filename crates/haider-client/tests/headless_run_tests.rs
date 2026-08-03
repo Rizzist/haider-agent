@@ -297,6 +297,7 @@ fn request(timeout: Option<Duration>) -> HeadlessRunRequest {
         model: Some("fake-model".into()),
         max_tokens: 4096,
         permission_overrides: SessionPermissionOverridesV1::default(),
+        trust_hooks: false,
         timeout,
         terminal_grace: Duration::from_millis(250),
     }
@@ -595,6 +596,25 @@ async fn control_attach_precedes_submit_and_pre_response_events_correlate() {
     assert_eq!(result.response.as_deref(), Some("daemon answer"));
     assert_eq!(result.terminal_seq, Some(3));
     assert_eq!(events.len(), 3);
+}
+
+/// MUTATION CHECK: omit the `--trust-hooks` feature requirement or require it
+/// for ordinary runs. Expected RUNTIME failure: the exact set difference is
+/// empty or contains something other than the additive hooks feature.
+#[test]
+fn run_scoped_hook_trust_requires_only_the_additive_hooks_feature() {
+    let ordinary =
+        haider_client::required_headless_features(SessionPermissionOverridesV1::default());
+    let trusted = haider_client::required_headless_features_with_hook_trust(
+        SessionPermissionOverridesV1::default(),
+    );
+    assert_eq!(
+        trusted
+            .difference(&ordinary)
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([haider_rpc::FEATURE_HOOKS_V1.to_owned()])
+    );
 }
 
 /// MUTATION CHECK: reduce replayed run facts before the idempotent retry
