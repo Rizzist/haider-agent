@@ -21,7 +21,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         "[name]",
     ),
     session_cmd("provider", "Switch provider — the model follows", "[name]"),
-    cmd("theme", "Change the theme", "[dawn·ivory·dark]"),
+    cmd("theme", "Change the theme", "[light·dark·desert·oasis]"),
     session_cmd(
         "tree",
         "Open the session tree — jump to or fork any node",
@@ -323,7 +323,7 @@ pub const HELP_TEXT: &[&str] = &[
     "  /model [name]      switch model — fable-5 · gpt-5.6 · gemini-3 · qwen3",
     "  /provider [name]   anthropic · openai · gemini · kimi",
     "  /providers         provider registry — endpoints, models, defaults, health",
-    "  /theme [name]      dawn · ivory · dark",
+    "  /theme [name]      light · dark · desert · oasis",
     "  /tree              session tree — every branch, ⏎ jump to a node / open a fork, f forks there",
     "  /fork              fork the session at the current point",
     "  /branch [new|name] branches — numbered picker · direct switch · new forks at the last committed node",

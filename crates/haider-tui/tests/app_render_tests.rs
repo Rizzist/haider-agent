@@ -154,20 +154,22 @@ fn session_screen_shows_transcript_and_meter() {
 #[test]
 fn theme_cycle_changes_the_ground_color() {
     let mut model = model_after_full_demo();
-    assert_eq!(model.theme, ThemeKey::Dawn);
-    let (_, terminal) = draw(&model, 40, 12);
-    let dawn_bg = terminal.backend().buffer()[(0, 0)].bg;
-
-    model.handle(ctrl('t'));
-    assert_eq!(model.theme, ThemeKey::Ivory);
-    model.handle(ctrl('t'));
-    assert_eq!(model.theme, ThemeKey::Dark);
+    assert_eq!(model.theme, ThemeKey::Dark, "registry default");
     let (_, terminal) = draw(&model, 40, 12);
     let dark_bg = terminal.backend().buffer()[(0, 0)].bg;
-    assert_ne!(dawn_bg, dark_bg, "theme actually re-grounds the frame");
 
     model.handle(ctrl('t'));
-    assert_eq!(model.theme, ThemeKey::Dawn, "cycle wraps");
+    assert_eq!(model.theme, ThemeKey::Desert);
+    model.handle(ctrl('t'));
+    assert_eq!(model.theme, ThemeKey::Oasis);
+    model.handle(ctrl('t'));
+    assert_eq!(model.theme, ThemeKey::Light, "cycle wraps the registry");
+    let (_, terminal) = draw(&model, 40, 12);
+    let light_bg = terminal.backend().buffer()[(0, 0)].bg;
+    assert_ne!(dark_bg, light_bg, "theme actually re-grounds the frame");
+
+    model.handle(ctrl('t'));
+    assert_eq!(model.theme, ThemeKey::Dark, "full circle");
 }
 
 #[test]
@@ -513,7 +515,7 @@ fn status_bar_has_boxed_chips_and_hint() {
     assert!(text.contains("[ IDLE ]"), "boxed state chip");
     assert!(text.contains("fable-5 · anthropic"));
     assert!(text.contains("[ ◉ voice · whisper→openai ]"), "voice chip");
-    assert!(text.contains("/help · theme desert dawn"), "launcher hint");
+    assert!(text.contains("/help · theme dark"), "launcher hint");
 }
 
 // ---- TUI2 review r1 + mouse regressions ----

@@ -77,9 +77,13 @@ fn sync_terminal_bg(theme: ThemeKey) {
     let _ = out.flush();
 }
 
-/// Detect the system/terminal appearance (OSC 11 background luminance) and
-/// map it to a theme: dark ground → Dark, light ground (or undetectable) →
-/// Desert Dawn. Call BEFORE entering raw mode/alt screen.
+/// Detect the system/terminal appearance and map it to a theme family:
+/// light ground → Light, dark ground → Dark, undetectable → Dark (owner
+/// spec §3's fallback law). Two best-effort probes, authority first:
+/// the OSC 11 background query under a short deadline (ground truth when
+/// the emulator answers), then the `COLORFGBG` env convention for
+/// terminals that set it but stay silent on OSC (e.g. rxvt lineage,
+/// some tmux setups). Call BEFORE entering raw mode/alt screen.
 ///
 /// Known residual (review TUI1 P2): the probe owns the tty for its bounded
 /// window, so a keystroke typed in that pre-UI instant is consumed, not
@@ -88,9 +92,34 @@ fn sync_terminal_bg(theme: ThemeKey) {
 /// reader — lands with the daemon-era input stack (see OPTIMIZATIONS.md).
 #[must_use]
 pub fn detect_system_theme() -> ThemeKey {
-    match termbg::theme(Duration::from_millis(80)) {
-        Ok(termbg::Theme::Dark) => ThemeKey::Dark,
-        Ok(termbg::Theme::Light) | Err(_) => ThemeKey::Dawn,
+    let osc = termbg::theme(Duration::from_millis(80)).ok();
+    resolve_system_theme(osc, std::env::var("COLORFGBG").ok().as_deref())
+}
+
+/// The pure resolution behind [`detect_system_theme`], testable without a
+/// terminal: OSC answer beats `COLORFGBG`; nothing detectable → Dark.
+#[must_use]
+pub fn resolve_system_theme(osc: Option<termbg::Theme>, colorfgbg: Option<&str>) -> ThemeKey {
+    match osc {
+        Some(termbg::Theme::Light) => ThemeKey::Light,
+        Some(termbg::Theme::Dark) => ThemeKey::Dark,
+        None => colorfgbg
+            .and_then(theme_from_colorfgbg)
+            .unwrap_or(ThemeKey::Dark),
+    }
+}
+
+/// Parse the `COLORFGBG` convention (`"<fg>;<bg>"`, sometimes
+/// `"<fg>;default;<bg>"`): the LAST field is the background's 16-color
+/// index — 0-6 and 8 are dark grounds, 7 and 15 light. Anything else
+/// (unset, `default`, malformed) is honestly undetectable → `None`.
+#[must_use]
+pub fn theme_from_colorfgbg(value: &str) -> Option<ThemeKey> {
+    let bg: u8 = value.rsplit(';').next()?.trim().parse().ok()?;
+    match bg {
+        0..=6 | 8 => Some(ThemeKey::Dark),
+        7 | 15 => Some(ThemeKey::Light),
+        _ => None,
     }
 }
 

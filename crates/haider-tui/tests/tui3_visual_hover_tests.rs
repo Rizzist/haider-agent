@@ -78,34 +78,43 @@ fn session_model() -> AppModel {
 // ---- Item 1: the composer band, exact white-blend, no stray tints ----
 
 #[test]
-fn composer_band_is_the_exact_sim_blend_in_all_three_themes() {
-    // Hand-computed sim blends (inputBg over bg, round half-up):
-    //   dawn : white 28.0% over #f3ead9 → (246, 240, 228)
-    //   ivory: ink   3.5% over #fbf9f3 → (244, 241, 235)
-    //   dark : white  4.5% over #14100a → ( 31,  27,  21)
+fn composer_band_is_the_exact_designed_blend_in_every_theme() {
+    // Hand-computed design blends (inputBg over bg, round half-up):
+    //   light : ink   4.0% over #faf6ee → (241, 237, 229)
+    //   dark  : white 4.5% over #120e08 → ( 29,  25,  19)
+    //   desert: white 28.0% over #f0e4cc → (244, 236, 218)
+    //   oasis : white 4.5% over #0c1410 → ( 23,  31,  27)
     let expected = [
         (
-            ThemeKey::Dawn,
+            ThemeKey::Light,
             Rgb {
-                r: 246,
-                g: 240,
-                b: 228,
-            },
-        ),
-        (
-            ThemeKey::Ivory,
-            Rgb {
-                r: 244,
-                g: 241,
-                b: 235,
+                r: 241,
+                g: 237,
+                b: 229,
             },
         ),
         (
             ThemeKey::Dark,
             Rgb {
-                r: 31,
-                g: 27,
-                b: 21,
+                r: 29,
+                g: 25,
+                b: 19,
+            },
+        ),
+        (
+            ThemeKey::Desert,
+            Rgb {
+                r: 244,
+                g: 236,
+                b: 218,
+            },
+        ),
+        (
+            ThemeKey::Oasis,
+            Rgb {
+                r: 23,
+                g: 31,
+                b: 27,
             },
         ),
     ];

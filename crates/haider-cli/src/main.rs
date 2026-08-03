@@ -71,7 +71,7 @@ async fn main() -> ExitCode {
                  events [--follow] [--no-spawn], \
                  hooks list [--json], hooks trust <digest>, hooks revoke <digest>, \
                  update [--check], \
-                 tui [--theme dawn|ivory|dark], tui --demo [--plain], \
+                 tui [--theme light|dark|desert|oasis], tui --demo [--plain], \
                  import [codex|claude-code], --ready)"
             );
             ExitCode::from(2)
@@ -296,7 +296,8 @@ fn front_door_exit_code(error: &haider_client::EnsureError) -> u8 {
     }
 }
 
-/// `haider tui --demo [--plain] [--theme dawn|ivory|dark]` — the scripted
+/// `haider tui --demo [--plain] [--theme light|dark|desert|oasis]` — the
+/// scripted
 /// demo drives every surface until the daemon lands (W3). `--plain` (or a
 /// non-TTY stdout, research rec 2) renders the final state as plain text
 /// instead of taking the terminal. `HAIDER_SHAHADA=translit` selects the
@@ -314,7 +315,7 @@ async fn tui_command(rest: &[String]) -> ExitCode {
             "--theme" => match iter.next().and_then(|name| ThemeKey::parse(name)) {
                 Some(key) => theme = Some(key),
                 None => {
-                    eprintln!("haider tui: --theme takes dawn|ivory|dark");
+                    eprintln!("haider tui: --theme takes light|dark|desert|oasis");
                     return ExitCode::from(2);
                 }
             },
@@ -361,7 +362,7 @@ async fn tui_command(rest: &[String]) -> ExitCode {
     if !interactive {
         // The plain/CI oracle stays deterministic: no demo-store load, no
         // save — persistence is an interactive-session affordance.
-        model.theme = theme.unwrap_or(ThemeKey::Dawn);
+        model.theme = theme.unwrap_or_default();
         // Fallible write: `print!` panics on BrokenPipe (review r1 P2).
         // A closed pipe is a normal consumer choice → success; other write
         // failures are real I/O errors.
@@ -387,8 +388,8 @@ async fn tui_command(rest: &[String]) -> ExitCode {
     });
     // Explicit --theme wins; then the persisted theme (sim: a known
     // `data.themeName` restores); otherwise follow the system/terminal
-    // appearance (OSC 11 background luminance): dark ground -> Dark,
-    // light -> Dawn.
+    // appearance (OSC 11 / COLORFGBG): light ground -> Light, dark or
+    // undetectable -> Dark.
     if let Some(key) = theme {
         model.theme = key;
     } else if !theme_restored {

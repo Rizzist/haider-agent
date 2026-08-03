@@ -137,6 +137,126 @@ fn boot_splash_keeps_centered_shahada() {
     );
 }
 
+// ---- §2: the palettes — every surface legible, no raw colors ----
+
+/// WCAG relative luminance — an oracle independent of the theme module.
+fn luminance(rgb: haider_tui::theme::Rgb) -> f64 {
+    fn channel(c: u8) -> f64 {
+        let c = f64::from(c) / 255.0;
+        if c <= 0.039_28 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    }
+    0.2126 * channel(rgb.r) + 0.7152 * channel(rgb.g) + 0.0722 * channel(rgb.b)
+}
+
+fn contrast(a: haider_tui::theme::Rgb, b: haider_tui::theme::Rgb) -> f64 {
+    let (la, lb) = (luminance(a), luminance(b));
+    let (hi, lo) = if la > lb { (la, lb) } else { (lb, la) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
+#[test]
+fn every_theme_clears_the_contrast_floors() {
+    // Owner spec §2: "every surface must be legible". The floors are the
+    // design contract each palette was built against — body ink reads at
+    // AAA-body strength, metadata at large-text strength, accents and
+    // state inks at UI-component strength, on EVERY ground they render on.
+    for key in haider_tui::theme::ThemeKey::ALL {
+        let theme = key.theme();
+        let label = theme.label;
+        let floor = |name: &str, ink, ground, min: f64| {
+            let ratio = contrast(ink, ground);
+            assert!(
+                ratio >= min,
+                "{label}: {name} contrast {ratio:.2} under the {min} floor"
+            );
+        };
+        // Inks on the page ground.
+        floor("text", theme.text, theme.bg, 6.5);
+        floor("bright", theme.bright, theme.bg, 8.0);
+        floor("dim", theme.dim, theme.bg, 3.4);
+        floor("gold", theme.gold, theme.bg, 3.2);
+        floor("maroon", theme.maroon, theme.bg, 4.0);
+        floor("ok", theme.ok, theme.bg, 3.2);
+        floor("warn", theme.warn, theme.bg, 3.2);
+        floor("err", theme.err, theme.bg, 3.2);
+        // Faint is DESIGNED barely-there: present, never body-legible.
+        let faint = contrast(theme.faint, theme.bg);
+        assert!(
+            (1.35..=2.8).contains(&faint),
+            "{label}: faint {faint:.2} outside its barely-there band"
+        );
+        // Frame chrome: visible but quiet.
+        let frame = contrast(theme.frame, theme.bg);
+        assert!(
+            (1.5..=3.5).contains(&frame),
+            "{label}: frame {frame:.2} outside its quiet band"
+        );
+        // Filled badges: the badge_fg must read on every fill tone.
+        floor("badge_fg on gold", theme.badge_fg, theme.gold, 2.7);
+        floor("badge_fg on maroon", theme.badge_fg, theme.maroon, 2.7);
+        floor("badge_fg on warn", theme.badge_fg, theme.warn, 2.7);
+        floor("badge_fg on err", theme.badge_fg, theme.err, 2.7);
+        // Tinted grounds: composer band, selection/hover, menu card,
+        // sticky bar — the inks that render there must survive the tint.
+        floor("bright on input_bg", theme.bright, theme.input_bg, 7.0);
+        floor("gold on input_bg", theme.gold, theme.input_bg, 3.0);
+        floor("bright on sel_bg", theme.bright, theme.sel_bg, 6.0);
+        floor("dim on sel_bg", theme.dim, theme.sel_bg, 2.8);
+        floor("maroon on sel_bg", theme.maroon, theme.sel_bg, 3.5);
+        floor("text on gold_soft", theme.text, theme.gold_soft, 5.0);
+        floor("bright on gold_soft", theme.bright, theme.gold_soft, 6.0);
+        floor("bright on bar_bg", theme.bright, theme.bar_bg, 6.5);
+    }
+}
+
+#[test]
+fn every_surface_uses_theme_slots() {
+    // Mechanical enforcement of the no-raw-color law: in the themed render
+    // path, every color routes through the Theme's semantic slots.
+    //   * `Color::` may appear ONLY in style.rs — the single Rgb→ratatui
+    //     seam (and the one place pulse() re-reads a style's channels).
+    //   * `Rgb::hex(` may appear ONLY in theme.rs — palette definitions.
+    //   * plain.rs stays entirely colorless (the piped-output law).
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut scanned = 0usize;
+    for entry in std::fs::read_dir(&src).expect("src dir") {
+        let path = entry.expect("entry").path();
+        if path.extension().is_none_or(|ext| ext != "rs") {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .expect("file name")
+            .to_string_lossy()
+            .into_owned();
+        let body = std::fs::read_to_string(&path).expect("read source");
+        scanned += 1;
+        if name != "style.rs" {
+            assert!(
+                !body.contains("Color::"),
+                "{name}: raw `Color::` outside the style seam — route it through a Theme slot"
+            );
+        }
+        if name != "theme.rs" {
+            assert!(
+                !body.contains("Rgb::hex("),
+                "{name}: raw `Rgb::hex(` outside the palette registry"
+            );
+        }
+        if name == "plain.rs" {
+            assert!(
+                !body.contains("Style") && !body.contains("Color"),
+                "plain.rs must stay colorless (piped-output law)"
+            );
+        }
+    }
+    assert!(scanned > 20, "the sweep actually walked the render path");
+}
+
 #[test]
 fn narrow_boot_omits_the_shahada_whole() {
     // Dignity rule 2 travels with the shahada to its new home: at 24

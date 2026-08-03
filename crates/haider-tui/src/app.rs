@@ -2375,7 +2375,10 @@ impl Default for AppModel {
             tree_view: None,
             pending_jump: std::cell::RefCell::new(None),
             tools_inventory: None,
-            theme: ThemeKey::Dawn,
+            // Dark is the registry default AND the detection fallback
+            // (owner spec §3); main.rs resolves the persisted choice and
+            // the detected appearance over this before the first frame.
+            theme: ThemeKey::default(),
             sanctum_tier: SanctumTier::default(),
             projection: SessionProjection::new(),
             identity: IdentityLine::default(),
@@ -5530,8 +5533,9 @@ impl AppModel {
                         self.flash = Some(format!("· theme → {}", key.theme().label));
                     }
                     None => {
-                        self.flash =
-                            Some(format!("· unknown theme “{name}” — dawn · ivory · dark"));
+                        self.flash = Some(format!(
+                            "· unknown theme “{name}” — light · dark · desert · oasis"
+                        ));
                     }
                 },
                 None => {
@@ -5541,7 +5545,7 @@ impl AppModel {
                     // still list the choices.
                     self.cycle_theme();
                     if let Some(flash) = &mut self.flash {
-                        flash.push_str(" · themes — dawn · ivory · dark");
+                        flash.push_str(" · themes — light · dark · desert · oasis");
                     }
                 }
             },

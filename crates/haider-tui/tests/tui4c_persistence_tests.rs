@@ -657,7 +657,7 @@ fn guarded_singles_restore_theme_vfs_dir_and_voice() {
     let mut hydrated = launcher_model();
     let outcome = hydrate(&mut hydrated, dto);
     assert!(!outcome.theme_restored);
-    assert_eq!(hydrated.theme, ThemeKey::Dawn, "unknown theme → default");
+    assert_eq!(hydrated.theme, ThemeKey::Dark, "unknown theme → default");
 }
 
 // ---- The dump_screens-equivalence check: seeds in, seeds out ----
