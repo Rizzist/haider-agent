@@ -210,3 +210,49 @@ fn every_theme_keeps_ink_tokens_distinct_from_its_ground() {
         }
     }
 }
+
+/// MUTATION CHECK: wash any ink token toward its ground (e.g. water `dim`
+/// to `#c5d8dc`, ~1.3:1). Expected RUNTIME failure: the WCAG floor names
+/// the theme and token. The original palette pass verified these ratios
+/// out-of-band; this law makes them regression-proof — mere distinctness
+/// (`token != bg`) let a washed token through.
+#[test]
+fn every_theme_clears_wcag_contrast_floors() {
+    fn luminance(c: haider_tui::theme::Rgb) -> f64 {
+        let (r, g, b) = (c.r, c.g, c.b);
+        let chan = |v: u8| {
+            let s = f64::from(v) / 255.0;
+            if s <= 0.04045 {
+                s / 12.92
+            } else {
+                ((s + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * chan(r) + 0.7152 * chan(g) + 0.0722 * chan(b)
+    }
+    fn ratio(a: haider_tui::theme::Rgb, b: haider_tui::theme::Rgb) -> f64 {
+        let (la, lb) = (luminance(a), luminance(b));
+        let (hi, lo) = if la > lb { (la, lb) } else { (lb, la) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+    for key in ThemeKey::ALL {
+        let theme: &Theme = key.theme();
+        for (name, token, floor) in [
+            ("text", theme.text, 7.0),
+            ("bright", theme.bright, 9.0),
+            ("dim", theme.dim, 3.0),
+            ("gold", theme.gold, 3.0),
+            ("maroon", theme.maroon, 3.0),
+            ("ok", theme.ok, 3.0),
+            ("warn", theme.warn, 3.0),
+            ("err", theme.err, 3.0),
+        ] {
+            let measured = ratio(token, theme.bg);
+            assert!(
+                measured >= floor,
+                "{}: {name} is {measured:.2}:1 on the ground, floor {floor}:1",
+                theme.label
+            );
+        }
+    }
+}
