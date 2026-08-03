@@ -20,6 +20,7 @@ fn theme_keys_parse_and_roundtrip_in_menu_order() {
             ThemeKey::Light,
             ThemeKey::Dark,
             ThemeKey::Desert,
+            ThemeKey::Water,
             ThemeKey::Oasis
         ]
     );

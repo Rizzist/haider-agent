@@ -10,6 +10,7 @@
 //! * [`DARK`]   — the identity's night rendering, refreshed: deep warm
 //!   ground, aged gold, ember maroon, every pairing re-contrasted.
 //! * [`DESERT`] — sand ground, burnished amber, dusk-plum ink.
+//! * [`WATER`] — sea-glass ground, tide teal, coral dusk (desert's contrast).
 //! * [`OASIS`]  — palm-night ground, moonlit spring text, date gold.
 //!
 //! Terminals have no alpha channel, so translucent chrome (`rgba` in the
@@ -66,16 +67,18 @@ pub enum ThemeKey {
     #[default]
     Dark,
     Desert,
+    Water,
     Oasis,
 }
 
 impl ThemeKey {
     /// The fixed themes in `/theme`-menu order (the `system` entry lives a
     /// level up, in [`ThemeChoice`]).
-    pub const ALL: [ThemeKey; 4] = [
+    pub const ALL: [ThemeKey; 5] = [
         ThemeKey::Light,
         ThemeKey::Dark,
         ThemeKey::Desert,
+        ThemeKey::Water,
         ThemeKey::Oasis,
     ];
 
@@ -88,6 +91,7 @@ impl ThemeKey {
             "light" => Some(Self::Light),
             "dark" => Some(Self::Dark),
             "desert" => Some(Self::Desert),
+            "water" => Some(Self::Water),
             "oasis" => Some(Self::Oasis),
             // Legacy sim-era names (pre-UI-themes persistence migrates).
             "dawn" => Some(Self::Desert),
@@ -103,6 +107,7 @@ impl ThemeKey {
             Self::Light => "light",
             Self::Dark => "dark",
             Self::Desert => "desert",
+            Self::Water => "water",
             Self::Oasis => "oasis",
         }
     }
@@ -114,6 +119,7 @@ impl ThemeKey {
             Self::Light => &LIGHT,
             Self::Dark => &DARK,
             Self::Desert => &DESERT,
+            Self::Water => &WATER,
             Self::Oasis => &OASIS,
         }
     }
@@ -314,6 +320,40 @@ pub const DESERT: Theme = {
         badge_fg: bg,
         input_bg: white.over(bg, 280),
         sel_bg: maroon.over(bg, 100),
+    }
+};
+
+/// Water — the desert's contrast (owner ask): where desert is sand under
+/// a dusk-plum sky, water is sea-glass under a deep tide. Cool pale ground,
+/// ocean-slate ink, tide-teal accent in the gold slot, coral dusk in the
+/// maroon slot; ok/warn/err keep the family's semantic hues.
+pub const WATER: Theme = {
+    let bg = Rgb::hex(0xe3eef0);
+    let gold = Rgb::hex(0x0d6678);
+    let maroon = Rgb::hex(0xa03a4d);
+    let white = Rgb::hex(0xffffff);
+    Theme {
+        key: ThemeKey::Water,
+        label: "Water",
+        dark: false,
+        bg,
+        bar_bg: gold.over(bg, 50),
+        frame: gold.over(bg, 280),
+        text: Rgb::hex(0x243b47),
+        bright: Rgb::hex(0x122730),
+        dim: Rgb::hex(0x53707e),
+        faint: Rgb::hex(0xb7ccd2),
+        gold,
+        gold_soft: gold.over(bg, 140),
+        gold_half: gold.over(bg, 500),
+        maroon,
+        maroon_soft: maroon.over(bg, 80),
+        ok: Rgb::hex(0x2e7051),
+        warn: Rgb::hex(0x9a5b10),
+        err: Rgb::hex(0xb3231c),
+        badge_fg: bg,
+        input_bg: white.over(bg, 280),
+        sel_bg: gold.over(bg, 100),
     }
 };
 
