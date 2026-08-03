@@ -128,6 +128,10 @@ const BACK_CHIP_COLS: usize = 10;
 /// Cells the header reserves around the mark before it may be drawn: the
 /// back chip, its margins, and a readable minimum for the info block.
 const HEADER_MARK_RESERVED: u16 = 38;
+/// The launcher header's reservation — the session's minus the back chip
+/// (the launcher has nowhere to go back to): lead cell, margins, and the
+/// same readable minimum for the wordmark/info block.
+const LAUNCHER_HEADER_RESERVED: u16 = 28;
 
 /// Left/right composer padding in cells (sim InputBar `padding: … 16px`).
 const COMPOSER_PAD: usize = 2;
@@ -157,6 +161,33 @@ fn ellipsize(text: &str, budget: usize) -> String {
         out.push('…');
         out
     }
+}
+
+/// Ellipsize a SPAN row to `cap` cells, never a flattened string: mixed
+/// rows keep their law of DIM labels beside BRIGHT values (TUI3a) — cutting
+/// through a styled span keeps its style, and the `…` wears dim ink.
+fn ellipsize_spans<'s>(spans: Vec<Span<'s>>, cap: usize, theme: &Theme) -> Vec<Span<'s>> {
+    if Line::from(spans.clone()).width() <= cap {
+        return spans;
+    }
+    let mut used = 0usize;
+    let mut kept: Vec<Span<'s>> = Vec::new();
+    for span in spans {
+        let width = span.content.chars().count();
+        if used + width <= cap.saturating_sub(1) {
+            used += width;
+            kept.push(span);
+            continue;
+        }
+        let room = cap.saturating_sub(1).saturating_sub(used);
+        if room > 0 {
+            let cut: String = span.content.chars().take(room).collect();
+            kept.push(Span::styled(cut, span.style));
+        }
+        kept.push(Span::styled("…", theme.dim_style()));
+        break;
+    }
+    kept
 }
 
 /// A chip whose CHROME (the `[ ]` border stand-in) and label carry
@@ -273,14 +304,26 @@ fn mark_lines_within(
 }
 
 fn render_boot(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rect) {
-    let _sanctum = SanctumLine::new(model.sanctum_tier);
+    let sanctum = SanctumLine::new(model.sanctum_tier);
     // The mark gets breathing room per sim proportions (52px line-height;
     // a terminal cell cannot scale the glyph — noted divergence).
     let mark_block = mark_lines(model, theme, area.width);
     let mark_rows = mark_block.len();
     let mut lines = vec![Line::default()];
     lines.extend(mark_block);
+    lines.push(Line::default());
+    // UI-themes wave (owner spec §1): the BIG art + shahada ceremony lives
+    // on the boot/loading splash — the settled launcher wears the compact
+    // header band instead. The ceremony stack moved here verbatim: gold
+    // (NOT bold) shahada under the mark, then the gold half-strength
+    // dignity rule. Dignity rule 2 travels with it: the sanctum renders
+    // whole or not at all, always alone.
+    if let Some(text) = sanctum.fit(area.width.saturating_sub(2) as usize) {
+        lines.push(Line::styled(text, theme.gold_style()));
+        lines.push(Line::default());
+    }
     lines.extend([
+        Line::styled("────────────────", theme.rule_style()),
         Line::default(),
         Line::styled(spaced_wordmark(), theme.bright_style()),
         // Sim `.sub` on the boot screen is GOLD and PULSES while the
@@ -387,9 +430,14 @@ fn render_launcher(
     area: Rect,
     hits: &mut Vec<(Rect, Hit)>,
 ) {
-    // Sim layout (Launcher, tui.js:4237 / JSX 3219): the centered content
-    // column on top, then the palette (CmdMenu) directly ABOVE the composer,
-    // then the gold-ruled composer at the bottom.
+    // UI-themes wave (owner spec §1): the launcher is a SESSION-SHAPED
+    // surface — a compact header band on top (wordmark · version · device,
+    // the session header's anatomy without the back chip), a rule, then the
+    // top-aligned content column (recent sessions, Aura/Accounts/Peers,
+    // shellout), then the palette directly above the gold-ruled composer.
+    // The BIG centered mark and the shahada belong to the boot splash
+    // alone now — people open many terminals; the settled launcher scans
+    // like a working surface, not a poster.
     let palette = if model.palette_open() {
         palette_block(model, theme, area.width)
     } else {
@@ -399,30 +447,60 @@ fn render_launcher(
     // Sacred-input ledger (review r3 P2-1a, launcher form; r6 P2-1: same
     // shed ladder as the session): the composer grows up to its need but
     // tail-windows to whatever the height allows — the cursor row is never
-    // hidden. TUI6.1 fix 2 reordered the rungs to `band_rule_reserve`'s
-    // law (review r1: launcher 90×4 kept the OPTIONAL content column and
-    // lost the closing rule): under pressure the content yields, THEN the
-    // closing-rule row (the gap), then the top rule, before the composer
-    // loses its row.
+    // hidden. Shed order under pressure, first to yield first: content →
+    // the closing-rule row (the gap) → header line 2 → header rule → input
+    // rule → header line 1 — the composer's cursor row never.
     let needed = composer_height(model, area.width);
+    let mut header_h: u16 = 2;
+    let mut header_rule_h: u16 = 1;
     let mut content_min: u16 = 1;
     let mut rule_h: u16 = 1;
     // TUI6.2 fix 6 (review r2 finding 6): the closing-rule row (the gap,
     // TUI5's net-zero trick) is DERIVED from `band_rule_reserve` — the
     // function is the runtime authority here, not a debug-only tie. The
     // content column yields first when keeping it would starve the
-    // reserved rule (r1's launcher 90×4).
-    if band_rule_reserve(area.height, content_min + rule_h + 1, rule_h) == 0 {
+    // reserved rule (r1's launcher 90×4), then the header band sheds
+    // line 2 → rule → line 1: the band triple (top rule · composer ·
+    // closing rule) outlives the WHOLE header, so the launcher's floor
+    // frame is the same triple the reviewer pinned before the band
+    // existed (launcher 90×4).
+    let starves_rule = |header_h: u16, header_rule_h: u16, content_min: u16, rule_h: u16| {
+        band_rule_reserve(
+            area.height,
+            header_h + header_rule_h + content_min + rule_h + 1,
+            rule_h,
+        ) == 0
+    };
+    if starves_rule(header_h, header_rule_h, content_min, rule_h) {
         content_min = 0;
     }
-    let gap = band_rule_reserve(area.height, content_min + rule_h + 1, rule_h);
-    let mut input_avail = area.height.saturating_sub(content_min + rule_h + gap);
+    if starves_rule(header_h, header_rule_h, content_min, rule_h) {
+        header_h = 1;
+    }
+    if starves_rule(header_h, header_rule_h, content_min, rule_h) {
+        header_rule_h = 0;
+    }
+    if starves_rule(header_h, header_rule_h, content_min, rule_h) {
+        header_h = 0;
+    }
+    let gap = band_rule_reserve(
+        area.height,
+        header_h + header_rule_h + content_min + rule_h + 1,
+        rule_h,
+    );
+    let chrome = header_h + header_rule_h + content_min + gap;
+    let mut input_avail = area.height.saturating_sub(chrome + rule_h);
     if input_avail < 1 {
         rule_h = 0;
+        input_avail = area.height.saturating_sub(chrome);
+    }
+    if input_avail < 1 {
+        header_h = 0;
+        header_rule_h = 0;
         input_avail = area.height;
     }
     let composer_rows = needed.min(input_avail).clamp(1, area.height.max(1));
-    let fixed = content_min + rule_h + composer_rows + gap;
+    let fixed = header_h + header_rule_h + content_min + gap + rule_h + composer_rows;
     if palette_height > area.height.saturating_sub(fixed) {
         palette_height = 0;
     }
@@ -435,12 +513,16 @@ fn render_launcher(
     // exactly as the gap did.
     let band_rule_h = gap;
     let [
+        header_area,
+        header_rule,
         content_area,
         palette_area,
         rule_area,
         composer_area,
         band_rule_area,
     ] = Layout::vertical([
+        Constraint::Length(header_h),
+        Constraint::Length(header_rule_h),
         Constraint::Min(content_min),
         Constraint::Length(palette_height),
         Constraint::Length(rule_h),
@@ -451,92 +533,92 @@ fn render_launcher(
 
     let sanctum = SanctumLine::new(model.sanctum_tier);
     let identity = &model.identity;
-    // Sim typography (.center, tui.js:4243-4308): big maroon mark with
-    // breathing room above and below · gold (NOT bold) shahada · the gold
-    // half-strength rule · bright letter-spaced wordmark · dim version
-    // line · info lines with DIM labels and BRIGHT values.
-    let mark_block = mark_lines(model, theme, area.width);
-    let mark_rows = mark_block.len();
-    let mut lines = vec![Line::default()];
-    lines.extend(mark_block);
-    lines.push(Line::default());
-    // Dignity rule: the sanctum renders whole or not at all, always alone.
-    if let Some(text) = sanctum.fit(area.width.saturating_sub(2) as usize) {
-        lines.push(Line::styled(text, theme.gold_style()));
-        lines.push(Line::default());
+    // ---- The header band: the session header's typography without the
+    // back chip. Line 1: mark · bold GOLD product · dim version/moniker ·
+    // BRIGHT device (the owner's header contract: wordmark, version,
+    // device). Line 2: the identity info — DIM labels beside BRIGHT values
+    // (TUI3a) — with the working dir, ellipsized to the band.
+    let mark_ink = theme.maroon_style().add_modifier(Modifier::BOLD);
+    let mut header_top: Vec<Span<'_>> = vec![Span::raw(" ")];
+    let mut header_bottom: Vec<Span<'_>> = vec![Span::raw(" ")];
+    let header_art = crate::mark::header_fits(area.width, LAUNCHER_HEADER_RESERVED);
+    if header_art {
+        // The compact cut of the big art: the SAME GeezaPro-derived حيدر
+        // letterforms at header scale (16×2 — `mark::HEADER`), spanning
+        // both band lines exactly as it does beside a session's info block.
+        let rows = crate::mark::header_rows();
+        header_top.push(Span::styled(rows[0].clone(), mark_ink));
+        header_top.push(Span::raw("  "));
+        header_bottom.push(Span::styled(rows[1].clone(), mark_ink));
+        header_bottom.push(Span::raw("  "));
+    } else {
+        header_top.push(Span::styled(format!("{}  ", sanctum.mark()), mark_ink));
+        header_bottom.push(Span::raw(" ".repeat(sanctum.mark().chars().count() + 2)));
     }
-    lines.push(Line::styled("────────────────", theme.rule_style()));
-    lines.push(Line::default());
-    lines.push(Line::styled(spaced_wordmark(), theme.bright_style()));
-    lines.push(Line::styled(launcher_subline(VERSION), theme.dim_style()));
-    lines.push(Line::default());
-    let column_cap = (area.width as usize)
-        .saturating_sub(4)
-        .clamp(10, LAUNCHER_COLS);
-    // The info line belongs to the same capped column (owner item 5); when
-    // it cannot fit, it WRAPS at a `·` boundary instead of running the full
-    // width of a wide frame (the sim's `.info` is a wrapping flex row).
-    let provider_half = vec![
+    header_top.push(Span::styled(
+        "haider",
+        theme
+            .gold_style()
+            .add_modifier(ratatui::style::Modifier::BOLD),
+    ));
+    header_top.push(Span::styled(
+        format!(" {}", launcher_subline(VERSION)),
+        theme.dim_style(),
+    ));
+    header_top.push(Span::styled(" · ", theme.dim_style()));
+    header_top.push(Span::styled(identity.device.clone(), theme.bright_style()));
+    header_bottom.extend([
         Span::styled("provider ", theme.dim_style()),
         Span::styled(identity.provider.clone(), theme.bright_style()),
         Span::styled(" · model ", theme.dim_style()),
         Span::styled(identity.model_short.clone(), theme.bright_style()),
-    ];
-    let account_half = vec![
-        Span::styled("account ", theme.dim_style()),
+        Span::styled(" · account ", theme.dim_style()),
         Span::styled(identity.account.clone(), theme.bright_style()),
-        Span::styled(" · device ", theme.dim_style()),
-        Span::styled(identity.device.clone(), theme.bright_style()),
-    ];
-    let one_line: Vec<Span<'_>> = provider_half
-        .into_iter()
-        .chain(std::iter::once(Span::styled(" · ", theme.dim_style())))
-        .chain(account_half)
-        .collect();
-    // ELLIPSIZED to the column, not wrapped: the launcher's vertical budget
-    // is the scarce one, and the owner asked for "metas ellipsized to it".
-    let info = Line::from(one_line);
-    if info.width() <= column_cap {
-        lines.push(info);
-    } else {
-        // Ellipsize the SPANS, never a flattened string: the info line's law
-        // is DIM labels beside BRIGHT values (TUI3a), and collapsing it to
-        // one styled string would silently drop that.
-        let mut used = 0usize;
-        let mut kept: Vec<Span<'_>> = Vec::new();
-        for span in info.spans {
-            let width = span.content.chars().count();
-            if used + width <= column_cap.saturating_sub(1) {
-                used += width;
-                kept.push(span);
-                continue;
-            }
-            let room = column_cap.saturating_sub(1).saturating_sub(used);
-            if room > 0 {
-                let cut: String = span.content.chars().take(room).collect();
-                kept.push(Span::styled(cut, span.style));
-            }
-            kept.push(Span::styled("…", theme.dim_style()));
-            break;
-        }
-        lines.push(Line::from(kept));
-    }
-    // Sim `.dirline`: dir {dir} · mesh off — `cd` on the launcher
-    // retargets this dir (shell builtins, §4).
-    lines.push(Line::from(vec![
-        Span::styled("dir ", theme.dim_style()),
+        Span::styled(" · dir ", theme.dim_style()),
         Span::styled(model.launcher_dir.clone(), theme.bright_style()),
         Span::styled(" · mesh ", theme.dim_style()),
         Span::styled("off", theme.bright_style()),
-    ]));
-    lines.push(Line::default());
+    ]);
+    let band_cap = area.width as usize;
+    let header_top = ellipsize_spans(header_top, band_cap, theme);
+    let header_bottom = ellipsize_spans(header_bottom, band_cap, theme);
+    // Shed chrome renders nothing: a 1-row header keeps only the product
+    // line (the area clips line 2), a 0-row header/rule disappears whole.
+    frame.render_widget(
+        Paragraph::new(Text::from(vec![
+            Line::from(header_top),
+            Line::from(header_bottom),
+        ]))
+        .style(theme.text_style()),
+        header_area,
+    );
+    // Replace the half-block header mark with the crisp حيدر image on a
+    // graphics terminal — same 16×2 footprint at the band's lead cell.
+    if header_art && header_area.height >= crate::mark::HEADER_ROWS {
+        draw_wordmark_image(
+            model,
+            Rect {
+                x: header_area.x + 1,
+                y: header_area.y,
+                width: crate::mark::HEADER_COLS,
+                height: crate::mark::HEADER_ROWS,
+            },
+            frame,
+        );
+    }
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "─".repeat(header_rule.width as usize),
+            theme.frame_style(),
+        )),
+        header_rule,
+    );
 
-    // ---- The `.recent` COLUMN (tui.js:4331-4334): a fixed-width block,
-    // centered as a whole, text-align LEFT inside — every session row and
-    // Aura/Accounts/Peers row starts at the SAME left column. The column
-    // is the widest row's content, capped by the frame (sim
-    // min(560px, 92%)); every line pads to it so per-line centering yields
-    // one shared left edge and hover bands span the full column.
+    // ---- The content column: TOP-ALIGNED under the band (the session
+    // surface's reading order), one breathing row first. The shared-column
+    // trick survives: every row pads to the widest so hover bands span the
+    // block; the block hugs the band's left edge instead of centering.
+    let mut lines: Vec<Line<'_>> = vec![Line::default()];
     // Sim `.recent { width: min(560px, 92%) }` (tui.js:4331-4334) at 12.5px
     // mono ≈ 7.5px/cell → ~74 cells. Capped at LAUNCHER_COLS so a wide
     // terminal keeps the sim's proportions instead of letting the block span
@@ -752,40 +834,30 @@ fn render_launcher(
             )));
         }
     }
-    // The banner yields before any other launcher row (TUI4 item 6): if the
-    // block overflows the content area, redraw it with the one-line mark
-    // rather than letting `centered` drop the sanctum or the recent list.
-    // The rebuild skips exactly the mark block it emitted — when the head
-    // was already the one-line text mark this is the identity, never an
-    // eaten sanctum or rule.
-    // Compaction removes head rows the recorded hit indices still count
-    // (W5g-7: on a 24-row terminal the 4-row banner collapses to 1, and
-    // every launcher hit rect sat exactly 3 rows below its painted row —
-    // the owner's "hover is off on the main menu"). The shift is a single
-    // scalar BY CONSTRUCTION: compaction only ever replaces the head
-    // block, and no hit row lives inside it.
-    let (lines, compact_shift) = if lines.len() > content_area.height as usize {
-        let mut compact = vec![Line::default()];
-        compact.extend(mark_lines_within(model, theme, content_area.width, 0));
-        let removed = (1 + mark_rows).saturating_sub(compact.len());
-        compact.extend(lines.into_iter().skip(1 + mark_rows));
-        (compact, removed)
-    } else {
-        (lines, 0)
-    };
-    let (middle, dropped) = centered(frame, content_area, lines);
-    let visible = |row: usize| row.checked_sub(compact_shift)?.checked_sub(dropped);
+    // Top-aligned under the band: rows render from the header rule down
+    // and CLIP at the bottom under pressure (the shed ladder already gave
+    // the content column up first; the composer band below stays sacred).
+    // No centering, no compaction — a hit row IS its painted row (the
+    // W5g-7 hover-offset class of bug is unrepresentable here).
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).style(theme.text_style()),
+        content_area,
+    );
+    let visible = |row: usize| (row < content_area.height as usize).then_some(row);
     for (row, id) in sample_rows {
         if let Some(row) = visible(row) {
             hits.push((
-                row_rect(content_area, middle.y, row),
+                row_rect(content_area, content_area.y, row),
                 Hit::AttachSession(id),
             ));
         }
     }
     for (row, which) in extra_rows {
         if let Some(row) = visible(row) {
-            hits.push((row_rect(content_area, middle.y, row), Hit::ExtraRow(which)));
+            hits.push((
+                row_rect(content_area, content_area.y, row),
+                Hit::ExtraRow(which),
+            ));
         }
     }
     if palette_height > 0 {

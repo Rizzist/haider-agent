@@ -293,7 +293,12 @@ fn the_banner_renders_whole_or_falls_back_to_the_text_mark() {
     // MUTATION CHECK: widen `BANNER_COLS`/`BANNER_MARGIN` without moving the
     // gate, or clip instead of falling back, and one of these two halves
     // fails — the mark is never partially drawn.
-    let model = launcher_model();
+    //
+    // UI-themes wave flip: the big banner is BOOT-SPLASH ceremony now (the
+    // settled launcher wears the compact header band), so the tier law is
+    // pinned on the boot screen, where the banner still lives.
+    let model = AppModel::new();
+    assert_eq!(model.screen, Screen::Boot);
     let wide = draw(&model, 118, 34);
     let banner = haider_tui::mark::banner_rows();
     for row in &banner {
@@ -344,7 +349,10 @@ fn the_session_header_mark_spans_both_lines_or_yields() {
 // ---- Item 5: the launcher column cap ----
 
 #[test]
-fn the_launcher_column_is_capped_and_centered_at_a_wide_frame() {
+fn the_launcher_column_is_capped_and_left_anchored_at_a_wide_frame() {
+    // UI-themes wave flip: the block used to be centred under the big art;
+    // as a session-shaped surface it hugs the header band's left edge. The
+    // cap survives — a 165-col frame must not stretch rows across it.
     let model = launcher_model();
     let frame = draw(&model, 165, 40);
     let cap = 70usize;
@@ -375,20 +383,16 @@ fn the_launcher_column_is_capped_and_centered_at_a_wide_frame() {
         edges.windows(2).all(|pair| pair[0] == pair[1]),
         "the recent block is not one column: {edges:?}"
     );
-    // …and that column is centred in the frame.
-    let left = edges[0];
+    // …and that column hugs the band's left edge (the one-cell rail lead),
+    // never the old centring.
+    assert_eq!(edges[0], 1, "the column is left-anchored after the rail");
+    // The identity info and dir moved INTO the header band (line 2).
+    let info_row = frame.row_of("provider anthropic");
+    assert_eq!(info_row, 1, "identity info lives on header line 2");
     assert!(
-        left.abs_diff(165 - left - cap) <= 2,
-        "the column is not centred (left margin {left})"
+        frame.rows[info_row].contains("dir ~/dev"),
+        "dir in the band"
     );
-    // The info/dir lines are inside the cap too (they are centred text, not
-    // part of the padded column, so only their width is constrained).
-    for needle in ["provider anthropic", "dir ~/dev"] {
-        let row = &frame.rows[frame.row_of(needle)];
-        let start = row.chars().take_while(|c| *c == ' ').count();
-        let ink = row.trim_end().chars().count() - start;
-        assert!(ink <= cap, "{needle:?} spans {ink} cells, over the cap");
-    }
 }
 
 // ---- Item 7: the todos panel ----

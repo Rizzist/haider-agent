@@ -76,7 +76,12 @@ fn boot_screen_shows_mark_word_and_progressing_checks() {
 }
 
 #[test]
-fn launcher_shows_sanctum_identity_and_composer() {
+fn launcher_shows_header_band_identity_and_composer() {
+    // UI-themes wave (owner spec §1): the settled launcher is a
+    // session-shaped surface — header band with the compact mark, version
+    // and device; the shahada and the big centered art belong to the boot
+    // splash alone. Flip rationale: this test used to pin the centered
+    // sanctum launcher.
     let mut model = AppModel::new();
     model.handle(AppEvent::Envelope(Box::new(EventPayload::HarnessStatus(
         HarnessStatus::Ready,
@@ -84,12 +89,17 @@ fn launcher_shows_sanctum_identity_and_composer() {
     assert_eq!(model.screen, Screen::Launcher);
     let (text, _) = draw(&model, 80, 24);
     assert!(
-        text.contains(SHAHADA_ARABIC),
-        "sanctum line, Arabic default:\n{text}"
+        !text.contains(SHAHADA_ARABIC),
+        "the shahada is boot-splash ceremony, not launcher chrome:\n{text}"
     );
+    assert!(text.contains("haider"), "header band product mark");
     assert!(text.contains("the lion"));
     assert!(text.contains("provider"));
     assert!(text.contains("anthropic"));
+    assert!(
+        text.contains(&model.identity.device),
+        "device name in the header"
+    );
     assert!(text.contains("recent sessions"));
     assert!(text.contains("billing-service"), "sim seed rows present");
     assert!(text.contains("Stripe webhooks + invoice backfill"));
@@ -103,28 +113,27 @@ fn launcher_shows_sanctum_identity_and_composer() {
 }
 
 #[test]
-fn narrow_launcher_omits_the_sanctum_whole() {
+fn narrow_launcher_keeps_the_text_mark_and_no_sanctum() {
     let mut model = AppModel::new();
     model.handle(AppEvent::Envelope(Box::new(EventPayload::HarnessStatus(
         HarnessStatus::Ready,
     ))));
     let (text, _) = draw(&model, 24, 20);
-    // Dignity rule: at 24 columns the shahada cannot fit whole, so NO part
-    // of it may appear — never truncated, never ellipsized.
+    // The shahada never appears on the launcher any more (boot only) —
+    // and at 24 columns nothing may leak a fragment of it either.
     for word in ["الله", "محمد", "رسول"] {
         assert!(
             !text.contains(word),
             "sanctum fragment leaked into narrow frame"
         );
     }
-    assert!(text.contains("H A I D E"), "the rest still renders");
-    // At 24×20 the block is taller than the frame, so the centered helper
-    // sheds from the top — the banner is never drawn here (it needs 32 cols)
-    // and the one-line mark is among the rows that yield. The dignity law is
-    // upheld either way: what renders is whole.
+    // Whole-or-nothing (dignity rule 2): 24 columns cannot hold the 16-cell
+    // header art beside the info block, so the band steps down to the
+    // one-line TEXT mark — never a clipped half of the art.
+    assert!(text.contains("حيدر"), "the text-mark tier:\n{text}");
     assert!(
         !text.contains(&haider_tui::mark::banner_rows()[2]),
-        "no banner row at a frame too narrow for it"
+        "the big banner belongs to boot alone"
     );
 }
 
