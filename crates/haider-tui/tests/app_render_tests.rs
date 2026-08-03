@@ -165,6 +165,8 @@ fn theme_cycle_changes_the_ground_color() {
     model.handle(ctrl('t'));
     assert_eq!(model.theme, ThemeKey::Desert);
     model.handle(ctrl('t'));
+    assert_eq!(model.theme, ThemeKey::Water);
+    model.handle(ctrl('t'));
     assert_eq!(model.theme, ThemeKey::Oasis);
     model.handle(ctrl('t'));
     assert_eq!(model.theme, ThemeKey::Light, "cycle wraps the registry");

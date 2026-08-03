@@ -3868,6 +3868,7 @@ fn render_theme_picker(
                     crate::theme::ThemeKey::Light => "paper & ink",
                     crate::theme::ThemeKey::Dark => "aged gold on warm black",
                     crate::theme::ThemeKey::Desert => "sand · amber · dusk",
+                    crate::theme::ThemeKey::Water => "sea glass · tide teal · coral",
                     crate::theme::ThemeKey::Oasis => "palm night · date gold",
                 },
             };
