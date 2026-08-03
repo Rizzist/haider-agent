@@ -21,7 +21,11 @@ pub const COMMANDS: &[CommandSpec] = &[
         "[name]",
     ),
     session_cmd("provider", "Switch provider — the model follows", "[name]"),
-    cmd("theme", "Change the theme", "[light·dark·desert·oasis]"),
+    cmd(
+        "theme",
+        "Change the theme — bare /theme opens the picker",
+        "[system·light·dark·desert·oasis]",
+    ),
     session_cmd(
         "tree",
         "Open the session tree — jump to or fork any node",
@@ -213,16 +217,21 @@ fn login_args(slot: usize, fragment: &str) -> Vec<PaletteItem> {
         .collect()
 }
 
-/// `/theme`'s argument candidates, derived from the theme registry (sim
-/// `argSlots("theme")`, tui.js:227 — value = key, desc = label).
+/// `/theme`'s argument candidates, derived from the CHOICE registry
+/// (owner spec §3): `system` leads, then the fixed themes by name.
 fn theme_args(fragment: &str) -> Vec<PaletteItem> {
-    crate::theme::ThemeKey::ALL
+    crate::theme::ThemeChoice::MENU
         .iter()
-        .filter(|key| key.name().starts_with(fragment))
-        .map(|key| PaletteItem::Arg {
+        .filter(|choice| choice.name().starts_with(fragment))
+        .map(|choice| PaletteItem::Arg {
             cmd: "theme",
-            value: key.name().to_owned(),
-            desc: key.theme().label.to_owned(),
+            value: choice.name().to_owned(),
+            desc: match choice {
+                crate::theme::ThemeChoice::System => {
+                    "follow the terminal · auto light / dark".to_owned()
+                }
+                crate::theme::ThemeChoice::Fixed(key) => key.theme().label.to_owned(),
+            },
         })
         .collect()
 }
@@ -323,7 +332,7 @@ pub const HELP_TEXT: &[&str] = &[
     "  /model [name]      switch model — fable-5 · gpt-5.6 · gemini-3 · qwen3",
     "  /provider [name]   anthropic · openai · gemini · kimi",
     "  /providers         provider registry — endpoints, models, defaults, health",
-    "  /theme [name]      light · dark · desert · oasis",
+    "  /theme [name]      system (follow the terminal) · light · dark · desert · oasis — bare /theme opens the picker",
     "  /tree              session tree — every branch, ⏎ jump to a node / open a fork, f forks there",
     "  /fork              fork the session at the current point",
     "  /branch [new|name] branches — numbered picker · direct switch · new forks at the last committed node",

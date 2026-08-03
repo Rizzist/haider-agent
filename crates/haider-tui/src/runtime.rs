@@ -96,6 +96,10 @@ pub fn detect_system_theme() -> ThemeKey {
     resolve_system_theme(osc, std::env::var("COLORFGBG").ok().as_deref())
 }
 
+/// The OSC probe's answer type, re-exported so tests can drive
+/// [`resolve_system_theme`] without depending on termbg themselves.
+pub use termbg::Theme as TerminalAppearance;
+
 /// The pure resolution behind [`detect_system_theme`], testable without a
 /// terminal: OSC answer beats `COLORFGBG`; nothing detectable → Dark.
 #[must_use]
@@ -238,6 +242,11 @@ pub async fn run_demo(
     sync_terminal_bg(model.theme);
     sync_window_title(&model.window_title());
     let mut active_theme = model.theme;
+    // Owner spec §3: the theme CHOICE is TUI-local display state — persist
+    // committed changes to the profile-dir settings file. Previews inside
+    // the open picker move only the resolved theme, so they never write.
+    let mut settings = crate::settings::SettingsStore::open_default();
+    let mut active_choice = model.theme_choice;
     let mut active_title = model.window_title();
 
     // Query the terminal for a graphics protocol and build the wordmark image
@@ -404,6 +413,12 @@ pub async fn run_demo(
             }
         }
         // Theme cycled: re-sync the emulator background.
+        if model.theme_choice != active_choice {
+            active_choice = model.theme_choice;
+            if let Some(store) = settings.as_mut() {
+                store.save_if_changed(active_choice);
+            }
+        }
         if model.theme != active_theme {
             active_theme = model.theme;
             sync_terminal_bg(active_theme);
@@ -2493,6 +2508,11 @@ pub async fn run_live(
     sync_terminal_bg(model.theme);
     sync_window_title(&model.window_title());
     let mut active_theme = model.theme;
+    // Owner spec §3: the theme CHOICE is TUI-local display state — persist
+    // committed changes to the profile-dir settings file. Previews inside
+    // the open picker move only the resolved theme, so they never write.
+    let mut settings = crate::settings::SettingsStore::open_default();
+    let mut active_choice = model.theme_choice;
     let mut active_title = model.window_title();
 
     // Graphics wordmark query — after raw mode, before the input pump (see the
@@ -2607,6 +2627,12 @@ pub async fn run_live(
                 }
                 ShellRequest::AttachRead(path) => attach_read_effects(&mut model, &path),
                 ShellRequest::Quit => model.should_quit = true,
+            }
+        }
+        if model.theme_choice != active_choice {
+            active_choice = model.theme_choice;
+            if let Some(store) = settings.as_mut() {
+                store.save_if_changed(active_choice);
             }
         }
         if model.theme != active_theme {

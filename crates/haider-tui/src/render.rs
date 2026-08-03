@@ -864,7 +864,11 @@ fn render_launcher(
         frame.render_widget(Paragraph::new(Text::from(palette)), palette_area);
         palette_row_hits(model, palette_area, hits);
     }
-    render_composer(model, theme, frame, rule_area, composer_area, hits);
+    if theme_picker_showing(model) {
+        render_theme_picker(model, theme, frame, rule_area, composer_area, hits);
+    } else {
+        render_composer(model, theme, frame, rule_area, composer_area, hits);
+    }
     // TUI5 item 1b: the frame rule under the launcher band (the sim
     // StatusBar's border-top — the owner's missing "line under it").
     if band_rule_h > 0 {
@@ -2221,6 +2225,8 @@ fn render_session(
             height: composer_area.height - ask_area.height,
         };
         render_composer(model, theme, frame, rule_area, shifted, hits);
+    } else if theme_picker_showing(model) {
+        render_theme_picker(model, theme, frame, rule_area, composer_area, hits);
     } else {
         render_composer(model, theme, frame, rule_area, composer_area, hits);
     }
@@ -3805,6 +3811,103 @@ fn menu_block(
     (lines, option_rows)
 }
 
+/// Rows the `/theme` picker card needs: title + body + the five choice
+/// rows + hint (menu_block windows the options under height pressure).
+const THEME_PICKER_ROWS: u16 = 8;
+
+/// Whether the `/theme` picker renders THIS frame: open, on a surface
+/// that hosts it, with no daemon card holding the input slot (the menu /
+/// ask branches outrank it — local chrome never sits on a live ask).
+fn theme_picker_showing(model: &AppModel) -> bool {
+    model.theme_picker.is_some()
+        && matches!(model.screen, Screen::Launcher | Screen::Session)
+        && model.projection.open_menu().is_none()
+        && model.login.is_none()
+}
+
+/// The `/theme` picker (owner spec §3): a numbered arrow-highlight card in
+/// the composer's slot, rendered through the SAME `menu_block` anatomy as
+/// every other card. The ● marks the COMMITTED choice; the ❯ highlight
+/// previews live as it moves. Hits carry [`Hit::ThemeOption`] so hover
+/// previews and a click commits.
+fn render_theme_picker(
+    model: &AppModel,
+    theme: &Theme,
+    frame: &mut Frame<'_>,
+    rule_area: Rect,
+    composer_area: Rect,
+    hits: &mut Vec<(Rect, Hit)>,
+) {
+    let Some(picker) = model.theme_picker else {
+        return;
+    };
+    use crate::theme::ThemeChoice;
+    use haider_protocol::menu::{Menu, MenuKind, MenuOption, MenuScope};
+    let committed = |choice: ThemeChoice| {
+        if choice == picker.prior { '●' } else { '○' }
+    };
+    let options = ThemeChoice::MENU
+        .iter()
+        .map(|choice| {
+            let blurb = match choice {
+                ThemeChoice::System => "follow the terminal · auto light / dark",
+                ThemeChoice::Fixed(key) => match key {
+                    crate::theme::ThemeKey::Light => "paper & ink",
+                    crate::theme::ThemeKey::Dark => "aged gold on warm black",
+                    crate::theme::ThemeKey::Desert => "sand · amber · dusk",
+                    crate::theme::ThemeKey::Oasis => "palm night · date gold",
+                },
+            };
+            MenuOption {
+                key: choice.name().to_owned(),
+                label: format!("{} {} — {blurb}", committed(*choice), choice.name()),
+                detail: None,
+                decision: None,
+            }
+        })
+        .collect();
+    let card = Menu {
+        id: haider_protocol::ids::MenuId::new("theme-picker"),
+        kind: MenuKind::Choice,
+        title: "theme — how haider dresses this terminal".to_owned(),
+        body: vec!["previews as you highlight · system re-reads the terminal each boot".to_owned()],
+        options,
+        blocking: false,
+        scope: MenuScope::Session,
+        origin: "theme".to_owned(),
+        ttl_ms: None,
+        timeout_option: None,
+    };
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "─".repeat(rule_area.width as usize),
+            theme.warn_style(),
+        ))
+        .style(theme.text_style()),
+        rule_area,
+    );
+    let footer = " ↑↓ preview · ⏎ keep · 1-5 quick · esc back";
+    let (lines, option_rows) = menu_block(&card, picker.selection, theme, composer_area, footer);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).style(theme.menu_style()),
+        composer_area,
+    );
+    for (row_offset, option_index) in option_rows {
+        let y = composer_area.y + row_offset;
+        if y < composer_area.y + composer_area.height {
+            hits.push((
+                Rect {
+                    x: composer_area.x,
+                    y,
+                    width: composer_area.width,
+                    height: 1,
+                },
+                Hit::ThemeOption(option_index),
+            ));
+        }
+    }
+}
+
 /// Sim `MENU_GLYPH` (tui.js:3057) mapped onto the protocol's menu kinds.
 /// The command cards (`voice` ◉ / `tools` ⚒) are `Choice` menus — their
 /// free-form `origin` tag carries the sim kind (MenuKind is frozen).
@@ -3815,6 +3918,7 @@ fn menu_glyph(menu: &haider_protocol::menu::Menu) -> &'static str {
         MenuKind::Exhausted => "⟳",
         MenuKind::Choice if menu.origin == "voice" => "◉",
         MenuKind::Choice if menu.origin == "tools" => "⚒",
+        MenuKind::Choice if menu.origin == "theme" => "◑",
         _ => "?",
     }
 }
@@ -3860,6 +3964,12 @@ fn composer_height(model: &AppModel, width: u16) -> u16 {
     // (W3c3 M3): title, masked field, hint.
     if model.login.is_some() {
         return LOGIN_CARD_ROWS;
+    }
+    // The `/theme` picker replaces the composer on its surfaces (owner
+    // spec §3) — same input-replacement law as a blocking menu. A daemon
+    // card outranks it (render_session keeps the menu branch first).
+    if theme_picker_showing(model) {
+        return THEME_PICKER_ROWS;
     }
     let rows = crate::composer::wrap_rows(model.composer.text(), composer_text_budget(width))
         .len()

@@ -12,6 +12,7 @@
 use haider_tui::app::{AppModel, Hit, Screen};
 use haider_tui::render::render;
 use haider_tui::sanctum::SHAHADA_ARABIC;
+use haider_tui::theme::{ThemeChoice, ThemeKey};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::layout::Rect;
@@ -269,4 +270,144 @@ fn narrow_boot_omits_the_shahada_whole() {
             "sanctum fragment leaked into a narrow boot frame"
         );
     }
+}
+
+// ---- §3: the theme system — picker, persistence, detection ----
+
+#[test]
+fn theme_picker_lists_and_switches_instantly() {
+    let mut model = launcher_model();
+    assert_eq!(model.theme_choice, ThemeChoice::System);
+    assert_eq!(model.theme, ThemeKey::Dark, "system fell back to dark");
+    common::run_slash(&mut model, "/theme");
+    assert!(model.theme_picker.is_some(), "bare /theme opens the picker");
+    // The card lists every choice, numbered, ● on the committed row.
+    let (rows, hits, _) = draw(&model, 100, 30);
+    for needle in [
+        "1. ● system",
+        "2. ○ light",
+        "3. ○ dark",
+        "4. ○ desert",
+        "5. ○ oasis",
+    ] {
+        assert!(
+            rows.iter().any(|row| row.contains(needle)),
+            "picker row {needle:?} missing:\n{}",
+            rows.join("\n")
+        );
+    }
+    // Every row is clickable (owner menu law: answer by number OR click).
+    for index in 0..5 {
+        assert!(
+            hits.iter().any(|(_, hit)| *hit == Hit::ThemeOption(index)),
+            "picker row {index} has no hit"
+        );
+    }
+    // Moving the highlight PREVIEWS instantly — the resolved theme flips
+    // with the row while the committed choice waits.
+    model.handle(common::key(ratatui::crossterm::event::KeyCode::Down));
+    assert_eq!(model.theme, ThemeKey::Light, "row 2 previews light");
+    assert_eq!(
+        model.theme_choice,
+        ThemeChoice::System,
+        "preview commits nothing"
+    );
+    // A digit commits instantly and closes the picker.
+    model.handle(common::key(ratatui::crossterm::event::KeyCode::Char('4')));
+    assert!(model.theme_picker.is_none(), "digit committed and closed");
+    assert_eq!(model.theme_choice, ThemeChoice::Fixed(ThemeKey::Desert));
+    assert_eq!(model.theme, ThemeKey::Desert);
+    // esc reverts a preview to the choice held on open.
+    common::run_slash(&mut model, "/theme");
+    model.handle(common::key(ratatui::crossterm::event::KeyCode::Down));
+    assert_eq!(model.theme, ThemeKey::Oasis, "previewing the next row");
+    model.handle(common::key(ratatui::crossterm::event::KeyCode::Esc));
+    assert!(model.theme_picker.is_none());
+    assert_eq!(model.theme, ThemeKey::Desert, "esc reverted the preview");
+    assert_eq!(model.theme_choice, ThemeChoice::Fixed(ThemeKey::Desert));
+    // A click commits like a digit (value-carrying hit).
+    common::run_slash(&mut model, "/theme");
+    model.handle_hit(Hit::ThemeOption(4));
+    assert!(model.theme_picker.is_none());
+    assert_eq!(model.theme_choice, ThemeChoice::Fixed(ThemeKey::Oasis));
+    assert_eq!(model.theme, ThemeKey::Oasis);
+}
+
+#[test]
+fn theme_persists_and_reloads() {
+    use haider_tui::settings::SettingsStore;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("tui-settings.json");
+    // Save-if-changed writes the choice; a fresh store reloads it.
+    let mut store = SettingsStore::at(path.clone());
+    assert_eq!(store.load(), None, "no file yet → defaults");
+    store.save_if_changed(ThemeChoice::Fixed(ThemeKey::Desert));
+    assert_eq!(
+        SettingsStore::at(path.clone()).load(),
+        Some(ThemeChoice::Fixed(ThemeKey::Desert))
+    );
+    // `system` round-trips as a CHOICE — the resolved theme is never
+    // persisted, so the next boot re-evaluates the terminal.
+    store.save_if_changed(ThemeChoice::System);
+    assert_eq!(
+        SettingsStore::at(path.clone()).load(),
+        Some(ThemeChoice::System)
+    );
+    // Corrupt bytes and foreign versions mean defaults, never damage.
+    std::fs::write(&path, b"{not json").expect("write");
+    assert_eq!(SettingsStore::at(path.clone()).load(), None);
+    std::fs::write(&path, br#"{"version":9,"theme":"desert"}"#).expect("write");
+    assert_eq!(SettingsStore::at(path.clone()).load(), None);
+    // A legacy sim-era name migrates through the same parse gate.
+    std::fs::write(&path, br#"{"version":1,"theme":"dawn"}"#).expect("write");
+    assert_eq!(
+        SettingsStore::at(path.clone()).load(),
+        Some(ThemeChoice::Fixed(ThemeKey::Desert))
+    );
+    // And the model applies a reloaded choice exactly as boot does.
+    let mut model = launcher_model();
+    model.detected_system = ThemeKey::Light;
+    let choice = SettingsStore::at(path).load().expect("choice");
+    model.apply_theme_choice(choice);
+    assert_eq!(
+        model.theme,
+        ThemeKey::Desert,
+        "fixed choice ignores detection"
+    );
+    model.apply_theme_choice(ThemeChoice::System);
+    assert_eq!(model.theme, ThemeKey::Light, "system follows detection");
+}
+
+#[test]
+fn system_theme_follows_detection_fallback_dark() {
+    use haider_tui::runtime::{TerminalAppearance, resolve_system_theme, theme_from_colorfgbg};
+    // OSC 11 is the authority when the emulator answers.
+    assert_eq!(
+        resolve_system_theme(Some(TerminalAppearance::Light), None),
+        ThemeKey::Light
+    );
+    assert_eq!(
+        resolve_system_theme(Some(TerminalAppearance::Dark), Some("0;15")),
+        ThemeKey::Dark,
+        "an answered OSC beats COLORFGBG"
+    );
+    // COLORFGBG fallback: the LAST field is the background index.
+    assert_eq!(theme_from_colorfgbg("15;0"), Some(ThemeKey::Dark));
+    assert_eq!(theme_from_colorfgbg("0;15"), Some(ThemeKey::Light));
+    assert_eq!(theme_from_colorfgbg("0;default;7"), Some(ThemeKey::Light));
+    assert_eq!(theme_from_colorfgbg("default;default"), None);
+    assert_eq!(theme_from_colorfgbg("garbage"), None);
+    assert_eq!(
+        resolve_system_theme(None, Some("15;0")),
+        ThemeKey::Dark,
+        "COLORFGBG answers when OSC cannot"
+    );
+    // Undetectable → dark (the owner's fallback law).
+    assert_eq!(resolve_system_theme(None, None), ThemeKey::Dark);
+    assert_eq!(resolve_system_theme(None, Some("nonsense")), ThemeKey::Dark);
+    // And the choice layer: `system` resolves against exactly that.
+    assert_eq!(
+        ThemeChoice::System.resolve(resolve_system_theme(None, None)),
+        ThemeKey::Dark
+    );
 }
