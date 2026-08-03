@@ -59,6 +59,7 @@ fn theme_choice_parses_system_and_fixed_names() {
             ThemeChoice::Fixed(ThemeKey::Light),
             ThemeChoice::Fixed(ThemeKey::Dark),
             ThemeChoice::Fixed(ThemeKey::Desert),
+            ThemeChoice::Fixed(ThemeKey::Water),
             ThemeChoice::Fixed(ThemeKey::Oasis),
         ]
     );
@@ -254,5 +255,27 @@ fn every_theme_clears_wcag_contrast_floors() {
                 theme.label
             );
         }
+    }
+}
+
+/// MUTATION CHECK: hand-roll `MENU` again and drop a registry theme.
+/// Expected RUNTIME failure: the covering pin names the missing key —
+/// the v0.0.62 live probe found `water` absent from the picker while
+/// every suite law read MENU itself (self-referential coverage).
+#[test]
+fn picker_menu_covers_every_registry_theme_once() {
+    use haider_tui::theme::ThemeChoice;
+    assert_eq!(ThemeChoice::MENU.len(), ThemeKey::ALL.len() + 1);
+    assert_eq!(ThemeChoice::MENU[0], ThemeChoice::System);
+    for key in ThemeKey::ALL {
+        assert_eq!(
+            ThemeChoice::MENU
+                .iter()
+                .filter(|choice| **choice == ThemeChoice::Fixed(key))
+                .count(),
+            1,
+            "{} must appear exactly once in the picker",
+            key.name()
+        );
     }
 }

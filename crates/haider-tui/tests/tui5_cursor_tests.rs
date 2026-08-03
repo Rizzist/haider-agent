@@ -318,7 +318,7 @@ fn cursor_renders_reverse_video_mid_text() {
 
 #[test]
 fn cursor_cell_is_themed_on_every_theme() {
-    for key_name in ["light", "dark", "desert", "oasis"] {
+    for key_name in ["light", "dark", "desert", "water", "oasis"] {
         let mut model = launcher_model();
         let theme_key = ThemeKey::parse(key_name).expect("theme name");
         model.theme = theme_key;

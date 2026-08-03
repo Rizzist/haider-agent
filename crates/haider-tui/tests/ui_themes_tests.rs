@@ -288,7 +288,8 @@ fn theme_picker_lists_and_switches_instantly() {
         "2. ○ light",
         "3. ○ dark",
         "4. ○ desert",
-        "5. ○ oasis",
+        "5. ○ water",
+        "6. ○ oasis",
     ] {
         assert!(
             rows.iter().any(|row| row.contains(needle)),
@@ -320,7 +321,7 @@ fn theme_picker_lists_and_switches_instantly() {
     // esc reverts a preview to the choice held on open.
     common::run_slash(&mut model, "/theme");
     model.handle(common::key(ratatui::crossterm::event::KeyCode::Down));
-    assert_eq!(model.theme, ThemeKey::Oasis, "previewing the next row");
+    assert_eq!(model.theme, ThemeKey::Water, "previewing the next row");
     model.handle(common::key(ratatui::crossterm::event::KeyCode::Esc));
     assert!(model.theme_picker.is_none());
     assert_eq!(model.theme, ThemeKey::Desert, "esc reverted the preview");
@@ -433,7 +434,7 @@ fn assert_picker_rows(model: &AppModel, surface: &str) {
         "{surface}: /theme + ⏎ must open the picker"
     );
     let (rows, hits, _) = draw(model, 100, 30);
-    for needle in ["1. ● system", "3. ○ dark", "5. ○ oasis"] {
+    for needle in ["1. ● system", "3. ○ dark", "6. ○ oasis"] {
         assert!(
             rows.iter().any(|row| row.contains(needle)),
             "{surface}: picker row {needle:?} not RENDERED:\n{}",

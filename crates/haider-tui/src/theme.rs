@@ -139,13 +139,18 @@ pub enum ThemeChoice {
 impl ThemeChoice {
     /// The `/theme` picker's rows, in menu order: `system` first (the
     /// default), then the fixed themes.
-    pub const MENU: [ThemeChoice; 5] = [
-        ThemeChoice::System,
-        ThemeChoice::Fixed(ThemeKey::Light),
-        ThemeChoice::Fixed(ThemeKey::Dark),
-        ThemeChoice::Fixed(ThemeKey::Desert),
-        ThemeChoice::Fixed(ThemeKey::Oasis),
-    ];
+    /// DERIVED from [`ThemeKey::ALL`] so a new registry theme can never
+    /// miss the picker (the hand-rolled list silently dropped `water` —
+    /// live-probe catch on v0.0.62).
+    pub const MENU: [ThemeChoice; ThemeKey::ALL.len() + 1] = {
+        let mut menu = [ThemeChoice::System; ThemeKey::ALL.len() + 1];
+        let mut i = 0;
+        while i < ThemeKey::ALL.len() {
+            menu[i + 1] = ThemeChoice::Fixed(ThemeKey::ALL[i]);
+            i += 1;
+        }
+        menu
+    };
 
     /// Parse a `/theme` argument or a persisted choice name.
     #[must_use]

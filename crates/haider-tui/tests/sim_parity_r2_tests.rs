@@ -252,7 +252,10 @@ fn theme_arg_slot_offers_completes_and_runs() {
         model.handle(key(KeyCode::Char(c)));
     }
     let labels: Vec<String> = model.palette_items().iter().map(|i| i.label()).collect();
-    assert_eq!(labels, ["system", "light", "dark", "desert", "oasis"]);
+    assert_eq!(
+        labels,
+        ["system", "light", "dark", "desert", "water", "oasis"]
+    );
     let (rows, hits, _) = draw(&model, 118, 34);
     assert!(rows.iter().any(|row| row.contains("Oasis")), "descs");
     // Ghost offers the first slot value after the trailing space.
@@ -668,7 +671,7 @@ fn exact_theme_enter_opens_the_picker_not_the_arg_slot() {
     let labels: Vec<String> = model.palette_items().iter().map(|i| i.label()).collect();
     assert_eq!(
         labels,
-        ["system", "light", "dark", "desert", "oasis"],
+        ["system", "light", "dark", "desert", "water", "oasis"],
         "slot rows after the space"
     );
 
