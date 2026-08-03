@@ -4,6 +4,13 @@
 //! the session actor's post-store seam. Decision hooks wait for the committed
 //! `PermissionRequired` fact and answer the already-open menu through the same
 //! durable CAS as every interactive surface.
+//!
+//! User-message hooks likewise classify only the canonical committed
+//! `UserMessage` acceptance fact. TUI, RPC, headless, and voice submissions all
+//! converge on that one acceptance transaction before this module observes
+//! them, so one accepted message produces one surface-independent hook event.
+//! Surface identity is intentionally absent: preserving that 1:1 fact/event
+//! mapping gives every submission surface identical hook semantics.
 
 #[cfg(test)]
 #[path = "hooks_tests.rs"]
@@ -13,17 +20,18 @@ use crate::session_hub::SessionHub;
 use haider_core::{
     HookTrustChange, HookTrustCommand, MenuResolutionCommand, MenuResolutionOutcome, StoreHandle,
 };
-use haider_protocol::EventPayload;
 use haider_protocol::effect::{AuthorizationVerdict, EffectIntent, EffectPhase};
 use haider_protocol::envelope::{PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION};
 use haider_protocol::hook::{
-    HOOKS_CONFIG_SCHEMA, HookDecisionKind, HookEventPayload, HookFired, HookNotice, HookOutput,
-    HookRuntimeKind, HookSubscription, HookSubscriptionState,
+    HOOKS_CONFIG_SCHEMA, HookAttachmentMetadata, HookAttachmentSet, HookDecisionKind,
+    HookEventPayload, HookFired, HookInput, HookNotice, HookOutput, HookRuntimeKind,
+    HookSubscription, HookSubscriptionState,
 };
 use haider_protocol::ids::{EffectId, EventId, MenuId, RunId, SessionId};
 use haider_protocol::item::{ItemEvent, TurnItem};
 use haider_protocol::menu::{AnswerVia, DecisionKind, Menu, MenuAnswer, MenuKind};
 use haider_protocol::state::{RunState, SessionState};
+use haider_protocol::{DeliveryMode, EventPayload};
 use haider_rpc::{CommandId, HookSummaryWire};
 use rustix::fd::OwnedFd;
 use rustix::fs::{FileType, Mode, OFlags};
@@ -49,6 +57,7 @@ const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const MAX_TIMEOUT_MS: u64 = 300_000;
 const INLINE_OUTPUT_BYTES: usize = 8 * 1024;
 const MAX_STREAM_OUTPUT_BYTES: usize = 512 * 1024;
+const MAX_USER_MESSAGE_TEXT_BYTES: usize = 32 * 1024;
 const SUBSCRIBE_QUEUE: usize = 64;
 const SUBSCRIBE_BACKOFF_MIN: Duration = Duration::from_millis(200);
 const SUBSCRIBE_BACKOFF_MAX: Duration = Duration::from_secs(5);
@@ -93,6 +102,7 @@ impl HookKind {
 #[serde(rename_all = "snake_case")]
 enum MatchEvent {
     SessionCreated,
+    UserMessage,
     RunStarted,
     RunParked,
     RunFinished,
@@ -107,6 +117,7 @@ impl MatchEvent {
     fn as_str(self) -> &'static str {
         match self {
             Self::SessionCreated => "session_created",
+            Self::UserMessage => "user_message",
             Self::RunStarted => "run_started",
             Self::RunParked => "run_parked",
             Self::RunFinished => "run_finished",
@@ -131,6 +142,10 @@ struct HookMatcher {
     outcome: Option<String>,
     #[serde(default)]
     parked_kind: Option<String>,
+    #[serde(default)]
+    mode: Option<DeliveryMode>,
+    #[serde(default)]
+    has_attachments: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -544,7 +559,7 @@ struct SubscriberHandle {
 }
 
 struct SubscriberMessage {
-    envelope: RawEnvelope,
+    input: Arc<[u8]>,
     delivered: oneshot::Sender<()>,
 }
 
@@ -793,6 +808,7 @@ async fn handle_committed(
     } else {
         None
     };
+    let mut prepared_input = None::<Result<Arc<[u8]>, String>>;
     for definition in discovery.hooks.into_values() {
         if !definition
             .matcher
@@ -836,9 +852,46 @@ async fn handle_committed(
             }
             continue;
         }
+        if prepared_input.is_none() {
+            prepared_input = Some(
+                prepare_hook_input(&service.inner.store, &envelope)
+                    .await
+                    .map(Arc::from),
+            );
+        }
+        let input = match prepared_input.as_ref() {
+            Some(Ok(input)) => Arc::clone(input),
+            Some(Err(reason)) => {
+                if !journal_notice_once(
+                    service,
+                    state,
+                    &envelope,
+                    HookNotice {
+                        hook: Some(definition.name.clone()),
+                        digest: Some(definition.digest.clone()),
+                        source: definition.source_path.display().to_string(),
+                        reason: reason.clone(),
+                    },
+                )
+                .await
+                {
+                    return false;
+                }
+                continue;
+            }
+            None => continue,
+        };
         match definition.kind {
             HookKind::Exec => {
-                if !fire_exec(service.clone(), definition, envelope.clone(), run_override).await {
+                if !fire_exec(
+                    service.clone(),
+                    definition,
+                    envelope.clone(),
+                    &input,
+                    run_override,
+                )
+                .await
+                {
                     return false;
                 }
             }
@@ -857,6 +910,7 @@ async fn handle_committed(
                     jobs,
                     definition,
                     envelope.clone(),
+                    input,
                     run_scope,
                 )
                 .await
@@ -880,6 +934,7 @@ async fn deliver_subscriber(
     jobs: &mut JoinSet<()>,
     definition: HookDefinition,
     envelope: RawEnvelope,
+    input: Arc<[u8]>,
     run_scope: Option<(SessionId, RunId)>,
 ) -> bool {
     let definition_key = definition.subscriber_key();
@@ -890,7 +945,7 @@ async fn deliver_subscriber(
         None => format!("{definition_key}\0profile"),
     };
     let mut message = SubscriberMessage {
-        envelope: envelope.clone(),
+        input,
         delivered: oneshot::channel().0,
     };
     loop {
@@ -1018,6 +1073,8 @@ struct MatchFacts {
     outcome: Option<&'static str>,
     parked_kind: Option<&'static str>,
     provider: Option<String>,
+    mode: Option<DeliveryMode>,
+    has_attachments: Option<bool>,
 }
 
 fn classify(envelope: &RawEnvelope) -> Option<MatchFacts> {
@@ -1028,54 +1085,82 @@ fn classify(envelope: &RawEnvelope) -> Option<MatchFacts> {
                 outcome: None,
                 parked_kind: None,
                 provider: None,
+                mode: None,
+                has_attachments: None,
+            },
+            EventPayload::UserMessage {
+                attachments, mode, ..
+            } => MatchFacts {
+                event: MatchEvent::UserMessage,
+                outcome: None,
+                parked_kind: None,
+                provider: None,
+                mode: Some(mode),
+                has_attachments: Some(!attachments.is_empty()),
             },
             EventPayload::RunState(RunState::Thinking) => MatchFacts {
                 event: MatchEvent::RunStarted,
                 outcome: None,
                 parked_kind: None,
                 provider: None,
+                mode: None,
+                has_attachments: None,
             },
             EventPayload::RunState(RunState::PermissionRequired { .. }) => MatchFacts {
                 event: MatchEvent::RunParked,
                 outcome: None,
                 parked_kind: Some("permission"),
                 provider: None,
+                mode: None,
+                has_attachments: None,
             },
             EventPayload::RunState(RunState::InputRequired { .. }) => MatchFacts {
                 event: MatchEvent::RunParked,
                 outcome: None,
                 parked_kind: Some("input"),
                 provider: None,
+                mode: None,
+                has_attachments: None,
             },
             EventPayload::RunState(RunState::Done) => MatchFacts {
                 event: MatchEvent::RunFinished,
                 outcome: Some("done"),
                 parked_kind: None,
                 provider: None,
+                mode: None,
+                has_attachments: None,
             },
             EventPayload::RunState(RunState::Errored) => MatchFacts {
                 event: MatchEvent::RunFinished,
                 outcome: Some("errored"),
                 parked_kind: None,
                 provider: None,
+                mode: None,
+                has_attachments: None,
             },
             EventPayload::RunState(RunState::Cancelled) => MatchFacts {
                 event: MatchEvent::RunFinished,
                 outcome: Some("cancelled"),
                 parked_kind: None,
                 provider: None,
+                mode: None,
+                has_attachments: None,
             },
             EventPayload::AgentSpawned(_) => MatchFacts {
                 event: MatchEvent::SubagentSpawned,
                 outcome: None,
                 parked_kind: None,
                 provider: None,
+                mode: None,
+                has_attachments: None,
             },
             EventPayload::AgentReport(_) => MatchFacts {
                 event: MatchEvent::SubagentReported,
                 outcome: None,
                 parked_kind: None,
                 provider: None,
+                mode: None,
+                has_attachments: None,
             },
             EventPayload::Item(ItemEvent::Completed {
                 item: TurnItem::ContextCompaction { .. },
@@ -1085,6 +1170,8 @@ fn classify(envelope: &RawEnvelope) -> Option<MatchFacts> {
                 outcome: None,
                 parked_kind: None,
                 provider: None,
+                mode: None,
+                has_attachments: None,
             },
             _ => return None,
         };
@@ -1096,12 +1183,16 @@ fn classify(envelope: &RawEnvelope) -> Option<MatchFacts> {
             outcome: None,
             parked_kind: None,
             provider: None,
+            mode: None,
+            has_attachments: None,
         }),
         HookEventPayload::AccountExpired { provider, .. } => Some(MatchFacts {
             event: MatchEvent::AccountExpired,
             outcome: None,
             parked_kind: None,
             provider: Some(provider),
+            mode: None,
+            has_attachments: None,
         }),
         _ => None,
     }
@@ -1127,13 +1218,91 @@ impl HookMatcher {
                 .parked_kind
                 .as_deref()
                 .is_none_or(|expected| facts.parked_kind == Some(expected))
+            && self
+                .mode
+                .is_none_or(|expected| facts.mode == Some(expected))
+            && self
+                .has_attachments
+                .is_none_or(|expected| facts.has_attachments == Some(expected))
     }
+}
+
+async fn prepare_hook_input(
+    store: &haider_core::SqliteStoreHandle,
+    envelope: &RawEnvelope,
+) -> Result<Vec<u8>, String> {
+    let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone()) else {
+        return serde_json::to_vec(envelope)
+            .map_err(|error| format!("hook event JSON serialization failed: {error}"));
+    };
+    let EventPayload::UserMessage {
+        text,
+        attachments,
+        mode,
+    } = payload
+    else {
+        return serde_json::to_vec(envelope)
+            .map_err(|error| format!("hook event JSON serialization failed: {error}"));
+    };
+    let run = envelope.run_id.clone().ok_or_else(|| {
+        "user_message hook input was skipped: committed fact has no run id".to_owned()
+    })?;
+    let (text, truncated) = bounded_user_message_text(&text);
+    let mut items = Vec::with_capacity(attachments.len());
+    for attachment in attachments {
+        let (artifact, mime) = match attachment {
+            haider_protocol::tool::AttachmentBlock::Image { artifact, mime, .. } => {
+                (artifact, mime)
+            }
+            haider_protocol::tool::AttachmentBlock::PastedText { artifact, .. } => {
+                (artifact, "text/plain".to_owned())
+            }
+            haider_protocol::tool::AttachmentBlock::Skill { name, .. } => {
+                return Err(format!(
+                    "user_message hook input was skipped: skill attachment `{name}` has no artifact metadata"
+                ));
+            }
+        };
+        let bytes = store.get(&artifact).await.map_err(|error| {
+            format!(
+                "user_message hook input was skipped: attachment {artifact} metadata is unavailable: {error:?}"
+            )
+        })?;
+        items.push(HookAttachmentMetadata {
+            mime,
+            bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            artifact,
+        });
+    }
+    let count = u32::try_from(items.len()).unwrap_or(u32::MAX);
+    serde_json::to_vec(&HookInput::UserMessage {
+        session: envelope.session_id.clone(),
+        run,
+        branch: envelope.branch_id.clone(),
+        mode,
+        text,
+        truncated,
+        attachments: HookAttachmentSet { count, items },
+    })
+    .map_err(|error| format!("user_message hook input serialization failed: {error}"))
+}
+
+fn bounded_user_message_text(text: &str) -> (String, bool) {
+    if text.len() <= MAX_USER_MESSAGE_TEXT_BYTES {
+        return (text.to_owned(), false);
+    }
+    let mut end = MAX_USER_MESSAGE_TEXT_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (text[..end].to_owned(), true)
 }
 
 async fn fire_exec(
     service: HookService,
     definition: HookDefinition,
     cause: RawEnvelope,
+    input: &[u8],
     run_override: bool,
 ) -> bool {
     if !definition_current(&service, &definition, run_override).await {
@@ -1149,16 +1318,9 @@ async fn fire_exec(
             )
             .await;
     }
-    let input = match serde_json::to_vec(&cause) {
-        Ok(input) => input,
-        Err(error) => {
-            tracing::warn!(target: "haider.hooks", ?error, "hook input serialization failed");
-            return false;
-        }
-    };
     let result = run_command(
         &definition,
-        &input,
+        input,
         &service.inner.store,
         service.inner.shutdown.subscribe(),
     )
@@ -1331,7 +1493,7 @@ fn strict_decision(result: &HookProcessResult) -> Option<HookDecisionKind> {
 }
 
 /// pub(crate) for the fire-time re-verification law tests.
-pub(crate) async fn definition_current(
+async fn definition_current(
     service: &HookService,
     definition: &HookDefinition,
     run_override: bool,
@@ -1642,7 +1804,7 @@ async fn run_subscriber(
             .await;
         let exit_code = loop {
             if let Some(message) = pending.take() {
-                if write_jsonl(stdin.as_mut(), &message.envelope).await.is_ok() {
+                if write_jsonl(stdin.as_mut(), &message.input).await.is_ok() {
                     let _ = message.delivered.send(());
                 } else {
                     pending = Some(message);
@@ -1654,7 +1816,7 @@ async fn run_subscriber(
                 status = child.wait() => break status.ok().and_then(|status| status.code()),
                 event = events.recv() => match event {
                     Some(message) => {
-                        if write_jsonl(stdin.as_mut(), &message.envelope).await.is_ok() {
+                        if write_jsonl(stdin.as_mut(), &message.input).await.is_ok() {
                             let _ = message.delivered.send(());
                         } else {
                             pending = Some(message);
@@ -1779,18 +1941,15 @@ fn spawn_subscriber(definition: &HookDefinition) -> Option<tokio::process::Child
 
 async fn write_jsonl(
     stdin: Option<&mut tokio::process::ChildStdin>,
-    envelope: &RawEnvelope,
+    input: &[u8],
 ) -> std::io::Result<()> {
     let stdin = stdin.ok_or_else(|| std::io::Error::other("subscriber stdin unavailable"))?;
-    let mut bytes = serde_json::to_vec(envelope).map_err(std::io::Error::other)?;
+    let mut bytes = input.to_vec();
     bytes.push(b'\n');
     stdin.write_all(&bytes).await
 }
 
-pub(crate) async fn discover_async(
-    cwd: PathBuf,
-    profile_root: PathBuf,
-) -> Result<Discovery, String> {
+async fn discover_async(cwd: PathBuf, profile_root: PathBuf) -> Result<Discovery, String> {
     tokio::task::spawn_blocking(move || discover(&cwd, &profile_root))
         .await
         .map_err(|error| format!("hook discovery task stopped: {error}"))?

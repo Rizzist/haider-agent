@@ -3,21 +3,23 @@
 use super::{
     CapturedBytes, HookDefinition, HookEngine, HookKind, HookMatcher, HookService, HookSource,
     HookTrustPolicy, MatchEvent, classify, discover, hook_digest, make_output,
-    next_subscriber_backoff, run_command,
+    next_subscriber_backoff, prepare_hook_input, run_command,
 };
 use crate::session_hub::{SessionHub, SessionHubConfig};
-use haider_core::{SessionCreateCommand, SqliteStoreHandle, StoreHandle};
+use haider_core::{SessionCreateCommand, SqliteStoreHandle, StoreHandle, TurnAcceptCommand};
+use haider_protocol::DeliveryMode;
 use haider_protocol::EventPayload;
 use haider_protocol::effect::{AuthorizationVerdict, EffectClass, EffectIntent, EffectPhase};
 use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
 };
 use haider_protocol::hook::{
-    HookEventPayload, HookRuntimeKind, HookSubscription, HookSubscriptionState,
+    HookEventPayload, HookInput, HookRuntimeKind, HookSubscription, HookSubscriptionState,
 };
-use haider_protocol::ids::{DeviceId, EffectId, EventId, MenuId, RunId, SessionId};
+use haider_protocol::ids::{ArtifactRef, DeviceId, EffectId, EventId, MenuId, RunId, SessionId};
 use haider_protocol::menu::{AnswerVia, DecisionKind, Menu, MenuKind, MenuOption, MenuScope};
 use haider_protocol::state::RunState;
+use haider_protocol::tool::AttachmentBlock;
 use haider_rpc::CommandId;
 use haider_tools::{EffectBroker, JournalSink, PermissionPolicy, ProcessExec, ToolResult};
 use std::path::{Path, PathBuf};
@@ -205,6 +207,10 @@ impl EngineFixture {
         Self::start_with_trust(command, timeout_ms, decision, kind, true).await
     }
 
+    async fn start_user_message(command: &str) -> Self {
+        Self::start_with_event_and_trust(command, 1_000, false, "exec", true, "user_message").await
+    }
+
     async fn start_untrusted(command: &str, timeout_ms: u64) -> Self {
         Self::start_with_trust(command, timeout_ms, false, "exec", false).await
     }
@@ -216,6 +222,22 @@ impl EngineFixture {
         kind: &str,
         trust: bool,
     ) -> Self {
+        let event = if decision {
+            "run_parked"
+        } else {
+            "run_started"
+        };
+        Self::start_with_event_and_trust(command, timeout_ms, decision, kind, trust, event).await
+    }
+
+    async fn start_with_event_and_trust(
+        command: &str,
+        timeout_ms: u64,
+        decision: bool,
+        kind: &str,
+        trust: bool,
+        event: &str,
+    ) -> Self {
         let workspace_guard = tempfile::tempdir().expect("workspace");
         let profile_guard = tempfile::tempdir().expect("profile");
         let workspace = canonical(workspace_guard.path());
@@ -224,11 +246,7 @@ impl EngineFixture {
         write_hook(
             &workspace,
             "test_hook",
-            if decision {
-                "run_parked"
-            } else {
-                "run_started"
-            },
+            event,
             command,
             timeout_ms,
             decision,
@@ -277,6 +295,45 @@ impl EngineFixture {
             session_id,
             run_id,
         }
+    }
+
+    async fn accept_user_message(
+        &self,
+        id: &str,
+        text: &str,
+        mode: DeliveryMode,
+        attachments: Vec<AttachmentBlock>,
+    ) {
+        let request_json = serde_json::json!({
+            "session_id": &self.session_id,
+            "worker_generation": self.store.worker_generation(),
+            "branch_id": serde_json::Value::Null,
+            "text": text,
+            "attachments": &attachments,
+            "mode": mode,
+        })
+        .to_string();
+        let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
+        self.hub
+            .accept_internal_turn(TurnAcceptCommand {
+                command_id: format!("{id}-command"),
+                request_digest,
+                request_json,
+                session_id: self.session_id.clone(),
+                worker_generation: self.store.worker_generation(),
+                run_id: self.run_id.clone(),
+                agent_id: None,
+                branch_id: None,
+                text: text.to_owned(),
+                attachments,
+                mode,
+                queued_event_id: EventId::new(format!("{id}-queued")),
+                user_event_id: EventId::new(format!("{id}-user")),
+                active_event_id: EventId::new(format!("{id}-active")),
+                device_id: DeviceId::new("hooks-test-device"),
+            })
+            .await
+            .expect("accept user message");
     }
 
     async fn append_permission(&self, menu: Menu) {
@@ -583,6 +640,8 @@ fn matcher_filters_use_fact_specific_provider_outcome_and_parked_kind() {
             provider: Some("openai".into()),
             outcome: None,
             parked_kind: None,
+            mode: None,
+            has_attachments: None,
         }
         .matches(&account, "different-session-provider", &account_facts)
     );
@@ -602,6 +661,8 @@ fn matcher_filters_use_fact_specific_provider_outcome_and_parked_kind() {
             provider: None,
             outcome: Some("errored".into()),
             parked_kind: None,
+            mode: None,
+            has_attachments: None,
         }
         .matches(&finished, "fake", &finished_facts)
     );
@@ -623,9 +684,330 @@ fn matcher_filters_use_fact_specific_provider_outcome_and_parked_kind() {
             provider: None,
             outcome: None,
             parked_kind: Some("input".into()),
+            mode: None,
+            has_attachments: None,
         }
         .matches(&parked, "fake", &parked_facts)
     );
+}
+
+/// MUTATION CHECK: dispatch from a surface callback, add surface identity to
+/// hook JSON, or bypass the committed UserMessage classifier. Expected
+/// RUNTIME failure: one marker is absent/duplicated or the two captured JSON
+/// byte strings differ.
+#[tokio::test]
+async fn committed_user_message_hook_projection_is_surface_neutral() {
+    let output = tempfile::tempdir().expect("hook output");
+    let headless_path = output.path().join("headless.json");
+    let rpc_path = output.path().join("rpc.json");
+    let headless_command = format!("cat > '{}'", headless_path.display());
+    let rpc_command = format!("cat > '{}'", rpc_path.display());
+
+    // These fixtures begin at the shared daemon acceptance seam. Surface
+    // clients have already converged before the canonical fact is committed.
+    let headless = EngineFixture::start_user_message(&headless_command).await;
+    headless
+        .accept_user_message(
+            "headless-user-message",
+            "surface-neutral text",
+            DeliveryMode::Queue,
+            vec![],
+        )
+        .await;
+    let headless_events = wait_for(&headless, |events| {
+        events.iter().any(|event| {
+            HookEventPayload::from_payload_value(event.payload.clone())
+                .is_ok_and(|payload| matches!(payload, HookEventPayload::HookFired(_)))
+        })
+    })
+    .await;
+    assert_eq!(
+        headless_events
+            .iter()
+            .filter(|event| {
+                HookEventPayload::from_payload_value(event.payload.clone())
+                    .is_ok_and(|payload| matches!(payload, HookEventPayload::HookFired(_)))
+            })
+            .count(),
+        1
+    );
+    headless.close().await;
+
+    let rpc = EngineFixture::start_user_message(&rpc_command).await;
+    rpc.accept_user_message(
+        "rpc-user-message",
+        "surface-neutral text",
+        DeliveryMode::Queue,
+        vec![],
+    )
+    .await;
+    let rpc_events = wait_for(&rpc, |events| {
+        events.iter().any(|event| {
+            HookEventPayload::from_payload_value(event.payload.clone())
+                .is_ok_and(|payload| matches!(payload, HookEventPayload::HookFired(_)))
+        })
+    })
+    .await;
+    assert_eq!(
+        rpc_events
+            .iter()
+            .filter(|event| {
+                HookEventPayload::from_payload_value(event.payload.clone())
+                    .is_ok_and(|payload| matches!(payload, HookEventPayload::HookFired(_)))
+            })
+            .count(),
+        1
+    );
+    rpc.close().await;
+
+    let headless_json = std::fs::read(&headless_path).expect("headless hook JSON");
+    let rpc_json = std::fs::read(&rpc_path).expect("RPC hook JSON");
+    assert_eq!(headless_json, rpc_json);
+    let value: serde_json::Value = serde_json::from_slice(&headless_json).expect("hook input");
+    assert_eq!(value["event"], "user_message");
+    assert!(value.get("surface").is_none());
+    assert!(value.get("client_kind").is_none());
+}
+
+/// MUTATION CHECK: raise/remove the text cap, truncate at an invalid UTF-8
+/// boundary, or derive the flag from the bounded output. Expected RUNTIME
+/// failure: the literal prefix/32768-byte boundary or either flag differs.
+#[tokio::test]
+async fn text_bounded_with_truncated_flag() {
+    let profile = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(profile.path())
+        .await
+        .expect("store");
+    let session_id = SessionId::new("bounded-session");
+    let run_id = RunId::new("bounded-run");
+    let text = format!("{}é", "x".repeat(32_767));
+    let oversized = raw_event(
+        &session_id,
+        &run_id,
+        store.worker_generation(),
+        "bounded-user",
+        EventPayload::UserMessage {
+            text,
+            attachments: vec![],
+            mode: DeliveryMode::Steer,
+        },
+    );
+    let input: HookInput = serde_json::from_slice(
+        &prepare_hook_input(&store, &oversized)
+            .await
+            .expect("bounded input"),
+    )
+    .expect("typed bounded input");
+    let HookInput::UserMessage {
+        text, truncated, ..
+    } = input;
+    assert_eq!(text, "x".repeat(32_767));
+    assert!(truncated);
+    assert!(text.len() <= 32_768);
+
+    let exact = raw_event(
+        &session_id,
+        &run_id,
+        store.worker_generation(),
+        "exact-user",
+        EventPayload::UserMessage {
+            text: "y".repeat(32_768),
+            attachments: vec![],
+            mode: DeliveryMode::Steer,
+        },
+    );
+    let input: HookInput = serde_json::from_slice(
+        &prepare_hook_input(&store, &exact)
+            .await
+            .expect("exact input"),
+    )
+    .expect("typed exact input");
+    let HookInput::UserMessage {
+        text, truncated, ..
+    } = input;
+    assert_eq!(text.len(), 32_768);
+    assert!(!truncated);
+    store.close().await.expect("store close");
+}
+
+/// MUTATION CHECK: serialize AttachmentBlock/resolved CAS contents, omit byte
+/// lengths, or label pasted text with image MIME. Expected RUNTIME failure:
+/// the exact metadata/count drifts or the planted content appears in JSON.
+#[tokio::test]
+async fn attachment_metadata_never_carries_bytes() {
+    let profile = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(profile.path())
+        .await
+        .expect("store");
+    let image_bytes = b"ATTACHMENT_BYTES_MUST_NEVER_APPEAR";
+    let text_bytes = b"pasted text body must stay in CAS";
+    let image_artifact = store
+        .put(image_bytes.to_vec())
+        .await
+        .expect("image artifact");
+    let text_artifact = store.put(text_bytes.to_vec()).await.expect("text artifact");
+    let event = raw_event(
+        &SessionId::new("attachment-session"),
+        &RunId::new("attachment-run"),
+        store.worker_generation(),
+        "attachment-user",
+        EventPayload::UserMessage {
+            text: "inspect metadata only".into(),
+            attachments: vec![
+                AttachmentBlock::Image {
+                    artifact: image_artifact.clone(),
+                    mime: "image/png".into(),
+                    width: Some(640),
+                    height: Some(480),
+                },
+                AttachmentBlock::PastedText {
+                    artifact: text_artifact.clone(),
+                    lines: 3,
+                },
+            ],
+            mode: DeliveryMode::Queue,
+        },
+    );
+    let bytes = prepare_hook_input(&store, &event)
+        .await
+        .expect("metadata-only input");
+    let input: HookInput = serde_json::from_slice(&bytes).expect("typed hook input");
+    let HookInput::UserMessage { attachments, .. } = &input;
+    assert_eq!(attachments.count, 2);
+    assert_eq!(attachments.items[0].mime, "image/png");
+    assert_eq!(attachments.items[0].bytes, image_bytes.len() as u64);
+    assert_eq!(attachments.items[0].artifact, image_artifact);
+    assert_eq!(attachments.items[1].mime, "text/plain");
+    assert_eq!(attachments.items[1].bytes, text_bytes.len() as u64);
+    assert_eq!(attachments.items[1].artifact, text_artifact);
+
+    let value = serde_json::to_value(input).expect("hook input value");
+    for item in value["attachments"]["items"]
+        .as_array()
+        .expect("attachment items")
+    {
+        let object = item.as_object().expect("metadata object");
+        assert_eq!(object.len(), 3);
+        assert!(object.contains_key("mime"));
+        assert!(object.contains_key("bytes"));
+        assert!(object.contains_key("artifact"));
+    }
+    let json = String::from_utf8(bytes).expect("UTF-8 hook JSON");
+    assert!(!json.contains("ATTACHMENT_BYTES_MUST_NEVER_APPEAR"));
+    assert!(!json.contains("pasted text body must stay in CAS"));
+    assert!(!json.contains("data_base64"));
+    assert!(!json.contains("content"));
+    store.close().await.expect("store close");
+}
+
+/// MUTATION CHECK: ignore mode/attachment filters, invert attachment presence,
+/// or apply them to non-user facts. Expected RUNTIME failure: one literal
+/// queue/steer or attached/unattached match changes truth value.
+#[test]
+fn matcher_filters_respected() {
+    let session_id = SessionId::new("filter-session");
+    let run_id = RunId::new("filter-run");
+    let attached_queue = raw_event(
+        &session_id,
+        &run_id,
+        1,
+        "attached-queue",
+        EventPayload::UserMessage {
+            text: "queued image".into(),
+            attachments: vec![AttachmentBlock::Image {
+                artifact: ArtifactRef::new("blake3:filter-image"),
+                mime: "image/png".into(),
+                width: None,
+                height: None,
+            }],
+            mode: DeliveryMode::Queue,
+        },
+    );
+    let attached_facts = classify(&attached_queue).expect("attached facts");
+    let matcher = |mode, has_attachments| HookMatcher {
+        event: MatchEvent::UserMessage,
+        session: None,
+        provider: None,
+        outcome: None,
+        parked_kind: None,
+        mode,
+        has_attachments,
+    };
+    assert!(matcher(Some(DeliveryMode::Queue), Some(true)).matches(
+        &attached_queue,
+        "fake",
+        &attached_facts
+    ));
+    assert!(!matcher(Some(DeliveryMode::Steer), Some(true)).matches(
+        &attached_queue,
+        "fake",
+        &attached_facts
+    ));
+    assert!(!matcher(Some(DeliveryMode::Queue), Some(false)).matches(
+        &attached_queue,
+        "fake",
+        &attached_facts
+    ));
+
+    let empty_steer = raw_event(
+        &session_id,
+        &run_id,
+        1,
+        "empty-steer",
+        EventPayload::UserMessage {
+            text: "steer text".into(),
+            attachments: vec![],
+            mode: DeliveryMode::Steer,
+        },
+    );
+    let empty_facts = classify(&empty_steer).expect("empty facts");
+    assert!(matcher(Some(DeliveryMode::Steer), Some(false)).matches(
+        &empty_steer,
+        "fake",
+        &empty_facts
+    ));
+    let thinking = raw_event(
+        &session_id,
+        &run_id,
+        1,
+        "thinking",
+        EventPayload::RunState(RunState::Thinking),
+    );
+    let thinking_facts = classify(&thinking).expect("thinking facts");
+    let wrong_event = HookMatcher {
+        event: MatchEvent::RunStarted,
+        session: None,
+        provider: None,
+        outcome: None,
+        parked_kind: None,
+        mode: Some(DeliveryMode::Steer),
+        has_attachments: Some(false),
+    };
+    assert!(!wrong_event.matches(&thinking, "fake", &thinking_facts));
+}
+
+/// MUTATION CHECK: accept malformed mode/attachment filters permissively or
+/// fail discovery as a whole. Expected RUNTIME failure: either invalid hook is
+/// executable or its name lacks an honest malformed-entry notice.
+#[test]
+fn malformed_user_message_filters_are_skipped_honestly() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let profile = tempfile::tempdir().expect("profile");
+    write_profile_policy(profile.path(), "per_digest");
+    std::fs::write(
+        workspace.path().join("hooks.json"),
+        r#"{"schema":"haider.hooks.v1","hooks":{"bad_mode":{"matcher":{"event":"user_message","mode":"interrupt"},"kind":"exec","command":"printf forbidden"},"bad_attachments":{"matcher":{"event":"user_message","has_attachments":"yes"},"kind":"exec","command":"printf forbidden"}}}"#,
+    )
+    .expect("malformed filters");
+    let discovery =
+        discover(&canonical(workspace.path()), &canonical(profile.path())).expect("discovery");
+    assert!(discovery.hooks.is_empty());
+    for name in ["bad_mode", "bad_attachments"] {
+        assert!(discovery.notices.iter().any(|notice| {
+            notice.hook.as_deref() == Some(name)
+                && notice.reason.contains("hook entry is malformed")
+        }));
+    }
 }
 
 /// MUTATION CHECK: resolve `allow` to an always-grant or bypass the menu CAS.
@@ -1207,6 +1589,8 @@ fn standalone_definition(workspace: &Path, command: String) -> HookDefinition {
             provider: None,
             outcome: None,
             parked_kind: None,
+            mode: None,
+            has_attachments: None,
         },
         kind: HookKind::Exec,
         command,

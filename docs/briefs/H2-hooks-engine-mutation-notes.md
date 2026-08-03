@@ -22,6 +22,22 @@ backoff values rather than re-reading the production constants they pin.
 | Put hook facts in closed `EventPayload` or rename their additive discriminants. | Protocol `hook_fired` golden and unknown-kind tolerance test | Exact JSON drifts or an older typed reducer no longer ignores the raw additive payload while `RawEnvelope` still round-trips it. |
 | Apply trust/revoke outside the R2 receipt transaction, reuse a command id with changed coordinates, or share the management revision. | `haider-store/tests/hook_trust_tests.rs` | Replay/order diverges, changed coordinates are accepted, or the unrelated management revision advances. |
 | Make `--trust-hooks` profile-global, append it after acceptance, emit it for ordinary runs, or change ordinary turn wire bytes. | Store atomic run-trust test, client `headless_submit_body` test, required-feature test, and RPC exact-shape test | The acceptance batch lacks the correlated run fact, ordinary submission gains one, the client chooses the wrong variant, or the feature/method set changes. |
+| Dispatch `user_message` from a surface callback, add surface/client identity, or emit more than once per committed fact. | `haider-daemond/tests/user_message_hook_tests.rs::user_message_hook_fires_for_headless_and_rpc_submissions_identically` and `hooks::tests::committed_user_message_hook_projection_is_surface_neutral` | Either the production headless/direct-RPC session has other than one HookFired fact, normalized captured JSON differs, or the post-acceptance projection bytes diverge at RUNTIME. |
+| Remove/raise the 32768-byte bound, cut through UTF-8, or compute `truncated` from the retained prefix. | `hooks::tests::text_bounded_with_truncated_flag` | The multibyte fixture is not the exact 32767-byte valid prefix with `truncated:true`, or the exact 32768-byte fixture is incorrectly marked truncated. |
+| Serialize `AttachmentBlock` or resolved CAS contents, omit count/length/digest, or expose a pasted-text body. | `hooks::tests::attachment_metadata_never_carries_bytes` and protocol `golden_user_message_hook_event_projection` | The planted sentinel appears in hook JSON, a metadata object gains any key beyond mime/bytes/artifact, exact counts/lengths drift, or the additive golden changes. |
+| Ignore/invert `mode` or `has_attachments`, apply them to unrelated facts, or decode invalid values permissively. | `hooks::tests::matcher_filters_respected` and `malformed_user_message_filters_are_skipped_honestly` | A literal queue/steer or attached/unattached match flips, a run-start fact passes user-only filters, or either malformed named hook becomes discoverable without its honest notice. |
+
+## User-message matcher mutations executed (2026-08-03)
+
+Each production mutation below was applied alone, its named observer was run,
+and the production code was restored before the next mutation.
+
+| Executed production mutation | Observed RUNTIME failure |
+|---|---|
+| Replaced the sanitized `HookInput::UserMessage` projection with the raw committed envelope. | `committed_user_message_hook_projection_is_surface_neutral` failed its byte-equality assertion: the two inputs exposed distinct acceptance event ids and commit timestamps. The black-box headless/direct-RPC law exercises the same projection through both production clients. |
+| Raised the text bound from 32 KiB to 64 KiB. | `text_bounded_with_truncated_flag` retained the oversized multibyte input instead of the literal 32767-byte valid prefix and failed at RUNTIME. |
+| Replaced each attachment byte length with zero. | `attachment_metadata_never_carries_bytes` observed `0` instead of the planted image artifact's literal `34` bytes. |
+| Removed the `mode` predicate from `HookMatcher::matches`. | `matcher_filters_respected` allowed a `steer` matcher to accept the committed `queue` fact and failed its negative assertion. |
 
 The isolated secret fixture re-executes only its named test with
 `HAIDER_HOOK_VAULT_SENTINEL` planted in the parent environment. This avoids a
