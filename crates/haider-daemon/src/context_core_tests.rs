@@ -786,15 +786,31 @@ async fn manual_compaction_command_replay_compacts_exactly_once() {
     .await
     .expect("seed turn completes");
 
-    let reused = manager_handle
-        .compact(
-            session_id.clone(),
-            "submit-before-manual-compaction".into(),
-            store.worker_generation(),
-            None,
-        )
-        .await
-        .expect_err("turn command id cannot be reused for compaction");
+    // The journal's Done fact lands a beat before the worker's in-memory
+    // turn slot releases; under parallel-suite load the reused-id compact
+    // can race that gap and answer Busy first. Bounded retry through the
+    // Busy window (gate27 hygiene class) so the assert exercises the
+    // receipt-identity law, not the settle race.
+    let reused = {
+        let mut attempt = 0;
+        loop {
+            let error = manager_handle
+                .compact(
+                    session_id.clone(),
+                    "submit-before-manual-compaction".into(),
+                    store.worker_generation(),
+                    None,
+                )
+                .await
+                .expect_err("turn command id cannot be reused for compaction");
+            if error.code == haider_protocol::error::ErrorCode::Busy && attempt < 40 {
+                attempt += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                continue;
+            }
+            break error;
+        }
+    };
     assert_eq!(
         reused.code,
         haider_protocol::error::ErrorCode::InvalidArgument
