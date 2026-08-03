@@ -23,6 +23,41 @@ system (system default · `/theme` picker · profile-dir persistence).
 | `hydrate` applies the demo file's theme again (the pre-wave behavior). | `tui4c_persistence_tests::guarded_singles_restore_theme_vfs_dir_and_voice` | "hydrate surfaces the legacy theme, never applies it" fails with `left: Desert` — the profile-dir settings file is the one theme-persistence authority. |
 | The launcher shed ladder drops the three header-shed rungs (the band stops yielding). | `tui6_softwrap_tests::reserved_rule_sweeps_launcher` | The 90×4 floor pin fails: "optional content renders but the TOP rule is missing" — the band triple (top rule · composer · closing rule) must outlive the whole header. |
 
+## ui-themes-fix (post-v0.0.60 live probe)
+
+The installed v0.0.60 probe found bare `/theme` + ⏎ at the LAUNCHER never
+opened the picker. Root cause: the palette's exact-match LEAD JUMP put the
+arg rows under ⏎, so enter ran the highlighted `system` row on every
+surface — the picker only opened on the esc-dismissed path the original
+law drove (a masked observer). A second gap rode with it: the persistence
+watch keyed on a choice DIFF, so committing the boot-default choice wrote
+no settings file. Both fixed on `ui-themes-fix`; mutations EXECUTED
+2026-08-03 against the committed fix:
+
+| Production mutation | Runtime observer | Expected RUNTIME failure |
+|---|---|---|
+| `open_theme_picker`'s surface gate drops `Screen::Launcher` (the launcher reverts to the by-name flash). | `theme_picker_opens_on_every_composer_surface` | "launcher: /theme + ⏎ must open the picker" — the law drives the NATURAL typed flow (no palette dismissal) and asserts the rendered ROWS, so a flash-only launcher cannot pass. |
+| `/theme` rejoins `has_arg_slots` (the exact-match lead jump returns). | `theme_picker_opens_on_every_composer_surface` | The same launcher assertion fails — ⏎ lands on the highlighted `system` ARG row again (the probe's exact regression) instead of running bare `/theme`. |
+| `commit_theme_choice` stops bumping `theme_commits`. | `theme_commit_persists_from_the_launcher_flow` | "a commit that re-affirms the boot default still persists" fails with `left: None` — the diff-keyed blindness the probe hit, now unrepresentable while the counter law holds. |
+
+Fix-wave structural notes:
+
+- One dispatch authority, no copies: every surface reaches the picker
+  through the same `execute_slash` → `open_theme_picker` path; the fix
+  extended the SURFACE GATES (open/keys/render) to aura and subagent
+  rather than adding a second dispatch. Screens without a composer
+  (tree/tools/hooks/accounts/providers) cannot type `/theme` at all.
+- ⏎ and TAB deliberately split predicates: `has_arg_slots` (⏎ enters the
+  slot) lost `theme`; the new `offers_arg_completions` (TAB opens the
+  slot) kept it — so `/theme li<tab>` completion survives while ⏎ opens
+  the picker.
+- Process note: the first mutation run of this fix wave was executed
+  against UNCOMMITTED sources and the `git checkout` reverts destroyed
+  two files of the fix (redone from scratch). The commit-before-mutation
+  law exists for exactly this; this wave re-learned it the hard way and
+  all tabled observations above were re-executed against the committed
+  tree.
+
 Structural notes (not mutations):
 
 - The `/theme` picker is MODEL-LOCAL overlay state (`AppModel::theme_picker`),
