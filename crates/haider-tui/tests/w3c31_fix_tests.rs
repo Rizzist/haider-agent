@@ -46,6 +46,8 @@ fn summary(n: usize, head_seq: u64) -> SessionSummary {
         head_seq,
         worker_generation: 7,
         metadata: None,
+        turn_count: None,
+        latest_context_footprint: None,
     }
 }
 

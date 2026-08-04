@@ -618,7 +618,22 @@ fn render_launcher(
     // ---- The content column: TOP-ALIGNED under the band (the session
     // surface's reading order), one breathing row first. The shared-column
     // trick survives: every row pads to the widest so hover bands span the
-    // block; the block hugs the band's left edge instead of centering.
+    // block. HORIZONTALLY the LAUNCHER_COLS-capped block CENTERS in the
+    // frame (owner screenshot — the settled launcher left-anchored a
+    // ~70-col block in a wide terminal): the pad derives from the CAP, not
+    // the built rows, so the block's left edge is stable across frames (a
+    // shellout appearing never makes the block jump), and at widths ≤ the
+    // cap the pad is zero — exactly the old left-anchored geometry. The
+    // header band above and the composer band below stay full-width.
+    let center_pad =
+        u16::try_from((area.width as usize).saturating_sub(LAUNCHER_COLS) / 2).unwrap_or(0);
+    // ONE rect for paint AND hits — shifting only one of them is the
+    // W5g-7 hover-offset class of bug, horizontal edition.
+    let content_area = Rect {
+        x: content_area.x.saturating_add(center_pad),
+        width: content_area.width.saturating_sub(center_pad),
+        ..content_area
+    };
     let mut lines: Vec<Line<'_>> = vec![Line::default()];
     // Sim `.recent { width: min(560px, 92%) }` (tui.js:4331-4334) at 12.5px
     // mono ≈ 7.5px/cell → ~74 cells. Capped at LAUNCHER_COLS so a wide
@@ -708,6 +723,13 @@ fn render_launcher(
             spans.push(Span::styled("  errored ·", theme.warn_style()));
         }
         let turns = entry.turns();
+        // Launcher fix 2: the row's figures ask the SESSION (turns /
+        // row_tokens), which prefers a fresher `session.list` summary over
+        // an empty projection — real counts at boot, no attach — and the
+        // live/checked-in values whenever the projection has applied at
+        // least as far. An Estimated footprint wears the meter's honest
+        // `~` prefix.
+        let (tokens, tokens_estimated) = entry.row_tokens();
         // Sim renders the blurb segment only when a blurb exists
         // (tui.js:3267 `s.blurb ? … : null`).
         let blurb = entry
@@ -716,7 +738,7 @@ fn render_launcher(
             .map(|title| format!(" “{title}” ·"))
             .unwrap_or_default();
         let meta = format!(
-            "{blurb} {} · {} {} · {} tok · {} · {} · {}",
+            "{blurb} {} · {} {} · {}{} tok · {} · {} · {}",
             // DERIVED (B2b): the seed static plus daemon-installed named
             // branches — the launcher aggregate counts all branches.
             if entry.branches() > 1 {
@@ -726,7 +748,8 @@ fn render_launcher(
             },
             turns,
             if turns == 1 { "turn" } else { "turns" },
-            fmt_tok(entry.projection.context_tokens()),
+            if tokens_estimated { "~" } else { "" },
+            fmt_tok(tokens),
             entry.model_short,
             entry.device,
             entry.ago
@@ -838,8 +861,9 @@ fn render_launcher(
     // Top-aligned under the band: rows render from the header rule down
     // and CLIP at the bottom under pressure (the shed ladder already gave
     // the content column up first; the composer band below stays sacred).
-    // No centering, no compaction — a hit row IS its painted row (the
-    // W5g-7 hover-offset class of bug is unrepresentable here).
+    // No VERTICAL centering, no compaction — a hit row IS its painted row
+    // (the W5g-7 hover-offset class of bug is unrepresentable here), and
+    // the horizontal center pad above moved paint and hits as ONE rect.
     frame.render_widget(
         Paragraph::new(Text::from(lines)).style(theme.text_style()),
         content_area,

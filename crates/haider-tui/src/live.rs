@@ -1158,6 +1158,10 @@ impl LiveDriver {
             } => {
                 for summary in sessions {
                     model.upsert_live_session(&summary.session_id);
+                    // Launcher fix 2: the additive turn/footprint fields
+                    // hydrate the row's counts at list time — tolerantly
+                    // (an older daemon's summary stores nothing).
+                    model.note_summary_counts(&summary);
                     self.generations
                         .insert(summary.session_id.clone(), summary.worker_generation);
                     if !self.attachments.contains_key(&summary.session_id) {

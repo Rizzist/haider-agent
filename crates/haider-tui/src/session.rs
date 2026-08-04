@@ -85,6 +85,29 @@ pub struct SessionState {
     /// rows, so a row displays `offset + live user rows` and seeds keep
     /// their sim metas while real turns still move the number.
     pub turns_offset: u32,
+    /// Roster hydration from a `session.list` summary (the additive daemon
+    /// fields): real turns/tokens on the row WITHOUT attaching. `None`
+    /// until a summary carrying at least one counted field arrives — an
+    /// older daemon never sets it and the row degrades to its
+    /// projection-derived display (never a fabricated count).
+    pub summary_counts: Option<SummaryCounts>,
+}
+
+/// The additive `session.list` counts one roster row holds (launcher fix 2
+/// — "0 turns · 0 tok until open+back"). `head_seq` is the freshness key
+/// against the projection's applied cursor: a projection that has applied
+/// AT LEAST this far holds live truth and outranks the summary
+/// (checkout/checkin values beat stale summaries); a summary strictly
+/// ahead of everything applied wins the row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SummaryCounts {
+    /// The committed head the summary was taken at.
+    pub head_seq: u64,
+    /// Committed user-turn count, when the daemon sent one.
+    pub turns: Option<u64>,
+    /// Latest durable context snapshot, when the daemon sent one — its
+    /// `truth` field is the exact/estimated honesty flag.
+    pub footprint: Option<haider_protocol::context::ContextFootprint>,
 }
 
 impl SessionState {
@@ -115,7 +138,22 @@ impl SessionState {
             ago: String::new(),
             branches_offset: 1,
             turns_offset: 0,
+            summary_counts: None,
         }
+    }
+
+    /// True when the stored summary is FRESHER than everything this row's
+    /// projection has applied — the only state in which summary counts may
+    /// outrank checkout/checkin truth. An attach replays through the
+    /// listed head, so the moment a session has been opened (or a
+    /// background attachment has caught up) the projection's cursor
+    /// reaches `head_seq` and the live values win again.
+    fn summary_is_fresher(&self) -> bool {
+        self.summary_counts.as_ref().is_some_and(|counts| {
+            self.projection
+                .last_applied()
+                .is_none_or(|applied| counts.head_seq > applied)
+        })
     }
 
     /// Live subagents in this session's tree (sim `sessionLive`,
@@ -158,10 +196,43 @@ impl SessionState {
     }
 
     /// Turns shown on the launcher row (sim: user entries of the active
-    /// branch, tui.js:3248).
+    /// branch, tui.js:3248). A FRESHER `session.list` summary that carried
+    /// a turn count wins the figure (real turns at boot, no attach);
+    /// otherwise — no summary, an older daemon's summary without the
+    /// field, or a projection that has applied at least as far — the
+    /// projection-derived count exactly as before the additive fields.
     #[must_use]
     pub fn turns(&self) -> u32 {
+        if self.summary_is_fresher()
+            && let Some(turns) = self.summary_counts.as_ref().and_then(|counts| counts.turns)
+        {
+            return u32::try_from(turns).unwrap_or(u32::MAX);
+        }
         self.turns_offset + self.projection.user_row_count()
+    }
+
+    /// The launcher row's token figure and its honesty marker:
+    /// `(tokens, estimated)`. A FRESHER summary's footprint wins —
+    /// `used_tokens`, flagged when the daemon marked the snapshot
+    /// Estimated (the renderer's `~` prefix); otherwise the projection's
+    /// cumulative context tokens, exactly as before the additive fields.
+    #[must_use]
+    pub fn row_tokens(&self) -> (u64, bool) {
+        if self.summary_is_fresher()
+            && let Some(footprint) = self
+                .summary_counts
+                .as_ref()
+                .and_then(|counts| counts.footprint.as_ref())
+        {
+            return (
+                footprint.used_tokens,
+                matches!(
+                    footprint.truth,
+                    haider_protocol::context::ContextFootprintTruth::Estimated
+                ),
+            );
+        }
+        (self.projection.context_tokens(), false)
     }
 
     /// Route one RAW envelope into this (non-attached) session — the

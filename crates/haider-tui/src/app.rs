@@ -7068,6 +7068,42 @@ impl AppModel {
         ui_gen
     }
 
+    /// Hydrate one roster row's counts from a `session.list` summary
+    /// (launcher fix 2 — the additive daemon fields). Tolerant by law:
+    ///
+    /// * BOTH fields absent (an older daemon) → store nothing — the row
+    ///   keeps whatever it already shows (its projection-derived display,
+    ///   or an earlier value-carrying summary), never a fabricated count;
+    /// * a summary at or behind one already stored never replaces it;
+    /// * freshness against live/checked-in values is judged at READ time
+    ///   ([`crate::session::SessionState::turns`] / `row_tokens`), so a
+    ///   checkin AFTER this call still beats a stale summary.
+    pub fn note_summary_counts(&mut self, summary: &haider_rpc::SessionSummary) {
+        if summary.turn_count.is_none() && summary.latest_context_footprint.is_none() {
+            return;
+        }
+        let Some(entry) = self
+            .sessions
+            .iter_mut()
+            .find(|row| row.id == summary.session_id)
+        else {
+            return;
+        };
+        if entry
+            .summary_counts
+            .as_ref()
+            .is_some_and(|held| held.head_seq >= summary.head_seq)
+        {
+            return;
+        }
+        entry.summary_counts = Some(crate::session::SummaryCounts {
+            head_seq: summary.head_seq,
+            turns: summary.turn_count,
+            footprint: summary.latest_context_footprint.clone(),
+        });
+        self.dirty = true;
+    }
+
     /// Seed a session's cursor with the sequence its attach asked FROM, so
     /// the strict gap law covers the FIRST delivered envelope too (W3c3.1,
     /// review P1-1).

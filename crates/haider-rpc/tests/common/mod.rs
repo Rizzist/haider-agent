@@ -131,6 +131,8 @@ pub fn transcript() -> Vec<WireFrame> {
                     head_seq: 9,
                     worker_generation: 7,
                     metadata: None,
+                    turn_count: None,
+                    latest_context_footprint: None,
                 }],
                 next_cursor: Some("cursor-after-session-1".into()),
             },

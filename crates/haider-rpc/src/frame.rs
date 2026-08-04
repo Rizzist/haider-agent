@@ -709,6 +709,17 @@ pub struct SessionSummary {
     /// readers must not infer anything from its absence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<SessionMetadataV1>,
+    /// Additive roster-hydration field (UI launcher fix 2): committed
+    /// user-turn count at `head_seq`. `None` when an older daemon omits the
+    /// field — readers degrade to their pre-field behavior, never fabricate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_count: Option<u64>,
+    /// Additive roster-hydration field: latest durable request-local context
+    /// snapshot at or before `head_seq` — the same shape and absence
+    /// semantics as [`SessionReadResult::latest_context_footprint`]. Its
+    /// `truth` field carries the exact/estimated flag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_context_footprint: Option<ContextFootprint>,
 }
 
 /// Result of a non-subscribing session read.

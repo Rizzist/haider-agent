@@ -2939,6 +2939,12 @@ impl HubConnection {
                 head_seq: self.hub.inner.store.latest_seq(session_id).await?,
                 worker_generation: self.hub.inner.store.worker_generation(),
                 metadata: self.hub.inner.store.session_metadata(session_id).await?,
+                // Additive roster-hydration fields: POPULATION is the
+                // summary-fields daemon lane's work — until it lands this
+                // daemon honestly omits them (the TUI degrades to its
+                // pre-field display, never a fabricated count).
+                turn_count: None,
+                latest_context_footprint: None,
             });
         }
         let next_cursor = has_more

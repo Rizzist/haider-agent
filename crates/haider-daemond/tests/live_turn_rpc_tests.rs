@@ -4139,6 +4139,8 @@ async fn scenario_2_real_uds_creates_attaches_and_replays_typed_session() {
             head_seq: 1,
             worker_generation: created.worker_generation,
             metadata: Some(metadata.clone()),
+            turn_count: None,
+            latest_context_footprint: None,
         }
     );
 
