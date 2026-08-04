@@ -208,7 +208,19 @@ impl SessionState {
                             envelope.branch_id.as_ref(),
                             envelope.agent_id.as_ref(),
                         ),
-                        Err(_) => self.projection.count_unknown_payload(),
+                        // S3: the additive agent-event union rides raw
+                        // envelopes OUTSIDE `EventPayload` — try it before
+                        // counting the payload unknown (both twins).
+                        Err(_) => {
+                            if !route_agent_event(
+                                &mut self.branch_state,
+                                &mut self.projection,
+                                &self.chips,
+                                envelope,
+                            ) {
+                                self.projection.count_unknown_payload();
+                            }
+                        }
                     }
                 }
                 RawOutcome::Applied
@@ -280,7 +292,7 @@ impl SessionState {
             Destination::Agent => apply_agent_payload(&mut self.chips, payload),
             Destination::Chip(target) => {
                 if let Some(chip) = crate::app::find_chip_mut(&mut self.chips, &target) {
-                    chip.transcript.apply(payload);
+                    chip_apply(chip, payload);
                 }
             }
             Destination::Session => self.absorb_envelope(payload),
@@ -422,6 +434,76 @@ pub fn apply_agent_payload(chips: &mut Vec<ChipModel>, payload: &EventPayload) {
         }
         _ => {}
     }
+}
+
+/// Apply one agent-scoped payload to a chip transcript — the
+/// `Destination::Chip` arm all three routes share (attached, background,
+/// parked view), so the decision can never drift.
+///
+/// S3: a `UserMessage` that reached a chip through the PARENT session's
+/// stream is parent-authored by construction — the daemon's child-prompt
+/// projection (the spawn prompt, `message_subagent` steers, and
+/// chip-composer sends alike) is the only writer of agent-scoped user
+/// rows — so the row wears the `→ · from main` marking instead of a plain
+/// user row. The demo driver's `ChipEmit` beats apply straight to the
+/// chip projection and stay plain: the sim fabricates locally and must
+/// not dress its rows as parent-stream truth.
+pub fn chip_apply(chip: &mut ChipModel, payload: &EventPayload) {
+    if let EventPayload::UserMessage {
+        text, attachments, ..
+    } = payload
+    {
+        chip.transcript
+            .push_user_from_main(text.clone(), attachments.len());
+    } else {
+        chip.transcript.apply(payload);
+    }
+}
+
+/// Route one admitted envelope whose payload sits OUTSIDE the
+/// `EventPayload` union (S3): the additive `AgentEventPayload` kinds ride
+/// raw envelopes so exhaustive consumers stay source-compatible, and this
+/// hook is the raw-envelope reader `haider_protocol::agent` promises.
+/// Shared by the attached and background twins. Returns `false` when the
+/// payload is no agent event either — the caller counts it unknown,
+/// exactly as before.
+///
+/// `AgentMessaged` becomes a parent-timeline note on the branch the
+/// envelope names — the active surfaces, a parked view, or the orphan
+/// counter. It is never guessed into another branch's transcript, and the
+/// callsign comes from the OWNING branch's chips (an unknown agent keeps
+/// its opaque id — no fabricated names).
+pub fn route_agent_event(
+    branch_state: &mut crate::branch::BranchState,
+    projection: &mut SessionProjection,
+    chips: &[ChipModel],
+    envelope: &RawEnvelope,
+) -> bool {
+    use crate::branch::BranchScope;
+    let Some(fact) = haider_protocol::agent::AgentMessaged::from_payload_value(&envelope.payload)
+    else {
+        return false;
+    };
+    match branch_state.content_scope(envelope.branch_id.as_ref()) {
+        BranchScope::Active => projection.push_note(crate::app::messaged_note(chips, &fact)),
+        BranchScope::ParkedMain => {
+            if let Some(view) = branch_state.parked_main_mut() {
+                let note = crate::app::messaged_note(&view.chips, &fact);
+                view.projection.push_note(note);
+            }
+        }
+        BranchScope::ParkedNamed(id) => {
+            if let Some(view) = branch_state.view_mut(&id) {
+                let note = crate::app::messaged_note(&view.chips, &fact);
+                view.projection.push_note(note);
+            }
+        }
+        BranchScope::Orphan => branch_state.count_orphan(),
+        // `content_scope` never says Aggregate (aggregate is a TYPE
+        // decision, and this payload's type is agent-fact) — nothing to do.
+        BranchScope::Aggregate => {}
+    }
+    true
 }
 
 /// Apply one payload to every chip transcript in the tree — the answer

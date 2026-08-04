@@ -371,9 +371,12 @@ fn child_view_renders_user_messages() {
     model.view_path = vec!["t1-audit".to_owned()];
     let (rows, _, _) = draw(&model, 100, 30);
     let first_y = row_of(&rows, "audit the toolset and report gaps");
+    // HONEST FLIP (S3): an agent-scoped user row is parent-authored by
+    // construction, so the chip renders it with the → `from main` sigil
+    // instead of the plain ❯ user row it wore when this pin was written.
     assert!(
-        rows[first_y as usize].contains('❯'),
-        "the chip's first user message renders as a sigiled user row"
+        rows[first_y as usize].contains('→'),
+        "the chip's first user message renders as a from-main sigiled row"
     );
     // A mid-run steer arrives later on the same scope and renders too.
     model.route_raw(&raw(3, Some("t1-audit"), &user_message("focus on fs_edit")));

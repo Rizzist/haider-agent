@@ -322,12 +322,12 @@ fn the_driver_refuses_demo_vocabulary_aloud_and_unwinds_the_optimistic_state() {
     // MUTATION CHECK: fold these arms back into the `ResetAllSessions`
     // no-op arm of `LiveDriver::handle_request` and every case below sees
     // `turn_active` stuck true with no flash.
+    //
+    // HONEST FLIP (S3): `ChipSubmit` left this list — it is live
+    // vocabulary now (`agent.message`), pinned by
+    // `s3_subagent_timeline_tests::chip_composer_rides_the_steer_wire_and_flashes_daemon_receipt`.
     let cases: Vec<AppRequest> = vec![
         AppRequest::Talk,
-        AppRequest::ChipSubmit {
-            agent: "a1".into(),
-            text: "steer".into(),
-        },
         AppRequest::ChipClose { agent: "a1".into() },
         AppRequest::AuraSubmit {
             text: "orchestrate".into(),
@@ -448,9 +448,12 @@ fn live_aura_door_is_closed_at_the_one_entrance() {
 #[test]
 fn live_subagent_steer_and_close_refuse_instead_of_destroying_the_text() {
     // Live chips are REAL (committed `AgentSpawned` envelopes route into
-    // the chip tree), but steering and closing them are demo-driver beats
-    // — there is no `agent.steer` RPC yet, so the typed text was silently
-    // destroyed and the ✕ silently discarded.
+    // the chip tree). HONEST FLIP (S3): steering now RIDES the
+    // `agent.message` wire when the daemon serves `agent_message_v1` —
+    // this model's daemon does NOT, so the steer refuses with the
+    // stale-daemon note instead of the old demo-only voice (the happy
+    // path is pinned in s3_subagent_timeline_tests). Closing stays a
+    // demo-driver beat and keeps its refusal.
     let mut model = live_model();
     let mut driver = LiveDriver::new("test");
     attached_session(&mut driver, &mut model);
@@ -488,13 +491,14 @@ fn live_subagent_steer_and_close_refuse_instead_of_destroying_the_text() {
     assert!(!model.chips.is_empty(), "the live chip exists");
     model.handle_hit(Hit::ChipRow("a1".to_owned()));
     assert_eq!(model.screen, Screen::Subagent);
-    // Steer: the typed text must be refused aloud, not destroyed.
+    // Steer: with `agent_message_v1` unserved, the typed text must be
+    // refused aloud — naming the surface — not destroyed.
     common::submit(&mut model, "steer the subagent");
     assert!(
         model
             .flash
             .as_deref()
-            .is_some_and(|flash| flash.contains("demo only")),
+            .is_some_and(|flash| flash.contains("messaging a subagent")),
         "got {:?}",
         model.flash
     );

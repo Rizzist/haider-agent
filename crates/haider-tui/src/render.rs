@@ -4730,14 +4730,24 @@ fn transcript_lines<'a>(
             text,
             attachments,
             voice,
+            from_main,
         } => {
             lines.push(Line::default());
             // Sim UserRow (tui.js:4465-4492): MAROON bold sigil (gold ❯
             // belongs to the composer/sticky only), bright pre-wrap text
             // (multi-line submits keep their newlines), gold pill paste
             // tokens. Voice rows swap the sigil for ◉ and tag ` · spoken`
-            // (tui.js:3884-3890).
-            let sigil = if *voice { "◉ " } else { "❯ " };
+            // (tui.js:3884-3890). Parent-authored rows in a chip
+            // transcript (S3) swap it for → and tag ` · from main` — the
+            // same boundary-crossing glyph the parent's `→ messaged`
+            // marker wears.
+            let sigil = if *from_main {
+                "→ "
+            } else if *voice {
+                "◉ "
+            } else {
+                "❯ "
+            };
             let last_segment = text.split('\n').count().saturating_sub(1);
             for (index, segment) in text.split('\n').enumerate() {
                 let mut spans = if index == 0 {
@@ -4758,6 +4768,9 @@ fn transcript_lines<'a>(
                     }
                     if *voice {
                         spans.push(Span::styled(" · spoken", theme.faint_style()));
+                    }
+                    if *from_main {
+                        spans.push(Span::styled(" · from main", theme.faint_style()));
                     }
                 }
                 lines.push(Line::from(spans));
