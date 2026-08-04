@@ -840,9 +840,15 @@ async fn real_uds_oauth_add_is_capability_and_connection_bound_durable_and_secre
     callback_socket
         .write_all(
             format!(
-                "GET {}?{} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+                // A browser sends the authority it navigated to — derive the
+                // Host from the redirect URL itself, never a hand-recomputed
+                // shape (the v0.0.65 owner bug hid behind a hand-written
+                // `127.0.0.1` here while the Anthropic redirect said
+                // `localhost`).
+                "GET {}?{} HTTP/1.1\r\nHost: {}:{}\r\nConnection: close\r\n\r\n",
                 callback.path(),
                 callback.query().expect("callback query"),
+                callback.host_str().expect("callback host"),
                 callback.port().expect("callback port")
             )
             .as_bytes(),

@@ -23,6 +23,7 @@ use haider_daemon::{
 };
 use haider_protocol::DeliveryMode;
 use haider_protocol::EventPayload;
+use haider_protocol::context::ContextFootprintTruth;
 use haider_protocol::effect::{
     AuthorizationSource, AuthorizationVerdict, EffectClass, EffectIntent, EffectOutcome,
     EffectPhase,
@@ -4139,6 +4140,11 @@ async fn scenario_2_real_uds_creates_attaches_and_replays_typed_session() {
             head_seq: 1,
             worker_generation: created.worker_generation,
             metadata: Some(metadata.clone()),
+            // A just-created session is truly empty: zero committed user
+            // turns, so exactly-zero tokens is honest roster truth.
+            turn_count: Some(0),
+            footprint_tokens: Some(0),
+            footprint_truth: Some(ContextFootprintTruth::Exact),
         }
     );
 

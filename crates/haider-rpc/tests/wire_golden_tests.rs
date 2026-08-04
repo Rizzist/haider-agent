@@ -473,6 +473,54 @@ fn session_create_ignores_unknown_additive_fields() {
     ));
 }
 
+/// Older-client tolerance for the session.list roster-truth fields, both
+/// directions: an OLDER daemon's summary (no turn/footprint fields) must
+/// decode with every roster field `None` — absence is "unknown", never
+/// zero — and a NEWER daemon's enriched summary must decode by a client
+/// that does not know the NEXT additive field either.
+///
+/// MUTATION CHECK: make `SessionSummary` strict about unknown fields, or
+/// default a missing `turn_count`/`footprint_tokens` to `Some(0)`. Expected
+/// failure: one of the decodes below rejects, or the older-daemon row stops
+/// reading as unknown.
+#[test]
+fn session_summary_roster_truth_fields_are_additive_and_tolerated() {
+    let older_daemon = r#"{
+        "method":"session.list",
+        "sessions":[{"session_id":"session-1","head_seq":9,"worker_generation":7}]
+    }"#;
+    let body: ResponseBody = serde_json::from_str(older_daemon).expect("older summary decodes");
+    let ResponseBody::SessionList { sessions, .. } = body else {
+        panic!("expected session.list body");
+    };
+    assert_eq!(sessions[0].turn_count, None);
+    assert_eq!(sessions[0].footprint_tokens, None);
+    assert_eq!(sessions[0].footprint_truth, None);
+
+    let newer_daemon = r#"{
+        "method":"session.list",
+        "sessions":[{
+            "session_id":"session-1",
+            "head_seq":9,
+            "worker_generation":7,
+            "turn_count":4,
+            "footprint_tokens":33500,
+            "footprint_truth":"exact",
+            "future_roster_field":true
+        }]
+    }"#;
+    let body: ResponseBody = serde_json::from_str(newer_daemon).expect("newer summary decodes");
+    let ResponseBody::SessionList { sessions, .. } = body else {
+        panic!("expected session.list body");
+    };
+    assert_eq!(sessions[0].turn_count, Some(4));
+    assert_eq!(sessions[0].footprint_tokens, Some(33_500));
+    assert_eq!(
+        sessions[0].footprint_truth,
+        Some(haider_protocol::context::ContextFootprintTruth::Exact)
+    );
+}
+
 /// R7 additive-field tolerance for the two turn mutation methods
 /// (`session_create_ignores_unknown_additive_fields` is the twin).
 ///

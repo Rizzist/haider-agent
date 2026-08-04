@@ -41,7 +41,6 @@ use tokio::time::Instant;
 use url::Url;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::accounts::SECRET_TTL;
 use crate::session_hub::FrameSink;
 
 const CALLBACK_RESPONSE_LIMIT: usize = 8 * 1024;
@@ -1301,6 +1300,15 @@ fn is_numeric_loopback_http(url: &Url) -> bool {
     url.scheme() == "http" && matches!(url.host(), Some(url::Host::Ipv4(ip)) if ip.is_loopback())
 }
 
+/// How long a started browser flow stays valid, from `start` to code
+/// exchange. Generous by design: the user is off in a browser reading the
+/// provider's consent page, possibly logging in and completing 2FA first.
+/// The pre-fix tie to the 5-minute staged-secret TTL could expire the flow
+/// mid-consent, tearing the listener down so the eventual callback found
+/// nothing (or a reused port). Ten minutes is the flow's own law; the
+/// rejection page quotes it.
+pub(crate) const OAUTH_FLOW_TTL: Duration = Duration::from_secs(600);
+
 /// Flow bounds and deadlines. Tests inject short deterministic values.
 #[derive(Debug, Clone, Copy)]
 pub struct OAuthCoordinatorConfig {
@@ -1314,7 +1322,7 @@ impl Default for OAuthCoordinatorConfig {
         Self {
             max_flows: 16,
             max_invalid_callbacks: 8,
-            flow_ttl: SECRET_TTL,
+            flow_ttl: OAUTH_FLOW_TTL,
         }
     }
 }
@@ -1839,7 +1847,8 @@ async fn begin_flow(inner: Arc<CoordinatorInner>, job: StartJob) {
     let state_b64 = Zeroizing::new(URL_SAFE_NO_PAD.encode(state.as_slice()));
     let nonce_b64 = Zeroizing::new(URL_SAFE_NO_PAD.encode(nonce.as_slice()));
     let callback_segment = Zeroizing::new(URL_SAFE_NO_PAD.encode(callback_random.as_slice()));
-    let (path, uri) = compose_redirect(&job.provider, bound.port(), callback_segment.as_str());
+    let (path, uri, callback_authority) =
+        compose_redirect(&job.provider, bound.port(), callback_segment.as_str());
     let callback_path = Zeroizing::new(path);
     let redirect_uri = Zeroizing::new(uri);
     let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier_b64.as_bytes()));
@@ -1950,7 +1959,7 @@ async fn begin_flow(inner: Arc<CoordinatorInner>, job: StartJob) {
             registration,
             listener,
             callback_path,
-            bound.port(),
+            callback_authority,
             state_b64,
             verifier_b64,
             nonce_b64,
@@ -2496,7 +2505,7 @@ async fn run_callback_flow(
     registration: Arc<OAuthProviderRegistration>,
     listener: TcpListener,
     callback_path: Zeroizing<String>,
-    port: u16,
+    callback_authority: String,
     expected_state: Zeroizing<String>,
     verifier: Zeroizing<String>,
     nonce: Zeroizing<String>,
@@ -2531,7 +2540,7 @@ async fn run_callback_flow(
                     let callback = read_callback(
                         &mut stream,
                         callback_path.as_str(),
-                        port,
+                        callback_authority.as_str(),
                         expected_state.as_bytes(),
                     );
                     tokio::pin!(callback);
@@ -2551,9 +2560,10 @@ async fn run_callback_flow(
                     }
                 };
                 match callback_result {
-                    CallbackResult::Invalid => {
+                    CallbackResult::Invalid(reason) => {
                         invalid = invalid.saturating_add(1);
-                        let _ = send_callback_page(&mut stream, 400, INVALID_HTML).await;
+                        let _ =
+                            send_callback_page(&mut stream, 400, &rejection_html(reason)).await;
                         if invalid >= inner.config.max_invalid_callbacks {
                             set_terminal(
                                 &inner,
@@ -2631,8 +2641,54 @@ async fn run_callback_flow(
     }
 }
 
+/// WHY one loopback callback was rejected. Static copy only: the served
+/// page must explain itself and how to retry, but must never echo request
+/// data back to the browser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CallbackRejection {
+    /// The bytes never parsed as a plain `GET` browser callback.
+    MalformedRequest,
+    /// Wrong `Host` authority or callback path — usually a stale link from
+    /// an earlier sign-in attempt landing on a reused or foreign listener.
+    WrongAddress,
+    /// `state`/`code`/`error` did not match this flow — stale, replayed,
+    /// duplicated, or from another sign-in attempt.
+    WrongAttempt,
+    /// Correct state, but the provider reported an error outside the RFC
+    /// 6749 vocabulary this daemon recognizes.
+    UnrecognizedProviderError,
+}
+
+impl CallbackRejection {
+    const fn why(self) -> &'static str {
+        match self {
+            Self::MalformedRequest => {
+                "the request did not parse as a plain browser sign-in callback"
+            }
+            Self::WrongAddress => {
+                "it arrived on an address or path that does not belong to the sign-in attempt this listener is waiting for (often a leftover link from an earlier attempt)"
+            }
+            Self::WrongAttempt => {
+                "its sign-in state does not match the attempt in progress, so it is stale, replayed, or from a different sign-in"
+            }
+            Self::UnrecognizedProviderError => {
+                "the provider reported an error Haider does not recognize"
+            }
+        }
+    }
+}
+
+/// The rejection page. Never a bare "rejected": it states WHY (static,
+/// request-independent copy) and how to retry, quoting the flow TTL.
+fn rejection_html(reason: CallbackRejection) -> String {
+    format!(
+        "<!doctype html><meta charset=utf-8><meta name=referrer content=no-referrer><title>Haider sign-in callback rejected</title><p>This callback was rejected: {}.</p><p>To retry, return to Haider and start the sign-in again — each sign-in link is valid for one attempt within 10 minutes.</p>",
+        reason.why()
+    )
+}
+
 enum CallbackResult {
-    Invalid,
+    Invalid(CallbackRejection),
     Denied(&'static str),
     Code(Zeroizing<Vec<u8>>),
 }
@@ -2640,7 +2696,7 @@ enum CallbackResult {
 async fn read_callback(
     stream: &mut TcpStream,
     expected_path: &str,
-    port: u16,
+    expected_authority: &str,
     expected_state: &[u8],
 ) -> CallbackResult {
     let mut request = Zeroizing::new(Vec::with_capacity(1024));
@@ -2664,73 +2720,78 @@ async fn read_callback(
         tokio::time::timeout(CALLBACK_READ_TIMEOUT, read).await,
         Ok(Ok(()))
     ) {
-        return CallbackResult::Invalid;
+        return CallbackResult::Invalid(CallbackRejection::MalformedRequest);
     }
-    parse_callback(&request, expected_path, port, expected_state)
+    parse_callback(&request, expected_path, expected_authority, expected_state)
 }
 
 fn parse_callback(
     request: &[u8],
     expected_path: &str,
-    port: u16,
+    expected_authority: &str,
     expected_state: &[u8],
 ) -> CallbackResult {
     let Ok(text) = std::str::from_utf8(request) else {
-        return CallbackResult::Invalid;
+        return CallbackResult::Invalid(CallbackRejection::MalformedRequest);
     };
     if !text.is_ascii() {
-        return CallbackResult::Invalid;
+        return CallbackResult::Invalid(CallbackRejection::MalformedRequest);
     }
     let Some(header_end) = text.find("\r\n\r\n") else {
-        return CallbackResult::Invalid;
+        return CallbackResult::Invalid(CallbackRejection::MalformedRequest);
     };
     if !text[header_end + 4..].is_empty() {
-        return CallbackResult::Invalid;
+        return CallbackResult::Invalid(CallbackRejection::MalformedRequest);
     }
     let mut lines = text[..header_end].split("\r\n");
     let Some(request_line) = lines.next() else {
-        return CallbackResult::Invalid;
+        return CallbackResult::Invalid(CallbackRejection::MalformedRequest);
     };
     let mut parts = request_line.split(' ');
     let (Some(method), Some(target), Some(version), None) =
         (parts.next(), parts.next(), parts.next(), parts.next())
     else {
-        return CallbackResult::Invalid;
+        return CallbackResult::Invalid(CallbackRejection::MalformedRequest);
     };
     if method != "GET" || version != "HTTP/1.1" || !target.starts_with('/') || target.contains('#')
     {
-        return CallbackResult::Invalid;
+        return CallbackResult::Invalid(CallbackRejection::MalformedRequest);
     }
     let mut host = None;
     let mut content_length = None;
     for line in lines {
         let Some((name, value)) = line.split_once(':') else {
-            return CallbackResult::Invalid;
+            return CallbackResult::Invalid(CallbackRejection::MalformedRequest);
         };
         if name.eq_ignore_ascii_case("host") {
             if host.replace(value.trim()).is_some() {
-                return CallbackResult::Invalid;
+                return CallbackResult::Invalid(CallbackRejection::MalformedRequest);
             }
         } else if name.eq_ignore_ascii_case("content-length") {
             if content_length.replace(value.trim()).is_some() {
-                return CallbackResult::Invalid;
+                return CallbackResult::Invalid(CallbackRejection::MalformedRequest);
             }
         } else if name.eq_ignore_ascii_case("transfer-encoding") {
-            return CallbackResult::Invalid;
+            return CallbackResult::Invalid(CallbackRejection::MalformedRequest);
         }
     }
     if content_length.is_some_and(|length| length != "0") {
-        return CallbackResult::Invalid;
+        return CallbackResult::Invalid(CallbackRejection::MalformedRequest);
     }
-    let expected_host = format!("127.0.0.1:{port}");
-    if host != Some(expected_host.as_str()) {
-        return CallbackResult::Invalid;
+    // The one authority law: the browser sends the exact `host:port` it
+    // navigated to, which is the redirect authority THIS flow registered
+    // with the provider (`compose_redirect` — `localhost:<port>` for
+    // Anthropic parity, numeric `127.0.0.1:<port>` for everyone else).
+    // Validating a recomputed shape instead of the flow's own composed
+    // authority is the v0.0.65 owner bug.
+    if host != Some(expected_authority) {
+        return CallbackResult::Invalid(CallbackRejection::WrongAddress);
     }
     let Some((path, query)) = target.split_once('?') else {
-        return CallbackResult::Invalid;
+        return CallbackResult::Invalid(CallbackRejection::WrongAddress);
     };
     if path != expected_path || query.is_empty() {
-        return CallbackResult::Invalid;
+        return CallbackResult::Invalid(CallbackRejection::WrongAddress);
     }
     let mut states = Vec::new();
     let mut codes = Vec::new();
@@ -2750,11 +2811,11 @@ fn parse_callback(
         || codes.len() > 1
         || errors.len() > 1
     {
-        return CallbackResult::Invalid;
+        return CallbackResult::Invalid(CallbackRejection::WrongAttempt);
     }
     if let Some(code) = codes.pop() {
         if code.is_empty() || code.len() > 4096 {
-            return CallbackResult::Invalid;
+            return CallbackResult::Invalid(CallbackRejection::WrongAttempt);
         }
         CallbackResult::Code(code)
     } else {
@@ -2768,7 +2829,8 @@ fn parse_callback(
                 | b"server_error"
                 | b"temporarily_unavailable",
             ) => CallbackResult::Denied("authorization_denied"),
-            Some(_) | None => CallbackResult::Invalid,
+            Some(_) => CallbackResult::Invalid(CallbackRejection::UnrecognizedProviderError),
+            None => CallbackResult::Invalid(CallbackRejection::WrongAttempt),
         }
     }
 }
@@ -3024,20 +3086,29 @@ async fn scrub_source_chunks(mut pending: Vec<bytes::Bytes>) -> usize {
 /// is rejected with "Redirect URI … not supported by client". CSRF stays
 /// covered by `state` + PKCE, and the per-flow PORT still discriminates
 /// flows; every other provider keeps the hardened random-path shape.
+///
+/// The returned `authority` is the exact `host:port` a browser navigating
+/// to `uri` sends as its `Host` header, and it is the ONLY authority the
+/// flow's loopback listener accepts. The listener MUST validate against
+/// this same composed instance — the v0.0.65 regression (owner screenshot)
+/// moved the redirect to `localhost:<port>` while the listener kept
+/// demanding `127.0.0.1:<port>`, so every legitimate Anthropic callback
+/// carrying the CORRECT state was served the rejection page.
 pub(crate) fn compose_redirect(
     provider: &str,
     port: u16,
     hardened_segment: &str,
-) -> (String, String) {
+) -> (String, String, String) {
     if provider == haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME {
         (
             "/callback".to_owned(),
             format!("http://localhost:{port}/callback"),
+            format!("localhost:{port}"),
         )
     } else {
         let path = format!("/oauth/callback/{hardened_segment}");
         let uri = format!("http://127.0.0.1:{port}{path}");
-        (path, uri)
+        (path, uri, format!("127.0.0.1:{port}"))
     }
 }
 
@@ -3390,7 +3461,6 @@ fn respond_public_error(route: &OAuthRoute, error: OAuthPublicError) {
 
 const SUCCESS_HTML: &str = "<!doctype html><meta charset=utf-8><meta name=referrer content=no-referrer><title>Haider authorization complete</title><p>Authorization received. Return to Haider.</p>";
 const DENIED_HTML: &str = "<!doctype html><meta charset=utf-8><meta name=referrer content=no-referrer><title>Haider authorization cancelled</title><p>Authorization was not granted. Return to Haider.</p>";
-const INVALID_HTML: &str = "<!doctype html><meta charset=utf-8><meta name=referrer content=no-referrer><title>Invalid callback</title><p>This callback was rejected.</p>";
 
 async fn send_callback_page(
     stream: &mut TcpStream,

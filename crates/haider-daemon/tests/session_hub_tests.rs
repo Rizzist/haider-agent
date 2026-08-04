@@ -23,7 +23,7 @@ use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
 };
 use haider_protocol::ids::{
-    ArtifactRef, BranchId, DeviceId, EventId, ItemId, MenuId, NodeId, RunId, SessionId,
+    AgentId, ArtifactRef, BranchId, DeviceId, EventId, ItemId, MenuId, NodeId, RunId, SessionId,
 };
 use haider_protocol::item::ItemEvent;
 use haider_protocol::menu::{Menu, MenuKind, MenuOption, MenuScope};
@@ -36,7 +36,7 @@ use haider_rpc::{
     ERROR_CODE_ARTIFACT_TOO_LARGE, ERROR_CODE_ATTACHMENT_MIME_UNSUPPORTED,
     ERROR_CODE_ATTACHMENT_NOT_FOUND, ERROR_CODE_ATTACHMENT_TOO_LARGE,
     ERROR_CODE_ATTACHMENTS_TOO_LARGE, ERROR_CODE_TOO_MANY_ATTACHMENTS, ErrorData,
-    ObserveRunStateWire, RequestBody, RequestId, ResponseBody, SeqRange, WireFrame,
+    ObserveRunStateWire, RequestBody, RequestId, ResponseBody, SeqRange, SessionSummary, WireFrame,
 };
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1385,6 +1385,141 @@ async fn session_read_exposes_latest_footprint_independent_of_requested_range() 
     );
 
     connection.close().await.expect("connection closes");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// One committed main-timeline user turn. `agent_scoped` marks a prompt
+/// steered INTO a subagent (the delegation projection shape), which is not
+/// a roster turn.
+fn user_turn_envelope(
+    session_id: &SessionId,
+    event_id: &str,
+    worker_generation: u64,
+    agent_scoped: bool,
+) -> RawEnvelope {
+    let mut envelope = envelope(session_id, event_id, worker_generation);
+    if agent_scoped {
+        envelope.agent_id = Some(AgentId::new("agent-under-test"));
+    }
+    envelope.payload = serde_json::to_value(EventPayload::UserMessage {
+        text: format!("turn {event_id}"),
+        attachments: Vec::new(),
+        mode: DeliveryMode::Queue,
+    })
+    .expect("user message serializes");
+    envelope
+}
+
+async fn list_summaries(hub: &SessionHub) -> Vec<SessionSummary> {
+    let sink = Arc::new(CollectSink::default());
+    let connection = hub
+        .open_connection(
+            capabilities(),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection");
+    connection
+        .request(
+            RequestId::new("roster-list"),
+            RequestBody::SessionList {
+                cursor: None,
+                limit: 10,
+            },
+        )
+        .await
+        .expect("session.list routes");
+    let WireFrame::Response {
+        body: ResponseBody::SessionList { sessions, .. },
+        ..
+    } = sink.next().await
+    else {
+        panic!("expected session.list response");
+    };
+    connection.close().await.expect("connection closes");
+    sessions
+}
+
+/// The owner bug (launcher roster "0 turns · 0 tok" until attach): rosters
+/// hydrate from `session.list` summaries, so a session with COMMITTED
+/// turns and a durable footprint snapshot must report both from the
+/// summary alone — this test never attaches and never observes. The count
+/// excludes subagent-scoped prompts, and the footprint is the LATEST
+/// durable snapshot with its honesty marker.
+///
+/// MUTATION CHECK: zero the summary's `turn_count`, count agent-scoped
+/// prompts as turns, or drop/first-match the footprint projection.
+/// Expected RUNTIME failure: the exact roster numbers below change.
+#[tokio::test]
+async fn summaries_report_turns_and_tokens_for_unattached_sessions() {
+    let (_root, store, hub) = open_hub(None, 8).await;
+    let session_id = SessionId::new("roster-truth");
+    let generation = store.worker_generation();
+    let mut events = vec![
+        user_turn_envelope(&session_id, "turn-1", generation, false),
+        footprint_envelope(&session_id, "footprint-mid", generation, 12_000),
+        user_turn_envelope(&session_id, "turn-2", generation, false),
+        user_turn_envelope(&session_id, "child-prompt", generation, true),
+        footprint_envelope(&session_id, "footprint-new", generation, 18_000),
+    ];
+    hub.append(&mut events).await.expect("turns append");
+
+    let sessions = list_summaries(&hub).await;
+    assert_eq!(sessions.len(), 1);
+    let summary = &sessions[0];
+    assert_eq!(summary.session_id, session_id);
+    assert_eq!(summary.turn_count, Some(2));
+    assert_eq!(summary.footprint_tokens, Some(18_000));
+    assert_eq!(
+        summary.footprint_truth,
+        Some(ContextFootprintTruth::Estimated)
+    );
+
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// Zero-honesty law: zero turns/tokens appear EXCLUSIVELY for truly empty
+/// sessions (no committed user turn, no durable snapshot — zero is then
+/// exact truth). A session WITH committed turns but no snapshot reports
+/// UNKNOWN tokens (`None`), never zero.
+///
+/// MUTATION CHECK: report `Some(0)` tokens whenever no snapshot exists, or
+/// report `None` for the truly empty session. Expected RUNTIME failure:
+/// one of the two rows below flips.
+#[tokio::test]
+async fn zero_is_only_reported_for_truly_empty_sessions() {
+    let (_root, store, hub) = open_hub(None, 8).await;
+    let generation = store.worker_generation();
+    let empty = SessionId::new("roster-empty");
+    append_one(&hub, &empty, generation, "non-turn-seed").await;
+    let with_turns = SessionId::new("roster-turns-without-footprint");
+    let mut events = vec![user_turn_envelope(&with_turns, "turn-1", generation, false)];
+    hub.append(&mut events).await.expect("turn appends");
+
+    let sessions = list_summaries(&hub).await;
+    let by_id = |id: &SessionId| {
+        sessions
+            .iter()
+            .find(|summary| &summary.session_id == id)
+            .expect("listed summary")
+    };
+    let empty_summary = by_id(&empty);
+    assert_eq!(empty_summary.turn_count, Some(0));
+    assert_eq!(empty_summary.footprint_tokens, Some(0));
+    assert_eq!(
+        empty_summary.footprint_truth,
+        Some(ContextFootprintTruth::Exact)
+    );
+    let with_turns_summary = by_id(&with_turns);
+    assert_eq!(with_turns_summary.turn_count, Some(1));
+    assert_eq!(
+        with_turns_summary.footprint_tokens, None,
+        "unknown tokens must never be rendered as zero"
+    );
+    assert_eq!(with_turns_summary.footprint_truth, None);
+
     hub.shutdown().await.expect("hub stops");
     store.close().await.expect("store closes");
 }
