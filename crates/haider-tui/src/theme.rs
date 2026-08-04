@@ -1,14 +1,16 @@
-//! The theme registry — one identity (warm ground · gold accent · maroon
-//! ink), four designed renderings (UI-themes wave, owner spec §2).
+//! The theme registry — one identity (gold accent · maroon ink, worn on
+//! grounds from pearl to charcoal), five designed renderings (UI-themes
+//! wave + the S2 refinement of light/dark).
 //!
 //! Every widget reads tokens from a [`Theme`] resolved once per frame;
 //! nothing hardcodes a color (`every_surface_uses_theme_slots` enforces
 //! this mechanically). The registry began as `/tui`-sim parity; this wave
 //! supersedes the sim's `THEMES` with palettes designed for the terminal:
 //!
-//! * [`LIGHT`]  — warm paper-white ground, ink-dark text, muted gold.
-//! * [`DARK`]   — the identity's night rendering, refreshed: deep warm
-//!   ground, aged gold, ember maroon, every pairing re-contrasted.
+//! * [`LIGHT`]  — pearl-white ground, near-black neutral ink, restrained
+//!   grays; the identity accents used sparingly (S2 owner spec §1).
+//! * [`DARK`]   — neutral charcoal ground, neutral light-gray text, cool
+//!   dim; gold kept as a restrained accent, never a warm wash (S2 §2).
 //! * [`DESERT`] — sand ground, burnished amber, dusk-plum ink.
 //! * [`WATER`] — sea-glass ground, tide teal, coral dusk (desert's contrast).
 //! * [`OASIS`]  — palm-night ground, moonlit spring text, date gold.
@@ -32,7 +34,7 @@ pub struct Rgb {
 }
 
 impl Rgb {
-    /// `Rgb::hex(0xfaf6ee)` — the light theme's paper ground.
+    /// `Rgb::hex(0xfdfdfd)` — the light theme's pearl ground.
     #[must_use]
     pub const fn hex(v: u32) -> Self {
         Self {
@@ -227,14 +229,16 @@ pub struct Theme {
     pub sel_bg: Rgb,
 }
 
-/// Light — warm paper-white ground, ink-dark text, muted gold accent. A
-/// palette designed AS light (owner spec §2), not an inverted dark: the
-/// ink is near-black for real contrast (13:1 body, 17:1 emphasis) and the
-/// accents are deepened to keep ≥ 3.9:1 on paper.
+/// Light — FULL pearl white (S2 owner spec §1, "like Claude Code light"):
+/// a barely-there pearl ground, near-black neutral ink, restrained
+/// NEUTRAL grays (no warm cast anywhere in the chrome), and the identity
+/// accents — gold deepened to 6.2:1, sienna maroon — used sparingly. The
+/// UI-themes wave's warm paper (#faf6ee) is retired; every gray here is
+/// mixed from the neutral ink, so the page reads white, not cream.
 pub const LIGHT: Theme = {
-    let bg = Rgb::hex(0xfaf6ee);
-    let ink = Rgb::hex(0x14110c);
-    let gold = Rgb::hex(0x8a6508);
+    let bg = Rgb::hex(0xfdfdfd);
+    let ink = Rgb::hex(0x171717);
+    let gold = Rgb::hex(0x7d5a05);
     let maroon = Rgb::hex(0x7c2d12);
     Theme {
         key: ThemeKey::Light,
@@ -243,15 +247,15 @@ pub const LIGHT: Theme = {
         bg,
         bar_bg: ink.over(bg, 40),
         frame: ink.over(bg, 300),
-        text: Rgb::hex(0x2e2a24),
+        text: Rgb::hex(0x363636),
         bright: ink,
-        dim: Rgb::hex(0x6e675c),
-        faint: Rgb::hex(0xd8d1c2),
+        dim: Rgb::hex(0x6e6e6e),
+        faint: Rgb::hex(0xd9d9d9),
         gold,
-        gold_soft: gold.over(bg, 110),
+        gold_soft: gold.over(bg, 90),
         gold_half: gold.over(bg, 500),
         maroon,
-        maroon_soft: maroon.over(bg, 70),
+        maroon_soft: maroon.over(bg, 60),
         ok: Rgb::hex(0x2f6e3f),
         warn: Rgb::hex(0x9c4e06),
         err: Rgb::hex(0xb02121),
@@ -261,11 +265,14 @@ pub const LIGHT: Theme = {
     }
 };
 
-/// Dark — the identity's night rendering, refreshed: a deeper warm ground,
-/// aged gold lifted a step, ember maroon warmed, and the muddy pairings of
-/// the sim era (dim 3.2:1, sunken faint) re-contrasted to 5.3:1 / 1.9:1.
+/// Dark — neutral charcoal in Codex CLI's register (S2 owner spec §2): a
+/// true-neutral near-black ground, neutral light-gray text, a COOL dim,
+/// and every chrome blend (band, selection, sticky bar, frames) mixed
+/// from WHITE — never from gold — so the identity's aged gold and ember
+/// survive as restrained accents instead of the warm wash the sim-era
+/// palette painted over every surface.
 pub const DARK: Theme = {
-    let bg = Rgb::hex(0x120e08);
+    let bg = Rgb::hex(0x0f0f0f);
     let gold = Rgb::hex(0xd9b544);
     let maroon = Rgb::hex(0xe57a4a);
     let white = Rgb::hex(0xffffff);
@@ -274,12 +281,12 @@ pub const DARK: Theme = {
         label: "Dark",
         dark: true,
         bg,
-        bar_bg: gold.over(bg, 50),
-        frame: gold.over(bg, 260),
-        text: Rgb::hex(0xd6c7a4),
-        bright: Rgb::hex(0xf5eeda),
-        dim: Rgb::hex(0x93856a),
-        faint: Rgb::hex(0x4a4030),
+        bar_bg: white.over(bg, 40),
+        frame: white.over(bg, 220),
+        text: Rgb::hex(0xd4d4d4),
+        bright: Rgb::hex(0xf2f2f2),
+        dim: Rgb::hex(0x8b949e),
+        faint: Rgb::hex(0x3a3a3a),
         gold,
         gold_soft: gold.over(bg, 120),
         gold_half: gold.over(bg, 500),
@@ -290,7 +297,7 @@ pub const DARK: Theme = {
         err: Rgb::hex(0xff8577),
         badge_fg: bg,
         input_bg: white.over(bg, 45),
-        sel_bg: gold.over(bg, 100),
+        sel_bg: white.over(bg, 100),
     }
 };
 

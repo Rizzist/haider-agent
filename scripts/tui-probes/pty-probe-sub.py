@@ -209,7 +209,8 @@ probelib.verdict(
         ("back_to_session", "branch main" in final),
         ("final_has_subtree", "subagents" in final),
         ("sticky_prompt_pinned", sticky or ("use two subagents" in scrolled)),
-        ("sticky_band_ground", sticky or ("48;2;28;22;11" in scrolled)),
+        # S2 neutral dark: barBg = white @0.04 over #0f0f0f → 25;25;25.
+        ("sticky_band_ground", sticky or ("48;2;25;25;25" in scrolled)),
         # TUI6 item 6: both band rules on the aura stage and the session
         # (the closing rule sheds by the ledger at short frames — tall
         # runs enforce, short runs SKIP loudly).

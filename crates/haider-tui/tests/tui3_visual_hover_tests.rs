@@ -79,26 +79,27 @@ fn session_model() -> AppModel {
 
 #[test]
 fn composer_band_is_the_exact_designed_blend_in_every_theme() {
-    // Hand-computed design blends (inputBg over bg, round half-up):
-    //   light : ink   4.0% over #faf6ee → (241, 237, 229)
-    //   dark  : white 4.5% over #120e08 → ( 29,  25,  19)
+    // Hand-computed design blends (inputBg over bg, round half-up).
+    // S2 flip: light/dark re-grounded (pearl #fdfdfd · charcoal #0f0f0f).
+    //   light : ink   4.0% over #fdfdfd → (244, 244, 244)
+    //   dark  : white 4.5% over #0f0f0f → ( 26,  26,  26)
     //   desert: white 28.0% over #f0e4cc → (244, 236, 218)
     //   oasis : white 4.5% over #0c1410 → ( 23,  31,  27)
     let expected = [
         (
             ThemeKey::Light,
             Rgb {
-                r: 241,
-                g: 237,
-                b: 229,
+                r: 244,
+                g: 244,
+                b: 244,
             },
         ),
         (
             ThemeKey::Dark,
             Rgb {
-                r: 29,
-                g: 25,
-                b: 19,
+                r: 26,
+                g: 26,
+                b: 26,
             },
         ),
         (
@@ -138,11 +139,11 @@ fn composer_band_is_the_exact_designed_blend_in_every_theme() {
         // status row — no stray tinted rows bracket the band.
         assert_eq!(buffer[(0, composer_y - 1)].fg, Color::from(theme.gold));
         assert_eq!(buffer[(0, composer_y - 1)].bg, Color::from(theme.bg));
-        // TUI4 item 2: the row BELOW the composer is the band's padding row
-        // — the band is one complete panel, not a stripe behind the text —
-        // and the row after that is its closing frame rule on plain ground.
-        assert_eq!(buffer[(0, composer_y + 1)].bg, Color::from(rgb));
-        assert_eq!(buffer[(0, composer_y + 2)].bg, Color::from(theme.bg));
+        // S2 item 4 FLIP (was TUI4 item 2's padding row): the pad is
+        // retired — the band rests at exactly ONE text row, so the row
+        // below the composer is its closing frame rule on plain ground.
+        assert_eq!(buffer[(0, composer_y + 1)].bg, Color::from(theme.bg));
+        assert_eq!(buffer[(0, composer_y + 1)].fg, Color::from(theme.frame));
         let status_y = u16::try_from(rows.len() - 1).expect("status row");
         assert_eq!(
             buffer[(0, status_y)].bg,

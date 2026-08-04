@@ -11,7 +11,7 @@ sends and asserts the SCREEN (via forced full repaints):
 - word movement both encodings: ESC b (⌥b, what most mac terminals send)
   and ESC[1;3D (CSI ⌥←) — "one two" → "one Xtwo";
 - kills: ESC[F (End) + ⌃U empties the line back to the placeholder;
-- selection: ESC[1;2D (⇧←) ×2 paints the selBg band (38;31;14 dark)
+- selection: ESC[1;2D (⇧←) ×2 paints the selBg band (39;39;39 dark)
   in the composer row; ⌃C COPIES (OSC 52 with base64("me") = bWU= in the
   stream, the honest flash on screen) instead of navigating;
 - history: ESC[A (↑) recalls the submitted "hello", typing extends it to
@@ -34,7 +34,7 @@ cols, rows = int(sys.argv[1]), int(sys.argv[2])
 binary = sys.argv[3] if len(sys.argv) > 3 else "/usr/local/bin/haider"
 
 GOLD_BG = b"48;2;217;181;68"  # dark cursor-cell ground (theme.rs DARK gold)
-SEL_BG = b"48;2;38;31;14"  # dark selBg (gold @0.1 over ground)
+SEL_BG = b"48;2;39;39;39"  # dark selBg (S2 neutral: white @0.1 over #0f0f0f)
 
 # The cursor/selection cells SPLIT styled words with SGR runs mid-word
 # ("hell" + SGR + "o"), so TEXT assertions strip ANSI first; COLOR

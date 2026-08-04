@@ -50,7 +50,7 @@ fn launcher_renders_header_band_not_centered_art() {
     let model = launcher_model();
     assert_eq!(model.screen, Screen::Launcher);
     let (rows, _, _) = draw(&model, 100, 30);
-    // The header band sits AT THE TOP: the compact 16×2 mark art spans
+    // The header band sits AT THE TOP: the compact 24×2 mark art spans
     // band lines 0-1, the product mark + version + device beside it.
     let art = haider_tui::mark::header_rows();
     assert!(
