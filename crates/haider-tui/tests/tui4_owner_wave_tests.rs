@@ -341,10 +341,13 @@ fn the_session_header_mark_spans_both_lines_or_yields() {
 // ---- Item 5: the launcher column cap ----
 
 #[test]
-fn the_launcher_column_is_capped_and_left_anchored_at_a_wide_frame() {
-    // UI-themes wave flip: the block used to be centred under the big art;
-    // as a session-shaped surface it hugs the header band's left edge. The
-    // cap survives — a 165-col frame must not stretch rows across it.
+fn the_launcher_column_is_capped_and_centered_at_a_wide_frame() {
+    // HONEST FLIP (ui-launcher-fixes, owner screenshot): the ui-themes
+    // wave left-anchored this block against the header band's edge; the
+    // owner reversed it — the capped column now CENTERS horizontally in a
+    // wide frame (the header/composer bands stay full-width; ≤-cap widths
+    // keep the old geometry — `launcher_fixes_tests` pins those). The cap
+    // survives — a 165-col frame must not stretch rows across it.
     let model = launcher_model();
     let frame = draw(&model, 165, 40);
     let cap = 70usize;
@@ -375,9 +378,10 @@ fn the_launcher_column_is_capped_and_left_anchored_at_a_wide_frame() {
         edges.windows(2).all(|pair| pair[0] == pair[1]),
         "the recent block is not one column: {edges:?}"
     );
-    // …and that column hugs the band's left edge (the one-cell rail lead),
-    // never the old centring.
-    assert_eq!(edges[0], 1, "the column is left-anchored after the rail");
+    // …and that column CENTERS in the frame: the pad derives from the cap
+    // ((165-70)/2 = 47), the rail cell sits on the pad's edge, so the
+    // shared text edge is 48 — never the old left anchor's 1.
+    assert_eq!(edges[0], 48, "the column centers: pad 47 + the rail cell");
     // The identity info and dir moved INTO the header band (line 2).
     let info_row = frame.row_of("provider anthropic");
     assert_eq!(info_row, 1, "identity info lives on header line 2");
