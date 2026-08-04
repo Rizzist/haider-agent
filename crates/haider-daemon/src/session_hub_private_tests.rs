@@ -352,6 +352,7 @@ async fn provider_models_refresh_requires_control_and_hands_off_correlation() {
         snapshot: Arc::new(Mutex::new(Vec::new())),
         management: crate::accounts::ManagementSnapshot::new(0, Vec::new(), Vec::new()),
         vault_supported: true,
+        discovery_disabled: false,
     })
     .expect("install accounts");
 

@@ -5153,6 +5153,7 @@ async fn oauth_import_source_ownership_tracks_the_latest_alias_incarnation() {
         source: "codex".to_owned(),
         alias: alias.as_str().to_owned(),
         provider: OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
+        candidate: None,
     };
     let imported_json = imported.canonical_json().expect("import coordinates");
     let imported_digest = blake3::hash(imported_json.as_bytes()).to_hex().to_string();

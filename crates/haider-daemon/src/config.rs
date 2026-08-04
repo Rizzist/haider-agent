@@ -68,6 +68,9 @@ pub struct DaemonConfig {
     /// profile resolver; the packaged default is
     /// `haider_client::PACKAGED_DEFAULT_MODEL`.
     pub default_model: String,
+    /// Disables probing first-party device credential stores for this profile.
+    /// The wire reports an explicit disabled state rather than an empty scan.
+    pub discovery_disabled: bool,
     /// Deterministic runtime fault seam used only by shutdown-barrier tests.
     ///
     /// Production constructors leave this false. Keeping the injection on the
@@ -95,6 +98,7 @@ impl DaemonConfig {
             drain_timeout: Duration::from_secs(5),
             session_hub: SessionHubConfig::default(),
             default_model: haider_client::PACKAGED_DEFAULT_MODEL.to_owned(),
+            discovery_disabled: false,
             inject_worker_manager_shutdown_error: false,
         }
     }
