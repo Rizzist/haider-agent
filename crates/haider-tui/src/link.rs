@@ -736,6 +736,17 @@ pub fn request_body(command: LiveCommand) -> RequestBody {
             validation_model: None,
         },
         LiveCommand::AccountList => RequestBody::AccountList { provider: None },
+        // D2: the read carries nothing; the import carries ONLY the opaque
+        // candidate id — the daemon re-reads the local store itself, so no
+        // credential bytes exist to send.
+        LiveCommand::DeviceCandidates => RequestBody::AccountDeviceCandidates,
+        LiveCommand::DeviceImport {
+            command_id,
+            candidate,
+        } => RequestBody::AccountImportDevice {
+            command_id,
+            candidate,
+        },
         LiveCommand::AccountSetActive { command_id, alias } => {
             RequestBody::AccountSetActive { command_id, alias }
         }
@@ -996,6 +1007,23 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
             descriptors,
             revision,
         }],
+        ResponseBody::AccountDeviceCandidates {
+            discovery_disabled,
+            candidates,
+        } => vec![LiveReply::DeviceCandidates {
+            discovery_disabled,
+            candidates,
+        }],
+        ResponseBody::AccountImportDevice {
+            descriptor,
+            revision,
+        } => context.command_id.clone().map_or_else(Vec::new, |id| {
+            vec![LiveReply::DeviceImported {
+                command_id: id,
+                descriptor,
+                revision,
+            }]
+        }),
         ResponseBody::AccountSetActive {
             descriptor,
             revision,

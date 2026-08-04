@@ -1334,7 +1334,13 @@ impl DemoDriver {
             | AppRequest::AttachUpload { .. }
             // W10b live-only mutations: the demo reducer removes locally.
             | AppRequest::AccountRemove { .. }
-            | AppRequest::ProviderRemove { .. } => {}
+            | AppRequest::ProviderRemove { .. }
+            // D2 device discovery is LIVE-ONLY vocabulary, unreachable by
+            // the reducer's gate (`device_discovery_available` is false in
+            // demo — the sim has no device to probe, so the section is
+            // honestly absent and nothing can push these).
+            | AppRequest::DeviceCandidatesRefresh
+            | AppRequest::DeviceImport { .. } => {}
             // `/accounts` (W5d): the demo world answers from the sim's seed
             // list, synchronously — through the SAME reducer seams as live
             // (apply_snapshot / apply_account_selected), so the

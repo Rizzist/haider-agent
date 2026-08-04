@@ -262,6 +262,19 @@ pub enum LiveCommand {
     },
     /// `account.list` for the `/accounts` screen (W5d). A read.
     AccountList,
+    /// `account.device_candidates` (D2) — the daemon's metadata-only
+    /// discovery of first-party CLI credential stores. A read, issued on
+    /// screen entry only; secrets never ride its response by D1's wire
+    /// contract.
+    DeviceCandidates,
+    /// `account.import_device` (D2). DURABLE + receipted: the daemon
+    /// dedupes by command id and re-reads the local store itself — the
+    /// candidate id is the only payload, and the response installs
+    /// NOTHING locally (the chained `account.list` is the materializer).
+    DeviceImport {
+        command_id: CommandId,
+        candidate: String,
+    },
     /// `account.set_active` (W5d). DURABLE mutation: the same command id
     /// replays the same committed result. `alias` rides along client-side
     /// so a failure reply can clear the exact pending row.
@@ -344,6 +357,7 @@ impl LiveCommand {
             Self::HooksTrust { command_id, .. } => Some(command_id),
             Self::LoginApi { command_id, .. } => Some(command_id),
             Self::AccountSetActive { command_id, .. } => Some(command_id),
+            Self::DeviceImport { command_id, .. } => Some(command_id),
             Self::SetDefaultModel { command_id, .. } => Some(command_id),
             Self::ConfigureProvider { command_id, .. } => Some(command_id),
             Self::AccountAddOAuth { command_id, .. } => Some(command_id),
@@ -351,6 +365,7 @@ impl LiveCommand {
             | Self::Attach { .. }
             | Self::Detach { .. }
             | Self::AccountList
+            | Self::DeviceCandidates
             | Self::ProviderList
             | Self::RefreshProviderModels { .. }
             | Self::OAuthStart { .. }
@@ -580,6 +595,22 @@ pub enum LiveReply {
         descriptors: Vec<haider_protocol::credential::CredentialDescriptor>,
         revision: Option<u64>,
     },
+    /// `account.device_candidates` answered (D2): the daemon's
+    /// metadata-only discovery report. `discovery_disabled` is the honest
+    /// configured-off state, never an empty-device claim.
+    DeviceCandidates {
+        discovery_disabled: bool,
+        candidates: Vec<haider_rpc::DeviceCredentialCandidateWire>,
+    },
+    /// `account.import_device` committed (D2): the daemon's receipt. It
+    /// retires the outbox entry and chains the `account.list` refresh —
+    /// the descriptor itself installs NOTHING locally (daemon truth is
+    /// the only materializer, the branch discipline).
+    DeviceImported {
+        command_id: CommandId,
+        descriptor: haider_protocol::credential::CredentialDescriptor,
+        revision: u64,
+    },
     /// `account.set_active` committed: the selected descriptor + the
     /// management revision the mutation finalized at.
     AccountSelected {
@@ -786,6 +817,10 @@ pub struct LiveDriver {
     /// The cwd the last `hooks.list` was issued for — what a trust receipt
     /// chains its refresh against (captured at issuance by the reducer).
     hooks_cwd: Option<String>,
+    /// The in-flight `account.import_device` (D2), so a typed failure
+    /// releases the exact pending candidate and lands its honest reason
+    /// in the section. Durable — it survives a reconnect in the outbox.
+    pending_device_import: Option<(CommandId, String)>,
     /// The one OAuth add flight (W5e-1): the card's whole driver state.
     oauth_flight: Option<OAuthFlight>,
     /// Durable mutations awaiting a response, in issue order.
@@ -875,6 +910,7 @@ impl LiveDriver {
             pending_custom: None,
             pending_hook_trust: None,
             hooks_cwd: None,
+            pending_device_import: None,
             oauth_flight: None,
             outbox: Vec::new(),
             menus: HashMap::new(),
@@ -1542,6 +1578,41 @@ impl LiveDriver {
                 // discovered before the picker or the bootstrap can work.
                 self.provider_model_refreshes(model)
             }
+            LiveReply::DeviceCandidates {
+                discovery_disabled,
+                candidates,
+            } => {
+                // Metadata only, wholesale (D2): the section renders what
+                // the daemon reported and nothing else — an empty or
+                // switched-off report simply keeps the section absent.
+                model.device.apply(candidates, discovery_disabled);
+                model.dirty = true;
+                Vec::new()
+            }
+            LiveReply::DeviceImported {
+                command_id,
+                descriptor,
+                revision: _,
+            } => {
+                self.retire(&command_id);
+                if self
+                    .pending_device_import
+                    .as_ref()
+                    .is_some_and(|(pending, _)| *pending == command_id)
+                {
+                    self.pending_device_import = None;
+                }
+                model.device.pending_import = None;
+                // The receipt NAMES what the daemon committed; the rows
+                // themselves land via the chained refresh below — nothing
+                // is inserted here (D2's installs-nothing-locally law).
+                model.device.message = Some(format!(
+                    "✓ imported {} → {} · {}",
+                    descriptor.provider, descriptor.alias, descriptor.identity
+                ));
+                model.dirty = true;
+                vec![LiveCommand::AccountList, LiveCommand::ProviderList]
+            }
             LiveReply::AccountSelected {
                 command_id,
                 descriptor,
@@ -1955,6 +2026,25 @@ impl LiveDriver {
                         self.retire(id);
                     }
                     model.accounts.message = Some(format!("`{alias}` not removed — {message}"));
+                    model.dirty = true;
+                    return Vec::new();
+                }
+                // D2: a failed `account.import_device` releases the exact
+                // pending candidate and lands the daemon's honest typed
+                // reason inside the section (both screens render it).
+                // Nothing moved locally, so nothing rolls back.
+                if let Some(id) = &command_id
+                    && self
+                        .pending_device_import
+                        .as_ref()
+                        .is_some_and(|(pending, _)| pending == id)
+                    && self.pending_device_import.take().is_some()
+                {
+                    if !retryable {
+                        self.retire(id);
+                    }
+                    model.device.pending_import = None;
+                    model.device.message = Some(format!("✗ import failed — {message}"));
                     model.dirty = true;
                     return Vec::new();
                 }
@@ -2542,6 +2632,17 @@ impl LiveDriver {
             }
             // `/accounts` (W5d): a read — never in the outbox.
             AppRequest::AccountsRefresh => vec![LiveCommand::AccountList],
+            // A read — never outboxed; the reducer already gated on the
+            // feature bit and pushes it on screen entry only (D2).
+            AppRequest::DeviceCandidatesRefresh => vec![LiveCommand::DeviceCandidates],
+            AppRequest::DeviceImport { candidate } => {
+                let command_id = self.mint();
+                self.pending_device_import = Some((command_id.clone(), candidate.clone()));
+                vec![self.enqueue(LiveCommand::DeviceImport {
+                    command_id,
+                    candidate,
+                })]
+            }
             AppRequest::ProvidersRefresh => vec![LiveCommand::ProviderList],
             AppRequest::OAuthAddStart {
                 provider,
