@@ -22,7 +22,7 @@
 //! (`rescan_needed`); the durable `Queued`+`UserMessage` pair is the overflow
 //! buffer.
 
-use crate::delegation::{DelegationHandle, SpawnCoordinates};
+use crate::delegation::{DelegationHandle, MessageCoordinates, SpawnCoordinates};
 use crate::project_instructions::{self, LoadedProjectInstructions};
 use crate::session_hub::{HubStoreHandle, SessionHub, SessionHubError};
 use crate::turn_recovery::{cancelled_resumption_payloads, failed_resumption_payloads};
@@ -65,9 +65,9 @@ use haider_provider::{
 use haider_provider::{Provider, ToolDefinition, TurnRequest};
 use haider_tools::{
     CasSink, ChangeLedger, CommandOutputSink, EffectBroker, FsCaseMode, FsEdit, FsGlob, FsList,
-    FsPatch, FsRead, FsSearch, FsSearchMode, FsWrite, JournalSink, PermissionPolicy, ProcessBounds,
-    ProcessExec, ProcessResult, ResultBounds, SessionGrant, SessionGrantScope, ShellSession,
-    SpawnSubagent, ToolError, ToolResult, TurnAttribution,
+    FsPatch, FsRead, FsSearch, FsSearchMode, FsWrite, JournalSink, MessageSubagent,
+    PermissionPolicy, ProcessBounds, ProcessExec, ProcessResult, ResultBounds, SessionGrant,
+    SessionGrantScope, ShellSession, SpawnSubagent, ToolError, ToolResult, TurnAttribution,
 };
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::Path;
@@ -530,6 +530,14 @@ impl SystemPromptBuilder {
     pub const VERSION: &'static str = "haider-system-v2";
 
     pub fn build(metadata: &SessionMetadataV1, instructions: &[(&str, &str)]) -> String {
+        Self::build_with_handoff(metadata, instructions, None)
+    }
+
+    pub fn build_with_handoff(
+        metadata: &SessionMetadataV1,
+        instructions: &[(&str, &str)],
+        handoff_dir: Option<&Path>,
+    ) -> String {
         let mut prompt = format!(
             "{}\nYou are Haider Code, a coding agent operating inside the canonical workspace below.\n\
              Workspace: {}\n\
@@ -538,6 +546,11 @@ impl SystemPromptBuilder {
             Self::VERSION,
             metadata.cwd
         );
+        if let Some(handoff_dir) = handoff_dir {
+            prompt.push_str("\nEphemeral parent handoff directory: ");
+            prompt.push_str(&handoff_dir.to_string_lossy());
+            prompt.push_str(" (EPHEMERAL; use it for shared specs, never durable storage).");
+        }
         for (path, text) in instructions {
             prompt.push_str("\n\nProject instructions (");
             prompt.push_str(path);
@@ -577,6 +590,7 @@ enum ManagerCommand {
     Nudge {
         session_id: SessionId,
         run_id: RunId,
+        accepted_seq: u64,
         text: String,
         completed: oneshot::Sender<Result<(), HaiderError>>,
     },
@@ -600,6 +614,7 @@ enum SupervisorCommand {
     Submit(Box<PendingTurn>),
     Nudge {
         run_id: RunId,
+        accepted_seq: u64,
         text: String,
         completed: oneshot::Sender<Result<(), HaiderError>>,
     },
@@ -780,6 +795,7 @@ impl WorkerManagerHandle {
         &self,
         session_id: SessionId,
         run_id: RunId,
+        accepted_seq: u64,
         text: String,
     ) -> Result<(), HaiderError> {
         let (completed, response) = oneshot::channel();
@@ -787,6 +803,7 @@ impl WorkerManagerHandle {
             .try_send(ManagerCommand::Nudge {
                 session_id,
                 run_id,
+                accepted_seq,
                 text,
                 completed,
             })
@@ -994,6 +1011,7 @@ async fn run_manager(
             ManagerCommand::Nudge {
                 session_id,
                 run_id,
+                accepted_seq,
                 text,
                 completed,
             } => {
@@ -1017,6 +1035,7 @@ async fn run_manager(
                 };
                 if let Err(error) = supervisor.try_send(SupervisorCommand::Nudge {
                     run_id,
+                    accepted_seq,
                     text,
                     completed,
                 }) {
@@ -1498,6 +1517,10 @@ async fn run_supervisor(
     let mut stopping = false;
     let mut rescan_needed = false;
     let mut deferred_shell = VecDeque::<PendingShellExec>::new();
+    // A nudge's accepted user-message sequence is its process-stable delivery
+    // key. Existing messages are already part of a restarted turn's compiled
+    // prompt; new messages are inserted when they cross into the live harness.
+    let mut delivered_nudges = durable_user_message_seqs(&lease).await.unwrap_or_default();
 
     loop {
         if active.is_none() && !stopping {
@@ -1675,9 +1698,18 @@ async fn run_supervisor(
                                 *pending,
                             ).await;
                         }
-                        Some(SupervisorCommand::Nudge { run_id, text, completed }) => {
+                        Some(SupervisorCommand::Nudge {
+                            run_id,
+                            accepted_seq,
+                            text,
+                            completed,
+                        }) => {
                             let result = if run_id == active_run {
-                                turn.harness.nudge(text)
+                                if delivered_nudges.insert(accepted_seq) {
+                                    turn.harness.nudge(text)
+                                } else {
+                                    Ok(())
+                                }
                             } else {
                                 Err(HaiderError::new(
                                     ErrorCode::RunNotActive,
@@ -2290,6 +2322,25 @@ async fn durable_runs(
     Ok(runs)
 }
 
+async fn durable_user_message_seqs(store: &HubStoreHandle) -> Result<HashSet<u64>, HaiderError> {
+    let mut cursor = 0;
+    let mut sequences = HashSet::new();
+    loop {
+        let page = StoreHandle::read(store, store.session_id(), cursor, 256).await?;
+        if page.is_empty() {
+            return Ok(sequences);
+        }
+        cursor = page.last().map_or(cursor, |envelope| envelope.seq);
+        for envelope in page {
+            if serde_json::from_value::<EventPayload>(envelope.payload)
+                .is_ok_and(|payload| matches!(payload, EventPayload::UserMessage { .. }))
+            {
+                sequences.insert(envelope.seq);
+            }
+        }
+    }
+}
+
 /// Live counterpart of startup effect reconciliation, scoped to one run.
 ///
 /// Dispatcher close is attempted first, but its return value is not evidence
@@ -2637,7 +2688,14 @@ async fn perform_manual_compaction(
     let instruction_entries = instructions
         .as_ref()
         .map_or_else(Vec::new, LoadedProjectInstructions::prompt_entries);
-    let post_compaction_system_prompt = SystemPromptBuilder::build(metadata, &instruction_entries);
+    let handoff_dir = delegation
+        .handoff_dir_for_child_session(lease.session_id(), &metadata.cwd)
+        .await?;
+    let post_compaction_system_prompt = SystemPromptBuilder::build_with_handoff(
+        metadata,
+        &instruction_entries,
+        handoff_dir.as_deref(),
+    );
     let post_compaction_tools = dependencies.tool_factory.definitions();
     let mut messages = PromptHistoryCompiler::compile_idle_with_artifacts(
         lease,
@@ -3070,6 +3128,9 @@ async fn start_turn(
         )
     })?;
     let agent_id = delegation.agent_for_session(lease.session_id()).await?;
+    let handoff_dir = delegation
+        .handoff_dir_for_child_session(lease.session_id(), &metadata.cwd)
+        .await?;
     let instructions = project_instructions::load(&metadata.cwd).await;
     journal_project_instructions_if_changed(
         lease,
@@ -3166,7 +3227,11 @@ async fn start_turn(
     let instruction_entries = instructions
         .as_ref()
         .map_or_else(Vec::new, LoadedProjectInstructions::prompt_entries);
-    config.system_prompt = Some(SystemPromptBuilder::build(metadata, &instruction_entries));
+    config.system_prompt = Some(SystemPromptBuilder::build_with_handoff(
+        metadata,
+        &instruction_entries,
+        handoff_dir.as_deref(),
+    ));
     config.tools = dependencies.tool_factory.definitions();
     // W6c children retain the spawn tool. The coordinator derives their
     // durable depth from the parent delegation and returns a typed tool
@@ -3780,6 +3845,7 @@ pub(crate) enum RegisteredToolRoute {
     FsPatch,
     ProcessExec,
     SpawnSubagent,
+    MessageSubagent,
 }
 
 #[derive(Debug, Clone)]
@@ -3884,6 +3950,14 @@ pub(crate) fn registered_tools() -> Vec<RegisteredTool> {
                 manifest,
                 default: ToolPermissionDefault::Allow,
                 route: RegisteredToolRoute::SpawnSubagent,
+            }
+        },
+        {
+            let manifest = haider_tools::message_subagent_manifest();
+            RegisteredTool {
+                manifest,
+                default: ToolPermissionDefault::NotApplicable,
+                route: RegisteredToolRoute::MessageSubagent,
             }
         },
     ]
@@ -4118,6 +4192,58 @@ impl ToolDispatcher for BrokerToolDispatcher {
             );
             return Ok(ToolDispatchResult::Deferred(established.ticket));
         }
+        if route == RegisteredToolRoute::MessageSubagent {
+            let request = MessageSubagent::from_tool_args(args).map_err(tool_error)?;
+            let agent = request.agent.clone();
+            let receipt = match self
+                .delegation
+                .message(
+                    MessageCoordinates {
+                        parent_session_id: self.session_id.clone(),
+                        parent_agent_id: self.parent_agent_id.clone(),
+                        command_id: format!("tool-{run_id}-{call_id}"),
+                    },
+                    request,
+                )
+                .await
+            {
+                Ok(receipt) => receipt,
+                Err(error)
+                    if error.code == ErrorCode::InvalidArgument
+                        && error.details.as_ref().is_some_and(|details| {
+                            details.get("kind").and_then(serde_json::Value::as_str)
+                                == Some("not_owned_child")
+                        }) =>
+                {
+                    return Ok(ToolDispatchResult::Completed(BoundedResult {
+                        preview: serde_json::json!({
+                            "status": "rejected",
+                            "kind": "not_owned_child",
+                            "agent": agent,
+                            "message": error.message,
+                        })
+                        .to_string(),
+                        truncated: false,
+                        artifact: None,
+                        cursor: None,
+                    }));
+                }
+                Err(error) => return Err(error),
+            };
+            let preview = serde_json::to_string(&receipt).map_err(|error| {
+                HaiderError::new(
+                    ErrorCode::Internal,
+                    format!("cannot encode message_subagent receipt: {error}"),
+                    false,
+                )
+            })?;
+            return Ok(ToolDispatchResult::Completed(BoundedResult {
+                preview,
+                truncated: false,
+                artifact: None,
+                cursor: None,
+            }));
+        }
         let result = match route {
             RegisteredToolRoute::FsRead => {
                 let path = required_string(&args, "path")?;
@@ -4272,7 +4398,9 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     )
                     .await
             }
-            RegisteredToolRoute::RequestInput | RegisteredToolRoute::SpawnSubagent => {
+            RegisteredToolRoute::RequestInput
+            | RegisteredToolRoute::SpawnSubagent
+            | RegisteredToolRoute::MessageSubagent => {
                 return Err(HaiderError::new(
                     ErrorCode::InvalidArgument,
                     format!("tool `{name}` is not dispatched by the general-tool match"),

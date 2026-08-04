@@ -1,22 +1,25 @@
 #![allow(clippy::expect_used)]
 
 use crate::connection::{ConnectionContext, DrainNotice, serve};
-use crate::delegation::{DelegationHandle, SpawnCoordinates};
+use crate::delegation::{DelegationHandle, MessageCoordinates, SpawnCoordinates};
 use crate::session_hub::{SessionHub, SessionHubConfig};
 use crate::worker::{
-    BrokerToolFactory, ProviderFactory, ResolvedTurnProvider, WorkerDependencies, WorkerManager,
+    BrokerToolFactory, ProviderFactory, ResolvedTurnProvider, TurnToolFactory, WorkerDependencies,
+    WorkerManager, WorkerToolContext,
 };
 use async_trait::async_trait;
 use haider_core::{
-    BranchCreateCommand, SessionCreateCommand, SqliteStoreHandle, StoreHandle, TurnAcceptCommand,
-    TurnAdmissionDisposition, TurnCancelCommand,
+    BranchCreateCommand, CancelToken, EventIdGenerator, SessionCreateCommand, SqliteStoreHandle,
+    StoreHandle, ToolDispatchResult, TurnAcceptCommand, TurnAdmissionDisposition,
+    TurnCancelCommand,
 };
 use haider_protocol::DeliveryMode;
 use haider_protocol::EventPayload;
-use haider_protocol::agent::ChipState;
+use haider_protocol::agent::{AgentMessageDelivery, AgentMessageReceipt, AgentMessaged, ChipState};
 use haider_protocol::effect::{EffectOutcome, EffectPhase};
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
-use haider_protocol::ids::{BranchId, DeviceId, EventId, MenuId, RunId, SessionId};
+use haider_protocol::error::ErrorCode;
+use haider_protocol::ids::{AgentId, BranchId, DeviceId, EventId, MenuId, RunId, SessionId};
 use haider_protocol::item::{ItemEvent, TurnItem};
 use haider_protocol::menu::Menu;
 use haider_protocol::provider::{Block, CapabilityDoc, FinishReason};
@@ -29,14 +32,14 @@ use haider_rpc::{
     AttachMode, Capability, CapabilitySet, ClientKind, CommandId, Hello, RequestBody, RequestId,
     ResponseBody, WIRE_PROTOCOL_VERSION, WireFrame, uds_codec,
 };
-use haider_tools::SpawnSubagent;
+use haider_tools::{MessageSubagent, SpawnSubagent};
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Notify, mpsc, watch};
 use tokio::time::{Duration, timeout};
 
 /// MUTATION CHECK: hard-code parent chip projection to `branch_id: None` or
@@ -94,13 +97,33 @@ fn delegation_parent_projection_is_pinned_to_the_spawn_branch() {
         7,
     )
     .expect("projection envelope");
-    assert_eq!(envelope.branch_id, Some(branch_id));
-    assert_eq!(envelope.run_id, Some(record.parent_run_id));
+    assert_eq!(envelope.branch_id, Some(branch_id.clone()));
+    assert_eq!(envelope.run_id, Some(record.parent_run_id.clone()));
     assert!(matches!(
         serde_json::from_value::<EventPayload>(envelope.payload),
         Ok(EventPayload::AgentChipState { agent, chip: ChipState::Done })
             if agent == agent_id
     ));
+    let message = format!("{}suffix", "é".repeat(205));
+    let envelope = crate::delegation::agent_messaged_envelope(
+        &record,
+        "branch-message-event",
+        EventId::new("child-message-cause"),
+        &message,
+        AgentMessageDelivery::DeliveredQueued,
+        DeviceId::new("branch-message-device"),
+        8,
+    )
+    .expect("message projection envelope");
+    assert_eq!(envelope.branch_id, Some(branch_id));
+    assert_eq!(envelope.run_id, Some(record.parent_run_id));
+    assert_eq!(envelope.render.prompt, PromptRender::Omit);
+    assert!(envelope.render.ui && envelope.render.durable);
+    let fact = AgentMessaged::from_payload_value(&envelope.payload).expect("agent fact");
+    assert_eq!(fact.agent, agent_id);
+    assert_eq!(fact.delivery, AgentMessageDelivery::DeliveredQueued);
+    assert_eq!(fact.preview.chars().count(), 200);
+    assert_eq!(fact.preview, message.chars().take(200).collect::<String>());
 }
 
 /// MUTATION CHECK: drop the parent branch while converting
@@ -180,18 +203,30 @@ async fn established_spawn_captures_parent_branch_and_replays_one_child() {
         .read(&records[0].child_session_id, 0, 128)
         .await
         .expect("child events");
+    let spawn_prompts = child_events
+        .iter()
+        .filter(|event| event.run_id.as_ref() == Some(&records[0].child_run_id))
+        .filter_map(|event| {
+            let EventPayload::UserMessage { text, .. } =
+                serde_json::from_value::<EventPayload>(event.payload.clone()).ok()?
+            else {
+                return None;
+            };
+            Some((event, text))
+        })
+        .collect::<Vec<_>>();
     assert_eq!(
-        child_events
-            .iter()
-            .filter(|event| {
-                event.run_id.as_ref() == Some(&records[0].child_run_id)
-                    && serde_json::from_value::<EventPayload>(event.payload.clone())
-                        .is_ok_and(|payload| matches!(payload, EventPayload::UserMessage { .. }))
-            })
-            .count(),
+        spawn_prompts.len(),
         1,
         "replaying one spawn must not create a second live child turn"
     );
+    let (spawn_prompt, text) = &spawn_prompts[0];
+    assert_eq!(
+        text,
+        "Delegated task: test branch pin\n\nreport after branch switch\n\nReturn a concise final report for the parent agent."
+    );
+    assert!(spawn_prompt.render.ui && spawn_prompt.render.durable);
+    assert_eq!(spawn_prompt.render.prompt, PromptRender::Verbatim);
     assert!(
         child_events
             .iter()
@@ -274,6 +309,550 @@ impl ProviderFactory for FixedProviderFactory {
             attempt_resolver: None,
         })
     }
+}
+
+struct GatedSteerProvider {
+    requests: Mutex<Vec<TurnRequest>>,
+    request_count: AtomicUsize,
+    gate_request: usize,
+    gate_started: Arc<Notify>,
+    release_gate: Arc<Notify>,
+}
+
+impl GatedSteerProvider {
+    fn new(gate_request: usize) -> Self {
+        Self {
+            requests: Mutex::new(Vec::new()),
+            request_count: AtomicUsize::new(0),
+            gate_request,
+            gate_started: Arc::new(Notify::new()),
+            release_gate: Arc::new(Notify::new()),
+        }
+    }
+
+    fn requests(&self) -> Vec<TurnRequest> {
+        self.requests.lock().expect("request lock").clone()
+    }
+}
+
+#[async_trait]
+impl Provider for GatedSteerProvider {
+    async fn capabilities(&self) -> CapabilityDoc {
+        FakeProvider::new(Vec::new()).capabilities().await
+    }
+
+    async fn stream_turn(&self, request: TurnRequest) -> Result<ProviderStream, ProviderError> {
+        self.requests.lock().expect("request lock").push(request);
+        let request_index = self.request_count.fetch_add(1, Ordering::SeqCst);
+        let (sender, receiver) = mpsc::channel(4);
+        if request_index == self.gate_request {
+            self.gate_started.notify_one();
+            let release_gate = Arc::clone(&self.release_gate);
+            tokio::spawn(async move {
+                release_gate.notified().await;
+                let _ = sender
+                    .send(Ok(haider_protocol::provider::StreamEvent::Finish {
+                        reason: FinishReason::EndTurn,
+                    }))
+                    .await;
+            });
+        } else {
+            tokio::spawn(async move {
+                let _ = sender
+                    .send(Ok(haider_protocol::provider::StreamEvent::TextDelta {
+                        text: "steer incorporated".into(),
+                    }))
+                    .await;
+                let _ = sender
+                    .send(Ok(haider_protocol::provider::StreamEvent::Finish {
+                        reason: FinishReason::EndTurn,
+                    }))
+                    .await;
+            });
+        }
+        Ok(receiver.into())
+    }
+}
+
+/// MUTATION CHECK: route a running-child message through a fresh queued run,
+/// skip the worker nudge, omit the parent fact, count preview bytes, or drop
+/// the child handoff line. Expected RUNTIME failure: the second request is not
+/// the same-round steer, the receipt/fact changes, or the UTF-8/path pins fail.
+#[tokio::test]
+async fn message_subagent_steers_running_child_and_journals_bounded_parent_fact() {
+    use haider_protocol::ids::ItemId;
+
+    let root = tempfile::tempdir().expect("temp profile");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let workspace = std::fs::canonicalize(workspace.path()).expect("canonical workspace");
+    let workspace_text = workspace.to_string_lossy().into_owned();
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let provider = Arc::new(GatedSteerProvider::new(0));
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let manager = WorkerManager::start(
+        hub.clone(),
+        WorkerDependencies {
+            provider_factory: Arc::new(FixedProviderFactory {
+                provider: provider.clone(),
+            }),
+            tool_factory: Arc::new(BrokerToolFactory),
+            delegation: None,
+        },
+        false,
+    );
+    hub.install_worker_manager(manager.handle())
+        .expect("install manager");
+    let parent_session = SessionId::new("message-running-parent");
+    let parent_run = RunId::new("message-running-parent-run");
+    hub.create_internal_session(SessionCreateCommand {
+        command_id: "create-message-running-parent".into(),
+        request_digest: "create-message-running-parent-digest".into(),
+        request_json: r#"{"session":"message-running-parent"}"#.into(),
+        session_id: parent_session.clone(),
+        cwd: workspace_text.clone(),
+        provider: "fake".into(),
+        model: "fake-model".into(),
+        max_tokens: 4096,
+        permission_overrides: None,
+        system_prompt_version: crate::worker::SystemPromptBuilder::VERSION.into(),
+        event_id: EventId::new("created-message-running-parent"),
+        device_id: DeviceId::new("message-running-device"),
+    })
+    .await
+    .expect("create parent");
+    terminalize_test_parent(&hub, &parent_session, &parent_run, "message-running").await;
+    let handoff = crate::delegation::handoff_dir(&workspace_text, &parent_session);
+    assert!(!handoff.exists(), "handoff must be lazy until first spawn");
+    let delegation = DelegationHandle::new(hub.clone());
+    let established = delegation
+        .establish(
+            SpawnCoordinates {
+                parent_session_id: parent_session.clone(),
+                parent_run_id: parent_run.clone(),
+                parent_branch_id: None,
+                parent_agent_id: None,
+                tool_item_id: ItemId::new("message-running-spawn-item"),
+                call_id: "message-running-spawn-call".into(),
+                metadata: SessionMetadataV1 {
+                    cwd: workspace_text.clone(),
+                    provider: "fake".into(),
+                    model: "fake-model".into(),
+                    max_tokens: 4096,
+                    system_prompt_version: Some(crate::worker::SystemPromptBuilder::VERSION.into()),
+                    permission_overrides: None,
+                    created_at_ms: 1,
+                },
+            },
+            SpawnSubagent {
+                task: "parser audit".into(),
+                prompt: "inspect the parser state machine".into(),
+            },
+        )
+        .await
+        .expect("establish child");
+    assert_eq!(
+        std::fs::read(handoff.join(".gitignore")).expect("ignore"),
+        b"*"
+    );
+    let child_record = hub
+        .delegation(established.ticket.manifest.agent.clone())
+        .await
+        .expect("delegation lookup")
+        .expect("delegation row");
+    delegation.launch(&established).await.expect("launch child");
+    timeout(Duration::from_secs(5), provider.gate_started.notified())
+        .await
+        .expect("first child request");
+    let first_request = provider.requests().remove(0);
+    let system = first_request.system_prompt.expect("child system prompt");
+    assert!(system.contains(&handoff.to_string_lossy().into_owned()));
+    assert!(system.contains("EPHEMERAL"));
+
+    let mut control = UdsControlClient::connect(hub.clone()).await;
+    control.attach_control(parent_session.clone()).await;
+    let message = format!("{}tail", "界".repeat(205));
+    let receipt = control
+        .message_agent(
+            "message-running-command",
+            parent_session.clone(),
+            store.worker_generation(),
+            established.ticket.manifest.agent.clone(),
+            message.clone(),
+        )
+        .await
+        .expect("steer running child over RPC");
+    assert_eq!(receipt.delivery, AgentMessageDelivery::DeliveredSteer);
+    assert_eq!(receipt.child_run_id, child_record.child_run_id);
+
+    let replay = control
+        .message_agent(
+            "message-running-command",
+            parent_session.clone(),
+            store.worker_generation(),
+            established.ticket.manifest.agent.clone(),
+            message.clone(),
+        )
+        .await
+        .expect("same message command replays");
+    assert_eq!(replay, receipt);
+    let conflict = control
+        .message_agent(
+            "message-running-command",
+            parent_session.clone(),
+            store.worker_generation(),
+            established.ticket.manifest.agent.clone(),
+            "different text must not cross the durable command fence".into(),
+        )
+        .await
+        .expect_err("changed replay semantics rejected");
+    assert_eq!(conflict.0, "invalid_argument");
+    assert!(conflict.1.contains("different semantics"));
+    provider.release_gate.notify_one();
+
+    timeout(Duration::from_secs(5), async {
+        while provider.requests().len() < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("steered provider request");
+    let requests = provider.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "same-command replay must not inject twice"
+    );
+    assert!(requests[1].messages.iter().any(|provider_message| {
+        provider_message
+            .blocks
+            .iter()
+            .any(|block| matches!(block, Block::Text { text } if text == &message))
+    }));
+    let child_events = store
+        .read(&child_record.child_session_id, 0, 256)
+        .await
+        .expect("child journal");
+    let steered_runs = child_events
+        .iter()
+        .filter(|event| {
+            serde_json::from_value::<EventPayload>(event.payload.clone()).is_ok_and(|payload| {
+                matches!(payload, EventPayload::UserMessage { text, .. } if text == message)
+            })
+        })
+        .filter_map(|event| event.run_id.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(steered_runs, vec![receipt.child_run_id.clone()]);
+
+    let parent_events = store
+        .read(&parent_session, 0, 256)
+        .await
+        .expect("parent journal");
+    let fact = parent_events
+        .iter()
+        .find_map(|event| {
+            AgentMessaged::from_payload_value(&event.payload).map(|fact| (event, fact))
+        })
+        .expect("parent AgentMessaged fact");
+    assert_eq!(fact.1.agent, established.ticket.manifest.agent);
+    assert_eq!(fact.1.delivery, AgentMessageDelivery::DeliveredSteer);
+    assert_eq!(fact.1.preview.chars().count(), 200);
+    assert_eq!(
+        fact.1.preview,
+        message.chars().take(200).collect::<String>()
+    );
+    assert!(fact.0.render.ui && fact.0.render.durable);
+    assert_eq!(fact.0.render.prompt, PromptRender::Omit);
+
+    control.close().await;
+    hub.delete_session(parent_session.clone())
+        .await
+        .expect("delete quiesced parent session");
+    assert!(
+        store
+            .session_metadata(&parent_session)
+            .await
+            .expect("read deleted parent metadata")
+            .is_none()
+    );
+    assert!(
+        !handoff.exists(),
+        "parent deletion cleans ephemeral handoff"
+    );
+    manager.shutdown().await.expect("manager shutdown");
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
+}
+
+/// MUTATION CHECK: reuse the terminal spawn run or queue without submitting
+/// it immediately. Expected RUNTIME failure: the receipt is not queued, the
+/// run id is unchanged, or the second provider request never starts.
+#[tokio::test]
+async fn message_subagent_starts_an_idle_child_immediately() {
+    use haider_protocol::ids::ItemId;
+
+    let root = tempfile::tempdir().expect("temp profile");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let workspace = std::fs::canonicalize(workspace.path())
+        .expect("canonical workspace")
+        .to_string_lossy()
+        .into_owned();
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let provider = Arc::new(GatedSteerProvider::new(1));
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let manager = WorkerManager::start(
+        hub.clone(),
+        WorkerDependencies {
+            provider_factory: Arc::new(FixedProviderFactory {
+                provider: provider.clone(),
+            }),
+            tool_factory: Arc::new(BrokerToolFactory),
+            delegation: None,
+        },
+        false,
+    );
+    hub.install_worker_manager(manager.handle())
+        .expect("install manager");
+    let parent_session = SessionId::new("message-idle-parent");
+    let parent_run = RunId::new("message-idle-parent-run");
+    hub.create_internal_session(SessionCreateCommand {
+        command_id: "create-message-idle-parent".into(),
+        request_digest: "create-message-idle-parent-digest".into(),
+        request_json: r#"{"session":"message-idle-parent"}"#.into(),
+        session_id: parent_session.clone(),
+        cwd: workspace.clone(),
+        provider: "fake".into(),
+        model: "fake-model".into(),
+        max_tokens: 4096,
+        permission_overrides: None,
+        system_prompt_version: crate::worker::SystemPromptBuilder::VERSION.into(),
+        event_id: EventId::new("created-message-idle-parent"),
+        device_id: DeviceId::new("message-idle-device"),
+    })
+    .await
+    .expect("create parent");
+    terminalize_test_parent(&hub, &parent_session, &parent_run, "message-idle").await;
+    let delegation = DelegationHandle::new(hub.clone());
+    let established = delegation
+        .establish(
+            SpawnCoordinates {
+                parent_session_id: parent_session.clone(),
+                parent_run_id: parent_run.clone(),
+                parent_branch_id: None,
+                parent_agent_id: None,
+                tool_item_id: ItemId::new("message-idle-spawn-item"),
+                call_id: "message-idle-spawn-call".into(),
+                metadata: SessionMetadataV1 {
+                    cwd: workspace.clone(),
+                    provider: "fake".into(),
+                    model: "fake-model".into(),
+                    max_tokens: 4096,
+                    system_prompt_version: Some(crate::worker::SystemPromptBuilder::VERSION.into()),
+                    permission_overrides: None,
+                    created_at_ms: 1,
+                },
+            },
+            SpawnSubagent {
+                task: "first pass".into(),
+                prompt: "finish once".into(),
+            },
+        )
+        .await
+        .expect("establish child");
+    let child_record = hub
+        .delegation(established.ticket.manifest.agent.clone())
+        .await
+        .expect("delegation lookup")
+        .expect("delegation row");
+    let child_session = child_record.child_session_id.clone();
+    delegation.launch(&established).await.expect("launch child");
+    wait_for_state(&store, &child_session, |state| *state == RunState::Done).await;
+    let parent_lease = hub
+        .acquire_worker_lease(parent_session.clone())
+        .await
+        .expect("parent tool lease");
+    let dispatcher = TurnToolFactory::create(
+        &BrokerToolFactory,
+        WorkerToolContext {
+            metadata: SessionMetadataV1 {
+                cwd: workspace,
+                provider: "fake".into(),
+                model: "fake-model".into(),
+                max_tokens: 4096,
+                system_prompt_version: Some(crate::worker::SystemPromptBuilder::VERSION.into()),
+                permission_overrides: None,
+                created_at_ms: 1,
+            },
+            store: parent_lease,
+            run_id: parent_run.clone(),
+            branch_id: None,
+            device_id: DeviceId::new("message-idle-tool-device"),
+            event_ids: Arc::new(EventIdGenerator::new("message-idle-tool-event")),
+            delegation: delegation.clone(),
+            agent_id: None,
+        },
+    )
+    .await
+    .expect("create production tool dispatcher")
+    .expect("dispatcher available");
+    let tool_result = dispatcher
+        .execute(
+            &parent_run,
+            &haider_protocol::ids::ItemId::new("message-idle-tool-item"),
+            "message-idle-tool-call",
+            "message_subagent",
+            serde_json::json!({
+                "agent": established.ticket.manifest.agent.clone(),
+                "message": "perform the follow-up pass"
+            }),
+            &CancelToken::new(),
+        )
+        .await
+        .expect("execute production message_subagent tool");
+    let ToolDispatchResult::Completed(tool_result) = tool_result else {
+        panic!("message_subagent must complete with a receipt")
+    };
+    let receipt: AgentMessageReceipt =
+        serde_json::from_str(&tool_result.preview).expect("decode tool delivery receipt");
+    assert_eq!(receipt.delivery, AgentMessageDelivery::DeliveredQueued);
+    assert_ne!(receipt.child_run_id, child_record.child_run_id);
+    timeout(Duration::from_secs(5), provider.gate_started.notified())
+        .await
+        .expect("idle child starts second request");
+    let running_tool_result = dispatcher
+        .execute(
+            &parent_run,
+            &haider_protocol::ids::ItemId::new("message-idle-running-tool-item"),
+            "message-idle-running-tool-call",
+            "message_subagent",
+            serde_json::json!({
+                "agent": established.ticket.manifest.agent,
+                "message": "steer the live follow-up before it finishes"
+            }),
+            &CancelToken::new(),
+        )
+        .await
+        .expect("execute running-child message_subagent tool");
+    let ToolDispatchResult::Completed(running_tool_result) = running_tool_result else {
+        panic!("running message_subagent must complete with a receipt")
+    };
+    let running_receipt: AgentMessageReceipt = serde_json::from_str(&running_tool_result.preview)
+        .expect("decode running tool delivery receipt");
+    assert_eq!(
+        running_receipt.delivery,
+        AgentMessageDelivery::DeliveredSteer
+    );
+    assert_eq!(running_receipt.child_run_id, receipt.child_run_id);
+    provider.release_gate.notify_one();
+    timeout(Duration::from_secs(5), async {
+        while provider.requests().len() < 3 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("running child consumes tool steer");
+    assert!(
+        provider.requests()[1]
+            .messages
+            .iter()
+            .any(|provider_message| {
+                provider_message.blocks.iter().any(|block| {
+            matches!(block, Block::Text { text } if text == "perform the follow-up pass")
+        })
+            })
+    );
+    assert!(provider.requests()[2].messages.iter().any(|provider_message| {
+        provider_message.blocks.iter().any(|block| {
+            matches!(block, Block::Text { text } if text == "steer the live follow-up before it finishes")
+        })
+    }));
+    manager.shutdown().await.expect("manager shutdown");
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
+}
+
+/// MUTATION CHECK: authorize by target id alone or by ancestry instead of
+/// exact direct ownership. Expected RUNTIME failure: the foreign parent call
+/// succeeds or loses the typed `not_owned_child` detail.
+#[tokio::test]
+async fn only_own_children_are_messageable_with_typed_error() {
+    use haider_protocol::ids::ItemId;
+
+    let root = tempfile::tempdir().expect("temp profile");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let workspace = std::fs::canonicalize(workspace.path())
+        .expect("canonical workspace")
+        .to_string_lossy()
+        .into_owned();
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let owner = SessionId::new("message-owner-parent");
+    hub.create_internal_session(SessionCreateCommand {
+        command_id: "create-message-owner-parent".into(),
+        request_digest: "create-message-owner-parent-digest".into(),
+        request_json: r#"{"session":"message-owner-parent"}"#.into(),
+        session_id: owner.clone(),
+        cwd: workspace.clone(),
+        provider: "fake".into(),
+        model: "fake-model".into(),
+        max_tokens: 4096,
+        permission_overrides: None,
+        system_prompt_version: crate::worker::SystemPromptBuilder::VERSION.into(),
+        event_id: EventId::new("created-message-owner-parent"),
+        device_id: DeviceId::new("message-owner-device"),
+    })
+    .await
+    .expect("create owner");
+    let delegation = DelegationHandle::new(hub.clone());
+    let established = delegation
+        .establish(
+            SpawnCoordinates {
+                parent_session_id: owner,
+                parent_run_id: RunId::new("message-owner-run"),
+                parent_branch_id: None,
+                parent_agent_id: None,
+                tool_item_id: ItemId::new("message-owner-item"),
+                call_id: "message-owner-call".into(),
+                metadata: SessionMetadataV1 {
+                    cwd: workspace,
+                    provider: "fake".into(),
+                    model: "fake-model".into(),
+                    max_tokens: 4096,
+                    system_prompt_version: Some(crate::worker::SystemPromptBuilder::VERSION.into()),
+                    permission_overrides: None,
+                    created_at_ms: 1,
+                },
+            },
+            SpawnSubagent {
+                task: "owned child".into(),
+                prompt: "do not cross parents".into(),
+            },
+        )
+        .await
+        .expect("establish owned child");
+    let error = delegation
+        .message(
+            MessageCoordinates {
+                parent_session_id: SessionId::new("foreign-parent"),
+                parent_agent_id: None,
+                command_id: "foreign-message".into(),
+            },
+            MessageSubagent {
+                agent: established.ticket.manifest.agent,
+                message: "steal this child".into(),
+            },
+        )
+        .await
+        .expect_err("foreign parent rejected");
+    assert_eq!(error.code, ErrorCode::InvalidArgument);
+    assert_eq!(
+        error
+            .details
+            .as_ref()
+            .and_then(|details| details["kind"].as_str()),
+        Some("not_owned_child")
+    );
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
 }
 
 /// MUTATION CHECK: submit the child before terminalizing AgentSpawn, keep the
@@ -506,7 +1085,9 @@ async fn production_spawn_effect_wait_and_report_chain_is_end_to_end() {
             matches!(
                 block,
                 Block::ToolResult { call_id, preview, .. }
-                    if call_id == "spawn-call" && preview == "child report"
+                    if call_id == "spawn-call"
+                        && preview.starts_with("agent: agent-")
+                        && preview.ends_with("\n\nchild report")
             )
         })
     }));
@@ -569,6 +1150,24 @@ async fn production_spawn_effect_wait_and_report_chain_is_end_to_end() {
         })
         .expect("spawn manifest");
     assert_eq!(spawned.task, "tests");
+    let projected_prompt = parent_events
+        .iter()
+        .find(|event| {
+            event.agent_id.as_ref() == Some(&spawned.agent)
+                && serde_json::from_value::<EventPayload>(event.payload.clone()).is_ok_and(
+                    |payload| {
+                        matches!(
+                            payload,
+                            EventPayload::UserMessage { text, .. }
+                                if text.contains("run the focused test suite")
+                        )
+                    },
+                )
+        })
+        .expect("spawn prompt projected into child-scoped parent timeline");
+    assert_eq!(projected_prompt.branch_id, Some(branch_a.clone()));
+    assert!(projected_prompt.render.ui && projected_prompt.render.durable);
+    assert_eq!(projected_prompt.render.prompt, PromptRender::Omit);
     // Owner ask: the wire carries NO neutral callsign — the TUI claims
     // the honor roll (mutation: restore the SUB-hex mint → fails).
     assert!(spawned.callsign.is_none());
@@ -655,6 +1254,58 @@ async fn accept_parent(
     })
     .await
     .expect("accept parent")
+}
+
+async fn terminalize_test_parent(
+    hub: &SessionHub,
+    session_id: &SessionId,
+    run_id: &RunId,
+    label: &str,
+) {
+    hub.accept_internal_turn(TurnAcceptCommand {
+        command_id: format!("submit-{label}-parent"),
+        request_digest: format!("submit-{label}-parent-digest"),
+        request_json: format!(r#"{{"turn":"{label}-parent"}}"#),
+        session_id: session_id.clone(),
+        worker_generation: hub.worker_generation(),
+        run_id: run_id.clone(),
+        agent_id: None,
+        branch_id: None,
+        text: format!("parent coordinates for {label}"),
+        attachments: Vec::new(),
+        mode: DeliveryMode::Queue,
+        queued_event_id: EventId::new(format!("queued-{label}-parent")),
+        user_event_id: EventId::new(format!("user-{label}-parent")),
+        active_event_id: EventId::new(format!("active-{label}-parent")),
+        device_id: DeviceId::new("s1-message-test-device"),
+    })
+    .await
+    .expect("accept test parent");
+    let mut terminal = [EventEnvelope {
+        schema_version: SCHEMA_VERSION,
+        event_id: EventId::new(format!("done-{label}-parent")),
+        seq: 0,
+        session_id: session_id.clone(),
+        branch_id: None,
+        run_id: Some(run_id.clone()),
+        agent_id: None,
+        device_id: DeviceId::new("s1-message-test-device"),
+        authority_epoch: 0,
+        worker_generation: hub.worker_generation(),
+        causation_id: None,
+        correlation_id: None,
+        committed_at_ms: 0,
+        render: RenderTargets {
+            ui: true,
+            durable: true,
+            prompt: PromptRender::Omit,
+        },
+        payload: serde_json::to_value(EventPayload::RunState(RunState::Done))
+            .expect("parent done payload"),
+    }];
+    hub.append(&mut terminal)
+        .await
+        .expect("terminalize test parent");
 }
 
 async fn wait_for_state(
@@ -1008,6 +1659,41 @@ impl UdsControlClient {
                 } if observed == request_id => {
                     panic!("child menu answer failed: {code}: {message}")
                 }
+                _ => {}
+            }
+        }
+    }
+
+    async fn message_agent(
+        &mut self,
+        command_id: &str,
+        session_id: SessionId,
+        worker_generation: u64,
+        agent: AgentId,
+        text: String,
+    ) -> Result<AgentMessageReceipt, (String, String)> {
+        let request_id = RequestId::new(format!("agent-message-{command_id}"));
+        self.send(WireFrame::Request {
+            request_id: request_id.clone(),
+            body: RequestBody::AgentMessage {
+                command_id: CommandId::new(command_id),
+                session_id,
+                worker_generation,
+                agent,
+                text,
+            },
+        })
+        .await;
+        loop {
+            match self.next().await {
+                WireFrame::Response {
+                    request_id: observed,
+                    body: ResponseBody::AgentMessage { receipt },
+                } if observed == request_id => return Ok(receipt),
+                WireFrame::Response {
+                    request_id: observed,
+                    body: ResponseBody::Error { code, message, .. },
+                } if observed == request_id => return Err((code, message)),
                 _ => {}
             }
         }

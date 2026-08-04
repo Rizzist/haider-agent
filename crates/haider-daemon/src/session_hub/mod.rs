@@ -123,7 +123,7 @@ use haider_rpc::{
     ERROR_CODE_VISION_UNSUPPORTED, ErrorData, MenuInput, ProtocolError, RequestBody, RequestId,
     ResponseBody, SeqRange, SessionReadResult, SessionSummary, SubmitDisposition, WireFrame,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -503,6 +503,10 @@ struct HubInner {
     observer: Arc<dyn SessionHubObserver>,
     metrics: Arc<HubMetrics>,
     actors: Mutex<HashMap<SessionId, SessionActorHandle>>,
+    /// Permanent tombstones for sessions deleted in this daemon lifetime.
+    /// `actor_for` checks them at both sides of its await so deletion cannot
+    /// race actor recreation or fresh admission.
+    deleting_sessions: Mutex<HashSet<SessionId>>,
     actor_tasks: Mutex<Vec<JoinHandle<()>>>,
     replay_tasks: Mutex<Vec<JoinHandle<ReplayCompletion>>>,
     attachments: Mutex<HashMap<AttachmentId, AttachmentOwner>>,
@@ -800,6 +804,9 @@ enum ActorCommand {
     UnregisterHarness {
         lease_id: WorkerLeaseId,
     },
+    StopIfQuiescent {
+        completed: oneshot::Sender<Result<bool, HaiderError>>,
+    },
     Stop,
 }
 
@@ -893,6 +900,7 @@ impl SessionHub {
                 observer,
                 metrics: Arc::new(HubMetrics::default()),
                 actors: Mutex::new(HashMap::new()),
+                deleting_sessions: Mutex::new(HashSet::new()),
                 actor_tasks: Mutex::new(Vec::new()),
                 replay_tasks: Mutex::new(Vec::new()),
                 attachments: Mutex::new(HashMap::new()),
@@ -1078,7 +1086,12 @@ impl SessionHub {
     ) -> Result<(), HaiderError> {
         self.worker_manager()
             .map_err(hub_error_as_store)?
-            .nudge(accepted.session_id, accepted.run_id, text)
+            .nudge(
+                accepted.session_id,
+                accepted.run_id,
+                accepted.accepted_seq,
+                text,
+            )
             .await
     }
 
@@ -1533,6 +1546,126 @@ impl SessionHub {
         self.inner.store.session_ids().await.map_err(Into::into)
     }
 
+    /// Deletes one quiesced session through the daemon's production
+    /// lifecycle. New actor admission is fenced first; attached or
+    /// nonterminal sessions are refused. The actor stops before the durable
+    /// transaction, and ephemeral handoff data is cleaned only after commit.
+    pub async fn delete_session(&self, session_id: SessionId) -> Result<(), HaiderError> {
+        {
+            let mut deleting = lock(&self.inner.deleting_sessions).map_err(hub_error_as_store)?;
+            if !deleting.insert(session_id.clone()) {
+                return Err(HaiderError::new(
+                    ErrorCode::Busy,
+                    "session deletion is already in progress",
+                    true,
+                ));
+            }
+        }
+        let result = self.delete_fenced_session(&session_id).await;
+        if result.is_err()
+            && let Ok(mut deleting) = lock(&self.inner.deleting_sessions)
+        {
+            deleting.remove(&session_id);
+        }
+        result
+    }
+
+    async fn delete_fenced_session(&self, session_id: &SessionId) -> Result<(), HaiderError> {
+        let metadata = self
+            .inner
+            .store
+            .session_metadata(session_id)
+            .await?
+            .ok_or_else(|| {
+                HaiderError::new(ErrorCode::InvalidArgument, "session was not found", false)
+            })?;
+        if lock(&self.inner.attachments)
+            .map_err(hub_error_as_store)?
+            .values()
+            .any(|owner| owner.session_id == *session_id)
+        {
+            return Err(HaiderError::new(
+                ErrorCode::Busy,
+                "attached session cannot be deleted",
+                true,
+            ));
+        }
+        if self.session_has_nonterminal_runs(session_id).await? {
+            return Err(HaiderError::new(
+                ErrorCode::Busy,
+                "nonterminal session cannot be deleted",
+                true,
+            ));
+        }
+        let actor = lock(&self.inner.actors)
+            .map_err(hub_error_as_store)?
+            .get(session_id)
+            .cloned();
+        if let Some(actor) = actor {
+            let (completed, quiescent) = oneshot::channel();
+            actor
+                .commands
+                .send(ActorCommand::StopIfQuiescent { completed })
+                .await
+                .map_err(|_| {
+                    HaiderError::new(
+                        ErrorCode::Internal,
+                        "session actor stopped before deletion fencing",
+                        true,
+                    )
+                })?;
+            if !quiescent.await.map_err(|_| {
+                HaiderError::new(
+                    ErrorCode::Internal,
+                    "session actor did not acknowledge deletion fencing",
+                    true,
+                )
+            })?? {
+                return Err(HaiderError::new(
+                    ErrorCode::Busy,
+                    "session became nonterminal or attached during deletion",
+                    true,
+                ));
+            }
+            // The actor stopped only after its FIFO-local quiescence check.
+            // The deletion tombstone prevents any replacement from racing
+            // this removal.
+            lock(&self.inner.actors)
+                .map_err(hub_error_as_store)?
+                .remove(session_id);
+        }
+        self.inner.store.delete_session(session_id.clone()).await?;
+        crate::delegation::DelegationHandle::new(self.clone())
+            .cleanup_handoff_for_deleted_parent(&metadata.cwd, session_id)
+            .await;
+        Ok(())
+    }
+
+    async fn session_has_nonterminal_runs(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<bool, HaiderError> {
+        let mut cursor = 0;
+        let mut states = HashMap::<RunId, RunState>::new();
+        loop {
+            let page = self.inner.store.read(session_id, cursor, 256).await?;
+            if page.is_empty() {
+                return Ok(states.values().any(|state| !state.is_terminal()));
+            }
+            cursor = page.last().map_or(cursor, |event| event.seq);
+            for event in page {
+                let Some(run_id) = event.run_id else {
+                    continue;
+                };
+                if let Ok(EventPayload::RunState(state)) =
+                    serde_json::from_value::<EventPayload>(event.payload)
+                {
+                    states.insert(run_id, state);
+                }
+            }
+        }
+    }
+
     async fn acquire_worker_lease_inner(
         &self,
         session_id: SessionId,
@@ -1585,6 +1718,13 @@ impl SessionHub {
         if self.inner.draining.load(Ordering::Acquire) {
             return Err(SessionHubError::Closed);
         }
+        if lock(&self.inner.deleting_sessions)?.contains(&session_id) {
+            return Err(SessionHubError::Store(HaiderError::new(
+                ErrorCode::InvalidArgument,
+                "session was deleted",
+                false,
+            )));
+        }
         {
             let actors = lock(&self.inner.actors)?;
             if let Some(actor) = actors.get(&session_id) {
@@ -1605,6 +1745,13 @@ impl SessionHub {
         let mut actors = lock(&self.inner.actors)?;
         if self.inner.draining.load(Ordering::Acquire) {
             return Err(SessionHubError::Closed);
+        }
+        if lock(&self.inner.deleting_sessions)?.contains(&session_id) {
+            return Err(SessionHubError::Store(HaiderError::new(
+                ErrorCode::InvalidArgument,
+                "session was deleted",
+                false,
+            )));
         }
         if let Some(actor) = actors.get(&session_id) {
             return Ok(actor.clone());
@@ -1747,6 +1894,22 @@ impl SessionHub {
             catch_up_bytes,
         };
         let (cancel, _) = watch::channel(false);
+        // Serialize the final owner publication with deletion-fence minting.
+        // A pre-fence register that returns from the actor after deletion
+        // started must detach/refuse instead of appearing behind the deleter's
+        // attachment check.
+        let deleting = lock(&self.inner.deleting_sessions)?;
+        if deleting.contains(&session_id) {
+            drop(deleting);
+            let _ = actor.commands.try_send(ActorCommand::Detach {
+                attachment_id: attachment_id.clone(),
+            });
+            return Err(SessionHubError::Store(HaiderError::new(
+                ErrorCode::InvalidArgument,
+                "session was deleted",
+                false,
+            )));
+        }
         lock(&self.inner.attachments)?.insert(
             attachment_id,
             AttachmentOwner {
@@ -1757,6 +1920,7 @@ impl SessionHub {
                 cancel,
             },
         );
+        drop(deleting);
         Ok(RegisterResult::Registered(registration))
     }
 

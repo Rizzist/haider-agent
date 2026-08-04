@@ -3,12 +3,13 @@
 use std::collections::BTreeSet;
 
 use haider_protocol::DeliveryMode;
+use haider_protocol::agent::{AgentMessageDelivery, AgentMessageReceipt};
 use haider_protocol::credential::{AuthMethod, CredentialDescriptor, CredentialStatus};
 use haider_protocol::effect::EffectClass;
 use haider_protocol::envelope::{PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION};
 use haider_protocol::ids::CredentialAlias;
 use haider_protocol::ids::{
-    ArtifactRef, BranchId, DeviceId, EventId, ItemId, MenuId, NodeId, RunId, SessionId,
+    AgentId, ArtifactRef, BranchId, DeviceId, EventId, ItemId, MenuId, NodeId, RunId, SessionId,
 };
 use haider_protocol::session::{SessionMetadataV1, SessionPermissionOverridesV1};
 use haider_protocol::tool::{
@@ -1015,6 +1016,29 @@ pub fn transcript() -> Vec<WireFrame> {
                     subagents: Vec::new(),
                     updated_at_ms: 1_753_500_000_009,
                     last_event_kinds: vec!["run_state".into(), "menu_opened".into()],
+                },
+            },
+        },
+        // S1 append-only direct-child message wire. Older clients retain the
+        // preceding transcript and decode this method as unknown.
+        WireFrame::Request {
+            request_id: RequestId::new("request-agent-message"),
+            body: RequestBody::AgentMessage {
+                command_id: CommandId::new("command-agent-message"),
+                session_id: SessionId::new("session-parent"),
+                worker_generation: 7,
+                agent: AgentId::new("agent-child-7"),
+                text: "re-read the parser fixture".into(),
+            },
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-agent-message"),
+            body: ResponseBody::AgentMessage {
+                receipt: AgentMessageReceipt {
+                    agent: AgentId::new("agent-child-7"),
+                    delivery: AgentMessageDelivery::DeliveredSteer,
+                    child_run_id: RunId::new("run-child-7"),
+                    child_run_state: haider_protocol::state::RunState::Streaming,
                 },
             },
         },

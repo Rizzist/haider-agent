@@ -21,7 +21,8 @@ use haider_core::{
 };
 use haider_protocol::DeliveryMode;
 use haider_protocol::agent::{
-    AgentManifest, AgentRole, ChildReport, ChipState, Grant, Placement, ReportVerification,
+    AgentManifest, AgentMessageDelivery, AgentMessageReceipt, AgentMessaged, AgentRole,
+    ChildReport, ChipState, Grant, Placement, ReportVerification,
 };
 use haider_protocol::effect::EffectClass;
 use haider_protocol::envelope::{
@@ -32,8 +33,10 @@ use haider_protocol::ids::{AgentId, BranchId, EventId, ItemId, LeaseId, RunId, S
 use haider_protocol::item::{ItemEvent, TurnItem};
 use haider_protocol::session::SessionMetadataV1;
 use haider_protocol::state::RunState;
-use haider_tools::SpawnSubagent;
-use std::collections::{HashSet, VecDeque};
+use haider_tools::{MessageSubagent, SpawnSubagent};
+use rustix::fs::{Mode, OFlags};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -44,6 +47,8 @@ const STALL_NUDGE_TEXT: &str = "report your status or conclude";
 const STALL_REPORT_SUMMARY: &str =
     "subagent stalled after one nudge and was cancelled without further progress";
 const MAX_REPORT_BYTES: usize = 16 * 1024;
+const MAX_MESSAGE_PREVIEW_CHARS: usize = 200;
+const HANDOFF_IGNORE: &[u8] = b"*";
 
 #[derive(Clone)]
 pub(crate) struct DelegationHandle {
@@ -59,6 +64,13 @@ pub(crate) struct SpawnCoordinates {
     pub(crate) tool_item_id: ItemId,
     pub(crate) call_id: String,
     pub(crate) metadata: SessionMetadataV1,
+}
+
+pub(crate) struct MessageCoordinates {
+    pub(crate) parent_session_id: SessionId,
+    pub(crate) parent_agent_id: Option<AgentId>,
+    /// Receipt-stable identity: a model tool call id or chip-wire command id.
+    pub(crate) command_id: String,
 }
 
 pub(crate) struct EstablishedSpawn {
@@ -96,6 +108,8 @@ impl DelegationHandle {
                 coordinates.parent_agent_id.as_ref(),
             )
             .await?;
+        self.ensure_handoff_dir(&coordinates.metadata.cwd, &coordinates.parent_session_id)
+            .await?;
         let identity = stable_digest(&[
             coordinates.parent_session_id.as_str(),
             coordinates.parent_run_id.as_str(),
@@ -125,6 +139,7 @@ impl DelegationHandle {
                     "fs_edit".into(),
                     "process_exec".into(),
                     "spawn_subagent".into(),
+                    "message_subagent".into(),
                 ],
                 effect_ceiling: vec![
                     EffectClass::FsRead,
@@ -391,6 +406,448 @@ impl DelegationHandle {
             .map(|record| record.agent_id))
     }
 
+    /// Returns the parent's shared, ephemeral handoff path for a delegated
+    /// child session. Root sessions have no child handoff line.
+    pub(crate) async fn handoff_dir_for_child_session(
+        &self,
+        child_session_id: &SessionId,
+        workspace: &str,
+    ) -> Result<Option<PathBuf>, HaiderError> {
+        Ok(self
+            .hub
+            .delegation_for_child_session(child_session_id.clone())
+            .await?
+            .map(|record| handoff_dir(workspace, &record.parent_session_id)))
+    }
+
+    /// Best-effort cleanup used only after the parent session's durable
+    /// deletion transaction commits. Never call this for idle or shutdown.
+    pub(crate) async fn cleanup_handoff_for_deleted_parent(
+        &self,
+        workspace: &str,
+        parent_session_id: &SessionId,
+    ) {
+        let path = handoff_dir(workspace, parent_session_id);
+        match tokio::fs::remove_dir_all(&path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(path = %path.display(), ?error, "could not clean ephemeral handoff directory");
+            }
+        }
+    }
+
+    /// Delivers one direct-child message through the same durable STEER seam
+    /// as stall supervision, or starts a fresh immediate turn when the child
+    /// has no nonterminal run.
+    pub(crate) async fn message(
+        &self,
+        coordinates: MessageCoordinates,
+        request: MessageSubagent,
+    ) -> Result<AgentMessageReceipt, HaiderError> {
+        let record = self
+            .hub
+            .delegation(request.agent.clone())
+            .await?
+            .ok_or_else(|| not_owned_child(&request.agent))?;
+        if record.parent_session_id != coordinates.parent_session_id
+            || record.parent_agent_id != coordinates.parent_agent_id
+        {
+            return Err(not_owned_child(&request.agent));
+        }
+
+        let identity = stable_digest(&[
+            coordinates.parent_session_id.as_str(),
+            coordinates
+                .parent_agent_id
+                .as_ref()
+                .map_or("root", AgentId::as_str),
+            &coordinates.command_id,
+            request.agent.as_str(),
+        ]);
+        if let Some(receipt) = self
+            .replayed_message_receipt(&record, &identity, &request.message)
+            .await?
+        {
+            return Ok(receipt);
+        }
+
+        let snapshot = self
+            .child_session_snapshot(&record.child_session_id)
+            .await?;
+        let (accepted, delivery, child_run_state) = if let Some((run_id, state)) = snapshot.active {
+            let accepted = self
+                .accept_child_message(&record, &identity, run_id, &request.message, "steer")
+                .await?;
+            if accepted.disposition != haider_core::TurnAdmissionDisposition::SteerPending {
+                return Err(HaiderError::new(
+                    ErrorCode::StoreCorrupt,
+                    "child message did not bind to the active child run",
+                    false,
+                ));
+            }
+            (accepted, AgentMessageDelivery::DeliveredSteer, state)
+        } else {
+            let run_id = RunId::new(format!("run-child-message-{identity}"));
+            let accepted = self
+                .accept_child_message(&record, &identity, run_id, &request.message, "queued")
+                .await?;
+            if !matches!(
+                accepted.disposition,
+                haider_core::TurnAdmissionDisposition::Started
+                    | haider_core::TurnAdmissionDisposition::Queued
+            ) {
+                return Err(HaiderError::new(
+                    ErrorCode::StoreCorrupt,
+                    "idle child message did not create a fresh child turn",
+                    false,
+                ));
+            }
+            (
+                accepted,
+                AgentMessageDelivery::DeliveredQueued,
+                RunState::Queued,
+            )
+        };
+        let child_message = self
+            .child_message_event(&record.child_session_id, &identity)
+            .await?
+            .ok_or_else(|| {
+                HaiderError::new(
+                    ErrorCode::StoreCorrupt,
+                    "accepted child message has no durable user event",
+                    false,
+                )
+            })?;
+        self.append_parent_message_facts(
+            &record,
+            &identity,
+            &child_message,
+            &child_message.text,
+            delivery,
+        )
+        .await?;
+        match delivery {
+            AgentMessageDelivery::DeliveredSteer => {
+                self.hub
+                    .submit_internal_nudge(accepted.clone(), request.message)
+                    .await?;
+            }
+            AgentMessageDelivery::DeliveredQueued => {
+                self.hub.submit_internal_turn(accepted.clone()).await?;
+            }
+        }
+        Ok(AgentMessageReceipt {
+            agent: record.agent_id,
+            delivery,
+            child_run_id: accepted.run_id,
+            child_run_state,
+        })
+    }
+
+    async fn accept_child_message(
+        &self,
+        record: &DelegationRecord,
+        identity: &str,
+        run_id: RunId,
+        text: &str,
+        path: &str,
+    ) -> Result<AcceptedTurn, HaiderError> {
+        let request_json = serde_json::to_string(&serde_json::json!({
+            "session_id": record.child_session_id,
+            "run_id": run_id,
+            "agent": record.agent_id,
+            "text": text,
+            "mode": DeliveryMode::Steer,
+            "delivery_path": path,
+        }))
+        .map_err(internal_serialization)?;
+        self.hub
+            .accept_internal_turn(TurnAcceptCommand {
+                command_id: format!("delegation-message-{path}-{identity}"),
+                request_digest: digest_bytes(request_json.as_bytes()),
+                request_json,
+                session_id: record.child_session_id.clone(),
+                worker_generation: self.hub.worker_generation(),
+                branch_id: None,
+                run_id,
+                agent_id: Some(record.agent_id.clone()),
+                text: text.to_owned(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Steer,
+                queued_event_id: EventId::new(format!(
+                    "delegation-message-{path}-queued-{identity}"
+                )),
+                user_event_id: EventId::new(format!("delegation-message-{path}-user-{identity}")),
+                active_event_id: EventId::new(format!(
+                    "delegation-message-{path}-active-{identity}"
+                )),
+                device_id: self.hub.device_id(),
+            })
+            .await
+    }
+
+    async fn child_session_snapshot(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<ChildSessionSnapshot, HaiderError> {
+        let mut cursor = 0;
+        let mut states = HashMap::<RunId, (RunState, u64)>::new();
+        loop {
+            let page = self
+                .hub
+                .read_internal_session(session_id, cursor, 256)
+                .await?;
+            if page.is_empty() {
+                break;
+            }
+            cursor = page.last().map_or(cursor, |envelope| envelope.seq);
+            for envelope in page {
+                let Some(run_id) = envelope.run_id else {
+                    continue;
+                };
+                if let Ok(haider_protocol::EventPayload::RunState(state)) =
+                    serde_json::from_value::<haider_protocol::EventPayload>(envelope.payload)
+                {
+                    states.insert(run_id, (state, envelope.seq));
+                }
+            }
+        }
+        let active = states
+            .iter()
+            .filter(|(_, (state, _))| !state.is_terminal() && *state != RunState::Cancelling)
+            .max_by_key(|(_, (_, seq))| *seq)
+            .map(|(run_id, (state, _))| (run_id.clone(), state.clone()));
+        Ok(ChildSessionSnapshot {
+            active,
+            states: states
+                .into_iter()
+                .map(|(run_id, (state, _))| (run_id, state))
+                .collect(),
+        })
+    }
+
+    async fn child_message_event(
+        &self,
+        session_id: &SessionId,
+        identity: &str,
+    ) -> Result<Option<ChildMessageEvent>, HaiderError> {
+        let queued_id = format!("delegation-message-queued-user-{identity}");
+        let steer_id = format!("delegation-message-steer-user-{identity}");
+        let mut cursor = 0;
+        loop {
+            let page = self
+                .hub
+                .read_internal_session(session_id, cursor, 256)
+                .await?;
+            if page.is_empty() {
+                return Ok(None);
+            }
+            cursor = page.last().map_or(cursor, |envelope| envelope.seq);
+            for envelope in page {
+                if envelope.event_id.as_str() != queued_id && envelope.event_id.as_str() != steer_id
+                {
+                    continue;
+                }
+                let Some(run_id) = envelope.run_id.clone() else {
+                    return Err(HaiderError::new(
+                        ErrorCode::StoreCorrupt,
+                        "child message user event has no run id",
+                        false,
+                    ));
+                };
+                let delivery = if envelope.event_id.as_str() == steer_id {
+                    AgentMessageDelivery::DeliveredSteer
+                } else {
+                    AgentMessageDelivery::DeliveredQueued
+                };
+                let text =
+                    match serde_json::from_value::<haider_protocol::EventPayload>(envelope.payload)
+                    {
+                        Ok(haider_protocol::EventPayload::UserMessage { text, .. }) => text,
+                        _ => {
+                            return Err(HaiderError::new(
+                                ErrorCode::StoreCorrupt,
+                                "child message event is not a user message",
+                                false,
+                            ));
+                        }
+                    };
+                return Ok(Some(ChildMessageEvent {
+                    run_id,
+                    event_id: envelope.event_id,
+                    seq: envelope.seq,
+                    delivery,
+                    text,
+                }));
+            }
+        }
+    }
+
+    async fn replayed_message_receipt(
+        &self,
+        record: &DelegationRecord,
+        identity: &str,
+        text: &str,
+    ) -> Result<Option<AgentMessageReceipt>, HaiderError> {
+        let Some(message) = self
+            .child_message_event(&record.child_session_id, identity)
+            .await?
+        else {
+            return Ok(None);
+        };
+        if message.text != text {
+            return Err(HaiderError::new(
+                ErrorCode::InvalidArgument,
+                "agent.message command replayed with different semantics",
+                false,
+            ));
+        }
+        self.append_parent_message_facts(
+            record,
+            identity,
+            &message,
+            &message.text,
+            message.delivery,
+        )
+        .await?;
+        let snapshot = self
+            .child_session_snapshot(&record.child_session_id)
+            .await?;
+        let child_run_state = snapshot
+            .states
+            .get(&message.run_id)
+            .cloned()
+            .unwrap_or(RunState::Done);
+        if !child_run_state.is_terminal() && child_run_state != RunState::Cancelling {
+            let accepted = AcceptedTurn {
+                session_id: record.child_session_id.clone(),
+                run_id: message.run_id.clone(),
+                accepted_seq: message.seq,
+                worker_generation: self.hub.worker_generation(),
+                branch_id: None,
+                disposition: match message.delivery {
+                    AgentMessageDelivery::DeliveredSteer => {
+                        haider_core::TurnAdmissionDisposition::SteerPending
+                    }
+                    AgentMessageDelivery::DeliveredQueued => {
+                        haider_core::TurnAdmissionDisposition::Started
+                    }
+                },
+            };
+            match message.delivery {
+                AgentMessageDelivery::DeliveredSteer => {
+                    self.hub
+                        .submit_internal_nudge(accepted, message.text.clone())
+                        .await?;
+                }
+                AgentMessageDelivery::DeliveredQueued => {
+                    self.hub.submit_internal_turn(accepted).await?;
+                }
+            }
+        }
+        Ok(Some(AgentMessageReceipt {
+            agent: record.agent_id.clone(),
+            delivery: message.delivery,
+            child_run_id: message.run_id,
+            child_run_state,
+        }))
+    }
+
+    async fn append_parent_message_facts(
+        &self,
+        record: &DelegationRecord,
+        identity: &str,
+        child_message: &ChildMessageEvent,
+        text: &str,
+        delivery: AgentMessageDelivery,
+    ) -> Result<(), HaiderError> {
+        let fact_id = format!("delegation-message-fact-{identity}");
+        let projection_id = format!(
+            "delegation-prompt-{}-{}",
+            record.agent_id.as_str(),
+            child_message.seq
+        );
+        let existing = self.parent_event_ids(record).await?;
+        let mut envelopes = Vec::with_capacity(2);
+        if !existing.contains(&fact_id) {
+            envelopes.push(agent_messaged_envelope(
+                record,
+                &fact_id,
+                child_message.event_id.clone(),
+                text,
+                delivery,
+                self.hub.device_id(),
+                self.hub.worker_generation(),
+            )?);
+        }
+        if !existing.contains(&projection_id) {
+            envelopes.push(child_prompt_projection_envelope(
+                record,
+                &projection_id,
+                child_message.event_id.clone(),
+                text,
+                self.hub.device_id(),
+                self.hub.worker_generation(),
+            )?);
+        }
+        if !envelopes.is_empty() {
+            self.hub.append(&mut envelopes).await?;
+        }
+        Ok(())
+    }
+
+    async fn parent_event_ids(
+        &self,
+        record: &DelegationRecord,
+    ) -> Result<HashSet<String>, HaiderError> {
+        let mut cursor = 0;
+        let mut ids = HashSet::new();
+        loop {
+            let page = self
+                .hub
+                .read_internal_session(&record.parent_session_id, cursor, 256)
+                .await?;
+            if page.is_empty() {
+                return Ok(ids);
+            }
+            cursor = page.last().map_or(cursor, |envelope| envelope.seq);
+            ids.extend(
+                page.into_iter()
+                    .map(|envelope| envelope.event_id.as_str().to_owned()),
+            );
+        }
+    }
+
+    async fn ensure_handoff_dir(
+        &self,
+        workspace: &str,
+        parent_session_id: &SessionId,
+    ) -> Result<PathBuf, HaiderError> {
+        let workspace = PathBuf::from(workspace);
+        let short = handoff_session_short(parent_session_id);
+        let path = handoff_dir(
+            workspace.to_str().ok_or_else(|| {
+                HaiderError::new(
+                    ErrorCode::InvalidArgument,
+                    "workspace path is not valid UTF-8",
+                    false,
+                )
+            })?,
+            parent_session_id,
+        );
+        tokio::task::spawn_blocking(move || seed_handoff_dir(&workspace, &short))
+            .await
+            .map_err(|error| {
+                HaiderError::new(
+                    ErrorCode::Internal,
+                    format!("handoff directory task failed: {error}"),
+                    true,
+                )
+            })??;
+        Ok(path)
+    }
+
     async fn derive_terminal_report(
         &self,
         record: &DelegationRecord,
@@ -647,6 +1104,10 @@ impl DelegationHandle {
                     .event_id
                     .as_str()
                     .starts_with(&format!("delegation-chip-{}-", record.agent_id.as_str()))
+                    || envelope
+                        .event_id
+                        .as_str()
+                        .starts_with(&format!("delegation-prompt-{}-", record.agent_id.as_str()))
                 {
                     projected_events.insert(envelope.event_id.as_str().to_owned());
                 }
@@ -691,9 +1152,30 @@ impl DelegationHandle {
                 if envelope.run_id.as_ref() != Some(&record.child_run_id) {
                     continue;
                 }
-                let Ok(haider_protocol::EventPayload::RunState(state)) =
+                let Ok(payload) =
                     serde_json::from_value::<haider_protocol::EventPayload>(envelope.payload)
                 else {
+                    continue;
+                };
+                if let haider_protocol::EventPayload::UserMessage { text, .. } = payload {
+                    let event_id = format!(
+                        "delegation-prompt-{}-{}",
+                        record.agent_id.as_str(),
+                        envelope.seq
+                    );
+                    if mirror.projected_events.insert(event_id.clone()) {
+                        projections.push(child_prompt_projection_envelope(
+                            record,
+                            &event_id,
+                            envelope.event_id,
+                            &text,
+                            self.hub.device_id(),
+                            self.hub.worker_generation(),
+                        )?);
+                    }
+                    continue;
+                }
+                let haider_protocol::EventPayload::RunState(state) = payload else {
                     continue;
                 };
                 let Some(chip) = chip_for_run_state(&state) else {
@@ -866,6 +1348,19 @@ struct ChipMirror {
     last_chip: Option<ChipState>,
 }
 
+struct ChildSessionSnapshot {
+    active: Option<(RunId, RunState)>,
+    states: HashMap<RunId, RunState>,
+}
+
+struct ChildMessageEvent {
+    run_id: RunId,
+    event_id: EventId,
+    seq: u64,
+    delivery: AgentMessageDelivery,
+    text: String,
+}
+
 #[derive(Clone, Copy)]
 enum CancelCause {
     Stall,
@@ -944,6 +1439,183 @@ pub(crate) fn chip_projection_envelope(
         },
         payload,
     })
+}
+
+pub(crate) fn child_prompt_projection_envelope(
+    record: &DelegationRecord,
+    event_id: &str,
+    causation_id: EventId,
+    text: &str,
+    device_id: haider_protocol::ids::DeviceId,
+    worker_generation: u64,
+) -> Result<RawEnvelope, HaiderError> {
+    let payload = serde_json::to_value(haider_protocol::EventPayload::UserMessage {
+        text: text.to_owned(),
+        attachments: Vec::new(),
+        mode: DeliveryMode::Steer,
+    })
+    .map_err(internal_serialization)?;
+    Ok(EventEnvelope {
+        schema_version: SCHEMA_VERSION,
+        event_id: EventId::new(event_id),
+        seq: 0,
+        session_id: record.parent_session_id.clone(),
+        branch_id: record.parent_branch_id.clone(),
+        run_id: Some(record.parent_run_id.clone()),
+        // Existing chip routing scopes ordinary transcript payloads by the
+        // child agent carried on the envelope.
+        agent_id: Some(record.agent_id.clone()),
+        device_id,
+        authority_epoch: 0,
+        worker_generation,
+        causation_id: Some(causation_id),
+        correlation_id: None,
+        committed_at_ms: 0,
+        render: RenderTargets {
+            ui: true,
+            durable: true,
+            // Child transcript visibility must never leak child instructions
+            // into the parent's provider history.
+            prompt: PromptRender::Omit,
+        },
+        payload,
+    })
+}
+
+pub(crate) fn agent_messaged_envelope(
+    record: &DelegationRecord,
+    event_id: &str,
+    causation_id: EventId,
+    text: &str,
+    delivery: AgentMessageDelivery,
+    device_id: haider_protocol::ids::DeviceId,
+    worker_generation: u64,
+) -> Result<RawEnvelope, HaiderError> {
+    let preview = text.chars().take(MAX_MESSAGE_PREVIEW_CHARS).collect();
+    let payload = AgentMessaged {
+        agent: record.agent_id.clone(),
+        preview,
+        delivery,
+    }
+    .to_payload_value()
+    .map_err(internal_serialization)?;
+    Ok(EventEnvelope {
+        schema_version: SCHEMA_VERSION,
+        event_id: EventId::new(event_id),
+        seq: 0,
+        session_id: record.parent_session_id.clone(),
+        branch_id: record.parent_branch_id.clone(),
+        run_id: Some(record.parent_run_id.clone()),
+        agent_id: record.parent_agent_id.clone(),
+        device_id,
+        authority_epoch: 0,
+        worker_generation,
+        causation_id: Some(causation_id),
+        correlation_id: None,
+        committed_at_ms: 0,
+        render: RenderTargets {
+            ui: true,
+            durable: true,
+            prompt: PromptRender::Omit,
+        },
+        payload,
+    })
+}
+
+fn not_owned_child(agent: &AgentId) -> HaiderError {
+    let mut error = HaiderError::new(
+        ErrorCode::InvalidArgument,
+        format!("subagent {agent} is not a direct child of this session"),
+        false,
+    );
+    error.details = Some(serde_json::json!({
+        "kind": "not_owned_child",
+        "agent": agent,
+    }));
+    error
+}
+
+fn handoff_session_short(session_id: &SessionId) -> String {
+    blake3::hash(session_id.as_str().as_bytes()).to_hex()[..16].to_owned()
+}
+
+pub(crate) fn handoff_dir(workspace: &str, session_id: &SessionId) -> PathBuf {
+    Path::new(workspace)
+        .join(".haider")
+        .join("handoff")
+        .join(handoff_session_short(session_id))
+}
+
+fn seed_handoff_dir(workspace: &Path, session_short: &str) -> Result<(), HaiderError> {
+    if !workspace.is_absolute()
+        || std::fs::canonicalize(workspace)
+            .ok()
+            .as_deref()
+            .is_none_or(|canonical| canonical != workspace)
+    {
+        return Err(HaiderError::new(
+            ErrorCode::InvalidArgument,
+            "handoff workspace must be an existing canonical directory",
+            false,
+        ));
+    }
+    let mut directory = rustix::fs::openat(
+        rustix::fs::CWD,
+        workspace,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| handoff_io_error(workspace, error))?;
+    let mut display = workspace.to_path_buf();
+    for component in [".haider", "handoff", session_short] {
+        display.push(component);
+        match rustix::fs::mkdirat(&directory, component, Mode::from_raw_mode(0o700)) {
+            Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+            Err(error) => return Err(handoff_io_error(&display, error)),
+        }
+        directory = rustix::fs::openat(
+            &directory,
+            component,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| handoff_io_error(&display, error))?;
+    }
+    let ignore_path = display.join(".gitignore");
+    let ignore = rustix::fs::openat(
+        &directory,
+        ".gitignore",
+        OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o600),
+    )
+    .map_err(|error| handoff_io_error(&ignore_path, error))?;
+    let mut written = 0;
+    while written < HANDOFF_IGNORE.len() {
+        match rustix::io::write(&ignore, &HANDOFF_IGNORE[written..]) {
+            Ok(0) => {
+                return Err(HaiderError::new(
+                    ErrorCode::Internal,
+                    format!("short write while seeding {}", ignore_path.display()),
+                    true,
+                ));
+            }
+            Ok(count) => written = written.saturating_add(count),
+            Err(rustix::io::Errno::INTR) => {}
+            Err(error) => return Err(handoff_io_error(&ignore_path, error)),
+        }
+    }
+    Ok(())
+}
+
+fn handoff_io_error(path: &Path, error: rustix::io::Errno) -> HaiderError {
+    HaiderError::new(
+        ErrorCode::Internal,
+        format!(
+            "cannot prepare ephemeral handoff path {}: {error}",
+            path.display()
+        ),
+        false,
+    )
 }
 
 fn stable_digest(parts: &[&str]) -> String {

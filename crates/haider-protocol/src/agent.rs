@@ -2,7 +2,8 @@
 //! same object local or remote; placement is a manifest field. Callsigns are
 //! display identity ONLY — the wire keys everything by opaque id.
 
-use crate::ids::{AgentId, DeviceId, LeaseId, WorkspaceRevision};
+use crate::ids::{AgentId, DeviceId, LeaseId, RunId, WorkspaceRevision};
+use crate::state::RunState;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -96,4 +97,51 @@ pub enum ReportVerification {
     Red,
     Waived,
     Unverified,
+}
+
+/// How one parent-authored child message crossed the worker boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentMessageDelivery {
+    DeliveredSteer,
+    DeliveredQueued,
+}
+
+/// Receipt returned by both the model tool and the chip-composer wire.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentMessageReceipt {
+    pub agent: AgentId,
+    pub delivery: AgentMessageDelivery,
+    pub child_run_id: RunId,
+    pub child_run_state: RunState,
+}
+
+/// Bounded parent-timeline fact for a message sent to a direct child.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentMessaged {
+    pub agent: AgentId,
+    pub preview: String,
+    pub delivery: AgentMessageDelivery,
+}
+
+/// Additive agent-event union kept separate from [`crate::EventPayload`] so
+/// existing exhaustive consumers stay source-compatible. Raw-envelope
+/// readers preserve this newer event kind for S3 timeline rendering.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AgentEventPayload {
+    AgentMessaged(AgentMessaged),
+}
+
+impl AgentMessaged {
+    pub fn to_payload_value(&self) -> Result<serde_json::Value, serde_json::Error> {
+        serde_json::to_value(AgentEventPayload::AgentMessaged(self.clone()))
+    }
+
+    #[must_use]
+    pub fn from_payload_value(value: &serde_json::Value) -> Option<Self> {
+        match serde_json::from_value::<AgentEventPayload>(value.clone()).ok()? {
+            AgentEventPayload::AgentMessaged(messaged) => Some(messaged),
+        }
+    }
 }

@@ -523,7 +523,44 @@ pub(super) async fn run_session_actor(
                     worker = None;
                 }
             }
+            ActorCommand::StopIfQuiescent { completed } => {
+                let result = if attachments.is_empty() {
+                    session_is_quiescent(&store, &session_id).await
+                } else {
+                    Ok(false)
+                };
+                let should_stop = result.as_ref().is_ok_and(|quiescent| *quiescent);
+                let _ = completed.send(result);
+                if should_stop {
+                    break;
+                }
+            }
             ActorCommand::Stop => break,
+        }
+    }
+}
+
+async fn session_is_quiescent(
+    store: &SqliteStoreHandle,
+    session_id: &SessionId,
+) -> Result<bool, HaiderError> {
+    let mut cursor = 0;
+    let mut states = HashMap::<RunId, RunState>::new();
+    loop {
+        let page = store.read(session_id, cursor, 256).await?;
+        if page.is_empty() {
+            return Ok(states.values().all(RunState::is_terminal));
+        }
+        cursor = page.last().map_or(cursor, |event| event.seq);
+        for event in page {
+            let Some(run_id) = event.run_id else {
+                continue;
+            };
+            if let Ok(EventPayload::RunState(state)) =
+                serde_json::from_value::<EventPayload>(event.payload)
+            {
+                states.insert(run_id, state);
+            }
         }
     }
 }

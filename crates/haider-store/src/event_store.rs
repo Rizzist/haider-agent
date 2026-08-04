@@ -790,6 +790,31 @@ impl Store {
         Ok(ids.into_iter().map(SessionId::new).collect())
     }
 
+    /// Deletes one already-quiesced session and every row it owns in one
+    /// transaction. Runtime quiescence and admission fencing belong to the
+    /// daemon; this store operation owns only referentially complete removal.
+    pub fn delete_session(&self, session_id: &SessionId) -> StoreResult<()> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        require_session(&transaction, session_id)?;
+        for statement in [
+            "DELETE FROM hook_dispatch_outbox WHERE session_id = ?1",
+            "DELETE FROM menu_resolutions WHERE session_id = ?1",
+            "DELETE FROM branches WHERE session_id = ?1",
+            "DELETE FROM delegations WHERE parent_session_id = ?1 OR child_session_id = ?1",
+            "DELETE FROM events WHERE session_id = ?1",
+            "DELETE FROM command_receipts WHERE session_id = ?1",
+            "DELETE FROM sessions WHERE id = ?1",
+        ] {
+            transaction
+                .execute(statement, [session_id.as_str()])
+                .map_err(map_sqlite_error)?;
+        }
+        transaction.commit().map_err(map_sqlite_error)
+    }
+
     /// Loads typed session configuration. Legacy `{}` rows return `None`.
     pub fn session_metadata(
         &self,

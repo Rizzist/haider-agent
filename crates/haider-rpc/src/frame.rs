@@ -3,10 +3,13 @@
 use std::collections::BTreeSet;
 
 use haider_protocol::DeliveryMode;
+use haider_protocol::agent::AgentMessageReceipt;
 use haider_protocol::branch::BranchDescriptor;
 use haider_protocol::context::ContextFootprint;
 use haider_protocol::envelope::RawEnvelope;
-use haider_protocol::ids::{ArtifactRef, BranchId, ItemId, MenuId, NodeId, RunId, SessionId};
+use haider_protocol::ids::{
+    AgentId, ArtifactRef, BranchId, ItemId, MenuId, NodeId, RunId, SessionId,
+};
 use haider_protocol::session::{SessionMetadataV1, SessionPermissionOverridesV1};
 use haider_protocol::tool::{AttachmentBlock, ToolInventorySnapshot};
 use serde::de::Error as _;
@@ -206,6 +209,8 @@ pub const FEATURE_BRANCH_CREATE_V1: &str = "branch_create_v1";
 pub const FEATURE_ARTIFACT_PUT_V1: &str = "artifact_put_v1";
 /// Daemon-owned hook discovery, execution, decision answers, and trust receipts.
 pub const FEATURE_HOOKS_V1: &str = "hooks_v1";
+/// Daemon implements owned direct-child messaging for tools and chip composers.
+pub const FEATURE_AGENT_MESSAGE_V1: &str = "agent_message_v1";
 
 /// Kind of client taking part in the handshake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -920,6 +925,16 @@ pub enum RequestBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
     },
+    /// Message one direct child of the named parent session. The daemon
+    /// chooses current-round STEER versus an immediate fresh child turn.
+    #[serde(rename = "agent.message")]
+    AgentMessage {
+        command_id: CommandId,
+        session_id: SessionId,
+        worker_generation: u64,
+        agent: AgentId,
+        text: String,
+    },
     /// Branch-capable decode form of `turn.submit`.
     #[serde(rename = "turn.submit")]
     TurnSubmitWithBranch {
@@ -1209,6 +1224,8 @@ pub enum ResponseBody {
         worker_generation: u64,
         name: String,
     },
+    #[serde(rename = "agent.message")]
+    AgentMessage { receipt: AgentMessageReceipt },
     /// Durable acceptance coordinates of `turn.submit` (R3): `run_id` and
     /// the `UserMessage` sequence committed by the acceptance transaction.
     /// Socket order relative to that transaction's events is NOT promised —

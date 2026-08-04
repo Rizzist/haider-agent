@@ -870,9 +870,15 @@ fn observe_methods_preserve_older_client_unknown_method_tolerance() {
     }
 
     let frame = transcript()
-        .last()
-        .cloned()
-        .expect("H1 observe response appended to transcript");
+        .into_iter()
+        .find(|frame| {
+            matches!(
+                frame,
+                WireFrame::Response { request_id, .. }
+                    if request_id.as_str() == "request-observe"
+            )
+        })
+        .expect("H1 observe response remains in the additive transcript");
     let encoded = serde_json::to_string(&frame).expect("current observe response serializes");
     assert!(encoded.contains(r#""method":"session.observe""#));
     let decoded: PreH1Frame =

@@ -12,6 +12,7 @@
 //! transaction or one workspace `spawn_blocking`.
 
 use super::*;
+use crate::delegation::{DelegationHandle, MessageCoordinates};
 use base64::Engine as _;
 use haider_protocol::EventPayload;
 use haider_protocol::agent::ChipState;
@@ -19,6 +20,7 @@ use haider_protocol::context::ContextFootprint;
 use haider_protocol::item::ItemEvent;
 use haider_protocol::menu::MenuKind;
 use haider_protocol::state::RunState;
+use haider_tools::MessageSubagent;
 use std::collections::{BTreeMap, VecDeque};
 
 const MAX_ATTACHMENTS_PER_TURN: usize = 5;
@@ -677,6 +679,44 @@ impl HubConnection {
                     fork_node_id,
                     fork_seq,
                     name,
+                )
+                .await
+            }
+            RequestBody::AgentMessage {
+                command_id,
+                session_id,
+                worker_generation,
+                agent,
+                text,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                if !self
+                    .hub
+                    .holds_control_attachment(&self.connection_id, &session_id)?
+                {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        "agent messaging requires a control attachment to the parent session",
+                        false,
+                        None,
+                    );
+                }
+                self.agent_message(
+                    request_id,
+                    command_id,
+                    session_id,
+                    worker_generation,
+                    agent,
+                    text,
                 )
                 .await
             }
@@ -2169,6 +2209,73 @@ impl HubConnection {
                 worker_generation: created.worker_generation,
                 name: created.name,
             },
+        })
+    }
+
+    async fn agent_message(
+        &self,
+        request_id: RequestId,
+        command_id: CommandId,
+        session_id: SessionId,
+        worker_generation: u64,
+        agent: haider_protocol::ids::AgentId,
+        text: String,
+    ) -> Result<(), SessionHubError> {
+        if command_id.as_str().trim().is_empty() {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "agent-message command id must not be empty",
+                false,
+                None,
+            );
+        }
+        if worker_generation != self.hub.worker_generation() {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_STALE_GENERATION,
+                "agent-message worker generation is stale",
+                false,
+                None,
+            );
+        }
+        let message = match MessageSubagent::from_tool_args(serde_json::json!({
+            "agent": agent,
+            "message": text,
+        })) {
+            Ok(message) => message,
+            Err(error) => {
+                return self.respond_error(
+                    request_id,
+                    ERROR_CODE_INVALID_ARGUMENT,
+                    &error.to_string(),
+                    false,
+                    None,
+                );
+            }
+        };
+        let delegation = DelegationHandle::new(self.hub.clone());
+        let parent_agent_id = match delegation.agent_for_session(&session_id).await {
+            Ok(agent) => agent,
+            Err(error) => return self.respond_turn_error(request_id, error),
+        };
+        let receipt = match delegation
+            .message(
+                MessageCoordinates {
+                    parent_session_id: session_id,
+                    parent_agent_id,
+                    command_id: command_id.0,
+                },
+                message,
+            )
+            .await
+        {
+            Ok(receipt) => receipt,
+            Err(error) => return self.respond_turn_error(request_id, error),
+        };
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::AgentMessage { receipt },
         })
     }
 

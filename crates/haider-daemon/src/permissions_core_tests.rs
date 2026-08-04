@@ -46,6 +46,7 @@ fn canonical_inventory_equals_advertised_dispatchable_set() {
         .collect::<Vec<_>>();
     assert_eq!(advertised, registered);
     assert!(advertised.contains(&"process_exec"));
+    assert!(advertised.contains(&"message_subagent"));
     assert!(!advertised.contains(&"exec"));
     assert!(
         advertised
@@ -68,6 +69,10 @@ fn canonical_inventory_equals_advertised_dispatchable_set() {
     assert_eq!(
         registered_tool_route("fs_edit"),
         Some(RegisteredToolRoute::FsEdit)
+    );
+    assert_eq!(
+        registered_tool_route("message_subagent"),
+        Some(RegisteredToolRoute::MessageSubagent)
     );
 }
 
