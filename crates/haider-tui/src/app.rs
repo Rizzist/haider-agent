@@ -896,6 +896,39 @@ pub fn report_note(report: &haider_protocol::agent::ChildReport) -> String {
     format!("└ subagent report ({verdict}) — {}", report.summary)
 }
 
+/// A chip's display name: callsign + honorific when one is claimed, the
+/// bare callsign otherwise (§5.1: display identity, never an address).
+#[must_use]
+pub fn chip_display_name(chip: &ChipModel) -> String {
+    if chip.hon.is_empty() {
+        chip.callsign.clone()
+    } else {
+        format!("{} {}", chip.callsign, chip.hon)
+    }
+}
+
+/// The parent-timeline row one `AgentMessaged` journal fact becomes (S3) —
+/// the messaged marker between the `ChildSpawn` and `ChildResult` rows,
+/// same dim note voice as [`report_note`]. The delivery kind rides the
+/// tail subtly (`steer` — landed inside the running child turn · `queued`
+/// — started a fresh child turn). Callsign resolution is display-only: an
+/// agent with no chip (or an unclaimed callsign) keeps its opaque id
+/// rather than inventing a name.
+#[must_use]
+pub fn messaged_note(chips: &[ChipModel], fact: &haider_protocol::agent::AgentMessaged) -> String {
+    let who = find_chip(chips, fact.agent.as_str())
+        .filter(|chip| !chip.callsign.is_empty())
+        .map_or_else(|| fact.agent.as_str().to_owned(), chip_display_name);
+    let delivery = match fact.delivery {
+        haider_protocol::agent::AgentMessageDelivery::DeliveredSteer => "steer",
+        haider_protocol::agent::AgentMessageDelivery::DeliveredQueued => "queued",
+    };
+    // The preview is a bounded single fact — one timeline row, so its
+    // newlines flatten (the daemon's 200-char bound already applied).
+    let preview = fact.preview.replace(['\n', '\r'], " ");
+    format!("→ messaged {who} · {preview} · {delivery}")
+}
+
 pub fn find_chip_mut<'t>(chips: &'t mut [ChipModel], agent: &str) -> Option<&'t mut ChipModel> {
     for chip in chips {
         if chip.agent == agent {
@@ -1490,7 +1523,8 @@ impl LoginCard {
 /// | `/compact` | local `turn_active` + demo beat | honest flash |
 /// | `enter_aura` (`/aura`, ◉ Aura row) | the aura stage | honest flash |
 /// | ◉ talk hold | local `listening` + demo timer | honest flash |
-/// | subagent submit / close | `ChipSubmit` / `ChipClose` | honest flash |
+/// | subagent submit | `ChipSubmit` (scripted beat) | `ChipSubmit` → `agent.message` (S3); feature-gated honest flash |
+/// | subagent close | `ChipClose` | honest flash |
 /// | shell builtins (`ls` · `cd` …) | the demo VFS | honest flash |
 /// | `/sessions` | honest stub (the sim's screen is unbuilt) | real listing + open |
 ///
@@ -1645,8 +1679,11 @@ pub enum AppRequest {
     CopyText(String),
     /// The ◉ talk hold started — fire the canned phrase after 1300 ms.
     Talk,
-    /// Steer/message a subagent (respondChip, §2.4) — a full turn on the
-    /// CHIP's state machine.
+    /// Steer/message a subagent (respondChip, §2.4). Demo: a full turn on
+    /// the CHIP's state machine (scripted beats). Live (S3): the driver
+    /// rides S1's `agent.message` wire — the daemon chooses steer vs
+    /// queued and its receipt flashes the delivery kind; the transcript
+    /// rows arrive as journal facts, nothing painted locally.
     ChipSubmit { agent: String, text: String },
     /// Close a chip (✕ / the docs-recovery close arm): lifecycle flags are
     /// the reducer's; the driver owns the 5 s removal + resume timers.
@@ -3879,13 +3916,15 @@ impl AppModel {
             return;
         }
         // §4 step 6: the subagent screen steers ITS chip (respondChip).
+        // LIVE (S3): the composer rides S1's `agent.message` wire — the
+        // daemon delivers (steer vs queued), journals the `AgentMessaged`
+        // fact and the chip's user row, and the receipt's flash names what
+        // it did. Nothing is painted locally. A daemon that does not serve
+        // the method refuses honestly instead of destroying the text.
         if self.screen == Screen::Subagent {
-            if !self.mode.fabricates_locally() {
-                // Steering a subagent is the demo driver's scripted beat.
-                // Live chips come from committed `AgentSpawned` envelopes
-                // and there is no `agent.steer` RPC yet, so this text was
-                // silently destroyed (W3c3.1 r2, P1-A).
-                self.refuse_demo_only("steering a subagent");
+            if !self.daemon_serves(haider_rpc::FEATURE_AGENT_MESSAGE_V1) {
+                self.flash = Some(self.stale_daemon_note("messaging a subagent"));
+                self.dirty = true;
                 return;
             }
             if let Some(agent) = self.view_path.last().cloned() {
@@ -6170,7 +6209,19 @@ impl AppModel {
                             envelope.branch_id.as_ref(),
                             envelope.agent_id.as_ref(),
                         ),
-                        Err(_) => self.projection.count_unknown_payload(),
+                        // S3: the additive agent-event union rides raw
+                        // envelopes OUTSIDE `EventPayload` — try it before
+                        // counting the payload unknown (both twins).
+                        Err(_) => {
+                            if !crate::session::route_agent_event(
+                                &mut self.branch_state,
+                                &mut self.projection,
+                                &self.chips,
+                                envelope,
+                            ) {
+                                self.projection.count_unknown_payload();
+                            }
+                        }
                     }
                 }
                 RawOutcome::Applied
@@ -6521,7 +6572,7 @@ impl AppModel {
             Destination::Agent => crate::session::apply_agent_payload(&mut self.chips, payload),
             Destination::Chip(target) => {
                 if let Some(chip) = find_chip_mut(&mut self.chips, &target) {
-                    chip.transcript.apply(payload);
+                    crate::session::chip_apply(chip, payload);
                 }
             }
             Destination::Session => self.handle_envelope(payload),

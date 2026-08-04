@@ -378,6 +378,10 @@ pub enum EntryDto {
         attachments: usize,
         #[serde(default)]
         voice: bool,
+        /// S3: parent-authored chip rows keep their `→ · from main`
+        /// marking across a reload (defaulting keeps old stores loading).
+        #[serde(default)]
+        from_main: bool,
     },
     Item {
         item_id: ItemId,
@@ -552,10 +556,12 @@ fn entry_to_dto(entry: &TranscriptEntry) -> EntryDto {
             text,
             attachments,
             voice,
+            from_main,
         } => EntryDto::User {
             text: text.clone(),
             attachments: *attachments,
             voice: *voice,
+            from_main: *from_main,
         },
         TranscriptEntry::Item(block) => EntryDto::Item {
             item_id: block.item_id.clone(),
@@ -778,10 +784,12 @@ fn entry_from_dto(dto: EntryDto) -> TranscriptEntry {
             text,
             attachments,
             voice,
+            from_main,
         } => TranscriptEntry::User {
             text,
             attachments,
             voice,
+            from_main,
         },
         EntryDto::Item {
             item_id,

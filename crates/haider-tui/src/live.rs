@@ -151,6 +151,20 @@ pub enum LiveCommand {
         fork_seq: u64,
         name: Option<String>,
     },
+    /// `agent.message` — one parent-authored message to a DIRECT child
+    /// (S1's wire; S3 rides it from the chip composer). Receipt-backed:
+    /// the daemon dedupes by command id, chooses steer-vs-queued ITSELF,
+    /// and journals the `AgentMessaged` fact plus the chip's user row —
+    /// the response receipt only names what it did and retires the outbox
+    /// entry. Nothing is painted locally.
+    AgentMessage {
+        command_id: CommandId,
+        session: SessionId,
+        worker_generation: u64,
+        /// The chip's opaque agent id (never the callsign — §5.1).
+        agent: String,
+        text: String,
+    },
     /// `shell.exec` — the W8b `!` escape: one exact user command for the
     /// session daemon's workspace, receipt-backed and PreAuthorized
     /// (UserTyped). Zero provider requests; the committed
@@ -322,6 +336,7 @@ impl LiveCommand {
             | Self::Cancel { command_id, .. }
             | Self::Compact { command_id, .. }
             | Self::BranchCreate { command_id, .. }
+            | Self::AgentMessage { command_id, .. }
             | Self::ShellExec { command_id, .. }
             | Self::AccountRemove { command_id, .. }
             | Self::ProviderRemove { command_id, .. }
@@ -452,6 +467,16 @@ pub enum LiveReply {
         session: SessionId,
         branch_id: haider_protocol::ids::BranchId,
         name: String,
+    },
+    /// `agent.message` answered with the daemon's delivery receipt (S1
+    /// wire, S3 consumer): which child, steer-into-the-running-turn versus
+    /// a queued fresh child turn, and the child run's coordinates. The
+    /// receipt retires the outbox entry and paints ONLY the transient
+    /// flash — the timeline rows ride the journal facts on the attachment
+    /// stream, so nothing here fabricates transcript state.
+    AgentMessaged {
+        command_id: CommandId,
+        receipt: haider_protocol::agent::AgentMessageReceipt,
     },
     /// `shell.exec` accepted; the `CommandExecution` events arrive on the
     /// attachment stream.
@@ -1364,6 +1389,34 @@ impl LiveDriver {
             | LiveReply::Compacted { command_id }
             | LiveReply::ShellAccepted { command_id } => {
                 self.retire(&command_id);
+                Vec::new()
+            }
+            LiveReply::AgentMessaged {
+                command_id,
+                receipt,
+            } => {
+                self.retire(&command_id);
+                // DAEMON TRUTH ONLY (S3): the flash names the receipt's
+                // own delivery kind — steer landed inside the child's
+                // running turn, queued started a fresh child turn. The
+                // chip's user row and the parent's `→ messaged` marker
+                // both arrive as journal facts; nothing is painted here
+                // beyond this transient line.
+                let who = crate::app::find_chip(&model.chips, receipt.agent.as_str())
+                    .filter(|chip| !chip.callsign.is_empty())
+                    .map_or_else(
+                        || receipt.agent.as_str().to_owned(),
+                        crate::app::chip_display_name,
+                    );
+                model.flash = Some(match receipt.delivery {
+                    haider_protocol::agent::AgentMessageDelivery::DeliveredSteer => {
+                        format!("· messaged {who} — delivered as a steer into the running turn")
+                    }
+                    haider_protocol::agent::AgentMessageDelivery::DeliveredQueued => {
+                        format!("· messaged {who} — queued as a fresh child turn")
+                    }
+                });
+                model.dirty = true;
                 Vec::new()
             }
             LiveReply::BranchForked {
@@ -2404,6 +2457,26 @@ impl LiveDriver {
                 Some(session) => vec![self.submit(model, &session, text, branch, attachments)],
                 None => Vec::new(),
             },
+            // S3: the chip composer rides S1's `agent.message` wire. The
+            // AGENT was captured at issuance by the reducer (the viewed
+            // chip); the daemon owns delivery (steer vs queued), the
+            // journal facts paint the rows, and the receipt's flash is
+            // the only client-side touch.
+            AppRequest::ChipSubmit { agent, text } => match model.active_session.clone() {
+                Some(session) => {
+                    let command_id = self.mint();
+                    let worker_generation =
+                        self.generations.get(&session).copied().unwrap_or_default();
+                    vec![self.enqueue(LiveCommand::AgentMessage {
+                        command_id,
+                        session,
+                        worker_generation,
+                        agent,
+                        text,
+                    })]
+                }
+                None => Vec::new(),
+            },
             // B4b: the receipt-free upload — no mint, no outbox (see the
             // `LiveCommand::ArtifactPut` charter). The reducer already
             // chipped the draft; only the reply mutates it further.
@@ -2696,7 +2769,6 @@ impl LiveDriver {
             // gate, the user sees a flash instead of a dead UI, and the
             // pinned test sees a failure instead of silence.
             AppRequest::Talk
-            | AppRequest::ChipSubmit { .. }
             | AppRequest::ChipClose { .. }
             | AppRequest::AuraSubmit { .. }
             | AppRequest::AuraTalk
@@ -2816,7 +2888,6 @@ impl LiveDriver {
 const fn demo_only_label(request: &AppRequest) -> &'static str {
     match request {
         AppRequest::Talk => "push-to-talk",
-        AppRequest::ChipSubmit { .. } => "steering a subagent",
         AppRequest::ChipClose { .. } => "closing a subagent",
         AppRequest::AuraSubmit { .. } | AppRequest::AuraTalk | AppRequest::ResetAura => "Aura Mode",
         _ => "that",
@@ -2831,6 +2902,7 @@ const fn command_session(command: &LiveCommand) -> Option<&SessionId> {
         | LiveCommand::Cancel { session, .. }
         | LiveCommand::Compact { session, .. }
         | LiveCommand::BranchCreate { session, .. }
+        | LiveCommand::AgentMessage { session, .. }
         | LiveCommand::ShellExec { session, .. }
         | LiveCommand::ToolsInventory { session }
         | LiveCommand::Answer { session, .. } => Some(session),

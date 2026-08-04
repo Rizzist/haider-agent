@@ -31,14 +31,26 @@ pub fn render_plain(projection: &SessionProjection, window: u64) -> String {
                 text,
                 attachments,
                 voice,
+                from_main,
             } => {
-                out.push_str(if *voice { "◉ " } else { "❯ " });
+                // S3: parent-authored chip rows wear → · from main (the
+                // rendered view's vocabulary, kept greppable here).
+                out.push_str(if *from_main {
+                    "→ "
+                } else if *voice {
+                    "◉ "
+                } else {
+                    "❯ "
+                });
                 out.push_str(text);
                 if *attachments > 0 {
                     out.push_str(&format!(" [+{attachments} attachment(s)]"));
                 }
                 if *voice {
                     out.push_str(" · spoken");
+                }
+                if *from_main {
+                    out.push_str(" · from main");
                 }
                 out.push('\n');
             }

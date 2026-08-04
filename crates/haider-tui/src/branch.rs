@@ -191,6 +191,15 @@ impl BranchState {
         if is_aggregate(payload) {
             return BranchScope::Aggregate;
         }
+        self.content_scope(branch)
+    }
+
+    /// The branch arms alone (S3): an additive agent fact outside the
+    /// `EventPayload` union is never aggregate BY TYPE, so it scopes
+    /// purely by the envelope's branch — the same arms `scope_of` takes
+    /// after its type check, shared so the two can never drift.
+    #[must_use]
+    pub fn content_scope(&self, branch: Option<&BranchId>) -> BranchScope {
         if branch == self.active.as_ref() {
             return BranchScope::Active;
         }
@@ -429,7 +438,7 @@ pub fn absorb_into_view(
         Destination::Agent => crate::session::apply_agent_payload(&mut view.chips, payload),
         Destination::Chip(target) => {
             if let Some(chip) = crate::app::find_chip_mut(&mut view.chips, &target) {
-                chip.transcript.apply(payload);
+                crate::session::chip_apply(chip, payload);
             }
         }
         Destination::Session => {

@@ -377,6 +377,7 @@ fn user_messages_and_menus_project() {
             text: "run the tests".to_owned(),
             attachments: 0,
             voice: false,
+            from_main: false,
         }]
     );
 

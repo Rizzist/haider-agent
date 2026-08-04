@@ -648,6 +648,22 @@ pub fn request_body(command: LiveCommand) -> RequestBody {
             fork_seq,
             name,
         },
+        // S3: the chip composer's steer rides S1's `agent.message` wire —
+        // the agent id crosses as the OPAQUE protocol id (§5.1: callsigns
+        // are display identity, never addresses).
+        LiveCommand::AgentMessage {
+            command_id,
+            session,
+            worker_generation,
+            agent,
+            text,
+        } => RequestBody::AgentMessage {
+            command_id,
+            session_id: session,
+            worker_generation,
+            agent: haider_rpc::haider_protocol::ids::AgentId::new(agent),
+            text,
+        },
         LiveCommand::ShellExec {
             command_id,
             session,
@@ -894,6 +910,17 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
                 name,
             }]
         }),
+        // S3: the delivery receipt is DAEMON truth — steer vs queued was
+        // the daemon's choice, and only the flash consumes it (the rows
+        // ride the journal facts on the attachment stream).
+        ResponseBody::AgentMessage { receipt } => {
+            context.command_id.clone().map_or_else(Vec::new, |id| {
+                vec![LiveReply::AgentMessaged {
+                    command_id: id,
+                    receipt,
+                }]
+            })
+        }
         ResponseBody::ShellExec { .. } => context.command_id.clone().map_or_else(Vec::new, |id| {
             vec![LiveReply::ShellAccepted { command_id: id }]
         }),

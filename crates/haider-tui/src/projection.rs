@@ -37,10 +37,17 @@ pub enum TranscriptEntry {
     /// A user message (`EventPayload::UserMessage`). `voice` marks a
     /// spoken submission (◉ sigil + ` · spoken` tag) — demo-local: the
     /// protocol has no voice surface yet, so the reducer pushes these.
+    /// `from_main` marks a PARENT-AUTHORED row in a chip transcript
+    /// (S3: → sigil + ` · from main` tag) — stream truth, never a guess:
+    /// the daemon's child-prompt projection is the only writer of
+    /// agent-scoped user rows, so every one of them crossed the
+    /// parent→child boundary (spawn prompt, tool steer, chip-composer
+    /// send alike).
     User {
         text: String,
         attachments: usize,
         voice: bool,
+        from_main: bool,
     },
     /// A turn item and its streaming accumulation state.
     Item(ItemBlock),
@@ -378,6 +385,7 @@ impl SessionProjection {
                 text: text.clone(),
                 attachments: attachments.len(),
                 voice: false,
+                from_main: false,
             }),
             EventPayload::Item(event) => self.apply_item(event),
             EventPayload::Usage(usage) => self.usage = Some(usage.clone()),
@@ -636,6 +644,21 @@ impl SessionProjection {
             text,
             attachments: 0,
             voice: true,
+            from_main: false,
+        });
+    }
+
+    /// Append a PARENT-AUTHORED user row (S3): a `UserMessage` that
+    /// reached a chip transcript through the parent session's
+    /// agent-scoped stream. The daemon's child-prompt projection is the
+    /// only writer of such envelopes, so the marking is stream truth —
+    /// see [`crate::session::chip_apply`].
+    pub fn push_user_from_main(&mut self, text: String, attachments: usize) {
+        self.entries.push(TranscriptEntry::User {
+            text,
+            attachments,
+            voice: false,
+            from_main: true,
         });
     }
 
