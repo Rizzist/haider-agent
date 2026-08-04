@@ -3745,9 +3745,7 @@ fn authorize(capabilities: &CapabilitySet, operation: Operation) -> Result<(), &
 fn valid_device_candidate_id(candidate: &str) -> bool {
     candidate.len() == 68
         && candidate.starts_with("dc1_")
-        && candidate.as_bytes()[4..]
-            .iter()
-            .all(u8::is_ascii_hexdigit)
+        && candidate.as_bytes()[4..].iter().all(u8::is_ascii_hexdigit)
 }
 
 struct ValidatedWorkspace {

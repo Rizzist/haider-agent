@@ -1007,22 +1007,15 @@ pub(crate) fn oauth_import_path(source: &str) -> Result<PathBuf, HaiderError> {
     Ok(PathBuf::from(home).join(spec.home_relative_path))
 }
 
-/// Reads and converts one daemon-local CLI credential file.
-///
-/// The returned bundle is the first and only object allowed to leave this
-/// function. File bytes and all token fields stay in zeroizing storage.
-pub(crate) fn load_oauth_import_bundle(
-    source: &str,
-    generation: u64,
-) -> Result<OAuthTokenBundleV1, HaiderError> {
-    load_oauth_import_material(source, generation).map(|material| material.bundle)
-}
-
 pub(crate) struct OAuthImportMaterial {
     pub bundle: OAuthTokenBundleV1,
     pub kimi_device_id: Option<Zeroizing<Vec<u8>>>,
 }
 
+/// Reads and converts one daemon-local CLI credential file.
+///
+/// The returned material is the first and only object allowed to leave this
+/// function. File bytes and all token fields stay in zeroizing storage.
 pub(crate) fn load_oauth_import_material(
     source: &str,
     generation: u64,
@@ -1322,8 +1315,8 @@ fn kimi_import_bundle(
     registration: &OAuthProviderRegistration,
     generation: u64,
 ) -> Result<OAuthTokenBundleV1, HaiderError> {
-    let credentials: KimiCredentials =
-        serde_json::from_slice(bytes).map_err(|error| malformed_import(path, "kimi-code", &error))?;
+    let credentials: KimiCredentials = serde_json::from_slice(bytes)
+        .map_err(|error| malformed_import(path, "kimi-code", &error))?;
     if credentials.access_token.0.is_empty()
         || credentials.refresh_token.0.is_empty()
         || !credentials.token_type.eq_ignore_ascii_case("bearer")

@@ -1002,7 +1002,7 @@ async fn auth_aware_factory_routes_sanctioned_oauth_descriptors_to_subscription_
             &anthropic_alias,
             &bundle(
                 ANTHROPIC_OAUTH_PROVIDER_NAME,
-                "https://claude.ai",
+                "https://claude.com",
                 "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
                 // The stored grant must cover EVERY configured scope
                 // (W5g-7 Claude Code parity set) or resolve refuses it.
@@ -1016,6 +1016,11 @@ async fn auth_aware_factory_routes_sanctioned_oauth_descriptors_to_subscription_
                 ],
                 b"ANTHROPIC_FACTORY_ACCESS_SENTINEL_d716",
             )
+            // D1: the anthropic registration is SerializedRotating now, so a
+            // current bundle carries a not-yet-due refresh_after marker;
+            // without it resolve forces the serialized refresh path instead
+            // of exercising the dispatch routing under test.
+            .with_refresh_after(u64::MAX - 3)
             .encode()
             .expect("encode Anthropic bundle"),
         )
@@ -1091,7 +1096,7 @@ async fn auth_aware_factory_routes_sanctioned_oauth_descriptors_to_subscription_
     let (_, _, anthropic_access_fingerprint) = factory
         .resolve_provider(&metadata(ANTHROPIC_OAUTH_PROVIDER_NAME, "claude-oauth"))
         .await
-        .expect("Anthropic conservative OAuth handoff");
+        .expect("Anthropic serialized-rotating OAuth handoff");
     assert_eq!(anthropic_access_fingerprint, None);
     let openai = factory
         .resolve_for_turn(&metadata(OPENAI_OAUTH_PROVIDER_NAME, "gpt-oauth"))
@@ -1279,10 +1284,11 @@ fn run_oauth_import_env_child(test_name: &str, overrides: &[(&str, &std::path::P
         command.env(key, path);
     }
     let output = command.output().expect("spawn isolated import test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        output.status.success(),
-        "isolated import test failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
+        output.status.success() && stdout.contains("running 1 test"),
+        "isolated import test failed or did not run\nstdout:\n{}\nstderr:\n{}",
+        stdout,
         String::from_utf8_lossy(&output.stderr)
     );
     true
@@ -5392,7 +5398,7 @@ async fn claude_code_import_honors_expiry_and_anthropic_registration() {
     let bundle = haider_accounts::OAuthTokenBundleV1::decode(stored.expose_secret())
         .expect("decode Claude bundle");
     assert_eq!(bundle.provider_id, ANTHROPIC_OAUTH_PROVIDER_NAME);
-    assert_eq!(bundle.issuer, "https://claude.ai");
+    assert_eq!(bundle.issuer, "https://claude.com");
     assert_eq!(bundle.audience, "9d1c250a-e61b-44d9-88ed-5944d1962f5e");
     assert_eq!(bundle.expires_at_unix_ms, 4_102_444_800_123);
     assert_eq!(bundle.access_token(), b"fake-claude-access-token-1");
@@ -6310,4 +6316,379 @@ fn custom_login_targets_only_chat_completions_profiles() {
         "a vendor-family profile NEVER validates against a stored origin"
     );
     assert!(custom_login_target(None, "custom-llama").is_none());
+}
+
+// ───────────────────── D1 device candidate import laws ──────────────────────
+
+const KIMI_IMPORT_FIXTURE: &[u8] = br#"{
+  "access_token": "fake-kimi-access-token-1",
+  "refresh_token": "fake-kimi-refresh-token-1",
+  "expires_at": 4102444800.0,
+  "expires_in": 3600,
+  "scope": "all",
+  "token_type": "Bearer"
+}"#;
+
+const KIMI_DEVICE_ID_IMPORT_FIXTURE: &[u8] = b"6f2a9c31-77d4-4b8e-9a10-3c5de88f01ab";
+
+const GEMINI_DISCOVERY_FIXTURE: &[u8] = br#"{
+  "access_token": "fake-gemini-access-token-1",
+  "refresh_token": "fake-gemini-refresh-token-1",
+  "expiry_date": 4102444800123
+}"#;
+
+async fn send_import_device(
+    commands: &mpsc::Sender<AccountCommand>,
+    sink: Arc<dyn FrameSink>,
+    command_id: &str,
+    candidate: &str,
+) {
+    commands
+        .send(AccountCommand::ImportDevice(Box::new(DeviceImportJob {
+            command_id: command_id.to_owned(),
+            candidate: candidate.to_owned(),
+            discovery_disabled: false,
+            route: LoginRoute {
+                request_id: RequestId::new(format!("{command_id}-request")),
+                sink,
+            },
+        })))
+        .await
+        .expect("send device import");
+}
+
+async fn expect_import_device_error(
+    frames: &mut mpsc::UnboundedReceiver<WireFrame>,
+    expected_message: &str,
+) {
+    let frame = tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        .await
+        .expect("device import error deadline")
+        .expect("device import error response");
+    match frame {
+        WireFrame::Response {
+            body:
+                ResponseBody::Error {
+                    code,
+                    message,
+                    retryable,
+                    ..
+                },
+            ..
+        } => {
+            assert_eq!(code, ERROR_CODE_INVALID_ARGUMENT);
+            assert_eq!(message, expected_message);
+            assert!(!retryable);
+        }
+        other => panic!("unexpected device import response: {other:?}"),
+    }
+}
+
+/// LAW: import_device_is_receipted_and_lands_a_working_account. Codex and
+/// kimi-code fixture stores travel the real machinery end to end — discovery
+/// mints the opaque candidate, `account.import_device` re-discovers and
+/// routes through the per-source import parsers — and each import answers
+/// with its own response method, lands a resolvable vault bundle (plus the
+/// kimi first-party device identity), and writes a durable receipt that
+/// names the candidate and carries no token bytes.
+#[tokio::test(flavor = "current_thread")]
+async fn import_device_is_receipted_and_lands_a_working_account() {
+    let fixture_dir = test_store_dir();
+    let codex_path = fixture_dir.path().join("codex-auth.json");
+    std::fs::write(&codex_path, CODEX_IMPORT_FIXTURE_1).expect("write Codex fixture");
+    let kimi_path = fixture_dir.path().join("kimi-code.json");
+    std::fs::write(&kimi_path, KIMI_IMPORT_FIXTURE).expect("write Kimi fixture");
+    let kimi_device_path = fixture_dir.path().join("kimi-device-id");
+    std::fs::write(&kimi_device_path, KIMI_DEVICE_ID_IMPORT_FIXTURE).expect("write Kimi device id");
+    let empty_home = fixture_dir.path().join("empty-home");
+    std::fs::create_dir_all(&empty_home).expect("mkdir empty home");
+    if run_oauth_import_env_child(
+        "accounts::accounts_tests::import_device_is_receipted_and_lands_a_working_account",
+        &[
+            ("HAIDER_CODEX_AUTH_PATH", &codex_path),
+            ("HAIDER_KIMI_CREDS_PATH", &kimi_path),
+            ("HAIDER_KIMI_DEVICE_ID_PATH", &kimi_device_path),
+            ("HOME", &empty_home),
+        ],
+    ) {
+        return;
+    }
+
+    let candidates = crate::device_discovery::discover_device_candidates(false);
+    let candidate_for = |provider: &str| {
+        candidates
+            .iter()
+            .find(|candidate| candidate.wire.provider == provider)
+            .unwrap_or_else(|| panic!("missing {provider} candidate in {candidates:?}"))
+    };
+    let codex_candidate = candidate_for(OPENAI_OAUTH_PROVIDER_NAME);
+    assert!(codex_candidate.wire.import_supported);
+    let codex_candidate = codex_candidate.wire.candidate.clone();
+    let kimi_candidate = candidate_for(KIMI_OAUTH_PROVIDER_NAME);
+    assert!(kimi_candidate.wire.import_supported);
+    let kimi_candidate = kimi_candidate.wire.candidate.clone();
+
+    let store_dir = test_store_dir();
+    let store = open_store(store_dir.path()).await;
+    let vault = Arc::new(MemoryVault::new());
+    let (mut actor, snapshot, management) = start_oauth_import_test_actor(
+        &store,
+        Arc::clone(&vault),
+        HashSet::new(),
+        RefreshFenceRegistry::default(),
+    );
+    let (sink, mut frames) = channel_sink();
+
+    send_import_device(
+        &actor.commands(),
+        Arc::clone(&sink),
+        "import-device-codex-1",
+        &codex_candidate,
+    )
+    .await;
+    let codex_descriptor = match tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        .await
+        .expect("Codex device import deadline")
+        .expect("Codex device import response")
+    {
+        WireFrame::Response {
+            body:
+                ResponseBody::AccountImportDevice {
+                    descriptor,
+                    revision: 1,
+                },
+            ..
+        } => descriptor,
+        other => panic!("unexpected Codex device import response: {other:?}"),
+    };
+    assert_eq!(codex_descriptor.alias.as_str(), OPENAI_OAUTH_PROVIDER_NAME);
+    assert_eq!(codex_descriptor.provider, OPENAI_OAUTH_PROVIDER_NAME);
+    assert_eq!(codex_descriptor.identity, "fake-account-1");
+    assert!(codex_descriptor.active);
+    let stored = vault
+        .resolve(&CredentialAlias::new(OPENAI_OAUTH_PROVIDER_NAME))
+        .expect("stored Codex bundle");
+    let bundle = haider_accounts::OAuthTokenBundleV1::decode(stored.expose_secret())
+        .expect("decode Codex bundle");
+    assert_eq!(bundle.provider_id, OPENAI_OAUTH_PROVIDER_NAME);
+    assert_eq!(bundle.access_token(), b"fake-access-token-1");
+    assert_eq!(
+        bundle.refresh_token(),
+        Some(b"fake-refresh-token-1".as_slice())
+    );
+    assert_eq!(bundle.generation, 1);
+
+    send_import_device(
+        &actor.commands(),
+        Arc::clone(&sink),
+        "import-device-kimi-1",
+        &kimi_candidate,
+    )
+    .await;
+    let kimi_descriptor = match tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        .await
+        .expect("Kimi device import deadline")
+        .expect("Kimi device import response")
+    {
+        WireFrame::Response {
+            body:
+                ResponseBody::AccountImportDevice {
+                    descriptor,
+                    revision: 2,
+                },
+            ..
+        } => descriptor,
+        other => panic!("unexpected Kimi device import response: {other:?}"),
+    };
+    assert_eq!(kimi_descriptor.alias.as_str(), KIMI_OAUTH_PROVIDER_NAME);
+    assert_eq!(kimi_descriptor.provider, KIMI_OAUTH_PROVIDER_NAME);
+    assert_eq!(kimi_descriptor.identity, "Kimi Code subscription");
+    assert!(kimi_descriptor.active);
+    let stored = vault
+        .resolve(&CredentialAlias::new(KIMI_OAUTH_PROVIDER_NAME))
+        .expect("stored Kimi bundle");
+    let kimi_bundle = haider_accounts::OAuthTokenBundleV1::decode(stored.expose_secret())
+        .expect("decode Kimi bundle");
+    assert_eq!(kimi_bundle.provider_id, KIMI_OAUTH_PROVIDER_NAME);
+    assert_eq!(kimi_bundle.access_token(), b"fake-kimi-access-token-1");
+    assert_eq!(
+        kimi_bundle.refresh_token(),
+        Some(b"fake-kimi-refresh-token-1".as_slice())
+    );
+    assert_eq!(kimi_bundle.expires_at_unix_ms, 4_102_444_800_000);
+    assert_eq!(kimi_bundle.granted_scopes, ["all"]);
+    let device_identity = vault
+        .resolve(&CredentialAlias::new(KIMI_DEVICE_ALIAS))
+        .expect("stored Kimi device identity");
+    assert_eq!(
+        device_identity.expose_secret(),
+        KIMI_DEVICE_ID_IMPORT_FIXTURE
+    );
+
+    assert_eq!(snapshot.lock().expect("snapshot").len(), 2);
+    assert_eq!(management.read().expect("management").revision, 2);
+
+    let receipts = store.account_add_receipts().await.expect("import receipts");
+    let receipt_for = |command_id: &str| {
+        receipts
+            .iter()
+            .find(|row| row.command_id == command_id)
+            .unwrap_or_else(|| panic!("missing durable receipt for {command_id}"))
+    };
+    let codex_receipt = receipt_for("import-device-codex-1");
+    assert_eq!(
+        codex_receipt.request_json,
+        format!(
+            r#"{{"source":"codex","alias":"openai-oauth","provider":"openai-oauth","candidate":"{codex_candidate}"}}"#
+        )
+    );
+    let kimi_receipt = receipt_for("import-device-kimi-1");
+    assert_eq!(
+        kimi_receipt.request_json,
+        format!(
+            r#"{{"source":"kimi-code","alias":"kimi-oauth","provider":"kimi-oauth","candidate":"{kimi_candidate}"}}"#
+        )
+    );
+    for receipt in [codex_receipt, kimi_receipt] {
+        let durable = format!(
+            "{}{}",
+            receipt.request_json,
+            receipt.response_json.as_deref().unwrap_or_default()
+        );
+        for secret in [
+            "fake-access-token-1",
+            "fake-refresh-token-1",
+            "fake-id-token-1",
+            "fake-kimi-access-token-1",
+            "fake-kimi-refresh-token-1",
+            "6f2a9c31-77d4-4b8e-9a10-3c5de88f01ab",
+        ] {
+            assert!(!durable.contains(secret), "receipt leaked {secret}");
+        }
+    }
+
+    actor.shutdown().await;
+    store.close().await.expect("close");
+}
+
+/// LAW: unsupported_candidate_is_honest_not_guessed. A discoverable store
+/// without a sanctioned import parser (gemini), or missing its required
+/// first-party companion material (kimi-code without a device identity), is
+/// reported with `import_supported:false` and an honest reason — and
+/// `account.import_device` refuses with that same reason instead of guessing
+/// a parser. Nothing is committed, receipted, or stored.
+#[tokio::test(flavor = "current_thread")]
+async fn unsupported_candidate_is_honest_not_guessed() {
+    let fixture_dir = test_store_dir();
+    let gemini_path = fixture_dir.path().join("gemini-oauth-creds.json");
+    std::fs::write(&gemini_path, GEMINI_DISCOVERY_FIXTURE).expect("write Gemini fixture");
+    let kimi_path = fixture_dir.path().join("kimi-code.json");
+    std::fs::write(&kimi_path, KIMI_IMPORT_FIXTURE).expect("write Kimi fixture");
+    let kimi_device_path = fixture_dir.path().join("missing-kimi-device-id");
+    let empty_home = fixture_dir.path().join("empty-home");
+    std::fs::create_dir_all(&empty_home).expect("mkdir empty home");
+    if run_oauth_import_env_child(
+        "accounts::accounts_tests::unsupported_candidate_is_honest_not_guessed",
+        &[
+            ("HAIDER_GEMINI_CREDS_PATH", &gemini_path),
+            ("HAIDER_KIMI_CREDS_PATH", &kimi_path),
+            ("HAIDER_KIMI_DEVICE_ID_PATH", &kimi_device_path),
+            ("HOME", &empty_home),
+        ],
+    ) {
+        return;
+    }
+
+    let candidates = crate::device_discovery::discover_device_candidates(false);
+    let candidate_for = |provider: &str| {
+        candidates
+            .iter()
+            .find(|candidate| candidate.wire.provider == provider)
+            .unwrap_or_else(|| panic!("missing {provider} candidate in {candidates:?}"))
+    };
+    let gemini = candidate_for("gemini");
+    assert!(!gemini.wire.import_supported);
+    assert!(gemini.import_source.is_none());
+    let gemini_reason = gemini
+        .wire
+        .unsupported_reason
+        .clone()
+        .expect("gemini honest reason");
+    assert!(
+        gemini_reason.contains("cannot be imported"),
+        "honest reason: {gemini_reason}"
+    );
+    let kimi = candidate_for(KIMI_OAUTH_PROVIDER_NAME);
+    assert!(!kimi.wire.import_supported);
+    assert!(kimi.import_source.is_none());
+    let kimi_reason = kimi
+        .wire
+        .unsupported_reason
+        .clone()
+        .expect("kimi honest reason");
+    assert!(
+        kimi_reason.contains("device identity"),
+        "honest reason: {kimi_reason}"
+    );
+
+    let store_dir = test_store_dir();
+    let store = open_store(store_dir.path()).await;
+    let vault = Arc::new(MemoryVault::new());
+    let (mut actor, snapshot, management) = start_oauth_import_test_actor(
+        &store,
+        Arc::clone(&vault),
+        HashSet::new(),
+        RefreshFenceRegistry::default(),
+    );
+    let (sink, mut frames) = channel_sink();
+
+    send_import_device(
+        &actor.commands(),
+        Arc::clone(&sink),
+        "import-device-gemini-1",
+        &gemini.wire.candidate,
+    )
+    .await;
+    expect_import_device_error(&mut frames, &gemini_reason).await;
+
+    send_import_device(
+        &actor.commands(),
+        Arc::clone(&sink),
+        "import-device-kimi-unsupported-1",
+        &kimi.wire.candidate,
+    )
+    .await;
+    expect_import_device_error(&mut frames, &kimi_reason).await;
+
+    // A well-formed but unknown candidate id is honestly unavailable, never
+    // resolved to a guessed path or parser.
+    let unknown = format!("dc1_{}", "f".repeat(64));
+    send_import_device(
+        &actor.commands(),
+        Arc::clone(&sink),
+        "import-device-unknown-1",
+        &unknown,
+    )
+    .await;
+    expect_import_device_error(&mut frames, "device credential candidate is unavailable").await;
+
+    assert!(snapshot.lock().expect("snapshot").is_empty());
+    assert_eq!(management.read().expect("management").revision, 0);
+    assert!(
+        store
+            .account_add_receipts()
+            .await
+            .expect("import receipts")
+            .is_empty(),
+        "a refused candidate must never leave a durable receipt"
+    );
+    assert!(
+        vault
+            .resolve(&CredentialAlias::new(KIMI_OAUTH_PROVIDER_NAME))
+            .is_err(),
+        "a refused candidate must never land a vault bundle"
+    );
+
+    actor.shutdown().await;
+    store.close().await.expect("close");
 }

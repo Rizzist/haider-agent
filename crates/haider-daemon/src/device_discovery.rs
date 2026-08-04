@@ -26,8 +26,7 @@ const CLAUDE_CUSTOM_CLIENT_REASON: &str =
     "Claude Code credential uses a custom OAuth client that Haider cannot safely refresh";
 const KIMI_DEVICE_REASON: &str =
     "Kimi Code credential is missing its matching first-party device identity";
-const CLAUDE_UNVERIFIED_REASON: &str =
-    "Claude OAuth path exists, but its credential shape is not verified by current first-party documentation";
+const CLAUDE_UNVERIFIED_REASON: &str = "Claude OAuth path exists, but its credential shape is not verified by current first-party documentation";
 
 #[derive(Debug, Clone)]
 pub(crate) struct DeviceCandidate {
@@ -175,7 +174,11 @@ fn discover_claude() -> Option<DeviceCandidate> {
     if parsed.oauth.access_token.0.is_empty()
         || parsed.oauth.refresh_token.0.is_empty()
         || parsed.oauth.expires_at_ms == 0
-        || !parsed.oauth.scopes.iter().any(|scope| scope == "user:inference")
+        || !parsed
+            .oauth
+            .scopes
+            .iter()
+            .any(|scope| scope == "user:inference")
     {
         return None;
     }
@@ -222,10 +225,7 @@ struct KimiFile {
 }
 
 fn discover_kimi() -> Option<DeviceCandidate> {
-    let path = env_or_home(
-        "HAIDER_KIMI_CREDS_PATH",
-        ".kimi/credentials/kimi-code.json",
-    )?;
+    let path = env_or_home("HAIDER_KIMI_CREDS_PATH", ".kimi/credentials/kimi-code.json")?;
     let bytes = read_bounded(&path)?;
     let parsed: KimiFile = serde_json::from_slice(&bytes).ok()?;
     let expires_at_ms = seconds_to_millis(parsed.expires_at)?;

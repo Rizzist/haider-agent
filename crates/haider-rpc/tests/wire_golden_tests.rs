@@ -1356,3 +1356,143 @@ fn provider_models_unavailable_reason_is_typed_and_golden() {
         })
     );
 }
+
+/// LAW (D1): goldens additive + tolerance re-proved for the device
+/// credential discovery surface.
+///
+/// Additivity is pinned two ways: the D1 frames are APPENDED to the golden
+/// transcript (the fixture regeneration for this wave inserted entries only —
+/// every pre-D1 golden byte is unchanged), and this test freezes the appended
+/// surface's decode behavior for skewed peers. Tolerance is re-proved in both
+/// directions: a current client decodes future-shaped D1 frames (extra
+/// fields) into the typed variants, absent optional fields default, and the
+/// CUT `account.refresh` method — which never became wire surface — decodes
+/// as Unknown exactly like any other future method.
+///
+/// MUTATION CHECK: make `account_label` non-optional, stop skipping absent
+/// optionals during encode, add a token-bearing field to the candidate wire,
+/// or resurrect an `account.refresh` request variant. Expected runtime
+/// failure: the matching assertion below (defaulted decode, key-absence
+/// scan, no-token-field scan, or Unknown-method decode) breaks.
+#[test]
+fn device_discovery_goldens_are_additive_and_tolerance_re_proved() {
+    use haider_rpc::{DeviceCredentialCandidateWire, FEATURE_ACCOUNT_DEVICE_DISCOVERY_V1};
+
+    // The feature bit is a pinned wire literal.
+    assert_eq!(
+        FEATURE_ACCOUNT_DEVICE_DISCOVERY_V1,
+        "account_device_discovery_v1"
+    );
+
+    // The appended golden frames live at the END of the transcript: every
+    // index before the D1 welcome predates this wave, so old fixture entries
+    // could not have moved.
+    let frames = transcript();
+    let d1_start = frames
+        .iter()
+        .position(|frame| {
+            matches!(
+                frame,
+                WireFrame::Welcome(welcome)
+                    if welcome.features.contains(FEATURE_ACCOUNT_DEVICE_DISCOVERY_V1)
+            )
+        })
+        .expect("D1 welcome frame in the golden transcript");
+    assert_eq!(frames.len() - d1_start, 6, "D1 appends exactly six frames");
+    for frame in &frames[d1_start..] {
+        let encoded = ws_codec::encode(frame, TEST_FRAME_LIMIT).expect("encode D1 frame");
+        assert!(
+            !encoded.contains("refresh"),
+            "the cut refresh-now action must not ride any D1 frame: {encoded}"
+        );
+    }
+
+    // Newer-daemon tolerance: unknown extra fields (response-level and
+    // candidate-level) are ignored, and the typed shape still lands.
+    let future_response = r#"{"v":1,"kind":"response","request_id":"request-future-candidates","body":{"method":"account.device_candidates","discovery_disabled":false,"future_scan_ms":9,"candidates":[{"candidate":"dc1_0000000000000000000000000000000000000000000000000000000000000000","provider":"openai-oauth","source_label":"Codex","freshness":"fresh","path":"/home/future/.codex/auth.json","import_supported":true,"future_field":"ignored"}]}}"#;
+    let decoded: WireFrame = serde_json::from_str(future_response).expect("tolerant D1 decode");
+    let WireFrame::Response {
+        body:
+            ResponseBody::AccountDeviceCandidates {
+                discovery_disabled: false,
+                candidates,
+            },
+        ..
+    } = decoded
+    else {
+        panic!("expected a typed device-candidates response");
+    };
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(
+        candidates[0].account_label, None,
+        "absent optional defaults"
+    );
+    assert_eq!(candidates[0].expires_at_ms, None);
+    assert_eq!(candidates[0].unsupported_reason, None);
+
+    // Older-daemon shape: `candidates` itself may be absent; the response
+    // still decodes with an empty list rather than failing the frame.
+    let minimal_response = r#"{"v":1,"kind":"response","request_id":"request-minimal-candidates","body":{"method":"account.device_candidates","discovery_disabled":true}}"#;
+    let decoded: WireFrame = serde_json::from_str(minimal_response).expect("minimal D1 decode");
+    assert!(matches!(
+        decoded,
+        WireFrame::Response {
+            body: ResponseBody::AccountDeviceCandidates {
+                discovery_disabled: true,
+                ref candidates,
+            },
+            ..
+        } if candidates.is_empty()
+    ));
+
+    // Encode direction: absent optionals stay OFF the wire (append-only
+    // discipline), and no serialized key can carry token material.
+    let bare = DeviceCredentialCandidateWire {
+        candidate: format!("dc1_{}", "0".repeat(64)),
+        provider: "openai-oauth".into(),
+        source_label: "Codex".into(),
+        account_label: None,
+        freshness: "unknown".into(),
+        expires_at_ms: None,
+        path: "/home/golden/.codex/auth.json".into(),
+        import_supported: true,
+        unsupported_reason: None,
+    };
+    let encoded = serde_json::to_value(&bare).expect("encode bare candidate");
+    let keys: Vec<&str> = encoded
+        .as_object()
+        .expect("candidate object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        [
+            "candidate",
+            "freshness",
+            "import_supported",
+            "path",
+            "provider",
+            "source_label"
+        ],
+        "absent optionals must be omitted and no secret-bearing key may exist"
+    );
+    for key in keys {
+        assert!(
+            !key.contains("token") && !key.contains("secret") && !key.contains("device_id"),
+            "candidate wire grew a secret-shaped field: {key}"
+        );
+    }
+
+    // The cut refresh-now method never became surface: to every peer it is
+    // just another unknown future method, tolerated as Unknown.
+    let refresh_request = r#"{"v":1,"kind":"request","request_id":"request-refresh-cut","body":{"method":"account.refresh","alias":"openai-oauth"}}"#;
+    let decoded: WireFrame = serde_json::from_str(refresh_request).expect("tolerant decode");
+    assert_eq!(
+        decoded,
+        WireFrame::Request {
+            request_id: haider_rpc::RequestId::new("request-refresh-cut"),
+            body: RequestBody::Unknown,
+        }
+    );
+}

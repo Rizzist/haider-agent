@@ -183,8 +183,9 @@ pub const FEATURE_ACCOUNT_OAUTH_PKCE_V1: &str = "account_oauth_pkce_v1";
 pub const FEATURE_ACCOUNT_OAUTH_DEVICE_V1: &str = "account_oauth_device_v1";
 /// Daemon imports OAuth credentials from approved, daemon-local CLI stores.
 pub const FEATURE_ACCOUNT_OAUTH_IMPORT_V1: &str = "account_oauth_import_v1";
-/// Daemon implements metadata-only device credential discovery, receipted
-/// candidate import, and receipted per-account refresh-now.
+/// Daemon implements metadata-only device credential discovery and receipted
+/// candidate import. There is no wire refresh action: same-alias re-login or
+/// re-import replaces tokens, and broker-internal refresh stays daemon-owned.
 pub const FEATURE_ACCOUNT_DEVICE_DISCOVERY_V1: &str = "account_device_discovery_v1";
 /// Daemon implements durable `account.add` for an OAuth-ready reference.
 pub const FEATURE_ACCOUNT_MANAGEMENT_V1: &str = "account_management_v1";

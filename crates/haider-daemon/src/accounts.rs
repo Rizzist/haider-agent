@@ -65,9 +65,9 @@ use tokio::time::Instant;
 use zeroize::Zeroizing;
 
 use crate::oauth::{
-    CredentialBroker, OAuthCoordinator, OAuthCoordinatorConfig, OAuthInferenceAuthMode,
-    OAuthInferenceHeaderSet, OAuthProviderCatalog, OAuthReadyClaim, RefreshFenceRegistry,
-    KIMI_DEVICE_ALIAS, OAuthImportMaterial, load_oauth_import_material, oauth_import_source_spec,
+    CredentialBroker, KIMI_DEVICE_ALIAS, OAuthCoordinator, OAuthCoordinatorConfig,
+    OAuthImportMaterial, OAuthInferenceAuthMode, OAuthInferenceHeaderSet, OAuthProviderCatalog,
+    OAuthReadyClaim, RefreshFenceRegistry, load_oauth_import_material, oauth_import_source_spec,
     sanctioned_inference,
 };
 use crate::provider_registry::{
@@ -4048,11 +4048,7 @@ async fn handle_oauth_import_heal(
         Ok(Ok(imported)) => imported,
         Ok(Err(_)) | Err(_) => return Ok(OAuthImportHealResult::RefreshFallback { source }),
     };
-    if bool::from(
-        current
-            .access_token()
-            .ct_eq(imported.bundle.access_token()),
-    ) {
+    if bool::from(current.access_token().ct_eq(imported.bundle.access_token())) {
         return Ok(OAuthImportHealResult::RefreshFallback { source });
     }
     let source_access_fingerprint = *blake3::hash(imported.bundle.access_token()).as_bytes();
@@ -4355,7 +4351,7 @@ async fn handle_oauth_import(
             match tokio::task::spawn_blocking(move || {
                 load_oauth_import_material(&source, generation)
             })
-                .await
+            .await
             {
                 Ok(Ok(material)) => material,
                 Ok(Err(error)) => {
@@ -4669,16 +4665,16 @@ async fn persist_oauth_import_material(
     let device_alias = CredentialAlias::new(KIMI_DEVICE_ALIAS);
     let vault_for_read = Arc::clone(&vault);
     let alias_for_read = device_alias.clone();
-    let prior_device = match tokio::task::spawn_blocking(move || {
-        vault_for_read.resolve(&alias_for_read)
-    })
-    .await
-    .map_err(|_| HaiderError::new(ErrorCode::ProviderError, "OAuth vault worker failed", true))?
-    {
-        Ok(secret) => Some(secret),
-        Err(error) if error.code == ErrorCode::CredentialMissing => None,
-        Err(error) => return Err(error),
-    };
+    let prior_device =
+        match tokio::task::spawn_blocking(move || vault_for_read.resolve(&alias_for_read))
+            .await
+            .map_err(|_| {
+                HaiderError::new(ErrorCode::ProviderError, "OAuth vault worker failed", true)
+            })? {
+            Ok(secret) => Some(secret),
+            Err(error) if error.code == ErrorCode::CredentialMissing => None,
+            Err(error) => return Err(error),
+        };
     let vault_for_put = Arc::clone(&vault);
     let alias_for_put = device_alias.clone();
     tokio::task::spawn_blocking(move || vault_for_put.put(&alias_for_put, &device_id))
@@ -6117,6 +6113,7 @@ pub(crate) struct AccountsRuntime {
 impl AccountsRuntime {
     /// Loads the descriptor store, runs receipt reconciliation, and starts
     /// the account actor (vault-supported platforms only).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn initialize(
         store: &SqliteStoreHandle,
         dependencies: &AccountsDependencies,
