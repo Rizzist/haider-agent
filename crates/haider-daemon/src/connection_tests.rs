@@ -53,12 +53,17 @@ fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> Qu
 ///
 /// MUTATION CHECK: remove `FEATURE_AGENT_MESSAGE_V1`. Expected RUNTIME
 /// failure: the future chip composer cannot discover its served wire.
+///
+/// MUTATION CHECK: remove `FEATURE_ACCOUNT_DEVICE_DISCOVERY_V1`. Expected
+/// RUNTIME failure: clients cannot discover the served metadata-only device
+/// credential discovery + candidate import surface (D1).
 #[test]
 fn welcome_features_pin_served_management_families() {
     assert_eq!(
         welcome_features(),
         BTreeSet::from([
             haider_rpc::FEATURE_AGENT_MESSAGE_V1.to_owned(),
+            haider_rpc::FEATURE_ACCOUNT_DEVICE_DISCOVERY_V1.to_owned(),
             FEATURE_ACCOUNT_LOGIN_API_V1.to_owned(),
             haider_rpc::FEATURE_ACCOUNT_MANAGEMENT_V1.to_owned(),
             haider_rpc::FEATURE_ACCOUNT_OAUTH_DEVICE_V1.to_owned(),

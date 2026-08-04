@@ -65,9 +65,10 @@ use tokio::time::Instant;
 use zeroize::Zeroizing;
 
 use crate::oauth::{
-    CredentialBroker, OAuthCoordinator, OAuthCoordinatorConfig, OAuthInferenceAuthMode,
-    OAuthInferenceHeaderSet, OAuthProviderCatalog, OAuthReadyClaim, RefreshFenceRegistry,
-    load_oauth_import_bundle, oauth_import_source_spec, sanctioned_inference,
+    CredentialBroker, KIMI_DEVICE_ALIAS, OAuthCoordinator, OAuthCoordinatorConfig,
+    OAuthImportMaterial, OAuthInferenceAuthMode, OAuthInferenceHeaderSet, OAuthProviderCatalog,
+    OAuthReadyClaim, RefreshFenceRegistry, load_oauth_import_material, oauth_import_source_spec,
+    sanctioned_inference,
 };
 use crate::provider_registry::{
     CachedProviderModelSource, JsonProviderRegistryStore, ProductionProviderEndpointValidator,
@@ -664,6 +665,7 @@ pub(crate) struct AccountsFacade {
     pub snapshot: AccountsSnapshot,
     pub management: ManagementSnapshot,
     pub vault_supported: bool,
+    pub discovery_disabled: bool,
 }
 
 /// Correlated response route back to the requesting connection. Disconnect
@@ -697,6 +699,13 @@ pub(crate) struct OAuthAddJob {
 pub(crate) struct OAuthImportJob {
     pub command_id: String,
     pub source: String,
+    pub route: LoginRoute,
+}
+
+pub(crate) struct DeviceImportJob {
+    pub command_id: String,
+    pub candidate: String,
+    pub discovery_disabled: bool,
     pub route: LoginRoute,
 }
 
@@ -757,6 +766,11 @@ pub(crate) enum AccountCommand {
     Login(Box<LoginJob>),
     AddOAuth(Box<OAuthAddJob>),
     ImportOAuth(Box<OAuthImportJob>),
+    DeviceCandidates {
+        discovery_disabled: bool,
+        completed: LoginRoute,
+    },
+    ImportDevice(Box<DeviceImportJob>),
     SetActive(Box<SetActiveJob>),
     Remove(Box<RemoveAccountJob>),
     SetDefaultModel(Box<SetDefaultModelJob>),
@@ -1103,6 +1117,43 @@ async fn run_account_actor(
                     &refresh_fences,
                     *job,
                     None,
+                    OAuthCommitResponse::ImportLegacy,
+                    None,
+                )
+                .await;
+            }
+            AccountCommand::DeviceCandidates {
+                discovery_disabled,
+                completed,
+            } => {
+                let candidates = tokio::task::spawn_blocking(move || {
+                    crate::device_discovery::discover_device_candidates(discovery_disabled)
+                })
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|candidate| candidate.wire)
+                .collect();
+                respond(
+                    &completed,
+                    ResponseBody::AccountDeviceCandidates {
+                        discovery_disabled: crate::device_discovery::discovery_is_disabled(
+                            discovery_disabled,
+                        ),
+                        candidates,
+                    },
+                );
+            }
+            AccountCommand::ImportDevice(job) => {
+                handle_device_import(
+                    &store,
+                    &mut accounts,
+                    Arc::clone(&vault),
+                    &snapshot,
+                    management.as_ref(),
+                    &reserved_aliases,
+                    &refresh_fences,
+                    *job,
                 )
                 .await;
             }
@@ -3553,6 +3604,8 @@ struct OAuthImportIdentity {
     source: String,
     alias: String,
     provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    candidate: Option<String>,
 }
 
 impl OAuthImportIdentity {
@@ -3852,6 +3905,75 @@ fn fresh_oauth_heal_command_id() -> Result<String, HaiderError> {
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn handle_device_import(
+    store: &SqliteStoreHandle,
+    accounts: &mut AccountStore<Box<dyn StoreLike>>,
+    vault: Arc<dyn Vault>,
+    snapshot: &AccountsSnapshot,
+    management: Option<&ManagementSnapshot>,
+    reserved_aliases: &HashSet<String>,
+    refresh_fences: &RefreshFenceRegistry,
+    job: DeviceImportJob,
+) {
+    let candidate_id = job.candidate.clone();
+    let disabled = job.discovery_disabled;
+    let candidate = tokio::task::spawn_blocking(move || {
+        crate::device_discovery::candidate_by_id(disabled, &candidate_id)
+    })
+    .await
+    .ok()
+    .flatten();
+    let Some(candidate) = candidate else {
+        respond_management_error(
+            &job.route,
+            &HaiderError::new(
+                ErrorCode::InvalidArgument,
+                if crate::device_discovery::discovery_is_disabled(disabled) {
+                    "device credential discovery is disabled"
+                } else {
+                    "device credential candidate is unavailable"
+                },
+                false,
+            ),
+        );
+        return;
+    };
+    let Some(source) = candidate.import_source else {
+        respond_management_error(
+            &job.route,
+            &HaiderError::new(
+                ErrorCode::InvalidArgument,
+                candidate
+                    .wire
+                    .unsupported_reason
+                    .unwrap_or_else(|| "device credential cannot be imported".to_owned()),
+                false,
+            ),
+        );
+        return;
+    };
+    let receipt_candidate = Some(job.candidate.clone());
+    handle_oauth_import(
+        store,
+        accounts,
+        vault,
+        snapshot,
+        management,
+        reserved_aliases,
+        refresh_fences,
+        OAuthImportJob {
+            command_id: job.command_id,
+            source: source.to_owned(),
+            route: job.route,
+        },
+        None,
+        OAuthCommitResponse::ImportDevice,
+        receipt_candidate,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn handle_oauth_import_heal(
     store: &SqliteStoreHandle,
     accounts: &mut AccountStore<Box<dyn StoreLike>>,
@@ -3919,17 +4041,17 @@ async fn handle_oauth_import_heal(
     };
     let source_for_read = source.clone();
     let imported = match tokio::task::spawn_blocking(move || {
-        load_oauth_import_bundle(&source_for_read, generation)
+        load_oauth_import_material(&source_for_read, generation)
     })
     .await
     {
         Ok(Ok(imported)) => imported,
         Ok(Err(_)) | Err(_) => return Ok(OAuthImportHealResult::RefreshFallback { source }),
     };
-    if bool::from(current.access_token().ct_eq(imported.access_token())) {
+    if bool::from(current.access_token().ct_eq(imported.bundle.access_token())) {
         return Ok(OAuthImportHealResult::RefreshFallback { source });
     }
-    let source_access_fingerprint = *blake3::hash(imported.access_token()).as_bytes();
+    let source_access_fingerprint = *blake3::hash(imported.bundle.access_token()).as_bytes();
     if current.import_source_access_fingerprint() == Some(source_access_fingerprint)
         || (current.import_source_access_fingerprint().is_none() && current.generation > 1)
     {
@@ -3943,11 +4065,11 @@ async fn handle_oauth_import_heal(
     }
     let mut committed = OAuthRefreshFence {
         fence_epoch: expected.fence_epoch,
-        generation: imported.generation,
-        issuer: imported.issuer.clone(),
-        audience: imported.audience.clone(),
-        resource: imported.resource.clone(),
-        subject_hash: imported.identity.subject_hash.clone(),
+        generation: imported.bundle.generation,
+        issuer: imported.bundle.issuer.clone(),
+        audience: imported.bundle.audience.clone(),
+        resource: imported.bundle.resource.clone(),
+        subject_hash: imported.bundle.identity.subject_hash.clone(),
     };
     let command_id = fresh_oauth_heal_command_id()?;
     let sink = Arc::new(OAuthImportHealSink::default());
@@ -3969,6 +4091,8 @@ async fn handle_oauth_import_heal(
             },
         },
         Some(imported),
+        OAuthCommitResponse::ImportLegacy,
+        None,
     )
     .await;
     let committed_descriptor = sink.take().ok_or_else(|| {
@@ -4003,7 +4127,9 @@ async fn handle_oauth_import(
     reserved_aliases: &HashSet<String>,
     refresh_fences: &RefreshFenceRegistry,
     job: OAuthImportJob,
-    preloaded_bundle: Option<haider_accounts::OAuthTokenBundleV1>,
+    preloaded_material: Option<OAuthImportMaterial>,
+    response_kind: OAuthCommitResponse,
+    receipt_candidate: Option<String>,
 ) {
     let spec = match oauth_import_source_spec(&job.source) {
         Ok(spec) => spec,
@@ -4032,6 +4158,7 @@ async fn handle_oauth_import(
         source: spec.source.to_owned(),
         alias: alias.as_str().to_owned(),
         provider: spec.provider.to_owned(),
+        candidate: receipt_candidate,
     };
     let request_json = match identity.canonical_json() {
         Ok(json) => json,
@@ -4053,10 +4180,7 @@ async fn handle_oauth_import(
         Ok(Some(ManagementClaim::Committed { response, revision })) => {
             respond(
                 &job.route,
-                ResponseBody::AccountOAuthImport {
-                    descriptor: response.descriptor,
-                    revision,
-                },
+                oauth_import_response(response_kind, response.descriptor, revision),
             );
             return;
         }
@@ -4094,10 +4218,7 @@ async fn handle_oauth_import(
             };
             respond(
                 &job.route,
-                ResponseBody::AccountOAuthImport {
-                    descriptor: response.descriptor,
-                    revision,
-                },
+                oauth_import_response(response_kind, response.descriptor, revision),
             );
             return;
         }
@@ -4213,8 +4334,8 @@ async fn handle_oauth_import(
         None => 1,
     };
     let source = spec.source.to_owned();
-    let imported = match preloaded_bundle {
-        Some(imported) if imported.generation == generation => imported,
+    let imported = match preloaded_material {
+        Some(imported) if imported.bundle.generation == generation => imported,
         Some(_) => {
             respond_management_error(
                 &job.route,
@@ -4227,10 +4348,12 @@ async fn handle_oauth_import(
             return;
         }
         None => {
-            match tokio::task::spawn_blocking(move || load_oauth_import_bundle(&source, generation))
-                .await
+            match tokio::task::spawn_blocking(move || {
+                load_oauth_import_material(&source, generation)
+            })
+            .await
             {
-                Ok(Ok(bundle)) => bundle,
+                Ok(Ok(material)) => material,
                 Ok(Err(error)) => {
                     respond_management_error(&job.route, &error);
                     return;
@@ -4249,7 +4372,7 @@ async fn handle_oauth_import(
             }
         }
     };
-    if imported.provider_id != spec.provider {
+    if imported.bundle.provider_id != spec.provider {
         respond_management_error(
             &job.route,
             &HaiderError::new(
@@ -4262,7 +4385,7 @@ async fn handle_oauth_import(
     }
     if resume
         && let Some(prior) = prior_bundle.as_ref()
-        && same_oauth_import(prior, &imported)
+        && same_oauth_import(prior, &imported.bundle)
     {
         let descriptor = oauth_descriptor_for(
             spec.provider,
@@ -4290,7 +4413,7 @@ async fn handle_oauth_import(
             &job.command_id,
             &alias,
             &job.route,
-            OAuthCommitResponse::Import,
+            response_kind,
         )
         .await;
         return;
@@ -4298,7 +4421,7 @@ async fn handle_oauth_import(
     if replacing.is_some() {
         refresh_fences.invalidate(&alias);
     }
-    if let Err(error) = persist_oauth_bundle(
+    if let Err(error) = persist_oauth_import_material(
         accounts,
         Arc::clone(&vault),
         spec.provider,
@@ -4319,7 +4442,7 @@ async fn handle_oauth_import(
         &job.command_id,
         &alias,
         &job.route,
-        OAuthCommitResponse::Import,
+        response_kind,
     )
     .await;
 }
@@ -4520,6 +4643,74 @@ async fn persist_oauth_bundle(
     Ok(())
 }
 
+async fn persist_oauth_import_material(
+    accounts: &mut AccountStore<Box<dyn StoreLike>>,
+    vault: Arc<dyn Vault>,
+    provider: &str,
+    alias: &CredentialAlias,
+    material: OAuthImportMaterial,
+    prior_secret: Option<SecretHandle>,
+) -> Result<(), HaiderError> {
+    let Some(device_id) = material.kimi_device_id else {
+        return persist_oauth_bundle(
+            accounts,
+            vault,
+            provider,
+            alias,
+            material.bundle,
+            prior_secret,
+        )
+        .await;
+    };
+    let device_alias = CredentialAlias::new(KIMI_DEVICE_ALIAS);
+    let vault_for_read = Arc::clone(&vault);
+    let alias_for_read = device_alias.clone();
+    let prior_device =
+        match tokio::task::spawn_blocking(move || vault_for_read.resolve(&alias_for_read))
+            .await
+            .map_err(|_| {
+                HaiderError::new(ErrorCode::ProviderError, "OAuth vault worker failed", true)
+            })? {
+            Ok(secret) => Some(secret),
+            Err(error) if error.code == ErrorCode::CredentialMissing => None,
+            Err(error) => return Err(error),
+        };
+    let vault_for_put = Arc::clone(&vault);
+    let alias_for_put = device_alias.clone();
+    tokio::task::spawn_blocking(move || vault_for_put.put(&alias_for_put, &device_id))
+        .await
+        .map_err(|_| {
+            HaiderError::new(ErrorCode::ProviderError, "OAuth vault worker failed", true)
+        })??;
+    if let Err(error) = persist_oauth_bundle(
+        accounts,
+        Arc::clone(&vault),
+        provider,
+        alias,
+        material.bundle,
+        prior_secret,
+    )
+    .await
+    {
+        let rollback_vault = Arc::clone(&vault);
+        let rollback_alias = device_alias;
+        let rollback = tokio::task::spawn_blocking(move || match prior_device {
+            Some(previous) => rollback_vault.put(&rollback_alias, previous.expose_secret()),
+            None => rollback_vault.delete(&rollback_alias),
+        })
+        .await;
+        if !matches!(rollback, Ok(Ok(()))) {
+            return Err(HaiderError::new(
+                ErrorCode::ProviderError,
+                "OAuth import and device-identity rollback failed",
+                true,
+            ));
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 fn oauth_descriptor(
     identity: &OAuthAddIdentity,
@@ -4549,7 +4740,26 @@ fn oauth_descriptor_for(
 #[derive(Clone, Copy)]
 enum OAuthCommitResponse {
     Add,
-    Import,
+    ImportLegacy,
+    ImportDevice,
+}
+
+fn oauth_import_response(
+    response: OAuthCommitResponse,
+    descriptor: CredentialDescriptor,
+    revision: u64,
+) -> ResponseBody {
+    match response {
+        OAuthCommitResponse::ImportLegacy => ResponseBody::AccountOAuthImport {
+            descriptor,
+            revision,
+        },
+        OAuthCommitResponse::ImportDevice => ResponseBody::AccountImportDevice {
+            descriptor,
+            revision,
+        },
+        OAuthCommitResponse::Add => unreachable!("OAuth add is not an import response"),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4573,7 +4783,9 @@ async fn finalize_oauth_commit(
             OAuthCommitResponse::Add => {
                 respond_error(route, ERROR_CODE_PROVIDER_ERROR, &error.message, true);
             }
-            OAuthCommitResponse::Import => respond_management_error(route, &error),
+            OAuthCommitResponse::ImportLegacy | OAuthCommitResponse::ImportDevice => {
+                respond_management_error(route, &error);
+            }
         }
         return;
     };
@@ -4592,7 +4804,9 @@ async fn finalize_oauth_commit(
                 OAuthCommitResponse::Add => {
                     respond_error(route, ERROR_CODE_PROVIDER_ERROR, &error.message, true);
                 }
-                OAuthCommitResponse::Import => respond_management_error(route, &error),
+                OAuthCommitResponse::ImportLegacy | OAuthCommitResponse::ImportDevice => {
+                    respond_management_error(route, &error);
+                }
             }
             return;
         }
@@ -4600,13 +4814,9 @@ async fn finalize_oauth_commit(
     publish_management_snapshot(snapshot, management, accounts, revision);
     match response {
         OAuthCommitResponse::Add => respond(route, ResponseBody::AccountAdd { descriptor }),
-        OAuthCommitResponse::Import => respond(
-            route,
-            ResponseBody::AccountOAuthImport {
-                descriptor,
-                revision,
-            },
-        ),
+        OAuthCommitResponse::ImportLegacy | OAuthCommitResponse::ImportDevice => {
+            respond(route, oauth_import_response(response, descriptor, revision));
+        }
     }
 }
 
@@ -5903,6 +6113,7 @@ pub(crate) struct AccountsRuntime {
 impl AccountsRuntime {
     /// Loads the descriptor store, runs receipt reconciliation, and starts
     /// the account actor (vault-supported platforms only).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn initialize(
         store: &SqliteStoreHandle,
         dependencies: &AccountsDependencies,
@@ -5911,6 +6122,7 @@ impl AccountsRuntime {
         instance_id: &str,
         default_model: &str,
         provider_names: &std::collections::BTreeSet<String>,
+        discovery_disabled: bool,
     ) -> Result<Self, HaiderError> {
         let descriptor_store: Box<dyn StoreLike> = match &dependencies.descriptor_store {
             Some(injected) => Box::new(DescriptorStore::Injected(Arc::clone(injected))),
@@ -6034,6 +6246,7 @@ impl AccountsRuntime {
                         snapshot,
                         management,
                         vault_supported: true,
+                        discovery_disabled,
                     },
                     actor: Some(actor),
                     vault,
@@ -6053,6 +6266,7 @@ impl AccountsRuntime {
                         snapshot,
                         management,
                         vault_supported: false,
+                        discovery_disabled,
                     },
                     actor: Some(actor),
                     vault: VaultProvision::Unsupported,

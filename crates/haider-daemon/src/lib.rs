@@ -54,6 +54,7 @@ mod connection;
 #[cfg(test)]
 mod context_core_tests;
 mod delegation;
+mod device_discovery;
 mod endpoint;
 mod error;
 mod hooks;

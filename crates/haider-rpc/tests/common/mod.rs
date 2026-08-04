@@ -18,8 +18,9 @@ use haider_protocol::tool::{
 };
 use haider_rpc::{
     AccountAddMethod, AttachMode, AttachState, AttachmentId, CancelStatus, Capability, ClientKind,
-    CommandId, ERROR_CODE_ALREADY_RESOLVED, ERROR_CODE_CAPABILITY_DENIED, ERROR_CODE_CURSOR_AHEAD,
-    ERROR_CODE_PROVIDER_REMOVE_REFUSED, ERROR_CODE_REVISION_CONFLICT, ErrorData,
+    CommandId, DeviceCredentialCandidateWire, ERROR_CODE_ALREADY_RESOLVED,
+    ERROR_CODE_CAPABILITY_DENIED, ERROR_CODE_CURSOR_AHEAD, ERROR_CODE_PROVIDER_REMOVE_REFUSED,
+    ERROR_CODE_REVISION_CONFLICT, ErrorData, FEATURE_ACCOUNT_DEVICE_DISCOVERY_V1,
     FEATURE_ACCOUNT_LOGIN_API_V1, FEATURE_ACCOUNT_MANAGEMENT_V1, FEATURE_ACCOUNT_OAUTH_DEVICE_V1,
     FEATURE_ACCOUNT_OAUTH_PKCE_V1, FEATURE_ACCOUNT_ROTATION_V1, FEATURE_ARTIFACT_PUT_V1,
     FEATURE_BRANCH_CREATE_V1, FEATURE_PROVIDER_CONFIGURE_V1, FEATURE_PROVIDER_MANAGEMENT_V1,
@@ -1065,6 +1066,81 @@ pub fn transcript() -> Vec<WireFrame> {
                     child_run_id: RunId::new("run-child-7"),
                     child_run_state: haider_protocol::state::RunState::Streaming,
                 },
+            },
+        },
+        // D1 append-only device credential discovery + import. Every earlier
+        // frame stays byte-for-byte frozen; there is deliberately NO
+        // `account.refresh` frame — refresh-now was cut by owner decision and
+        // never became wire surface. Candidates are metadata-only: no field
+        // of the candidate wire can carry token bytes.
+        WireFrame::Welcome(Welcome {
+            protocol: 1,
+            instance_id: "instance-device-discovery".into(),
+            daemon_generation: 12,
+            frame_limit: TEST_FRAME_LIMIT as u32,
+            profile_id: "profile-1".into(),
+            daemon_version: "0.0.13".into(),
+            lifecycle_phase: LifecyclePhase::Ready,
+            capabilities_granted: capabilities([Capability::View, Capability::Control]),
+            features: BTreeSet::from([FEATURE_ACCOUNT_DEVICE_DISCOVERY_V1.to_owned()]),
+        }),
+        WireFrame::Request {
+            request_id: RequestId::new("request-device-candidates"),
+            body: RequestBody::AccountDeviceCandidates,
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-device-candidates"),
+            body: ResponseBody::AccountDeviceCandidates {
+                discovery_disabled: false,
+                candidates: vec![
+                    DeviceCredentialCandidateWire {
+                        candidate: format!("dc1_{}", "0123456789abcdef".repeat(4)),
+                        provider: "openai-oauth".into(),
+                        source_label: "Codex".into(),
+                        account_label: Some("person@example.invalid".into()),
+                        freshness: "fresh".into(),
+                        expires_at_ms: Some(1_753_503_600_000),
+                        path: "/home/golden/.codex/auth.json".into(),
+                        import_supported: true,
+                        unsupported_reason: None,
+                    },
+                    DeviceCredentialCandidateWire {
+                        candidate: format!("dc1_{}", "fedcba9876543210".repeat(4)),
+                        provider: "gemini".into(),
+                        source_label: "Gemini CLI".into(),
+                        account_label: None,
+                        freshness: "unknown".into(),
+                        expires_at_ms: None,
+                        path: "/home/golden/.gemini/oauth_creds.json".into(),
+                        import_supported: false,
+                        unsupported_reason: Some(
+                            "Gemini CLI OAuth credentials cannot be imported".into(),
+                        ),
+                    },
+                ],
+            },
+        },
+        // The honest configured-off state: disabled is a report, never an
+        // empty-device claim.
+        WireFrame::Response {
+            request_id: RequestId::new("request-device-candidates-disabled"),
+            body: ResponseBody::AccountDeviceCandidates {
+                discovery_disabled: true,
+                candidates: Vec::new(),
+            },
+        },
+        WireFrame::Request {
+            request_id: RequestId::new("request-import-device"),
+            body: RequestBody::AccountImportDevice {
+                command_id: CommandId::new("command-import-device"),
+                candidate: format!("dc1_{}", "0123456789abcdef".repeat(4)),
+            },
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-import-device"),
+            body: ResponseBody::AccountImportDevice {
+                descriptor: golden_oauth_descriptor(),
+                revision: 13,
             },
         },
     ]

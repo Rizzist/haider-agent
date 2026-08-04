@@ -183,6 +183,10 @@ pub const FEATURE_ACCOUNT_OAUTH_PKCE_V1: &str = "account_oauth_pkce_v1";
 pub const FEATURE_ACCOUNT_OAUTH_DEVICE_V1: &str = "account_oauth_device_v1";
 /// Daemon imports OAuth credentials from approved, daemon-local CLI stores.
 pub const FEATURE_ACCOUNT_OAUTH_IMPORT_V1: &str = "account_oauth_import_v1";
+/// Daemon implements metadata-only device credential discovery and receipted
+/// candidate import. There is no wire refresh action: same-alias re-login or
+/// re-import replaces tokens, and broker-internal refresh stays daemon-owned.
+pub const FEATURE_ACCOUNT_DEVICE_DISCOVERY_V1: &str = "account_device_discovery_v1";
 /// Daemon implements durable `account.add` for an OAuth-ready reference.
 pub const FEATURE_ACCOUNT_MANAGEMENT_V1: &str = "account_management_v1";
 /// Daemon implements provider management reads.
@@ -606,6 +610,34 @@ pub struct ProviderActiveWire {
 pub struct ProviderDefaultWire {
     pub provider: String,
     pub model: String,
+}
+
+/// Metadata-only projection of one first-party credential store found on the
+/// daemon's device. Token, scope, client-secret, and device-id bytes have no
+/// representation in this type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceCredentialCandidateWire {
+    /// Opaque daemon-derived identifier consumed by account.import_device.
+    pub candidate: String,
+    /// Haider provider this credential would serve.
+    pub provider: String,
+    /// Human-facing first-party source name.
+    pub source_label: String,
+    /// Account email/label only when the probed store itself carries one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_label: Option<String>,
+    /// Coarse fresh | expiring | expired | unknown access-token hint.
+    pub freshness: String,
+    /// Provider access-token expiry, when the store states one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_ms: Option<u64>,
+    /// Credential file inspected by the daemon. Never a token value.
+    pub path: String,
+    /// False when discovery is safe but reuse is unverified or unsupported.
+    pub import_supported: bool,
+    /// Honest, actionable explanation paired with an unsupported candidate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unsupported_reason: Option<String>,
 }
 
 /// Public-only flow progress. No variant can carry callback/token secrets or
@@ -1096,6 +1128,16 @@ pub enum RequestBody {
         command_id: CommandId,
         source: String,
     },
+    /// Reads only bounded, non-secret metadata from known first-party stores.
+    #[serde(rename = "account.device_candidates")]
+    AccountDeviceCandidates,
+    /// Imports one candidate by opaque identifier. The daemon re-discovers
+    /// and reads the local source; credential bytes never cross this frame.
+    #[serde(rename = "account.import_device")]
+    AccountImportDevice {
+        command_id: CommandId,
+        candidate: String,
+    },
     /// Durable OAuth account creation. `oauth_reference` is transient,
     /// daemon-instance/connection-bound, single-use, and excluded from the
     /// semantic command digest.
@@ -1354,6 +1396,18 @@ pub enum ResponseBody {
     },
     #[serde(rename = "account.oauth_import")]
     AccountOAuthImport {
+        descriptor: haider_protocol::credential::CredentialDescriptor,
+        revision: u64,
+    },
+    #[serde(rename = "account.device_candidates")]
+    AccountDeviceCandidates {
+        /// True is an honest configured-off state, not an empty-device claim.
+        discovery_disabled: bool,
+        #[serde(default)]
+        candidates: Vec<DeviceCredentialCandidateWire>,
+    },
+    #[serde(rename = "account.import_device")]
+    AccountImportDevice {
         descriptor: haider_protocol::credential::CredentialDescriptor,
         revision: u64,
     },

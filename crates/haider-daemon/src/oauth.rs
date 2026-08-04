@@ -57,7 +57,7 @@ const CALLBACK_READ_TIMEOUT: Duration = Duration::from_secs(2);
 const TOKEN_TIMEOUT: Duration = Duration::from_secs(15);
 const OAUTH_REFRESH_SKEW: Duration = Duration::from_secs(30);
 const KIMI_REFRESH_REJECTED_TTL: Duration = Duration::from_secs(300);
-const KIMI_DEVICE_ALIAS: &str = "_kimi_oauth_device_id_v1";
+pub(crate) const KIMI_DEVICE_ALIAS: &str = "_kimi_oauth_device_id_v1";
 const KIMI_DEVICE_POLL_SLOW_DOWN: Duration = Duration::from_secs(5);
 const KIMI_REFRESH_BACKOFF_INITIAL: Duration = Duration::from_millis(250);
 const KIMI_REFRESH_MAX_ATTEMPTS: usize = 3;
@@ -974,9 +974,16 @@ pub(crate) fn oauth_import_source_spec(source: &str) -> Result<OAuthImportSource
             env_override: "HAIDER_CLAUDE_CREDS_PATH",
             home_relative_path: ".claude/.credentials.json",
         }),
+        "kimi-code" => Ok(OAuthImportSourceSpec {
+            source: "kimi-code",
+            provider: haider_provider::KIMI_OAUTH_PROVIDER_NAME,
+            default_alias: haider_provider::KIMI_OAUTH_PROVIDER_NAME,
+            env_override: "HAIDER_KIMI_CREDS_PATH",
+            home_relative_path: ".kimi/credentials/kimi-code.json",
+        }),
         _ => Err(HaiderError::new(
             ErrorCode::InvalidArgument,
-            "OAuth import source must be `codex` or `claude-code`",
+            "OAuth import source must be codex, claude-code, or kimi-code",
             false,
         )),
     }
@@ -1000,14 +1007,19 @@ pub(crate) fn oauth_import_path(source: &str) -> Result<PathBuf, HaiderError> {
     Ok(PathBuf::from(home).join(spec.home_relative_path))
 }
 
+pub(crate) struct OAuthImportMaterial {
+    pub bundle: OAuthTokenBundleV1,
+    pub kimi_device_id: Option<Zeroizing<Vec<u8>>>,
+}
+
 /// Reads and converts one daemon-local CLI credential file.
 ///
-/// The returned bundle is the first and only object allowed to leave this
+/// The returned material is the first and only object allowed to leave this
 /// function. File bytes and all token fields stay in zeroizing storage.
-pub(crate) fn load_oauth_import_bundle(
+pub(crate) fn load_oauth_import_material(
     source: &str,
     generation: u64,
-) -> Result<OAuthTokenBundleV1, HaiderError> {
+) -> Result<OAuthImportMaterial, HaiderError> {
     let spec = oauth_import_source_spec(source)?;
     let path = oauth_import_path(source)?;
     let bytes = read_oauth_import_file(&path, spec.source)?;
@@ -1023,11 +1035,33 @@ pub(crate) fn load_oauth_import_bundle(
                 false,
             )
         })?;
-    match spec.source {
+    let bundle = match spec.source {
         "codex" => codex_import_bundle(&path, &bytes, &registration, generation),
         "claude-code" => claude_import_bundle(&path, &bytes, &registration, generation),
+        "kimi-code" => kimi_import_bundle(&path, &bytes, &registration, generation),
         _ => unreachable!("source spec is closed"),
-    }
+    }?;
+    let kimi_device_id = if spec.source == "kimi-code" {
+        let device_path = crate::device_discovery::kimi_device_id_path().ok_or_else(|| {
+            HaiderError::new(
+                ErrorCode::CredentialMissing,
+                "cannot locate Kimi Code device identity: HOME and HAIDER_KIMI_DEVICE_ID_PATH are unset",
+                false,
+            )
+        })?;
+        let device = read_oauth_import_file(&device_path, "kimi-code device identity")?;
+        let trimmed = crate::device_discovery::trim_ascii(&device);
+        if !crate::device_discovery::valid_kimi_device_id(trimmed) {
+            return Err(invalid_import(&device_path, "kimi-code device identity"));
+        }
+        Some(Zeroizing::new(trimmed.to_vec()))
+    } else {
+        None
+    };
+    Ok(OAuthImportMaterial {
+        bundle,
+        kimi_device_id,
+    })
 }
 
 fn read_oauth_import_file(path: &Path, source: &str) -> Result<Zeroizing<Vec<u8>>, HaiderError> {
@@ -1191,9 +1225,13 @@ struct ClaudeCredentials {
     refresh_token: SecretJson,
     #[serde(rename = "expiresAt")]
     expires_at_unix_ms: u64,
+    #[serde(default, rename = "refreshTokenExpiresAt")]
+    refresh_expires_at_unix_ms: Option<u64>,
     scopes: Vec<String>,
     #[serde(default, rename = "subscriptionType")]
-    _subscription_type: Option<String>,
+    subscription_type: Option<String>,
+    #[serde(default, rename = "clientId")]
+    client_id: Option<String>,
 }
 
 fn claude_import_bundle(
@@ -1206,6 +1244,21 @@ fn claude_import_bundle(
         .map_err(|error| malformed_import(path, "claude-code", &error))?;
     let source_access_fingerprint =
         *blake3::hash(credentials.oauth.access_token.0.as_slice()).as_bytes();
+    if credentials.oauth.access_token.0.is_empty()
+        || credentials.oauth.refresh_token.0.is_empty()
+        || credentials.oauth.expires_at_unix_ms == 0
+        || credentials
+            .oauth
+            .refresh_expires_at_unix_ms
+            .is_some_and(|expiry| expiry == 0)
+        || credentials
+            .oauth
+            .client_id
+            .as_deref()
+            .is_some_and(|client_id| client_id != registration.client_id)
+    {
+        return Err(invalid_import(path, "claude-code"));
+    }
     if !registration
         .scopes
         .iter()
@@ -1214,11 +1267,18 @@ fn claude_import_bundle(
     {
         return Err(invalid_import(path, "claude-code"));
     }
+    let display_identity = match credentials.oauth.subscription_type.as_deref() {
+        Some("max") => "Claude Max subscription",
+        Some("pro") => "Claude Pro subscription",
+        Some("team") => "Claude Team subscription",
+        Some("enterprise") => "Claude Enterprise subscription",
+        _ => "Claude Code subscription",
+    };
     let identity = OAuthIdentityV1 {
         subject_hash: blake3::hash(credentials.oauth.access_token.0.as_slice())
             .to_hex()
             .to_string(),
-        display_identity: "Claude Max subscription".into(),
+        display_identity: display_identity.into(),
     };
     OAuthTokenBundleV1::new(
         registration.provider_id.clone(),
@@ -1229,13 +1289,84 @@ fn claude_import_bundle(
         credentials.oauth.access_token.0,
         Some(credentials.oauth.refresh_token.0),
         credentials.oauth.expires_at_unix_ms,
-        None,
+        credentials.oauth.refresh_expires_at_unix_ms,
         credentials.oauth.scopes,
         identity,
         generation,
     )
     .map(|bundle| bundle.with_import_source_access_fingerprint(source_access_fingerprint))
     .map_err(|_| invalid_import(path, "claude-code"))
+}
+
+#[derive(Deserialize)]
+struct KimiCredentials {
+    access_token: SecretJson,
+    refresh_token: SecretJson,
+    expires_at: f64,
+    #[serde(default)]
+    expires_in: f64,
+    scope: String,
+    token_type: String,
+}
+
+fn kimi_import_bundle(
+    path: &Path,
+    bytes: &[u8],
+    registration: &OAuthProviderRegistration,
+    generation: u64,
+) -> Result<OAuthTokenBundleV1, HaiderError> {
+    let credentials: KimiCredentials = serde_json::from_slice(bytes)
+        .map_err(|error| malformed_import(path, "kimi-code", &error))?;
+    if credentials.access_token.0.is_empty()
+        || credentials.refresh_token.0.is_empty()
+        || !credentials.token_type.eq_ignore_ascii_case("bearer")
+        || !credentials.expires_at.is_finite()
+        || credentials.expires_at <= 0.0
+        || credentials.expires_at > (u64::MAX / 1000) as f64
+        || !credentials.expires_in.is_finite()
+        || credentials.expires_in.is_sign_negative()
+    {
+        return Err(invalid_import(path, "kimi-code"));
+    }
+    let expires_at_unix_ms = (credentials.expires_at * 1000.0) as u64;
+    let expires_in = credentials.expires_in as u64;
+    let refresh_threshold = if expires_in == 0 {
+        300
+    } else {
+        300_u64.max(expires_in / 2)
+    };
+    let source_access_fingerprint = *blake3::hash(&credentials.access_token.0).as_bytes();
+    OAuthTokenBundleV1::new(
+        registration.provider_id.clone(),
+        registration.issuer.clone(),
+        registration.audience.clone(),
+        registration.resource.clone(),
+        credentials.token_type,
+        credentials.access_token.0,
+        Some(credentials.refresh_token.0),
+        expires_at_unix_ms,
+        None,
+        credentials
+            .scope
+            .split_ascii_whitespace()
+            .map(str::to_owned)
+            .collect(),
+        OAuthIdentityV1 {
+            subject_hash: blake3::Hash::from_bytes(source_access_fingerprint)
+                .to_hex()
+                .to_string(),
+            display_identity: "Kimi Code subscription".into(),
+        },
+        generation,
+    )
+    .map(|bundle| {
+        bundle
+            .with_import_source_access_fingerprint(source_access_fingerprint)
+            .with_refresh_after(
+                expires_at_unix_ms.saturating_sub(refresh_threshold.saturating_mul(1000)),
+            )
+    })
+    .map_err(|_| invalid_import(path, "kimi-code"))
 }
 
 fn decode_unverified_jwt_payload<T>(token: &[u8]) -> Option<T>
@@ -2432,7 +2563,9 @@ async fn load_or_create_kimi_device_id(
         .await
         .map_err(|_| OAuthPublicError::new("device_identity_unavailable", true))?;
     match resolved {
-        Ok(device_id) if valid_uuid_v4(device_id.expose_secret()) => {
+        Ok(device_id)
+            if crate::device_discovery::valid_kimi_device_id(device_id.expose_secret()) =>
+        {
             drop(lease);
             return Ok(device_id);
         }
@@ -2477,16 +2610,6 @@ async fn load_or_create_kimi_device_id(
         .await
         .map_err(|_| OAuthPublicError::new("device_identity_unavailable", true))?
         .map_err(|_| OAuthPublicError::new("device_identity_unavailable", true))
-}
-
-fn valid_uuid_v4(value: &[u8]) -> bool {
-    value.len() == 36
-        && value.iter().enumerate().all(|(index, byte)| match index {
-            8 | 13 | 18 | 23 => *byte == b'-',
-            _ => byte.is_ascii_hexdigit(),
-        })
-        && value[14] == b'4'
-        && matches!(value[19].to_ascii_lowercase(), b'8' | b'9' | b'a' | b'b')
 }
 
 fn same_origin(left: &Url, right: &Url) -> bool {
@@ -3147,7 +3270,7 @@ fn classify_token_error(status: u16, body: &[u8]) -> OAuthPublicError {
     }
 }
 
-struct SecretJson(Zeroizing<Vec<u8>>);
+pub(crate) struct SecretJson(pub(crate) Zeroizing<Vec<u8>>);
 
 impl<'de> Deserialize<'de> for SecretJson {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>

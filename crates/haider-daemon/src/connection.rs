@@ -1384,6 +1384,7 @@ fn welcome_features() -> BTreeSet<String> {
     BTreeSet::from([
         haider_rpc::FEATURE_AGENT_MESSAGE_V1.to_owned(),
         FEATURE_ACCOUNT_LOGIN_API_V1.to_owned(),
+        haider_rpc::FEATURE_ACCOUNT_DEVICE_DISCOVERY_V1.to_owned(),
         haider_rpc::FEATURE_ACCOUNT_MANAGEMENT_V1.to_owned(),
         haider_rpc::FEATURE_ACCOUNT_OAUTH_IMPORT_V1.to_owned(),
         haider_rpc::FEATURE_ACCOUNT_OAUTH_PKCE_V1.to_owned(),

@@ -310,6 +310,7 @@ async fn run_inner(
         &instance_id,
         &config.default_model,
         &creatable_providers,
+        config.discovery_disabled,
     )
     .await
     {

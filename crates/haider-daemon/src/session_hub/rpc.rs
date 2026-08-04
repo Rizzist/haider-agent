@@ -1139,6 +1139,33 @@ impl HubConnection {
                 }
                 self.account_oauth_import(request_id, command_id, source)
             }
+            RequestBody::AccountDeviceCandidates => {
+                if let Err(message) = authorize(&self.capabilities, Operation::View) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.account_device_candidates(request_id)
+            }
+            RequestBody::AccountImportDevice {
+                command_id,
+                candidate,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.account_import_device(request_id, command_id, candidate)
+            }
             RequestBody::AccountAdd {
                 command_id,
                 provider,
@@ -1350,6 +1377,33 @@ impl HubConnection {
                 Ok(None)
             }
         }
+    }
+
+    fn device_surface_facade(
+        &self,
+        request_id: &RequestId,
+    ) -> Result<Option<crate::accounts::AccountsFacade>, SessionHubError> {
+        if self.transport != crate::accounts::ConnectionTransport::LocalSameUid {
+            self.respond_error(
+                request_id.clone(),
+                ERROR_CODE_CAPABILITY_DENIED,
+                "device credential discovery is only served on authenticated same-UID local connections",
+                false,
+                None,
+            )?;
+            return Ok(None);
+        }
+        let Some(facade) = self.hub.accounts()? else {
+            self.respond_error(
+                request_id.clone(),
+                ERROR_CODE_DRAINING,
+                "account actor is unavailable",
+                true,
+                None,
+            )?;
+            return Ok(None);
+        };
+        Ok(Some(facade))
     }
 
     /// `vault.stage`: connection-scoped, non-durable, inline (no I/O). The
@@ -1588,12 +1642,12 @@ impl HubConnection {
             return Ok(());
         };
         if command_id.as_str().trim().is_empty()
-            || !matches!(source.as_str(), "codex" | "claude-code")
+            || !matches!(source.as_str(), "codex" | "claude-code" | "kimi-code")
         {
             return self.respond_error(
                 request_id,
                 ERROR_CODE_INVALID_ARGUMENT,
-                "account.oauth_import requires a command id and source `codex` or `claude-code`",
+                "account.oauth_import requires a command id and source `codex`, `claude-code`, or `kimi-code`",
                 false,
                 None,
             );
@@ -1632,6 +1686,56 @@ impl HubConnection {
                 None,
             ),
         }
+    }
+
+    fn account_device_candidates(&self, request_id: RequestId) -> Result<(), SessionHubError> {
+        let Some(facade) = self.device_surface_facade(&request_id)? else {
+            return Ok(());
+        };
+        self.send_management_command(
+            request_id.clone(),
+            crate::accounts::AccountCommand::DeviceCandidates {
+                discovery_disabled: facade.discovery_disabled,
+                completed: crate::accounts::LoginRoute {
+                    request_id,
+                    sink: Arc::clone(&self.sink),
+                },
+            },
+        )
+    }
+
+    fn account_import_device(
+        &self,
+        request_id: RequestId,
+        command_id: CommandId,
+        candidate: String,
+    ) -> Result<(), SessionHubError> {
+        let Some(facade) = self.secret_surface_facade(&request_id)? else {
+            return Ok(());
+        };
+        if command_id.as_str().trim().is_empty() || !valid_device_candidate_id(&candidate) {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "account.import_device requires a command id and valid opaque candidate id",
+                false,
+                None,
+            );
+        }
+        self.send_management_command(
+            request_id.clone(),
+            crate::accounts::AccountCommand::ImportDevice(Box::new(
+                crate::accounts::DeviceImportJob {
+                    command_id: command_id.0,
+                    candidate,
+                    discovery_disabled: facade.discovery_disabled,
+                    route: crate::accounts::LoginRoute {
+                        request_id,
+                        sink: Arc::clone(&self.sink),
+                    },
+                },
+            )),
+        )
     }
 
     fn account_oauth_status(
@@ -3636,6 +3740,12 @@ fn authorize(capabilities: &CapabilitySet, operation: Operation) -> Result<(), &
         Operation::View => "this method requires the view capability",
         Operation::Control => "this method requires the control capability",
     })
+}
+
+fn valid_device_candidate_id(candidate: &str) -> bool {
+    candidate.len() == 68
+        && candidate.starts_with("dc1_")
+        && candidate.as_bytes()[4..].iter().all(u8::is_ascii_hexdigit)
 }
 
 struct ValidatedWorkspace {
