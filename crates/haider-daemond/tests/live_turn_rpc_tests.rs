@@ -2835,6 +2835,7 @@ async fn w8a_shell_busy_builtin_rejection_and_inventory_are_typed() {
             "fs_edit",
             "process_exec",
             "spawn_subagent",
+            "message_subagent",
         ]
     );
     assert!(!names.contains(&"exec"));

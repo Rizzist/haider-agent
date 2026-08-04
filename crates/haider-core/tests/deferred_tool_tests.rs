@@ -215,7 +215,10 @@ async fn waits_for_every_sibling_then_auto_continues_without_idle() {
         .collect::<Vec<_>>();
     assert_eq!(
         tool_results,
-        vec![("call-a", "report a"), ("call-b", "report b")]
+        vec![
+            ("call-a", "agent: agent-a\n\nreport a"),
+            ("call-b", "agent: agent-b\n\nreport b")
+        ]
     );
 
     let events = store.events(&SessionId::new("parent")).await;
@@ -331,7 +334,7 @@ async fn errored_child_is_a_red_report_and_parent_tool_result() {
         message.blocks.iter().any(|block| {
             matches!(
                 block,
-                Block::ToolResult { preview, .. } if preview == "public child failure"
+                Block::ToolResult { preview, .. } if preview == "agent: agent-a\n\npublic child failure"
             )
         })
     }));
