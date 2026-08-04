@@ -78,6 +78,18 @@ Unknown method.
   `assertion failed: discover_device_candidates(true).is_empty()` — a
   disabled profile still scanned the device.
 
+## K1 re-run after the anthropic-registration revert (EXECUTED, reverted)
+
+After the owner-directed revert of the dead lane's anthropic OAuth
+registration change (claude.com/cai endpoints and SerializedRotating back to
+the pre-lane claude.ai / console.anthropic.com endpoints and Conservative
+policy — web verification found no source for the claude.com/cai path), K1
+was applied and run again on the reverted tree: same observer, output showed
+`running 1 test` → FAILED with
+`discovery response leaked token material eyJhbGciOiJSUzI1NiIs…`, then the
+mutation was reverted and the observer re-ran green. The token-bytes law does
+not depend on the registration surface.
+
 ## Path-outside-home traversal — not applicable, with reasoning
 
 No wire input ever names a path. `account.import_device` carries only the

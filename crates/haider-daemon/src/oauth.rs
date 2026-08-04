@@ -308,9 +308,9 @@ pub const SANCTIONED_PROVIDER_REGISTRATIONS: &[SanctionedOAuthRegistration] = &[
     },
     SanctionedOAuthRegistration {
         provider_id: haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME,
-        issuer: "https://claude.com",
-        authorization_endpoint: "https://claude.com/cai/oauth/authorize",
-        token_endpoint: "https://platform.claude.com/v1/oauth/token",
+        issuer: "https://claude.ai",
+        authorization_endpoint: "https://claude.ai/oauth/authorize",
+        token_endpoint: "https://console.anthropic.com/v1/oauth/token",
         client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
         // Claude Code 2.1.220's exact scope set, same order (W5g-7): the
         // consent page derives its permission items from these, and the
@@ -351,7 +351,7 @@ pub const SANCTIONED_PROVIDER_REGISTRATIONS: &[SanctionedOAuthRegistration] = &[
         },
         flow_mode: OAuthFlowMode::AuthorizationCode,
         auth_header_set: OAuthAuthHeaderSet::Standard,
-        refresh_policy: OAuthRefreshPolicy::SerializedRotating,
+        refresh_policy: OAuthRefreshPolicy::Conservative,
     },
     SanctionedOAuthRegistration {
         provider_id: haider_provider::KIMI_OAUTH_PROVIDER_NAME,

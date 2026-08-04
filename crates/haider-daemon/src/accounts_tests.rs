@@ -1002,7 +1002,7 @@ async fn auth_aware_factory_routes_sanctioned_oauth_descriptors_to_subscription_
             &anthropic_alias,
             &bundle(
                 ANTHROPIC_OAUTH_PROVIDER_NAME,
-                "https://claude.com",
+                "https://claude.ai",
                 "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
                 // The stored grant must cover EVERY configured scope
                 // (W5g-7 Claude Code parity set) or resolve refuses it.
@@ -1016,11 +1016,6 @@ async fn auth_aware_factory_routes_sanctioned_oauth_descriptors_to_subscription_
                 ],
                 b"ANTHROPIC_FACTORY_ACCESS_SENTINEL_d716",
             )
-            // D1: the anthropic registration is SerializedRotating now, so a
-            // current bundle carries a not-yet-due refresh_after marker;
-            // without it resolve forces the serialized refresh path instead
-            // of exercising the dispatch routing under test.
-            .with_refresh_after(u64::MAX - 3)
             .encode()
             .expect("encode Anthropic bundle"),
         )
@@ -1096,7 +1091,7 @@ async fn auth_aware_factory_routes_sanctioned_oauth_descriptors_to_subscription_
     let (_, _, anthropic_access_fingerprint) = factory
         .resolve_provider(&metadata(ANTHROPIC_OAUTH_PROVIDER_NAME, "claude-oauth"))
         .await
-        .expect("Anthropic serialized-rotating OAuth handoff");
+        .expect("Anthropic conservative OAuth handoff");
     assert_eq!(anthropic_access_fingerprint, None);
     let openai = factory
         .resolve_for_turn(&metadata(OPENAI_OAUTH_PROVIDER_NAME, "gpt-oauth"))
@@ -5398,7 +5393,7 @@ async fn claude_code_import_honors_expiry_and_anthropic_registration() {
     let bundle = haider_accounts::OAuthTokenBundleV1::decode(stored.expose_secret())
         .expect("decode Claude bundle");
     assert_eq!(bundle.provider_id, ANTHROPIC_OAUTH_PROVIDER_NAME);
-    assert_eq!(bundle.issuer, "https://claude.com");
+    assert_eq!(bundle.issuer, "https://claude.ai");
     assert_eq!(bundle.audience, "9d1c250a-e61b-44d9-88ed-5944d1962f5e");
     assert_eq!(bundle.expires_at_unix_ms, 4_102_444_800_123);
     assert_eq!(bundle.access_token(), b"fake-claude-access-token-1");

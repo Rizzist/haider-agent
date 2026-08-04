@@ -937,18 +937,14 @@ fn sanctioned_oauth_table_has_exact_owner_grants_and_precise_reasons() {
         .iter()
         .find(|registration| registration.provider_id == "anthropic-oauth")
         .expect("Anthropic OAuth registration");
-    // D1 re-pin: Claude Code 2.1.220 uses the claude.com origins (the
-    // claude.ai / console.anthropic.com endpoints were the pre-migration
-    // hosts). The broker refuses stored bundles whose issuer differs, so
-    // pre-migration bundles require a same-alias re-login/re-import.
-    assert_eq!(anthropic.issuer, "https://claude.com");
+    assert_eq!(anthropic.issuer, "https://claude.ai");
     assert_eq!(
         anthropic.authorization_endpoint,
-        "https://claude.com/cai/oauth/authorize"
+        "https://claude.ai/oauth/authorize"
     );
     assert_eq!(
         anthropic.token_endpoint,
-        "https://platform.claude.com/v1/oauth/token"
+        "https://console.anthropic.com/v1/oauth/token"
     );
     assert_eq!(anthropic.client_id, "9d1c250a-e61b-44d9-88ed-5944d1962f5e");
     // Claude Code 2.1.220 parity (W5g-7): the consent page derives its
@@ -969,12 +965,6 @@ fn sanctioned_oauth_table_has_exact_owner_grants_and_precise_reasons() {
         OAuthTokenRequestEncoding::Json
     );
     assert!(anthropic.authorization_code_includes_state);
-    // D1 pin: Anthropic rotates the refresh token on refresh, so the
-    // registration must serialize refreshes instead of Conservative racing.
-    assert_eq!(
-        anthropic.refresh_policy,
-        OAuthRefreshPolicy::SerializedRotating
-    );
     assert_eq!(anthropic.refresh_encoding, OAuthTokenRequestEncoding::Json);
     assert_eq!(
         anthropic.inference,
