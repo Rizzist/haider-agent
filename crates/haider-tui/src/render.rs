@@ -1739,13 +1739,13 @@ fn render_session(
     }
     // The closing rule was reserved ABOVE, before the panels (TUI6.1
     // fix 2 — sim anatomy: the border-top of whatever follows the
-    // InputBar, SubTree tui.js:4764 / StatusBar tui.js:5497). The PAD is
-    // the InputBar's bottom padding and stays behind every panel but
-    // ahead of the breathing rows (TUI6 item 6 / TUI6d).
-    let band_pad = u16::from(budget > 0 && input_rule_h > 0);
-    if band_pad > 0 {
-        budget -= band_pad;
-    }
+    // InputBar, SubTree tui.js:4764 / StatusBar tui.js:5497).
+    // S2 owner item 4: the TUI6-era PAD row (the InputBar's bottom
+    // padding) is RETIRED — the band rests at exactly ONE text row
+    // between its rules and grows only with content. The breathing room
+    // that separates the transcript's tail from the band lives in the
+    // TRANSCRIPT stream now (its one trailing blank line, S2 item 5), so
+    // it scrolls with the history instead of padding the chrome.
     // One breathing row above each block that is actually present, taken
     // last and given up first.
     let want_lead = u16::from(waiting_height > 0);
@@ -1774,7 +1774,6 @@ fn render_session(
         palette_area,
         rule_area,
         composer_area,
-        band_pad_area,
         band_rule_area,
         _lead_subtree,
         subtree_area,
@@ -1791,7 +1790,6 @@ fn render_session(
         Constraint::Length(palette_height),
         Constraint::Length(input_rule_h),
         Constraint::Length(input_height),
-        Constraint::Length(band_pad),
         Constraint::Length(band_rule_h),
         Constraint::Length(lead_subtree),
         Constraint::Length(subtree_height),
@@ -1927,7 +1925,17 @@ fn render_session(
     // thinking, pulsing (1.4s). The port also breathes the dot ● ↔ ◌ on
     // the shared clock — the owner's marquee "alive" element.
     if model.projection.is_thinking() {
+        // S2 item 5: one breathing row above the badge — it must never
+        // sit flush against the last output line.
+        lines.push(Line::default());
         lines.push(thinking_line(theme, model.anim_phase));
+    }
+    // S2 item 5: exactly ONE blank line between the transcript's last
+    // output and the composer band. The breathing row rides the STREAM
+    // (the pad row died with S2 item 4), so at the bottom-anchored tail
+    // it separates output from the band and it scrolls with history.
+    if !lines.is_empty() {
+        lines.push(Line::default());
     }
     // Wrapped-row prefix sums — the sticky line and the wheel clamp need
     // real row math, not logical line counts.
@@ -2231,12 +2239,10 @@ fn render_session(
     } else {
         render_composer(model, theme, frame, rule_area, composer_area, hits);
     }
-    // The inputBg band is one panel: the composer rows AND the padding row
-    // below them carry it edge to edge (owner item 2 — the band used to sit
-    // behind the text row only, so it read as "cut in half").
-    if band_pad > 0 {
-        frame.render_widget(Block::default().style(theme.input_style()), band_pad_area);
-    }
+    // The inputBg band is one panel edge to edge (owner item 2); S2 item 4
+    // retired its padding row — the closing rule sits directly under the
+    // last composer row, so the band rests at ONE line and grows only
+    // with content.
     if band_rule_h > 0 {
         frame.render_widget(
             Paragraph::new(Line::styled(
@@ -3053,20 +3059,16 @@ fn render_subagent(
         .clamp(1, area.height.max(1));
     // TUI6 item 6 (the band-anatomy sweep — the owner's screenshot was
     // THIS surface: `❯ message …` straight into `▼ subagents`): the band
-    // closes with the rule reserved above plus an inputBg pad row when a
-    // row remains (the pad is the InputBar's bottom padding and stays
-    // OPTIONAL — behind the rule, per the law).
-    let spare = area.height.saturating_sub(
-        chrome + gap + transcript_min + subtree_height + input_height + band_rule_h,
-    );
-    let band_pad = u16::from(spare > 0 && input_rule_h > 0);
+    // closes with the rule reserved above. S2 item 4 retired the pad row
+    // that used to ride under it (session parity): the band rests at ONE
+    // text row between its rules; the chip transcript's own trailing
+    // blank line carries the breathing room instead.
     let [
         header_area,
         header_rule,
         transcript_area,
         rule_area,
         composer_area,
-        band_pad_area,
         band_rule_area,
         subtree_area,
         _gap,
@@ -3076,7 +3078,6 @@ fn render_subagent(
         Constraint::Min(transcript_min),
         Constraint::Length(input_rule_h),
         Constraint::Length(input_height),
-        Constraint::Length(band_pad),
         Constraint::Length(band_rule_h),
         Constraint::Length(subtree_height),
         Constraint::Length(gap),
@@ -3200,6 +3201,9 @@ fn render_subagent(
         );
     }
     if chip.state == crate::script::ChipDisplayState::Thinking {
+        // S2 item 5: the chip view keeps the session's rhythm — one
+        // breathing row above the thinking badge.
+        lines.push(Line::default());
         lines.push(thinking_line(theme, model.anim_phase));
     }
     if display == crate::script::ChipDisplayState::Waiting && live_children > 0 {
@@ -3210,6 +3214,11 @@ fn render_subagent(
                 theme.dim_style(),
             ),
         ]));
+    }
+    // S2 item 5, session parity: one blank line between the chip
+    // transcript's tail and the band.
+    if !lines.is_empty() {
+        lines.push(Line::default());
     }
     let mut total: u16 = 0;
     for line in &lines {
@@ -3273,12 +3282,9 @@ fn render_subagent(
     } else {
         render_composer(model, theme, frame, rule_area, composer_area, hits);
     }
-    // The band's closing anatomy (TUI6 item 6): inputBg pad, then the
-    // frame rule — rendered on BOTH the composer and question-card forms,
-    // exactly as the session band does.
-    if band_pad > 0 {
-        frame.render_widget(Block::default().style(theme.input_style()), band_pad_area);
-    }
+    // The band's closing anatomy (TUI6 item 6, S2 item 4): the frame rule
+    // directly under the band — rendered on BOTH the composer and
+    // question-card forms, exactly as the session band does.
     if band_rule_h > 0 {
         frame.render_widget(
             Paragraph::new(Line::styled(
@@ -4002,20 +4008,22 @@ fn composer_height(model: &AppModel, width: u16) -> u16 {
 ///
 /// BAND ANATOMY (TUI6 item 6, per Claude Code's own TUI): every surface
 /// that draws an input band closes it with a rule BELOW as well as the
-/// rule above. The sweep's enumeration of input-band render paths and
-/// where each closing rule lives:
+/// rule above — and since S2 item 4 the rule sits DIRECTLY under the
+/// last composer row on every surface (the session/subagent pad row is
+/// retired: the band rests at one line and grows only with content). The
+/// sweep's enumeration of input-band render paths:
 ///   - `render_launcher`  — `band_rule_area` (TUI5 item 1b, gap→rule);
-///   - `render_session`   — `band_pad` + `band_rule_area`, on BOTH the
-///     composer and blocking-menu forms (the rule renders outside the
-///     menu if/else);
-///   - `render_subagent`  — `band_pad` + `band_rule_area` (TUI6 — the
-///     owner's screenshot), composer and question-card forms alike;
+///   - `render_session`   — `band_rule_area`, on BOTH the composer and
+///     blocking-menu forms (the rule renders outside the menu if/else);
+///   - `render_subagent`  — `band_rule_area` (TUI6 — the owner's
+///     screenshot), composer and question-card forms alike;
 ///   - `render_aura`      — `band_rule_area` (TUI6, gap→rule);
 ///   - the login card and the arg-slot/palette state REPLACE the
 ///     composer's CONTENT inside the same band, so they inherit the
 ///     hosting surface's two rules — no separate path exists.
 ///
-/// Each surface's pair is pinned by a test in `tui6_softwrap_tests`.
+/// Each surface's pair is pinned by a test in `tui6_softwrap_tests`; the
+/// one-line rest height by `s2_ui_refinement_tests`.
 fn render_composer(
     model: &AppModel,
     theme: &Theme,

@@ -139,11 +139,11 @@ fn composer_band_is_the_exact_designed_blend_in_every_theme() {
         // status row — no stray tinted rows bracket the band.
         assert_eq!(buffer[(0, composer_y - 1)].fg, Color::from(theme.gold));
         assert_eq!(buffer[(0, composer_y - 1)].bg, Color::from(theme.bg));
-        // TUI4 item 2: the row BELOW the composer is the band's padding row
-        // — the band is one complete panel, not a stripe behind the text —
-        // and the row after that is its closing frame rule on plain ground.
-        assert_eq!(buffer[(0, composer_y + 1)].bg, Color::from(rgb));
-        assert_eq!(buffer[(0, composer_y + 2)].bg, Color::from(theme.bg));
+        // S2 item 4 FLIP (was TUI4 item 2's padding row): the pad is
+        // retired — the band rests at exactly ONE text row, so the row
+        // below the composer is its closing frame rule on plain ground.
+        assert_eq!(buffer[(0, composer_y + 1)].bg, Color::from(theme.bg));
+        assert_eq!(buffer[(0, composer_y + 1)].fg, Color::from(theme.frame));
         let status_y = u16::try_from(rows.len() - 1).expect("status row");
         assert_eq!(
             buffer[(0, status_y)].bg,

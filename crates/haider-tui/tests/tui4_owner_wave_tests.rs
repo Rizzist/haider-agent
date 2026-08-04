@@ -114,9 +114,8 @@ fn an_untouched_launcher_never_plays_anything() {
 #[test]
 fn the_composer_band_fills_its_whole_region_and_closes_with_a_rule() {
     // MUTATION CHECK: drop the `Block::default().style(input_style)` ground
-    // in `render_composer`, or the band-pad row, and the per-cell background
-    // sweep below fails; drop the closing rule and the frame-rule assertion
-    // fails.
+    // in `render_composer` and the per-cell background sweep below fails;
+    // drop the closing rule and the frame-rule assertion fails.
     let mut model = launcher_model();
     submit(&mut model, "walk me through the harness");
     let frame = draw(&model, 118, 34);
@@ -143,24 +142,17 @@ fn the_composer_band_fills_its_whole_region_and_closes_with_a_rule() {
             "composer row cell {x} is outside the band"
         );
     }
-    // …and so does the padding row beneath it: the band is a panel, not a
-    // stripe behind the text (owner: "kinda cut in half").
-    for x in 0..118 {
-        assert_eq!(
-            frame.bg(x, composer_y + 1),
-            expected,
-            "band padding row cell {x} is outside the band"
-        );
-    }
-    // The band closes with a visible boundary — the sim draws it as the
-    // border-top of whatever follows the InputBar.
-    let closing = frame.rows[composer_y as usize + 2].clone();
+    // S2 item 4 FLIP (was TUI4 item 2's padding-row sweep): the pad row
+    // is retired — the band rests at exactly ONE text row and the closing
+    // rule sits DIRECTLY beneath the composer (owner screenshot: the band
+    // read two rows tall at rest).
+    let closing = frame.rows[composer_y as usize + 1].clone();
     assert!(
         closing.chars().filter(|c| *c == '─').count() >= 100,
-        "no closing rule under the band, got {closing:?}"
+        "no closing rule directly under the band, got {closing:?}"
     );
     assert_ne!(
-        frame.bg(0, composer_y + 2),
+        frame.bg(0, composer_y + 1),
         expected,
         "the closing rule sits OUTSIDE the band"
     );

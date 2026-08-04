@@ -411,7 +411,8 @@ fn launcher_composer_is_bottom_anchored_with_the_gold_rule() {
     // own ellipsis law). The CONTENT is unchanged — pin it whole at a
     // width that holds it, and pin the dir still showing at 118.
     assert!(
-        rows.iter().any(|row| row.contains("dir ~/dev/enterprise-s")),
+        rows.iter()
+            .any(|row| row.contains("dir ~/dev/enterprise-s")),
         "the dir shows at 118, ellipsized to the band"
     );
     let (wide_info_rows, _, _) = draw(&model, 130, 34);

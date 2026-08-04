@@ -2066,11 +2066,17 @@ fn header_mark_reads_as_letterforms_at_24_cols() {
     // and the bar stops short of the right edge (the drop's air), so the
     // bowl below stays open.
     assert_eq!(groups(mark::HEADER[0]), 2);
-    assert!(mark::HEADER[0].ends_with('.'), "the ح bar leaves the drop air");
+    assert!(
+        mark::HEADER[0].ends_with('.'),
+        "the ح bar leaves the drop air"
+    );
     // Body row: all FOUR letters carry ink — `ر` `ـد` `ـيـ` `حـ` in
     // visual order (this is the row the 16-col map flattened away).
     assert_eq!(groups(mark::HEADER[1]), 4);
-    assert!(mark::HEADER[1].ends_with("###"), "the ح drop descends at the edge");
+    assert!(
+        mark::HEADER[1].ends_with("###"),
+        "the ح drop descends at the edge"
+    );
     // Baseline row: `ر`'s swept body stands CLEAR of the single kashida
     // run reaching the right edge (the word breaks at `د`, which does not
     // join forward).

@@ -119,7 +119,11 @@ fn light_solid_tokens_match_the_design_hexes() {
     assert_eq!(LIGHT.bright, Rgb::hex(0x171717));
     assert_eq!(LIGHT.dim, Rgb::hex(0x6e6e6e), "neutral gray, no warm cast");
     assert_eq!(LIGHT.faint, Rgb::hex(0xd9d9d9));
-    assert_eq!(LIGHT.gold, Rgb::hex(0x7d5a05), "deepened for the white page");
+    assert_eq!(
+        LIGHT.gold,
+        Rgb::hex(0x7d5a05),
+        "deepened for the white page"
+    );
     assert_eq!(LIGHT.maroon, Rgb::hex(0x7c2d12));
     assert_eq!(LIGHT.badge_fg, LIGHT.bg);
 }
@@ -139,10 +143,22 @@ fn desert_solid_tokens_match_the_design_hexes() {
 /// identity and stay byte-identical.
 #[test]
 fn dark_refresh_keeps_the_identity_hexes() {
-    assert_eq!(DARK.bg, Rgb::hex(0x0f0f0f), "neutral charcoal, not warm brown");
-    assert_eq!(DARK.gold, Rgb::hex(0xd9b544), "aged gold — the kept identity");
+    assert_eq!(
+        DARK.bg,
+        Rgb::hex(0x0f0f0f),
+        "neutral charcoal, not warm brown"
+    );
+    assert_eq!(
+        DARK.gold,
+        Rgb::hex(0xd9b544),
+        "aged gold — the kept identity"
+    );
     assert_eq!(DARK.maroon, Rgb::hex(0xe57a4a), "ember — the kept identity");
-    assert_eq!(DARK.text, Rgb::hex(0xd4d4d4), "neutral light gray, not cream");
+    assert_eq!(
+        DARK.text,
+        Rgb::hex(0xd4d4d4),
+        "neutral light gray, not cream"
+    );
     assert_eq!(DARK.dim, Rgb::hex(0x8b949e), "cool dim (owner: 'cool dim')");
 }
 
