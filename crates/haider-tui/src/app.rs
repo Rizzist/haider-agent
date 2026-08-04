@@ -289,6 +289,19 @@ impl AppModel {
         self.mode.fabricates_locally() || self.daemon_features.contains(feature)
     }
 
+    /// Whether the LIVE daemon serves D1's device-credential discovery
+    /// (D2). Deliberately NOT [`Self::daemon_serves`] — that predicate is
+    /// demo-true, and the demo has no device to probe: the section is
+    /// sim-honestly ABSENT there, exactly like an ungated daemon (no
+    /// notice either way — discovery is an enhancement).
+    #[must_use]
+    pub fn device_discovery_available(&self) -> bool {
+        !self.mode.fabricates_locally()
+            && self
+                .daemon_features
+                .contains(haider_rpc::FEATURE_ACCOUNT_DEVICE_DISCOVERY_V1)
+    }
+
     /// Whether the connected daemon's provider registry lists `provider`
     /// (B6b). Some adapters ship WITHOUT a feature bit (Gemini, B6a), so
     /// `provider.list` truth is their capability signal: boot always issues
@@ -335,6 +348,67 @@ impl AccountsState {
             self.cursor = self.rows.len().saturating_sub(1);
         }
         true
+    }
+}
+
+/// The "found on this device" section (D2): metadata-only credential
+/// candidates the DAEMON discovered in first-party CLI stores (D1's
+/// `account.device_candidates`). LIVE-ONLY truth: the demo never populates
+/// it (the sim has no device to probe — sim-honest absent), an ungated
+/// daemon is never asked. Import installs NOTHING locally — the daemon
+/// re-reads the store itself and the new account lands via the normal
+/// `account.list` refresh chained to the receipt.
+#[derive(Debug, Default)]
+pub struct DeviceCandidatesState {
+    /// The daemon's last discovery report. Refreshed on SCREEN ENTRY only
+    /// (no polling) — freshness hints are hints, not live meters.
+    pub candidates: Vec<haider_rpc::DeviceCredentialCandidateWire>,
+    /// The daemon's honest configured-off state — never an empty-device
+    /// claim (D1's wire contract).
+    pub discovery_disabled: bool,
+    /// In-flight `account.import_device` candidate id. One at a time; the
+    /// correlated receipt or failure clears it — never a render.
+    pub pending_import: Option<String>,
+    /// Last import outcome, rendered inside the section on BOTH screens
+    /// that show it (the section is shared, so the message travels with
+    /// it rather than with one screen's message slot).
+    pub message: Option<String>,
+}
+
+impl DeviceCandidatesState {
+    /// Applies a discovery report (screen-entry refresh). Wholesale
+    /// replacement: candidate ids are daemon-derived and opaque, so there
+    /// is nothing to merge.
+    pub fn apply(
+        &mut self,
+        candidates: Vec<haider_rpc::DeviceCredentialCandidateWire>,
+        discovery_disabled: bool,
+    ) {
+        self.candidates = candidates;
+        self.discovery_disabled = discovery_disabled;
+    }
+
+    /// How many candidates are actually importable — the numbered,
+    /// selectable rows. Unsupported rows render dim + inert and are
+    /// deliberately NOT in this count.
+    #[must_use]
+    pub fn supported_len(&self) -> usize {
+        self.candidates
+            .iter()
+            .filter(|candidate| candidate.import_supported)
+            .count()
+    }
+
+    /// The `index`th SUPPORTED candidate's opaque id — the digit/⏎/click
+    /// coordinate. Numbering skips unsupported rows by construction, so a
+    /// key can never land an inert row's id.
+    #[must_use]
+    pub fn supported_id(&self, index: usize) -> Option<String> {
+        self.candidates
+            .iter()
+            .filter(|candidate| candidate.import_supported)
+            .nth(index)
+            .map(|candidate| candidate.candidate.clone())
     }
 }
 
@@ -1738,6 +1812,17 @@ pub enum AppRequest {
     /// Fetch/refresh the `/accounts` rows (`account.list`). Pushed on
     /// entering the screen; the demo driver answers from the seed list.
     AccountsRefresh,
+    /// Read the daemon's device-credential discovery report (D2,
+    /// `account.device_candidates`). Pushed on SCREEN ENTRY only —
+    /// `/accounts` and `/providers`, both feature-gated by the reducer —
+    /// never polled. Unreachable in demo by that gate.
+    DeviceCandidatesRefresh,
+    /// Import one discovered candidate by its opaque daemon-derived id
+    /// (D2, `account.import_device`). Receipted + durable: the daemon
+    /// re-reads the local store itself — no credential bytes ride this
+    /// request, and NOTHING is installed locally on the reply; the new
+    /// account lands via the chained `account.list` refresh.
+    DeviceImport { candidate: String },
     /// `account.set_active` for the clicked/entered row. The model already
     /// holds `pending_select` — the dot moves only when the driver's reply
     /// applies (optimism forbidden, report §5.1).
@@ -1926,6 +2011,11 @@ pub enum Hit {
     AccountRow(String),
     /// One add-row button on `/accounts` (sim tui.js:3621-3628).
     AccountAdd(AccountAddKind),
+    /// One SUPPORTED "found on this device" candidate row (D2), by its
+    /// opaque daemon-derived id (value-carrying: a stale rect can only
+    /// ever import the candidate it was measured on). Unsupported rows
+    /// get NO hit at all — dim, honest, inert.
+    DeviceImport(String),
     /// One `/providers` model chip: click sets the provider default.
     ProviderModel {
         provider: String,
@@ -2410,6 +2500,9 @@ pub struct AppModel {
     pub wordmark: std::cell::RefCell<Option<crate::wordmark::Wordmark>>,
     /// `/accounts` screen state (rows, revision gate, pending select).
     pub accounts: AccountsState,
+    /// The "found on this device" discovery section (D2), shared by
+    /// `/accounts` and the `/providers` buttons area.
+    pub device: DeviceCandidatesState,
     /// `/providers` screen state (report §5.2).
     pub providers: ProvidersState,
     /// What the CONNECTED daemon advertised in `Welcome` (features +
@@ -2525,6 +2618,7 @@ impl Default for AppModel {
             // render falls back to the half-block art in `crate::mark`.
             wordmark: std::cell::RefCell::new(None),
             accounts: AccountsState::default(),
+            device: DeviceCandidatesState::default(),
             providers: ProvidersState::default(),
             daemon_features: std::collections::BTreeSet::new(),
             daemon_version: None,
@@ -4351,6 +4445,12 @@ impl AppModel {
         self.accounts.message = None;
         self.switch_surface(Screen::Accounts);
         self.requests.push(AppRequest::AccountsRefresh);
+        // D2: the device-discovery read rides SCREEN ENTRY only (no
+        // polling), and only when the live daemon serves it — demo and
+        // ungated daemons keep the section honestly absent.
+        if self.device_discovery_available() {
+            self.requests.push(AppRequest::DeviceCandidatesRefresh);
+        }
         self.dirty = true;
     }
 
@@ -4556,6 +4656,43 @@ impl AppModel {
         self.dirty = true;
     }
 
+    /// One-key import of a discovered device credential (D2). The TUI
+    /// sends ONLY the opaque candidate id — the daemon re-discovers and
+    /// reads the local store itself, so no credential bytes cross the
+    /// wire and nothing is installed locally: the pending pulse is the
+    /// only visible change until the receipt lands and the chained
+    /// `account.list` refresh materializes the account (daemon truth
+    /// only, the §5.1 discipline).
+    ///
+    /// An UNSUPPORTED candidate is inert here by construction: its row
+    /// carries no hit, no number, and no cursor slot, and this method
+    /// re-checks the flag so even a stale coordinate cannot dispatch it.
+    pub fn import_device_candidate(&mut self, candidate_id: &str) {
+        let Some(candidate) = self
+            .device
+            .candidates
+            .iter()
+            .find(|candidate| candidate.candidate == candidate_id)
+        else {
+            return;
+        };
+        if !candidate.import_supported {
+            return;
+        }
+        if self.device.pending_import.is_some() {
+            self.device.message =
+                Some("· one import at a time — waiting for the daemon".to_owned());
+            self.dirty = true;
+            return;
+        }
+        self.device.pending_import = Some(candidate.candidate.clone());
+        self.device.message = None;
+        self.requests.push(AppRequest::DeviceImport {
+            candidate: candidate.candidate.clone(),
+        });
+        self.dirty = true;
+    }
+
     /// THE ONE DOOR into `/providers` (report §5.2).
     fn enter_providers(&mut self) {
         if self.screen == Screen::Providers {
@@ -4564,6 +4701,11 @@ impl AppModel {
         self.providers.message = None;
         self.switch_surface(Screen::Providers);
         self.requests.push(AppRequest::ProvidersRefresh);
+        // D2: the shared buttons area shows the same "found on this
+        // device" section here — same entry-only refresh, same gate.
+        if self.device_discovery_available() {
+            self.requests.push(AppRequest::DeviceCandidatesRefresh);
+        }
         self.dirty = true;
     }
 
@@ -4709,6 +4851,15 @@ impl AppModel {
                 }
             }
             KeyCode::Char('h') => self.open_huggingface_preset(),
+            // D2: the shared "found on this device" section is numbered
+            // here too — the same one-key import as `/accounts` (the
+            // provider cursor keeps ↑/↓; digits belong to the section).
+            KeyCode::Char(c @ '1'..='9') => {
+                let index = (c as usize) - ('1' as usize);
+                if let Some(id) = self.device.supported_id(index) {
+                    self.import_device_candidate(&id);
+                }
+            }
             KeyCode::Up => {
                 self.providers.cursor = self.providers.cursor.saturating_sub(1);
                 self.dirty = true;
@@ -5309,11 +5460,26 @@ impl AppModel {
                 self.dirty = true;
             }
             KeyCode::Down => {
-                if !self.accounts.rows.is_empty() {
-                    self.accounts.cursor =
-                        (self.accounts.cursor + 1).min(self.accounts.rows.len() - 1);
+                // D2: the flattened selectable rows extend into the
+                // "found on this device" section's SUPPORTED candidates
+                // (unsupported rows are inert and get no cursor slot).
+                let total = self.accounts.rows.len() + self.device.supported_len();
+                if total > 0 {
+                    self.accounts.cursor = (self.accounts.cursor + 1).min(total - 1);
                 }
                 self.dirty = true;
+            }
+            // D2 one-key import (the owner menu law, the hooks digits
+            // precedent): `[n]` names the nth SUPPORTED candidate. The
+            // cursor follows so the pending pulse lands under the
+            // highlight the user just addressed.
+            KeyCode::Char(c @ '1'..='9') => {
+                let index = (c as usize) - ('1' as usize);
+                if let Some(id) = self.device.supported_id(index) {
+                    self.accounts.cursor = self.accounts.rows.len() + index;
+                    self.import_device_candidate(&id);
+                    self.dirty = true;
+                }
             }
             KeyCode::Enter => {
                 if let Some(alias) = self
@@ -5323,6 +5489,18 @@ impl AppModel {
                     .map(|row| row.alias.clone())
                 {
                     self.select_account(&alias);
+                } else if let Some(id) = self
+                    .device
+                    .supported_id(
+                        self.accounts
+                            .cursor
+                            .saturating_sub(self.accounts.rows.len()),
+                    )
+                    .filter(|_| self.accounts.cursor >= self.accounts.rows.len())
+                {
+                    // ⏎ on a highlighted candidate row imports it — the
+                    // same dispatch as its digit.
+                    self.import_device_candidate(&id);
                 }
             }
             _ => {}
@@ -7210,6 +7388,14 @@ impl AppModel {
             // NEVER an optimistic flip — select_account only requests.
             Hit::AccountRow(alias) if self.screen == Screen::Accounts => {
                 self.select_account(&alias);
+            }
+            // D2: click = the row's digit. Only SUPPORTED candidate rows
+            // ever rendered a hit; the dispatch re-checks the flag anyway
+            // (a stale rect can only import what it was measured on).
+            Hit::DeviceImport(candidate)
+                if matches!(self.screen, Screen::Accounts | Screen::Providers) =>
+            {
+                self.import_device_candidate(&candidate);
             }
             Hit::AccountAdd(kind)
                 if matches!(self.screen, Screen::Accounts | Screen::Providers) =>

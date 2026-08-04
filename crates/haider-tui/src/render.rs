@@ -991,6 +991,114 @@ fn push_custom_card_lines<'a>(model: &'a AppModel, theme: &Theme, lines_out: &mu
     }
 }
 
+/// The "found on this device" section (D2) — the daemon's metadata-only
+/// discovery of first-party CLI credential stores, shared by /accounts and
+/// /providers exactly like the add buttons below it. ABSENT entirely when
+/// there is nothing to offer: demo mode and an ungated daemon never
+/// populate the list, and an empty or switched-off discovery keeps it
+/// empty — the section is an enhancement, never a notice.
+///
+/// Row anatomy: SUPPORTED candidates are numbered `[n]` (the one-key
+/// import coordinate — digits, ⏎ on the highlight, or a click on the
+/// full-width hit) and show provider · source label · freshness (+ the
+/// account label when the store itself carried one). UNSUPPORTED
+/// candidates render DIM with their honest reason and get no number, no
+/// hit, and no cursor slot — inert by construction.
+///
+/// `cursor_base` is `Some(accounts-row-count)` on /accounts (the flattened
+/// selectable rows extend into the numbered candidates); `None` on
+/// /providers, whose cursor stays over the provider rows.
+fn push_device_candidates_section<'a>(
+    model: &'a AppModel,
+    theme: &Theme,
+    width: u16,
+    cursor_base: Option<usize>,
+    lines_out: &mut Vec<Line<'a>>,
+    rects_out: &mut Vec<(usize, u16, u16, Hit)>,
+) {
+    if model.device.candidates.is_empty() {
+        return;
+    }
+    lines_out.push(Line::from(vec![
+        Span::styled(
+            "found on this device",
+            theme
+                .bright_style()
+                .add_modifier(ratatui::style::Modifier::BOLD),
+        ),
+        Span::styled(
+            " — the daemon can import these · nothing is read until you ask",
+            theme.dim_style(),
+        ),
+    ]));
+    if let Some(message) = &model.device.message {
+        lines_out.push(Line::styled(message.clone(), theme.gold_style()));
+    }
+    let mut number = 0usize;
+    for candidate in &model.device.candidates {
+        let freshness_style = match candidate.freshness.as_str() {
+            "fresh" => theme.ok_style(),
+            "expiring" | "expired" => theme.warn_style(),
+            _ => theme.dim_style(),
+        };
+        if candidate.import_supported {
+            let hit = Hit::DeviceImport(candidate.candidate.clone());
+            let hovered = model.hovered.as_ref() == Some(&hit);
+            let selected = cursor_base.is_some_and(|base| model.accounts.cursor == base + number);
+            let pending =
+                model.device.pending_import.as_deref() == Some(candidate.candidate.as_str());
+            let mut spans = vec![
+                Span::raw("  "),
+                Span::styled(format!("[{}] ", number + 1), theme.gold_style()),
+                Span::styled(
+                    candidate.source_label.clone(),
+                    theme
+                        .bright_style()
+                        .add_modifier(ratatui::style::Modifier::BOLD),
+                ),
+                Span::styled(format!(" · {}", candidate.provider), theme.dim_style()),
+            ];
+            if let Some(label) = &candidate.account_label {
+                spans.push(Span::styled(format!(" · {label}"), theme.dim_style()));
+            }
+            spans.push(Span::styled(
+                format!(" · {}", candidate.freshness),
+                freshness_style,
+            ));
+            if pending {
+                // In-flight feedback WITHOUT installing anything —
+                // forbidden optimism, the §5.1 discipline.
+                spans.push(Span::styled(
+                    " importing…",
+                    theme.pulse_ink(theme.gold, model.anim_phase),
+                ));
+            }
+            rects_out.push((lines_out.len(), 0, width, hit));
+            let mut line = Line::from(spans);
+            if hovered || selected {
+                line = hover_band(line, true, width, theme);
+            }
+            lines_out.push(line);
+            number += 1;
+        } else {
+            // Dim, honest, inert: the reason rides the row, and no hit or
+            // number exists to dispatch it.
+            let reason = candidate
+                .unsupported_reason
+                .clone()
+                .unwrap_or_else(|| "import not supported".to_owned());
+            lines_out.push(Line::styled(
+                format!(
+                    "      {} · {} · {} — {reason}",
+                    candidate.source_label, candidate.provider, candidate.freshness
+                ),
+                theme.dim_style(),
+            ));
+        }
+    }
+    lines_out.push(Line::raw(""));
+}
+
 /// The account add-button rows (OAuth/API/Kimi/Gemini/HF/custom) with
 /// per-button relative hit rects — shared by /accounts and /providers
 /// (owner ask: providers should offer the SAME add options in place).
@@ -1306,10 +1414,32 @@ fn render_accounts(
     // = the editable name/origin fields (the provider.configure front
     // door).
     push_custom_card_lines(model, theme, &mut footer_lines);
+    // D2: the discovered-candidate section sits with the add chrome — the
+    // cursor's flattened selectable rows continue past the account rows
+    // into its numbered candidates.
+    push_device_candidates_section(
+        model,
+        theme,
+        area.width,
+        Some(model.accounts.rows.len()),
+        &mut footer_lines,
+        &mut add_button_rects,
+    );
     push_account_add_buttons(model, theme, &mut footer_lines, &mut add_button_rects);
     footer_lines.push(Line::raw(""));
     footer_lines.push(Line::styled(
-        "click an account to make it active · + adds via OAuth / API · x removes · esc back",
+        // D2: the key map names the digit import only while numbered
+        // candidates are actually on screen.
+        if model
+            .device
+            .candidates
+            .iter()
+            .any(|candidate| candidate.import_supported)
+        {
+            "click an account to make it active · + adds via OAuth / API · digits import found credentials · x removes · esc back"
+        } else {
+            "click an account to make it active · + adds via OAuth / API · x removes · esc back"
+        },
         theme.faint_style(),
     ));
 
@@ -1531,6 +1661,9 @@ fn render_providers(
     }
 
     lines.push(Line::raw(""));
+    // D2: the shared buttons area carries the same "found on this device"
+    // section here — digits import; the provider cursor is untouched.
+    push_device_candidates_section(model, theme, area.width, None, &mut lines, &mut chip_hits);
     push_account_add_buttons(model, theme, &mut lines, &mut chip_hits);
     lines.push(Line::styled(
         "click a model to set the default · e edits · x removes · h HuggingFace · esc back",
