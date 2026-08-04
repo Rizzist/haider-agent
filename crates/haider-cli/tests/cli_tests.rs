@@ -547,12 +547,16 @@ fn run_nonpermission_input_cancels_and_exits_77() {
         {"step":"emit_request_input","call_id":"ask","kind":"question","title":"Need input"},
         {"step":"finish","reason":"tool_use"}
     ]"#;
-    let out = haider()
-        .args(["run", "--provider", "fake", "hello", "--output", "json"])
-        .env("HAIDER_TEST_FAKE_PROVIDER", script)
-        .output()
-        .expect("binary runs");
-    assert_eq!(out.status.code(), Some(77));
+    let out = haider_with_boot_retry(
+        &["run", "--provider", "fake", "hello", "--output", "json"],
+        &[("HAIDER_TEST_FAKE_PROVIDER", script)],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(77),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let value: serde_json::Value = serde_json::from_slice(&out.stdout).expect("blocked JSON");
     assert_eq!(value["outcome"], "input_required");
     assert_eq!(value["error"]["code"], "input_required");
