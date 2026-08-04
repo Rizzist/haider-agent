@@ -772,6 +772,9 @@ async fn coordinator_for_registration(
     registration: OAuthProviderRegistration,
     ttl: Duration,
 ) -> (OAuthCoordinator, mpsc::UnboundedReceiver<WireFrame>) {
+    // Start under the registration's OWN provider id so per-provider start
+    // behavior (the composed redirect shape) is exercised live, not skipped.
+    let provider = registration.provider_id.clone();
     let catalog = OAuthProviderCatalog::with_test_registrations([registration]).expect("catalog");
     let coordinator = OAuthCoordinator::new(
         "daemon-instance-test".into(),
@@ -791,7 +794,7 @@ async fn coordinator_for_registration(
     coordinator
         .try_start(
             "connection-1",
-            "fake-oauth".into(),
+            provider,
             "work-oauth".into(),
             "attempt-1".into(),
             route,
@@ -1672,6 +1675,85 @@ async fn anthropic_protocol_uses_json_code_with_state_and_json_refresh() {
     );
 }
 
+/// The accepted-with-correct-state law, live-shaped (owner bug v0.0.65).
+///
+/// 91f8156 moved Anthropic's registered redirect to Claude Code parity
+/// (`http://localhost:<port>/callback`) but left the listener's Host law at
+/// `127.0.0.1:<port>`, so every REAL browser callback — which sends the
+/// authority it navigated to, `Host: localhost:<port>` — was served the 400
+/// rejection page. This drives the full flow exactly like that browser: an
+/// Anthropic-shaped registration, the fake server's redirect followed by
+/// reqwest to `http://localhost:<port>/callback`, correct state and code.
+/// It MUST be accepted and reach Ready.
+///
+/// MUTATION CHECK: collapse `compose_redirect`'s authority to
+/// `127.0.0.1:<port>` for every provider (the pre-fix listener law) while
+/// keeping the localhost redirect. Expected RUNTIME failure: the browser
+/// response is the 400 rejection page instead of `SUCCESS_HTML` and the flow
+/// never reaches Ready. Verified by revert on 2026-08-04.
+#[tokio::test]
+async fn anthropic_localhost_browser_callback_is_accepted_with_correct_state() {
+    let server = FakeOAuthServer::start(FakeMode::Success, false).await;
+    server
+        .state
+        .expect_refresh_binding
+        .store(false, Ordering::SeqCst);
+    server.state.expect_code_state.store(true, Ordering::SeqCst);
+    let mut registration = server.registration(Arc::new(FakeIdentityVerifier));
+    registration.provider_id = haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME.to_owned();
+    registration.authorization_code_encoding = OAuthTokenRequestEncoding::Json;
+    registration.authorization_code_includes_state = true;
+    registration.refresh_encoding = OAuthTokenRequestEncoding::Json;
+    registration.refresh_includes_binding = false;
+    let (coordinator, mut receiver) =
+        coordinator_for_registration(registration, Duration::from_secs(5)).await;
+    let (flow_id, authorization_url, port) = started_flow(&mut receiver).await;
+    // The authorize redirect the provider will replay must be the parity
+    // shape — the browser lands on localhost, never the numeric authority.
+    let authorize = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(Policy::none())
+        .build()
+        .expect("authorize probe")
+        .get(authorization_url.clone())
+        .send()
+        .await
+        .expect("authorize");
+    let location = authorize
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .expect("callback location")
+        .to_str()
+        .expect("callback text")
+        .to_owned();
+    assert!(
+        location.starts_with(&format!("http://localhost:{port}/callback?")),
+        "redirect must be Claude Code parity shaped: {location}"
+    );
+    // A real browser navigates to that exact URL and therefore sends
+    // `Host: localhost:<port>`. reqwest does the same when following it.
+    let response = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("browser")
+        .get(&location)
+        .send()
+        .await
+        .expect("browser callback");
+    let status = response.status();
+    let body = response.text().await.expect("callback html");
+    assert_eq!(
+        (status.as_u16(), body.as_str()),
+        (200, SUCCESS_HTML),
+        "the correct-state localhost callback must be accepted"
+    );
+    assert!(matches!(
+        wait_ready(&coordinator, &flow_id).await,
+        OAuthFlowStatusWire::Ready { .. }
+    ));
+    assert_eq!(server.state.token_calls.load(Ordering::SeqCst), 1);
+}
+
 #[tokio::test]
 async fn fake_browser_success_proves_s256_exact_redirect_and_one_exchange() {
     let server = FakeOAuthServer::start(FakeMode::Success, false).await;
@@ -1749,6 +1831,7 @@ async fn early_malicious_connection_does_not_consume_valid_callback() {
 fn wrong_missing_duplicate_state_path_host_port_and_non_get_are_rejected() {
     let state = b"STATE_SENTINEL_317b";
     let path = "/oauth/callback/random";
+    let authority = "127.0.0.1:43210";
     let valid = |target: &str, host: &str, method: &str| {
         format!("{method} {target} HTTP/1.1\r\nHost: {host}\r\n\r\n")
     };
@@ -1761,7 +1844,7 @@ fn wrong_missing_duplicate_state_path_host_port_and_non_get_are_rejected() {
             )
             .as_bytes(),
             path,
-            43210,
+            authority,
             state
         ),
         CallbackResult::Code(_)
@@ -1783,6 +1866,10 @@ fn wrong_missing_duplicate_state_path_host_port_and_non_get_are_rejected() {
             "127.0.0.1:43210",
             "GET",
         ),
+        // A hardened numeric-loopback flow never registered `localhost`, so
+        // that authority stays foreign HERE — while the Anthropic parity
+        // flow accepts exactly `localhost:<port>` (see the localhost
+        // authority law test below).
         valid(
             &format!("{path}?code=x&state=STATE_SENTINEL_317b"),
             "localhost:43210",
@@ -1806,10 +1893,54 @@ fn wrong_missing_duplicate_state_path_host_port_and_non_get_are_rejected() {
         ),
     ] {
         assert!(matches!(
-            parse_callback(request.as_bytes(), path, 43210, state),
-            CallbackResult::Invalid
+            parse_callback(request.as_bytes(), path, authority, state),
+            CallbackResult::Invalid(_)
         ));
     }
+}
+
+/// The listener validates the SAME authority the flow registered with the
+/// provider. For the Anthropic Claude Code parity shape that authority is
+/// `localhost:<port>` — a browser landing on the registered redirect MUST
+/// be accepted with the correct state, and the numeric authority (which no
+/// browser following that redirect ever sends) stays foreign.
+#[test]
+fn anthropic_localhost_authority_accepts_correct_state_and_numeric_stays_foreign() {
+    let state = b"STATE_SENTINEL_317b";
+    let (path, uri, authority) = compose_redirect(
+        haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME,
+        43210,
+        "SEGMENT",
+    );
+    assert_eq!(uri, format!("http://{authority}{path}"));
+    let request = |host: &str| {
+        format!("GET {path}?code=x&state=STATE_SENTINEL_317b HTTP/1.1\r\nHost: {host}\r\n\r\n")
+    };
+    assert!(matches!(
+        parse_callback(
+            request("localhost:43210").as_bytes(),
+            &path,
+            &authority,
+            state
+        ),
+        CallbackResult::Code(_)
+    ));
+    for foreign in ["127.0.0.1:43210", "localhost:43211", "[::1]:43210"] {
+        assert!(matches!(
+            parse_callback(request(foreign).as_bytes(), &path, &authority, state),
+            CallbackResult::Invalid(CallbackRejection::WrongAddress)
+        ));
+    }
+    assert!(matches!(
+        parse_callback(
+            format!("GET {path}?code=x&state=wrong HTTP/1.1\r\nHost: localhost:43210\r\n\r\n")
+                .as_bytes(),
+            &path,
+            &authority,
+            state
+        ),
+        CallbackResult::Invalid(CallbackRejection::WrongAttempt)
+    ));
 }
 
 #[test]
@@ -1826,15 +1957,15 @@ fn duplicate_code_error_and_fragment_are_rejected_but_valid_denial_is_terminal()
         "error=private_provider_error&state=s",
     ] {
         assert!(matches!(
-            parse_callback(request(query).as_bytes(), path, 43210, b"s"),
-            CallbackResult::Invalid
+            parse_callback(request(query).as_bytes(), path, "127.0.0.1:43210", b"s"),
+            CallbackResult::Invalid(_)
         ));
     }
     assert!(matches!(
         parse_callback(
             request("error=access_denied&state=s").as_bytes(),
             path,
-            43210,
+            "127.0.0.1:43210",
             b"s"
         ),
         CallbackResult::Denied("access_denied")
@@ -1851,7 +1982,7 @@ fn duplicate_code_error_and_fragment_are_rejected_but_valid_denial_is_terminal()
             parse_callback(
                 request(&format!("error={error}&state=s")).as_bytes(),
                 path,
-                43210,
+                "127.0.0.1:43210",
                 b"s"
             ),
             CallbackResult::Denied("authorization_denied")
@@ -2158,7 +2289,16 @@ async fn independent_flows_never_reuse_state_nonce_callback_path_or_pkce_verifie
 
 #[test]
 fn callback_success_page_and_provider_config_have_no_secret_material() {
-    for html in [SUCCESS_HTML, DENIED_HTML, INVALID_HTML] {
+    let rejections = [
+        CallbackRejection::MalformedRequest,
+        CallbackRejection::WrongAddress,
+        CallbackRejection::WrongAttempt,
+        CallbackRejection::UnrecognizedProviderError,
+    ]
+    .map(rejection_html);
+    let mut pages = vec![SUCCESS_HTML.to_owned(), DENIED_HTML.to_owned()];
+    pages.extend(rejections);
+    for html in pages {
         for sentinel in [
             CODE_SENTINEL,
             "STATE_SENTINEL",
@@ -2171,6 +2311,33 @@ fn callback_success_page_and_provider_config_have_no_secret_material() {
         ] {
             assert!(!html.contains(sentinel));
         }
+    }
+}
+
+/// The rejection page must say WHY and how to retry — never the bare
+/// pre-fix "This callback was rejected." with no explanation (owner
+/// screenshot, v0.0.65).
+#[test]
+fn rejection_pages_state_a_reason_and_retry_guidance() {
+    for reason in [
+        CallbackRejection::MalformedRequest,
+        CallbackRejection::WrongAddress,
+        CallbackRejection::WrongAttempt,
+        CallbackRejection::UnrecognizedProviderError,
+    ] {
+        let page = rejection_html(reason);
+        assert!(
+            page.contains(&format!("rejected: {}.", reason.why())),
+            "page must state the reason: {page}"
+        );
+        assert!(
+            page.contains("To retry, return to Haider and start the sign-in again"),
+            "page must say how to retry: {page}"
+        );
+        assert!(
+            !page.contains("This callback was rejected.</p>"),
+            "the bare unexplained rejection sentence must be gone: {page}"
+        );
     }
 }
 
@@ -4960,18 +5127,31 @@ async fn late_refresh_failure_cannot_expire_a_newer_same_alias_generation() {
 }
 
 /// MUTATION CHECK: collapse the per-provider redirect branch (every
-/// provider hardened, or every provider parity). Expected RUNTIME
-/// failure: one of the two exact shapes below.
+/// provider hardened, or every provider parity), or decouple the listener
+/// authority from the registered redirect authority. Expected RUNTIME
+/// failure: one of the exact shapes below, or an authority that is not the
+/// exact `host:port` of its own `uri`.
 #[test]
 fn anthropic_redirect_is_claude_code_parity_and_others_stay_hardened() {
-    let (path, uri) = compose_redirect(
+    let (path, uri, authority) = compose_redirect(
         haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME,
         58820,
         "SEGMENT",
     );
     assert_eq!(path, "/callback");
     assert_eq!(uri, "http://localhost:58820/callback");
-    let (path, uri) = compose_redirect("openai-oauth", 58820, "SEGMENT");
+    assert_eq!(authority, "localhost:58820");
+    let (path, uri, authority) = compose_redirect("openai-oauth", 58820, "SEGMENT");
     assert_eq!(path, "/oauth/callback/SEGMENT");
     assert_eq!(uri, "http://127.0.0.1:58820/oauth/callback/SEGMENT");
+    assert_eq!(authority, "127.0.0.1:58820");
+}
+
+/// The flow TTL is generous by design: the user is off reading the
+/// provider's consent page (often logging in and completing 2FA first).
+/// MUTATION CHECK: re-tie `flow_ttl` to the 5-minute staged-secret TTL.
+/// Expected RUNTIME failure: the ten-minute floor below.
+#[test]
+fn default_flow_ttl_is_at_least_ten_minutes() {
+    assert!(OAuthCoordinatorConfig::default().flow_ttl >= Duration::from_secs(600));
 }

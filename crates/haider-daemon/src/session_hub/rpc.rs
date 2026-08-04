@@ -16,7 +16,7 @@ use crate::delegation::{DelegationHandle, MessageCoordinates};
 use base64::Engine as _;
 use haider_protocol::EventPayload;
 use haider_protocol::agent::ChipState;
-use haider_protocol::context::ContextFootprint;
+use haider_protocol::context::{ContextFootprint, ContextFootprintTruth};
 use haider_protocol::item::ItemEvent;
 use haider_protocol::menu::MenuKind;
 use haider_protocol::state::RunState;
@@ -38,7 +38,24 @@ async fn latest_context_footprint(
     session_id: &SessionId,
     through_seq: u64,
 ) -> Result<Option<ContextFootprint>, HaiderError> {
+    Ok(session_summary_truth(store, session_id, through_seq)
+        .await?
+        .1)
+}
+
+/// One sealed-journal replay computing the roster truth a `session.list`
+/// summary carries for an UNATTACHED session: the committed main-timeline
+/// user-turn count (durable `UserMessage` envelopes not scoped to a
+/// subagent) and the latest durable [`ContextFootprint`] snapshot. These
+/// are the SAME durable sources the observe surface replays, so a summary
+/// never disagrees with observation after attach.
+async fn session_summary_truth(
+    store: &dyn StoreHandle,
+    session_id: &SessionId,
+    through_seq: u64,
+) -> Result<(u64, Option<ContextFootprint>), HaiderError> {
     let mut since_seq = 0;
+    let mut turns = 0_u64;
     let mut latest = None;
     while since_seq < through_seq {
         let page = store.read(session_id, since_seq, REPLAY_PAGE_SIZE).await?;
@@ -48,24 +65,48 @@ async fn latest_context_footprint(
         let mut advanced = false;
         for envelope in page {
             if envelope.seq > through_seq {
-                return Ok(latest);
+                return Ok((turns, latest));
             }
             since_seq = envelope.seq;
             advanced = true;
-            let Ok(EventPayload::Item(ItemEvent::Completed { item, .. })) =
-                serde_json::from_value::<EventPayload>(envelope.payload)
-            else {
+            let agent_scoped = envelope.agent_id.is_some();
+            let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload) else {
                 continue;
             };
-            if let Some(footprint) = ContextFootprint::from_extension_item(&item) {
-                latest = Some(footprint);
+            match payload {
+                EventPayload::UserMessage { .. } if !agent_scoped => {
+                    turns = turns.saturating_add(1);
+                }
+                EventPayload::Item(ItemEvent::Completed { item, .. }) => {
+                    if let Some(footprint) = ContextFootprint::from_extension_item(&item) {
+                        latest = Some(footprint);
+                    }
+                }
+                _ => {}
             }
         }
         if !advanced {
             break;
         }
     }
-    Ok(latest)
+    Ok((turns, latest))
+}
+
+/// Projects one replayed truth into the summary's additive wire fields.
+///
+/// Zero-honesty law: `Some(0)` tokens are reported EXCLUSIVELY for truly
+/// empty sessions (no committed user turn and no durable snapshot — zero
+/// is then exact). A session with committed turns but no snapshot reports
+/// `None`: unknown is never rendered as zero.
+fn summary_footprint_fields(
+    turns: u64,
+    footprint: Option<&ContextFootprint>,
+) -> (Option<u64>, Option<ContextFootprintTruth>) {
+    match footprint {
+        Some(footprint) => (Some(footprint.used_tokens), Some(footprint.truth)),
+        None if turns == 0 => (Some(0), Some(ContextFootprintTruth::Exact)),
+        None => (None, None),
+    }
 }
 
 pub(super) fn filter_provider_summaries(
@@ -2934,11 +2975,23 @@ impl HubConnection {
         }
         let mut sessions = Vec::with_capacity(selected.len());
         for session_id in &selected {
+            let head_seq = self.hub.inner.store.latest_seq(session_id).await?;
+            // Roster truth for unattached sessions: replay the same sealed
+            // journal the observe surface reads. The launcher must never
+            // show "0 turns · 0 tok" for a session that merely lacks an
+            // attachment.
+            let (turns, footprint) =
+                session_summary_truth(&self.hub.inner.store, session_id, head_seq).await?;
+            let (footprint_tokens, footprint_truth) =
+                summary_footprint_fields(turns, footprint.as_ref());
             sessions.push(SessionSummary {
                 session_id: session_id.clone(),
-                head_seq: self.hub.inner.store.latest_seq(session_id).await?,
+                head_seq,
                 worker_generation: self.hub.inner.store.worker_generation(),
                 metadata: self.hub.inner.store.session_metadata(session_id).await?,
+                turn_count: Some(turns),
+                footprint_tokens,
+                footprint_truth,
             });
         }
         let next_cursor = has_more

@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use haider_protocol::DeliveryMode;
 use haider_protocol::agent::AgentMessageReceipt;
 use haider_protocol::branch::BranchDescriptor;
-use haider_protocol::context::ContextFootprint;
+use haider_protocol::context::{ContextFootprint, ContextFootprintTruth};
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::ids::{
     AgentId, ArtifactRef, BranchId, ItemId, MenuId, NodeId, RunId, SessionId,
@@ -709,6 +709,27 @@ pub struct SessionSummary {
     /// readers must not infer anything from its absence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<SessionMetadataV1>,
+    /// Additive roster-truth field: committed main-timeline user turns
+    /// (durable `UserMessage` envelopes not scoped to a subagent), computed
+    /// from the same sealed journal the observe surface replays. `None`
+    /// only when an older daemon omits the field — readers must not infer
+    /// emptiness from absence; `Some(0)` is reported exclusively for
+    /// sessions with no committed user turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_count: Option<u64>,
+    /// Additive roster-truth field: `used_tokens` of the latest durable
+    /// [`ContextFootprint`] snapshot (the observe/W7 vocabulary). `Some(0)`
+    /// is reported exclusively for truly empty sessions (no committed user
+    /// turn and no snapshot); a session with content but no durable
+    /// snapshot reports `None` — unknown is never rendered as zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub footprint_tokens: Option<u64>,
+    /// Honesty marker paired with `footprint_tokens`: `Exact` when
+    /// provider-reported usage supplied the count (or the session is truly
+    /// empty — zero is exact), `Estimated` for locally accounted requests.
+    /// Present exactly when `footprint_tokens` is present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub footprint_truth: Option<ContextFootprintTruth>,
 }
 
 /// Result of a non-subscribing session read.

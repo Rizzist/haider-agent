@@ -4,6 +4,7 @@ use std::collections::BTreeSet;
 
 use haider_protocol::DeliveryMode;
 use haider_protocol::agent::{AgentMessageDelivery, AgentMessageReceipt};
+use haider_protocol::context::ContextFootprintTruth;
 use haider_protocol::credential::{AuthMethod, CredentialDescriptor, CredentialStatus};
 use haider_protocol::effect::EffectClass;
 use haider_protocol::envelope::{PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION};
@@ -123,6 +124,9 @@ pub fn transcript() -> Vec<WireFrame> {
                 attachment_id: attachment_id.clone(),
             },
         },
+        // The pre-roster-truth summary shape: an older daemon omits the
+        // additive turn/footprint fields entirely — these bytes must stay
+        // frozen so older-daemon tolerance keeps a golden witness.
         WireFrame::Response {
             request_id: RequestId::new("request-list"),
             body: ResponseBody::SessionList {
@@ -131,8 +135,29 @@ pub fn transcript() -> Vec<WireFrame> {
                     head_seq: 9,
                     worker_generation: 7,
                     metadata: None,
+                    turn_count: None,
+                    footprint_tokens: None,
+                    footprint_truth: None,
                 }],
                 next_cursor: Some("cursor-after-session-1".into()),
+            },
+        },
+        // The roster-truth summary shape: turn count plus footprint tokens
+        // with the observe honesty marker, for launcher rosters that hydrate
+        // from `session.list` without attaching.
+        WireFrame::Response {
+            request_id: RequestId::new("request-list-roster"),
+            body: ResponseBody::SessionList {
+                sessions: vec![SessionSummary {
+                    session_id: session_id.clone(),
+                    head_seq: 9,
+                    worker_generation: 7,
+                    metadata: None,
+                    turn_count: Some(4),
+                    footprint_tokens: Some(33_500),
+                    footprint_truth: Some(ContextFootprintTruth::Exact),
+                }],
+                next_cursor: None,
             },
         },
         WireFrame::Response {
