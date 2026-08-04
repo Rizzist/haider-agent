@@ -58,7 +58,7 @@ impl EffectOperation for SpawnSubagent {
 pub fn spawn_subagent_manifest() -> ToolManifest {
     ToolManifest {
         name: "spawn_subagent".into(),
-        description: "Delegate one bounded task to a depth-capped local child agent".into(),
+        description: "Delegate one bounded task to a depth-capped local child agent. Shared specs may be placed in the EPHEMERAL <workspace>/.haider/handoff/<session-short>/ directory.".into(),
         effects: vec![EffectClass::AgentSpawn],
         dispatch: DispatchMode::Deferred,
         input_schema: serde_json::json!({

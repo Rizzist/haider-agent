@@ -104,6 +104,13 @@ impl SqliteStoreHandle {
         run_blocking(move || owner.with_store(Store::session_ids)).await
     }
 
+    /// Deletes a session after the daemon has fenced new admission and
+    /// stopped its actor.
+    pub async fn delete_session(&self, session_id: SessionId) -> Result<(), HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.delete_session(&session_id))).await
+    }
+
     /// Loads typed live-session configuration; legacy `{}` rows return `None`.
     pub async fn session_metadata(
         &self,

@@ -87,6 +87,62 @@ impl ArtifactReader for TestArtifacts {
     }
 }
 
+/// MUTATION CHECK: restore the current-run `!current_user_seen` filter.
+/// Expected RUNTIME failure: the durable mid-round STEER disappears from the
+/// restarted provider prompt even though its acceptance committed.
+#[tokio::test]
+async fn current_run_recovery_keeps_every_durable_steer_message() {
+    let store = MemoryStore::new();
+    let session_id = SessionId::new("current-steer-history-session");
+    let run_id = RunId::new("current-steer-history-run");
+    let mut events = vec![
+        envelope(
+            &session_id,
+            &run_id,
+            "current-steer-initial",
+            EventPayload::UserMessage {
+                text: "inspect the parser".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        ),
+        envelope(
+            &session_id,
+            &run_id,
+            "current-steer-mid-round",
+            EventPayload::UserMessage {
+                text: "also reproduce the Unicode boundary failure".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Steer,
+            },
+            PromptRender::Verbatim,
+        ),
+    ];
+    StoreHandle::append(&store, &mut events)
+        .await
+        .expect("append current-run steer history");
+
+    let messages = PromptHistoryCompiler::compile(&store, &session_id, None, None, &run_id)
+        .await
+        .expect("compile restarted current run");
+    let text = messages
+        .iter()
+        .flat_map(|message| &message.blocks)
+        .filter_map(|block| match block {
+            Block::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        text,
+        [
+            "inspect the parser",
+            "also reproduce the Unicode boundary failure"
+        ]
+    );
+}
+
 #[tokio::test]
 async fn provider_opaque_extension_rehydrates_for_a_terminal_prior_run() {
     let store = MemoryStore::new();

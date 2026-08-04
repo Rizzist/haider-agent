@@ -1,0 +1,6 @@
+{
+  "type": "agent_messaged",
+  "agent": "agent-child-7",
+  "preview": "check the non-degenerate parser fixture",
+  "delivery": "delivered_steer"
+}

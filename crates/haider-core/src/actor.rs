@@ -2807,7 +2807,13 @@ impl HarnessActor {
                 }
             };
             let result = BoundedResult {
-                preview: completion.report.summary.clone(),
+                // The opaque id is operational routing, not display identity:
+                // a later `message_subagent` call must be able to name the
+                // direct child without guessing from task/callsign text.
+                preview: format!(
+                    "agent: {}\n\n{}",
+                    completion.report.agent, completion.report.summary
+                ),
                 truncated: completion.truncated,
                 artifact: None,
                 cursor: None,

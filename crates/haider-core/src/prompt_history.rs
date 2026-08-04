@@ -743,7 +743,7 @@ fn render_journal(
         match payload {
             EventPayload::UserMessage {
                 text, attachments, ..
-            } if !is_current || !current_user_seen => {
+            } => {
                 let mut blocks = vec![Block::Text { text }];
                 blocks.extend(attachments.into_iter().map(Block::Attachment));
                 messages.push(Message {

@@ -7,7 +7,7 @@
 #![allow(clippy::expect_used)] // tests may expect; the lint guards src/ only
 
 use haider_protocol::EventPayload;
-use haider_protocol::agent::ChipState;
+use haider_protocol::agent::{AgentMessageDelivery, AgentMessaged, ChipState};
 use haider_protocol::branch::{BranchCreated, BranchDescriptor, BranchEventPayload};
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets};
 use haider_protocol::hook::{
@@ -710,6 +710,27 @@ fn golden_agent_family() {
             workspace_revision: Some(WorkspaceRevision::new("blake3:r2")),
         },
     );
+}
+
+/// MUTATION CHECK: remove/rename the additive fact or collapse either
+/// delivery receipt. Expected RUNTIME failure: the canonical parent-timeline
+/// JSON differs and no longer round-trips through the satellite union.
+#[test]
+fn golden_agent_messaged_fact() {
+    let fact = AgentMessaged {
+        agent: AgentId::new("agent-child-7"),
+        preview: "check the non-degenerate parser fixture".into(),
+        delivery: AgentMessageDelivery::DeliveredSteer,
+    };
+    additive_golden(
+        "agent_messaged",
+        &haider_protocol::agent::AgentEventPayload::AgentMessaged(fact.clone()),
+    );
+    let value = fact
+        .to_payload_value()
+        .expect("serialize additive agent fact");
+    assert!(serde_json::from_value::<EventPayload>(value.clone()).is_err());
+    assert_eq!(AgentMessaged::from_payload_value(&value), Some(fact));
 }
 
 /// MUTATION CHECK: remove the serde default from `AgentManifest::task`.

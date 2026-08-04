@@ -9,6 +9,7 @@ mod broker;
 mod error;
 mod filesystem;
 mod ledger;
+mod message_subagent;
 mod process;
 mod request_input;
 mod shell;
@@ -25,6 +26,7 @@ pub use filesystem::{
     ResultBounds, TurnAttribution,
 };
 pub use ledger::{ChangeLedger, ChangeLedgerSink, FsWriteRecord, TurnChanges};
+pub use message_subagent::{MessageSubagent, message_subagent_manifest};
 pub use process::{
     CommandOutputSink, NoopCommandOutputSink, PROCESS_OUTPUT_CHUNK_BYTES, ProcessBounds,
     ProcessCancelHandle, ProcessControl, ProcessControlAction, ProcessControlResult, ProcessExec,

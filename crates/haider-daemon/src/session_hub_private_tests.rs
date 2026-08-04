@@ -35,6 +35,92 @@ fn provider_summary(provider: &str) -> haider_rpc::ProviderSummaryWire {
     }
 }
 
+/// MUTATION CHECK: make `StopIfQuiescent` stop first and let the deleter
+/// discover the accepted run afterward. Expected RUNTIME failure: the
+/// barrier reports success or the still-live actor cannot acknowledge the
+/// follow-up lease command.
+#[tokio::test]
+async fn deletion_barrier_preserves_a_prefence_accepted_turn_and_its_actor() {
+    let root = tempfile::tempdir().expect("temp store");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let session_id = SessionId::new("delete-barrier-session");
+    hub.create_internal_session(SessionCreateCommand {
+        command_id: "create-delete-barrier-session".into(),
+        request_digest: "create-delete-barrier-session-digest".into(),
+        request_json: r#"{"session":"delete-barrier-session"}"#.into(),
+        session_id: session_id.clone(),
+        cwd: std::fs::canonicalize(std::env::current_dir().expect("cwd"))
+            .expect("canonical cwd")
+            .to_string_lossy()
+            .into_owned(),
+        provider: "fake".into(),
+        model: "fake-model".into(),
+        max_tokens: 4096,
+        permission_overrides: None,
+        system_prompt_version: crate::worker::SystemPromptBuilder::VERSION.into(),
+        event_id: EventId::new("created-delete-barrier-session"),
+        device_id: DeviceId::new("delete-barrier-device"),
+    })
+    .await
+    .expect("create session");
+    let actor = hub
+        .existing_actor(&session_id)
+        .expect("actor lookup")
+        .expect("session actor");
+    let (accepted, acceptance) = oneshot::channel();
+    actor
+        .commands
+        .send(ActorCommand::AcceptTurn {
+            command: TurnAcceptCommand {
+                command_id: "accept-delete-barrier-turn".into(),
+                request_digest: "accept-delete-barrier-turn-digest".into(),
+                request_json: r#"{"turn":"delete-barrier"}"#.into(),
+                session_id: session_id.clone(),
+                worker_generation: store.worker_generation(),
+                branch_id: None,
+                run_id: RunId::new("delete-barrier-run"),
+                agent_id: None,
+                text: "preserve this accepted turn".into(),
+                attachments: Vec::new(),
+                mode: haider_protocol::DeliveryMode::Queue,
+                queued_event_id: EventId::new("delete-barrier-queued"),
+                user_event_id: EventId::new("delete-barrier-user"),
+                active_event_id: EventId::new("delete-barrier-active"),
+                device_id: DeviceId::new("delete-barrier-device"),
+            },
+            completed: accepted,
+        })
+        .await
+        .expect("queue pre-fence acceptance");
+    let (completed, quiescent) = oneshot::channel();
+    actor
+        .commands
+        .send(ActorCommand::StopIfQuiescent { completed })
+        .await
+        .expect("queue deletion barrier");
+    acceptance
+        .await
+        .expect("acceptance response")
+        .expect("accepted turn commits");
+    assert!(!quiescent.await.expect("barrier response").expect("scan"));
+
+    let (lease_completed, lease_ack) = oneshot::channel();
+    actor
+        .commands
+        .send(ActorCommand::AcquireWorkerLease {
+            lease_id: WorkerLeaseId("delete-barrier-lease".into()),
+            cancellation_wake: None,
+            completed: lease_completed,
+        })
+        .await
+        .expect("actor remains live after refused deletion");
+    lease_ack.await.expect("live actor acknowledges lease");
+
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
+}
+
 /// The optional `provider.list` coordinate filters the production snapshot
 /// projection without probing or rebuilding provider data.
 ///
