@@ -8,7 +8,7 @@
 //!
 //! The two paths share one footprint. The image is fit (aspect-preserved,
 //! centered) into the SAME cell rectangle the half-block art would occupy
-//! (banner 28×4, header 16×2), so the layout is identical — only the fidelity
+//! (banner 28×4, header 24×2), so the layout is identical — only the fidelity
 //! of the mark changes.
 //!
 //! DIGNITY (sanctum rule 2, mirrored from `crate::mark`): whole or nothing.

@@ -405,8 +405,19 @@ fn launcher_composer_is_bottom_anchored_with_the_gold_rule() {
     assert_eq!(buffer[(0, composer_y)].bg, Color::from(theme.input_bg));
     // The launcher shows dir + mesh (sim .dirline) — the dir is the
     // launcher's shell working dir (TUI3b §4: `cd` retargets it).
+    // S2 flip: the header mark widened 16 → 24 cols (owner rebuild), so
+    // the band's info line ellipsizes ~8 cells earlier and 118 no longer
+    // fits the full tail (` · mesh off` yields to the `…` by the band's
+    // own ellipsis law). The CONTENT is unchanged — pin it whole at a
+    // width that holds it, and pin the dir still showing at 118.
     assert!(
-        rows.iter()
+        rows.iter().any(|row| row.contains("dir ~/dev/enterprise-s")),
+        "the dir shows at 118, ellipsized to the band"
+    );
+    let (wide_info_rows, _, _) = draw(&model, 130, 34);
+    assert!(
+        wide_info_rows
+            .iter()
             .any(|row| row.contains("dir ~/dev/enterprise-suite · mesh off"))
     );
     // Sample metadata carries the blurb and branch count; TUI4 item 5 caps

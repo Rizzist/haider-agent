@@ -54,41 +54,48 @@ pub const BANNER: [&str; 8] = [
     ".####.........##..##........",
 ];
 
-/// The session-header mark: 16 × 4 pixels → 16 cols × 2 terminal rows, so it
+/// The session-header mark: 24 × 4 pixels → 24 cols × 2 terminal rows, so it
 /// spans BOTH header lines beside the info block (owner item 6).
 ///
-/// TUI6 item 7: the original 24-wide raster read too wide/blocky beside
-/// `[ ← main ]` at header scale — this is its two-thirds rework (24 → 16
-/// cols exactly), derived by re-scaling the SAME GeezaPro reference the
-/// 24-map was hand-cleaned from, letter by letter: `ر` body 2 px with the
-/// tail clear of the baseline, `ـد` upright on the baseline, `ـيـ` tooth
-/// with the two dots straddling beneath it, `حـ` head bar sweeping one
-/// pixel right into the drop at the frame's right edge (never a filled
-/// wedge — the open bowl IS the letter). The 28×8 launcher/boot banner is
-/// untouched.
+/// S2 rebuild (owner screenshot): the TUI6 16-col "two-thirds rework"
+/// squeezed every letter body into identical 2×2 blocks — at header scale
+/// the mark read as DISCONNECTED SQUARES, not letterforms. This map is
+/// derived from the 28×8 launcher/boot banner (which reads correctly) at
+/// HALF vertical resolution: every banner stroke is a 2-px pair, so
+/// halving maps each pair to exactly one pixel row — the baseline becomes
+/// a `▀` rule, the descenders `▄`/`█` bumps beneath it, and `ـد`'s 4-px
+/// upright keeps its pair and still renders as solid `█` ink. Width then
+/// tightens 28 → 24 by closing inter-letter AIR only; every stroke
+/// keeps the banner's own proportions, letter by letter:
 ///
-/// At two rows the baseline and the descenders share one cell row: the
-/// baseline is the upper half and `ر`'s tail and `ي`'s two dots are the
-/// lower half, so they read as `█` bumps hanging off a `▀` rule. The
-/// TUI5-era note called 24 px the floor for the dots; at 16 the dots
-/// narrow to the minimum 2-px pair with a 2-px gap and still register —
-/// the real floor is the GAP, which survives the rework. Below THAT the
-/// mark would be a mangled `ى`, which the dignity rule forbids, so there
-/// is still no one-row tier and no narrower map.
+/// * `ر`  — body descending through the cell seam into the swept tail,
+///   standing CLEAR of the baseline (the word breaks at `د`, which does
+///   not join forward);
+/// * `ـد` — the 2-px upright on the baseline;
+/// * `ـيـ` — tooth above the baseline, the two dots straddling BENEATH
+///   it as `█` bumps off the `▀` rule (2-px dots, 2-px gap — the gap is
+///   the legibility floor and survives);
+/// * `حـ` — the head bar sweeping right and thickening into the drop at
+///   the frame's edge, the bowl left OPEN beneath (never a filled wedge
+///   — the open bowl IS the letter).
+///
+/// Below ~24 cols the letters collapse back into blocks, which the
+/// dignity rule forbids — so there is no narrower map and no one-row
+/// tier; a tight frame falls back to the one-line text mark instead.
 pub const HEADER: [&str; 4] = [
-    ".##..##..##.###.",
-    ".##..##..##..###",
-    "....############",
-    "##.....##..##...",
+    ".......##.......#######.",
+    "...##..##...##.......###",
+    "..##..##################",
+    "###.......##..##........",
 ];
 
 /// Cells the banner needs (its map width).
 pub const BANNER_COLS: u16 = 28;
 /// Terminal rows the banner occupies (half the map's pixel rows).
 pub const BANNER_ROWS: u16 = 4;
-/// Cells the header mark needs (TUI6 item 7: two-thirds of the original
-/// 24).
-pub const HEADER_COLS: u16 = 16;
+/// Cells the header mark needs (S2 rebuild: back to 24 — the width the
+/// letterforms need to read as script rather than squares).
+pub const HEADER_COLS: u16 = 24;
 /// Terminal rows the header mark occupies.
 pub const HEADER_ROWS: u16 = 2;
 

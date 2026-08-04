@@ -544,7 +544,8 @@ fn render_launcher(
     let header_art = crate::mark::header_fits(area.width, LAUNCHER_HEADER_RESERVED);
     if header_art {
         // The compact cut of the big art: the SAME GeezaPro-derived حيدر
-        // letterforms at header scale (16×2 — `mark::HEADER`), spanning
+        // letterforms at header scale (24×2 — `mark::HEADER`, the S2
+        // half-res-banner rebuild), spanning
         // both band lines exactly as it does beside a session's info block.
         let rows = crate::mark::header_rows();
         header_top.push(Span::styled(rows[0].clone(), mark_ink));
@@ -593,7 +594,7 @@ fn render_launcher(
         header_area,
     );
     // Replace the half-block header mark with the crisp حيدر image on a
-    // graphics terminal — same 16×2 footprint at the band's lead cell.
+    // graphics terminal — same 24×2 footprint at the band's lead cell.
     if header_art && header_area.height >= crate::mark::HEADER_ROWS {
         draw_wordmark_image(
             model,
@@ -1864,7 +1865,7 @@ fn render_session(
         header_area,
     );
     // Replace the half-block header mark with the crisp حيدر image on a graphics
-    // terminal — same 16×2 footprint, at the fixed slot after the back chip and
+    // terminal — same 24×2 footprint, at the fixed slot after the back chip and
     // its two-space gap. No-op (half-block art stays) when header_fits chose the
     // art tier and there is no graphics protocol.
     if crate::mark::header_fits(area.width, HEADER_MARK_RESERVED) {

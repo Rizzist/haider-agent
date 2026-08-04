@@ -2044,37 +2044,46 @@ fn reserved_rule_sweeps_aura() {
 // ---- Item 7: the thinner header mark ----
 
 #[test]
-fn header_mark_is_two_thirds_thinner_and_keeps_its_anatomy() {
+fn header_mark_reads_as_letterforms_at_24_cols() {
+    // S2 FLIP (owner screenshot): the 16-col "two-thirds" map compressed
+    // every letter body into identical 2×2 blocks and read as
+    // disconnected squares — the anatomy pinned here is the 24×4 rebuild,
+    // the banner at half vertical resolution with only inter-letter air
+    // tightened. The verbatim art rows are pinned in
+    // `s2_ui_refinement_tests::header_mark_uses_halfblock_glyphs`.
     use haider_tui::mark;
     /// Ink groups in one pixel row (a letterform stroke = one group).
     fn groups(row: &str) -> usize {
         row.split('.').filter(|s| !s.is_empty()).count()
     }
-    // Two-thirds of the TUI4 24-col raster, exactly; the 28-col
-    // launcher/boot banner is out of scope and untouched.
-    assert_eq!(mark::HEADER_COLS, 16);
+    assert_eq!(mark::HEADER_COLS, 24);
     assert_eq!(mark::HEADER_ROWS, 2);
     assert_eq!(mark::BANNER_COLS, 28, "launcher banner untouched");
     for (index, row) in mark::HEADER.iter().enumerate() {
-        assert_eq!(row.len(), 16, "pixel row {index} is 16 wide");
+        assert_eq!(row.len(), 24, "pixel row {index} is 24 wide");
     }
-    // Anatomy (the same letters, narrower): the upright rows carry FOUR
-    // ink groups — `ر` `ـد` `ـيـ` `حـ` in visual order…
-    assert_eq!(groups(mark::HEADER[0]), 4);
+    // Head row: only `ـد`'s upright and `حـ`'s head bar rise this high —
+    // and the bar stops short of the right edge (the drop's air), so the
+    // bowl below stays open.
+    assert_eq!(groups(mark::HEADER[0]), 2);
+    assert!(mark::HEADER[0].ends_with('.'), "the ح bar leaves the drop air");
+    // Body row: all FOUR letters carry ink — `ر` `ـد` `ـيـ` `حـ` in
+    // visual order (this is the row the 16-col map flattened away).
     assert_eq!(groups(mark::HEADER[1]), 4);
-    // …the baseline is ONE run reaching the right edge, with `ر` standing
-    // clear of it (the word breaks at `د`, which does not join forward)…
-    assert_eq!(groups(mark::HEADER[2]), 1);
+    assert!(mark::HEADER[1].ends_with("###"), "the ح drop descends at the edge");
+    // Baseline row: `ر`'s swept body stands CLEAR of the single kashida
+    // run reaching the right edge (the word breaks at `د`, which does not
+    // join forward).
+    assert_eq!(groups(mark::HEADER[2]), 2);
     assert!(mark::HEADER[2].ends_with('#'));
-    assert!(mark::HEADER[2].starts_with("...."), "ر stands clear");
-    // …and the descender row carries THREE groups: the tail plus `ي`'s
-    // two dots, still separated — the legibility floor is the dot GAP,
-    // which the two-thirds rework preserves.
+    assert!(mark::HEADER[2].starts_with(".."), "the ر body is inset");
+    // Descender row: the tail plus `ي`'s two dots, still separated — the
+    // legibility floor is the dot GAP, which the rebuild keeps at 2 px.
     assert_eq!(groups(mark::HEADER[3]), 3);
     // The rendering never exceeds the declared cells, and stays pure
     // half-block ink.
     for row in mark::header_rows() {
-        assert!(row.trim_end().chars().count() <= 16);
+        assert!(row.trim_end().chars().count() <= 24);
         assert!(row.chars().all(|c| "█▀▄ ".contains(c)));
     }
 }
