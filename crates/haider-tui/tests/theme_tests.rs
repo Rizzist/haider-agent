@@ -95,27 +95,31 @@ fn labels_and_families_match_the_design() {
 
 #[test]
 fn hex_decodes_channels() {
-    assert_eq!(Rgb::hex(0xfaf6ee), rgb(0xfa, 0xf6, 0xee));
+    assert_eq!(Rgb::hex(0xfdfdfd), rgb(0xfd, 0xfd, 0xfd));
     assert_eq!(Rgb::hex(0x000000), rgb(0, 0, 0));
     assert_eq!(Rgb::hex(0xffffff), rgb(255, 255, 255));
 }
 
 #[test]
 fn over_blends_extremes_exactly() {
-    let base = Rgb::hex(0x120e08);
+    let base = Rgb::hex(0x0f0f0f);
     let ink = Rgb::hex(0xd9b544);
     assert_eq!(ink.over(base, 0), base, "alpha 0 keeps the ground");
     assert_eq!(ink.over(base, 1000), ink, "alpha 1 is the ink");
 }
 
+/// S2 flip: the warm paper (#faf6ee) and its warm-cast grays are RETIRED
+/// per the owner's pearl-white spec — the ground is a barely-there pearl,
+/// the ink neutral near-black, every gray neutral, the gold deepened for
+/// the whiter page.
 #[test]
 fn light_solid_tokens_match_the_design_hexes() {
-    assert_eq!(LIGHT.bg, Rgb::hex(0xfaf6ee));
-    assert_eq!(LIGHT.text, Rgb::hex(0x2e2a24));
-    assert_eq!(LIGHT.bright, Rgb::hex(0x14110c));
-    assert_eq!(LIGHT.dim, Rgb::hex(0x6e675c));
-    assert_eq!(LIGHT.faint, Rgb::hex(0xd8d1c2));
-    assert_eq!(LIGHT.gold, Rgb::hex(0x8a6508));
+    assert_eq!(LIGHT.bg, Rgb::hex(0xfdfdfd), "pearl, not warm paper");
+    assert_eq!(LIGHT.text, Rgb::hex(0x363636));
+    assert_eq!(LIGHT.bright, Rgb::hex(0x171717));
+    assert_eq!(LIGHT.dim, Rgb::hex(0x6e6e6e), "neutral gray, no warm cast");
+    assert_eq!(LIGHT.faint, Rgb::hex(0xd9d9d9));
+    assert_eq!(LIGHT.gold, Rgb::hex(0x7d5a05), "deepened for the white page");
     assert_eq!(LIGHT.maroon, Rgb::hex(0x7c2d12));
     assert_eq!(LIGHT.badge_fg, LIGHT.bg);
 }
@@ -129,17 +133,17 @@ fn desert_solid_tokens_match_the_design_hexes() {
     assert_eq!(DESERT.badge_fg, DESERT.bg);
 }
 
+/// S2 flip: the warm-brown ground (#120e08) and warm cream text are
+/// RETIRED per the owner's Codex-register spec — neutral charcoal ground,
+/// neutral light-gray text, cool dim. The gold and ember ACCENTS are the
+/// identity and stay byte-identical.
 #[test]
 fn dark_refresh_keeps_the_identity_hexes() {
-    assert_eq!(DARK.bg, Rgb::hex(0x120e08));
-    assert_eq!(DARK.gold, Rgb::hex(0xd9b544), "aged gold, lifted a step");
-    assert_eq!(DARK.maroon, Rgb::hex(0xe57a4a), "warmed ember");
-    assert_eq!(DARK.text, Rgb::hex(0xd6c7a4));
-    assert_eq!(
-        DARK.dim,
-        Rgb::hex(0x93856a),
-        "the sim-era 3.2:1 dim, re-contrasted"
-    );
+    assert_eq!(DARK.bg, Rgb::hex(0x0f0f0f), "neutral charcoal, not warm brown");
+    assert_eq!(DARK.gold, Rgb::hex(0xd9b544), "aged gold — the kept identity");
+    assert_eq!(DARK.maroon, Rgb::hex(0xe57a4a), "ember — the kept identity");
+    assert_eq!(DARK.text, Rgb::hex(0xd4d4d4), "neutral light gray, not cream");
+    assert_eq!(DARK.dim, Rgb::hex(0x8b949e), "cool dim (owner: 'cool dim')");
 }
 
 #[test]
@@ -154,20 +158,24 @@ fn oasis_solid_tokens_match_the_design_hexes() {
 
 #[test]
 fn light_blends_match_hand_computed_goldens() {
-    assert_eq!(LIGHT.bar_bg, rgb(241, 237, 229)); // ink 4.0% over paper
-    assert_eq!(LIGHT.frame, rgb(181, 177, 170)); // ink 30%
-    assert_eq!(LIGHT.gold_soft, rgb(238, 230, 213)); // gold 11%
-    assert_eq!(LIGHT.input_bg, rgb(241, 237, 229)); // ink 4.0%
-    assert_eq!(LIGHT.sel_bg, rgb(229, 225, 218)); // ink 9%
+    assert_eq!(LIGHT.bar_bg, rgb(244, 244, 244)); // ink 4.0% over pearl
+    assert_eq!(LIGHT.frame, rgb(184, 184, 184)); // ink 30%
+    assert_eq!(LIGHT.gold_soft, rgb(241, 238, 231)); // gold 9%
+    assert_eq!(LIGHT.input_bg, rgb(244, 244, 244)); // ink 4.0%
+    assert_eq!(LIGHT.sel_bg, rgb(232, 232, 232)); // ink 9%
 }
 
+/// S2: every dark chrome blend now mixes from WHITE over the charcoal —
+/// the gold-tinted bar/frame/selection grounds were the "warm wash" the
+/// owner retired. The probe ladder's raw SGR constants track these bytes
+/// (scripts/tui-probes: sel_bg 39;39;39 · bar_bg 25;25;25).
 #[test]
 fn dark_blends_match_hand_computed_goldens() {
-    assert_eq!(DARK.bar_bg, rgb(28, 22, 11)); // gold 5%
-    assert_eq!(DARK.frame, rgb(70, 57, 24)); // gold 26%
-    assert_eq!(DARK.gold_soft, rgb(42, 34, 15)); // gold 12%
-    assert_eq!(DARK.input_bg, rgb(29, 25, 19)); // white 4.5%
-    assert_eq!(DARK.sel_bg, rgb(38, 31, 14)); // gold 10%
+    assert_eq!(DARK.bar_bg, rgb(25, 25, 25)); // white 4%
+    assert_eq!(DARK.frame, rgb(68, 68, 68)); // white 22%
+    assert_eq!(DARK.gold_soft, rgb(39, 35, 21)); // gold 12% — the accent's soft ground
+    assert_eq!(DARK.input_bg, rgb(26, 26, 26)); // white 4.5%
+    assert_eq!(DARK.sel_bg, rgb(39, 39, 39)); // white 10%
 }
 
 #[test]

@@ -79,26 +79,27 @@ fn session_model() -> AppModel {
 
 #[test]
 fn composer_band_is_the_exact_designed_blend_in_every_theme() {
-    // Hand-computed design blends (inputBg over bg, round half-up):
-    //   light : ink   4.0% over #faf6ee → (241, 237, 229)
-    //   dark  : white 4.5% over #120e08 → ( 29,  25,  19)
+    // Hand-computed design blends (inputBg over bg, round half-up).
+    // S2 flip: light/dark re-grounded (pearl #fdfdfd · charcoal #0f0f0f).
+    //   light : ink   4.0% over #fdfdfd → (244, 244, 244)
+    //   dark  : white 4.5% over #0f0f0f → ( 26,  26,  26)
     //   desert: white 28.0% over #f0e4cc → (244, 236, 218)
     //   oasis : white 4.5% over #0c1410 → ( 23,  31,  27)
     let expected = [
         (
             ThemeKey::Light,
             Rgb {
-                r: 241,
-                g: 237,
-                b: 229,
+                r: 244,
+                g: 244,
+                b: 244,
             },
         ),
         (
             ThemeKey::Dark,
             Rgb {
-                r: 29,
-                g: 25,
-                b: 19,
+                r: 26,
+                g: 26,
+                b: 26,
             },
         ),
         (
