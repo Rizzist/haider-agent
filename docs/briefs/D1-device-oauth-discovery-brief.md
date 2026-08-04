@@ -53,3 +53,12 @@ Standing lane laws: tests never inline; mutation-notes with RUNTIME
 kills; CARGO_INCREMENTAL=0; fmt + workspace clippy -D warnings;
 ledger; NO haider-tui; no Cargo.lock; no version bumps; leave
 uncommitted; no git. Up to 3 research + 2 verify subagents.
+
+## AMENDMENT (owner, mid-lane): refresh-now is CUT
+
+`account.refresh` does not make sense — the harness cannot know which
+email a user will log in with; re-login with an existing account
+already replaces/refreshes the token (same-alias login replaces). The
+wave ships DISCOVERY + IMPORT only. Any refresh_now RPC/feature/tests
+the lane produced are to be excised at review before merge; the
+broker's internal refresh machinery (C2) is untouched.
