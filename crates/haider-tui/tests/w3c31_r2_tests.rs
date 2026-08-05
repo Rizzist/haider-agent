@@ -99,6 +99,7 @@ fn listed(n: usize) -> LiveReply {
                 turn_count: None,
                 footprint_tokens: None,
                 footprint_truth: None,
+                title: None,
             })
             .collect(),
         next_cursor: None,

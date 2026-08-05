@@ -556,6 +556,9 @@ fn recovered_acceptance(
         worker_generation,
         branch_id,
         disposition: TurnAdmissionDisposition::Started,
+        // Recovery reconstructions never re-title (G2): the auto-title
+        // consumed its own durable receipt at the original acceptance.
+        first_user_turn: false,
     }
 }
 

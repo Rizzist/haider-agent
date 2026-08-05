@@ -17,9 +17,9 @@ use haider_store::{
     ContextCompactionClaim, ContextCompactionReceiptResponse, DelegationCreateOutcome,
     DelegationRecord, EventStore, HookTrustChange, HookTrustCommand, MenuResolutionCommand,
     MenuResolutionOutcome, ProfileLease, SessionCreateCommand, SessionCreateOutcome,
-    SessionSelectModelCommand, SessionSelectModelOutcome, ShellExecAcceptCommand,
-    ShellExecAcceptOutcome, Store, TurnAcceptCommand, TurnAcceptOutcome, TurnCancelCommand,
-    TurnCancelOutcome,
+    SessionRenameCommand, SessionRenameOutcome, SessionSelectModelCommand,
+    SessionSelectModelOutcome, ShellExecAcceptCommand, ShellExecAcceptOutcome, Store,
+    TurnAcceptCommand, TurnAcceptOutcome, TurnCancelCommand, TurnCancelOutcome,
 };
 use haider_tools::{CasSink, ToolResult};
 use std::path::Path;
@@ -193,6 +193,31 @@ impl SqliteStoreHandle {
     ) -> Result<SessionSelectModelOutcome, HaiderError> {
         let owner = Arc::clone(&self.owner);
         run_blocking(move || owner.with_store(|store| store.select_session_model(&command))).await
+    }
+
+    /// Preflights a durable `session.rename` receipt (R2 replay).
+    pub async fn session_rename_receipt(
+        &self,
+        command_id: String,
+        request_digest: String,
+        request_json: String,
+    ) -> Result<Option<haider_store::RenamedSession>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.session_rename_receipt(&command_id, &request_digest, &request_json)
+            })
+        })
+        .await
+    }
+
+    /// Atomically applies one normalized live-session rename (G2).
+    pub async fn rename_session(
+        &self,
+        command: SessionRenameCommand,
+    ) -> Result<SessionRenameOutcome, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.rename_session(&command))).await
     }
 
     pub async fn create_delegation(

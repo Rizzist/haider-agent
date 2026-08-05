@@ -340,6 +340,15 @@ pub enum LiveCommand {
         model: String,
         provider: String,
     },
+    /// `session.rename` (G2): receipted live-session rename. DURABLE — a
+    /// reconnect resends under the same command id and the daemon replays
+    /// the committed receipt.
+    Rename {
+        command_id: CommandId,
+        session: SessionId,
+        worker_generation: u64,
+        title: String,
+    },
     /// `provider.configure` CREATE for a custom OpenAI-compatible provider
     /// (W5g-4). Identity fields are fixed by the card: chat-completions
     /// family, api-key auth, enabled. The served model seeds the inventory
@@ -396,6 +405,7 @@ impl LiveCommand {
             Self::DeviceImport { command_id, .. } => Some(command_id),
             Self::SetDefaultModel { command_id, .. } => Some(command_id),
             Self::SelectModel { command_id, .. } => Some(command_id),
+            Self::Rename { command_id, .. } => Some(command_id),
             Self::ConfigureProvider { command_id, .. } => Some(command_id),
             Self::AccountAddOAuth { command_id, .. } => Some(command_id),
             Self::List { .. }
@@ -700,6 +710,14 @@ pub enum LiveReply {
         model: String,
         worker_generation: u64,
     },
+    /// `session.rename` committed (G2): the NORMALIZED title — never an
+    /// echo of the request.
+    Renamed {
+        command_id: CommandId,
+        session: SessionId,
+        title: Option<String>,
+        worker_generation: u64,
+    },
     /// `provider.configure` committed (W5g-4).
     ProviderConfigured {
         command_id: CommandId,
@@ -892,6 +910,9 @@ pub struct LiveDriver {
     /// In-flight `session.select_model` (F2a): the REQUESTED pair, so a
     /// typed refusal can land on the exact selection that asked.
     pending_model_select: Option<(CommandId, String, String)>,
+    /// In-flight `session.rename` (G2): (command, session), so a typed
+    /// refusal lands on the exact session that asked.
+    pending_rename: Option<(CommandId, SessionId)>,
     /// W10b in-flight removals: (command, alias/provider) — failures
     /// surface on the owning screen; successes come as typed replies.
     pending_account_remove: Option<(CommandId, String)>,
@@ -993,6 +1014,7 @@ impl LiveDriver {
             pending_account_select: None,
             pending_default_model: None,
             pending_model_select: None,
+            pending_rename: None,
             pending_account_remove: None,
             pending_provider_remove: None,
             pending_custom: None,
@@ -1782,6 +1804,24 @@ impl LiveDriver {
                 model.apply_model_selected(&provider, &model_name);
                 Vec::new()
             }
+            LiveReply::Renamed {
+                command_id,
+                session,
+                title,
+                worker_generation,
+            } => {
+                self.retire(&command_id);
+                if self
+                    .pending_rename
+                    .as_ref()
+                    .is_some_and(|(id, _)| *id == command_id)
+                {
+                    self.pending_rename = None;
+                }
+                self.generations.insert(session.clone(), worker_generation);
+                model.apply_renamed(&session, title);
+                Vec::new()
+            }
             LiveReply::DefaultModelSet {
                 command_id,
                 provider,
@@ -2201,6 +2241,22 @@ impl LiveDriver {
                         self.retire(id);
                     }
                     model.model_select_failed(&provider, &model_name, &code, &message);
+                    return Vec::new();
+                }
+                // A failed `session.rename` (G2): the typed public reason
+                // lands on the exact session that asked, never a silent
+                // IDLE.
+                if let Some(id) = &command_id
+                    && self
+                        .pending_rename
+                        .as_ref()
+                        .is_some_and(|(pending, _)| pending == id)
+                    && let Some((_, session)) = self.pending_rename.take()
+                {
+                    if !retryable {
+                        self.retire(id);
+                    }
+                    model.rename_failed(&session, &code, &message);
                     return Vec::new();
                 }
                 // A failed `account.set_default_model` releases its gate;
@@ -2886,6 +2942,17 @@ impl LiveDriver {
                     provider,
                 })]
             }
+            AppRequest::Rename { session, title } => {
+                let command_id = self.mint();
+                let worker_generation = self.generations.get(&session).copied().unwrap_or_default();
+                self.pending_rename = Some((command_id.clone(), session.clone()));
+                vec![self.enqueue(LiveCommand::Rename {
+                    command_id,
+                    session,
+                    worker_generation,
+                    title,
+                })]
+            }
             AppRequest::ProviderConfigure {
                 attempt,
                 name,
@@ -3209,6 +3276,7 @@ const fn command_session(command: &LiveCommand) -> Option<&SessionId> {
         | LiveCommand::ShellExec { session, .. }
         | LiveCommand::ToolsInventory { session }
         | LiveCommand::SelectModel { session, .. }
+        | LiveCommand::Rename { session, .. }
         | LiveCommand::Answer { session, .. } => Some(session),
         _ => None,
     }

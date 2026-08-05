@@ -230,6 +230,11 @@ pub const FEATURE_AGENT_MESSAGE_V1: &str = "agent_message_v1";
 /// optional `provider` names the selected model row's provider attribute,
 /// and the next logical turn resolves through the committed pair.
 pub const FEATURE_SESSION_MODEL_SELECT_V1: &str = "session_model_select_v1";
+/// Daemon implements receipted live-session renaming (`session.rename`,
+/// G2): the committed title lands in `sessions.meta_json`, a
+/// `session_renamed` config fact is journaled atomically with the receipt,
+/// and `session.list` summaries carry the title.
+pub const FEATURE_SESSION_RENAME_V1: &str = "session_rename_v1";
 /// Daemon vaults the profile transcription secret (the Deepgram API key)
 /// and serves `transcription.secret_get`/`transcription.secret_set` on
 /// authenticated same-UID local UDS connections only (T1).
@@ -785,6 +790,12 @@ pub struct SessionSummary {
     /// Present exactly when `footprint_tokens` is present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub footprint_truth: Option<ContextFootprintTruth>,
+    /// Additive G2 field: the committed session title, so launcher rosters
+    /// name rows without attaching. `None` for untitled sessions and when
+    /// an older daemon omits the field — readers must not infer anything
+    /// from its absence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 /// Result of a non-subscribing session read.
@@ -1091,6 +1102,18 @@ pub enum RequestBody {
         model: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider: Option<String>,
+    },
+    /// Receipted live-session rename (G2). `title` is normalized by the
+    /// daemon (trimmed, control characters stripped, ≤ 80 chars; empty
+    /// collapses to `None`); an absent/`None` title CLEARS the stored one.
+    /// Same-command retries replay the committed receipt.
+    #[serde(rename = "session.rename")]
+    SessionRename {
+        command_id: CommandId,
+        session_id: SessionId,
+        worker_generation: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
     },
     /// Executes exact user-supplied shell program bytes on the session daemon.
     /// The command creates no user message and no provider request. `cwd`, when
@@ -1414,6 +1437,18 @@ pub enum ResponseBody {
         provider: String,
         model: String,
         selected_seq: u64,
+        worker_generation: u64,
+    },
+    /// Durable coordinates of a committed rename (G2): the NORMALIZED title
+    /// — never an echo of the request — plus the committed journal sequence
+    /// of the `session_renamed` fact. A same-command retry receives this
+    /// exact body from its receipt.
+    #[serde(rename = "session.rename")]
+    SessionRename {
+        session_id: SessionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        renamed_seq: u64,
         worker_generation: u64,
     },
     /// Durable acceptance coordinates for one direct shell command. Terminal

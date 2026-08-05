@@ -1421,6 +1421,12 @@ impl DemoDriver {
             } => {
                 model.apply_model_selected(&provider, &model_name);
             }
+            // G2: same twin-honesty shape — demo renames locally in the
+            // reducer and never pushes this request; a stray one commits
+            // the fabricated truth instead of vanishing.
+            AppRequest::Rename { session, title } => {
+                model.apply_renamed(&session, Some(title));
+            }
             AppRequest::OAuthAddStart {
                 provider, attempt, ..
             } => {
@@ -2358,16 +2364,28 @@ pub fn rendered_selection_text(
 /// Success stays quiet — the OAuth card already narrates ("your browser
 /// opened …"). Failure must not strand the user behind copy that claims a
 /// browser opened: the URL lands on the clipboard and the flash says so.
-/// The `/attach` read effect (B4b) — the ONE filesystem touch in the
+/// The `/attach` read effect (B4b + G2) — the ONE filesystem touch in the
 /// attach pipeline, shell-owned like every other IO. Bounded read + magic
 /// sniff ride `haider-client`'s `load_image_attachment` (the SAME
 /// allowlist and 5 MiB cap `haider run --attach` enforces — jpeg/png/gif/
-/// webp by magic bytes, never by extension). Failure is an honest flash
+/// webp by magic bytes, never by extension); a readable NON-image falls
+/// back to `load_text_attachment` — the UTF-8 text-file lane (G2), same
+/// fallback order as `haider run --attach`. Failure is an honest flash
 /// and NOTHING uploads; success chips the draft and issues the
 /// receipt-free upload through the model's one issuance seam.
 pub fn attach_read_effects(model: &mut AppModel, path: &str) {
-    match haider_client::load_image_attachment(std::path::Path::new(path)) {
-        Ok(image) => {
+    let loaded = match haider_client::load_image_attachment(std::path::Path::new(path)) {
+        Ok(image) => Ok(haider_client::HeadlessAttachment::Image(image)),
+        Err(haider_client::HeadlessRunError::Attachment { ref code, .. })
+            if code == "unsupported_attachment_type" =>
+        {
+            haider_client::load_text_attachment(std::path::Path::new(path))
+                .map(haider_client::HeadlessAttachment::File)
+        }
+        Err(error) => Err(error),
+    };
+    match loaded {
+        Ok(haider_client::HeadlessAttachment::Image(image)) => {
             let name = std::path::Path::new(path).file_name().map_or_else(
                 || path.to_owned(),
                 |name| name.to_string_lossy().into_owned(),
@@ -2379,10 +2397,21 @@ pub fn attach_read_effects(model: &mut AppModel, path: &str) {
                 format!("{name} · {kib} KB"),
             );
         }
+        Ok(haider_client::HeadlessAttachment::File(file)) => {
+            let label = format!("{} · {} lines", file.name, file.lines);
+            model.begin_attachment_upload(
+                file.bytes,
+                crate::composer::PendingKind::File {
+                    name: file.name,
+                    lines: file.lines,
+                },
+                label,
+            );
+        }
         Err(error) => {
-            // The client error's own wording names the reason (not an
-            // image / over the cap / unreadable); strip its headless
-            // framing down to the message.
+            // The client error's own wording names the reason (binary /
+            // over the cap / unreadable); strip its headless framing down
+            // to the message.
             let note = match error {
                 haider_client::HeadlessRunError::Attachment { message, .. } => message,
                 other => other.to_string(),

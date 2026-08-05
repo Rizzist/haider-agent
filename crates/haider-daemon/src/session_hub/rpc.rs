@@ -1041,6 +1041,36 @@ impl HubConnection {
                 )
                 .await
             }
+            RequestBody::SessionRename {
+                command_id,
+                session_id,
+                worker_generation,
+                title,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                if !self
+                    .hub
+                    .holds_control_attachment(&self.connection_id, &session_id)?
+                {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        "session rename requires a control attachment to this session",
+                        false,
+                        None,
+                    );
+                }
+                self.session_rename(request_id, command_id, session_id, worker_generation, title)
+                    .await
+            }
             RequestBody::ShellExec {
                 command_id,
                 session_id,
@@ -2726,6 +2756,138 @@ impl HubConnection {
         })
     }
 
+    /// `session.rename` (G2) — receipted live-session rename, the exact
+    /// `session.select_model` shape: normalization here, durability in the
+    /// store's one transaction, receipt replay BEFORE validation so a lost
+    /// response stays recoverable, and the same worker-generation fence.
+    async fn session_rename(
+        &self,
+        request_id: RequestId,
+        command_id: CommandId,
+        session_id: SessionId,
+        worker_generation: u64,
+        title: Option<String>,
+    ) -> Result<(), SessionHubError> {
+        if command_id.as_str().trim().is_empty() {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "session rename needs a command id",
+                false,
+                None,
+            );
+        }
+        let title = normalize_session_title(title);
+        let request_json = serde_json::to_string(&serde_json::json!({
+            "session_id": &session_id,
+            "worker_generation": worker_generation,
+            "title": &title,
+        }))
+        .map_err(|error| {
+            SessionHubError::Task(format!("cannot encode session-rename coordinates: {error}"))
+        })?;
+        let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
+
+        // Receipt replay precedes validation so a lost response remains
+        // recoverable even after metadata changes.
+        match self
+            .hub
+            .session_rename_receipt(&command_id, &request_digest, &request_json)
+            .await
+        {
+            Ok(Some(renamed)) => return self.respond_session_renamed(request_id, renamed),
+            Ok(None) => {}
+            Err(SessionHubError::Store(error)) => {
+                return self.respond_turn_error(request_id, error);
+            }
+            Err(error) => return Err(error),
+        }
+
+        let command = SessionRenameCommand {
+            command_id: command_id.0,
+            request_digest,
+            request_json,
+            session_id,
+            worker_generation,
+            title,
+            only_if_untitled: false,
+            event_id: EventId::new(random_id("session-renamed")?),
+            device_id: self.hub.inner.device_id.clone(),
+        };
+        let renamed = match self.hub.rename_session(command).await {
+            Ok(SessionRenameOutcome::Committed { renamed, .. })
+            | Ok(SessionRenameOutcome::IdempotentReplay { renamed }) => renamed,
+            Ok(SessionRenameOutcome::Skipped) => {
+                // The guard is auto-title-only; an explicit rename never
+                // sets it, so this arm is unreachable by construction.
+                return Err(SessionHubError::Task(
+                    "explicit session rename cannot be skipped".into(),
+                ));
+            }
+            Err(SessionHubError::Store(error)) => {
+                return self.respond_turn_error(request_id, error);
+            }
+            Err(error) => return Err(error),
+        };
+        self.respond_session_renamed(request_id, renamed)
+    }
+
+    fn respond_session_renamed(
+        &self,
+        request_id: RequestId,
+        renamed: RenamedSession,
+    ) -> Result<(), SessionHubError> {
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::SessionRename {
+                session_id: renamed.session_id,
+                title: renamed.title,
+                renamed_seq: renamed.renamed_seq,
+                worker_generation: renamed.worker_generation,
+            },
+        })
+    }
+
+    /// G2 auto-title: on the FIRST main-timeline accept of an untitled
+    /// session, journal the same `session_renamed` fact through the same
+    /// actor/store lane with an INTERNAL per-session command id — the
+    /// receipt makes it at-most-once forever, and the store-side
+    /// `only_if_untitled` guard makes overwrite impossible even under an
+    /// explicit-rename race. Best-effort by design: a failed auto-title
+    /// must never fail the already-committed turn.
+    async fn maybe_auto_title(&self, session_id: &SessionId, slug: String) {
+        let Ok(Some(metadata)) = self.hub.session_metadata(session_id).await else {
+            return;
+        };
+        if metadata.title.is_some() {
+            return;
+        }
+        // Generation- and title-free coordinates: the SAME digest across
+        // retries and daemon restarts, so the receipt dedupes forever.
+        let Ok(request_json) = serde_json::to_string(&serde_json::json!({
+            "session_id": session_id,
+            "auto_title": true,
+        })) else {
+            return;
+        };
+        let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
+        let Ok(event_id) = random_id("auto-title") else {
+            return;
+        };
+        let command = SessionRenameCommand {
+            command_id: format!("auto-title-{session_id}"),
+            request_digest,
+            request_json,
+            session_id: session_id.clone(),
+            worker_generation: self.hub.inner.store.worker_generation(),
+            title: Some(slug),
+            only_if_untitled: true,
+            event_id: EventId::new(event_id),
+            device_id: self.hub.inner.device_id.clone(),
+        };
+        let _ = self.hub.rename_session(command).await;
+    }
+
     async fn agent_message(
         &self,
         request_id: RequestId,
@@ -2841,6 +3003,14 @@ impl HubConnection {
             .await
         {
             Ok(Some(accepted)) => {
+                // G2: a replayed first-accept still gets its auto-title —
+                // the internal receipt makes the retry harmless, and a
+                // crash between the original accept and its auto-title
+                // would otherwise leave the session unnamed forever.
+                if accepted.first_user_turn {
+                    self.maybe_auto_title(&session_id, auto_title_slug(&text))
+                        .await;
+                }
                 if accepted.worker_generation == self.hub.inner.store.worker_generation()
                     && let Err(error) = self.hub.worker_manager()?.submit(accepted.clone()).await
                 {
@@ -2866,6 +3036,9 @@ impl HubConnection {
                 );
             }
         }
+        // Captured before `text` moves into the acceptance command; only a
+        // committed FIRST accept consumes it (G2 auto-title).
+        let first_turn_slug = auto_title_slug(&text);
         let command = TurnAcceptCommand {
             command_id: command_id.0,
             request_digest,
@@ -2891,6 +3064,13 @@ impl HubConnection {
             }
             Err(error) => return Err(error),
         };
+        // G2 auto-title, between the committed acceptance and the worker
+        // handoff so the config fact lands ahead of any run movement (the
+        // F3 head-CAS tolerance covers a later interleave anyway).
+        if accepted.first_user_turn {
+            self.maybe_auto_title(&accepted.session_id, first_turn_slug)
+                .await;
+        }
         // Durable-before-provider: the manager sees this only after the actor
         // committed and synchronously published the acceptance transaction.
         if let Err(error) = self.hub.worker_manager()?.submit(accepted.clone()).await {
@@ -3480,14 +3660,21 @@ impl HubConnection {
                 session_summary_truth(&self.hub.inner.store, session_id, head_seq).await?;
             let (footprint_tokens, footprint_truth) =
                 summary_footprint_fields(turns, footprint.as_ref());
+            let metadata = self.hub.inner.store.session_metadata(session_id).await?;
+            // G2: the committed title rides the summary top-level so
+            // rosters name rows without decoding metadata.
+            let title = metadata
+                .as_ref()
+                .and_then(|metadata| metadata.title.clone());
             sessions.push(SessionSummary {
                 session_id: session_id.clone(),
                 head_seq,
                 worker_generation: self.hub.inner.store.worker_generation(),
-                metadata: self.hub.inner.store.session_metadata(session_id).await?,
+                metadata,
                 turn_count: Some(turns),
                 footprint_tokens,
                 footprint_truth,
+                title,
             });
         }
         let next_cursor = has_more
@@ -4026,6 +4213,42 @@ fn standard_base64_decoded_len(encoded: &str) -> Result<usize, &'static str> {
     Ok(bytes.len() / 4 * 3 - padding)
 }
 
+/// The ONE title-normalization seam (G2): control characters stripped,
+/// trimmed, capped at 80 characters, empty collapses to `None`. The store
+/// transaction re-asserts these bounds.
+fn normalize_session_title(title: Option<String>) -> Option<String> {
+    let cleaned: String = title?.chars().filter(|c| !c.is_control()).collect();
+    let capped: String = cleaned.trim().chars().take(80).collect();
+    let capped = capped.trim_end();
+    if capped.is_empty() {
+        None
+    } else {
+        Some(capped.to_owned())
+    }
+}
+
+/// Daemon-side mirror of the TUI's `slug_name` (G2 auto-title): first three
+/// whitespace words, joined by `-`, lowercased, `[a-z0-9-]` only, at most
+/// 28 characters, fallback `session`.
+fn auto_title_slug(text: &str) -> String {
+    let joined = text
+        .split_whitespace()
+        .take(3)
+        .collect::<Vec<_>>()
+        .join("-")
+        .to_lowercase();
+    let slug: String = joined
+        .chars()
+        .filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-')
+        .take(28)
+        .collect();
+    if slug.is_empty() {
+        "session".to_owned()
+    } else {
+        slug
+    }
+}
+
 async fn validate_turn_attachments(
     store: &haider_core::SqliteStoreHandle,
     attachments: &[haider_protocol::tool::AttachmentBlock],
@@ -4047,6 +4270,10 @@ async fn validate_turn_attachments(
     let mut total_bytes = 0_usize;
     for (index, attachment) in attachments.iter().enumerate() {
         let index_u32 = u32::try_from(index).unwrap_or(u32::MAX);
+        // Set only for File blocks: the daemon re-verifies the bytes decode
+        // as UTF-8 after the CAS read below (G2 — the client gate is not
+        // trusted; a provider must never receive undecodable "text").
+        let mut requires_utf8 = false;
         let artifact = match attachment {
             haider_protocol::tool::AttachmentBlock::Image { artifact, mime, .. } => {
                 if !IMAGE_ATTACHMENT_MIME_ALLOWLIST.contains(&mime.as_str()) {
@@ -4064,6 +4291,27 @@ async fn validate_turn_attachments(
                 artifact
             }
             haider_protocol::tool::AttachmentBlock::PastedText { artifact, .. } => artifact,
+            haider_protocol::tool::AttachmentBlock::File { artifact, name, .. } => {
+                // Name sanity (G2): a display basename, never a path and
+                // never terminal-control bytes. The cap mirrors the client
+                // loader; violation is a client bug, refused honestly.
+                if name.is_empty()
+                    || name.chars().count() > 120
+                    || name.chars().any(char::is_control)
+                    || name.contains('/')
+                    || name.contains('\\')
+                {
+                    return Err(AttachmentValidationFailure {
+                        code: ERROR_CODE_INVALID_ARGUMENT,
+                        message: format!(
+                            "attachment {index} declares an invalid file name; names are non-empty basenames of at most 120 characters with no control characters"
+                        ),
+                        data: None,
+                    });
+                }
+                requires_utf8 = true;
+                artifact
+            }
             haider_protocol::tool::AttachmentBlock::Skill { name, .. } => {
                 return Err(AttachmentValidationFailure {
                     code: ERROR_CODE_INVALID_ARGUMENT,
@@ -4095,6 +4343,15 @@ async fn validate_turn_attachments(
                     actual_bytes,
                     max_bytes: MAX_ATTACHMENT_BYTES as u64,
                 }),
+            });
+        }
+        if requires_utf8 && std::str::from_utf8(&bytes).is_err() {
+            return Err(AttachmentValidationFailure {
+                code: ERROR_CODE_INVALID_ARGUMENT,
+                message: format!(
+                    "attachment {index} is not UTF-8 text; only UTF-8 text files can be attached (unsupported_attachment_encoding)"
+                ),
+                data: None,
             });
         }
         total_bytes = total_bytes.saturating_add(bytes.len());

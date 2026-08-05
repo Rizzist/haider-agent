@@ -862,6 +862,118 @@ async fn mime_allowlist_enforced_at_acceptance() {
     store.close().await.expect("store closes");
 }
 
+/// LAW (LA2 daemon half + LA3 name sanity, G2): the daemon re-gates File
+/// attachments independently of the client — a CAS payload that is not
+/// UTF-8 is refused at ACCEPTANCE (never at run), and a name that is empty,
+/// over 120 characters, path-shaped, or control-laced is refused before any
+/// CAS read. The journal head never advances for a refused submit.
+///
+/// MUTATION CHECK: remove the `requires_utf8` decode check or the name
+/// sanity gate in `validate_turn_attachments`. Expected RUNTIME failure:
+/// the matching submit below is durably accepted (head advances) instead of
+/// returning `invalid_argument`.
+#[tokio::test]
+async fn file_attachment_utf8_and_name_sanity_enforced_at_acceptance() {
+    let (_root, store, hub) = open_hub(None, 8).await;
+    let sink = Arc::new(CollectSink::default());
+    let connection = hub
+        .open_connection(
+            capabilities(),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection");
+    let session_id = SessionId::new("attachment-file-validation");
+    attach_control_session(&hub, &store, &connection, &sink, &session_id).await;
+
+    // A verified CAS object that is NOT UTF-8: the client gate is not
+    // trusted — the daemon decodes and refuses.
+    let ResponseBody::ArtifactPut {
+        artifact: binary_ref,
+        ..
+    } = upload_bytes(
+        &connection,
+        &sink,
+        "put-binary-file",
+        &[0xff, 0xfe, 0x00, 0x80],
+    )
+    .await
+    else {
+        panic!("binary fixture upload succeeds");
+    };
+    connection
+        .request(
+            RequestId::new("submit-non-utf8-file"),
+            RequestBody::TurnSubmit {
+                command_id: CommandId::new("submit-non-utf8-file"),
+                session_id: session_id.clone(),
+                worker_generation: store.worker_generation(),
+                text: "read this file".into(),
+                attachments: vec![AttachmentBlock::File {
+                    artifact: binary_ref,
+                    name: "blob.bin".into(),
+                    lines: 1,
+                }],
+                mode: DeliveryMode::Queue,
+            },
+        )
+        .await
+        .expect("non-UTF-8 submit routes");
+    assert!(matches!(
+        sink.next().await,
+        WireFrame::Response {
+            body: ResponseBody::Error { ref code, ref message, .. },
+            ..
+        } if code == haider_rpc::ERROR_CODE_INVALID_ARGUMENT && message.contains("not UTF-8")
+    ));
+
+    // Name sanity: a path-shaped name is refused before any CAS read.
+    let ResponseBody::ArtifactPut {
+        artifact: text_ref, ..
+    } = upload_bytes(&connection, &sink, "put-text-file", b"plain text").await
+    else {
+        panic!("text fixture upload succeeds");
+    };
+    for (label, name) in [
+        ("submit-path-name", "../etc/passwd".to_owned()),
+        ("submit-empty-name", String::new()),
+        ("submit-control-name", "notes\u{7}.md".to_owned()),
+        ("submit-long-name", "n".repeat(121)),
+    ] {
+        connection
+            .request(
+                RequestId::new(label),
+                RequestBody::TurnSubmit {
+                    command_id: CommandId::new(label),
+                    session_id: session_id.clone(),
+                    worker_generation: store.worker_generation(),
+                    text: "read this file".into(),
+                    attachments: vec![AttachmentBlock::File {
+                        artifact: text_ref.clone(),
+                        name,
+                        lines: 1,
+                    }],
+                    mode: DeliveryMode::Queue,
+                },
+            )
+            .await
+            .expect("bad-name submit routes");
+        assert!(matches!(
+            sink.next().await,
+            WireFrame::Response {
+                body: ResponseBody::Error { ref code, ref message, .. },
+                ..
+            } if code == haider_rpc::ERROR_CODE_INVALID_ARGUMENT
+                && message.contains("invalid file name")
+        ));
+    }
+    assert_eq!(store.latest_seq(&session_id).await.expect("head"), 1);
+
+    connection.close().await.expect("connection closes");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
 /// MUTATION CHECK: validate only persisted worker_generation and omit the
 /// active lease token. Expected failure: the superseded first worker appends
 /// successfully in the same daemon generation.

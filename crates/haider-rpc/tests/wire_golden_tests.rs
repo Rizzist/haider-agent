@@ -1401,16 +1401,17 @@ fn device_discovery_goldens_are_additive_and_tolerance_re_proved() {
         })
         .expect("D1 welcome frame in the golden transcript");
     // D1's six frames stay contiguous at their original offset; T1 then
-    // appended seven transcription-secret frames and U1 three usage-report
-    // frames AFTER them — each append pinned by its own additive law — so
-    // D1 ends at the NEXT appended welcome (whichever wave owns it) and
-    // nothing before `d1_start` can have moved.
+    // appended seven transcription-secret frames, U1 three usage-report
+    // frames, and G2 three session-rename frames AFTER them — each append
+    // pinned by its own additive law — so D1 ends at the NEXT appended
+    // welcome (whichever wave owns it) and nothing before `d1_start` can
+    // have moved.
     assert_eq!(
         frames.len() - d1_start,
-        6 + 7 + 3,
+        6 + 7 + 3 + 3,
         "six D1 frames, then T1's seven transcription frames, then U1's \
-         three usage frames — the accounted tail pins that nothing before \
-         d1_start moved"
+         three usage frames, then G2's three session-rename frames — the \
+         accounted tail pins that nothing before d1_start moved"
     );
     for frame in &frames[d1_start..d1_start + 6] {
         let encoded = ws_codec::encode(frame, TEST_FRAME_LIMIT).expect("encode D1 frame");
@@ -1640,6 +1641,132 @@ fn model_selection_refusals_are_typed_and_golden() {
     );
 }
 
+/// LAW (G2 wire): the session-rename family appends exactly three frames at
+/// the END of the golden transcript (welcome advertising
+/// `session_rename_v1`, the rename request, the committed response); a
+/// title-less request (a CLEAR) keeps `title` OFF the wire in both
+/// directions; and `SessionSummary.title` is additive — absent for older
+/// daemons, tolerated by older readers.
+///
+/// MUTATION CHECK: serialize `title: null`, rename the `session.rename`
+/// method tag, or make `title` required. Expected RUNTIME failure: the
+/// exact golden strings or the tolerant decodes below.
+#[test]
+fn session_rename_frames_are_additive_and_golden() {
+    use haider_rpc::{FEATURE_SESSION_RENAME_V1, SessionSummary};
+
+    // The feature bit is a pinned wire literal.
+    assert_eq!(FEATURE_SESSION_RENAME_V1, "session_rename_v1");
+
+    // The G2 frames are the transcript tail: three frames, append-only.
+    let frames = transcript();
+    let g2_start = frames
+        .iter()
+        .position(|frame| {
+            matches!(
+                frame,
+                WireFrame::Welcome(welcome)
+                    if welcome.features.contains(FEATURE_SESSION_RENAME_V1)
+            )
+        })
+        .expect("G2 welcome frame in the golden transcript");
+    assert_eq!(
+        frames.len() - g2_start,
+        3,
+        "G2 appends exactly three frames"
+    );
+
+    // Exact golden bytes for the titled request/response pair.
+    let request = WireFrame::Request {
+        request_id: haider_rpc::RequestId::new("request-rename"),
+        body: RequestBody::SessionRename {
+            command_id: haider_rpc::CommandId::new("command-rename"),
+            session_id: haider_rpc::haider_protocol::ids::SessionId::new("session-1"),
+            worker_generation: 7,
+            title: Some("Parser rewrite".into()),
+        },
+    };
+    let encoded = serde_json::to_string(&request).expect("encode rename request");
+    assert_eq!(
+        encoded,
+        r#"{"v":1,"kind":"request","request_id":"request-rename","body":{"method":"session.rename","command_id":"command-rename","session_id":"session-1","worker_generation":7,"title":"Parser rewrite"}}"#
+    );
+    assert_eq!(
+        serde_json::from_str::<WireFrame>(&encoded).expect("decode rename request"),
+        request
+    );
+
+    // A CLEAR keeps `title` OFF the wire entirely (no `title: null`).
+    let clear = WireFrame::Request {
+        request_id: haider_rpc::RequestId::new("request-rename-clear"),
+        body: RequestBody::SessionRename {
+            command_id: haider_rpc::CommandId::new("command-rename-clear"),
+            session_id: haider_rpc::haider_protocol::ids::SessionId::new("session-1"),
+            worker_generation: 7,
+            title: None,
+        },
+    };
+    let encoded = serde_json::to_string(&clear).expect("encode rename clear");
+    assert_eq!(
+        encoded,
+        r#"{"v":1,"kind":"request","request_id":"request-rename-clear","body":{"method":"session.rename","command_id":"command-rename-clear","session_id":"session-1","worker_generation":7}}"#
+    );
+    assert_eq!(
+        serde_json::from_str::<WireFrame>(&encoded).expect("decode rename clear"),
+        clear
+    );
+
+    let response = WireFrame::Response {
+        request_id: haider_rpc::RequestId::new("request-rename"),
+        body: ResponseBody::SessionRename {
+            session_id: haider_rpc::haider_protocol::ids::SessionId::new("session-1"),
+            title: Some("Parser rewrite".into()),
+            renamed_seq: 61,
+            worker_generation: 7,
+        },
+    };
+    let encoded = serde_json::to_string(&response).expect("encode rename response");
+    assert_eq!(
+        encoded,
+        r#"{"v":1,"kind":"response","request_id":"request-rename","body":{"method":"session.rename","session_id":"session-1","title":"Parser rewrite","renamed_seq":61,"worker_generation":7}}"#
+    );
+    assert_eq!(
+        serde_json::from_str::<WireFrame>(&encoded).expect("decode rename response"),
+        response
+    );
+
+    // To an older peer the method is just another tolerated unknown, and
+    // unknown future fields are ignored by a newer one.
+    let future_view = r#"{"v":1,"kind":"request","request_id":"request-rename-future","body":{"method":"session.rename","command_id":"c","session_id":"s","worker_generation":1,"title":"t","future_field":true}}"#;
+    assert!(serde_json::from_str::<WireFrame>(future_view).is_ok());
+
+    // SessionSummary.title is additive: absent stays OFF the wire, and a
+    // summary WITH a title round-trips.
+    let bare = serde_json::to_value(SessionSummary {
+        session_id: haider_rpc::haider_protocol::ids::SessionId::new("session-1"),
+        head_seq: 9,
+        worker_generation: 7,
+        metadata: None,
+        turn_count: None,
+        footprint_tokens: None,
+        footprint_truth: None,
+        title: None,
+    })
+    .expect("encode bare summary");
+    assert!(
+        bare.get("title").is_none(),
+        "absent title must be omitted: {bare}"
+    );
+    let titled: SessionSummary = serde_json::from_value(serde_json::json!({
+        "session_id": "session-1",
+        "head_seq": 9,
+        "worker_generation": 7,
+        "title": "Parser rewrite",
+    }))
+    .expect("decode titled summary");
+    assert_eq!(titled.title.as_deref(), Some("Parser rewrite"));
+}
+
 /// The T1 transcription-secret family obeys the same additive rules as
 /// every v1 method: appended at the transcript END, kind-tagged exact
 /// method names, unknown-field tolerance, redacted secrets, and absent
@@ -1656,9 +1783,10 @@ fn transcription_secret_frames_are_additive_and_redacted() {
     assert_eq!(haider_rpc::FEATURE_TRANSCRIPTION_V1, "transcription_v1");
 
     // The seven T1 frames sit directly before U1's three appended usage
-    // frames at the transcript tail (U1's own law pins those).
+    // frames and G2's three session-rename frames at the transcript tail
+    // (each later wave's own law pins its append).
     let frames = transcript();
-    let tail = &frames[frames.len() - 10..frames.len() - 3];
+    let tail = &frames[frames.len() - 13..frames.len() - 6];
     let methods: Vec<String> = tail
         .iter()
         .map(|frame| {
@@ -1768,7 +1896,9 @@ fn usage_report_goldens_are_additive_normalized_and_secret_free() {
     // The feature bit is a pinned wire literal.
     assert_eq!(FEATURE_USAGE_REPORT_V1, "usage_report_v1");
 
-    // The U1 frames are the transcript tail: three frames, append-only.
+    // The U1 frames were appended at the then-END of the transcript: three
+    // frames, append-only; G2 later appended three session-rename frames
+    // strictly AFTER them (pinned by G2's own law).
     let frames = transcript();
     let u1_start = frames
         .iter()
@@ -1782,10 +1912,10 @@ fn usage_report_goldens_are_additive_normalized_and_secret_free() {
         .expect("U1 welcome frame in the golden transcript");
     assert_eq!(
         frames.len() - u1_start,
-        3,
-        "U1 appends exactly three frames"
+        3 + 3,
+        "three U1 frames, then G2's three session-rename frames"
     );
-    for frame in &frames[u1_start..] {
+    for frame in &frames[u1_start..u1_start + 3] {
         let encoded = ws_codec::encode(frame, TEST_FRAME_LIMIT).expect("encode U1 frame");
         // Key positions only: `"api_key"` the AuthMethod VALUE is legitimate;
         // a key named like a secret is not.

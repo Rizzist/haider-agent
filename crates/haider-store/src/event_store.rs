@@ -254,6 +254,53 @@ pub enum SessionSelectModelOutcome {
     },
 }
 
+/// Secret-free coordinates for one atomic live-session rename (G2).
+///
+/// `title` is the NORMALIZED value — the daemon trims, strips control
+/// characters, caps at 80 chars, and collapses empty to `None` before this
+/// command exists; the store applies it verbatim. `only_if_untitled` is the
+/// auto-title guard: when set, an existing title turns the whole command
+/// into a durable no-op ([`SessionRenameOutcome::Skipped`]) — auto-title
+/// must never overwrite.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRenameCommand {
+    pub command_id: String,
+    pub request_digest: String,
+    pub request_json: String,
+    pub session_id: SessionId,
+    pub worker_generation: u64,
+    pub title: Option<String>,
+    pub only_if_untitled: bool,
+    pub event_id: EventId,
+    pub device_id: DeviceId,
+}
+
+/// Stable response stored in the committed `session.rename` receipt.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RenamedSession {
+    pub session_id: SessionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub renamed_seq: u64,
+    pub worker_generation: u64,
+}
+
+/// Result of the atomic title-update/event/receipt transaction.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SessionRenameOutcome {
+    Committed {
+        renamed: RenamedSession,
+        envelope: Box<RawEnvelope>,
+    },
+    IdempotentReplay {
+        renamed: RenamedSession,
+    },
+    /// `only_if_untitled` found an existing title: nothing was claimed,
+    /// journaled, or updated. Only the internal auto-title path can see
+    /// this — an explicit rename never sets the guard.
+    Skipped,
+}
+
 /// Secret-free coordinates for atomically accepting a live turn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnAcceptCommand {
@@ -293,6 +340,13 @@ pub struct AcceptedTurn {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch_id: Option<BranchId>,
     pub disposition: TurnAdmissionDisposition,
+    /// Additive G2 fact: this acceptance committed the session's FIRST
+    /// main-timeline user node (its tree parent was empty). The daemon's
+    /// auto-title fires only on such accepts. `false` stays off the wire so
+    /// pre-G2 receipt bytes are unchanged, and legacy receipts replay as
+    /// `false` — a replay from before the feature never titles.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub first_user_turn: bool,
 }
 
 /// Result of the atomic turn-acceptance transaction.
@@ -1271,6 +1325,9 @@ impl Store {
             max_tokens: command.max_tokens,
             system_prompt_version: Some(command.system_prompt_version.clone()),
             permission_overrides: command.permission_overrides,
+            // G2: sessions are born untitled; the daemon-side auto-title
+            // (first accept) or an explicit `session.rename` fills this.
+            title: None,
             created_at_ms,
         };
         let metadata_json = serde_json::to_string(&metadata).map_err(|error| {
@@ -1726,6 +1783,168 @@ impl Store {
         })
     }
 
+    /// Looks up a committed `session.rename` response before session,
+    /// generation, or metadata validation (R2 response-loss replay).
+    pub fn session_rename_receipt(
+        &self,
+        command_id: &str,
+        request_digest: &str,
+        request_json: &str,
+    ) -> StoreResult<Option<RenamedSession>> {
+        validate_command_identity(command_id, request_digest, request_json)?;
+        let connection = self.connection()?;
+        lookup_command_response(
+            &connection,
+            command_id,
+            "session.rename",
+            request_digest,
+            request_json,
+            "session-rename",
+        )
+    }
+
+    /// Atomically applies one NORMALIZED rename (G2): updates the session's
+    /// typed metadata title (every other field preserved), appends the
+    /// `session_renamed` fact, and finalizes the command receipt. Any late
+    /// failure rolls all three back — the exact `select_session_model`
+    /// shape, including the worker-generation fence.
+    ///
+    /// The daemon owns normalization/validation; this transaction owns only
+    /// durability. With `only_if_untitled` set (auto-title), an existing
+    /// title short-circuits to [`SessionRenameOutcome::Skipped`] BEFORE any
+    /// receipt claim — auto-title never overwrites and leaves no trace when
+    /// it yields.
+    pub fn rename_session(
+        &self,
+        command: &SessionRenameCommand,
+    ) -> StoreResult<SessionRenameOutcome> {
+        validate_command_identity(
+            &command.command_id,
+            &command.request_digest,
+            &command.request_json,
+        )?;
+        if command.worker_generation != self.worker_generation {
+            return Err(stale_generation(
+                command.worker_generation,
+                self.worker_generation,
+            ));
+        }
+        if let Some(title) = &command.title
+            && (title.trim().is_empty()
+                || title.chars().count() > 80
+                || title.chars().any(char::is_control))
+        {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "session rename must carry a normalized title",
+                false,
+            ));
+        }
+
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        if let Some(renamed) = lookup_command_response(
+            &transaction,
+            &command.command_id,
+            "session.rename",
+            &command.request_digest,
+            &command.request_json,
+            "session-rename",
+        )? {
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(SessionRenameOutcome::IdempotentReplay { renamed });
+        }
+        require_typed_session(&transaction, &command.session_id)?;
+        let metadata_json: String = transaction
+            .query_row(
+                "SELECT meta_json FROM sessions WHERE id = ?1",
+                [command.session_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(map_sqlite_error)?;
+        let Some(mut metadata) = decode_session_metadata(&command.session_id, &metadata_json)?
+        else {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "legacy session has no live-worker metadata",
+                false,
+            ));
+        };
+        if command.only_if_untitled && metadata.title.is_some() {
+            return Ok(SessionRenameOutcome::Skipped);
+        }
+        metadata.title = command.title.clone();
+        let updated_metadata = serde_json::to_string(&metadata).map_err(|error| {
+            store_error(
+                ErrorCode::InvalidArgument,
+                format!("cannot serialize session metadata: {error}"),
+                false,
+            )
+        })?;
+
+        let now = now_ms()?;
+        claim_pending_receipt(
+            &transaction,
+            &command.command_id,
+            "session.rename",
+            &command.request_digest,
+            &command.request_json,
+            now,
+        )?;
+        let updated_rows = transaction
+            .execute(
+                "UPDATE sessions SET meta_json = ?2 WHERE id = ?1",
+                params![command.session_id.as_str(), updated_metadata],
+            )
+            .map_err(map_sqlite_error)?;
+        if updated_rows != 1 {
+            return Err(corrupt("session row disappeared during rename"));
+        }
+        let mut envelopes = vec![unstamped_raw_command_envelope(
+            command.event_id.clone(),
+            &command.session_id,
+            None,
+            None,
+            command.device_id.clone(),
+            self.worker_generation,
+            haider_protocol::session::SessionConfigEventPayload::session_renamed_value(
+                command.title.clone(),
+            )
+            .map_err(|error| {
+                store_error(
+                    ErrorCode::InvalidArgument,
+                    format!("cannot serialize session-renamed payload: {error}"),
+                    false,
+                )
+            })?,
+            PromptRender::Omit,
+        )?];
+        append_transaction_envelopes(&transaction, &command.session_id, now, &mut envelopes)?;
+        let renamed = RenamedSession {
+            session_id: command.session_id.clone(),
+            title: command.title.clone(),
+            renamed_seq: envelopes[0].seq,
+            worker_generation: self.worker_generation,
+        };
+        finalize_command_receipt(
+            &transaction,
+            &command.command_id,
+            command.session_id.as_str(),
+            None,
+            Some(renamed.renamed_seq),
+            &renamed,
+            now,
+            "session-rename",
+        )?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(SessionRenameOutcome::Committed {
+            renamed,
+            envelope: Box::new(envelopes.remove(0)),
+        })
+    }
+
     /// Reads one current named-ref descriptor. `None` remains the implicit
     /// legacy/main branch and therefore has no row.
     pub fn branch(
@@ -2060,6 +2279,14 @@ impl Store {
                 command.agent_id.as_ref(),
             )?
         };
+        // G2 auto-title coordinate: the session's FIRST main-timeline user
+        // node is exactly the one committed with no tree parent on the
+        // main lane (a named branch forks from an existing node; a steer
+        // and a subagent turn always have ancestry).
+        let first_user_turn = command.agent_id.is_none()
+            && command.branch_id.is_none()
+            && !same_run_steer
+            && parent.is_none();
         let user_node = TreeNode {
             node: NodeId::new(format!("node-{}", command.user_event_id)),
             parent,
@@ -2189,6 +2416,7 @@ impl Store {
             worker_generation: self.worker_generation,
             branch_id: command.branch_id.clone(),
             disposition,
+            first_user_turn,
         };
         finalize_command_receipt(
             &transaction,

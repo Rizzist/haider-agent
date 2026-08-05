@@ -209,6 +209,9 @@ fn content_block(
         Block::Attachment(AttachmentBlock::PastedText { artifact, .. }) => Err(invalid_request(
             format!("pasted-text attachment `{artifact}` was not resolved by the prompt compiler"),
         )),
+        Block::Attachment(AttachmentBlock::File { artifact, .. }) => Err(invalid_request(format!(
+            "file attachment `{artifact}` was not resolved by the prompt compiler"
+        ))),
         Block::Attachment(AttachmentBlock::Skill { name, .. }) => Err(invalid_request(format!(
             "skill attachment `{name}` was not resolved by the prompt compiler"
         ))),

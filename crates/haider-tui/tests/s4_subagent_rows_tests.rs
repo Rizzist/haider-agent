@@ -349,6 +349,7 @@ fn summary(session_id: &str, head_seq: u64, tokens: u64) -> haider_rpc::SessionS
         turn_count: Some(1),
         footprint_tokens: Some(tokens),
         footprint_truth: Some(ContextFootprintTruth::Exact),
+        title: None,
     }
 }
 

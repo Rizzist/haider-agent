@@ -68,6 +68,10 @@ fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> Qu
 /// MUTATION CHECK: remove `FEATURE_USAGE_REPORT_V1`. Expected RUNTIME
 /// failure: clients cannot discover the served cross-provider `usage.report`
 /// snapshot (U1).
+///
+/// MUTATION CHECK: remove `FEATURE_SESSION_RENAME_V1`. Expected RUNTIME
+/// failure: clients cannot discover the served receipted `session.rename`
+/// surface (G2) and the TUI keeps its stale-daemon notice forever.
 #[test]
 fn welcome_features_pin_served_management_families() {
     assert_eq!(
@@ -91,6 +95,7 @@ fn welcome_features_pin_served_management_families() {
             FEATURE_PROVIDER_REMOVE_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_MODEL_SELECT_V1.to_owned(),
             FEATURE_SESSION_MUTATION_V1.to_owned(),
+            haider_rpc::FEATURE_SESSION_RENAME_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_OBSERVE_V1.to_owned(),
             FEATURE_SESSION_PERMISSION_OVERRIDES_V1.to_owned(),
             FEATURE_SHELL_EXEC_V1.to_owned(),

@@ -176,6 +176,35 @@ pub(super) async fn run_session_actor(
                 }
                 let _ = completed.send(result);
             }
+            ActorCommand::Rename { command, completed } => {
+                // G2: the metadata title update, session_renamed fact, and
+                // R2 receipt are one transaction; only the committed fact
+                // is publishable, and the serialized arm advances the
+                // actor's in-memory head so the compaction head CAS keeps
+                // observing journal truth (a store-direct rename desyncs
+                // it). A Skipped auto-title moves nothing.
+                let result = store.rename_session(command).await;
+                if let Ok(haider_core::SessionRenameOutcome::Committed { envelope, .. }) = &result {
+                    head = envelope.seq;
+                    authority_epoch = envelope.authority_epoch;
+                    observer.observe(HubObservation::Persisted {
+                        session_id: session_id.clone(),
+                        through_seq: head,
+                    });
+                    publish(
+                        &mut attachments,
+                        std::slice::from_ref(envelope.as_ref()),
+                        catch_up_byte_budget,
+                        &metrics,
+                        &hooks,
+                    );
+                    observer.observe(HubObservation::Published {
+                        session_id: session_id.clone(),
+                        through_seq: head,
+                    });
+                }
+                let _ = completed.send(result);
+            }
             ActorCommand::AcceptTurn { command, completed } => {
                 // MUTATION CHECK: publishing before this durable transaction
                 // returns makes live clients observe an acceptance a restart

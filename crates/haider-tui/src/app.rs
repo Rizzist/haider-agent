@@ -2113,6 +2113,11 @@ pub enum AppRequest {
         model: String,
         provider: String,
     },
+    /// G2: receipted live-session rename (`session.rename`) — `/rename`
+    /// on an attached session. The daemon normalizes the title; the name
+    /// moves only on the correlated NORMALIZED reply (optimism forbidden,
+    /// same law as [`Self::SelectModel`]).
+    Rename { session: SessionId, title: String },
     /// Start an OAuth add flow (`account.oauth_start`) for the card.
     OAuthAddStart {
         provider: String,
@@ -3171,9 +3176,10 @@ impl AppModel {
         dropped
     }
 
-    /// `/attach <path>` (B4b): chip the draft with one image, uploaded
-    /// ahead of the submit. Every refusal is an honest notice; the read
-    /// itself is shell-owned ([`AppRequest::AttachRead`]).
+    /// `/attach <path>` (B4b + G2): chip the draft with one image or one
+    /// UTF-8 text file, uploaded ahead of the submit. Every refusal is an
+    /// honest notice; the read itself is shell-owned
+    /// ([`AppRequest::AttachRead`]).
     fn attach_command(&mut self, remainder: &str) {
         if self.screen != Screen::Session {
             self.flash = Some("· /attach — session only".to_owned());
@@ -3198,7 +3204,7 @@ impl AppModel {
         }
         let path = remainder.trim();
         if path.is_empty() {
-            self.flash = Some("· /attach — give an image path".to_owned());
+            self.flash = Some("· /attach — give a file path".to_owned());
             self.dirty = true;
             return;
         }
@@ -3210,6 +3216,74 @@ impl AppModel {
         self.requests.push(AppRequest::AttachRead {
             path: path.to_owned(),
         });
+        self.dirty = true;
+    }
+
+    /// `/rename <name>` (G2): rename the attached session. Live rides the
+    /// receipted `session.rename` — the header moves only on the daemon's
+    /// NORMALIZED reply; demo renames locally (its world is local by
+    /// design, like the model picker). Bare `/rename` is a usage flash —
+    /// clearing is deliberately not offered here.
+    fn rename_command(&mut self, remainder: &str) {
+        if self.screen != Screen::Session {
+            self.flash = Some("· /rename — session only".to_owned());
+            self.dirty = true;
+            return;
+        }
+        let title = remainder.trim();
+        if title.is_empty() {
+            self.flash = Some("· /rename — give a name".to_owned());
+            self.dirty = true;
+            return;
+        }
+        if self.mode.fabricates_locally() {
+            self.session_name = Some(title.to_owned());
+            self.flash = Some(format!("· renamed → {title}"));
+            self.dirty = true;
+            return;
+        }
+        // Feature gate: without `session.rename` the daemon cannot commit
+        // a title — the honest stale-daemon notice names the fix.
+        if !self.daemon_serves(haider_rpc::FEATURE_SESSION_RENAME_V1) {
+            self.flash = Some(self.stale_daemon_note("session rename"));
+            self.dirty = true;
+            return;
+        }
+        let Some(session) = self.active_session.clone() else {
+            self.flash = Some("· /rename — no attached session".to_owned());
+            self.dirty = true;
+            return;
+        };
+        self.requests.push(AppRequest::Rename {
+            session,
+            title: title.to_owned(),
+        });
+        self.dirty = true;
+    }
+
+    /// The NORMALIZED title committed (G2): render daemon truth — never an
+    /// echo of the request. The active header updates when the rename hit
+    /// the attached session; a background session's roster row updates in
+    /// place.
+    pub fn apply_renamed(&mut self, session: &SessionId, title: Option<String>) {
+        if self.active_session.as_ref() == Some(session) {
+            self.session_name = title.clone();
+        } else if let Some(entry) = self.sessions.iter_mut().find(|entry| &entry.id == session) {
+            entry.name = title.clone();
+        }
+        self.flash = Some(match &title {
+            Some(title) => format!("· renamed → {title}"),
+            None => "· session name cleared".to_owned(),
+        });
+        self.dirty = true;
+    }
+
+    /// A typed `session.rename` refusal (G2): the public reason reaches the
+    /// session view as an error line plus a flash — never a silent IDLE
+    /// (the F2e law).
+    pub fn rename_failed(&mut self, session: &SessionId, code: &str, message: &str) {
+        self.record_session_error(session, format!("rename failed — {code}: {message}"));
+        self.flash = Some(format!("· rename failed — {code}"));
         self.dirty = true;
     }
 
@@ -7626,6 +7700,7 @@ impl AppModel {
             }
             "branch" => self.branch_command(&remainder),
             "attach" => self.attach_command(&remainder),
+            "rename" => self.rename_command(&remainder),
             "compact" => {
                 // Manual compaction (sim tui.js:1791-1806). Adapted gate:
                 // the sim's single-threaded state writes tolerate /compact
@@ -7838,7 +7913,7 @@ impl AppModel {
             other => {
                 // Known stubs name their wave; typos say so (review r1 P2).
                 let wave = match other {
-                    "fork" | "rename" => Some("the daemon wave (W3)"),
+                    "fork" => Some("the daemon wave (W3)"),
                     "peers" => Some("the mesh wave (post-v0.1)"),
                     "update" => Some("the gates wave (W4)"),
                     _ => None,
@@ -8918,6 +8993,25 @@ impl AppModel {
     ///   ([`crate::session::SessionState::turns`] / `row_tokens`), so a
     ///   checkin AFTER this call still beats a stale summary.
     pub fn note_summary_counts(&mut self, summary: &haider_rpc::SessionSummary) {
+        // G2: the wire title names the row FIRST — the counts gate below
+        // must not starve it. Absence hydrates nothing (an older daemon
+        // omits the field; a live rename reply is the clearing authority).
+        if summary.title.is_some() {
+            if self.active_session.as_ref() == Some(&summary.session_id) {
+                if self.session_name != summary.title {
+                    self.session_name = summary.title.clone();
+                    self.dirty = true;
+                }
+            } else if let Some(entry) = self
+                .sessions
+                .iter_mut()
+                .find(|row| row.id == summary.session_id)
+                && entry.name != summary.title
+            {
+                entry.name = summary.title.clone();
+                self.dirty = true;
+            }
+        }
         if summary.turn_count.is_none() && summary.footprint_tokens.is_none() {
             return;
         }

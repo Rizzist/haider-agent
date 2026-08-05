@@ -216,6 +216,7 @@ fn metadata(cwd: String) -> SessionMetadataV1 {
         max_tokens: 4096,
         system_prompt_version: Some(SystemPromptBuilder::VERSION.into()),
         permission_overrides: None,
+        title: None,
         created_at_ms: 1,
     }
 }

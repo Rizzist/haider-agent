@@ -184,6 +184,7 @@ fn summary(n: usize, head_seq: u64) -> SessionSummary {
         turn_count: None,
         footprint_tokens: None,
         footprint_truth: None,
+        title: None,
     }
 }
 

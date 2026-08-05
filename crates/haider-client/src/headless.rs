@@ -62,6 +62,45 @@ pub struct HeadlessImageAttachment {
     pub mime: String,
 }
 
+/// One UTF-8 text file ready for receipt-free daemon upload (G2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadlessFileAttachment {
+    pub bytes: Vec<u8>,
+    /// Sanitized display BASENAME (never a full path — privacy): ≤ 120
+    /// chars, control characters stripped, `file` when nothing survives.
+    pub name: String,
+    /// Text line count, the chip/wire display figure.
+    pub lines: u32,
+}
+
+/// One loaded attachment of either supported kind (G2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeadlessAttachment {
+    Image(HeadlessImageAttachment),
+    File(HeadlessFileAttachment),
+}
+
+impl HeadlessAttachment {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Image(image) => &image.bytes,
+            Self::File(file) => &file.bytes,
+        }
+    }
+}
+
+impl From<HeadlessImageAttachment> for HeadlessAttachment {
+    fn from(image: HeadlessImageAttachment) -> Self {
+        Self::Image(image)
+    }
+}
+
+impl From<HeadlessFileAttachment> for HeadlessAttachment {
+    fn from(file: HeadlessFileAttachment) -> Self {
+        Self::File(file)
+    }
+}
+
 /// Reads at most the accepted image size plus one byte and identifies the
 /// format from magic bytes rather than the path extension.
 pub fn load_image_attachment(path: &Path) -> Result<HeadlessImageAttachment, HeadlessRunError> {
@@ -98,6 +137,63 @@ pub fn load_image_attachment(path: &Path) -> Result<HeadlessImageAttachment, Hea
     })
 }
 
+/// Reads at most the accepted attachment size plus one byte and validates
+/// strict UTF-8 (G2). PDFs and other binary formats are not supported: a
+/// non-UTF-8 payload is a DISTINCT typed refusal
+/// (`unsupported_attachment_encoding`), never a lossy re-encode.
+pub fn load_text_attachment(path: &Path) -> Result<HeadlessFileAttachment, HeadlessRunError> {
+    let file = std::fs::File::open(path).map_err(|error| HeadlessRunError::Attachment {
+        code: "attachment_io".into(),
+        message: format!("cannot open attachment {}: {error}", path.display()),
+    })?;
+    let mut bytes = Vec::new();
+    file.take((MAX_HEADLESS_ATTACHMENT_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| HeadlessRunError::Attachment {
+            code: "attachment_io".into(),
+            message: format!("cannot read attachment {}: {error}", path.display()),
+        })?;
+    if bytes.len() > MAX_HEADLESS_ATTACHMENT_BYTES {
+        return Err(HeadlessRunError::Attachment {
+            code: "attachment_too_large".into(),
+            message: format!(
+                "attachment {} exceeds the 5 MiB per-attachment limit",
+                path.display()
+            ),
+        });
+    }
+    let text = std::str::from_utf8(&bytes).map_err(|_| HeadlessRunError::Attachment {
+        code: "unsupported_attachment_encoding".into(),
+        message: format!(
+            "attachment {} is not UTF-8 text (PDFs and other binary formats are not supported)",
+            path.display()
+        ),
+    })?;
+    let lines = u32::try_from(text.lines().count()).unwrap_or(u32::MAX);
+    let name = sanitize_attachment_name(
+        &path
+            .file_name()
+            .map_or_else(String::new, |name| name.to_string_lossy().into_owned()),
+    );
+    Ok(HeadlessFileAttachment { bytes, name, lines })
+}
+
+/// The ONE name-sanitizing seam (G2): basename in, ≤ 120 chars out, control
+/// characters stripped, `file` when nothing survives. The daemon re-checks
+/// the same bounds at validation.
+fn sanitize_attachment_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .filter(|c| !c.is_control() && *c != '/' && *c != '\\')
+        .take(120)
+        .collect();
+    if cleaned.is_empty() {
+        "file".to_owned()
+    } else {
+        cleaned
+    }
+}
+
 fn sniff_image_mime(bytes: &[u8]) -> Option<&'static str> {
     if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
         Some("image/jpeg")
@@ -117,7 +213,7 @@ fn sniff_image_mime(bytes: &[u8]) -> Option<&'static str> {
 pub struct HeadlessRunRequest {
     pub cwd: String,
     pub prompt: String,
-    pub attachments: Vec<HeadlessImageAttachment>,
+    pub attachments: Vec<HeadlessAttachment>,
     /// Explicit provider override. `None` follows the daemon's active account.
     pub provider: Option<String>,
     /// Explicit model override. `None` follows the selected provider summary.
@@ -1152,33 +1248,41 @@ async fn upload_attachments(
     ensure: &EnsureOptions,
     connection: &mut HeadlessConnection,
     reconnects: &mut ReconnectBudget,
-    attachments: &[HeadlessImageAttachment],
+    attachments: &[HeadlessAttachment],
 ) -> Result<(Vec<AttachmentBlock>, Vec<ArtifactRef>), HeadlessRunError> {
     let mut blocks = Vec::with_capacity(attachments.len());
     let mut refs = Vec::with_capacity(attachments.len());
     for attachment in attachments {
         let expected = ArtifactRef::new(format!(
             "blake3:{}",
-            blake3::hash(&attachment.bytes).to_hex()
+            blake3::hash(attachment.bytes()).to_hex()
         ));
         let body = RequestBody::ArtifactPut {
-            data_base64: encode_base64(&attachment.bytes),
+            data_base64: encode_base64(attachment.bytes()),
         };
         loop {
             match connection.client.request(body.clone()).await {
                 Ok(ResponseBody::ArtifactPut { artifact, bytes }) => {
-                    let expected_bytes = u64::try_from(attachment.bytes.len()).unwrap_or(u64::MAX);
+                    let expected_bytes =
+                        u64::try_from(attachment.bytes().len()).unwrap_or(u64::MAX);
                     if artifact != expected || bytes != expected_bytes {
                         return Err(protocol_error(
                             "artifact.put",
                             "response content address or byte count did not match the upload",
                         ));
                     }
-                    blocks.push(AttachmentBlock::Image {
-                        artifact: artifact.clone(),
-                        mime: attachment.mime.clone(),
-                        width: None,
-                        height: None,
+                    blocks.push(match attachment {
+                        HeadlessAttachment::Image(image) => AttachmentBlock::Image {
+                            artifact: artifact.clone(),
+                            mime: image.mime.clone(),
+                            width: None,
+                            height: None,
+                        },
+                        HeadlessAttachment::File(file) => AttachmentBlock::File {
+                            artifact: artifact.clone(),
+                            name: file.name.clone(),
+                            lines: file.lines,
+                        },
                     });
                     refs.push(artifact);
                     break;

@@ -107,6 +107,16 @@ pub enum AttachmentBlock {
         artifact: ArtifactRef,
         lines: u32,
     },
+    /// A UTF-8 text FILE attached by path (G2). Like [`Self::PastedText`]
+    /// the tree stores the CAS ref, never the bytes; the prompt compiler
+    /// inlines the content with a `<file name=… lines=…>` header so the
+    /// model sees the filename. `name` is the sanitized BASENAME only
+    /// (never a full path — privacy), ≤ 120 chars, no control characters.
+    File {
+        artifact: ArtifactRef,
+        name: String,
+        lines: u32,
+    },
     /// Inline `/skill` reference, pinned by hash (reserved until §9.4 lands).
     Skill {
         name: String,

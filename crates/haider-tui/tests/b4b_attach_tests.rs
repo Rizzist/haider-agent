@@ -288,19 +288,22 @@ fn attach_uploads_then_submit_carries_refs() {
 fn oversized_and_non_image_attach_are_honest_notices_with_no_upload() {
     let mut model = live_model();
 
-    // Not an image (magic sniff, never the extension).
-    let text_file = temp_file("notes.png", b"just some text, whatever the name says");
-    attach_read_effects(&mut model, &text_file.display().to_string());
+    // Not an image AND not UTF-8 (G2): the image sniff falls through to
+    // the text lane, which refuses binary with the DISTINCT encoding
+    // message — never a silent chip.
+    let binary_file = temp_file("blob.png", &[0xff, 0xfe, 0x00, 0x80, 0x81]);
+    attach_read_effects(&mut model, &binary_file.display().to_string());
     assert!(
         model
             .flash
             .as_deref()
-            .is_some_and(|flash| flash.contains("not a JPEG, PNG, GIF, or WebP image")),
+            .is_some_and(|flash| flash.contains("not UTF-8 text")),
         "flash: {:?}",
         model.flash
     );
     assert!(model.composer.attachments().is_empty(), "no chip");
     assert!(model.requests.is_empty(), "no upload request");
+    let _ = std::fs::remove_file(&binary_file);
 
     // Over the 5 MiB per-attachment cap (the client mirror of B4a's
     // acceptance validation).
@@ -338,8 +341,112 @@ fn oversized_and_non_image_attach_are_honest_notices_with_no_upload() {
     );
     assert!(model.requests.is_empty(), "no read request for the sixth");
 
-    let _ = std::fs::remove_file(&text_file);
     let _ = std::fs::remove_file(&big_file);
+}
+
+// ---- law 2b (G2): the text fallback chips a File and rides the wire ----
+
+/// LAW (G2 TUI half): a readable NON-image `/attach` falls back to the
+/// UTF-8 text lane — the chip is `name · N lines`, the upload carries the
+/// exact file bytes, and the completed submit rides an
+/// `AttachmentBlock::File` with the sanitized basename on the wire.
+///
+/// MUTATION CHECK: drop the fallback from `attach_read_effects` or mint an
+/// Image/PastedText block from `PendingKind::File` in `ready_block`.
+/// Expected RUNTIME failure: no chip appears, or the submit's wire JSON
+/// loses `"kind": "file"` / the name.
+#[test]
+fn attach_text_fallback_chips_a_file_and_submit_carries_the_block() {
+    let mut model = live_model();
+    let mut driver = LiveDriver::new("test");
+    let bytes = b"alpha line\nbeta line\ngamma line";
+    // A CLEAN basename (the wire name is the basename, so the unique part
+    // must live in the directory, not the file name).
+    let dir = std::env::temp_dir().join(format!(
+        "haider-b4b-g2-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("notes.md");
+    std::fs::write(&path, bytes).expect("temp file writes");
+
+    attach_read_effects(&mut model, &path.display().to_string());
+    let chips = model.composer.attachments();
+    assert_eq!(chips.len(), 1);
+    assert!(chips[0].artifact.is_none(), "the chip is still uploading");
+    assert!(
+        chips[0].label.contains("notes.md") && chips[0].label.contains("3 lines"),
+        "label names the file and its line count: {}",
+        chips[0].label
+    );
+
+    let commands = drain(&mut driver, &mut model);
+    let put = commands
+        .iter()
+        .find(|command| matches!(command, LiveCommand::ArtifactPut { .. }))
+        .expect("the upload command")
+        .clone();
+    let LiveCommand::ArtifactPut {
+        upload,
+        surface,
+        bytes: sent,
+    } = put.clone()
+    else {
+        unreachable!()
+    };
+    assert_eq!(sent.as_slice(), bytes, "the exact file bytes travel");
+
+    let artifact = ArtifactRef::new(format!("blake3:{:0>64}", "g2f"));
+    for reply in map_response(
+        &CommandContext::of(&put),
+        ResponseBody::ArtifactPut {
+            artifact: artifact.clone(),
+            bytes: bytes.len() as u64,
+        },
+    ) {
+        driver.apply(&mut model, reply);
+    }
+    let _ = (upload, surface);
+    assert!(
+        !model.composer.has_uploading_attachment(),
+        "the chip is ready"
+    );
+
+    submit(&mut model, "summarize the attached notes");
+    let commands = drain(&mut driver, &mut model);
+    let submit_command = commands
+        .iter()
+        .find(|command| matches!(command, LiveCommand::Submit { .. }))
+        .expect("the submit")
+        .clone();
+    let LiveCommand::Submit { attachments, .. } = submit_command.clone() else {
+        unreachable!()
+    };
+    assert_eq!(
+        attachments,
+        vec![AttachmentBlock::File {
+            artifact: artifact.clone(),
+            name: "notes.md".to_owned(),
+            lines: 3,
+        }]
+    );
+    // EXACT WIRE: the tagged file block rides `turn.submit`.
+    let encoded = serde_json::to_value(request_body(submit_command)).expect("encodes");
+    assert_eq!(
+        encoded.get("attachments").expect("attachments ride"),
+        &serde_json::json!([{
+            "kind": "file",
+            "artifact": artifact.as_str(),
+            "name": "notes.md",
+            "lines": 3,
+        }])
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ---- law 3: the paste pill is REAL ------------------------------------
