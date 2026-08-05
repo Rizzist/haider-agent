@@ -229,6 +229,63 @@ fn device_labels_mask_on_both_screens_with_per_screen_reveal_pins() {
     );
 }
 
+/// RV7 (review-of-record survivor, closed): the `r` toggle writes ONLY
+/// its own surface's pin — in STATE, not just at render. A cross-screen
+/// flag leak (`/accounts`' `r` arm also assigning `providers.revealed`)
+/// SURVIVED every render-level law in this file: the enter-door resets
+/// scrub the leaked flag before any walk can draw it, so a walk alone
+/// cannot distinguish true isolation from rescue-by-reset. This law
+/// binds the flags themselves, in both directions, and keeps a render
+/// walk as the behavior half.
+///
+/// MUTATION CHECK (executed, RV7): add
+/// `self.providers.revealed = self.accounts.revealed;` to the accounts
+/// `r` arm — the first state assert fails.
+#[test]
+fn reveal_pins_are_surface_isolated_in_state_not_just_at_render() {
+    let mut model = live_discovery_model();
+
+    // r on /accounts writes the ACCOUNTS pin only.
+    model.handle(key(KeyCode::Char('r')));
+    assert!(
+        model.accounts.revealed,
+        "precondition: r revealed /accounts"
+    );
+    assert!(
+        !model.providers.revealed,
+        "a reveal on /accounts must not touch the /providers pin (state isolation)"
+    );
+
+    // The behavior half: /providers still opens masked.
+    model.handle(key(KeyCode::Esc));
+    run_slash(&mut model, "/providers");
+    assert_eq!(model.screen, Screen::Providers);
+    model.requests.clear();
+    let frame = draw(&model, 118, 44);
+    assert!(
+        !frame.contains("you@work.com"),
+        "/providers opens masked after an /accounts reveal:\n{frame}"
+    );
+
+    // Mirror: r on /providers writes the PROVIDERS pin only.
+    model.handle(key(KeyCode::Char('r')));
+    assert!(
+        model.providers.revealed,
+        "precondition: r revealed /providers"
+    );
+    assert!(
+        !model.accounts.revealed,
+        "a reveal on /providers must not touch the /accounts pin (state isolation)"
+    );
+    model.handle(key(KeyCode::Esc));
+    run_slash(&mut model, "/accounts");
+    let frame = draw(&model, 118, 40);
+    assert!(
+        !frame.contains("you@work.com"),
+        "/accounts opens masked after a /providers reveal:\n{frame}"
+    );
+}
+
 /// Receipts carry the identity MASKED-ALWAYS: the device-import receipt
 /// and the OAuth completion receipt are transient chrome with no reveal
 /// loop of their own — the durable, revealable surface is the account

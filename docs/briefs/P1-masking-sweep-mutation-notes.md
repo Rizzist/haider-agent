@@ -77,3 +77,22 @@ completion receipt shares execution #4's seam class and its own assert
 in `import_and_oauth_receipts_mask_the_identity_always`
 (`p*****@e******.invalid` + no-raw) — a verbatim mutation there fails
 that assert identically.
+
+## Review of record (coordinator, executed post-lane)
+
+| RV7 | cross-screen flag leak: the `/accounts` `r` arm also assigns
+`self.providers.revealed = self.accounts.revealed` (`app.rs`) |
+**SURVIVED the lane's campaign** — every masking suite
+(`p1_masking_sweep_tests`, extended `w5d`/`d2`/`w3c3`) stayed green.
+Honest gap: every render-level walk is RESCUED by the enter-door resets
+— `enter_providers` scrubs the leaked flag before any frame can draw
+it, so a walk cannot distinguish true pin isolation from
+rescue-by-reset; the lane's isolation claim was pinned only in the walk
+direction, not the flag direction. Law added:
+`reveal_pins_are_surface_isolated_in_state_not_just_at_render` — binds
+the FLAGS in both directions (r on `/accounts` must not touch
+`providers.revealed`; mirror for `/providers`) plus the render walks as
+the behavior half. Re-executed against the applied mutation ("running 1
+test" observed): KILLED at `p1_masking_sweep_tests.rs:254`: `panicked:
+a reveal on /accounts must not touch the /providers pin (state
+isolation)`. Reverted (`git checkout app.rs`), suite 5/5 green. |

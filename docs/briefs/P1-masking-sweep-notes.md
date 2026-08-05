@@ -88,10 +88,14 @@ no-raw). `u2_usage_screen_tests` untouched — still green.
 
 ## Ledger
 
-- Test count: 1901 → 1905 (`xtask test-count --update`; +4 P1 laws, the
-  extended suites grew asserts inside existing tests).
-- Mutation campaign: 6 executed, 6 kills — see
+- Test count: 1901 → 1906 (`xtask test-count --update`; +4 P1 laws, then
+  +1 RV7 isolation law; the extended suites grew asserts inside existing
+  tests).
+- Mutation campaign: 6 executed, 6 kills by the lane; +1 review-of-record
+  survivor (RV7 cross-screen flag leak) closed with a state-level
+  isolation law and re-executed to a kill — see
   `P1-masking-sweep-mutation-notes.md` (mask-verbatim executed on TWO new
-  surfaces + the login card, both reset doors, the receipt seam).
+  surfaces + the login card, both reset doors, the receipt seam, the
+  reveal-pin flag isolation).
 - `cargo fmt` clean; `cargo test -p haider-tui` green (81 binaries);
   ladder 16/16 (14 demo + 2 live rows).
