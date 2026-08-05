@@ -211,6 +211,13 @@ fn every_theme_clears_the_contrast_floors() {
         floor("text on gold_soft", theme.text, theme.gold_soft, 5.0);
         floor("bright on gold_soft", theme.bright, theme.gold_soft, 6.0);
         floor("bright on bar_bg", theme.bright, theme.bar_bg, 6.5);
+        // F2d markdown pairs: the inline-code pill (gold on gold_soft),
+        // the code-block interior (body ink on the bar tint), and the
+        // fence rule (metadata ink on the bar tint) must read on every
+        // theme — the markdown renderer leans on exactly these pairs.
+        floor("gold on gold_soft", theme.gold, theme.gold_soft, 3.2);
+        floor("text on bar_bg", theme.text, theme.bar_bg, 6.5);
+        floor("dim on bar_bg", theme.dim, theme.bar_bg, 3.0);
     }
 }
 

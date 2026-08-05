@@ -5206,34 +5206,44 @@ fn item_lines<'a>(
             // stands alone.
             //
             // The streaming cursor is wrapped WITH the text (review r4
-            // P2-2): its cell is accounted for by the walker, so a last
-            // row that exactly fills the budget pushes the ▮ onto its own
-            // RAILED row instead of overflowing rail-less. It is split
-            // back out below to keep its gold ink.
+            // P2-2): it rides the last markdown line as a Cursor-kind
+            // span, so its cell is accounted for by the styled walker and
+            // a last row that exactly fills the budget pushes the ▮ onto
+            // its own RAILED row instead of overflowing rail-less.
+            //
+            // F2d: the body is MARKDOWN — parsed to kind-tagged spans
+            // (line-stable: one MdLine per source line; unterminated
+            // spans in a streaming prefix render literally and restyle
+            // in place once the closing marker arrives), wrapped by the
+            // same pre-wrap walk as plain text so styling never moves a
+            // break, and inked via `Theme::md_style` theme slots.
             let budget = (width as usize).saturating_sub(3);
-            let body = if budget == 0 {
-                vec![String::new()]
-            } else if block.streaming {
-                wrap_body(&format!("{text}▮"), budget)
-            } else {
-                wrap_body(text, budget)
-            };
-            let last = body.len().saturating_sub(1);
-            for (index, mut row) in body.into_iter().enumerate() {
-                let cursor_here =
-                    block.streaming && index == last && budget > 0 && row.ends_with('▮');
-                if cursor_here {
-                    row.pop();
-                }
-                let mut spans = vec![
+            if budget == 0 {
+                lines.push(Line::from(vec![
                     Span::raw(" "),
                     Span::styled("▏ ", theme.rail_style()),
-                    Span::styled(row, theme.text_style()),
-                ];
-                if cursor_here {
-                    spans.push(Span::styled("▮", theme.gold_style()));
+                ]));
+            } else {
+                let mut md_lines = crate::md::render_markdown(text);
+                if block.streaming
+                    && let Some(tail) = md_lines.last_mut()
+                {
+                    tail.spans.push(crate::md::MdSpan {
+                        text: "▮".to_owned(),
+                        kind: crate::md::MdKind::Cursor,
+                    });
                 }
-                lines.push(Line::from(spans));
+                for md_line in md_lines {
+                    for row in crate::md::wrap_spans(&md_line.spans, budget) {
+                        let mut spans =
+                            vec![Span::raw(" "), Span::styled("▏ ", theme.rail_style())];
+                        spans.extend(
+                            row.into_iter()
+                                .map(|span| Span::styled(span.text, theme.md_style(span.kind))),
+                        );
+                        lines.push(Line::from(spans));
+                    }
+                }
             }
         }
         TurnItem::Reasoning { summary } => {

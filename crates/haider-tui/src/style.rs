@@ -177,6 +177,55 @@ impl Theme {
             .bg(self.sel_bg.into())
     }
 
+    /// Inline code (F2d): the accent ink on its soft ground — the same
+    /// pill pair the composer's paste tokens wear, so `code` reads as one
+    /// visual language. Contrast pinned (gold on gold_soft floor).
+    #[must_use]
+    pub fn md_code_style(&self) -> Style {
+        Style::default()
+            .fg(self.gold.into())
+            .bg(self.gold_soft.into())
+    }
+
+    /// Fenced code block interior (F2d): body ink on the bar tint — a
+    /// quiet block ground that keeps code body-legible (floor pinned).
+    #[must_use]
+    pub fn md_code_block_style(&self) -> Style {
+        Style::default().fg(self.text.into()).bg(self.bar_bg.into())
+    }
+
+    /// Fence delimiter line (F2d): the ``` rule and its language tag —
+    /// metadata ink on the block ground (floor pinned).
+    #[must_use]
+    pub fn md_fence_style(&self) -> Style {
+        Style::default().fg(self.dim.into()).bg(self.bar_bg.into())
+    }
+
+    /// One markdown span kind → its themed style (F2d). Every kind maps
+    /// to THEME SLOTS — the mechanical no-raw-color law covers this seam
+    /// like every other.
+    #[must_use]
+    pub fn md_style(&self, kind: crate::md::MdKind) -> Style {
+        use crate::md::MdKind;
+        match kind {
+            MdKind::Text => self.text_style(),
+            MdKind::Bold => self.bright_style().add_modifier(Modifier::BOLD),
+            MdKind::Italic => self.text_style().add_modifier(Modifier::ITALIC),
+            MdKind::BoldItalic => self
+                .bright_style()
+                .add_modifier(Modifier::BOLD | Modifier::ITALIC),
+            MdKind::Code => self.md_code_style(),
+            MdKind::CodeBlock => self.md_code_block_style(),
+            MdKind::Fence => self.md_fence_style(),
+            // Heading hierarchy: the mark is accent metadata; the text is
+            // emphasized ink, BOLD — the terminal's heading register.
+            MdKind::HeadingMark => self.gold_style(),
+            MdKind::Heading => self.bright_style().add_modifier(Modifier::BOLD),
+            MdKind::ListMark => self.gold_style(),
+            MdKind::Cursor => self.gold_style(),
+        }
+    }
+
     /// Success / warning / error inks.
     #[must_use]
     pub fn ok_style(&self) -> Style {
