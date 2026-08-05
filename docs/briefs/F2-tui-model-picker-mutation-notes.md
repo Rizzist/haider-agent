@@ -33,3 +33,13 @@ SURVIVED and forced a new law — recorded honestly below.
   real renderer output, not fixture echoes.
 - After the final revert: full `cargo test -p haider-tui` green (74
   suites), `cargo clippy --all-targets` clean, tree clean.
+
+## Review of record (coordinator, executed post-lane)
+
+| # | Mutation (seam) | Law | Observed kill |
+|---|---|---|---|
+| RV1 | Search filter matches everything: token walk replaced by `true` (`app.rs` `model_picker_filtered`) | `search_matches_model_and_provider_case_insensitively` | KILLED — running 1 test → FAILED at the exclusion assert: the law pins that non-matching rows are ABSENT, so a match-all filter cannot pass (vacuity check on the owner's "even search" contract) |
+
+Reverted; suite green. Lane's 10-mutation campaign reviewed: M5's
+deliberately-different resolved provider and M3's hand-computed oracle close
+the echo and self-referential classes; no further gaps found.
