@@ -5059,19 +5059,21 @@ fn build_account_provider(
 ) -> Result<Arc<dyn Provider>, HaiderError> {
     let compatible_base_url = account_openai_compatible_base_url(provider, profile, base_url);
     let anthropic_fast = anthropic_fast_for(tuning, model);
+    let anthropic_effort = anthropic_effort_for(tuning, model);
+    let openai_effort = openai_effort_for(tuning, profile, model);
     let adapter: Arc<dyn Provider> = match (provider, auth_method) {
         (ANTHROPIC_PROVIDER_NAME, AuthMethod::ApiKey) => Arc::new(
             AnthropicProvider::new(credential, model)
                 .map_err(|error| adapter_construction_error(provider, error))?
                 .with_account(alias.clone())
-                .with_effort(tuning.effort.clone())
+                .with_effort(anthropic_effort.clone())
                 .with_fast(anthropic_fast),
         ),
         (OPENAI_PROVIDER_NAME, AuthMethod::ApiKey) => Arc::new(
             OpenAiProvider::new(credential, model)
                 .map_err(|error| adapter_construction_error(provider, error))?
                 .with_account(alias.clone())
-                .with_effort(tuning.effort.clone()),
+                .with_effort(openai_effort.clone()),
         ),
         (GEMINI_PROVIDER_NAME, AuthMethod::ApiKey) => Arc::new(
             GeminiProvider::new(credential, model)
@@ -5135,7 +5137,7 @@ fn build_account_provider(
                 OpenAiProvider::new_subscription(credential, model, inference.base_url)
                     .map_err(|error| adapter_construction_error(provider, error))?
                     .with_account(alias.clone())
-                    .with_effort(tuning.effort.clone()),
+                    .with_effort(openai_effort.clone()),
             )
         }
         (ANTHROPIC_OAUTH_PROVIDER_NAME, AuthMethod::OAuth) => {
@@ -5159,7 +5161,7 @@ fn build_account_provider(
                 AnthropicProvider::new_subscription(credential, model, inference.base_url)
                     .map_err(|error| adapter_construction_error(provider, error))?
                     .with_account(alias.clone())
-                    .with_effort(tuning.effort.clone())
+                    .with_effort(anthropic_effort.clone())
                     .with_fast(anthropic_fast),
             )
         }
@@ -5236,6 +5238,40 @@ fn build_account_provider(
 /// request the API documents as broken for it.
 pub(crate) fn anthropic_fast_for(tuning: &ProviderTuning, model: &str) -> bool {
     tuning.fast && haider_provider::anthropic_fast_mode_supported(model)
+}
+
+/// G3 effort gate at construction (review of record): effort is validated at
+/// SELECTION time against the then-current pair, but a later model switch
+/// can leave a stale level outside the new pair's ladder. Anthropic clamps
+/// down the documented ladder (Claude Code's published fallback rule) so a
+/// stale `xhigh` on a 4.6 row sends `high`, never a documented-400 request;
+/// a model with no documented ladder passes the selection through verbatim.
+pub(crate) fn anthropic_effort_for(tuning: &ProviderTuning, model: &str) -> Option<String> {
+    haider_provider::anthropic_effort_clamp(model, tuning.effort.as_deref())
+}
+
+/// Same stale-pair gate for OpenAI pairs, sourced from the pair's CATALOG
+/// ladder (the kimi-arm pattern): a declared ladder that excludes the stale
+/// level drops it to `None` (provider default — vocabularies differ across
+/// families, so no cross-family fallback order is invented); a pair whose
+/// catalog declares NO ladder passes the selection through verbatim.
+pub(crate) fn openai_effort_for(
+    tuning: &ProviderTuning,
+    profile: Option<&ProviderSummaryWire>,
+    model: &str,
+) -> Option<String> {
+    let effort = tuning.effort.clone()?;
+    let declared = profile.and_then(|profile| {
+        profile
+            .model_details
+            .iter()
+            .find(|detail| detail.name == model)
+            .map(|detail| detail.supported_efforts.as_slice())
+    });
+    match declared {
+        Some(ladder) if !ladder.is_empty() && !ladder.iter().any(|level| *level == effort) => None,
+        _ => Some(effort),
+    }
 }
 
 fn account_openai_compatible_base_url<'a>(

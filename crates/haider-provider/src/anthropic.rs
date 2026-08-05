@@ -70,10 +70,11 @@ pub struct AnthropicProvider {
     api_url: String,
     auth_mode: AnthropicAuthMode,
     fixed_origin_guard: Option<Arc<FixedOriginGuard>>,
-    /// Session-selected effort (G3), injected VERBATIM as
-    /// `output_config.effort`. Validation against the pair's ladder happened
-    /// at selection time; a post-switch mismatch surfaces the provider's own
-    /// error rather than being silently rewritten.
+    /// Session-selected effort (G3), injected as `output_config.effort`.
+    /// The DAEMON gates it at construction: post-switch stale levels clamp
+    /// down the documented ladder (`anthropic_effort_clamp`), so the adapter
+    /// applies what it is handed verbatim; only models with no documented
+    /// ladder still surface the provider's own error.
     effort: Option<String>,
     /// Session-selected fast mode (G3): body `speed: "fast"` plus the
     /// `fast-mode-2026-02-01` beta header. The caller gates this on the

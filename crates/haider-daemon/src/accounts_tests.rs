@@ -6745,3 +6745,100 @@ fn provider_tuning_derives_from_metadata_and_fast_gate_filters_stale_pairs() {
     };
     assert!(!anthropic_fast_for(&off, "claude-opus-5"));
 }
+
+/// LAW (review of record, construction-gate effort half): a stale effort
+/// after a model switch NEVER rides onto a wire the pair documents as
+/// invalid. Anthropic clamps down the documented ladder (Claude Code's
+/// fallback rule: `xhigh` on a 4.6 row -> `high`); a ladder-known pair with
+/// an out-of-vocabulary value drops to provider default; only ladder-unknown
+/// models pass the selection through verbatim. OpenAI pairs source the gate
+/// from the pair's CATALOG ladder: declared-and-excluded drops to `None`,
+/// declared-empty passes verbatim (vocabularies differ across families — no
+/// invented cross-family fallback).
+#[test]
+fn stale_effort_clamps_for_anthropic_and_drops_for_declared_openai_ladders() {
+    use crate::accounts::{ProviderTuning, anthropic_effort_for, openai_effort_for};
+
+    let tuning = ProviderTuning {
+        effort: Some("xhigh".to_owned()),
+        fast: false,
+    };
+    assert_eq!(
+        anthropic_effort_for(&tuning, "claude-fable-5").as_deref(),
+        Some("xhigh"),
+        "a supported level passes untouched"
+    );
+    assert_eq!(
+        anthropic_effort_for(&tuning, "claude-opus-4-6").as_deref(),
+        Some("high"),
+        "xhigh clamps DOWN to high on the max-not-xhigh ladder"
+    );
+    assert_eq!(
+        anthropic_effort_for(&tuning, "claude-mystery-9").as_deref(),
+        Some("xhigh"),
+        "an unknown model passes the selection through verbatim"
+    );
+    let garbage = ProviderTuning {
+        effort: Some("turbo".to_owned()),
+        fast: false,
+    };
+    assert_eq!(
+        anthropic_effort_for(&garbage, "claude-opus-5"),
+        None,
+        "an out-of-vocabulary value on a known ladder drops to provider default"
+    );
+
+    let summary = ProviderSummaryWire {
+        provider: "openai-oauth".to_owned(),
+        api_family: ProviderApiFamilyWire::OpenAiResponses,
+        endpoint: None,
+        models: vec!["gpt-5.5".to_owned()],
+        model_details: vec![
+            ModelDetailWire {
+                name: "gpt-5.5".to_owned(),
+                context_window: Some(400_000),
+                supported_efforts: vec!["low".to_owned(), "medium".to_owned(), "high".to_owned()],
+                default_effort: Some("medium".to_owned()),
+                supported_speeds: Vec::new(),
+                supports_thinking_type: None,
+            },
+            ModelDetailWire {
+                name: "gpt-5.6-sol".to_owned(),
+                context_window: Some(400_000),
+                supported_efforts: Vec::new(),
+                default_effort: None,
+                supported_speeds: Vec::new(),
+                supports_thinking_type: None,
+            },
+        ],
+        auth_methods: vec![AuthMethod::OAuth],
+        availability: haider_rpc::ProviderAvailabilityWire::Available,
+        availability_reason: None,
+        default_model: Some("gpt-5.5".to_owned()),
+        enabled: true,
+    };
+    assert_eq!(
+        openai_effort_for(&tuning, Some(&summary), "gpt-5.5"),
+        None,
+        "a declared ladder that excludes the stale level drops it"
+    );
+    let supported = ProviderTuning {
+        effort: Some("medium".to_owned()),
+        fast: false,
+    };
+    assert_eq!(
+        openai_effort_for(&supported, Some(&summary), "gpt-5.5").as_deref(),
+        Some("medium"),
+        "a declared ladder that includes the level passes it"
+    );
+    assert_eq!(
+        openai_effort_for(&tuning, Some(&summary), "gpt-5.6-sol").as_deref(),
+        Some("xhigh"),
+        "a declared-EMPTY ladder passes the selection through verbatim"
+    );
+    assert_eq!(
+        openai_effort_for(&tuning, None, "gpt-5.5").as_deref(),
+        Some("xhigh"),
+        "no profile at all passes the selection through verbatim"
+    );
+}

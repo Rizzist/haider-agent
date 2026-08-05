@@ -53,6 +53,37 @@ pub fn anthropic_default_effort(model: &str) -> Option<&'static str> {
     (!anthropic_supported_efforts(model).is_empty()).then_some("high")
 }
 
+/// Anthropic's canonical effort order, least to most.
+const ANTHROPIC_EFFORT_ORDER: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+
+/// Clamps a session-selected effort to `model`'s documented ladder using
+/// Claude Code's published fallback rule: an unsupported level falls to the
+/// HIGHEST supported level at or below it (`xhigh` on a 4.6 row → `high`).
+/// A model with NO documented ladder passes the selection through VERBATIM —
+/// we refuse to rewrite what we cannot know, and the provider's own error
+/// surfaces. A ladder-known model with a value outside the canonical
+/// vocabulary drops to `None` (provider default) rather than sending a
+/// documented-invalid request.
+#[must_use]
+pub fn anthropic_effort_clamp(model: &str, effort: Option<&str>) -> Option<String> {
+    let requested = effort?;
+    let ladder = anthropic_supported_efforts(model);
+    if ladder.is_empty() {
+        return Some(requested.to_owned());
+    }
+    if ladder.contains(&requested) {
+        return Some(requested.to_owned());
+    }
+    let requested_rank = ANTHROPIC_EFFORT_ORDER
+        .iter()
+        .position(|level| *level == requested)?;
+    ANTHROPIC_EFFORT_ORDER[..requested_rank]
+        .iter()
+        .rev()
+        .find(|level| ladder.contains(*level))
+        .map(|level| (*level).to_owned())
+}
+
 /// Whether `model` supports the fast-mode research preview: `claude-opus-5`
 /// and `claude-opus-4-8` ONLY (opus-4-7 + fast is a hard API error; opus-4-6
 /// silently bills standard).
@@ -125,6 +156,35 @@ mod tests {
             );
             assert_eq!(anthropic_default_effort(model), None);
         }
+    }
+
+    /// LAW (review of record): the clamp follows Claude Code's published
+    /// fallback rule — an unsupported level falls to the HIGHEST supported
+    /// level at or below it; supported levels and ladder-unknown models pass
+    /// verbatim; out-of-vocabulary values on a known ladder drop to `None`.
+    #[test]
+    fn anthropic_effort_clamp_falls_down_the_documented_ladder() {
+        assert_eq!(
+            anthropic_effort_clamp("claude-opus-4-6", Some("xhigh")).as_deref(),
+            Some("high"),
+            "xhigh -> high on the max-not-xhigh ladder (max is ABOVE xhigh)"
+        );
+        assert_eq!(
+            anthropic_effort_clamp("claude-sonnet-4-6", Some("max")).as_deref(),
+            Some("max"),
+            "max is IN the 4.6 ladder and passes"
+        );
+        assert_eq!(
+            anthropic_effort_clamp("claude-fable-5", Some("xhigh")).as_deref(),
+            Some("xhigh")
+        );
+        assert_eq!(
+            anthropic_effort_clamp("claude-mystery-9", Some("xhigh")).as_deref(),
+            Some("xhigh"),
+            "no documented ladder: pass through verbatim"
+        );
+        assert_eq!(anthropic_effort_clamp("claude-opus-5", Some("turbo")), None);
+        assert_eq!(anthropic_effort_clamp("claude-opus-5", None), None);
     }
 
     /// LAW (LE4, gate half): fast mode is statically gated to claude-opus-5
