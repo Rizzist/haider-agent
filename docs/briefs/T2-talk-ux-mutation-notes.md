@@ -32,3 +32,6 @@ suites were re-run green after the final revert. No mutant survived.
 - Post-campaign: `t2_wave_tests` 11/11, `t2_talk_state_tests` 23/23,
   `t2_talk_setup_tests` 15/15, `t2_talk_link_tests` 6/6,
   `transcription_tests` 4/4 — all green on the reverted tree.
+
+## Review of record (coordinator, executed post-lane)
+| RV5 | Realize cap disabled (`talk.rs realize_commit`, nth(usize::MAX)) | `realized_transcripts_are_capped` | KILLED — running 1 test → FAILED; reverted, 23/23 green. Lane's 10-kill campaign reviewed — no further gaps |
