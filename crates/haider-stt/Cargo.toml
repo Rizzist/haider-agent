@@ -1,0 +1,26 @@
+[package]
+name = "haider-stt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+cpal.workspace = true
+futures-util.workspace = true
+hex.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+url.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+
+[lints]
+workspace = true

@@ -1398,7 +1398,15 @@ fn device_discovery_goldens_are_additive_and_tolerance_re_proved() {
             )
         })
         .expect("D1 welcome frame in the golden transcript");
-    assert_eq!(frames.len() - d1_start, 6, "D1 appends exactly six frames");
+    // D1's six frames stay contiguous at their original offset; T1 later
+    // appended seven transcription-secret frames AFTER them (pinned by
+    // `transcription_secret_frames_are_additive_and_redacted`), so the tail
+    // is exactly 6 + 7 and nothing before `d1_start` can have moved.
+    assert_eq!(
+        frames.len() - d1_start,
+        6 + 7,
+        "six D1 frames followed by the seven appended T1 frames"
+    );
     for frame in &frames[d1_start..] {
         let encoded = ws_codec::encode(frame, TEST_FRAME_LIMIT).expect("encode D1 frame");
         assert!(
@@ -1624,5 +1632,115 @@ fn model_selection_refusals_are_typed_and_golden() {
     assert_eq!(
         haider_rpc::FEATURE_SESSION_MODEL_SELECT_V1,
         "session_model_select_v1"
+    );
+}
+
+/// The T1 transcription-secret family obeys the same additive rules as
+/// every v1 method: appended at the transcript END, kind-tagged exact
+/// method names, unknown-field tolerance, redacted secrets, and absent
+/// optionals kept OFF the wire.
+///
+/// MUTATION CHECK: rename a `transcription.*` tag, derive `Debug` for the
+/// new secret-bearing frames, make `clear` required, or serialize
+/// `secret: null` for the empty get. Expected runtime failure: the matching
+/// assertion below (tail pin, redaction scan, tolerant decode, or key-set
+/// pin).
+#[test]
+fn transcription_secret_frames_are_additive_and_redacted() {
+    // The feature bit is the discovery contract for the family.
+    assert_eq!(haider_rpc::FEATURE_TRANSCRIPTION_V1, "transcription_v1");
+
+    // The seven appended frames close the golden transcript, in order.
+    let frames = transcript();
+    let tail = &frames[frames.len() - 7..];
+    let methods: Vec<String> = tail
+        .iter()
+        .map(|frame| {
+            let value = serde_json::to_value(frame).expect("frame JSON");
+            format!(
+                "{}:{}",
+                value["kind"].as_str().unwrap_or_default(),
+                value["body"]["method"].as_str().unwrap_or_default()
+            )
+        })
+        .collect();
+    assert_eq!(
+        methods,
+        vec![
+            "request:transcription.secret_set",
+            "response:transcription.secret_set",
+            "request:transcription.secret_get",
+            "response:transcription.secret_get",
+            "response:transcription.secret_get",
+            "request:transcription.secret_set",
+            "response:transcription.secret_set",
+        ]
+    );
+
+    // Debug redaction: neither direction can reveal the secret.
+    let set_request = WireFrame::Request {
+        request_id: haider_rpc::RequestId::new("request-transcription-set"),
+        body: RequestBody::TranscriptionSecretSet {
+            secret: haider_rpc::SecretWire::new("dg-debug-sentinel-9c8b7a"),
+            clear: false,
+        },
+    };
+    let get_response = WireFrame::Response {
+        request_id: haider_rpc::RequestId::new("request-transcription-get"),
+        body: ResponseBody::TranscriptionSecretGet {
+            secret: Some(haider_rpc::SecretWire::new("dg-debug-sentinel-9c8b7a")),
+        },
+    };
+    for frame in [&set_request, &get_response] {
+        let debug = format!("{frame:?}");
+        assert!(
+            !debug.contains("dg-debug-sentinel-9c8b7a"),
+            "ordinary frame formatting must never reveal the key: {debug}"
+        );
+        assert!(
+            debug.contains("[REDACTED]"),
+            "redaction marker missing: {debug}"
+        );
+    }
+
+    // Tolerant decode: unknown fields ignored; absent `clear` defaults
+    // false (older writers).
+    let set_json = format!(
+        r#"{{"v":{WIRE_PROTOCOL_VERSION},"kind":"request","request_id":"r1","body":{{
+            "method":"transcription.secret_set","secret":"sk-x","future_set_field":true}}}}"#
+    );
+    match serde_json::from_str::<WireFrame>(&set_json).expect("tolerant set decode") {
+        WireFrame::Request {
+            body: RequestBody::TranscriptionSecretSet { clear, .. },
+            ..
+        } => assert!(!clear, "absent clear defaults to false"),
+        other => panic!("expected TranscriptionSecretSet, got {other:?}"),
+    }
+    let get_json = format!(
+        r#"{{"v":{WIRE_PROTOCOL_VERSION},"kind":"request","request_id":"r2","body":{{
+            "method":"transcription.secret_get","future_get_field":1}}}}"#
+    );
+    assert!(matches!(
+        serde_json::from_str::<WireFrame>(&get_json).expect("tolerant get decode"),
+        WireFrame::Request {
+            body: RequestBody::TranscriptionSecretGet,
+            ..
+        }
+    ));
+
+    // Encode direction: the empty get keeps `secret` OFF the wire (no
+    // `secret: null` for older readers), and the SET response never carries
+    // a secret-bearing key at all.
+    let empty = serde_json::to_value(ResponseBody::TranscriptionSecretGet { secret: None })
+        .expect("encode empty get");
+    assert_eq!(
+        empty,
+        serde_json::json!({"method": "transcription.secret_get"})
+    );
+    let set_ok = serde_json::to_value(ResponseBody::TranscriptionSecretSet { present: true })
+        .expect("encode set response");
+    assert_eq!(
+        set_ok,
+        serde_json::json!({"method": "transcription.secret_set", "present": true})
     );
 }

@@ -12,6 +12,7 @@ members = [
     "crates/haider-accounts",
     "crates/haider-rpc",
     "crates/haider-client",
+    "crates/haider-stt",
     "crates/haider-tui",
     "crates/haider-cli",
     "xtask",
@@ -28,6 +29,8 @@ rust-version = "1.95"
 async-trait = "0.1"
 base64 = "0.22"
 blake3 = "1"
+cpal = "0.15"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 hex = "0.4"
 bytes = "1"
 getrandom = "0.3"
@@ -44,6 +47,7 @@ sha2 = "0.10"
 subtle = "2"
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "test-util", "net", "signal"] }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 tracing = "0.1"
 unicode-segmentation = "1"
 unicode-width = "0.2"

@@ -666,6 +666,11 @@ pub(crate) struct AccountsFacade {
     pub management: ManagementSnapshot,
     pub vault_supported: bool,
     pub discovery_disabled: bool,
+    /// The profile-scoped vault itself, for the SMALL bounded-secret
+    /// surfaces the connection task serves inline (T1: the transcription
+    /// secret — one ≤512-byte file read/write, comparable to one store
+    /// transaction). `None` exactly when `vault_supported` is false.
+    pub vault: Option<Arc<dyn Vault>>,
 }
 
 /// Correlated response route back to the requesting connection. Disconnect
@@ -6247,6 +6252,7 @@ impl AccountsRuntime {
                         management,
                         vault_supported: true,
                         discovery_disabled,
+                        vault: Some(Arc::clone(scoped)),
                     },
                     actor: Some(actor),
                     vault,
@@ -6267,6 +6273,7 @@ impl AccountsRuntime {
                         management,
                         vault_supported: false,
                         discovery_disabled,
+                        vault: None,
                     },
                     actor: Some(actor),
                     vault: VaultProvision::Unsupported,

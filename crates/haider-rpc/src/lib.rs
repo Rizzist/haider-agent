@@ -53,14 +53,14 @@ pub use frame::{
     FEATURE_PROVIDER_MANAGEMENT_V1, FEATURE_PROVIDER_MODELS_V1, FEATURE_PROVIDER_REMOVE_V1,
     FEATURE_SESSION_MODEL_SELECT_V1, FEATURE_SESSION_MUTATION_V1, FEATURE_SESSION_OBSERVE_V1,
     FEATURE_SESSION_PERMISSION_OVERRIDES_V1, FEATURE_SHELL_EXEC_V1, FEATURE_TOOL_INVENTORY_V1,
-    FEATURE_TURN_CONTROL_V1, FEATURE_VAULT_STAGE_V1, Hello, HookSummaryWire, LifecyclePhase,
-    MenuInput, ModelDetailWire, OAuthAuthorizationWire, OAuthAvailabilityWire, OAuthFlowId,
-    OAuthFlowStatusWire, OAuthReadyRefWire, ObserveMenuWire, ObserveRunStateWire,
-    ObserveSubagentWire, ProtocolError, ProviderActiveWire, ProviderApiFamilyWire,
-    ProviderAuthRequirementWire, ProviderAvailabilityWire, ProviderDefaultWire,
-    ProviderRemoveRefusalReasonWire, ProviderSummaryWire, RequestBody, RequestId, ResponseBody,
-    SecretWire, SeqRange, SessionObserveDigest, SessionReadResult, SessionSummary, StagePurpose,
-    SubmitDisposition, WIRE_PROTOCOL_VERSION, Welcome, WireFrame,
+    FEATURE_TRANSCRIPTION_V1, FEATURE_TURN_CONTROL_V1, FEATURE_VAULT_STAGE_V1, Hello,
+    HookSummaryWire, LifecyclePhase, MenuInput, ModelDetailWire, OAuthAuthorizationWire,
+    OAuthAvailabilityWire, OAuthFlowId, OAuthFlowStatusWire, OAuthReadyRefWire, ObserveMenuWire,
+    ObserveRunStateWire, ObserveSubagentWire, ProtocolError, ProviderActiveWire,
+    ProviderApiFamilyWire, ProviderAuthRequirementWire, ProviderAvailabilityWire,
+    ProviderDefaultWire, ProviderRemoveRefusalReasonWire, ProviderSummaryWire, RequestBody,
+    RequestId, ResponseBody, SecretWire, SeqRange, SessionObserveDigest, SessionReadResult,
+    SessionSummary, StagePurpose, SubmitDisposition, WIRE_PROTOCOL_VERSION, Welcome, WireFrame,
 };
 pub use negotiation::{Negotiated, ServerRange, negotiate};
 

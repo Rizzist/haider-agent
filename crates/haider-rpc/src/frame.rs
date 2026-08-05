@@ -230,6 +230,10 @@ pub const FEATURE_AGENT_MESSAGE_V1: &str = "agent_message_v1";
 /// optional `provider` names the selected model row's provider attribute,
 /// and the next logical turn resolves through the committed pair.
 pub const FEATURE_SESSION_MODEL_SELECT_V1: &str = "session_model_select_v1";
+/// Daemon vaults the profile transcription secret (the Deepgram API key)
+/// and serves `transcription.secret_get`/`transcription.secret_set` on
+/// authenticated same-UID local UDS connections only (T1).
+pub const FEATURE_TRANSCRIPTION_V1: &str = "transcription_v1";
 
 /// Kind of client taking part in the handshake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1252,6 +1256,26 @@ pub enum RequestBody {
         provider: String,
         expected_revision: u64,
     },
+    /// Reads the profile's vaulted transcription secret (the Deepgram API
+    /// key) for the TUI-resident engine. Served ONLY on authenticated
+    /// same-UID local UDS connections with Control — the raw secret answer
+    /// rides the same protected surface as `vault.stage`, and both codecs
+    /// zeroize the encoded frame buffers around it.
+    #[serde(rename = "transcription.secret_get")]
+    TranscriptionSecretGet,
+    /// Stores or clears the profile's transcription secret in the daemon
+    /// vault (FileVault, profile-scoped alias). `clear: true` requires an
+    /// EMPTY `secret` and deletes the entry; otherwise the secret must be
+    /// non-empty, ≤512 chars, with no control bytes (ADE key hygiene).
+    /// UDS-only, like every raw-secret surface. Deliberately NON-durable
+    /// command-wise: no receipt may ever contain a secret; the vault file
+    /// itself is the durable truth.
+    #[serde(rename = "transcription.secret_set")]
+    TranscriptionSecretSet {
+        secret: SecretWire,
+        #[serde(default)]
+        clear: bool,
+    },
     /// Decode artifact for a method this crate does not know (tolerance
     /// discipline). W3b answers it with a protocol error, not a panic.
     #[serde(other)]
@@ -1509,6 +1533,19 @@ pub enum ResponseBody {
     },
     #[serde(rename = "provider.remove")]
     ProviderRemove { provider: String, revision: u64 },
+    /// The vaulted transcription secret, or `None` when no secret is
+    /// stored. Only ever sent on the same-UID local UDS surface; the
+    /// value's `Debug` is redacted and both peers zeroize the encoded
+    /// buffers ([`SecretWire`] laws).
+    #[serde(rename = "transcription.secret_get")]
+    TranscriptionSecretGet {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        secret: Option<SecretWire>,
+    },
+    /// Post-commit vault state: `present` is true after a store, false
+    /// after a clear. Never echoes the secret.
+    #[serde(rename = "transcription.secret_set")]
+    TranscriptionSecretSet { present: bool },
     /// Successful durable menu resolution. The same-command retry receives
     /// the original sequence; a different command receives
     /// [`ERROR_CODE_ALREADY_RESOLVED`] instead.
