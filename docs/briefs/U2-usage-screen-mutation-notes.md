@@ -72,3 +72,6 @@ revert; full workspace green before the campaign.
 | 6 | filter prefix law | KILLED |
 | 7 | install clears in-flight | KILLED |
 | 8 | F2b scroll application | KILLED |
+
+## Review of record (coordinator, executed post-lane)
+| RV6 | `err` tone threshold made unreachable (0.90 → 1.90, `format.rs`) | `usage_tone_thresholds_are_pinned` | KILLED — running the suite → FAILED at the tone pin; reverted, 18/18 green. Lane's 8-execution campaign reviewed — no further gaps |
