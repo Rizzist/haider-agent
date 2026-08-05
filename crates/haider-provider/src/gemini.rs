@@ -468,6 +468,11 @@ fn gemini_request_json(request: &TurnRequest) -> Result<serde_json::Value, Provi
                         "pasted-text attachment `{artifact}` was not resolved by the prompt compiler"
                     )));
                 }
+                Block::Attachment(AttachmentBlock::File { artifact, .. }) => {
+                    return Err(invalid_request(format!(
+                        "file attachment `{artifact}` was not resolved by the prompt compiler"
+                    )));
+                }
                 Block::Attachment(AttachmentBlock::Skill { name, .. }) => {
                     return Err(invalid_request(format!(
                         "skill attachment `{name}` was not resolved by the prompt compiler"

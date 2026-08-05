@@ -567,6 +567,15 @@ fn golden_attachments() {
             lines: 120,
         },
     );
+    // G2 additive text-file variant: ref + display basename + line count.
+    golden(
+        "attachment_file",
+        &AttachmentBlock::File {
+            artifact: ArtifactRef::new("blake3:file"),
+            name: "notes.md".into(),
+            lines: 42,
+        },
+    );
 }
 
 #[test]

@@ -4047,6 +4047,10 @@ async fn validate_turn_attachments(
     let mut total_bytes = 0_usize;
     for (index, attachment) in attachments.iter().enumerate() {
         let index_u32 = u32::try_from(index).unwrap_or(u32::MAX);
+        // Set only for File blocks: the daemon re-verifies the bytes decode
+        // as UTF-8 after the CAS read below (G2 — the client gate is not
+        // trusted; a provider must never receive undecodable "text").
+        let mut requires_utf8 = false;
         let artifact = match attachment {
             haider_protocol::tool::AttachmentBlock::Image { artifact, mime, .. } => {
                 if !IMAGE_ATTACHMENT_MIME_ALLOWLIST.contains(&mime.as_str()) {
@@ -4064,6 +4068,27 @@ async fn validate_turn_attachments(
                 artifact
             }
             haider_protocol::tool::AttachmentBlock::PastedText { artifact, .. } => artifact,
+            haider_protocol::tool::AttachmentBlock::File { artifact, name, .. } => {
+                // Name sanity (G2): a display basename, never a path and
+                // never terminal-control bytes. The cap mirrors the client
+                // loader; violation is a client bug, refused honestly.
+                if name.is_empty()
+                    || name.chars().count() > 120
+                    || name.chars().any(char::is_control)
+                    || name.contains('/')
+                    || name.contains('\\')
+                {
+                    return Err(AttachmentValidationFailure {
+                        code: ERROR_CODE_INVALID_ARGUMENT,
+                        message: format!(
+                            "attachment {index} declares an invalid file name; names are non-empty basenames of at most 120 characters with no control characters"
+                        ),
+                        data: None,
+                    });
+                }
+                requires_utf8 = true;
+                artifact
+            }
             haider_protocol::tool::AttachmentBlock::Skill { name, .. } => {
                 return Err(AttachmentValidationFailure {
                     code: ERROR_CODE_INVALID_ARGUMENT,
@@ -4095,6 +4120,15 @@ async fn validate_turn_attachments(
                     actual_bytes,
                     max_bytes: MAX_ATTACHMENT_BYTES as u64,
                 }),
+            });
+        }
+        if requires_utf8 && std::str::from_utf8(&bytes).is_err() {
+            return Err(AttachmentValidationFailure {
+                code: ERROR_CODE_INVALID_ARGUMENT,
+                message: format!(
+                    "attachment {index} is not UTF-8 text; only UTF-8 text files can be attached (unsupported_attachment_encoding)"
+                ),
+                data: None,
             });
         }
         total_bytes = total_bytes.saturating_add(bytes.len());

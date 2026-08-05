@@ -3416,6 +3416,14 @@ async fn find_committed_menu_answer(
     }
 }
 
+/// The ONE header shape a File attachment inlines with (G2): the model sees
+/// the filename and line count, then the verbatim UTF-8 content. Both the
+/// main prompt lane and the compaction lane call this — parity by
+/// construction, not by copy.
+fn file_attachment_text(name: &str, lines: u32, text: &str) -> String {
+    format!("<file name=\"{name}\" lines=\"{lines}\">\n{text}\n</file>")
+}
+
 async fn resolve_prompt_attachments(
     store: &HubStoreHandle,
     messages: &mut [Message],
@@ -3453,6 +3461,29 @@ async fn resolve_prompt_attachments(
                         )
                     })?;
                     *block = haider_protocol::provider::Block::Text { text };
+                }
+                haider_protocol::provider::Block::Attachment(
+                    haider_protocol::tool::AttachmentBlock::File {
+                        artifact,
+                        name,
+                        lines,
+                    },
+                ) => {
+                    // G2: a text-file attachment is inlined IN PLACE like
+                    // PastedText, with a header naming the file — providers
+                    // must never see a File block.
+                    let artifact = artifact.clone();
+                    let bytes = store.get_artifact(artifact.clone()).await?;
+                    let text = String::from_utf8(bytes).map_err(|_| {
+                        HaiderError::new(
+                            ErrorCode::InvalidArgument,
+                            format!("file attachment {artifact} is not UTF-8"),
+                            false,
+                        )
+                    })?;
+                    *block = haider_protocol::provider::Block::Text {
+                        text: file_attachment_text(name, *lines, &text),
+                    };
                 }
                 haider_protocol::provider::Block::Attachment(
                     haider_protocol::tool::AttachmentBlock::Skill { name, .. },
@@ -3496,6 +3527,28 @@ async fn prepare_compaction_messages(
                         )
                     })?;
                     message.blocks[index] = haider_protocol::provider::Block::Text { text };
+                    index += 1;
+                }
+                haider_protocol::provider::Block::Attachment(
+                    haider_protocol::tool::AttachmentBlock::File {
+                        artifact,
+                        name,
+                        lines,
+                    },
+                ) => {
+                    // G2 compaction parity: the summarization request sees
+                    // the same inlined `<file>` text the main lane sends.
+                    let bytes = store.get_artifact(artifact.clone()).await?;
+                    let text = String::from_utf8(bytes).map_err(|_| {
+                        HaiderError::new(
+                            ErrorCode::InvalidArgument,
+                            format!("file attachment {artifact} is not UTF-8"),
+                            false,
+                        )
+                    })?;
+                    message.blocks[index] = haider_protocol::provider::Block::Text {
+                        text: file_attachment_text(&name, lines, &text),
+                    };
                     index += 1;
                 }
                 haider_protocol::provider::Block::Attachment(

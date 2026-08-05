@@ -877,6 +877,172 @@ async fn compaction_summary_request_carries_no_image_attachments() {
     task.join().await.expect("daemon joins");
 }
 
+/// LAW (LA1, G2 end-to-end text attach): a `turn.submit` carrying a File
+/// attachment journals the File block in `UserMessage` (CAS ref, never
+/// bytes), `resolve_prompt_attachments` REPLACES it in place with a
+/// `Block::Text` wearing the `<file name=… lines=…>` header, and the
+/// provider request carries the file text with ZERO attachment blocks and
+/// zero resolved image payloads. The compaction summarization request gets
+/// the SAME inlined text (compaction parity).
+///
+/// MUTATION CHECK: drop the File arm from `resolve_prompt_attachments` (the
+/// block reaches the adapter and the run fails), or drop the header from
+/// `file_attachment_text`. Expected RUNTIME failure: the provider request
+/// assertions below.
+#[tokio::test]
+async fn file_attachment_is_inlined_with_header_and_never_reaches_the_provider() {
+    let root = tempfile::Builder::new()
+        .prefix("g2af-")
+        .tempdir_in("/tmp")
+        .expect("short temporary root");
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace");
+    let config = DaemonConfig::new(
+        "g2a-file-inline",
+        root.path().join("store"),
+        root.path().join("runtime"),
+    );
+    let (dependencies, fake) = fake_dependencies(vec![
+        FakeStep::EmitText {
+            text: "file answer".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+        FakeStep::EmitText {
+            text: "summary without file blocks".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]);
+    let task = ready_with_dependencies(&config, dependencies).await;
+    let mut client = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "g2a-file-client",
+        "g2a-file-instance",
+        ClientKind::Cli,
+    )
+    .await;
+    let artifact = upload_artifact(
+        &mut client,
+        &config,
+        "put-file-text",
+        b"alpha line\nbeta line\ngamma line",
+    )
+    .await;
+    let (session_id, generation) = create_and_attach(&mut client, &config, &workspace).await;
+    let file = AttachmentBlock::File {
+        artifact: artifact.clone(),
+        name: "notes.md".into(),
+        lines: 3,
+    };
+    send_request(
+        &mut client,
+        &config,
+        "submit-file",
+        RequestBody::TurnSubmit {
+            command_id: CommandId::new("submit-file-command"),
+            session_id: session_id.clone(),
+            worker_generation: generation,
+            text: "summarize the attached notes".into(),
+            attachments: vec![file.clone()],
+            mode: DeliveryMode::Queue,
+        },
+    )
+    .await;
+    let (run_id, _) = next_submit_response(&mut client).await;
+    let _ = events_until_terminal(&mut client, &run_id).await;
+    let _ = next_idle(&mut client).await;
+
+    let expected_inline =
+        "<file name=\"notes.md\" lines=\"3\">\nalpha line\nbeta line\ngamma line\n</file>";
+    let requests = fake.requests();
+    assert_eq!(requests.len(), 1);
+    let request = &requests[0];
+    assert!(
+        request.attachments.is_empty(),
+        "no resolved base64 payloads ride a text-file turn"
+    );
+    assert!(
+        request.messages.iter().all(|message| {
+            message
+                .blocks
+                .iter()
+                .all(|block| !matches!(block, Block::Attachment(_)))
+        }),
+        "the provider must never see an attachment block"
+    );
+    assert!(
+        request.messages.iter().any(|message| {
+            message
+                .blocks
+                .iter()
+                .any(|block| matches!(block, Block::Text { text } if text == expected_inline))
+        }),
+        "the file text is inlined with its header"
+    );
+
+    // Compaction parity: the summarization request sees the same inline.
+    send_request(
+        &mut client,
+        &config,
+        "compact-file-history",
+        RequestBody::SessionCompact {
+            command_id: CommandId::new("compact-file-history-command"),
+            session_id: session_id.clone(),
+            worker_generation: generation,
+        },
+    )
+    .await;
+    loop {
+        if matches!(
+            client.next().await,
+            WireFrame::Response {
+                body: ResponseBody::SessionCompact { .. },
+                ..
+            }
+        ) {
+            break;
+        }
+    }
+    let requests = fake.requests();
+    assert_eq!(requests.len(), 2);
+    let summary_request = &requests[1];
+    assert!(summary_request.attachments.is_empty());
+    assert!(summary_request.messages.iter().all(|message| {
+        message
+            .blocks
+            .iter()
+            .all(|block| !matches!(block, Block::Attachment(_)))
+    }));
+    assert!(
+        summary_request.messages.iter().any(|message| {
+            message.blocks.iter().any(
+                |block| matches!(block, Block::Text { text } if text.contains(expected_inline)),
+            )
+        }),
+        "compaction inlines the same `<file>` text"
+    );
+
+    // The DURABLE journal keeps the File block by ref — inlining is a
+    // prompt-compile concern, never a journal rewrite.
+    let journal = read_session(&mut client, &config, session_id, "read-after-file-turn").await;
+    assert!(journal.iter().any(|envelope| {
+        serde_json::from_value::<EventPayload>(envelope.payload.clone()).is_ok_and(|payload| {
+            matches!(
+                payload,
+                EventPayload::UserMessage { attachments, .. }
+                    if attachments == vec![file.clone()]
+            )
+        })
+    }));
+
+    task.shutdown_handle().request("test complete");
+    task.join().await.expect("daemon joins");
+}
+
 #[tokio::test]
 async fn injected_fake_turn_runs_through_the_openai_provider_name() {
     let root = test_root("w5a-openai-live-");

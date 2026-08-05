@@ -31,9 +31,10 @@ pub use client::{
 };
 pub use headless::{
     DEFAULT_TERMINAL_GRACE, ERROR_CODE_NO_ACTIVE_ACCOUNT, ERROR_CODE_NO_DEFAULT_MODEL,
-    HeadlessBlockingReason, HeadlessEvent, HeadlessFailureCode, HeadlessImageAttachment,
-    HeadlessOutcome, HeadlessPermissionDenial, HeadlessRunError, HeadlessRunFailure,
-    HeadlessRunRequest, HeadlessRunResult, load_image_attachment, required_headless_features,
+    HeadlessAttachment, HeadlessBlockingReason, HeadlessEvent, HeadlessFailureCode,
+    HeadlessFileAttachment, HeadlessImageAttachment, HeadlessOutcome, HeadlessPermissionDenial,
+    HeadlessRunError, HeadlessRunFailure, HeadlessRunRequest, HeadlessRunResult,
+    load_image_attachment, load_text_attachment, required_headless_features,
     required_headless_features_with_attachments, required_headless_features_with_hook_trust,
     run_headless,
 };

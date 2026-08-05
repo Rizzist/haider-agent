@@ -1869,6 +1869,11 @@ fn responses_request_json(
                         "pasted-text attachment `{artifact}` was not resolved by the prompt compiler"
                     )));
                 }
+                Block::Attachment(AttachmentBlock::File { artifact, .. }) => {
+                    return Err(invalid_request(format!(
+                        "file attachment `{artifact}` was not resolved by the prompt compiler"
+                    )));
+                }
                 Block::Attachment(AttachmentBlock::Skill { name, .. }) => {
                     return Err(invalid_request(format!(
                         "skill attachment `{name}` was not resolved by the prompt compiler"

@@ -863,10 +863,14 @@ async fn headless_attach_uploads_then_submits_with_durable_identity() {
     });
 
     let mut with_image = request(None);
-    with_image.attachments.push(HeadlessImageAttachment {
-        bytes: image_bytes,
-        mime: "image/png".into(),
-    });
+    with_image
+        .attachments
+        .push(haider_client::HeadlessAttachment::Image(
+            HeadlessImageAttachment {
+                bytes: image_bytes,
+                mime: "image/png".into(),
+            },
+        ));
     let (result, events) = run_with_events(profile, with_image, 4, Duration::ZERO).await;
     peer.await.expect("peer");
     assert_eq!(result.outcome, HeadlessOutcome::Done);

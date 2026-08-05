@@ -1252,6 +1252,52 @@ fn attach_loader_sniffs_image_magic_not_extensions() {
     ));
 }
 
+/// LAW (LA2 client half + LA3, G2): the text-file loader accepts UTF-8 with
+/// an honest line count and a sanitized BASENAME, refuses non-UTF-8 with the
+/// DISTINCT `unsupported_attachment_encoding` code, and refuses the 5 MiB
+/// overrun with the same cap the image lane enforces.
+///
+/// MUTATION CHECK: drop the UTF-8 validation, reuse
+/// `unsupported_attachment_type` for binary payloads, or carry the full path
+/// as the name. Expected RUNTIME failure: the matching assertion below.
+#[test]
+fn attach_text_loader_validates_utf8_and_sanitizes_the_name() {
+    let directory = tempfile::tempdir().expect("attachment tempdir");
+
+    let text = directory.path().join("notes.md");
+    std::fs::write(&text, "line one\nline two\nline three").expect("write text");
+    let loaded = haider_client::load_text_attachment(&text).expect("UTF-8 text loads");
+    assert_eq!(loaded.name, "notes.md", "basename only, never the path");
+    assert_eq!(loaded.lines, 3);
+    assert_eq!(loaded.bytes, b"line one\nline two\nline three");
+
+    // Non-UTF-8 is the DISTINCT encoding refusal — never the image code.
+    let binary = directory.path().join("blob.pdf");
+    std::fs::write(&binary, [0xff, 0xfe, 0x00, 0x80, 0x81]).expect("write binary");
+    let error = haider_client::load_text_attachment(&binary).expect_err("binary refused");
+    assert!(matches!(
+        error,
+        HeadlessRunError::Attachment { ref code, ref message, .. }
+            if code == "unsupported_attachment_encoding" && message.contains("not UTF-8")
+    ));
+
+    // Over the 5 MiB per-attachment cap: same bound as the image lane.
+    let big = directory.path().join("big.txt");
+    std::fs::write(&big, "a".repeat(5 * 1024 * 1024 + 1)).expect("write oversized");
+    let error = haider_client::load_text_attachment(&big).expect_err("oversize refused");
+    assert!(matches!(
+        error,
+        HeadlessRunError::Attachment { ref code, .. } if code == "attachment_too_large"
+    ));
+
+    // Control characters are stripped from the display name and the length
+    // is capped at 120 characters.
+    let weird = directory.path().join("a\u{7}b.txt");
+    std::fs::write(&weird, "x").expect("write control-name file");
+    let loaded = haider_client::load_text_attachment(&weird).expect("loads");
+    assert_eq!(loaded.name, "ab.txt", "control characters stripped");
+}
+
 /// MUTATION CHECK: omit landed artifact refs/count from the additive JSON
 /// result or serialize raw bytes. Expected RUNTIME failure: the exact
 /// attachment object no longer contains only the stable CAS identities.
