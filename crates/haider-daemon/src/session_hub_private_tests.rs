@@ -712,6 +712,108 @@ async fn worker_head_cas_rejects_a_compaction_batch_after_history_advances() {
     store.close().await.expect("store close");
 }
 
+/// LAW (F3, the tolerance half of the compaction head CAS): a delta made
+/// ONLY of session-config facts (`model_selected`) between the compaction's
+/// planned head and the actor's head does NOT reject the batch — the fact
+/// moved the journal, not the conversation tree, so the planned parent is
+/// still valid and the compaction commits. The reject pin above stays the
+/// other half: a run-state advance still gets the honest Busy.
+///
+/// MUTATION CHECK: revert the `session_config_only_delta` tolerance in the
+/// actor CAS. Expected runtime failure: this append is refused Busy. The
+/// inverse mutation (classifier accepts every payload) is killed by the
+/// reject pin above.
+#[tokio::test]
+async fn worker_head_cas_tolerates_a_config_fact_delta() {
+    let root = tempfile::tempdir().expect("temp store");
+    let store = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("store opens");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub opens");
+    let session_id = SessionId::new("compaction-head-cas-config");
+    let run_id = RunId::new("compaction-head-cas-config-run");
+    let generation = store.worker_generation();
+    let mut queued = [run_state_envelope(
+        &session_id,
+        &run_id,
+        generation,
+        "config-cas-queued",
+        RunState::Queued,
+    )];
+    hub.append(&mut queued).await.expect("queued prefix");
+    let expected_head = store.latest_seq(&session_id).await.expect("head");
+    let lease = hub
+        .acquire_worker_lease(session_id.clone())
+        .await
+        .expect("lease");
+    let actor = hub
+        .existing_actor(&session_id)
+        .expect("actor lookup")
+        .expect("actor exists");
+
+    // The interleaved journal movement is a pure config fact: no run, no
+    // conversation-tree movement.
+    let mut fact = run_state_envelope(
+        &session_id,
+        &run_id,
+        generation,
+        "config-cas-model-selected",
+        RunState::Queued,
+    );
+    fact.run_id = None;
+    fact.payload = haider_protocol::session::ModelSelected {
+        provider: "fake-b".into(),
+        model: "model-b".into(),
+    }
+    .to_payload_value()
+    .expect("fact serializes");
+    let (advance_completed, advance_response) = oneshot::channel();
+    actor
+        .commands
+        .send(ActorCommand::Append {
+            envelopes: vec![fact],
+            completed: advance_completed,
+        })
+        .await
+        .expect("advance queues");
+    let (cas_completed, cas_response) = oneshot::channel();
+    actor
+        .commands
+        .send(ActorCommand::WorkerAppend {
+            lease_id: lease.lease_id.clone(),
+            expected_head: Some(expected_head),
+            envelopes: vec![run_state_envelope(
+                &session_id,
+                &run_id,
+                generation,
+                "config-cas-batch",
+                RunState::Streaming,
+            )],
+            completed: cas_completed,
+        })
+        .await
+        .expect("CAS queues behind advance");
+
+    advance_response
+        .await
+        .expect("advance response")
+        .expect("advance commits");
+    cas_response
+        .await
+        .expect("CAS response")
+        .expect("a config-fact-only delta must not reject the batch");
+    let history = store.read(&session_id, 0, 16).await.expect("history");
+    assert!(
+        history
+            .iter()
+            .any(|event| event.event_id == EventId::new("config-cas-batch")),
+        "the tolerated batch is durably committed"
+    );
+
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
+}
+
 /// Exact D2g handoff schedule: acceptance is durably committed, the external
 /// manager gate closes and Shutdown is enqueued before the post-commit hint
 /// can hand off. The hint receives typed Busy, while the drain sweep still
