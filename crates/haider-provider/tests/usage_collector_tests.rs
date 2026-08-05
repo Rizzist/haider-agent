@@ -44,7 +44,7 @@ fn openai_wham_fixture_yields_primary_secondary_and_named_extra_windows() {
         .parse(200, &fixture("openai_wham_usage.json"))
         .expect("wham fixture parses");
     assert_eq!(reading.plan.as_deref(), Some("plus"));
-    assert_eq!(reading.windows.len(), 3, "primary, secondary, one named");
+    assert_eq!(reading.windows.len(), 4, "primary, secondary, two named");
     assert_eq!(reading.windows[0].window, "primary");
     assert!((reading.windows[0].utilization - 0.06).abs() < 1e-9);
     assert_eq!(reading.windows[0].resets_at_ms, Some(1_738_300_000_000));
@@ -58,6 +58,14 @@ fn openai_wham_fixture_yields_primary_secondary_and_named_extra_windows() {
         Some("GPT-5.3-Codex-Spark")
     );
     assert!((reading.windows[2].utilization - 0.41).abs() < 1e-9);
+    // Sub-percent window: `used_percent` is percent BY NAME — 0.5 means
+    // 0.5%, and only the parser's own /100 lands it at 0.005 (the defensive
+    // normalizer alone would misread 0.5 as a 50% fraction).
+    assert_eq!(
+        reading.windows[3].label.as_deref(),
+        Some("Sub-Percent-Lane")
+    );
+    assert!((reading.windows[3].utilization - 0.005).abs() < 1e-9);
 }
 
 /// LAW (anthropic_live_fixture_normalizes_percent_scale_and_rfc3339_resets):

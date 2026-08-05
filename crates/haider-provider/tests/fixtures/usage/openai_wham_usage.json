@@ -30,6 +30,17 @@
           "limit_window_seconds": 18000
         }
       }
+    },
+    {
+      "limit_name": "Sub-Percent-Lane",
+      "metered_feature": "trace",
+      "rate_limit": {
+        "primary_window": {
+          "used_percent": 0.5,
+          "reset_at": 1738330000,
+          "limit_window_seconds": 18000
+        }
+      }
     }
   ],
   "credits": {
