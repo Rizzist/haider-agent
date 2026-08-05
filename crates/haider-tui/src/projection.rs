@@ -189,6 +189,11 @@ pub struct SessionProjection {
     last_seq: Option<u64>,
     harness: Option<HarnessStatus>,
     run: Option<RunState>,
+    /// F2e: whether THIS turn's failure already produced a visible error
+    /// line (`RunFailed` or a client-observed rejection). An `Errored`
+    /// state with no reported reason synthesizes one — a turn must never
+    /// end in a silent ✗.
+    run_failure_reported: bool,
     interrupted: bool,
     entries: Vec<TranscriptEntry>,
     /// Item ids whose lifecycle has closed — a re-delivered `Completed` (or a
@@ -362,8 +367,20 @@ impl SessionProjection {
                 if matches!(run, RunState::Cancelled) {
                     self.interrupted = true;
                 } else if !run.is_terminal() {
-                    // A new or progressing turn clears the idle(i) marker.
+                    // A new or progressing turn clears the idle(i) marker —
+                    // and re-arms the F2e unpaired-error synthesizer.
                     self.interrupted = false;
+                    self.run_failure_reported = false;
+                }
+                // F2e: an `Errored` turn with NO paired `RunFailed` reason
+                // still gets a visible line — the pre-W5g-6 owner bug
+                // (badge-only ✗) must stay dead even when the daemon
+                // serves no public reason.
+                if matches!(run, RunState::Errored) && !self.run_failure_reported {
+                    self.run_failure_reported = true;
+                    self.entries.push(TranscriptEntry::Error {
+                        text: "errored — the daemon reported no public reason".to_owned(),
+                    });
                 }
                 self.run = Some(run.clone());
             }
@@ -396,6 +413,7 @@ impl SessionProjection {
                     .ok()
                     .and_then(|value| value.as_str().map(str::to_owned))
                     .unwrap_or_else(|| format!("{code:?}"));
+                self.run_failure_reported = true;
                 self.entries.push(TranscriptEntry::Error {
                     text: format!("{code} — {message}"),
                 });
@@ -404,15 +422,86 @@ impl SessionProjection {
             // transcript row of its own (the sim's tree reads entries; the
             // node is the durable identity riding beside them).
             EventPayload::NodeCommitted(node) => self.record_node_anchor(node),
-            // Consumed by later waves (effects timeline, subagent tree, gate
-            // panel, accounts). The projection stays tolerant of them now.
+            // F2e error-visibility sweep: every turn-level failure the
+            // wire can carry surfaces as a VISIBLE session-view line with
+            // its public reason — never a silent IDLE.
+            EventPayload::Effect(haider_protocol::effect::EffectPhase::Outcome {
+                outcome, ..
+            }) => {
+                use haider_protocol::effect::EffectOutcome;
+                match outcome {
+                    EffectOutcome::Failed { error } => {
+                        self.entries.push(TranscriptEntry::Error {
+                            text: format!("effect failed — {error}"),
+                        });
+                    }
+                    EffectOutcome::CancelledEscalated { note } => {
+                        self.entries.push(TranscriptEntry::Error {
+                            text: format!("effect cancel escalated — {note}"),
+                        });
+                    }
+                    EffectOutcome::Unknown => {
+                        self.entries.push(TranscriptEntry::Error {
+                            text: "effect outcome unknown — crash window; reconcile via the recovery menu"
+                                .to_owned(),
+                        });
+                    }
+                    EffectOutcome::Ok | EffectOutcome::Cancelled => {}
+                }
+            }
+            EventPayload::GateReport(report) => {
+                use haider_protocol::verify::VerifyVerdict;
+                let new_errors = report.new_errors.len();
+                match &report.verdict {
+                    VerifyVerdict::ErroredWithReport => {
+                        self.entries.push(TranscriptEntry::Error {
+                            text: format!(
+                                "verify errored — cycle cap exhausted · {new_errors} new error(s)"
+                            ),
+                        });
+                    }
+                    VerifyVerdict::FailedEnv { item } => {
+                        self.entries.push(TranscriptEntry::Error {
+                            text: format!("verify failed-env — {item}"),
+                        });
+                    }
+                    VerifyVerdict::Incomplete { reason } => {
+                        self.entries.push(TranscriptEntry::Error {
+                            text: format!("verify incomplete — {reason}"),
+                        });
+                    }
+                    VerifyVerdict::AcknowledgedRed => {
+                        self.entries.push(TranscriptEntry::Error {
+                            text: format!(
+                                "verify acknowledged-red — {new_errors} new error(s) cited out of scope"
+                            ),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            // §4.4: a rotation surfaces like a model change — a visible
+            // note naming the new account and the public cause.
+            EventPayload::Rotation(rotation) => {
+                use haider_protocol::credential::RotationCause;
+                let cause = match rotation.cause {
+                    RotationCause::RateLimit => "rate limit",
+                    RotationCause::Error => "provider error",
+                    RotationCause::Manual => "manual",
+                };
+                self.push_note(format!(
+                    "account rotated → {} ({} · {cause})",
+                    rotation.to.as_str(),
+                    rotation.provider
+                ));
+            }
+            // Consumed by later waves (effects timeline, subagent tree,
+            // accounts). The projection stays tolerant of them now.
             EventPayload::Effect(_)
             | EventPayload::ToolResult { .. }
             | EventPayload::AgentSpawned(_)
             | EventPayload::AgentReport(_)
-            | EventPayload::AgentChipState { .. }
-            | EventPayload::GateReport(_)
-            | EventPayload::Rotation(_) => {}
+            | EventPayload::AgentChipState { .. } => {}
         }
     }
 

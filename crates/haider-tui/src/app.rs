@@ -8249,6 +8249,18 @@ impl AppModel {
         self.dirty = true;
     }
 
+    /// F2e: route a client-observed failure to `session`'s OWN view —
+    /// the attached projection when it is live on screen, the parked
+    /// slot's otherwise — so the error line is there when the user looks.
+    pub fn record_session_error(&mut self, session: &SessionId, text: String) {
+        if self.active_session.as_ref() == Some(session) {
+            self.projection.record_local_error(text);
+        } else if let Some(entry) = self.sessions.iter_mut().find(|entry| &entry.id == session) {
+            entry.projection.record_local_error(text);
+        }
+        self.dirty = true;
+    }
+
     /// A typed `session.select_model` refusal. With the picker open the
     /// public reason lands INLINE (the row stays selectable for a retry);
     /// otherwise it reaches the session view as an error line — never a

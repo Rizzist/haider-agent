@@ -2197,12 +2197,25 @@ impl LiveDriver {
                 // ever coming to clear it — and Esc, which now cancels only
                 // a run the stream named, has nothing to cancel (P1-4).
                 if let Some(id) = &command_id {
-                    let was_submit = self.outbox.iter().any(|pending| {
-                        &pending.command_id == id
-                            && matches!(pending.command, LiveCommand::Submit { .. })
+                    let submit_session = self.outbox.iter().find_map(|pending| {
+                        if &pending.command_id != id {
+                            return None;
+                        }
+                        match &pending.command {
+                            LiveCommand::Submit { session, .. } => Some(session.clone()),
+                            _ => None,
+                        }
                     });
-                    if was_submit {
+                    if let Some(session) = submit_session {
                         model.turn_active = false;
+                        // F2e: the rejected turn's public reason reaches
+                        // the SESSION VIEW, not just a transient flash —
+                        // an api/oauth/endpoint rejection must never end
+                        // as a silent IDLE.
+                        model.record_session_error(
+                            &session,
+                            format!("submit rejected — {code}: {message}"),
+                        );
                     }
                     if !retryable {
                         self.retire(id);
