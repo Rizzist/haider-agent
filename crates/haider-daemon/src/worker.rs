@@ -23,6 +23,9 @@
 //! buffer.
 
 #[cfg(test)]
+#[path = "g1_todo_runtime_tests.rs"]
+mod g1_todo_runtime_tests;
+#[cfg(test)]
 #[path = "pair_switch_runtime_tests.rs"]
 mod pair_switch_runtime_tests;
 
@@ -2723,7 +2726,8 @@ async fn perform_manual_compaction(
         &instruction_entries,
         handoff_dir.as_deref(),
     );
-    let post_compaction_tools = dependencies.tool_factory.definitions();
+    let post_compaction_tools =
+        advertised_tool_definitions(&dependencies.tool_factory, agent_id.is_some());
     let mut messages = PromptHistoryCompiler::compile_idle_with_artifacts(
         lease,
         lease,
@@ -3172,6 +3176,9 @@ async fn start_turn(
         )
     })?;
     let agent_id = delegation.agent_for_session(lease.session_id()).await?;
+    // G1 (L5): a delegation-owned session is a child — its tool pack below
+    // excludes the root-only planning surface.
+    let delegated_child = agent_id.is_some();
     let handoff_dir = delegation
         .handoff_dir_for_child_session(lease.session_id(), &metadata.cwd)
         .await?;
@@ -3276,11 +3283,12 @@ async fn start_turn(
         &instruction_entries,
         handoff_dir.as_deref(),
     ));
-    config.tools = dependencies.tool_factory.definitions();
+    config.tools = advertised_tool_definitions(&dependencies.tool_factory, delegated_child);
     // W6c children retain the spawn tool. The coordinator derives their
     // durable depth from the parent delegation and returns a typed tool
     // result at the cap; hiding the tool would turn that recoverable model
-    // decision into provider-specific behavior.
+    // decision into provider-specific behavior. G1: children do NOT retain
+    // `todo_write` — the plan surface is root-only (L5).
     config.attachments = attachments;
     config.context_compactor = Some(Arc::new(DaemonContextCompactor {
         store: lease.clone(),
@@ -3880,6 +3888,7 @@ pub(crate) struct BrokerToolFactory;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RegisteredToolRoute {
     RequestInput,
+    TodoWrite,
     FsRead,
     FsList,
     FsSearch,
@@ -3932,6 +3941,15 @@ pub(crate) fn registered_tools() -> Vec<RegisteredTool> {
             ToolPermissionDefault::NotApplicable,
             RegisteredToolRoute::RequestInput,
         ),
+        {
+            // G1: actor-owned like request_input — no brokered effect.
+            let manifest = haider_tools::todo_write_manifest();
+            RegisteredTool {
+                manifest,
+                default: ToolPermissionDefault::NotApplicable,
+                route: RegisteredToolRoute::TodoWrite,
+            }
+        },
         registered_tool(
             tool_definition("fs_read", "Read a UTF-8 file", &["path"]),
             vec![EffectClass::FsRead],
@@ -4022,6 +4040,21 @@ fn provider_definition(manifest: ToolManifest) -> ToolDefinition {
         description: manifest.description,
         input_schema: manifest.input_schema,
     }
+}
+
+/// The tool pack one turn advertises (G1). The plan surface is root-only:
+/// a delegated child session never sees `todo_write` — the pinned panel and
+/// the Todos history nodes belong to the root planning timeline. This is the
+/// single advertisement seam; delegation `Grant` lists stay untouched.
+pub(crate) fn advertised_tool_definitions(
+    tool_factory: &Arc<dyn TurnToolFactory>,
+    delegated_child: bool,
+) -> Vec<ToolDefinition> {
+    let mut definitions = tool_factory.definitions();
+    if delegated_child {
+        definitions.retain(|definition| definition.name != "todo_write");
+    }
+    definitions
 }
 
 #[async_trait]
@@ -4457,6 +4490,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     .await
             }
             RegisteredToolRoute::RequestInput
+            | RegisteredToolRoute::TodoWrite
             | RegisteredToolRoute::SpawnSubagent
             | RegisteredToolRoute::MessageSubagent => {
                 return Err(HaiderError::new(
