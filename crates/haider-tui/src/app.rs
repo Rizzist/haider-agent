@@ -219,6 +219,11 @@ pub enum Screen {
     /// active session's workspace, plus the session's journaled hook
     /// firings. Live-only truth: demo renders a sim-honest empty state.
     Hooks,
+    /// `/usage` (U2) — the cross-provider usage report: OAuth limit bars,
+    /// API-key token/cost counters, journal-derived local stats. Backed by
+    /// U1's `usage.report` read in live mode; demo renders an honest
+    /// empty state (usage is daemon truth, never fabricated).
+    Usage,
 }
 
 /// Sim `AUTH_LABEL` (tui.js:145): the badge text per auth method.
@@ -608,6 +613,117 @@ impl ProvidersState {
                     .find(|detail| detail.name == model)
             })
             .and_then(|detail| detail.context_window)
+    }
+}
+
+/// One `/usage` provider group: a provider and the report indices of its
+/// accounts, both in REPORT order (daemon truth — never re-sorted).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageGroup {
+    pub provider: String,
+    /// Indices into [`UsageState::report`]'s `accounts`.
+    pub accounts: Vec<usize>,
+}
+
+/// The `/usage` screen state (U2). The report is U1's `usage.report`
+/// snapshot CONSUMED whole — meter windows, typed unavailability, local
+/// counters; nothing here re-derives or fabricates a reading.
+#[derive(Debug, Default)]
+pub struct UsageState {
+    /// The last committed `usage.report` snapshot. `None` until the first
+    /// reply lands (live) — the demo never fabricates one.
+    pub report: Option<haider_protocol::usage::UsageReportV1>,
+    /// A read is in flight (screen entry / `r`).
+    pub fetching: bool,
+    /// The last read's typed failure — rendered on the screen, never a
+    /// bare flash; a later good reply clears it.
+    pub error: Option<String>,
+    /// `/usage <provider>`: case-insensitive PREFIX filter over provider
+    /// names (`anthropic` catches `anthropic-oauth`). `None` shows all.
+    pub filter: Option<String>,
+    /// Cursor over the FILTERED provider groups (↑/↓, F2b follow).
+    pub cursor: usize,
+    /// Per-provider selected account (←/→ tabs). Clamped lazily against
+    /// the group at read time so a shrunken report can never index out.
+    pub tabs: std::collections::BTreeMap<String, usize>,
+    /// Identities render MASKED unless this is set (U2 owner addendum —
+    /// streamer-friendly by default). `r` toggles it for the CURRENT
+    /// visit only: the one door in ([`AppModel::enter_usage`]) and the esc
+    /// exit both reset to masked, so a screen never OPENS revealed.
+    pub revealed: bool,
+    /// F2b scroll discipline: RENDER is the single scroll authority — the
+    /// frame writes the true max and reconciles this offset against it.
+    pub scroll: std::cell::Cell<u16>,
+    pub scroll_max: std::cell::Cell<u16>,
+    /// Armed by a cursor move: the next frame scrolls the cursor's group
+    /// header into view, then clears the latch.
+    pub follow_cursor: std::cell::Cell<bool>,
+}
+
+impl UsageState {
+    /// Install a committed `usage.report` snapshot. The ONLY writer of
+    /// `report`; clears the in-flight mark and any stale error.
+    pub fn apply_report(&mut self, report: haider_protocol::usage::UsageReportV1) {
+        self.report = Some(report);
+        self.fetching = false;
+        self.error = None;
+        let groups = self.groups().len();
+        if self.cursor >= groups {
+            self.cursor = groups.saturating_sub(1);
+        }
+    }
+
+    /// A `usage.report` read failed: the typed message lands on the
+    /// screen. A held snapshot stays visible under the error line —
+    /// clearly older truth, never a fabrication.
+    pub fn read_failed(&mut self, message: &str) {
+        self.fetching = false;
+        self.error = Some(message.to_owned());
+    }
+
+    /// The FILTERED provider groups, report order preserved: accounts
+    /// grouped by provider (first-seen order), the `/usage <provider>`
+    /// prefix filter applied case-insensitively.
+    #[must_use]
+    pub fn groups(&self) -> Vec<UsageGroup> {
+        let mut groups: Vec<UsageGroup> = Vec::new();
+        let Some(report) = &self.report else {
+            return groups;
+        };
+        let filter = self.filter.as_deref().unwrap_or("");
+        for (index, account) in report.accounts.iter().enumerate() {
+            if !filter.is_empty()
+                && !account
+                    .provider
+                    .to_ascii_lowercase()
+                    .starts_with(&filter.to_ascii_lowercase())
+            {
+                continue;
+            }
+            if let Some(group) = groups
+                .iter_mut()
+                .find(|group| group.provider == account.provider)
+            {
+                group.accounts.push(index);
+            } else {
+                groups.push(UsageGroup {
+                    provider: account.provider.clone(),
+                    accounts: vec![index],
+                });
+            }
+        }
+        groups
+    }
+
+    /// The selected tab WITHIN `group` — the ←/→ choice clamped to the
+    /// group's current width (a shrunken report can never index out).
+    #[must_use]
+    pub fn selected_tab(&self, group: &UsageGroup) -> usize {
+        self.tabs
+            .get(&group.provider)
+            .copied()
+            .unwrap_or(0)
+            .min(group.accounts.len().saturating_sub(1))
     }
 }
 
@@ -1965,6 +2081,10 @@ pub enum AppRequest {
     AccountSetActive { alias: String },
     /// Fetch/refresh the `/providers` summaries (`provider.list`).
     ProvidersRefresh,
+    /// Fetch/refresh the `/usage` snapshot (U1's `usage.report`). A READ —
+    /// pushed on screen entry and by `r`, live-only vocabulary: the demo
+    /// opens an honest empty state and never fabricates a meter.
+    UsageRefresh,
     /// `account.set_default_model` under the expected-revision CAS. The
     /// default marker moves only on the correlated reply.
     SetDefaultModel {
@@ -2115,6 +2235,13 @@ pub enum Hit {
     ModelPickerRow {
         provider: String,
         model: String,
+    },
+    /// One `/usage` account tab chip (U2). VALUE-CARRYING: the provider +
+    /// the index WITHIN its group, so a stale hit map can never select a
+    /// different account.
+    UsageAccountTab {
+        provider: String,
+        index: usize,
     },
     BackChip,
     TalkChip,
@@ -2779,6 +2906,10 @@ pub struct AppModel {
     /// (H4). Checked in/out with the session exactly like `branch_state`
     /// (the A→B→A law).
     pub hook_facts: crate::hooks::HookFactsLog,
+    /// `/usage` screen state (U2): the `usage.report` snapshot, provider
+    /// filter, group cursor, account tabs, F2b scroll cells. APP-level —
+    /// the report is account truth, not session display state.
+    pub usage: UsageState,
 }
 
 impl Default for AppModel {
@@ -2882,6 +3013,7 @@ impl Default for AppModel {
             custom_attempt_seq: 0,
             hooks: crate::hooks::HooksScreenState::default(),
             hook_facts: crate::hooks::HookFactsLog::default(),
+            usage: UsageState::default(),
         }
     }
 }
@@ -3229,6 +3361,7 @@ impl AppModel {
             Screen::Tools => "haider — tools".to_owned(),
             Screen::Providers => "haider — providers".to_owned(),
             Screen::Hooks => "haider — hooks".to_owned(),
+            Screen::Usage => "haider — usage".to_owned(),
             Screen::Session | Screen::Subagent | Screen::Aura => {
                 // Strip control characters: user text must never smuggle
                 // escape sequences into OSC 2 (review r1 P1).
@@ -3321,6 +3454,9 @@ impl AppModel {
             // Hooks: only an in-flight trust receipt animates (the pending
             // row's `…` beat, the accounts pattern).
             Screen::Hooks => self.hooks.pending.is_some(),
+            // Usage: a static snapshot — nothing animates (the fetching
+            // note is a plain line, never a pulse).
+            Screen::Usage => false,
             Screen::Session | Screen::Subagent => {
                 // `● thinking…` (tui.js:4458-4462) · the ⚒ running tool
                 // glyph (tui.js:4524-4530) · the processing todo's box
@@ -3919,6 +4055,14 @@ impl AppModel {
         }
         if self.screen == Screen::Providers {
             self.handle_providers_key(key.code);
+            return;
+        }
+        // `/usage` (U2): a full-screen read-only report — esc walks back,
+        // ↑/↓ move the provider cursor, ←/→ tab through a provider's
+        // accounts, F2b page/scroll keys reach everything; every other key
+        // is swallowed (the F2a key-ownership law — no composer beneath).
+        if self.screen == Screen::Usage {
+            self.handle_usage_key(key.code);
             return;
         }
         // A SELECT menu replaces the composer (sim §3 law); a zero-option
@@ -5975,6 +6119,145 @@ impl AppModel {
         self.dirty = true;
     }
 
+    /// THE ONE DOOR into `/usage` (U2). Works everywhere like `/accounts`;
+    /// `filter` is `/usage <provider>`'s first token (empty clears). The
+    /// live path is feature-gated BEFORE anything opens (the B2b lesson);
+    /// demo opens an honest empty state — usage is daemon truth and the
+    /// demo fabricates no meter. Re-running `/usage` while the screen is
+    /// up re-filters and (live) re-reads.
+    fn enter_usage(&mut self, filter: Option<&str>) {
+        self.dirty = true;
+        let filter = filter
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+            .map(str::to_ascii_lowercase);
+        if !self.mode.fabricates_locally()
+            && !self.daemon_serves(haider_rpc::FEATURE_USAGE_REPORT_V1)
+        {
+            self.flash = Some(self.stale_daemon_note("the usage report"));
+            return;
+        }
+        let refilter = self.usage.filter != filter;
+        self.usage.filter = filter;
+        if refilter {
+            // A new filter re-anchors navigation; the frame reconciles the
+            // scroll against the new true range (render authority).
+            self.usage.cursor = 0;
+            self.usage.scroll.set(0);
+        }
+        // MASK LAW (owner addendum): every open starts masked — a reveal
+        // never survives into a later visit, whichever way the last one
+        // ended (esc, ⌃C, a screen switch).
+        self.usage.revealed = false;
+        if self.screen != Screen::Usage {
+            self.switch_surface(Screen::Usage);
+        }
+        if !self.mode.fabricates_locally() {
+            self.usage.fetching = true;
+            self.requests.push(AppRequest::UsageRefresh);
+        }
+    }
+
+    /// Esc from `/usage`: same routing as `/accounts`. Closing the screen
+    /// RESTORES the mask (owner addendum) — a reveal is per-visit.
+    fn exit_usage(&mut self) {
+        self.usage.revealed = false;
+        let target = if self.active_session.is_some()
+            || !self.projection.entries().is_empty()
+            || self.session_name.is_some()
+        {
+            Screen::Session
+        } else {
+            Screen::Launcher
+        };
+        self.switch_surface(target);
+        self.dirty = true;
+    }
+
+    /// Keys on `/usage` (U2). KEY-OWNERSHIP: esc closes (never a ⏎
+    /// action — the screen is read-only), ↑/↓ move the provider-group
+    /// cursor (F2b follow), ←/→ (and tab/shift-tab) cycle the cursor
+    /// group's accounts wrapping, PageUp/PageDown/Home/End scroll against
+    /// the frame-written max, `r` toggles the identity reveal (owner
+    /// addendum — per-visit), `f` re-reads (live). Everything else is
+    /// swallowed.
+    fn handle_usage_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc => self.exit_usage(),
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.usage.cursor = self.usage.cursor.saturating_sub(1);
+                self.usage.follow_cursor.set(true);
+                self.dirty = true;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let groups = self.usage.groups().len();
+                if groups > 0 {
+                    self.usage.cursor = (self.usage.cursor + 1).min(groups - 1);
+                }
+                self.usage.follow_cursor.set(true);
+                self.dirty = true;
+            }
+            KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
+                let groups = self.usage.groups();
+                let Some(group) = groups.get(self.usage.cursor.min(groups.len().saturating_sub(1)))
+                else {
+                    return;
+                };
+                let len = group.accounts.len();
+                if len < 2 {
+                    return;
+                }
+                let current = self.usage.selected_tab(group);
+                let next = if matches!(code, KeyCode::Right | KeyCode::Tab) {
+                    (current + 1) % len
+                } else {
+                    (current + len - 1) % len
+                };
+                self.usage.tabs.insert(group.provider.clone(), next);
+                self.usage.follow_cursor.set(true);
+                self.dirty = true;
+            }
+            KeyCode::Char('r') => {
+                // Owner addendum: `r` toggles the identity REVEAL for this
+                // visit only — the screen always opens masked and closing
+                // restores the mask.
+                self.usage.revealed = !self.usage.revealed;
+                self.dirty = true;
+            }
+            // A manual re-read (live only — the demo has nothing to fetch
+            // and the honest empty state already says so).
+            KeyCode::Char('f') if !self.mode.fabricates_locally() => {
+                self.usage.fetching = true;
+                self.requests.push(AppRequest::UsageRefresh);
+                self.dirty = true;
+            }
+            // F2b: page keys move the viewport and clamp at the true
+            // frame-written range.
+            KeyCode::PageUp => {
+                self.usage
+                    .scroll
+                    .set(self.usage.scroll.get().saturating_sub(8));
+                self.dirty = true;
+            }
+            KeyCode::PageDown => {
+                let max = self.usage.scroll_max.get();
+                self.usage
+                    .scroll
+                    .set(self.usage.scroll.get().saturating_add(8).min(max));
+                self.dirty = true;
+            }
+            KeyCode::Home => {
+                self.usage.scroll.set(0);
+                self.dirty = true;
+            }
+            KeyCode::End => {
+                self.usage.scroll.set(self.usage.scroll_max.get());
+                self.dirty = true;
+            }
+            _ => {}
+        }
+    }
+
     /// Click on a model chip: request the default change under the CAS.
     /// The `*` marker moves ONLY on the correlated reply (§5.1's law
     /// applied to the management screen).
@@ -7434,6 +7717,9 @@ impl AppModel {
             "accounts" => self.enter_accounts(),
             "providers" => self.enter_providers(),
             "hooks" => self.enter_hooks(),
+            // U2: `/usage [provider]` — the cross-provider usage report;
+            // the optional first token is a provider prefix filter.
+            "usage" => self.enter_usage(arg.as_deref()),
             // W5e-3: choose from the DISCOVERED catalog. Both are
             // feature-gated BEFORE shipping this time (the W5e-1b lesson).
             "model" => {
@@ -8811,6 +9097,21 @@ impl AppModel {
             Hit::ProviderAccounts if self.screen == Screen::Providers => {
                 self.enter_accounts();
             }
+            // U2: a click on an account tab chip selects exactly the
+            // account the rect was rendered for (value-carrying) and moves
+            // the cursor to its group.
+            Hit::UsageAccountTab { provider, index } if self.screen == Screen::Usage => {
+                let groups = self.usage.groups();
+                let Some(position) = groups.iter().position(|group| group.provider == provider)
+                else {
+                    return;
+                };
+                if index < groups[position].accounts.len() {
+                    self.usage.cursor = position;
+                    self.usage.tabs.insert(provider, index);
+                    self.dirty = true;
+                }
+            }
             // Dismissed/replaced palettes drop the click.
             Hit::PaletteRow(item) if self.palette_open() => self.activate_palette_item(item),
             // A `/theme` picker row: click commits (the hover already
@@ -9032,6 +9333,19 @@ impl AppModel {
                 current.saturating_add(3).min(max)
             };
             self.providers.scroll.set(next);
+            self.dirty = true;
+            return;
+        }
+        // U2: the usage report rides the same F2b wheel discipline.
+        if self.screen == Screen::Usage {
+            let max = self.usage.scroll_max.get();
+            let current = self.usage.scroll.get().min(max);
+            let next = if up {
+                current.saturating_sub(3)
+            } else {
+                current.saturating_add(3).min(max)
+            };
+            self.usage.scroll.set(next);
             self.dirty = true;
             return;
         }

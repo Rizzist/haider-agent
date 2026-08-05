@@ -186,6 +186,11 @@ pub enum LiveCommand {
     HooksList {
         cwd: String,
     },
+    /// `usage.report` — a READ of the cross-provider usage snapshot
+    /// (U2 /usage, U1's wire). Parameterless, receipt-free, never outboxed:
+    /// a socket loss simply leaves the screen on its honest fetching /
+    /// stale state and `r` re-reads.
+    UsageReport,
     /// `hooks.trust` / `hooks.revoke` — a receipted digest pin or
     /// revocation (H3's R2 pattern). DURABLE: a lost response retries under
     /// the same command id and replays the same committed change. The
@@ -405,6 +410,8 @@ impl LiveCommand {
             | Self::OAuthCancel { .. }
             | Self::ToolsInventory { .. }
             | Self::HooksList { .. }
+            // U2: the usage snapshot is a read (see above).
+            | Self::UsageReport
             // A stage carries no durable identity BY DESIGN (see above).
             | Self::Stage { .. }
             // T2: reads + the deliberately receipt-free secret set (no
@@ -549,6 +556,19 @@ pub enum LiveReply {
     /// stage precedent): the failure lands on the hooks screen, not a
     /// launcher flash.
     HooksListFailed {
+        message: String,
+    },
+    /// `usage.report` answered — the committed cross-provider snapshot
+    /// (U2). Boxed: a many-account report is the largest read this enum
+    /// carries.
+    UsageReport {
+        report: Box<haider_protocol::usage::UsageReportV1>,
+    },
+    /// `usage.report` FAILED. Identity-tagged from the link's request
+    /// context (the read has no durable command id — the hooks.list
+    /// precedent): the typed message lands on the usage screen, never a
+    /// bare flash.
+    UsageReportFailed {
         message: String,
     },
     /// `hooks.trust` / `hooks.revoke` committed: the daemon's receipt. It
@@ -1411,6 +1431,18 @@ impl LiveDriver {
             }
             LiveReply::HooksListFailed { message } => {
                 model.hooks.list_failed(&message);
+                model.dirty = true;
+                Vec::new()
+            }
+            // U2: the ONLY writer of the /usage snapshot — committed
+            // daemon truth, installed whole.
+            LiveReply::UsageReport { report } => {
+                model.usage.apply_report(*report);
+                model.dirty = true;
+                Vec::new()
+            }
+            LiveReply::UsageReportFailed { message } => {
+                model.usage.read_failed(&message);
                 model.dirty = true;
                 Vec::new()
             }
@@ -2935,6 +2967,8 @@ impl LiveDriver {
                 self.hooks_cwd = Some(cwd.clone());
                 vec![LiveCommand::HooksList { cwd }]
             }
+            // U2: a read — never outboxed (the hooks.list discipline).
+            AppRequest::UsageRefresh => vec![LiveCommand::UsageReport],
             AppRequest::HooksTrust { digest, trusted } => {
                 let command_id = self.mint();
                 self.pending_hook_trust = Some((command_id.clone(), digest.clone()));

@@ -464,6 +464,9 @@ pub struct CommandContext {
     /// durable id, so its ERROR reply is identity-tagged from here — the
     /// failure lands on the hooks screen, never an uncorrelated flash.
     hooks_list: bool,
+    /// This request was a `usage.report` read (U2). Same identity pattern
+    /// as `hooks_list`: the error reply lands on the usage screen.
+    usage_report: bool,
     /// This request was a transcription-secret RPC (T2). Same identity
     /// pattern: neither carries a durable command id, so the error reply
     /// is tagged with WHICH operation failed and lands on the talk flow.
@@ -517,6 +520,7 @@ impl CommandContext {
                 _ => None,
             },
             hooks_list: matches!(command, LiveCommand::HooksList { .. }),
+            usage_report: matches!(command, LiveCommand::UsageReport),
             transcription: match command {
                 LiveCommand::TranscriptionSecretGet => Some(crate::live::TranscriptionOp::Get),
                 LiveCommand::TranscriptionSecretSet { .. } => {
@@ -691,6 +695,8 @@ pub fn request_body(command: LiveCommand) -> RequestBody {
             session_id: session,
         },
         LiveCommand::HooksList { cwd } => RequestBody::HooksList { cwd },
+        // U2: parameterless read (U1's wire) — CONSUMED, never redefined.
+        LiveCommand::UsageReport => RequestBody::UsageReport,
         // The trusted flag is COMMAND SELECTION, not wire data: `true` is
         // the `hooks.trust` method, `false` `hooks.revoke` — both carry
         // only the receipt id and the digest (H3's wire shapes).
@@ -977,6 +983,9 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
             snapshot: Box::new(inventory),
         }],
         ResponseBody::HooksList { policy, hooks } => vec![LiveReply::Hooks { policy, hooks }],
+        ResponseBody::UsageReport { report } => vec![LiveReply::UsageReport {
+            report: Box::new(report),
+        }],
         // Both trust receipts carry the same driver fact — which METHOD
         // answered is already encoded in the committed `trusted` flag.
         ResponseBody::HooksTrust { digest, trusted }
@@ -1214,6 +1223,13 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
                 // the hooks screen, not an uncorrelated flash.
                 if context.hooks_list {
                     return vec![LiveReply::HooksListFailed {
+                        message: message.clone(),
+                    }];
+                }
+                // U2: a `usage.report` error lands on the usage screen —
+                // the same identity pattern.
+                if context.usage_report {
+                    return vec![LiveReply::UsageReportFailed {
                         message: message.clone(),
                     }];
                 }

@@ -1341,6 +1341,10 @@ impl DemoDriver {
             // request is ever pushed.
             | AppRequest::HooksRefresh { .. }
             | AppRequest::HooksTrust { .. }
+            // U2 live-only vocabulary: `/usage` in demo opens its honest
+            // empty state (usage is daemon truth, never fabricated) and
+            // the reducer's demo gate never pushes the read.
+            | AppRequest::UsageRefresh
             // B2b live-only vocabulary: `/branch new` in demo mode flashes
             // its honest stub upstream — branches are daemon truth.
             | AppRequest::BranchCreate { .. }

@@ -77,6 +77,15 @@ pub const COMMANDS: &[CommandSpec] = &[
         "Providers — registry truth: endpoints, models, defaults, health",
         "",
     ),
+    // U2 registry extension (no sim counterpart): the cross-provider
+    // usage report — OAuth limit bars, API-key token/cost counters,
+    // local journal stats. Bare `/usage` shows every account; a provider
+    // argument filters.
+    cmd(
+        "usage",
+        "Usage — cross-provider limit meters, costs, local stats",
+        "[provider]",
+    ),
     cmd("login", "Add a provider account", "<provider> <oauth|api>"),
     cmd(
         "clear",
@@ -203,6 +212,10 @@ pub fn has_arg_slots(name: &str) -> bool {
     // picker is bare /model's argument experience, so ⏎ on the `/model`
     // row must RUN it and open the picker — never lead-jump onto an arg
     // row. Tab still completes through `offers_arg_completions`.
+    //
+    // `/usage` follows the same law (U2): bare `/usage` IS the experience
+    // (the full report), so ⏎ on its row must RUN it — never lead-jump
+    // onto a provider-filter arg row. Tab still completes the filter.
     matches!(name, "login" | "provider" | "account")
 }
 
@@ -212,7 +225,7 @@ pub fn has_arg_slots(name: &str) -> bool {
 /// here while ⏎ runs them (and opens their pickers).
 #[must_use]
 pub fn offers_arg_completions(name: &str) -> bool {
-    matches!(name, "theme" | "model") || has_arg_slots(name)
+    matches!(name, "theme" | "model" | "usage") || has_arg_slots(name)
 }
 
 /// `/login`'s two argument slots: provider, then method. Slot 0 names the
@@ -351,6 +364,9 @@ pub fn palette_items(query: &str, in_session: bool, slots: &DynamicSlots) -> Vec
         "model" if done_args == 0 => dynamic_args("model", &slots.models, &fragment),
         "provider" if done_args == 0 => dynamic_args("provider", &slots.providers, &fragment),
         "account" if done_args == 0 => dynamic_args("account", &slots.accounts, &fragment),
+        // U2: `/usage <provider>`'s filter slot completes from the same
+        // discovered provider roster as `/provider`.
+        "usage" if done_args == 0 => dynamic_args("usage", &slots.providers, &fragment),
         _ => Vec::new(),
     }
 }
@@ -369,6 +385,7 @@ pub const HELP_TEXT: &[&str] = &[
     "  /sessions          list + switch sessions",
     "  /aura              Aura Mode — a voice/orchestrator session (spawns sessions, never codes) — demo only",
     "  /peers             reachability ladder — enrolled peers · sponsored SSH nodes · shell targets",
+    "  /usage [provider]  cross-provider usage — OAuth limit bars + resets · API-key tokens/cost · local stats",
     "  /accounts          provider credentials — OAuth / API / HuggingFace / OpenCode Zen+Go / custom, pick the active",
     "  /account <alias>   switch the active account for its provider (tab-completes aliases)",
     "  /login <prov> <oauth|api>  add a provider account (OAuth loopback, API key, or custom URL)",

@@ -76,3 +76,130 @@ pub fn meter_cells(pct: f64, cells: usize) -> String {
 
 /// The status-bar meter width used by the sim (`meterCells(pct)`).
 pub const METER_CELLS_DEFAULT: usize = 10;
+
+/// The `/usage` limit bars' width in cells (U2).
+pub const USAGE_BAR_CELLS: usize = 10;
+
+/// A `/usage` limit bar: the wire's 0.0–1.0 utilization fraction rendered
+/// as `▰▰▰▱▱▱▱▱▱▱` (U2).
+///
+/// BAR-MATH LAW: input clamps to [0, 1] (the wire promises the range, the
+/// renderer re-proves it), fill is FLOOR-based — never rounding a 96%
+/// window up to a full bar — with two honesty clamps: any nonzero
+/// utilization shows at least one filled cell, and anything under 1.0
+/// keeps at least one empty cell. Only a genuinely exhausted window (≥ 1.0)
+/// renders full; only a genuinely untouched one (0.0) renders empty.
+#[must_use]
+pub fn usage_bar(utilization: f64, cells: usize) -> String {
+    let clamped = utilization.clamp(0.0, 1.0);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let mut full = ((clamped * cells as f64).floor() as usize).min(cells);
+    if clamped > 0.0 && full == 0 {
+        full = 1;
+    }
+    if clamped < 1.0 && full == cells {
+        full = cells.saturating_sub(1);
+    }
+    let mut out = String::with_capacity(cells * "▰".len());
+    for _ in 0..full {
+        out.push('▰');
+    }
+    for _ in full..cells {
+        out.push('▱');
+    }
+    out
+}
+
+/// The `/usage` percent label beside a bar: the 0.0–1.0 fraction as a
+/// whole percent, clamped to 0–100 and rounded half-up (`0.83` → `83%`).
+#[must_use]
+pub fn fmt_pct(utilization: f64) -> String {
+    let clamped = utilization.clamp(0.0, 1.0);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let pct = (clamped * 100.0).round() as u32;
+    format!("{pct}%")
+}
+
+/// Reset-instant formatting for `/usage` windows (U2): the delta from the
+/// report's own `generated_at_ms` to `resets_at_ms`, BOTH on the daemon's
+/// clock — never the client's, so the line is a pure function of the
+/// snapshot.
+///
+/// RESET-TIME LAW, tiered like [`fmt_elapsed`]: an elapsed or sub-minute
+/// reset says `resets soon`; under an hour `resets in {m}m`; under a day
+/// `resets in {h}h {m}m`; from a day up `resets in {d}d {h}h`. Minutes
+/// floor (a window never claims more runway than it has).
+#[must_use]
+pub fn fmt_reset(generated_at_ms: u64, resets_at_ms: u64) -> String {
+    let delta_ms = resets_at_ms.saturating_sub(generated_at_ms);
+    let minutes = delta_ms / 60_000;
+    if minutes == 0 {
+        return "resets soon".to_owned();
+    }
+    let days = minutes / (24 * 60);
+    let hours = (minutes % (24 * 60)) / 60;
+    let mins = minutes % 60;
+    if days > 0 {
+        format!("resets in {days}d {hours}h")
+    } else if hours > 0 {
+        format!("resets in {hours}h {mins}m")
+    } else {
+        format!("resets in {mins}m")
+    }
+}
+
+/// The ink a `/usage` bar's filled cells wear, from the same 0.0–1.0
+/// fraction the bar renders (U2). THRESHOLD LAW: below 0.70 the calm `ok`
+/// slot, from 0.70 the `warn` slot, from 0.90 the `err` slot — theme
+/// slots only, never raw colors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageTone {
+    Ok,
+    Warn,
+    Err,
+}
+
+/// Streamer-friendly identity masking for `/usage` (U2 owner addendum).
+///
+/// MASK LAW: emails keep the first character of the local part and the
+/// first character of the domain, `*` for every other character
+/// (length-preserving), with the final `.tld` left readable —
+/// `support@diffforge.ai` → `s******@d********.ai`. Non-email identities
+/// mask the same way as one part. The masked form never contains the
+/// full local part.
+#[must_use]
+pub fn mask_identity(identity: &str) -> String {
+    fn mask_part(part: &str) -> String {
+        let mut chars = part.chars();
+        chars.next().map_or_else(String::new, |first| {
+            let rest = chars.count();
+            let mut out = String::with_capacity(part.len());
+            out.push(first);
+            out.push_str(&"*".repeat(rest));
+            out
+        })
+    }
+    match identity.split_once('@') {
+        Some((local, domain)) => {
+            let masked_domain = domain.rsplit_once('.').map_or_else(
+                || mask_part(domain),
+                |(name, tld)| format!("{}.{tld}", mask_part(name)),
+            );
+            format!("{}@{masked_domain}", mask_part(local))
+        }
+        None => mask_part(identity),
+    }
+}
+
+/// See [`UsageTone`].
+#[must_use]
+pub fn usage_tone(utilization: f64) -> UsageTone {
+    let clamped = utilization.clamp(0.0, 1.0);
+    if clamped >= 0.90 {
+        UsageTone::Err
+    } else if clamped >= 0.70 {
+        UsageTone::Warn
+    } else {
+        UsageTone::Ok
+    }
+}

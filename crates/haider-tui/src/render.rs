@@ -70,7 +70,8 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
         | Screen::Providers
         | Screen::Tree
         | Screen::Tools
-        | Screen::Hooks => 1,
+        | Screen::Hooks
+        | Screen::Usage => 1,
     };
     let [body, status] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(status_height)]).areas(area);
@@ -90,6 +91,7 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
             Screen::Accounts => render_accounts(model, theme, frame, body, &mut hits),
             Screen::Providers => render_providers(model, theme, frame, body, &mut hits),
             Screen::Hooks => render_hooks(model, theme, frame, body, &mut hits),
+            Screen::Usage => render_usage(model, theme, frame, body, &mut hits),
         }
     }
     if model.help_open {
@@ -1775,6 +1777,405 @@ fn render_providers(
                 x: footer_area.x + x,
                 y,
                 width: width.min(footer_area.width - x),
+                height: 1,
+            },
+            hit,
+        ));
+    }
+}
+
+/// One `/usage` meter line's bar ink from its utilization (U2): the
+/// threshold law lives in [`crate::format::usage_tone`]; this only maps
+/// tones onto theme slots.
+fn usage_bar_style(theme: &Theme, utilization: f64) -> ratatui::style::Style {
+    match crate::format::usage_tone(utilization) {
+        crate::format::UsageTone::Ok => theme.ok_style(),
+        crate::format::UsageTone::Warn => theme.warn_style(),
+        crate::format::UsageTone::Err => theme.err_style(),
+    }
+}
+
+/// U2 — the `/usage` screen: one block per provider group showing the
+/// SELECTED account (←/→ tabs), its meter state rendered per the wire's
+/// tag — `metered` limit bars with % + reset times, `unavailable` the
+/// typed reason (NEVER a fabricated bar), `local_only` an honest
+/// no-server-meter note — plus journal-derived local stats and a
+/// device-total footer. F2b scroll discipline throughout; identities wear
+/// the streamer mask unless this visit toggled `r`.
+fn render_usage(
+    model: &AppModel,
+    theme: &Theme,
+    frame: &mut Frame<'_>,
+    area: Rect,
+    hits: &mut Vec<(Rect, Hit)>,
+) {
+    use haider_protocol::usage::AccountMeterStateV1;
+
+    let mut lines: Vec<Line<'_>> = Vec::new();
+    // (line, column, width, hit) — chips resolved to rects after layout.
+    let mut chip_hits: Vec<(usize, u16, u16, Hit)> = Vec::new();
+    // F2b: each provider group's header line, for cursor-follow scrolling.
+    let mut header_lines: Vec<usize> = Vec::new();
+
+    lines.push(Line::from(vec![
+        Span::styled(
+            "USAGE",
+            theme
+                .bright_style()
+                .add_modifier(ratatui::style::Modifier::BOLD),
+        ),
+        Span::styled(
+            " — meters are provider truth · stats are this device's journal",
+            theme.dim_style(),
+        ),
+    ]));
+    if let Some(filter) = &model.usage.filter {
+        lines.push(Line::styled(
+            format!("  filter: {filter}* — bare /usage clears"),
+            theme.gold_style(),
+        ));
+    }
+    if model.mode.fabricates_locally() {
+        lines.push(Line::styled(
+            "  demo — usage is live daemon truth, never fabricated; run bare `haider` against a daemon",
+            theme.dim_style(),
+        ));
+    } else if let Some(error) = &model.usage.error {
+        lines.push(Line::from(vec![
+            Span::styled("  ✗ usage read failed — ", theme.err_style()),
+            Span::styled(error.clone(), theme.err_style()),
+        ]));
+    } else if model.usage.fetching && model.usage.report.is_none() {
+        lines.push(Line::styled("  fetching usage…", theme.dim_style()));
+    }
+    lines.push(Line::raw(""));
+
+    let groups = model.usage.groups();
+    if let Some(report) = &model.usage.report {
+        if report.accounts.is_empty() {
+            lines.push(Line::styled(
+                "  no accounts known — /login adds one",
+                theme.dim_style(),
+            ));
+        } else if groups.is_empty() {
+            lines.push(Line::styled(
+                format!(
+                    "  no accounts match \"{}\" — bare /usage clears the filter",
+                    model.usage.filter.as_deref().unwrap_or_default()
+                ),
+                theme.dim_style(),
+            ));
+        }
+        for (index, group) in groups.iter().enumerate() {
+            let selected_tab = model.usage.selected_tab(group);
+            let Some(account) = group
+                .accounts
+                .get(selected_tab)
+                .and_then(|&slot| report.accounts.get(slot))
+            else {
+                continue;
+            };
+
+            // Group header: provider · account tab chips ([alias] each, the
+            // selected one gold). Chips are value-carrying hits.
+            let mut spans = vec![Span::styled(
+                group.provider.clone(),
+                theme
+                    .bright_style()
+                    .add_modifier(ratatui::style::Modifier::BOLD),
+            )];
+            let mut offset = group.provider.chars().count() as u16;
+            if group.accounts.len() > 1 {
+                let counter = format!("  {}/{} ←→", selected_tab + 1, group.accounts.len());
+                offset += counter.chars().count() as u16;
+                spans.push(Span::styled(counter, theme.dim_style()));
+            }
+            spans.push(Span::raw("  "));
+            offset += 2;
+            for (position, &slot) in group.accounts.iter().enumerate() {
+                let Some(entry) = report.accounts.get(slot) else {
+                    continue;
+                };
+                let label = format!("[{}]", entry.alias.as_str());
+                let width = label.chars().count() as u16;
+                chip_hits.push((
+                    lines.len(),
+                    offset,
+                    width,
+                    Hit::UsageAccountTab {
+                        provider: group.provider.clone(),
+                        index: position,
+                    },
+                ));
+                spans.push(Span::styled(
+                    label,
+                    if position == selected_tab {
+                        theme.gold_style()
+                    } else {
+                        theme.dim_style()
+                    },
+                ));
+                spans.push(Span::raw(" "));
+                offset += width + 1;
+            }
+            let mut header = Line::from(spans);
+            if model.usage.cursor == index {
+                header = hover_band(header, true, area.width, theme);
+            }
+            header_lines.push(lines.len());
+            lines.push(header);
+
+            // Identity line: email/handle (MASKED unless revealed) · plan
+            // · auth flavor. The mask is the default on every open.
+            let identity = account.identity.as_deref().unwrap_or("—");
+            let identity = if model.usage.revealed || identity == "—" {
+                identity.to_owned()
+            } else {
+                crate::format::mask_identity(identity)
+            };
+            let mut parts = vec![identity];
+            if let Some(plan) = &account.plan {
+                parts.push(plan.clone());
+            }
+            parts.push(crate::app::auth_label(account.auth_method).to_owned());
+            lines.push(Line::styled(
+                format!("    {}", parts.join(" · ")),
+                theme.dim_style(),
+            ));
+
+            // Meter state — rendered per the wire's tag, never re-judged.
+            match &account.meter {
+                AccountMeterStateV1::Metered { windows } if windows.is_empty() => {
+                    lines.push(Line::styled(
+                        "    metered — no windows reported",
+                        theme.dim_style(),
+                    ));
+                }
+                AccountMeterStateV1::Metered { windows } => {
+                    let name_of = |window: &haider_protocol::usage::UsageWindowV1| {
+                        window
+                            .label
+                            .clone()
+                            .unwrap_or_else(|| window.window.clone())
+                    };
+                    let name_w = windows
+                        .iter()
+                        .map(|window| name_of(window).chars().count())
+                        .max()
+                        .unwrap_or(4)
+                        .clamp(4, 18);
+                    for window in windows {
+                        let name = ellipsize(&name_of(window), name_w);
+                        let mut spans = vec![
+                            Span::styled(format!("    {name:<name_w$}  "), theme.text_style()),
+                            Span::styled(
+                                crate::format::usage_bar(
+                                    window.utilization,
+                                    crate::format::USAGE_BAR_CELLS,
+                                ),
+                                usage_bar_style(theme, window.utilization),
+                            ),
+                            Span::styled(
+                                format!("  {:>4}", crate::format::fmt_pct(window.utilization)),
+                                theme.bright_style(),
+                            ),
+                        ];
+                        if let Some(resets_at_ms) = window.resets_at_ms {
+                            spans.push(Span::styled(
+                                format!(
+                                    " · {}",
+                                    crate::format::fmt_reset(report.generated_at_ms, resets_at_ms)
+                                ),
+                                theme.dim_style(),
+                            ));
+                        }
+                        lines.push(Line::from(spans));
+                    }
+                }
+                AccountMeterStateV1::Unavailable { reason } => {
+                    // The typed reason, honestly — NEVER a fabricated bar.
+                    lines.push(Line::from(vec![
+                        Span::styled("    meter unavailable — ", theme.warn_style()),
+                        Span::styled(reason.clone(), theme.warn_style()),
+                    ]));
+                }
+                AccountMeterStateV1::LocalOnly => {
+                    // API-key/custom: no server meter EXISTS — no 0-100
+                    // bar; the local counters below are the only truth.
+                    lines.push(Line::styled(
+                        "    api key — no provider meter · local counters only",
+                        theme.dim_style(),
+                    ));
+                }
+            }
+
+            // Local journal stats: duration/cost/LOC, then token splits.
+            let local = &account.local;
+            let cost = local
+                .est_cost_usd
+                .map_or_else(|| "est —".to_owned(), |usd| format!("est ${usd:.2}"));
+            lines.push(Line::styled(
+                format!(
+                    "    local — {} session{} · {} · {cost} · +{} −{} lines",
+                    local.sessions,
+                    if local.sessions == 1 { "" } else { "s" },
+                    fmt_elapsed(local.total_duration_ms),
+                    local.lines_added,
+                    local.lines_removed,
+                ),
+                theme.dim_style(),
+            ));
+            lines.push(Line::styled(
+                format!(
+                    "    tokens — in {} · out {} · reasoning {} · cached {}",
+                    fmt_tok(local.input_tokens),
+                    fmt_tok(local.output_tokens),
+                    fmt_tok(local.reasoning_tokens),
+                    fmt_tok(local.cached_tokens),
+                ),
+                theme.dim_style(),
+            ));
+            lines.push(Line::raw(""));
+        }
+
+        // Device totals over every SHOWN account (all tabs, not just the
+        // selected ones): sessions/duration/LOC attribute uniquely to a
+        // dominant account (U1's law), so the sums never double-count.
+        if !groups.is_empty() {
+            let shown: Vec<&haider_protocol::usage::AccountUsageReportV1> = groups
+                .iter()
+                .flat_map(|group| group.accounts.iter())
+                .filter_map(|&slot| report.accounts.get(slot))
+                .collect();
+            let sessions: u64 = shown.iter().map(|account| account.local.sessions).sum();
+            let duration: u64 = shown
+                .iter()
+                .map(|account| account.local.total_duration_ms)
+                .sum();
+            let added: u64 = shown.iter().map(|account| account.local.lines_added).sum();
+            let removed: u64 = shown
+                .iter()
+                .map(|account| account.local.lines_removed)
+                .sum();
+            let costs: Vec<f64> = shown
+                .iter()
+                .filter_map(|account| account.local.est_cost_usd)
+                .collect();
+            let cost = if costs.is_empty() {
+                "est —".to_owned()
+            } else {
+                format!("est ${:.2}", costs.iter().sum::<f64>())
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "THIS DEVICE",
+                    theme
+                        .bright_style()
+                        .add_modifier(ratatui::style::Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(
+                        " — journal totals over {} shown account{}",
+                        shown.len(),
+                        if shown.len() == 1 { "" } else { "s" }
+                    ),
+                    theme.dim_style(),
+                ),
+            ]));
+            lines.push(Line::styled(
+                format!(
+                    "    {sessions} session{} · {} · {cost} · +{added} −{removed} lines",
+                    if sessions == 1 { "" } else { "s" },
+                    fmt_elapsed(duration),
+                ),
+                theme.dim_style(),
+            ));
+        }
+    } else if !model.mode.fabricates_locally()
+        && !model.usage.fetching
+        && model.usage.error.is_none()
+    {
+        lines.push(Line::styled(
+            "  no usage snapshot yet — f fetches one",
+            theme.dim_style(),
+        ));
+    }
+
+    // F2b: a PINNED footer hint under the scrolling report; tiny frames
+    // keep the flowed layout (still reachable by scrolling to the end).
+    let hint =
+        "←/→ account · ↑↓ provider · r reveal · f refresh · esc back · /usage <provider> filters";
+    let mut footer_lines: Vec<Line<'_>> = Vec::new();
+    let pinned = area.height >= 12;
+    if pinned {
+        footer_lines.push(Line::styled(hint, theme.faint_style()));
+    } else {
+        lines.push(Line::styled(hint, theme.faint_style()));
+    }
+    let footer_height = u16::try_from(footer_lines.len()).unwrap_or(0);
+    let [report_area, footer_area] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(footer_height)]).areas(area);
+
+    // RENDER is the single scroll authority (the transcript's law): the
+    // frame writes the true max, reconciles the offset, and resolves a
+    // cursor-follow latch against ITS OWN line layout.
+    let total = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+    let max_scroll = total.saturating_sub(report_area.height);
+    model.usage.scroll_max.set(max_scroll);
+    let mut scroll = model.usage.scroll.get().min(max_scroll);
+    if model.usage.follow_cursor.take() {
+        let header = header_lines
+            .get(model.usage.cursor)
+            .and_then(|&line| u16::try_from(line).ok())
+            .unwrap_or(0);
+        if header < scroll {
+            scroll = header;
+        } else if header + 1 >= scroll + report_area.height {
+            scroll = (header + 2)
+                .saturating_sub(report_area.height)
+                .min(max_scroll);
+        }
+    }
+    model.usage.scroll.set(scroll);
+    frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), report_area);
+    // The house scroll indicator: `⋮` gutter marks on the edge rows while
+    // content hides beyond them.
+    if scroll > 0 && report_area.height > 0 {
+        frame.render_widget(
+            Paragraph::new(Line::styled("⋮", theme.faint_style())),
+            Rect {
+                x: report_area.x,
+                y: report_area.y,
+                width: 1.min(report_area.width),
+                height: 1,
+            },
+        );
+    }
+    if scroll < max_scroll && report_area.height > 1 {
+        frame.render_widget(
+            Paragraph::new(Line::styled("⋮", theme.faint_style())),
+            Rect {
+                x: report_area.x,
+                y: report_area.y + report_area.height - 1,
+                width: 1.min(report_area.width),
+                height: 1,
+            },
+        );
+    }
+    if footer_height > 0 {
+        frame.render_widget(Paragraph::new(footer_lines), footer_area);
+    }
+
+    for (line_index, x, width, hit) in chip_hits {
+        let line = u16::try_from(line_index).unwrap_or(u16::MAX);
+        if line < scroll || line - scroll >= report_area.height || x >= report_area.width {
+            continue;
+        }
+        hits.push((
+            Rect {
+                x: report_area.x + x,
+                y: report_area.y + (line - scroll),
+                width: width.min(report_area.width - x),
                 height: 1,
             },
             hit,
