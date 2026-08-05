@@ -284,6 +284,13 @@ pub struct AccountsState {
     /// Keyboard highlight over the flattened selectable rows (W5
     /// accessibility extension — separately goldened).
     pub cursor: usize,
+    /// P1 MASK LAW (the U2 owner addendum extended): row identities and
+    /// the shared device-section labels render MASKED unless this is set.
+    /// `r` toggles it for the CURRENT visit only — the one door in
+    /// ([`AppModel::enter_accounts`]) and the esc exit both reset to
+    /// masked, so the screen never OPENS revealed (the U2 ⌃C lesson: the
+    /// enter-door reset covers exits that bypass `exit_accounts`).
+    pub revealed: bool,
 }
 
 impl AppModel {
@@ -521,6 +528,11 @@ pub struct ProvidersState {
     /// Armed by a cursor move: the next frame scrolls the cursor's
     /// provider block into view, then clears the latch.
     pub follow_cursor: std::cell::Cell<bool>,
+    /// P1 MASK LAW: the only identity this screen renders is the shared
+    /// device-section's `account_label` — masked unless this is set. Same
+    /// per-visit `r` semantics as `/accounts`/`/usage`: reset on the one
+    /// door in ([`AppModel::enter_providers`]) and on the esc exit.
+    pub revealed: bool,
 }
 
 impl ProvidersState {
@@ -5770,6 +5782,10 @@ impl AppModel {
             return;
         }
         self.accounts.message = None;
+        // P1 MASK LAW (the U2 owner addendum): every open starts masked —
+        // a reveal never survives into a later visit, whichever way the
+        // last one ended (esc, ⌃C, a screen switch).
+        self.accounts.revealed = false;
         self.switch_surface(Screen::Accounts);
         self.requests.push(AppRequest::AccountsRefresh);
         // D2: the device-discovery read rides SCREEN ENTRY only (no
@@ -5783,8 +5799,10 @@ impl AppModel {
 
     /// Esc from `/accounts` (sim tui.js:2516-2519): with a login card open
     /// the card's own total-modality already consumed the key; otherwise
-    /// back to the session if one is attached, else the launcher.
+    /// back to the session if one is attached, else the launcher. Closing
+    /// RESTORES the mask (P1) — a reveal is per-visit.
     fn exit_accounts(&mut self) {
+        self.accounts.revealed = false;
         let target = if self.active_session.is_some()
             || !self.projection.entries().is_empty()
             || self.session_name.is_some()
@@ -6095,6 +6113,9 @@ impl AppModel {
             return;
         }
         self.providers.message = None;
+        // P1 MASK LAW: same one-door reset as `/accounts` — the shared
+        // device section's labels always open masked here too.
+        self.providers.revealed = false;
         self.switch_surface(Screen::Providers);
         self.requests.push(AppRequest::ProvidersRefresh);
         // D2: the shared buttons area shows the same "found on this
@@ -6105,8 +6126,10 @@ impl AppModel {
         self.dirty = true;
     }
 
-    /// Esc from `/providers`: same routing as `/accounts`.
+    /// Esc from `/providers`: same routing as `/accounts`. Closing
+    /// RESTORES the mask (P1) — a reveal is per-visit.
     fn exit_providers(&mut self) {
+        self.providers.revealed = false;
         let target = if self.active_session.is_some()
             || !self.projection.entries().is_empty()
             || self.session_name.is_some()
@@ -6388,6 +6411,13 @@ impl AppModel {
             KeyCode::Char('h') => self.open_huggingface_preset(),
             KeyCode::Char('z') => self.open_opencode_zen_preset(),
             KeyCode::Char('g') => self.open_opencode_go_preset(),
+            KeyCode::Char('r') => {
+                // P1 (the U2 owner addendum): `r` toggles the identity
+                // REVEAL for this visit only — the device section's
+                // account labels are the only identity this screen shows.
+                self.providers.revealed = !self.providers.revealed;
+                self.dirty = true;
+            }
             // D2: the shared "found on this device" section is numbered
             // here too — the same one-key import as `/accounts` (the
             // provider cursor keeps ↑/↓; digits belong to the section).
@@ -6529,9 +6559,15 @@ impl AppModel {
             .is_some_and(|card| card.attempt == attempt)
         {
             self.oauth_add = None;
+            // P1 MASK LAW: the receipt is transient chrome with no key
+            // loop of its own, so the identity rides it MASKED-ALWAYS
+            // (one authority — `mask_identity`); the durable, revealable
+            // surface is the account row itself.
             self.accounts.message = Some(format!(
                 "✓ {} → {} · oauth · {}",
-                descriptor.provider, descriptor.alias, descriptor.identity
+                descriptor.provider,
+                descriptor.alias,
+                crate::format::mask_identity(&descriptor.identity)
             ));
             self.requests.push(AppRequest::AccountsRefresh);
             self.dirty = true;
@@ -7069,6 +7105,16 @@ impl AppModel {
                     self.import_device_candidate(&id);
                     self.dirty = true;
                 }
+            }
+            KeyCode::Char('r') => {
+                // P1 (the U2 owner addendum): `r` toggles the identity
+                // REVEAL for this visit only — the screen always opens
+                // masked and closing restores the mask. The login/OAuth
+                // cards' total modality already consumed the key above
+                // when a card is open, so a typed alias/key `r` can never
+                // land here.
+                self.accounts.revealed = !self.accounts.revealed;
+                self.dirty = true;
             }
             KeyCode::Enter => {
                 if let Some(alias) = self

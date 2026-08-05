@@ -159,7 +159,11 @@ pub enum UsageTone {
     Err,
 }
 
-/// Streamer-friendly identity masking for `/usage` (U2 owner addendum).
+/// Streamer-friendly identity masking (U2 owner addendum; P1 extended it
+/// to every surface that renders an account identity). THE ONE AUTHORITY
+/// — no second mask dialect exists: `/usage` identity lines, `/accounts`
+/// rows, the shared device-discovery labels, the import/OAuth receipts,
+/// and the login card's committed identity all pass through here.
 ///
 /// MASK LAW: emails keep the first character of the local part and the
 /// first character of the domain, `*` for every other character
@@ -167,6 +171,13 @@ pub enum UsageTone {
 /// `support@diffforge.ai` → `s******@d********.ai`. Non-email identities
 /// mask the same way as one part. The masked form never contains the
 /// full local part.
+///
+/// NOT masked anywhere, by design: account ALIASES — the daemon's alias
+/// grammar (`[a-z0-9][a-z0-9._-]{0,63}`, no `@`) means an alias can never
+/// be an email, and U2 shipped `/usage`'s alias chips unmasked. The
+/// launcher header's `account <alias>` segment and `/providers`' active-
+/// account line render aliases, so they carry no mask (a masked alias
+/// would be a second dialect, not more safety).
 #[must_use]
 pub fn mask_identity(identity: &str) -> String {
     fn mask_part(part: &str) -> String {

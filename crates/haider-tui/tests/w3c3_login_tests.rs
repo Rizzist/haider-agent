@@ -378,6 +378,16 @@ fn a_committed_login_shows_the_descriptor_identity_and_no_secret() {
     let text = frame_text(&model, 118, 36);
     assert!(text.contains("signed in"), "the card confirms");
     assert!(!text.contains(SENTINEL));
+    // P1 MASK LAW: the committed identity rides the card MASKED-ALWAYS
+    // (the card has no reveal loop — its keys belong to the fields).
+    assert!(
+        text.contains("signed in · a******************"),
+        "the identity renders masked:\n{text}"
+    );
+    assert!(
+        !text.contains("sk-…7f2"),
+        "the raw identity never rides the card:\n{text}"
+    );
 }
 
 #[test]

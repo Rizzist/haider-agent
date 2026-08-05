@@ -1706,9 +1706,14 @@ impl LiveDriver {
                 // The receipt NAMES what the daemon committed; the rows
                 // themselves land via the chained refresh below — nothing
                 // is inserted here (D2's installs-nothing-locally law).
+                // P1 MASK LAW: the identity rides the receipt MASKED-
+                // ALWAYS (one authority — `mask_identity`); receipts are
+                // transient chrome with no reveal loop of their own.
                 model.device.message = Some(format!(
                     "✓ imported {} → {} · {}",
-                    descriptor.provider, descriptor.alias, descriptor.identity
+                    descriptor.provider,
+                    descriptor.alias,
+                    crate::format::mask_identity(&descriptor.identity)
                 ));
                 model.dirty = true;
                 vec![LiveCommand::AccountList, LiveCommand::ProviderList]

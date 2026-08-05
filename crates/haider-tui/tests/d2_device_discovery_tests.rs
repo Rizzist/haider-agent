@@ -192,9 +192,16 @@ fn device_section_lists_candidates_with_freshness() {
         text.contains("found on this device"),
         "the section header renders:\n{text}"
     );
+    // P1 MASK LAW: the account label is a real identity (the store's
+    // signed-in email) — MASKED by default; `p1_masking_sweep_tests.rs`
+    // owns the reveal laws.
     assert!(
-        text.contains("[1] Codex CLI · openai · you@work.com · fresh"),
-        "supported row: number · source · provider · account label · freshness:\n{text}"
+        text.contains("[1] Codex CLI · openai · y**@w***.com · fresh"),
+        "supported row: number · source · provider · MASKED account label · freshness:\n{text}"
+    );
+    assert!(
+        !text.contains("you@work.com"),
+        "the raw account label never renders on open:\n{text}"
     );
     assert!(
         text.contains("Kimi Code · kimi-oauth · expiring"),
@@ -315,6 +322,12 @@ fn one_key_import_dispatches_receipted_command_and_installs_nothing_locally() {
     assert!(
         message.contains("imported openai → codex-cli"),
         "the receipt names what the daemon committed: {message}"
+    );
+    // P1 MASK LAW: the receipt carries the identity MASKED-ALWAYS —
+    // receipts are transient chrome with no reveal loop of their own.
+    assert!(
+        message.contains("y**@w***.com") && !message.contains("you@work.com"),
+        "the receipt masks the identity: {message}"
     );
 
     // The chained snapshot is the materializer.

@@ -1031,6 +1031,15 @@ fn push_device_candidates_section<'a>(
     if model.device.candidates.is_empty() {
         return;
     }
+    // P1 MASK LAW: the candidate `account_label` is a real identity (the
+    // store's signed-in email) — masked unless the OWNING screen's visit
+    // revealed it. The section is shared, so the pin travels with the
+    // screen that hosts it; any other host renders masked-always.
+    let revealed = match model.screen {
+        crate::app::Screen::Accounts => model.accounts.revealed,
+        crate::app::Screen::Providers => model.providers.revealed,
+        _ => false,
+    };
     lines_out.push(Line::from(vec![
         Span::styled(
             "found on this device",
@@ -1071,6 +1080,11 @@ fn push_device_candidates_section<'a>(
                 Span::styled(format!(" · {}", candidate.provider), theme.dim_style()),
             ];
             if let Some(label) = &candidate.account_label {
+                let label = if revealed {
+                    label.clone()
+                } else {
+                    crate::format::mask_identity(label)
+                };
                 spans.push(Span::styled(format!(" · {label}"), theme.dim_style()));
             }
             spans.push(Span::styled(
@@ -1282,7 +1296,17 @@ fn render_accounts(
                     },
                 ),
                 Span::styled(
-                    format!(" · {} · {status_text}", row.identity),
+                    // P1 MASK LAW (the U2 owner addendum extended): the
+                    // identity renders MASKED unless this visit revealed
+                    // it (`r`) — one authority, `format::mask_identity`.
+                    format!(
+                        " · {} · {status_text}",
+                        if model.accounts.revealed {
+                            row.identity.clone()
+                        } else {
+                            crate::format::mask_identity(&row.identity)
+                        }
+                    ),
                     theme.dim_style(),
                 ),
             ];
@@ -1450,9 +1474,9 @@ fn render_accounts(
             .iter()
             .any(|candidate| candidate.import_supported)
         {
-            "click an account to make it active · + adds via OAuth / API · digits import found credentials · x removes · esc back"
+            "click an account to make it active · + adds via OAuth / API · digits import found credentials · x removes · r reveals · esc back"
         } else {
-            "click an account to make it active · + adds via OAuth / API · x removes · esc back"
+            "click an account to make it active · + adds via OAuth / API · x removes · r reveals · esc back"
         },
         theme.faint_style(),
     ));
@@ -1687,7 +1711,18 @@ fn render_providers(
     // the add login buttons") — a fixed footer under a scrolling roster.
     // Tiny frames keep the flowed layout instead: everything stays in the
     // scroll body, still reachable by scrolling to the end.
-    let hint = "click a model to set the default · e edits · x removes · h HuggingFace · z Zen · g Go · esc back";
+    // P1: the key map names the reveal only while a masked identity is
+    // actually on screen (the shared device section's account labels).
+    let hint = if model
+        .device
+        .candidates
+        .iter()
+        .any(|candidate| candidate.account_label.is_some())
+    {
+        "click a model to set the default · e edits · x removes · h HuggingFace · z Zen · g Go · r reveals · esc back"
+    } else {
+        "click a model to set the default · e edits · x removes · h HuggingFace · z Zen · g Go · esc back"
+    };
     let mut footer_lines: Vec<Line<'_>> = Vec::new();
     let mut footer_hits: Vec<(usize, u16, u16, Hit)> = Vec::new();
     let pinned = area.height >= 12;
@@ -5370,7 +5405,14 @@ fn login_lines(card: &crate::app::LoginCard, theme: &Theme, width: u16) -> Vec<L
         LoginStage::Submitting => "  key   ❯ validating…".to_owned(),
         LoginStage::Failed(text) => format!("  ✗ {text}"),
         LoginStage::Entry => format!("  key   ❯ {key_caret}"),
-        LoginStage::Done(identity) => format!("  ✓ signed in · {identity}"),
+        // P1 MASK LAW: the committed identity rides the card MASKED-
+        // ALWAYS (one authority — `mask_identity`). The card is transient
+        // confirmation chrome whose keys belong to the alias/key fields,
+        // so it carries no reveal of its own; the durable, revealable
+        // surface is the `/accounts` row the refresh lands.
+        LoginStage::Done(identity) => {
+            format!("  ✓ signed in · {}", crate::format::mask_identity(identity))
+        }
     };
     let hint = match &card.stage {
         LoginStage::Entry => {

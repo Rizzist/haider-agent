@@ -99,9 +99,16 @@ fn accounts_screen_renders_the_sim_hierarchy() {
     // The local group header carries its account's base URL.
     assert!(frame.contains("local · http://127.0.0.1:8000/v1"));
     // Selected vs sibling rows: dot + AUTH_LABEL + identity + status.
-    assert!(frame.contains("● work-chatgpt [oauth] · you@work.com · ChatGPT · active · in use"));
-    assert!(frame.contains("○ billing-key [api key] · sk-…a91f · active"));
-    assert!(!frame.contains("billing-key [api key] · sk-…a91f · active · in use"));
+    // P1 MASK LAW: identities render MASKED by default (the U2 owner
+    // addendum extended) — the raw email / key fragment never shows on
+    // open; `p1_masking_sweep_tests.rs` owns the reveal laws.
+    assert!(frame.contains("● work-chatgpt [oauth] · y**@w***.com · ChatGPT · active · in use"));
+    assert!(frame.contains("○ billing-key [api key] · s******* · active"));
+    assert!(!frame.contains("billing-key [api key] · s******* · active · in use"));
+    assert!(
+        !frame.contains("you@work.com") && !frame.contains("sk-…a91f"),
+        "the raw identity never renders on open"
+    );
     // The one global add row, after all groups (sim button order).
     let last_row = frame
         .rfind("● hf-endpoint")
@@ -248,9 +255,10 @@ fn expired_and_revoked_rows_refuse_selection_locally() {
         model.accounts.message.as_deref(),
         Some("· billing-key is not usable — /login to re-authenticate")
     );
-    // And it renders the additive status vocabulary.
+    // And it renders the additive status vocabulary (identity MASKED —
+    // the P1 default).
     let frame = draw(&model, 100, 32);
-    assert!(frame.contains("○ billing-key [api key] · sk-…a91f · expired"));
+    assert!(frame.contains("○ billing-key [api key] · s******* · expired"));
 }
 
 /// Esc routing (sim tui.js:2516-2519): no session → launcher; the sim's
@@ -278,6 +286,7 @@ fn pending_select_renders_feedback_without_moving_the_dot() {
     let mut model = accounts_model();
     model.select_account("billing-key");
     let frame = draw(&model, 100, 32);
-    assert!(frame.contains("○ billing-key [api key] · sk-…a91f · active …"));
+    // Identity MASKED (the P1 default) — the pending pulse rides the row.
+    assert!(frame.contains("○ billing-key [api key] · s******* · active …"));
     assert!(frame.contains("● work-chatgpt"));
 }
