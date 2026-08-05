@@ -17,6 +17,8 @@ mod catalog;
 #[cfg(test)]
 mod catalog_tests;
 mod effort;
+#[cfg(test)]
+mod effort_tests;
 mod gemini;
 #[cfg(test)]
 mod gemini_tests;

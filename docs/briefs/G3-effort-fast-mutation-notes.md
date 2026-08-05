@@ -138,3 +138,24 @@ membership, thinking capture, thinking replay) are M1-M6.
 
 Tree clean after the final revert (`git status` empty); daemon lib 307
 passed, daemond effort wire laws 2 passed, provider + tui law files green.
+
+## Review of record (coordinator, executed post-lane)
+
+Read the full branch diff. The lane's 13 kills spot-checked; deviations 1-5
+verified in-diff (deviation 3's child-create law and deviation 4's opaque
+strip both confirmed as real-bug fixes). ONE structurally-unobserved gap
+found and closed:
+
+| # | Finding (seam) | Verdict | Resolution |
+|---|---|---|---|
+| RM1 | Stale-effort construction gating was INCONSISTENT across families: fast/kimi/gemini silently degrade a stale selection after a model switch, but anthropic/openai passed `tuning.effort` VERBATIM into the adapters (anthropic.rs documented it as "surface the provider's error") — a stale `xhigh` on an opus-4-6 pair sent a documented-400 request | Policy overruled for consistency + Claude Code's published fallback semantics | New `anthropic_effort_clamp` (provider effort.rs: highest supported at-or-below; verbatim pass-through ONLY for ladder-unknown models; out-of-vocabulary drops to None) + `anthropic_effort_for`/`openai_effort_for` construction gates (openai: catalog-ladder membership, declared-and-excluded drops, declared-empty passes). Laws: `anthropic_effort_clamp_falls_down_the_documented_ladder` (provider) + `stale_effort_clamps_for_anthropic_and_drops_for_declared_openai_ladders` (daemon). Kill-verified BOTH gates: clamp disabled → "xhigh clamps DOWN to high" assert fails; openai gate disabled → "declared ladder that excludes" assert fails; both "running 1 test" observed, reverted, green |
+
+| RM2 | The lane's effort.rs laws (static ladders, fast gate) lived in an INLINE `#[cfg(test)] mod tests` — invisible to the xtask counter (workspace rule: tests live in tests/ dirs and *_tests.rs files, never inline). The lane's "1951" silently excluded 3 laws | CONFIRMED by recount arithmetic (+1 where +2 was expected) | Moved the module to `crates/haider-provider/src/effort_tests.rs` (wired in lib.rs); all 4 laws (3 lane + 1 review) now counted and running |
+
+Honest residual: the two RM1 laws observe the GATE HELPERS; the four
+`.with_effort(gated.clone())` call sites in build_account_provider are
+eyeball-verified but not independently observed (a factory-level
+request-capture harness would be needed; the helpers are the single
+derivation authority so the residual is one-line variable swaps).
+Ledger truth: 1951 -> 1956 (+2 review laws, +3 lane laws surfaced from the
+inline module the counter could not see).
