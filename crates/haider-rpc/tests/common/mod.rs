@@ -309,6 +309,8 @@ pub fn transcript() -> Vec<WireFrame> {
                     permission_overrides: None,
                     system_prompt_version: None,
                     title: None,
+                    effort: None,
+                    fast: false,
                     created_at_ms: 1_753_500_040_000,
                 },
             },
@@ -566,6 +568,10 @@ pub fn transcript() -> Vec<WireFrame> {
                     model_details: vec![ModelDetailWire {
                         name: "frontier-a".into(),
                         context_window: None,
+                        supported_efforts: Vec::new(),
+                        default_effort: None,
+                        supported_speeds: Vec::new(),
+                        supports_thinking_type: None,
                     }],
                     auth_methods: vec![AuthMethod::ApiKey],
                     availability: ProviderAvailabilityWire::Available,
@@ -627,6 +633,10 @@ pub fn transcript() -> Vec<WireFrame> {
                     model_details: vec![ModelDetailWire {
                         name: "frontier-a".into(),
                         context_window: None,
+                        supported_efforts: Vec::new(),
+                        default_effort: None,
+                        supported_speeds: Vec::new(),
+                        supports_thinking_type: None,
                     }],
                     auth_methods: vec![AuthMethod::ApiKey],
                     availability: ProviderAvailabilityWire::Available,
@@ -662,6 +672,10 @@ pub fn transcript() -> Vec<WireFrame> {
                     model_details: vec![ModelDetailWire {
                         name: "local-frontier-a".into(),
                         context_window: None,
+                        supported_efforts: Vec::new(),
+                        default_effort: None,
+                        supported_speeds: Vec::new(),
+                        supports_thinking_type: None,
                     }],
                     auth_methods: Vec::new(),
                     availability: ProviderAvailabilityWire::Available,
@@ -719,10 +733,18 @@ pub fn transcript() -> Vec<WireFrame> {
                         ModelDetailWire {
                             name: "frontier-a".into(),
                             context_window: None,
+                            supported_efforts: Vec::new(),
+                            default_effort: None,
+                            supported_speeds: Vec::new(),
+                            supports_thinking_type: None,
                         },
                         ModelDetailWire {
                             name: "frontier-b".into(),
                             context_window: None,
+                            supported_efforts: Vec::new(),
+                            default_effort: None,
+                            supported_speeds: Vec::new(),
+                            supports_thinking_type: None,
                         },
                     ],
                     auth_methods: vec![AuthMethod::OAuth],
@@ -1011,6 +1033,10 @@ pub fn transcript() -> Vec<WireFrame> {
                     model_details: vec![ModelDetailWire {
                         name: "gemini-2.5-flash".into(),
                         context_window: Some(1_048_576),
+                        supported_efforts: Vec::new(),
+                        default_effort: None,
+                        supported_speeds: Vec::new(),
+                        supports_thinking_type: None,
                     }],
                     auth_methods: vec![AuthMethod::ApiKey],
                     availability: ProviderAvailabilityWire::Available,
@@ -1314,6 +1340,44 @@ pub fn transcript() -> Vec<WireFrame> {
                 session_id: SessionId::new("session-1"),
                 title: Some("Parser rewrite".into()),
                 renamed_seq: 61,
+                worker_generation: 7,
+            },
+        },
+        // ── G3: the two session-tuning pairs, appended at the transcript
+        // END (additive-wire law — nothing before them can have moved). ──
+        WireFrame::Request {
+            request_id: RequestId::new("request-select-effort"),
+            body: RequestBody::SessionSelectEffort {
+                command_id: CommandId::new("command-select-effort"),
+                session_id: SessionId::new("session-1"),
+                worker_generation: 7,
+                effort: Some("xhigh".into()),
+            },
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-select-effort"),
+            body: ResponseBody::SessionSelectEffort {
+                session_id: SessionId::new("session-1"),
+                effort: Some("xhigh".into()),
+                selected_seq: 43,
+                worker_generation: 7,
+            },
+        },
+        WireFrame::Request {
+            request_id: RequestId::new("request-select-fast"),
+            body: RequestBody::SessionSelectFast {
+                command_id: CommandId::new("command-select-fast"),
+                session_id: SessionId::new("session-1"),
+                worker_generation: 7,
+                enabled: true,
+            },
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-select-fast"),
+            body: ResponseBody::SessionSelectFast {
+                session_id: SessionId::new("session-1"),
+                enabled: true,
+                selected_seq: 44,
                 worker_generation: 7,
             },
         },

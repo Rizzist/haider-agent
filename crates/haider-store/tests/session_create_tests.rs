@@ -21,6 +21,8 @@ fn command(command_id: &str, session_id: &str, event_id: &str) -> SessionCreateC
         model: "fake-v1".into(),
         max_tokens: 4096,
         permission_overrides: None,
+        effort: None,
+        fast: false,
         system_prompt_version: "test-system-v1".into(),
         event_id: EventId::new(event_id),
         device_id: DeviceId::new("daemon-test"),

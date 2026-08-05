@@ -3158,6 +3158,8 @@ fn render_session(
             height: composer_area.height - ask_area.height,
         };
         render_composer(model, theme, frame, rule_area, shifted, hits);
+    } else if effort_picker_showing(model) {
+        render_effort_picker(model, theme, frame, rule_area, composer_area, hits);
     } else if theme_picker_showing(model) {
         render_theme_picker(model, theme, frame, rule_area, composer_area, hits);
     } else {
@@ -4241,6 +4243,8 @@ fn render_subagent(
                 ));
             }
         }
+    } else if effort_picker_showing(model) {
+        render_effort_picker(model, theme, frame, rule_area, composer_area, hits);
     } else if theme_picker_showing(model) {
         render_theme_picker(model, theme, frame, rule_area, composer_area, hits);
     } else {
@@ -4616,7 +4620,9 @@ fn render_aura(
         transcript_area,
     );
 
-    if theme_picker_showing(model) {
+    if effort_picker_showing(model) {
+        render_effort_picker(model, theme, frame, rule_area, composer_area, hits);
+    } else if theme_picker_showing(model) {
         render_theme_picker(model, theme, frame, rule_area, composer_area, hits);
     } else {
         render_composer(model, theme, frame, rule_area, composer_area, hits);
@@ -4893,6 +4899,118 @@ fn render_theme_picker(
     }
 }
 
+/// Whether the `/effort` picker renders THIS frame (G3): open, on a
+/// session surface, with no daemon card holding the input slot — the same
+/// outranking law as `/theme`.
+fn effort_picker_showing(model: &AppModel) -> bool {
+    model.effort_picker.is_some()
+        && matches!(model.screen, Screen::Session | Screen::Subagent)
+        && model.projection.open_menu().is_none()
+        && model.login.is_none()
+        && !(model.screen == Screen::Subagent
+            && model
+                .viewed_chip()
+                .is_some_and(|chip| chip.question_menu().is_some()))
+}
+
+/// Rows the `/effort` picker card needs: title + body + the option rows +
+/// hint (menu_block windows the options under height pressure).
+fn effort_picker_rows_height(model: &AppModel) -> u16 {
+    let options = model.effort_picker_rows().len().max(1);
+    u16::try_from(options).unwrap_or(u16::MAX).saturating_add(3)
+}
+
+/// The `/effort` picker (G3): the CURRENT pair's declared ladder in the
+/// composer's slot, through the SAME `menu_block` anatomy as `/theme`. The
+/// ● marks the session's current selection; ◇ tags the provider default.
+/// Hits carry [`Hit::EffortOption`] so hover highlights and a click
+/// commits.
+fn render_effort_picker(
+    model: &AppModel,
+    theme: &Theme,
+    frame: &mut Frame<'_>,
+    rule_area: Rect,
+    composer_area: Rect,
+    hits: &mut Vec<(Rect, Hit)>,
+) {
+    let Some(picker) = model.effort_picker.as_ref() else {
+        return;
+    };
+    use haider_protocol::menu::{Menu, MenuKind, MenuOption, MenuScope};
+    let rows = model.effort_picker_rows();
+    let pending = picker.pending.clone();
+    let options = rows
+        .iter()
+        .map(|row| {
+            let marker = if row.is_current { '●' } else { '○' };
+            let name = row.effort.as_deref().unwrap_or("default");
+            let mut label = format!("{marker} {name}");
+            if row.is_provider_default {
+                label.push_str(" — provider default");
+            }
+            if row.effort.is_none() {
+                label.push_str(" — revert to the provider's own level");
+            }
+            if pending.as_ref() == Some(&row.effort) {
+                label.push_str(" · committing…");
+            }
+            MenuOption {
+                key: name.to_owned(),
+                label,
+                detail: None,
+                decision: None,
+            }
+        })
+        .collect();
+    let mut body = vec![format!(
+        "{} · {} — validated by the daemon against this pair's ladder",
+        model.identity.model_short, model.identity.provider
+    )];
+    if let Some(error) = &picker.error {
+        body.push(format!("✗ {error}"));
+    }
+    let card = Menu {
+        id: haider_protocol::ids::MenuId::new("effort-picker"),
+        kind: MenuKind::Choice,
+        title: "effort — reasoning depth for this pair".to_owned(),
+        body,
+        options,
+        blocking: false,
+        scope: MenuScope::Session,
+        origin: "effort".to_owned(),
+        ttl_ms: None,
+        timeout_option: None,
+    };
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "─".repeat(rule_area.width as usize),
+            theme.warn_style(),
+        ))
+        .style(theme.text_style()),
+        rule_area,
+    );
+    let footer = " ↑↓ pick · ⏎ select · 1-9 quick · esc back";
+    let (lines, option_rows) = menu_block(&card, picker.selection, theme, composer_area, footer);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).style(theme.menu_style()),
+        composer_area,
+    );
+    for (row_offset, option_index) in option_rows {
+        let y = composer_area.y + row_offset;
+        if y < composer_area.y + composer_area.height {
+            hits.push((
+                Rect {
+                    x: composer_area.x,
+                    y,
+                    width: composer_area.width,
+                    height: 1,
+                },
+                Hit::EffortOption(option_index),
+            ));
+        }
+    }
+}
+
 /// Sim `MENU_GLYPH` (tui.js:3057) mapped onto the protocol's menu kinds.
 /// The command cards (`voice` ◉ / `tools` ⚒) are `Choice` menus — their
 /// free-form `origin` tag carries the sim kind (MenuKind is frozen).
@@ -4954,6 +5072,11 @@ fn composer_height(model: &AppModel, width: u16) -> u16 {
     // row count is stage-dependent).
     if let Some(card) = model.talk_setup.as_ref() {
         return card.height();
+    }
+    // The `/effort` picker replaces the composer (G3) — same
+    // input-replacement law as `/theme`; a daemon card outranks it.
+    if effort_picker_showing(model) {
+        return effort_picker_rows_height(model);
     }
     // The `/theme` picker replaces the composer on its surfaces (owner
     // spec §3) — same input-replacement law as a blocking menu. A daemon

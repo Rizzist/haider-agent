@@ -14,8 +14,9 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
 
 use crate::anthropic::{
-    ANTHROPIC_OAUTH_BASE_URL, ANTHROPIC_OAUTH_BETA_HEADER, ANTHROPIC_OAUTH_BETA_VALUE,
-    ANTHROPIC_OAUTH_SYSTEM_IDENTITY, AnthropicProvider, SseChunkSource, stream_sse_source,
+    ANTHROPIC_FAST_BETA_VALUE, ANTHROPIC_OAUTH_BASE_URL, ANTHROPIC_OAUTH_BETA_HEADER,
+    ANTHROPIC_OAUTH_BETA_VALUE, ANTHROPIC_OAUTH_SYSTEM_IDENTITY, AnthropicProvider, SseChunkSource,
+    stream_sse_source,
 };
 use crate::origin::FixedDnsResolver;
 use crate::{Message, ProviderError, ProviderErrorKind, ToolDefinition, TurnRequest};
@@ -455,4 +456,142 @@ async fn hanging_mid_turn_fixture_times_out_only_the_idle_chunk_await() {
     assert!(error.message.contains("90 seconds"));
     assert!(receiver.recv().await.is_none(), "failure is surfaced once");
     stream_task.await.expect("stream task exits after timeout");
+}
+
+/// LAW (LE3, anthropic half): the session effort rides `output_config.effort`
+/// VERBATIM on BOTH auth modes; the body NEVER carries a `thinking` field
+/// (`thinking.budget_tokens` 400s on 4.7+ and every 5-family model), and —
+/// pinning brief decision 10 — never `temperature`/`top_p`/`top_k`. With no
+/// effort the payload keeps its exact pre-G3 top-level key set.
+///
+/// MUTATION CHECK (executed — see the G3 mutation notes): route the effort
+/// through `thinking: {"budget_tokens": ...}` instead of `output_config`.
+/// Expected runtime failure: the no-thinking-field and output_config
+/// assertions below.
+#[test]
+fn effort_rides_output_config_and_never_thinking_or_sampling_params() {
+    for oauth in [false, true] {
+        let provider = payload_provider(oauth).with_effort(Some("xhigh".into()));
+        let payload = provider
+            .request_payload(&payload_request(Some("system prompt")))
+            .expect("payload with effort");
+        assert_eq!(
+            payload["output_config"],
+            serde_json::json!({"effort": "xhigh"}),
+            "effort rides output_config (oauth={oauth}): {payload}"
+        );
+        let object = payload.as_object().expect("payload object");
+        for forbidden in ["thinking", "temperature", "top_p", "top_k", "speed"] {
+            assert!(
+                !object.contains_key(forbidden),
+                "`{forbidden}` must not ride an effort-only payload (oauth={oauth}): {payload}"
+            );
+        }
+
+        // Without an effort the pre-G3 body shape is byte-stable: the exact
+        // top-level key set, no output_config.
+        let plain = payload_provider(oauth)
+            .request_payload(&payload_request(Some("system prompt")))
+            .expect("payload without effort");
+        let mut keys: Vec<&str> = plain
+            .as_object()
+            .expect("plain object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "max_tokens",
+                "messages",
+                "model",
+                "stream",
+                "system",
+                "tools"
+            ],
+            "the effortless payload keeps the pre-G3 key set (oauth={oauth})"
+        );
+    }
+}
+
+/// LAW (LE4, wire half): fast mode is `speed: "fast"` in the body PLUS the
+/// `fast-mode-2026-02-01` beta header — comma-joined AFTER the OAuth beta on
+/// subscription requests, alone on api-key requests — and fast OFF keeps the
+/// exact pre-G3 header value.
+///
+/// MUTATION CHECK (executed — see the G3 mutation notes): replace the OAuth
+/// comma-join with the fast beta ALONE. Expected runtime failure: the OAuth
+/// header assertion below (and live, the subscription identity check 400s).
+#[tokio::test]
+async fn fast_mode_sets_speed_body_and_comma_joined_beta_header() {
+    // Body: both auth modes carry the top-level speed field.
+    for oauth in [false, true] {
+        let payload = payload_provider(oauth)
+            .with_fast(true)
+            .request_payload(&payload_request(Some("system prompt")))
+            .expect("fast payload");
+        assert_eq!(
+            payload["speed"], "fast",
+            "fast rides the body (oauth={oauth}): {payload}"
+        );
+    }
+
+    // Header, api-key mode: the fast beta alone.
+    let api_key = payload_provider(false).with_fast(true);
+    let request = api_key
+        .request(&serde_json::json!({"model": "claude-audit"}))
+        .await
+        .expect("api-key fast request");
+    assert_eq!(
+        request
+            .headers()
+            .get(ANTHROPIC_OAUTH_BETA_HEADER)
+            .expect("fast beta header"),
+        ANTHROPIC_FAST_BETA_VALUE
+    );
+
+    // Header, api-key mode, fast OFF: no beta header at all (pre-G3 shape).
+    let request = payload_provider(false)
+        .request(&serde_json::json!({"model": "claude-audit"}))
+        .await
+        .expect("api-key standard request");
+    assert!(request.headers().get(ANTHROPIC_OAUTH_BETA_HEADER).is_none());
+
+    // Header, OAuth mode: ONE comma-joined value, subscription beta FIRST.
+    let vault = MemoryVault::new();
+    let alias = CredentialAlias::new("anthropic-fast-header-audit");
+    vault
+        .put(&alias, b"ANTHROPIC_FAST_SENTINEL_77aa")
+        .expect("store OAuth access");
+    let oauth = AnthropicProvider::new_subscription_with_dns_resolver(
+        vault.resolve(&alias).expect("resolve OAuth access"),
+        "claude-audit",
+        ANTHROPIC_OAUTH_BASE_URL,
+        Arc::new(StubFixedResolver {
+            address: SocketAddr::from(([93, 184, 216, 34], 443)),
+        }),
+    )
+    .expect("Anthropic subscription provider")
+    .with_fast(true);
+    let request = oauth
+        .request(&serde_json::json!({"model": "claude-audit"}))
+        .await
+        .expect("oauth fast request");
+    assert_eq!(
+        request
+            .headers()
+            .get(ANTHROPIC_OAUTH_BETA_HEADER)
+            .expect("oauth+fast beta header"),
+        "oauth-2025-04-20,fast-mode-2026-02-01"
+    );
+    assert_eq!(
+        request
+            .headers()
+            .get_all(ANTHROPIC_OAUTH_BETA_HEADER)
+            .iter()
+            .count(),
+        1,
+        "the betas comma-join into ONE header value"
+    );
 }

@@ -63,6 +63,8 @@ fn hook_dispatch_outbox_is_atomic_persistent_and_idempotently_acknowledged() {
             model: "fake-model".into(),
             max_tokens: 4096,
             permission_overrides: None,
+            effort: None,
+            fast: false,
             system_prompt_version: "hook-outbox-v1".into(),
             event_id: EventId::new("hook-outbox-created"),
             device_id: DeviceId::new("hook-outbox-device"),

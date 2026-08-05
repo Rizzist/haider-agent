@@ -238,6 +238,93 @@ fn golden_session_renamed_fact() {
     assert!(serde_json::from_value::<EventPayload>(titled).is_err());
 }
 
+/// G3 goldens for the two session-config tuning facts, plus their F3
+/// contract: BOTH decode as `SessionConfigEventPayload`, which is exactly
+/// what lets the compaction head CAS tolerate a mid-compaction effort or
+/// fast change (the classifier decodes this union).
+///
+/// MUTATION CHECK: rename either tag, drop the `effort` skip, or remove a
+/// variant from the union. Expected RUNTIME failure: the fixture bytes
+/// differ, the revert payload grows an `effort` key, or the classifier
+/// decode below fails.
+#[test]
+fn golden_session_config_effort_and_fast_facts() {
+    use haider_protocol::session::{EffortSelected, FastModeSelected, SessionConfigEventPayload};
+
+    golden(
+        "session_config_effort_selected",
+        &SessionConfigEventPayload::EffortSelected(EffortSelected {
+            effort: Some("xhigh".into()),
+        }),
+    );
+    golden(
+        "session_config_fast_selected",
+        &SessionConfigEventPayload::FastModeSelected(FastModeSelected { enabled: true }),
+    );
+
+    // A revert-to-default selection carries NO effort key at all.
+    let revert = EffortSelected { effort: None }
+        .to_payload_value()
+        .expect("revert payload");
+    assert_eq!(revert, serde_json::json!({"type": "effort_selected"}));
+
+    // The F3 classifier contract: every tuning fact IS a session-config
+    // payload, and each helper decodes its own fact and refuses the others'.
+    let effort_value = EffortSelected {
+        effort: Some("low".into()),
+    }
+    .to_payload_value()
+    .expect("effort payload");
+    let fast_value = FastModeSelected { enabled: false }
+        .to_payload_value()
+        .expect("fast payload");
+    for value in [&effort_value, &fast_value] {
+        serde_json::from_value::<SessionConfigEventPayload>(value.clone())
+            .expect("tuning facts decode as session-config payloads");
+    }
+    assert_eq!(
+        EffortSelected::from_payload_value(&effort_value),
+        Some(EffortSelected {
+            effort: Some("low".into())
+        })
+    );
+    assert_eq!(EffortSelected::from_payload_value(&fast_value), None);
+    assert_eq!(
+        FastModeSelected::from_payload_value(&fast_value),
+        Some(FastModeSelected { enabled: false })
+    );
+    assert_eq!(FastModeSelected::from_payload_value(&effort_value), None);
+}
+
+/// G3 metadata additivity: pre-G3 metadata JSON (no tuning keys) decodes
+/// with `effort: None` / `fast: false`, and a metadata row with the tuning
+/// unset serializes WITHOUT the keys — pre-G3 rows stay byte-identical.
+///
+/// MUTATION CHECK: drop either serde default/skip attribute. Expected
+/// RUNTIME failure: the legacy decode errors or the re-encoded JSON grows
+/// an `effort`/`fast` key.
+#[test]
+fn session_metadata_tuning_fields_are_additive_and_skip_defaults() {
+    use haider_protocol::session::SessionMetadataV1;
+
+    let legacy = r#"{"cwd":"/tmp","provider":"anthropic","model":"claude-test","max_tokens":4096,"created_at_ms":1}"#;
+    let decoded: SessionMetadataV1 = serde_json::from_str(legacy).expect("legacy metadata decodes");
+    assert_eq!(decoded.effort, None);
+    assert!(!decoded.fast);
+    let encoded = serde_json::to_string(&decoded).expect("re-encode");
+    assert!(!encoded.contains("effort"));
+    assert!(!encoded.contains("fast"));
+
+    let tuned = SessionMetadataV1 {
+        effort: Some("max".into()),
+        fast: true,
+        ..decoded
+    };
+    let encoded = serde_json::to_value(&tuned).expect("tuned encode");
+    assert_eq!(encoded["effort"], "max");
+    assert_eq!(encoded["fast"], true);
+}
+
 /// MUTATION CHECK: remove, rename, or reorder any project-instruction audit
 /// coordinate. Expected RUNTIME failure: the additive fact golden differs or
 /// no longer round-trips while remaining unknown to the core payload enum.

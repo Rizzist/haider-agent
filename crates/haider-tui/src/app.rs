@@ -2122,6 +2122,15 @@ pub enum AppRequest {
     /// moves only on the correlated NORMALIZED reply (optimism forbidden,
     /// same law as [`Self::SelectModel`]).
     Rename { session: SessionId, title: String },
+    /// G3: receipted live-session effort selection
+    /// (`session.select_effort`). `None` reverts to the provider default;
+    /// the identity's reasoning segment moves only on the correlated reply.
+    SelectEffort {
+        session: SessionId,
+        effort: Option<String>,
+    },
+    /// G3: the receipted fast-mode toggle (`session.select_fast`).
+    SelectFast { session: SessionId, enabled: bool },
     /// Start an OAuth add flow (`account.oauth_start`) for the card.
     OAuthAddStart {
         provider: String,
@@ -2258,6 +2267,8 @@ pub enum Hit {
     /// One `/theme` picker row (model-local card): hover previews, click
     /// commits. Carries the MENU index it was rendered for.
     ThemeOption(usize),
+    /// One `/effort` picker row (G3).
+    EffortOption(usize),
     /// One `/model` picker row (F2a). VALUE-CARRYING (review r2 P2-2): the
     /// rect holds the pair it was rendered for, so a stale hit map can
     /// never select a different row.
@@ -2543,6 +2554,33 @@ pub struct ThemePicker {
     pub prior: ThemeChoice,
 }
 
+/// The `/effort` picker (G3): a composer-slot card listing the CURRENT
+/// pair's declared ladder (daemon truth — the TUI holds no tables) plus a
+/// leading "default" row that reverts to the provider default. ⏎ / digit
+/// commits the receipted selection; esc closes; the identity's reasoning
+/// segment moves only on the RESOLVED reply.
+#[derive(Debug, Default)]
+pub struct EffortPicker {
+    /// Index into [`AppModel::effort_picker_rows`].
+    pub selection: usize,
+    /// In-flight `session.select_effort`: the REQUESTED value.
+    pub pending: Option<Option<String>>,
+    /// Honest inline error — a typed refusal from the daemon.
+    pub error: Option<String>,
+}
+
+/// One `/effort` picker row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffortPickerRow {
+    /// `None` is the leading "provider default" row.
+    pub effort: Option<String>,
+    /// The provider's own declared default level, when it names one.
+    pub is_provider_default: bool,
+    /// The session's CURRENT selection (explicit level, or default row
+    /// when nothing is pinned).
+    pub is_current: bool,
+}
+
 /// The full-screen `/model` picker (F2a): one row per model × provider
 /// pair across EVERY enabled provider, searchable. MODEL-LOCAL overlay —
 /// it owns the keyboard while open (⏎ selects the HIGHLIGHTED row, esc
@@ -2648,6 +2686,8 @@ pub struct AppModel {
     /// highlight). MODEL-LOCAL — deliberately not a projection card so it
     /// can never ride a session checkout or block a daemon menu.
     pub theme_picker: Option<ThemePicker>,
+    /// The `/effort` picker overlay (G3), composer-replacing like `/theme`.
+    pub effort_picker: Option<EffortPicker>,
     /// The full-screen `/model` picker overlay (F2a). MODEL-LOCAL — never
     /// a projection card, so it can never ride a session checkout.
     pub model_picker: Option<ModelPicker>,
@@ -2963,6 +3003,7 @@ impl Default for AppModel {
             theme_choice: ThemeChoice::default(),
             detected_system: ThemeKey::default(),
             theme_picker: None,
+            effort_picker: None,
             model_picker: None,
             theme_commits: 0,
             sanctum_tier: SanctumTier::default(),
@@ -3697,11 +3738,47 @@ impl AppModel {
                 (row.alias.clone(), desc)
             })
             .collect();
+        // `/effort` completes from the CURRENT pair's declared ladder
+        // (G3, daemon truth): a leading `default` plus the levels.
+        let efforts = self
+            .current_pair_detail()
+            .map(|detail| {
+                let mut rows = vec![(
+                    "default".to_owned(),
+                    "revert to the provider default".to_owned(),
+                )];
+                rows.extend(detail.supported_efforts.iter().map(|level| {
+                    let mut desc = "reasoning effort".to_owned();
+                    if detail.default_effort.as_deref() == Some(level.as_str()) {
+                        desc.push_str(" · provider default");
+                    }
+                    (level.clone(), desc)
+                }));
+                rows
+            })
+            .unwrap_or_default();
         crate::commands::DynamicSlots {
             providers,
             models,
             accounts,
+            efforts,
         }
+    }
+
+    /// The CURRENT pair's daemon-projected detail row (G3): the one source
+    /// of the effort ladder / default / fast gate — the TUI holds no tables.
+    #[must_use]
+    pub fn current_pair_detail(&self) -> Option<&haider_rpc::ModelDetailWire> {
+        self.providers
+            .providers
+            .iter()
+            .find(|summary| summary.provider == self.identity.provider)
+            .and_then(|summary| {
+                summary
+                    .model_details
+                    .iter()
+                    .find(|detail| detail.name == self.identity.model_short)
+            })
     }
 
     pub fn palette_items(&self) -> Vec<PaletteItem> {
@@ -4097,6 +4174,23 @@ impl AppModel {
                 self.handle_model_picker_key(key.code);
                 return;
             }
+        }
+        // The `/effort` picker owns the keys while it is showing (G3) —
+        // the same input-replacement law as `/theme`; a daemon card
+        // outranks it and closes it.
+        if self.effort_picker.is_some() {
+            let menu_owns = (self.screen == Screen::Session
+                && self.projection.open_menu().is_some())
+                || (self.screen == Screen::Subagent
+                    && self
+                        .viewed_chip()
+                        .is_some_and(|chip| chip.question_menu().is_some()));
+            if !menu_owns && matches!(self.screen, Screen::Session | Screen::Subagent) {
+                self.handle_effort_picker_key(key.code);
+                return;
+            }
+            self.effort_picker = None;
+            self.dirty = true;
         }
         // The `/theme` picker owns the keys while it is showing. A daemon
         // card or a navigation away from its surfaces outranks it: the
@@ -6093,13 +6187,14 @@ impl AppModel {
     pub fn composer_identity(&self, budget: usize) -> Option<String> {
         let model = self.identity.model_short.as_str();
         let auth = self.identity_auth_label();
-        let reasoning = self.identity.reasoning.as_ref().map(|level| {
-            if self.identity.fast {
-                format!("{level} · fast")
-            } else {
-                level.clone()
-            }
-        });
+        // G3 (LE7): the tuning segment exists when EITHER knob is set —
+        // explicit effort, the fast marker riding it, or fast alone.
+        let reasoning = match (&self.identity.reasoning, self.identity.fast) {
+            (Some(level), true) => Some(format!("{level} · fast")),
+            (Some(level), false) => Some(level.clone()),
+            (None, true) => Some("fast".to_owned()),
+            (None, false) => None,
+        };
         let mut candidates: Vec<String> = Vec::new();
         if let (Some(auth), Some(reasoning)) = (auth, reasoning.as_ref()) {
             candidates.push(format!("{model} · {auth} · {reasoning}"));
@@ -7967,6 +8062,18 @@ impl AppModel {
                     self.flash = Some(format!("· no provider \"{requested}\" in the registry"));
                 }
             }
+            // G3: `/effort [level|default]` — with an argument commits the
+            // receipted selection; bare opens the ladder picker.
+            "effort" => {
+                let requested = remainder.trim().to_owned();
+                self.effort_command(if requested.is_empty() {
+                    None
+                } else {
+                    Some(requested)
+                });
+            }
+            // G3: `/fast` toggles fast mode on the current pair.
+            "fast" => self.fast_command(),
             "account" => {
                 // Sim tui.js:1770-1780: no alias → note listing them; a
                 // known alias selects (same daemon-gated path as a click);
@@ -9345,6 +9452,10 @@ impl AppModel {
             Hit::ThemeOption(index) if self.theme_picker.is_some() => {
                 self.commit_theme_row(index);
             }
+            // G3: an `/effort` row click commits exactly that row.
+            Hit::EffortOption(index) if self.effort_picker.is_some() => {
+                self.commit_effort_row(index);
+            }
             // F2a: a picker row click selects exactly the pair the rect
             // was rendered for (value-carrying — a stale map can never
             // select a different row).
@@ -9668,6 +9779,16 @@ impl AppModel {
             Some(Hit::ThemeOption(index)) if self.theme_picker.is_some() => {
                 self.preview_theme_row(index);
             }
+            // G3: hover moves the effort highlight (no preview side effect —
+            // effort commits only on the RESOLVED reply).
+            Some(Hit::EffortOption(index)) if self.effort_picker.is_some() => {
+                if index < self.effort_picker_rows().len()
+                    && let Some(picker) = self.effort_picker.as_mut()
+                {
+                    picker.selection = index;
+                    self.dirty = true;
+                }
+            }
             _ => {}
         }
     }
@@ -9972,6 +10093,239 @@ impl AppModel {
                 .record_local_error(format!("model selection failed — {reason}"));
             self.flash = Some(format!("· model selection failed — {code}"));
         }
+        self.dirty = true;
+    }
+
+    /// `/effort` (G3). With an argument the level is validated against the
+    /// CURRENT pair's daemon-declared ladder and committed as a receipted
+    /// selection (`default` reverts); bare opens the picker. An empty
+    /// ladder refuses honestly — the TUI holds no tables to guess from.
+    pub fn effort_command(&mut self, requested: Option<String>) {
+        self.dirty = true;
+        if self.screen != Screen::Session && self.screen != Screen::Subagent {
+            self.flash = Some("· /effort — session only".to_owned());
+            return;
+        }
+        let ladder: Vec<String> = self
+            .current_pair_detail()
+            .map(|detail| detail.supported_efforts.clone())
+            .unwrap_or_default();
+        if ladder.is_empty() {
+            self.flash = Some(format!(
+                "· /effort — {} · {} declares no effort ladder",
+                self.identity.model_short, self.identity.provider
+            ));
+            return;
+        }
+        let Some(requested) = requested else {
+            self.effort_picker = Some(EffortPicker::default());
+            return;
+        };
+        let effort = if requested.eq_ignore_ascii_case("default") {
+            None
+        } else if ladder.iter().any(|level| *level == requested) {
+            Some(requested)
+        } else {
+            self.flash = Some(format!(
+                "· effort \"{requested}\" is not in this pair's ladder — {}",
+                ladder.join(" · ")
+            ));
+            return;
+        };
+        self.request_effort(effort);
+    }
+
+    /// `/fast` (G3): toggles fast mode. Enabling refuses on a pair whose
+    /// daemon-projected detail declares no `fast` speed (decision 6: client
+    /// refusal AND daemon refusal — no silent no-op); disabling always goes
+    /// through so recovery is never gated.
+    pub fn fast_command(&mut self) {
+        self.dirty = true;
+        if self.screen != Screen::Session && self.screen != Screen::Subagent {
+            self.flash = Some("· /fast — session only".to_owned());
+            return;
+        }
+        let enabled = !self.identity.fast;
+        if enabled && !self.pair_supports_fast() {
+            self.flash = Some(format!(
+                "· /fast — {} · {} does not support fast mode",
+                self.identity.model_short, self.identity.provider
+            ));
+            return;
+        }
+        let live_session = (!self.mode.fabricates_locally())
+            .then(|| self.active_session.clone())
+            .flatten();
+        let Some(session) = live_session else {
+            self.apply_fast_selected(enabled);
+            return;
+        };
+        if !self.daemon_serves(haider_rpc::FEATURE_SESSION_FAST_SELECT_V1) {
+            self.flash = Some(self.stale_daemon_note("fast-mode selection"));
+            return;
+        }
+        self.requests
+            .push(AppRequest::SelectFast { session, enabled });
+    }
+
+    /// Whether the CURRENT pair's daemon detail declares the `fast` speed.
+    #[must_use]
+    pub fn pair_supports_fast(&self) -> bool {
+        self.current_pair_detail()
+            .is_some_and(|detail| detail.supported_speeds.iter().any(|speed| speed == "fast"))
+    }
+
+    /// The `/effort` picker rows: `default` first, then the CURRENT pair's
+    /// declared ladder with provider-default and current markers.
+    #[must_use]
+    pub fn effort_picker_rows(&self) -> Vec<EffortPickerRow> {
+        let detail = self.current_pair_detail();
+        let ladder: Vec<String> = detail
+            .map(|detail| detail.supported_efforts.clone())
+            .unwrap_or_default();
+        let provider_default = detail.and_then(|detail| detail.default_effort.clone());
+        let current = self.identity.reasoning.clone();
+        let mut rows = vec![EffortPickerRow {
+            effort: None,
+            is_provider_default: false,
+            is_current: current.is_none(),
+        }];
+        rows.extend(ladder.into_iter().map(|level| EffortPickerRow {
+            is_provider_default: provider_default.as_deref() == Some(level.as_str()),
+            is_current: current.as_deref() == Some(level.as_str()),
+            effort: Some(level),
+        }));
+        rows
+    }
+
+    /// KEY-OWNERSHIP (G3, the `/theme` law): while the effort picker shows
+    /// it owns every key — ⏎ commits the highlighted row, digits commit
+    /// directly, esc closes without selecting.
+    fn handle_effort_picker_key(&mut self, code: KeyCode) {
+        self.dirty = true;
+        let count = self.effort_picker_rows().len();
+        match code {
+            KeyCode::Esc => {
+                self.effort_picker = None;
+            }
+            KeyCode::Up | KeyCode::Down => {
+                if let Some(picker) = self.effort_picker.as_mut()
+                    && count > 0
+                {
+                    picker.selection = if code == KeyCode::Up {
+                        (picker.selection + count - 1) % count
+                    } else {
+                        (picker.selection + 1) % count
+                    };
+                }
+            }
+            KeyCode::Char(c @ '1'..='9') => {
+                let index = (c as usize) - ('1' as usize);
+                if index < count {
+                    self.commit_effort_row(index);
+                }
+            }
+            KeyCode::Enter => {
+                let Some(selection) = self.effort_picker.as_ref().map(|picker| picker.selection)
+                else {
+                    return;
+                };
+                if self
+                    .effort_picker
+                    .as_ref()
+                    .is_some_and(|picker| picker.pending.is_some())
+                {
+                    return;
+                }
+                self.commit_effort_row(selection);
+            }
+            _ => {}
+        }
+    }
+
+    /// Commits one picker row as the receipted selection.
+    pub fn commit_effort_row(&mut self, index: usize) {
+        let Some(row) = self.effort_picker_rows().into_iter().nth(index) else {
+            return;
+        };
+        self.request_effort(row.effort);
+    }
+
+    /// Issues the receipted effort selection (live) or fabricates locally
+    /// (demo / launcher default identity).
+    fn request_effort(&mut self, effort: Option<String>) {
+        self.dirty = true;
+        let live_session = (!self.mode.fabricates_locally())
+            .then(|| self.active_session.clone())
+            .flatten();
+        let Some(session) = live_session else {
+            self.apply_effort_selected(effort.as_deref());
+            return;
+        };
+        if !self.daemon_serves(haider_rpc::FEATURE_SESSION_EFFORT_SELECT_V1) {
+            let note = self.stale_daemon_note("effort selection");
+            if let Some(picker) = self.effort_picker.as_mut() {
+                picker.error = Some(note.trim_start_matches("· ").to_owned());
+            } else {
+                self.flash = Some(note);
+            }
+            return;
+        }
+        if let Some(picker) = self.effort_picker.as_mut() {
+            picker.pending = Some(effort.clone());
+            picker.error = None;
+        }
+        self.requests
+            .push(AppRequest::SelectEffort { session, effort });
+    }
+
+    /// The RESOLVED effort committed (G3/R2): render daemon truth. On
+    /// anthropic pairs the flash notes the prompt-cache re-warm (decision
+    /// 5 — changing effort invalidates the prompt cache).
+    pub fn apply_effort_selected(&mut self, effort: Option<&str>) {
+        self.identity.reasoning = effort.map(str::to_owned);
+        self.effort_picker = None;
+        let label = effort.unwrap_or("default");
+        self.flash = Some(if self.identity.provider.starts_with("anthropic") {
+            format!("· effort → {label} · cache re-warm")
+        } else {
+            format!("· effort → {label}")
+        });
+        self.dirty = true;
+    }
+
+    /// The committed fast toggle (G3/R2): render daemon truth.
+    pub fn apply_fast_selected(&mut self, enabled: bool) {
+        self.identity.fast = enabled;
+        let state = if enabled { "on" } else { "off" };
+        self.flash = Some(if self.identity.provider.starts_with("anthropic") {
+            format!("· fast → {state} · cache re-warm")
+        } else {
+            format!("· fast → {state}")
+        });
+        self.dirty = true;
+    }
+
+    /// A typed `session.select_effort` refusal: inline when the picker is
+    /// open, an error line + flash otherwise — never a silent no-op.
+    pub fn effort_select_failed(&mut self, code: &str, message: &str) {
+        let reason = format!("{code}: {message}");
+        if let Some(picker) = self.effort_picker.as_mut() {
+            picker.pending = None;
+            picker.error = Some(reason);
+        } else {
+            self.projection
+                .record_local_error(format!("effort selection failed — {reason}"));
+            self.flash = Some(format!("· effort selection failed — {code}"));
+        }
+        self.dirty = true;
+    }
+
+    /// A typed `session.select_fast` refusal.
+    pub fn fast_select_failed(&mut self, code: &str, message: &str) {
+        self.projection
+            .record_local_error(format!("fast-mode selection failed — {code}: {message}"));
+        self.flash = Some(format!("· fast-mode selection failed — {code}"));
         self.dirty = true;
     }
 

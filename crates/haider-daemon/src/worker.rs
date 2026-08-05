@@ -3110,6 +3110,40 @@ async fn fail_shell_exec(
     append_session_idle(lease, device_id, event_ids, false).await
 }
 
+/// The provider-opaque tag a session provider's wire accepts (G3/LT3).
+/// Everything outside the three native families speaks the chat-completions
+/// dialect, whose wire accepts the `openai-compatible` tag.
+fn accepted_opaque_provider(provider_name: &str) -> &'static str {
+    use haider_provider::{
+        GEMINI_PROVIDER_NAME, OPENAI_COMPATIBLE_PROVIDER_NAME, OPENAI_OAUTH_PROVIDER_NAME,
+        OPENAI_PROVIDER_NAME,
+    };
+    match provider_name {
+        ANTHROPIC_PROVIDER_NAME | ANTHROPIC_OAUTH_PROVIDER_NAME => ANTHROPIC_PROVIDER_NAME,
+        OPENAI_PROVIDER_NAME | OPENAI_OAUTH_PROVIDER_NAME => OPENAI_PROVIDER_NAME,
+        GEMINI_PROVIDER_NAME => GEMINI_PROVIDER_NAME,
+        _ => OPENAI_COMPATIBLE_PROVIDER_NAME,
+    }
+}
+
+/// Drops provider-opaque blocks minted by a DIFFERENT provider family from
+/// the compiled prompt (G3/LT3), and with them any message left empty — an
+/// empty assistant content array is itself a wire error. Same-family facts
+/// pass through untouched: this is a strip, never a rewrite.
+fn strip_foreign_provider_opaque(messages: &mut Vec<Message>, provider_name: &str) {
+    let accepted = accepted_opaque_provider(provider_name);
+    for message in messages.iter_mut() {
+        message.blocks.retain(|block| {
+            !matches!(
+                block,
+                haider_protocol::provider::Block::ProviderOpaque { provider, .. }
+                    if provider != accepted
+            )
+        });
+    }
+    messages.retain(|message| !message.blocks.is_empty());
+}
+
 /// Re-reads THIS session's metadata for one logical turn (F1). The store is
 /// the one truth for the current model selection: a committed
 /// `session.select_model` between turns is picked up here, which is what
@@ -3204,6 +3238,13 @@ async fn start_turn(
         &accepted.run_id,
     )
     .await?;
+    // G3 (LT3): provider-opaque continuation facts are only valid on the
+    // wire family that minted them — every adapter REJECTS a foreign tag.
+    // After a cross-provider model switch the compiled history still carries
+    // the old family's facts (openai encrypted reasoning, gemini signed
+    // parts, anthropic thinking blocks), so they are stripped here, before
+    // the request, instead of failing every turn on the new pair.
+    strip_foreign_provider_opaque(&mut messages, &resolved.provider_name);
     if messages.iter().any(|message| {
         message.blocks.iter().any(|block| {
             matches!(

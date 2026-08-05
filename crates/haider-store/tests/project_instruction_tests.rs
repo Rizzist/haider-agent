@@ -24,6 +24,8 @@ fn accepted_store() -> (tempfile::TempDir, Store, SessionId, RunId) {
             model: "fake-model".into(),
             max_tokens: 4096,
             permission_overrides: None,
+            effort: None,
+            fast: false,
             system_prompt_version: "haider-system-v2".into(),
             event_id: EventId::new("created-project-instruction-store"),
             device_id: DeviceId::new("project-instruction-store-device"),

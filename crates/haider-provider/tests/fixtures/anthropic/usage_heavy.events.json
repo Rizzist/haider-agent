@@ -1,15 +1,36 @@
 [
   {
     "result": "ok",
-    "value": {"event": "reasoning_delta", "text": "Compare the evidence. "}
+    "value": {
+      "event": "reasoning_delta",
+      "text": "Compare the evidence. "
+    }
   },
   {
     "result": "ok",
-    "value": {"event": "reasoning_delta", "text": "Then answer."}
+    "value": {
+      "event": "reasoning_delta",
+      "text": "Then answer."
+    }
   },
   {
     "result": "ok",
-    "value": {"event": "text_delta", "text": "Done."}
+    "value": {
+      "event": "provider_opaque",
+      "provider": "anthropic",
+      "data": {
+        "type": "thinking",
+        "thinking": "Compare the evidence. Then answer.",
+        "signature": "signature_sanitized"
+      }
+    }
+  },
+  {
+    "result": "ok",
+    "value": {
+      "event": "text_delta",
+      "text": "Done."
+    }
   },
   {
     "result": "ok",
@@ -24,6 +45,9 @@
   },
   {
     "result": "ok",
-    "value": {"event": "finish", "reason": "end_turn"}
+    "value": {
+      "event": "finish",
+      "reason": "end_turn"
+    }
   }
 ]

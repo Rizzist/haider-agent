@@ -41,6 +41,51 @@ pub(crate) struct ModelSelectionAuthority {
     summaries: Vec<ProviderSummaryWire>,
 }
 
+/// A typed G3 tuning refusal beside [`SelectionRefusal`]: `/effort` and
+/// `/fast` refuse in pair-capability terms, never with a silent no-op.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TuningRefusal {
+    /// The requested effort is not in the CURRENT pair's declared ladder.
+    /// `supported` is the exact ladder consulted — EMPTY means the pair
+    /// declares no effort vocabulary at all.
+    EffortUnsupported {
+        provider: String,
+        model: String,
+        effort: String,
+        supported: Vec<String>,
+    },
+    /// Fast mode was requested on a pair outside the static fast gate.
+    FastUnsupported { provider: String, model: String },
+}
+
+impl TuningRefusal {
+    pub(crate) fn message(&self) -> String {
+        match self {
+            Self::EffortUnsupported {
+                provider,
+                model,
+                effort,
+                supported,
+            } => {
+                if supported.is_empty() {
+                    format!(
+                        "pair `{model}` · `{provider}` declares no effort ladder — \
+                         effort `{effort}` cannot be validated"
+                    )
+                } else {
+                    format!(
+                        "effort `{effort}` is not in pair `{model}` · `{provider}`'s ladder ({})",
+                        supported.join(", ")
+                    )
+                }
+            }
+            Self::FastUnsupported { provider, model } => {
+                format!("pair `{model}` · `{provider}` does not support fast mode")
+            }
+        }
+    }
+}
+
 /// A typed selection refusal. Every variant names WHY in selection terms.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SelectionRefusal {
@@ -203,6 +248,99 @@ impl ModelSelectionAuthority {
             });
         }
         Ok((provider.to_owned(), model.to_owned()))
+    }
+
+    /// The CURRENT pair's declared effort ladder (G3), in validation-truth
+    /// order: the management projection's per-model detail (the registry
+    /// enriches anthropic/gemini rows from the pinned static tables when
+    /// their catalogs declare none), then — for the static-table families
+    /// only — the table itself, so an anthropic/gemini pair validates even
+    /// before a management snapshot exists. Everything else honestly gets
+    /// the EMPTY ladder.
+    pub(crate) fn effort_ladder(&self, provider: &str, model: &str) -> Vec<String> {
+        let declared = self
+            .summaries
+            .iter()
+            .find(|summary| summary.provider == provider)
+            .and_then(|summary| {
+                summary
+                    .model_details
+                    .iter()
+                    .find(|detail| detail.name == model)
+            })
+            .map(|detail| detail.supported_efforts.clone());
+        if let Some(ladder) = declared.filter(|ladder| !ladder.is_empty()) {
+            return ladder;
+        }
+        match provider {
+            haider_provider::ANTHROPIC_PROVIDER_NAME
+            | haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME => {
+                haider_provider::anthropic_supported_efforts(model)
+                    .iter()
+                    .map(|level| (*level).to_owned())
+                    .collect()
+            }
+            haider_provider::GEMINI_PROVIDER_NAME => {
+                haider_provider::gemini_supported_efforts(model)
+                    .iter()
+                    .map(|level| (*level).to_owned())
+                    .collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Validates one explicit effort selection against the CURRENT pair's
+    /// declared ladder (G3). `None` — revert to the provider default — is
+    /// always valid; a present value must be IN the ladder, and an empty
+    /// ladder refuses every value honestly.
+    pub(crate) fn validate_effort(
+        &self,
+        provider: &str,
+        model: &str,
+        effort: Option<&str>,
+    ) -> Result<(), TuningRefusal> {
+        let Some(effort) = effort else {
+            return Ok(());
+        };
+        let supported = self.effort_ladder(provider, model);
+        if supported.iter().any(|level| level == effort) {
+            Ok(())
+        } else {
+            Err(TuningRefusal::EffortUnsupported {
+                provider: provider.to_owned(),
+                model: model.to_owned(),
+                effort: effort.to_owned(),
+                supported,
+            })
+        }
+    }
+
+    /// Validates one fast-mode toggle (G3). Disabling is always accepted —
+    /// recovery must never be gated. Enabling requires an anthropic-family
+    /// pair inside the pinned static fast gate.
+    pub(crate) fn validate_fast(
+        &self,
+        provider: &str,
+        model: &str,
+        enabled: bool,
+    ) -> Result<(), TuningRefusal> {
+        if !enabled {
+            return Ok(());
+        }
+        let supported = matches!(
+            provider,
+            haider_provider::ANTHROPIC_PROVIDER_NAME
+                | haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME
+        ) && haider_provider::anthropic_fast_mode_supported(model);
+        if supported {
+            Ok(())
+        } else {
+            Err(TuningRefusal::FastUnsupported {
+                provider: provider.to_owned(),
+                model: model.to_owned(),
+            })
+        }
     }
 
     /// Resolves a `spawn_subagent` model selector to the child's pair.

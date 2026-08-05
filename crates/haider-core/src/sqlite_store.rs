@@ -220,6 +220,56 @@ impl SqliteStoreHandle {
         run_blocking(move || owner.with_store(|store| store.rename_session(&command))).await
     }
 
+    /// Preflights a durable `session.select_effort` receipt (R2 replay).
+    pub async fn session_select_effort_receipt(
+        &self,
+        command_id: String,
+        request_digest: String,
+        request_json: String,
+    ) -> Result<Option<haider_store::SelectedEffort>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.session_select_effort_receipt(&command_id, &request_digest, &request_json)
+            })
+        })
+        .await
+    }
+
+    /// Atomically applies one resolved live-session effort selection (G3).
+    pub async fn select_session_effort(
+        &self,
+        command: haider_store::SessionSelectEffortCommand,
+    ) -> Result<haider_store::SessionSelectEffortOutcome, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.select_session_effort(&command))).await
+    }
+
+    /// Preflights a durable `session.select_fast` receipt (R2 replay).
+    pub async fn session_select_fast_receipt(
+        &self,
+        command_id: String,
+        request_digest: String,
+        request_json: String,
+    ) -> Result<Option<haider_store::SelectedFast>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.session_select_fast_receipt(&command_id, &request_digest, &request_json)
+            })
+        })
+        .await
+    }
+
+    /// Atomically applies one validated live-session fast-mode toggle (G3).
+    pub async fn select_session_fast(
+        &self,
+        command: haider_store::SessionSelectFastCommand,
+    ) -> Result<haider_store::SessionSelectFastOutcome, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.select_session_fast(&command))).await
+    }
+
     pub async fn create_delegation(
         &self,
         record: DelegationRecord,

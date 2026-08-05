@@ -195,6 +195,8 @@ async fn respond_create_and_attach(
                 permission_overrides: None,
                 system_prompt_version: Some("test".into()),
                 title: None,
+                effort: None,
+                fast: false,
                 created_at_ms: 1,
             },
         },

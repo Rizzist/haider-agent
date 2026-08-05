@@ -108,6 +108,8 @@ fn session_permission_overrides_replace_only_write_and_exec_ask_defaults() {
         permission_overrides,
         system_prompt_version: None,
         title: None,
+        effort: None,
+        fast: false,
         created_at_ms: 1,
     };
     let decision = |metadata: &SessionMetadataV1, class: EffectClass| {
@@ -439,6 +441,8 @@ fn create_durable_session(store: &Store, session_id: &SessionId) {
             model: "fake-v1".into(),
             max_tokens: 4096,
             permission_overrides: None,
+            effort: None,
+            fast: false,
             system_prompt_version: "test-v1".into(),
             event_id: EventId::new(format!("created-{session_id}")),
             device_id: DeviceId::new("recovery-test"),

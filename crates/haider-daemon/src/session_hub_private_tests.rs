@@ -58,6 +58,8 @@ async fn deletion_barrier_preserves_a_prefence_accepted_turn_and_its_actor() {
         model: "fake-model".into(),
         max_tokens: 4096,
         permission_overrides: None,
+        effort: None,
+        fast: false,
         system_prompt_version: crate::worker::SystemPromptBuilder::VERSION.into(),
         event_id: EventId::new("created-delete-barrier-session"),
         device_id: DeviceId::new("delete-barrier-device"),
@@ -170,6 +172,8 @@ async fn branch_create_receipt_replays_before_attachment_and_generation_validati
             model: "fake-model".into(),
             max_tokens: 4096,
             permission_overrides: None,
+            effort: None,
+            fast: false,
             system_prompt_version: crate::worker::SystemPromptBuilder::VERSION.into(),
             event_id: EventId::new("created-branch-rpc-session"),
             device_id: DeviceId::new("branch-rpc-device"),
@@ -489,6 +493,8 @@ fn create_command(session_id: &SessionId, suffix: &str) -> SessionCreateCommand 
         model: "fake-v1".into(),
         max_tokens: 4_096,
         permission_overrides: None,
+        effort: None,
+        fast: false,
         system_prompt_version: "test-system-v1".into(),
         event_id: EventId::new(format!("created-{suffix}")),
         device_id: DeviceId::new("worker-law-test"),
@@ -909,6 +915,119 @@ async fn worker_head_cas_tolerates_a_rename_fact_delta() {
         history
             .iter()
             .any(|event| event.event_id == EventId::new("rename-cas-batch")),
+        "the tolerated batch is durably committed"
+    );
+
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
+}
+
+/// LAW (LE5, extending the F3 tolerance half above to G3's config facts): a
+/// delta made of `effort_selected` AND `fast_mode_selected` facts between
+/// the compaction's planned head and the actor's head does NOT reject the
+/// batch — a mid-compaction `/effort` or `/fast` change must never wedge the
+/// head CAS. Membership is structural: the classifier decodes the
+/// `SessionConfigEventPayload` union the new variants joined.
+///
+/// MUTATION CHECK: remove `EffortSelected`/`FastModeSelected` from
+/// `SessionConfigEventPayload` (or decode `model_selected` only in
+/// `session_config_only_delta`). Expected runtime failure: this append is
+/// refused Busy. The inverse (classifier accepts every payload) stays killed
+/// by the reject pin above.
+#[tokio::test]
+async fn worker_head_cas_tolerates_an_effort_and_fast_fact_delta() {
+    let root = tempfile::tempdir().expect("temp store");
+    let store = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("store opens");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub opens");
+    let session_id = SessionId::new("compaction-head-cas-tuning");
+    let run_id = RunId::new("compaction-head-cas-tuning-run");
+    let generation = store.worker_generation();
+    let mut queued = [run_state_envelope(
+        &session_id,
+        &run_id,
+        generation,
+        "tuning-cas-queued",
+        RunState::Queued,
+    )];
+    hub.append(&mut queued).await.expect("queued prefix");
+    let expected_head = store.latest_seq(&session_id).await.expect("head");
+    let lease = hub
+        .acquire_worker_lease(session_id.clone())
+        .await
+        .expect("lease");
+    let actor = hub
+        .existing_actor(&session_id)
+        .expect("actor lookup")
+        .expect("actor exists");
+
+    // The interleaved journal movement is BOTH G3 tuning facts: no run, no
+    // conversation-tree movement.
+    let mut effort_fact = run_state_envelope(
+        &session_id,
+        &run_id,
+        generation,
+        "tuning-cas-effort-selected",
+        RunState::Queued,
+    );
+    effort_fact.run_id = None;
+    effort_fact.payload = haider_protocol::session::EffortSelected {
+        effort: Some("xhigh".into()),
+    }
+    .to_payload_value()
+    .expect("effort fact serializes");
+    let mut fast_fact = run_state_envelope(
+        &session_id,
+        &run_id,
+        generation,
+        "tuning-cas-fast-selected",
+        RunState::Queued,
+    );
+    fast_fact.run_id = None;
+    fast_fact.payload = haider_protocol::session::FastModeSelected { enabled: true }
+        .to_payload_value()
+        .expect("fast fact serializes");
+    let (advance_completed, advance_response) = oneshot::channel();
+    actor
+        .commands
+        .send(ActorCommand::Append {
+            envelopes: vec![effort_fact, fast_fact],
+            completed: advance_completed,
+        })
+        .await
+        .expect("advance queues");
+    let (cas_completed, cas_response) = oneshot::channel();
+    actor
+        .commands
+        .send(ActorCommand::WorkerAppend {
+            lease_id: lease.lease_id.clone(),
+            expected_head: Some(expected_head),
+            envelopes: vec![run_state_envelope(
+                &session_id,
+                &run_id,
+                generation,
+                "tuning-cas-batch",
+                RunState::Streaming,
+            )],
+            completed: cas_completed,
+        })
+        .await
+        .expect("CAS queues behind advance");
+
+    advance_response
+        .await
+        .expect("advance response")
+        .expect("advance commits");
+    cas_response
+        .await
+        .expect("CAS response")
+        .expect("an effort+fast fact delta must not reject the batch");
+    let history = store.read(&session_id, 0, 16).await.expect("history");
+    assert!(
+        history
+            .iter()
+            .any(|event| event.event_id == EventId::new("tuning-cas-batch")),
         "the tolerated batch is durably committed"
     );
 

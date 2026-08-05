@@ -507,19 +507,14 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
     fn discovered_slugs(&self, provider: &str) -> Vec<String> {
         self.discovered_details(provider)
             .into_iter()
-            .map(|(slug, _context_window)| slug)
+            .map(|model| model.slug)
             .collect()
     }
 
-    fn discovered_details(&self, provider: &str) -> Vec<(String, Option<u64>)> {
+    fn discovered_details(&self, provider: &str) -> Vec<DiscoveredModel> {
         self.model_source
             .models(provider)
-            .map(|models| {
-                pickable(&models)
-                    .into_iter()
-                    .map(|model| (model.slug, model.context_window))
-                    .collect()
-            })
+            .map(|models| pickable(&models))
             .unwrap_or_default()
     }
 
@@ -527,12 +522,65 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
         let model_details = self
             .discovered_details(&profile.provider_id)
             .into_iter()
-            .map(|(name, context_window)| ModelDetailWire {
-                name,
-                context_window,
-            })
+            .map(|model| model_detail_wire(&profile.provider_id, model))
             .collect();
         provider_summary(profile, model_details)
+    }
+}
+
+/// Projects one discovered model into its wire detail, enriching the G3
+/// tuning fields for providers whose CATALOG declares none: anthropic and
+/// gemini effort ladders come from the pinned static capability tables, and
+/// the anthropic fast gate rides `supported_speeds`. The daemon is the ONE
+/// source of this truth — clients hold no tables.
+fn model_detail_wire(provider: &str, model: DiscoveredModel) -> ModelDetailWire {
+    let static_ladder: &[&str] = if model.supported_efforts.is_empty() {
+        match provider {
+            ANTHROPIC_PROVIDER_NAME | ANTHROPIC_OAUTH_PROVIDER_NAME => {
+                haider_provider::anthropic_supported_efforts(&model.slug)
+            }
+            GEMINI_PROVIDER_NAME => haider_provider::gemini_supported_efforts(&model.slug),
+            _ => &[],
+        }
+    } else {
+        &[]
+    };
+    let supported_efforts = if model.supported_efforts.is_empty() {
+        static_ladder
+            .iter()
+            .map(|level| (*level).to_owned())
+            .collect()
+    } else {
+        model.supported_efforts.clone()
+    };
+    let default_effort = model.default_effort.clone().or_else(|| match provider {
+        ANTHROPIC_PROVIDER_NAME | ANTHROPIC_OAUTH_PROVIDER_NAME => {
+            haider_provider::anthropic_default_effort(&model.slug).map(str::to_owned)
+        }
+        GEMINI_PROVIDER_NAME => {
+            haider_provider::gemini_default_effort(&model.slug).map(str::to_owned)
+        }
+        _ => None,
+    });
+    let supported_speeds = if matches!(
+        provider,
+        ANTHROPIC_PROVIDER_NAME | ANTHROPIC_OAUTH_PROVIDER_NAME
+    ) && haider_provider::anthropic_fast_mode_supported(&model.slug)
+    {
+        vec!["fast".to_owned()]
+    } else {
+        Vec::new()
+    };
+    ModelDetailWire {
+        name: model.slug,
+        context_window: model.context_window,
+        supported_efforts,
+        default_effort,
+        supported_speeds,
+        supports_thinking_type: model
+            .extensions
+            .as_ref()
+            .map(|extensions| extensions.supports_thinking_type),
     }
 }
 

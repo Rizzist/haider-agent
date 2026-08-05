@@ -177,6 +177,15 @@ pub const ERROR_CODE_PROVIDER_UNAVAILABLE: &str = "provider_unavailable";
 /// provider errors surface at turn time.
 pub const ERROR_CODE_MODEL_UNKNOWN: &str = "model_unknown";
 
+/// A `session.select_effort` refusal (G3): the requested effort is not in
+/// the CURRENT pair's declared ladder — including the empty-ladder case
+/// where the pair declares no effort vocabulary at all.
+pub const ERROR_CODE_EFFORT_UNSUPPORTED: &str = "effort_unsupported";
+
+/// A `session.select_fast` refusal (G3): the CURRENT pair is not in the
+/// static fast-mode gate. Turning fast OFF is always accepted.
+pub const ERROR_CODE_FAST_UNSUPPORTED: &str = "fast_unsupported";
+
 /// Daemon implements receipt-backed session creation and metadata.
 pub const FEATURE_SESSION_MUTATION_V1: &str = "session_mutation_v1";
 /// Daemon implements durable submit/cancel turn control.
@@ -235,6 +244,14 @@ pub const FEATURE_SESSION_MODEL_SELECT_V1: &str = "session_model_select_v1";
 /// `session_renamed` config fact is journaled atomically with the receipt,
 /// and `session.list` summaries carry the title.
 pub const FEATURE_SESSION_RENAME_V1: &str = "session_rename_v1";
+/// Daemon implements receipted live-session effort selection
+/// (`session.select_effort`), validated against the CURRENT pair's declared
+/// effort ladder; `effort: null` reverts to the provider default (G3).
+pub const FEATURE_SESSION_EFFORT_SELECT_V1: &str = "session_effort_select_v1";
+/// Daemon implements the receipted live-session fast-mode toggle
+/// (`session.select_fast`), statically gated to the pairs Anthropic
+/// documents for the fast-mode research preview (G3).
+pub const FEATURE_SESSION_FAST_SELECT_V1: &str = "session_fast_select_v1";
 /// Daemon vaults the profile transcription secret (the Deepgram API key)
 /// and serves `transcription.secret_get`/`transcription.secret_set` on
 /// authenticated same-UID local UDS connections only (T1).
@@ -598,11 +615,33 @@ pub enum ProviderAvailabilityWire {
 }
 
 /// Provider-declared metadata for one pickable model.
+///
+/// The G3 tuning fields are DAEMON truth: the daemon projects them from the
+/// provider's own catalog, enriched from the pinned static capability tables
+/// for providers whose catalog declares none (anthropic effort/fast, gemini
+/// thinkingLevel). Clients hold no tables — an absent/empty field means "the
+/// pair declares nothing" and tuning commands refuse honestly.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelDetailWire {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
+    /// The pair's effort ladder, in the provider's own vocabulary and order.
+    /// EMPTY (absent on the wire) means "no declared ladder".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supported_efforts: Vec<String>,
+    /// The provider's declared default effort, when it names one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_effort: Option<String>,
+    /// Request speeds beyond standard the pair supports (`"fast"` today).
+    /// EMPTY (absent on the wire) means standard only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supported_speeds: Vec<String>,
+    /// Kimi's catalog-declared `supports_thinking_type` flag, carried so the
+    /// provider factory can pick the documented wire shape (thinking.effort
+    /// vs top-level reasoning_effort) without a client-side table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_thinking_type: Option<bool>,
 }
 
 /// One provider's read-only management projection.
@@ -1115,6 +1154,30 @@ pub enum RequestBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         title: Option<String>,
     },
+    /// Receipted live-session effort selection (G3), mirroring
+    /// `session.select_model` exactly: receipt replay precedes validation,
+    /// the store fences the worker generation, and the next logical turn
+    /// resolves through the committed metadata. `effort: null` (absent)
+    /// reverts to the provider default; a present value must be in the
+    /// CURRENT pair's declared ladder.
+    #[serde(rename = "session.select_effort")]
+    SessionSelectEffort {
+        command_id: CommandId,
+        session_id: SessionId,
+        worker_generation: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<String>,
+    },
+    /// Receipted live-session fast-mode toggle (G3), same law set as
+    /// `session.select_effort`. Enabling requires the CURRENT pair to be in
+    /// the static fast gate; disabling is always accepted.
+    #[serde(rename = "session.select_fast")]
+    SessionSelectFast {
+        command_id: CommandId,
+        session_id: SessionId,
+        worker_generation: u64,
+        enabled: bool,
+    },
     /// Executes exact user-supplied shell program bytes on the session daemon.
     /// The command creates no user message and no provider request. `cwd`, when
     /// present, is workspace-relative and applies only to this invocation.
@@ -1451,6 +1514,26 @@ pub enum ResponseBody {
         renamed_seq: u64,
         worker_generation: u64,
     },
+    /// Durable coordinates of a committed effort selection (G3/R2): the
+    /// RESOLVED value plus the committed journal sequence of the
+    /// `effort_selected` fact. A same-command retry receives this exact body
+    /// from its receipt.
+    #[serde(rename = "session.select_effort")]
+    SessionSelectEffort {
+        session_id: SessionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<String>,
+        selected_seq: u64,
+        worker_generation: u64,
+    },
+    /// Durable coordinates of a committed fast-mode toggle (G3/R2).
+    #[serde(rename = "session.select_fast")]
+    SessionSelectFast {
+        session_id: SessionId,
+        enabled: bool,
+        selected_seq: u64,
+        worker_generation: u64,
+    },
     /// Durable acceptance coordinates for one direct shell command. Terminal
     /// status and byte output arrive through the ordinary item event stream.
     #[serde(rename = "shell.exec")]
@@ -1712,6 +1795,20 @@ pub enum ErrorData {
     /// A model selection named a model outside the implied provider's KNOWN
     /// discovered inventory ([`ERROR_CODE_MODEL_UNKNOWN`]).
     ModelUnknown { provider: String, model: String },
+    /// An effort selection named a level outside the CURRENT pair's declared
+    /// ladder ([`ERROR_CODE_EFFORT_UNSUPPORTED`]). `supported` is the exact
+    /// ladder the daemon validated against — EMPTY means the pair declares
+    /// no effort vocabulary at all (G3).
+    EffortUnsupported {
+        provider: String,
+        model: String,
+        effort: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        supported: Vec<String>,
+    },
+    /// A fast-mode enable named a pair outside the static fast gate
+    /// ([`ERROR_CODE_FAST_UNSUPPORTED`]) (G3).
+    FastUnsupported { provider: String, model: String },
     /// A custom-provider removal was refused. Blocking credential aliases are
     /// carried as typed data so clients never need to parse the message.
     ProviderRemoveRefused {

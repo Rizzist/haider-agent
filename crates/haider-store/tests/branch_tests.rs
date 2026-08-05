@@ -24,6 +24,8 @@ fn create_session(store: &Store, session_id: &SessionId) {
             model: "fake-model".into(),
             max_tokens: 4096,
             permission_overrides: None,
+            effort: None,
+            fast: false,
             system_prompt_version: "branch-test-v1".into(),
             event_id: EventId::new(format!("created-{session_id}")),
             device_id: DeviceId::new("branch-test-device"),

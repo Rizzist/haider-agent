@@ -1408,9 +1408,10 @@ fn device_discovery_goldens_are_additive_and_tolerance_re_proved() {
     // have moved.
     assert_eq!(
         frames.len() - d1_start,
-        6 + 7 + 3 + 3,
+        6 + 7 + 3 + 3 + 4,
         "six D1 frames, then T1's seven transcription frames, then U1's \
-         three usage frames, then G2's three session-rename frames — the \
+         three usage frames, then G2's three session-rename frames, then \
+         G3's four session-tuning frames — the \
          accounted tail pins that nothing before d1_start moved"
     );
     for frame in &frames[d1_start..d1_start + 6] {
@@ -1658,7 +1659,9 @@ fn session_rename_frames_are_additive_and_golden() {
     // The feature bit is a pinned wire literal.
     assert_eq!(FEATURE_SESSION_RENAME_V1, "session_rename_v1");
 
-    // The G2 frames are the transcript tail: three frames, append-only.
+    // The G2 frames were appended at the then-END of the transcript: three
+    // frames, append-only; G3 later appended its four session-tuning frames
+    // strictly AFTER them (pinned by G3's own law).
     let frames = transcript();
     let g2_start = frames
         .iter()
@@ -1672,8 +1675,8 @@ fn session_rename_frames_are_additive_and_golden() {
         .expect("G2 welcome frame in the golden transcript");
     assert_eq!(
         frames.len() - g2_start,
-        3,
-        "G2 appends exactly three frames"
+        3 + 4,
+        "G2's three frames, then G3's four session-tuning frames"
     );
 
     // Exact golden bytes for the titled request/response pair.
@@ -1782,11 +1785,12 @@ fn transcription_secret_frames_are_additive_and_redacted() {
     // The feature bit is the discovery contract for the family.
     assert_eq!(haider_rpc::FEATURE_TRANSCRIPTION_V1, "transcription_v1");
 
-    // The seven T1 frames sit directly before U1's three appended usage
-    // frames and G2's three session-rename frames at the transcript tail
-    // (each later wave's own law pins its append).
+    // The seven T1 frames sit directly before U1's three usage frames,
+    // G2's three session-rename frames, and G3's four session-tuning
+    // frames at the transcript tail (each later wave's own law pins its
+    // append).
     let frames = transcript();
-    let tail = &frames[frames.len() - 13..frames.len() - 6];
+    let tail = &frames[frames.len() - 17..frames.len() - 10];
     let methods: Vec<String> = tail
         .iter()
         .map(|frame| {
@@ -1912,8 +1916,10 @@ fn usage_report_goldens_are_additive_normalized_and_secret_free() {
         .expect("U1 welcome frame in the golden transcript");
     assert_eq!(
         frames.len() - u1_start,
-        3 + 3,
-        "three U1 frames, then G2's three session-rename frames"
+        3 + 3 + 4,
+        "three U1 frames, then G2's three session-rename frames, then G3's \
+         four session-tuning frames (each later wave's own law pins its \
+         append)"
     );
     for frame in &frames[u1_start..u1_start + 3] {
         let encoded = ws_codec::encode(frame, TEST_FRAME_LIMIT).expect("encode U1 frame");
@@ -1987,4 +1993,177 @@ fn usage_report_goldens_are_additive_normalized_and_secret_free() {
             ..
         }
     ));
+}
+
+/// G3 goldens: the two session-tuning pairs pin their exact v1 bytes — an
+/// effort request/response with the value present, the ABSENT-`effort`
+/// revert shape (no `"effort"` key at all, mirroring the select_model
+/// absent-provider law), and the fast pair — plus additive-field tolerance
+/// and the two feature literals.
+///
+/// MUTATION CHECK: serialize `effort: None` as `"effort":null`, rename a
+/// method tag, or change a feature literal. Expected RUNTIME failure: the
+/// exact golden strings below.
+#[test]
+fn session_tuning_pairs_are_golden_and_revert_omits_the_effort_key() {
+    assert_eq!(
+        haider_rpc::FEATURE_SESSION_EFFORT_SELECT_V1,
+        "session_effort_select_v1"
+    );
+    assert_eq!(
+        haider_rpc::FEATURE_SESSION_FAST_SELECT_V1,
+        "session_fast_select_v1"
+    );
+    assert_eq!(
+        haider_rpc::ERROR_CODE_EFFORT_UNSUPPORTED,
+        "effort_unsupported"
+    );
+    assert_eq!(haider_rpc::ERROR_CODE_FAST_UNSUPPORTED, "fast_unsupported");
+
+    let request = WireFrame::Request {
+        request_id: haider_rpc::RequestId::new("request-select-effort"),
+        body: RequestBody::SessionSelectEffort {
+            command_id: haider_rpc::CommandId::new("command-select-effort"),
+            session_id: haider_rpc::haider_protocol::ids::SessionId::new("session-1"),
+            worker_generation: 7,
+            effort: Some("xhigh".into()),
+        },
+    };
+    assert_eq!(
+        serde_json::to_string(&request).expect("encode effort request"),
+        r#"{"v":1,"kind":"request","request_id":"request-select-effort","body":{"method":"session.select_effort","command_id":"command-select-effort","session_id":"session-1","worker_generation":7,"effort":"xhigh"}}"#
+    );
+
+    // The revert carries NO effort key — byte-for-byte what an
+    // effort-unaware encoder of the same fields would emit.
+    let revert = WireFrame::Request {
+        request_id: haider_rpc::RequestId::new("request-select-effort-revert"),
+        body: RequestBody::SessionSelectEffort {
+            command_id: haider_rpc::CommandId::new("command-select-effort-revert"),
+            session_id: haider_rpc::haider_protocol::ids::SessionId::new("session-1"),
+            worker_generation: 7,
+            effort: None,
+        },
+    };
+    let encoded = serde_json::to_string(&revert).expect("encode revert");
+    assert_eq!(
+        encoded,
+        r#"{"v":1,"kind":"request","request_id":"request-select-effort-revert","body":{"method":"session.select_effort","command_id":"command-select-effort-revert","session_id":"session-1","worker_generation":7}}"#
+    );
+    assert_eq!(
+        serde_json::from_str::<WireFrame>(&encoded).expect("decode revert"),
+        revert
+    );
+
+    let response = WireFrame::Response {
+        request_id: haider_rpc::RequestId::new("request-select-effort"),
+        body: ResponseBody::SessionSelectEffort {
+            session_id: haider_rpc::haider_protocol::ids::SessionId::new("session-1"),
+            effort: Some("xhigh".into()),
+            selected_seq: 43,
+            worker_generation: 7,
+        },
+    };
+    assert_eq!(
+        serde_json::to_string(&response).expect("encode effort response"),
+        r#"{"v":1,"kind":"response","request_id":"request-select-effort","body":{"method":"session.select_effort","session_id":"session-1","effort":"xhigh","selected_seq":43,"worker_generation":7}}"#
+    );
+
+    let fast = WireFrame::Request {
+        request_id: haider_rpc::RequestId::new("request-select-fast"),
+        body: RequestBody::SessionSelectFast {
+            command_id: haider_rpc::CommandId::new("command-select-fast"),
+            session_id: haider_rpc::haider_protocol::ids::SessionId::new("session-1"),
+            worker_generation: 7,
+            enabled: true,
+        },
+    };
+    assert_eq!(
+        serde_json::to_string(&fast).expect("encode fast request"),
+        r#"{"v":1,"kind":"request","request_id":"request-select-fast","body":{"method":"session.select_fast","command_id":"command-select-fast","session_id":"session-1","worker_generation":7,"enabled":true}}"#
+    );
+    let fast_response = WireFrame::Response {
+        request_id: haider_rpc::RequestId::new("request-select-fast"),
+        body: ResponseBody::SessionSelectFast {
+            session_id: haider_rpc::haider_protocol::ids::SessionId::new("session-1"),
+            enabled: true,
+            selected_seq: 44,
+            worker_generation: 7,
+        },
+    };
+    assert_eq!(
+        serde_json::to_string(&fast_response).expect("encode fast response"),
+        r#"{"v":1,"kind":"response","request_id":"request-select-fast","body":{"method":"session.select_fast","session_id":"session-1","enabled":true,"selected_seq":44,"worker_generation":7}}"#
+    );
+
+    // Additive tolerance: unknown fields ignored, and to an older reader
+    // the new methods are just Unknown — never a decode failure.
+    let future: RequestBody = serde_json::from_str(
+        r#"{"method":"session.select_effort","command_id":"c","session_id":"s","worker_generation":1,"effort":"low","future_field":true}"#,
+    )
+    .expect("additive effort decode");
+    assert!(matches!(future, RequestBody::SessionSelectEffort { .. }));
+
+    // The typed refusal data pins its kind + ladder coordinates.
+    let data = ErrorData::EffortUnsupported {
+        provider: "anthropic-oauth".into(),
+        model: "claude-opus-4-6".into(),
+        effort: "xhigh".into(),
+        supported: ["low", "medium", "high", "max"].map(str::to_owned).to_vec(),
+    };
+    assert_eq!(
+        serde_json::to_value(&data).expect("effort refusal data"),
+        serde_json::json!({
+            "kind": "effort_unsupported",
+            "provider": "anthropic-oauth",
+            "model": "claude-opus-4-6",
+            "effort": "xhigh",
+            "supported": ["low", "medium", "high", "max"],
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(ErrorData::FastUnsupported {
+            provider: "anthropic-oauth".into(),
+            model: "claude-sonnet-5".into(),
+        })
+        .expect("fast refusal data"),
+        serde_json::json!({
+            "kind": "fast_unsupported",
+            "provider": "anthropic-oauth",
+            "model": "claude-sonnet-5",
+        })
+    );
+}
+
+/// G3 ModelDetailWire additivity: a pre-G3 daemon's detail row (name +
+/// context_window only) decodes with EMPTY tuning fields, and a detail row
+/// with the tuning unset serializes to the exact pre-G3 bytes — the
+/// provider snapshot goldens above stay byte-stable by construction.
+///
+/// MUTATION CHECK: drop a serde default/skip attribute on the new fields.
+/// Expected RUNTIME failure: the legacy decode errors or the bare row's
+/// bytes grow a tuning key.
+#[test]
+fn model_detail_tuning_fields_are_additive_and_skip_empty() {
+    let legacy: haider_rpc::ModelDetailWire =
+        serde_json::from_str(r#"{"name":"frontier-a","context_window":200000}"#)
+            .expect("pre-G3 detail decodes");
+    assert!(legacy.supported_efforts.is_empty());
+    assert_eq!(legacy.default_effort, None);
+    assert!(legacy.supported_speeds.is_empty());
+    assert_eq!(legacy.supports_thinking_type, None);
+    assert_eq!(
+        serde_json::to_string(&legacy).expect("re-encode"),
+        r#"{"name":"frontier-a","context_window":200000}"#,
+        "unset tuning stays OFF the wire — pre-G3 bytes exactly"
+    );
+
+    let tuned: haider_rpc::ModelDetailWire = serde_json::from_str(
+        r#"{"name":"claude-opus-5","supported_efforts":["low","max"],"default_effort":"high","supported_speeds":["fast"],"supports_thinking_type":false,"future_field":1}"#,
+    )
+    .expect("tuned detail decodes with additive tolerance");
+    assert_eq!(tuned.supported_efforts, ["low", "max"]);
+    assert_eq!(tuned.default_effort.as_deref(), Some("high"));
+    assert_eq!(tuned.supported_speeds, ["fast"]);
+    assert_eq!(tuned.supports_thinking_type, Some(false));
 }

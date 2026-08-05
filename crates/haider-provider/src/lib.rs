@@ -16,6 +16,9 @@ mod anthropic_tests;
 mod catalog;
 #[cfg(test)]
 mod catalog_tests;
+mod effort;
+#[cfg(test)]
+mod effort_tests;
 mod gemini;
 #[cfg(test)]
 mod gemini_tests;
@@ -37,15 +40,20 @@ use tokio::sync::mpsc;
 use tokio::time::{Duration, sleep};
 
 pub use anthropic::{
-    ANTHROPIC_API_URL, ANTHROPIC_OAUTH_BASE_URL, ANTHROPIC_OAUTH_BETA_HEADER,
-    ANTHROPIC_OAUTH_BETA_VALUE, ANTHROPIC_OAUTH_PROVIDER_NAME, ANTHROPIC_OAUTH_SYSTEM_IDENTITY,
-    ANTHROPIC_PROVIDER_NAME, AnthropicCapture, AnthropicProvider, AnthropicRetryPolicy,
-    AnthropicTransportConfig, replay_anthropic_http_error, replay_anthropic_sse,
+    ANTHROPIC_API_URL, ANTHROPIC_FAST_BETA_VALUE, ANTHROPIC_OAUTH_BASE_URL,
+    ANTHROPIC_OAUTH_BETA_HEADER, ANTHROPIC_OAUTH_BETA_VALUE, ANTHROPIC_OAUTH_PROVIDER_NAME,
+    ANTHROPIC_OAUTH_SYSTEM_IDENTITY, ANTHROPIC_PROVIDER_NAME, AnthropicCapture, AnthropicProvider,
+    AnthropicRetryPolicy, AnthropicTransportConfig, replay_anthropic_http_error,
+    replay_anthropic_sse,
 };
 pub use catalog::{
     CatalogError, CatalogSource, DiscoveredCatalog, DiscoveredModel, DiscoveredModelExtensions,
     catalog_request_url, discover_models, discover_models_with_resolver,
     openai_compatible_catalog_endpoint, parse_catalog, pickable,
+};
+pub use effort::{
+    anthropic_default_effort, anthropic_effort_clamp, anthropic_fast_mode_supported,
+    anthropic_supported_efforts, gemini_default_effort, gemini_supported_efforts,
 };
 pub use gemini::{
     GEMINI_API_BASE_URL, GEMINI_MODELS_URL, GEMINI_PROVIDER_NAME, GeminiCapture, GeminiProvider,

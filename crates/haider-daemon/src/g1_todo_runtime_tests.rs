@@ -95,6 +95,8 @@ impl World {
             model: "fake-model".into(),
             max_tokens: 4096,
             permission_overrides: None,
+            effort: None,
+            fast: false,
             system_prompt_version: crate::worker::SystemPromptBuilder::VERSION.into(),
             event_id: EventId::new(format!("created-{prefix}")),
             device_id: device_id.clone(),

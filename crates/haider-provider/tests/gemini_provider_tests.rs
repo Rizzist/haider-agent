@@ -494,3 +494,67 @@ fn sparse_history_call_index_continues_past_the_greatest_not_the_count() {
         "next synthesized id must be greatest+1 (…0006), never the count"
     );
 }
+
+/// LAW (LE3, gemini half): the session effort rides
+/// `generationConfig.thinkingConfig.thinkingLevel` for 3.x-named models
+/// whose pinned static ladder declares the value; a 2.5-era model or an
+/// out-of-ladder value injects NOTHING — never `thinkingBudget`, never both
+/// fields (thinkingLevel + thinkingBudget together is a live 400).
+///
+/// MUTATION CHECK (executed — see the G3 mutation notes): drop the
+/// name/ladder gate and inject the level for every model. Expected runtime
+/// failure: the 2.5-era no-thinkingConfig assertion below.
+#[test]
+fn effort_injects_thinking_level_for_3x_models_only() {
+    let request = |model: &str| TurnRequest {
+        messages: vec![Message::user_text("hello")],
+        model: model.into(),
+        max_tokens: 64,
+        system_prompt: None,
+        tools: Vec::new(),
+        attachments: Vec::new(),
+    };
+
+    let payload = provider("gemini-3-flash")
+        .with_effort(Some("low".into()))
+        .request_payload(&request("gemini-3-flash"))
+        .expect("3.x payload with effort");
+    assert_eq!(
+        payload["generationConfig"],
+        serde_json::json!({
+            "maxOutputTokens": 64,
+            "thinkingConfig": {"thinkingLevel": "low"},
+        }),
+        "3.x models take thinkingLevel beside the output cap: {payload}"
+    );
+    assert!(
+        !payload["generationConfig"]
+            .as_object()
+            .expect("generationConfig")
+            .contains_key("thinkingBudget"),
+        "thinkingBudget must never appear: {payload}"
+    );
+
+    // 3.1-pro has no `minimal` in its ladder: the out-of-ladder value
+    // injects nothing rather than a documented 400.
+    let payload = provider("gemini-3.1-pro")
+        .with_effort(Some("minimal".into()))
+        .request_payload(&request("gemini-3.1-pro"))
+        .expect("3.1-pro payload with out-of-ladder effort");
+    assert_eq!(
+        payload["generationConfig"],
+        serde_json::json!({"maxOutputTokens": 64}),
+        "an out-of-ladder value injects nothing: {payload}"
+    );
+
+    // 2.5-era models keep the exact pre-G3 generationConfig.
+    let payload = provider("gemini-2.5-flash")
+        .with_effort(Some("low".into()))
+        .request_payload(&request("gemini-2.5-flash"))
+        .expect("2.5 payload with effort");
+    assert_eq!(
+        payload["generationConfig"],
+        serde_json::json!({"maxOutputTokens": 64}),
+        "2.5-era models take no thinking field at all: {payload}"
+    );
+}

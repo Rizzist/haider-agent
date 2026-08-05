@@ -228,6 +228,8 @@ async fn production_account_factory_dispatches_native_api_key_providers() {
         permission_overrides: None,
         system_prompt_version: None,
         title: None,
+        effort: None,
+        fast: false,
         created_at_ms: 1,
     };
 
@@ -335,10 +337,18 @@ async fn custom_chat_completions_profile_routes_with_profile_origin_and_legacy_f
             ModelDetailWire {
                 name: "llama-fixture".to_owned(),
                 context_window: Some(131_072),
+                supported_efforts: Vec::new(),
+                default_effort: None,
+                supported_speeds: Vec::new(),
+                supports_thinking_type: None,
             },
             ModelDetailWire {
                 name: "llama-other".to_owned(),
                 context_window: Some(65_536),
+                supported_efforts: Vec::new(),
+                default_effort: None,
+                supported_speeds: Vec::new(),
+                supports_thinking_type: None,
             },
         ],
         auth_methods: vec![AuthMethod::ApiKey],
@@ -388,6 +398,8 @@ async fn custom_chat_completions_profile_routes_with_profile_origin_and_legacy_f
             permission_overrides: None,
             system_prompt_version: None,
             title: None,
+            effort: None,
+            fast: false,
             created_at_ms: 1,
         })
         .await
@@ -411,6 +423,10 @@ fn keyless_summary(provider: &str, origin: &str) -> ProviderSummaryWire {
         model_details: vec![ModelDetailWire {
             name: "llama3.1:8b".to_owned(),
             context_window: None,
+            supported_efforts: Vec::new(),
+            default_effort: None,
+            supported_speeds: Vec::new(),
+            supports_thinking_type: None,
         }],
         auth_methods: Vec::new(),
         availability: haider_rpc::ProviderAvailabilityWire::Available,
@@ -450,6 +466,8 @@ async fn lk1_keyless_profile_resolves_placeholder_and_stored_key_wins() {
         permission_overrides: None,
         system_prompt_version: None,
         title: None,
+        effort: None,
+        fast: false,
         created_at_ms: 1,
     };
 
@@ -540,6 +558,8 @@ async fn lk1_keyless_fallback_stays_scoped_to_enabled_auth_none_profiles() {
                 permission_overrides: None,
                 system_prompt_version: None,
                 title: None,
+                effort: None,
+                fast: false,
                 created_at_ms: 1,
             })
             .await
@@ -998,6 +1018,8 @@ async fn retryable_rotation_bookkeeping_failure_waits_instead_of_killing_the_tur
             permission_overrides: None,
             system_prompt_version: None,
             title: None,
+            effort: None,
+            fast: false,
             created_at_ms: 1,
         },
         None,
@@ -1125,6 +1147,8 @@ async fn factory_uses_checked_resolver_and_durably_selects_one_limited_alternate
             permission_overrides: None,
             system_prompt_version: None,
             title: None,
+            effort: None,
+            fast: false,
             created_at_ms: 1,
         })
         .await
@@ -1327,6 +1351,8 @@ async fn auth_aware_factory_routes_sanctioned_oauth_descriptors_to_subscription_
         permission_overrides: None,
         system_prompt_version: None,
         title: None,
+        effort: None,
+        fast: false,
         created_at_ms: 1,
     };
     let (_, _, openai_access_fingerprint) = factory
@@ -1381,6 +1407,7 @@ async fn auth_aware_factory_routes_sanctioned_oauth_descriptors_to_subscription_
         vault.resolve(&wrong_alias).expect("resolve crosswire key"),
         "gpt-oauth",
         &wrong_alias,
+        &crate::accounts::ProviderTuning::default(),
     );
     let Err(error) = result else {
         panic!("OAuth provider ID must reject API-key mode");
@@ -6935,4 +6962,141 @@ async fn unsupported_candidate_is_honest_not_guessed() {
 
     actor.shutdown().await;
     store.close().await.expect("close");
+}
+
+/// LAW (LE4, construction-gate half): the per-turn tuning derived from
+/// session metadata carries effort/fast verbatim, and the CONSTRUCTION fast
+/// gate filters a stale flag on any pair outside the static table — a model
+/// switch after `/fast on` must yield standard requests, never the
+/// documented 4.7 hard error or 4.6 silent-standard billing.
+#[test]
+fn provider_tuning_derives_from_metadata_and_fast_gate_filters_stale_pairs() {
+    use crate::accounts::{ProviderTuning, anthropic_fast_for};
+
+    let metadata = haider_protocol::session::SessionMetadataV1 {
+        cwd: "/tmp".into(),
+        provider: "anthropic-oauth".into(),
+        model: "claude-opus-5".into(),
+        max_tokens: 4096,
+        system_prompt_version: None,
+        permission_overrides: None,
+        title: None,
+        effort: Some("xhigh".into()),
+        fast: true,
+        created_at_ms: 1,
+    };
+    let tuning = ProviderTuning::from_metadata(&metadata);
+    assert_eq!(tuning.effort.as_deref(), Some("xhigh"));
+    assert!(tuning.fast);
+
+    assert!(anthropic_fast_for(&tuning, "claude-opus-5"));
+    assert!(anthropic_fast_for(&tuning, "claude-opus-4-8"));
+    for stale in ["claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-5"] {
+        assert!(
+            !anthropic_fast_for(&tuning, stale),
+            "a stale fast flag on {stale} must not reach the wire"
+        );
+    }
+    let off = ProviderTuning {
+        effort: None,
+        fast: false,
+    };
+    assert!(!anthropic_fast_for(&off, "claude-opus-5"));
+}
+
+/// LAW (review of record, construction-gate effort half): a stale effort
+/// after a model switch NEVER rides onto a wire the pair documents as
+/// invalid. Anthropic clamps down the documented ladder (Claude Code's
+/// fallback rule: `xhigh` on a 4.6 row -> `high`); a ladder-known pair with
+/// an out-of-vocabulary value drops to provider default; only ladder-unknown
+/// models pass the selection through verbatim. OpenAI pairs source the gate
+/// from the pair's CATALOG ladder: declared-and-excluded drops to `None`,
+/// declared-empty passes verbatim (vocabularies differ across families — no
+/// invented cross-family fallback).
+#[test]
+fn stale_effort_clamps_for_anthropic_and_drops_for_declared_openai_ladders() {
+    use crate::accounts::{ProviderTuning, anthropic_effort_for, openai_effort_for};
+
+    let tuning = ProviderTuning {
+        effort: Some("xhigh".to_owned()),
+        fast: false,
+    };
+    assert_eq!(
+        anthropic_effort_for(&tuning, "claude-fable-5").as_deref(),
+        Some("xhigh"),
+        "a supported level passes untouched"
+    );
+    assert_eq!(
+        anthropic_effort_for(&tuning, "claude-opus-4-6").as_deref(),
+        Some("high"),
+        "xhigh clamps DOWN to high on the max-not-xhigh ladder"
+    );
+    assert_eq!(
+        anthropic_effort_for(&tuning, "claude-mystery-9").as_deref(),
+        Some("xhigh"),
+        "an unknown model passes the selection through verbatim"
+    );
+    let garbage = ProviderTuning {
+        effort: Some("turbo".to_owned()),
+        fast: false,
+    };
+    assert_eq!(
+        anthropic_effort_for(&garbage, "claude-opus-5"),
+        None,
+        "an out-of-vocabulary value on a known ladder drops to provider default"
+    );
+
+    let summary = ProviderSummaryWire {
+        provider: "openai-oauth".to_owned(),
+        api_family: ProviderApiFamilyWire::OpenAiResponses,
+        endpoint: None,
+        models: vec!["gpt-5.5".to_owned()],
+        model_details: vec![
+            ModelDetailWire {
+                name: "gpt-5.5".to_owned(),
+                context_window: Some(400_000),
+                supported_efforts: vec!["low".to_owned(), "medium".to_owned(), "high".to_owned()],
+                default_effort: Some("medium".to_owned()),
+                supported_speeds: Vec::new(),
+                supports_thinking_type: None,
+            },
+            ModelDetailWire {
+                name: "gpt-5.6-sol".to_owned(),
+                context_window: Some(400_000),
+                supported_efforts: Vec::new(),
+                default_effort: None,
+                supported_speeds: Vec::new(),
+                supports_thinking_type: None,
+            },
+        ],
+        auth_methods: vec![AuthMethod::OAuth],
+        availability: haider_rpc::ProviderAvailabilityWire::Available,
+        availability_reason: None,
+        default_model: Some("gpt-5.5".to_owned()),
+        enabled: true,
+    };
+    assert_eq!(
+        openai_effort_for(&tuning, Some(&summary), "gpt-5.5"),
+        None,
+        "a declared ladder that excludes the stale level drops it"
+    );
+    let supported = ProviderTuning {
+        effort: Some("medium".to_owned()),
+        fast: false,
+    };
+    assert_eq!(
+        openai_effort_for(&supported, Some(&summary), "gpt-5.5").as_deref(),
+        Some("medium"),
+        "a declared ladder that includes the level passes it"
+    );
+    assert_eq!(
+        openai_effort_for(&tuning, Some(&summary), "gpt-5.6-sol").as_deref(),
+        Some("xhigh"),
+        "a declared-EMPTY ladder passes the selection through verbatim"
+    );
+    assert_eq!(
+        openai_effort_for(&tuning, None, "gpt-5.5").as_deref(),
+        Some("xhigh"),
+        "no profile at all passes the selection through verbatim"
+    );
 }

@@ -1429,6 +1429,13 @@ impl DemoDriver {
             AppRequest::Rename { session, title } => {
                 model.apply_renamed(&session, Some(title));
             }
+            // G3: same defensive fabricated commit for the tuning twins.
+            AppRequest::SelectEffort { effort, .. } => {
+                model.apply_effort_selected(effort.as_deref());
+            }
+            AppRequest::SelectFast { enabled, .. } => {
+                model.apply_fast_selected(enabled);
+            }
             AppRequest::OAuthAddStart {
                 provider, attempt, ..
             } => {

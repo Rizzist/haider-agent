@@ -65,6 +65,11 @@ pub struct GeminiProvider {
     model: String,
     api_url: String,
     fixed_origin_guard: Arc<FixedOriginGuard>,
+    /// Session-selected effort (G3), injected as
+    /// `generationConfig.thinkingConfig.thinkingLevel` for 3.x-named models
+    /// whose pinned static ladder declares the value. Never `thinkingBudget`
+    /// (the 2.5-era numeric knob is deliberately unmodeled) and never both.
+    effort: Option<String>,
 }
 
 impl GeminiProvider {
@@ -104,6 +109,7 @@ impl GeminiProvider {
             model,
             api_url,
             fixed_origin_guard,
+            effort: None,
         })
     }
 
@@ -115,6 +121,13 @@ impl GeminiProvider {
     #[must_use]
     pub fn with_account(mut self, account: CredentialAlias) -> Self {
         self.account = Some(account);
+        self
+    }
+
+    /// Sets the session-selected effort injected as `thinkingLevel`.
+    #[must_use]
+    pub fn with_effort(mut self, effort: Option<String>) -> Self {
+        self.effort = effort;
         self
     }
 
@@ -146,7 +159,7 @@ impl GeminiProvider {
         request: &TurnRequest,
     ) -> Result<serde_json::Value, ProviderError> {
         self.validate_model(request)?;
-        gemini_request_json(request)
+        gemini_request_json(request, self.effort.as_deref())
     }
 
     pub async fn capture_response(
@@ -360,7 +373,10 @@ type CallNameIndex = HashMap<String, String>;
 type OpaqueCallIndex = HashMap<String, FunctionIdentity>;
 type ToolCallIndex = (CallNameIndex, OpaqueCallIndex);
 
-fn gemini_request_json(request: &TurnRequest) -> Result<serde_json::Value, ProviderError> {
+fn gemini_request_json(
+    request: &TurnRequest,
+    effort: Option<&str>,
+) -> Result<serde_json::Value, ProviderError> {
     let attachments = attachment_index(request)?;
     let (tool_names, opaque_calls) = tool_call_index(request)?;
     let mut contents = Vec::<serde_json::Value>::new();
@@ -524,9 +540,24 @@ fn gemini_request_json(request: &TurnRequest) -> Result<serde_json::Value, Provi
             })
         })
         .collect::<Vec<_>>();
+    // G3: `thinkingLevel` rides generationConfig for 3.x-named models when
+    // the pinned static ladder declares the selected value; anything else
+    // injects NOTHING (never `thinkingBudget`, never both fields).
+    let thinking_level = effort.filter(|effort| {
+        crate::effort::gemini_supported_efforts(&request.model)
+            .iter()
+            .any(|level| level == effort)
+    });
+    let generation_config = match thinking_level {
+        Some(level) => serde_json::json!({
+            "maxOutputTokens": request.max_tokens,
+            "thinkingConfig": {"thinkingLevel": level},
+        }),
+        None => serde_json::json!({"maxOutputTokens": request.max_tokens}),
+    };
     let mut payload = serde_json::json!({
         "contents": contents,
-        "generationConfig": {"maxOutputTokens": request.max_tokens},
+        "generationConfig": generation_config,
     });
     let object = payload
         .as_object_mut()

@@ -24,6 +24,14 @@ pub const COMMANDS: &[CommandSpec] = &[
         "[query]",
     ),
     session_cmd("provider", "Switch provider — the model follows", "[name]"),
+    // G3: per-pair reasoning effort + fast mode — daemon-validated against
+    // the CURRENT pair's declared ladder / static fast gate.
+    session_cmd(
+        "effort",
+        "Reasoning effort — bare /effort opens the ladder picker",
+        "[level|default]",
+    ),
+    session_cmd("fast", "Toggle fast mode (supported pairs only)", ""),
     cmd(
         "theme",
         "Change the theme — bare /theme opens the picker",
@@ -225,7 +233,10 @@ pub fn has_arg_slots(name: &str) -> bool {
 /// here while ⏎ runs them (and opens their pickers).
 #[must_use]
 pub fn offers_arg_completions(name: &str) -> bool {
-    matches!(name, "theme" | "model" | "usage") || has_arg_slots(name)
+    // `/effort` joins the tab-only set (G3): bare `/effort` IS the
+    // experience (the ladder picker), so ⏎ on its row must RUN it — never
+    // lead-jump onto a level row. Tab still completes the levels.
+    matches!(name, "theme" | "model" | "usage" | "effort") || has_arg_slots(name)
 }
 
 /// `/login`'s two argument slots: provider, then method. Slot 0 names the
@@ -294,6 +305,10 @@ pub struct DynamicSlots {
     pub models: Vec<(String, String)>,
     /// `(alias, description)` for `/account`.
     pub accounts: Vec<(String, String)>,
+    /// `(level, description)` for `/effort` — `default` plus the CURRENT
+    /// pair's daemon-declared ladder (G3). Empty means the pair declares no
+    /// ladder, which renders no rows rather than invented ones.
+    pub efforts: Vec<(String, String)>,
 }
 
 fn dynamic_args(
@@ -364,6 +379,8 @@ pub fn palette_items(query: &str, in_session: bool, slots: &DynamicSlots) -> Vec
         "model" if done_args == 0 => dynamic_args("model", &slots.models, &fragment),
         "provider" if done_args == 0 => dynamic_args("provider", &slots.providers, &fragment),
         "account" if done_args == 0 => dynamic_args("account", &slots.accounts, &fragment),
+        // G3: `/effort` completes from the current pair's declared ladder.
+        "effort" if done_args == 0 => dynamic_args("effort", &slots.efforts, &fragment),
         // U2: `/usage <provider>`'s filter slot completes from the same
         // discovered provider roster as `/provider`.
         "usage" if done_args == 0 => dynamic_args("usage", &slots.providers, &fragment),
@@ -377,6 +394,8 @@ pub const HELP_TEXT: &[&str] = &[
     "commands",
     "  /model [name]      switch model — fable-5 · gpt-5.6 · gemini-3 · qwen3",
     "  /provider [name]   anthropic · openai · gemini · kimi",
+    "  /effort [level]    reasoning effort for the CURRENT pair — bare /effort opens the ladder picker · default reverts",
+    "  /fast              toggle fast mode — supported pairs only (anthropic opus-5 · opus-4-8)",
     "  /providers         provider registry — endpoints, models, defaults, health",
     "  /theme [name]      system (follow the terminal) · light · dark · desert · oasis — bare /theme opens the picker",
     "  /tree              session tree — every branch, ⏎ jump to a node / open a fork, f forks there",
