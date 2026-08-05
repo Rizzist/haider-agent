@@ -429,6 +429,47 @@ fn golden_item_lifecycle() {
             },
         },
     );
+    // G1: the live plan lifecycle the actor now emits for `todo_write` —
+    // existing shapes (`TurnItem::Plan`, `TodoItem`), NEW fixtures.
+    golden(
+        "item_started_plan",
+        &ItemEvent::Started {
+            item_id: ItemId::new("it-5"),
+            item: TurnItem::Plan {
+                items: vec![
+                    haider_protocol::history::TodoItem {
+                        id: 0,
+                        text: "scope entrypoints".into(),
+                        state: haider_protocol::history::TodoState::Processing,
+                        dep: None,
+                    },
+                    haider_protocol::history::TodoItem {
+                        id: 1,
+                        text: "patch run loop".into(),
+                        state: haider_protocol::history::TodoState::Listed,
+                        dep: Some(0),
+                    },
+                ],
+            },
+        },
+    );
+    golden(
+        "item_started_tool_call_todo_write",
+        &ItemEvent::Started {
+            item_id: ItemId::new("it-6"),
+            item: TurnItem::ToolCall {
+                call_id: "c-3".into(),
+                name: "todo_write".into(),
+                args: serde_json::json!({
+                    "items": [
+                        {"id": 0, "text": "scope entrypoints", "state": "processing"},
+                        {"id": 1, "text": "patch run loop", "state": "listed", "dep": 0},
+                    ]
+                }),
+                status: ToolStatus::InProgress,
+            },
+        },
+    );
 }
 
 #[test]

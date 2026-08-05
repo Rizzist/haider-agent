@@ -1,0 +1,25 @@
+{
+  "event": "started",
+  "item_id": "it-6",
+  "item": {
+    "item": "tool_call",
+    "call_id": "c-3",
+    "name": "todo_write",
+    "args": {
+      "items": [
+        {
+          "id": 0,
+          "state": "processing",
+          "text": "scope entrypoints"
+        },
+        {
+          "dep": 0,
+          "id": 1,
+          "state": "listed",
+          "text": "patch run loop"
+        }
+      ]
+    },
+    "status": "in_progress"
+  }
+}

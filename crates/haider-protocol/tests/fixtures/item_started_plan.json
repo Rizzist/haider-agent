@@ -1,0 +1,20 @@
+{
+  "event": "started",
+  "item_id": "it-5",
+  "item": {
+    "item": "plan",
+    "items": [
+      {
+        "id": 0,
+        "text": "scope entrypoints",
+        "state": "processing"
+      },
+      {
+        "id": 1,
+        "text": "patch run loop",
+        "state": "listed",
+        "dep": 0
+      }
+    ]
+  }
+}
