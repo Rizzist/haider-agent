@@ -12,8 +12,10 @@ use serde::Deserialize;
 use tokio::sync::mpsc;
 
 use crate::origin::{FixedDnsResolver, FixedOriginGuard, SystemFixedDnsResolver};
+pub use crate::wire::ANTHROPIC_OAUTH_SYSTEM_IDENTITY;
 use crate::wire::{
-    SseDecoder, WireApiError, is_anthropic_context_error, provider_kind_name, request_json,
+    AnthropicSystemShape, SseDecoder, WireApiError, is_anthropic_context_error, provider_kind_name,
+    request_json,
 };
 use crate::{
     Provider, ProviderError, ProviderErrorKind, ProviderStream, ProviderStreamItem, TurnRequest,
@@ -208,12 +210,21 @@ impl AnthropicProvider {
 
     /// Builds the secret-free JSON body. Capture tools use this to record the
     /// exact payload shape without gaining access to the credential.
+    ///
+    /// The body shape follows the provider's auth mode: OAuth-subscription
+    /// requests must open `system` with the Claude Code identity block (see
+    /// [`ANTHROPIC_OAUTH_SYSTEM_IDENTITY`]); `x-api-key` requests keep the
+    /// plain-string system prompt untouched.
     pub fn request_payload(
         &self,
         request: &TurnRequest,
     ) -> Result<serde_json::Value, ProviderError> {
         self.validate_model(request)?;
-        request_json(request)
+        let system_shape = match self.auth_mode {
+            AnthropicAuthMode::ApiKey => AnthropicSystemShape::ApiKey,
+            AnthropicAuthMode::OAuthBearer => AnthropicSystemShape::OAuthClaudeCode,
+        };
+        request_json(request, system_shape)
     }
 
     /// Records one raw response for the ignored promotion harness.

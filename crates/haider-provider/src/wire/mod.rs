@@ -11,7 +11,37 @@ use crate::{
     MessageRole, ProviderError, ProviderErrorKind, ProviderStreamItem, TurnRequest, Utf8Assembler,
 };
 
-pub(crate) fn request_json(request: &TurnRequest) -> Result<serde_json::Value, ProviderError> {
+/// The exact identity line Anthropic's Messages API requires at the head of
+/// the `system` field on OAuth-subscription (Pro/Max bearer-token) requests.
+///
+/// The server silently validates OAuth-authenticated request bodies: unless
+/// the system prompt opens with this line — as its own first block when
+/// `system` is an array — the request is rejected with a deliberately generic
+/// HTTP 400 `invalid_request_error` whose message is just "Error". Omitting
+/// `system` entirely is rejected the same way, and concatenating the identity
+/// into a larger first block does not pass. The check is undocumented,
+/// server-side, and does not apply to `x-api-key` requests, so it is modeled
+/// here as an OAuth-only body shape rather than a change to the shared prompt.
+pub const ANTHROPIC_OAUTH_SYSTEM_IDENTITY: &str =
+    "You are Claude Code, Anthropic's official CLI for Claude.";
+
+/// How the `system` field of the Anthropic Messages body must be shaped for
+/// the active authentication mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AnthropicSystemShape {
+    /// `x-api-key` mode: the turn's system prompt rides as a plain string and
+    /// the field is omitted when the turn has none.
+    ApiKey,
+    /// OAuth-subscription bearer mode: `system` is always an array whose
+    /// first block is exactly [`ANTHROPIC_OAUTH_SYSTEM_IDENTITY`]; the turn's
+    /// real system prompt follows as its own second block.
+    OAuthClaudeCode,
+}
+
+pub(crate) fn request_json(
+    request: &TurnRequest,
+    system_shape: AnthropicSystemShape,
+) -> Result<serde_json::Value, ProviderError> {
     let attachments = attachment_index(request)?;
     let messages = request
         .messages
@@ -39,7 +69,7 @@ pub(crate) fn request_json(request: &TurnRequest) -> Result<serde_json::Value, P
             serde_json::json!({
                 "name": tool.name,
                 "description": tool.description,
-                "input_schema": tool.input_schema,
+                "input_schema": anthropic_tool_schema(&tool.input_schema),
             })
         })
         .collect::<Vec<_>>();
@@ -55,13 +85,45 @@ pub(crate) fn request_json(request: &TurnRequest) -> Result<serde_json::Value, P
             "Anthropic request payload was not a JSON object",
         ));
     };
-    if let Some(system) = &request.system_prompt {
-        object.insert("system".into(), serde_json::Value::String(system.clone()));
+    match system_shape {
+        AnthropicSystemShape::ApiKey => {
+            if let Some(system) = &request.system_prompt {
+                object.insert("system".into(), serde_json::Value::String(system.clone()));
+            }
+        }
+        AnthropicSystemShape::OAuthClaudeCode => {
+            let mut blocks = vec![serde_json::json!({
+                "type": "text",
+                "text": ANTHROPIC_OAUTH_SYSTEM_IDENTITY,
+            })];
+            if let Some(system) = &request.system_prompt {
+                blocks.push(serde_json::json!({"type": "text", "text": system}));
+            }
+            object.insert("system".into(), serde_json::Value::Array(blocks));
+        }
     }
     if !tools.is_empty() {
         object.insert("tools".into(), serde_json::Value::Array(tools));
     }
     Ok(payload)
+}
+
+/// Shapes one custom tool `input_schema` for Anthropic's Messages API, which
+/// rejects `oneOf`/`allOf`/`anyOf` at the top level of a tool schema with
+/// HTTP 400 `invalid_request_error` ("input_schema does not support oneOf,
+/// allOf, or anyOf at the top level"). The constraint is auth-agnostic — it
+/// fires for `x-api-key` and OAuth requests alike — so exactly those three
+/// top-level keys are dropped for every Anthropic request. Nested combinators
+/// are untouched, and the dropped clauses stay enforced where they always
+/// were: the tool executor validates arguments before running.
+fn anthropic_tool_schema(schema: &serde_json::Value) -> serde_json::Value {
+    let mut schema = schema.clone();
+    if let Some(object) = schema.as_object_mut() {
+        object.remove("oneOf");
+        object.remove("allOf");
+        object.remove("anyOf");
+    }
+    schema
 }
 
 fn attachment_index(request: &TurnRequest) -> Result<HashMap<&str, &str>, ProviderError> {

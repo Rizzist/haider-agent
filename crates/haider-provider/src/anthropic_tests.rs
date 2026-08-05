@@ -15,10 +15,10 @@ use tokio::sync::mpsc::error::TryRecvError;
 
 use crate::anthropic::{
     ANTHROPIC_OAUTH_BASE_URL, ANTHROPIC_OAUTH_BETA_HEADER, ANTHROPIC_OAUTH_BETA_VALUE,
-    AnthropicProvider, SseChunkSource, stream_sse_source,
+    ANTHROPIC_OAUTH_SYSTEM_IDENTITY, AnthropicProvider, SseChunkSource, stream_sse_source,
 };
 use crate::origin::FixedDnsResolver;
-use crate::{ProviderError, ProviderErrorKind};
+use crate::{Message, ProviderError, ProviderErrorKind, ToolDefinition, TurnRequest};
 
 struct HangingFixture {
     first_chunk: Option<Vec<u8>>,
@@ -214,6 +214,187 @@ async fn anthropic_oauth_subscription_is_bearer_beta_without_api_key_and_fixed_o
             .await
             .expect_err("loopback/private DNS answer must fail before bearer construction");
         assert_eq!(rebound_error.kind, ProviderErrorKind::InvalidRequest);
+    }
+}
+
+fn payload_provider(oauth: bool) -> AnthropicProvider {
+    let vault = MemoryVault::new();
+    let alias = CredentialAlias::new("anthropic-payload-audit");
+    vault
+        .put(&alias, b"anthropic-payload-audit-sentinel")
+        .expect("store payload audit secret");
+    let credential = vault.resolve(&alias).expect("resolve payload audit secret");
+    if oauth {
+        AnthropicProvider::new_subscription(credential, "claude-audit", ANTHROPIC_OAUTH_BASE_URL)
+            .expect("Anthropic subscription provider")
+    } else {
+        AnthropicProvider::new(credential, "claude-audit").expect("Anthropic key provider")
+    }
+}
+
+fn payload_request(system_prompt: Option<&str>) -> TurnRequest {
+    TurnRequest {
+        messages: vec![Message::user_text("Reply with exactly: payload-audit")],
+        model: "claude-audit".into(),
+        max_tokens: 30_000,
+        system_prompt: system_prompt.map(str::to_owned),
+        tools: vec![
+            ToolDefinition {
+                name: "fs_read".into(),
+                description: "Read a UTF-8 file".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                }),
+            },
+            ToolDefinition {
+                name: "fs_search".into(),
+                description: "Search UTF-8 files".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "anyOf": [{"required": ["pattern"]}, {"required": ["query"]}],
+                    "oneOf": [{"required": ["pattern"]}],
+                    "allOf": [{"type": "object"}],
+                    "properties": {
+                        "pattern": {"type": "string"},
+                        "query": {"type": "string"},
+                        "mode": {"anyOf": [{"const": "literal"}, {"const": "simple"}]},
+                    },
+                }),
+            },
+        ],
+        attachments: Vec::new(),
+    }
+}
+
+/// MUTATION CHECK: change or drop the identity text, merge it into the turn's
+/// own system block, reorder the blocks, omit `system` on a promptless OAuth
+/// turn, or leak the identity into api-key mode. Each mutation fails a named
+/// assertion below. Live law: Anthropic rejects OAuth-subscription bodies
+/// whose `system` does not open with the exact Claude Code identity block
+/// (captured 2026-08-05: schema-valid identity-free OAuth turns were refused
+/// with generic-"Error" responses on every attempt).
+#[test]
+fn oauth_payload_opens_system_with_claude_code_identity_block() {
+    let oauth = payload_provider(true);
+    let request = payload_request(Some("haider-system-v2\nYou are Haider Code."));
+    let payload = oauth.request_payload(&request).expect("OAuth payload");
+
+    let system = payload["system"]
+        .as_array()
+        .expect("OAuth system is an array of blocks");
+    assert_eq!(system.len(), 2, "identity block plus the turn's own prompt");
+    assert_eq!(
+        system[0],
+        serde_json::json!({
+            "type": "text",
+            "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+        }),
+        "first system block is exactly the Claude Code identity line"
+    );
+    assert_eq!(
+        system[1],
+        serde_json::json!({
+            "type": "text",
+            "text": "haider-system-v2\nYou are Haider Code.",
+        }),
+        "the turn's real system prompt rides as its own second block"
+    );
+
+    // A promptless OAuth turn still carries the identity block: omitting
+    // `system` entirely is rejected by the same server-side validation.
+    let bare = oauth
+        .request_payload(&payload_request(None))
+        .expect("promptless OAuth payload");
+    assert_eq!(
+        bare["system"],
+        serde_json::json!([{
+            "type": "text",
+            "text": ANTHROPIC_OAUTH_SYSTEM_IDENTITY,
+        }]),
+        "promptless OAuth turns send exactly the identity block"
+    );
+}
+
+/// MUTATION CHECK: prepend the identity to api-key bodies, turn the api-key
+/// system into an array, or let the two modes drift anywhere outside
+/// `system`. Each mutation fails a named assertion below.
+#[test]
+fn api_key_payload_keeps_plain_system_and_matches_oauth_outside_system() {
+    let api_key = payload_provider(false);
+    let oauth = payload_provider(true);
+    let request = payload_request(Some("haider-system-v2\nYou are Haider Code."));
+
+    let key_payload = api_key.request_payload(&request).expect("api-key payload");
+    assert_eq!(
+        key_payload["system"],
+        serde_json::Value::String("haider-system-v2\nYou are Haider Code.".into()),
+        "api-key mode sends the turn's system prompt as a plain string"
+    );
+    assert!(
+        !key_payload.to_string().contains("Claude Code"),
+        "api-key mode never carries the OAuth identity line"
+    );
+
+    let bare = api_key
+        .request_payload(&payload_request(None))
+        .expect("promptless api-key payload");
+    assert!(
+        bare.get("system").is_none(),
+        "promptless api-key turns omit `system` entirely"
+    );
+
+    // Golden cross-mode law: the two bodies differ in `system` and nowhere else.
+    let mut key_rest = key_payload;
+    let mut oauth_rest = oauth.request_payload(&request).expect("OAuth payload");
+    key_rest.as_object_mut().expect("object").remove("system");
+    oauth_rest.as_object_mut().expect("object").remove("system");
+    assert_eq!(
+        key_rest, oauth_rest,
+        "auth modes agree on every field except `system`"
+    );
+}
+
+/// MUTATION CHECK: keep any of `oneOf`/`allOf`/`anyOf` at the top level of a
+/// tool schema, or strip the nested `anyOf` too, and a named assertion below
+/// fails. Live law: Anthropic's Messages API rejects top-level combinators in
+/// custom tool schemas for both auth modes (captured 2026-08-05: HTTP 400
+/// "tools.3.custom.input_schema: input_schema does not support oneOf, allOf,
+/// or anyOf at the top level").
+#[test]
+fn tool_schemas_drop_top_level_combinators_for_both_auth_modes() {
+    for oauth in [false, true] {
+        let provider = payload_provider(oauth);
+        let payload = provider
+            .request_payload(&payload_request(Some("prompt")))
+            .expect("payload");
+        let tools = payload["tools"].as_array().expect("tools array");
+        assert_eq!(tools.len(), 2, "both tools survive schema shaping");
+        assert_eq!(
+            tools[0]["input_schema"],
+            payload_request(None).tools[0].input_schema,
+            "combinator-free schemas pass through byte-identical (oauth={oauth})"
+        );
+        let search_schema = &tools[1]["input_schema"];
+        for banned in ["oneOf", "allOf", "anyOf"] {
+            assert!(
+                search_schema.get(banned).is_none(),
+                "top-level `{banned}` is dropped from the Anthropic body (oauth={oauth})"
+            );
+        }
+        assert_eq!(
+            search_schema["properties"]["mode"],
+            serde_json::json!({"anyOf": [{"const": "literal"}, {"const": "simple"}]}),
+            "nested combinators are preserved (oauth={oauth})"
+        );
+        assert_eq!(
+            search_schema["additionalProperties"],
+            serde_json::json!(false),
+            "unrelated schema keys are untouched (oauth={oauth})"
+        );
     }
 }
 
