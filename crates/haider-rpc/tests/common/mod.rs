@@ -1308,6 +1308,44 @@ pub fn transcript() -> Vec<WireFrame> {
                 },
             },
         },
+        // ── G3: the two session-tuning pairs, appended at the transcript
+        // END (additive-wire law — nothing before them can have moved). ──
+        WireFrame::Request {
+            request_id: RequestId::new("request-select-effort"),
+            body: RequestBody::SessionSelectEffort {
+                command_id: CommandId::new("command-select-effort"),
+                session_id: SessionId::new("session-1"),
+                worker_generation: 7,
+                effort: Some("xhigh".into()),
+            },
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-select-effort"),
+            body: ResponseBody::SessionSelectEffort {
+                session_id: SessionId::new("session-1"),
+                effort: Some("xhigh".into()),
+                selected_seq: 43,
+                worker_generation: 7,
+            },
+        },
+        WireFrame::Request {
+            request_id: RequestId::new("request-select-fast"),
+            body: RequestBody::SessionSelectFast {
+                command_id: CommandId::new("command-select-fast"),
+                session_id: SessionId::new("session-1"),
+                worker_generation: 7,
+                enabled: true,
+            },
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-select-fast"),
+            body: ResponseBody::SessionSelectFast {
+                session_id: SessionId::new("session-1"),
+                enabled: true,
+                selected_seq: 44,
+                worker_generation: 7,
+            },
+        },
     ]
 }
 
