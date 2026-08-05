@@ -27,6 +27,19 @@ const MAX_ATTACHMENTS_PER_TURN: usize = 5;
 const MAX_ATTACHMENT_BYTES: usize = 5 * 1024 * 1024;
 const MAX_ATTACHMENT_BYTES_PER_TURN: usize = 16 * 1024 * 1024;
 
+/// Profile-vault alias holding the transcription secret (the Deepgram API
+/// key). Daemon-internal: clients only ever speak
+/// `transcription.secret_get`/`transcription.secret_set` — the alias never
+/// crosses the wire. Public to the crate so integration tests can address
+/// the same physical vault item the handler wrote.
+pub(crate) const TRANSCRIPTION_SECRET_ALIAS: &str = "transcription.deepgram";
+/// ADE key ceiling (`DEEPGRAM_MAX_API_KEY_LENGTH`).
+const TRANSCRIPTION_SECRET_MAX_LEN: usize = 512;
+
+pub(crate) fn transcription_secret_alias() -> haider_protocol::ids::CredentialAlias {
+    haider_protocol::ids::CredentialAlias::new(TRANSCRIPTION_SECRET_ALIAS)
+}
+
 struct AttachmentValidationFailure {
     code: &'static str,
     message: String,
@@ -1094,6 +1107,30 @@ impl HubConnection {
                 }
                 self.vault_stage(request_id, stage_id, purpose, secret)
             }
+            RequestBody::TranscriptionSecretGet => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.transcription_secret_get(request_id)
+            }
+            RequestBody::TranscriptionSecretSet { secret, clear } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.transcription_secret_set(request_id, secret, clear)
+            }
             RequestBody::AccountLoginApi {
                 command_id,
                 provider,
@@ -1500,6 +1537,142 @@ impl HubConnection {
                 ERROR_CODE_INVALID_ARGUMENT,
                 &format!("cannot mint stage reference: {message}"),
                 true,
+                None,
+            ),
+        }
+    }
+
+    /// `transcription.secret_get` (T1): answers the vaulted Deepgram key on
+    /// the same-UID local UDS surface only. Inline like `vault.stage`: one
+    /// bounded ≤512-byte vault file read, comparable to one store
+    /// transaction. A missing entry is an honest `secret: None`, never an
+    /// error — "no key yet" is a first-class setup state.
+    fn transcription_secret_get(&self, request_id: RequestId) -> Result<(), SessionHubError> {
+        let Some(facade) = self.secret_surface_facade(&request_id)? else {
+            return Ok(());
+        };
+        let Some(vault) = facade.vault else {
+            return self.respond_error(
+                request_id,
+                haider_rpc::ERROR_CODE_VAULT_UNSUPPORTED,
+                "this platform has no supported secret vault",
+                false,
+                None,
+            );
+        };
+        let alias = transcription_secret_alias();
+        match vault.resolve(&alias) {
+            Ok(secret) => {
+                let Ok(value) = std::str::from_utf8(secret.expose_secret()) else {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_INVALID_ARGUMENT,
+                        "stored transcription secret is not valid UTF-8; set it again",
+                        false,
+                        None,
+                    );
+                };
+                self.send(WireFrame::Response {
+                    request_id,
+                    body: ResponseBody::TranscriptionSecretGet {
+                        secret: Some(haider_rpc::SecretWire::new(value)),
+                    },
+                })
+            }
+            Err(error) if error.code == haider_protocol::error::ErrorCode::CredentialMissing => {
+                self.send(WireFrame::Response {
+                    request_id,
+                    body: ResponseBody::TranscriptionSecretGet { secret: None },
+                })
+            }
+            // The vault's own message carries an alias at most, never
+            // secret bytes (haider-accounts redaction law).
+            Err(error) => self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                &format!("could not read transcription secret: {}", error.message),
+                error.retryable,
+                None,
+            ),
+        }
+    }
+
+    /// `transcription.secret_set` (T1): stores or clears the Deepgram key
+    /// in the profile vault. ADE key hygiene is enforced BEFORE any vault
+    /// write: non-empty, ≤512 chars, no control bytes — and no refusal ever
+    /// echoes key material.
+    fn transcription_secret_set(
+        &self,
+        request_id: RequestId,
+        secret: haider_rpc::SecretWire,
+        clear: bool,
+    ) -> Result<(), SessionHubError> {
+        let Some(facade) = self.secret_surface_facade(&request_id)? else {
+            return Ok(());
+        };
+        let Some(vault) = facade.vault else {
+            return self.respond_error(
+                request_id,
+                haider_rpc::ERROR_CODE_VAULT_UNSUPPORTED,
+                "this platform has no supported secret vault",
+                false,
+                None,
+            );
+        };
+        let alias = transcription_secret_alias();
+        if clear {
+            if !secret.is_empty() {
+                return self.respond_error(
+                    request_id,
+                    ERROR_CODE_INVALID_ARGUMENT,
+                    "clear:true must not carry a secret",
+                    false,
+                    None,
+                );
+            }
+            return match vault.delete(&alias) {
+                Ok(()) => self.send(WireFrame::Response {
+                    request_id,
+                    body: ResponseBody::TranscriptionSecretSet { present: false },
+                }),
+                Err(error) => self.respond_error(
+                    request_id,
+                    ERROR_CODE_INVALID_ARGUMENT,
+                    &format!("could not clear transcription secret: {}", error.message),
+                    error.retryable,
+                    None,
+                ),
+            };
+        }
+        let value = secret.expose_secret().trim();
+        if value.is_empty() {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "transcription secret must not be empty",
+                false,
+                None,
+            );
+        }
+        if value.len() > TRANSCRIPTION_SECRET_MAX_LEN || value.chars().any(char::is_control) {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "transcription secret is not a valid API key",
+                false,
+                None,
+            );
+        }
+        match vault.put(&alias, value.as_bytes()) {
+            Ok(()) => self.send(WireFrame::Response {
+                request_id,
+                body: ResponseBody::TranscriptionSecretSet { present: true },
+            }),
+            Err(error) => self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                &format!("could not store transcription secret: {}", error.message),
+                error.retryable,
                 None,
             ),
         }

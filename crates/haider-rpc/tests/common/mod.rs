@@ -1143,6 +1143,47 @@ pub fn transcript() -> Vec<WireFrame> {
                 revision: 13,
             },
         },
+        // ── T1 additive transcription secret surface ─────────────────────
+        // Existing entries above stay byte-identical; everything below is
+        // append-only. The staged "secret" is a golden placeholder pinning
+        // the WIRE shape — Debug redaction is pinned separately.
+        WireFrame::Request {
+            request_id: RequestId::new("request-transcription-set"),
+            body: RequestBody::TranscriptionSecretSet {
+                secret: SecretWire::new("golden-placeholder-deepgram-key"),
+                clear: false,
+            },
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-transcription-set"),
+            body: ResponseBody::TranscriptionSecretSet { present: true },
+        },
+        WireFrame::Request {
+            request_id: RequestId::new("request-transcription-get"),
+            body: RequestBody::TranscriptionSecretGet,
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-transcription-get"),
+            body: ResponseBody::TranscriptionSecretGet {
+                secret: Some(SecretWire::new("golden-placeholder-deepgram-key")),
+            },
+        },
+        // The honest empty state: no key stored yet.
+        WireFrame::Response {
+            request_id: RequestId::new("request-transcription-get-empty"),
+            body: ResponseBody::TranscriptionSecretGet { secret: None },
+        },
+        WireFrame::Request {
+            request_id: RequestId::new("request-transcription-clear"),
+            body: RequestBody::TranscriptionSecretSet {
+                secret: SecretWire::new(""),
+                clear: true,
+            },
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-transcription-clear"),
+            body: ResponseBody::TranscriptionSecretSet { present: false },
+        },
     ]
 }
 

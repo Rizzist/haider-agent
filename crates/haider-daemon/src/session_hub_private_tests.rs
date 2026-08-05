@@ -353,6 +353,7 @@ async fn provider_models_refresh_requires_control_and_hands_off_correlation() {
         management: crate::accounts::ManagementSnapshot::new(0, Vec::new(), Vec::new()),
         vault_supported: true,
         discovery_disabled: false,
+        vault: Some(Arc::new(haider_accounts::MemoryVault::default())),
     })
     .expect("install accounts");
 
@@ -1908,6 +1909,320 @@ async fn recovery_terminalization_never_settles_idle_while_another_run_is_active
 
     handle.begin_draining();
     manager.shutdown().await.expect("manager drains");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+// ───────────────────── T1 transcription secret surface ──────────────────────
+
+fn transcription_facade(vault: Arc<dyn haider_accounts::Vault>) -> crate::accounts::AccountsFacade {
+    crate::accounts::AccountsFacade {
+        login: None,
+        oauth: None,
+        snapshot: Arc::new(Mutex::new(Vec::new())),
+        management: crate::accounts::ManagementSnapshot::new(0, Vec::new(), Vec::new()),
+        vault_supported: true,
+        discovery_disabled: false,
+        vault: Some(vault),
+    }
+}
+
+async fn transcription_request(
+    connection: &HubConnection,
+    sink: &CapturingFrameSink,
+    request_id: &str,
+    body: haider_rpc::RequestBody,
+) -> haider_rpc::ResponseBody {
+    connection
+        .request(haider_rpc::RequestId::new(request_id), body)
+        .await
+        .expect("request routes");
+    let mut frames = sink.0.lock().expect("frames");
+    let frame = frames.pop().expect("one correlated response");
+    assert!(frames.is_empty(), "exactly one response per request");
+    drop(frames);
+    match frame {
+        WireFrame::Response {
+            request_id: response_id,
+            body,
+        } => {
+            assert_eq!(response_id.as_str(), request_id);
+            body
+        }
+        other => panic!("expected a correlated response, got {other:?}"),
+    }
+}
+
+/// The T1 secret surface end to end over the REAL FileVault: set commits a
+/// physical profile-vault item under the crate alias, get returns the exact
+/// key, clear removes it, and the empty state is an honest `secret: None`.
+///
+/// MUTATION CHECK: store the key under a per-request alias (or echo the
+/// request instead of reading the vault). Expected runtime failure: the
+/// physical-alias assertion below, or the fresh-connection get returns
+/// nothing after a set.
+#[tokio::test]
+async fn transcription_secret_roundtrips_through_the_file_vault() {
+    let root = tempfile::tempdir().expect("temp store");
+    let store = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("store opens");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub opens");
+    let vault_root = root.path().join("vault");
+    let vault: Arc<dyn haider_accounts::Vault> =
+        Arc::new(haider_accounts::FileVault::new(vault_root.clone()));
+    hub.install_accounts(transcription_facade(Arc::clone(&vault)))
+        .expect("install accounts");
+    let sink = Arc::new(CapturingFrameSink::default());
+    let connection = hub
+        .open_connection(
+            std::collections::BTreeSet::from([
+                haider_rpc::Capability::View,
+                haider_rpc::Capability::Control,
+            ]),
+            sink.clone(),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("control connection");
+
+    // Empty state first: an honest None, not an error.
+    let body = transcription_request(
+        &connection,
+        &sink,
+        "t1-get-empty",
+        haider_rpc::RequestBody::TranscriptionSecretGet,
+    )
+    .await;
+    assert!(matches!(
+        body,
+        haider_rpc::ResponseBody::TranscriptionSecretGet { secret: None }
+    ));
+
+    // Set → present: true, and the item is PHYSICALLY in the vault under
+    // the crate's fixed alias.
+    let body = transcription_request(
+        &connection,
+        &sink,
+        "t1-set",
+        haider_rpc::RequestBody::TranscriptionSecretSet {
+            secret: haider_rpc::SecretWire::new("  dg-key-roundtrip-1f2e  "),
+            clear: false,
+        },
+    )
+    .await;
+    assert!(matches!(
+        body,
+        haider_rpc::ResponseBody::TranscriptionSecretSet { present: true }
+    ));
+    let alias = super::rpc::transcription_secret_alias();
+    assert_eq!(alias.as_str(), "transcription.deepgram");
+    let stored = vault.resolve(&alias).expect("physical vault item");
+    assert_eq!(
+        stored.expose_secret(),
+        b"dg-key-roundtrip-1f2e",
+        "the key is stored TRIMMED under the fixed alias"
+    );
+
+    // Get returns the exact key.
+    let body = transcription_request(
+        &connection,
+        &sink,
+        "t1-get",
+        haider_rpc::RequestBody::TranscriptionSecretGet,
+    )
+    .await;
+    match body {
+        haider_rpc::ResponseBody::TranscriptionSecretGet {
+            secret: Some(secret),
+        } => {
+            assert_eq!(secret.expose_secret(), "dg-key-roundtrip-1f2e");
+        }
+        other => panic!("expected the stored secret, got {other:?}"),
+    }
+
+    // Clear → present: false, physical item gone, get honest-empty again.
+    let body = transcription_request(
+        &connection,
+        &sink,
+        "t1-clear",
+        haider_rpc::RequestBody::TranscriptionSecretSet {
+            secret: haider_rpc::SecretWire::new(""),
+            clear: true,
+        },
+    )
+    .await;
+    assert!(matches!(
+        body,
+        haider_rpc::ResponseBody::TranscriptionSecretSet { present: false }
+    ));
+    assert!(vault.resolve(&alias).is_err(), "physical item removed");
+    let body = transcription_request(
+        &connection,
+        &sink,
+        "t1-get-after-clear",
+        haider_rpc::RequestBody::TranscriptionSecretGet,
+    )
+    .await;
+    assert!(matches!(
+        body,
+        haider_rpc::ResponseBody::TranscriptionSecretGet { secret: None }
+    ));
+
+    drop(connection);
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// UDS-ONLY LAW: the transcription secret surface answers a REMOTE
+/// transport with the same-UID capability denial — for BOTH methods — and a
+/// view-only local connection is denied Control.
+///
+/// MUTATION CHECK: route `transcription.secret_get` past
+/// `secret_surface_facade` (serve it to remote transports). Expected
+/// runtime failure: the remote get below receives the secret response
+/// instead of `capability_denied`.
+#[tokio::test]
+async fn transcription_secret_surface_is_uds_and_control_only() {
+    let root = tempfile::tempdir().expect("temp store");
+    let store = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("store opens");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub opens");
+    let vault: Arc<dyn haider_accounts::Vault> = Arc::new(haider_accounts::MemoryVault::default());
+    hub.install_accounts(transcription_facade(vault))
+        .expect("install accounts");
+
+    // Remote transport with full capabilities: denied for both methods.
+    let remote_sink = Arc::new(CapturingFrameSink::default());
+    let remote = hub
+        .open_connection(
+            std::collections::BTreeSet::from([
+                haider_rpc::Capability::View,
+                haider_rpc::Capability::Control,
+            ]),
+            remote_sink.clone(),
+            crate::accounts::ConnectionTransport::Remote,
+        )
+        .expect("remote connection");
+    for (index, body) in [
+        haider_rpc::RequestBody::TranscriptionSecretGet,
+        haider_rpc::RequestBody::TranscriptionSecretSet {
+            secret: haider_rpc::SecretWire::new("dg-remote-sentinel"),
+            clear: false,
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let response =
+            transcription_request(&remote, &remote_sink, &format!("t1-remote-{index}"), body).await;
+        assert!(matches!(
+            response,
+            haider_rpc::ResponseBody::Error { ref code, ref message, .. }
+                if code == haider_rpc::ERROR_CODE_CAPABILITY_DENIED
+                    && message.contains("same-UID")
+        ));
+    }
+
+    // Local view-only connection: Control is required.
+    let view_sink = Arc::new(CapturingFrameSink::default());
+    let view = hub
+        .open_connection(
+            std::collections::BTreeSet::from([haider_rpc::Capability::View]),
+            view_sink.clone(),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("view connection");
+    let response = transcription_request(
+        &view,
+        &view_sink,
+        "t1-view-get",
+        haider_rpc::RequestBody::TranscriptionSecretGet,
+    )
+    .await;
+    assert!(matches!(
+        response,
+        haider_rpc::ResponseBody::Error { ref code, .. }
+            if code == haider_rpc::ERROR_CODE_CAPABILITY_DENIED
+    ));
+
+    drop(remote);
+    drop(view);
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// KEY-HYGIENE LAW (ADE parity): empty, oversized (>512), and
+/// control-byte secrets are refused BEFORE any vault write; `clear: true`
+/// with a non-empty secret is refused; and no refusal message ever echoes
+/// key material.
+///
+/// MUTATION CHECK: validate AFTER `vault.put` (or drop the control-byte
+/// check). Expected runtime failure: the vault-emptiness assertion below —
+/// a refused key must leave no physical item.
+#[tokio::test]
+async fn transcription_secret_hygiene_refuses_before_any_vault_write() {
+    let root = tempfile::tempdir().expect("temp store");
+    let store = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("store opens");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub opens");
+    let vault: Arc<dyn haider_accounts::Vault> = Arc::new(haider_accounts::MemoryVault::default());
+    hub.install_accounts(transcription_facade(Arc::clone(&vault)))
+        .expect("install accounts");
+    let sink = Arc::new(CapturingFrameSink::default());
+    let connection = hub
+        .open_connection(
+            std::collections::BTreeSet::from([
+                haider_rpc::Capability::View,
+                haider_rpc::Capability::Control,
+            ]),
+            sink.clone(),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("control connection");
+    let refused = [
+        ("t1-empty", "   ".to_owned(), false),
+        ("t1-oversized", "x".repeat(513), false),
+        ("t1-control", "dg-bad\u{7}sentinel-8d7c".to_owned(), false),
+        (
+            "t1-clear-with-secret",
+            "dg-clear-sentinel-8d7c".to_owned(),
+            true,
+        ),
+    ];
+    for (request_id, secret, clear) in refused {
+        let response = transcription_request(
+            &connection,
+            &sink,
+            request_id,
+            haider_rpc::RequestBody::TranscriptionSecretSet {
+                secret: haider_rpc::SecretWire::new(secret),
+                clear,
+            },
+        )
+        .await;
+        match response {
+            haider_rpc::ResponseBody::Error { code, message, .. } => {
+                assert_eq!(
+                    code,
+                    haider_rpc::ERROR_CODE_INVALID_ARGUMENT,
+                    "{request_id}"
+                );
+                assert!(
+                    !message.contains("sentinel-8d7c"),
+                    "refusals must never echo key material: {message}"
+                );
+            }
+            other => panic!("{request_id}: expected invalid_argument, got {other:?}"),
+        }
+    }
+    assert!(
+        vault.list().expect("vault list").is_empty(),
+        "a refused key must leave no physical vault item"
+    );
+
+    drop(connection);
     hub.shutdown().await.expect("hub stops");
     store.close().await.expect("store closes");
 }
