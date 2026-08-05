@@ -421,3 +421,188 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> T {
     let bytes = fs::read(path).expect("reads JSON fixture");
     serde_json::from_slice(&bytes).expect("parses JSON fixture")
 }
+
+/// LAW (LT1, thinking capture): a scripted stream with a SIGNED thinking
+/// block — signature split across two signature_delta frames — and a
+/// redacted_thinking block yields provider-opaque facts carrying the EXACT
+/// wire payloads, emitted at each block's stop and therefore BEFORE the
+/// tool_use events that follow; an UNSIGNED thinking block captures nothing.
+///
+/// MUTATION CHECK (executed — see the G3 mutation notes): drop the
+/// signature accumulation (keep only the last fragment). Expected runtime
+/// failure: the concatenated-signature assertion below.
+#[test]
+fn signed_thinking_and_redacted_blocks_are_captured_for_replay() {
+    let bytes = "event: message_start\n\
+         data: {\"type\":\"message_start\",\"message\":{\"content\":[],\"usage\":{\"input_tokens\":1}}}\n\n\
+         event: content_block_start\n\
+         data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}\n\n\
+         event: content_block_delta\n\
+         data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"weigh the options\"}}\n\n\
+         event: content_block_delta\n\
+         data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig-first-\"}}\n\n\
+         event: content_block_delta\n\
+         data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig-second\"}}\n\n\
+         event: content_block_stop\n\
+         data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+         event: content_block_start\n\
+         data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"ENCRYPTED_PAYLOAD_b64\"}}\n\n\
+         event: content_block_stop\n\
+         data: {\"type\":\"content_block_stop\",\"index\":1}\n\n\
+         event: content_block_start\n\
+         data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_capture\",\"name\":\"fs_read\",\"input\":{}}}\n\n\
+         event: content_block_delta\n\
+         data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n\
+         event: content_block_stop\n\
+         data: {\"type\":\"content_block_stop\",\"index\":2}\n\n\
+         event: message_delta\n\
+         data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n\
+         event: message_stop\n\
+         data: {\"type\":\"message_stop\"}\n";
+
+    let items = replay_anthropic_sse(bytes.as_bytes());
+    assert_eq!(
+        items,
+        vec![
+            Ok(StreamEvent::ReasoningDelta {
+                text: "weigh the options".into(),
+            }),
+            Ok(StreamEvent::ProviderOpaque {
+                provider: "anthropic".into(),
+                data: serde_json::json!({
+                    "type": "thinking",
+                    "thinking": "weigh the options",
+                    "signature": "sig-first-sig-second",
+                }),
+            }),
+            Ok(StreamEvent::ProviderOpaque {
+                provider: "anthropic".into(),
+                data: serde_json::json!({
+                    "type": "redacted_thinking",
+                    "data": "ENCRYPTED_PAYLOAD_b64",
+                }),
+            }),
+            Ok(StreamEvent::ToolCallStart {
+                call_id: "toolu_capture".into(),
+                name: "fs_read".into(),
+            }),
+            Ok(StreamEvent::ToolCallArgsDelta {
+                call_id: "toolu_capture".into(),
+                args_fragment: "{}".into(),
+            }),
+            Ok(StreamEvent::ToolCallEnd {
+                call_id: "toolu_capture".into(),
+            }),
+            Ok(StreamEvent::Finish {
+                reason: FinishReason::ToolUse,
+            }),
+        ],
+        "signed thinking + redacted blocks capture verbatim, BEFORE tool events"
+    );
+
+    // An unsigned thinking block (display-only) captures NOTHING.
+    let unsigned = "event: message_start\n\
+         data: {\"type\":\"message_start\",\"message\":{\"content\":[],\"usage\":{\"input_tokens\":1}}}\n\n\
+         event: content_block_start\n\
+         data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}\n\n\
+         event: content_block_delta\n\
+         data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"loose thought\"}}\n\n\
+         event: content_block_stop\n\
+         data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+         event: message_delta\n\
+         data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n\
+         event: message_stop\n\
+         data: {\"type\":\"message_stop\"}\n";
+    assert_eq!(
+        replay_anthropic_sse(unsigned.as_bytes()),
+        vec![
+            Ok(StreamEvent::ReasoningDelta {
+                text: "loose thought".into(),
+            }),
+            Ok(StreamEvent::Finish {
+                reason: FinishReason::EndTurn,
+            }),
+        ],
+        "an unsigned thinking block must not fabricate a replay fact"
+    );
+}
+
+/// LAW (LT2, thinking replay): captured anthropic thinking/redacted_thinking
+/// facts replay VERBATIM, in original order, BEFORE the tool_use block in
+/// the assistant message of the follow-up request — and normalized
+/// `Block::Reasoning` display summaries stay REJECTED (they carry no
+/// provider-valid signature; replaying them as thinking blocks is a live
+/// 400, which is exactly why the fix rides the provider-opaque channel).
+///
+/// MUTATION CHECK (executed — see the G3 mutation notes): filter
+/// provider-opaque blocks whose payload `type` is "thinking" out of the
+/// anthropic content mapping (the classic redacted-thinking bug, inverted).
+/// Expected runtime failure: the verbatim-order assertion below.
+#[test]
+fn thinking_facts_replay_verbatim_in_order_and_normalized_reasoning_stays_rejected() {
+    let thinking = serde_json::json!({
+        "type": "thinking",
+        "thinking": "weigh the options",
+        "signature": "sig-first-sig-second",
+    });
+    let redacted = serde_json::json!({
+        "type": "redacted_thinking",
+        "data": "ENCRYPTED_PAYLOAD_b64",
+    });
+    let request = TurnRequest {
+        model: "claude-fable-5".into(),
+        max_tokens: 512,
+        system_prompt: None,
+        tools: Vec::new(),
+        attachments: Vec::new(),
+        messages: vec![
+            Message::user_text("read the file"),
+            Message {
+                role: MessageRole::Assistant,
+                blocks: vec![
+                    Block::ProviderOpaque {
+                        provider: "anthropic".into(),
+                        data: thinking.clone(),
+                    },
+                    Block::ProviderOpaque {
+                        provider: "anthropic".into(),
+                        data: redacted.clone(),
+                    },
+                    Block::ToolCall {
+                        call_id: "toolu_capture".into(),
+                        name: "fs_read".into(),
+                        args: serde_json::json!({"path": "/tmp/x"}),
+                    },
+                ],
+            },
+            Message::tool_result("toolu_capture", "file contents", false),
+        ],
+    };
+    let payload = provider("claude-fable-5")
+        .request_payload(&request)
+        .expect("tool-loop payload with thinking facts");
+    let content = payload["messages"][1]["content"]
+        .as_array()
+        .expect("assistant content");
+    assert_eq!(
+        content[0], thinking,
+        "the signed thinking block replays VERBATIM first"
+    );
+    assert_eq!(
+        content[1], redacted,
+        "redacted_thinking replays verbatim second — dropping it is the classic 400"
+    );
+    assert_eq!(content[2]["type"], "tool_use");
+    assert_eq!(content[2]["id"], "toolu_capture");
+    assert_eq!(content.len(), 3);
+
+    // Normalized display reasoning stays rejected.
+    let mut normalized = request;
+    normalized.messages[1].blocks[0] = Block::Reasoning {
+        summary: "a display summary".into(),
+    };
+    let error = provider("claude-fable-5")
+        .request_payload(&normalized)
+        .expect_err("normalized reasoning must stay rejected");
+    assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+}

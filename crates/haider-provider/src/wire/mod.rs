@@ -475,10 +475,23 @@ impl StreamState {
                             Some(StreamEvent::ToolCallStart { call_id: id, name }),
                         )
                     }
-                    WireContentBlock::Thinking { .. } => (OpenBlock::Thinking, None),
-                    WireContentBlock::RedactedThinking
-                    | WireContentBlock::Fallback
-                    | WireContentBlock::Unknown => (OpenBlock::Opaque, None),
+                    // G3 (LT1): thinking blocks accumulate their text AND
+                    // signature for verbatim tool-loop replay. Display law is
+                    // unchanged — only DELTAS are emitted as ReasoningDelta;
+                    // the start content merely seeds the replay accumulator.
+                    WireContentBlock::Thinking { thinking } => (
+                        OpenBlock::Thinking {
+                            thinking,
+                            signature: String::new(),
+                        },
+                        None,
+                    ),
+                    WireContentBlock::RedactedThinking { data } => {
+                        (OpenBlock::Redacted { data }, None)
+                    }
+                    WireContentBlock::Fallback | WireContentBlock::Unknown => {
+                        (OpenBlock::Opaque, None)
+                    }
                 };
                 self.open_blocks.insert(index, block);
                 Ok(item)
@@ -486,7 +499,7 @@ impl StreamState {
             WireEvent::ContentBlockDelta { index, delta } => {
                 self.require_started("content_block_delta")?;
                 self.require_before_message_delta("content_block_delta")?;
-                let block = self.open_blocks.get(&index).ok_or_else(|| {
+                let block = self.open_blocks.get_mut(&index).ok_or_else(|| {
                     malformed(format!(
                         "Anthropic delta references unopened content block index {index}"
                     ))
@@ -501,12 +514,25 @@ impl StreamState {
                             args_fragment: partial_json,
                         }))
                     }
-                    (OpenBlock::Thinking, WireDelta::Thinking { thinking }) => {
-                        Ok(Some(StreamEvent::ReasoningDelta { text: thinking }))
+                    // Display AND capture: the delta streams to the UI as
+                    // reasoning and joins the verbatim replay accumulator.
+                    (
+                        OpenBlock::Thinking { thinking, .. },
+                        WireDelta::Thinking { thinking: delta },
+                    ) => {
+                        thinking.push_str(&delta);
+                        Ok(Some(StreamEvent::ReasoningDelta { text: delta }))
                     }
-                    (OpenBlock::Thinking, WireDelta::Signature) | (_, WireDelta::Unknown) => {
+                    // signature_delta fragments ACCUMULATE (LT1): the block's
+                    // replayable signature is their concatenation.
+                    (
+                        OpenBlock::Thinking { signature, .. },
+                        WireDelta::Signature { signature: delta },
+                    ) => {
+                        signature.push_str(&delta);
                         Ok(None)
                     }
+                    (_, WireDelta::Unknown) => Ok(None),
                     _ => Err(malformed(format!(
                         "Anthropic delta type does not match content block index {index}"
                     ))),
@@ -519,7 +545,38 @@ impl StreamState {
                     Some(OpenBlock::Tool { call_id }) => {
                         Ok(Some(StreamEvent::ToolCallEnd { call_id }))
                     }
-                    Some(OpenBlock::Text | OpenBlock::Thinking | OpenBlock::Opaque) => Ok(None),
+                    // G3 (LT1): a SIGNED thinking block becomes a
+                    // provider-opaque fact carrying the EXACT wire shape the
+                    // Messages API requires replayed verbatim within a
+                    // tool-use turn. An unsigned block (display-only
+                    // thinking) is not replayable and captures nothing —
+                    // today's behavior.
+                    Some(OpenBlock::Thinking {
+                        thinking,
+                        signature,
+                    }) => Ok(
+                        (!signature.is_empty()).then(|| StreamEvent::ProviderOpaque {
+                            provider: crate::ANTHROPIC_PROVIDER_NAME.into(),
+                            data: serde_json::json!({
+                                "type": "thinking",
+                                "thinking": thinking,
+                                "signature": signature,
+                            }),
+                        }),
+                    ),
+                    // redacted_thinking replays as-is; the classic bug this
+                    // pins against is filtering `type == "thinking"` and
+                    // dropping these (a live 400).
+                    Some(OpenBlock::Redacted { data }) => {
+                        Ok((!data.is_empty()).then(|| StreamEvent::ProviderOpaque {
+                            provider: crate::ANTHROPIC_PROVIDER_NAME.into(),
+                            data: serde_json::json!({
+                                "type": "redacted_thinking",
+                                "data": data,
+                            }),
+                        }))
+                    }
+                    Some(OpenBlock::Text | OpenBlock::Opaque) => Ok(None),
                     None => Err(malformed(format!(
                         "Anthropic stop references unopened content block index {index}"
                     ))),
@@ -630,8 +687,18 @@ impl InputUsage {
 #[derive(Debug)]
 enum OpenBlock {
     Text,
-    Tool { call_id: String },
-    Thinking,
+    Tool {
+        call_id: String,
+    },
+    /// Thinking accumulates text + signature for verbatim replay (G3/LT1).
+    Thinking {
+        thinking: String,
+        signature: String,
+    },
+    /// redacted_thinking carries its encrypted payload from the start event.
+    Redacted {
+        data: String,
+    },
     Opaque,
 }
 
@@ -699,10 +766,13 @@ enum WireContentBlock {
         input: serde_json::Value,
     },
     Thinking {
-        #[serde(default, rename = "thinking")]
-        _thinking: String,
+        #[serde(default)]
+        thinking: String,
     },
-    RedactedThinking,
+    RedactedThinking {
+        #[serde(default)]
+        data: String,
+    },
     Fallback,
     #[serde(other)]
     Unknown,
@@ -718,7 +788,10 @@ enum WireDelta {
     #[serde(rename = "thinking_delta")]
     Thinking { thinking: String },
     #[serde(rename = "signature_delta")]
-    Signature,
+    Signature {
+        #[serde(default)]
+        signature: String,
+    },
     #[serde(other)]
     Unknown,
 }

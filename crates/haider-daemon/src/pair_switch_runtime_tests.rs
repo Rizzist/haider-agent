@@ -1351,3 +1351,135 @@ async fn spawned_child_inherits_parent_effort_and_fast() {
 
     world.shutdown().await;
 }
+
+/// LAW (LT3, cross-provider strip): after a model switch to a different
+/// provider family, NO foreign provider-opaque facts reach the request — the
+/// journaled continuation state of the OLD family (here an anthropic
+/// thinking fact) is stripped at prompt assembly, while the switch-target's
+/// request keeps the surrounding conversation intact.
+///
+/// The unit half pins the tag table and the empty-message sweep directly.
+///
+/// MUTATION CHECK (executed — see the G3 mutation notes): skip the strip in
+/// `start_turn`. Expected runtime failure: the foreign-opaque scan below
+/// finds the anthropic fact in provider B's request.
+#[tokio::test]
+async fn cross_provider_switch_strips_foreign_opaque_facts() {
+    let fake_a = Arc::new(FakeProvider::new(vec![
+        // Turn 1 on provider A mints an "anthropic"-tagged opaque fact that
+        // the journal keeps as provider-opaque continuation state.
+        FakeStep::EmitProviderOpaque {
+            provider: "anthropic".into(),
+            data: serde_json::json!({
+                "type": "thinking",
+                "thinking": "family-local state",
+                "signature": "sig-a",
+            }),
+        },
+        FakeStep::EmitText {
+            text: "answer from a".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let fake_b = Arc::new(FakeProvider::new(text_turn("answer from b")));
+    let world = PairSwitchWorld::boot("g3-strip", fake_a.clone(), fake_b.clone()).await;
+
+    world
+        .run_turn("g3-strip-one", "mint continuation state")
+        .await;
+    world
+        .hub
+        .select_session_model(world.select_command("g3-strip-select"))
+        .await
+        .expect("switch to provider B");
+    world
+        .run_turn("g3-strip-two", "run on the new family")
+        .await;
+
+    let b_requests = fake_b.requests();
+    assert_eq!(b_requests.len(), 1, "turn 2 lands on provider B");
+    let foreign_opaque = b_requests[0].messages.iter().any(|message| {
+        message.blocks.iter().any(|block| {
+            matches!(
+                block,
+                Block::ProviderOpaque { provider, .. } if provider == "anthropic"
+            )
+        })
+    });
+    assert!(
+        !foreign_opaque,
+        "no anthropic thinking fact may reach the openai-family request: {b_requests:?}"
+    );
+    // The strip removes the FACT, not the conversation: provider B still
+    // sees turn 1's user text and assistant answer.
+    let history_survives = b_requests[0].messages.iter().any(|message| {
+        message
+            .blocks
+            .iter()
+            .any(|block| matches!(block, Block::Text { text } if text == "answer from a"))
+    });
+    assert!(
+        history_survives,
+        "the surrounding history must survive the strip: {b_requests:?}"
+    );
+
+    world.shutdown().await;
+}
+
+/// LAW (LT3, unit half): the tag table maps every session provider to the
+/// ONE opaque tag its wire accepts, and the strip drops foreign blocks plus
+/// any message they leave empty while passing same-family blocks verbatim.
+#[test]
+fn opaque_tag_table_and_strip_are_exact() {
+    use crate::worker::{accepted_opaque_provider, strip_foreign_provider_opaque};
+
+    for (provider, accepted) in [
+        ("anthropic", "anthropic"),
+        ("anthropic-oauth", "anthropic"),
+        ("openai", "openai"),
+        ("openai-oauth", "openai"),
+        ("gemini", "gemini"),
+        ("openai-compatible", "openai-compatible"),
+        ("kimi-oauth", "openai-compatible"),
+        ("custom-lab", "openai-compatible"),
+    ] {
+        assert_eq!(accepted_opaque_provider(provider), accepted, "{provider}");
+    }
+
+    let anthropic_fact = Block::ProviderOpaque {
+        provider: "anthropic".into(),
+        data: serde_json::json!({"type": "thinking"}),
+    };
+    let openai_fact = Block::ProviderOpaque {
+        provider: "openai".into(),
+        data: serde_json::json!({"type": "reasoning"}),
+    };
+    let mut messages = vec![
+        haider_provider::Message::user_text("hello"),
+        haider_provider::Message::assistant(vec![openai_fact.clone()]),
+        haider_provider::Message::assistant(vec![
+            anthropic_fact.clone(),
+            Block::Text {
+                text: "kept".into(),
+            },
+        ]),
+    ];
+    strip_foreign_provider_opaque(&mut messages, "anthropic-oauth");
+    assert_eq!(
+        messages.len(),
+        2,
+        "the emptied foreign-only assistant message is swept"
+    );
+    assert_eq!(
+        messages[1].blocks,
+        vec![
+            anthropic_fact,
+            Block::Text {
+                text: "kept".into()
+            }
+        ],
+        "same-family facts and text pass through verbatim"
+    );
+}
