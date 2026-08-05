@@ -366,11 +366,13 @@ pub enum LiveCommand {
         worker_generation: u64,
         enabled: bool,
     },
-    /// `provider.configure` CREATE for a custom OpenAI-compatible provider
-    /// (W5g-4). Identity fields are fixed by the card: chat-completions
-    /// family, api-key auth (or auth NONE for the G4a keyless presets),
-    /// enabled. The served model seeds the inventory and the default in one
-    /// stroke (an enabled create requires both — daemon law, W5g-5).
+    /// `provider.configure` for a custom OpenAI-compatible provider
+    /// (W5g-4) or a G4b enterprise builtin. Identity fields are fixed by
+    /// the card: the stated family, api-key auth (or auth NONE for the G4a
+    /// keyless presets), enabled. The served model seeds the inventory and
+    /// the default in one stroke (an enabled create requires both — daemon
+    /// law, W5g-5); the G4b enterprise cards echo an EXPLICIT inventory
+    /// instead.
     ConfigureProvider {
         command_id: CommandId,
         provider: String,
@@ -378,6 +380,12 @@ pub enum LiveCommand {
         model: String,
         /// G4a: `auth_requirement: none` on the wire when true.
         keyless: bool,
+        /// G4b: chat-completions for customs/azure, anthropic-messages for
+        /// the enterprise builtins.
+        family: haider_rpc::ProviderApiFamilyWire,
+        /// G4b: explicit inventory echo; EMPTY derives `[model]`.
+        models: Vec<String>,
+        default_model: Option<String>,
         expected_revision: u64,
     },
     /// `transcription.secret_get` (T2): read the vaulted Deepgram key for
@@ -3147,6 +3155,9 @@ impl LiveDriver {
                 origin,
                 model: served_model,
                 keyless,
+                family,
+                models,
+                default_model,
                 expected_revision,
             } => {
                 let command_id = self.mint();
@@ -3157,6 +3168,9 @@ impl LiveDriver {
                     origin,
                     model: served_model,
                     keyless,
+                    family,
+                    models,
+                    default_model,
                     expected_revision,
                 })]
             }

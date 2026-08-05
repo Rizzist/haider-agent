@@ -466,6 +466,27 @@ pub enum CustomField {
     Name,
     Origin,
     Model,
+    /// G4b: the vertex card's second coordinate (location); unused by
+    /// every other card kind.
+    Extra,
+}
+
+/// Which provider surface the card configures (G4b). `Generic` is the
+/// pre-G4b custom/preset card byte-for-byte; the enterprise kinds relabel
+/// the fields and reshape the submit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CustomCardKind {
+    /// OpenAI-compatible custom/preset (name + origin + model).
+    Generic,
+    /// Azure OpenAI v1: name + resource endpoint + DEPLOYMENT name; submit
+    /// derives `{endpoint}/openai/v1` and chains the key card.
+    Azure,
+    /// Bedrock mantle: the `origin` field holds the REGION; submit builds
+    /// the mantle URL and echoes the seeded model inventory.
+    Bedrock,
+    /// Claude on Vertex: `origin` holds the PROJECT ID, `extra` the
+    /// LOCATION (default `global`).
+    Vertex,
 }
 
 /// Where the `+ Custom (OpenAI-compatible)` card is in its flow.
@@ -507,6 +528,10 @@ pub struct CustomProviderCard {
     /// `auth_requirement: none` and commit SKIPS the key card, going
     /// straight to model discovery.
     pub keyless: bool,
+    /// G4b: which provider surface this card configures.
+    pub kind: CustomCardKind,
+    /// G4b: the vertex LOCATION field; empty for every other kind.
+    pub extra: String,
 }
 
 /// The `/providers` screen state (report §5.2). Same daemon-truth law as
@@ -1669,6 +1694,56 @@ pub fn account_alias_ok(alias: &str) -> bool {
 
 /// A character's place in the alias grammar, as typed: uppercase folds to
 /// lowercase, anything outside `[a-z0-9._-]` is dropped at the keyboard.
+/// Azure v1 base derivation (G4b): the resource endpoint gains
+/// `/openai/v1` unless the user already pasted it. Format-only — the
+/// daemon's origin predicate and validator hold the authority.
+fn azure_v1_base(endpoint: &str) -> String {
+    let trimmed = endpoint.trim_end_matches('/');
+    if trimmed.ends_with("/openai/v1") {
+        trimmed.to_owned()
+    } else {
+        format!("{trimmed}/openai/v1")
+    }
+}
+
+/// Bedrock mantle URL template (G4b) — format-only; the daemon's shape
+/// validator refuses anything the region field smuggles in.
+fn bedrock_mantle_url(region: &str) -> String {
+    format!("https://bedrock-mantle.{region}.api.aws/anthropic")
+}
+
+/// The region of a stored mantle endpoint, for card prefill.
+fn bedrock_region_of(endpoint: &str) -> Option<&str> {
+    endpoint
+        .trim_end_matches('/')
+        .strip_prefix("https://bedrock-mantle.")?
+        .strip_suffix(".api.aws/anthropic")
+}
+
+/// Vertex models URL template (G4b) — format-only, daemon-validated.
+fn vertex_models_url(project: &str, location: &str) -> String {
+    if location == "global" {
+        format!(
+            "https://aiplatform.googleapis.com/v1/projects/{project}/locations/global/publishers/anthropic/models"
+        )
+    } else {
+        format!(
+            "https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/publishers/anthropic/models"
+        )
+    }
+}
+
+/// The (project, location) of a stored vertex endpoint, for card prefill.
+fn vertex_coordinates_of(endpoint: &str) -> Option<(String, String)> {
+    let rest = endpoint.trim_end_matches('/').strip_prefix("https://")?;
+    let (_, path) = rest.split_once('/')?;
+    let (project, rest) = path
+        .strip_prefix("v1/projects/")?
+        .split_once("/locations/")?;
+    let location = rest.strip_suffix("/publishers/anthropic/models")?;
+    Some((project.to_owned(), location.to_owned()))
+}
+
 fn alias_char(c: char) -> Option<char> {
     let c = c.to_ascii_lowercase();
     (c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-')).then_some(c)
@@ -2147,11 +2222,20 @@ pub enum AppRequest {
         name: String,
         origin: String,
         /// The served model id — seeds the inventory AND the default (an
-        /// enabled create requires both, daemon law).
+        /// enabled create requires both, daemon law). EMPTY when `models`
+        /// carries an explicit inventory echo (G4b bedrock/vertex).
         model: String,
         /// G4a: true for auth-None presets — the wire carries
         /// `auth_requirement: none` instead of `api_key`.
         keyless: bool,
+        /// G4b: the profile API family — chat-completions for
+        /// customs/azure, anthropic-messages for the enterprise builtins.
+        family: haider_rpc::ProviderApiFamilyWire,
+        /// G4b: explicit inventory echo for seeded-list providers; EMPTY
+        /// derives `[model]` (the pre-G4b shape).
+        models: Vec<String>,
+        /// G4b: the echoed default; `None` derives `Some(model)`.
+        default_model: Option<String>,
         expected_revision: u64,
     },
     /// G4a: re-run one provider's model discovery
@@ -2386,6 +2470,16 @@ pub enum AccountAddKind {
     /// G4a: local LM Studio preset — keyless (auth-None) custom provider
     /// at the default `http://127.0.0.1:1234/v1`.
     LmStudio,
+    /// G4b: Azure OpenAI v1 — the custom card in Azure shape (resource
+    /// endpoint + api-key header + deployment-name model).
+    AzureOpenAi,
+    /// G4b: Bedrock mantle — the builtin `bedrock` profile's region card,
+    /// then its bearer key.
+    Bedrock,
+    /// G4b: Claude on Vertex — the builtin `vertex` profile's
+    /// project/location card, then an access token (or the gcloud device
+    /// import).
+    Vertex,
     Custom,
 }
 
@@ -6592,7 +6686,14 @@ impl AppModel {
             KeyCode::Char('e') => {
                 if let Some(summary) = self.providers.providers.get(self.providers.cursor).cloned()
                 {
-                    self.open_custom_edit(&summary);
+                    // G4b: the enterprise builtins edit through their OWN
+                    // cards (region / project+location) — the generic edit
+                    // card would submit the wrong identity family.
+                    match summary.provider.as_str() {
+                        "bedrock" => self.open_bedrock_card(),
+                        "vertex" => self.open_vertex_card(),
+                        _ => self.open_custom_edit(&summary),
+                    }
                 }
             }
             KeyCode::Char('h') => self.open_huggingface_preset(),
@@ -6600,6 +6701,10 @@ impl AppModel {
             KeyCode::Char('g') => self.open_opencode_go_preset(),
             KeyCode::Char('o') => self.open_ollama_preset(),
             KeyCode::Char('l') => self.open_lmstudio_preset(),
+            // G4b enterprise cards.
+            KeyCode::Char('a') => self.open_azure_card(),
+            KeyCode::Char('b') => self.open_bedrock_card(),
+            KeyCode::Char('v') => self.open_vertex_card(),
             // G4a: `f` re-runs model discovery for the selected provider —
             // the affordance behind the local presets' "start the server,
             // then refresh" hint. Live-only vocabulary; the daemon answers
@@ -6696,6 +6801,9 @@ impl AppModel {
             | AccountAddKind::OpencodeGo
             | AccountAddKind::Ollama
             | AccountAddKind::LmStudio
+            | AccountAddKind::AzureOpenAi
+            | AccountAddKind::Bedrock
+            | AccountAddKind::Vertex
             | AccountAddKind::Custom => return,
         };
         let alias = smallest_free_alias(provider, &self.accounts.rows);
@@ -6926,6 +7034,8 @@ impl AppModel {
             attempt: self.custom_attempt_seq,
             edit: false,
             keyless: false,
+            kind: CustomCardKind::Generic,
+            extra: String::new(),
         });
         self.dirty = true;
     }
@@ -6959,6 +7069,8 @@ impl AppModel {
             attempt: self.custom_attempt_seq,
             edit: true,
             keyless: summary.auth_methods.is_empty(),
+            kind: CustomCardKind::Generic,
+            extra: String::new(),
         });
         self.dirty = true;
     }
@@ -6998,6 +7110,130 @@ impl AppModel {
     /// default local server origin.
     fn open_lmstudio_preset(&mut self) {
         self.open_keyless_preset("lmstudio", "http://127.0.0.1:1234/v1");
+    }
+
+    /// G4b: the Azure OpenAI card — the custom card in Azure shape. The
+    /// user pastes the RESOURCE endpoint (`https://{res}.openai.azure.com`)
+    /// and the DEPLOYMENT name; submit derives `{endpoint}/openai/v1` and
+    /// the daemon speaks the `api-key` header from then on. Live-only: the
+    /// demo has no azure fabrication.
+    fn open_azure_card(&mut self) {
+        if self.custom_add.is_some() || self.oauth_add.is_some() {
+            return;
+        }
+        if self.mode.fabricates_locally()
+            || !self.daemon_serves(haider_rpc::FEATURE_PROVIDER_CONFIGURE_V1)
+        {
+            self.providers.message = Some(self.stale_daemon_note("Azure OpenAI providers"));
+            self.dirty = true;
+            return;
+        }
+        let taken: Vec<AccountRow> = self
+            .providers
+            .providers
+            .iter()
+            .map(|summary| AccountRow {
+                alias: summary.provider.clone(),
+                provider: summary.provider.clone(),
+                method: haider_protocol::credential::AuthMethod::ApiKey,
+                identity: String::new(),
+                status: haider_protocol::credential::CredentialStatus::Ok,
+                selected: false,
+                base_url: None,
+            })
+            .collect();
+        self.custom_attempt_seq += 1;
+        self.custom_add = Some(CustomProviderCard {
+            name: smallest_free_alias("azure", &taken),
+            origin: "https://".to_owned(),
+            model: String::new(),
+            focus: CustomField::Origin,
+            phase: CustomPhase::Editing { error: None },
+            attempt: self.custom_attempt_seq,
+            edit: false,
+            keyless: false,
+            kind: CustomCardKind::Azure,
+            extra: String::new(),
+        });
+        self.dirty = true;
+    }
+
+    /// G4b: the Bedrock card — the builtin `bedrock` profile's REGION
+    /// (default `us-east-1`); submit re-configures the mantle endpoint and
+    /// chains the bearer-key card. Gated on the daemon actually listing
+    /// the builtin (provider-list truth, the B6b Gemini pattern).
+    fn open_bedrock_card(&mut self) {
+        self.open_enterprise_card(CustomCardKind::Bedrock);
+    }
+
+    /// G4b: the Vertex card — the builtin `vertex` profile's PROJECT ID +
+    /// LOCATION (default `global`); submit configures the endpoint and
+    /// chains an access-token card (~1h tokens; the gcloud device import
+    /// auto-refreshes instead).
+    fn open_vertex_card(&mut self) {
+        self.open_enterprise_card(CustomCardKind::Vertex);
+    }
+
+    fn open_enterprise_card(&mut self, kind: CustomCardKind) {
+        if self.custom_add.is_some() || self.oauth_add.is_some() {
+            return;
+        }
+        let provider = match kind {
+            CustomCardKind::Bedrock => "bedrock",
+            CustomCardKind::Vertex => "vertex",
+            CustomCardKind::Generic | CustomCardKind::Azure => return,
+        };
+        if self.mode.fabricates_locally() || !self.daemon_lists_provider(provider) {
+            self.providers.message = Some(self.stale_daemon_note("enterprise Claude providers"));
+            self.dirty = true;
+            return;
+        }
+        // Prefill from the LISTED profile: a bedrock endpoint parses back
+        // to its region; a vertex endpoint to project + location.
+        let endpoint = self
+            .providers
+            .providers
+            .iter()
+            .find(|summary| summary.provider == provider)
+            .and_then(|summary| summary.endpoint.clone());
+        let (origin, extra) = match kind {
+            CustomCardKind::Bedrock => (
+                endpoint
+                    .as_deref()
+                    .and_then(bedrock_region_of)
+                    .unwrap_or("us-east-1")
+                    .to_owned(),
+                String::new(),
+            ),
+            _ => {
+                let (project, location) = endpoint
+                    .as_deref()
+                    .and_then(vertex_coordinates_of)
+                    .unwrap_or_default();
+                (
+                    project,
+                    if location.is_empty() {
+                        "global".to_owned()
+                    } else {
+                        location
+                    },
+                )
+            }
+        };
+        self.custom_attempt_seq += 1;
+        self.custom_add = Some(CustomProviderCard {
+            name: provider.to_owned(),
+            origin,
+            model: String::new(),
+            focus: CustomField::Origin,
+            phase: CustomPhase::Editing { error: None },
+            attempt: self.custom_attempt_seq,
+            edit: false,
+            keyless: false,
+            kind,
+            extra,
+        });
+        self.dirty = true;
     }
 
     /// One-click custom-provider preset: the custom card prefilled with a
@@ -7048,6 +7284,8 @@ impl AppModel {
             attempt: self.custom_attempt_seq,
             edit: false,
             keyless,
+            kind: CustomCardKind::Generic,
+            extra: String::new(),
         });
         self.dirty = true;
     }
@@ -7060,9 +7298,30 @@ impl AppModel {
 
     /// ⏎ on the live card: `provider.configure` under the CURRENT provider
     /// revision (CAS — a stale snapshot is a typed conflict, never a
-    /// silent overwrite).
+    /// silent overwrite). G4b: the enterprise kinds reshape the submit —
+    /// azure derives the `/openai/v1` base from the resource endpoint;
+    /// bedrock/vertex build their templated endpoints from the card's
+    /// coordinates and ECHO the profile's seeded model inventory (the
+    /// daemon's shape validators stay the authority; the card only
+    /// formats).
     fn submit_custom_add(&mut self) {
         let expected_revision = self.providers.revision.unwrap_or(0);
+        let summary_inventory = |providers: &ProvidersState, name: &str| {
+            providers
+                .providers
+                .iter()
+                .find(|summary| summary.provider == name)
+                .map(|summary| {
+                    (
+                        summary.models.clone(),
+                        summary
+                            .default_model
+                            .clone()
+                            .or_else(|| summary.models.first().cloned()),
+                    )
+                })
+                .unwrap_or_default()
+        };
         let Some(card) = self.custom_add.as_mut() else {
             return;
         };
@@ -7081,23 +7340,70 @@ impl AppModel {
         }
         // An ENABLED create requires a model inventory and a default
         // (daemon law) — the card refuses to submit what would bounce.
-        if card.model.trim().is_empty() {
+        // Bedrock/vertex carry the profile's SEEDED inventory instead of a
+        // typed model.
+        if matches!(card.kind, CustomCardKind::Generic | CustomCardKind::Azure)
+            && card.model.trim().is_empty()
+        {
             card.focus = CustomField::Model;
             self.dirty = true;
             return;
         }
-        card.phase = CustomPhase::Submitting;
         let attempt = card.attempt;
         let name = card.name.clone();
-        let origin = card.origin.trim().to_owned();
         let model = card.model.trim().to_owned();
         let keyless = card.keyless;
+        let (origin, family, models, default_model) = match card.kind {
+            CustomCardKind::Generic => (
+                card.origin.trim().to_owned(),
+                haider_rpc::ProviderApiFamilyWire::OpenAiChatCompletions,
+                Vec::new(),
+                None,
+            ),
+            CustomCardKind::Azure => (
+                azure_v1_base(card.origin.trim()),
+                haider_rpc::ProviderApiFamilyWire::OpenAiChatCompletions,
+                Vec::new(),
+                None,
+            ),
+            CustomCardKind::Bedrock => {
+                let (models, default_model) = summary_inventory(&self.providers, &name);
+                (
+                    bedrock_mantle_url(card.origin.trim()),
+                    haider_rpc::ProviderApiFamilyWire::AnthropicMessages,
+                    models,
+                    default_model,
+                )
+            }
+            CustomCardKind::Vertex => {
+                let location = card.extra.trim();
+                let location = if location.is_empty() {
+                    "global"
+                } else {
+                    location
+                };
+                let (models, default_model) = summary_inventory(&self.providers, &name);
+                (
+                    vertex_models_url(card.origin.trim(), location),
+                    haider_rpc::ProviderApiFamilyWire::AnthropicMessages,
+                    models,
+                    default_model,
+                )
+            }
+        };
+        let Some(card) = self.custom_add.as_mut() else {
+            return;
+        };
+        card.phase = CustomPhase::Submitting;
         self.requests.push(AppRequest::ProviderConfigure {
             attempt,
             name,
             origin,
             model,
             keyless,
+            family,
+            models,
+            default_model,
             expected_revision,
         });
         self.dirty = true;
@@ -7136,10 +7442,26 @@ impl AppModel {
             self.dirty = true;
             return;
         }
-        self.accounts.message = Some(format!(
-            "✓ provider {} created · OpenAI-compatible — now add its key",
-            card.name
-        ));
+        // G4b: every keyed kind chains into the masked key card; the copy
+        // names what the "key" actually is on each surface.
+        self.accounts.message = Some(match card.kind {
+            CustomCardKind::Azure => format!(
+                "✓ provider {} configured · Azure OpenAI — now add its api-key",
+                card.name
+            ),
+            CustomCardKind::Bedrock => format!(
+                "✓ provider {} configured · Bedrock mantle — now add its bearer API key",
+                card.name
+            ),
+            CustomCardKind::Vertex => format!(
+                "✓ provider {} configured · Vertex — paste an access token (~1h), or import gcloud from the device rows",
+                card.name
+            ),
+            CustomCardKind::Generic => format!(
+                "✓ provider {} created · OpenAI-compatible — now add its key",
+                card.name
+            ),
+        });
         self.open_login_card(&card.name, None);
         self.dirty = true;
     }
@@ -7168,10 +7490,15 @@ impl AppModel {
                         // line takes focus.
                         CustomField::Model
                     } else {
-                        match card.focus {
-                            CustomField::Name => CustomField::Origin,
-                            CustomField::Origin => CustomField::Model,
-                            CustomField::Model => CustomField::Name,
+                        match (card.kind, card.focus) {
+                            // Bedrock has ONE field (the region).
+                            (CustomCardKind::Bedrock, _) => CustomField::Origin,
+                            // Vertex cycles project ↔ location.
+                            (CustomCardKind::Vertex, CustomField::Origin) => CustomField::Extra,
+                            (CustomCardKind::Vertex, _) => CustomField::Origin,
+                            (_, CustomField::Name) => CustomField::Origin,
+                            (_, CustomField::Origin) => CustomField::Model,
+                            (_, CustomField::Model | CustomField::Extra) => CustomField::Name,
                         }
                     };
                     self.dirty = true;
@@ -7181,10 +7508,13 @@ impl AppModel {
                 if let Some(card) = self.custom_add.as_mut()
                     && matches!(card.phase, CustomPhase::Editing { .. })
                 {
-                    card.focus = match card.focus {
-                        CustomField::Name => CustomField::Model,
-                        CustomField::Origin => CustomField::Name,
-                        CustomField::Model => CustomField::Origin,
+                    card.focus = match (card.kind, card.focus) {
+                        (CustomCardKind::Bedrock, _) => CustomField::Origin,
+                        (CustomCardKind::Vertex, CustomField::Origin) => CustomField::Extra,
+                        (CustomCardKind::Vertex, _) => CustomField::Origin,
+                        (_, CustomField::Name) => CustomField::Model,
+                        (_, CustomField::Origin) => CustomField::Name,
+                        (_, CustomField::Model | CustomField::Extra) => CustomField::Origin,
                     };
                     self.dirty = true;
                 }
@@ -7202,6 +7532,9 @@ impl AppModel {
                         }
                         CustomField::Model => {
                             card.model.pop();
+                        }
+                        CustomField::Extra => {
+                            card.extra.pop();
                         }
                     }
                     self.dirty = true;
@@ -7230,6 +7563,12 @@ impl AppModel {
                         CustomField::Model => {
                             if !c.is_control() {
                                 card.model.push(c);
+                                self.dirty = true;
+                            }
+                        }
+                        CustomField::Extra => {
+                            if !c.is_control() {
+                                card.extra.push(c);
                                 self.dirty = true;
                             }
                         }
@@ -9421,6 +9760,15 @@ impl AppModel {
                     }
                     AccountAddKind::LmStudio => {
                         self.open_lmstudio_preset();
+                    }
+                    AccountAddKind::AzureOpenAi => {
+                        self.open_azure_card();
+                    }
+                    AccountAddKind::Bedrock => {
+                        self.open_bedrock_card();
+                    }
+                    AccountAddKind::Vertex => {
+                        self.open_vertex_card();
                     }
                 }
             }

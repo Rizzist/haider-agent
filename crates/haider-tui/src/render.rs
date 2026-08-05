@@ -930,12 +930,19 @@ fn render_launcher(
 /// opens from either screen and must be VISIBLE from either).
 fn push_custom_card_lines<'a>(model: &'a AppModel, theme: &Theme, lines_out: &mut Vec<Line<'a>>) {
     if let Some(card) = &model.custom_add {
+        // G4b: the enterprise kinds retitle the SAME card and relabel its
+        // fields; Generic stays byte-for-byte.
+        let title = match card.kind {
+            crate::app::CustomCardKind::Generic => "add a custom provider — OpenAI-compatible",
+            crate::app::CustomCardKind::Azure => "add Azure OpenAI — v1 surface, api-key header",
+            crate::app::CustomCardKind::Bedrock => {
+                "configure Bedrock — Claude via the mantle bearer surface"
+            }
+            crate::app::CustomCardKind::Vertex => "configure Vertex — Claude on GCP",
+        };
         lines_out.push(Line::from(vec![
             Span::styled("◉ ", theme.gold_style()),
-            Span::styled(
-                "add a custom provider — OpenAI-compatible",
-                theme.warn_style(),
-            ),
+            Span::styled(title, theme.warn_style()),
         ]));
         if model.mode.fabricates_locally() {
             for line in [
@@ -959,35 +966,53 @@ fn push_custom_card_lines<'a>(model: &'a AppModel, theme: &Theme, lines_out: &mu
                 lines_out.push(Line::styled(format!("  ✗ {error}"), theme.err_style()));
             }
             let caret = |focused: bool| if focused { "▏" } else { "" };
-            lines_out.push(Line::styled(
-                format!(
-                    "  name   ❯ {}{}",
-                    card.name,
-                    caret(editing && card.focus == crate::app::CustomField::Name)
-                ),
-                theme.text_style(),
-            ));
-            lines_out.push(Line::styled(
-                format!(
-                    "  origin ❯ {}{}",
-                    card.origin,
-                    caret(editing && card.focus == crate::app::CustomField::Origin)
-                ),
-                theme.text_style(),
-            ));
-            lines_out.push(Line::styled(
-                format!(
-                    "  model  ❯ {}{}",
-                    card.model,
-                    caret(editing && card.focus == crate::app::CustomField::Model)
-                ),
-                theme.text_style(),
-            ));
-            if editing {
+            use crate::app::CustomCardKind;
+            // Per-kind field roster: (label, value, field).
+            let fields: Vec<(&str, &String, crate::app::CustomField)> = match card.kind {
+                CustomCardKind::Generic => vec![
+                    ("name    ", &card.name, crate::app::CustomField::Name),
+                    ("origin  ", &card.origin, crate::app::CustomField::Origin),
+                    ("model   ", &card.model, crate::app::CustomField::Model),
+                ],
+                CustomCardKind::Azure => vec![
+                    ("name    ", &card.name, crate::app::CustomField::Name),
+                    ("endpoint", &card.origin, crate::app::CustomField::Origin),
+                    ("deploy  ", &card.model, crate::app::CustomField::Model),
+                ],
+                CustomCardKind::Bedrock => {
+                    vec![("region  ", &card.origin, crate::app::CustomField::Origin)]
+                }
+                CustomCardKind::Vertex => vec![
+                    ("project ", &card.origin, crate::app::CustomField::Origin),
+                    ("location", &card.extra, crate::app::CustomField::Extra),
+                ],
+            };
+            for (label, value, field) in fields {
                 lines_out.push(Line::styled(
-                    "  the model the server serves (e.g. llama3.1:8b) · the key is asked next",
-                    theme.dim_style(),
+                    format!(
+                        "  {label} ❯ {}{}",
+                        value,
+                        caret(editing && card.focus == field)
+                    ),
+                    theme.text_style(),
                 ));
+            }
+            if editing {
+                let hint = match card.kind {
+                    CustomCardKind::Generic => {
+                        "  the model the server serves (e.g. llama3.1:8b) · the key is asked next"
+                    }
+                    CustomCardKind::Azure => {
+                        "  https://{resource}.openai.azure.com + your DEPLOYMENT name · api-key asked next"
+                    }
+                    CustomCardKind::Bedrock => {
+                        "  models are seeded (anthropic.claude-…) · the bearer API key is asked next"
+                    }
+                    CustomCardKind::Vertex => {
+                        "  access tokens expire ~1h — paste one next, or import gcloud (auto-refresh)"
+                    }
+                };
+                lines_out.push(Line::styled(hint, theme.dim_style()));
                 lines_out.push(Line::styled(
                     "  ⏎ create · tab field · esc cancel",
                     theme.gold_style(),
@@ -1137,7 +1162,7 @@ fn push_account_add_buttons<'a>(
     lines_out: &mut Vec<Line<'a>>,
     rects_out: &mut Vec<(usize, u16, u16, Hit)>,
 ) {
-    let rows: [&[(&str, crate::app::AccountAddKind)]; 5] = [
+    let rows: [&[(&str, crate::app::AccountAddKind)]; 6] = [
         &[
             ("+ OpenAI (OAuth)", crate::app::AccountAddKind::OpenAiOAuth),
             (
@@ -1165,6 +1190,12 @@ fn push_account_add_buttons<'a>(
         &[
             ("+ Ollama (local)", crate::app::AccountAddKind::Ollama),
             ("+ LM Studio (local)", crate::app::AccountAddKind::LmStudio),
+        ],
+        // G4b: the enterprise surfaces — Custom still stays last.
+        &[
+            ("+ Azure OpenAI", crate::app::AccountAddKind::AzureOpenAi),
+            ("+ Bedrock (Claude)", crate::app::AccountAddKind::Bedrock),
+            ("+ Vertex (Claude)", crate::app::AccountAddKind::Vertex),
         ],
         &[(
             "+ Custom (OpenAI-compatible)",
@@ -1749,6 +1780,7 @@ fn render_providers(
         "click a model to set the default · e edits · x removes · f refresh · esc back"
     };
     let preset_hint = "presets: h HuggingFace · z Zen · g Go · o Ollama · l LM Studio";
+    let enterprise_hint = "enterprise: a Azure · b Bedrock · v Vertex";
     let mut footer_lines: Vec<Line<'_>> = Vec::new();
     let mut footer_hits: Vec<(usize, u16, u16, Hit)> = Vec::new();
     let pinned = area.height >= 12;
@@ -1756,10 +1788,12 @@ fn render_providers(
         push_account_add_buttons(model, theme, &mut footer_lines, &mut footer_hits);
         footer_lines.push(Line::styled(hint, theme.faint_style()));
         footer_lines.push(Line::styled(preset_hint, theme.faint_style()));
+        footer_lines.push(Line::styled(enterprise_hint, theme.faint_style()));
     } else {
         push_account_add_buttons(model, theme, &mut lines, &mut chip_hits);
         lines.push(Line::styled(hint, theme.faint_style()));
         lines.push(Line::styled(preset_hint, theme.faint_style()));
+        lines.push(Line::styled(enterprise_hint, theme.faint_style()));
     }
     let footer_height = u16::try_from(footer_lines.len()).unwrap_or(0);
     let [roster_area, footer_area] =

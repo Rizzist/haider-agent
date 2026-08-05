@@ -845,22 +845,35 @@ pub fn request_body(command: LiveCommand) -> RequestBody {
             origin,
             model,
             keyless,
+            family,
+            models,
+            default_model,
             expected_revision,
-        } => RequestBody::ProviderConfigure {
-            command_id,
-            provider,
-            api_family: Some(haider_rpc::ProviderApiFamilyWire::OpenAiChatCompletions),
-            origin: Some(origin),
-            auth_requirement: Some(if keyless {
-                haider_rpc::ProviderAuthRequirementWire::None
+        } => {
+            // G4b: an explicit inventory echo (the enterprise cards) rides
+            // as-is; the pre-G4b custom shape derives both fields from the
+            // single served model, byte-for-byte.
+            let (models, default_model) = if models.is_empty() {
+                (vec![model.clone()], Some(model))
             } else {
-                haider_rpc::ProviderAuthRequirementWire::ApiKey
-            }),
-            enabled: true,
-            models: vec![model.clone()],
-            default_model: Some(model),
-            expected_revision,
-        },
+                (models, default_model)
+            };
+            RequestBody::ProviderConfigure {
+                command_id,
+                provider,
+                api_family: Some(family),
+                origin: Some(origin),
+                auth_requirement: Some(if keyless {
+                    haider_rpc::ProviderAuthRequirementWire::None
+                } else {
+                    haider_rpc::ProviderAuthRequirementWire::ApiKey
+                }),
+                enabled: true,
+                models,
+                default_model,
+                expected_revision,
+            }
+        }
         LiveCommand::OAuthStart {
             provider,
             desired_alias,
