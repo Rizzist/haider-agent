@@ -418,9 +418,15 @@ async fn ws_session_streams_audio_and_assembles_joined_finals() {
 /// the configured cap (production 900 s), sending KeepAlives while open and
 /// CloseStream at the cap — an abandoned socket can never bill forever.
 ///
+/// The load-bearing observation happens BEFORE `finish()` is ever called:
+/// the server must have seen CloseStream from the cap alone (`finish`
+/// would settle the session even without a cap, so asserting after it
+/// would be vacuous).
+///
 /// MUTATION CHECK: remove the cap arm from the session select (or the
-/// KeepAlive timer). Expected runtime failure: this law times out at its
-/// 5 s guard, or the KeepAlive count stays zero.
+/// KeepAlive timer). Expected runtime failure: the pre-finish CloseStream
+/// assertion below, or the KeepAlive count stays zero.
+/// Verified by revert on 2026-08-05.
 #[tokio::test]
 async fn abandoned_session_self_finalizes_at_the_cap_with_keepalives() {
     let fixture = spawn_ws_fixture(false).await;
@@ -431,23 +437,31 @@ async fn abandoned_session_self_finalizes_at_the_cap_with_keepalives() {
     let session = start_session(config, events_tx)
         .await
         .expect("handshake succeeds");
-    // Nobody sends audio and nobody calls finish for a while: the cap must
-    // settle the session on its own.
+    // Nobody sends audio and nobody calls finish: the cap must settle the
+    // session ON ITS OWN. Poll (bounded) for the server-observed
+    // CloseStream before finish is ever invoked.
     let started = std::time::Instant::now();
-    tokio::time::sleep(std::time::Duration::from_millis(900)).await;
-    let result = tokio::time::timeout(std::time::Duration::from_secs(5), session.finish())
-        .await
-        .expect("cap must settle the session")
-        .expect("empty session is a success");
-    assert!(result.text.is_empty());
-    assert_eq!(result.segments, 0);
-    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    let mut cap_closed = false;
+    while started.elapsed() < std::time::Duration::from_secs(5) {
+        if fixture.close_stream_seen.load(Ordering::SeqCst) {
+            cap_closed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        cap_closed,
+        "the cap alone must send CloseStream — finish() was never called"
+    );
     assert!(
         fixture.keepalives.load(Ordering::SeqCst) >= 2,
         "KeepAlives must flow while the stream is open"
     );
-    assert!(
-        fixture.close_stream_seen.load(Ordering::SeqCst),
-        "the cap ends with CloseStream, never a dangling socket"
-    );
+    // Finishing afterwards still settles cleanly with the empty result.
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), session.finish())
+        .await
+        .expect("capped session settles")
+        .expect("empty session is a success");
+    assert!(result.text.is_empty());
+    assert_eq!(result.segments, 0);
 }

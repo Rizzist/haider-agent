@@ -96,9 +96,15 @@ fn selected_model_is_a_read_only_hint() {
     std::fs::write(&sidecar, "  \n").expect("write sidecar");
     assert_eq!(selected_model_hint(dir.path()), None);
     // NEVER WRITTEN: exercise the whole read surface, then compare bytes.
-    std::fs::write(&sidecar, "small.en").expect("write sidecar");
+    // The sidecar content is deliberately NON-normalized (case + padding):
+    // a "helpful" normalization write-back would produce different bytes,
+    // so a byte-identical rewrite cannot slip past this law.
+    std::fs::write(&sidecar, "  SMALL.EN \n").expect("write sidecar");
     let before = std::fs::read(&sidecar).expect("sidecar bytes");
-    let _ = selected_model_hint(dir.path());
+    assert_eq!(
+        selected_model_hint(dir.path()).expect("hint").id,
+        "small.en"
+    );
     let _ = effective_model(dir.path(), Some("tiny.en"));
     let _ = effective_model(dir.path(), None);
     let _ = installed_model_ids(dir.path());
