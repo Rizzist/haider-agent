@@ -798,6 +798,19 @@ pub fn request_body(command: LiveCommand) -> RequestBody {
             model,
             provider: Some(provider),
         },
+        // G2: the /rename command's receipted title. Always `Some` — bare
+        // clearing is deliberately not offered by this client.
+        LiveCommand::Rename {
+            command_id,
+            session,
+            worker_generation,
+            title,
+        } => RequestBody::SessionRename {
+            command_id,
+            session_id: session,
+            worker_generation,
+            title: Some(title),
+        },
         // W5g-4: the card CREATES — identity fields are fixed here, never
         // typed. The origin string is data on the wire only; it is never
         // interpolated into a shell or browser command (report §4.4).
@@ -1111,6 +1124,21 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
                 session: session_id,
                 provider,
                 model,
+                worker_generation,
+            }]
+        }),
+        // G2: the NORMALIZED committed title — the reply reports daemon
+        // truth, never an echo of the request (R2).
+        ResponseBody::SessionRename {
+            session_id,
+            title,
+            worker_generation,
+            ..
+        } => context.command_id.clone().map_or_else(Vec::new, |id| {
+            vec![LiveReply::Renamed {
+                command_id: id,
+                session: session_id,
+                title,
                 worker_generation,
             }]
         }),

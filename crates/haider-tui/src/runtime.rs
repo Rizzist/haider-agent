@@ -1421,6 +1421,12 @@ impl DemoDriver {
             } => {
                 model.apply_model_selected(&provider, &model_name);
             }
+            // G2: same twin-honesty shape — demo renames locally in the
+            // reducer and never pushes this request; a stray one commits
+            // the fabricated truth instead of vanishing.
+            AppRequest::Rename { session, title } => {
+                model.apply_renamed(&session, Some(title));
+            }
             AppRequest::OAuthAddStart {
                 provider, attempt, ..
             } => {
