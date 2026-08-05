@@ -107,6 +107,7 @@ fn session_permission_overrides_replace_only_write_and_exec_ask_defaults() {
         max_tokens: 4096,
         permission_overrides,
         system_prompt_version: None,
+        title: None,
         created_at_ms: 1,
     };
     let decision = |metadata: &SessionMetadataV1, class: EffectClass| {

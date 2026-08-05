@@ -1271,6 +1271,9 @@ impl Store {
             max_tokens: command.max_tokens,
             system_prompt_version: Some(command.system_prompt_version.clone()),
             permission_overrides: command.permission_overrides,
+            // G2: sessions are born untitled; the daemon-side auto-title
+            // (first accept) or an explicit `session.rename` fills this.
+            title: None,
             created_at_ms,
         };
         let metadata_json = serde_json::to_string(&metadata).map_err(|error| {

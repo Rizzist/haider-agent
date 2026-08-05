@@ -54,6 +54,12 @@ pub struct SessionMetadataV1 {
     /// receipt bytes and means the daemon registry defaults remain authoritative.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_overrides: Option<SessionPermissionOverridesV1>,
+    /// Optional user-facing session title (G2). `None` for legacy rows and
+    /// untitled sessions — absence stays OFF the wire so pre-G2 metadata
+    /// bytes are unchanged. Normalized by the daemon: trimmed, control
+    /// characters stripped, ≤ 80 chars, empty collapses to `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     /// Durable creation time in Unix milliseconds.
     pub created_at_ms: u64,
 }
@@ -81,6 +87,32 @@ pub struct ModelSelected {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionConfigEventPayload {
     ModelSelected(ModelSelected),
+    /// Additive replay fact emitted atomically with a committed session
+    /// rename and its command receipt (G2). `None` = the title was cleared;
+    /// absence stays OFF the wire.
+    SessionRenamed {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+    },
+}
+
+impl SessionConfigEventPayload {
+    /// Encodes one committed rename fact.
+    pub fn session_renamed_value(
+        title: Option<String>,
+    ) -> Result<serde_json::Value, serde_json::Error> {
+        serde_json::to_value(Self::SessionRenamed { title })
+    }
+
+    /// Decodes a `session_renamed` fact: `Some(title)` when the payload is
+    /// one, `None` for every other payload.
+    #[must_use]
+    pub fn session_renamed_from_value(value: &serde_json::Value) -> Option<Option<String>> {
+        match serde_json::from_value::<Self>(value.clone()).ok()? {
+            Self::SessionRenamed { title } => Some(title),
+            SessionConfigEventPayload::ModelSelected(_) => None,
+        }
+    }
 }
 
 impl ModelSelected {
@@ -92,6 +124,7 @@ impl ModelSelected {
     pub fn from_payload_value(value: &serde_json::Value) -> Option<Self> {
         match serde_json::from_value::<SessionConfigEventPayload>(value.clone()).ok()? {
             SessionConfigEventPayload::ModelSelected(selected) => Some(selected),
+            SessionConfigEventPayload::SessionRenamed { .. } => None,
         }
     }
 }

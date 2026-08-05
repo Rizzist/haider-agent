@@ -3480,14 +3480,21 @@ impl HubConnection {
                 session_summary_truth(&self.hub.inner.store, session_id, head_seq).await?;
             let (footprint_tokens, footprint_truth) =
                 summary_footprint_fields(turns, footprint.as_ref());
+            let metadata = self.hub.inner.store.session_metadata(session_id).await?;
+            // G2: the committed title rides the summary top-level so
+            // rosters name rows without decoding metadata.
+            let title = metadata
+                .as_ref()
+                .and_then(|metadata| metadata.title.clone());
             sessions.push(SessionSummary {
                 session_id: session_id.clone(),
                 head_seq,
                 worker_generation: self.hub.inner.store.worker_generation(),
-                metadata: self.hub.inner.store.session_metadata(session_id).await?,
+                metadata,
                 turn_count: Some(turns),
                 footprint_tokens,
                 footprint_truth,
+                title,
             });
         }
         let next_cursor = has_more

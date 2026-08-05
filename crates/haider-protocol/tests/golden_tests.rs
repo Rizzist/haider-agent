@@ -193,6 +193,51 @@ fn golden_branch_created_fact() {
     );
 }
 
+/// LAW (G2 fact golden): the `session_renamed` config fact rides the
+/// additive `SessionConfigEventPayload` union — a titled rename pins its
+/// exact shape, a CLEAR keeps `title` OFF the wire, and the core
+/// [`EventPayload`] enum still treats the kind as unknown (raw-tolerated),
+/// exactly like `model_selected`.
+///
+/// MUTATION CHECK: rename the `session_renamed` tag, serialize
+/// `title: null` for a clear, or decode the fact through the core enum.
+/// Expected RUNTIME failure: fixture drift or the tolerance asserts below.
+#[test]
+fn golden_session_renamed_fact() {
+    use haider_protocol::session::SessionConfigEventPayload;
+    golden(
+        "session_renamed",
+        &SessionConfigEventPayload::SessionRenamed {
+            title: Some("Parser rewrite".into()),
+        },
+    );
+    // A CLEAR keeps `title` off the wire entirely.
+    let cleared = serde_json::to_value(SessionConfigEventPayload::SessionRenamed { title: None })
+        .expect("encode cleared rename");
+    assert_eq!(cleared, serde_json::json!({"type": "session_renamed"}));
+    assert_eq!(
+        SessionConfigEventPayload::session_renamed_from_value(&cleared),
+        Some(None)
+    );
+    let titled = serde_json::json!({"type": "session_renamed", "title": "Parser rewrite"});
+    assert_eq!(
+        SessionConfigEventPayload::session_renamed_from_value(&titled),
+        Some(Some("Parser rewrite".to_owned()))
+    );
+    // A model_selected fact is NOT a rename, and the decoder returns None
+    // for it rather than lying.
+    let selected = serde_json::json!({
+        "type": "model_selected", "provider": "fake", "model": "fake-v1"
+    });
+    assert_eq!(
+        SessionConfigEventPayload::session_renamed_from_value(&selected),
+        None
+    );
+    // The CORE payload enum does not decode the config fact — raw
+    // tolerance is what keeps exhaustive consumers source-compatible.
+    assert!(serde_json::from_value::<EventPayload>(titled).is_err());
+}
+
 /// MUTATION CHECK: remove, rename, or reorder any project-instruction audit
 /// coordinate. Expected RUNTIME failure: the additive fact golden differs or
 /// no longer round-trips while remaining unknown to the core payload enum.

@@ -4311,6 +4311,7 @@ async fn scenario_2_real_uds_creates_attaches_and_replays_typed_session() {
             turn_count: Some(0),
             footprint_tokens: Some(0),
             footprint_truth: Some(ContextFootprintTruth::Exact),
+            title: None,
         }
     );
 
