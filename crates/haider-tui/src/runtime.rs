@@ -1421,6 +1421,13 @@ impl DemoDriver {
             } => {
                 model.apply_model_selected(&provider, &model_name);
             }
+            // G3: same defensive fabricated commit for the tuning twins.
+            AppRequest::SelectEffort { effort, .. } => {
+                model.apply_effort_selected(effort.as_deref());
+            }
+            AppRequest::SelectFast { enabled, .. } => {
+                model.apply_fast_selected(enabled);
+            }
             AppRequest::OAuthAddStart {
                 provider, attempt, ..
             } => {

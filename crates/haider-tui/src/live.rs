@@ -340,6 +340,23 @@ pub enum LiveCommand {
         model: String,
         provider: String,
     },
+    /// `session.select_effort` (G3): receipted per-pair effort selection.
+    /// DURABLE — a reconnect resends under the same command id and the
+    /// daemon replays the committed receipt. `None` reverts to the
+    /// provider default.
+    SelectEffort {
+        command_id: CommandId,
+        session: SessionId,
+        worker_generation: u64,
+        effort: Option<String>,
+    },
+    /// `session.select_fast` (G3): the receipted fast-mode toggle. DURABLE.
+    SelectFast {
+        command_id: CommandId,
+        session: SessionId,
+        worker_generation: u64,
+        enabled: bool,
+    },
     /// `provider.configure` CREATE for a custom OpenAI-compatible provider
     /// (W5g-4). Identity fields are fixed by the card: chat-completions
     /// family, api-key auth, enabled. The served model seeds the inventory
@@ -396,6 +413,8 @@ impl LiveCommand {
             Self::DeviceImport { command_id, .. } => Some(command_id),
             Self::SetDefaultModel { command_id, .. } => Some(command_id),
             Self::SelectModel { command_id, .. } => Some(command_id),
+            Self::SelectEffort { command_id, .. } => Some(command_id),
+            Self::SelectFast { command_id, .. } => Some(command_id),
             Self::ConfigureProvider { command_id, .. } => Some(command_id),
             Self::AccountAddOAuth { command_id, .. } => Some(command_id),
             Self::List { .. }
@@ -700,6 +719,21 @@ pub enum LiveReply {
         model: String,
         worker_generation: u64,
     },
+    /// `session.select_effort` committed (G3): the RESOLVED value — never
+    /// an echo of the request.
+    EffortSelected {
+        command_id: CommandId,
+        session: SessionId,
+        effort: Option<String>,
+        worker_generation: u64,
+    },
+    /// `session.select_fast` committed (G3).
+    FastSelected {
+        command_id: CommandId,
+        session: SessionId,
+        enabled: bool,
+        worker_generation: u64,
+    },
     /// `provider.configure` committed (W5g-4).
     ProviderConfigured {
         command_id: CommandId,
@@ -892,6 +926,10 @@ pub struct LiveDriver {
     /// In-flight `session.select_model` (F2a): the REQUESTED pair, so a
     /// typed refusal can land on the exact selection that asked.
     pending_model_select: Option<(CommandId, String, String)>,
+    /// In-flight `session.select_effort` (G3): failure correlation.
+    pending_effort_select: Option<CommandId>,
+    /// In-flight `session.select_fast` (G3): failure correlation.
+    pending_fast_select: Option<CommandId>,
     /// W10b in-flight removals: (command, alias/provider) — failures
     /// surface on the owning screen; successes come as typed replies.
     pending_account_remove: Option<(CommandId, String)>,
@@ -993,6 +1031,8 @@ impl LiveDriver {
             pending_account_select: None,
             pending_default_model: None,
             pending_model_select: None,
+            pending_effort_select: None,
+            pending_fast_select: None,
             pending_account_remove: None,
             pending_provider_remove: None,
             pending_custom: None,
@@ -1782,6 +1822,42 @@ impl LiveDriver {
                 model.apply_model_selected(&provider, &model_name);
                 Vec::new()
             }
+            LiveReply::EffortSelected {
+                command_id,
+                session,
+                effort,
+                worker_generation,
+            } => {
+                self.retire(&command_id);
+                if self
+                    .pending_effort_select
+                    .as_ref()
+                    .is_some_and(|id| *id == command_id)
+                {
+                    self.pending_effort_select = None;
+                }
+                self.generations.insert(session, worker_generation);
+                model.apply_effort_selected(effort.as_deref());
+                Vec::new()
+            }
+            LiveReply::FastSelected {
+                command_id,
+                session,
+                enabled,
+                worker_generation,
+            } => {
+                self.retire(&command_id);
+                if self
+                    .pending_fast_select
+                    .as_ref()
+                    .is_some_and(|id| *id == command_id)
+                {
+                    self.pending_fast_select = None;
+                }
+                self.generations.insert(session, worker_generation);
+                model.apply_fast_selected(enabled);
+                Vec::new()
+            }
             LiveReply::DefaultModelSet {
                 command_id,
                 provider,
@@ -2203,6 +2279,36 @@ impl LiveDriver {
                     model.model_select_failed(&provider, &model_name, &code, &message);
                     return Vec::new();
                 }
+                // A failed `session.select_effort` (G3): the typed public
+                // reason lands inline in the picker when it is open, as a
+                // session-view error line otherwise.
+                if let Some(id) = &command_id
+                    && self
+                        .pending_effort_select
+                        .as_ref()
+                        .is_some_and(|pending| pending == id)
+                    && self.pending_effort_select.take().is_some()
+                {
+                    if !retryable {
+                        self.retire(id);
+                    }
+                    model.effort_select_failed(&code, &message);
+                    return Vec::new();
+                }
+                // A failed `session.select_fast` (G3).
+                if let Some(id) = &command_id
+                    && self
+                        .pending_fast_select
+                        .as_ref()
+                        .is_some_and(|pending| pending == id)
+                    && self.pending_fast_select.take().is_some()
+                {
+                    if !retryable {
+                        self.retire(id);
+                    }
+                    model.fast_select_failed(&code, &message);
+                    return Vec::new();
+                }
                 // A failed `account.set_default_model` releases its gate;
                 // a revision_conflict also refreshes (the CAS proved the
                 // snapshot stale).
@@ -2535,8 +2641,41 @@ impl LiveDriver {
         // envelope for that session (review P1-3).
         if model.route_raw(envelope) == RawOutcome::Applied {
             self.record_menu(session, envelope);
+            self.apply_tuning_fact(model, session, envelope);
         }
         Vec::new()
+    }
+
+    /// G3: committed `effort_selected`/`fast_mode_selected` facts populate
+    /// the identity's tuning segment for the ACTIVE session — this is what
+    /// makes "daemon truth on session attach" real: an attach replays the
+    /// journal, and the latest fact wins in replay order. Select replies
+    /// land the same values; both writers agree because both are committed
+    /// daemon truth.
+    fn apply_tuning_fact(&self, model: &mut AppModel, session: &SessionId, envelope: &RawEnvelope) {
+        if model.active_session.as_ref() != Some(session) {
+            return;
+        }
+        let Ok(payload) = serde_json::from_value::<
+            haider_protocol::session::SessionConfigEventPayload,
+        >(envelope.payload.clone()) else {
+            return;
+        };
+        match payload {
+            haider_protocol::session::SessionConfigEventPayload::EffortSelected(selected) => {
+                if model.identity.reasoning != selected.effort {
+                    model.identity.reasoning = selected.effort;
+                    model.dirty = true;
+                }
+            }
+            haider_protocol::session::SessionConfigEventPayload::FastModeSelected(selected) => {
+                if model.identity.fast != selected.enabled {
+                    model.identity.fast = selected.enabled;
+                    model.dirty = true;
+                }
+            }
+            haider_protocol::session::SessionConfigEventPayload::ModelSelected(_) => {}
+        }
     }
 
     /// Record a menu's COMMITTED opening coordinates, and retire its answer
@@ -2886,6 +3025,28 @@ impl LiveDriver {
                     provider,
                 })]
             }
+            AppRequest::SelectEffort { session, effort } => {
+                let command_id = self.mint();
+                let worker_generation = self.generations.get(&session).copied().unwrap_or_default();
+                self.pending_effort_select = Some(command_id.clone());
+                vec![self.enqueue(LiveCommand::SelectEffort {
+                    command_id,
+                    session,
+                    worker_generation,
+                    effort,
+                })]
+            }
+            AppRequest::SelectFast { session, enabled } => {
+                let command_id = self.mint();
+                let worker_generation = self.generations.get(&session).copied().unwrap_or_default();
+                self.pending_fast_select = Some(command_id.clone());
+                vec![self.enqueue(LiveCommand::SelectFast {
+                    command_id,
+                    session,
+                    worker_generation,
+                    enabled,
+                })]
+            }
             AppRequest::ProviderConfigure {
                 attempt,
                 name,
@@ -3209,6 +3370,8 @@ const fn command_session(command: &LiveCommand) -> Option<&SessionId> {
         | LiveCommand::ShellExec { session, .. }
         | LiveCommand::ToolsInventory { session }
         | LiveCommand::SelectModel { session, .. }
+        | LiveCommand::SelectEffort { session, .. }
+        | LiveCommand::SelectFast { session, .. }
         | LiveCommand::Answer { session, .. } => Some(session),
         _ => None,
     }

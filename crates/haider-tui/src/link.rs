@@ -798,6 +798,29 @@ pub fn request_body(command: LiveCommand) -> RequestBody {
             model,
             provider: Some(provider),
         },
+        // G3: the receipted per-pair tuning selections.
+        LiveCommand::SelectEffort {
+            command_id,
+            session,
+            worker_generation,
+            effort,
+        } => RequestBody::SessionSelectEffort {
+            command_id,
+            session_id: session,
+            worker_generation,
+            effort,
+        },
+        LiveCommand::SelectFast {
+            command_id,
+            session,
+            worker_generation,
+            enabled,
+        } => RequestBody::SessionSelectFast {
+            command_id,
+            session_id: session,
+            worker_generation,
+            enabled,
+        },
         // W5g-4: the card CREATES — identity fields are fixed here, never
         // typed. The origin string is data on the wire only; it is never
         // interpolated into a shell or browser command (report §4.4).
@@ -1111,6 +1134,33 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
                 session: session_id,
                 provider,
                 model,
+                worker_generation,
+            }]
+        }),
+        // G3: the RESOLVED tuning — daemon truth, never a request echo.
+        ResponseBody::SessionSelectEffort {
+            session_id,
+            effort,
+            worker_generation,
+            ..
+        } => context.command_id.clone().map_or_else(Vec::new, |id| {
+            vec![LiveReply::EffortSelected {
+                command_id: id,
+                session: session_id,
+                effort,
+                worker_generation,
+            }]
+        }),
+        ResponseBody::SessionSelectFast {
+            session_id,
+            enabled,
+            worker_generation,
+            ..
+        } => context.command_id.clone().map_or_else(Vec::new, |id| {
+            vec![LiveReply::FastSelected {
+                command_id: id,
+                session: session_id,
+                enabled,
                 worker_generation,
             }]
         }),
