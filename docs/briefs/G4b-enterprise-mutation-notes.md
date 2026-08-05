@@ -147,3 +147,26 @@ the mantle pinning, availability, and gcloud persistence laws.
   vice versa.
 - `git status --porcelain` verified clean after the final revert; the
   kills left no residue in the tree.
+
+## Review of record (coordinator, executed post-lane)
+
+Read the branch diff (31 files, no dep/lockfile drift — re-verified the
+lane's own git-add-A audit). Spot-verdicts:
+
+1. gcloud shell-out is injection-free by construction: fixed argv
+   ["auth", "print-access-token"], no shell, stdin null, bounded output,
+   Zeroizing stdout, secret-free typed errors. Accepted as-is.
+2. Enterprise origin mutability is scoped by explicit provider-name
+   match and shape validators; `enterprise_origin_reconfigure_is_shape_
+   validated` pins accept AND refuse directions; the pre-existing
+   `existing_custom_provider_identity_fields_are_create_only` law
+   survives untouched. Honest residual: the refusal of builtin origin
+   reconfiguration for NON-enterprise ids predates this wave and rests
+   on its own pre-existing guard, not a G4b law.
+3. Seeded-inventory predicate reviewed: bedrock/vertex by name, azure by
+   Custom-provenance + origin shape — G4a's discovery-only rule intact
+   for every other custom (law la_seeded_list… + LZ2 observe it).
+
+Lane's 10 kills spot-checked against the notes; no discrepancies. No
+unobserved gate warranting an executed review mutation. Campaign
+ACCEPTED. Ledger 2010 confirmed.
