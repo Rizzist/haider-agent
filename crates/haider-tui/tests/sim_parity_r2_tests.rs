@@ -610,13 +610,14 @@ fn ctrl_g_toggles_the_token_panel_and_esc_closes_it() {
 
 #[test]
 fn palette_and_menu_selection_wrap_around() {
-    // Palette: /t in session → 4 rows; Up from 0 wraps to the last.
+    // Palette: /t in session → 5 rows (T2 added `/talk`); Up from 0
+    // wraps to the last.
     let mut model = session_model();
     for c in "/t".chars() {
         model.handle(key(KeyCode::Char(c)));
     }
     model.handle(key(KeyCode::Up));
-    assert_eq!(model.palette_selection, 3);
+    assert_eq!(model.palette_selection, 4);
     model.handle(key(KeyCode::Down));
     assert_eq!(model.palette_selection, 0, "down from last wraps home");
 

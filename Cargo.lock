@@ -1174,6 +1174,7 @@ dependencies = [
  "haider-client",
  "haider-protocol",
  "haider-rpc",
+ "haider-stt",
  "image",
  "ratatui",
  "ratatui-image",

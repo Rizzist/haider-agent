@@ -121,6 +121,10 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
 const PLACEHOLDER_LAUNCHER: &str = "start a session — describe the task, or / for commands";
 const PLACEHOLDER_SESSION: &str =
     "message haider — ⏎ send · ⇧⏎ newline · / commands · paste images/text";
+/// T2: the short placeholder while a talk session is engaged — the wave +
+/// chip need the first row's right side, and the three-gesture contract
+/// IS the relevant hint.
+const PLACEHOLDER_TALK: &str = "speak — ⏎ send · esc cancel";
 /// Sim palette hint (`CmdMenu .chint`), pinned at the palette's BOTTOM.
 const PALETTE_HINT: &str = "↑↓ options · tab complete · ⏎ run · esc dismiss";
 /// Fixed command-name column (sim `.cname` flex-basis), in cells.
@@ -4440,6 +4444,11 @@ fn composer_height(model: &AppModel, width: u16) -> u16 {
     if model.login.is_some() {
         return LOGIN_CARD_ROWS;
     }
+    // T2: the `/talk` setup card replaces the composer the same way (its
+    // row count is stage-dependent).
+    if let Some(card) = model.talk_setup.as_ref() {
+        return card.height();
+    }
     // The `/theme` picker replaces the composer on its surfaces (owner
     // spec §3) — same input-replacement law as a blocking menu. A daemon
     // card outranks it (render_session keeps the menu branch first).
@@ -4453,7 +4462,15 @@ fn composer_height(model: &AppModel, width: u16) -> u16 {
     // height and paint (`render_composer`) share this same predicate, so
     // the band's geometry can never disagree with what lands in it.
     let chips = u16::from(model.composer.has_attachments());
-    u16::try_from(rows).unwrap_or(1).saturating_add(chips)
+    // T2: the partial-transcript ghost row claims ONE row above the text
+    // rows too — same shared-predicate discipline
+    // (`AppModel::talk_ghost_visible`), and CHROME by law: nothing here
+    // touches the transcript projection.
+    let ghost = u16::from(model.talk_ghost_visible());
+    u16::try_from(rows)
+        .unwrap_or(1)
+        .saturating_add(chips)
+        .saturating_add(ghost)
 }
 
 /// The gold rule + composer rows on the input ground (sim InputBar,
@@ -4524,6 +4541,22 @@ fn render_composer(
     // row the layout granted). The text rows — and their click windows —
     // shift down by exactly the carved row.
     let mut row_area = row_area;
+    // T2: the partial-transcript ghost row carves the VERY top of the
+    // band (dim, replaced per partial, realized into the composer on
+    // commit). Same shared predicate as `composer_height`; chrome only —
+    // it emits no hits and never enters the transcript.
+    if model.talk_ghost_visible() && row_area.height > 1 {
+        frame.render_widget(
+            Paragraph::new(talk_ghost_line(model, theme, row_area.width))
+                .style(theme.input_style()),
+            Rect {
+                height: 1,
+                ..row_area
+            },
+        );
+        row_area.y += 1;
+        row_area.height -= 1;
+    }
     if model.login.is_none() && model.composer.has_attachments() && row_area.height > 1 {
         frame.render_widget(
             Paragraph::new(attachment_chip_line(model, theme)).style(theme.input_style()),
@@ -4598,6 +4631,241 @@ fn attachment_chip_line(model: &AppModel, theme: &Theme) -> Line<'static> {
         theme.dim_style(),
     ));
     Line::from(spans)
+}
+
+/// T2 — the partial-transcript ghost row: `◉ <text>` in the dim slot,
+/// replaced per partial. Overlong text keeps its TAIL (the newest words
+/// are what the speaker is watching land) behind a leading `…`.
+fn talk_ghost_line(model: &AppModel, theme: &Theme, width: u16) -> Line<'static> {
+    let budget = usize::from(width).saturating_sub(COMPOSER_PAD + 4).max(4);
+    let ghost = model.talk.ghost.trim();
+    let chars: Vec<char> = ghost.chars().collect();
+    let text = if chars.len() > budget {
+        let tail: String = chars[chars.len() - (budget.saturating_sub(1))..]
+            .iter()
+            .collect();
+        format!("…{tail}")
+    } else {
+        ghost.to_owned()
+    };
+    Line::from(vec![
+        Span::raw(" ".repeat(COMPOSER_PAD)),
+        Span::styled("◉ ".to_owned(), theme.gold_style()),
+        Span::styled(text, theme.dim_style()),
+    ])
+}
+
+/// T2 — the right-to-left wave's spans: one glyph per ring slot, newest at
+/// the right edge. Hot columns wear the gold slot, quiet history the
+/// faint slot — theme tokens only (the mechanical no-raw-color law covers
+/// this seam like every other).
+fn talk_wave_spans(model: &AppModel, theme: &Theme) -> Vec<Span<'static>> {
+    model
+        .talk
+        .wave
+        .cells()
+        .into_iter()
+        .map(|cell| {
+            let glyph = crate::talk::wave_glyph(cell, model.talk.wave_plain);
+            let style = if cell.hot {
+                theme.gold_style()
+            } else {
+                theme.faint_style()
+            };
+            Span::styled(glyph.to_string(), style)
+        })
+        .collect()
+}
+
+/// T2 — the `/talk` setup card's band lines. Handed STATES, never the
+/// key: the key field renders a capped mask length (the login-card law).
+fn talk_setup_lines(card: &crate::talk::TalkSetupCard, theme: &Theme) -> Vec<Line<'static>> {
+    use crate::talk::{KeyStage, RuntimeRowState, SetupStage, WhisperRowState};
+    const MASK_CAP: usize = 32;
+    let mut lines = Vec::new();
+    let stage_label = match card.stage {
+        SetupStage::Engine => "engine",
+        SetupStage::Local => "local whisper",
+        SetupStage::DeepgramKey => "deepgram · API key",
+        SetupStage::DeepgramModels => "deepgram · model",
+        SetupStage::Language => "deepgram · language",
+    };
+    lines.push(Line::from(vec![Span::styled(
+        format!("  ◉ talk setup — {stage_label}"),
+        theme.gold_style(),
+    )]));
+    let marker = |selected: bool| {
+        if selected {
+            Span::styled("  ❯ ".to_owned(), theme.gold_style())
+        } else {
+            Span::raw("    ")
+        }
+    };
+    let row_ink = |selected: bool| {
+        if selected {
+            theme.bright_style()
+        } else {
+            theme.text_style()
+        }
+    };
+    match card.stage {
+        SetupStage::Engine => {
+            let rows = [
+                "[1] local whisper — on-device, shares the Diff Forge model dir",
+                "[2] deepgram — cloud streaming with your API key",
+            ];
+            for (index, row) in rows.iter().enumerate() {
+                let selected = card.selection == index;
+                lines.push(Line::from(vec![
+                    marker(selected),
+                    Span::styled((*row).to_owned(), row_ink(selected)),
+                ]));
+            }
+        }
+        SetupStage::Local => {
+            if card.loaded {
+                for (index, row) in card.whisper.iter().enumerate() {
+                    let selected = card.selection == index;
+                    let (state_text, state_style) = match &row.state {
+                        WhisperRowState::Installed => ("✓ installed".to_owned(), theme.ok_style()),
+                        WhisperRowState::Absent => ("⏎ download".to_owned(), theme.dim_style()),
+                        WhisperRowState::Downloading { percent } => (
+                            percent.map_or_else(
+                                || "↓ downloading…".to_owned(),
+                                |value| format!("↓ {value}%"),
+                            ),
+                            theme.gold_style(),
+                        ),
+                        WhisperRowState::Failed(message) => {
+                            (format!("✗ {message}"), theme.err_style())
+                        }
+                    };
+                    lines.push(Line::from(vec![
+                        marker(selected),
+                        Span::styled(format!("{} · {}  ", row.id, row.detail), row_ink(selected)),
+                        Span::styled(state_text, state_style),
+                    ]));
+                }
+                let runtime_selected = card.selection == card.whisper.len();
+                let (runtime_text, runtime_style) = match &card.runtime {
+                    RuntimeRowState::Unknown => ("checking…".to_owned(), theme.dim_style()),
+                    RuntimeRowState::Found(path) => (format!("✓ {path}"), theme.ok_style()),
+                    RuntimeRowState::Missing(hint) => (
+                        format!("✗ missing — ⏎ install · {hint}"),
+                        theme.warn_style(),
+                    ),
+                    RuntimeRowState::Installing => ("↓ installing…".to_owned(), theme.gold_style()),
+                    RuntimeRowState::Failed(message) => (format!("✗ {message}"), theme.err_style()),
+                };
+                lines.push(Line::from(vec![
+                    marker(runtime_selected),
+                    Span::styled("whisper-cli  ".to_owned(), row_ink(runtime_selected)),
+                    Span::styled(runtime_text, runtime_style),
+                ]));
+            } else {
+                lines.push(Line::from(Span::styled(
+                    "    loading the shared model dir…".to_owned(),
+                    theme.dim_style(),
+                )));
+            }
+        }
+        SetupStage::DeepgramKey => {
+            let (field, status): (Line<'static>, Line<'static>) = match card.key_stage {
+                KeyStage::Reuse => (
+                    Line::from(vec![
+                        Span::styled("    key ❯ ".to_owned(), theme.gold_style()),
+                        Span::styled("●●●●●●●● (vaulted)".to_owned(), theme.dim_style()),
+                    ]),
+                    Line::from(Span::styled(
+                        "    ⏎ reuse the vaulted key · r retype".to_owned(),
+                        theme.dim_style(),
+                    )),
+                ),
+                KeyStage::Entry => (
+                    Line::from(vec![
+                        Span::styled("    key ❯ ".to_owned(), theme.gold_style()),
+                        Span::styled(
+                            "●".repeat(card.masked_len().min(MASK_CAP)),
+                            theme.bright_style(),
+                        ),
+                        Span::styled("▏".to_owned(), theme.gold_style()),
+                    ]),
+                    Line::from(Span::styled(
+                        "    paste your Deepgram API key · ⏎ validates against /v1/auth/token"
+                            .to_owned(),
+                        theme.dim_style(),
+                    )),
+                ),
+                KeyStage::Validating => (
+                    Line::from(Span::styled(
+                        "    key ❯ ●●●●●●●●".to_owned(),
+                        theme.dim_style(),
+                    )),
+                    Line::from(Span::styled(
+                        "    validating the key + fetching streaming models…".to_owned(),
+                        theme.gold_style(),
+                    )),
+                ),
+                KeyStage::Storing => (
+                    Line::from(Span::styled(
+                        "    key ❯ ●●●●●●●●".to_owned(),
+                        theme.dim_style(),
+                    )),
+                    Line::from(Span::styled(
+                        "    key accepted — vaulting it in the daemon…".to_owned(),
+                        theme.gold_style(),
+                    )),
+                ),
+            };
+            lines.push(field);
+            lines.push(status);
+        }
+        SetupStage::DeepgramModels => {
+            if card.models.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "    no streaming models fetched".to_owned(),
+                    theme.dim_style(),
+                )));
+            } else {
+                // Window of 5 rows following the selection.
+                let window = 5usize;
+                let skip = card.selection.saturating_sub(window - 1);
+                for (index, model_row) in card.models.iter().enumerate().skip(skip).take(window) {
+                    let selected = card.selection == index;
+                    lines.push(Line::from(vec![
+                        marker(selected),
+                        Span::styled(model_row.name.clone(), row_ink(selected)),
+                        Span::styled(format!("  {}", model_row.languages), theme.dim_style()),
+                    ]));
+                }
+            }
+        }
+        SetupStage::Language => {
+            lines.push(Line::from(vec![
+                Span::styled("    language ❯ ".to_owned(), theme.gold_style()),
+                Span::styled(card.language.clone(), theme.bright_style()),
+                Span::styled("▏".to_owned(), theme.gold_style()),
+            ]));
+        }
+    }
+    if let Some(error) = &card.error {
+        lines.push(Line::from(Span::styled(
+            format!("    ⚠ {error}"),
+            theme.err_style(),
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        match card.stage {
+            SetupStage::Engine => "  esc close · ↑↓ or 1-2 pick · ⏎ select",
+            SetupStage::Local => "  esc close · ↑↓ pick · ⏎ use / download",
+            SetupStage::DeepgramKey => "  esc close · paste + ⏎",
+            SetupStage::DeepgramModels => "  esc close · ↑↓ pick · ⏎ select",
+            SetupStage::Language => "  esc close · e.g. en, en-US, multi · ⏎ save",
+        }
+        .to_owned(),
+        theme.faint_style(),
+    )));
+    lines
 }
 
 /// One composer text row's clickable window (TUI5 item 5): where its
@@ -4722,6 +4990,14 @@ fn composer_lines<'a>(
         lines.truncate(usize::from(allocated).max(1));
         return (lines, None, Vec::new());
     }
+    // T2: the `/talk` setup card owns the band the same way — no click
+    // windows, no talk chip (its key field is a secret surface, exactly
+    // the login card's reasoning).
+    if let Some(card) = model.talk_setup.as_ref() {
+        let mut lines = talk_setup_lines(card, theme);
+        lines.truncate(usize::from(allocated).max(1));
+        return (lines, None, Vec::new());
+    }
     let sigil = Span::styled(
         "❯ ",
         theme
@@ -4741,22 +5017,45 @@ fn composer_lines<'a>(
     } else {
         (theme.frame_style(), theme.gold_style())
     };
-    let talk_label = if model.listening {
-        "◉ listening…"
-    } else {
-        "◉ talk"
-    };
+    // T2: the label follows the live phase (`◉ transcribing…` while the
+    // engine assembles); demo listening keeps the sim wording through the
+    // same method.
+    let talk_label = model.talk_chip_label();
     let chip_spans = chip_two_tone(talk_label.to_owned(), talk_chrome, talk_ink);
     let chip_width = Line::from(chip_spans.clone()).width();
     // Right-aligned talk chip when the row leaves room (2-col right pad).
     // Hidden on the subagent and aura screens (sim §4.1 — aura has its own
     // hold-to-talk button).
     let talk_here = matches!(model.screen, Screen::Session | Screen::Launcher);
+    // T2 — the right-to-left wave rides the SAME first row, directly left
+    // of the chip, while audio flows. Fixed WAVE_WIDTH cells + one
+    // separating space; on a band too narrow for both, the wave yields
+    // and the chip keeps its original fit.
+    let wave_spans: Option<Vec<Span<'static>>> = (model.screen == Screen::Session
+        && model.talk.wave_active())
+    .then(|| talk_wave_spans(model, theme));
+    let wave_cols = wave_spans
+        .as_ref()
+        .map_or(0, |_| crate::talk::WAVE_WIDTH + 1);
     let chip_fit = |spans: &mut Vec<Span<'a>>| -> Option<(u16, u16)> {
         if !talk_here {
             return None;
         }
         let used = Line::from(spans.clone()).width();
+        let with_wave = used + chip_width + COMPOSER_PAD + wave_cols;
+        if wave_cols > 0 && (width as usize) > with_wave {
+            let filler = width as usize - with_wave;
+            spans.push(Span::raw(" ".repeat(filler)));
+            if let Some(wave) = wave_spans.clone() {
+                spans.extend(wave);
+            }
+            spans.push(Span::raw(" "));
+            spans.extend(chip_spans.clone());
+            return Some((
+                u16::try_from(used + filler + wave_cols).unwrap_or(0),
+                u16::try_from(chip_width).unwrap_or(0),
+            ));
+        }
         let total = used + chip_width + COMPOSER_PAD;
         if (width as usize) > total {
             let filler = width as usize - total;
@@ -4773,6 +5072,9 @@ fn composer_lines<'a>(
 
     if model.composer.is_empty() {
         let placeholder = match model.screen {
+            // T2: while talk is engaged the gesture contract replaces the
+            // long copy (and leaves the first row room for wave + chip).
+            Screen::Session if model.talk.engaged() => PLACEHOLDER_TALK.to_owned(),
             Screen::Launcher => PLACEHOLDER_LAUNCHER.to_owned(),
             // Sim SubComposer placeholder (tui.js:3430-3483).
             Screen::Subagent => model.viewed_chip().map_or_else(

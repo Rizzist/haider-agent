@@ -97,6 +97,13 @@ pub const COMMANDS: &[CommandSpec] = &[
         "Speak a turn (simulated STT) — needs voice enabled",
         "<words>",
     ),
+    // T2 registry extension (no sim counterpart): live dictation into the
+    // composer — local whisper or Deepgram, chosen in `/talk setup`.
+    session_cmd(
+        "talk",
+        "Dictate into the composer — ⏎ sends, esc cancels, typing keeps it",
+        "[setup·wave]",
+    ),
     session_cmd(
         "tools",
         "Tools — the core surface plus custom tools you register",
@@ -371,6 +378,7 @@ pub const HELP_TEXT: &[&str] = &[
     "  /hooks             hooks screen — daemon-discovered hooks · digest trust/revoke · recent firings",
     "  /voice             enable voice · pick STT / TTS providers (menu card) — demo only",
     "  /say <words>       speak a turn once voice is on (simulated STT) — demo only",
+    "  /talk [setup·wave] dictate into the composer (live) — ◉ chip or /talk toggles; ⏎ sends · esc cancels · typing keeps the words",
     "  /tools             core + custom tools · register with a dispatch mode (menu card) — demo only",
     "  /queue <steer|turn> mid-turn input mode — steer at safe boundary, or hold until turn end",
     "  /update            check for updates — FULL-SCREEN startup gate (harness-level)",

@@ -30,7 +30,7 @@ pub enum TranscriptionEngine {
 }
 
 /// The durable transcription preferences.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TranscriptionConfig {
     #[serde(default)]
     pub engine: TranscriptionEngine,
