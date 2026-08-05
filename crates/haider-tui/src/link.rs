@@ -765,6 +765,22 @@ pub fn request_body(command: LiveCommand) -> RequestBody {
             model,
             expected_revision,
         },
+        // F2a: the picker's receipted pair selection. The provider ALWAYS
+        // rides along — a picker row is a model × provider pair (absent
+        // provider is the legacy in-provider form other clients send).
+        LiveCommand::SelectModel {
+            command_id,
+            session,
+            worker_generation,
+            model,
+            provider,
+        } => RequestBody::SessionSelectModel {
+            command_id,
+            session_id: session,
+            worker_generation,
+            model,
+            provider: Some(provider),
+        },
         // W5g-4: the card CREATES — identity fields are fixed here, never
         // typed. The origin string is data on the wire only; it is never
         // interpolated into a shell or browser command (report §4.4).
@@ -1054,6 +1070,23 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
                 }]
             })
         }
+        // F2a: the RESOLVED pair — the reply reports daemon truth, never
+        // an echo of the request (R2).
+        ResponseBody::SessionSelectModel {
+            session_id,
+            provider,
+            model,
+            worker_generation,
+            ..
+        } => context.command_id.clone().map_or_else(Vec::new, |id| {
+            vec![LiveReply::ModelSelected {
+                command_id: id,
+                session: session_id,
+                provider,
+                model,
+                worker_generation,
+            }]
+        }),
         ResponseBody::ProviderConfigure { provider, revision } => {
             context.command_id.clone().map_or_else(Vec::new, |id| {
                 vec![LiveReply::ProviderConfigured {

@@ -15,10 +15,13 @@ pub struct CommandSpec {
 /// Sim-parity registry, same order.
 pub const COMMANDS: &[CommandSpec] = &[
     cmd("help", "Show all commands", ""),
-    session_cmd(
+    // F2a: /model works EVERYWHERE — in a session it switches the live
+    // pair (receipted select_model); at the launcher it sets the default
+    // pair new sessions use. Bare /model opens the full-screen picker.
+    cmd(
         "model",
-        "Switch the active model for this session",
-        "[name]",
+        "Pick a model — every provider, full-screen search",
+        "[query]",
     ),
     session_cmd("provider", "Switch provider — the model follows", "[name]"),
     cmd(
@@ -180,8 +183,7 @@ pub const PALETTE_MAX_ROWS: usize = 8;
 /// one account command this release makes executable.
 #[must_use]
 pub fn has_arg_slots(name: &str) -> bool {
-    // W5e-3 adds the three DISCOVERED slots. `/model` and `/provider` are
-    // session-scoped commands; `/account` works anywhere.
+    // W5e-3 adds the DISCOVERED slots; `/account` works anywhere.
     //
     // `/theme` is deliberately ABSENT (ui-themes-fix, live probe): the
     // picker is bare /theme's argument experience, so ⏎ on the `/theme`
@@ -189,16 +191,21 @@ pub fn has_arg_slots(name: &str) -> bool {
     // onto the highlighted `system` arg row, and the picker never opened
     // in the natural typed flow. Typed fragments (`/theme li…`) still
     // complete through the argument-position arm in `palette_items`.
-    matches!(name, "login" | "model" | "provider" | "account")
+    //
+    // `/model` joins `/theme` here (F2a — HEEDED HISTORY): the full-screen
+    // picker is bare /model's argument experience, so ⏎ on the `/model`
+    // row must RUN it and open the picker — never lead-jump onto an arg
+    // row. Tab still completes through `offers_arg_completions`.
+    matches!(name, "login" | "provider" | "account")
 }
 
 /// Commands whose argument slot TAB can open (`/theme ` completions
 /// included): a superset of [`has_arg_slots`]. Tab is an explicit "give
-/// me the slot" gesture, so `/theme` keeps its completions here while ⏎
-/// runs it (and opens the picker).
+/// me the slot" gesture, so `/theme` and `/model` keep their completions
+/// here while ⏎ runs them (and opens their pickers).
 #[must_use]
 pub fn offers_arg_completions(name: &str) -> bool {
-    name == "theme" || has_arg_slots(name)
+    matches!(name, "theme" | "model") || has_arg_slots(name)
 }
 
 /// `/login`'s two argument slots: provider, then method. Slot 0 names the

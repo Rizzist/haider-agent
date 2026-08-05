@@ -130,25 +130,42 @@ fn dynamic_slots_filter_by_prefix() {
     assert_eq!(offered, vec!["gpt-5.6-codex"]);
 }
 
-/// Selecting a discovered model applies it; an undiscovered one is REFUSED
-/// with an honest message instead of being silently accepted.
+/// Selecting a discovered model applies it; an undiscovered one cannot be
+/// selected at all. F2a re-homes this law onto the full-screen picker:
+/// `/model <query>` pre-fills the search, ⏎ selects the highlighted
+/// DISCOVERED row, and a query matching nothing leaves everything as it
+/// was (the picker stays open, honest and empty — never a silent accept).
 #[test]
 fn selecting_a_model_requires_it_to_be_discovered() {
+    use ratatui::crossterm::event::KeyCode;
     let mut model = model_with_catalog();
     run_slash(&mut model, "/model o4-mini");
+    let picker = model.model_picker.as_ref().expect("the picker opens");
+    assert_eq!(picker.query, "o4-mini", "the query pre-fills the search");
+    let rows = model.model_picker_filtered("o4-mini");
+    assert_eq!(rows.len(), 1, "exactly the discovered pair matches");
+    assert_eq!(rows[0].provider, "openai");
+    model.handle(common::key(KeyCode::Enter));
+    assert!(model.model_picker.is_none(), "selection closes the picker");
     assert_eq!(model.identity.model_short, "o4-mini");
-    assert_eq!(model.flash.as_deref(), Some("· model → o4-mini"));
+    assert_eq!(model.identity.provider, "openai");
 
     run_slash(&mut model, "/model gpt-9-imaginary");
+    assert!(
+        model.model_picker_filtered("gpt-9-imaginary").is_empty(),
+        "an undiscovered model matches no row"
+    );
+    model.handle(common::key(KeyCode::Enter));
     assert_eq!(
         model.identity.model_short, "o4-mini",
         "an undiscovered model must not be applied"
     );
-    let flash = model.flash.as_deref().unwrap_or_default();
     assert!(
-        flash.contains("not in this provider's discovered models"),
-        "and must say so: {flash:?}"
+        model.model_picker.is_some(),
+        "nothing to select — the picker stays open instead of guessing"
     );
+    model.handle(common::key(KeyCode::Esc));
+    assert!(model.model_picker.is_none(), "esc closes without selecting");
 }
 
 /// With no catalog AND no daemon feature, `/model` names the stale daemon

@@ -138,7 +138,10 @@ fn a_pinned_choice_survives_every_later_snapshot() {
         },
     );
     model.identity.provider = "openai-oauth".to_owned();
+    // F2a: /model opens the full-screen picker pre-filtered; ⏎ selects
+    // the highlighted discovered row — still an explicit user choice.
     run_slash(&mut model, "/model o4-mini");
+    model.handle(common::key(ratatui::crossterm::event::KeyCode::Enter));
     assert_eq!(model.identity.model_short, "o4-mini");
     assert!(model.identity_pinned, "/model is an explicit choice");
 

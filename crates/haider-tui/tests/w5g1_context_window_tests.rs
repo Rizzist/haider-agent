@@ -161,7 +161,9 @@ fn a_late_catalog_updates_even_a_pinned_identity() {
         },
     );
     model.identity.provider = "openai-oauth".to_owned();
+    // F2a: /model opens the picker pre-filtered; ⏎ selects the row.
     run_slash(&mut model, "/model gpt-5.6-sol");
+    model.handle(common::key(ratatui::crossterm::event::KeyCode::Enter));
     assert!(model.identity_pinned, "/model is an explicit choice");
     assert_eq!(model.identity.context_window, seed);
 
@@ -220,6 +222,7 @@ fn the_model_picker_adopts_the_picked_models_window() {
     assert_eq!(model.identity.context_window, 272_000);
 
     run_slash(&mut model, "/model gpt-5.3-codex-spark");
+    model.handle(common::key(ratatui::crossterm::event::KeyCode::Enter));
 
     assert_eq!(model.identity.model_short, "gpt-5.3-codex-spark");
     assert_eq!(

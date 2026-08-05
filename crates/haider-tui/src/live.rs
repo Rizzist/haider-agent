@@ -325,6 +325,16 @@ pub enum LiveCommand {
         model: String,
         expected_revision: u64,
     },
+    /// `session.select_model` (F2a/F1): receipted live-session pair
+    /// selection. DURABLE — a reconnect resends under the same command id
+    /// and the daemon replays the committed receipt.
+    SelectModel {
+        command_id: CommandId,
+        session: SessionId,
+        worker_generation: u64,
+        model: String,
+        provider: String,
+    },
     /// `provider.configure` CREATE for a custom OpenAI-compatible provider
     /// (W5g-4). Identity fields are fixed by the card: chat-completions
     /// family, api-key auth, enabled. The served model seeds the inventory
@@ -359,6 +369,7 @@ impl LiveCommand {
             Self::AccountSetActive { command_id, .. } => Some(command_id),
             Self::DeviceImport { command_id, .. } => Some(command_id),
             Self::SetDefaultModel { command_id, .. } => Some(command_id),
+            Self::SelectModel { command_id, .. } => Some(command_id),
             Self::ConfigureProvider { command_id, .. } => Some(command_id),
             Self::AccountAddOAuth { command_id, .. } => Some(command_id),
             Self::List { .. }
@@ -635,6 +646,15 @@ pub enum LiveReply {
         provider: haider_rpc::ProviderSummaryWire,
         revision: u64,
     },
+    /// `session.select_model` committed (F2a): the RESOLVED pair — never
+    /// an echo of the request.
+    ModelSelected {
+        command_id: CommandId,
+        session: SessionId,
+        provider: String,
+        model: String,
+        worker_generation: u64,
+    },
     /// `provider.configure` committed (W5g-4).
     ProviderConfigured {
         command_id: CommandId,
@@ -805,6 +825,9 @@ pub struct LiveDriver {
     pending_account_select: Option<(CommandId, String)>,
     /// The in-flight `account.set_default_model`: (command, provider).
     pending_default_model: Option<(CommandId, String)>,
+    /// In-flight `session.select_model` (F2a): the REQUESTED pair, so a
+    /// typed refusal can land on the exact selection that asked.
+    pending_model_select: Option<(CommandId, String, String)>,
     /// W10b in-flight removals: (command, alias/provider) — failures
     /// surface on the owning screen; successes come as typed replies.
     pending_account_remove: Option<(CommandId, String)>,
@@ -905,6 +928,7 @@ impl LiveDriver {
             login_started: None,
             pending_account_select: None,
             pending_default_model: None,
+            pending_model_select: None,
             pending_account_remove: None,
             pending_provider_remove: None,
             pending_custom: None,
@@ -1658,6 +1682,25 @@ impl LiveDriver {
                 }
                 Vec::new()
             }
+            LiveReply::ModelSelected {
+                command_id,
+                session,
+                provider,
+                model: model_name,
+                worker_generation,
+            } => {
+                self.retire(&command_id);
+                if self
+                    .pending_model_select
+                    .as_ref()
+                    .is_some_and(|(id, _, _)| *id == command_id)
+                {
+                    self.pending_model_select = None;
+                }
+                self.generations.insert(session, worker_generation);
+                model.apply_model_selected(&provider, &model_name);
+                Vec::new()
+            }
             LiveReply::DefaultModelSet {
                 command_id,
                 provider,
@@ -2060,6 +2103,23 @@ impl LiveDriver {
                     }
                     model.providers.message = Some(format!("`{provider}` not removed — {message}"));
                     model.dirty = true;
+                    return Vec::new();
+                }
+                // A failed `session.select_model` (F2a): the typed public
+                // reason lands on the exact selection that asked — inline
+                // in the picker when it is open, as a session-view error
+                // line otherwise. The row stays selectable for a retry.
+                if let Some(id) = &command_id
+                    && self
+                        .pending_model_select
+                        .as_ref()
+                        .is_some_and(|(pending, _, _)| pending == id)
+                    && let Some((_, provider, model_name)) = self.pending_model_select.take()
+                {
+                    if !retryable {
+                        self.retire(id);
+                    }
+                    model.model_select_failed(&provider, &model_name, &code, &message);
                     return Vec::new();
                 }
                 // A failed `account.set_default_model` releases its gate;
@@ -2700,6 +2760,23 @@ impl LiveDriver {
                     expected_revision,
                 })]
             }
+            AppRequest::SelectModel {
+                session,
+                model: model_name,
+                provider,
+            } => {
+                let command_id = self.mint();
+                let worker_generation = self.generations.get(&session).copied().unwrap_or_default();
+                self.pending_model_select =
+                    Some((command_id.clone(), provider.clone(), model_name.clone()));
+                vec![self.enqueue(LiveCommand::SelectModel {
+                    command_id,
+                    session,
+                    worker_generation,
+                    model: model_name,
+                    provider,
+                })]
+            }
             AppRequest::ProviderConfigure {
                 attempt,
                 name,
@@ -3010,6 +3087,7 @@ const fn command_session(command: &LiveCommand) -> Option<&SessionId> {
         | LiveCommand::AgentMessage { session, .. }
         | LiveCommand::ShellExec { session, .. }
         | LiveCommand::ToolsInventory { session }
+        | LiveCommand::SelectModel { session, .. }
         | LiveCommand::Answer { session, .. } => Some(session),
         _ => None,
     }

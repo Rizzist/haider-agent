@@ -74,17 +74,23 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
     };
     let [body, status] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(status_height)]).areas(area);
-    match model.screen {
-        Screen::Boot => render_boot(model, theme, frame, body),
-        Screen::Launcher => render_launcher(model, theme, frame, body, &mut hits),
-        Screen::Session => render_session(model, theme, frame, body, &mut hits),
-        Screen::Tree => render_tree(model, theme, frame, body, &mut hits),
-        Screen::Tools => render_tools(model, theme, frame, body),
-        Screen::Subagent => render_subagent(model, theme, frame, body, &mut hits),
-        Screen::Aura => render_aura(model, theme, frame, body, &mut hits),
-        Screen::Accounts => render_accounts(model, theme, frame, body, &mut hits),
-        Screen::Providers => render_providers(model, theme, frame, body, &mut hits),
-        Screen::Hooks => render_hooks(model, theme, frame, body, &mut hits),
+    // F2a: the full-screen /model picker COVERS the body while open —
+    // it owns the keys, so it owns the pixels and the hit map too.
+    if model.model_picker.is_some() {
+        render_model_picker(model, theme, frame, body, &mut hits);
+    } else {
+        match model.screen {
+            Screen::Boot => render_boot(model, theme, frame, body),
+            Screen::Launcher => render_launcher(model, theme, frame, body, &mut hits),
+            Screen::Session => render_session(model, theme, frame, body, &mut hits),
+            Screen::Tree => render_tree(model, theme, frame, body, &mut hits),
+            Screen::Tools => render_tools(model, theme, frame, body),
+            Screen::Subagent => render_subagent(model, theme, frame, body, &mut hits),
+            Screen::Aura => render_aura(model, theme, frame, body, &mut hits),
+            Screen::Accounts => render_accounts(model, theme, frame, body, &mut hits),
+            Screen::Providers => render_providers(model, theme, frame, body, &mut hits),
+            Screen::Hooks => render_hooks(model, theme, frame, body, &mut hits),
+        }
     }
     if model.help_open {
         render_help(theme, frame, body);
@@ -1768,6 +1774,216 @@ fn render_providers(
             hit,
         ));
     }
+}
+
+/// F2a — the full-screen `/model` picker: search bar on top, one row per
+/// model × provider pair (auth flavor + context window beside), the
+/// session's CURRENT pair and each provider's default marked, unavailable
+/// rows dimmed with their reason, honest inline errors.
+fn render_model_picker(
+    model: &AppModel,
+    theme: &Theme,
+    frame: &mut Frame<'_>,
+    area: Rect,
+    hits: &mut Vec<(Rect, Hit)>,
+) {
+    let Some(picker) = &model.model_picker else {
+        return;
+    };
+    if area.height < 4 || area.width < 8 {
+        return;
+    }
+    let rows = model.model_picker_filtered(&picker.query);
+    let [title_area, search_area, note_area, list_area, hint_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .areas(area);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                " MODELS",
+                theme
+                    .bright_style()
+                    .add_modifier(ratatui::style::Modifier::BOLD),
+            ),
+            Span::styled(
+                " — every provider · one line per model × provider pair",
+                theme.dim_style(),
+            ),
+        ])),
+        title_area,
+    );
+    // The search band: live substring over model + provider.
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" ❯ ", theme.gold_style()),
+            Span::styled(picker.query.clone(), theme.input_style()),
+            Span::styled("▮", theme.gold_style()),
+        ]))
+        .style(theme.input_style()),
+        search_area,
+    );
+    // Inline error (typed refusal / unavailability) outranks the header.
+    if let Some(error) = &picker.error {
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(" ✗ ", theme.err_style()),
+                Span::styled(error.clone(), theme.err_style()),
+            ])),
+            note_area,
+        );
+    } else {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                format!("   {} pairs · ⏎ selects the highlighted row", rows.len()),
+                theme.faint_style(),
+            )),
+            note_area,
+        );
+    }
+
+    // Column budget: model + provider columns sized to content, capped.
+    let model_w = rows
+        .iter()
+        .map(|row| row.model.chars().count().max(1))
+        .max()
+        .unwrap_or(8)
+        .clamp(8, 30);
+    let provider_w = rows
+        .iter()
+        .map(|row| row.provider.chars().count())
+        .max()
+        .unwrap_or(8)
+        .clamp(8, 22);
+    let window_len = list_area.height as usize;
+    // The menu viewport law: the selection rides inside the window.
+    let selection = picker.selection.min(rows.len().saturating_sub(1));
+    let start = if rows.len() <= window_len {
+        0
+    } else {
+        selection.min(rows.len() - window_len)
+    };
+    if rows.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                "   nothing matches — esc closes, backspace edits the search",
+                theme.dim_style(),
+            )),
+            list_area,
+        );
+    }
+    for (offset, row) in rows.iter().skip(start).take(window_len).enumerate() {
+        let index = start + offset;
+        let y = list_area.y + u16::try_from(offset).unwrap_or(0);
+        let selected = index == selection;
+        let pending = picker
+            .pending
+            .as_ref()
+            .is_some_and(|(provider, model_name)| {
+                *provider == row.provider && *model_name == row.model
+            });
+        let hidden_above = offset == 0 && start > 0;
+        let hidden_below = offset + 1 == window_len && start + window_len < rows.len();
+        let gutter = if hidden_above || hidden_below {
+            "⋮"
+        } else if row.is_current {
+            "●"
+        } else {
+            " "
+        };
+        let gutter_style = if row.is_current {
+            theme.gold_style()
+        } else {
+            theme.faint_style()
+        };
+        let ink = if !row.available || !row.selectable {
+            theme.dim_style()
+        } else {
+            theme.text_style()
+        };
+        let model_cell = if row.model.is_empty() {
+            "—".to_owned()
+        } else {
+            row.model.clone()
+        };
+        let default_mark = if row.is_default { "*" } else { " " };
+        let mut spans = vec![
+            Span::styled(format!(" {gutter} "), gutter_style),
+            Span::styled(
+                format!("{model_cell:<model_w$}"),
+                if selected {
+                    theme
+                        .bright_style()
+                        .add_modifier(ratatui::style::Modifier::BOLD)
+                } else if row.available && row.selectable {
+                    theme.text_style()
+                } else {
+                    theme.dim_style()
+                },
+            ),
+            Span::styled(default_mark.to_owned(), theme.gold_style()),
+            Span::raw(" "),
+            Span::styled(format!("{:<provider_w$}", row.provider), ink),
+            Span::raw(" "),
+            Span::styled(format!("{:<5}", row.auth), theme.dim_style()),
+            Span::styled(
+                row.context_window.map_or_else(
+                    || format!("{:>8}", "—"),
+                    |window| format!("{:>8}", crate::format::fmt_tok(window)),
+                ),
+                theme.dim_style(),
+            ),
+        ];
+        if row.is_current {
+            spans.push(Span::styled("  current", theme.gold_style()));
+        }
+        if pending {
+            spans.push(Span::styled(
+                "  …",
+                theme.pulse_ink(theme.gold, model.anim_phase),
+            ));
+        }
+        if let Some(reason) = row.reason.as_ref().filter(|_| !row.available) {
+            spans.push(Span::styled(format!("  {reason}"), theme.faint_style()));
+        }
+        let mut line = Line::from(spans);
+        if selected {
+            line = hover_band(line, true, area.width, theme);
+        }
+        frame.render_widget(
+            Paragraph::new(line),
+            Rect {
+                x: list_area.x,
+                y,
+                width: list_area.width,
+                height: 1,
+            },
+        );
+        hits.push((
+            Rect {
+                x: list_area.x,
+                y,
+                width: list_area.width,
+                height: 1,
+            },
+            Hit::ModelPickerRow {
+                provider: row.provider.clone(),
+                model: row.model.clone(),
+            },
+        ));
+    }
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            " ⏎ select · esc close · ↑↓ move · type to search",
+            theme.faint_style(),
+        )),
+        hint_area,
+    );
 }
 
 fn render_session(

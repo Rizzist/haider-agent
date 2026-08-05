@@ -1384,6 +1384,16 @@ impl DemoDriver {
                 let revision = model.providers.revision.map_or(1, |current| current + 1);
                 model.apply_default_model_set(summary, revision);
             }
+            // F2a: the reducer fabricates demo selections locally and
+            // never pushes this request in demo mode — but a defensive
+            // fabricated commit keeps the twin honest if one arrives.
+            AppRequest::SelectModel {
+                model: model_name,
+                provider,
+                ..
+            } => {
+                model.apply_model_selected(&provider, &model_name);
+            }
             AppRequest::OAuthAddStart {
                 provider, attempt, ..
             } => {

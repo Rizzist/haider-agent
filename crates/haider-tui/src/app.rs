@@ -1846,6 +1846,15 @@ pub enum AppRequest {
         model: String,
         expected_revision: u64,
     },
+    /// F2a: receipted live-session model selection (`session.select_model`)
+    /// — the picker's ⏎ on an attached session. The provider always rides
+    /// along (a picker row IS a model × provider pair); the identity pair
+    /// moves only on the correlated RESOLVED reply.
+    SelectModel {
+        session: SessionId,
+        model: String,
+        provider: String,
+    },
     /// Start an OAuth add flow (`account.oauth_start`) for the card.
     OAuthAddStart {
         provider: String,
@@ -1956,6 +1965,13 @@ pub enum Hit {
     /// One `/theme` picker row (model-local card): hover previews, click
     /// commits. Carries the MENU index it was rendered for.
     ThemeOption(usize),
+    /// One `/model` picker row (F2a). VALUE-CARRYING (review r2 P2-2): the
+    /// rect holds the pair it was rendered for, so a stale hit map can
+    /// never select a different row.
+    ModelPickerRow {
+        provider: String,
+        model: String,
+    },
     BackChip,
     TalkChip,
     HelpHint,
@@ -2219,6 +2235,46 @@ pub struct ThemePicker {
     pub prior: ThemeChoice,
 }
 
+/// The full-screen `/model` picker (F2a): one row per model × provider
+/// pair across EVERY enabled provider, searchable. MODEL-LOCAL overlay —
+/// it owns the keyboard while open (⏎ selects the HIGHLIGHTED row, esc
+/// closes without selecting; the palette's exact-match lead jump never
+/// gets near it — heeded history).
+#[derive(Debug, Default)]
+pub struct ModelPicker {
+    /// Live substring search over model + provider (+ auth flavor).
+    pub query: String,
+    /// Index into the FILTERED row list.
+    pub selection: usize,
+    /// In-flight `session.select_model`: the REQUESTED pair. The picker
+    /// renders it pulsing; the identity moves only on the resolved reply.
+    pub pending: Option<(String, String)>,
+    /// Honest inline error — a typed refusal or an unavailability reason.
+    pub error: Option<String>,
+}
+
+/// One `/model` picker row: a model × provider pair (or an honest
+/// placeholder for a provider with nothing discovered).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelPickerRow {
+    pub provider: String,
+    /// The model slug; empty for a provider placeholder row.
+    pub model: String,
+    /// `oauth` / `api` — what a turn on this row meters.
+    pub auth: &'static str,
+    pub context_window: Option<u64>,
+    /// Provider availability — unavailable rows render dimmed and refuse
+    /// with the reason instead of silently failing.
+    pub available: bool,
+    pub reason: Option<String>,
+    /// The provider's own declared default model.
+    pub is_default: bool,
+    /// The session's CURRENT pair.
+    pub is_current: bool,
+    /// False only for placeholder rows (nothing to select).
+    pub selectable: bool,
+}
+
 /// Identity shown in the status bar and launcher info line. Real values come
 /// from config/accounts in later waves; the demo pins sim-parity defaults.
 #[derive(Debug, Clone)]
@@ -2284,6 +2340,9 @@ pub struct AppModel {
     /// highlight). MODEL-LOCAL — deliberately not a projection card so it
     /// can never ride a session checkout or block a daemon menu.
     pub theme_picker: Option<ThemePicker>,
+    /// The full-screen `/model` picker overlay (F2a). MODEL-LOCAL — never
+    /// a projection card, so it can never ride a session checkout.
+    pub model_picker: Option<ModelPicker>,
     /// COMMIT counter for the theme choice (ui-themes-fix): bumped by
     /// every user commit — picker ⏎/digit/click, `/theme <name>`, ⌃T —
     /// and never by boot resolution or previews. The runtime's
@@ -2566,6 +2625,7 @@ impl Default for AppModel {
             theme_choice: ThemeChoice::default(),
             detected_system: ThemeKey::default(),
             theme_picker: None,
+            model_picker: None,
             theme_commits: 0,
             sanctum_tier: SanctumTier::default(),
             projection: SessionProjection::new(),
@@ -3546,6 +3606,25 @@ impl AppModel {
                 self.help_open = false;
             }
             return;
+        }
+        // The `/model` picker owns EVERY key while it is showing (F2a —
+        // heeded history: ⏎ selects the HIGHLIGHTED row, never an
+        // exact-match jump; esc closes without selecting). A daemon menu
+        // outranks it: local chrome never shadows a live ask.
+        if self.model_picker.is_some() {
+            let menu_owns = (self.screen == Screen::Session
+                && self.projection.open_menu().is_some())
+                || (self.screen == Screen::Subagent
+                    && self
+                        .viewed_chip()
+                        .is_some_and(|chip| chip.question_menu().is_some()));
+            if menu_owns {
+                self.model_picker = None;
+                self.dirty = true;
+            } else {
+                self.handle_model_picker_key(key.code);
+                return;
+            }
         }
         // The `/theme` picker owns the keys while it is showing. A daemon
         // card or a navigation away from its surfaces outranks it: the
@@ -6219,9 +6298,12 @@ impl AppModel {
             // W5e-3: choose from the DISCOVERED catalog. Both are
             // feature-gated BEFORE shipping this time (the W5e-1b lesson).
             "model" => {
+                // F2a: `/model [query]` opens the FULL-SCREEN picker —
+                // one row per model × provider pair across every enabled
+                // provider, query pre-filled. An empty registry keeps the
+                // honest flash (stale daemon named when undiscoverable).
                 let requested = remainder.trim().to_owned();
-                let slots = self.dynamic_slots();
-                if slots.models.is_empty() {
+                if self.providers.providers.is_empty() {
                     self.flash = Some(
                         if self.daemon_serves(haider_rpc::FEATURE_PROVIDER_MODELS_V1) {
                             "· no models discovered yet — /providers then refresh".to_owned()
@@ -6229,24 +6311,9 @@ impl AppModel {
                             self.stale_daemon_note("model discovery")
                         },
                     );
-                } else if requested.is_empty() {
-                    let names: Vec<&str> =
-                        slots.models.iter().map(|(slug, _)| slug.as_str()).collect();
-                    self.flash = Some(format!("· models — {}", names.join(" · ")));
-                } else if let Some((slug, _)) = slots
-                    .models
-                    .iter()
-                    .find(|(slug, _)| slug.eq_ignore_ascii_case(&requested))
-                {
-                    // The model is DISCOVERED, so selecting it is honest.
-                    self.identity.model_short = slug.clone();
-                    self.refresh_context_window();
-                    self.identity_pinned = true;
-                    self.flash = Some(format!("· model → {slug}"));
+                    self.requests.push(AppRequest::ProvidersRefresh);
                 } else {
-                    self.flash = Some(format!(
-                        "· \"{requested}\" is not in this provider's discovered models"
-                    ));
+                    self.open_model_picker(requested);
                 }
             }
             "provider" => {
@@ -7595,6 +7662,18 @@ impl AppModel {
             Hit::ThemeOption(index) if self.theme_picker.is_some() => {
                 self.commit_theme_row(index);
             }
+            // F2a: a picker row click selects exactly the pair the rect
+            // was rendered for (value-carrying — a stale map can never
+            // select a different row).
+            Hit::ModelPickerRow { provider, model } if self.model_picker.is_some() => {
+                if let Some(row) = self
+                    .model_picker_rows()
+                    .into_iter()
+                    .find(|row| row.provider == provider && row.model == model)
+                {
+                    self.select_model_row(&row);
+                }
+            }
             Hit::MenuOption { menu, index } => {
                 // Only the SAME menu the row was rendered for may answer —
                 // and on the subagent screen that menu is the CHIP's card,
@@ -7941,6 +8020,252 @@ impl AppModel {
     /// aura, subagent — through this ONE authority (ui-themes-fix: the
     /// launcher is the owner's primary surface). A daemon card outranks
     /// it — local chrome never sits on a live ask.
+    /// F2a: open the full-screen `/model` picker with `query` pre-filled.
+    /// Pushes a registry refresh so the roster is as fresh as the daemon
+    /// serves; rows render from the snapshot in hand meanwhile.
+    pub fn open_model_picker(&mut self, query: String) {
+        self.model_picker = Some(ModelPicker {
+            query,
+            ..ModelPicker::default()
+        });
+        self.requests.push(AppRequest::ProvidersRefresh);
+        self.dirty = true;
+    }
+
+    /// Every `/model` picker row: one per model × provider pair across
+    /// ALL enabled providers (daemon truth — `provider.list` order); an
+    /// enabled provider with nothing discovered contributes one honest
+    /// placeholder row carrying its reason.
+    #[must_use]
+    pub fn model_picker_rows(&self) -> Vec<ModelPickerRow> {
+        use haider_protocol::credential::AuthMethod;
+        let mut rows = Vec::new();
+        for summary in &self.providers.providers {
+            if !summary.enabled {
+                continue;
+            }
+            let available = matches!(
+                summary.availability,
+                haider_rpc::ProviderAvailabilityWire::Available
+            );
+            let reason = summary
+                .availability_reason
+                .clone()
+                .or_else(|| (!available).then(|| "provider unavailable".to_owned()));
+            // Auth flavor: the provider key's own encoding, the selected
+            // account's method, then a single declared method — the same
+            // truth order as the composer identity (F2c).
+            let auth = if summary.provider.ends_with("-oauth") {
+                "oauth"
+            } else if let Some(row) = self
+                .accounts
+                .rows
+                .iter()
+                .find(|row| row.provider == summary.provider && row.selected)
+            {
+                match row.method {
+                    AuthMethod::OAuth => "oauth",
+                    AuthMethod::ApiKey => "api",
+                }
+            } else {
+                match summary.auth_methods.as_slice() {
+                    [AuthMethod::OAuth] => "oauth",
+                    _ => "api",
+                }
+            };
+            if summary.models.is_empty() {
+                rows.push(ModelPickerRow {
+                    provider: summary.provider.clone(),
+                    model: String::new(),
+                    auth,
+                    context_window: None,
+                    available,
+                    reason: Some(reason.unwrap_or_else(|| "no discovered models".to_owned())),
+                    is_default: false,
+                    is_current: false,
+                    selectable: false,
+                });
+                continue;
+            }
+            for model in &summary.models {
+                rows.push(ModelPickerRow {
+                    provider: summary.provider.clone(),
+                    model: model.clone(),
+                    auth,
+                    context_window: self.providers.declared_window(&summary.provider, model),
+                    available,
+                    reason: reason.clone(),
+                    is_default: summary.default_model.as_deref() == Some(model),
+                    is_current: self.identity.provider == summary.provider
+                        && self.identity.model_short == *model,
+                    selectable: true,
+                });
+            }
+        }
+        rows
+    }
+
+    /// The picker's LIVE search: case-insensitive; every whitespace-
+    /// separated token must substring-match the row's model + provider
+    /// (+ auth flavor) haystack.
+    #[must_use]
+    pub fn model_picker_filtered(&self, query: &str) -> Vec<ModelPickerRow> {
+        let needle = query.to_ascii_lowercase();
+        let tokens: Vec<&str> = needle.split_whitespace().collect();
+        self.model_picker_rows()
+            .into_iter()
+            .filter(|row| {
+                let haystack =
+                    format!("{} {} {}", row.model, row.provider, row.auth).to_ascii_lowercase();
+                tokens.iter().all(|token| haystack.contains(token))
+            })
+            .collect()
+    }
+
+    /// KEY-OWNERSHIP LAW (F2a, heeded history): while the picker is open
+    /// it owns every key — ⏎ selects the HIGHLIGHTED row (never an
+    /// exact-match jump), esc closes WITHOUT selecting, characters edit
+    /// the search, ↑/↓ move the highlight (wrapping).
+    fn handle_model_picker_key(&mut self, code: KeyCode) {
+        self.dirty = true;
+        match code {
+            KeyCode::Esc => {
+                // Closes WITHOUT selecting — nothing else moves.
+                self.model_picker = None;
+            }
+            KeyCode::Up | KeyCode::Down => {
+                let Some(query) = self.model_picker.as_ref().map(|p| p.query.clone()) else {
+                    return;
+                };
+                let len = self.model_picker_filtered(&query).len();
+                if let Some(picker) = self.model_picker.as_mut()
+                    && len > 0
+                {
+                    picker.selection = if code == KeyCode::Up {
+                        (picker.selection + len - 1) % len
+                    } else {
+                        (picker.selection + 1) % len
+                    };
+                }
+            }
+            KeyCode::Enter => {
+                // ⏎ selects the HIGHLIGHTED row — never an exact-match
+                // jump (heeded history). No row under the highlight (empty
+                // filter) selects nothing; the picker stays open.
+                let Some((query, selection, pending)) = self
+                    .model_picker
+                    .as_ref()
+                    .map(|p| (p.query.clone(), p.selection, p.pending.is_some()))
+                else {
+                    return;
+                };
+                if pending {
+                    return;
+                }
+                let rows = self.model_picker_filtered(&query);
+                if let Some(row) = rows.get(selection).cloned() {
+                    self.select_model_row(&row);
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(picker) = self.model_picker.as_mut() {
+                    picker.query.pop();
+                    picker.selection = 0;
+                    picker.error = None;
+                }
+            }
+            KeyCode::Char(c) => {
+                if let Some(picker) = self.model_picker.as_mut() {
+                    picker.query.push(c);
+                    picker.selection = 0;
+                    picker.error = None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Selecting one picker row. Unavailable / placeholder rows show
+    /// their reason (never a silent failure). A live attached session
+    /// issues the receipted `session.select_model` and waits for the
+    /// RESOLVED pair; the launcher sets the default pair new sessions
+    /// use; demo fabricates locally.
+    pub fn select_model_row(&mut self, row: &ModelPickerRow) {
+        self.dirty = true;
+        if !row.selectable || !row.available {
+            let reason = row
+                .reason
+                .clone()
+                .unwrap_or_else(|| "provider unavailable".to_owned());
+            if let Some(picker) = self.model_picker.as_mut() {
+                picker.error = Some(format!("{} — {reason}", row.provider));
+            }
+            return;
+        }
+        // Demo fabricates locally; the launcher (no attached session)
+        // sets the default pair used by the next CreateSession.
+        let live_session = (!self.mode.fabricates_locally() && self.screen == Screen::Session)
+            .then(|| self.active_session.clone())
+            .flatten();
+        let Some(session) = live_session else {
+            self.identity.provider = row.provider.clone();
+            self.identity.model_short = row.model.clone();
+            self.identity_pinned = true;
+            self.refresh_context_window();
+            self.model_picker = None;
+            self.flash = Some(format!("· model → {} · {}", row.model, row.provider));
+            return;
+        };
+        if !self.daemon_serves(haider_rpc::FEATURE_SESSION_MODEL_SELECT_V1) {
+            let note = self
+                .stale_daemon_note("cross-provider model selection")
+                .trim_start_matches("· ")
+                .to_owned();
+            if let Some(picker) = self.model_picker.as_mut() {
+                picker.error = Some(note);
+            }
+            return;
+        }
+        if let Some(picker) = self.model_picker.as_mut() {
+            picker.pending = Some((row.provider.clone(), row.model.clone()));
+            picker.error = None;
+        }
+        self.requests.push(AppRequest::SelectModel {
+            session,
+            model: row.model.clone(),
+            provider: row.provider.clone(),
+        });
+    }
+
+    /// The RESOLVED pair committed (F2a/R2): render daemon truth — never
+    /// an echo of the request. Closes the picker when it is still open.
+    pub fn apply_model_selected(&mut self, provider: &str, model: &str) {
+        self.identity.provider = provider.to_owned();
+        self.identity.model_short = model.to_owned();
+        self.identity_pinned = true;
+        self.refresh_context_window();
+        self.model_picker = None;
+        self.flash = Some(format!("· model → {model} · {provider}"));
+        self.dirty = true;
+    }
+
+    /// A typed `session.select_model` refusal. With the picker open the
+    /// public reason lands INLINE (the row stays selectable for a retry);
+    /// otherwise it reaches the session view as an error line — never a
+    /// silent IDLE (F2e).
+    pub fn model_select_failed(&mut self, provider: &str, model: &str, code: &str, message: &str) {
+        let reason = format!("{model} · {provider} — {code}: {message}");
+        if let Some(picker) = self.model_picker.as_mut() {
+            picker.pending = None;
+            picker.error = Some(reason);
+        } else {
+            self.projection
+                .record_local_error(format!("model selection failed — {reason}"));
+            self.flash = Some(format!("· model selection failed — {code}"));
+        }
+        self.dirty = true;
+    }
+
     fn open_theme_picker(&mut self) {
         self.dirty = true;
         if !matches!(

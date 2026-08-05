@@ -416,6 +416,14 @@ impl SessionProjection {
         }
     }
 
+    /// F2a/F2e: a CLIENT-observed failure joins the transcript as a
+    /// visible error line (a rejected command on this session, a typed
+    /// selection refusal landing after its picker closed) — never a
+    /// silent IDLE. Local display truth only: nothing durable claims it.
+    pub fn record_local_error(&mut self, text: String) {
+        self.entries.push(TranscriptEntry::Error { text });
+    }
+
     /// B2b-m3: associate one committed node with the display entry it
     /// stands for. The daemon commits a turn's `UserMessage` and its
     /// `NodeCommitted` adjacently in ONE acceptance transaction (compaction
