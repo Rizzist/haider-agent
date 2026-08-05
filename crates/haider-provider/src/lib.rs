@@ -21,6 +21,8 @@ mod gemini;
 mod gemini_tests;
 mod openai;
 mod origin;
+mod pricing;
+mod usage;
 mod wire;
 
 use async_trait::async_trait;
@@ -61,6 +63,13 @@ pub use openai::{
     validate_openai_compatible_endpoint,
 };
 pub use origin::{FixedDnsResolver, FixedOriginGuard, SystemFixedDnsResolver};
+pub use pricing::{MODEL_RATES, ModelRate, estimate_chunk_cost_usd, model_rate};
+pub use usage::{
+    ANTHROPIC_OAUTH_USAGE_URL, ANTHROPIC_OAUTH_USAGE_USER_AGENT, KIMI_OAUTH_USAGE_URL,
+    MeterReading, MeterUnavailable, OPENAI_OAUTH_USAGE_URL, UsageMeterEndpoint,
+    normalize_utilization, parse_anthropic_oauth_usage, parse_kimi_usages, parse_openai_wham_usage,
+    parse_rfc3339_to_unix_ms,
+};
 
 /// Provider classes backed by production account credentials in this release.
 pub const BUILTIN_PROVIDER_NAMES: [&str; 7] = [

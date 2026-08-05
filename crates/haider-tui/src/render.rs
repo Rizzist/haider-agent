@@ -1117,7 +1117,7 @@ fn push_account_add_buttons<'a>(
     lines_out: &mut Vec<Line<'a>>,
     rects_out: &mut Vec<(usize, u16, u16, Hit)>,
 ) {
-    let rows: [&[(&str, crate::app::AccountAddKind)]; 3] = [
+    let rows: [&[(&str, crate::app::AccountAddKind)]; 4] = [
         &[
             ("+ OpenAI (OAuth)", crate::app::AccountAddKind::OpenAiOAuth),
             (
@@ -1136,11 +1136,13 @@ fn push_account_add_buttons<'a>(
         ],
         &[
             ("+ HuggingFace", crate::app::AccountAddKind::HuggingFace),
-            (
-                "+ Custom (OpenAI-compatible)",
-                crate::app::AccountAddKind::Custom,
-            ),
+            ("+ OpenCode Zen", crate::app::AccountAddKind::OpencodeZen),
+            ("+ OpenCode Go", crate::app::AccountAddKind::OpencodeGo),
         ],
+        &[(
+            "+ Custom (OpenAI-compatible)",
+            crate::app::AccountAddKind::Custom,
+        )],
     ];
     for chunk in rows {
         // One hit per BUTTON: per-button column rects, hover-aware (owner
@@ -1679,7 +1681,7 @@ fn render_providers(
     // the add login buttons") — a fixed footer under a scrolling roster.
     // Tiny frames keep the flowed layout instead: everything stays in the
     // scroll body, still reachable by scrolling to the end.
-    let hint = "click a model to set the default · e edits · x removes · h HuggingFace · esc back";
+    let hint = "click a model to set the default · e edits · x removes · h HuggingFace · z Zen · g Go · esc back";
     let mut footer_lines: Vec<Line<'_>> = Vec::new();
     let mut footer_hits: Vec<(usize, u16, u16, Hit)> = Vec::new();
     let pinned = area.height >= 12;

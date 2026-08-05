@@ -2067,6 +2067,8 @@ pub enum AccountAddKind {
     KimiOAuth,
     GeminiApi,
     HuggingFace,
+    OpencodeZen,
+    OpencodeGo,
     Custom,
 }
 
@@ -5016,6 +5018,8 @@ impl AppModel {
                 }
             }
             KeyCode::Char('h') => self.open_huggingface_preset(),
+            KeyCode::Char('z') => self.open_opencode_zen_preset(),
+            KeyCode::Char('g') => self.open_opencode_go_preset(),
             // D2: the shared "found on this device" section is numbered
             // here too — the same one-key import as `/accounts` (the
             // provider cursor keeps ↑/↓; digits belong to the section).
@@ -5084,6 +5088,8 @@ impl AppModel {
             | AccountAddKind::AnthropicApi
             | AccountAddKind::GeminiApi
             | AccountAddKind::HuggingFace
+            | AccountAddKind::OpencodeZen
+            | AccountAddKind::OpencodeGo
             | AccountAddKind::Custom => return,
         };
         let alias = smallest_free_alias(provider, &self.accounts.rows);
@@ -5347,6 +5353,30 @@ impl AppModel {
     /// HF router (openai-compatible); the user supplies the served model,
     /// then the normal login flow adds the token.
     fn open_huggingface_preset(&mut self) {
+        self.open_custom_preset("huggingface", "https://router.huggingface.co/v1");
+    }
+
+    /// U1: the OpenCode Zen preset — the custom card prefilled with the Zen
+    /// gateway (openai-compatible, Bearer OPENCODE_API_KEY via the normal
+    /// login flow; `GET {origin}/models` serves the inventory
+    /// unauthenticated). Zen has no usage endpoint today (`/zen/v1/usage`,
+    /// `/balance`, `/credits` all 404, verified 2026-08-05) — local
+    /// accounting applies; anomalyco/opencode#10448 tracks a future balance
+    /// API.
+    fn open_opencode_zen_preset(&mut self) {
+        self.open_custom_preset("opencode-zen", "https://opencode.ai/zen/v1");
+    }
+
+    /// U1: the OpenCode Go preset — Zen's budget lane, same contract with
+    /// its own model roster at `https://opencode.ai/zen/go/v1`.
+    fn open_opencode_go_preset(&mut self) {
+        self.open_custom_preset("opencode-go", "https://opencode.ai/zen/go/v1");
+    }
+
+    /// One-click custom-provider preset: the custom card prefilled with a
+    /// known openai-compatible origin; the user supplies the served model,
+    /// then the normal login flow adds the key.
+    fn open_custom_preset(&mut self, stem: &str, origin: &str) {
         if self.custom_add.is_some() || self.oauth_add.is_some() {
             return;
         }
@@ -5373,8 +5403,8 @@ impl AppModel {
             .collect();
         self.custom_attempt_seq += 1;
         self.custom_add = Some(CustomProviderCard {
-            name: smallest_free_alias("huggingface", &taken),
-            origin: "https://router.huggingface.co/v1".to_owned(),
+            name: smallest_free_alias(stem, &taken),
+            origin: origin.to_owned(),
             model: String::new(),
             focus: CustomField::Model,
             phase: CustomPhase::Editing { error: None },
@@ -7646,6 +7676,12 @@ impl AppModel {
                     }
                     AccountAddKind::HuggingFace => {
                         self.open_huggingface_preset();
+                    }
+                    AccountAddKind::OpencodeZen => {
+                        self.open_opencode_zen_preset();
+                    }
+                    AccountAddKind::OpencodeGo => {
+                        self.open_opencode_go_preset();
                     }
                 }
             }

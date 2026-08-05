@@ -362,7 +362,7 @@ pub const HELP_TEXT: &[&str] = &[
     "  /sessions          list + switch sessions",
     "  /aura              Aura Mode — a voice/orchestrator session (spawns sessions, never codes) — demo only",
     "  /peers             reachability ladder — enrolled peers · sponsored SSH nodes · shell targets",
-    "  /accounts          provider credentials — OAuth / API / HuggingFace / custom, pick the active",
+    "  /accounts          provider credentials — OAuth / API / HuggingFace / OpenCode Zen+Go / custom, pick the active",
     "  /account <alias>   switch the active account for its provider (tab-completes aliases)",
     "  /login <prov> <oauth|api>  add a provider account (OAuth loopback, API key, or custom URL)",
     "  /clear · /back     back to the main screen; typing there starts a fresh session",

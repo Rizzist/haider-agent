@@ -530,6 +530,7 @@ struct HubInner {
     accounts: Mutex<Option<crate::accounts::AccountsFacade>>,
     creatable_providers: Mutex<Option<std::collections::BTreeSet<String>>>,
     hooks: Arc<Mutex<Option<crate::hooks::WeakHookService>>>,
+    usage_report: Mutex<Option<Arc<crate::usage_report::UsageReportService>>>,
 }
 
 #[derive(Default)]
@@ -917,6 +918,7 @@ impl SessionHub {
                 accounts: Mutex::new(None),
                 creatable_providers: Mutex::new(None),
                 hooks: Arc::new(Mutex::new(None)),
+                usage_report: Mutex::new(None),
             }),
         })
     }
@@ -975,6 +977,28 @@ impl SessionHub {
         &self,
     ) -> Result<Option<crate::accounts::AccountsFacade>, SessionHubError> {
         Ok(lock(&self.inner.accounts)?.clone())
+    }
+
+    /// Installs the `usage.report` service (U1), mirroring the account
+    /// facade installation seam.
+    pub(crate) fn install_usage_report(
+        &self,
+        service: Arc<crate::usage_report::UsageReportService>,
+    ) -> Result<(), SessionHubError> {
+        let mut installed = lock(&self.inner.usage_report)?;
+        if installed.is_some() {
+            return Err(SessionHubError::Task(
+                "usage-report service is already installed".into(),
+            ));
+        }
+        *installed = Some(service);
+        Ok(())
+    }
+
+    pub(crate) fn usage_report_service(
+        &self,
+    ) -> Result<Option<Arc<crate::usage_report::UsageReportService>>, SessionHubError> {
+        Ok(lock(&self.inner.usage_report)?.clone())
     }
 
     /// Installs the ONE `session.create` provider whitelist (D3-5): the

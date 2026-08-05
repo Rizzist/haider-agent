@@ -230,10 +230,17 @@ pub const FEATURE_AGENT_MESSAGE_V1: &str = "agent_message_v1";
 /// optional `provider` names the selected model row's provider attribute,
 /// and the next logical turn resolves through the committed pair.
 pub const FEATURE_SESSION_MODEL_SELECT_V1: &str = "session_model_select_v1";
+<<<<<<< HEAD
 /// Daemon vaults the profile transcription secret (the Deepgram API key)
 /// and serves `transcription.secret_get`/`transcription.secret_set` on
 /// authenticated same-UID local UDS connections only (T1).
 pub const FEATURE_TRANSCRIPTION_V1: &str = "transcription_v1";
+=======
+/// Daemon implements the read-only cross-provider `usage.report` snapshot:
+/// per-account OAuth meters (normalized 0–1 utilization) plus journal-derived
+/// local counters. Never carries secret material.
+pub const FEATURE_USAGE_REPORT_V1: &str = "usage_report_v1";
+>>>>>>> u1-usage-collectors
 
 /// Kind of client taking part in the handshake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1256,6 +1263,7 @@ pub enum RequestBody {
         provider: String,
         expected_revision: u64,
     },
+<<<<<<< HEAD
     /// Reads the profile's vaulted transcription secret (the Deepgram API
     /// key) for the TUI-resident engine. Served ONLY on authenticated
     /// same-UID local UDS connections with Control — the raw secret answer
@@ -1276,6 +1284,14 @@ pub enum RequestBody {
         #[serde(default)]
         clear: bool,
     },
+=======
+    /// Reads the cross-provider usage snapshot: one entry per known account
+    /// with normalized OAuth meter windows or honest local-only/unavailable
+    /// states, plus journal-derived local counters. Read-only, receipt-free,
+    /// and parameterless in v1.
+    #[serde(rename = "usage.report")]
+    UsageReport,
+>>>>>>> u1-usage-collectors
     /// Decode artifact for a method this crate does not know (tolerance
     /// discipline). W3b answers it with a protocol error, not a panic.
     #[serde(other)]
@@ -1533,6 +1549,7 @@ pub enum ResponseBody {
     },
     #[serde(rename = "provider.remove")]
     ProviderRemove { provider: String, revision: u64 },
+<<<<<<< HEAD
     /// The vaulted transcription secret, or `None` when no secret is
     /// stored. Only ever sent on the same-UID local UDS surface; the
     /// value's `Debug` is redacted and both peers zeroize the encoded
@@ -1546,6 +1563,14 @@ pub enum ResponseBody {
     /// after a clear. Never echoes the secret.
     #[serde(rename = "transcription.secret_set")]
     TranscriptionSecretSet { present: bool },
+=======
+    /// Cross-provider usage snapshot (U1). Derived data only — meter
+    /// readings, aliases, display identities, local counters; never secrets.
+    #[serde(rename = "usage.report")]
+    UsageReport {
+        report: haider_protocol::usage::UsageReportV1,
+    },
+>>>>>>> u1-usage-collectors
     /// Successful durable menu resolution. The same-command retry receives
     /// the original sequence; a different command receives
     /// [`ERROR_CODE_ALREADY_RESOLVED`] instead.

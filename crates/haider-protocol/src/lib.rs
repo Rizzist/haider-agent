@@ -28,6 +28,7 @@ pub mod rpc;
 pub mod session;
 pub mod state;
 pub mod tool;
+pub mod usage;
 pub mod verify;
 
 /// Crate marker used by the workspace self-test.

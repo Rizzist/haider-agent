@@ -1,0 +1,27 @@
+{
+  "usage": {
+    "limit": "2048",
+    "used": "214",
+    "remaining": "1834",
+    "resetTime": "2026-01-09T15:23:13.716839300Z"
+  },
+  "limits": [
+    {
+      "window": {
+        "duration": 300,
+        "timeUnit": "TIME_UNIT_MINUTE"
+      },
+      "detail": {
+        "limit": "200",
+        "used": "139",
+        "remaining": "61",
+        "resetTime": "2026-01-06T13:33:02.717479433Z"
+      }
+    }
+  ],
+  "user": {
+    "membership": {
+      "level": "LEVEL_INTERMEDIATE"
+    }
+  }
+}

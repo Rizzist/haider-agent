@@ -177,8 +177,10 @@ fn add_login_buttons_pin_at_the_bottom() {
         .iter()
         .position(|row| row.contains("+ OpenAI (OAuth)"))
         .expect("button row");
+    // U1 widened the footer to FOUR button rows (OpenCode Zen/Go joined the
+    // HF row's band), so the bottom band is footer(4) + hint + status = 6.
     assert!(
-        oauth_row >= rows.len() - 5,
+        oauth_row >= rows.len() - 6,
         "buttons pin at the bottom band (footer + status bar), not mid-page (row {oauth_row})"
     );
     // Same flows: the hits still carry the AccountAdd kinds.

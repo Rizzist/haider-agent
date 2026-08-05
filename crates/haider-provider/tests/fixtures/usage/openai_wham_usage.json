@@ -1,0 +1,51 @@
+{
+  "plan_type": "plus",
+  "rate_limit": {
+    "primary_window": {
+      "used_percent": 6,
+      "reset_at": 1738300000,
+      "limit_window_seconds": 18000
+    },
+    "secondary_window": {
+      "used_percent": 24,
+      "reset_at": 1738900000,
+      "limit_window_seconds": 604800
+    }
+  },
+  "code_review_rate_limit": {
+    "primary_window": {
+      "used_percent": 0,
+      "reset_at": 1738900000,
+      "limit_window_seconds": 604800
+    }
+  },
+  "additional_rate_limits": [
+    {
+      "limit_name": "GPT-5.3-Codex-Spark",
+      "metered_feature": "spark",
+      "rate_limit": {
+        "primary_window": {
+          "used_percent": 41,
+          "reset_at": 1738320000,
+          "limit_window_seconds": 18000
+        }
+      }
+    },
+    {
+      "limit_name": "Sub-Percent-Lane",
+      "metered_feature": "trace",
+      "rate_limit": {
+        "primary_window": {
+          "used_percent": 0.5,
+          "reset_at": 1738330000,
+          "limit_window_seconds": 18000
+        }
+      }
+    }
+  ],
+  "credits": {
+    "has_credits": true,
+    "unlimited": false,
+    "balance": 5.39
+  }
+}

@@ -62,9 +62,15 @@ fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> Qu
 /// RUNTIME failure: pickers cannot discover the served receipted
 /// cross-provider model selection (F1).
 ///
+<<<<<<< HEAD
 /// MUTATION CHECK: remove `FEATURE_TRANSCRIPTION_V1`. Expected RUNTIME
 /// failure: the TUI talk surface cannot discover the served vaulted
 /// Deepgram-key RPCs (T1).
+=======
+/// MUTATION CHECK: remove `FEATURE_USAGE_REPORT_V1`. Expected RUNTIME
+/// failure: clients cannot discover the served cross-provider `usage.report`
+/// snapshot (U1).
+>>>>>>> u1-usage-collectors
 #[test]
 fn welcome_features_pin_served_management_families() {
     assert_eq!(
@@ -94,6 +100,7 @@ fn welcome_features_pin_served_management_families() {
             FEATURE_TOOL_INVENTORY_V1.to_owned(),
             haider_rpc::FEATURE_TRANSCRIPTION_V1.to_owned(),
             FEATURE_TURN_CONTROL_V1.to_owned(),
+            haider_rpc::FEATURE_USAGE_REPORT_V1.to_owned(),
             FEATURE_VAULT_STAGE_V1.to_owned(),
         ])
     );
