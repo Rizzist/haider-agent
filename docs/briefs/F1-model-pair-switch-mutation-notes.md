@@ -63,3 +63,18 @@ After the final revert: `pair_switch` 4/4 and `model_select` 15/15 green.
 `haider-daemond`, `haider-rpc`, `haider-protocol`, `haider-store`,
 `haider-core`, `haider-tools`, `haider-client`, `haider-accounts`,
 `haider-cli`, `haider-verify` suites green. Ledger 1618 → 1643 (+25).
+
+## Review of record (post-lane, executed)
+
+Two seams the lane's kill table did not cover were mutation-probed against
+the FULL relevant suites (store, daemon `model_select` + `pair_switch` +
+`compact`, daemond wire). Both mutations SURVIVED — real production gates
+with zero observation (the structurally-unobserved-second-gate class):
+
+| # | Mutation (seam) | Survived | Pin added | Kill after pin |
+|---|---|---|---|---|
+| RM1 | Generation fence deleted from `Store::select_session_model` (`event_store.rs`) — a stale-generation selection commits instead of refusing `SingleWriterViolation` | every suite green | `stale_generation_select_is_refused_and_mutates_nothing` (refusal code + no receipt + no fact + unchanged metadata + next turn still lands on A) | running 1 test → FAILED at the `expect_err` (the stale selection committed) |
+| RM2 | Manual compaction fed the supervisor's spawn snapshot instead of `fresh_turn_metadata` (`worker.rs` Compact arm, `&fresh` → `&metadata`) — summarization lands on the OLD provider after a pair switch | every suite green incl. all 5 compaction tests | `manual_compaction_follows_the_current_selection` (post-switch summarization request asserted on provider B's recording fake, model-b; A saw only turn 1) | running 1 test → FAILED (compaction work driven to the stale pair) |
+
+Both mutations reverted; 6/6 `pair_switch` laws green on clean code.
+Ledger 1643 → 1645 (+2 review pins).

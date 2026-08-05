@@ -184,9 +184,21 @@ impl PairSwitchWorld {
     /// The RESOLVED (`fake-b`, `model-b`) selection command with a stable
     /// receipt identity.
     fn select_command(&self, command_id: &str) -> SessionSelectModelCommand {
+        self.select_command_at_generation(command_id, self.store.worker_generation())
+    }
+
+    /// The same selection command pinned to an explicit worker generation —
+    /// the request JSON and digest carry the same generation the command
+    /// claims, so identity validation observes the fence, not a digest
+    /// mismatch.
+    fn select_command_at_generation(
+        &self,
+        command_id: &str,
+        worker_generation: u64,
+    ) -> SessionSelectModelCommand {
         let request_json = serde_json::json!({
             "session_id": self.session_id,
-            "worker_generation": self.store.worker_generation(),
+            "worker_generation": worker_generation,
             "model": "model-b",
             "provider": "fake-b",
         })
@@ -196,7 +208,7 @@ impl PairSwitchWorld {
             request_digest: blake3::hash(request_json.as_bytes()).to_hex().to_string(),
             request_json,
             session_id: self.session_id.clone(),
-            worker_generation: self.store.worker_generation(),
+            worker_generation,
             provider: "fake-b".into(),
             model: "model-b".into(),
             event_id: EventId::new(format!("{command_id}-event")),
@@ -483,6 +495,140 @@ async fn explicit_selector_spawns_the_child_cross_provider() {
         .expect("parent typed metadata");
     assert_eq!(parent_metadata.provider, "fake-a", "the parent never moves");
     assert_eq!(parent_metadata.model, "model-a");
+
+    world.shutdown().await;
+}
+
+/// LAW (stale_generation_select_is_refused_and_mutates_nothing): a
+/// selection carrying a stale worker generation is refused with
+/// `SingleWriterViolation` and commits NOTHING — the durable metadata keeps
+/// the old pair, no `model_selected` fact is appended, and the next turn
+/// still lands on the old provider.
+///
+/// MUTATION CHECK (review-of-record RM1): delete the generation fence in
+/// `Store::select_session_model`. Expected runtime failure: the stale
+/// selection commits, and turn 2 lands on provider B. Executed post-commit —
+/// see the F1 review mutation notes.
+#[tokio::test]
+async fn stale_generation_select_is_refused_and_mutates_nothing() {
+    let fake_a = Arc::new(FakeProvider::new(
+        [text_turn("first on a"), text_turn("second still on a")].concat(),
+    ));
+    let fake_b = Arc::new(FakeProvider::new(Vec::new()));
+    let world = PairSwitchWorld::boot("f1-stale", fake_a.clone(), fake_b.clone()).await;
+
+    world.run_turn("f1-stale-one", "first question").await;
+
+    let stale =
+        world.select_command_at_generation("f1-stale-select", world.store.worker_generation() + 1);
+    let error = world
+        .store
+        .select_session_model(stale.clone())
+        .await
+        .expect_err("a stale worker generation must be refused");
+    assert_eq!(error.code, ErrorCode::SingleWriterViolation);
+
+    // Nothing committed: no receipt, no fact, unchanged durable metadata.
+    let receipt = world
+        .store
+        .session_select_model_receipt(
+            stale.command_id.clone(),
+            stale.request_digest.clone(),
+            stale.request_json.clone(),
+        )
+        .await
+        .expect("receipt lookup");
+    assert!(
+        receipt.is_none(),
+        "a refused selection must not be receipted"
+    );
+    let facts = world
+        .store
+        .read(&world.session_id, 0, 1024)
+        .await
+        .expect("read journal")
+        .into_iter()
+        .filter(|event| ModelSelected::from_payload_value(&event.payload).is_some())
+        .count();
+    assert_eq!(facts, 0, "a refused selection must not append a fact");
+    let metadata = world
+        .store
+        .session_metadata(&world.session_id)
+        .await
+        .expect("metadata read")
+        .expect("typed metadata");
+    assert_eq!(metadata.provider, "fake-a");
+    assert_eq!(metadata.model, "model-a");
+
+    // The next turn still resolves through the old pair.
+    world.run_turn("f1-stale-two", "second question").await;
+    assert_eq!(fake_a.requests().len(), 2, "both turns land on provider A");
+    assert!(fake_b.requests().is_empty(), "provider B never serves");
+
+    world.shutdown().await;
+}
+
+/// LAW (manual_compaction_follows_the_current_selection): manual compaction
+/// is provider work between turns — after a committed pair switch, the
+/// summarization request lands on the NEW provider with the selected model,
+/// exactly like the next turn would.
+///
+/// MUTATION CHECK (review-of-record RM2): feed `perform_manual_compaction`
+/// the supervisor's spawn snapshot instead of `fresh_turn_metadata`.
+/// Expected runtime failure: the summarization request lands on provider A.
+/// Executed post-commit — see the F1 review mutation notes.
+#[tokio::test]
+async fn manual_compaction_follows_the_current_selection() {
+    let fake_a = Arc::new(FakeProvider::new(text_turn("history built on a")));
+    let fake_b = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitText {
+            text: "summary from b".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let world = PairSwitchWorld::boot("f1-compact", fake_a.clone(), fake_b.clone()).await;
+
+    world.run_turn("f1-compact-one", "build history").await;
+    world
+        .store
+        .select_session_model(world.select_command("f1-compact-select"))
+        .await
+        .expect("select model");
+
+    // Bounded retry through the post-Done Busy window (gate27 hygiene
+    // class) so the assert exercises pair pickup, not the settle race.
+    let mut attempt = 0;
+    loop {
+        match world
+            .manager
+            .handle()
+            .compact(
+                world.session_id.clone(),
+                "f1-compact-command".into(),
+                world.store.worker_generation(),
+                None,
+            )
+            .await
+        {
+            Ok(_) => break,
+            Err(error) if error.code == ErrorCode::Busy && attempt < 40 => {
+                attempt += 1;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(error) => panic!("manual compaction failed: {error:?}"),
+        }
+    }
+
+    let b_requests = fake_b.requests();
+    assert_eq!(
+        b_requests.len(),
+        1,
+        "the summarization request lands on provider B"
+    );
+    assert_eq!(b_requests[0].model, "model-b");
+    assert_eq!(fake_a.requests().len(), 1, "provider A saw only turn 1");
 
     world.shutdown().await;
 }
