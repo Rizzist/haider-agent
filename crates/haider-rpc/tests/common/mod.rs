@@ -1147,7 +1147,6 @@ pub fn transcript() -> Vec<WireFrame> {
                 revision: 13,
             },
         },
-<<<<<<< HEAD
         // ── T1 additive transcription secret surface ─────────────────────
         // Existing entries above stay byte-identical; everything below is
         // append-only. The staged "secret" is a golden placeholder pinning
@@ -1189,7 +1188,6 @@ pub fn transcript() -> Vec<WireFrame> {
             request_id: RequestId::new("request-transcription-clear"),
             body: ResponseBody::TranscriptionSecretSet { present: false },
         },
-=======
         // U1 append-only cross-provider usage report. Every earlier frame
         // stays byte-for-byte frozen. The request is parameterless; the
         // response carries only derived data — utilization is ALWAYS the
@@ -1284,7 +1282,6 @@ pub fn transcript() -> Vec<WireFrame> {
                 },
             },
         },
->>>>>>> u1-usage-collectors
     ]
 }
 

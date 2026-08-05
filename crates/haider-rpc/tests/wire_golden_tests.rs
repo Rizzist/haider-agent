@@ -1400,31 +1400,19 @@ fn device_discovery_goldens_are_additive_and_tolerance_re_proved() {
             )
         })
         .expect("D1 welcome frame in the golden transcript");
-<<<<<<< HEAD
-    // D1's six frames stay contiguous at their original offset; T1 later
-    // appended seven transcription-secret frames AFTER them (pinned by
-    // `transcription_secret_frames_are_additive_and_redacted`), so the tail
-    // is exactly 6 + 7 and nothing before `d1_start` can have moved.
+    // D1's six frames stay contiguous at their original offset; T1 then
+    // appended seven transcription-secret frames and U1 three usage-report
+    // frames AFTER them — each append pinned by its own additive law — so
+    // D1 ends at the NEXT appended welcome (whichever wave owns it) and
+    // nothing before `d1_start` can have moved.
     assert_eq!(
         frames.len() - d1_start,
-        6 + 7,
-        "six D1 frames followed by the seven appended T1 frames"
+        6 + 7 + 3,
+        "six D1 frames, then T1's seven transcription frames, then U1's \
+         three usage frames — the accounted tail pins that nothing before \
+         d1_start moved"
     );
-    for frame in &frames[d1_start..] {
-=======
-    let d1_end = frames
-        .iter()
-        .position(|frame| {
-            matches!(
-                frame,
-                WireFrame::Welcome(welcome)
-                    if welcome.features.contains(haider_rpc::FEATURE_USAGE_REPORT_V1)
-            )
-        })
-        .unwrap_or(frames.len());
-    assert_eq!(d1_end - d1_start, 6, "D1 appended exactly six frames");
-    for frame in &frames[d1_start..d1_end] {
->>>>>>> u1-usage-collectors
+    for frame in &frames[d1_start..d1_start + 6] {
         let encoded = ws_codec::encode(frame, TEST_FRAME_LIMIT).expect("encode D1 frame");
         assert!(
             !encoded.contains("refresh"),
@@ -1652,7 +1640,6 @@ fn model_selection_refusals_are_typed_and_golden() {
     );
 }
 
-<<<<<<< HEAD
 /// The T1 transcription-secret family obeys the same additive rules as
 /// every v1 method: appended at the transcript END, kind-tagged exact
 /// method names, unknown-field tolerance, redacted secrets, and absent
@@ -1668,9 +1655,10 @@ fn transcription_secret_frames_are_additive_and_redacted() {
     // The feature bit is the discovery contract for the family.
     assert_eq!(haider_rpc::FEATURE_TRANSCRIPTION_V1, "transcription_v1");
 
-    // The seven appended frames close the golden transcript, in order.
+    // The seven T1 frames sit directly before U1's three appended usage
+    // frames at the transcript tail (U1's own law pins those).
     let frames = transcript();
-    let tail = &frames[frames.len() - 7..];
+    let tail = &frames[frames.len() - 10..frames.len() - 3];
     let methods: Vec<String> = tail
         .iter()
         .map(|frame| {
@@ -1761,7 +1749,8 @@ fn transcription_secret_frames_are_additive_and_redacted() {
         set_ok,
         serde_json::json!({"method": "transcription.secret_set", "present": true})
     );
-=======
+}
+
 /// LAW (usage_report_goldens_are_additive_normalized_and_secret_free): the U1
 /// wave appends exactly three frames at the END of the golden transcript
 /// (welcome advertising `usage_report_v1`, the parameterless request, the
@@ -1868,5 +1857,4 @@ fn usage_report_goldens_are_additive_normalized_and_secret_free() {
             ..
         }
     ));
->>>>>>> u1-usage-collectors
 }
