@@ -23,6 +23,7 @@ pub mod headless;
 pub mod observe;
 pub mod profile;
 pub mod spawn;
+pub mod transcription;
 
 pub use client::{
     ClientConfig, ClientError, ConnectError, Connected, ConnectionState, DisconnectReason,

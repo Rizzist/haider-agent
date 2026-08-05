@@ -30,7 +30,9 @@ pub mod script;
 pub mod select;
 pub mod session;
 pub mod settings;
+pub mod stt_runtime;
 pub mod style;
+pub mod talk;
 pub mod theme;
 pub mod wordmark;
 

@@ -464,6 +464,10 @@ pub struct CommandContext {
     /// durable id, so its ERROR reply is identity-tagged from here — the
     /// failure lands on the hooks screen, never an uncorrelated flash.
     hooks_list: bool,
+    /// This request was a transcription-secret RPC (T2). Same identity
+    /// pattern: neither carries a durable command id, so the error reply
+    /// is tagged with WHICH operation failed and lands on the talk flow.
+    transcription: Option<crate::live::TranscriptionOp>,
 }
 
 impl CommandContext {
@@ -513,6 +517,13 @@ impl CommandContext {
                 _ => None,
             },
             hooks_list: matches!(command, LiveCommand::HooksList { .. }),
+            transcription: match command {
+                LiveCommand::TranscriptionSecretGet => Some(crate::live::TranscriptionOp::Get),
+                LiveCommand::TranscriptionSecretSet { .. } => {
+                    Some(crate::live::TranscriptionOp::Set)
+                }
+                _ => None,
+            },
         }
     }
 }
@@ -840,6 +851,13 @@ pub fn request_body(command: LiveCommand) -> RequestBody {
             attempt_id,
             oauth_reference,
         },
+        // T2: the wire bodies come from the ONE authority — the
+        // `haider-client` transcription helpers — so the link and every
+        // other consumer can never drift on these shapes.
+        LiveCommand::TranscriptionSecretGet => haider_client::transcription::secret_get_request(),
+        LiveCommand::TranscriptionSecretSet { secret, clear } => {
+            haider_client::transcription::secret_set_request(secret, clear)
+        }
         LiveCommand::Answer { .. } => unreachable!("answers ride send_frame, not request"),
     }
 }
@@ -1128,6 +1146,29 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
                 }]
             })
         }
+        // T2: parsed through the SAME `haider-client` helpers that built
+        // the requests — one authority for the wire shapes. `Error` bodies
+        // never reach these parsers (the arm below owns them), so a parse
+        // failure here is a genuinely skewed daemon and maps to the tagged
+        // failure reply.
+        body @ ResponseBody::TranscriptionSecretGet { .. } => {
+            match haider_client::transcription::secret_from_get_response(body) {
+                Ok(secret) => vec![LiveReply::TranscriptionSecret { secret }],
+                Err(error) => vec![LiveReply::TranscriptionSecretFailed {
+                    op: crate::live::TranscriptionOp::Get,
+                    message: error.to_string(),
+                }],
+            }
+        }
+        body @ ResponseBody::TranscriptionSecretSet { .. } => {
+            match haider_client::transcription::present_from_set_response(body) {
+                Ok(present) => vec![LiveReply::TranscriptionSecretStored { present }],
+                Err(error) => vec![LiveReply::TranscriptionSecretFailed {
+                    op: crate::live::TranscriptionOp::Set,
+                    message: error.to_string(),
+                }],
+            }
+        }
         ResponseBody::Error {
             code,
             message,
@@ -1173,6 +1214,15 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
                 // the hooks screen, not an uncorrelated flash.
                 if context.hooks_list {
                     return vec![LiveReply::HooksListFailed {
+                        message: message.clone(),
+                    }];
+                }
+                // T2: a transcription-secret error is identity-tagged with
+                // its OPERATION — the failure lands on the talk flow (the
+                // starting session or the setup card), never a bare flash.
+                if let Some(op) = context.transcription {
+                    return vec![LiveReply::TranscriptionSecretFailed {
+                        op,
                         message: message.clone(),
                     }];
                 }

@@ -347,6 +347,27 @@ pub enum LiveCommand {
         model: String,
         expected_revision: u64,
     },
+    /// `transcription.secret_get` (T2): read the vaulted Deepgram key for
+    /// the TUI-resident engine. A READ — no durable identity; the raw
+    /// secret answer rides the same protected UDS surface as
+    /// `vault.stage`.
+    TranscriptionSecretGet,
+    /// `transcription.secret_set` (T2): vault (or, with `clear`, delete)
+    /// the key. Deliberately NON-durable — no receipt may carry a secret;
+    /// the vault file is the durable truth (T1 daemon law), so no command
+    /// id and never outboxed.
+    TranscriptionSecretSet {
+        secret: haider_rpc::SecretWire,
+        clear: bool,
+    },
+}
+
+/// Which transcription-secret RPC an error reply belongs to (link-context
+/// identity — neither request carries a durable command id).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranscriptionOp {
+    Get,
+    Set,
 }
 
 impl LiveCommand {
@@ -386,6 +407,10 @@ impl LiveCommand {
             | Self::HooksList { .. }
             // A stage carries no durable identity BY DESIGN (see above).
             | Self::Stage { .. }
+            // T2: reads + the deliberately receipt-free secret set (no
+            // receipt may carry a secret — the vault file is the truth).
+            | Self::TranscriptionSecretGet
+            | Self::TranscriptionSecretSet { .. }
             // Content-addressed and receipt-free BY DESIGN (B4b): the
             // bytes are their own idempotency key.
             | Self::ArtifactPut { .. } => None,
@@ -685,6 +710,25 @@ pub enum LiveReply {
     AccountAdded {
         command_id: CommandId,
         descriptor: haider_protocol::credential::CredentialDescriptor,
+    },
+    /// `transcription.secret_get` answered (T2): the vaulted key, or an
+    /// honest `None`. The wrapper redacts Debug and zeroizes on drop; the
+    /// reducer routes it by its recorded intent and drops it promptly.
+    TranscriptionSecret {
+        secret: Option<haider_rpc::SecretWire>,
+    },
+    /// `transcription.secret_set` answered (T2): whether a secret is
+    /// present AFTER the operation.
+    TranscriptionSecretStored {
+        present: bool,
+    },
+    /// A transcription-secret RPC FAILED. Identity-tagged from the link's
+    /// request context (neither request has a durable command id — the
+    /// hooks-list / oauth-start precedent), so the failure lands on the
+    /// talk flow, never an uncorrelated flash.
+    TranscriptionSecretFailed {
+        op: TranscriptionOp,
+        message: String,
     },
     /// The connection died; the shell will dial again.
     Disconnected {
@@ -2297,6 +2341,21 @@ impl LiveDriver {
                 model.dirty = true;
                 Vec::new()
             }
+            // T2 transcription-secret answers: pure reducer routing — the
+            // intent recorded at issuance decides where each one lands
+            // (talk start, setup presence, setup probe). No driver state.
+            LiveReply::TranscriptionSecret { secret } => {
+                model.talk_secret_answer(secret);
+                Vec::new()
+            }
+            LiveReply::TranscriptionSecretStored { present } => {
+                model.talk_secret_stored(present);
+                Vec::new()
+            }
+            LiveReply::TranscriptionSecretFailed { op, message } => {
+                model.talk_secret_failed(op, message);
+                Vec::new()
+            }
         }
     }
 
@@ -2946,13 +3005,23 @@ impl LiveDriver {
                     name,
                 })]
             }
+            // T2: the secret RPCs — a read and a deliberately receipt-free
+            // set (no receipt may carry a secret; the daemon's vault file
+            // is the durable truth). Never outboxed: a socket loss simply
+            // drops the flight and the talk flow's error path says so.
+            AppRequest::TranscriptionSecretRead => vec![LiveCommand::TranscriptionSecretGet],
+            AppRequest::TranscriptionSecretStore { secret, clear } => {
+                vec![LiveCommand::TranscriptionSecretSet { secret, clear }]
+            }
             // Runtime-owned effects: `live_pass` hands these BACK to the
             // shell (they need the terminal, the process, or — for the
-            // B4b attach read — the filesystem), so reaching here at all
-            // would be a routing bug, not a discard.
+            // B4b attach read — the filesystem; TalkShell needs the mic
+            // and the stt supervisor), so reaching here at all would be a
+            // routing bug, not a discard.
             AppRequest::CopySelection
             | AppRequest::CopyText(_)
             | AppRequest::AttachRead { .. }
+            | AppRequest::TalkShell(_)
             | AppRequest::Quit => Vec::new(),
             // DEMO-ONLY VOCABULARY. The reducer refuses every one of these
             // upstream in live mode (`AppModel::refuse_demo_only`), so this

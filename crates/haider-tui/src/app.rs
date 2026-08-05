@@ -1879,6 +1879,24 @@ pub enum AppRequest {
     /// flashes it instead). Carried for the OAuth authorize hop — the URL
     /// always originates from the daemon's sanctioned registration.
     OpenUrl { url: String },
+    /// T2: read the vaulted Deepgram key (`transcription.secret_get`,
+    /// UDS-only). A READ — never outboxed; the answer routes by
+    /// [`crate::talk::TalkState::secret_intent`].
+    TranscriptionSecretRead,
+    /// T2: vault (or clear) the Deepgram key
+    /// (`transcription.secret_set`). The secret rides as [`SecretWire`] —
+    /// redacted Debug, zeroize-on-drop — and NOWHERE else. Deliberately
+    /// non-durable (no receipt may carry a secret; the vault file is the
+    /// truth), so no command id and no outbox.
+    TranscriptionSecretStore {
+        secret: haider_rpc::SecretWire,
+        clear: bool,
+    },
+    /// T2: a TUI-process STT effect (mic capture, engines, model
+    /// downloads, config IO) — runtime-owned like [`Self::CopySelection`];
+    /// `live_pass` hands it to the talk supervisor. Demo mode can never
+    /// reach it (the reducer refuses `/talk` there).
+    TalkShell(crate::talk::TalkShellCommand),
     /// Quit the app.
     Quit,
 }
@@ -2410,7 +2428,25 @@ pub struct AppModel {
     /// Per-session voice pipeline (sim DEFAULT_VOICE — ships ON).
     pub voice: VoiceState,
     /// The ◉ talk hold is live (`◉ listening…` chip + status segment).
+    /// Demo mode drives it directly (the canned hold); live mode keeps it
+    /// in lockstep with [`Self::talk`]'s engagement so the chip chrome,
+    /// the status segment and `animated()` read ONE flag in both modes.
     pub listening: bool,
+    /// T2 — the LIVE talk state machine (phase, generation, ghost
+    /// assembly, wave ring). Demo mode never engages it.
+    pub talk: crate::talk::TalkState,
+    /// The `/talk` setup card, while open. Owns the input band and the
+    /// keyboard (the login-card modality) — the Deepgram key never
+    /// reaches the composer.
+    pub talk_setup: Option<crate::talk::TalkSetupCard>,
+    /// The profile `transcription` section, loaded by the live runtime at
+    /// boot and refreshed on every `ConfigStored`. Pure data here — the
+    /// reducer performs no IO.
+    pub talk_config: haider_stt::config::TranscriptionConfig,
+    /// The TYPED config-load error, when the section exists but is
+    /// corrupt (`/talk` surfaces it honestly instead of flipping the
+    /// user's engine choice to a default).
+    pub talk_config_error: Option<String>,
     /// The launcher's working dir for shell builtins, in DISPLAY form
     /// (`~`-abbreviated, sim `~/dev/enterprise-suite`).
     pub launcher_dir: String,
@@ -2645,6 +2681,10 @@ impl Default for AppModel {
             queue_mode: false,
             voice: VoiceState::default(),
             listening: false,
+            talk: crate::talk::TalkState::default(),
+            talk_setup: None,
+            talk_config: haider_stt::config::TranscriptionConfig::default(),
+            talk_config_error: None,
             launcher_dir: "~/dev/enterprise-suite".to_owned(),
             cwd: "/".to_owned(),
             session_dir: "~/dev/enterprise-suite".to_owned(),
@@ -2959,6 +2999,18 @@ impl AppModel {
         if self.login.is_some() {
             self.close_login_card();
             self.flash = Some("· /login cancelled — the surface changed".to_owned());
+        }
+        // T2: talk is surface-local exactly like the login card — a live
+        // session (or the setup card) dies with the surface it borrowed
+        // the band from. Cancel is DISCARD by contract (Esc law), and the
+        // generation bump makes every late runtime event stale.
+        if self.talk.engaged() {
+            self.talk_cancel();
+            self.flash = Some("· ◉ talk cancelled — the surface changed".to_owned());
+        }
+        if self.talk_setup.is_some() {
+            self.talk_setup = None;
+            self.flash = Some("· /talk setup closed — the surface changed".to_owned());
         }
         let key = self.surface_key();
         // TUI6.1 fix 1 closure: the frame's CURRENT wrap budget outlives
@@ -3334,6 +3386,21 @@ impl AppModel {
                     self.login_key(&key);
                     return;
                 }
+                // The `/talk` setup card owns the keyboard while open
+                // (same modality: the Deepgram key must never reach the
+                // composer, the palette or the input ring).
+                if self.talk_setup.is_some() {
+                    self.talk_setup_key(&key);
+                    return;
+                }
+                // T2 toggle-to-talk: while a live talk session is engaged
+                // the state machine owns Esc (cancel), Enter (commit +
+                // submit) and plain typing (commit into the composer and
+                // keep editing — `talk_key` settles the session and
+                // returns false so the char flows the NORMAL path).
+                if self.talk.engaged() && self.talk_key(&key) {
+                    return;
+                }
                 // TUI5 item 4 — the selection gates run BEFORE the
                 // clear-on-keypress law, or ⌃C/Esc could never see the
                 // selection they govern.
@@ -3357,6 +3424,28 @@ impl AppModel {
                 if let Some(card) = self.login.as_mut() {
                     card.push_str(text);
                     return;
+                }
+                // The `/talk` setup card: paste lands in the FOCUSED field
+                // (the key buffer or the language field) and nowhere else.
+                if let Some(card) = self.talk_setup.as_mut() {
+                    match card.stage {
+                        crate::talk::SetupStage::DeepgramKey => card.key_push_str(text),
+                        crate::talk::SetupStage::Language => {
+                            for c in text.trim().chars() {
+                                if c.is_ascii_alphanumeric() || c == '-' {
+                                    card.language.push(c);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    return;
+                }
+                // T2: pasting while a talk session is engaged COMMITS the
+                // partial transcript first (the typing-commits law), then
+                // the paste itself flows the normal path below.
+                if self.talk.engaged() {
+                    self.talk_commit_to_composer();
                 }
                 // While a blocking menu replaces the composer, paste has no
                 // target (r2 P2).
@@ -4461,6 +4550,861 @@ impl AppModel {
             return;
         }
         self.submit_voice(TALK_PHRASE.to_owned());
+    }
+
+    // ===================================================================
+    // T2 — live toggle-to-talk (the `/talk` state machine)
+    // ===================================================================
+
+    /// The one talk entry point (TalkChip press and bare `/talk` share
+    /// it): toggle-to-talk. Idle starts a session; a press while
+    /// listening COMMITS AND SUBMITS (the Enter gesture); a press while
+    /// starting aborts.
+    pub fn talk_toggle(&mut self) {
+        if self.mode.fabricates_locally() {
+            // Demo keeps its canned ◉ hold on the chip; `/talk` says so.
+            self.flash =
+                Some("· /talk — live only (the demo chip plays the canned hold)".to_owned());
+            return;
+        }
+        if self.screen != Screen::Session {
+            self.flash = Some("· /talk — session only".to_owned());
+            return;
+        }
+        if self.talk_setup.is_some() {
+            return;
+        }
+        match self.talk.phase {
+            crate::talk::TalkPhase::Idle => self.talk_start(),
+            crate::talk::TalkPhase::Starting => {
+                self.talk_cancel();
+                self.flash = Some("· ◉ talk cancelled".to_owned());
+            }
+            crate::talk::TalkPhase::Listening => self.talk_commit_submit(),
+            crate::talk::TalkPhase::Finishing => {}
+        }
+    }
+
+    /// Start a session on the CONFIGURED engine. Local goes straight to
+    /// the runtime (which answers `ModelMissing`/`RuntimeMissing`
+    /// honestly); Deepgram first fetches the vaulted key from the daemon.
+    fn talk_start(&mut self) {
+        if let Some(error) = self.talk_config_error.clone() {
+            self.flash = Some(format!("· /talk — transcription config is broken: {error}"));
+            return;
+        }
+        match self.talk_config.engine {
+            haider_stt::config::TranscriptionEngine::Local => {
+                let generation = self
+                    .talk
+                    .begin(haider_stt::config::TranscriptionEngine::Local);
+                self.listening = true;
+                self.requests.push(AppRequest::TalkShell(
+                    crate::talk::TalkShellCommand::Start {
+                        generation,
+                        engine: crate::talk::TalkEngineSpec::Local {
+                            model_id: self.talk_config.whisper_model_id.clone(),
+                        },
+                    },
+                ));
+            }
+            haider_stt::config::TranscriptionEngine::Deepgram => {
+                if !self
+                    .daemon_features
+                    .contains(haider_rpc::FEATURE_TRANSCRIPTION_V1)
+                {
+                    self.flash = Some(
+                        "· /talk — this daemon does not vault transcription secrets (update haiderd)"
+                            .to_owned(),
+                    );
+                    return;
+                }
+                self.talk
+                    .begin(haider_stt::config::TranscriptionEngine::Deepgram);
+                self.listening = true;
+                self.talk.secret_intent = Some(crate::talk::SecretIntent::Start);
+                self.requests.push(AppRequest::TranscriptionSecretRead);
+            }
+        }
+    }
+
+    /// Esc law: DISCARD. Settles the machine (the generation bump makes
+    /// every late runtime event stale) and tells the runtime to tear the
+    /// mic/engine down. Nothing lands anywhere.
+    pub fn talk_cancel(&mut self) {
+        if !self.talk.engaged() {
+            return;
+        }
+        let generation = self.talk.generation;
+        self.talk.settle();
+        self.listening = false;
+        self.dirty = true;
+        self.requests.push(AppRequest::TalkShell(
+            crate::talk::TalkShellCommand::Cancel { generation },
+        ));
+    }
+
+    /// Enter law: COMMIT + SUBMIT. Input stops now; the engine assembles
+    /// the definitive transcript and [`Self::handle_talk`]'s `Finished`
+    /// arm realizes it into the composer and submits.
+    fn talk_commit_submit(&mut self) {
+        if self.talk.phase != crate::talk::TalkPhase::Listening {
+            return;
+        }
+        self.talk.phase = crate::talk::TalkPhase::Finishing;
+        self.talk.intent = crate::talk::CommitIntent::Submit;
+        self.dirty = true;
+        self.requests.push(AppRequest::TalkShell(
+            crate::talk::TalkShellCommand::Finish {
+                generation: self.talk.generation,
+            },
+        ));
+    }
+
+    /// Typing law: COMMIT INTO THE COMPOSER AND KEEP EDITING. What the
+    /// ghost showed is realized verbatim (plus one separating space); the
+    /// engine's unseen tail is discarded with the session — what you saw
+    /// is what you keep.
+    pub(crate) fn talk_commit_to_composer(&mut self) {
+        if !self.talk.engaged() {
+            return;
+        }
+        let generation = self.talk.generation;
+        self.realize_talk_ghost();
+        self.talk.settle();
+        self.listening = false;
+        self.dirty = true;
+        self.requests.push(AppRequest::TalkShell(
+            crate::talk::TalkShellCommand::Cancel { generation },
+        ));
+    }
+
+    /// Insert the current ghost text (capped, one trailing space) at the
+    /// cursor. No-op on an empty ghost.
+    fn realize_talk_ghost(&mut self) {
+        let ghost = self.talk.ghost.trim().to_owned();
+        if ghost.is_empty() {
+            return;
+        }
+        let mut text = crate::talk::clamp_realized(&ghost).to_owned();
+        text.push(' ');
+        self.composer.insert_str(&text);
+    }
+
+    /// Keyboard while a talk session is engaged. Returns true when the
+    /// key was CONSUMED; `false` lets the key flow the normal path (a
+    /// plain char after its commit, and ⌃C — the navigation hatch, whose
+    /// surface change cancels the session at the stash seam).
+    pub fn talk_key(&mut self, key: &KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Esc => {
+                self.talk_cancel();
+                self.flash = Some("· ◉ talk cancelled".to_owned());
+                true
+            }
+            KeyCode::Enter => {
+                self.talk_commit_submit();
+                true
+            }
+            KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => c != 'c',
+            KeyCode::Char(_) if key.modifiers.contains(KeyModifiers::ALT) => true,
+            KeyCode::Char(_) => {
+                self.talk_commit_to_composer();
+                false
+            }
+            // Arrows, backspace, tab, … are inert while talking: the
+            // contract stays three gestures wide.
+            _ => true,
+        }
+    }
+
+    /// True when the partial-transcript ghost row renders (chrome above
+    /// the composer — NEVER transcript content).
+    #[must_use]
+    pub fn talk_ghost_visible(&self) -> bool {
+        self.screen == Screen::Session
+            && self.talk.engaged()
+            && !self.talk.ghost.trim().is_empty()
+            && self.login.is_none()
+            && self.talk_setup.is_none()
+    }
+
+    /// The TalkChip's label for the current live phase (demo listening
+    /// keeps the sim wording).
+    #[must_use]
+    pub fn talk_chip_label(&self) -> &'static str {
+        if self.talk.phase == crate::talk::TalkPhase::Finishing {
+            "◉ transcribing…"
+        } else if self.listening {
+            "◉ listening…"
+        } else {
+            "◉ talk"
+        }
+    }
+
+    /// Route a typed engine/setup error: model/runtime gaps open the
+    /// setup card (the reinstall surface); everything else is an honest
+    /// flash.
+    fn talk_error(&mut self, error: haider_stt::SttError) {
+        match &error {
+            haider_stt::SttError::ModelMissing { model_id } => {
+                self.open_talk_setup_at_local(format!(
+                    "whisper model `{model_id}` is not installed (the shared dir is evictable) — download to continue"
+                ));
+            }
+            haider_stt::SttError::RuntimeMissing { hint } => {
+                self.open_talk_setup_at_local(format!("whisper-cli is not installed — {hint}"));
+            }
+            other => {
+                self.flash = Some(format!("· ◉ talk failed — {other}"));
+            }
+        }
+    }
+
+    /// Reduce one runtime talk event. Session-scoped events correlate by
+    /// generation — anything from a settled session is dropped whole.
+    pub fn handle_talk(&mut self, event: crate::talk::TalkEvent) {
+        use crate::talk::{CommitIntent, TalkEvent, TalkPhase};
+        match event {
+            TalkEvent::Started { generation, .. } => {
+                if generation == self.talk.generation && self.talk.phase == TalkPhase::Starting {
+                    self.talk.phase = TalkPhase::Listening;
+                    self.dirty = true;
+                }
+            }
+            TalkEvent::Envelope { generation, level } => {
+                if generation == self.talk.generation && self.talk.wave_active() {
+                    self.talk.wave.push(level);
+                    self.dirty = true;
+                }
+            }
+            TalkEvent::Partial { generation, frame } => {
+                if generation == self.talk.generation && self.talk.engaged() {
+                    self.talk.apply_frame(&frame);
+                    self.dirty = true;
+                }
+            }
+            TalkEvent::Health { generation, health } => {
+                if generation == self.talk.generation && self.talk.engaged() {
+                    self.dirty = true;
+                    self.flash = Some(match health {
+                        haider_stt::capture::CaptureHealth::DigitalZero { hint }
+                        | haider_stt::capture::CaptureHealth::Stalled { hint } => {
+                            format!("· mic: {hint}")
+                        }
+                        haider_stt::capture::CaptureHealth::Recovered => {
+                            "· mic signal recovered".to_owned()
+                        }
+                    });
+                }
+            }
+            TalkEvent::CapReached { generation } => {
+                if generation == self.talk.generation && self.talk.phase == TalkPhase::Listening {
+                    // The 900 s capture cap: finish into the composer —
+                    // the user presses ⏎ themselves.
+                    self.talk.phase = TalkPhase::Finishing;
+                    self.talk.intent = CommitIntent::Insert;
+                    self.flash = Some("· ◉ capture cap reached — transcribing".to_owned());
+                    self.dirty = true;
+                    self.requests.push(AppRequest::TalkShell(
+                        crate::talk::TalkShellCommand::Finish { generation },
+                    ));
+                }
+            }
+            TalkEvent::Finished { generation, result } => {
+                if generation != self.talk.generation || self.talk.phase != TalkPhase::Finishing {
+                    return;
+                }
+                let intent = self.talk.intent;
+                let ghost = self.talk.ghost.trim().to_owned();
+                self.talk.settle();
+                self.listening = false;
+                self.dirty = true;
+                match result {
+                    Ok(result) => {
+                        let text = result.text.trim().to_owned();
+                        if text.is_empty() {
+                            self.flash = Some("· ◉ heard nothing".to_owned());
+                        } else {
+                            self.composer.insert_str(crate::talk::clamp_realized(&text));
+                            match intent {
+                                CommitIntent::Submit => self.submit_composer(),
+                                CommitIntent::Insert => {
+                                    self.flash = Some("· ◉ transcribed — ⏎ to send".to_owned());
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        // Best-effort honesty: the words the ghost showed
+                        // were watched landing — keep them; say what broke.
+                        if !ghost.is_empty() {
+                            let mut text = crate::talk::clamp_realized(&ghost).to_owned();
+                            text.push(' ');
+                            self.composer.insert_str(&text);
+                        }
+                        self.talk_error(error);
+                    }
+                }
+            }
+            TalkEvent::StartFailed { generation, error } => {
+                if generation != self.talk.generation {
+                    return;
+                }
+                self.talk.settle();
+                self.listening = false;
+                self.dirty = true;
+                self.talk_error(error);
+            }
+            TalkEvent::SetupSnapshot { snapshot } => {
+                if let Some(card) = self.talk_setup.as_mut() {
+                    card.apply_snapshot(snapshot);
+                    self.dirty = true;
+                }
+            }
+            TalkEvent::KeyAccepted { secret, models } => {
+                self.talk_setup_key_accepted(secret, models);
+            }
+            TalkEvent::KeyRejected { error } => self.talk_setup_key_rejected(&error),
+            TalkEvent::DownloadProgress { model_id, percent } => {
+                if let Some(card) = self.talk_setup.as_mut() {
+                    for row in &mut card.whisper {
+                        if row.id == model_id {
+                            row.state = crate::talk::WhisperRowState::Downloading { percent };
+                        }
+                    }
+                    self.dirty = true;
+                }
+            }
+            TalkEvent::DownloadFinished { model_id, error } => {
+                if let Some(card) = self.talk_setup.as_mut() {
+                    for row in &mut card.whisper {
+                        if row.id == model_id {
+                            row.state = match &error {
+                                None => crate::talk::WhisperRowState::Installed,
+                                Some(message) => {
+                                    crate::talk::WhisperRowState::Failed(message.clone())
+                                }
+                            };
+                        }
+                    }
+                    self.dirty = true;
+                }
+            }
+            TalkEvent::RuntimeInstalled { outcome, hint } => {
+                if let Some(card) = self.talk_setup.as_mut() {
+                    card.runtime = match (outcome, hint) {
+                        (Ok(Some(path)), _) => crate::talk::RuntimeRowState::Found(path),
+                        (Ok(None), Some(hint)) => crate::talk::RuntimeRowState::Missing(hint),
+                        (Ok(None), None) => crate::talk::RuntimeRowState::Failed(
+                            "installed, but no whisper executable was found".to_owned(),
+                        ),
+                        (Err(message), _) => crate::talk::RuntimeRowState::Failed(message),
+                    };
+                    self.dirty = true;
+                }
+            }
+            TalkEvent::ConfigStored { config, error } => {
+                self.dirty = true;
+                match error {
+                    None => {
+                        self.talk_config = config;
+                        self.talk_config_error = None;
+                        if self.talk_setup.as_ref().is_some_and(|card| card.saving) {
+                            self.talk_setup = None;
+                            let label = match self.talk_config.engine {
+                                haider_stt::config::TranscriptionEngine::Local => "local whisper",
+                                haider_stt::config::TranscriptionEngine::Deepgram => "deepgram",
+                            };
+                            self.flash =
+                                Some(format!("· ◉ talk ready — {label} · press ◉ or /talk"));
+                        }
+                    }
+                    Some(message) => {
+                        if let Some(card) = self.talk_setup.as_mut() {
+                            card.saving = false;
+                            card.error = Some(format!("could not save the config — {message}"));
+                        } else {
+                            self.flash =
+                                Some(format!("· /talk — could not save the config: {message}"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The daemon's `transcription.secret_get` answer, routed by the
+    /// intent recorded at issuance.
+    pub fn talk_secret_answer(&mut self, secret: Option<haider_rpc::SecretWire>) {
+        let Some(intent) = self.talk.secret_intent.take() else {
+            return;
+        };
+        self.dirty = true;
+        match intent {
+            crate::talk::SecretIntent::Start => {
+                if self.talk.phase != crate::talk::TalkPhase::Starting {
+                    return;
+                }
+                match secret {
+                    Some(secret) => {
+                        let generation = self.talk.generation;
+                        self.requests.push(AppRequest::TalkShell(
+                            crate::talk::TalkShellCommand::Start {
+                                generation,
+                                engine: crate::talk::TalkEngineSpec::Deepgram {
+                                    secret,
+                                    model: self.talk_config.deepgram_model.clone(),
+                                    language: self.talk_config.language.clone(),
+                                },
+                            },
+                        ));
+                    }
+                    None => {
+                        self.talk.settle();
+                        self.listening = false;
+                        self.open_talk_setup();
+                        if let Some(card) = self.talk_setup.as_mut() {
+                            card.stage = crate::talk::SetupStage::DeepgramKey;
+                            card.error = Some(
+                                "no Deepgram key vaulted yet — paste one to continue".to_owned(),
+                            );
+                        }
+                    }
+                }
+            }
+            crate::talk::SecretIntent::SetupPresence => {
+                if let Some(card) = self.talk_setup.as_mut() {
+                    card.key_present = secret.is_some();
+                    if card.stage == crate::talk::SetupStage::DeepgramKey
+                        && card.key_present
+                        && card.key_stage == crate::talk::KeyStage::Entry
+                        && card.key_is_empty()
+                    {
+                        card.key_stage = crate::talk::KeyStage::Reuse;
+                    }
+                }
+                // The secret itself drops (and zeroizes) here — presence
+                // was the only question.
+            }
+            crate::talk::SecretIntent::SetupProbe => match (self.talk_setup.as_mut(), secret) {
+                (Some(_card), Some(secret)) => {
+                    self.requests.push(AppRequest::TalkShell(
+                        crate::talk::TalkShellCommand::ProbeKey { secret },
+                    ));
+                }
+                (Some(card), None) => {
+                    card.key_present = false;
+                    card.key_reused = false;
+                    card.key_stage = crate::talk::KeyStage::Entry;
+                    card.error = Some("the vaulted key is gone — paste one to continue".to_owned());
+                }
+                _ => {}
+            },
+        }
+    }
+
+    /// The daemon's `transcription.secret_set` answer.
+    pub fn talk_secret_stored(&mut self, present: bool) {
+        self.dirty = true;
+        let Some(card) = self.talk_setup.as_mut() else {
+            return;
+        };
+        if card.key_stage != crate::talk::KeyStage::Storing {
+            return;
+        }
+        if present {
+            card.key_present = true;
+            card.key_stage = crate::talk::KeyStage::Entry;
+            card.error = None;
+            card.stage = crate::talk::SetupStage::DeepgramModels;
+            card.selection = 0;
+        } else {
+            card.key_stage = crate::talk::KeyStage::Entry;
+            card.error = Some("the daemon reported no key after the store — try again".to_owned());
+        }
+    }
+
+    /// A transcription-secret RPC failed (typed daemon refusal or
+    /// transport) — surfaced where the flow lives.
+    pub fn talk_secret_failed(&mut self, op: crate::live::TranscriptionOp, message: String) {
+        self.dirty = true;
+        match op {
+            crate::live::TranscriptionOp::Get => match self.talk.secret_intent.take() {
+                Some(crate::talk::SecretIntent::Start) => {
+                    self.talk.settle();
+                    self.listening = false;
+                    self.flash = Some(format!("· ◉ talk failed — {message}"));
+                }
+                Some(
+                    crate::talk::SecretIntent::SetupPresence
+                    | crate::talk::SecretIntent::SetupProbe,
+                ) => {
+                    if let Some(card) = self.talk_setup.as_mut() {
+                        if card.key_stage == crate::talk::KeyStage::Validating {
+                            card.key_stage = crate::talk::KeyStage::Entry;
+                        }
+                        card.error = Some(message);
+                    }
+                }
+                None => {
+                    self.flash = Some(format!("· transcription vault — {message}"));
+                }
+            },
+            crate::live::TranscriptionOp::Set => {
+                if let Some(card) = self.talk_setup.as_mut() {
+                    card.key_stage = crate::talk::KeyStage::Entry;
+                    card.error = Some(format!("could not vault the key — {message}"));
+                } else {
+                    self.flash = Some(format!("· transcription vault — {message}"));
+                }
+            }
+        }
+    }
+
+    /// A probed key validated (model list riding along): vault it (typed
+    /// path) or proceed straight to the model picker (reuse path). A
+    /// closed card drops the secret unvaulted (it zeroizes).
+    fn talk_setup_key_accepted(
+        &mut self,
+        secret: haider_rpc::SecretWire,
+        models: Vec<crate::talk::DeepgramModelRow>,
+    ) {
+        let store = {
+            let Some(card) = self.talk_setup.as_mut() else {
+                return;
+            };
+            if card.key_stage != crate::talk::KeyStage::Validating {
+                return;
+            }
+            self.dirty = true;
+            card.models = models;
+            card.error = None;
+            if card.key_reused {
+                card.key_stage = crate::talk::KeyStage::Entry;
+                card.stage = crate::talk::SetupStage::DeepgramModels;
+                card.selection = 0;
+                false
+            } else {
+                card.key_stage = crate::talk::KeyStage::Storing;
+                true
+            }
+        };
+        if store {
+            self.requests.push(AppRequest::TranscriptionSecretStore {
+                secret,
+                clear: false,
+            });
+        }
+        // else: `secret` drops (zeroizes) — the reuse path never held a
+        // second copy to begin with.
+    }
+
+    /// A probed key was refused (or the endpoint failed).
+    fn talk_setup_key_rejected(&mut self, error: &haider_stt::SttError) {
+        let Some(card) = self.talk_setup.as_mut() else {
+            return;
+        };
+        if card.key_stage != crate::talk::KeyStage::Validating {
+            return;
+        }
+        self.dirty = true;
+        card.key_stage = crate::talk::KeyStage::Entry;
+        card.key_reused = false;
+        card.error = Some(match error {
+            haider_stt::SttError::Unauthorized(_) => {
+                "Deepgram refused the key (401) — check it and try again".to_owned()
+            }
+            other => format!("could not validate the key — {other}"),
+        });
+    }
+
+    /// Open the `/talk` setup card (engine picker first). Cancels any
+    /// engaged session; loads the world snapshot and the vaulted-key
+    /// presence.
+    pub fn open_talk_setup(&mut self) {
+        if self.mode.fabricates_locally() {
+            self.flash = Some("· /talk setup — live only".to_owned());
+            return;
+        }
+        if self.screen != Screen::Session {
+            self.flash = Some("· /talk — session only".to_owned());
+            return;
+        }
+        if self.talk.engaged() {
+            self.talk_cancel();
+        }
+        let vault_supported = self
+            .daemon_features
+            .contains(haider_rpc::FEATURE_TRANSCRIPTION_V1);
+        let mut card = crate::talk::TalkSetupCard::new(self.talk_config.clone(), vault_supported);
+        if let Some(error) = &self.talk_config_error {
+            card.error = Some(error.clone());
+        }
+        self.talk_setup = Some(card);
+        self.dirty = true;
+        self.requests.push(AppRequest::TalkShell(
+            crate::talk::TalkShellCommand::LoadSetup,
+        ));
+        if vault_supported {
+            self.talk.secret_intent = Some(crate::talk::SecretIntent::SetupPresence);
+            self.requests.push(AppRequest::TranscriptionSecretRead);
+        }
+    }
+
+    /// Open setup directly on the whisper stage with an honest error (the
+    /// `ModelMissing`/`RuntimeMissing` reinstall surface).
+    fn open_talk_setup_at_local(&mut self, error: String) {
+        self.open_talk_setup();
+        if let Some(card) = self.talk_setup.as_mut() {
+            card.stage = crate::talk::SetupStage::Local;
+            card.selection = 0;
+            card.error = Some(error);
+        } else {
+            // Setup could not open (screen changed under the error) — the
+            // message still lands.
+            self.flash = Some(format!("· ◉ talk — {error}"));
+        }
+    }
+
+    /// Keyboard while the setup card owns the band.
+    pub fn talk_setup_key(&mut self, key: &KeyEvent) {
+        use crate::talk::{KeyStage, SetupStage};
+        enum Action {
+            None,
+            Activate,
+            Close,
+        }
+        let action = {
+            let Some(card) = self.talk_setup.as_mut() else {
+                return;
+            };
+            match key.code {
+                KeyCode::Esc => Action::Close,
+                KeyCode::Enter => Action::Activate,
+                KeyCode::Up => {
+                    card.selection = card.selection.saturating_sub(1);
+                    Action::None
+                }
+                KeyCode::Down => {
+                    card.selection = (card.selection + 1).min(card.row_count().saturating_sub(1));
+                    Action::None
+                }
+                KeyCode::Backspace => {
+                    match card.stage {
+                        SetupStage::DeepgramKey => card.key_backspace(),
+                        SetupStage::Language => {
+                            card.language.pop();
+                        }
+                        _ => {}
+                    }
+                    Action::None
+                }
+                KeyCode::Char(c) => match card.stage {
+                    SetupStage::DeepgramKey => {
+                        if card.key_stage == KeyStage::Reuse {
+                            if c == 'r' {
+                                // Retype: abandon the vaulted key's reuse.
+                                card.key_stage = KeyStage::Entry;
+                                card.key_reused = false;
+                            }
+                        } else {
+                            card.key_push(c);
+                        }
+                        Action::None
+                    }
+                    SetupStage::Language => {
+                        if c.is_ascii_alphanumeric() || c == '-' {
+                            card.language.push(c);
+                        }
+                        Action::None
+                    }
+                    _ => {
+                        // Digit shortcuts activate rows directly (menu
+                        // parity).
+                        if let Some(digit) = c.to_digit(10) {
+                            let index = digit.saturating_sub(1) as usize;
+                            if index < card.row_count() {
+                                card.selection = index;
+                                Action::Activate
+                            } else {
+                                Action::None
+                            }
+                        } else {
+                            Action::None
+                        }
+                    }
+                },
+                _ => Action::None,
+            }
+        };
+        match action {
+            Action::None => {}
+            Action::Close => {
+                self.talk_setup = None;
+                self.flash = Some("· /talk setup closed".to_owned());
+            }
+            Action::Activate => self.talk_setup_activate(),
+        }
+    }
+
+    /// ⏎ (or a digit) on the setup card's highlighted row.
+    fn talk_setup_activate(&mut self) {
+        use crate::talk::{
+            KeyStage, RuntimeRowState, SetupStage, TalkShellCommand, WhisperRowState,
+        };
+        enum Action {
+            None,
+            Request(AppRequest),
+            ProbeVaulted,
+        }
+        let action = {
+            let Some(card) = self.talk_setup.as_mut() else {
+                return;
+            };
+            match card.stage {
+                SetupStage::Engine => {
+                    if card.selection == 0 {
+                        card.stage = SetupStage::Local;
+                        card.selection = 0;
+                        card.error = None;
+                        Action::None
+                    } else if card.vault_supported {
+                        card.stage = SetupStage::DeepgramKey;
+                        card.selection = 0;
+                        card.error = None;
+                        card.key_stage = if card.key_present && card.key_is_empty() {
+                            KeyStage::Reuse
+                        } else {
+                            KeyStage::Entry
+                        };
+                        Action::None
+                    } else {
+                        card.error = Some(
+                            "this daemon does not vault transcription secrets — update haiderd (feature transcription_v1)"
+                                .to_owned(),
+                        );
+                        Action::None
+                    }
+                }
+                SetupStage::Local => {
+                    if !card.loaded {
+                        Action::None
+                    } else if card.selection < card.whisper.len() {
+                        let row = &mut card.whisper[card.selection];
+                        match &row.state {
+                            WhisperRowState::Installed => {
+                                let mut config = card.config.clone();
+                                config.engine = haider_stt::config::TranscriptionEngine::Local;
+                                config.whisper_model_id = Some(row.id.to_owned());
+                                card.config = config.clone();
+                                card.saving = true;
+                                card.error = None;
+                                Action::Request(AppRequest::TalkShell(
+                                    TalkShellCommand::StoreConfig { config },
+                                ))
+                            }
+                            WhisperRowState::Absent | WhisperRowState::Failed(_) => {
+                                row.state = WhisperRowState::Downloading { percent: None };
+                                let model_id = row.id.to_owned();
+                                Action::Request(AppRequest::TalkShell(
+                                    TalkShellCommand::InstallModel { model_id },
+                                ))
+                            }
+                            WhisperRowState::Downloading { .. } => Action::None,
+                        }
+                    } else {
+                        // The runtime row.
+                        match &card.runtime {
+                            RuntimeRowState::Missing(_) | RuntimeRowState::Failed(_) => {
+                                card.runtime = RuntimeRowState::Installing;
+                                Action::Request(AppRequest::TalkShell(
+                                    TalkShellCommand::InstallRuntime,
+                                ))
+                            }
+                            RuntimeRowState::Found(_)
+                            | RuntimeRowState::Installing
+                            | RuntimeRowState::Unknown => Action::None,
+                        }
+                    }
+                }
+                SetupStage::DeepgramKey => match card.key_stage {
+                    KeyStage::Reuse => {
+                        card.key_reused = true;
+                        card.key_stage = KeyStage::Validating;
+                        card.error = None;
+                        Action::ProbeVaulted
+                    }
+                    KeyStage::Entry => {
+                        if card.key_is_empty() {
+                            card.error = Some("paste your Deepgram API key first".to_owned());
+                            Action::None
+                        } else {
+                            card.key_reused = false;
+                            card.key_stage = KeyStage::Validating;
+                            card.error = None;
+                            let secret = card.take_key();
+                            Action::Request(AppRequest::TalkShell(TalkShellCommand::ProbeKey {
+                                secret,
+                            }))
+                        }
+                    }
+                    KeyStage::Validating | KeyStage::Storing => Action::None,
+                },
+                SetupStage::DeepgramModels => {
+                    if card.models.is_empty() {
+                        card.error = Some(
+                            "no streaming models came back — go back and probe the key again"
+                                .to_owned(),
+                        );
+                        Action::None
+                    } else {
+                        let index = card.selection.min(card.models.len() - 1);
+                        card.config.deepgram_model = Some(card.models[index].name.clone());
+                        card.stage = SetupStage::Language;
+                        card.error = None;
+                        Action::None
+                    }
+                }
+                SetupStage::Language => {
+                    let language = card.language.trim().to_owned();
+                    let ok = !language.is_empty()
+                        && language.len() <= 24
+                        && language
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '-');
+                    if ok {
+                        let mut config = card.config.clone();
+                        config.engine = haider_stt::config::TranscriptionEngine::Deepgram;
+                        config.language = language;
+                        card.config = config.clone();
+                        card.saving = true;
+                        card.error = None;
+                        Action::Request(AppRequest::TalkShell(TalkShellCommand::StoreConfig {
+                            config,
+                        }))
+                    } else {
+                        card.error = Some(
+                            "language must be 1-24 characters of letters, digits or `-` (e.g. en, en-US)"
+                                .to_owned(),
+                        );
+                        Action::None
+                    }
+                }
+            }
+        };
+        match action {
+            Action::None => {}
+            Action::Request(request) => {
+                self.dirty = true;
+                self.requests.push(request);
+            }
+            Action::ProbeVaulted => {
+                self.dirty = true;
+                self.talk.secret_intent = Some(crate::talk::SecretIntent::SetupProbe);
+                self.requests.push(AppRequest::TranscriptionSecretRead);
+            }
+        }
     }
 
     /// An aura orchestrate turn: user row + driver request (§3.4).
@@ -6032,6 +6976,30 @@ impl AppModel {
                     "· /{name} — demo only; the live voice/tool surface lands after v0.0.12"
                 ));
             }
+            // T2: live dictation. Bare `/talk` toggles; `setup` opens the
+            // engine/model/key card; `wave` flips the glyph style (plain
+            // ASCII for fonts without partial blocks). Demo mode says so
+            // honestly — the canned ◉ hold stays the demo chip's.
+            "talk" => match arg.as_deref() {
+                Some("setup") => self.open_talk_setup(),
+                Some("wave") => {
+                    self.talk.wave_plain = !self.talk.wave_plain;
+                    self.flash = Some(format!(
+                        "· ◉ wave style — {}",
+                        if self.talk.wave_plain {
+                            "plain glyphs"
+                        } else {
+                            "partial blocks"
+                        }
+                    ));
+                }
+                Some(other) => {
+                    self.flash = Some(format!(
+                        "· /talk {other} — try /talk, /talk setup, /talk wave"
+                    ));
+                }
+                None => self.talk_toggle(),
+            },
             "theme" => match arg.as_deref() {
                 Some(name) => match ThemeChoice::parse(name) {
                     Some(choice) => {
@@ -7750,9 +8718,10 @@ impl AppModel {
             // already carry (review r2 P2-4).
             Hit::TalkChip if self.screen == Screen::Session => {
                 if !self.mode.fabricates_locally() {
-                    // The hold's 1.3 s timer lives in the DEMO driver;
-                    // live mode would set `listening` and never clear it.
-                    self.refuse_demo_only("push-to-talk");
+                    // T2: the live chip drives the real toggle-to-talk
+                    // machine (start · commit+submit) — the demo-only
+                    // refusal died with this wave.
+                    self.talk_toggle();
                 } else if !self.voice.enabled {
                     self.flash = Some("· enable voice first with /voice".to_owned());
                 } else if !self.turn_active && !self.listening {

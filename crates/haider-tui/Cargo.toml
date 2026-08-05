@@ -11,6 +11,7 @@ rustix = { version = "1", features = ["system"] }
 haider-protocol = { path = "../haider-protocol" }
 haider-rpc = { path = "../haider-rpc" }
 haider-client = { path = "../haider-client" }
+haider-stt = { path = "../haider-stt" }
 zeroize.workspace = true
 base64.workspace = true
 ratatui.workspace = true

@@ -396,23 +396,32 @@ fn live_compact_routes_to_the_daemon_and_fabricates_nothing() {
 }
 
 #[test]
-fn live_push_to_talk_refuses_instead_of_listening_forever() {
-    // The hold's 1.3 s timer lives in the demo driver; live mode would set
-    // `listening` and nothing would ever clear it.
+fn live_push_to_talk_never_wedges_listening() {
+    // SUPERSEDED BY T2 (this test's INTENT survives verbatim): the old
+    // refusal existed because live had no machinery to CLEAR `listening`
+    // — the demo hold's 1.3 s timer lives in the demo driver. T2 wires
+    // the chip to the real toggle-to-talk machine, so the law is now:
+    // a live press arms `listening` WITH a runtime effect behind it
+    // (never a wire command — the mic is TUI-process), and Esc clears
+    // the hold deterministically. No un-clearable hold, same as ever.
     let mut model = live_model();
     let mut driver = LiveDriver::new("test");
     attached_session(&mut driver, &mut model);
     model.voice.enabled = true;
     model.handle_hit(Hit::TalkChip);
-    assert!(!model.listening, "no un-clearable hold");
+    assert!(model.listening, "the live chip arms the real machine");
     assert!(
-        model
-            .flash
-            .as_deref()
-            .is_some_and(|flash| flash.contains("demo only")),
-        "got {:?}",
-        model.flash
+        model.requests.iter().any(|request| matches!(
+            request,
+            AppRequest::TalkShell(haider_tui::talk::TalkShellCommand::Start { .. })
+        )),
+        "the hold has a runtime effect behind it"
     );
+    // The talk effect is SHELL-routed: the driver mints no wire command.
+    assert!(pass(&mut driver, &mut model, None).is_empty());
+    // Esc clears the hold — the exact wedge the old refusal guarded.
+    model.handle(key(KeyCode::Esc));
+    assert!(!model.listening, "no un-clearable hold");
     assert!(pass(&mut driver, &mut model, None).is_empty());
 }
 

@@ -1340,7 +1340,13 @@ impl DemoDriver {
             // demo — the sim has no device to probe, so the section is
             // honestly absent and nothing can push these).
             | AppRequest::DeviceCandidatesRefresh
-            | AppRequest::DeviceImport { .. } => {}
+            | AppRequest::DeviceImport { .. }
+            // T2 live-only vocabulary: `/talk` refuses honestly upstream
+            // in demo mode (the chip keeps the canned hold), so neither
+            // the secret RPCs nor the stt-shell effects can be pushed.
+            | AppRequest::TranscriptionSecretRead
+            | AppRequest::TranscriptionSecretStore { .. }
+            | AppRequest::TalkShell(_) => {}
             // `/accounts` (W5d): the demo world answers from the sim's seed
             // list, synchronously — through the SAME reducer seams as live
             // (apply_snapshot / apply_account_selected), so the
@@ -2427,6 +2433,10 @@ pub enum ShellRequest {
     /// The outcome re-enters through [`attach_read_effects`]: an honest
     /// flash, or a chip + upload request on the model.
     AttachRead(String),
+    /// T2: one talk effect for the stt supervisor (mic capture, engines,
+    /// model downloads, config IO — all TUI-process, none wire). Outcomes
+    /// re-enter as [`crate::talk::TalkEvent`]s on the talk channel.
+    Talk(crate::talk::TalkShellCommand),
     /// End the process.
     Quit,
 }
@@ -2483,6 +2493,7 @@ pub fn live_pass(
             AppRequest::CopyText(text) => shell.push(ShellRequest::CopyText(text)),
             AppRequest::OpenUrl { url } => shell.push(ShellRequest::OpenUrl(url)),
             AppRequest::AttachRead { path } => shell.push(ShellRequest::AttachRead(path)),
+            AppRequest::TalkShell(command) => shell.push(ShellRequest::Talk(command)),
             AppRequest::Quit => shell.push(ShellRequest::Quit),
             request => commands.extend(driver.handle_request(model, request)),
         }
@@ -2528,11 +2539,26 @@ pub async fn run_live(
         config.client_instance_id.clone()
     };
     let mut driver = LiveDriver::new(instance);
+    // T2: the talk supervisor needs the profile store dir (config home)
+    // before the profile moves into the link.
+    let store_dir = profile.store_dir.clone();
     let mut link = crate::link::Link::start(client, profile, config);
     // W5e-1b: what this daemon actually serves gates the UI's affordances,
     // so a stale daemon shows an honest note instead of a failed request.
     model.daemon_features = link.daemon_features.clone();
     model.daemon_version = Some(link.daemon_version.clone());
+    // T2: load the profile's transcription section ONCE at boot (shell-
+    // owned IO — the reducer only ever sees the data). A present-but-
+    // corrupt section is a typed error `/talk` surfaces honestly.
+    match haider_stt::config::load(&store_dir) {
+        Ok(talk_config) => model.talk_config = talk_config,
+        Err(error) => model.talk_config_error = Some(error.to_string()),
+    }
+    // The stt supervisor + its event channel: outcomes re-enter the loop
+    // below and reduce through `handle_talk` — the same seam the tests
+    // drive.
+    let (talk_tx, mut talk_rx) = mpsc::unbounded_channel::<crate::talk::TalkEvent>();
+    let talk_runtime = crate::stt_runtime::TalkRuntime::spawn(talk_tx, store_dir);
 
     let _guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
@@ -2624,6 +2650,15 @@ pub async fn run_live(
                 Some(reply) => inbound = Some(reply),
                 None => break,
             },
+            // T2: talk-runtime outcomes (envelopes mark dirty and ride the
+            // guarded 30 fps frame tick below — the wave adds NO timer).
+            // The supervisor outlives this loop (its handle is owned
+            // here), so `None` is unreachable; guarded anyway.
+            talk_event = talk_rx.recv() => {
+                if let Some(event) = talk_event {
+                    model.handle_talk(event);
+                }
+            }
             _ = anim_tick.tick(), if model.animated() => {
                 model.anim_phase = model.anim_phase.wrapping_add(1);
                 model.dirty = true;
@@ -2657,6 +2692,7 @@ pub async fn run_live(
                     open_url_effects(&mut model, &url, &crate::browser::open_url);
                 }
                 ShellRequest::AttachRead(path) => attach_read_effects(&mut model, &path),
+                ShellRequest::Talk(command) => talk_runtime.execute(command),
                 ShellRequest::Quit => model.should_quit = true,
             }
         }
