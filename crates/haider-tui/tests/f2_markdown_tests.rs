@@ -122,6 +122,43 @@ fn styled_wrap_never_moves_a_break() {
     }
 }
 
+/// The styled wrap against a HAND-COMPUTED oracle — independent literals,
+/// not the wrapper's own output (the self-consistency law above cannot
+/// see a global budget shift; this one can).
+///
+/// MUTATION CHECK (F2d): shrink the walker's budget by one. Expected
+/// runtime failure: every literal row below breaks one cell early.
+#[test]
+fn styled_wrap_matches_the_hand_computed_oracle() {
+    let rows = |spans: &[MdSpan], budget: usize| -> Vec<String> {
+        wrap_spans(spans, budget)
+            .iter()
+            .map(|row| row.iter().map(|span| span.text.as_str()).collect())
+            .collect()
+    };
+    // Pre-wrap: the break lands at the space-run boundary; the space that
+    // crosses the edge fills to it and carries over.
+    assert_eq!(
+        rows(&text_span("the answer is 97 exactly"), 17),
+        vec!["the answer is 97 ".to_owned(), "exactly".to_owned()]
+    );
+    assert_eq!(
+        rows(&text_span("aaa bbb ccc"), 7),
+        vec!["aaa bbb".to_owned(), " ccc".to_owned()]
+    );
+    // An overlong unbreakable run hard-splits at the cell boundary.
+    assert_eq!(
+        rows(&text_span("abcdefghij"), 4),
+        vec!["abcd".to_owned(), "efgh".to_owned(), "ij".to_owned()]
+    );
+    // Styled spans break at the SAME columns: bold 97 changes nothing.
+    let styled = render_markdown("the answer is **97** exactly");
+    assert_eq!(
+        rows(&styled[0].spans, 17),
+        vec!["the answer is 97 ".to_owned(), "exactly".to_owned()]
+    );
+}
+
 /// Byte-content preservation: rendered plain text is the source minus
 /// ONLY marker characters (`*`, `_`, `` ` ``) consumed by matched pairs —
 /// an in-order subsequence with nothing else missing and nothing added.
