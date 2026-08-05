@@ -31,3 +31,11 @@ The download/deepgram/daemon laws use loopback TCP fixtures. In restricted
 sandboxes that prohibit `bind(2)` they compile but stop at fixture setup
 with `Operation not permitted`; they execute normally in the workspace/CI
 runtime where loopback fixtures are permitted.
+
+## Review of record (coordinator, executed post-lane)
+
+| # | Mutation (seam) | Law | Observed kill |
+|---|---|---|---|
+| RV3 | Zip-slip guard disabled: `escapes = false` (`runtime.rs reject_unsafe_zip_entries`) | `zip_entry_guard_refuses_escaping_names` + `runtime_zip_extraction_is_screened_and_lands_in_runtime_dir` | KILLED at BOTH levels — the security gate is observed by the unit law and the end-to-end extraction law; a `../evil.txt` archive entry extracts under the mutation and both pins fail |
+
+Reverted; 7/7 runtime laws green. Lane's 13-kill campaign reviewed — no further gaps.
