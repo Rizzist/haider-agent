@@ -749,3 +749,41 @@ fn stale_plan_started_cannot_overwrite_a_progressed_plan() {
     assert_eq!(todos_panel.items.len(), 2);
     assert_eq!(projection.duplicate_items(), 1);
 }
+
+#[test]
+fn empty_plan_completed_clears_the_pinned_panel_and_closes_the_id() {
+    // G1: the live `todo_write` clear — `Completed{Plan, []}` on the open
+    // lifecycle. The panel unpins and the id closes, which is why the live
+    // actor mints a FRESH item id when the model lists a new plan later.
+    let mut projection = SessionProjection::new();
+    projection.apply(&started(
+        70,
+        TurnItem::Plan {
+            items: vec![todo(0, "original direction", TodoState::Processing)],
+        },
+    ));
+    assert!(projection.todos().expect("plan pins").pinned);
+    projection.apply(&completed(70, TurnItem::Plan { items: vec![] }));
+    let panel = projection.todos().expect("plan record kept");
+    assert!(!panel.pinned, "the clear unpins the panel");
+    assert!(panel.items.is_empty());
+    // The cleared id is closed forever: a Started reusing it is ignored.
+    projection.apply(&started(
+        70,
+        TurnItem::Plan {
+            items: vec![todo(0, "reborn on closed id", TodoState::Processing)],
+        },
+    ));
+    assert!(!projection.todos().expect("still cleared").pinned);
+    assert_eq!(projection.duplicate_items(), 1);
+    // A fresh id pins the reborn plan.
+    projection.apply(&started(
+        71,
+        TurnItem::Plan {
+            items: vec![todo(0, "reborn", TodoState::Processing)],
+        },
+    ));
+    let panel = projection.todos().expect("reborn plan pins");
+    assert!(panel.pinned);
+    assert_eq!(panel.items[0].text, "reborn");
+}
