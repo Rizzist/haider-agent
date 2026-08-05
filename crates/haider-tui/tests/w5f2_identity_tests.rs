@@ -47,6 +47,10 @@ fn provider_summary(
             .map(|slug| haider_rpc::ModelDetailWire {
                 name: (*slug).to_owned(),
                 context_window: None,
+                supported_efforts: Vec::new(),
+                default_effort: None,
+                supported_speeds: Vec::new(),
+                supports_thinking_type: None,
             })
             .collect(),
         auth_methods: vec![AuthMethod::OAuth],

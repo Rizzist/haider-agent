@@ -64,6 +64,8 @@ fn digest(
             max_tokens: 4096,
             system_prompt_version: Some("v1".into()),
             permission_overrides: None,
+            effort: None,
+            fast: false,
             created_at_ms: 1_800_000_000_000,
         }),
         title: "Inspect durable automation truth".into(),

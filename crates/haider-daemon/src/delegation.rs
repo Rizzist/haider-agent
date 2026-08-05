@@ -235,6 +235,11 @@ impl DelegationHandle {
             "max_tokens": coordinates.metadata.max_tokens,
             "permission_overrides": child_overrides,
             "delegation_agent": agent_id,
+            // G3 (LE6): the child inherits the parent's CURRENT tuning; the
+            // keys join the semantic digest so a same-identity respawn under
+            // different tuning is a different command.
+            "effort": coordinates.metadata.effort,
+            "fast": coordinates.metadata.fast,
         }))
         .map_err(internal_serialization)?;
         let create_digest = digest_bytes(create_json.as_bytes());
@@ -249,6 +254,8 @@ impl DelegationHandle {
                 model: coordinates.metadata.model.clone(),
                 max_tokens: coordinates.metadata.max_tokens,
                 permission_overrides: child_overrides,
+                effort: coordinates.metadata.effort.clone(),
+                fast: coordinates.metadata.fast,
                 system_prompt_version: crate::worker::SystemPromptBuilder::VERSION.into(),
                 event_id: EventId::new(format!("delegation-created-{identity}")),
                 device_id: self.hub.device_id(),

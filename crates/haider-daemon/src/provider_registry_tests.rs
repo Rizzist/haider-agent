@@ -292,10 +292,18 @@ fn summaries_align_model_details_with_pickable_models_and_windows() {
             ModelDetailWire {
                 name: "frontier-a".to_owned(),
                 context_window: Some(100_000),
+                supported_efforts: Vec::new(),
+                default_effort: None,
+                supported_speeds: Vec::new(),
+                supports_thinking_type: None,
             },
             ModelDetailWire {
                 name: "frontier-b".to_owned(),
                 context_window: Some(200_000),
+                supported_efforts: Vec::new(),
+                default_effort: None,
+                supported_speeds: Vec::new(),
+                supports_thinking_type: None,
             },
         ]
     );

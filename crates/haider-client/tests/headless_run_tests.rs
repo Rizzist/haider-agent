@@ -194,6 +194,8 @@ async fn respond_create_and_attach(
                 max_tokens: 4096,
                 permission_overrides: None,
                 system_prompt_version: Some("test".into()),
+                effort: None,
+                fast: false,
                 created_at_ms: 1,
             },
         },

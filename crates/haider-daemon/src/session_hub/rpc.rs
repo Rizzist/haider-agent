@@ -1041,6 +1041,78 @@ impl HubConnection {
                 )
                 .await
             }
+            RequestBody::SessionSelectEffort {
+                command_id,
+                session_id,
+                worker_generation,
+                effort,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                if !self
+                    .hub
+                    .holds_control_attachment(&self.connection_id, &session_id)?
+                {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        "effort selection requires a control attachment to this session",
+                        false,
+                        None,
+                    );
+                }
+                self.session_select_effort(
+                    request_id,
+                    command_id,
+                    session_id,
+                    worker_generation,
+                    effort,
+                )
+                .await
+            }
+            RequestBody::SessionSelectFast {
+                command_id,
+                session_id,
+                worker_generation,
+                enabled,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                if !self
+                    .hub
+                    .holds_control_attachment(&self.connection_id, &session_id)?
+                {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        "fast-mode selection requires a control attachment to this session",
+                        false,
+                        None,
+                    );
+                }
+                self.session_select_fast(
+                    request_id,
+                    command_id,
+                    session_id,
+                    worker_generation,
+                    enabled,
+                )
+                .await
+            }
             RequestBody::ShellExec {
                 command_id,
                 session_id,
@@ -2726,6 +2798,262 @@ impl HubConnection {
         })
     }
 
+    /// `session.select_effort` — receipted live-session effort selection
+    /// (G3), the exact `session.select_model` law set: receipt replay
+    /// precedes validation, the ONE authority in `crate::model_select`
+    /// validates against the CURRENT pair's declared ladder, the store owns
+    /// durability, and the next logical turn re-reads the committed
+    /// metadata (R6 re-resolution).
+    async fn session_select_effort(
+        &self,
+        request_id: RequestId,
+        command_id: CommandId,
+        session_id: SessionId,
+        worker_generation: u64,
+        effort: Option<String>,
+    ) -> Result<(), SessionHubError> {
+        let effort = effort
+            .map(|effort| effort.trim().to_owned())
+            .filter(|effort| !effort.is_empty());
+        if command_id.as_str().trim().is_empty() {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "effort selection needs a command id",
+                false,
+                None,
+            );
+        }
+        let request_json = serde_json::to_string(&serde_json::json!({
+            "session_id": &session_id,
+            "worker_generation": worker_generation,
+            "effort": &effort,
+        }))
+        .map_err(|error| {
+            SessionHubError::Task(format!(
+                "cannot encode effort-selection coordinates: {error}"
+            ))
+        })?;
+        let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
+
+        // Receipt replay precedes validation so a lost response remains
+        // recoverable even after registry or inventory changes.
+        match self
+            .hub
+            .session_select_effort_receipt(&command_id, &request_digest, &request_json)
+            .await
+        {
+            Ok(Some(selected)) => return self.respond_effort_selected(request_id, selected),
+            Ok(None) => {}
+            Err(SessionHubError::Store(error)) => {
+                return self.respond_turn_error(request_id, error);
+            }
+            Err(error) => return Err(error),
+        }
+
+        let Some(current) = (match self.hub.session_metadata(&session_id).await {
+            Ok(metadata) => metadata,
+            Err(error) => return self.respond_turn_error(request_id, error),
+        }) else {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_NOT_FOUND,
+                "effort selection requires a live session with typed metadata",
+                false,
+                None,
+            );
+        };
+        let authority = self.tuning_authority()?;
+        if let Err(refusal) =
+            authority.validate_effort(&current.provider, &current.model, effort.as_deref())
+        {
+            return self.respond_tuning_refusal(request_id, &refusal);
+        }
+
+        let command = haider_core::SessionSelectEffortCommand {
+            command_id: command_id.0,
+            request_digest,
+            request_json,
+            session_id,
+            worker_generation,
+            effort,
+            event_id: EventId::new(random_id("effort-selected")?),
+            device_id: self.hub.inner.device_id.clone(),
+        };
+        let selected = match self.hub.select_session_effort(command).await {
+            Ok(SessionSelectEffortOutcome::Committed { selected, .. })
+            | Ok(SessionSelectEffortOutcome::IdempotentReplay { selected }) => selected,
+            Err(SessionHubError::Store(error)) => {
+                return self.respond_turn_error(request_id, error);
+            }
+            Err(error) => return Err(error),
+        };
+        self.respond_effort_selected(request_id, selected)
+    }
+
+    /// `session.select_fast` — the receipted fast-mode toggle (G3), same
+    /// law set as `session.select_effort`.
+    async fn session_select_fast(
+        &self,
+        request_id: RequestId,
+        command_id: CommandId,
+        session_id: SessionId,
+        worker_generation: u64,
+        enabled: bool,
+    ) -> Result<(), SessionHubError> {
+        if command_id.as_str().trim().is_empty() {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "fast-mode selection needs a command id",
+                false,
+                None,
+            );
+        }
+        let request_json = serde_json::to_string(&serde_json::json!({
+            "session_id": &session_id,
+            "worker_generation": worker_generation,
+            "enabled": enabled,
+        }))
+        .map_err(|error| {
+            SessionHubError::Task(format!(
+                "cannot encode fast-mode-selection coordinates: {error}"
+            ))
+        })?;
+        let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
+
+        match self
+            .hub
+            .session_select_fast_receipt(&command_id, &request_digest, &request_json)
+            .await
+        {
+            Ok(Some(selected)) => return self.respond_fast_selected(request_id, selected),
+            Ok(None) => {}
+            Err(SessionHubError::Store(error)) => {
+                return self.respond_turn_error(request_id, error);
+            }
+            Err(error) => return Err(error),
+        }
+
+        let Some(current) = (match self.hub.session_metadata(&session_id).await {
+            Ok(metadata) => metadata,
+            Err(error) => return self.respond_turn_error(request_id, error),
+        }) else {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_NOT_FOUND,
+                "fast-mode selection requires a live session with typed metadata",
+                false,
+                None,
+            );
+        };
+        let authority = self.tuning_authority()?;
+        if let Err(refusal) = authority.validate_fast(&current.provider, &current.model, enabled) {
+            return self.respond_tuning_refusal(request_id, &refusal);
+        }
+
+        let command = haider_core::SessionSelectFastCommand {
+            command_id: command_id.0,
+            request_digest,
+            request_json,
+            session_id,
+            worker_generation,
+            enabled,
+            event_id: EventId::new(random_id("fast-selected")?),
+            device_id: self.hub.inner.device_id.clone(),
+        };
+        let selected = match self.hub.select_session_fast(command).await {
+            Ok(SessionSelectFastOutcome::Committed { selected, .. })
+            | Ok(SessionSelectFastOutcome::IdempotentReplay { selected }) => selected,
+            Err(SessionHubError::Store(error)) => {
+                return self.respond_turn_error(request_id, error);
+            }
+            Err(error) => return Err(error),
+        };
+        self.respond_fast_selected(request_id, selected)
+    }
+
+    /// The one selection authority, loaded with the same summaries
+    /// `session.select_model` consults.
+    fn tuning_authority(
+        &self,
+    ) -> Result<crate::model_select::ModelSelectionAuthority, SessionHubError> {
+        let summaries = self
+            .hub
+            .accounts()?
+            .and_then(|facade| facade.management.read())
+            .map(|view| view.providers)
+            .unwrap_or_default();
+        Ok(crate::model_select::ModelSelectionAuthority::new(
+            self.hub.creatable_providers()?,
+            summaries,
+        ))
+    }
+
+    fn respond_tuning_refusal(
+        &self,
+        request_id: RequestId,
+        refusal: &crate::model_select::TuningRefusal,
+    ) -> Result<(), SessionHubError> {
+        use crate::model_select::TuningRefusal;
+        let (code, data) = match refusal {
+            TuningRefusal::EffortUnsupported {
+                provider,
+                model,
+                effort,
+                supported,
+            } => (
+                haider_rpc::ERROR_CODE_EFFORT_UNSUPPORTED,
+                Some(ErrorData::EffortUnsupported {
+                    provider: provider.clone(),
+                    model: model.clone(),
+                    effort: effort.clone(),
+                    supported: supported.clone(),
+                }),
+            ),
+            TuningRefusal::FastUnsupported { provider, model } => (
+                haider_rpc::ERROR_CODE_FAST_UNSUPPORTED,
+                Some(ErrorData::FastUnsupported {
+                    provider: provider.clone(),
+                    model: model.clone(),
+                }),
+            ),
+        };
+        self.respond_error(request_id, code, &refusal.message(), false, data)
+    }
+
+    fn respond_effort_selected(
+        &self,
+        request_id: RequestId,
+        selected: SelectedEffort,
+    ) -> Result<(), SessionHubError> {
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::SessionSelectEffort {
+                session_id: selected.session_id,
+                effort: selected.effort,
+                selected_seq: selected.selected_seq,
+                worker_generation: selected.worker_generation,
+            },
+        })
+    }
+
+    fn respond_fast_selected(
+        &self,
+        request_id: RequestId,
+        selected: SelectedFast,
+    ) -> Result<(), SessionHubError> {
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::SessionSelectFast {
+                session_id: selected.session_id,
+                enabled: selected.enabled,
+                selected_seq: selected.selected_seq,
+                worker_generation: selected.worker_generation,
+            },
+        })
+    }
+
     async fn agent_message(
         &self,
         request_id: RequestId,
@@ -3386,6 +3714,8 @@ impl HubConnection {
             model,
             max_tokens,
             permission_overrides,
+            effort: None,
+            fast: false,
             system_prompt_version: crate::worker::SystemPromptBuilder::VERSION.into(),
             event_id: EventId::new(random_id("session-created")?),
             device_id: self.hub.inner.device_id.clone(),

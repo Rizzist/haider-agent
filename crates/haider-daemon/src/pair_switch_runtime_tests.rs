@@ -10,15 +10,19 @@ use crate::worker::{
     BrokerToolFactory, ProviderFactory, ResolvedTurnProvider, WorkerDependencies, WorkerManager,
 };
 use haider_core::{
-    SessionCreateCommand, SessionSelectModelCommand, SessionSelectModelOutcome, SqliteStoreHandle,
-    StoreHandle, TurnAcceptCommand, TurnAdmissionDisposition,
+    SessionCreateCommand, SessionSelectEffortCommand, SessionSelectEffortOutcome,
+    SessionSelectFastCommand, SessionSelectFastOutcome, SessionSelectModelCommand,
+    SessionSelectModelOutcome, SqliteStoreHandle, StoreHandle, TurnAcceptCommand,
+    TurnAdmissionDisposition,
 };
 use haider_protocol::DeliveryMode;
 use haider_protocol::EventPayload;
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::{DeviceId, EventId, RunId, SessionId};
 use haider_protocol::provider::{Block, FinishReason};
-use haider_protocol::session::{ModelSelected, SessionMetadataV1};
+use haider_protocol::session::{
+    EffortSelected, FastModeSelected, ModelSelected, SessionMetadataV1,
+};
 use haider_protocol::state::RunState;
 use haider_provider::{FakeProvider, FakeStep};
 use std::collections::{BTreeSet, HashMap};
@@ -110,6 +114,8 @@ impl PairSwitchWorld {
             model: "model-a".into(),
             max_tokens: 4096,
             permission_overrides: None,
+            effort: None,
+            fast: false,
             system_prompt_version: crate::worker::SystemPromptBuilder::VERSION.into(),
             event_id: EventId::new(format!("created-{prefix}")),
             device_id: device_id.clone(),
@@ -294,6 +300,50 @@ impl PairSwitchWorld {
             worker_generation,
             provider: "fake-b".into(),
             model: "model-b".into(),
+            event_id: EventId::new(format!("{command_id}-event")),
+            device_id: self.device_id.clone(),
+        }
+    }
+
+    /// A RESOLVED effort selection command with a stable receipt identity
+    /// (G3 — the select_command twin).
+    fn effort_command(&self, command_id: &str, effort: Option<&str>) -> SessionSelectEffortCommand {
+        let effort = effort.map(str::to_owned);
+        let worker_generation = self.store.worker_generation();
+        let request_json = serde_json::json!({
+            "session_id": self.session_id,
+            "worker_generation": worker_generation,
+            "effort": effort,
+        })
+        .to_string();
+        SessionSelectEffortCommand {
+            command_id: command_id.to_owned(),
+            request_digest: blake3::hash(request_json.as_bytes()).to_hex().to_string(),
+            request_json,
+            session_id: self.session_id.clone(),
+            worker_generation,
+            effort,
+            event_id: EventId::new(format!("{command_id}-event")),
+            device_id: self.device_id.clone(),
+        }
+    }
+
+    /// A VALIDATED fast-mode toggle command with a stable receipt identity.
+    fn fast_command(&self, command_id: &str, enabled: bool) -> SessionSelectFastCommand {
+        let worker_generation = self.store.worker_generation();
+        let request_json = serde_json::json!({
+            "session_id": self.session_id,
+            "worker_generation": worker_generation,
+            "enabled": enabled,
+        })
+        .to_string();
+        SessionSelectFastCommand {
+            command_id: command_id.to_owned(),
+            request_digest: blake3::hash(request_json.as_bytes()).to_hex().to_string(),
+            request_json,
+            session_id: self.session_id.clone(),
+            worker_generation,
+            enabled,
             event_id: EventId::new(format!("{command_id}-event")),
             device_id: self.device_id.clone(),
         }
@@ -1024,6 +1074,280 @@ async fn unavailable_spawn_selector_is_a_typed_continuable_rejection() {
         )),
         "a refused selector must never create a child"
     );
+
+    world.shutdown().await;
+}
+
+/// LAW (LE1, effort_and_fast_persist): an effort selection and a fast toggle
+/// commit through the ACTOR with the `select_model` law set — the committed
+/// fact rides the envelope, the receipt replays the exact coordinates
+/// (appending nothing), the durable metadata carries the tuning, and a
+/// stale-generation command is refused mutating nothing.
+///
+/// MUTATION CHECK (executed — see the G3 mutation notes): skip the
+/// `meta_json` update in `select_session_config`. Expected runtime failure:
+/// the metadata assertions below read `None`/`false`.
+#[tokio::test]
+async fn effort_and_fast_select_are_receipted_and_persist() {
+    let fake_a = Arc::new(FakeProvider::new(text_turn("answer from a")));
+    let fake_b = Arc::new(FakeProvider::new(Vec::new()));
+    let world = PairSwitchWorld::boot("g3-persist", fake_a.clone(), fake_b.clone()).await;
+
+    // Effort commits with its fact…
+    let command = world.effort_command("g3-persist-effort", Some("xhigh"));
+    let SessionSelectEffortOutcome::Committed { selected, envelope } = world
+        .hub
+        .select_session_effort(command.clone())
+        .await
+        .expect("select effort")
+    else {
+        panic!("first effort selection must commit");
+    };
+    assert_eq!(selected.effort.as_deref(), Some("xhigh"));
+    assert_eq!(envelope.seq, selected.selected_seq);
+    let fact = EffortSelected::from_payload_value(&envelope.payload)
+        .expect("committed envelope carries the effort_selected fact");
+    assert_eq!(fact.effort.as_deref(), Some("xhigh"));
+
+    // …replays idempotently under the same command id…
+    let SessionSelectEffortOutcome::IdempotentReplay { selected: replayed } = world
+        .hub
+        .select_session_effort(command)
+        .await
+        .expect("replay effort selection")
+    else {
+        panic!("same-command retry must replay, not re-commit");
+    };
+    assert_eq!(replayed, selected);
+    let effort_facts = world
+        .store
+        .read(&world.session_id, 0, 1024)
+        .await
+        .expect("read journal")
+        .into_iter()
+        .filter(|event| EffortSelected::from_payload_value(&event.payload).is_some())
+        .count();
+    assert_eq!(effort_facts, 1, "replay must not append a second fact");
+
+    // …the fast toggle commits with its own fact…
+    let SessionSelectFastOutcome::Committed { envelope, .. } = world
+        .hub
+        .select_session_fast(world.fast_command("g3-persist-fast", true))
+        .await
+        .expect("select fast")
+    else {
+        panic!("fast toggle must commit");
+    };
+    let fact = FastModeSelected::from_payload_value(&envelope.payload)
+        .expect("committed envelope carries the fast_mode_selected fact");
+    assert!(fact.enabled);
+
+    // …and the durable metadata carries BOTH tunings.
+    let metadata = world
+        .store
+        .session_metadata(&world.session_id)
+        .await
+        .expect("metadata read")
+        .expect("typed metadata");
+    assert_eq!(metadata.effort.as_deref(), Some("xhigh"));
+    assert!(metadata.fast);
+
+    // Reverting effort to the provider default persists None.
+    world
+        .hub
+        .select_session_effort(world.effort_command("g3-persist-revert", None))
+        .await
+        .expect("revert effort");
+    let metadata = world
+        .store
+        .session_metadata(&world.session_id)
+        .await
+        .expect("metadata read")
+        .expect("typed metadata");
+    assert_eq!(metadata.effort, None);
+    assert!(metadata.fast, "the revert touches effort only");
+
+    // A stale worker generation is refused and mutates nothing.
+    let mut stale = world.effort_command("g3-persist-stale", Some("low"));
+    stale.worker_generation += 1;
+    let stale_json = serde_json::json!({
+        "session_id": world.session_id,
+        "worker_generation": stale.worker_generation,
+        "effort": "low",
+    })
+    .to_string();
+    stale.request_digest = blake3::hash(stale_json.as_bytes()).to_hex().to_string();
+    stale.request_json = stale_json;
+    let error = world
+        .hub
+        .select_session_effort(stale)
+        .await
+        .expect_err("stale generation must refuse");
+    let crate::session_hub::SessionHubError::Store(error) = error else {
+        panic!("stale generation surfaces as a store error, got {error:?}");
+    };
+    assert_eq!(error.code, ErrorCode::SingleWriterViolation);
+    let metadata = world
+        .store
+        .session_metadata(&world.session_id)
+        .await
+        .expect("metadata read")
+        .expect("typed metadata");
+    assert_eq!(metadata.effort, None, "a refused selection mutates nothing");
+
+    world.shutdown().await;
+}
+
+/// LAW (LE5, runtime half — extending switch_during_manual_compaction): an
+/// effort selection COMMITS through the actor while manual compaction is in
+/// flight, and the compaction still lands — the `effort_selected` fact moved
+/// the journal, not the tree, so the head CAS tolerates it instead of
+/// wedging.
+#[tokio::test]
+async fn effort_select_during_manual_compaction_lands_after_it() {
+    let fake_a = Arc::new(FakeProvider::new(
+        [
+            text_turn("history on a"),
+            vec![
+                FakeStep::Delay { ms: 1500 },
+                FakeStep::EmitText {
+                    text: "summary on a".into(),
+                },
+                FakeStep::Finish {
+                    reason: FinishReason::EndTurn,
+                },
+            ],
+        ]
+        .concat(),
+    ));
+    let fake_b = Arc::new(FakeProvider::new(Vec::new()));
+    let world = PairSwitchWorld::boot("g3-compact", fake_a.clone(), fake_b.clone()).await;
+
+    world.run_turn("g3-compact-one", "build history").await;
+    let compaction = world
+        .start_compaction_and_await_window("g3-compact-compact")
+        .await;
+
+    assert!(
+        world
+            .latest_run_states()
+            .await
+            .iter()
+            .any(|(_, state)| matches!(state, RunState::Compacting)),
+        "the session state is Compacting inside the window"
+    );
+    let SessionSelectEffortOutcome::Committed { selected, .. } = world
+        .hub
+        .select_session_effort(world.effort_command("g3-compact-select", Some("max")))
+        .await
+        .expect("effort selection during compaction must commit")
+    else {
+        panic!("effort selection during compaction must commit, not replay");
+    };
+    assert_eq!(selected.effort.as_deref(), Some("max"));
+
+    // The compaction still lands: the config-fact delta did not wedge the
+    // head CAS.
+    compaction.await.expect("compaction task");
+    let metadata = world
+        .store
+        .session_metadata(&world.session_id)
+        .await
+        .expect("metadata read")
+        .expect("typed metadata");
+    assert_eq!(metadata.effort.as_deref(), Some("max"));
+
+    world.shutdown().await;
+}
+
+/// LAW (LE6, subagent inheritance): a child spawned with NO selector
+/// inherits the parent's CURRENT effort and fast tuning through the
+/// metadata clone — the child session's durable metadata carries both.
+///
+/// MUTATION CHECK (executed — see the G3 mutation notes): reset
+/// `child.effort`/`child.fast` in `resolve_child_metadata`. Expected
+/// runtime failure: the child metadata assertions below read the defaults.
+#[tokio::test]
+async fn spawned_child_inherits_parent_effort_and_fast() {
+    let fake_a = Arc::new(FakeProvider::new(
+        [
+            text_turn("turn one on a"),
+            vec![
+                FakeStep::EmitToolCall {
+                    call_id: "tuning-spawn".into(),
+                    name: "spawn_subagent".into(),
+                    args: serde_json::json!({
+                        "task": "inherit tuning",
+                        "prompt": "report the tuning you run with"
+                    }),
+                },
+                FakeStep::Finish {
+                    reason: FinishReason::ToolUse,
+                },
+                FakeStep::EmitText {
+                    text: "child report".into(),
+                },
+                FakeStep::Finish {
+                    reason: FinishReason::EndTurn,
+                },
+                FakeStep::ExpectToolResult {
+                    call_id: "tuning-spawn".into(),
+                },
+                FakeStep::EmitText {
+                    text: "parent merged".into(),
+                },
+                FakeStep::Finish {
+                    reason: FinishReason::EndTurn,
+                },
+            ],
+        ]
+        .concat(),
+    ));
+    let fake_b = Arc::new(FakeProvider::new(Vec::new()));
+    let world = PairSwitchWorld::boot("g3-inherit", fake_a.clone(), fake_b.clone()).await;
+
+    world.run_turn("g3-inherit-one", "warm up").await;
+    world
+        .hub
+        .select_session_effort(world.effort_command("g3-inherit-effort", Some("xhigh")))
+        .await
+        .expect("select effort");
+    world
+        .hub
+        .select_session_fast(world.fast_command("g3-inherit-fast", true))
+        .await
+        .expect("select fast");
+    world.run_turn("g3-inherit-two", "now delegate").await;
+
+    let events = world
+        .store
+        .read(&world.session_id, 0, 1024)
+        .await
+        .expect("read parent journal");
+    let manifest = events
+        .iter()
+        .find_map(
+            |event| match serde_json::from_value::<EventPayload>(event.payload.clone()) {
+                Ok(EventPayload::AgentSpawned(manifest)) => Some(manifest),
+                _ => None,
+            },
+        )
+        .expect("spawn manifest");
+    let child_session = manifest
+        .coordinates
+        .as_ref()
+        .and_then(|coordinates| coordinates.get("child_session_id"))
+        .and_then(serde_json::Value::as_str)
+        .map(|id| SessionId::new(id.to_owned()))
+        .expect("child session coordinates");
+    let child_metadata = world
+        .store
+        .session_metadata(&child_session)
+        .await
+        .expect("child metadata read")
+        .expect("child typed metadata");
+    assert_eq!(child_metadata.effort.as_deref(), Some("xhigh"));
+    assert!(child_metadata.fast, "the child inherits the fast flag");
 
     world.shutdown().await;
 }

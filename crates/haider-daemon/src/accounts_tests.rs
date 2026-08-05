@@ -227,6 +227,8 @@ async fn production_account_factory_dispatches_native_api_key_providers() {
         max_tokens: 64,
         permission_overrides: None,
         system_prompt_version: None,
+        effort: None,
+        fast: false,
         created_at_ms: 1,
     };
 
@@ -334,10 +336,18 @@ async fn custom_chat_completions_profile_routes_with_profile_origin_and_legacy_f
             ModelDetailWire {
                 name: "llama-fixture".to_owned(),
                 context_window: Some(131_072),
+                supported_efforts: Vec::new(),
+                default_effort: None,
+                supported_speeds: Vec::new(),
+                supports_thinking_type: None,
             },
             ModelDetailWire {
                 name: "llama-other".to_owned(),
                 context_window: Some(65_536),
+                supported_efforts: Vec::new(),
+                default_effort: None,
+                supported_speeds: Vec::new(),
+                supports_thinking_type: None,
             },
         ],
         auth_methods: vec![AuthMethod::ApiKey],
@@ -386,6 +396,8 @@ async fn custom_chat_completions_profile_routes_with_profile_origin_and_legacy_f
             max_tokens: 64,
             permission_overrides: None,
             system_prompt_version: None,
+            effort: None,
+            fast: false,
             created_at_ms: 1,
         })
         .await
@@ -751,6 +763,8 @@ async fn retryable_rotation_bookkeeping_failure_waits_instead_of_killing_the_tur
             max_tokens: 64,
             permission_overrides: None,
             system_prompt_version: None,
+            effort: None,
+            fast: false,
             created_at_ms: 1,
         },
         None,
@@ -877,6 +891,8 @@ async fn factory_uses_checked_resolver_and_durably_selects_one_limited_alternate
             max_tokens: 64,
             permission_overrides: None,
             system_prompt_version: None,
+            effort: None,
+            fast: false,
             created_at_ms: 1,
         })
         .await
@@ -1078,6 +1094,8 @@ async fn auth_aware_factory_routes_sanctioned_oauth_descriptors_to_subscription_
         max_tokens: 64,
         permission_overrides: None,
         system_prompt_version: None,
+        effort: None,
+        fast: false,
         created_at_ms: 1,
     };
     let (_, _, openai_access_fingerprint) = factory

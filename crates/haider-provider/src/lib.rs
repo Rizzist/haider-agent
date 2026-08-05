@@ -16,6 +16,7 @@ mod anthropic_tests;
 mod catalog;
 #[cfg(test)]
 mod catalog_tests;
+mod effort;
 mod gemini;
 #[cfg(test)]
 mod gemini_tests;
@@ -46,6 +47,10 @@ pub use catalog::{
     CatalogError, CatalogSource, DiscoveredCatalog, DiscoveredModel, DiscoveredModelExtensions,
     catalog_request_url, discover_models, discover_models_with_resolver,
     openai_compatible_catalog_endpoint, parse_catalog, pickable,
+};
+pub use effort::{
+    anthropic_default_effort, anthropic_fast_mode_supported, anthropic_supported_efforts,
+    gemini_default_effort, gemini_supported_efforts,
 };
 pub use gemini::{
     GEMINI_API_BASE_URL, GEMINI_MODELS_URL, GEMINI_PROVIDER_NAME, GeminiCapture, GeminiProvider,

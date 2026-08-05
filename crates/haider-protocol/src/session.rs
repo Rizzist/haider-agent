@@ -54,8 +54,24 @@ pub struct SessionMetadataV1 {
     /// receipt bytes and means the daemon registry defaults remain authoritative.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_overrides: Option<SessionPermissionOverridesV1>,
+    /// Explicit per-pair reasoning-effort selection (G3). `None` means "the
+    /// provider's own default" and is skipped on the wire so pre-G3 metadata
+    /// rows stay byte-identical. The value is a provider-vocabulary STRING
+    /// validated against the CURRENT pair's declared ladder at selection
+    /// time — never a global enum.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// Anthropic fast-mode flag (G3). Skipped while false so pre-G3 metadata
+    /// rows stay byte-identical.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub fast: bool,
     /// Durable creation time in Unix milliseconds.
     pub created_at_ms: u64,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Additive replay fact emitted atomically with a committed live-session
@@ -72,6 +88,27 @@ pub struct ModelSelected {
     pub model: String,
 }
 
+/// Additive replay fact emitted atomically with a committed live-session
+/// effort selection and its command receipt (G3).
+///
+/// `None` reverts the session to the provider default. The fact is a pure
+/// session-config journal movement: it never moves the conversation tree,
+/// which is what lets the F3 compaction head CAS tolerate it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EffortSelected {
+    /// The selected effort, or `None` for "provider default".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
+/// Additive replay fact emitted atomically with a committed live-session
+/// fast-mode toggle and its command receipt (G3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FastModeSelected {
+    /// Whether fast mode is on after this fact.
+    pub enabled: bool,
+}
+
 /// Additive session-configuration event union kept separate from
 /// [`crate::EventPayload`] so existing exhaustive Rust consumers remain
 /// source compatible. Readers should try this decoder before treating an
@@ -81,6 +118,8 @@ pub struct ModelSelected {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionConfigEventPayload {
     ModelSelected(ModelSelected),
+    EffortSelected(EffortSelected),
+    FastModeSelected(FastModeSelected),
 }
 
 impl ModelSelected {
@@ -92,6 +131,35 @@ impl ModelSelected {
     pub fn from_payload_value(value: &serde_json::Value) -> Option<Self> {
         match serde_json::from_value::<SessionConfigEventPayload>(value.clone()).ok()? {
             SessionConfigEventPayload::ModelSelected(selected) => Some(selected),
+            _ => None,
+        }
+    }
+}
+
+impl EffortSelected {
+    pub fn to_payload_value(&self) -> Result<serde_json::Value, serde_json::Error> {
+        serde_json::to_value(SessionConfigEventPayload::EffortSelected(self.clone()))
+    }
+
+    #[must_use]
+    pub fn from_payload_value(value: &serde_json::Value) -> Option<Self> {
+        match serde_json::from_value::<SessionConfigEventPayload>(value.clone()).ok()? {
+            SessionConfigEventPayload::EffortSelected(selected) => Some(selected),
+            _ => None,
+        }
+    }
+}
+
+impl FastModeSelected {
+    pub fn to_payload_value(&self) -> Result<serde_json::Value, serde_json::Error> {
+        serde_json::to_value(SessionConfigEventPayload::FastModeSelected(self.clone()))
+    }
+
+    #[must_use]
+    pub fn from_payload_value(value: &serde_json::Value) -> Option<Self> {
+        match serde_json::from_value::<SessionConfigEventPayload>(value.clone()).ok()? {
+            SessionConfigEventPayload::FastModeSelected(selected) => Some(selected),
+            _ => None,
         }
     }
 }

@@ -31,7 +31,10 @@ use haider_protocol::ids::{
 use haider_protocol::item::{ItemEvent, TurnItem};
 use haider_protocol::menu::{Menu, MenuAnswer, MenuKind};
 use haider_protocol::project_instructions::ProjectInstructionsLoaded;
-use haider_protocol::session::{ModelSelected, SessionMetadataV1, SessionPermissionOverridesV1};
+use haider_protocol::session::{
+    EffortSelected, FastModeSelected, ModelSelected, SessionMetadataV1,
+    SessionPermissionOverridesV1,
+};
 use haider_protocol::state::{RunState, SessionState};
 use haider_protocol::tool::AttachmentBlock;
 use haider_protocol::{DeliveryMode, EventPayload};
@@ -105,6 +108,12 @@ pub struct SessionCreateCommand {
     pub model: String,
     pub max_tokens: u64,
     pub permission_overrides: Option<SessionPermissionOverridesV1>,
+    /// Creation-time effort selection (G3). `None` — the wire `session.create`
+    /// path — means the provider default; delegation passes the parent's
+    /// CURRENT effort so children inherit tuning through the metadata clone.
+    pub effort: Option<String>,
+    /// Creation-time fast-mode flag (G3); same inheritance seam as `effort`.
+    pub fast: bool,
     pub system_prompt_version: String,
     pub event_id: EventId,
     pub device_id: DeviceId,
@@ -251,6 +260,105 @@ pub enum SessionSelectModelOutcome {
     },
     IdempotentReplay {
         selected: SelectedModel,
+    },
+}
+
+/// Secret-free coordinates for one atomic live-session effort selection (G3).
+///
+/// `effort` is the RESOLVED, ladder-validated value — the daemon validates
+/// against the current pair's declared ladder before this command exists; the
+/// store applies it verbatim. `None` reverts to the provider default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSelectEffortCommand {
+    pub command_id: String,
+    pub request_digest: String,
+    pub request_json: String,
+    pub session_id: SessionId,
+    pub worker_generation: u64,
+    pub effort: Option<String>,
+    pub event_id: EventId,
+    pub device_id: DeviceId,
+}
+
+/// Stable response stored in the committed `session.select_effort` receipt.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SelectedEffort {
+    pub session_id: SessionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    pub selected_seq: u64,
+    pub worker_generation: u64,
+}
+
+/// Result of the atomic effort metadata-update/event/receipt transaction.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SessionSelectEffortOutcome {
+    Committed {
+        selected: SelectedEffort,
+        envelope: Box<RawEnvelope>,
+    },
+    IdempotentReplay {
+        selected: SelectedEffort,
+    },
+}
+
+/// Secret-free coordinates for one atomic live-session fast-mode toggle (G3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSelectFastCommand {
+    pub command_id: String,
+    pub request_digest: String,
+    pub request_json: String,
+    pub session_id: SessionId,
+    pub worker_generation: u64,
+    pub enabled: bool,
+    pub event_id: EventId,
+    pub device_id: DeviceId,
+}
+
+/// Stable response stored in the committed `session.select_fast` receipt.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SelectedFast {
+    pub session_id: SessionId,
+    pub enabled: bool,
+    pub selected_seq: u64,
+    pub worker_generation: u64,
+}
+
+/// Result of the atomic fast-mode metadata-update/event/receipt transaction.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SessionSelectFastOutcome {
+    Committed {
+        selected: SelectedFast,
+        envelope: Box<RawEnvelope>,
+    },
+    IdempotentReplay {
+        selected: SelectedFast,
+    },
+}
+
+/// Receipt/session coordinates shared by the G3 session-config transactions.
+struct SessionConfigSelection<'a> {
+    command_id: &'a str,
+    request_digest: &'a str,
+    request_json: &'a str,
+    session_id: &'a SessionId,
+    worker_generation: u64,
+    /// Durable receipt method name, e.g. `session.select_effort`.
+    method: &'static str,
+    /// Human description for receipt diagnostics.
+    description: &'static str,
+    event_id: EventId,
+    device_id: DeviceId,
+}
+
+/// Typed result of the shared session-config transaction.
+enum SessionConfigOutcome<R> {
+    Committed {
+        selected: R,
+        envelope: Box<RawEnvelope>,
+    },
+    IdempotentReplay {
+        selected: R,
     },
 }
 
@@ -1271,6 +1379,11 @@ impl Store {
             max_tokens: command.max_tokens,
             system_prompt_version: Some(command.system_prompt_version.clone()),
             permission_overrides: command.permission_overrides,
+            // G3 tuning: the wire `session.create` passes the defaults;
+            // delegation passes the parent's CURRENT tuning so children
+            // inherit effort/fast through the metadata clone (LE6).
+            effort: command.effort.clone(),
+            fast: command.fast,
             created_at_ms,
         };
         let metadata_json = serde_json::to_string(&metadata).map_err(|error| {
@@ -1721,6 +1834,274 @@ impl Store {
         )?;
         transaction.commit().map_err(map_sqlite_error)?;
         Ok(SessionSelectModelOutcome::Committed {
+            selected,
+            envelope: Box::new(envelopes.remove(0)),
+        })
+    }
+
+    /// Looks up a committed `session.select_effort` response before session,
+    /// generation, or metadata validation (R2 response-loss replay).
+    pub fn session_select_effort_receipt(
+        &self,
+        command_id: &str,
+        request_digest: &str,
+        request_json: &str,
+    ) -> StoreResult<Option<SelectedEffort>> {
+        validate_command_identity(command_id, request_digest, request_json)?;
+        let connection = self.connection()?;
+        lookup_command_response(
+            &connection,
+            command_id,
+            "session.select_effort",
+            request_digest,
+            request_json,
+            "session-select-effort",
+        )
+    }
+
+    /// Atomically applies one RESOLVED effort selection: updates the
+    /// session's typed metadata (`effort` only, every other field preserved),
+    /// appends the `effort_selected` fact, and finalizes the command receipt
+    /// — the exact `select_session_model` transaction shape (G3 clones the
+    /// F1 law set).
+    pub fn select_session_effort(
+        &self,
+        command: &SessionSelectEffortCommand,
+    ) -> StoreResult<SessionSelectEffortOutcome> {
+        if command
+            .effort
+            .as_deref()
+            .is_some_and(|effort| effort.trim().is_empty())
+        {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "effort selection must carry a non-empty effort or an explicit revert",
+                false,
+            ));
+        }
+        let effort = command.effort.clone();
+        let fact = EffortSelected {
+            effort: effort.clone(),
+        }
+        .to_payload_value()
+        .map_err(|error| {
+            store_error(
+                ErrorCode::InvalidArgument,
+                format!("cannot serialize effort-selected payload: {error}"),
+                false,
+            )
+        })?;
+        let session_id = command.session_id.clone();
+        let generation = self.worker_generation;
+        let outcome = self.select_session_config(
+            SessionConfigSelection {
+                command_id: &command.command_id,
+                request_digest: &command.request_digest,
+                request_json: &command.request_json,
+                session_id: &command.session_id,
+                worker_generation: command.worker_generation,
+                method: "session.select_effort",
+                description: "session-select-effort",
+                event_id: command.event_id.clone(),
+                device_id: command.device_id.clone(),
+            },
+            fact,
+            |metadata| metadata.effort = effort.clone(),
+            move |selected_seq| SelectedEffort {
+                session_id,
+                effort: command.effort.clone(),
+                selected_seq,
+                worker_generation: generation,
+            },
+        )?;
+        Ok(match outcome {
+            SessionConfigOutcome::Committed { selected, envelope } => {
+                SessionSelectEffortOutcome::Committed { selected, envelope }
+            }
+            SessionConfigOutcome::IdempotentReplay { selected } => {
+                SessionSelectEffortOutcome::IdempotentReplay { selected }
+            }
+        })
+    }
+
+    /// Looks up a committed `session.select_fast` response before session,
+    /// generation, or metadata validation (R2 response-loss replay).
+    pub fn session_select_fast_receipt(
+        &self,
+        command_id: &str,
+        request_digest: &str,
+        request_json: &str,
+    ) -> StoreResult<Option<SelectedFast>> {
+        validate_command_identity(command_id, request_digest, request_json)?;
+        let connection = self.connection()?;
+        lookup_command_response(
+            &connection,
+            command_id,
+            "session.select_fast",
+            request_digest,
+            request_json,
+            "session-select-fast",
+        )
+    }
+
+    /// Atomically applies one VALIDATED fast-mode toggle: updates the
+    /// session's typed metadata (`fast` only), appends the
+    /// `fast_mode_selected` fact, and finalizes the command receipt — the
+    /// exact `select_session_model` transaction shape (G3).
+    pub fn select_session_fast(
+        &self,
+        command: &SessionSelectFastCommand,
+    ) -> StoreResult<SessionSelectFastOutcome> {
+        let enabled = command.enabled;
+        let fact = FastModeSelected { enabled }
+            .to_payload_value()
+            .map_err(|error| {
+                store_error(
+                    ErrorCode::InvalidArgument,
+                    format!("cannot serialize fast-mode-selected payload: {error}"),
+                    false,
+                )
+            })?;
+        let session_id = command.session_id.clone();
+        let generation = self.worker_generation;
+        let outcome = self.select_session_config(
+            SessionConfigSelection {
+                command_id: &command.command_id,
+                request_digest: &command.request_digest,
+                request_json: &command.request_json,
+                session_id: &command.session_id,
+                worker_generation: command.worker_generation,
+                method: "session.select_fast",
+                description: "session-select-fast",
+                event_id: command.event_id.clone(),
+                device_id: command.device_id.clone(),
+            },
+            fact,
+            |metadata| metadata.fast = enabled,
+            move |selected_seq| SelectedFast {
+                session_id,
+                enabled,
+                selected_seq,
+                worker_generation: generation,
+            },
+        )?;
+        Ok(match outcome {
+            SessionConfigOutcome::Committed { selected, envelope } => {
+                SessionSelectFastOutcome::Committed { selected, envelope }
+            }
+            SessionConfigOutcome::IdempotentReplay { selected } => {
+                SessionSelectFastOutcome::IdempotentReplay { selected }
+            }
+        })
+    }
+
+    /// The shared `select_session_model` transaction shape for G3's
+    /// session-config selections: receipt replay inside the transaction,
+    /// generation fence, typed-metadata mutation, one published fact, and the
+    /// finalized receipt — all atomic, any late failure rolls all three back.
+    fn select_session_config<R: serde::Serialize + serde::de::DeserializeOwned>(
+        &self,
+        selection: SessionConfigSelection<'_>,
+        fact_payload: serde_json::Value,
+        mutate: impl FnOnce(&mut SessionMetadataV1),
+        respond: impl FnOnce(u64) -> R,
+    ) -> StoreResult<SessionConfigOutcome<R>> {
+        validate_command_identity(
+            selection.command_id,
+            selection.request_digest,
+            selection.request_json,
+        )?;
+        if selection.worker_generation != self.worker_generation {
+            return Err(stale_generation(
+                selection.worker_generation,
+                self.worker_generation,
+            ));
+        }
+
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        if let Some(selected) = lookup_command_response(
+            &transaction,
+            selection.command_id,
+            selection.method,
+            selection.request_digest,
+            selection.request_json,
+            selection.description,
+        )? {
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(SessionConfigOutcome::IdempotentReplay { selected });
+        }
+        require_typed_session(&transaction, selection.session_id)?;
+        let metadata_json: String = transaction
+            .query_row(
+                "SELECT meta_json FROM sessions WHERE id = ?1",
+                [selection.session_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(map_sqlite_error)?;
+        let Some(mut metadata) = decode_session_metadata(selection.session_id, &metadata_json)?
+        else {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "legacy session has no live-worker metadata",
+                false,
+            ));
+        };
+        mutate(&mut metadata);
+        let updated_metadata = serde_json::to_string(&metadata).map_err(|error| {
+            store_error(
+                ErrorCode::InvalidArgument,
+                format!("cannot serialize session metadata: {error}"),
+                false,
+            )
+        })?;
+
+        let now = now_ms()?;
+        claim_pending_receipt(
+            &transaction,
+            selection.command_id,
+            selection.method,
+            selection.request_digest,
+            selection.request_json,
+            now,
+        )?;
+        let updated_rows = transaction
+            .execute(
+                "UPDATE sessions SET meta_json = ?2 WHERE id = ?1",
+                params![selection.session_id.as_str(), updated_metadata],
+            )
+            .map_err(map_sqlite_error)?;
+        if updated_rows != 1 {
+            return Err(corrupt(
+                "session row disappeared during session-config selection",
+            ));
+        }
+        let mut envelopes = vec![unstamped_raw_command_envelope(
+            selection.event_id.clone(),
+            selection.session_id,
+            None,
+            None,
+            selection.device_id.clone(),
+            self.worker_generation,
+            fact_payload,
+            PromptRender::Omit,
+        )?];
+        append_transaction_envelopes(&transaction, selection.session_id, now, &mut envelopes)?;
+        let selected = respond(envelopes[0].seq);
+        finalize_command_receipt(
+            &transaction,
+            selection.command_id,
+            selection.session_id.as_str(),
+            None,
+            Some(envelopes[0].seq),
+            &selected,
+            now,
+            selection.description,
+        )?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(SessionConfigOutcome::Committed {
             selected,
             envelope: Box::new(envelopes.remove(0)),
         })

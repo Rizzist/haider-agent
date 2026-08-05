@@ -38,10 +38,18 @@ fn provider_summary_model_details_round_trip_names_and_windows() {
             ModelDetailWire {
                 name: "frontier-a".to_owned(),
                 context_window: Some(200_000),
+                supported_efforts: Vec::new(),
+                default_effort: None,
+                supported_speeds: Vec::new(),
+                supports_thinking_type: None,
             },
             ModelDetailWire {
                 name: "frontier-b".to_owned(),
                 context_window: None,
+                supported_efforts: Vec::new(),
+                default_effort: None,
+                supported_speeds: Vec::new(),
+                supports_thinking_type: None,
             },
         ],
         auth_methods: vec![AuthMethod::ApiKey],

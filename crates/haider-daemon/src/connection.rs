@@ -1398,6 +1398,8 @@ fn welcome_features() -> BTreeSet<String> {
         FEATURE_PROVIDER_MANAGEMENT_V1.to_owned(),
         FEATURE_PROVIDER_MODELS_V1.to_owned(),
         FEATURE_PROVIDER_REMOVE_V1.to_owned(),
+        haider_rpc::FEATURE_SESSION_EFFORT_SELECT_V1.to_owned(),
+        haider_rpc::FEATURE_SESSION_FAST_SELECT_V1.to_owned(),
         haider_rpc::FEATURE_SESSION_MODEL_SELECT_V1.to_owned(),
         FEATURE_SESSION_MUTATION_V1.to_owned(),
         FEATURE_SESSION_OBSERVE_V1.to_owned(),

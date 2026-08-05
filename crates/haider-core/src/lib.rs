@@ -41,11 +41,12 @@ pub use haider_store::{
     CreatedBranch, CreatedSession, DelegationCreateOutcome, DelegationRecord, DelegationState,
     HookTrustChange, HookTrustCommand, LoginClaim, LoginReceiptFailure, LoginReceiptResponse,
     LoginReceiptRow, ManagementClaim, ManagementReceiptRow, MenuResolutionCommand,
-    MenuResolutionOutcome, PROVIDER_CONFIGURE_METHOD, PROVIDER_REMOVE_METHOD, SelectedModel,
-    SessionCreateCommand, SessionCreateOutcome, SessionSelectModelCommand,
-    SessionSelectModelOutcome, ShellExecAcceptCommand, ShellExecAcceptOutcome, TurnAcceptCommand,
-    TurnAcceptOutcome, TurnAdmissionDisposition, TurnCancelCommand, TurnCancelOutcome,
-    TurnCancellationStatus,
+    MenuResolutionOutcome, PROVIDER_CONFIGURE_METHOD, PROVIDER_REMOVE_METHOD, SelectedEffort,
+    SelectedFast, SelectedModel, SessionCreateCommand, SessionCreateOutcome,
+    SessionSelectEffortCommand, SessionSelectEffortOutcome, SessionSelectFastCommand,
+    SessionSelectFastOutcome, SessionSelectModelCommand, SessionSelectModelOutcome,
+    ShellExecAcceptCommand, ShellExecAcceptOutcome, TurnAcceptCommand, TurnAcceptOutcome,
+    TurnAdmissionDisposition, TurnCancelCommand, TurnCancelOutcome, TurnCancellationStatus,
 };
 pub use prompt_history::{ArtifactReader, PromptHistoryCompiler};
 pub use recovery::{RecoveryReport, reconcile_dispatched_effects};

@@ -100,9 +100,11 @@ use async_trait::async_trait;
 use haider_core::{
     AcceptedShellExec, AcceptedTurn, BranchCreateCommand, BranchCreateOutcome, CancelledTurn,
     CreatedBranch, CreatedSession, HarnessHandle, MenuResolutionCommand, MenuResolutionOutcome,
-    SelectedModel, SessionCreateCommand, SessionCreateOutcome, SessionSelectModelCommand,
-    SessionSelectModelOutcome, ShellExecAcceptCommand, ShellExecAcceptOutcome, SqliteStoreHandle,
-    StoreHandle, TurnAcceptCommand, TurnAcceptOutcome, TurnAdmissionDisposition, TurnCancelCommand,
+    SelectedEffort, SelectedFast, SelectedModel, SessionCreateCommand, SessionCreateOutcome,
+    SessionSelectEffortCommand, SessionSelectEffortOutcome, SessionSelectFastCommand,
+    SessionSelectFastOutcome, SessionSelectModelCommand, SessionSelectModelOutcome,
+    ShellExecAcceptCommand, ShellExecAcceptOutcome, SqliteStoreHandle, StoreHandle,
+    TurnAcceptCommand, TurnAcceptOutcome, TurnAdmissionDisposition, TurnCancelCommand,
     TurnCancelOutcome, TurnCancellationStatus,
 };
 use haider_protocol::EventPayload;
@@ -746,6 +748,14 @@ enum ActorCommand {
     SelectModel {
         command: SessionSelectModelCommand,
         completed: oneshot::Sender<Result<SessionSelectModelOutcome, HaiderError>>,
+    },
+    SelectEffort {
+        command: SessionSelectEffortCommand,
+        completed: oneshot::Sender<Result<SessionSelectEffortOutcome, HaiderError>>,
+    },
+    SelectFast {
+        command: SessionSelectFastCommand,
+        completed: oneshot::Sender<Result<SessionSelectFastOutcome, HaiderError>>,
     },
     AcceptTurn {
         command: TurnAcceptCommand,
@@ -1422,6 +1432,78 @@ impl SessionHub {
         actor
             .commands
             .send(ActorCommand::SelectModel { command, completed })
+            .await
+            .map_err(|_| SessionHubError::Closed)?;
+        result
+            .await
+            .map_err(|_| SessionHubError::Closed)?
+            .map_err(Into::into)
+    }
+
+    async fn session_select_effort_receipt(
+        &self,
+        command_id: &CommandId,
+        request_digest: &str,
+        request_json: &str,
+    ) -> Result<Option<SelectedEffort>, SessionHubError> {
+        self.inner
+            .store
+            .session_select_effort_receipt(
+                command_id.0.clone(),
+                request_digest.to_owned(),
+                request_json.to_owned(),
+            )
+            .await
+            .map_err(Into::into)
+    }
+
+    /// The G3 effort selection, through the actor arm for the same reason as
+    /// [`Self::select_session_model`]: the actor's in-memory head must
+    /// advance with the committed fact or the compaction head CAS desyncs.
+    pub(crate) async fn select_session_effort(
+        &self,
+        command: SessionSelectEffortCommand,
+    ) -> Result<SessionSelectEffortOutcome, SessionHubError> {
+        let actor = self.actor_for(command.session_id.clone()).await?;
+        let (completed, result) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::SelectEffort { command, completed })
+            .await
+            .map_err(|_| SessionHubError::Closed)?;
+        result
+            .await
+            .map_err(|_| SessionHubError::Closed)?
+            .map_err(Into::into)
+    }
+
+    async fn session_select_fast_receipt(
+        &self,
+        command_id: &CommandId,
+        request_digest: &str,
+        request_json: &str,
+    ) -> Result<Option<SelectedFast>, SessionHubError> {
+        self.inner
+            .store
+            .session_select_fast_receipt(
+                command_id.0.clone(),
+                request_digest.to_owned(),
+                request_json.to_owned(),
+            )
+            .await
+            .map_err(Into::into)
+    }
+
+    /// The G3 fast-mode toggle, through the actor arm (same head-CAS law).
+    pub(crate) async fn select_session_fast(
+        &self,
+        command: SessionSelectFastCommand,
+    ) -> Result<SessionSelectFastOutcome, SessionHubError> {
+        let actor = self.actor_for(command.session_id.clone()).await?;
+        let (completed, result) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::SelectFast { command, completed })
             .await
             .map_err(|_| SessionHubError::Closed)?;
         result
