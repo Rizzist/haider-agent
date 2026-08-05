@@ -41,8 +41,9 @@ pub use haider_store::{
     CreatedBranch, CreatedSession, DelegationCreateOutcome, DelegationRecord, DelegationState,
     HookTrustChange, HookTrustCommand, LoginClaim, LoginReceiptFailure, LoginReceiptResponse,
     LoginReceiptRow, ManagementClaim, ManagementReceiptRow, MenuResolutionCommand,
-    MenuResolutionOutcome, PROVIDER_CONFIGURE_METHOD, PROVIDER_REMOVE_METHOD, SessionCreateCommand,
-    SessionCreateOutcome, ShellExecAcceptCommand, ShellExecAcceptOutcome, TurnAcceptCommand,
+    MenuResolutionOutcome, PROVIDER_CONFIGURE_METHOD, PROVIDER_REMOVE_METHOD, SelectedModel,
+    SessionCreateCommand, SessionCreateOutcome, SessionSelectModelCommand,
+    SessionSelectModelOutcome, ShellExecAcceptCommand, ShellExecAcceptOutcome, TurnAcceptCommand,
     TurnAcceptOutcome, TurnAdmissionDisposition, TurnCancelCommand, TurnCancelOutcome,
     TurnCancellationStatus,
 };

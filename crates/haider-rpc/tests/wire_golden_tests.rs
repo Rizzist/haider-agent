@@ -1496,3 +1496,133 @@ fn device_discovery_goldens_are_additive_and_tolerance_re_proved() {
         }
     );
 }
+
+/// LAW (absent_provider_keeps_legacy_bytes_and_behavior, bytes half): a
+/// model-only selection carries NO `provider` key — byte-for-byte the shape
+/// a provider-unaware peer would emit — and such a request decodes to
+/// `provider: None`.
+///
+/// MUTATION CHECK: serialize `provider: None` as `"provider":null` or make
+/// the field required. Expected RUNTIME failure: the exact golden string or
+/// the provider-less decode below.
+#[test]
+fn session_select_model_absent_provider_keeps_legacy_bytes() {
+    let frame = WireFrame::Request {
+        request_id: haider_rpc::RequestId::new("request-select-legacy"),
+        body: RequestBody::SessionSelectModel {
+            command_id: haider_rpc::CommandId::new("command-select-legacy"),
+            session_id: haider_rpc::haider_protocol::ids::SessionId::new("session-1"),
+            worker_generation: 7,
+            model: "model-next".into(),
+            provider: None,
+        },
+    };
+    let encoded = serde_json::to_string(&frame).expect("encode model-only selection");
+    assert_eq!(
+        encoded,
+        r#"{"v":1,"kind":"request","request_id":"request-select-legacy","body":{"method":"session.select_model","command_id":"command-select-legacy","session_id":"session-1","worker_generation":7,"model":"model-next"}}"#
+    );
+    let decoded: WireFrame = serde_json::from_str(&encoded).expect("decode model-only selection");
+    assert_eq!(decoded, frame);
+}
+
+/// The full pair-selection request and its response are golden: the request
+/// carries the optional provider attribute of the selected model row, and
+/// the response reports the RESOLVED pair plus committed fact coordinates.
+#[test]
+fn session_select_model_pair_request_and_response_are_golden() {
+    let request = WireFrame::Request {
+        request_id: haider_rpc::RequestId::new("request-select-pair"),
+        body: RequestBody::SessionSelectModel {
+            command_id: haider_rpc::CommandId::new("command-select-pair"),
+            session_id: haider_rpc::haider_protocol::ids::SessionId::new("session-1"),
+            worker_generation: 7,
+            model: "fable-5".into(),
+            provider: Some("anthropic-oauth".into()),
+        },
+    };
+    let encoded = serde_json::to_string(&request).expect("encode pair selection");
+    assert_eq!(
+        encoded,
+        r#"{"v":1,"kind":"request","request_id":"request-select-pair","body":{"method":"session.select_model","command_id":"command-select-pair","session_id":"session-1","worker_generation":7,"model":"fable-5","provider":"anthropic-oauth"}}"#
+    );
+    assert_eq!(
+        serde_json::from_str::<WireFrame>(&encoded).expect("decode pair selection"),
+        request
+    );
+
+    let response = WireFrame::Response {
+        request_id: haider_rpc::RequestId::new("request-select-pair"),
+        body: ResponseBody::SessionSelectModel {
+            session_id: haider_rpc::haider_protocol::ids::SessionId::new("session-1"),
+            provider: "anthropic-oauth".into(),
+            model: "fable-5".into(),
+            selected_seq: 42,
+            worker_generation: 7,
+        },
+    };
+    let encoded = serde_json::to_string(&response).expect("encode selection response");
+    assert_eq!(
+        encoded,
+        r#"{"v":1,"kind":"response","request_id":"request-select-pair","body":{"method":"session.select_model","session_id":"session-1","provider":"anthropic-oauth","model":"fable-5","selected_seq":42,"worker_generation":7}}"#
+    );
+    assert_eq!(
+        serde_json::from_str::<WireFrame>(&encoded).expect("decode selection response"),
+        response
+    );
+
+    // To an older peer the method is just another tolerated unknown.
+    let legacy_view = r#"{"v":1,"kind":"request","request_id":"request-select-pair","body":{"method":"session.select_model","command_id":"c","session_id":"s","worker_generation":1,"model":"m","provider":"p","future_field":true}}"#;
+    assert!(serde_json::from_str::<WireFrame>(legacy_view).is_ok());
+}
+
+/// LAWS (unavailable_provider_refused_typed /
+/// unknown_model_with_known_inventory_refused_typed, wire half): the refusal
+/// codes and their typed `ErrorData` kinds are stable, additive vocabulary.
+#[test]
+fn model_selection_refusals_are_typed_and_golden() {
+    assert_eq!(
+        [
+            haider_rpc::ERROR_CODE_PROVIDER_UNAVAILABLE,
+            haider_rpc::ERROR_CODE_MODEL_UNKNOWN,
+        ],
+        ["provider_unavailable", "model_unknown"]
+    );
+
+    let unavailable = serde_json::to_value(ErrorData::ProviderUnavailable {
+        provider: "frontier-imaginary".into(),
+    })
+    .expect("encode provider refusal data");
+    assert_eq!(
+        unavailable,
+        serde_json::json!({
+            "kind": "provider_unavailable",
+            "provider": "frontier-imaginary",
+        })
+    );
+    let unknown = serde_json::to_value(ErrorData::ModelUnknown {
+        provider: "anthropic-oauth".into(),
+        model: "fable-9-imaginary".into(),
+    })
+    .expect("encode model refusal data");
+    assert_eq!(
+        unknown,
+        serde_json::json!({
+            "kind": "model_unknown",
+            "provider": "anthropic-oauth",
+            "model": "fable-9-imaginary",
+        })
+    );
+    // Older peers decode both as tolerated Unknown data, never a hard error.
+    assert_eq!(
+        serde_json::from_value::<ErrorData>(serde_json::json!({"kind": "model_unknown_v9"}))
+            .expect("tolerant decode"),
+        ErrorData::Unknown
+    );
+
+    // The feature bit is the discovery contract for the whole family.
+    assert_eq!(
+        haider_rpc::FEATURE_SESSION_MODEL_SELECT_V1,
+        "session_model_select_v1"
+    );
+}

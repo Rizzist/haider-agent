@@ -990,6 +990,44 @@ impl HubConnection {
                 self.session_compact(request_id, command_id, session_id, worker_generation, None)
                     .await
             }
+            RequestBody::SessionSelectModel {
+                command_id,
+                session_id,
+                worker_generation,
+                model,
+                provider,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                if !self
+                    .hub
+                    .holds_control_attachment(&self.connection_id, &session_id)?
+                {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        "model selection requires a control attachment to this session",
+                        false,
+                        None,
+                    );
+                }
+                self.session_select_model(
+                    request_id,
+                    command_id,
+                    session_id,
+                    worker_generation,
+                    model,
+                    provider,
+                )
+                .await
+            }
             RequestBody::ShellExec {
                 command_id,
                 session_id,
@@ -2353,6 +2391,152 @@ impl HubConnection {
                 created_seq: created.created_seq,
                 worker_generation: created.worker_generation,
                 name: created.name,
+            },
+        })
+    }
+
+    /// `session.select_model` — receipted live-session model selection.
+    ///
+    /// Sessions are provider-agnostic: this is exactly as ceremonial as
+    /// picking a model. Resolution/validation ride the ONE authority in
+    /// `crate::model_select`; the store owns durability; the next logical
+    /// turn re-reads the committed metadata (R6 re-resolution), so commit
+    /// here IS next-turn pickup.
+    async fn session_select_model(
+        &self,
+        request_id: RequestId,
+        command_id: CommandId,
+        session_id: SessionId,
+        worker_generation: u64,
+        model: String,
+        provider: Option<String>,
+    ) -> Result<(), SessionHubError> {
+        if command_id.as_str().trim().is_empty() || model.trim().is_empty() {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "model selection needs a command id and a model",
+                false,
+                None,
+            );
+        }
+        let request_json = serde_json::to_string(&serde_json::json!({
+            "session_id": &session_id,
+            "worker_generation": worker_generation,
+            "model": &model,
+            "provider": &provider,
+        }))
+        .map_err(|error| {
+            SessionHubError::Task(format!(
+                "cannot encode model-selection coordinates: {error}"
+            ))
+        })?;
+        let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
+
+        // Receipt replay precedes validation so a lost response remains
+        // recoverable even after registry or inventory changes.
+        match self
+            .hub
+            .session_select_model_receipt(&command_id, &request_digest, &request_json)
+            .await
+        {
+            Ok(Some(selected)) => return self.respond_model_selected(request_id, selected),
+            Ok(None) => {}
+            Err(SessionHubError::Store(error)) => {
+                return self.respond_turn_error(request_id, error);
+            }
+            Err(error) => return Err(error),
+        }
+
+        let Some(current) = (match self.hub.session_metadata(&session_id).await {
+            Ok(metadata) => metadata,
+            Err(error) => return self.respond_turn_error(request_id, error),
+        }) else {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_NOT_FOUND,
+                "model selection requires a live session with typed metadata",
+                false,
+                None,
+            );
+        };
+        let summaries = self
+            .hub
+            .accounts()?
+            .and_then(|facade| facade.management.read())
+            .map(|view| view.providers)
+            .unwrap_or_default();
+        let authority = crate::model_select::ModelSelectionAuthority::new(
+            self.hub.creatable_providers()?,
+            summaries,
+        );
+        let (resolved_provider, resolved_model) =
+            match authority.validate_selection(&current.provider, provider.as_deref(), &model) {
+                Ok(pair) => pair,
+                Err(refusal) => return self.respond_selection_refusal(request_id, &refusal),
+            };
+
+        let command = SessionSelectModelCommand {
+            command_id: command_id.0,
+            request_digest,
+            request_json,
+            session_id,
+            worker_generation,
+            provider: resolved_provider,
+            model: resolved_model,
+            event_id: EventId::new(random_id("model-selected")?),
+            device_id: self.hub.inner.device_id.clone(),
+        };
+        let selected = match self.hub.select_session_model(command).await {
+            Ok(SessionSelectModelOutcome::Committed { selected, .. })
+            | Ok(SessionSelectModelOutcome::IdempotentReplay { selected }) => selected,
+            Err(SessionHubError::Store(error)) => {
+                return self.respond_turn_error(request_id, error);
+            }
+            Err(error) => return Err(error),
+        };
+        self.respond_model_selected(request_id, selected)
+    }
+
+    fn respond_selection_refusal(
+        &self,
+        request_id: RequestId,
+        refusal: &crate::model_select::SelectionRefusal,
+    ) -> Result<(), SessionHubError> {
+        use crate::model_select::SelectionRefusal;
+        let (code, data) = match refusal {
+            SelectionRefusal::ProviderUnavailable { provider } => (
+                haider_rpc::ERROR_CODE_PROVIDER_UNAVAILABLE,
+                Some(ErrorData::ProviderUnavailable {
+                    provider: provider.clone(),
+                }),
+            ),
+            SelectionRefusal::ModelUnknown { provider, model } => (
+                haider_rpc::ERROR_CODE_MODEL_UNKNOWN,
+                Some(ErrorData::ModelUnknown {
+                    provider: provider.clone(),
+                    model: model.clone(),
+                }),
+            ),
+            SelectionRefusal::ModelNotResolvable { .. }
+            | SelectionRefusal::InvalidSelector { .. } => (ERROR_CODE_INVALID_ARGUMENT, None),
+        };
+        self.respond_error(request_id, code, &refusal.message(), false, data)
+    }
+
+    fn respond_model_selected(
+        &self,
+        request_id: RequestId,
+        selected: SelectedModel,
+    ) -> Result<(), SessionHubError> {
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::SessionSelectModel {
+                session_id: selected.session_id,
+                provider: selected.provider,
+                model: selected.model,
+                selected_seq: selected.selected_seq,
+                worker_generation: selected.worker_generation,
             },
         })
     }

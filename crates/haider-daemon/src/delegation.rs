@@ -63,6 +63,12 @@ pub(crate) struct SpawnCoordinates {
     pub(crate) parent_agent_id: Option<AgentId>,
     pub(crate) tool_item_id: ItemId,
     pub(crate) call_id: String,
+    /// The CHILD's creation metadata. By default this is the parent's
+    /// current metadata verbatim — the child inherits the parent's CURRENT
+    /// model pair, including a pair committed by `session.select_model`
+    /// earlier in the parent's life. An explicit spawn model selector arrives
+    /// here already resolved ([`DelegationHandle::resolve_child_metadata`]);
+    /// `establish` never re-resolves.
     pub(crate) metadata: SessionMetadataV1,
 }
 
@@ -92,6 +98,56 @@ impl DelegationHandle {
             hub,
             stall_deadline,
         }
+    }
+
+    /// Resolves the child's metadata from the parent's CURRENT metadata plus
+    /// the request's optional model selector (F1).
+    ///
+    /// Sessions are provider-agnostic, children included: absent selector →
+    /// the child inherits the parent's current pair verbatim; a selector
+    /// resolves through the ONE `crate::model_select` authority — the same
+    /// truth `session.select_model` validates against. The outer `Err` is
+    /// infrastructure failure; the inner `Err` is a typed selection refusal
+    /// the model can act on (retry with an explicit pair).
+    pub(crate) fn resolve_child_metadata(
+        &self,
+        parent: &SessionMetadataV1,
+        request: &SpawnSubagent,
+    ) -> Result<Result<SessionMetadataV1, crate::model_select::SelectionRefusal>, HaiderError> {
+        let creatable = self.hub.creatable_providers().map_err(|error| {
+            HaiderError::new(
+                ErrorCode::Internal,
+                format!("creatable-provider registry is unavailable: {error}"),
+                false,
+            )
+        })?;
+        let summaries = self
+            .hub
+            .accounts()
+            .map_err(|error| {
+                HaiderError::new(
+                    ErrorCode::Internal,
+                    format!("account facade is unavailable: {error}"),
+                    false,
+                )
+            })?
+            .and_then(|facade| facade.management.read())
+            .map(|view| view.providers)
+            .unwrap_or_default();
+        let authority = crate::model_select::ModelSelectionAuthority::new(creatable, summaries);
+        Ok(authority
+            .resolve_child_selector(
+                &parent.provider,
+                &parent.model,
+                request.model.as_deref(),
+                request.provider.as_deref(),
+            )
+            .map(|(provider, model)| {
+                let mut child = parent.clone();
+                child.provider = provider;
+                child.model = model;
+                child
+            }))
     }
 
     /// Establishes child session, durable link, and accepted first turn. It

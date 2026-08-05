@@ -22,6 +22,10 @@
 //! (`rescan_needed`); the durable `Queued`+`UserMessage` pair is the overflow
 //! buffer.
 
+#[cfg(test)]
+#[path = "pair_switch_runtime_tests.rs"]
+mod pair_switch_runtime_tests;
+
 use crate::delegation::{DelegationHandle, MessageCoordinates, SpawnCoordinates};
 use crate::project_instructions::{self, LoadedProjectInstructions};
 use crate::session_hub::{HubStoreHandle, SessionHub, SessionHubError};
@@ -112,6 +116,12 @@ pub(crate) struct AcceptedCompaction {
 /// changes still affect the next logical turn. `resolve_for_turn` must return
 /// the provider name recorded in session metadata; `start_turn` rejects a
 /// mismatch.
+///
+/// F1 extension: the `metadata` argument is itself re-read from the store per
+/// logical turn (`fresh_turn_metadata`), so a committed
+/// `session.select_model` pair is what the next turn resolves through.
+/// Sessions are provider-agnostic — the pair is the CURRENT model selection,
+/// not session identity.
 #[async_trait]
 pub trait ProviderFactory: Send + Sync {
     async fn resolve_for_turn(
@@ -1559,16 +1569,25 @@ async fn run_supervisor(
                 let branch_id = pending.accepted.branch_id.clone();
                 let recovery_ready = pending.recovery_ready.take();
                 let recovering = pending.recovering;
-                match start_turn(
-                    &dependencies,
-                    &metadata,
-                    &lease,
-                    &device_id,
-                    Arc::clone(&event_ids),
-                    pending,
-                )
-                .await
-                {
+                // R6 extension (F1): the pair is re-read per logical turn, so
+                // a committed `session.select_model` reaches the NEXT turn
+                // without a worker restart. A failed read fails the turn
+                // honestly instead of silently pinning the spawn snapshot.
+                let turn_result = match fresh_turn_metadata(&lease).await {
+                    Ok(fresh) => {
+                        start_turn(
+                            &dependencies,
+                            &fresh,
+                            &lease,
+                            &device_id,
+                            Arc::clone(&event_ids),
+                            pending,
+                        )
+                        .await
+                    }
+                    Err(error) => Err(error),
+                };
+                match turn_result {
                     Ok(turn) => {
                         if let Some(ready) = recovery_ready {
                             let _ = ready.send(Ok(()));
@@ -1976,17 +1995,25 @@ async fn run_supervisor(
                         branch_id,
                         completed,
                     }) => {
-                        let result = perform_manual_compaction(
-                            &dependencies,
-                            &metadata,
-                            &lease,
-                            &device_id,
-                            Arc::clone(&event_ids),
-                            command_id,
-                            worker_generation,
-                            branch_id,
-                        )
-                        .await;
+                        // Manual compaction is provider work between turns:
+                        // it follows the CURRENT model selection exactly like
+                        // the next turn would (F1).
+                        let result = match fresh_turn_metadata(&lease).await {
+                            Ok(fresh) => {
+                                perform_manual_compaction(
+                                    &dependencies,
+                                    &fresh,
+                                    &lease,
+                                    &device_id,
+                                    Arc::clone(&event_ids),
+                                    command_id,
+                                    worker_generation,
+                                    branch_id,
+                                )
+                                .await
+                            }
+                            Err(error) => Err(error),
+                        };
                         let _ = completed.send(result);
                     }
                     Some(SupervisorCommand::ShellExec(pending)) => {
@@ -3078,6 +3105,23 @@ async fn fail_shell_exec(
     append_session_idle(lease, device_id, event_ids, false).await
 }
 
+/// Re-reads THIS session's metadata for one logical turn (F1). The store is
+/// the one truth for the current model selection: a committed
+/// `session.select_model` between turns is picked up here, which is what
+/// makes the receipt's promise — "the next turn resolves the new pair" —
+/// structural rather than aspirational. `None` (row vanished mid-life) and
+/// read failures fail the turn honestly; the spawn-time snapshot is never a
+/// silent fallback.
+async fn fresh_turn_metadata(lease: &HubStoreHandle) -> Result<SessionMetadataV1, HaiderError> {
+    lease.session_metadata().await?.ok_or_else(|| {
+        HaiderError::new(
+            ErrorCode::InvalidArgument,
+            "session metadata disappeared before turn start",
+            false,
+        )
+    })
+}
+
 /// Assembles and starts one accepted turn: provider resolution (R6 pinning —
 /// this is the once-per-logical-turn call), committed-history compilation
 /// (R4), tool dispatcher creation, harness registration under the lease, and
@@ -4130,6 +4174,20 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 return Err(error);
             }
             let request = SpawnSubagent::from_tool_args(args).map_err(tool_error)?;
+            // F1: resolve the child's pair BEFORE any durable spawn work. A
+            // typed selection refusal is a completed tool result — the model
+            // retries with an explicit pair — never a turn failure.
+            let child_metadata = match self
+                .delegation
+                .resolve_child_metadata(&self.metadata, &request)?
+            {
+                Ok(metadata) => metadata,
+                Err(refusal) => {
+                    return Ok(ToolDispatchResult::Completed(selection_rejection_result(
+                        &refusal,
+                    )));
+                }
+            };
             let intent = match broker.begin_agent_spawn(&request, &policy).await {
                 Ok(intent) => intent,
                 Err(ToolError::AuthorizationRequired { menu }) => {
@@ -4154,7 +4212,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         parent_agent_id: self.parent_agent_id.clone(),
                         tool_item_id: item_id.clone(),
                         call_id: call_id.to_owned(),
-                        metadata: self.metadata.clone(),
+                        metadata: child_metadata,
                     },
                     request,
                 )
@@ -4687,6 +4745,26 @@ fn typed_error_result(
     }
     BoundedResult {
         preview: body.to_string(),
+        truncated: false,
+        artifact: None,
+        cursor: None,
+    }
+}
+
+/// Typed spawn model-selector refusal as a COMPLETED tool result. Static
+/// vocabulary plus the caller's own selector strings; the candidates let the
+/// model retry with an explicit pair.
+fn selection_rejection_result(refusal: &crate::model_select::SelectionRefusal) -> BoundedResult {
+    BoundedResult {
+        preview: serde_json::json!({
+            "status": "rejected",
+            "error": {
+                "kind": refusal.kind(),
+                "message": refusal.message(),
+                "details": refusal.details(),
+            }
+        })
+        .to_string(),
         truncated: false,
         artifact: None,
         cursor: None,

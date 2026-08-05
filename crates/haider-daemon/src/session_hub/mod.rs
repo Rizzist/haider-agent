@@ -100,9 +100,10 @@ use async_trait::async_trait;
 use haider_core::{
     AcceptedShellExec, AcceptedTurn, BranchCreateCommand, BranchCreateOutcome, CancelledTurn,
     CreatedBranch, CreatedSession, HarnessHandle, MenuResolutionCommand, MenuResolutionOutcome,
-    SessionCreateCommand, SessionCreateOutcome, ShellExecAcceptCommand, ShellExecAcceptOutcome,
-    SqliteStoreHandle, StoreHandle, TurnAcceptCommand, TurnAcceptOutcome, TurnAdmissionDisposition,
-    TurnCancelCommand, TurnCancelOutcome, TurnCancellationStatus,
+    SelectedModel, SessionCreateCommand, SessionCreateOutcome, SessionSelectModelCommand,
+    SessionSelectModelOutcome, ShellExecAcceptCommand, ShellExecAcceptOutcome, SqliteStoreHandle,
+    StoreHandle, TurnAcceptCommand, TurnAcceptOutcome, TurnAdmissionDisposition, TurnCancelCommand,
+    TurnCancelOutcome, TurnCancellationStatus,
 };
 use haider_protocol::EventPayload;
 use haider_protocol::branch::BranchDescriptor;
@@ -741,6 +742,10 @@ enum ActorCommand {
         command: BranchCreateCommand,
         completed: oneshot::Sender<Result<BranchCreateOutcome, HaiderError>>,
     },
+    SelectModel {
+        command: SessionSelectModelCommand,
+        completed: oneshot::Sender<Result<SessionSelectModelOutcome, HaiderError>>,
+    },
     AcceptTurn {
         command: TurnAcceptCommand,
         completed: oneshot::Sender<Result<TurnAcceptOutcome, HaiderError>>,
@@ -1355,6 +1360,40 @@ impl SessionHub {
         actor
             .commands
             .send(ActorCommand::CreateBranch { command, completed })
+            .await
+            .map_err(|_| SessionHubError::Closed)?;
+        result
+            .await
+            .map_err(|_| SessionHubError::Closed)?
+            .map_err(Into::into)
+    }
+
+    async fn session_select_model_receipt(
+        &self,
+        command_id: &CommandId,
+        request_digest: &str,
+        request_json: &str,
+    ) -> Result<Option<SelectedModel>, SessionHubError> {
+        self.inner
+            .store
+            .session_select_model_receipt(
+                command_id.0.clone(),
+                request_digest.to_owned(),
+                request_json.to_owned(),
+            )
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn select_session_model(
+        &self,
+        command: SessionSelectModelCommand,
+    ) -> Result<SessionSelectModelOutcome, SessionHubError> {
+        let actor = self.actor_for(command.session_id.clone()).await?;
+        let (completed, result) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::SelectModel { command, completed })
             .await
             .map_err(|_| SessionHubError::Closed)?;
         result
@@ -2378,6 +2417,21 @@ impl HubStoreHandle {
 
     pub fn worker_generation(&self) -> u64 {
         self.worker_generation
+    }
+
+    /// Reads THIS lease's session metadata fresh from the store. The handle
+    /// cannot name another session, so the read carries the same structural
+    /// R1 seal as appends. The turn supervisor calls this before every turn
+    /// start so a committed `session.select_model` is picked up by the next
+    /// logical turn without a worker restart (R6 re-resolution).
+    pub(crate) async fn session_metadata(
+        &self,
+    ) -> Result<Option<haider_protocol::session::SessionMetadataV1>, HaiderError> {
+        self.hub
+            .inner
+            .store
+            .session_metadata(&self.session_id)
+            .await
     }
 
     /// Installs this lease's harness. The receiver cannot name another

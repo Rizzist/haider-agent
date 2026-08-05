@@ -148,6 +148,34 @@ pub(super) async fn run_session_actor(
                 }
                 let _ = completed.send(result);
             }
+            ActorCommand::SelectModel { command, completed } => {
+                // The metadata update, model_selected fact, and R2 receipt
+                // are one transaction. Only the committed fact is
+                // publishable, and the serialized arm is what makes "commit
+                // here IS next-turn pickup" true: a turn accepted after this
+                // arm re-reads the committed metadata.
+                let result = store.select_session_model(command).await;
+                if let Ok(SessionSelectModelOutcome::Committed { envelope, .. }) = &result {
+                    head = envelope.seq;
+                    authority_epoch = envelope.authority_epoch;
+                    observer.observe(HubObservation::Persisted {
+                        session_id: session_id.clone(),
+                        through_seq: head,
+                    });
+                    publish(
+                        &mut attachments,
+                        std::slice::from_ref(envelope.as_ref()),
+                        catch_up_byte_budget,
+                        &metrics,
+                        &hooks,
+                    );
+                    observer.observe(HubObservation::Published {
+                        session_id: session_id.clone(),
+                        through_seq: head,
+                    });
+                }
+                let _ = completed.send(result);
+            }
             ActorCommand::AcceptTurn { command, completed } => {
                 // MUTATION CHECK: publishing before this durable transaction
                 // returns makes live clients observe an acceptance a restart

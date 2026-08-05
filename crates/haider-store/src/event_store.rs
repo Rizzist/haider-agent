@@ -31,7 +31,7 @@ use haider_protocol::ids::{
 use haider_protocol::item::{ItemEvent, TurnItem};
 use haider_protocol::menu::{Menu, MenuAnswer, MenuKind};
 use haider_protocol::project_instructions::ProjectInstructionsLoaded;
-use haider_protocol::session::{SessionMetadataV1, SessionPermissionOverridesV1};
+use haider_protocol::session::{ModelSelected, SessionMetadataV1, SessionPermissionOverridesV1};
 use haider_protocol::state::{RunState, SessionState};
 use haider_protocol::tool::AttachmentBlock;
 use haider_protocol::{DeliveryMode, EventPayload};
@@ -210,6 +210,47 @@ pub enum BranchCreateOutcome {
     },
     IdempotentReplay {
         created: CreatedBranch,
+    },
+}
+
+/// Secret-free coordinates for one atomic live-session model selection.
+///
+/// `provider` and `model` are the RESOLVED pair — the daemon resolves and
+/// validates the selection before this command exists; the store applies it
+/// verbatim. Sessions are provider-agnostic: this mutates the session's
+/// current model selection (and its provider attribute), never its identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSelectModelCommand {
+    pub command_id: String,
+    pub request_digest: String,
+    pub request_json: String,
+    pub session_id: SessionId,
+    pub worker_generation: u64,
+    pub provider: String,
+    pub model: String,
+    pub event_id: EventId,
+    pub device_id: DeviceId,
+}
+
+/// Stable response stored in the committed `session.select_model` receipt.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SelectedModel {
+    pub session_id: SessionId,
+    pub provider: String,
+    pub model: String,
+    pub selected_seq: u64,
+    pub worker_generation: u64,
+}
+
+/// Result of the atomic metadata-update/event/receipt transaction.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SessionSelectModelOutcome {
+    Committed {
+        selected: SelectedModel,
+        envelope: Box<RawEnvelope>,
+    },
+    IdempotentReplay {
+        selected: SelectedModel,
     },
 }
 
@@ -1525,6 +1566,162 @@ impl Store {
         transaction.commit().map_err(map_sqlite_error)?;
         Ok(BranchCreateOutcome::Committed {
             created,
+            envelope: Box::new(envelopes.remove(0)),
+        })
+    }
+
+    /// Looks up a committed `session.select_model` response before session,
+    /// generation, or metadata validation (R2 response-loss replay).
+    pub fn session_select_model_receipt(
+        &self,
+        command_id: &str,
+        request_digest: &str,
+        request_json: &str,
+    ) -> StoreResult<Option<SelectedModel>> {
+        validate_command_identity(command_id, request_digest, request_json)?;
+        let connection = self.connection()?;
+        lookup_command_response(
+            &connection,
+            command_id,
+            "session.select_model",
+            request_digest,
+            request_json,
+            "session-select-model",
+        )
+    }
+
+    /// Atomically applies one RESOLVED model selection: updates the session's
+    /// typed metadata (provider + model, every other field preserved),
+    /// appends the `model_selected` fact, and finalizes the command receipt.
+    /// Any late failure rolls all three back.
+    ///
+    /// The daemon owns resolution and validation; this transaction owns only
+    /// durability. The next logical turn re-reads the committed metadata, so
+    /// commit here IS next-turn pickup.
+    pub fn select_session_model(
+        &self,
+        command: &SessionSelectModelCommand,
+    ) -> StoreResult<SessionSelectModelOutcome> {
+        validate_command_identity(
+            &command.command_id,
+            &command.request_digest,
+            &command.request_json,
+        )?;
+        if command.worker_generation != self.worker_generation {
+            return Err(stale_generation(
+                command.worker_generation,
+                self.worker_generation,
+            ));
+        }
+        if command.provider.trim().is_empty() || command.model.trim().is_empty() {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "model selection must carry a resolved provider and model",
+                false,
+            ));
+        }
+
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        if let Some(selected) = lookup_command_response(
+            &transaction,
+            &command.command_id,
+            "session.select_model",
+            &command.request_digest,
+            &command.request_json,
+            "session-select-model",
+        )? {
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(SessionSelectModelOutcome::IdempotentReplay { selected });
+        }
+        require_typed_session(&transaction, &command.session_id)?;
+        let metadata_json: String = transaction
+            .query_row(
+                "SELECT meta_json FROM sessions WHERE id = ?1",
+                [command.session_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(map_sqlite_error)?;
+        let Some(mut metadata) = decode_session_metadata(&command.session_id, &metadata_json)?
+        else {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "legacy session has no live-worker metadata",
+                false,
+            ));
+        };
+        metadata.provider = command.provider.clone();
+        metadata.model = command.model.clone();
+        let updated_metadata = serde_json::to_string(&metadata).map_err(|error| {
+            store_error(
+                ErrorCode::InvalidArgument,
+                format!("cannot serialize session metadata: {error}"),
+                false,
+            )
+        })?;
+
+        let now = now_ms()?;
+        claim_pending_receipt(
+            &transaction,
+            &command.command_id,
+            "session.select_model",
+            &command.request_digest,
+            &command.request_json,
+            now,
+        )?;
+        let updated_rows = transaction
+            .execute(
+                "UPDATE sessions SET meta_json = ?2 WHERE id = ?1",
+                params![command.session_id.as_str(), updated_metadata],
+            )
+            .map_err(map_sqlite_error)?;
+        if updated_rows != 1 {
+            return Err(corrupt("session row disappeared during model selection"));
+        }
+        let mut envelopes = vec![unstamped_raw_command_envelope(
+            command.event_id.clone(),
+            &command.session_id,
+            None,
+            None,
+            command.device_id.clone(),
+            self.worker_generation,
+            ModelSelected {
+                provider: command.provider.clone(),
+                model: command.model.clone(),
+            }
+            .to_payload_value()
+            .map_err(|error| {
+                store_error(
+                    ErrorCode::InvalidArgument,
+                    format!("cannot serialize model-selected payload: {error}"),
+                    false,
+                )
+            })?,
+            PromptRender::Omit,
+        )?];
+        append_transaction_envelopes(&transaction, &command.session_id, now, &mut envelopes)?;
+        let selected = SelectedModel {
+            session_id: command.session_id.clone(),
+            provider: command.provider.clone(),
+            model: command.model.clone(),
+            selected_seq: envelopes[0].seq,
+            worker_generation: self.worker_generation,
+        };
+        finalize_command_receipt(
+            &transaction,
+            &command.command_id,
+            command.session_id.as_str(),
+            None,
+            Some(selected.selected_seq),
+            &selected,
+            now,
+            "session-select-model",
+        )?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(SessionSelectModelOutcome::Committed {
+            selected,
             envelope: Box::new(envelopes.remove(0)),
         })
     }

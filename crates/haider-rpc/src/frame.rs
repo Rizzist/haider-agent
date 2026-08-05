@@ -166,6 +166,16 @@ pub const ERROR_CODE_TOO_MANY_ATTACHMENTS: &str = "too_many_attachments";
 pub const ERROR_CODE_ATTACHMENTS_TOO_LARGE: &str = "attachments_too_large";
 /// Stable local refusal when an image is submitted to a non-vision provider.
 pub const ERROR_CODE_VISION_UNSUPPORTED: &str = "vision_unsupported";
+/// Stable refusal for a model selection whose implied provider is not
+/// creatable on this daemon. Model selection is the user-facing act; the
+/// provider is an attribute of the selected model row, and this code names
+/// the one honest reason the row cannot be selected.
+pub const ERROR_CODE_PROVIDER_UNAVAILABLE: &str = "provider_unavailable";
+/// Stable refusal for a model selection naming a model outside the implied
+/// provider's KNOWN discovered inventory. A provider without a discovered
+/// inventory never produces this code — selection is accepted honestly and
+/// provider errors surface at turn time.
+pub const ERROR_CODE_MODEL_UNKNOWN: &str = "model_unknown";
 
 /// Daemon implements receipt-backed session creation and metadata.
 pub const FEATURE_SESSION_MUTATION_V1: &str = "session_mutation_v1";
@@ -215,6 +225,11 @@ pub const FEATURE_ARTIFACT_PUT_V1: &str = "artifact_put_v1";
 pub const FEATURE_HOOKS_V1: &str = "hooks_v1";
 /// Daemon implements owned direct-child messaging for tools and chip composers.
 pub const FEATURE_AGENT_MESSAGE_V1: &str = "agent_message_v1";
+/// Daemon implements receipted live-session model selection
+/// (`session.select_model`), including cross-provider rows: the request's
+/// optional `provider` names the selected model row's provider attribute,
+/// and the next logical turn resolves through the committed pair.
+pub const FEATURE_SESSION_MODEL_SELECT_V1: &str = "session_model_select_v1";
 
 /// Kind of client taking part in the handshake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1052,6 +1067,23 @@ pub enum RequestBody {
         session_id: SessionId,
         worker_generation: u64,
     },
+    /// Receipted live-session model selection. Sessions are provider-agnostic:
+    /// the user selects a MODEL, and the provider rides along as an attribute
+    /// of the selected row. An absent `provider` keeps today's bytes and
+    /// behavior — the model is selected within the session's current
+    /// provider. A present `provider` selects a row served by that provider;
+    /// the daemon validates creatability and, when a discovered inventory
+    /// exists, membership. The next logical turn resolves through the
+    /// committed pair (R6 re-resolution).
+    #[serde(rename = "session.select_model")]
+    SessionSelectModel {
+        command_id: CommandId,
+        session_id: SessionId,
+        worker_generation: u64,
+        model: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+    },
     /// Executes exact user-supplied shell program bytes on the session daemon.
     /// The command creates no user message and no provider request. `cwd`, when
     /// present, is workspace-relative and applies only to this invocation.
@@ -1338,6 +1370,18 @@ pub enum ResponseBody {
         worker_generation: u64,
         branch_id: BranchId,
     },
+    /// Durable coordinates of a committed model selection (R2): the RESOLVED
+    /// pair — never an echo of the request — plus the committed journal
+    /// sequence of the `model_selected` fact. A same-command retry receives
+    /// this exact body from its receipt.
+    #[serde(rename = "session.select_model")]
+    SessionSelectModel {
+        session_id: SessionId,
+        provider: String,
+        model: String,
+        selected_seq: u64,
+        worker_generation: u64,
+    },
     /// Durable acceptance coordinates for one direct shell command. Terminal
     /// status and byte output arrive through the ordinary item event stream.
     #[serde(rename = "shell.exec")]
@@ -1574,6 +1618,12 @@ pub enum ErrorData {
     },
     /// The provider did not serve a model catalog to the active credential.
     ProviderModelsUnavailable { provider: String, reason: String },
+    /// A model selection named a row whose provider attribute is not
+    /// creatable on this daemon ([`ERROR_CODE_PROVIDER_UNAVAILABLE`]).
+    ProviderUnavailable { provider: String },
+    /// A model selection named a model outside the implied provider's KNOWN
+    /// discovered inventory ([`ERROR_CODE_MODEL_UNKNOWN`]).
+    ModelUnknown { provider: String, model: String },
     /// A custom-provider removal was refused. Blocking credential aliases are
     /// carried as typed data so clients never need to parse the message.
     ProviderRemoveRefused {

@@ -2801,13 +2801,68 @@ impl CallbackRejection {
     }
 }
 
+/// Shared inline stylesheet for every loopback callback page. Fully
+/// self-contained by law: no external stylesheet, font, image, or script may
+/// ever be referenced — the page must render complete from these bytes alone
+/// (`callback_pages_are_branded_and_fully_self_contained`).
+macro_rules! callback_page_style {
+    () => {
+        "<style>\
+:root{color-scheme:dark}\
+body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;\
+background:#0c0c10;color:#e8e4da;font:16px/1.65 Georgia,'Times New Roman',serif}\
+main{max-width:27rem;padding:3rem 2.25rem;text-align:center}\
+.wordmark{margin:0 0 1.5rem;font:600 .8rem/1 'Avenir Next','Helvetica Neue',Arial,sans-serif;\
+letter-spacing:.5em;text-indent:.5em;text-transform:uppercase;color:#c9a35c}\
+.rule{width:2.5rem;margin:0 auto 1.5rem;border:0;border-top:1px solid rgba(201,163,92,.4)}\
+h1{margin:0 0 .8rem;font-size:1.3rem;font-weight:500;letter-spacing:.01em;color:#f3efe5}\
+p{margin:0 0 .8rem;color:#a8a294}\
+.hint{margin:1.4rem 0 0;font-size:.85rem;color:#6f6a5f}\
+</style>"
+    };
+}
+
+/// Opening boilerplate shared by every callback page: self-contained,
+/// referrer-suppressed, mobile-sane. The `<title>` follows per page.
+macro_rules! callback_page_head {
+    () => {
+        "<!doctype html><html lang=en><meta charset=utf-8>\
+<meta name=viewport content=\"width=device-width,initial-scale=1\">\
+<meta name=referrer content=no-referrer>"
+    };
+}
+
+/// The Haider wordmark as TEXT plus its gold rule — never an image or font
+/// request.
+macro_rules! callback_page_wordmark {
+    () => {
+        "<body><main><p class=wordmark>Haider</p><hr class=rule>"
+    };
+}
+
 /// The rejection page. Never a bare "rejected": it states WHY (static,
-/// request-independent copy) and how to retry, quoting the flow TTL.
+/// request-independent copy) and how to retry, quoting the flow TTL. The
+/// only non-literal byte source is [`CallbackRejection::why`]'s fixed
+/// four-reason vocabulary — request data NEVER reaches this format string.
 fn rejection_html(reason: CallbackRejection) -> String {
-    format!(
-        "<!doctype html><meta charset=utf-8><meta name=referrer content=no-referrer><title>Haider sign-in callback rejected</title><p>This callback was rejected: {}.</p><p>To retry, return to Haider and start the sign-in again — each sign-in link is valid for one attempt within 10 minutes.</p>",
-        reason.why()
-    )
+    [
+        concat!(
+            callback_page_head!(),
+            "<title>Haider — sign-in callback rejected</title>",
+            callback_page_style!(),
+            callback_page_wordmark!(),
+            "<h1>Sign-in callback rejected</h1>",
+            "<p>This callback was rejected: "
+        ),
+        reason.why(),
+        concat!(
+            ".</p>",
+            "<p class=hint>To retry, return to Haider and start the sign-in again — each \
+             sign-in link is valid for one attempt within 10 minutes.</p>",
+            "</main></html>"
+        ),
+    ]
+    .concat()
 }
 
 enum CallbackResult {
@@ -3582,8 +3637,27 @@ fn respond_public_error(route: &OAuthRoute, error: OAuthPublicError) {
     );
 }
 
-const SUCCESS_HTML: &str = "<!doctype html><meta charset=utf-8><meta name=referrer content=no-referrer><title>Haider authorization complete</title><p>Authorization received. Return to Haider.</p>";
-const DENIED_HTML: &str = "<!doctype html><meta charset=utf-8><meta name=referrer content=no-referrer><title>Haider authorization cancelled</title><p>Authorization was not granted. Return to Haider.</p>";
+/// Branded success page. A static constant: no request byte can reach it.
+const SUCCESS_HTML: &str = concat!(
+    callback_page_head!(),
+    "<title>Haider — authorization complete</title>",
+    callback_page_style!(),
+    callback_page_wordmark!(),
+    "<h1>Authorization received</h1>",
+    "<p>You can close this tab and return to Haider.</p>",
+    "</main></html>"
+);
+
+/// Branded cancellation page. A static constant: no request byte can reach it.
+const DENIED_HTML: &str = concat!(
+    callback_page_head!(),
+    "<title>Haider — authorization cancelled</title>",
+    callback_page_style!(),
+    callback_page_wordmark!(),
+    "<h1>Authorization was not granted</h1>",
+    "<p>Return to Haider to start the sign-in again whenever you like.</p>",
+    "</main></html>"
+);
 
 async fn send_callback_page(
     stream: &mut TcpStream,

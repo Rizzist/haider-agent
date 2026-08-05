@@ -17,8 +17,9 @@ use haider_store::{
     ContextCompactionClaim, ContextCompactionReceiptResponse, DelegationCreateOutcome,
     DelegationRecord, EventStore, HookTrustChange, HookTrustCommand, MenuResolutionCommand,
     MenuResolutionOutcome, ProfileLease, SessionCreateCommand, SessionCreateOutcome,
-    ShellExecAcceptCommand, ShellExecAcceptOutcome, Store, TurnAcceptCommand, TurnAcceptOutcome,
-    TurnCancelCommand, TurnCancelOutcome,
+    SessionSelectModelCommand, SessionSelectModelOutcome, ShellExecAcceptCommand,
+    ShellExecAcceptOutcome, Store, TurnAcceptCommand, TurnAcceptOutcome, TurnCancelCommand,
+    TurnCancelOutcome,
 };
 use haider_tools::{CasSink, ToolResult};
 use std::path::Path;
@@ -167,6 +168,31 @@ impl SqliteStoreHandle {
     ) -> Result<BranchCreateOutcome, HaiderError> {
         let owner = Arc::clone(&self.owner);
         run_blocking(move || owner.with_store(|store| store.create_branch(&command))).await
+    }
+
+    /// Preflights a durable `session.select_model` receipt (R2 replay).
+    pub async fn session_select_model_receipt(
+        &self,
+        command_id: String,
+        request_digest: String,
+        request_json: String,
+    ) -> Result<Option<haider_store::SelectedModel>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.session_select_model_receipt(&command_id, &request_digest, &request_json)
+            })
+        })
+        .await
+    }
+
+    /// Atomically applies one resolved live-session model selection.
+    pub async fn select_session_model(
+        &self,
+        command: SessionSelectModelCommand,
+    ) -> Result<SessionSelectModelOutcome, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.select_session_model(&command))).await
     }
 
     pub async fn create_delegation(

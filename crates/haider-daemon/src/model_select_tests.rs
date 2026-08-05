@@ -1,0 +1,347 @@
+//! Laws for the ONE model-selection authority (F1).
+//!
+//! Sessions are provider-agnostic: every law here speaks model selection.
+//! The live-session switch (`session.select_model`) and the spawn selector
+//! resolve through the same functions, so these unit laws bind both.
+
+#![allow(clippy::expect_used)]
+
+use super::{ModelSelectionAuthority, SelectionRefusal};
+use haider_rpc::{ProviderApiFamilyWire, ProviderAvailabilityWire, ProviderSummaryWire};
+use std::collections::BTreeSet;
+
+fn summary(
+    provider: &str,
+    models: &[&str],
+    availability: ProviderAvailabilityWire,
+) -> ProviderSummaryWire {
+    ProviderSummaryWire {
+        provider: provider.to_owned(),
+        api_family: ProviderApiFamilyWire::OpenAiResponses,
+        endpoint: None,
+        models: models.iter().map(|model| (*model).to_owned()).collect(),
+        model_details: Vec::new(),
+        auth_methods: Vec::new(),
+        availability,
+        availability_reason: None,
+        default_model: None,
+        enabled: true,
+    }
+}
+
+fn creatable(providers: &[&str]) -> Option<BTreeSet<String>> {
+    Some(
+        providers
+            .iter()
+            .map(|provider| (*provider).to_owned())
+            .collect(),
+    )
+}
+
+fn authority(
+    creatable_providers: &[&str],
+    summaries: Vec<ProviderSummaryWire>,
+) -> ModelSelectionAuthority {
+    ModelSelectionAuthority::new(creatable(creatable_providers), summaries)
+}
+
+// ───────────────────────────── live-session selection ───────────────────────
+
+/// LAW (absent_provider_keeps_legacy_bytes_and_behavior, behavior half): an
+/// absent provider selects within the session's CURRENT provider even when
+/// another provider also serves the model — nothing may guess cross-provider.
+#[test]
+fn absent_provider_selects_within_the_current_provider() {
+    let authority = authority(
+        &["openai", "anthropic-oauth"],
+        vec![
+            summary(
+                "openai",
+                &["gpt-a", "shared-model"],
+                ProviderAvailabilityWire::Available,
+            ),
+            summary(
+                "anthropic-oauth",
+                &["shared-model"],
+                ProviderAvailabilityWire::Available,
+            ),
+        ],
+    );
+    assert_eq!(
+        authority.validate_selection("openai", None, "shared-model"),
+        Ok(("openai".to_owned(), "shared-model".to_owned()))
+    );
+}
+
+/// LAW (unavailable_provider_refused_typed): a row whose provider attribute
+/// is not creatable is a typed refusal, and the copy speaks model selection.
+#[test]
+fn uncreatable_provider_is_refused_typed() {
+    let authority = authority(&["openai"], Vec::new());
+    let refusal = authority
+        .validate_selection("openai", Some("frontier-imaginary"), "some-model")
+        .expect_err("uncreatable provider must refuse");
+    assert_eq!(
+        refusal,
+        SelectionRefusal::ProviderUnavailable {
+            provider: "frontier-imaginary".to_owned()
+        }
+    );
+    assert_eq!(refusal.kind(), "provider_unavailable");
+    assert!(refusal.message().contains("model row"));
+}
+
+/// LAW (unknown_model_with_known_inventory_refused_typed): a provider with a
+/// discovered inventory refuses a model outside it.
+#[test]
+fn unknown_model_with_known_inventory_is_refused_typed() {
+    let authority = authority(
+        &["openai", "anthropic-oauth"],
+        vec![summary(
+            "anthropic-oauth",
+            &["fable-5", "fable-4.5"],
+            ProviderAvailabilityWire::Available,
+        )],
+    );
+    let refusal = authority
+        .validate_selection("openai", Some("anthropic-oauth"), "fable-9-imaginary")
+        .expect_err("model outside a known inventory must refuse");
+    assert_eq!(
+        refusal,
+        SelectionRefusal::ModelUnknown {
+            provider: "anthropic-oauth".to_owned(),
+            model: "fable-9-imaginary".to_owned(),
+        }
+    );
+    assert_eq!(refusal.kind(), "model_unknown");
+}
+
+/// A provider WITHOUT a discovered inventory accepts honestly — provider
+/// errors surface at turn time, never a guessed refusal.
+#[test]
+fn unknown_inventory_accepts_honestly() {
+    let authority = authority(&["openai", "anthropic-oauth"], Vec::new());
+    assert_eq!(
+        authority.validate_selection("openai", Some("anthropic-oauth"), "fable-5"),
+        Ok(("anthropic-oauth".to_owned(), "fable-5".to_owned()))
+    );
+}
+
+/// Selecting a row on the session's CURRENT provider never consults
+/// creatability — the session already runs it (explicit == absent).
+#[test]
+fn current_provider_rows_skip_creatability() {
+    let authority = ModelSelectionAuthority::new(None, Vec::new());
+    assert_eq!(
+        authority.validate_selection("fake", Some("fake"), "fake-model-2"),
+        Ok(("fake".to_owned(), "fake-model-2".to_owned()))
+    );
+    assert_eq!(
+        authority.validate_selection("fake", None, "fake-model-2"),
+        Ok(("fake".to_owned(), "fake-model-2".to_owned()))
+    );
+}
+
+/// An enabled custom chat-completions profile is creatable without a static
+/// registry row — the same rule `session.create` applies.
+#[test]
+fn enabled_custom_chat_completions_profile_is_creatable() {
+    let mut custom = summary(
+        "my-endpoint",
+        &["local-model"],
+        ProviderAvailabilityWire::Available,
+    );
+    custom.api_family = ProviderApiFamilyWire::OpenAiChatCompletions;
+    let authority = ModelSelectionAuthority::new(creatable(&["openai"]), vec![custom]);
+    assert_eq!(
+        authority.validate_selection("openai", Some("my-endpoint"), "local-model"),
+        Ok(("my-endpoint".to_owned(), "local-model".to_owned()))
+    );
+}
+
+/// An empty model is a malformed selector, not a lookup.
+#[test]
+fn empty_model_is_an_invalid_selector() {
+    let authority = authority(&["openai"], Vec::new());
+    assert!(matches!(
+        authority.validate_selection("openai", None, "  "),
+        Err(SelectionRefusal::InvalidSelector { .. })
+    ));
+}
+
+// ───────────────────────────── child spawn selector ─────────────────────────
+
+/// LAW (child_inherits_the_parents_current_pair_by_default): no selector →
+/// the parent's CURRENT pair verbatim. The runtime half — inheritance after
+/// a mid-session pair switch — is pinned in `pair_switch_runtime_tests.rs`.
+#[test]
+fn absent_selector_inherits_the_parents_current_pair() {
+    let authority = authority(&["openai"], Vec::new());
+    assert_eq!(
+        authority.resolve_child_selector("anthropic-oauth", "fable-5", None, None),
+        Ok(("anthropic-oauth".to_owned(), "fable-5".to_owned()))
+    );
+}
+
+/// LAW (preference order): the parent's own provider wins whenever its known
+/// inventory serves the model — even when another available provider also
+/// serves it. MUTATION: invert the preference (candidates before parent) and
+/// this pins the child to `other`.
+#[test]
+fn bare_model_prefers_the_parents_provider() {
+    let authority = authority(
+        &["openai", "other"],
+        vec![
+            summary(
+                "openai",
+                &["shared-model"],
+                ProviderAvailabilityWire::Available,
+            ),
+            summary(
+                "other",
+                &["shared-model"],
+                ProviderAvailabilityWire::Available,
+            ),
+        ],
+    );
+    assert_eq!(
+        authority.resolve_child_selector("openai", "gpt-a", Some("shared-model"), None),
+        Ok(("openai".to_owned(), "shared-model".to_owned()))
+    );
+}
+
+/// Exactly one available provider serving the model resolves without an
+/// explicit provider.
+#[test]
+fn bare_model_resolves_through_the_single_serving_provider() {
+    let authority = authority(
+        &["openai", "anthropic-oauth"],
+        vec![
+            summary("openai", &["gpt-a"], ProviderAvailabilityWire::Available),
+            summary(
+                "anthropic-oauth",
+                &["fable-5"],
+                ProviderAvailabilityWire::Available,
+            ),
+        ],
+    );
+    assert_eq!(
+        authority.resolve_child_selector("openai", "gpt-a", Some("fable-5"), None),
+        Ok(("anthropic-oauth".to_owned(), "fable-5".to_owned()))
+    );
+}
+
+/// LAW (ambiguous_model_is_typed_with_candidates): several serving providers
+/// refuse typed, NAMING every candidate — never a guess.
+#[test]
+fn ambiguous_bare_model_is_typed_with_candidates() {
+    let authority = authority(
+        &["openai", "kimi", "other"],
+        vec![
+            summary("openai", &["gpt-a"], ProviderAvailabilityWire::Available),
+            summary(
+                "kimi",
+                &["shared-model"],
+                ProviderAvailabilityWire::Available,
+            ),
+            summary(
+                "other",
+                &["shared-model"],
+                ProviderAvailabilityWire::Available,
+            ),
+        ],
+    );
+    let refusal = authority
+        .resolve_child_selector("openai", "gpt-a", Some("shared-model"), None)
+        .expect_err("two candidates must not be guessed between");
+    let SelectionRefusal::ModelNotResolvable { model, candidates } = &refusal else {
+        panic!("expected ModelNotResolvable, got {refusal:?}");
+    };
+    assert_eq!(model, "shared-model");
+    assert_eq!(candidates, &["kimi".to_owned(), "other".to_owned()]);
+    assert!(refusal.message().contains("kimi"));
+    assert!(refusal.message().contains("other"));
+}
+
+/// LAW (unavailable_is_typed): nobody serves the bare model → typed refusal
+/// with EMPTY candidates and retry-with-explicit-pair guidance.
+#[test]
+fn unserved_bare_model_is_typed_with_empty_candidates() {
+    let authority = authority(
+        &["openai"],
+        vec![summary(
+            "openai",
+            &["gpt-a"],
+            ProviderAvailabilityWire::Available,
+        )],
+    );
+    let refusal = authority
+        .resolve_child_selector("openai", "gpt-a", Some("nobody-serves-this"), None)
+        .expect_err("unserved model must refuse");
+    assert_eq!(
+        refusal,
+        SelectionRefusal::ModelNotResolvable {
+            model: "nobody-serves-this".to_owned(),
+            candidates: Vec::new(),
+        }
+    );
+    assert!(refusal.message().contains("explicit"));
+}
+
+/// An UNAVAILABLE provider serving the model is not a candidate: with no
+/// other server the bare model refuses instead of landing on a dead row.
+#[test]
+fn unavailable_providers_are_not_candidates() {
+    let authority = authority(
+        &["openai", "kimi"],
+        vec![
+            summary("openai", &["gpt-a"], ProviderAvailabilityWire::Available),
+            summary(
+                "kimi",
+                &["shared-model"],
+                ProviderAvailabilityWire::Unavailable,
+            ),
+        ],
+    );
+    assert!(matches!(
+        authority.resolve_child_selector("openai", "gpt-a", Some("shared-model"), None),
+        Err(SelectionRefusal::ModelNotResolvable { candidates, .. }) if candidates.is_empty()
+    ));
+}
+
+/// An explicit pair rides the SAME validation as a live-session selection:
+/// cross-provider works when creatable, and a known inventory still binds.
+#[test]
+fn explicit_pair_validates_like_a_live_selection() {
+    let authority = authority(
+        &["fake-a", "fake-b"],
+        vec![summary(
+            "fake-b",
+            &["model-b"],
+            ProviderAvailabilityWire::Available,
+        )],
+    );
+    assert_eq!(
+        authority.resolve_child_selector("fake-a", "model-a", Some("model-b"), Some("fake-b")),
+        Ok(("fake-b".to_owned(), "model-b".to_owned()))
+    );
+    assert!(matches!(
+        authority.resolve_child_selector("fake-a", "model-a", Some("model-x"), Some("fake-b")),
+        Err(SelectionRefusal::ModelUnknown { .. })
+    ));
+    assert!(matches!(
+        authority.resolve_child_selector("fake-a", "model-a", Some("model-c"), Some("fake-c")),
+        Err(SelectionRefusal::ProviderUnavailable { .. })
+    ));
+}
+
+/// A provider without a model is a malformed selector — the selector is the
+/// MODEL; the provider only disambiguates it.
+#[test]
+fn provider_without_model_is_an_invalid_selector() {
+    let authority = authority(&["openai"], Vec::new());
+    assert!(matches!(
+        authority.resolve_child_selector("openai", "gpt-a", None, Some("openai")),
+        Err(SelectionRefusal::InvalidSelector { .. })
+    ));
+}

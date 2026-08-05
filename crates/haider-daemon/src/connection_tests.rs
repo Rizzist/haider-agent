@@ -57,6 +57,10 @@ fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> Qu
 /// MUTATION CHECK: remove `FEATURE_ACCOUNT_DEVICE_DISCOVERY_V1`. Expected
 /// RUNTIME failure: clients cannot discover the served metadata-only device
 /// credential discovery + candidate import surface (D1).
+///
+/// MUTATION CHECK: remove `FEATURE_SESSION_MODEL_SELECT_V1`. Expected
+/// RUNTIME failure: pickers cannot discover the served receipted
+/// cross-provider model selection (F1).
 #[test]
 fn welcome_features_pin_served_management_families() {
     assert_eq!(
@@ -78,6 +82,7 @@ fn welcome_features_pin_served_management_families() {
             FEATURE_PROVIDER_MANAGEMENT_V1.to_owned(),
             FEATURE_PROVIDER_MODELS_V1.to_owned(),
             FEATURE_PROVIDER_REMOVE_V1.to_owned(),
+            haider_rpc::FEATURE_SESSION_MODEL_SELECT_V1.to_owned(),
             FEATURE_SESSION_MUTATION_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_OBSERVE_V1.to_owned(),
             FEATURE_SESSION_PERMISSION_OVERRIDES_V1.to_owned(),

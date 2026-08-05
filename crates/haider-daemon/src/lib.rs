@@ -59,6 +59,7 @@ mod endpoint;
 mod error;
 mod hooks;
 mod lifecycle;
+mod model_select;
 mod oauth;
 #[cfg(test)]
 mod permissions_core_tests;

@@ -181,6 +181,8 @@ async fn established_spawn_captures_parent_branch_and_replays_one_child() {
     let request = SpawnSubagent {
         task: "test branch pin".into(),
         prompt: "report after branch switch".into(),
+        model: None,
+        provider: None,
     };
     let delegation = DelegationHandle::new(hub.clone());
     let first = delegation
@@ -446,6 +448,8 @@ async fn message_subagent_steers_running_child_and_journals_bounded_parent_fact(
             SpawnSubagent {
                 task: "parser audit".into(),
                 prompt: "inspect the parser state machine".into(),
+                model: None,
+                provider: None,
             },
         )
         .await
@@ -654,6 +658,8 @@ async fn message_subagent_starts_an_idle_child_immediately() {
             SpawnSubagent {
                 task: "first pass".into(),
                 prompt: "finish once".into(),
+                model: None,
+                provider: None,
             },
         )
         .await
@@ -825,6 +831,8 @@ async fn only_own_children_are_messageable_with_typed_error() {
             SpawnSubagent {
                 task: "owned child".into(),
                 prompt: "do not cross parents".into(),
+                model: None,
+                provider: None,
             },
         )
         .await

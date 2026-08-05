@@ -1741,7 +1741,18 @@ async fn anthropic_localhost_browser_callback_is_accepted_with_correct_state() {
         .await
         .expect("browser callback");
     let status = response.status();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .expect("content type")
+        .to_str()
+        .expect("content type text")
+        .to_owned();
     let body = response.text().await.expect("callback html");
+    assert_eq!(
+        content_type, "text/html; charset=utf-8",
+        "the branded page must declare its type and charset"
+    );
     assert_eq!(
         (status.as_u16(), body.as_str()),
         (200, SUCCESS_HTML),
@@ -2312,6 +2323,62 @@ fn callback_success_page_and_provider_config_have_no_secret_material() {
             assert!(!html.contains(sentinel));
         }
     }
+}
+
+/// The branded callback pages are FULLY self-contained: the Haider wordmark
+/// is text, the styling is one inline sheet, and no page may ever reference
+/// an external stylesheet, font, image, or script — a loopback page that
+/// phones anywhere defeats the point of a loopback page. Also pins the
+/// no-JS posture: the pages carry no script at all.
+///
+/// MUTATION CHECK: brand via `<img src=...>`, an external font `@import`,
+/// or a `<script>` — any of the substring bans below fails.
+#[test]
+fn callback_pages_are_branded_and_fully_self_contained() {
+    let rejections = [
+        CallbackRejection::MalformedRequest,
+        CallbackRejection::WrongAddress,
+        CallbackRejection::WrongAttempt,
+        CallbackRejection::UnrecognizedProviderError,
+    ]
+    .map(rejection_html);
+    let mut pages = vec![SUCCESS_HTML.to_owned(), DENIED_HTML.to_owned()];
+    pages.extend(rejections);
+    for html in &pages {
+        assert!(
+            html.contains(r#"<p class=wordmark>Haider</p>"#),
+            "the wordmark is text, present on every page: {html}"
+        );
+        assert!(
+            html.contains("#c9a35c"),
+            "the gold accent is part of the shared sheet: {html}"
+        );
+        assert!(
+            html.contains("<style>") && html.contains("color-scheme:dark"),
+            "styling is one inline dark sheet: {html}"
+        );
+        for banned in [
+            "http://", "https://", "src=", "@import", "url(", "<script", "<link", "onload",
+        ] {
+            assert!(
+                !html.contains(banned),
+                "callback pages must be self-contained (found `{banned}`): {html}"
+            );
+        }
+        assert!(
+            html.contains("<meta name=referrer content=no-referrer>"),
+            "referrer suppression stays on every page: {html}"
+        );
+    }
+    assert!(
+        SUCCESS_HTML.contains("Authorization received")
+            && SUCCESS_HTML.contains("You can close this tab and return to Haider."),
+        "the success copy is the owner's line: {SUCCESS_HTML}"
+    );
+    assert!(
+        DENIED_HTML.contains("Authorization was not granted"),
+        "the cancellation page keeps its meaning: {DENIED_HTML}"
+    );
 }
 
 /// The rejection page must say WHY and how to retry — never the bare
