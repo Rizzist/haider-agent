@@ -1024,18 +1024,6 @@ pub(crate) fn start_account_actor(config: AccountActorConfig) -> AccountActorHan
     )
 }
 
-fn start_account_actor_with_broker(
-    config: AccountActorConfig,
-    build_broker: impl FnOnce(mpsc::Sender<AccountCommand>) -> Result<CredentialBroker, HaiderError>,
-) -> Result<(AccountActorHandle, CredentialBroker), HaiderError> {
-    start_account_actor_with_services(
-        config,
-        build_broker,
-        Arc::new(ProductionProviderModelDiscoverer),
-        Arc::new(crate::gcloud::GcloudCli),
-    )
-}
-
 fn start_account_actor_with_services(
     config: AccountActorConfig,
     build_broker: impl FnOnce(mpsc::Sender<AccountCommand>) -> Result<CredentialBroker, HaiderError>,

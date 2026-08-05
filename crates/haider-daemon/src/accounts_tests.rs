@@ -1835,7 +1835,7 @@ fn start_oauth_import_heal_test_actor(
     let broker_vault = vault.clone() as Arc<dyn Vault>;
     let broker_snapshot = Arc::clone(&snapshot);
     let broker_fences = refresh_fences.clone();
-    let (actor, broker) = start_account_actor_with_broker(
+    let (actor, broker) = start_account_actor_with_services(
         AccountActorConfig {
             store: store.clone(),
             accounts,
@@ -1859,6 +1859,8 @@ fn start_oauth_import_heal_test_actor(
                 broker_fences,
             )
         },
+        Arc::new(ProductionProviderModelDiscoverer),
+        Arc::new(UnreachableGcloud),
     )
     .expect("OAuth import heal actor");
     (actor, broker, snapshot, refresh_fences)
