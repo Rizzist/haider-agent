@@ -54,6 +54,9 @@ pub(crate) fn discover_device_candidates(disabled: bool) -> Vec<DeviceCandidate>
     if let Some(candidate) = discover_gemini() {
         candidates.push(candidate);
     }
+    if let Some(candidate) = discover_gcloud() {
+        candidates.push(candidate);
+    }
     candidates
 }
 
@@ -285,6 +288,41 @@ fn discover_gemini() -> Option<DeviceCandidate> {
         path,
         false,
         Some(GEMINI_UNSUPPORTED_REASON.to_owned()),
+    ))
+}
+
+/// The gcloud import-source key consumed by the account actor's dedicated
+/// import arm (G4b, LV2).
+pub(crate) const GCLOUD_IMPORT_SOURCE: &str = "gcloud";
+
+/// Google Cloud ADC via the local gcloud installation (G4b): discovery only
+/// checks that `application_default_credentials.json` EXISTS — the file is
+/// never read (its refresh token belongs to gcloud, not Haider). Import
+/// runs `gcloud auth print-access-token` and vaults the RESULT; the broker
+/// re-runs the same command when the ~1h token expires.
+fn discover_gcloud() -> Option<DeviceCandidate> {
+    // Probe order: the haider test/ops override, then gcloud's own
+    // CLOUDSDK_CONFIG, then the default `~/.config/gcloud`.
+    let config_dir = match std::env::var_os("HAIDER_GCLOUD_CONFIG_DIR")
+        .or_else(|| std::env::var_os("CLOUDSDK_CONFIG"))
+        .filter(|value| !value.is_empty())
+    {
+        Some(path) => PathBuf::from(path),
+        None => env_or_home("HAIDER_GCLOUD_CONFIG_DIR", ".config/gcloud")?,
+    };
+    let path = config_dir.join("application_default_credentials.json");
+    if !path.is_file() {
+        return None;
+    }
+    Some(candidate(
+        GCLOUD_IMPORT_SOURCE,
+        haider_provider::VERTEX_PROVIDER_NAME,
+        "Google Cloud (gcloud ADC)",
+        None,
+        None,
+        path,
+        true,
+        None,
     ))
 }
 

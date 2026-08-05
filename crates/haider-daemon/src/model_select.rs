@@ -273,8 +273,14 @@ impl ModelSelectionAuthority {
             return ladder;
         }
         match provider {
+            // G4b: bedrock/vertex serve the same Claude families — the
+            // static tables normalize their enterprise spellings
+            // (`anthropic.` prefix, `@date` suffix), so `/effort`
+            // validates on those pairs too.
             haider_provider::ANTHROPIC_PROVIDER_NAME
-            | haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME => {
+            | haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME
+            | haider_provider::BEDROCK_PROVIDER_NAME
+            | haider_provider::VERTEX_PROVIDER_NAME => {
                 haider_provider::anthropic_supported_efforts(model)
                     .iter()
                     .map(|level| (*level).to_owned())

@@ -345,3 +345,59 @@ fn provider_without_model_is_an_invalid_selector() {
         Err(SelectionRefusal::InvalidSelector { .. })
     ));
 }
+
+// ───────────────────────────── G4b enterprise tuning ────────────────────────
+
+/// LAW (LE-x, gate halves): `/effort` validates on bedrock/vertex pairs
+/// through the normalized static tables — `anthropic.claude-opus-5` and a
+/// dated vertex slug resolve their family ladders even with NO management
+/// snapshot — while `/fast` refuses on the `bedrock`/`vertex` provider ids
+/// REGARDLESS of model, and keeps accepting the same models on the
+/// first-party anthropic providers (both directions).
+///
+/// MUTATION CHECK: drop bedrock/vertex from `effort_ladder`'s static arm
+/// (the effort half), or widen `validate_fast`'s provider match to include
+/// them (the fast half). Expected RUNTIME failure: the named assertions.
+#[test]
+fn le_bedrock_and_vertex_pairs_validate_effort_but_refuse_fast() {
+    let authority = authority(&["bedrock", "vertex", "anthropic"], Vec::new());
+    authority
+        .validate_effort("bedrock", "anthropic.claude-opus-5", Some("xhigh"))
+        .expect("normalized bedrock spelling resolves the opus-5 ladder");
+    authority
+        .validate_effort("vertex", "claude-sonnet-4-6@20251101", Some("max"))
+        .expect("dated vertex slug resolves the sonnet-4-6 ladder");
+    assert!(
+        authority
+            .validate_effort("vertex", "claude-sonnet-4-6@20251101", Some("xhigh"))
+            .is_err(),
+        "the 4.6 ladder has no xhigh — normalization never widens it"
+    );
+    assert!(
+        authority
+            .validate_effort("bedrock", "anthropic.claude-nova-1", Some("high"))
+            .is_err(),
+        "unknown families keep the honest empty ladder"
+    );
+
+    for (provider, model) in [
+        ("bedrock", "anthropic.claude-opus-5"),
+        ("bedrock", "claude-opus-5"),
+        ("vertex", "claude-opus-5"),
+        ("vertex", "claude-opus-4-8@20260115"),
+    ] {
+        assert!(
+            authority.validate_fast(provider, model, true).is_err(),
+            "fast must refuse on {provider} · {model}"
+        );
+        authority
+            .validate_fast(provider, model, false)
+            .expect("disabling fast is always accepted — recovery is never gated");
+    }
+    authority
+        .validate_fast("anthropic", "claude-opus-5", true)
+        .expect("the first-party pair keeps fast");
+    authority
+        .validate_fast("anthropic", "anthropic.claude-opus-5", true)
+        .expect("normalization admits the enterprise spelling ON the claude api");
+}

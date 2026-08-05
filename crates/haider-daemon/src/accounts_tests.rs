@@ -60,6 +60,26 @@ impl ProviderRegistryStoreLike for TestProviderStore {
     }
 }
 
+/// A fresh registry for the direct `handle_login` harness calls (G4b: the
+/// login handler consults the registry for the full provider publish).
+fn login_registry() -> ProviderRegistry<Box<dyn ProviderRegistryStoreLike>> {
+    test_provider_registry()
+}
+
+/// A gcloud source no test may reach: any invocation is a loud failure so a
+/// mis-scripted test can never shell out to a real `gcloud`.
+struct UnreachableGcloud;
+
+impl crate::gcloud::GcloudAccessTokenSource for UnreachableGcloud {
+    fn print_access_token(&self) -> Result<zeroize::Zeroizing<Vec<u8>>, HaiderError> {
+        Err(HaiderError::new(
+            ErrorCode::Internal,
+            "test gcloud source must not be invoked",
+            false,
+        ))
+    }
+}
+
 fn test_provider_registry() -> ProviderRegistry<Box<dyn ProviderRegistryStoreLike>> {
     let store: Box<dyn ProviderRegistryStoreLike> = Box::new(TestProviderStore::default());
     let model_source = Arc::new(CachedProviderModelSource::default());
@@ -297,7 +317,7 @@ async fn validator_ping_uses_real_adapter_and_stores_no_secret_in_errors() {
     let model =
         std::env::var("HAIDER_GEMINI_MODEL").unwrap_or_else(|_| "gemini-2.5-flash".to_owned());
     let result = ProviderCredentialValidator
-        .validate(GEMINI_PROVIDER_NAME, &model, secret.as_bytes())
+        .validate(GEMINI_PROVIDER_NAME, &model, secret.as_bytes(), None)
         .await;
     if let Err(error) = &result {
         assert!(!error.message.contains(&secret));
@@ -640,7 +660,9 @@ async fn lk2_keyless_preset_configure_persists_and_mock_discovery_flips_availabl
     );
     assert_eq!(auth, ProviderAuthRequirementWire::None);
 
-    let before = providers.summary("ollama").expect("pre-discovery summary");
+    let before = providers
+        .summary("ollama", &|_| false)
+        .expect("pre-discovery summary");
     assert_eq!(
         before.availability,
         haider_rpc::ProviderAvailabilityWire::Unavailable,
@@ -654,7 +676,9 @@ async fn lk2_keyless_preset_configure_persists_and_mock_discovery_flips_availabl
     server.await.expect("mock server served one request");
     providers.replace_models("ollama".to_owned(), catalog.models);
 
-    let after = providers.summary("ollama").expect("post-discovery summary");
+    let after = providers
+        .summary("ollama", &|_| false)
+        .expect("post-discovery summary");
     assert_eq!(
         after.availability,
         haider_rpc::ProviderAvailabilityWire::Available
@@ -1775,7 +1799,7 @@ fn start_oauth_import_test_actor(
     let accounts = memory_accounts();
     let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(Vec::new()));
     let providers = test_provider_registry();
-    let management = ManagementSnapshot::new(0, Vec::new(), providers.summaries());
+    let management = ManagementSnapshot::new(0, Vec::new(), providers.summaries(&|_| false));
     let actor = start_account_actor(AccountActorConfig {
         store: store.clone(),
         accounts,
@@ -1806,7 +1830,7 @@ fn start_oauth_import_heal_test_actor(
     let accounts = memory_accounts();
     let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(Vec::new()));
     let providers = test_provider_registry();
-    let management = ManagementSnapshot::new(0, Vec::new(), providers.summaries());
+    let management = ManagementSnapshot::new(0, Vec::new(), providers.summaries(&|_| false));
     let refresh_fences = RefreshFenceRegistry::default();
     let broker_vault = vault.clone() as Arc<dyn Vault>;
     let broker_snapshot = Arc::clone(&snapshot);
@@ -1865,6 +1889,7 @@ impl CredentialValidator for UnavailableValidator {
         _provider: &str,
         _model: &str,
         _secret: &[u8],
+        _endpoint: Option<&str>,
     ) -> Result<ValidatedIdentity, ValidationError> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Err(ValidationError {
@@ -1931,6 +1956,7 @@ async fn login_publishes_only_after_receipt_and_revision_commit() {
             _provider: &str,
             _model: &str,
             _secret: &[u8],
+            _endpoint: Option<&str>,
         ) -> Result<ValidatedIdentity, ValidationError> {
             self.entered.notify_one();
             self.release.notified().await;
@@ -2026,6 +2052,7 @@ async fn pending_login_secret_past_the_ttl_is_wiped_and_forces_restage() {
         &validator,
         &snapshot,
         None,
+        &login_registry(),
         "profile-ttl",
         "claude-test",
         &mut pending,
@@ -2056,6 +2083,7 @@ async fn pending_login_secret_past_the_ttl_is_wiped_and_forces_restage() {
         &validator,
         &snapshot,
         None,
+        &login_registry(),
         "profile-ttl",
         "claude-test",
         &mut pending,
@@ -3585,6 +3613,7 @@ async fn omitted_api_alias_is_stable_command_derived_and_secret_free() {
             _provider: &str,
             _model: &str,
             _secret: &[u8],
+            _endpoint: Option<&str>,
         ) -> Result<ValidatedIdentity, ValidationError> {
             Ok(ValidatedIdentity {
                 identity: "validated-person@example.invalid".into(),
@@ -4161,7 +4190,7 @@ async fn pre_v8_pending_provider_receipts_reconcile_without_a_discovered_cache()
         ManagementClaim::Fresh
     ));
 
-    reconcile_provider_receipts(&store, &mut providers)
+    reconcile_provider_receipts(&store, &memory_accounts(), &mut providers)
         .await
         .expect("legacy receipt reconciliation");
     assert_eq!(store.management_revision().await.expect("revision"), 2);
@@ -4186,7 +4215,7 @@ async fn pre_v8_pending_provider_receipts_reconcile_without_a_discovered_cache()
         .expect("reconciled configured profile");
     assert_eq!(configured.configured_models, vec!["frontier-legacy-new"]);
     let summary = providers
-        .summary("legacy-configure")
+        .summary("legacy-configure", &|_| false)
         .expect("legacy summary");
     assert!(summary.models.is_empty());
     assert_eq!(summary.default_model, None);
@@ -4382,7 +4411,8 @@ async fn custom_provider_refresh_uses_stored_origin_and_publishes_discovered_slu
     vault
         .put(&gemini_alias, b"GEMINI_REFRESH_API_KEY_SENTINEL_8c")
         .expect("seed Gemini API key");
-    let management = ManagementSnapshot::new(0, accounts.list().to_vec(), providers.summaries());
+    let management =
+        ManagementSnapshot::new(0, accounts.list().to_vec(), providers.summaries(&|_| false));
     let discoverer = Arc::new(BlockingModelDiscoverer {
         started: tokio::sync::Notify::new(),
         release: tokio::sync::Notify::new(),
@@ -4459,6 +4489,7 @@ async fn custom_provider_refresh_uses_stored_origin_and_publishes_discovered_slu
             )
         },
         discoverer_trait,
+        Arc::new(UnreachableGcloud),
     )
     .expect("custom refresh actor");
 
@@ -4636,7 +4667,8 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
         )
         .expect("seed OAuth bundle");
     let providers = test_provider_registry();
-    let management = ManagementSnapshot::new(0, accounts.list().to_vec(), providers.summaries());
+    let management =
+        ManagementSnapshot::new(0, accounts.list().to_vec(), providers.summaries(&|_| false));
     let discoverer = Arc::new(BlockingModelDiscoverer {
         started: tokio::sync::Notify::new(),
         release: tokio::sync::Notify::new(),
@@ -4692,6 +4724,7 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
             )
         },
         discoverer_trait,
+        Arc::new(UnreachableGcloud),
     )
     .expect("actor with broker");
 
@@ -4990,6 +5023,7 @@ async fn live_smoke_packaged_default_model_validates_a_real_key() {
             "anthropic",
             haider_client::PACKAGED_DEFAULT_MODEL,
             key.trim().as_bytes(),
+            None,
         )
         .await
         .unwrap_or_else(|error| {
@@ -6245,7 +6279,7 @@ async fn provider_remove_commits_replays_fences_and_beats_restart_resurrection()
     let providers = ProviderRegistry::new(provider_store, initial, source)
         .expect("provider registry with custom profile");
     let accounts = memory_accounts();
-    let management = ManagementSnapshot::new(0, Vec::new(), providers.summaries());
+    let management = ManagementSnapshot::new(0, Vec::new(), providers.summaries(&|_| false));
     let mut actor = start_account_actor(AccountActorConfig {
         store: store.clone(),
         accounts,
@@ -6393,7 +6427,7 @@ async fn provider_remove_commits_replays_fences_and_beats_restart_resurrection()
     )
     .expect("restart loads stale projection");
     assert!(restarted.get("custom-lab").is_some());
-    reconcile_provider_receipts(&store, &mut restarted)
+    reconcile_provider_receipts(&store, &memory_accounts(), &mut restarted)
         .await
         .expect("removal receipt reconciles restart");
     assert!(restarted.get("custom-lab").is_none());
@@ -6440,7 +6474,8 @@ async fn provider_remove_refuses_release_owned_and_account_referenced_profiles()
             })
             .expect("blocking descriptor");
     }
-    let management = ManagementSnapshot::new(0, accounts.list().to_vec(), providers.summaries());
+    let management =
+        ManagementSnapshot::new(0, accounts.list().to_vec(), providers.summaries(&|_| false));
     let mut actor = start_account_actor(AccountActorConfig {
         store: store.clone(),
         accounts,
@@ -6989,19 +7024,44 @@ fn provider_tuning_derives_from_metadata_and_fast_gate_filters_stale_pairs() {
     assert_eq!(tuning.effort.as_deref(), Some("xhigh"));
     assert!(tuning.fast);
 
-    assert!(anthropic_fast_for(&tuning, "claude-opus-5"));
-    assert!(anthropic_fast_for(&tuning, "claude-opus-4-8"));
+    assert!(anthropic_fast_for(
+        "anthropic-oauth",
+        &tuning,
+        "claude-opus-5"
+    ));
+    assert!(anthropic_fast_for("anthropic", &tuning, "claude-opus-4-8"));
     for stale in ["claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-5"] {
         assert!(
-            !anthropic_fast_for(&tuning, stale),
+            !anthropic_fast_for("anthropic", &tuning, stale),
             "a stale fast flag on {stale} must not reach the wire"
         );
     }
+    // G4b (LE-x construction half): bedrock/vertex refuse fast REGARDLESS
+    // of model — the normalized gate would otherwise admit the enterprise
+    // spellings of opus-5 — while the SAME pairs stay admitted on the
+    // first-party providers (both directions).
+    for enterprise in ["bedrock", "vertex"] {
+        for model in [
+            "anthropic.claude-opus-5",
+            "claude-opus-5",
+            "claude-opus-4-8@20260115",
+        ] {
+            assert!(
+                !anthropic_fast_for(enterprise, &tuning, model),
+                "fast must refuse on {enterprise} for {model}"
+            );
+        }
+    }
+    assert!(anthropic_fast_for(
+        "anthropic",
+        &tuning,
+        "anthropic.claude-opus-5"
+    ));
     let off = ProviderTuning {
         effort: None,
         fast: false,
     };
-    assert!(!anthropic_fast_for(&off, "claude-opus-5"));
+    assert!(!anthropic_fast_for("anthropic", &off, "claude-opus-5"));
 }
 
 /// LAW (review of record, construction-gate effort half): a stale effort
@@ -7099,4 +7159,647 @@ fn stale_effort_clamps_for_anthropic_and_drops_for_declared_openai_ladders() {
         Some("xhigh"),
         "no profile at all passes the selection through verbatim"
     );
+}
+
+// ───────────────────────────── G4b enterprise laws ──────────────────────────
+
+fn enterprise_summary(provider: &str, endpoint: Option<&str>) -> ProviderSummaryWire {
+    let (models, default_model): (Vec<String>, &str) = if provider == "bedrock" {
+        (
+            haider_provider::BEDROCK_SEED_MODELS
+                .iter()
+                .map(|slug| (*slug).to_owned())
+                .collect(),
+            "anthropic.claude-fable-5",
+        )
+    } else {
+        (
+            haider_provider::VERTEX_SEED_MODELS
+                .iter()
+                .map(|slug| (*slug).to_owned())
+                .collect(),
+            "claude-fable-5",
+        )
+    };
+    ProviderSummaryWire {
+        provider: provider.to_owned(),
+        api_family: ProviderApiFamilyWire::AnthropicMessages,
+        endpoint: endpoint.map(str::to_owned),
+        models: models.clone(),
+        model_details: Vec::new(),
+        auth_methods: vec![AuthMethod::ApiKey],
+        availability: haider_rpc::ProviderAvailabilityWire::Available,
+        availability_reason: None,
+        default_model: Some(default_model.to_owned()),
+        enabled: true,
+    }
+}
+
+fn enterprise_metadata(provider: &str, model: &str) -> haider_protocol::session::SessionMetadataV1 {
+    haider_protocol::session::SessionMetadataV1 {
+        cwd: "/tmp/enterprise-dispatch".to_owned(),
+        provider: provider.to_owned(),
+        model: model.to_owned(),
+        max_tokens: 64,
+        permission_overrides: None,
+        system_prompt_version: None,
+        title: None,
+        effort: None,
+        fast: false,
+        created_at_ms: 1,
+    }
+}
+
+/// LAW (G4b factory arms + decision 5 surfaces): a stored key resolves the
+/// bedrock pair through the mantle-pinned Anthropic adapter (ApiKey surface
+/// — the EXACT x-api-key reuse) and the vertex pair through the vertex
+/// adapter (the new CloudBearer surface); a vertex profile with NO endpoint
+/// refuses construction with a typed reason instead of guessing a URL.
+///
+/// MUTATION CHECK: delete the `(BEDROCK_PROVIDER_NAME, ApiKey)` (or vertex)
+/// arm from `build_account_provider`. Expected RUNTIME failure: resolution
+/// reports "no account-backed adapter" instead of the surfaces below.
+#[tokio::test]
+async fn g4b_factory_builds_bedrock_and_vertex_adapters_with_their_surfaces() {
+    let dispatch = |provider: &str, endpoint: Option<&str>, model: &str| {
+        let summary = enterprise_summary(provider, endpoint);
+        let alias = CredentialAlias::new(format!("{provider}-key"));
+        let vault = Arc::new(MemoryVault::default());
+        vault
+            .put(&alias, b"ENTERPRISE_BEARER_SENTINEL_1f2e")
+            .unwrap_or_else(|error| panic!("seed key: {error:?}"));
+        let descriptor = CredentialDescriptor {
+            alias: alias.clone(),
+            provider: provider.to_owned(),
+            base_url: None,
+            auth_method: AuthMethod::ApiKey,
+            identity: format!("{provider} bearer"),
+            status: CredentialStatus::Ok,
+            active: true,
+        };
+        let snapshot = Arc::new(StdMutex::new(vec![descriptor.clone()]));
+        let management = ManagementSnapshot::new(0, vec![descriptor], vec![summary]);
+        let factory = AccountsProviderFactory::new_with_management(
+            snapshot,
+            management,
+            VaultProvision::Available(vault as Arc<dyn Vault>),
+            Arc::new(ProductionAccountBuilder),
+        );
+        let metadata = enterprise_metadata(provider, model);
+        async move { factory.resolve_for_turn(&metadata).await }
+    };
+
+    let bedrock = dispatch(
+        "bedrock",
+        Some("https://bedrock-mantle.us-east-1.api.aws/anthropic"),
+        "anthropic.claude-fable-5",
+    )
+    .await
+    .expect("bedrock dispatch");
+    assert_eq!(bedrock.provider_name, "bedrock");
+    assert_eq!(
+        bedrock.provider.credential_surface(),
+        haider_provider::ProviderCredentialSurface::ApiKey,
+        "the mantle bearer is the exact x-api-key surface (decision 5)"
+    );
+
+    let vertex = dispatch(
+        "vertex",
+        Some(
+            "https://aiplatform.googleapis.com/v1/projects/acme-ai/locations/global/publishers/anthropic/models",
+        ),
+        "claude-fable-5",
+    )
+    .await
+    .expect("vertex dispatch");
+    assert_eq!(
+        vertex.provider.credential_surface(),
+        haider_provider::ProviderCredentialSurface::CloudBearer,
+        "the vertex adapter reports the new CloudBearer surface (decision 5)"
+    );
+
+    let endpoint_less = match dispatch("vertex", None, "claude-fable-5").await {
+        Err(error) => error,
+        Ok(_) => panic!("an endpoint-less vertex profile must refuse construction"),
+    };
+    assert!(
+        endpoint_less.message.contains("project endpoint"),
+        "the refusal names the missing endpoint: {}",
+        endpoint_less.message
+    );
+}
+
+/// A scripted gcloud source for the LV2 laws.
+#[derive(Default)]
+struct ScriptedGcloud {
+    responses: StdMutex<std::collections::VecDeque<Result<Vec<u8>, String>>>,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl ScriptedGcloud {
+    fn push_token(&self, token: &[u8]) {
+        if let Ok(mut responses) = self.responses.lock() {
+            responses.push_back(Ok(token.to_vec()));
+        }
+    }
+
+    fn push_failure(&self, reason: &str) {
+        if let Ok(mut responses) = self.responses.lock() {
+            responses.push_back(Err(reason.to_owned()));
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl crate::gcloud::GcloudAccessTokenSource for ScriptedGcloud {
+    fn print_access_token(&self) -> Result<zeroize::Zeroizing<Vec<u8>>, HaiderError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        match self
+            .responses
+            .lock()
+            .ok()
+            .and_then(|mut responses| responses.pop_front())
+        {
+            Some(Ok(token)) => Ok(zeroize::Zeroizing::new(token)),
+            Some(Err(reason)) => Err(crate::gcloud::gcloud_error(reason)),
+            None => Err(crate::gcloud::gcloud_error("script exhausted")),
+        }
+    }
+}
+
+/// LAW (LV2 — the gcloud refresh source): an auth failure on THE vertex
+/// gcloud descriptor re-mints the token through the mocked shell-out and
+/// PERSISTS it in the vault before the retry; a failing shell-out surfaces
+/// the typed gcloud error (vault untouched); and every other ApiKey
+/// descriptor keeps the classic non-refreshable auth failure with the
+/// source never invoked (both directions).
+///
+/// MUTATION CHECK: drop the `vault.put` from `refresh_gcloud` (return the
+/// fresh token without persisting). Expected RUNTIME failure: the
+/// vault-persistence equality below.
+#[tokio::test]
+async fn lv2_gcloud_refresh_source_refreshes_vault_and_surfaces_failure() {
+    let vault = Arc::new(MemoryVault::default());
+    let alias = CredentialAlias::new(crate::gcloud::VERTEX_GCLOUD_ALIAS);
+    vault
+        .put(&alias, b"STALE_GCLOUD_TOKEN_00aa")
+        .expect("seed stale token");
+    let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(Vec::new()));
+    let (status_commands, _status_receiver) = mpsc::channel(4);
+    let gcloud = Arc::new(ScriptedGcloud::default());
+    gcloud.push_token(b"FRESH_GCLOUD_TOKEN_11bb");
+    gcloud.push_failure("gcloud exited with exit status: 1: Reauthentication required");
+    let broker = CredentialBroker::new(
+        vault.clone() as Arc<dyn Vault>,
+        OAuthProviderCatalog::default(),
+        Arc::clone(&snapshot),
+        status_commands,
+    )
+    .expect("credential broker")
+    .with_gcloud_source(gcloud.clone() as Arc<dyn crate::gcloud::GcloudAccessTokenSource>)
+    .expect("install scripted source before sharing");
+
+    let descriptor = CredentialDescriptor {
+        alias: alias.clone(),
+        provider: "vertex".to_owned(),
+        base_url: None,
+        auth_method: AuthMethod::ApiKey,
+        identity: "gcloud access token (auto-refresh)".to_owned(),
+        status: CredentialStatus::Ok,
+        active: true,
+    };
+    let refreshed = broker
+        .refresh_after_auth_failure(&descriptor, None)
+        .await
+        .expect("gcloud refresh");
+    assert_eq!(refreshed.expose_secret(), b"FRESH_GCLOUD_TOKEN_11bb");
+    assert_eq!(
+        vault
+            .resolve(&alias)
+            .expect("refreshed vault entry")
+            .expose_secret(),
+        b"FRESH_GCLOUD_TOKEN_11bb",
+        "the refresh PERSISTS in the vault, not just the returned handle"
+    );
+    assert_eq!(gcloud.calls(), 1);
+
+    // A failing shell-out surfaces honestly and leaves the vault alone.
+    let failure = broker
+        .refresh_after_auth_failure(&descriptor, None)
+        .await
+        .expect_err("scripted failure surfaces");
+    assert!(
+        failure.message.contains("gcloud"),
+        "the error names gcloud: {}",
+        failure.message
+    );
+    assert_eq!(
+        vault.resolve(&alias).expect("vault entry").expose_secret(),
+        b"FRESH_GCLOUD_TOKEN_11bb"
+    );
+
+    // Every OTHER ApiKey descriptor keeps the classic refusal — and never
+    // touches the shell-out source.
+    let plain = CredentialDescriptor {
+        alias: CredentialAlias::new("vertex-key"),
+        provider: "vertex".to_owned(),
+        base_url: None,
+        auth_method: AuthMethod::ApiKey,
+        identity: "pasted access token".to_owned(),
+        status: CredentialStatus::Ok,
+        active: true,
+    };
+    let refused = broker
+        .refresh_after_auth_failure(&plain, None)
+        .await
+        .expect_err("plain keys stay non-refreshable");
+    assert!(refused.message.contains("authentication failed"));
+    assert_eq!(gcloud.calls(), 2, "the plain-key refusal never shells out");
+}
+
+/// LAW (LA-x, env-bridge half): with `AWS_BEARER_TOKEN_BEDROCK` set and no
+/// bedrock descriptor, startup imports the value through the accounts env
+/// bridge — deterministic `bedrock-env` alias, active ApiKey descriptor,
+/// token in the vault — and an EXISTING bedrock descriptor suppresses the
+/// import entirely (an explicit login is never fought). Child-process
+/// isolated: the variable is process-global.
+///
+/// MUTATION CHECK: drop the `import_bedrock_env_bearer` call from
+/// `AccountsRuntime::initialize` (the unit here drives the same fn the
+/// initialize path calls; the descriptor/vault assertions fail if the
+/// import stops importing).
+#[tokio::test]
+async fn la_env_bridge_imports_aws_bearer_token_bedrock() {
+    let token_value = std::path::Path::new("BEDROCK_ENV_SENTINEL_9c3d");
+    if run_oauth_import_env_child(
+        "accounts::accounts_tests::la_env_bridge_imports_aws_bearer_token_bedrock",
+        &[(crate::accounts::BEDROCK_ENV_BEARER_VAR, token_value)],
+    ) {
+        return;
+    }
+    let vault: Arc<dyn Vault> = Arc::new(MemoryVault::default());
+    let provision = VaultProvision::Available(Arc::clone(&vault));
+    let mut accounts = memory_accounts();
+    import_bedrock_env_bearer(&mut accounts, &provision);
+    let descriptor = accounts
+        .list()
+        .iter()
+        .find(|descriptor| descriptor.provider == "bedrock")
+        .cloned()
+        .expect("env bridge imported a bedrock descriptor");
+    assert_eq!(descriptor.alias.as_str(), "bedrock-env");
+    assert_eq!(descriptor.auth_method, AuthMethod::ApiKey);
+    assert!(descriptor.active);
+    assert_eq!(
+        vault
+            .resolve(&descriptor.alias)
+            .expect("vaulted env token")
+            .expose_secret(),
+        b"BEDROCK_ENV_SENTINEL_9c3d"
+    );
+
+    // Idempotence + suppression: a second boot with the descriptor present
+    // imports NOTHING (the existing account is never fought).
+    import_bedrock_env_bearer(&mut accounts, &provision);
+    assert_eq!(
+        accounts
+            .list()
+            .iter()
+            .filter(|descriptor| descriptor.provider == "bedrock")
+            .count(),
+        1
+    );
+}
+
+/// LAW (G4b login target): `account.login_api` for an enterprise builtin
+/// validates through the injected validator AT the profile's stored
+/// endpoint WITH the profile's declared default-model spelling — never the
+/// global vendor default — and commits the descriptor under the provider.
+///
+/// MUTATION CHECK: drop the `enterprise_login_target` endpoint from the
+/// validator call in `handle_login`. Expected RUNTIME failure: the recorded
+/// endpoint below is `None`.
+#[tokio::test]
+async fn enterprise_login_validates_at_the_profile_endpoint_with_its_default_model() {
+    #[derive(Default)]
+    struct RecordingValidator {
+        seen: StdMutex<Vec<(String, String, Option<String>)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl CredentialValidator for RecordingValidator {
+        fn supports(&self, provider: &str) -> bool {
+            provider == "bedrock"
+        }
+
+        async fn validate(
+            &self,
+            provider: &str,
+            model: &str,
+            _secret: &[u8],
+            endpoint: Option<&str>,
+        ) -> Result<ValidatedIdentity, ValidationError> {
+            if let Ok(mut seen) = self.seen.lock() {
+                seen.push((
+                    provider.to_owned(),
+                    model.to_owned(),
+                    endpoint.map(str::to_owned),
+                ));
+            }
+            Ok(ValidatedIdentity {
+                identity: "bedrock bearer".into(),
+            })
+        }
+    }
+
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let mut accounts = memory_accounts();
+    let vault = MemoryVault::default();
+    let validator = RecordingValidator::default();
+    let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(Vec::new()));
+    let management = ManagementSnapshot::new(
+        0,
+        Vec::new(),
+        vec![enterprise_summary(
+            "bedrock",
+            Some("https://bedrock-mantle.us-east-1.api.aws/anthropic"),
+        )],
+    );
+    let mut pending: HashMap<String, PendingSecret> = HashMap::new();
+    let (sink, mut frames) = channel_sink();
+    handle_login(
+        &store,
+        &mut accounts,
+        &vault,
+        &validator,
+        &snapshot,
+        Some(&management),
+        &login_registry(),
+        "profile-bedrock",
+        "claude-global-default",
+        &mut pending,
+        &HashSet::new(),
+        LoginJob {
+            command_id: "bedrock-login".to_owned(),
+            provider: "bedrock".to_owned(),
+            display_alias: Some("bedrock-main".to_owned()),
+            validation_model: None,
+            secret: Some(Zeroizing::new(b"BEDROCK_LOGIN_SENTINEL".to_vec())),
+            route: LoginRoute {
+                request_id: RequestId::new("bedrock-login-request"),
+                sink: Arc::clone(&sink),
+            },
+        },
+    )
+    .await;
+    let frame = frames.try_recv().expect("login response");
+    match frame {
+        WireFrame::Response {
+            body: ResponseBody::AccountLoginApi { descriptor },
+            ..
+        } => {
+            assert_eq!(descriptor.provider, "bedrock");
+            assert_eq!(descriptor.alias.as_str(), "bedrock-main");
+        }
+        other => panic!("expected a committed login, got {other:?}"),
+    }
+    let seen = validator.seen.lock().expect("recorded validations").clone();
+    assert_eq!(
+        seen,
+        vec![(
+            "bedrock".to_owned(),
+            "anthropic.claude-fable-5".to_owned(),
+            Some("https://bedrock-mantle.us-east-1.api.aws/anthropic".to_owned()),
+        )],
+        "validation runs at the profile endpoint with the profile default model"
+    );
+    store.close().await.expect("close store");
+}
+
+/// LAW (G4b factory route): azure-origin custom profiles route through the
+/// `api-key` adapter, non-azure customs keep the TrustedLan custom route,
+/// and builtin ids keep the strict Bearer route — the ONE mapping behind
+/// `custom_compatible_adapter`, both directions.
+#[test]
+fn azure_origin_custom_profiles_route_through_the_api_key_header_adapter() {
+    use crate::accounts::{CompatibleAdapterRoute, compatible_adapter_route};
+    assert_eq!(
+        compatible_adapter_route("azure", "https://contoso.openai.azure.com/openai/v1"),
+        CompatibleAdapterRoute::Azure
+    );
+    assert_eq!(
+        compatible_adapter_route(
+            "my-azure-lane",
+            "https://acme.services.ai.azure.com/openai/v1"
+        ),
+        CompatibleAdapterRoute::Azure
+    );
+    assert_eq!(
+        compatible_adapter_route("vllm-lab", "http://127.0.0.1:8000/v1"),
+        CompatibleAdapterRoute::Custom
+    );
+    assert_eq!(
+        compatible_adapter_route("openai-compatible", "https://gateway.example.com/v1"),
+        CompatibleAdapterRoute::Builtin
+    );
+    assert_eq!(
+        compatible_adapter_route(
+            "vllm-lab",
+            "https://contoso.openai.azure.com.evil.example/v1"
+        ),
+        CompatibleAdapterRoute::Custom,
+        "a lookalike host never inherits the azure header mode"
+    );
+}
+
+/// LAW (LV2, import half — the D-wave pattern): the gcloud ADC discovery
+/// candidate imports by RUNNING the (mocked) shell-out — never by copying a
+/// credential file — vaults the token under the fixed `vertex-gcloud`
+/// alias, commits an active vertex descriptor, and publishes the FULL
+/// provider view so a configured vertex profile lights Available in the
+/// same stroke; a re-import refreshes the token in place (no duplicate).
+/// Child-process isolated: discovery reads the config-dir env override.
+///
+/// MUTATION CHECK: route the gcloud source through `handle_oauth_import`
+/// (drop the dedicated arm). Expected RUNTIME failure: the import errors on
+/// the bundle machinery instead of committing the descriptor below.
+#[tokio::test]
+async fn lv2_gcloud_device_import_vaults_the_token_and_lights_vertex() {
+    let fixture_dir = test_store_dir();
+    std::fs::write(
+        fixture_dir
+            .path()
+            .join("application_default_credentials.json"),
+        b"{\"type\":\"authorized_user\"}",
+    )
+    .expect("write ADC marker");
+    if run_oauth_import_env_child(
+        "accounts::accounts_tests::lv2_gcloud_device_import_vaults_the_token_and_lights_vertex",
+        &[("HAIDER_GCLOUD_CONFIG_DIR", fixture_dir.path())],
+    ) {
+        return;
+    }
+
+    let candidate = crate::device_discovery::discover_device_candidates(false)
+        .into_iter()
+        .find(|candidate| candidate.wire.provider == "vertex")
+        .expect("gcloud ADC candidate discovered");
+    assert!(candidate.wire.import_supported);
+    assert_eq!(candidate.wire.source_label, "Google Cloud (gcloud ADC)");
+
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let mut accounts = memory_accounts();
+    let vault: Arc<dyn Vault> = Arc::new(MemoryVault::default());
+    let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(Vec::new()));
+    // A vertex profile whose card already supplied the endpoint: the
+    // import is exactly what flips it Available. The registry seeds the
+    // builtin vertex profile exactly like daemon initialize does.
+    let provider_store: Box<dyn ProviderRegistryStoreLike> = Box::new(TestProviderStore::default());
+    let mut providers = ProviderRegistry::new(
+        provider_store,
+        crate::provider_registry::initial_provider_profiles(
+            &std::collections::BTreeSet::from(["vertex".to_owned()]),
+            "unused",
+        ),
+        Arc::new(CachedProviderModelSource::default()),
+    )
+    .expect("seeded vertex registry");
+    let vertex_models: Vec<String> = haider_provider::VERTEX_SEED_MODELS
+        .iter()
+        .map(|slug| (*slug).to_owned())
+        .collect();
+    providers
+        .configure(crate::provider_registry::ProviderConfigureInput {
+            provider: "vertex".to_owned(),
+            api_family: Some(ProviderApiFamilyWire::AnthropicMessages),
+            origin: Some(
+                "https://aiplatform.googleapis.com/v1/projects/acme-ai/locations/global/publishers/anthropic/models"
+                    .to_owned(),
+            ),
+            auth_requirement: Some(ProviderAuthRequirementWire::ApiKey),
+            enabled: true,
+            models: vertex_models,
+            default_model: Some("claude-fable-5".to_owned()),
+        })
+        .expect("configure vertex endpoint");
+    let management = ManagementSnapshot::new(
+        0,
+        Vec::new(),
+        providers.summaries(&provider_has_credential(&accounts)),
+    );
+    let before = management
+        .read()
+        .expect("pre-import view")
+        .providers
+        .into_iter()
+        .find(|summary| summary.provider == "vertex")
+        .expect("vertex summary");
+    assert_eq!(
+        before.availability,
+        haider_rpc::ProviderAvailabilityWire::Unavailable,
+        "no credential yet"
+    );
+
+    let gcloud = Arc::new(ScriptedGcloud::default());
+    gcloud.push_token(b"GCLOUD_IMPORT_TOKEN_31ab");
+    gcloud.push_token(b"GCLOUD_REIMPORT_TOKEN_42cd");
+    let (sink, mut frames) = channel_sink();
+    let job = |command_id: &str, request_id: &str| DeviceImportJob {
+        command_id: command_id.to_owned(),
+        candidate: candidate.wire.candidate.clone(),
+        discovery_disabled: false,
+        route: LoginRoute {
+            request_id: RequestId::new(request_id),
+            sink: Arc::clone(&sink),
+        },
+    };
+    handle_device_import(
+        &store,
+        &mut accounts,
+        Arc::clone(&vault),
+        &snapshot,
+        Some(&management),
+        &providers,
+        &HashSet::new(),
+        &RefreshFenceRegistry::default(),
+        gcloud.clone() as Arc<dyn crate::gcloud::GcloudAccessTokenSource>,
+        job("gcloud-import-1", "req-1"),
+    )
+    .await;
+    let alias = CredentialAlias::new(crate::gcloud::VERTEX_GCLOUD_ALIAS);
+    match frames.try_recv().expect("import response") {
+        WireFrame::Response {
+            body: ResponseBody::AccountImportDevice { descriptor, .. },
+            ..
+        } => {
+            assert_eq!(descriptor.provider, "vertex");
+            assert_eq!(descriptor.alias, alias);
+            assert!(descriptor.active);
+            assert_eq!(descriptor.auth_method, AuthMethod::ApiKey);
+        }
+        other => panic!("expected a committed device import, got {other:?}"),
+    }
+    assert_eq!(
+        vault
+            .resolve(&alias)
+            .expect("vaulted gcloud token")
+            .expose_secret(),
+        b"GCLOUD_IMPORT_TOKEN_31ab"
+    );
+    let after = management
+        .read()
+        .expect("post-import view")
+        .providers
+        .into_iter()
+        .find(|summary| summary.provider == "vertex")
+        .expect("vertex summary");
+    assert_eq!(
+        after.availability,
+        haider_rpc::ProviderAvailabilityWire::Available,
+        "the imported credential lights the configured vertex profile"
+    );
+
+    // Re-import = refresh: same alias, fresh token, still exactly one
+    // vertex descriptor.
+    handle_device_import(
+        &store,
+        &mut accounts,
+        Arc::clone(&vault),
+        &snapshot,
+        Some(&management),
+        &providers,
+        &HashSet::new(),
+        &RefreshFenceRegistry::default(),
+        gcloud.clone() as Arc<dyn crate::gcloud::GcloudAccessTokenSource>,
+        job("gcloud-import-2", "req-2"),
+    )
+    .await;
+    match frames.try_recv().expect("re-import response") {
+        WireFrame::Response {
+            body: ResponseBody::AccountImportDevice { descriptor, .. },
+            ..
+        } => assert_eq!(descriptor.alias, alias),
+        other => panic!("expected a committed re-import, got {other:?}"),
+    }
+    assert_eq!(
+        vault
+            .resolve(&alias)
+            .expect("refreshed token")
+            .expose_secret(),
+        b"GCLOUD_REIMPORT_TOKEN_42cd"
+    );
+    assert_eq!(
+        accounts
+            .list()
+            .iter()
+            .filter(|descriptor| descriptor.provider == "vertex")
+            .count(),
+        1
+    );
+    store.close().await.expect("close store");
 }

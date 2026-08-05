@@ -73,6 +73,7 @@ impl CredentialValidator for ScriptedValidator {
         _provider: &str,
         _model: &str,
         secret: &[u8],
+        _endpoint: Option<&str>,
     ) -> Result<ValidatedIdentity, ValidationError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         if let Ok(mut observed) = self.observed.lock() {

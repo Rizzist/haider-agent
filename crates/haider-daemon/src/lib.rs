@@ -57,6 +57,7 @@ mod delegation;
 mod device_discovery;
 mod endpoint;
 mod error;
+mod gcloud;
 mod hooks;
 mod lifecycle;
 mod model_select;
@@ -84,6 +85,7 @@ pub use accounts::{
 };
 pub use config::DaemonConfig;
 pub use error::{DaemonError, IncumbentDiagnostics};
+pub use gcloud::{GcloudAccessTokenSource, GcloudCli};
 pub use lifecycle::{DaemonState, Readiness, ShutdownDisposition, ShutdownHandle, ShutdownOutcome};
 pub use oauth::{
     OAuthAuthorizeParameter, OAuthCoordinatorConfig, OAuthIdentityExpectation, OAuthIdentityMode,

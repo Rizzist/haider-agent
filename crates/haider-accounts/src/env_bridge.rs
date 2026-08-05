@@ -17,7 +17,7 @@ use crate::{AccountsResult, Vault, accounts_error};
 /// The alias is deterministic (`<provider>-env`) so callers can persist a
 /// matching descriptor. Resolution never consults the environment again.
 pub fn import_env(
-    vault: &impl Vault,
+    vault: &dyn Vault,
     provider: &str,
     env_var: &str,
 ) -> AccountsResult<CredentialAlias> {

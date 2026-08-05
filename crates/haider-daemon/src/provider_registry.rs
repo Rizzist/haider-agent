@@ -10,10 +10,12 @@ use haider_protocol::credential::AuthMethod;
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_provider::{
     ANTHROPIC_API_URL, ANTHROPIC_OAUTH_BASE_URL, ANTHROPIC_OAUTH_PROVIDER_NAME,
-    ANTHROPIC_PROVIDER_NAME, DiscoveredModel, GEMINI_API_BASE_URL, GEMINI_PROVIDER_NAME,
+    ANTHROPIC_PROVIDER_NAME, BEDROCK_MANTLE_DEFAULT_BASE_URL, BEDROCK_PROVIDER_NAME,
+    BEDROCK_SEED_MODELS, DiscoveredModel, GEMINI_API_BASE_URL, GEMINI_PROVIDER_NAME,
     KIMI_OAUTH_BASE_URL, KIMI_OAUTH_PROVIDER_NAME, OPENAI_COMPATIBLE_PROVIDER_NAME,
     OPENAI_OAUTH_PROVIDER_NAME, OPENAI_PROVIDER_NAME, OPENAI_RESPONSES_API_URL,
-    OPENAI_SUBSCRIPTION_RESPONSES_URL, pickable,
+    OPENAI_SUBSCRIPTION_RESPONSES_URL, VERTEX_PROVIDER_NAME, VERTEX_SEED_MODELS,
+    azure_openai_origin, pickable,
 };
 use haider_rpc::{
     ModelDetailWire, ProviderApiFamilyWire, ProviderAuthRequirementWire, ProviderAvailabilityWire,
@@ -249,16 +251,27 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
             .find(|profile| profile.provider_id == provider)
     }
 
-    pub(crate) fn summaries(&self) -> Vec<ProviderSummaryWire> {
+    /// Projects every profile into its wire summary. `has_credential`
+    /// answers "does at least one account exist for this provider" — the
+    /// G4b seeded-inventory availability rule consults it (decision 6), so
+    /// every caller must state its account truth explicitly.
+    pub(crate) fn summaries(
+        &self,
+        has_credential: &dyn Fn(&str) -> bool,
+    ) -> Vec<ProviderSummaryWire> {
         self.profiles
             .iter()
-            .map(|profile| self.summary_profile(profile))
+            .map(|profile| self.summary_profile(profile, has_credential))
             .collect()
     }
 
-    pub(crate) fn summary(&self, provider: &str) -> Option<ProviderSummaryWire> {
+    pub(crate) fn summary(
+        &self,
+        provider: &str,
+        has_credential: &dyn Fn(&str) -> bool,
+    ) -> Option<ProviderSummaryWire> {
         self.get(provider)
-            .map(|profile| self.summary_profile(profile))
+            .map(|profile| self.summary_profile(profile, has_credential))
     }
 
     pub(crate) fn replace_models(&self, provider: String, models: Vec<DiscoveredModel>) {
@@ -354,6 +367,18 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
             .find(|profile| profile.provider_id == input.provider)
         {
             require_matching_identity(existing, &input)?;
+            // G4b: an enterprise builtin's origin change (region/project
+            // re-configuration) applies only through its shape validator —
+            // an off-template URL is refused, never stored.
+            if let Some(validator) = enterprise_origin_validator(&existing.provider_id)
+                && let Some(origin) = input
+                    .origin
+                    .as_ref()
+                    .filter(|origin| Some(*origin) != existing.base_url.as_ref())
+            {
+                let validated = validator(origin).map_err(|error| invalid(error.message))?;
+                existing.base_url = Some(validated);
+            }
             existing.enabled = input.enabled;
             existing.configured_models = normalized_models(input.models)?;
             existing.default_model = validated_default(discovered_models, input.default_model)?;
@@ -437,7 +462,7 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
         }
         let model = model.trim();
         if !self
-            .discovered_slugs(provider)
+            .selectable_slugs(provider)
             .iter()
             .any(|discovered| discovered == model)
         {
@@ -511,6 +536,21 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
             .collect()
     }
 
+    /// The slugs a default-model selection validates against: discovery
+    /// stays authoritative once it has run; a SEEDED-inventory profile
+    /// (bedrock/vertex, azure-origin customs — G4b) falls back to its
+    /// configured list, which IS its inventory until discovery speaks.
+    fn selectable_slugs(&self, provider: &str) -> Vec<String> {
+        let discovered = self.discovered_slugs(provider);
+        if discovered.is_empty()
+            && let Some(profile) = self.get(provider)
+            && seeded_inventory(profile)
+        {
+            return profile.configured_models.clone();
+        }
+        discovered
+    }
+
     fn discovered_details(&self, provider: &str) -> Vec<DiscoveredModel> {
         self.model_source
             .models(provider)
@@ -518,13 +558,71 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
             .unwrap_or_default()
     }
 
-    fn summary_profile(&self, profile: &ProviderProfileV1) -> ProviderSummaryWire {
-        let model_details = self
-            .discovered_details(&profile.provider_id)
-            .into_iter()
-            .map(|model| model_detail_wire(&profile.provider_id, model))
-            .collect();
-        provider_summary(profile, model_details)
+    fn summary_profile(
+        &self,
+        profile: &ProviderProfileV1,
+        has_credential: &dyn Fn(&str) -> bool,
+    ) -> ProviderSummaryWire {
+        let discovered = self.discovered_details(&profile.provider_id);
+        // G4b seeded-inventory fallback (decision 6 + LZ2): with nothing
+        // discovered, a seeded-list profile's configured models ARE its
+        // inventory — projected through the same detail enrichment so the
+        // effort ladders ride the wire.
+        let seeded_fallback = discovered.is_empty() && seeded_inventory(profile);
+        let model_details = if seeded_fallback {
+            profile
+                .configured_models
+                .iter()
+                .map(|slug| model_detail_wire(&profile.provider_id, seeded_model(slug)))
+                .collect()
+        } else {
+            discovered
+                .into_iter()
+                .map(|model| model_detail_wire(&profile.provider_id, model))
+                .collect()
+        };
+        provider_summary(
+            profile,
+            model_details,
+            seeded_fallback,
+            has_credential(&profile.provider_id),
+        )
+    }
+}
+
+/// Whether this profile's CONFIGURED model list may serve as its inventory
+/// when discovery has nothing (G4b): the two enterprise builtins seed the
+/// documented sets (bedrock mantle and vertex expose no models API), and an
+/// Azure-origin custom keeps its manually entered deployments (LZ2 — Azure
+/// has no confirmed deployment-listing endpoint either). Every OTHER custom
+/// keeps the G4a rule: discovery is the only inventory truth.
+fn seeded_inventory(profile: &ProviderProfileV1) -> bool {
+    if profile.configured_models.is_empty() {
+        return false;
+    }
+    match profile.provider_id.as_str() {
+        BEDROCK_PROVIDER_NAME | VERTEX_PROVIDER_NAME => true,
+        _ => {
+            matches!(profile.provenance, ProviderProvenance::Custom)
+                && profile.base_url.as_deref().is_some_and(azure_openai_origin)
+        }
+    }
+}
+
+/// A bare discovered-model row for one seeded slug: no window, no pricing,
+/// no declared efforts — "never a guess"; the static tables enrich it in
+/// [`model_detail_wire`] exactly like a discovered row.
+fn seeded_model(slug: &str) -> DiscoveredModel {
+    DiscoveredModel {
+        slug: slug.to_owned(),
+        display_name: slug.to_owned(),
+        context_window: None,
+        description: None,
+        default_effort: None,
+        supported_efforts: Vec::new(),
+        visible: true,
+        priority: None,
+        extensions: None,
     }
 }
 
@@ -536,9 +634,12 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
 fn model_detail_wire(provider: &str, model: DiscoveredModel) -> ModelDetailWire {
     let static_ladder: &[&str] = if model.supported_efforts.is_empty() {
         match provider {
-            ANTHROPIC_PROVIDER_NAME | ANTHROPIC_OAUTH_PROVIDER_NAME => {
-                haider_provider::anthropic_supported_efforts(&model.slug)
-            }
+            // G4b: bedrock/vertex serve the same Claude families — the
+            // pinned static tables normalize their enterprise spellings.
+            ANTHROPIC_PROVIDER_NAME
+            | ANTHROPIC_OAUTH_PROVIDER_NAME
+            | BEDROCK_PROVIDER_NAME
+            | VERTEX_PROVIDER_NAME => haider_provider::anthropic_supported_efforts(&model.slug),
             GEMINI_PROVIDER_NAME => haider_provider::gemini_supported_efforts(&model.slug),
             _ => &[],
         }
@@ -554,7 +655,10 @@ fn model_detail_wire(provider: &str, model: DiscoveredModel) -> ModelDetailWire 
         model.supported_efforts.clone()
     };
     let default_effort = model.default_effort.clone().or_else(|| match provider {
-        ANTHROPIC_PROVIDER_NAME | ANTHROPIC_OAUTH_PROVIDER_NAME => {
+        ANTHROPIC_PROVIDER_NAME
+        | ANTHROPIC_OAUTH_PROVIDER_NAME
+        | BEDROCK_PROVIDER_NAME
+        | VERTEX_PROVIDER_NAME => {
             haider_provider::anthropic_default_effort(&model.slug).map(str::to_owned)
         }
         GEMINI_PROVIDER_NAME => {
@@ -562,6 +666,9 @@ fn model_detail_wire(provider: &str, model: DiscoveredModel) -> ModelDetailWire 
         }
         _ => None,
     });
+    // FAST stays Claude-API-only (G4b decision 4, LE-x): bedrock and vertex
+    // details NEVER advertise `supported_speeds`, even for models inside
+    // the static fast gate — the research found no fast mode on either.
     let supported_speeds = if matches!(
         provider,
         ANTHROPIC_PROVIDER_NAME | ANTHROPIC_OAUTH_PROVIDER_NAME
@@ -608,6 +715,8 @@ pub(crate) fn initial_provider_profiles(
 fn provider_summary(
     profile: &ProviderProfileV1,
     model_details: Vec<ModelDetailWire>,
+    seeded_fallback: bool,
+    credentialed: bool,
 ) -> ProviderSummaryWire {
     let discovered_models = model_details
         .iter()
@@ -619,9 +728,15 @@ fn provider_summary(
         ProviderAuthRequirementWire::None | ProviderAuthRequirementWire::Unknown => Vec::new(),
         _ => Vec::new(),
     };
+    // G4b (decision 6, LA-x): a SEEDED inventory carries no proof the
+    // endpoint answers — there is no discovery for these surfaces — so it
+    // lights Available only once a credential exists AND the profile has an
+    // endpoint to serve from (vertex seeds without one until its card runs).
+    let seeded_ready = !seeded_fallback || (credentialed && profile.base_url.is_some());
     let available = profile.enabled
         && !matches!(profile.api_family, ProviderApiFamilyWire::Unknown)
-        && !discovered_models.is_empty();
+        && !discovered_models.is_empty()
+        && seeded_ready;
     let default_model = profile
         .default_model
         .as_ref()
@@ -646,6 +761,10 @@ fn provider_summary(
                 "provider is disabled".to_owned()
             } else if matches!(profile.api_family, ProviderApiFamilyWire::Unknown) {
                 "provider API family is unavailable".to_owned()
+            } else if seeded_fallback && profile.base_url.is_none() {
+                "provider endpoint is not configured".to_owned()
+            } else if seeded_fallback && !credentialed {
+                "provider has no credential".to_owned()
             } else {
                 "provider model inventory is unavailable".to_owned()
             }
@@ -657,6 +776,42 @@ fn provider_summary(
 
 fn builtin_or_unknown(provider: &str, anthropic_default_model: &str) -> ProviderProfileV1 {
     let _ = anthropic_default_model;
+    // G4b enterprise builtins seed a CONFIGURED model inventory (neither
+    // surface exposes a models API) plus, for bedrock, the default-region
+    // mantle endpoint. Vertex seeds NO endpoint — its card must supply the
+    // project/location before the profile can serve.
+    if provider == BEDROCK_PROVIDER_NAME {
+        return ProviderProfileV1 {
+            provider_id: provider.to_owned(),
+            display_name: provider.to_owned(),
+            api_family: ProviderApiFamilyWire::AnthropicMessages,
+            base_url: Some(BEDROCK_MANTLE_DEFAULT_BASE_URL.to_owned()),
+            enabled: true,
+            auth_requirement: ProviderAuthRequirementWire::ApiKey,
+            configured_models: BEDROCK_SEED_MODELS
+                .iter()
+                .map(|slug| (*slug).to_owned())
+                .collect(),
+            default_model: Some(BEDROCK_SEED_MODELS[0].to_owned()),
+            provenance: ProviderProvenance::BuiltIn,
+        };
+    }
+    if provider == VERTEX_PROVIDER_NAME {
+        return ProviderProfileV1 {
+            provider_id: provider.to_owned(),
+            display_name: provider.to_owned(),
+            api_family: ProviderApiFamilyWire::AnthropicMessages,
+            base_url: None,
+            enabled: true,
+            auth_requirement: ProviderAuthRequirementWire::ApiKey,
+            configured_models: VERTEX_SEED_MODELS
+                .iter()
+                .map(|slug| (*slug).to_owned())
+                .collect(),
+            default_model: Some(VERTEX_SEED_MODELS[0].to_owned()),
+            provenance: ProviderProvenance::BuiltIn,
+        };
+    }
     let (api_family, base_url, auth_requirement, enabled, provenance) = match provider {
         ANTHROPIC_PROVIDER_NAME => (
             ProviderApiFamilyWire::AnthropicMessages,
@@ -739,6 +894,10 @@ fn require_matching_identity(
             .origin
             .as_ref()
             .is_some_and(|origin| Some(origin) != existing.base_url.as_ref())
+            // G4b: the enterprise builtins' origins are deliberately
+            // MUTABLE — the card supplies region/project coordinates —
+            // and stay pinned by their URL-shape validators instead.
+            && enterprise_origin_validator(&existing.provider_id).is_none()
         || input
             .auth_requirement
             .is_some_and(|requirement| requirement != existing.auth_requirement)
@@ -749,6 +908,20 @@ fn require_matching_identity(
         )));
     }
     Ok(())
+}
+
+type EnterpriseOriginValidator = fn(&str) -> Result<String, haider_provider::ProviderError>;
+
+/// The shape validator that governs an enterprise builtin's mutable origin
+/// (G4b): bedrock accepts only the mantle template (LB2's shape authority),
+/// vertex only the publishers-models template. Every other provider gets
+/// `None` — origins stay create-only for them.
+fn enterprise_origin_validator(provider_id: &str) -> Option<EnterpriseOriginValidator> {
+    match provider_id {
+        BEDROCK_PROVIDER_NAME => Some(haider_provider::validate_bedrock_mantle_base_url),
+        VERTEX_PROVIDER_NAME => Some(haider_provider::validate_vertex_models_base_url),
+        _ => None,
+    }
 }
 
 fn normalized_models(models: Vec<String>) -> Result<Vec<String>, HaiderError> {

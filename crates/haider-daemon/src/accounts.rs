@@ -46,10 +46,11 @@ use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::CredentialAlias;
 use haider_provider::{
     ANTHROPIC_OAUTH_PROVIDER_NAME, ANTHROPIC_PROVIDER_NAME, AnthropicProvider,
-    BUILTIN_PROVIDER_NAMES, CatalogError, CatalogSource, DiscoveredCatalog, GEMINI_PROVIDER_NAME,
-    GeminiProvider, KIMI_OAUTH_PROVIDER_NAME, Message, OPENAI_COMPATIBLE_PROVIDER_NAME,
-    OPENAI_OAUTH_PROVIDER_NAME, OPENAI_PROVIDER_NAME, OpenAiCompatibleProvider, OpenAiProvider,
-    Provider, ProviderErrorKind, TurnRequest, discover_models,
+    BEDROCK_PROVIDER_NAME, BUILTIN_PROVIDER_NAMES, CatalogError, CatalogSource, DiscoveredCatalog,
+    GEMINI_PROVIDER_NAME, GeminiProvider, KIMI_OAUTH_PROVIDER_NAME, Message,
+    OPENAI_COMPATIBLE_PROVIDER_NAME, OPENAI_OAUTH_PROVIDER_NAME, OPENAI_PROVIDER_NAME,
+    OpenAiCompatibleProvider, OpenAiProvider, Provider, ProviderErrorKind, TurnRequest,
+    VERTEX_PROVIDER_NAME, azure_openai_origin, discover_models,
 };
 use haider_rpc::{
     ERROR_CODE_BUSY, ERROR_CODE_CREDENTIAL_MISSING, ERROR_CODE_INVALID_ARGUMENT,
@@ -132,12 +133,15 @@ pub trait CredentialValidator: Send + Sync {
     fn supports(&self, provider: &str) -> bool;
 
     /// Proves the secret authenticates for `model` (a minimal, already-
-    /// audited provider request), without persisting anything.
+    /// audited provider request), without persisting anything. `endpoint`
+    /// carries the profile origin for endpoint-addressed providers (G4b:
+    /// bedrock mantle, vertex); the fixed vendor endpoints ignore it.
     async fn validate(
         &self,
         provider: &str,
         model: &str,
         secret: &[u8],
+        endpoint: Option<&str>,
     ) -> Result<ValidatedIdentity, ValidationError>;
 }
 
@@ -156,6 +160,7 @@ impl CredentialValidator for AnthropicValidator {
         provider: &str,
         model: &str,
         secret: &[u8],
+        _endpoint: Option<&str>,
     ) -> Result<ValidatedIdentity, ValidationError> {
         if provider != ANTHROPIC_PROVIDER_NAME {
             return Err(ValidationError {
@@ -163,7 +168,7 @@ impl CredentialValidator for AnthropicValidator {
                 message: format!("no validator for provider {provider}"),
             });
         }
-        validate_provider_api_key(provider, model, secret).await
+        validate_provider_api_key(provider, model, secret, None).await
     }
 }
 
@@ -178,7 +183,11 @@ impl CredentialValidator for ProviderCredentialValidator {
     fn supports(&self, provider: &str) -> bool {
         matches!(
             provider,
-            ANTHROPIC_PROVIDER_NAME | OPENAI_PROVIDER_NAME | GEMINI_PROVIDER_NAME
+            ANTHROPIC_PROVIDER_NAME
+                | OPENAI_PROVIDER_NAME
+                | GEMINI_PROVIDER_NAME
+                | BEDROCK_PROVIDER_NAME
+                | VERTEX_PROVIDER_NAME
         )
     }
 
@@ -187,6 +196,7 @@ impl CredentialValidator for ProviderCredentialValidator {
         provider: &str,
         model: &str,
         secret: &[u8],
+        endpoint: Option<&str>,
     ) -> Result<ValidatedIdentity, ValidationError> {
         if !self.supports(provider) {
             return Err(ValidationError {
@@ -194,7 +204,7 @@ impl CredentialValidator for ProviderCredentialValidator {
                 message: format!("no validator for provider {provider}"),
             });
         }
-        validate_provider_api_key(provider, model, secret).await
+        validate_provider_api_key(provider, model, secret, endpoint).await
     }
 }
 
@@ -202,6 +212,7 @@ async fn validate_provider_api_key(
     provider: &str,
     model: &str,
     secret: &[u8],
+    endpoint: Option<&str>,
 ) -> Result<ValidatedIdentity, ValidationError> {
     // Mint a SecretHandle through the vault seam (its constructor is
     // deliberately vault-only); the roundtrip vault is dropped and
@@ -215,6 +226,10 @@ async fn validate_provider_api_key(
             kind: ValidationFailureKind::Unavailable,
             message: format!("validation staging failed: {}", error.message),
         })?;
+    let missing_endpoint = || ValidationError {
+        kind: ValidationFailureKind::Unavailable,
+        message: format!("provider {provider} has no configured endpoint to validate against"),
+    };
     let adapter: Arc<dyn Provider> = match provider {
         ANTHROPIC_PROVIDER_NAME => {
             Arc::new(AnthropicProvider::new(handle, model).map_err(map_provider_error)?)
@@ -225,6 +240,17 @@ async fn validate_provider_api_key(
         GEMINI_PROVIDER_NAME => {
             Arc::new(GeminiProvider::new(handle, model).map_err(map_provider_error)?)
         }
+        // G4b: the enterprise anthropic surfaces validate against the
+        // PROFILE endpoint through the same shape-pinned constructors the
+        // turn path uses (LB2/LV1 authority — never a second URL builder).
+        BEDROCK_PROVIDER_NAME => Arc::new(
+            AnthropicProvider::new_endpoint(handle, model, endpoint.ok_or_else(missing_endpoint)?)
+                .map_err(map_provider_error)?,
+        ),
+        VERTEX_PROVIDER_NAME => Arc::new(
+            AnthropicProvider::new_vertex(handle, model, endpoint.ok_or_else(missing_endpoint)?)
+                .map_err(map_provider_error)?,
+        ),
         _ => {
             return Err(ValidationError {
                 kind: ValidationFailureKind::Unavailable,
@@ -278,6 +304,28 @@ fn custom_login_target(
     Some((origin, profile.default_model))
 }
 
+/// An enterprise builtin's login target (G4b): the bedrock/vertex profile's
+/// STORED endpoint plus its declared default model, so the key validates
+/// against the exact origin and model spelling it will serve
+/// (`anthropic.claude-fable-5` on the mantle — never the global vendor
+/// default). `None` for every other provider AND for a vertex profile whose
+/// card has not yet supplied an endpoint.
+fn enterprise_login_target(
+    management: Option<&ManagementSnapshot>,
+    provider: &str,
+) -> Option<(String, Option<String>)> {
+    if !matches!(provider, BEDROCK_PROVIDER_NAME | VERTEX_PROVIDER_NAME) {
+        return None;
+    }
+    let view = management?.read()?;
+    let profile = view
+        .providers
+        .into_iter()
+        .find(|profile| profile.provider == provider)?;
+    let origin = profile.endpoint?;
+    Some((origin, profile.default_model))
+}
+
 /// The same 1-token validation turn, driven through
 /// [`OpenAiCompatibleProvider`] at a custom profile's STORED origin
 /// (W5g-5). The key authenticates against the server it will actually
@@ -300,9 +348,15 @@ async fn validate_openai_compatible_key(
     // Custom-provenance origins only reach this validator (builtins keep the
     // fixed validator set), so the G4a TrustedLan matrix applies: a stored
     // key for a LAN Ollama/LM Studio box must validate against the origin it
-    // will actually serve from.
-    let adapter =
-        OpenAiCompatibleProvider::new_custom(handle, model, origin).map_err(map_provider_error)?;
+    // will actually serve from. G4b: an AZURE origin validates through the
+    // azure adapter — the key must ride the `api-key` header here exactly
+    // as it will at turn time, or validation would 401 a working key.
+    let adapter = if azure_openai_origin(origin) {
+        OpenAiCompatibleProvider::new_azure(handle, model, origin)
+    } else {
+        OpenAiCompatibleProvider::new_custom(handle, model, origin)
+    }
+    .map_err(map_provider_error)?;
     let request = TurnRequest {
         messages: vec![Message::user_text("ping")],
         model: model.to_owned(),
@@ -377,6 +431,10 @@ pub struct AccountsDependencies {
     pub oauth_coordinator: OAuthCoordinatorConfig,
     /// Validates custom provider origins on the account actor's owned task.
     pub provider_endpoint_validator: Arc<dyn ProviderEndpointValidator>,
+    /// G4b (LV2): the `gcloud auth print-access-token` shell-out behind the
+    /// vertex gcloud device import and its auth-failure refresh. Tests
+    /// inject scripted sources; production shells out.
+    pub gcloud: Arc<dyn crate::gcloud::GcloudAccessTokenSource>,
 }
 
 impl Default for AccountsDependencies {
@@ -388,6 +446,7 @@ impl Default for AccountsDependencies {
             oauth_catalog: OAuthProviderCatalog::default(),
             oauth_coordinator: OAuthCoordinatorConfig::default(),
             provider_endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
+            gcloud: Arc::new(crate::gcloud::GcloudCli),
         }
     }
 }
@@ -656,6 +715,22 @@ impl ManagementSnapshot {
                 providers,
             };
         }
+    }
+}
+
+/// The account-truth predicate the registry's seeded-inventory availability
+/// rule consults (G4b, decision 6): at least one descriptor exists for the
+/// provider — any status; a limited/expired account is still a credential,
+/// and honesty about ITS state belongs to the account row, not the
+/// provider's availability dot.
+pub(crate) fn provider_has_credential<'a>(
+    accounts: &'a AccountStore<Box<dyn StoreLike>>,
+) -> impl Fn(&str) -> bool + 'a {
+    move |provider| {
+        accounts
+            .list()
+            .iter()
+            .any(|descriptor| descriptor.provider == provider)
     }
 }
 
@@ -945,6 +1020,7 @@ pub(crate) fn start_account_actor(config: AccountActorConfig) -> AccountActorHan
         forced,
         None,
         Arc::new(ProductionProviderModelDiscoverer),
+        Arc::new(crate::gcloud::GcloudCli),
     )
 }
 
@@ -956,6 +1032,7 @@ fn start_account_actor_with_broker(
         config,
         build_broker,
         Arc::new(ProductionProviderModelDiscoverer),
+        Arc::new(crate::gcloud::GcloudCli),
     )
 }
 
@@ -963,6 +1040,7 @@ fn start_account_actor_with_services(
     config: AccountActorConfig,
     build_broker: impl FnOnce(mpsc::Sender<AccountCommand>) -> Result<CredentialBroker, HaiderError>,
     model_discoverer: Arc<dyn ProviderModelDiscoverer>,
+    gcloud: Arc<dyn crate::gcloud::GcloudAccessTokenSource>,
 ) -> Result<(AccountActorHandle, CredentialBroker), HaiderError> {
     let (commands, receiver) = mpsc::channel(ACTOR_CAPACITY);
     let (force_stop, forced) = watch::channel(false);
@@ -975,10 +1053,12 @@ fn start_account_actor_with_services(
         forced,
         Some(broker.clone()),
         model_discoverer,
+        gcloud,
     );
     Ok((handle, broker))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_account_actor(
     config: AccountActorConfig,
     commands: mpsc::Sender<AccountCommand>,
@@ -987,6 +1067,7 @@ fn spawn_account_actor(
     forced: watch::Receiver<bool>,
     broker: Option<CredentialBroker>,
     model_discoverer: Arc<dyn ProviderModelDiscoverer>,
+    gcloud: Arc<dyn crate::gcloud::GcloudAccessTokenSource>,
 ) -> AccountActorHandle {
     let task = tokio::spawn(run_account_actor(
         config,
@@ -995,6 +1076,7 @@ fn spawn_account_actor(
         forced,
         broker,
         model_discoverer,
+        gcloud,
     ));
     AccountActorHandle {
         commands,
@@ -1015,6 +1097,7 @@ async fn run_account_actor(
     mut force_stop: watch::Receiver<bool>,
     broker: Option<CredentialBroker>,
     model_discoverer: Arc<dyn ProviderModelDiscoverer>,
+    gcloud: Arc<dyn crate::gcloud::GcloudAccessTokenSource>,
 ) {
     let AccountActorConfig {
         store,
@@ -1094,6 +1177,7 @@ async fn run_account_actor(
                     validator.as_ref(),
                     &snapshot,
                     management.as_ref(),
+                    &providers,
                     &profile_id,
                     &default_model,
                     &mut pending,
@@ -1160,8 +1244,10 @@ async fn run_account_actor(
                     Arc::clone(&vault),
                     &snapshot,
                     management.as_ref(),
+                    &providers,
                     &reserved_aliases,
                     &refresh_fences,
+                    Arc::clone(&gcloud),
                     *job,
                 )
                 .await;
@@ -1571,7 +1657,7 @@ async fn finish_provider_models_refresh(
                 }
             };
             providers.replace_models(provider.clone(), catalog.models);
-            let summaries = providers.summaries();
+            let summaries = providers.summaries(&provider_has_credential(accounts));
             let Some(summary) = summaries
                 .iter()
                 .find(|summary| summary.provider == provider)
@@ -1634,7 +1720,8 @@ async fn finish_provider_models_refresh(
                     return;
                 }
             };
-            let Some(summary) = providers.summary(&provider) else {
+            let Some(summary) = providers.summary(&provider, &provider_has_credential(accounts))
+            else {
                 respond_provider_models_unavailable(
                     completed,
                     &provider,
@@ -2612,7 +2699,11 @@ async fn handle_set_active(
         }
     };
     if let Some(management) = management {
-        management.publish(revision, accounts.list().to_vec(), providers.summaries());
+        management.publish(
+            revision,
+            accounts.list().to_vec(),
+            providers.summaries(&provider_has_credential(accounts)),
+        );
     }
     respond(
         &job.route,
@@ -2831,7 +2922,11 @@ async fn handle_remove_account(
     };
     reserved_aliases.remove(alias.as_str());
     if let Some(management) = management {
-        management.publish(revision, accounts.list().to_vec(), providers.summaries());
+        management.publish(
+            revision,
+            accounts.list().to_vec(),
+            providers.summaries(&provider_has_credential(accounts)),
+        );
     }
     respond(
         &job.route,
@@ -2931,7 +3026,9 @@ async fn handle_set_default_model(
             return;
         }
     };
-    let Some(provider) = providers.summary(&profile.provider_id) else {
+    let Some(provider) =
+        providers.summary(&profile.provider_id, &provider_has_credential(accounts))
+    else {
         respond_management_error(
             &job.route,
             &HaiderError::new(
@@ -2958,7 +3055,11 @@ async fn handle_set_default_model(
         }
     };
     if let Some(management) = management {
-        management.publish(revision, accounts.list().to_vec(), providers.summaries());
+        management.publish(
+            revision,
+            accounts.list().to_vec(),
+            providers.summaries(&provider_has_credential(accounts)),
+        );
     }
     respond(
         &job.route,
@@ -3112,7 +3213,9 @@ async fn handle_provider_configure(
             return;
         }
     };
-    let Some(provider) = providers.summary(&profile.provider_id) else {
+    let Some(provider) =
+        providers.summary(&profile.provider_id, &provider_has_credential(accounts))
+    else {
         respond_management_error(
             &job.route,
             &HaiderError::new(
@@ -3139,7 +3242,11 @@ async fn handle_provider_configure(
         }
     };
     if let Some(management) = management {
-        management.publish(revision, accounts.list().to_vec(), providers.summaries());
+        management.publish(
+            revision,
+            accounts.list().to_vec(),
+            providers.summaries(&provider_has_credential(accounts)),
+        );
     }
     respond(
         &job.route,
@@ -3306,7 +3413,11 @@ async fn handle_provider_remove(
         }
     };
     if let Some(management) = management {
-        management.publish(revision, accounts.list().to_vec(), providers.summaries());
+        management.publish(
+            revision,
+            accounts.list().to_vec(),
+            providers.summaries(&provider_has_credential(accounts)),
+        );
     }
     respond(
         &job.route,
@@ -3327,6 +3438,7 @@ async fn handle_login(
     validator: &dyn CredentialValidator,
     snapshot: &AccountsSnapshot,
     management: Option<&ManagementSnapshot>,
+    providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
     _profile_id: &str,
     default_model: &str,
     pending: &mut HashMap<String, PendingSecret>,
@@ -3344,6 +3456,9 @@ async fn handle_login(
     // A CUSTOM chat-completions profile validates against its OWN stored
     // origin (W5g-5); everything else keeps the fixed validator set.
     let custom_target = custom_login_target(management, &provider);
+    // G4b: the enterprise builtins validate at their PROFILE endpoint with
+    // the profile's declared default model spelling.
+    let enterprise_target = enterprise_login_target(management, &provider);
     if !validator.supports(&provider) && custom_target.is_none() {
         respond_error(
             &route,
@@ -3372,6 +3487,11 @@ async fn handle_login(
             custom_target
                 .as_ref()
                 .and_then(|(_, default)| default.clone())
+                .or_else(|| {
+                    enterprise_target
+                        .as_ref()
+                        .and_then(|(_, default)| default.clone())
+                })
                 .unwrap_or_else(|| default_model.to_owned())
         }),
         display_alias: Some(selected_alias.clone()),
@@ -3447,6 +3567,7 @@ async fn handle_login(
             finalize_and_respond(
                 store,
                 accounts,
+                providers,
                 snapshot,
                 management,
                 &command_id,
@@ -3472,6 +3593,7 @@ async fn handle_login(
             finalize_and_respond(
                 store,
                 accounts,
+                providers,
                 snapshot,
                 management,
                 &command_id,
@@ -3508,7 +3630,14 @@ async fn handle_login(
         }
         None => {
             validator
-                .validate(&provider, &identity.resolved_model, &secret)
+                .validate(
+                    &provider,
+                    &identity.resolved_model,
+                    &secret,
+                    enterprise_target
+                        .as_ref()
+                        .map(|(origin, _)| origin.as_str()),
+                )
                 .await
         }
     };
@@ -3550,6 +3679,7 @@ async fn handle_login(
             finalize_and_respond(
                 store,
                 accounts,
+                providers,
                 snapshot,
                 management,
                 &command_id,
@@ -3914,14 +4044,17 @@ fn fresh_oauth_heal_command_id() -> Result<String, HaiderError> {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 async fn handle_device_import(
     store: &SqliteStoreHandle,
     accounts: &mut AccountStore<Box<dyn StoreLike>>,
     vault: Arc<dyn Vault>,
     snapshot: &AccountsSnapshot,
     management: Option<&ManagementSnapshot>,
+    providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
     reserved_aliases: &HashSet<String>,
     refresh_fences: &RefreshFenceRegistry,
+    gcloud: Arc<dyn crate::gcloud::GcloudAccessTokenSource>,
     job: DeviceImportJob,
 ) {
     let candidate_id = job.candidate.clone();
@@ -3961,6 +4094,15 @@ async fn handle_device_import(
         );
         return;
     };
+    // G4b (LV2): the gcloud candidate imports through the SHELL-OUT source,
+    // not an OAuth bundle file — its own arm, before the bundle machinery.
+    if source == crate::device_discovery::GCLOUD_IMPORT_SOURCE {
+        handle_gcloud_import(
+            store, accounts, vault, snapshot, management, providers, gcloud, job,
+        )
+        .await;
+        return;
+    }
     let receipt_candidate = Some(job.candidate.clone());
     handle_oauth_import(
         store,
@@ -3980,6 +4122,114 @@ async fn handle_device_import(
         receipt_candidate,
     )
     .await;
+}
+
+/// Imports (or refreshes) the vertex gcloud credential (G4b, LV2): run the
+/// mockable shell-out, vault the token under the fixed `vertex-gcloud`
+/// alias, and upsert the descriptor. DELIBERATELY receipt-free: re-import
+/// IS refresh (each run mints a fresh short-lived token), so replaying the
+/// command after a crash or retry is idempotent by construction, and no
+/// receipt may carry a secret anyway — the vault file is the durable truth
+/// (the transcription-secret precedent).
+#[allow(clippy::too_many_arguments)]
+async fn handle_gcloud_import(
+    store: &SqliteStoreHandle,
+    accounts: &mut AccountStore<Box<dyn StoreLike>>,
+    vault: Arc<dyn Vault>,
+    snapshot: &AccountsSnapshot,
+    management: Option<&ManagementSnapshot>,
+    providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+    gcloud: Arc<dyn crate::gcloud::GcloudAccessTokenSource>,
+    job: DeviceImportJob,
+) {
+    let token = match tokio::task::spawn_blocking(move || gcloud.print_access_token()).await {
+        Ok(Ok(token)) => token,
+        Ok(Err(error)) => {
+            respond_management_error(&job.route, &error);
+            return;
+        }
+        Err(_) => {
+            respond_management_error(
+                &job.route,
+                &crate::gcloud::gcloud_error("import worker was lost"),
+            );
+            return;
+        }
+    };
+    let alias = CredentialAlias::new(crate::gcloud::VERTEX_GCLOUD_ALIAS);
+    let vault_for_write = Arc::clone(&vault);
+    let alias_for_write = alias.clone();
+    let written =
+        tokio::task::spawn_blocking(move || vault_for_write.put(&alias_for_write, &token)).await;
+    match written {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            respond_management_error(&job.route, &error);
+            return;
+        }
+        Err(_) => {
+            respond_management_error(
+                &job.route,
+                &crate::gcloud::gcloud_error("vault worker was lost"),
+            );
+            return;
+        }
+    }
+    let refreshed = accounts.get(&alias).is_some();
+    let result = if refreshed {
+        // Re-import refreshed the vault token; the descriptor only needs
+        // its status healed.
+        accounts.set_status(&alias, CredentialStatus::Ok)
+    } else {
+        accounts.add(CredentialDescriptor {
+            alias: alias.clone(),
+            provider: haider_provider::VERTEX_PROVIDER_NAME.to_owned(),
+            base_url: None,
+            auth_method: AuthMethod::ApiKey,
+            identity: "gcloud access token (auto-refresh)".to_owned(),
+            status: CredentialStatus::Ok,
+            active: true,
+        })
+    };
+    if let Err(error) = result {
+        respond_management_error(&job.route, &error);
+        return;
+    }
+    let revision = match store.advance_management_revision().await {
+        Ok(revision) => revision,
+        Err(error) => {
+            respond_management_error(&job.route, &error);
+            return;
+        }
+    };
+    // The fresh credential flips the vertex seeded-inventory availability
+    // (decision 6) — publish the FULL provider view, not just accounts.
+    refresh_resolver_snapshot(snapshot, accounts);
+    if let Some(management) = management {
+        management.publish(
+            revision,
+            accounts.list().to_vec(),
+            providers.summaries(&provider_has_credential(accounts)),
+        );
+    }
+    let Some(descriptor) = accounts.get(&alias).cloned() else {
+        respond_management_error(
+            &job.route,
+            &HaiderError::new(
+                ErrorCode::Internal,
+                "gcloud import descriptor disappeared before the response",
+                false,
+            ),
+        );
+        return;
+    };
+    respond(
+        &job.route,
+        ResponseBody::AccountImportDevice {
+            descriptor,
+            revision,
+        },
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4847,9 +5097,11 @@ fn descriptor_for(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn finalize_and_respond(
     store: &SqliteStoreHandle,
     accounts: &mut AccountStore<Box<dyn StoreLike>>,
+    providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
     snapshot: &AccountsSnapshot,
     management: Option<&ManagementSnapshot>,
     command_id: &str,
@@ -4881,7 +5133,17 @@ async fn finalize_and_respond(
             return;
         }
     };
-    publish_management_snapshot(snapshot, management, accounts, revision);
+    // A login can flip a SEEDED-inventory provider's availability (G4b
+    // decision 6 — bedrock/vertex light Available once a credential
+    // exists), so the login publish carries the full provider view.
+    refresh_resolver_snapshot(snapshot, accounts);
+    if let Some(management) = management {
+        management.publish(
+            revision,
+            accounts.list().to_vec(),
+            providers.summaries(&provider_has_credential(accounts)),
+        );
+    }
     respond(route, ResponseBody::AccountLoginApi { descriptor });
 }
 
@@ -5062,7 +5324,7 @@ fn build_account_provider(
     tuning: &ProviderTuning,
 ) -> Result<Arc<dyn Provider>, HaiderError> {
     let compatible_base_url = account_openai_compatible_base_url(provider, profile, base_url);
-    let anthropic_fast = anthropic_fast_for(tuning, model);
+    let anthropic_fast = anthropic_fast_for(provider, tuning, model);
     let anthropic_effort = anthropic_effort_for(tuning, model);
     let openai_effort = openai_effort_for(tuning, profile, model);
     let adapter: Arc<dyn Provider> = match (provider, auth_method) {
@@ -5073,6 +5335,45 @@ fn build_account_provider(
                 .with_effort(anthropic_effort.clone())
                 .with_fast(anthropic_fast),
         ),
+        // G4b: Bedrock mantle — the endpoint-parameterized Anthropic
+        // adapter at the profile's mantle base (LB1/LB2). Effort clamps
+        // through the normalized static tables; FAST is deliberately the
+        // provider-gated `anthropic_fast_for`, which refuses bedrock
+        // regardless of model (decision 4).
+        (BEDROCK_PROVIDER_NAME, AuthMethod::ApiKey) => {
+            let endpoint = enterprise_endpoint(profile, base_url).ok_or_else(|| {
+                HaiderError::new(
+                    ErrorCode::InvalidArgument,
+                    "bedrock profile has no configured mantle endpoint",
+                    false,
+                )
+            })?;
+            Arc::new(
+                AnthropicProvider::new_endpoint(credential, model, endpoint)
+                    .map_err(|error| adapter_construction_error(provider, error))?
+                    .with_account(alias.clone())
+                    .with_effort(anthropic_effort.clone())
+                    .with_fast(anthropic_fast),
+            )
+        }
+        // G4b: Claude on Vertex — model-in-URL, version-in-body, plain
+        // Bearer (LV1). Same provider-gated fast refusal as bedrock.
+        (VERTEX_PROVIDER_NAME, AuthMethod::ApiKey) => {
+            let endpoint = enterprise_endpoint(profile, base_url).ok_or_else(|| {
+                HaiderError::new(
+                    ErrorCode::InvalidArgument,
+                    "vertex profile has no configured project endpoint — set the project and location on its card",
+                    false,
+                )
+            })?;
+            Arc::new(
+                AnthropicProvider::new_vertex(credential, model, endpoint)
+                    .map_err(|error| adapter_construction_error(provider, error))?
+                    .with_account(alias.clone())
+                    .with_effort(anthropic_effort.clone())
+                    .with_fast(anthropic_fast),
+            )
+        }
         (OPENAI_PROVIDER_NAME, AuthMethod::ApiKey) => Arc::new(
             OpenAiProvider::new(credential, model)
                 .map_err(|error| adapter_construction_error(provider, error))?
@@ -5268,8 +5569,27 @@ fn build_account_provider(
 /// gate — 4.7 hard-errors on `speed: "fast"` and 4.6 silently bills
 /// standard, so an out-of-gate pair sends a standard request instead of a
 /// request the API documents as broken for it.
-pub(crate) fn anthropic_fast_for(tuning: &ProviderTuning, model: &str) -> bool {
-    tuning.fast && haider_provider::anthropic_fast_mode_supported(model)
+///
+/// G4b (decision 4, LE-x): FAST is Claude-API-only — `bedrock` and `vertex`
+/// refuse REGARDLESS of model, because the effort-table normalization makes
+/// `anthropic.claude-opus-5` pass the model gate while neither platform
+/// serves the fast research preview.
+pub(crate) fn anthropic_fast_for(provider: &str, tuning: &ProviderTuning, model: &str) -> bool {
+    !matches!(provider, BEDROCK_PROVIDER_NAME | VERTEX_PROVIDER_NAME)
+        && tuning.fast
+        && haider_provider::anthropic_fast_mode_supported(model)
+}
+
+/// The endpoint an enterprise (anthropic-family) profile serves from: the
+/// PROFILE origin is the authority (the card writes it there), with the
+/// credential descriptor's `base_url` as the compatibility fallback.
+fn enterprise_endpoint<'a>(
+    profile: Option<&'a ProviderSummaryWire>,
+    credential_base_url: Option<&'a str>,
+) -> Option<&'a str> {
+    profile
+        .and_then(|profile| profile.endpoint.as_deref())
+        .or(credential_base_url)
 }
 
 /// G3 effort gate at construction (review of record): effort is validated at
@@ -5324,8 +5644,33 @@ fn account_openai_compatible_base_url<'a>(
         .and_then(|profile| profile.endpoint.as_deref().or(credential_base_url))
 }
 
+/// Which compatible constructor a (provider, origin) pair routes through —
+/// the ONE mapping behind [`custom_compatible_adapter`], split out so the
+/// azure/builtin/custom routing is unit-pinned (G4b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompatibleAdapterRoute {
+    /// Azure OpenAI v1 (G4b): `api-key` header under the Strict fence.
+    Azure,
+    /// A builtin id that ever routes here (defensive — none does today)
+    /// keeps the Strict fence and the Bearer header.
+    Builtin,
+    /// Custom provenance: TrustedLan matrix, Bearer header (G4a).
+    Custom,
+}
+
+pub(crate) fn compatible_adapter_route(provider: &str, base_url: &str) -> CompatibleAdapterRoute {
+    if azure_openai_origin(base_url) {
+        CompatibleAdapterRoute::Azure
+    } else if haider_provider::BUILTIN_PROVIDER_NAMES.contains(&provider) {
+        CompatibleAdapterRoute::Builtin
+    } else {
+        CompatibleAdapterRoute::Custom
+    }
+}
+
 /// Builds the profile-routed compatible adapter under the provenance-correct
-/// origin policy (G4a): custom provider ids get the TrustedLan matrix; a
+/// origin policy (G4a) and header mode (G4b): azure origins take the
+/// `api-key` adapter, custom provider ids the TrustedLan matrix, and a
 /// builtin id that ever routes here (defensive — none does today) keeps the
 /// Strict fence.
 fn custom_compatible_adapter(
@@ -5334,10 +5679,16 @@ fn custom_compatible_adapter(
     model: &str,
     base_url: &str,
 ) -> Result<OpenAiCompatibleProvider, HaiderError> {
-    if haider_provider::BUILTIN_PROVIDER_NAMES.contains(&provider) {
-        OpenAiCompatibleProvider::new(credential, model, base_url)
-    } else {
-        OpenAiCompatibleProvider::new_custom(credential, model, base_url)
+    match compatible_adapter_route(provider, base_url) {
+        CompatibleAdapterRoute::Azure => {
+            OpenAiCompatibleProvider::new_azure(credential, model, base_url)
+        }
+        CompatibleAdapterRoute::Builtin => {
+            OpenAiCompatibleProvider::new(credential, model, base_url)
+        }
+        CompatibleAdapterRoute::Custom => {
+            OpenAiCompatibleProvider::new_custom(credential, model, base_url)
+        }
     }
     .map_err(|error| adapter_construction_error(provider, error))
 }
@@ -5740,7 +6091,11 @@ impl haider_core::ProviderAttemptResolver for AccountsAttemptResolver {
                 let Some(current) = self.current_descriptor(current_account) else {
                     return Ok(haider_core::ProviderAttemptDecision::Stop);
                 };
-                if current.auth_method == AuthMethod::OAuth
+                // G4b (LV2): the vertex gcloud-refresh credential recovers
+                // in-turn exactly like OAuth — the broker re-mints its
+                // token through the mocked/production shell-out once.
+                if (current.auth_method == AuthMethod::OAuth
+                    || crate::gcloud::is_gcloud_refresh_descriptor(&current))
                     && !self.auth_refresh_attempted.swap(true, Ordering::AcqRel)
                 {
                     let Some(broker) = &self.factory.broker else {
@@ -6199,6 +6554,7 @@ async fn reconcile_set_active_receipts(
 
 async fn reconcile_provider_receipts(
     store: &SqliteStoreHandle,
+    accounts: &AccountStore<Box<dyn StoreLike>>,
     providers: &mut ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
 ) -> Result<(), HaiderError> {
     let rows = store.provider_management_receipts().await?;
@@ -6325,13 +6681,15 @@ async fn reconcile_provider_receipts(
             }
             _ => unreachable!("provider receipt methods were validated above"),
         };
-        let summary = providers.summary(&profile.provider_id).ok_or_else(|| {
-            HaiderError::new(
-                ErrorCode::StoreCorrupt,
-                "reconciled provider disappeared before receipt finalization",
-                false,
-            )
-        })?;
+        let summary = providers
+            .summary(&profile.provider_id, &provider_has_credential(accounts))
+            .ok_or_else(|| {
+                HaiderError::new(
+                    ErrorCode::StoreCorrupt,
+                    "reconciled provider disappeared before receipt finalization",
+                    false,
+                )
+            })?;
         store
             .finalize_management_receipt(
                 row.command_id,
@@ -6388,6 +6746,56 @@ pub(crate) struct AccountsRuntime {
     pub broker: Option<CredentialBroker>,
 }
 
+/// The environment variable AWS documents for Bedrock bearer keys; the
+/// startup env bridge (G4b, LA-x) imports it once when set.
+pub(crate) const BEDROCK_ENV_BEARER_VAR: &str = "AWS_BEARER_TOKEN_BEDROCK";
+
+/// One-shot startup import of `AWS_BEARER_TOKEN_BEDROCK` through the
+/// accounts env bridge (G4b, LA-x): when the variable is set AND no bedrock
+/// descriptor exists yet, the value is vaulted under the deterministic
+/// `bedrock-env` alias and a descriptor lands active. An explicit login or
+/// removal is never fought — any existing bedrock descriptor (any status)
+/// suppresses the import entirely. Best-effort by design: a malformed value
+/// or vault failure skips the import rather than failing daemon boot, and
+/// resolution never consults the environment again (the bridge contract).
+fn import_bedrock_env_bearer(
+    accounts: &mut AccountStore<Box<dyn StoreLike>>,
+    vault: &VaultProvision,
+) {
+    if std::env::var_os(BEDROCK_ENV_BEARER_VAR).is_none()
+        || accounts
+            .list()
+            .iter()
+            .any(|descriptor| descriptor.provider == BEDROCK_PROVIDER_NAME)
+    {
+        return;
+    }
+    let VaultProvision::Available(vault) = vault else {
+        return;
+    };
+    let Ok(alias) = haider_accounts::import_env(
+        vault.as_ref(),
+        BEDROCK_PROVIDER_NAME,
+        BEDROCK_ENV_BEARER_VAR,
+    ) else {
+        return;
+    };
+    let descriptor = CredentialDescriptor {
+        alias: alias.clone(),
+        provider: BEDROCK_PROVIDER_NAME.to_owned(),
+        base_url: None,
+        auth_method: AuthMethod::ApiKey,
+        identity: format!("{BEDROCK_ENV_BEARER_VAR} (env import)"),
+        status: CredentialStatus::Ok,
+        active: true,
+    };
+    if accounts.add(descriptor).is_err() {
+        // The descriptor store refused (never a duplicate — checked above);
+        // drop the orphaned vault entry so the next boot retries cleanly.
+        let _ = vault.delete(&alias);
+    }
+}
+
 impl AccountsRuntime {
     /// Loads the descriptor store, runs receipt reconciliation, and starts
     /// the account actor (vault-supported platforms only).
@@ -6416,7 +6824,7 @@ impl AccountsRuntime {
             model_source.clone(),
         )?;
         let provider_ids = providers
-            .summaries()
+            .summaries(&|_| false)
             .into_iter()
             .map(|summary| summary.provider)
             .collect::<Vec<_>>();
@@ -6464,7 +6872,8 @@ impl AccountsRuntime {
         reconcile_login_receipts(store, &mut accounts, &vault).await?;
         reconcile_oauth_add_receipts(store, &mut accounts, &vault).await?;
         reconcile_set_active_receipts(store, &mut accounts).await?;
-        reconcile_provider_receipts(store, &mut providers).await?;
+        reconcile_provider_receipts(store, &accounts, &mut providers).await?;
+        import_bedrock_env_bearer(&mut accounts, &vault);
         let reserved_aliases = store
             .reserved_account_aliases()
             .await?
@@ -6474,7 +6883,7 @@ impl AccountsRuntime {
         let management = ManagementSnapshot::new(
             store.management_revision().await?,
             accounts.list().to_vec(),
-            providers.summaries(),
+            providers.summaries(&provider_has_credential(&accounts)),
         );
         let actor_vault: Arc<dyn Vault> = match &vault {
             VaultProvision::Available(vault) => Arc::clone(vault),
@@ -6507,15 +6916,22 @@ impl AccountsRuntime {
                     Arc::clone(scoped),
                 )
                 .map_err(crate::oauth::oauth_error)?;
-                let (actor, broker) = start_account_actor_with_broker(actor_config, |commands| {
-                    CredentialBroker::new_with_fences(
-                        Arc::clone(scoped),
-                        dependencies.oauth_catalog.clone(),
-                        Arc::clone(&snapshot),
-                        commands,
-                        refresh_fences,
-                    )
-                })?;
+                let gcloud = Arc::clone(&dependencies.gcloud);
+                let (actor, broker) = start_account_actor_with_services(
+                    actor_config,
+                    |commands| {
+                        CredentialBroker::new_with_fences(
+                            Arc::clone(scoped),
+                            dependencies.oauth_catalog.clone(),
+                            Arc::clone(&snapshot),
+                            commands,
+                            refresh_fences,
+                        )?
+                        .with_gcloud_source(Arc::clone(&gcloud))
+                    },
+                    Arc::new(ProductionProviderModelDiscoverer),
+                    Arc::clone(&gcloud),
+                )?;
                 let commands = actor.commands();
                 Ok(Self {
                     facade: AccountsFacade {

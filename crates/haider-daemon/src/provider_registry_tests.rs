@@ -89,7 +89,11 @@ fn enabled_profile_with_unknown_api_family_is_never_available() {
         vec![discovered("frontier-future", true, None)],
     )]);
     let registry = ProviderRegistry::new(store, Vec::new(), source).expect("registry");
-    let summary = registry.summaries().into_iter().next().expect("summary");
+    let summary = registry
+        .summaries(&|_| false)
+        .into_iter()
+        .next()
+        .expect("summary");
     assert_eq!(
         summary.availability,
         ProviderAvailabilityWire::Unavailable,
@@ -112,7 +116,11 @@ fn unknown_factory_provider_is_never_rendered_healthy() {
         model_source([]),
     )
     .expect("registry");
-    let summary = registry.summaries().into_iter().next().expect("summary");
+    let summary = registry
+        .summaries(&|_| false)
+        .into_iter()
+        .next()
+        .expect("summary");
     assert_eq!(summary.availability, ProviderAvailabilityWire::Unavailable);
     assert!(!summary.enabled);
     assert!(summary.models.is_empty());
@@ -143,7 +151,7 @@ fn gemini_is_a_builtin_generate_content_api_key_provider() {
     )
     .expect("Gemini registry");
     let summary = registry
-        .summary(GEMINI_PROVIDER_NAME)
+        .summary(GEMINI_PROVIDER_NAME, &|_| false)
         .expect("Gemini summary");
     assert_eq!(
         summary.api_family,
@@ -248,7 +256,11 @@ fn summaries_report_pickable_discovered_models_not_profile_literals() {
     )]);
     let registry = ProviderRegistry::new(store, Vec::new(), source).expect("registry");
 
-    let summary = registry.summaries().into_iter().next().expect("summary");
+    let summary = registry
+        .summaries(&|_| false)
+        .into_iter()
+        .next()
+        .expect("summary");
     assert_eq!(summary.models, vec!["frontier-a", "frontier-b"]);
     assert_eq!(summary.default_model.as_deref(), Some("frontier-a"));
     assert_eq!(summary.availability, ProviderAvailabilityWire::Available);
@@ -284,7 +296,11 @@ fn summaries_align_model_details_with_pickable_models_and_windows() {
     )]);
     let registry = ProviderRegistry::new(store, Vec::new(), source).expect("registry");
 
-    let summary = registry.summaries().into_iter().next().expect("summary");
+    let summary = registry
+        .summaries(&|_| false)
+        .into_iter()
+        .next()
+        .expect("summary");
     assert_eq!(summary.models, vec!["frontier-a", "frontier-b"]);
     assert_eq!(
         summary.model_details,
@@ -347,7 +363,11 @@ fn builtin_without_cached_models_is_unknown_not_available_with_guesses() {
     )
     .expect("registry");
 
-    let summary = registry.summaries().into_iter().next().expect("summary");
+    let summary = registry
+        .summaries(&|_| false)
+        .into_iter()
+        .next()
+        .expect("summary");
     assert!(summary.models.is_empty());
     assert_eq!(summary.default_model, None);
     assert_eq!(summary.availability, ProviderAvailabilityWire::Unavailable);
@@ -381,7 +401,7 @@ fn kimi_oauth_is_a_builtin_chat_completions_subscription_provider() {
     )
     .expect("Kimi provider registry");
     let summary = registry
-        .summaries()
+        .summaries(&|_| false)
         .into_iter()
         .next()
         .expect("Kimi summary");
@@ -483,4 +503,301 @@ fn provider_registry_removes_only_custom_profiles_and_clears_models() {
     assert!(registry.get("custom").is_none());
     assert!(source.models("custom").is_none());
     assert!(registry.get(OPENAI_PROVIDER_NAME).is_some());
+}
+
+// ───────────────────────────── G4b enterprise seeds ─────────────────────────
+
+fn seeded_registry(provider: &str) -> ProviderRegistry<MemoryProviderStore> {
+    ProviderRegistry::new(
+        MemoryProviderStore::default(),
+        initial_provider_profiles(
+            &std::collections::BTreeSet::from([provider.to_owned()]),
+            "unused-literal",
+        ),
+        model_source([]),
+    )
+    .expect("registry")
+}
+
+/// LAW (LA-x — the seeded-list availability rule, decision 6): a bedrock or
+/// vertex profile with its SEEDED model list lights Available exactly when
+/// a credential exists AND an endpoint is configured — no discovery
+/// requirement — and stays honestly Unavailable otherwise, with the reason
+/// naming the missing piece. Both directions on the credential axis; the
+/// vertex seed (no endpoint until its card runs) pins the endpoint axis.
+///
+/// MUTATION CHECK: drop the `credentialed` conjunct (or the `base_url`
+/// conjunct) from `seeded_ready` in `provider_summary`. Expected RUNTIME
+/// failure: the credential-less bedrock row (respectively the endpoint-less
+/// vertex row) reports Available.
+#[test]
+fn la_seeded_list_providers_light_available_once_a_credential_exists() {
+    let bedrock = seeded_registry("bedrock");
+    let without_credential = bedrock
+        .summary("bedrock", &|_| false)
+        .expect("bedrock summary");
+    assert_eq!(
+        without_credential.availability,
+        ProviderAvailabilityWire::Unavailable
+    );
+    assert_eq!(
+        without_credential.availability_reason.as_deref(),
+        Some("provider has no credential")
+    );
+    assert_eq!(
+        without_credential.models,
+        haider_provider::BEDROCK_SEED_MODELS
+            .iter()
+            .map(|slug| (*slug).to_owned())
+            .collect::<Vec<_>>(),
+        "the seeded list IS the inventory even before a credential"
+    );
+
+    let with_credential = bedrock
+        .summary("bedrock", &|provider| provider == "bedrock")
+        .expect("bedrock summary");
+    assert_eq!(
+        with_credential.availability,
+        ProviderAvailabilityWire::Available,
+        "a credential + the seeded default-region endpoint light bedrock"
+    );
+    assert_eq!(
+        with_credential.endpoint.as_deref(),
+        Some("https://bedrock-mantle.us-east-1.api.aws/anthropic")
+    );
+    assert_eq!(
+        with_credential.default_model.as_deref(),
+        Some("anthropic.claude-fable-5")
+    );
+
+    // Vertex seeds NO endpoint: a credential alone must not light it.
+    let vertex = seeded_registry("vertex");
+    let endpoint_less = vertex.summary("vertex", &|_| true).expect("vertex summary");
+    assert_eq!(
+        endpoint_less.availability,
+        ProviderAvailabilityWire::Unavailable
+    );
+    assert_eq!(
+        endpoint_less.availability_reason.as_deref(),
+        Some("provider endpoint is not configured")
+    );
+    assert_eq!(
+        endpoint_less.models,
+        haider_provider::VERTEX_SEED_MODELS
+            .iter()
+            .map(|slug| (*slug).to_owned())
+            .collect::<Vec<_>>()
+    );
+}
+
+/// LAW (LE-x, wire-detail half): bedrock/vertex seeded model details carry
+/// the normalized static effort ladders and defaults, but NEVER
+/// `supported_speeds` — fast is Claude-API-only (decision 4) — while the
+/// first-party anthropic detail keeps advertising fast (both directions).
+///
+/// MUTATION CHECK: add bedrock/vertex to the `supported_speeds` provider
+/// match in `model_detail_wire`. Expected RUNTIME failure: the empty-speeds
+/// assertions below.
+#[test]
+fn bedrock_and_vertex_model_details_get_effort_ladders_but_no_speeds() {
+    let bedrock = seeded_registry("bedrock")
+        .summary("bedrock", &|_| true)
+        .expect("bedrock summary");
+    let opus = bedrock
+        .model_details
+        .iter()
+        .find(|detail| detail.name == "anthropic.claude-opus-5")
+        .expect("seeded opus detail");
+    assert_eq!(
+        opus.supported_efforts,
+        ["low", "medium", "high", "xhigh", "max"],
+        "the normalized static ladder rides the seeded detail"
+    );
+    assert_eq!(opus.default_effort.as_deref(), Some("high"));
+    assert!(
+        opus.supported_speeds.is_empty(),
+        "fast is Claude-API-only — no speeds on bedrock details"
+    );
+    assert!(
+        bedrock
+            .model_details
+            .iter()
+            .all(|detail| detail.supported_speeds.is_empty()),
+        "no bedrock detail may advertise a speed"
+    );
+    assert_eq!(
+        bedrock
+            .model_details
+            .iter()
+            .find(|detail| detail.name == "anthropic.claude-haiku-4-5")
+            .expect("seeded haiku detail")
+            .context_window,
+        None,
+        "seeded rows never guess a context window"
+    );
+
+    let vertex = seeded_registry("vertex")
+        .summary("vertex", &|_| true)
+        .expect("vertex summary");
+    let dated = vertex
+        .model_details
+        .iter()
+        .find(|detail| detail.name == "claude-sonnet-4-5@20250929")
+        .expect("dated vertex detail");
+    assert!(
+        dated.supported_efforts.is_empty(),
+        "sonnet-4-5 documents no ladder — normalization never invents one"
+    );
+    assert!(
+        vertex
+            .model_details
+            .iter()
+            .all(|detail| detail.supported_speeds.is_empty())
+    );
+
+    // The FIRST-PARTY detail keeps fast (the other direction).
+    let anthropic = ProviderRegistry::new(
+        MemoryProviderStore::default(),
+        initial_provider_profiles(
+            &std::collections::BTreeSet::from([ANTHROPIC_PROVIDER_NAME.to_owned()]),
+            "unused",
+        ),
+        model_source([(
+            ANTHROPIC_PROVIDER_NAME,
+            vec![discovered("claude-opus-5", true, None)],
+        )]),
+    )
+    .expect("registry")
+    .summary(ANTHROPIC_PROVIDER_NAME, &|_| false)
+    .expect("anthropic summary");
+    assert_eq!(
+        anthropic.model_details[0].supported_speeds,
+        ["fast"],
+        "the claude api keeps advertising fast"
+    );
+}
+
+/// LAW (LZ2 — the azure discovery-404 fallback): an Azure-origin CUSTOM
+/// profile keeps its manually entered deployments as inventory when
+/// discovery has nothing, and lights Available once its key exists; a
+/// non-azure custom keeps the G4a rule (discovery is the only inventory
+/// truth) — both directions.
+///
+/// MUTATION CHECK: drop the azure-origin arm from `seeded_inventory`.
+/// Expected RUNTIME failure: the azure row below reports Unavailable with
+/// an empty model list.
+#[test]
+fn lz2_azure_custom_keeps_manual_deployments_available_without_discovery() {
+    let custom = |provider: &str, origin: &str| ProviderProfileV1 {
+        provider_id: provider.to_owned(),
+        display_name: provider.to_owned(),
+        api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
+        base_url: Some(origin.to_owned()),
+        enabled: true,
+        auth_requirement: ProviderAuthRequirementWire::ApiKey,
+        configured_models: vec!["my-gpt-deployment".to_owned()],
+        default_model: Some("my-gpt-deployment".to_owned()),
+        provenance: ProviderProvenance::Custom,
+    };
+    let store = MemoryProviderStore::default();
+    store
+        .save(&[
+            custom("azure", "https://contoso.openai.azure.com/openai/v1"),
+            custom("vllm", "https://gateway.example.com/v1"),
+        ])
+        .expect("seed profiles");
+    let registry = ProviderRegistry::new(store, Vec::new(), model_source([])).expect("registry");
+
+    let azure = registry
+        .summary("azure", &|provider| provider == "azure")
+        .expect("azure summary");
+    assert_eq!(azure.availability, ProviderAvailabilityWire::Available);
+    assert_eq!(azure.models, ["my-gpt-deployment"]);
+    assert_eq!(azure.default_model.as_deref(), Some("my-gpt-deployment"));
+
+    let keyless_azure = registry
+        .summary("azure", &|_| false)
+        .expect("azure summary");
+    assert_eq!(
+        keyless_azure.availability,
+        ProviderAvailabilityWire::Unavailable,
+        "a seeded inventory without a credential stays honest"
+    );
+
+    let generic = registry
+        .summary("vllm", &|_| true)
+        .expect("generic custom summary");
+    assert_eq!(
+        generic.availability,
+        ProviderAvailabilityWire::Unavailable,
+        "non-azure customs keep the G4a discovery-only inventory rule"
+    );
+    assert!(generic.models.is_empty());
+    assert_eq!(
+        generic.availability_reason.as_deref(),
+        Some("provider model inventory is unavailable")
+    );
+}
+
+/// LAW (G4b origin mutability): the enterprise builtins' origins move ONLY
+/// through their shape validators — a region re-configure applies, an
+/// off-template URL is refused with nothing stored, and custom profiles
+/// keep the create-only identity law untouched (both directions; the
+/// create-only half is additionally pinned by
+/// `existing_custom_provider_identity_fields_are_create_only`).
+///
+/// MUTATION CHECK: skip the validator call in the enterprise origin-update
+/// branch of `configured_profiles_with_inventory`. Expected RUNTIME
+/// failure: the off-template configure below succeeds and stores the URL.
+#[test]
+fn enterprise_origin_reconfigure_is_shape_validated() {
+    let mut registry = seeded_registry("bedrock");
+    let models: Vec<String> = haider_provider::BEDROCK_SEED_MODELS
+        .iter()
+        .map(|slug| (*slug).to_owned())
+        .collect();
+    let reconfigure = |origin: &str| ProviderConfigureInput {
+        provider: "bedrock".to_owned(),
+        api_family: Some(ProviderApiFamilyWire::AnthropicMessages),
+        origin: Some(origin.to_owned()),
+        auth_requirement: Some(ProviderAuthRequirementWire::ApiKey),
+        enabled: true,
+        models: models.clone(),
+        default_model: Some("anthropic.claude-fable-5".to_owned()),
+    };
+
+    let profile = registry
+        .configure(reconfigure(
+            "https://bedrock-mantle.eu-central-1.api.aws/anthropic",
+        ))
+        .expect("region re-configure applies");
+    assert_eq!(
+        profile.base_url.as_deref(),
+        Some("https://bedrock-mantle.eu-central-1.api.aws/anthropic")
+    );
+
+    let refused = registry
+        .configure(reconfigure("https://api.anthropic.com"))
+        .expect_err("off-template origin must refuse");
+    assert!(refused.message.contains("bedrock-mantle"));
+    assert_eq!(
+        registry
+            .get("bedrock")
+            .expect("profile persists")
+            .base_url
+            .as_deref(),
+        Some("https://bedrock-mantle.eu-central-1.api.aws/anthropic"),
+        "a refused origin stores NOTHING"
+    );
+
+    // Seeded default-model selection validates against the seeded list.
+    registry
+        .set_default_model("bedrock", "anthropic.claude-opus-5")
+        .expect("seeded inventory serves default selection");
+    assert!(
+        registry
+            .set_default_model("bedrock", "not-a-seeded-model")
+            .is_err(),
+        "an off-inventory default stays refused"
+    );
 }

@@ -3767,6 +3767,9 @@ struct BrokerInner {
     shutting_down: AtomicBool,
     client: reqwest::Client,
     refresh_skew: Duration,
+    /// G4b (LV2): the mockable `gcloud auth print-access-token` source the
+    /// vertex gcloud-refresh credential re-mints through on auth failure.
+    gcloud: Arc<dyn crate::gcloud::GcloudAccessTokenSource>,
     #[cfg(test)]
     panic_refresh_worker: AtomicBool,
 }
@@ -3967,11 +3970,30 @@ impl CredentialBroker {
                 shutting_down: AtomicBool::new(false),
                 client,
                 refresh_skew: OAUTH_REFRESH_SKEW,
+                gcloud: Arc::new(crate::gcloud::GcloudCli),
                 #[cfg(test)]
                 panic_refresh_worker: AtomicBool::new(false),
             }),
             tasks: Arc::new(OwnedTaskSet::new()),
         })
+    }
+
+    /// Replaces the gcloud shell-out source. MUST run before the broker is
+    /// shared (construction time); a shared broker is refused so a test can
+    /// never silently keep the production CLI source.
+    pub(crate) fn with_gcloud_source(
+        mut self,
+        gcloud: Arc<dyn crate::gcloud::GcloudAccessTokenSource>,
+    ) -> Result<Self, HaiderError> {
+        let Some(inner) = Arc::get_mut(&mut self.inner) else {
+            return Err(HaiderError::new(
+                ErrorCode::Internal,
+                "gcloud source must be installed before the broker is shared",
+                false,
+            ));
+        };
+        inner.gcloud = gcloud;
+        Ok(self)
     }
 
     pub(crate) async fn resolve(
@@ -4018,6 +4040,13 @@ impl CredentialBroker {
                 self.resolve_oauth(descriptor, true, failed_access_fingerprint)
                     .await
             }
+            // G4b (LV2): the vertex gcloud-refresh credential re-mints
+            // through the mockable shell-out — a fresh token is vaulted
+            // before the turn retries; failure surfaces the typed gcloud
+            // error instead of a generic auth failure.
+            AuthMethod::ApiKey if crate::gcloud::is_gcloud_refresh_descriptor(descriptor) => {
+                self.refresh_gcloud(descriptor).await
+            }
             AuthMethod::ApiKey => Err(rotation_error(
                 descriptor,
                 haider_accounts::RotationTrigger::AuthExpired,
@@ -4025,6 +4054,29 @@ impl CredentialBroker {
                 "API credential authentication failed",
             )),
         }
+    }
+
+    /// Runs the gcloud source off the async runtime, vaults the fresh token
+    /// under the SAME alias, and returns the re-read handle. The vault write
+    /// is the durable truth (the transcription-secret precedent): the next
+    /// resolve serves the refreshed token with no descriptor mutation.
+    async fn refresh_gcloud(
+        &self,
+        descriptor: &CredentialDescriptor,
+    ) -> Result<SecretHandle, HaiderError> {
+        let gcloud = Arc::clone(&self.inner.gcloud);
+        let token = tokio::task::spawn_blocking(move || gcloud.print_access_token())
+            .await
+            .map_err(|_| crate::gcloud::gcloud_error("refresh worker was lost"))??;
+        let vault = Arc::clone(&self.inner.vault);
+        let alias = descriptor.alias.clone();
+        tokio::task::spawn_blocking(move || {
+            vault
+                .put(&alias, &token)
+                .and_then(|()| vault.resolve(&alias))
+        })
+        .await
+        .map_err(|_| crate::gcloud::gcloud_error("vault worker was lost"))?
     }
 
     pub(crate) async fn resolve_account(
