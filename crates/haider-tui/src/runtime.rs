@@ -1392,6 +1392,8 @@ impl DemoDriver {
             // fabricates locally (sim confirmAuth) and never pushes this
             // request — only the live card's ⏎ does.
             AppRequest::ProviderConfigure { .. } => {}
+            // Live-only read (G4a): demo fabricates no discovery.
+            AppRequest::ProviderModelsRefresh { .. } => {}
             AppRequest::SetDefaultModel {
                 provider,
                 model: default,

@@ -70,10 +70,10 @@ fn add_row_is_bottom_anchored_even_when_empty() {
         .iter()
         .position(|row| row.contains("click an account to make it active"))
         .expect("hints rendered");
-    // Bottom block: buttons(4, since U1 added the OpenCode Zen/Go row) +
-    // blank + hints, then the status row.
+    // Bottom block: buttons(5, since U1 added the OpenCode Zen/Go row and
+    // G4a the Ollama/LM Studio row) + blank + hints, then the status row.
     assert!(
-        button_row >= rows.len() - 7,
+        button_row >= rows.len() - 8,
         "add row must sit at the bottom (row {button_row} of {})",
         rows.len()
     );

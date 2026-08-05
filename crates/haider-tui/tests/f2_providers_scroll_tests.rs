@@ -178,9 +178,11 @@ fn add_login_buttons_pin_at_the_bottom() {
         .position(|row| row.contains("+ OpenAI (OAuth)"))
         .expect("button row");
     // U1 widened the footer to FOUR button rows (OpenCode Zen/Go joined the
-    // HF row's band), so the bottom band is footer(4) + hint + status = 6.
+    // HF row's band); G4a added the local-preset row (Ollama/LM Studio) and
+    // split the key map into action + preset hint lines, so the bottom band
+    // is footer(5) + hints(2) + status = 8.
     assert!(
-        oauth_row >= rows.len() - 6,
+        oauth_row >= rows.len() - 8,
         "buttons pin at the bottom band (footer + status bar), not mid-page (row {oauth_row})"
     );
     // Same flows: the hits still carry the AccountAdd kinds.

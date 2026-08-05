@@ -814,18 +814,25 @@ pub fn request_body(command: LiveCommand) -> RequestBody {
         // W5g-4: the card CREATES — identity fields are fixed here, never
         // typed. The origin string is data on the wire only; it is never
         // interpolated into a shell or browser command (report §4.4).
+        // G4a: keyless presets carry `auth_requirement: none` — the only
+        // identity difference from a keyed custom.
         LiveCommand::ConfigureProvider {
             command_id,
             provider,
             origin,
             model,
+            keyless,
             expected_revision,
         } => RequestBody::ProviderConfigure {
             command_id,
             provider,
             api_family: Some(haider_rpc::ProviderApiFamilyWire::OpenAiChatCompletions),
             origin: Some(origin),
-            auth_requirement: Some(haider_rpc::ProviderAuthRequirementWire::ApiKey),
+            auth_requirement: Some(if keyless {
+                haider_rpc::ProviderAuthRequirementWire::None
+            } else {
+                haider_rpc::ProviderAuthRequirementWire::ApiKey
+            }),
             enabled: true,
             models: vec![model.clone()],
             default_model: Some(model),

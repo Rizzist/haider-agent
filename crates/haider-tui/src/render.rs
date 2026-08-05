@@ -1137,7 +1137,7 @@ fn push_account_add_buttons<'a>(
     lines_out: &mut Vec<Line<'a>>,
     rects_out: &mut Vec<(usize, u16, u16, Hit)>,
 ) {
-    let rows: [&[(&str, crate::app::AccountAddKind)]; 4] = [
+    let rows: [&[(&str, crate::app::AccountAddKind)]; 5] = [
         &[
             ("+ OpenAI (OAuth)", crate::app::AccountAddKind::OpenAiOAuth),
             (
@@ -1158,6 +1158,13 @@ fn push_account_add_buttons<'a>(
             ("+ HuggingFace", crate::app::AccountAddKind::HuggingFace),
             ("+ OpenCode Zen", crate::app::AccountAddKind::OpencodeZen),
             ("+ OpenCode Go", crate::app::AccountAddKind::OpencodeGo),
+        ],
+        // G4a: the local OSS presets — keyless customs at the servers'
+        // default loopback origins. OpenAI stays first, Custom stays last
+        // (the B6b edge rule).
+        &[
+            ("+ Ollama (local)", crate::app::AccountAddKind::Ollama),
+            ("+ LM Studio (local)", crate::app::AccountAddKind::LmStudio),
         ],
         &[(
             "+ Custom (OpenAI-compatible)",
@@ -1573,8 +1580,23 @@ fn render_providers(
     }
     for (index, summary) in model.providers.providers.iter().enumerate() {
         use haider_rpc::ProviderAvailabilityWire;
+        // G4a: a KEYLESS local provider (chat-completions custom, stored
+        // origin, no auth methods) with nothing discovered is almost always
+        // a server that is not running — say so, actionably.
+        let keyless_local = matches!(
+            summary.api_family,
+            haider_rpc::ProviderApiFamilyWire::OpenAiChatCompletions
+        ) && summary.endpoint.is_some()
+            && summary.auth_methods.is_empty();
         let (dot, dot_style, health) = match summary.availability {
             ProviderAvailabilityWire::Available => ("●", theme.ok_style(), "available".to_owned()),
+            ProviderAvailabilityWire::Unavailable if keyless_local && summary.models.is_empty() => {
+                (
+                    "○",
+                    theme.dim_style(),
+                    "unavailable — start the server, then refresh (f)".to_owned(),
+                )
+            }
             ProviderAvailabilityWire::Unavailable => (
                 "○",
                 theme.dim_style(),
@@ -1713,25 +1735,31 @@ fn render_providers(
     // scroll body, still reachable by scrolling to the end.
     // P1: the key map names the reveal only while a masked identity is
     // actually on screen (the shared device section's account labels).
+    // G4a: the preset roster outgrew one hint line at narrow widths — the
+    // key map splits into the action line and the preset line so `r
+    // reveals`/`esc back` stay visible at 100-118 columns.
     let hint = if model
         .device
         .candidates
         .iter()
         .any(|candidate| candidate.account_label.is_some())
     {
-        "click a model to set the default · e edits · x removes · h HuggingFace · z Zen · g Go · r reveals · esc back"
+        "click a model to set the default · e edits · x removes · f refresh · r reveals · esc back"
     } else {
-        "click a model to set the default · e edits · x removes · h HuggingFace · z Zen · g Go · esc back"
+        "click a model to set the default · e edits · x removes · f refresh · esc back"
     };
+    let preset_hint = "presets: h HuggingFace · z Zen · g Go · o Ollama · l LM Studio";
     let mut footer_lines: Vec<Line<'_>> = Vec::new();
     let mut footer_hits: Vec<(usize, u16, u16, Hit)> = Vec::new();
     let pinned = area.height >= 12;
     if pinned {
         push_account_add_buttons(model, theme, &mut footer_lines, &mut footer_hits);
         footer_lines.push(Line::styled(hint, theme.faint_style()));
+        footer_lines.push(Line::styled(preset_hint, theme.faint_style()));
     } else {
         push_account_add_buttons(model, theme, &mut lines, &mut chip_hits);
         lines.push(Line::styled(hint, theme.faint_style()));
+        lines.push(Line::styled(preset_hint, theme.faint_style()));
     }
     let footer_height = u16::try_from(footer_lines.len()).unwrap_or(0);
     let [roster_area, footer_area] =

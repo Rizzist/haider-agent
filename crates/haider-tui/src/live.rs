@@ -351,14 +351,16 @@ pub enum LiveCommand {
     },
     /// `provider.configure` CREATE for a custom OpenAI-compatible provider
     /// (W5g-4). Identity fields are fixed by the card: chat-completions
-    /// family, api-key auth, enabled. The served model seeds the inventory
-    /// and the default in one stroke (an enabled create requires both —
-    /// daemon law, W5g-5).
+    /// family, api-key auth (or auth NONE for the G4a keyless presets),
+    /// enabled. The served model seeds the inventory and the default in one
+    /// stroke (an enabled create requires both — daemon law, W5g-5).
     ConfigureProvider {
         command_id: CommandId,
         provider: String,
         origin: String,
         model: String,
+        /// G4a: `auth_requirement: none` on the wire when true.
+        keyless: bool,
         expected_revision: u64,
     },
     /// `transcription.secret_get` (T2): read the vaulted Deepgram key for
@@ -2677,6 +2679,28 @@ impl LiveDriver {
                 provider: row.provider.clone(),
             });
         }
+        // G4a: KEYLESS custom providers have no account row at all — their
+        // discovery trigger is the provider summary itself: an enabled
+        // chat-completions custom with a stored origin, no auth methods,
+        // and no models yet asks once per connection.
+        for summary in &model.providers.providers {
+            let keyless = matches!(
+                summary.api_family,
+                haider_rpc::ProviderApiFamilyWire::OpenAiChatCompletions
+            ) && summary.endpoint.is_some()
+                && summary.auth_methods.is_empty()
+                && summary.enabled;
+            if !keyless
+                || !summary.models.is_empty()
+                || self.models_requested.contains(&summary.provider)
+            {
+                continue;
+            }
+            self.models_requested.insert(summary.provider.clone());
+            commands.push(LiveCommand::RefreshProviderModels {
+                provider: summary.provider.clone(),
+            });
+        }
         commands
     }
 
@@ -2958,6 +2982,7 @@ impl LiveDriver {
                 name,
                 origin,
                 model: served_model,
+                keyless,
                 expected_revision,
             } => {
                 let command_id = self.mint();
@@ -2967,8 +2992,15 @@ impl LiveDriver {
                     provider: name,
                     origin,
                     model: served_model,
+                    keyless,
                     expected_revision,
                 })]
+            }
+            // G4a: an explicit models re-discovery (the `f` key and the
+            // keyless commit chain). A read — not outboxed, no receipt.
+            AppRequest::ProviderModelsRefresh { provider } => {
+                self.models_requested.insert(provider.clone());
+                vec![LiveCommand::RefreshProviderModels { provider }]
             }
             AppRequest::AccountSetActive { alias } => {
                 let command_id = self.mint();

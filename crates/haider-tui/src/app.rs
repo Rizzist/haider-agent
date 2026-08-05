@@ -503,6 +503,10 @@ pub struct CustomProviderCard {
     /// are locked; only the model line is typed (`provider.configure`
     /// update semantics: supplied identity must match exactly).
     pub edit: bool,
+    /// G4a: an auth-None (keyless) preset — the configure carries
+    /// `auth_requirement: none` and commit SKIPS the key card, going
+    /// straight to model discovery.
+    pub keyless: bool,
 }
 
 /// The `/providers` screen state (report §5.2). Same daemon-truth law as
@@ -2136,8 +2140,16 @@ pub enum AppRequest {
         /// The served model id — seeds the inventory AND the default (an
         /// enabled create requires both, daemon law).
         model: String,
+        /// G4a: true for auth-None presets — the wire carries
+        /// `auth_requirement: none` instead of `api_key`.
+        keyless: bool,
         expected_revision: u64,
     },
+    /// G4a: re-run one provider's model discovery
+    /// (`provider.models_refresh`) — pushed by `f` on `/providers` and by a
+    /// committed keyless configure. A READ against the stored origin; the
+    /// inventory moves only on the daemon's refreshed snapshot.
+    ProviderModelsRefresh { provider: String },
     /// Open a URL in the user's browser (runtime-owned effect; the demo
     /// flashes it instead). Carried for the OAuth authorize hop — the URL
     /// always originates from the daemon's sanctioned registration.
@@ -2357,6 +2369,12 @@ pub enum AccountAddKind {
     HuggingFace,
     OpencodeZen,
     OpencodeGo,
+    /// G4a: local Ollama preset — keyless (auth-None) custom provider at
+    /// the default `http://127.0.0.1:11434/v1`.
+    Ollama,
+    /// G4a: local LM Studio preset — keyless (auth-None) custom provider
+    /// at the default `http://127.0.0.1:1234/v1`.
+    LmStudio,
     Custom,
 }
 
@@ -6485,6 +6503,25 @@ impl AppModel {
             KeyCode::Char('h') => self.open_huggingface_preset(),
             KeyCode::Char('z') => self.open_opencode_zen_preset(),
             KeyCode::Char('g') => self.open_opencode_go_preset(),
+            KeyCode::Char('o') => self.open_ollama_preset(),
+            KeyCode::Char('l') => self.open_lmstudio_preset(),
+            // G4a: `f` re-runs model discovery for the selected provider —
+            // the affordance behind the local presets' "start the server,
+            // then refresh" hint. Live-only vocabulary; the daemon answers
+            // with the refreshed inventory or a typed reason.
+            KeyCode::Char('f') if !self.mode.fabricates_locally() => {
+                if let Some(provider) = self
+                    .providers
+                    .providers
+                    .get(self.providers.cursor)
+                    .map(|summary| summary.provider.clone())
+                {
+                    self.providers.message = Some(format!("refreshing {provider} models…"));
+                    self.requests
+                        .push(AppRequest::ProviderModelsRefresh { provider });
+                    self.dirty = true;
+                }
+            }
             KeyCode::Char('r') => {
                 // P1 (the U2 owner addendum): `r` toggles the identity
                 // REVEAL for this visit only — the device section's
@@ -6562,6 +6599,8 @@ impl AppModel {
             | AccountAddKind::HuggingFace
             | AccountAddKind::OpencodeZen
             | AccountAddKind::OpencodeGo
+            | AccountAddKind::Ollama
+            | AccountAddKind::LmStudio
             | AccountAddKind::Custom => return,
         };
         let alias = smallest_free_alias(provider, &self.accounts.rows);
@@ -6791,6 +6830,7 @@ impl AppModel {
             phase: CustomPhase::Editing { error: None },
             attempt: self.custom_attempt_seq,
             edit: false,
+            keyless: false,
         });
         self.dirty = true;
     }
@@ -6823,6 +6863,7 @@ impl AppModel {
             phase: CustomPhase::Editing { error: None },
             attempt: self.custom_attempt_seq,
             edit: true,
+            keyless: summary.auth_methods.is_empty(),
         });
         self.dirty = true;
     }
@@ -6851,10 +6892,33 @@ impl AppModel {
         self.open_custom_preset("opencode-go", "https://opencode.ai/zen/go/v1");
     }
 
+    /// G4a: the Ollama preset — a KEYLESS (auth-None) custom provider at
+    /// ollama's default compat origin. The user supplies the served model
+    /// (`ollama pull` names it); commit skips the key card and discovers.
+    fn open_ollama_preset(&mut self) {
+        self.open_keyless_preset("ollama", "http://127.0.0.1:11434/v1");
+    }
+
+    /// G4a: the LM Studio preset — the same keyless contract at LM Studio's
+    /// default local server origin.
+    fn open_lmstudio_preset(&mut self) {
+        self.open_keyless_preset("lmstudio", "http://127.0.0.1:1234/v1");
+    }
+
     /// One-click custom-provider preset: the custom card prefilled with a
     /// known openai-compatible origin; the user supplies the served model,
     /// then the normal login flow adds the key.
     fn open_custom_preset(&mut self, stem: &str, origin: &str) {
+        self.open_preset_card(stem, origin, false);
+    }
+
+    /// G4a keyless variant: same card, `auth_requirement: none` on commit,
+    /// no key card afterwards.
+    fn open_keyless_preset(&mut self, stem: &str, origin: &str) {
+        self.open_preset_card(stem, origin, true);
+    }
+
+    fn open_preset_card(&mut self, stem: &str, origin: &str, keyless: bool) {
         if self.custom_add.is_some() || self.oauth_add.is_some() {
             return;
         }
@@ -6888,6 +6952,7 @@ impl AppModel {
             phase: CustomPhase::Editing { error: None },
             attempt: self.custom_attempt_seq,
             edit: false,
+            keyless,
         });
         self.dirty = true;
     }
@@ -6931,11 +6996,13 @@ impl AppModel {
         let name = card.name.clone();
         let origin = card.origin.trim().to_owned();
         let model = card.model.trim().to_owned();
+        let keyless = card.keyless;
         self.requests.push(AppRequest::ProviderConfigure {
             attempt,
             name,
             origin,
             model,
+            keyless,
             expected_revision,
         });
         self.dirty = true;
@@ -6957,10 +7024,23 @@ impl AppModel {
     /// A committed `provider.configure`: close the card and chain straight
     /// into the masked key card — the provider needs a credential before
     /// it can serve anything (report §4.4: custom = base URL + key).
+    /// G4a: a KEYLESS card skips the key card entirely — there is no
+    /// credential to add — and goes straight to model discovery.
     pub fn custom_add_committed(&mut self, attempt: u64) {
         let Some(card) = self.custom_add.take_if(|card| card.attempt == attempt) else {
             return;
         };
+        if card.keyless {
+            self.providers.message = Some(format!(
+                "✓ provider {} created · keyless — discovering models…",
+                card.name
+            ));
+            self.requests.push(AppRequest::ProviderModelsRefresh {
+                provider: card.name,
+            });
+            self.dirty = true;
+            return;
+        }
         self.accounts.message = Some(format!(
             "✓ provider {} created · OpenAI-compatible — now add its key",
             card.name
@@ -9228,6 +9308,12 @@ impl AppModel {
                     }
                     AccountAddKind::OpencodeGo => {
                         self.open_opencode_go_preset();
+                    }
+                    AccountAddKind::Ollama => {
+                        self.open_ollama_preset();
+                    }
+                    AccountAddKind::LmStudio => {
+                        self.open_lmstudio_preset();
                     }
                 }
             }
