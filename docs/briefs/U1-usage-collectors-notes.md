@@ -226,3 +226,11 @@ untouched.
 - kimi-oauth meter is fixture-verified only (no live kimi account on this
   machine); openai-oauth likewise (account expired) — both parsers ride
   shapes lifted from their ecosystems' shipping decoders.
+
+## Review of record (coordinator, executed post-lane)
+
+| # | Mutation (seam) | Verdict |
+|---|---|---|
+| RV4 | Anthropic meter beta-header VALUE corrupted (`usage.rs extra_headers`) | **SURVIVED** the full provider+daemon suites — the mandatory header pair was only observed by the GATED live-poll test, invisible to CI. Closed with `anthropic_meter_request_carries_the_required_header_values` (exact-value pins for beta + claude-code UA; openai/kimi pinned Bearer-only). Re-executed: running 1 test → FAILED at the beta-value assert. Reverted, 10/10 green |
+
+Token-logging sweep of all new non-test files: clean (no token/bearer/key material in any log call). Secrets-on-wire: lane's sweep law reviewed, no gaps found.

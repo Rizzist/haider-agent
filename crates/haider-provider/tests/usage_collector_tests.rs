@@ -311,3 +311,30 @@ fn pricing_estimates_known_families_and_refuses_unknown_models() {
         Some(0.0)
     );
 }
+
+/// LAW (review-of-record RV4): the anthropic-oauth meter request's REQUIRED
+/// header pair is pinned by VALUE — `anthropic-beta: oauth-2025-04-20` and a
+/// `claude-code/` user-agent. The endpoint refuses requests without them,
+/// but only a gated live test would notice; this pin makes the contract
+/// CI-observable. openai/kimi meters ride Bearer alone.
+///
+/// MUTATION CHECK: corrupt either header value in
+/// `UsageMeterEndpoint::extra_headers`. Expected failure: the exact-value
+/// asserts below.
+#[test]
+fn anthropic_meter_request_carries_the_required_header_values() {
+    let headers = UsageMeterEndpoint::AnthropicOauth.extra_headers();
+    assert_eq!(headers.len(), 2, "beta + user-agent, nothing else");
+    assert!(
+        headers.contains(&("anthropic-beta", "oauth-2025-04-20")),
+        "the beta header value is load-bearing: {headers:?}"
+    );
+    assert!(
+        headers
+            .iter()
+            .any(|(name, value)| *name == "user-agent" && value.starts_with("claude-code/")),
+        "the endpoint requires a claude-code user-agent: {headers:?}"
+    );
+    assert!(UsageMeterEndpoint::OpenAiOauth.extra_headers().is_empty());
+    assert!(UsageMeterEndpoint::KimiOauth.extra_headers().is_empty());
+}
